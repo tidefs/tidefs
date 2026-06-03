@@ -975,11 +975,13 @@ Important 2026-06-01 findings:
   `unmount` and `daemon_stop`, passed. A focused current-tree rerun at
   `/root/ai/tmp/tidefs-validation/fuse-generic-184-20260603T183844Z.json`
   now passes `generic/184` after FUSE special-node `mknod` preserves device
-  node type, `rdev`, and `/dev/null` write-through behavior. The remaining
-  #6590 FUSE product failures are `generic/169`, `generic/192`, and
-  `generic/198`, pointing at `FS_IOC_FSGETXATTR`/remount visibility,
-  post-sleep scratch visibility, and AIO sparse-file behavior. This is still
-  not TFR-018 closure.
+  node type, `rdev`, and `/dev/null` write-through behavior. A second focused
+  current-head rerun at
+  `/root/ai/tmp/tidefs-validation/fuse-generic-192-20260603T190341Z.json`
+  now passes `generic/192`. The remaining #6590 FUSE product failures are
+  `generic/169` and `generic/198`, pointing at
+  `FS_IOC_FSGETXATTR`/remount visibility and AIO sparse-file behavior. This
+  is still not TFR-018 closure.
 - `TFR-018`: commit `2bb253a6` makes the FUSE xfstests guest use the
   coreutils `mv` binary so `generic/245` is no longer classified by BusyBox
   wording alone. The #6592 FUSE xfstests tranche now has current-head

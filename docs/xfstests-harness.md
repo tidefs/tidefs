@@ -179,11 +179,12 @@ feature/precondition rows; and 3 rows are environment or feature skips. The
 infrastructure rows, including `unmount` and `daemon_stop`, passed. A focused
 current-tree rerun at
 `/root/ai/tmp/tidefs-validation/fuse-generic-184-20260603T183844Z.json`
-passes `generic/184`, so the remaining #6590 FUSE product defects are
-`generic/169`, `generic/192`, and `generic/198`. Those failures currently
-expose `FS_IOC_FSGETXATTR`/remount visibility issues, post-sleep
-timestamp/stat file visibility failure, and AIO sparse-file `Bus error`
-behavior. This is classification
+passes `generic/184`. A second focused current-head run at
+`/root/ai/tmp/tidefs-validation/fuse-generic-192-20260603T190341Z.json`
+passes `generic/192`. The remaining #6590 FUSE product defects are
+`generic/169` and `generic/198`, exposing `FS_IOC_FSGETXATTR`/remount
+visibility issues and AIO sparse-file `Bus error` behavior. This is
+classification
 
 On commit `2bb253a6`, after the FUSE xfstests guest started using the
 coreutils `mv` binary instead of the BusyBox applet, an outside-sandbox
