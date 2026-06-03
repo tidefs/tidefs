@@ -181,9 +181,12 @@ current-tree rerun at
 `/root/ai/tmp/tidefs-validation/fuse-generic-184-20260603T183844Z.json`
 passes `generic/184`. A second focused current-head run at
 `/root/ai/tmp/tidefs-validation/fuse-generic-192-20260603T190341Z.json`
-passes `generic/192`. The remaining #6590 FUSE product defects are
-`generic/169` and `generic/198`, exposing `FS_IOC_FSGETXATTR`/remount
-visibility issues and AIO sparse-file `Bus error` behavior. This is
+passes `generic/192`. A focused patched-tree run at
+`/root/ai/tmp/tidefs-validation/fuse-generic-169-20260603T192830Z-fsgetxattr.json`
+passes `generic/169` after `FS_IOC_FSGETXATTR` reports a Linux-shaped empty
+`struct fsxattr` and the xfstests helper keeps a stable per-device backing
+store across remounts. The remaining #6590 FUSE product defect is
+`generic/198`, exposing AIO sparse-file `Bus error` behavior. This is
 classification
 
 On commit `2bb253a6`, after the FUSE xfstests guest started using the

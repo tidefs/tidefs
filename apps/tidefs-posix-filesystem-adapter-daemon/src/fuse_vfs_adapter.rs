@@ -24,8 +24,8 @@ use crate::fuse_read::{EngineReadRequest, FuseReadDispatch};
 use crate::fuse_rename::{EngineRenameRequest, FuseRenameDispatch};
 use crate::fusewire::{
     parse_defrag_input, parse_fiemap_input, DefragIoctlInput, DefragIoctlOutput, FiemapInput,
-    FiemapOutput, FuseLockIn, FuseSetlkRequest, FIEMAP_HEADER_SIZE, FS_IOC_FIEMAP,
-    TIDEFS_IOC_DEFRAG,
+    FiemapOutput, FsxattrOutput, FuseLockIn, FuseSetlkRequest, FIEMAP_HEADER_SIZE, FS_IOC_FIEMAP,
+    FS_IOC_FSGETXATTR, TIDEFS_IOC_DEFRAG,
 };
 use crate::handler_prelude::*;
 use crate::lock_dispatch::{DaemonLockDispatch, LockDispatchError};
@@ -6401,6 +6401,25 @@ impl FuseVfsAdapter {
         Ok(buf)
     }
 
+    /// Dispatch FS_IOC_FSGETXATTR with Linux-shaped empty inode xflags.
+    pub fn dispatch_fsgetxattr(
+        &self,
+        ctx: &RequestCtx,
+        ino: u64,
+        out_size: u32,
+    ) -> Result<Vec<u8>, Errno> {
+        {
+            let engine = self.engine.lock().unwrap();
+            engine.getattr(InodeId::new(ino), None, ctx)?;
+        }
+        let buf = FsxattrOutput::empty().encode();
+        let buf_len = u32::try_from(buf.len()).map_err(|_| Errno::EFBIG)?;
+        if buf_len > out_size && out_size > 0 {
+            return Err(Errno::ERANGE);
+        }
+        Ok(buf)
+    }
+
     /// Dispatch TIDEFS_IOC_DEFRAG: trigger online defrag for an inode.
     ///
     /// Uses [`VfsEngine::defrag_file`] to merge adjacent extents with the
@@ -8653,6 +8672,11 @@ impl Filesystem for FuseVfsAdapter {
                 }
             };
             match self.dispatch_fiemap(&ctx, ino, fh, input, out_size) {
+                Ok(buf) => reply.ioctl(0, &buf),
+                Err(errno) => reply.reply_errno(errno),
+            }
+        } else if cmd == FS_IOC_FSGETXATTR {
+            match self.dispatch_fsgetxattr(&ctx, ino, out_size) {
                 Ok(buf) => reply.ioctl(0, &buf),
                 Err(errno) => reply.reply_errno(errno),
             }
@@ -17621,6 +17645,25 @@ mod tests {
         let result = fixture.adapter.dispatch_fiemap(&ctx, 1, 999, input, 4096);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn dispatch_fsgetxattr_reports_empty_linux_fsxattr() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+
+        let response = fixture
+            .adapter
+            .dispatch_fsgetxattr(&ctx, root.get(), crate::fusewire::FSXATTR_WIRE_SIZE as u32)
+            .expect("fsgetxattr");
+
+        assert_eq!(response.len(), crate::fusewire::FSXATTR_WIRE_SIZE);
+        assert_eq!(&response[0..20], &[0u8; 20]);
+        assert_eq!(&response[20..28], &[0u8; 8]);
     }
 
     #[test]

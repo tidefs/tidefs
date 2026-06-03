@@ -1319,10 +1319,14 @@ Concrete current drift:
   `/root/ai/tmp/tidefs-validation/fuse-generic-184-20260603T183844Z.json`
   now passes `generic/184`. A second focused current-head run at
   `/root/ai/tmp/tidefs-validation/fuse-generic-192-20260603T190341Z.json`
-  now passes `generic/192`, leaving `generic/169` and `generic/198` as the
-  remaining #6590 FUSE product failures. All infrastructure rows in the
-  original tranche, including `unmount` and `daemon_stop`, passed. This is
-  still not TFR-018 closure.
+  now passes `generic/192`. A focused patched-tree run at
+  `/root/ai/tmp/tidefs-validation/fuse-generic-169-20260603T192830Z-fsgetxattr.json`
+  now passes `generic/169` after `FS_IOC_FSGETXATTR` reports a Linux-shaped
+  empty `struct fsxattr` and the xfstests helper keeps a stable per-device
+  backing store across remounts, leaving `generic/198` as the remaining #6590
+  FUSE product failure. All infrastructure rows in the original tranche,
+  including `unmount` and `daemon_stop`, passed. This is still not TFR-018
+  closure.
 - Commit `2bb253a6` replaces the FUSE xfstests guest BusyBox `mv` applet with
   coreutils `mv`, and commit `07262209` keeps future manifests from claiming
   clean unmount when the teardown row failed. A committed-head outside-sandbox

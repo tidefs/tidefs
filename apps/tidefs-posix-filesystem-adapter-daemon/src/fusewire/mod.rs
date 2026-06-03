@@ -1323,6 +1323,50 @@ pub struct FuseSetlkRequest {
 /// Linux `FS_IOC_FIEMAP` ioctl command value.
 pub const FS_IOC_FIEMAP: u32 = 0xC020_660B;
 
+/// Linux `FS_IOC_FSGETXATTR` ioctl command value.
+pub const FS_IOC_FSGETXATTR: u32 = 0x801C_581F;
+
+/// Linux `FS_IOC_FSSETXATTR` ioctl command value.
+pub const FS_IOC_FSSETXATTR: u32 = 0x401C_5820;
+
+/// Wire size of `struct fsxattr`.
+pub const FSXATTR_WIRE_SIZE: usize = 28;
+
+/// Response for Linux `struct fsxattr`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FsxattrOutput {
+    pub fsx_xflags: u32,
+    pub fsx_extsize: u32,
+    pub fsx_nextents: u32,
+    pub fsx_projid: u32,
+    pub fsx_cowextsize: u32,
+}
+
+impl FsxattrOutput {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            fsx_xflags: 0,
+            fsx_extsize: 0,
+            fsx_nextents: 0,
+            fsx_projid: 0,
+            fsx_cowextsize: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> std::vec::Vec<u8> {
+        let mut buf = std::vec::Vec::with_capacity(FSXATTR_WIRE_SIZE);
+        buf.extend_from_slice(&self.fsx_xflags.to_le_bytes());
+        buf.extend_from_slice(&self.fsx_extsize.to_le_bytes());
+        buf.extend_from_slice(&self.fsx_nextents.to_le_bytes());
+        buf.extend_from_slice(&self.fsx_projid.to_le_bytes());
+        buf.extend_from_slice(&self.fsx_cowextsize.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        buf
+    }
+}
+
 /// Wire size of a `struct fiemap` header.
 pub const FIEMAP_HEADER_SIZE: usize = 32;
 

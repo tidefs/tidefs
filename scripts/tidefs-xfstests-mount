@@ -4,7 +4,7 @@
 # xfstests calls this as: tidefs-preview <mountpoint> -o <options>
 # (via mount.fuse which looks for TEST_DEV on PATH)
 #
-# The wrapper creates a per-mount backing store, launches the FUSE daemon,
+# The wrapper creates a per-device backing store, launches the FUSE daemon,
 # daemonizes it, and waits for the mountpoint to become ready.
 set -euo pipefail
 
@@ -54,12 +54,15 @@ store_root="${TIDEFS_XFSTESTS_STORE_ROOT:-/tmp/tidefs-xfstests-store}"
 mkdir -p "$store_root"
 
 mount_tag="$(echo "$device" | tr -dc 'a-zA-Z0-9._-' | head -c 32)"
-store_dir="$store_root/xfstests-${mount_tag}-$$"
+store_dir="$store_root/xfstests-${mount_tag}"
 mkdir -p "$store_dir"
 
 tidefs_bin="${TIDEFS_BIN:-}"
 [ -n "$tidefs_bin" ] || tidefs_bin="$(command -v tidefs-posix-filesystem-adapter-daemon 2>/dev/null || true)"
 [ -n "$tidefs_bin" ] && [ -x "$tidefs_bin" ] || die "tidefs-posix-filesystem-adapter-daemon not found (set TIDEFS_BIN)"
+
+log_file="$store_dir/tidefs-$$.log"
+pid_file="$store_dir/tidefs-$$.pid"
 
 debug "mountpoint=$mountpoint store=$store_dir tidefs=$tidefs_bin"
 debug "daemon_opts=$daemon_opts"
@@ -81,9 +84,9 @@ fi
 "$tidefs_bin" mount --store "$store_dir" --mount "$mountpoint" \
     --options "$daemon_opts" \
     "${root_auth_args[@]}" \
-    &>"$store_dir/tidefs.log" &
+    &>"$log_file" &
 tidefs_pid=$!
-echo "$tidefs_pid" > "$store_dir/tidefs.pid"
+echo "$tidefs_pid" > "$pid_file"
 
 # Wait for mountpoint (poll up to 30s)
 for waited in $(seq 30); do
@@ -92,7 +95,7 @@ for waited in $(seq 30); do
         disown "$tidefs_pid" 2>/dev/null || true
         exit 0
     fi
-    kill -0 "$tidefs_pid" 2>/dev/null || { tail -20 "$store_dir/tidefs.log" 2>/dev/null >&2; die "tidefs daemon exited before mount became ready"; }
+    kill -0 "$tidefs_pid" 2>/dev/null || { tail -20 "$log_file" 2>/dev/null >&2; die "tidefs daemon exited before mount became ready"; }
     sleep 1
 done
 

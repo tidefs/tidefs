@@ -978,10 +978,13 @@ Important 2026-06-01 findings:
   node type, `rdev`, and `/dev/null` write-through behavior. A second focused
   current-head rerun at
   `/root/ai/tmp/tidefs-validation/fuse-generic-192-20260603T190341Z.json`
-  now passes `generic/192`. The remaining #6590 FUSE product failures are
-  `generic/169` and `generic/198`, pointing at
-  `FS_IOC_FSGETXATTR`/remount visibility and AIO sparse-file behavior. This
-  is still not TFR-018 closure.
+  now passes `generic/192`. A focused patched-tree rerun at
+  `/root/ai/tmp/tidefs-validation/fuse-generic-169-20260603T192830Z-fsgetxattr.json`
+  now passes `generic/169` after `FS_IOC_FSGETXATTR` reports a Linux-shaped
+  empty `struct fsxattr` and the xfstests helper keeps a stable per-device
+  backing store across remounts. The remaining #6590 FUSE product failure is
+  `generic/198`, pointing at AIO sparse-file behavior. This is still not
+  TFR-018 closure.
 - `TFR-018`: commit `2bb253a6` makes the FUSE xfstests guest use the
   coreutils `mv` binary so `generic/245` is no longer classified by BusyBox
   wording alone. The #6592 FUSE xfstests tranche now has current-head
