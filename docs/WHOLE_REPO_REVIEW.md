@@ -1312,11 +1312,15 @@ Concrete current drift:
   with KVM and Linux 7.0.0. The copied JSON at
   reports `passed=10`, `failed=4`, `blocked=0`, `unsupported=43`, and
   `skipped=3`, with exactly one xfstests row for each requested `generic/151`
-  through `generic/200`. No xfstests rows pass; `generic/169`, `generic/184`,
-  `generic/192`, and `generic/198` fail as product defects; 43 rows are
-  unsupported; and 3 rows are skipped preconditions. All infrastructure rows,
-  including `unmount` and `daemon_stop`, pass. This completes the #6590
-  TFR-018 closure.
+  through `generic/200`. That tranche had no xfstests pass rows:
+  `generic/169`, `generic/184`, `generic/192`, and `generic/198` failed as
+  product defects; 43 rows were unsupported; and 3 rows were skipped
+  preconditions. A focused current-tree rerun at
+  `/root/ai/tmp/tidefs-validation/fuse-generic-184-20260603T183844Z.json`
+  now passes `generic/184`, leaving `generic/169`, `generic/192`, and
+  `generic/198` as the remaining #6590 FUSE product failures. All
+  infrastructure rows in the original tranche, including `unmount` and
+  `daemon_stop`, passed. This is still not TFR-018 closure.
 - Commit `2bb253a6` replaces the FUSE xfstests guest BusyBox `mv` applet with
   coreutils `mv`, and commit `07262209` keeps future manifests from claiming
   clean unmount when the teardown row failed. A committed-head outside-sandbox

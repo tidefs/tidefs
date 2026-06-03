@@ -1352,7 +1352,13 @@ impl VfsEngine for VfsLocalFileSystem {
         rdev: u32,
         ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
-        match mode & S_IFMT {
+        let file_type = mode & S_IFMT;
+        let rdev = match file_type {
+            S_IFCHR | S_IFBLK => rdev,
+            _ => 0,
+        };
+
+        match file_type {
             S_IFREG => {
                 self.create_metadata_only_node(parent, name, NodeKind::File, mode, rdev, ctx)
             }

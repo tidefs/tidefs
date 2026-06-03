@@ -1,8 +1,8 @@
 //! FUSE daemon mount-option parser.
 //!
-//! Parses `-o atime,relatime,noatime,sync,async,...` comma-separated
+//! Parses `-o atime,relatime,noatime,sync,async,dev,nodev,...` comma-separated
 //! FUSE mount options into a typed [`MountOptions`] struct with
-//! timestamp policy and sync-mode flags.
+//! timestamp policy, sync-mode flags, and device-node enablement.
 
 use std::str::FromStr;
 use tidefs_dataset_lifecycle::SyncGuarantee;
@@ -72,7 +72,8 @@ impl FromStr for TimestampPolicy {
 /// Parsed FUSE `-o` mount options.
 ///
 /// Supports the options relevant to the TideFS daemon: atime policy
-/// sync/async write mode, and intent-log buffered-write toggle.
+/// sync/async write mode, device-node enablement, and intent-log
+/// buffered-write toggle.
 /// Unrecognized options are rejected.
 /// Idmapped mounts are explicitly refused (not yet supported).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +85,9 @@ pub struct MountOptions {
     pub sync: bool,
     /// Per-dataset write-acknowledgment durability guarantee.
     pub sync_guarantee: SyncGuarantee,
+    /// When true, allow special character and block devices on the mounted
+    /// filesystem by passing the kernel FUSE `dev` mount option.
+    pub dev: bool,
     /// When true, tiny buffered writes may record inline `BufferedWrite`
     /// entries before acknowledging the kernel. Larger writes are left to the
     /// storage commit path so the FUSE hot path does not hash user payloads.
@@ -96,6 +100,7 @@ impl Default for MountOptions {
             timestamp_policy: TimestampPolicy::default(),
             sync: false,
             sync_guarantee: SyncGuarantee::Local,
+            dev: false,
             intent_log_write: false,
         }
     }
@@ -105,7 +110,8 @@ impl MountOptions {
     /// Parse a comma-separated `-o` option string.
     ///
     /// Supported keys: `atime`, `strictatime`, `relatime`, `noatime`,
-    /// `sync`, `async`, `intent_log_write=true`, `intent_log_write=false`.
+    /// `sync`, `async`, `dev`, `nodev`, `intent_log_write=true`,
+    /// `intent_log_write=false`.
     /// Unknown options produce an error.
     ///
     /// If multiple atime-policy options appear, the last one wins.
@@ -133,6 +139,8 @@ impl MountOptions {
                 }
                 "sync" => opts.sync = true,
                 "async" => opts.sync = false,
+                "dev" => opts.dev = true,
+                "nodev" => opts.dev = false,
                 "intent_log_write=true" => opts.intent_log_write = true,
                 "intent_log_write=false" => opts.intent_log_write = false,
                 other => {
@@ -151,7 +159,7 @@ impl MountOptions {
                     }
                     return Err(format!(
                         "unsupported mount option `{other}`; \
-                         supported: atime, relatime, noatime, sync, async,                          intent_log_write=true|false.                          Idmapped mounts are not supported."
+                         supported: atime, relatime, noatime, sync, async,                          dev, nodev, intent_log_write=true|false.                          Idmapped mounts are not supported."
                     ));
                 }
             }
@@ -163,12 +171,15 @@ impl MountOptions {
     /// Convert to the FUSE kernel `MountOption` slice for use with
     /// `fuser::spawn_mount2`.
     pub fn to_fuse_mount_options(&self) -> Vec<fuser::MountOption> {
-        let mut v = Vec::with_capacity(2);
+        let mut v = Vec::with_capacity(3);
         if let Some(option) = self.timestamp_policy.to_fuse_mount_option() {
             v.push(option);
         }
         if self.sync {
             v.push(fuser::MountOption::Sync);
+        }
+        if self.dev {
+            v.push(fuser::MountOption::Dev);
         }
         v
     }
@@ -261,6 +272,7 @@ mod tests {
         let opts = MountOptions::default();
         assert_eq!(opts.timestamp_policy, TimestampPolicy::RelativeAtime);
         assert!(!opts.sync);
+        assert!(!opts.dev);
         assert!(!opts.intent_log_write);
     }
 
@@ -308,10 +320,20 @@ mod tests {
     }
 
     #[test]
+    fn mount_options_parse_dev_and_nodev() {
+        let opts = MountOptions::parse("dev").unwrap();
+        assert!(opts.dev);
+
+        let opts = MountOptions::parse("dev,nodev").unwrap();
+        assert!(!opts.dev);
+    }
+
+    #[test]
     fn mount_options_parse_combined() {
-        let opts = MountOptions::parse("noatime,sync").unwrap();
+        let opts = MountOptions::parse("noatime,sync,dev").unwrap();
         assert_eq!(opts.timestamp_policy, TimestampPolicy::NoAtime);
         assert!(opts.sync);
+        assert!(opts.dev);
     }
 
     #[test]
@@ -327,6 +349,9 @@ mod tests {
 
         let opts = MountOptions::parse("sync,async").unwrap();
         assert!(!opts.sync);
+
+        let opts = MountOptions::parse("nodev,dev").unwrap();
+        assert!(opts.dev);
     }
 
     #[test]
@@ -351,11 +376,13 @@ mod tests {
             timestamp_policy: TimestampPolicy::NoAtime,
             sync: true,
             sync_guarantee: SyncGuarantee::Local,
+            dev: true,
             intent_log_write: true,
         };
         let v = opts.to_fuse_mount_options();
         assert!(v.contains(&fuser::MountOption::NoAtime));
         assert!(v.contains(&fuser::MountOption::Sync));
+        assert!(v.contains(&fuser::MountOption::Dev));
     }
 
     #[test]
@@ -364,6 +391,7 @@ mod tests {
             timestamp_policy: TimestampPolicy::StrictAtime,
             sync: false,
             sync_guarantee: SyncGuarantee::Local,
+            dev: false,
             intent_log_write: true,
         };
         assert!(opts.to_fuse_mount_options().is_empty());

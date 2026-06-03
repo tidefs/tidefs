@@ -969,13 +969,17 @@ Important 2026-06-01 findings:
   booted Linux 7.0.0, mounted the TideFS FUSE adapter, and produced one
   structured row for every requested `generic/151` through `generic/200` test.
   The aggregate counters are `passed=10`, `failed=4`, `blocked=0`,
-  `unsupported=43`, and `skipped=3`; the xfstests rows specifically have zero
+  `unsupported=43`, and `skipped=3`; the xfstests rows specifically had zero
   PASS rows, 4 product FAIL rows (`generic/169`, `184`, `192`, `198`), 43
   unsupported rows, and 3 skipped rows. The infrastructure rows, including
-  `unmount` and `daemon_stop`, passed. The failures currently point at
-  `FS_IOC_FSGETXATTR`/remount visibility, special-node `mknod`, post-sleep
-  scratch directory is
-  not as TFR-018 closure.
+  `unmount` and `daemon_stop`, passed. A focused current-tree rerun at
+  `/root/ai/tmp/tidefs-validation/fuse-generic-184-20260603T183844Z.json`
+  now passes `generic/184` after FUSE special-node `mknod` preserves device
+  node type, `rdev`, and `/dev/null` write-through behavior. The remaining
+  #6590 FUSE product failures are `generic/169`, `generic/192`, and
+  `generic/198`, pointing at `FS_IOC_FSGETXATTR`/remount visibility,
+  post-sleep scratch visibility, and AIO sparse-file behavior. This is still
+  not TFR-018 closure.
 - `TFR-018`: commit `2bb253a6` makes the FUSE xfstests guest use the
   coreutils `mv` binary so `generic/245` is no longer classified by BusyBox
   wording alone. The #6592 FUSE xfstests tranche now has current-head

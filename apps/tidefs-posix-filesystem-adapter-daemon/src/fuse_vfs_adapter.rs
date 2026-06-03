@@ -6,7 +6,7 @@
 //! `fuser::Filesystem`, mapping every supported FUSE operation to the
 //! corresponding 29-op VfsEngine contract.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::Ordering;
@@ -222,6 +222,10 @@ fn check_parent_write_execute(
     parent: InodeId,
     ctx: &RequestCtx,
 ) -> Result<(), Errno> {
+    let parent_attr = engine.getattr(parent, None, ctx)?;
+    if parent_attr.kind != NodeKind::Dir {
+        return Err(Errno::ENOTDIR);
+    }
     let acl: Option<Vec<PosixAclEntry>> =
         match engine.getxattr(parent, b"system.posix_acl_access", ctx) {
             Ok(data) => tidefs_permission::decode_posix_acl_xattr(&data).ok(),
@@ -229,7 +233,7 @@ fn check_parent_write_execute(
             Err(_) => None,
         };
     plan_fuse_access_result(
-        engine.getattr(parent, None, ctx),
+        Ok(parent_attr),
         ctx,
         ACCESS_WRITE | ACCESS_EXECUTE,
         acl.as_deref(),
@@ -281,6 +285,10 @@ fn namespace_kind_to_node_kind(kind: u32) -> NodeKind {
         tidefs_namespace::KIND_DIR => NodeKind::Dir,
         tidefs_namespace::KIND_FILE => NodeKind::File,
         tidefs_namespace::KIND_SYMLINK => NodeKind::Symlink,
+        tidefs_namespace::KIND_FIFO => NodeKind::Fifo,
+        tidefs_namespace::KIND_SOCKET => NodeKind::Socket,
+        tidefs_namespace::KIND_CHAR => NodeKind::CharDev,
+        tidefs_namespace::KIND_BLOCK => NodeKind::BlockDev,
         _ => NodeKind::File, // fallback: treat unknown as regular file
     }
 }
@@ -1835,6 +1843,11 @@ fn file_type_for_posix_mode(mode: u32) -> FileType {
     match mode & S_IFMT {
         tidefs_types_vfs_core::S_IFDIR => FileType::Directory,
         tidefs_types_vfs_core::S_IFREG => FileType::RegularFile,
+        tidefs_types_vfs_core::S_IFLNK => FileType::Symlink,
+        tidefs_types_vfs_core::S_IFCHR => FileType::CharDevice,
+        tidefs_types_vfs_core::S_IFBLK => FileType::BlockDevice,
+        tidefs_types_vfs_core::S_IFIFO => FileType::NamedPipe,
+        tidefs_types_vfs_core::S_IFSOCK => FileType::Socket,
         _ => FileType::RegularFile,
     }
 }
@@ -4009,7 +4022,6 @@ impl FuseVfsAdapter {
             let e = self.engine.lock().unwrap();
             e.lookup(InodeId::new(parent), name, ctx)
         };
-        eprintln!("  DIAG  dispatch_lookup: engine.lookup() completed");
 
         // Track per-inode lookup frequency metric for reclaim.
         if let Ok(ref attr) = result {
@@ -4051,7 +4063,6 @@ impl FuseVfsAdapter {
             let _ = (ctx, unique, fh);
         }
 
-        eprintln!("  DIAG  dispatch_getattr: entered ino={ino}");
         // Check the short-lived getattr cache before acquiring engine lock.
         {
             let cache = self.getattr_cache.lock().unwrap();
@@ -4666,9 +4677,9 @@ impl FuseVfsAdapter {
         mode: u32,
         rdev: u32,
     ) -> Result<InodeAttr, Errno> {
-        if let Some(ref ns) = self.namespace {
-            return self.dispatch_mknod_via_namespace(ns, parent, name, mode, rdev);
-        }
+        // Mounted mutations use the VFS engine as the authoritative inode,
+        // metadata, and persistence boundary. Namespace-only mknod remains
+        // available through dispatch_mknod_via_namespace for legacy tests.
         self.dispatch_mknod_entry(ctx, parent, name, mode, rdev)
     }
 
@@ -6810,8 +6821,20 @@ impl FuseVfsAdapter {
         // The VFS engine is authoritative for mounted mutations.  The
         // namespace handle remains a fallback for legacy namespace-only test
         // surfaces, but must not hide engine-created children from readdir.
-        let engine_error = match self.dispatch_readdir_via_engine(ctx, ino, fh, offset) {
-            Ok(entries) => return Ok(entries),
+        let engine_offset = if self.namespace.is_some() { 0 } else { offset };
+        let engine_error = match self.dispatch_readdir_via_engine(ctx, ino, fh, engine_offset) {
+            Ok(engine_entries) => {
+                if let Some(ref ns) = self.namespace {
+                    return self.merge_namespace_readdir_entries(
+                        ns,
+                        ino,
+                        fh,
+                        offset,
+                        engine_entries,
+                    );
+                }
+                return Ok(engine_entries);
+            }
             Err(errno @ (Errno::ENOENT | Errno::EBADF | Errno::EIO)) => errno,
             Err(e) => return Err(e),
         };
@@ -6824,6 +6847,45 @@ impl FuseVfsAdapter {
             }
         }
         Err(engine_error)
+    }
+
+    fn merge_namespace_readdir_entries(
+        &self,
+        ns: &Namespace,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        engine_entries: (Vec<DirEntry>, bool),
+    ) -> Result<(Vec<DirEntry>, bool), Errno> {
+        let (mut entries, engine_has_more) = engine_entries;
+        let (namespace_entries, namespace_has_more) =
+            match self.dispatch_readdir_via_namespace(ns, ino, fh, DirCookie::START) {
+                Ok(entries) => entries,
+                Err(Errno::ENOENT | Errno::EIO) => return Ok((entries, engine_has_more)),
+                Err(e) => return Err(e),
+            };
+
+        let mut seen_names: HashSet<Vec<u8>> =
+            entries.iter().map(|entry| entry.name.clone()).collect();
+        for entry in namespace_entries {
+            if seen_names.insert(entry.name.clone()) {
+                entries.push(entry);
+            }
+        }
+
+        for (index, entry) in entries.iter_mut().enumerate() {
+            entry.cookie = u64::try_from(index + 1).map_err(|_| Errno::EOVERFLOW)?;
+        }
+
+        let entries = if offset == 0 {
+            entries
+        } else {
+            entries
+                .into_iter()
+                .filter(|entry| entry.cookie > offset)
+                .collect()
+        };
+        Ok((entries, engine_has_more || namespace_has_more))
     }
 
     /// Namespace-backed readdir: iterate [`tidefs_namespace::Namespace`]
@@ -9074,6 +9136,13 @@ mod tests {
         }
     }
 
+    fn root_ctx_with_umask(umask: u32) -> RequestCtx {
+        RequestCtx {
+            umask,
+            ..root_ctx()
+        }
+    }
+
     struct AdapterFixture {
         adapter: FuseVfsAdapter,
         root: PathBuf,
@@ -9103,6 +9172,16 @@ mod tests {
         let engine = VfsLocalFileSystem::new(local_fs);
         let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
         AdapterFixture { adapter, root }
+    }
+
+    fn writable_test_parent(fixture: &AdapterFixture, name: &[u8]) -> InodeId {
+        let root_ctx = root_ctx_with_umask(0);
+        let engine = fixture.adapter.engine.lock().unwrap();
+        let root = engine.get_root_inode(&root_ctx).expect("root inode");
+        engine
+            .mkdir(root, name, 0o777, &root_ctx)
+            .expect("create writable test parent")
+            .inode_id
     }
 
     fn adapter_fixture_with_namespace() -> AdapterFixture {
@@ -11496,14 +11575,11 @@ mod tests {
     fn vfs_adapter_dispatch_mknod_fifo_creates_entry_with_umask() {
         let fixture = adapter_fixture();
         let ctx = access_ctx(1000, 1001, &[1001]);
-        let root = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine.get_root_inode(&ctx).expect("root inode")
-        };
+        let parent = writable_test_parent(&fixture, b"mknod-fifo-parent");
 
         let attr = fixture
             .adapter
-            .dispatch_mknod_entry(&ctx, root.get(), b"pipe", S_IFIFO | 0o666, 0)
+            .dispatch_mknod_entry(&ctx, parent.get(), b"pipe", S_IFIFO | 0o666, 0)
             .expect("mknod fifo dispatch");
 
         assert_eq!(attr.kind, NodeKind::Fifo);
@@ -11513,7 +11589,7 @@ mod tests {
         assert_eq!(attr.posix.gid, 1001);
 
         let engine = fixture.adapter.engine.lock().unwrap();
-        let lookup = engine.lookup(root, b"pipe", &ctx).expect("fifo lookup");
+        let lookup = engine.lookup(parent, b"pipe", &ctx).expect("fifo lookup");
         assert_eq!(lookup.inode_id, attr.inode_id);
         assert_eq!(lookup.kind, NodeKind::Fifo);
         assert_eq!(
@@ -11522,7 +11598,7 @@ mod tests {
                 .dentry_invalidations
                 .lock()
                 .unwrap()
-                .entry_generation(root.get(), b"pipe"),
+                .entry_generation(parent.get(), b"pipe"),
             Some(1)
         );
     }
@@ -11531,14 +11607,11 @@ mod tests {
     fn vfs_adapter_dispatch_mknod_regular_file_creates_entry() {
         let fixture = adapter_fixture();
         let ctx = access_ctx(1000, 1001, &[1001]);
-        let root = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine.get_root_inode(&ctx).expect("root inode")
-        };
+        let parent = writable_test_parent(&fixture, b"mknod-regular-parent");
 
         let attr = fixture
             .adapter
-            .dispatch_mknod_entry(&ctx, root.get(), b"regular", libc::S_IFREG | 0o644, 0)
+            .dispatch_mknod_entry(&ctx, parent.get(), b"regular", libc::S_IFREG | 0o644, 0)
             .expect("mknod regular file dispatch");
 
         assert_eq!(attr.kind, NodeKind::File);
@@ -11551,7 +11624,7 @@ mod tests {
 
         let engine = fixture.adapter.engine.lock().unwrap();
         let lookup = engine
-            .lookup(root, b"regular", &ctx)
+            .lookup(parent, b"regular", &ctx)
             .expect("regular file lookup");
         assert_eq!(lookup.inode_id, attr.inode_id);
         assert_eq!(lookup.kind, NodeKind::File);
@@ -11561,39 +11634,58 @@ mod tests {
                 .dentry_invalidations
                 .lock()
                 .unwrap()
-                .entry_generation(root.get(), b"regular"),
+                .entry_generation(parent.get(), b"regular"),
             Some(1)
         );
     }
 
     #[test]
-    fn vfs_adapter_dispatch_mknod_eopnotsupp_on_block_and_char_device() {
+    fn vfs_adapter_dispatch_mknod_block_and_char_devices_preserve_kind_and_rdev() {
         let fixture = adapter_fixture();
-        let ctx = access_ctx(1000, 1001, &[1001]);
+        let ctx = root_ctx();
         let root = {
             let engine = fixture.adapter.engine.lock().unwrap();
             engine.get_root_inode(&ctx).expect("root inode")
         };
 
-        // Block device nodes are rejected with EOPNOTSUPP (engine level).
-        let result = fixture.adapter.dispatch_mknod_entry(
-            &ctx,
-            root.get(),
-            b"blockdev",
-            libc::S_IFBLK | 0o600,
-            0x0800,
-        );
-        assert_eq!(result.unwrap_err(), Errno::EOPNOTSUPP);
+        let cases = [
+            (
+                b"blockdev".as_slice(),
+                libc::S_IFBLK | 0o600,
+                0x0800,
+                NodeKind::BlockDev,
+                FileType::BlockDevice,
+            ),
+            (
+                b"chardev".as_slice(),
+                libc::S_IFCHR | 0o600,
+                0x0103,
+                NodeKind::CharDev,
+                FileType::CharDevice,
+            ),
+        ];
 
-        // Character device nodes are rejected with EOPNOTSUPP (engine level).
-        let result = fixture.adapter.dispatch_mknod_entry(
-            &ctx,
-            root.get(),
-            b"chardev",
-            libc::S_IFCHR | 0o600,
-            0x0103,
-        );
-        assert_eq!(result.unwrap_err(), Errno::EOPNOTSUPP);
+        for (name, mode, rdev, expected_kind, expected_file_type) in cases {
+            let attr = fixture
+                .adapter
+                .dispatch_mknod_entry(&ctx, root.get(), name, mode, rdev)
+                .expect("mknod special device dispatch");
+
+            assert_eq!(attr.kind, expected_kind);
+            assert_eq!(attr.posix.mode & libc::S_IFMT, mode & libc::S_IFMT);
+            assert_eq!(attr.posix.rdev, rdev);
+
+            let attr_out = fixture
+                .adapter
+                .dispatch_getattr(&ctx, attr.inode_id.get(), 11632, None)
+                .expect("getattr special device");
+            assert_eq!(attr_out.attr.mode & libc::S_IFMT, mode & libc::S_IFMT);
+            assert_eq!(attr_out.attr.rdev, rdev);
+            assert_eq!(
+                file_attr_from_fuse_attr(&attr_out.attr).kind,
+                expected_file_type
+            );
+        }
     }
 
     #[test]
@@ -11651,14 +11743,11 @@ mod tests {
         // dispatch_mknod_entry and returns the same attributes.
         let fixture = adapter_fixture();
         let ctx = access_ctx(1000, 1001, &[1001]);
-        let root = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine.get_root_inode(&ctx).expect("root inode")
-        };
+        let parent = writable_test_parent(&fixture, b"mknod-public-parent");
 
         let attr = fixture
             .adapter
-            .dispatch_mknod(&ctx, root.get(), b"public-pipe", S_IFIFO | 0o600, 0)
+            .dispatch_mknod(&ctx, parent.get(), b"public-pipe", S_IFIFO | 0o600, 0)
             .expect("dispatch_mknod public");
 
         assert_eq!(attr.kind, NodeKind::Fifo);
@@ -11669,7 +11758,7 @@ mod tests {
 
         let engine = fixture.adapter.engine.lock().unwrap();
         let lookup = engine
-            .lookup(root, b"public-pipe", &ctx)
+            .lookup(parent, b"public-pipe", &ctx)
             .expect("lookup public mknod entry");
         assert_eq!(lookup.inode_id, attr.inode_id);
         assert_eq!(lookup.kind, NodeKind::Fifo);
@@ -20830,6 +20919,42 @@ mod tests {
     }
 
     #[test]
+    fn file_attr_from_fuse_attr_maps_posix_mode_file_types() {
+        let cases = [
+            (tidefs_types_vfs_core::S_IFDIR, FileType::Directory),
+            (tidefs_types_vfs_core::S_IFREG, FileType::RegularFile),
+            (tidefs_types_vfs_core::S_IFLNK, FileType::Symlink),
+            (tidefs_types_vfs_core::S_IFCHR, FileType::CharDevice),
+            (tidefs_types_vfs_core::S_IFBLK, FileType::BlockDevice),
+            (tidefs_types_vfs_core::S_IFIFO, FileType::NamedPipe),
+            (tidefs_types_vfs_core::S_IFSOCK, FileType::Socket),
+        ];
+
+        for (mode_type, expected) in cases {
+            let attr = FuseAttr {
+                ino: 7,
+                size: 0,
+                blocks: 0,
+                atime: 0,
+                mtime: 0,
+                ctime: 0,
+                atimensec: 0,
+                mtimensec: 0,
+                ctimensec: 0,
+                mode: mode_type | 0o644,
+                nlink: 1,
+                uid: 1000,
+                gid: 1000,
+                rdev: 0x0103,
+                blksize: 512,
+                padding: 0,
+            };
+
+            assert_eq!(file_attr_from_fuse_attr(&attr).kind, expected);
+        }
+    }
+
+    #[test]
     fn vfs_adapter_dispatch_mkdir_eexist_returns_eexist() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -21173,14 +21298,11 @@ mod tests {
     fn vfs_adapter_dispatch_mknod_mode_masked_by_umask() {
         let fixture = adapter_fixture();
         let ctx = access_ctx(1000, 1001, &[1001]); // umask = 0o022
-        let root = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine.get_root_inode(&ctx).expect("root inode")
-        };
+        let parent = writable_test_parent(&fixture, b"mknod-mode-parent");
 
         let attr = fixture
             .adapter
-            .dispatch_mknod_entry(&ctx, root.get(), b"mode-masked-pipe", S_IFIFO | 0o666, 0)
+            .dispatch_mknod_entry(&ctx, parent.get(), b"mode-masked-pipe", S_IFIFO | 0o666, 0)
             .expect("mknod dispatch");
 
         assert_eq!(attr.posix.mode & 0o777, 0o644);
@@ -21571,7 +21693,7 @@ mod tests {
     }
 
     #[test]
-    fn vfs_adapter_dispatch_mknod_entry_char_device_returns_eopnotsupp() {
+    fn vfs_adapter_dispatch_mknod_entry_special_nodes_preserve_kind_and_rdev() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
         let root = {
@@ -21579,15 +21701,48 @@ mod tests {
             engine.get_root_inode(&ctx).expect("root inode")
         };
 
-        let result = fixture.adapter.dispatch_mknod_entry(
-            &ctx,
-            root.get(),
-            b"char-dev",
-            libc::S_IFCHR | 0o600,
-            0,
-        );
+        let cases: &[(&[u8], u32, u32, NodeKind, u32)] = &[
+            (
+                b"char-dev",
+                libc::S_IFCHR | 0o600,
+                0x0103,
+                NodeKind::CharDev,
+                0x0103,
+            ),
+            (
+                b"block-dev",
+                libc::S_IFBLK | 0o600,
+                0x0801,
+                NodeKind::BlockDev,
+                0x0801,
+            ),
+            (
+                b"socket-node",
+                libc::S_IFSOCK | 0o700,
+                999,
+                NodeKind::Socket,
+                0,
+            ),
+        ];
 
-        assert_eq!(result, Err(Errno::EOPNOTSUPP));
+        for (name, mode, rdev, expected_kind, expected_rdev) in cases {
+            let attr = fixture
+                .adapter
+                .dispatch_mknod_entry(&ctx, root.get(), name, *mode, *rdev)
+                .expect("dispatch_mknod_entry special node");
+
+            assert_eq!(attr.kind, *expected_kind);
+            assert_eq!(attr.posix.mode & libc::S_IFMT, *mode & libc::S_IFMT);
+            assert_eq!(attr.posix.rdev, *expected_rdev);
+
+            let looked_up = fixture
+                .adapter
+                .dispatch_lookup(&ctx, root.get(), name)
+                .expect("special node lookup");
+            assert_eq!(looked_up.inode_id, attr.inode_id);
+            assert_eq!(looked_up.kind, *expected_kind);
+            assert_eq!(looked_up.posix.rdev, *expected_rdev);
+        }
     }
 
     #[test]
@@ -30391,6 +30546,139 @@ mod tests {
             .dispatch_symlink(&ctx, root_ino, b"", b"/target")
             .unwrap_err();
         assert_eq!(err, Errno::EINVAL);
+    }
+
+    #[test]
+    fn namespace_kind_to_node_kind_maps_special_entries() {
+        let cases = [
+            (tidefs_namespace::KIND_FIFO, NodeKind::Fifo),
+            (tidefs_namespace::KIND_SOCKET, NodeKind::Socket),
+            (tidefs_namespace::KIND_CHAR, NodeKind::CharDev),
+            (tidefs_namespace::KIND_BLOCK, NodeKind::BlockDev),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(namespace_kind_to_node_kind(raw), expected);
+        }
+    }
+
+    #[test]
+    fn namespace_dispatch_mknod_special_nodes_preserve_lookup_getattr_and_listing() {
+        let (ns, mut fixture) = namespace_fixture();
+        let ctx = root_ctx();
+        let root_ino = 1u64;
+        let cases: &[(&str, u32, u32, NodeKind, u32)] = &[
+            (
+                "pipe",
+                libc::S_IFIFO | 0o644,
+                0,
+                NodeKind::Fifo,
+                tidefs_namespace::KIND_FIFO,
+            ),
+            (
+                "null",
+                libc::S_IFCHR | 0o660,
+                0x0103,
+                NodeKind::CharDev,
+                tidefs_namespace::KIND_CHAR,
+            ),
+            (
+                "sda1",
+                libc::S_IFBLK | 0o660,
+                0x0801,
+                NodeKind::BlockDev,
+                tidefs_namespace::KIND_BLOCK,
+            ),
+            (
+                "sock",
+                libc::S_IFSOCK | 0o700,
+                0,
+                NodeKind::Socket,
+                tidefs_namespace::KIND_SOCKET,
+            ),
+        ];
+
+        for (idx, (name, mode, rdev, kind, namespace_kind)) in cases.iter().enumerate() {
+            let attr = fixture
+                .adapter
+                .dispatch_mknod_via_namespace(&ns, root_ino, name.as_bytes(), *mode, *rdev)
+                .expect("namespace mknod");
+            assert_eq!(attr.kind, *kind, "created kind for {name}");
+            assert_eq!(
+                attr.posix.mode & libc::S_IFMT,
+                *mode & libc::S_IFMT,
+                "created mode type for {name}"
+            );
+            assert_eq!(attr.posix.rdev, *rdev, "created rdev for {name}");
+
+            let ns_attrs = ns.get_attrs(attr.inode_id.get()).expect("namespace attrs");
+            assert_eq!(
+                ns_attrs.mode & libc::S_IFMT,
+                *mode & libc::S_IFMT,
+                "namespace mode type for {name}"
+            );
+            assert_eq!(ns_attrs.rdev, *rdev, "namespace rdev for {name}");
+
+            let ns_entry = ns
+                .read_dir(root_ino, tidefs_dir_index::DirCookie(0))
+                .expect("namespace readdir")
+                .0
+                .into_iter()
+                .find(|entry| entry.name.as_slice() == name.as_bytes())
+                .expect("namespace directory entry");
+            assert_eq!(
+                ns_entry.kind, *namespace_kind,
+                "namespace entry kind for {name}"
+            );
+
+            let looked_up = fixture
+                .adapter
+                .dispatch_lookup(&ctx, root_ino, name.as_bytes())
+                .expect("namespace lookup");
+            assert_eq!(looked_up.kind, *kind, "lookup kind for {name}");
+            assert_eq!(looked_up.posix.rdev, *rdev, "lookup rdev for {name}");
+
+            let attr_out = fixture
+                .adapter
+                .dispatch_getattr(&ctx, attr.inode_id.get(), 10_000 + idx as u64, None)
+                .expect("namespace getattr");
+            assert_eq!(
+                attr_out.attr.mode & libc::S_IFMT,
+                *mode & libc::S_IFMT,
+                "getattr mode type for {name}"
+            );
+            assert_eq!(attr_out.attr.rdev, *rdev, "getattr rdev for {name}");
+        }
+
+        let dh = fixture
+            .adapter
+            .dispatch_opendir(&ctx, root_ino)
+            .expect("namespace opendir");
+        let (entries, has_more) = fixture
+            .adapter
+            .dispatch_readdir(&ctx, root_ino, dh.dh_id.get(), 0)
+            .expect("namespace readdir");
+        assert!(!has_more);
+        let (plus_entries, plus_has_more) = fixture
+            .adapter
+            .dispatch_readdirplus(&ctx, root_ino, dh.dh_id.get(), 0)
+            .expect("namespace readdirplus");
+        assert!(!plus_has_more);
+
+        for (name, _mode, rdev, kind, _namespace_kind) in cases {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.name.as_slice() == name.as_bytes())
+                .expect("FUSE readdir entry");
+            assert_eq!(entry.kind, *kind, "readdir kind for {name}");
+
+            let (_entry, attr) = plus_entries
+                .iter()
+                .find(|(entry, _attr)| entry.name.as_slice() == name.as_bytes())
+                .expect("FUSE readdirplus entry");
+            assert_eq!(attr.kind, *kind, "readdirplus attr kind for {name}");
+            assert_eq!(attr.posix.rdev, *rdev, "readdirplus attr rdev for {name}");
+        }
     }
 
     // ── Namespace-backed getattr / setattr dispatch tests ────────────────

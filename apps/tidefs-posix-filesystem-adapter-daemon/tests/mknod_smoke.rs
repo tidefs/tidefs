@@ -3,16 +3,18 @@
 use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
     RootAuthenticationKey,
 };
+use tidefs_namespace::Namespace;
 use tidefs_posix_filesystem_adapter_daemon::fuse_vfs_adapter::FuseVfsAdapter;
 
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
@@ -29,8 +31,9 @@ fn mount_options() -> Vec<fuser::MountOption> {
     vec![
         fuser::MountOption::FSName("tidefs-mknod-smoke".to_string()),
         fuser::MountOption::RW,
-        fuser::MountOption::NoDev,
+        fuser::MountOption::Dev,
         fuser::MountOption::NoSuid,
+        fuser::MountOption::NoAtime,
         fuser::MountOption::Subtype("tidefs".to_string()),
     ]
 }
@@ -56,7 +59,9 @@ impl MountedVfs {
         )
         .expect("open local filesystem");
         let engine = VfsLocalFileSystem::new(filesystem);
-        let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create FUSE VFS adapter");
+        let adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create FUSE VFS adapter")
+            .with_namespace(Arc::new(Namespace::new()));
         let session = fuser::spawn_mount2(adapter, &mount, &mount_options()).expect("mount FUSE");
 
         Self {
@@ -118,16 +123,6 @@ fn assert_raw_errno(err: &io::Error, expected: i32) {
     );
 }
 
-fn assert_mknod_errno(path: &Path, mode: libc::mode_t, rdev: libc::dev_t, expected: i32) {
-    let err = mknod_path(path, mode, rdev).expect_err("mknod should fail");
-    assert_raw_errno(&err, expected);
-    assert!(
-        !path.exists(),
-        "failed mknod should not leave an entry at {}",
-        path.display()
-    );
-}
-
 #[test]
 fn mknod_fifo_creates_visible_fifo_with_mode() {
     with_umask(0, || {
@@ -161,33 +156,47 @@ fn mknod_fifo_duplicate_name_returns_eexist() {
 }
 
 #[test]
-fn mknod_regular_device_and_socket_nodes_return_eopnotsupp() {
+fn mknod_special_device_nodes_preserve_rdev_and_null_is_writable() {
     with_umask(0, || {
         let mount = MountedVfs::new();
+        let null = mount.path("/null");
+        let disk = mount.path("/disk");
+        let sock = mount.path("/sock");
+        let null_rdev: libc::dev_t = 0x0103;
+        let disk_rdev: libc::dev_t = 0x0801;
 
-        assert_mknod_errno(
-            &mount.path("/regular-via-mknod"),
-            libc::S_IFREG | 0o640,
-            0,
-            libc::EOPNOTSUPP,
-        );
-        assert_mknod_errno(
-            &mount.path("/char-device"),
-            libc::S_IFCHR | 0o600,
-            0x0103,
-            libc::EOPNOTSUPP,
-        );
-        assert_mknod_errno(
-            &mount.path("/block-device"),
-            libc::S_IFBLK | 0o600,
-            0x0800,
-            libc::EOPNOTSUPP,
-        );
-        assert_mknod_errno(
-            &mount.path("/socket-node"),
-            libc::S_IFSOCK | 0o600,
-            0,
-            libc::EOPNOTSUPP,
-        );
+        mknod_path(&null, libc::S_IFCHR | 0o600, null_rdev)
+            .expect("mknod char device through FUSE mount");
+        let metadata = fs::metadata(&null).expect("metadata for char device");
+        assert!(metadata.file_type().is_char_device());
+        assert_eq!(metadata.mode() & libc::S_IFMT, libc::S_IFCHR);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.rdev(), null_rdev);
+        let mut null_file = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&null)
+            .expect("char device rdev 1:3 should open like /dev/null");
+        null_file
+            .write_all(b"fred\n")
+            .expect("char device rdev 1:3 should accept writes like /dev/null");
+        drop(null_file);
+        let metadata = fs::metadata(&null).expect("metadata after char device write");
+        assert_eq!(metadata.size(), 0);
+
+        mknod_path(&disk, libc::S_IFBLK | 0o660, disk_rdev)
+            .expect("mknod block device through FUSE mount");
+        let metadata = fs::metadata(&disk).expect("metadata for block device");
+        assert!(metadata.file_type().is_block_device());
+        assert_eq!(metadata.mode() & libc::S_IFMT, libc::S_IFBLK);
+        assert_eq!(metadata.mode() & 0o777, 0o660);
+        assert_eq!(metadata.rdev(), disk_rdev);
+
+        mknod_path(&sock, libc::S_IFSOCK | 0o700, 0).expect("mknod socket through FUSE mount");
+        let metadata = fs::metadata(&sock).expect("metadata for socket node");
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.mode() & libc::S_IFMT, libc::S_IFSOCK);
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        assert_eq!(metadata.rdev(), 0);
     });
 }

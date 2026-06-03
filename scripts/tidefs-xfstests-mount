@@ -33,6 +33,23 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+daemon_opts="${TIDEFS_XFSTESTS_DAEMON_OPTIONS:-atime,dev}"
+if [ -n "${mount_opts:-}" ]; then
+    old_ifs="$IFS"
+    IFS=,
+    for opt in $mount_opts; do
+        case "$opt" in
+            atime|strictatime|relatime|noatime)
+                daemon_opts="$opt"
+                ;;
+            sync|async|dev|nodev)
+                daemon_opts="$daemon_opts,$opt"
+                ;;
+        esac
+    done
+    IFS="$old_ifs"
+fi
+
 store_root="${TIDEFS_XFSTESTS_STORE_ROOT:-/tmp/tidefs-xfstests-store}"
 mkdir -p "$store_root"
 
@@ -45,6 +62,7 @@ tidefs_bin="${TIDEFS_BIN:-}"
 [ -n "$tidefs_bin" ] && [ -x "$tidefs_bin" ] || die "tidefs-posix-filesystem-adapter-daemon not found (set TIDEFS_BIN)"
 
 debug "mountpoint=$mountpoint store=$store_dir tidefs=$tidefs_bin"
+debug "daemon_opts=$daemon_opts"
 
 [ -c /dev/fuse ] || modprobe fuse 2>/dev/null || true
 
@@ -61,6 +79,7 @@ elif [ -f "$_auth_key_file" ] && [ -r "$_auth_key_file" ]; then
 fi
 # tidefs-posix-filesystem-adapter-daemon mount (via fuser::mount2), daemonized
 "$tidefs_bin" mount --store "$store_dir" --mount "$mountpoint" \
+    --options "$daemon_opts" \
     "${root_auth_args[@]}" \
     &>"$store_dir/tidefs.log" &
 tidefs_pid=$!

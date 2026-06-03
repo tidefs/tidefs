@@ -143,7 +143,7 @@ Anti-regression rule:
 | `FUSE_SETATTR` | `setattr()` | **Implemented** | chmod/chown/truncate/utimens |
 | `FUSE_READLINK` | `readlink()` | **Implemented** | Byte output |
 | `FUSE_SYMLINK` | `symlink()` | **Implemented** | Byte target |
-| `FUSE_MKNOD` | `mknod()` | **Implemented** | Returns `EOPNOTSUPP` for device/fifo/socket |
+| `FUSE_MKNOD` | `mknod()` | **Implemented** | Creates regular, FIFO, character-device, block-device, and socket metadata nodes; unsupported type bits return `EOPNOTSUPP` |
 | `FUSE_MKDIR` | `mkdir()` | **Implemented** | |
 | `FUSE_UNLINK` | `unlink()` | **Implemented** | |
 | `FUSE_RMDIR` | `rmdir()` | **Implemented** | |

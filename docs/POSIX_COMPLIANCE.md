@@ -1,6 +1,6 @@
 # POSIX Compliance Matrix
 
-Last updated: 2026-06-02
+Last updated: 2026-06-03
 
 This document tracks which POSIX filesystem operations work correctly through
 the TideFS FUSE mount, which have known gaps, and which are untested.
@@ -100,9 +100,10 @@ Status: DONE = implemented and tested, GAP = implemented with known issues,
 | symlink | DONE | |
 | readlink | DONE | |
 | mknod (S_IFREG) | DONE | |
-| mknod (S_IFBLK) | GAP | Block device node support is a runtime nonclaim after `generic/184` failed |
-| mknod (S_IFCHR) | GAP | Character device node support is a runtime nonclaim after `generic/184` failed |
-| mknod (S_IFSOCK) | NONE | Socket node creation remains unclaimed; special-node runtime acceptance is still open |
+| mknod (S_IFIFO) | DONE | Mounted smoke verifies FIFO metadata and duplicate-name errno |
+| mknod (S_IFBLK) | DONE | Mounted smoke verifies block-device mode and `rdev` metadata |
+| mknod (S_IFCHR) | DONE | Mounted smoke verifies character-device mode, `rdev` metadata, and `/dev/null` write-through behavior |
+| mknod (S_IFSOCK) | DONE | Mounted smoke verifies socket mode and zero `rdev` metadata |
 
 ## Extended Attribute Operations
 

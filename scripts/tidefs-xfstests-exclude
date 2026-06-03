@@ -2,7 +2,7 @@
 #
 # Tests excluded because they require features not yet in the tidefs FUSE adapter.
 # Format: one test pattern per line. Comments start with #.
-# Tag legend: [ACL] [CAP] [ENCRYPT] [IMMUTABLE] [IOCTL] [KERNEL] [MMAP] [MKNOD] [QUOTA] [SWAP] [TIMESTAMPS]
+# Tag legend: [ACL] [CAP] [ENCRYPT] [IMMUTABLE] [IOCTL] [KERNEL] [MMAP] [QUOTA] [SWAP] [TIMESTAMPS]
 #
 # Removed as delivered:
 #   file locks (#491/#791): generic/131, generic/150, generic/167
@@ -10,6 +10,7 @@
 #   O_DIRECT (#876): generic/095, generic/130, generic/208-213, generic/240
 #   sub-second timestamps (#3184): generic/258 (atimensec/mtimensec/ctimensec confirmed
 #     wired through full FUSE attr path — fuse_vfs_adapter.rs:782-784,839-841)
+#   special-node mknod: generic/184
 
 # --- ACLs ---
 #   ACL evaluation IS wired via tidefs-posix-acl + tidefs-permission check_access()
@@ -67,8 +68,6 @@ generic/248
 generic/252
 generic/255
 generic/263
-
-# --- mknod device/fifo/socket (explicitly unsupported) ---
 
 # --- Quota ---
 generic/244

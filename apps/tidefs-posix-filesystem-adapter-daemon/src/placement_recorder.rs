@@ -34,8 +34,8 @@ use tidefs_cluster::placement_heal::{PlacementMap, PlacementObjectReceipt};
 use tidefs_local_filesystem::vfs_engine_impl::VfsLocalFileSystem;
 use tidefs_types_extent_map_core::FiemapExtent;
 use tidefs_types_vfs_core::{
-    DirEntry, EngineDirHandle, EngineFileHandle, Errno,
-    InodeAttr, InodeId, LockSpec, NodeKind, RequestCtx, SetAttr, StatFs,
+    DirEntry, EngineDirHandle, EngineFileHandle, Errno, InodeAttr, InodeId, LockSpec, NodeKind,
+    RequestCtx, SetAttr, StatFs,
 };
 use tidefs_vfs_engine::LseekDataRange;
 use tidefs_vfs_engine::{AllocatedInode, PageOwnershipMode, VfsEngine, VfsEngineStatFs};
@@ -101,8 +101,7 @@ impl ClusterPlacementRecorder {
         let map_path = backing_dir.join(PLACEMENT_MAP_FILENAME);
         let data = bincode::serialize(&self.map)
             .map_err(|e| format!("placement map serialize failed: {e}"))?;
-        std::fs::write(&map_path, &data)
-            .map_err(|e| format!("placement map write failed: {e}"))?;
+        std::fs::write(&map_path, &data).map_err(|e| format!("placement map write failed: {e}"))?;
         Ok(())
     }
 
@@ -132,7 +131,10 @@ impl ClusterPlacementRecorder {
     /// read has been placed — a gap means the data was written before cluster
     /// mode or the placement was lost.
     pub fn has_placement_for_range(&self, inode_id: u64, offset: u64, length: u64) -> bool {
-        !self.map.members_for_range(inode_id, offset, length).is_empty()
+        !self
+            .map
+            .members_for_range(inode_id, offset, length)
+            .is_empty()
     }
 
     /// Number of receipts stored (covers the full receipt index).
@@ -186,32 +188,73 @@ impl VfsEngine for ClusterPlacementVfsEngine {
     fn lookup(&self, parent: InodeId, name: &[u8], ctx: &RequestCtx) -> Result<InodeAttr, Errno> {
         self.inner.lookup(parent, name, ctx)
     }
-    fn getattr(&self, inode: InodeId, handle: Option<&EngineFileHandle>, ctx: &RequestCtx) -> Result<InodeAttr, Errno> {
+    fn getattr(
+        &self,
+        inode: InodeId,
+        handle: Option<&EngineFileHandle>,
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
         self.inner.getattr(inode, handle, ctx)
     }
-    fn setattr(&self, inode: InodeId, attr: &SetAttr, handle: Option<&EngineFileHandle>, ctx: &RequestCtx) -> Result<InodeAttr, Errno> {
+    fn setattr(
+        &self,
+        inode: InodeId,
+        attr: &SetAttr,
+        handle: Option<&EngineFileHandle>,
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
         let prev = self.inner.getattr(inode, handle, ctx).ok();
         let result = self.inner.setattr(inode, attr, handle, ctx)?;
         // Record placement for truncate-extend (FATTR_SIZE = 1 << 3).
         if attr.valid & (1 << 3) != 0 {
             if let Some(prev_attr) = prev {
                 if attr.size > prev_attr.posix.size {
-                    self.record_write_placement(inode, prev_attr.posix.size, attr.size - prev_attr.posix.size);
+                    self.record_write_placement(
+                        inode,
+                        prev_attr.posix.size,
+                        attr.size - prev_attr.posix.size,
+                    );
                 }
             }
         }
         Ok(result)
     }
-    fn mkdir(&self, parent: InodeId, name: &[u8], mode: u32, ctx: &RequestCtx) -> Result<InodeAttr, Errno> {
+    fn mkdir(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
         self.inner.mkdir(parent, name, mode, ctx)
     }
-    fn create(&self, parent: InodeId, name: &[u8], mode: u32, flags: u32, ctx: &RequestCtx) -> Result<(InodeAttr, EngineFileHandle), Errno> {
+    fn create(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<(InodeAttr, EngineFileHandle), Errno> {
         self.inner.create(parent, name, mode, flags, ctx)
     }
-    fn create_excl(&self, parent: InodeId, name: &[u8], mode: u32, flags: u32, ctx: &RequestCtx) -> Result<(InodeAttr, EngineFileHandle), Errno> {
+    fn create_excl(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<(InodeAttr, EngineFileHandle), Errno> {
         self.inner.create_excl(parent, name, mode, flags, ctx)
     }
-    fn tmpfile(&self, parent: InodeId, mode: u32, flags: u32, ctx: &RequestCtx) -> Result<(InodeAttr, EngineFileHandle), Errno> {
+    fn tmpfile(
+        &self,
+        parent: InodeId,
+        mode: u32,
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<(InodeAttr, EngineFileHandle), Errno> {
         self.inner.tmpfile(parent, mode, flags, ctx)
     }
     fn unlink(&self, parent: InodeId, name: &[u8], ctx: &RequestCtx) -> Result<(), Errno> {
@@ -220,31 +263,77 @@ impl VfsEngine for ClusterPlacementVfsEngine {
     fn rmdir(&self, parent: InodeId, name: &[u8], ctx: &RequestCtx) -> Result<(), Errno> {
         self.inner.rmdir(parent, name, ctx)
     }
-    fn rename(&self, old_parent: InodeId, old_name: &[u8], new_parent: InodeId, new_name: &[u8], flags: u32, ctx: &RequestCtx) -> Result<(), Errno> {
-        self.inner.rename(old_parent, old_name, new_parent, new_name, flags, ctx)
+    fn rename(
+        &self,
+        old_parent: InodeId,
+        old_name: &[u8],
+        new_parent: InodeId,
+        new_name: &[u8],
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
+        self.inner
+            .rename(old_parent, old_name, new_parent, new_name, flags, ctx)
     }
-    fn link(&self, target: InodeId, new_parent: InodeId, new_name: &[u8], ctx: &RequestCtx) -> Result<InodeAttr, Errno> {
+    fn link(
+        &self,
+        target: InodeId,
+        new_parent: InodeId,
+        new_name: &[u8],
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
         self.inner.link(target, new_parent, new_name, ctx)
     }
-    fn symlink(&self, parent: InodeId, name: &[u8], target: &[u8], ctx: &RequestCtx) -> Result<InodeAttr, Errno> {
+    fn symlink(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        target: &[u8],
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
         self.inner.symlink(parent, name, target, ctx)
     }
     fn readlink(&self, inode: InodeId, ctx: &RequestCtx) -> Result<Vec<u8>, Errno> {
         self.inner.readlink(inode, ctx)
     }
-    fn mknod(&self, parent: InodeId, name: &[u8], mode: u32, rdev: u32, ctx: &RequestCtx) -> Result<InodeAttr, Errno> {
+    fn mknod(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        rdev: u32,
+        ctx: &RequestCtx,
+    ) -> Result<InodeAttr, Errno> {
         self.inner.mknod(parent, name, mode, rdev, ctx)
     }
-    fn allocate_inode(&self, kind: NodeKind, parent: InodeId, mode: u32, uid: u32, gid: u32) -> Result<AllocatedInode, Errno> {
+    fn allocate_inode(
+        &self,
+        kind: NodeKind,
+        parent: InodeId,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<AllocatedInode, Errno> {
         self.inner.allocate_inode(kind, parent, mode, uid, gid)
     }
-    fn open(&self, inode: InodeId, flags: u32, ctx: &RequestCtx) -> Result<EngineFileHandle, Errno> {
+    fn open(
+        &self,
+        inode: InodeId,
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<EngineFileHandle, Errno> {
         self.inner.open(inode, flags, ctx)
     }
     fn release(&self, fh: &EngineFileHandle) -> Result<(), Errno> {
         self.inner.release(fh)
     }
-    fn read(&self, fh: &EngineFileHandle, offset: u64, size: u32, ctx: &RequestCtx) -> Result<Vec<u8>, Errno> {
+    fn read(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        size: u32,
+        ctx: &RequestCtx,
+    ) -> Result<Vec<u8>, Errno> {
         let data = self.inner.read(fh, offset, size, ctx)?;
         // Verify placement: the data being read should have placement receipts.
         // A gap means the data was written before cluster mode or placement
@@ -263,7 +352,13 @@ impl VfsEngine for ClusterPlacementVfsEngine {
         }
         Ok(data)
     }
-    fn write(&self, fh: &EngineFileHandle, offset: u64, data: &[u8], ctx: &RequestCtx) -> Result<u32, Errno> {
+    fn write(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        data: &[u8],
+        ctx: &RequestCtx,
+    ) -> Result<u32, Errno> {
         let written = self.inner.write(fh, offset, data, ctx)?;
         let written_u64 = u64::from(written);
         if written_u64 > 0 {
@@ -271,8 +366,18 @@ impl VfsEngine for ClusterPlacementVfsEngine {
         }
         Ok(written)
     }
-    fn copy_file_range(&self, source_fh: &EngineFileHandle, offset_in: u64, dest_fh: &EngineFileHandle, offset_out: u64, length: u64, ctx: &RequestCtx) -> Result<u32, Errno> {
-        let copied = self.inner.copy_file_range(source_fh, offset_in, dest_fh, offset_out, length, ctx)?;
+    fn copy_file_range(
+        &self,
+        source_fh: &EngineFileHandle,
+        offset_in: u64,
+        dest_fh: &EngineFileHandle,
+        offset_out: u64,
+        length: u64,
+        ctx: &RequestCtx,
+    ) -> Result<u32, Errno> {
+        let copied = self
+            .inner
+            .copy_file_range(source_fh, offset_in, dest_fh, offset_out, length, ctx)?;
         let copied_u64 = u64::from(copied);
         if copied_u64 > 0 {
             self.record_write_placement(dest_fh.inode_id, offset_out, copied_u64);
@@ -289,7 +394,14 @@ impl VfsEngine for ClusterPlacementVfsEngine {
         self.persist_placement();
         Ok(())
     }
-    fn fallocate(&self, fh: &EngineFileHandle, mode: u32, offset: u64, length: u64, ctx: &RequestCtx) -> Result<(), Errno> {
+    fn fallocate(
+        &self,
+        fh: &EngineFileHandle,
+        mode: u32,
+        offset: u64,
+        length: u64,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
         self.inner.fallocate(fh, mode, offset, length, ctx)?;
         // Record placement for allocation modes (mode=0 or FALLOC_FL_KEEP_SIZE).
         if mode == 0 || mode & 1 != 0 {
@@ -297,13 +409,32 @@ impl VfsEngine for ClusterPlacementVfsEngine {
         }
         Ok(())
     }
-    fn readahead(&self, fh: &EngineFileHandle, offset: u64, length: u32, ctx: &RequestCtx) -> Result<(), Errno> {
+    fn readahead(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        length: u32,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
         self.inner.readahead(fh, offset, length, ctx)
     }
-    fn data_ranges(&self, fh: &EngineFileHandle, offset: u64, length: u64, ctx: &RequestCtx) -> Result<Vec<LseekDataRange>, Errno> {
+    fn data_ranges(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        length: u64,
+        ctx: &RequestCtx,
+    ) -> Result<Vec<LseekDataRange>, Errno> {
         self.inner.data_ranges(fh, offset, length, ctx)
     }
-    fn fiemap_file(&self, fh: &EngineFileHandle, offset: u64, length: u64, max_extents: u32, ctx: &RequestCtx) -> Result<Vec<FiemapExtent>, Errno> {
+    fn fiemap_file(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        length: u64,
+        max_extents: u32,
+        ctx: &RequestCtx,
+    ) -> Result<Vec<FiemapExtent>, Errno> {
         self.inner.fiemap_file(fh, offset, length, max_extents, ctx)
     }
     fn opendir(&self, inode: InodeId, ctx: &RequestCtx) -> Result<EngineDirHandle, Errno> {
@@ -312,13 +443,28 @@ impl VfsEngine for ClusterPlacementVfsEngine {
     fn releasedir(&self, dh: &EngineDirHandle) -> Result<(), Errno> {
         self.inner.releasedir(dh)
     }
-    fn readdir(&self, dh: &EngineDirHandle, offset_cookie: u64, ctx: &RequestCtx) -> Result<(Vec<DirEntry>, bool), Errno> {
+    fn readdir(
+        &self,
+        dh: &EngineDirHandle,
+        offset_cookie: u64,
+        ctx: &RequestCtx,
+    ) -> Result<(Vec<DirEntry>, bool), Errno> {
         self.inner.readdir(dh, offset_cookie, ctx)
     }
-    fn fsyncdir(&self, dh: &EngineDirHandle, datasync: bool, ctx: &RequestCtx) -> Result<(), Errno> {
+    fn fsyncdir(
+        &self,
+        dh: &EngineDirHandle,
+        datasync: bool,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
         self.inner.fsyncdir(dh, datasync, ctx)
     }
-    fn fdatasync_inode(&self, fh: &EngineFileHandle, datasync: bool, ctx: &RequestCtx) -> Result<(), Errno> {
+    fn fdatasync_inode(
+        &self,
+        fh: &EngineFileHandle,
+        datasync: bool,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
         self.inner.fdatasync_inode(fh, datasync, ctx)?;
         self.persist_placement();
         Ok(())
@@ -331,7 +477,14 @@ impl VfsEngine for ClusterPlacementVfsEngine {
     fn getxattr(&self, inode: InodeId, name: &[u8], ctx: &RequestCtx) -> Result<Vec<u8>, Errno> {
         self.inner.getxattr(inode, name, ctx)
     }
-    fn setxattr(&self, inode: InodeId, name: &[u8], value: &[u8], flags: u32, ctx: &RequestCtx) -> Result<(), Errno> {
+    fn setxattr(
+        &self,
+        inode: InodeId,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
         self.inner.setxattr(inode, name, value, flags, ctx)
     }
     fn listxattr(&self, inode: InodeId, ctx: &RequestCtx) -> Result<Vec<u8>, Errno> {
@@ -340,7 +493,12 @@ impl VfsEngine for ClusterPlacementVfsEngine {
     fn removexattr(&self, inode: InodeId, name: &[u8], ctx: &RequestCtx) -> Result<(), Errno> {
         self.inner.removexattr(inode, name, ctx)
     }
-    fn getlk(&self, inode: InodeId, lock: &LockSpec, ctx: &RequestCtx) -> Result<Option<LockSpec>, Errno> {
+    fn getlk(
+        &self,
+        inode: InodeId,
+        lock: &LockSpec,
+        ctx: &RequestCtx,
+    ) -> Result<Option<LockSpec>, Errno> {
         self.inner.getlk(inode, lock, ctx)
     }
     fn setlk(&self, inode: InodeId, lock: &LockSpec, ctx: &RequestCtx) -> Result<(), Errno> {
@@ -431,7 +589,10 @@ mod tests {
         assert_eq!(loaded.member_id(), 1);
         assert_eq!(loaded.placement_map().epoch(), 3);
         assert!(loaded.placement_map().replicas_of(100u64 << 32).is_some());
-        assert!(loaded.placement_map().replicas_of((100u64 << 32) | 1).is_some());
+        assert!(loaded
+            .placement_map()
+            .replicas_of((100u64 << 32) | 1)
+            .is_some());
     }
 }
 
@@ -464,16 +625,28 @@ mod integration_tests {
 
             // Verify read-path lookup works after reload.
             let members = recorder.members_for_range(100, 0, 4096);
-            assert!(members.contains(&7), "member 7 should hold block 0 of inode 100");
+            assert!(
+                members.contains(&7),
+                "member 7 should hold block 0 of inode 100"
+            );
 
             let members = recorder.members_for_range(100, 4096, 4096);
-            assert!(members.contains(&7), "member 7 should hold block 1 of inode 100");
+            assert!(
+                members.contains(&7),
+                "member 7 should hold block 1 of inode 100"
+            );
 
             let members = recorder.members_for_range(100, 16384, 4096);
-            assert!(members.contains(&7), "member 7 should hold block at offset 16384");
+            assert!(
+                members.contains(&7),
+                "member 7 should hold block at offset 16384"
+            );
 
             let members = recorder.members_for_range(200, 0, 4096);
-            assert!(members.contains(&7), "member 7 should hold block 0 of inode 200");
+            assert!(
+                members.contains(&7),
+                "member 7 should hold block 0 of inode 200"
+            );
 
             // Verify has_placement_for_range.
             assert!(recorder.has_placement_for_range(100, 0, 4096));

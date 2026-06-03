@@ -77,7 +77,8 @@ Debug with `TIDEFS_XFSTESTS_DEBUG=1`.
 
 ## Exclude list
 
-`scripts/tidefs-xfstests-exclude` contains 45 tests excluded because they require features not yet in the TideFS FUSE adapter:
+`scripts/tidefs-xfstests-exclude` contains tests excluded because they
+require features not yet in the TideFS FUSE adapter:
 
 | Feature area          | Tests excluded |
 |-----------------------|---------------|
@@ -88,13 +89,13 @@ Debug with `TIDEFS_XFSTESTS_DEBUG=1`.
 | FS_IOC ioctls         | generic/009 |
 | Kernel-specific       | generic/048, 054, 058, 062 |
 | Mmap coherency        | generic/091, 215, 216, 223, 224, 225, 226, 228, 229, 230, 231, 235, 239, 247, 248, 252, 255, 263 |
-| Mknod device/fifo     | generic/184 |
 | Quota                 | generic/244, 245, 383 |
 | Swap                  | generic/472, 493, 494 |
 | Sub-second timestamps | generic/258 |
 
 Delivered (no longer excluded): O_DIRECT (#876), POSIX file locks (#491/#791),
-FIEMAP (#500), fallocate modes (#515), RENAME_EXCHANGE (#532).
+FIEMAP (#500), fallocate modes (#515), RENAME_EXCHANGE (#532), special-node
+`mknod` for `generic/184`.
 
 The exclude file is passed to xfstests-check via `-E` when `TIDEFS_XFSTESTS_EXCLUDE` is set. Override with:
 
@@ -175,11 +176,14 @@ for every requested xfstests test: zero xfstests rows passed; 4 rows failed as
 product defects (`generic/169`, `184`, `192`, `198`); 43 rows are unsupported
 feature/precondition rows; and 3 rows are environment or feature skips. The
 `passed=10`, `failed=4`, `blocked=0`, `unsupported=43`, and `skipped=3`; all
-infrastructure rows, including `unmount` and `daemon_stop`, passed. The failed
-rows currently expose `FS_IOC_FSGETXATTR`/remount visibility issues
-(`generic/169`), special-node `mknod` runtime failure (`generic/184`),
-post-sleep timestamp/stat file visibility failure (`generic/192`), and AIO
-sparse-file `Bus error` behavior (`generic/198`). This is classification
+infrastructure rows, including `unmount` and `daemon_stop`, passed. A focused
+current-tree rerun at
+`/root/ai/tmp/tidefs-validation/fuse-generic-184-20260603T183844Z.json`
+passes `generic/184`, so the remaining #6590 FUSE product defects are
+`generic/169`, `generic/192`, and `generic/198`. Those failures currently
+expose `FS_IOC_FSGETXATTR`/remount visibility issues, post-sleep
+timestamp/stat file visibility failure, and AIO sparse-file `Bus error`
+behavior. This is classification
 
 On commit `2bb253a6`, after the FUSE xfstests guest started using the
 coreutils `mv` binary instead of the BusyBox applet, an outside-sandbox

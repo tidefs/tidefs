@@ -299,7 +299,7 @@ GROUP
 set -e
 dev="tidefs-xfstests-root"
 mnt=""
-daemon_opts="atime"
+daemon_opts="atime,dev"
 daemon_coherency="writeback"
 daemon_content_capacity_bytes="2147483648"
 merge_mount_opts() {
@@ -310,7 +310,7 @@ merge_mount_opts() {
             atime|strictatime|relatime|noatime)
                 daemon_opts="$opt"
                 ;;
-            sync|async)
+            sync|async|dev|nodev)
                 daemon_opts="$daemon_opts,$opt"
                 ;;
         esac

@@ -473,13 +473,18 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
                 }
                 // Validate node_id (first 8 bytes, little-endian) is nonzero.
                 let node_id = u64::from_le_bytes([
-                    token_bytes[0], token_bytes[1], token_bytes[2], token_bytes[3],
-                    token_bytes[4], token_bytes[5], token_bytes[6], token_bytes[7],
+                    token_bytes[0],
+                    token_bytes[1],
+                    token_bytes[2],
+                    token_bytes[3],
+                    token_bytes[4],
+                    token_bytes[5],
+                    token_bytes[6],
+                    token_bytes[7],
                 ]);
                 if node_id == 0 {
                     return Err(
-                        "cluster mount: lease token has zero node_id (uninitialized)"
-                            .to_string(),
+                        "cluster mount: lease token has zero node_id (uninitialized)".to_string(),
                     );
                 }
             }
@@ -596,27 +601,32 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     }
 
     // When cluster-authorized, wrap the engine in a placement-recording layer.
-    let vfs_engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> =
-        if config.cluster_authorized {
-            let member_id = config.cluster_lease_token_bytes.as_ref().map(|b| {
-                u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-            }).unwrap_or(1);
-            let epoch = config.cluster_lease_token_bytes.as_ref().map(|b| {
-                u64::from_le_bytes([b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]])
-            }).unwrap_or(1);
-            let cluster_engine = crate::placement_recorder::ClusterPlacementVfsEngine::new(
-                base_engine,
-                config.backing_dir.clone(),
-                member_id,
-                epoch,
-            );
-            Box::new(cluster_engine)
-        } else {
-            Box::new(base_engine)
-        };
+    let vfs_engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> = if config
+        .cluster_authorized
+    {
+        let member_id = config
+            .cluster_lease_token_bytes
+            .as_ref()
+            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+            .unwrap_or(1);
+        let epoch = config
+            .cluster_lease_token_bytes
+            .as_ref()
+            .map(|b| u64::from_le_bytes([b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]]))
+            .unwrap_or(1);
+        let cluster_engine = crate::placement_recorder::ClusterPlacementVfsEngine::new(
+            base_engine,
+            config.backing_dir.clone(),
+            member_id,
+            epoch,
+        );
+        Box::new(cluster_engine)
+    } else {
+        Box::new(base_engine)
+    };
     let mut adapter = fuse_vfs_adapter::FuseVfsAdapter::new(vfs_engine)
-    .map_err(|e| format!("adapter init: {e:?}"))?
-    .with_coherency_profile(config.coherency_profile);
+        .map_err(|e| format!("adapter init: {e:?}"))?
+        .with_coherency_profile(config.coherency_profile);
 
     // Attach the resolved stable DatasetId for lifecycle gating and metrics.
     if let Some(ds_id) = dataset_id {

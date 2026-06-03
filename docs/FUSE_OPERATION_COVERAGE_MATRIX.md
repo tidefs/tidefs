@@ -143,10 +143,10 @@ Each op must document its behavior under each named profile:
 
 ---
 
-
+- Focused mounted smoke coverage now exercises FIFO, character-device,
+  block-device, and socket `mknod` metadata. The broader
   `scripts/tidefs-xfstests-*`, and `nix/tidefs-posix-scoreboard.sh` must
-  exercise every op before this matrix can be treated as runtime coverage
-  special-node `mknod` remains a runtime nonclaim until that row has passing
+  exercise every op before this matrix can be treated as full runtime coverage.
 - Crash/fault injection at commit_group boundaries for durability ops (fsync, write)
 
 ## 10. Dependencies

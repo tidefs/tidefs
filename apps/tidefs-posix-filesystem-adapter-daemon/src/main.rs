@@ -419,14 +419,9 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         },
         fuser::MountOption::FSName(config.fs_name.clone()),
     ];
-    if let Some(option) = config.mount_opts.timestamp_policy.to_fuse_mount_option() {
-        options.push(option);
-    }
+    options.extend(config.mount_opts.to_fuse_mount_options());
     if config.writeback_cache {
         options.push(fuser::MountOption::WritebackCache);
-    }
-    if config.mount_opts.sync {
-        options.push(fuser::MountOption::Sync);
     }
 
     let ns_handle = adapter
