@@ -1,0 +1,20 @@
+[package]
+name = "tidefs-types-polymorphic-directory-index-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Authority type definitions for the polymorphic directory index with two
+canonical representations (DirMicroListV1 inline O(n) vs DirBtreeRootV1
+external B+tree O(log n)), switching thresholds with hysteresis, tagged
+64-bit readdir cookies, and dataset-level DirPolicy. no_std / forbid(unsafe_code).
+"""
+
+[features]
+default = []
+alloc = []
+
+[dependencies]

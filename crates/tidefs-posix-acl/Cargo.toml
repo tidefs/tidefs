@@ -1,0 +1,21 @@
+[package]
+name = "tidefs-posix-acl"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+POSIX ACL xattr codec and canonical ACL evaluation: encode/decode the Linux
+binary xattr format, evaluate ACL entries against caller credentials,
+synchronise mode↔ACL on setxattr/chmod, and apply default-ACL inheritance
+for file/directory creation. Pure, deterministic, no_std / forbid(unsafe_code).
+"""
+
+[features]
+default = []
+alloc = []
+
+[dependencies]
+blake3 = { version = "1", default-features = false }

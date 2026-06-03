@@ -1,0 +1,26 @@
+; Block-size sweep: sequential read at 512B, 4K, 64K, 1M
+; TideFS fio benchmarking — profile 1 quick-required
+[seq-read-512b]
+rw=read
+bs=512
+iodepth=4
+size=8M
+offset=0
+[seq-read-4k]
+rw=read
+bs=4k
+iodepth=4
+size=16M
+offset=0
+[seq-read-64k]
+rw=read
+bs=64k
+iodepth=4
+size=32M
+offset=0
+[seq-read-1m]
+rw=read
+bs=1m
+iodepth=4
+size=64M
+offset=0

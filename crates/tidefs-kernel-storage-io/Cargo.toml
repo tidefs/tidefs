@@ -1,0 +1,26 @@
+[package]
+name = "tidefs-kernel-storage-io"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Kernel-portable block-I/O storage adapter trait and KernelPoolCore
+implementation. Provides sector-aligned read, write, and flush/barrier
+primitives for no_std kernel-mode intent-log append and transaction-group
+commit-barrier durability paths.
+"""
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core" }
+tidefs-vfs-engine = { path = "../tidefs-vfs-engine" }
+
+[features]
+default = ["alloc"]
+alloc = []

@@ -1,0 +1,13 @@
+; ublk fio verification: random read verify against ublk block device
+; Depends on rand-write having been run first to lay down verifiable data.
+[global]
+ioengine=psync
+direct=1
+bs=4k
+
+[rand-read-verify]
+rw=randread
+verify=crc32c
+verify_fatal=1
+size=3M
+offset=0

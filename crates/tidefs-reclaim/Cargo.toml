@@ -1,0 +1,21 @@
+[package]
+name = "tidefs-reclaim"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Background segment reclaim pipeline for TideFS local object store"
+
+[dependencies]
+tidefs-pool-allocator = { path = "../tidefs-pool-allocator" }
+tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
+tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
+tidefs-dedup = { path = "../tidefs-dedup" }
+
+[dev-dependencies]
+tidefs-spacemap-allocator = { path = "../tidefs-spacemap-allocator" }
+
+[lib]
+path = "src/lib.rs"

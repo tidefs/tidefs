@@ -1,0 +1,843 @@
+//! Dead-object reclaim queue with commit_group-anchored reclamation eligibility.
+//!
+//! Provides a persistent, crash-safe queue for objects whose storage space
+//! is eligible for reclamation only after the stable committed commit_group advances
+//! past the object's `death_commit_group`.  Enqueue is idempotent by object ID.
+//!
+//! # Integration
+//!
+//! - **Snapshot destroy** enqueues dead objects after catalog removal.
+//! - **Segment cleaner** enqueues dead objects after live-block relocation.
+//! - **Allocator** calls `ack_reclaimed` after space is freed.
+
+use alloc::collections::BTreeMap as BTreeMapAlloc;
+use alloc::vec::Vec;
+
+use tidefs_binary_schema_checksum::blake3_domain_digest;
+use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
+use tidefs_types_reclaim_queue_core::{DeadObjectEntry, ObjectKey};
+
+// ---------------------------------------------------------------------------
+// DeadObjectReclaimQueue
+// ---------------------------------------------------------------------------
+
+/// Persistent dead-object reclaim queue backed by an ordered map.
+///
+/// Entries are keyed by [`ObjectKey`] for deterministic iteration order
+/// and idempotent enqueue (duplicate object IDs are silently ignored).
+///
+/// # Crash safety
+///
+/// On startup, call [`decode`](Self::decode) from the persisted bytes
+/// to recover the queue.  Enqueue during normal operation is idempotent,
+/// so re-enqueuing the same object after replay is a no-op.
+///
+/// # Eligibility
+///
+/// [`dequeue_batch`](Self::dequeue_batch) returns only entries whose
+/// `death_commit_group` is strictly less than the provided `stable_committed_txg`
+/// and whose `eligible` flag is `true`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeadObjectReclaimQueue {
+    entries: BTreeMapAlloc<ObjectKey, DeadObjectEntry>,
+}
+
+impl DeadObjectReclaimQueue {
+    /// Create an empty dead-object reclaim queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: BTreeMapAlloc::new(),
+        }
+    }
+
+    /// Number of entries in the queue.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` if the queue is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Enqueue a dead object for eventual reclamation.
+    ///
+    /// Idempotent: if an entry with the same `object_id` already exists,
+    /// returns `Ok(false)` without modifying the queue.  This allows
+    /// replay-safe re-enqueue during crash recovery.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if the entry was newly inserted.
+    /// - `Ok(false)` if the entry was already present (duplicate).
+    pub fn enqueue(&mut self, entry: DeadObjectEntry) -> bool {
+        use alloc::collections::btree_map::Entry;
+        match self.entries.entry(entry.object_id) {
+            Entry::Vacant(v) => {
+                v.insert(entry);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
+    /// Dequeue up to `max_count` eligible entries.
+    ///
+    /// An entry is eligible when `eligible` is `true` and `death_commit_group` is
+    /// strictly less than `stable_committed_txg`.  Entries are returned in
+    /// object-key order for deterministic processing.
+    ///
+    /// The entries are *not* removed from the queue; call
+    /// [`ack_reclaimed`](Self::ack_reclaimed) after the allocator has
+    /// freed the space.
+    #[must_use]
+    pub fn dequeue_batch(
+        &self,
+        max_count: usize,
+        stable_committed_txg: u64,
+    ) -> Vec<DeadObjectEntry> {
+        if max_count == 0 || self.is_empty() {
+            return Vec::new();
+        }
+        self.entries
+            .values()
+            .filter(|e| e.is_reclaimable(stable_committed_txg))
+            .take(max_count)
+            .copied()
+            .collect()
+    }
+
+    /// Remove successfully reclaimed entries from the queue.
+    ///
+    /// Call this after the allocator has freed the objects' space.
+    /// Missing keys are silently ignored (the entry may have been removed
+    /// by a concurrent operation or a prior ack).
+    ///
+    /// Returns the number of entries actually removed.
+    pub fn ack_reclaimed(&mut self, object_ids: &[ObjectKey]) -> usize {
+        let mut removed = 0;
+        for id in object_ids {
+            if self.entries.remove(id).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Mark an entry as ineligible for reclamation.
+    ///
+    /// Used when a snapshot or clone references a dead object, preventing
+    /// its space from being reclaimed until the reference is dropped.
+    ///
+    /// Returns `true` if the entry was found and updated.
+    pub fn mark_ineligible(&mut self, object_id: &ObjectKey) -> bool {
+        if let Some(entry) = self.entries.get_mut(object_id) {
+            entry.eligible = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark an entry as eligible for reclamation.
+    ///
+    /// Used when the last snapshot/clone reference to a dead object is
+    /// dropped, allowing the object's space to be reclaimed.
+    ///
+    /// Returns `true` if the entry was found and updated.
+    pub fn mark_eligible(&mut self, object_id: &ObjectKey) -> bool {
+        if let Some(entry) = self.entries.get_mut(object_id) {
+            entry.eligible = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return all entries in object-key order.
+    #[must_use]
+    pub fn all_entries(&self) -> Vec<DeadObjectEntry> {
+        self.entries.values().copied().collect()
+    }
+
+    /// Number of entries currently eligible for reclamation given a
+    /// stable committed commit_group.
+    #[must_use]
+    pub fn eligible_count(&self, stable_committed_txg: u64) -> usize {
+        self.entries
+            .values()
+            .filter(|e| e.is_reclaimable(stable_committed_txg))
+            .count()
+    }
+
+    /// Remove all entries from the queue.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    // ------------------------------------------------------------------
+    // Binary encoding
+    // ------------------------------------------------------------------
+
+    /// Magic bytes identifying a dead-object reclaim-queue payload.
+    const MAGIC: &'static [u8; 4] = b"DRCL";
+
+    /// Current binary format version.
+    const FORMAT_VERSION: u32 = 1;
+
+    /// Schema family identifier for dead-object-queue BLAKE3 domain context.
+    const FAMILY_ID: SchemaFamilyId = SchemaFamilyId(0x4452_434C_0000_0001);
+
+    /// Schema type identifier for dead-object-queue format v1.
+    const TYPE_ID: SchemaTypeId = SchemaTypeId(1);
+
+    /// Schema version for dead-object-queue format v1.0.
+    const VERSION: SchemaVersion = SchemaVersion::new(1, 0);
+
+    /// Domain tag for dead-object-queue payload integrity.
+    const DOMAIN_TAG: DomainTag = DomainTag::SectionBody;
+
+    /// Encode the entire queue to a byte vector with a BLAKE3 integrity footer.
+    ///
+    /// Format (little-endian):
+    /// - 4 bytes: magic `DRCL`
+    /// - 4 bytes: format version (u32)
+    /// - 4 bytes: entry count (u32)
+    /// - N * 65 bytes: per-entry encoded records
+    /// - 32 bytes: BLAKE3 domain-separated digest over all preceding bytes
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let entries = self.all_entries();
+        let count = entries.len() as u32;
+
+        let body_len = 12usize
+            .checked_add(count as usize * DeadObjectEntry::ENCODED_SIZE)
+            .expect("dead-object queue too large to encode");
+        let mut buf = Vec::with_capacity(body_len + 32);
+
+        // Header
+        buf.extend_from_slice(Self::MAGIC);
+        buf.extend_from_slice(&Self::FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+
+        // Entries
+        for entry in &entries {
+            buf.extend_from_slice(&entry.encode());
+        }
+
+        // BLAKE3 integrity footer over all preceding bytes
+        let digest = blake3_domain_digest(
+            &buf,
+            Self::FAMILY_ID,
+            Self::TYPE_ID,
+            Self::VERSION,
+            Self::DOMAIN_TAG,
+        );
+        buf.extend_from_slice(&digest);
+
+        buf
+    }
+
+    /// Decode a queue from bytes previously produced by [`encode`](Self::encode).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeadObjectQueueDecodeError`] if the buffer is truncated,
+    /// has an invalid magic, an unsupported version, a corrupt entry, or a
+    /// BLAKE3 integrity footer mismatch.
+    pub fn decode(data: &[u8]) -> Result<Self, DeadObjectQueueDecodeError> {
+        // Minimum size: header (12) + footer (32) = 44 bytes
+        if data.len() < 44 {
+            return Err(DeadObjectQueueDecodeError::Truncated);
+        }
+
+        // Verify magic
+        let magic = &data[0..4];
+        if magic != Self::MAGIC {
+            return Err(DeadObjectQueueDecodeError::InvalidMagic);
+        }
+
+        // Verify version
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != Self::FORMAT_VERSION {
+            return Err(DeadObjectQueueDecodeError::UnsupportedVersion {
+                found: version,
+                expected: Self::FORMAT_VERSION,
+            });
+        }
+
+        // Verify BLAKE3 integrity footer
+        let body_len = data.len() - 32;
+        let expected_digest = blake3_domain_digest(
+            &data[..body_len],
+            Self::FAMILY_ID,
+            Self::TYPE_ID,
+            Self::VERSION,
+            Self::DOMAIN_TAG,
+        );
+        let actual_digest: [u8; 32] = data[body_len..].try_into().unwrap();
+        if expected_digest != actual_digest {
+            return Err(DeadObjectQueueDecodeError::IntegrityFooterMismatch);
+        }
+
+        // Parse entry count
+        let count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let expected_body_len = 12usize
+            .checked_add(
+                count
+                    .checked_mul(DeadObjectEntry::ENCODED_SIZE)
+                    .ok_or(DeadObjectQueueDecodeError::Truncated)?,
+            )
+            .ok_or(DeadObjectQueueDecodeError::Truncated)?;
+
+        if body_len < expected_body_len {
+            return Err(DeadObjectQueueDecodeError::Truncated);
+        }
+
+        // Parse entries (enqueue is idempotent, so duplicates in data are harmless)
+        let mut queue = Self::new();
+        for i in 0..count {
+            let offset = 12 + i * DeadObjectEntry::ENCODED_SIZE;
+            let entry_bytes: &[u8; DeadObjectEntry::ENCODED_SIZE] = data
+                [offset..offset + DeadObjectEntry::ENCODED_SIZE]
+                .try_into()
+                .map_err(|_| DeadObjectQueueDecodeError::Truncated)?;
+            let entry = DeadObjectEntry::decode(entry_bytes)
+                .map_err(|e| DeadObjectQueueDecodeError::EntryDecode(alloc::format!("{e}")))?;
+            queue.enqueue(entry);
+        }
+
+        Ok(queue)
+    }
+
+    /// Estimate the serialized byte size without allocating.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        let count = self.len();
+        12 + count * DeadObjectEntry::ENCODED_SIZE + 32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeadObjectQueueDecodeError -- queue-level decode failure
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur when decoding a [`DeadObjectReclaimQueue`] from
+/// its wire-format encoding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeadObjectQueueDecodeError {
+    /// Data is shorter than the minimum header + footer.
+    Truncated,
+    /// Magic bytes do not match the expected `DRCL`.
+    InvalidMagic,
+    /// Format version is not supported.
+    UnsupportedVersion { found: u32, expected: u32 },
+    /// A per-entry decode failed.
+    EntryDecode(String),
+    /// The BLAKE3 integrity footer did not verify.
+    IntegrityFooterMismatch,
+}
+
+impl core::fmt::Display for DeadObjectQueueDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Truncated => f.write_str("truncated dead-object-queue data"),
+            Self::InvalidMagic => f.write_str("invalid dead-object-queue magic bytes"),
+            Self::UnsupportedVersion { found, expected } => {
+                write!(
+                    f,
+                    "unsupported dead-object-queue version: found {found}, expected {expected}"
+                )
+            }
+            Self::EntryDecode(msg) => {
+                write!(f, "dead-object-queue entry decode error: {msg}")
+            }
+            Self::IntegrityFooterMismatch => {
+                f.write_str("dead-object-queue BLAKE3 integrity footer mismatch")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oid(byte: u8) -> ObjectKey {
+        let mut k = [0u8; 32];
+        k[0] = byte;
+        ObjectKey(k)
+    }
+
+    fn entry(id: u8, death_commit_group: u64, eligible: bool, enqueued_at: u64) -> DeadObjectEntry {
+        DeadObjectEntry::new(
+            oid(id),
+            [0u8; 16],
+            death_commit_group,
+            eligible,
+            enqueued_at,
+        )
+    }
+
+    // ── enqueue / idempotency ─────────────────────────────────────────
+
+    #[test]
+    fn enqueue_adds_entry() {
+        let mut q = DeadObjectReclaimQueue::new();
+        assert!(q.enqueue(entry(1, 10, true, 5)));
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn enqueue_idempotent_duplicate_is_noop() {
+        let mut q = DeadObjectReclaimQueue::new();
+        assert!(q.enqueue(entry(1, 10, true, 5)));
+        assert!(!q.enqueue(entry(1, 20, false, 6))); // different fields, same object_id
+        assert_eq!(q.len(), 1);
+        // Original entry is preserved (first-write-wins)
+        let all = q.all_entries();
+        assert_eq!(all[0].death_commit_group, 10);
+        assert!(all[0].eligible);
+    }
+
+    #[test]
+    fn enqueue_multiple_different_ids() {
+        let mut q = DeadObjectReclaimQueue::new();
+        for i in 1..=10u8 {
+            assert!(q.enqueue(entry(i, i as u64 * 10, true, i as u64)));
+        }
+        assert_eq!(q.len(), 10);
+    }
+
+    // ── dequeue_batch eligibility ──────────────────────────────────────
+
+    #[test]
+    fn dequeue_batch_respects_max_count() {
+        let mut q = DeadObjectReclaimQueue::new();
+        for i in 1..=5u8 {
+            q.enqueue(entry(i, i as u64, true, 0));
+        }
+        let batch = q.dequeue_batch(3, 100);
+        assert_eq!(batch.len(), 3);
+    }
+
+    #[test]
+    fn dequeue_batch_filters_by_death_txg() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 10, true, 0)); // death_commit_group=10, not eligible at stable=10
+        q.enqueue(entry(2, 5, true, 0)); // death_commit_group=5, eligible at stable=10
+        q.enqueue(entry(3, 10, true, 0)); // death_commit_group=10, not eligible at stable=10
+
+        let batch = q.dequeue_batch(10, 10);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].object_id, oid(2));
+    }
+
+    #[test]
+    fn dequeue_batch_respects_eligible_flag() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, false, 0)); // death_commit_group=5, eligible=false => NOT eligible
+        q.enqueue(entry(2, 5, true, 0)); // death_commit_group=5, eligible=true => eligible
+
+        let batch = q.dequeue_batch(10, 10);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].object_id, oid(2));
+    }
+
+    #[test]
+    fn dequeue_batch_returns_deterministic_order() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(30, 1, true, 0));
+        q.enqueue(entry(10, 1, true, 0));
+        q.enqueue(entry(20, 1, true, 0));
+
+        let batch = q.dequeue_batch(10, 100);
+        let ids: Vec<u8> = batch.iter().map(|e| e.object_id.0[0]).collect();
+        assert_eq!(ids, [10, 20, 30]); // sorted by ObjectKey
+    }
+
+    #[test]
+    fn dequeue_batch_does_not_remove_entries() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 0));
+        q.enqueue(entry(2, 5, true, 0));
+
+        let batch = q.dequeue_batch(10, 10);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(q.len(), 2); // entries still in queue
+
+        // Same entries dequeued again
+        let batch2 = q.dequeue_batch(10, 10);
+        assert_eq!(batch2.len(), 2);
+    }
+
+    #[test]
+    fn dequeue_batch_empty_queue() {
+        let q = DeadObjectReclaimQueue::new();
+        assert!(q.dequeue_batch(10, 100).is_empty());
+    }
+
+    #[test]
+    fn dequeue_batch_max_count_zero() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 0));
+        assert!(q.dequeue_batch(0, 100).is_empty());
+    }
+
+    // ── ack_reclaimed ──────────────────────────────────────────────────
+
+    #[test]
+    fn ack_reclaimed_removes_entries() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 0));
+        q.enqueue(entry(2, 5, true, 0));
+        q.enqueue(entry(3, 5, true, 0));
+
+        let removed = q.ack_reclaimed(&[oid(1), oid(3)]);
+        assert_eq!(removed, 2);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.all_entries()[0].object_id, oid(2));
+    }
+
+    #[test]
+    fn ack_reclaimed_missing_keys_silently_ignored() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 0));
+
+        let removed = q.ack_reclaimed(&[oid(1), oid(99)]);
+        assert_eq!(removed, 1);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn ack_reclaimed_empty_ids_removes_none() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 0));
+        assert_eq!(q.ack_reclaimed(&[]), 0);
+        assert_eq!(q.len(), 1);
+    }
+
+    // ── mark_ineligible / mark_eligible ────────────────────────────────
+
+    #[test]
+    fn mark_ineligible_sets_flag() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 0));
+        assert!(q.mark_ineligible(&oid(1)));
+        // Now not eligible regardless of commit_group
+        assert!(q.dequeue_batch(10, 100).is_empty());
+    }
+
+    #[test]
+    fn mark_ineligible_missing_key_returns_false() {
+        let mut q = DeadObjectReclaimQueue::new();
+        assert!(!q.mark_ineligible(&oid(99)));
+    }
+
+    #[test]
+    fn mark_eligible_restores_eligibility() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, false, 0));
+        assert!(q.mark_eligible(&oid(1)));
+        let batch = q.dequeue_batch(10, 10);
+        assert_eq!(batch.len(), 1);
+    }
+
+    // ── eligible_count ─────────────────────────────────────────────────
+
+    #[test]
+    fn eligible_count_mixed() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 0)); // eligible at stable=10
+        q.enqueue(entry(2, 15, true, 0)); // NOT eligible at stable=10
+        q.enqueue(entry(3, 5, false, 0)); // NOT eligible (flag)
+        q.enqueue(entry(4, 8, true, 0)); // eligible at stable=10
+
+        assert_eq!(q.eligible_count(10), 2);
+    }
+
+    // ── clear ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn clear_empties_queue() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 0));
+        q.enqueue(entry(2, 5, true, 0));
+        q.clear();
+        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
+    }
+
+    // ── encode / decode round-trip ─────────────────────────────────────
+
+    #[test]
+    fn encode_decode_empty_queue() {
+        let q = DeadObjectReclaimQueue::new();
+        let bytes = q.encode();
+        let decoded = DeadObjectReclaimQueue::decode(&bytes).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn encode_decode_single_entry() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(42, 10, true, 5));
+        let bytes = q.encode();
+        let decoded = DeadObjectReclaimQueue::decode(&bytes).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded.all_entries(), q.all_entries());
+    }
+
+    #[test]
+    fn encode_decode_many_entries() {
+        let mut q = DeadObjectReclaimQueue::new();
+        for i in 0..100u8 {
+            q.enqueue(entry(i, i as u64 + 1, i % 2 == 0, i as u64));
+        }
+        let bytes = q.encode();
+        let decoded = DeadObjectReclaimQueue::decode(&bytes).unwrap();
+        assert_eq!(decoded.len(), q.len());
+        assert_eq!(decoded, q);
+    }
+
+    #[test]
+    fn encode_decode_mixed_eligibility() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 1));
+        q.enqueue(entry(2, 10, false, 2));
+        q.enqueue(entry(3, 15, true, 3));
+
+        let bytes = q.encode();
+        let decoded = DeadObjectReclaimQueue::decode(&bytes).unwrap();
+        assert_eq!(decoded, q);
+
+        // Eligibility should survive round-trip
+        let batch = decoded.dequeue_batch(10, 10);
+        assert_eq!(batch.len(), 1); // only id=1 has death_commit_group(5) < 10 AND eligible=true
+    }
+
+    #[test]
+    fn encode_decode_max_txg_values() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(DeadObjectEntry::new(
+            oid(1),
+            [0xFFu8; 16],
+            u64::MAX,
+            true,
+            u64::MAX,
+        ));
+        let bytes = q.encode();
+        let decoded = DeadObjectReclaimQueue::decode(&bytes).unwrap();
+        assert_eq!(decoded, q);
+    }
+
+    #[test]
+    fn encoded_len_matches_actual() {
+        let mut q = DeadObjectReclaimQueue::new();
+        assert_eq!(q.encode().len(), q.encoded_len());
+
+        q.enqueue(entry(1, 5, true, 0));
+        assert_eq!(q.encode().len(), q.encoded_len());
+
+        for i in 2..=20u8 {
+            q.enqueue(entry(i, i as u64, true, 0));
+        }
+        assert_eq!(q.encode().len(), q.encoded_len());
+    }
+
+    #[test]
+    fn encoded_len_formula() {
+        let n = 10;
+        let mut q = DeadObjectReclaimQueue::new();
+        for i in 0..n {
+            q.enqueue(entry(i as u8, 1, true, 0));
+        }
+        // 12 header + n*65 entries + 32 footer
+        assert_eq!(q.encoded_len(), 12 + n * 65 + 32);
+    }
+
+    // ── decode error conditions ────────────────────────────────────────
+
+    #[test]
+    fn decode_rejects_truncated() {
+        assert_eq!(
+            DeadObjectReclaimQueue::decode(&[0u8; 8]),
+            Err(DeadObjectQueueDecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_invalid_magic() {
+        let mut data = vec![0u8; 44];
+        data[0..4].copy_from_slice(b"XXXX");
+        // Recompute footer over the bad body
+        let body = &data[..12];
+        let digest = blake3_domain_digest(
+            body,
+            DeadObjectReclaimQueue::FAMILY_ID,
+            DeadObjectReclaimQueue::TYPE_ID,
+            DeadObjectReclaimQueue::VERSION,
+            DeadObjectReclaimQueue::DOMAIN_TAG,
+        );
+        data[12..44].copy_from_slice(&digest);
+        assert_eq!(
+            DeadObjectReclaimQueue::decode(&data),
+            Err(DeadObjectQueueDecodeError::InvalidMagic)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_unsupported_version() {
+        let mut header = vec![0u8; 12];
+        header[0..4].copy_from_slice(b"DRCL");
+        header[4..8].copy_from_slice(&99u32.to_le_bytes());
+        header[8..12].copy_from_slice(&0u32.to_le_bytes());
+        let digest = blake3_domain_digest(
+            &header,
+            DeadObjectReclaimQueue::FAMILY_ID,
+            DeadObjectReclaimQueue::TYPE_ID,
+            DeadObjectReclaimQueue::VERSION,
+            DeadObjectReclaimQueue::DOMAIN_TAG,
+        );
+        let mut data = header;
+        data.extend_from_slice(&digest);
+        assert_eq!(
+            DeadObjectReclaimQueue::decode(&data),
+            Err(DeadObjectQueueDecodeError::UnsupportedVersion {
+                found: 99,
+                expected: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn decode_rejects_corrupted_footer() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 0));
+        let mut bytes = q.encode();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        assert_eq!(
+            DeadObjectReclaimQueue::decode(&bytes),
+            Err(DeadObjectQueueDecodeError::IntegrityFooterMismatch)
+        );
+    }
+
+    #[test]
+    fn decode_errors_display_non_empty() {
+        let variants = [
+            DeadObjectQueueDecodeError::Truncated,
+            DeadObjectQueueDecodeError::InvalidMagic,
+            DeadObjectQueueDecodeError::UnsupportedVersion {
+                found: 2,
+                expected: 1,
+            },
+            DeadObjectQueueDecodeError::EntryDecode("test".into()),
+            DeadObjectQueueDecodeError::IntegrityFooterMismatch,
+        ];
+        for err in &variants {
+            let s = alloc::format!("{err}");
+            assert!(!s.is_empty(), "Display output empty for {err:?}");
+        }
+    }
+
+    // ── integration-style tests ────────────────────────────────────────
+
+    #[test]
+    fn full_lifecycle_enqueue_dequeue_ack() {
+        let mut q = DeadObjectReclaimQueue::new();
+
+        // Simulate: objects die at different txgs
+        q.enqueue(entry(1, 100, true, 100)); // died at commit_group 100
+        q.enqueue(entry(2, 200, true, 200)); // died at commit_group 200
+        q.enqueue(entry(3, 300, true, 300)); // died at commit_group 300
+
+        // At stable_txg=150, only object 1 is eligible
+        let batch = q.dequeue_batch(10, 150);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].object_id, oid(1));
+
+        // Ack reclaimed object 1
+        let removed = q.ack_reclaimed(&[oid(1)]);
+        assert_eq!(removed, 1);
+        assert_eq!(q.len(), 2);
+
+        // At stable_txg=250, object 2 becomes eligible
+        let batch = q.dequeue_batch(10, 250);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].object_id, oid(2));
+
+        // Ack reclaimed object 2
+        q.ack_reclaimed(&[oid(2)]);
+        assert_eq!(q.len(), 1);
+
+        // At stable_txg=350, object 3 becomes eligible
+        let batch = q.dequeue_batch(10, 350);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].object_id, oid(3));
+    }
+
+    #[test]
+    fn snapshot_reference_prevents_reclamation() {
+        let mut q = DeadObjectReclaimQueue::new();
+
+        // Object dies but a snapshot still references it
+        q.enqueue(entry(1, 100, true, 100));
+
+        // Snapshot exists -> mark ineligible
+        assert!(q.mark_ineligible(&oid(1)));
+
+        // Even though death_commit_group < stable_txg, eligible=false blocks reclamation
+        let batch = q.dequeue_batch(10, 200);
+        assert!(batch.is_empty());
+
+        // Snapshot destroyed -> mark eligible
+        assert!(q.mark_eligible(&oid(1)));
+        let batch = q.dequeue_batch(10, 200);
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn crash_recovery_replay_is_idempotent() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 10, true, 5));
+        q.enqueue(entry(2, 12, true, 6));
+        q.enqueue(entry(3, 14, true, 7));
+
+        // Persist
+        let bytes = q.encode();
+
+        // Simulate crash and reload
+        let recovered = DeadObjectReclaimQueue::decode(&bytes).unwrap();
+        assert_eq!(recovered, q);
+
+        // Re-enqueue same objects (replay) -- should be idempotent
+        let mut q2 = recovered;
+        assert!(!q2.enqueue(entry(1, 10, true, 5))); // duplicate
+        assert!(!q2.enqueue(entry(2, 12, true, 6))); // duplicate
+        assert!(q2.enqueue(entry(4, 16, true, 8))); // new entry
+
+        assert_eq!(q2.len(), 4); // original 3 + new 1
+    }
+
+    #[test]
+    fn large_queue_encode_decode_is_deterministic() {
+        let mut q = DeadObjectReclaimQueue::new();
+        for i in 0..500u16 {
+            let byte = (i % 256) as u8;
+            q.enqueue(entry(byte, i as u64, i % 2 == 0, i as u64));
+        }
+        let bytes1 = q.encode();
+        let bytes2 = q.encode();
+        assert_eq!(bytes1, bytes2, "encode must be deterministic");
+        let decoded = DeadObjectReclaimQueue::decode(&bytes1).unwrap();
+        assert_eq!(decoded.len(), q.len());
+    }
+}

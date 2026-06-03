@@ -1,0 +1,20 @@
+[package]
+name = "tidefs-spacemap-allocator"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Deterministic segment-level free-space allocator with BTreeSet-backed run-based
+free map, metaslab-partitioned bitmap encoding, generation counters, and
+incremental checkpointing. Foundation layer for pool-wide space management (G1).
+"""
+
+[dependencies]
+
+[dev-dependencies]
+
+[lib]
+path = "src/lib.rs"

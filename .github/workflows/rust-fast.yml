@@ -1,0 +1,91 @@
+name: Rust Fast
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_TEST_FLAGS: --locked
+  CARGO_TARGET_DIR: /tmp/tidefs-cargo-target
+  RUST_BACKTRACE: 1
+  TIDEFS_RUST_FAST_CRATES: tidefs-xtask,tidefs-extent-map,tidefs-schema-codec-posix-filesystem-adapter,tidefs-secret-key-policy-runtime
+
+jobs:
+  workspace:
+    name: Workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq pkg-config libfuse3-dev libibverbs-dev librdmacm-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache cargo target
+        uses: actions/cache@v5
+        with:
+          path: /tmp/tidefs-cargo-target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-target-
+
+      - name: Check workspace metadata
+        run: cargo metadata --locked --format-version 1 --no-deps >/dev/null
+
+      - name: Run selected crate tests
+        run: ./scripts/ci-test-runner.sh --crates "$TIDEFS_RUST_FAST_CRATES" --json ci-test-summary.json
+
+      - name: Run transport smoke test
+        run: cargo test -p tidefs-transport --locked send_message_missing_session_fails
+
+      - name: Upload test summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-fast-summary
+          path: ci-test-summary.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Report summary
+        if: always()
+        run: |
+          if [[ -f ci-test-summary.json ]]; then
+            echo '## Workspace Test Results' >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            jq -c '.[] | {crate, status, tests}' ci-test-summary.json >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+            failed=$(jq '[.[] | select(.status != "pass")] | length' ci-test-summary.json)
+            echo "**$failed crate(s) did not pass**" >> "$GITHUB_STEP_SUMMARY"
+          fi

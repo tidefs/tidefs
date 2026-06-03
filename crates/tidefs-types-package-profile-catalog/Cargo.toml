@@ -1,0 +1,12 @@
+[package]
+name = "tidefs-types-package-profile-catalog"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Build profile, capability, bundle, and surface manifest enums for tidefs"
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,16 @@
+# TideFS POSIX VFS kernel module Kbuild.
+#
+# This file builds the tidefs-kmod-posix-vfs crate as an out-of-tree
+# Rust-for-Linux kernel module against Linux 7.0.
+#
+# Build command (from repo root):
+#   make -C <linux-7.0-build> M=crates/tidefs-kmod-posix-vfs modules
+#
+# Prerequisites:
+#   - Linux 7.0 kernel build tree with CONFIG_RUST=y
+#   - modules_prepare completed (builds rust/kernel.o, rust/pin_init.o, etc.)
+#   - bindgen available for Rust binding generation
+#   - rustc 1.78+ with rust-src component
+
+obj-m := tidefs_posix_vfs.o
+tidefs_posix_vfs-y := tidefs_posix_vfs_main.o tidefs_posix_vfs_shim.o

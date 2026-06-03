@@ -1,0 +1,50 @@
+[package]
+name = "tidefs-commit_group"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Transaction group (commit_group) subsystem for TideFS: dirty-page tracking,
+write accumulation, atomic commit to the object store, and fsync
+durability. Central write-path funnel between in-memory mutation
+and stable storage.
+"""
+
+[dependencies]
+tidefs-intent-log = { path = "../tidefs-intent-log", optional = true }
+tidefs-types-extent-map-core = { path = "../tidefs-types-extent-map-core", optional = true }
+tidefs-extent-map = { path = "../tidefs-extent-map", optional = true }
+tidefs-checksum-tree = { path = "../tidefs-checksum-tree", optional = true }
+tidefs-kernel-storage-io = { path = "../tidefs-kernel-storage-io", optional = true }
+tidefs-vfs-engine = { path = "../tidefs-vfs-engine", optional = true }
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core", optional = true }
+blake3 = { version = "=1.5.5", default-features = false }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = [
+    "blake3/std",
+    "serde",
+    "tidefs-checksum-tree",
+    "tidefs-extent-map",
+    "tidefs-intent-log",
+    "tidefs-intent-log/std",
+    "tidefs-types-extent-map-core",
+]
+kernel-storage = [
+    "tidefs-kernel-storage-io",
+    "tidefs-types-vfs-core",
+    "tidefs-vfs-engine",
+]

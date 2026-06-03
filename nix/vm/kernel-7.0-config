@@ -1,0 +1,175 @@
+# TideFS K7-02 Linux 7.0 QEMU validation kernel config
+# Base: x86_64, QEMU virtio, FUSE, ublk, RDMA (SoftRoCE), ext4, tmpfs
+# Format: nixpkgs generate-config.pl (OPTION value, no CONFIG_ prefix, no =)
+
+X86_64 y
+
+# Minimum arch support
+MULTIUSER y
+SMP y
+HYPERVISOR_GUEST y
+PARAVIRT y
+KVM_GUEST y
+BLK_DEV_INITRD y
+
+# NixOS/systemd guest baseline
+SYSVIPC y
+CGROUPS y
+CGROUP_SCHED y
+FAIR_GROUP_SCHED y
+CGROUP_PIDS y
+CGROUP_FREEZER y
+CGROUP_DEVICE y
+CPUSETS y
+MEMCG y
+NAMESPACES y
+UTS_NS y
+IPC_NS y
+PID_NS y
+NET_NS y
+USER_NS y
+DEVPTS_FS? y
+FILE_LOCKING y
+FSNOTIFY y
+DNOTIFY y
+INOTIFY_USER y
+ANON_INODES? y
+FHANDLE y
+SECCOMP y
+SECCOMP_FILTER y
+BPF y
+BPF_SYSCALL y
+CGROUP_BPF y
+
+# Timers / clocksources
+HZ_100 y
+POSIX_TIMERS y
+NO_HZ y
+HIGH_RES_TIMERS y
+
+# CPU / NUMA
+NR_CPUS 8
+X86_X2APIC y
+
+# Memory
+TRANSPARENT_HUGEPAGE y
+COMPACTION y
+
+# Power management
+ACPI y
+
+# PCI
+PCI y
+PCI_MSI y
+
+# Virtio
+VIRTIO_MENU y
+VIRTIO_PCI y
+VIRTIO_BALLOON y
+VIRTIO_BLK y
+VIRTIO_CONSOLE y
+VIRTIO_NET y
+VIRTIO_INPUT y
+
+# Network
+NET y
+UNIX y
+INET y
+NETDEVICES y
+
+# Block layer
+BLOCK y
+BLK_DEV y
+BLK_DEV_NVME y
+BLK_DEV_LOOP y
+MD y
+BLK_DEV_DM y
+DM_FLAKEY y
+
+# Filesystems
+EXT4_FS y
+AUTOFS_FS y
+OVERLAY_FS y
+TMPFS y
+TMPFS_XATTR y
+TMPFS_POSIX_ACL y
+PROC_FS y
+SYSFS y
+DEVTMPFS y
+DEVTMPFS_MOUNT y
+CONFIGFS_FS y
+DEVPTS_MULTIPLE_INSTANCES? y
+
+# NixOS test-driver store/share transport
+NET_9P y
+NET_9P_VIRTIO y
+9P_FS y
+9P_FS_POSIX_ACL y
+VIRTIO_FS y
+
+# FUSE
+FUSE_FS y
+
+# ublk
+BLK_DEV_UBLK y
+
+# RDMA / SoftRoCE
+INFINIBAND y
+INFINIBAND_USER_ACCESS y
+RDMA_RXE y
+INFINIBAND_ADDR_TRANS y
+
+# Networking for RDMA
+IPV6 y
+NET_IPIP y
+
+# Stack protection / hardening (keep minimal for VM)
+STACKPROTECTOR y
+STACKPROTECTOR_STRONG y
+
+# ELF core / binaries
+BINFMT_ELF y
+BINFMT_SCRIPT y
+
+# TTY / console
+TTY y
+SERIAL_8250 y
+SERIAL_8250_CONSOLE y
+VT y
+VT_CONSOLE y
+
+# Kernel features
+PRINTK y
+BUG y
+ELF_CORE? y
+FUTEX y
+EPOLL y
+SIGNALFD y
+TIMERFD y
+EVENTFD y
+SHMEM y
+AIO y
+IO_URING? y
+ADVISE_SYSCALLS y
+MEMBARRIER y
+KALLSYMS y
+KALLSYMS_ALL y
+DEBUG_KERNEL y
+DEBUG_FS y
+DEBUG_FS_ALLOW_ALL y
+FAULT_INJECTION y
+FAULT_INJECTION_DEBUG_FS y
+FAIL_MAKE_REQUEST y
+
+# Rust support (for TideFS out-of-tree kernel modules)
+MODULES y
+MODULE_UNLOAD y
+MODULE_FORCE_UNLOAD y
+RUST y
+# Let kernel build system auto-detect tool versions
+# RUSTC_VERSION and BINDGEN_VERSION are set by the Makefile
+
+# Override nixpkgs common config mismatches (Linux 7.0 selects these as =y
+# but common config wants =m; mark optional to avoid hard errors)
+IPV6_FOU_TUNNEL? y
+NVME_AUTH? y

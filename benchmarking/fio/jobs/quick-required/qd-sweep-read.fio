@@ -1,0 +1,26 @@
+; Queue-depth sweep: sequential read at QD 1, 4, 16, 64
+; TideFS fio benchmarking — profile 1 quick-required
+[seq-read-qd1]
+rw=read
+bs=4k
+iodepth=1
+size=16M
+offset=0
+[seq-read-qd4]
+rw=read
+bs=4k
+iodepth=4
+size=16M
+offset=0
+[seq-read-qd16]
+rw=read
+bs=4k
+iodepth=16
+size=16M
+offset=0
+[seq-read-qd64]
+rw=read
+bs=4k
+iodepth=64
+size=16M
+offset=0

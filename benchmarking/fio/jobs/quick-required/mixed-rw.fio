@@ -1,0 +1,16 @@
+; Mixed read/write workloads at varying queue depths
+; TideFS fio benchmarking — profile 1 quick-required
+[randrw-70r30w-qd4]
+rw=randrw
+rwmixread=70
+bs=4k
+iodepth=4
+size=32M
+offset=0
+[randrw-50r50w-qd4]
+rw=randrw
+rwmixread=50
+bs=4k
+iodepth=4
+size=32M
+offset=0

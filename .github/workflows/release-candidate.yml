@@ -1,0 +1,200 @@
+name: Release Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Candidate run profile
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - smoke
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_TEST_FLAGS: --locked
+  CARGO_TARGET_DIR: /tmp/tidefs-cargo-target
+  RUST_BACKTRACE: 1
+  TIDEFS_RUST_FAST_CRATES: tidefs-xtask,tidefs-extent-map,tidefs-schema-codec-posix-filesystem-adapter,tidefs-secret-key-policy-runtime
+
+jobs:
+  rust-smoke:
+    name: Rust smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq pkg-config libfuse3-dev libibverbs-dev librdmacm-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check workspace metadata
+        run: cargo metadata --locked --format-version 1 --no-deps >/dev/null
+
+      - name: Run selected crate tests
+        run: ./scripts/ci-test-runner.sh --crates "$TIDEFS_RUST_FAST_CRATES" --json ci-test-summary.json
+
+      - name: Run transport smoke test
+        run: cargo test -p tidefs-transport --locked send_message_missing_session_fails
+
+      - name: Upload Rust summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-rust-summary
+          path: ci-test-summary.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  nix:
+    name: Nix build
+    needs: rust-smoke
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build pure check derivations
+        run: |
+          nix build -L \
+            .#checks.x86_64-linux.rdmaCarrierTwoNode
+
+      - name: Build core packages
+        run: |
+          nix build -L \
+            .#packages.x86_64-linux.default \
+            .#packages.x86_64-linux.tidefsFuseRuntime \
+            .#packages.x86_64-linux.tidefsUblkRuntime \
+            .#packages.x86_64-linux.tidefsPosixVfsKmod
+
+  qemu:
+    name: ${{ matrix.name }}
+    needs: nix
+    runs-on: [self-hosted, linux, x64, tidefs, nix, kvm]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: kmod-xfstests-smoke
+            command: nix run .#kmod-xfstests-smoke -- --timeout 1800
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Host preflight
+        run: |
+          test -c /dev/kvm
+          test -c /dev/fuse
+
+      - name: Run target
+        run: timeout --foreground 7200s bash -lc '${{ matrix.command }}'
+
+      - name: Upload runtime output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-qemu-${{ matrix.name }}
+          path: |
+            /tmp/tidefs-validation/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  xfstests:
+    name: ${{ matrix.target }}
+    if: ${{ inputs.profile == 'full' }}
+    needs: qemu
+    runs-on: [self-hosted, linux, x64, tidefs, nix, kvm, xfstests]
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: fuse
+            command: nix run .#fuse-xfstests-validation
+          - target: kmod-smoke
+            command: nix run .#kmod-xfstests-smoke -- --timeout 3600
+          - target: k7-vfs
+            command: nix run .#k7-vfs-xfstests-validation
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Host preflight
+        run: |
+          test -c /dev/kvm
+          test -c /dev/fuse
+
+      - name: Run target
+        run: timeout --foreground 14400s bash -lc '${{ matrix.command }}'
+
+      - name: Upload xfstests output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-xfstests-${{ matrix.target }}
+          path: |
+            /tmp/tidefs-validation/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  rdma:
+    name: ${{ matrix.name }}
+    if: ${{ inputs.profile == 'full' }}
+    needs: qemu
+    runs-on: [self-hosted, linux, x64, tidefs, nix, kvm, rdma]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: static-carrier-check
+            command: nix build -L .#checks.x86_64-linux.rdmaCarrierTwoNode
+          - name: host-probe
+            command: nix run .#rdma-probe
+          - name: qemu-two-node
+            command: nix run .#qemu-rdma-two-node-nixos -- --validation-dir /tmp/tidefs-rdma-two-node
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Host preflight
+        run: |
+          test -c /dev/kvm
+          command -v modinfo >/dev/null
+
+      - name: Run target
+        run: timeout --foreground 10800s bash -lc '${{ matrix.command }}'
+
+      - name: Upload RDMA output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-rdma-${{ matrix.name }}
+          path: |
+            /tmp/tidefs-rdma-two-node/**
+            /tmp/tidefs-validation/**
+          if-no-files-found: ignore
+          retention-days: 14

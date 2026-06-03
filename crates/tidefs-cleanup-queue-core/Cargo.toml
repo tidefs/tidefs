@@ -1,0 +1,26 @@
+[package]
+name = "tidefs-cleanup-queue-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Persistent deferred cleanup work queue backed by the generic B+tree"
+
+[dependencies]
+tidefs-btree = { path = "../tidefs-btree" }
+tidefs-types-deferred-cleanup-core = { path = "../tidefs-types-deferred-cleanup-core" }
+tidefs-types-dataset-feature-flags-core = { path = "../tidefs-types-dataset-feature-flags-core" }
+tidefs-commit_group = { path = "../tidefs-commit_group" }
+
+tidefs-reclaim-queue-core = { path = "../tidefs-reclaim-queue-core" }
+tidefs-intent-log = { path = "../tidefs-intent-log" }
+blake3 = "1"
+
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+path = "src/lib.rs"

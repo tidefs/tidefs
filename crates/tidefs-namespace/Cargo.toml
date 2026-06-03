@@ -1,0 +1,33 @@
+[package]
+name = "tidefs-namespace"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+TideFS namespace layer providing inode allocation, path resolution, and
+core namespace operations (create, lookup, unlink, rename) atop the
+polymorphic directory index. This crate is the primary namespace primitive
+that the FUSE adapter and higher-level filesystem consumers call.
+"""
+
+[dependencies]
+tidefs-btree = { path = "../tidefs-btree" }
+tidefs-dir-index = { path = "../tidefs-dir-index" }
+tidefs-types-polymorphic-directory-index-core = { path = "../tidefs-types-polymorphic-directory-index-core", features = ["alloc"] }
+tidefs-orphan-index = { path = "../tidefs-orphan-index" }
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+tidefs-intent-log = { path = "../tidefs-intent-log" }
+fxhash = "0.2"
+tidefs-local-filesystem = { path = "../tidefs-local-filesystem", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["in-memory-dir-index"]
+in-memory-dir-index = ["tidefs-dir-index/in-memory-dir-index"]
+persistent-dir-index = ["tidefs-dir-index/persistent-dir-index"]
+local-fs-persist = ["dep:tidefs-local-filesystem"]

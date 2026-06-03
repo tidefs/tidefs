@@ -1,0 +1,20 @@
+[package]
+name = "tidefs-binary_schema-checksum"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Canonical binary schema checksum/digest: crc32c, blake3-256, profile glue, domain-separated hashing per P2-03 §4"
+
+[dependencies]
+tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+crc32c = { version = "0.6", default-features = false }
+blake3 = { version = "1", default-features = false }
+
+[dev-dependencies]
+proptest = "=1.9.0"
+
+[lib]
+path = "src/lib.rs"

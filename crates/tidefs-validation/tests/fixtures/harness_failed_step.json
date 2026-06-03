@@ -1,0 +1,1 @@
+[{"ScenarioBegin":{"name":"harness-failed-step"}},{"ValidationStep":{"name":"fixture regression gate","command":"cargo test -p tidefs-validation --test fixture_regression","status":"Failed","exit_code":101}},{"Assert":{"condition":"failed validation step status and exit code recorded","passed":true}},{"ScenarioEnd":{"name":"harness-failed-step"}}]

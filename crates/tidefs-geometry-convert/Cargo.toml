@@ -1,0 +1,20 @@
+[package]
+name = "tidefs-geometry-convert"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Online pool geometry conversion: rewrites locator table entries to change
+durability policy (mirror <-> erasure coding) without destroying data.
+Uses extent_id indirection so extent maps stay unchanged.
+"""
+
+[dependencies]
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core", features = ["alloc"] }
+tidefs-locator-table = { path = "../tidefs-locator-table" }
+tidefs-erasure-coding = { path = "../tidefs-erasure-coding" }
+
+[dev-dependencies]

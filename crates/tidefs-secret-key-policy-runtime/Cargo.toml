@@ -1,0 +1,15 @@
+[package]
+name = "tidefs-secret-key-policy-runtime"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "P9-04 secret-key-policy runtime: seal, lease, rotate, revoke, activate, recover"
+
+[dependencies]
+tidefs-types-secret-key-policy-core = { path = "../tidefs-types-secret-key-policy-core" }
+
+[lib]
+path = "src/lib.rs"

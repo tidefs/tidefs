@@ -1,0 +1,52 @@
+#!/bin/sh
+# TideFS xfstests-check wrapper: reimplements the Nix xfstests-check wrapper
+# but injects a local.config that sets MOUNT_PROG to our mount wrapper
+# (which strips -t fuse and delegates to /usr/sbin/mount.fuse).
+# This is needed because the Nix util-linux mount binary lacks FUSE support.
+#
+# Environment:
+#   TIDEFS_XFSTESTS_MOUNT_HELPER_DIR  mount helper directory (must contain
+#                                      the "mount" wrapper and "tidefs-preview")
+#   TIDEFS_BIN                        path to tidefs-posix-filesystem-adapter-daemon
+# Usage: tidefs-xfstests-check-wrapper [xfstests-check args...]
+set -eu
+
+XFSTESTS_STORE="/nix/store/89zj163815x5w8labri1z6n8595xj6j3-xfstests-2023.05.14/lib/xfstests"
+MH_DIR="${TIDEFS_XFSTESTS_MOUNT_HELPER_DIR:-}"
+DAEMON_BIN="${TIDEFS_BIN:-}"
+
+dir=$(mktemp --tmpdir -d xfstests.XXXXXX)
+trap "rm -rf $dir" EXIT
+chmod a+rx "$dir"
+cd "$dir"
+
+# Symlink xfstests suite
+for f in $(cd "$XFSTESTS_STORE" && echo *); do
+  ln -s "$XFSTESTS_STORE/$f" "$f"
+done
+
+# Write local.config: override MOUNT_PROG to use our mount wrapper.
+# The mount wrapper strips "-t fuse" and delegates to /usr/sbin/mount.fuse.
+if [ -n "${MH_DIR}" ] && [ -x "${MH_DIR}/mount" ]; then
+  MOUNT_PROG_VAL="${MH_DIR}/mount"
+else
+  MOUNT_PROG_VAL="/usr/sbin/mount.fuse"
+fi
+
+cat >local.config <<EOF
+MOUNT_PROG=${MOUNT_PROG_VAL}
+FSTYP=fuse
+TEST_DEV=tidefs-preview
+EOF
+
+# Set PATH: mount helper dir first, then /usr/bin:/usr/sbin, then Nix packages.
+NIX_BASE="/nix/store/89zj163815x5w8labri1z6n8595xj6j3-xfstests-2023.05.14/bin"
+NIX_UTIL="/nix/store/g9h37kjrpvyzhsq4a79v2qkrpl4y1s7k-util-linux-2.42-bin/bin"
+
+export PATH="/usr/bin:/usr/sbin${MH_DIR:+:${MH_DIR}}:${NIX_BASE}:${NIX_UTIL}:${PATH:-}"
+export FSTYP="fuse"
+export TEST_DEV="tidefs-preview"
+export TIDEFS_BIN="${DAEMON_BIN}"
+export TIDEFS_XFSTESTS_MOUNT_HELPER_DIR="${MH_DIR}"
+
+exec ./check "$@"

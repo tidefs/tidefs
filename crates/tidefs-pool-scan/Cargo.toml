@@ -1,0 +1,29 @@
+[package]
+name = "tidefs-pool-scan"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Pool device scanner: device enumeration via /sys/block, device type detection,
+pool label reading, and topology report generation. Phase 1 of pool import.
+"""
+
+[[bin]]
+name = "tidefs-pool-scan"
+path = "src/main.rs"
+
+[dependencies]
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core", features = ["serde"] }
+tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+blake3 = "=1.5.5"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

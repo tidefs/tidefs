@@ -1,0 +1,31 @@
+[package]
+name = "tidefs-dataset-lifecycle"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Dataset lifecycle runtime: wraps DatasetStateV1 with validated state transitions,
+poison semantics for in-flight mounts, GC pin-set integration, and mount-time gating.
+"""
+
+[features]
+default = ["alloc"]
+alloc = [
+    "tidefs-incremental-job-core/alloc",
+    "tidefs-types-dataset-lifecycle-core/alloc",
+    "tidefs-types-incremental-job-core/alloc",
+    "tidefs-gc-pin-set/alloc",
+]
+poison-gating = ["alloc"]
+
+[dependencies]
+tidefs-types-dataset-lifecycle-core = { path = "../tidefs-types-dataset-lifecycle-core", default-features = false }
+tidefs-gc-pin-set = { path = "../tidefs-gc-pin-set", default-features = false }
+tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core", default-features = false }
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core", default-features = false }
+tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
+tidefs-dataset-catalog = { path = "../tidefs-dataset-catalog" }
+tidefs-derived-catalog = { path = "../tidefs-derived-catalog" }

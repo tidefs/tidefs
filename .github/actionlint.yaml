@@ -1,0 +1,10 @@
+self-hosted-runner:
+  labels:
+    - tidefs
+    - nix
+    - kvm
+    - fuse
+    - ublk
+    - rdma
+    - kernel
+    - xfstests

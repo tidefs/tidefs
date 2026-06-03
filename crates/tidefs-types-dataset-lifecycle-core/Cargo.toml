@@ -1,0 +1,20 @@
+[package]
+name = "tidefs-types-dataset-lifecycle-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Authority type definitions for the per-dataset lifecycle state machine
+(ACTIVE/DESTROYING/TOMBSTONE), mount-time gating, poison semantics, pinned
+traversal roots, and destroy job tracking. no_std / forbid(unsafe_code).
+"""
+
+[features]
+default = []
+alloc = []
+
+[dependencies]
+blake3 = { version = "1.5", default-features = false }

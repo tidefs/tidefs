@@ -1,0 +1,55 @@
+/target/
+/target-local/
+/target-btree/
+/target-check/
+/target-timing/
+/result
+/result-*
+/.direnv/
+/target-worktree/
+build-target/
+/target-tmp/
+/target-clippy/
+.cargo-target/
+
+# Build artifacts — never commit
+**/target/
+*.orig
+*.bak
+*.tmp
+result
+result-*
+.tidefs_label
+.tidefs_log_device
+.tidefs_pool_device
+.direnv/
+
+# Runtime, validation, benchmark, and coverage output -- never commit
+/benchmarking/results/
+/logs/
+/tmp/
+*.log
+*.state
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.pid
+validation.json
+
+# QEMU runtime artifacts — never commit
+*.qcow2
+*.sock
+qemu.sock
+
+# Publish-guard generated artifacts — never commit
+.git-resolved-index
+
+# Secret material -- never commit
+/secrets/
+/.env
+/.env.*
+*.pem
+*.key
+id_rsa
+id_ed25519

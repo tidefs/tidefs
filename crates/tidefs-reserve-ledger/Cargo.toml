@@ -1,0 +1,21 @@
+[package]
+name = "tidefs-reserve-ledger"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Reserve ledger and budget domain runtime: named resource pools with reserve guarantees, pressure state machine, and domain governance for Design rule Rule 3"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+blake3 = { version = "1", default-features = false }
+tidefs-claim-ledger = { path = "../tidefs-claim-ledger" }
+tidefs-types-claim-ledger-core = { path = "../tidefs-types-claim-ledger-core" }
+
+[dev-dependencies]
+
+[lib]
+path = "src/lib.rs"

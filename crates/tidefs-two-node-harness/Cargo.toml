@@ -1,0 +1,37 @@
+[package]
+name = "tidefs-two-node-harness"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Deterministic two-node transport harness with storage+transport scenario: loopback, QEMU, BLAKE3-authenticated session, chunk verification, and VFSSEND2 state transfer"
+
+[features]
+default = []
+qemu = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+blake3 = { version = "1", default-features = false }
+tidefs-send-stream = { path = "../tidefs-send-stream" }
+tidefs-transport = { path = "../tidefs-transport" }
+tidefs-auth = { path = "../tidefs-auth" }
+tidefs-chunk-shipper = { path = "../tidefs-chunk-shipper" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-placement-planner = { path = "../tidefs-placement-planner" }
+tidefs-durability-layout = { path = "../tidefs-durability-layout" }
+
+[dev-dependencies]
+tidefs-cluster = { path = "../tidefs-cluster" }
+tidefs-partition-runtime = { path = "../tidefs-partition-runtime" }
+tidefs-rebuild-runtime = { path = "../tidefs-rebuild-runtime" }
+tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-receive-stream = { path = "../tidefs-receive-stream" }
+tidefs-membership-live = { path = "../tidefs-membership-live" }
+tidefs-membership-types = { path = "../tidefs-membership-types" }
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"

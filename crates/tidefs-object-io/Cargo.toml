@@ -1,0 +1,21 @@
+[package]
+name = "tidefs-object-io"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Offset-based read/write primitives bridging extent-map and object-store for TideFS"
+
+[dependencies]
+tidefs-types-extent-map-core = { path = "../tidefs-types-extent-map-core" }
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+blake3 = "=1.5.5"
+
+[dev-dependencies]
+tidefs-extent-map = { path = "../tidefs-extent-map" }
+tempfile = "3"
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,37 @@
+[package]
+name = "tidefs-device-removal"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Device removal state machine: orchestrates safe device decommission from a
+TideFS pool with object evacuation, locator-table migration, allocation
+fencing, and committed-root anchoring for crash-safe resume.
+"""
+
+[dependencies]
+tidefs-pool-scan = { path = "../tidefs-pool-scan" }
+tidefs-locator-table = { path = "../tidefs-locator-table" }
+tidefs-block-allocator = { path = "../tidefs-block-allocator" }
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "=1.5.5"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+rust.dead_code = "deny"
+rust.unused_imports = "deny"
+rust.unused_mut = "deny"
+rust.unused_must_use = "deny"

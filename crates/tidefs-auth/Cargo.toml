@@ -1,0 +1,27 @@
+[package]
+name = "tidefs-auth"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "P9-02 authentication/authorization/audit model: Ed25519 node identity, mutual attestation, principal model, session grants, authorization pipeline, override machinery, audit chain seals"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = { version = "1", features = ["serde"] }
+rand = "0.7"
+sha2 = "0.10"
+hmac = "0.12"
+blake3 = "1"
+chacha20poly1305 = "0.10"
+thiserror = "2"
+hex = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tidefs-permission = { path = "../tidefs-permission" }
+
+[lib]
+path = "src/lib.rs"

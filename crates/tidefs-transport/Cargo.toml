@@ -1,0 +1,67 @@
+[package]
+name = "tidefs-transport"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Transport/session layer: TCP transport backend, session cohort graph, 5-lane multiplexing, chunk shipper, reconnection"
+
+[features]
+default = []
+tls = ["rustls", "rcgen"]
+loopback = []
+tdma = ["tidefs-tdma-scheduler"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "macros"] }
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"], optional = true }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-membership-types = { path = "../tidefs-membership-types" }
+tidefs-clock-timing = { path = "../tidefs-clock-timing" }
+tidefs-types-transport-session = { path = "../tidefs-types-transport-session" }
+tidefs-tdma-scheduler = { path = "../tidefs-tdma-scheduler", optional = true }
+bincode = "1"
+ed25519-dalek = { version = "1", features = ["serde"] }
+rand = "0.7"
+blake3 = "1"
+tidefs-auth = { path = "../tidefs-auth" }
+crc32c = "0.6"
+tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
+tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+tidefs-binary_schema-framing = { path = "../tidefs-binary_schema-framing" }
+tidefs-lease = { path = "../tidefs-lease" }
+tidefs-cluster = { path = "../tidefs-cluster" }
+tidefs-placement-planner = { path = "../tidefs-placement-planner" }
+tidefs-durability-layout = { path = "../tidefs-durability-layout" }
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+libc = "0.2"
+lz4_flex = "0.11"
+zstd = "0.13"
+
+[dev-dependencies]
+tidefs-placement-planner = { path = "../tidefs-placement-planner" }
+tidefs-durability-layout = { path = "../tidefs-durability-layout" }
+tidefs-lease = { path = "../tidefs-lease" }
+tidefs-cluster = { path = "../tidefs-cluster" }
+tokio-test = "0.4"
+tempfile = "3"
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+criterion = "0.4"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[build-dependencies]
+cc = "1"
+
+[lib]
+path = "src/lib.rs"

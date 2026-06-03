@@ -1,0 +1,13 @@
+# TideFS trace: lookup happy path and ENOENT negative-lookup
+# Schema: pool_trace_v1, Version: 1
+# Covers: FUSE lookup reply path (issue #2529, LK-001)
+{"op":"trace_meta","args":{"schema":"pool_trace_v1","version":1}}
+{"op":"create_pool","args":{"device_count":1,"device_size_bytes":1073741824}}
+{"op":"create_dataset","args":{"dataset":"test_lookup"},"expect":{"result":"ok"}}
+{"op":"mkdir","args":{"dataset":"test_lookup","path":"dir1"},"expect":{"result":"ok"}}
+{"op":"create_file","args":{"dataset":"test_lookup","path":"dir1/file_a"},"expect":{"result":"ok"}}
+{"op":"lookup","args":{"dataset":"test_lookup","path":"dir1/file_a"},"expect":{"found":true,"kind":"file"}}
+{"op":"lookup","args":{"dataset":"test_lookup","path":"dir1/nonexistent"},"expect":{"found":false,"err":"ENOENT"}}
+{"op":"mkdir","args":{"dataset":"test_lookup","path":"dir2"},"expect":{"result":"ok"}}
+{"op":"lookup","args":{"dataset":"test_lookup","path":"dir2"},"expect":{"found":true,"kind":"dir"}}
+{"op":"close_pool","args":{}}

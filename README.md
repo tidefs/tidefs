@@ -1,0 +1,50 @@
+# TideFS
+
+TideFS is a Rust filesystem and storage stack aimed at OpenZFS/Ceph-class
+reliability and scale. It is not there yet. The repo is a pre-alpha
+implementation with serious architectural debt tracked in
+`docs/REVIEW_TODO_REGISTER.md`.
+TideFS does not currently fulfill the OpenZFS/Ceph-class narrative; that is
+the target, not a present-tense capability claim.
+
+This repository is the fresh TideFS tree on `master`; source paths, crates,
+binaries, and docs should use TideFS names.
+
+The primary remote is the private GitHub repository `tidefs/tidefs`. It stays
+private until the operator gives an explicit public-release go-ahead.
+
+## Current Policy
+
+- License: `GPL-2.0-only WITH Linux-syscall-note`.
+- Durable review debt belongs in `docs/REVIEW_TODO_REGISTER.md`; inline notes
+  are only short pointers to register entries.
+- Publishing-facing capability wording must pass
+  `cargo run -p tidefs-xtask -- check-claims-gate`.
+- Commits should be clean, scoped, and bisectable in the same spirit as Linux
+  kernel development.
+
+## Layout
+
+```text
+apps/        runnable daemons, demos, and operator tools
+crates/      storage core, adapters, kernel-facing crates, and shared types
+docs/        design docs, review policy, and debt register
+kmod/        Rust-for-Linux bridge substrate
+xtask/       repo checks and developer commands
+```
+
+## Build
+
+Keep Cargo output outside the repository:
+
+```sh
+export CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target
+cargo check --workspace --locked
+```
+
+## Start Here
+
+- `docs/LICENSING.md`
+- `docs/REVIEW_TODO_POLICY.md`
+- `docs/REVIEW_TODO_REGISTER.md`
+- `docs/INDEX.md`

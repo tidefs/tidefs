@@ -1,0 +1,10 @@
+# Trace regression catalog
+#
+# Smoke traces collected from peer-crate smoke runs are stored here
+# as JSON files.  CI replays every trace against a fresh harness to
+# catch behavioural regressions.
+#
+# Format: one file per peer crate per milestone, e.g.:
+#   dir_index_v1.0.json
+#   extent_map_v1.0.json
+#   object_store_v1.0.json

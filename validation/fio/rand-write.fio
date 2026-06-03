@@ -1,0 +1,12 @@
+; ublk fio verification: random write with verify metadata against ublk block device
+[global]
+ioengine=psync
+direct=1
+bs=4k
+
+[rand-write-verify]
+rw=randwrite
+verify=crc32c
+verify_fatal=1
+size=3M
+offset=0

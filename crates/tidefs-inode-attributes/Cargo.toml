@@ -1,0 +1,26 @@
+[package]
+name = "tidefs-inode-attributes"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Runtime inode-attribute store providing POSIX attribute get/set dispatch,
+link-count tracking, and stat translation. In-memory default; designed
+for replacement with a persistent store.
+"""
+
+[dependencies]
+tidefs-posix-acl = { path = "../tidefs-posix-acl" }
+tidefs-inode-table = { path = "../tidefs-inode-table" }
+parking_lot = "0.12"
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+libc = "0.2"
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+
+
+[dev-dependencies]
+proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
+tempfile = "3"

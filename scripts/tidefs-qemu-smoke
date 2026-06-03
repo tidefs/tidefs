@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo="${TIDEFS_REPO:-$(cd -- "$script_dir/.." && pwd)}"
+exec bash "$script_dir/tidefs-nix-qemu-build" \
+  --target qemuSmoke \
+  --name tidefs-qemu-smoke \
+  --repo "$repo" \
+  "$@"

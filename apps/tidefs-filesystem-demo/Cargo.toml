@@ -1,0 +1,20 @@
+[package]
+name = "tidefs-filesystem-demo"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Demo for the TideFS Local Filesystem MVP over the Local Object Store"
+
+[dependencies]
+tidefs-local-filesystem = { path = "../../crates/tidefs-local-filesystem" }
+tidefs-posix-filesystem-adapter-daemon = { path = "../../apps/tidefs-posix-filesystem-adapter-daemon" }
+tidefs-vfs-engine = { path = "../../crates/tidefs-vfs-engine" }
+tidefs-local-object-store = { path = "../../crates/tidefs-local-object-store" }
+fuser = { version = "0.14.0", features = ["abi-7-28"] }
+
+[[bin]]
+name = "tidefs-filesystem-demo"
+path = "src/main.rs"

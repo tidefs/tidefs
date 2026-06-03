@@ -1,0 +1,3330 @@
+//! Storage node server: accept transport connections and serve
+//! put/get/delete/list/stats operations backed by a ReplicatedObjectStore,
+//! plus send/receive backed by a LocalFileSystem at a configured fs_root.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use tidefs_local_filesystem::{self as vfs, ChangedRecordExport, RootAuthenticationKey};
+use tidefs_local_object_store::StoreOptions;
+use tidefs_membership_epoch::session_binding::{RosterSessionRegistry, SessionAcceptor};
+use tidefs_membership_epoch::{MemberClass, MemberId};
+use tidefs_membership_live::connection_acceptance::ConnectionAcceptor;
+use tidefs_membership_live::peer_eviction::EvictionAction;
+use tidefs_membership_live::peer_join::PeerJoinHandshake;
+use tidefs_membership_live::reconnect_handshake::PeerReconnectOutcome;
+use tidefs_membership_live::session_binding::SessionBindingTable;
+use tidefs_membership_live::{
+    recv_membership_msg, send_membership_msg, MembershipConfig, MembershipRuntime,
+    MembershipTransport, MembershipView, MembershipWireMessage, SwimAck,
+};
+use tidefs_membership_types::MemberIdentity;
+use tidefs_node_join::{JoinPipeline, JoinPipelinePhase};
+use tidefs_pool_import::{pool_import, ImportedPool};
+use tidefs_cluster::ClusterPlacementPolicy;
+use tidefs_cluster::pool_protocol::{CatalogEntryRow, ClusterPoolCatalogDeltaResponse, ClusterPoolCatalogQueryResponse, ClusterPoolCreateResponse, ClusterPoolImportResponse, ClusterPoolLeaseResponse, ClusterPoolMessage};
+use tidefs_cluster::{ClusterLeaseConfig, ClusterLeaseRuntime, FenceAuthority, FenceValidator};
+use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
+use tidefs_partition_runtime::split_brain_guard::SplitBrainGuard;
+use tidefs_partition_runtime::types::PartitionFence;
+use tidefs_membership_epoch::EpochId;
+use tidefs_replicated_object_store::{
+    ReplicatedObjectStore, ReplicatedStoreConfig, TransportReplicatedStore,
+    TransportReplicatedStoreConfig,
+};
+use tidefs_transport::connection_registry::ConnectionRegistry;
+use tidefs_transport::{
+    send_replication_msg, send_segment_fetch_response, PlacementVersionTracker, ReplicationMessage,
+    SegmentFetchRequest, SegmentFetchResponse, SessionCloseReason, Transport, TransportError,
+    SEGMENT_FETCH_REQUEST_MAGIC,
+};
+
+use crate::authority_spine::RuntimeAuthority;
+use crate::protocol::{self, Frame};
+use crate::snapshot_barrier::{SnapshotBarrierConfig, SnapshotCoordinator};
+
+/// Magic prefix for cluster pool protocol messages (CP01 = Cluster Pool v1).
+const CLUSTER_POOL_MESSAGE_MAGIC: &[u8; 4] = b"CP01";
+
+/// Active store backend, selected by the runtime authority spine.
+///
+/// When `RuntimeAuthority::is_live()` is true, the storage node uses the
+/// transport-backed [`TransportReplicatedStore`]; otherwise it falls back
+/// to the local path-backed [`ReplicatedObjectStore`] for single-node or
+/// harness use.
+enum StoreBackend {
+    /// Local path-backed replicated store (single-node/harness path).
+    Local(Box<ReplicatedObjectStore>),
+    /// Transport-backed replicated store (live multi-node path).
+    TransportBacked(Box<TransportReplicatedStore>),
+}
+
+fn sync_entries_from_store(store: &StoreBackend) -> Vec<([u8; 32], Vec<u8>)> {
+    match store {
+        StoreBackend::Local(rs) => rs
+            .list_keys_local()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|key| {
+                rs.get_key_local(key)
+                    .ok()
+                    .flatten()
+                    .map(|payload| (key.as_bytes32(), payload))
+            })
+            .collect(),
+        StoreBackend::TransportBacked(ts) => ts
+            .list_keys_local()
+            .into_iter()
+            .filter_map(|key| {
+                ts.get_key_local(key)
+                    .ok()
+                    .flatten()
+                    .map(|payload| (key.as_bytes32(), payload))
+            })
+            .collect(),
+    }
+}
+
+/// Configuration for a storage node server.
+#[derive(Clone)]
+pub struct StorageNodeConfig {
+    /// Address to bind the TCP listener on.
+    pub bind_addr: SocketAddr,
+    /// Local node ID for the transport layer.
+    pub node_id: u64,
+    /// Paths for the replicated object store.
+    pub store_paths: Vec<PathBuf>,
+    /// Pool device path for pool import at startup.
+    /// When set, the daemon imports the pool before opening the store.
+    pub pool_device_path: Option<PathBuf>,
+    /// Directory for pool import lock files. Defaults to /dev/tidefs/import.
+    pub pool_lock_dir: Option<PathBuf>,
+    /// Human-readable node identity string (e.g. "node-7.rack-3").
+    pub node_identity: Option<String>,
+    /// Runtime authority spine disclosing the active transport backend.
+    /// When set, membership, transport, and replication subsystems
+    /// consume this rather than raw CLI flags.
+    pub authority: Option<RuntimeAuthority>,
+    /// Filesystem root for send/receive operations.
+    /// When set, the server can export and import changed-record streams.
+    pub fs_root: Option<PathBuf>,
+    /// Root authentication key for opening the filesystem (send path).
+    pub root_auth_key: Option<RootAuthenticationKey>,
+    /// Member class for this node: Voter, Learner, DataOnly, etc.
+    /// Defaults to Voter if not set.
+    pub member_class: Option<MemberClass>,
+    /// Failure domain identifier for this node (e.g. rack id).
+    /// Defaults to the node_id when not set.
+    pub failure_domain: Option<u64>,
+    /// Optional bind address for the membership control transport.
+    pub membership_bind_addr: Option<SocketAddr>,
+    /// Membership peers to register and dial during startup.
+    pub membership_peers: Vec<MembershipPeerConfig>,
+    /// Storage replica data endpoints to connect during startup.
+    pub replica_peers: Vec<MembershipPeerConfig>,
+    /// Use RDMA transport backend when available, falling back to TCP.
+    /// When false (default), uses TCP transport.
+    pub rdma: bool,
+    /// Carrier policy for fail-closed RDMA enforcement (#6672).
+    /// "prefer" (default) allows silent fallback to TCP; "enforce" fails
+    /// closed when an RDMA claim cannot be satisfied.
+    pub carrier_policy: Option<String>,
+    /// Optional path to a ready-marker file created after startup completes.
+    pub ready_file: Option<std::path::PathBuf>,
+    /// Drain timeout in seconds for graceful node-drain on shutdown.
+    pub drain_timeout_secs: u64,
+
+    /// Optional directory for membership checkpoint persistence.
+    /// When set, the runtime loads the latest epoch checkpoint on startup
+    /// and creates new checkpoints after each epoch advancement,
+    /// enabling cold-start cluster recovery without manual repair.
+    pub membership_checkpoint_dir: Option<PathBuf>,
+
+    /// Optional cluster lease configuration. When set, the node acquires
+    /// and renews a membership lease for clustered pool import, and the
+    /// write fence validator is activated for transport dispatch gating.
+    pub cluster_lease_config: Option<ClusterLeaseConfig>,
+}
+
+/// Bootstrap configuration for one membership peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MembershipPeerConfig {
+    pub node_id: u64,
+    pub addr: SocketAddr,
+    pub member_class: MemberClass,
+    pub failure_domain: u64,
+}
+
+/// Cloned/shared state passed to each session handler thread.
+#[allow(dead_code)]
+struct SessionContext {
+    transport: Arc<Mutex<Transport>>,
+    store: Arc<Mutex<StoreBackend>>,
+    membership: Arc<Mutex<MembershipRuntime>>,
+    membership_transport: Option<Arc<Mutex<MembershipTransport>>>,
+    authority: Option<RuntimeAuthority>,
+    config: StorageNodeConfig,
+    imported_pool: Option<ImportedPool>,
+    start_time: Instant,
+    /// Pending evictions queued by the eviction callback for processing.
+    pending_evictions: Arc<Mutex<Vec<(SocketAddr, EvictionAction)>>>,
+    /// Roster-to-session registry shared between PeerJoinHandshake and ConnectionAcceptor.
+    roster_session_registry: Arc<std::sync::RwLock<RosterSessionRegistry>>,
+    /// Session acceptor wrapping the roster registry for roster-verified bindings.
+    session_acceptor: Arc<std::sync::RwLock<SessionAcceptor>>,
+    /// First-time peer-join handshake for unknown peers.
+    peer_join_handshake: Arc<PeerJoinHandshake>,
+    /// Known-peer reconnect acceptor: delivers ReconnectStatePushMessage on reconnect.
+    connection_acceptor: Arc<ConnectionAcceptor>,
+    /// Placement version tracker for consistent rebalance across nodes.
+    placement_version_tracker: Arc<PlacementVersionTracker>,
+    active_barrier: Arc<Mutex<Option<SnapshotCoordinator>>>,
+    /// Write-fence validator from the cluster lease runtime.
+    /// When set, transport-layer write dispatch must validate the write
+    /// fence token against this validator before committing writes.
+    fence_validator: Option<FenceValidator>,
+    /// Cluster lease runtime for granting pool lease tokens to clients.
+    /// When None (not yet wired), lease requests are refused with a
+    /// "not configured" error.
+    lease_runtime: Option<std::sync::Arc<std::sync::Mutex<ClusterLeaseRuntime>>>,
+    /// Split-brain guard for partition-based fencing of write operations.
+    /// When set and the node is on the minority side of a partition,
+    /// write-gating operations (import, catalog mutations, lease grants)
+    /// are refused with a typed MinorityFenced error before they hit storage.
+    split_brain_guard: Option<Arc<Mutex<SplitBrainGuard>>>,
+}
+/// Bridges an Arc<ConnectionAcceptor> into a Box<dyn EpochCommitSubscriber>
+/// for registration with the EpochAdvanceCoordinator.
+///
+/// ConnectionAcceptor already implements the local epoch_coordinator::EpochCommitSubscriber,
+/// but it's held behind Arc for shared ownership. This thin wrapper delegates
+/// on_epoch_committed to the inner acceptor.
+struct AcceptorCoordinatorBridge {
+    acceptor: Arc<ConnectionAcceptor>,
+}
+
+impl tidefs_membership_live::epoch_coordinator::EpochCommitSubscriber
+    for AcceptorCoordinatorBridge
+{
+    fn on_epoch_committed(&self, view: &tidefs_membership_live::epoch_coordinator::EpochView) {
+        tidefs_membership_live::epoch_coordinator::EpochCommitSubscriber::on_epoch_committed(
+            self.acceptor.as_ref(),
+            view,
+        );
+    }
+}
+
+/// A running storage node server.
+pub struct StorageNode {
+    transport: Arc<Mutex<Transport>>,
+    store: Arc<Mutex<StoreBackend>>,
+    membership: Arc<Mutex<MembershipRuntime>>,
+    membership_transport: Option<Arc<Mutex<MembershipTransport>>>,
+    _membership_service: Option<MembershipServiceHandle>,
+    config: StorageNodeConfig,
+    /// Runtime authority spine constructed at startup.
+    authority: Option<RuntimeAuthority>,
+    /// Result of pool import at startup, if pool_device_path was set.
+    imported_pool: Option<ImportedPool>,
+    /// Daemon start time for uptime calculation.
+    /// Cluster lease runtime for clustered pool import ownership.
+    /// When configured, the node acquires a membership lease and
+    /// issues write fences through the associated FenceAuthority.
+    /// Wrapped in Arc<Mutex<>> so it can be shared into SessionContext
+    /// for per-session lease token grants.
+    cluster_lease_runtime: Option<Arc<Mutex<ClusterLeaseRuntime>>>,
+    /// Write-fence validator for transport-layer write gating.
+    /// Extracted from the FenceAuthority in ClusterLeaseRuntime.
+    fence_validator: Option<FenceValidator>,
+    /// Split-brain guard for partition-based fencing.
+    /// Shared into SessionContext for per-session write gating.
+    split_brain_guard: Option<Arc<Mutex<SplitBrainGuard>>>,
+    start_time: Instant,
+    /// Node-join pipeline tracking the staged join through ShadowOnly→VoterSpread→ReplicaTarget.
+    join_pipeline: JoinPipeline,
+    /// Stop flag for graceful shutdown.
+    stop: Arc<AtomicBool>,
+    /// Connection registry for eviction executor: maps peer IDs to endpoint addrs.
+    /// Populated after transport handshake in serve_one.
+    connection_registry: Arc<ConnectionRegistry>,
+    /// Session binding table for eviction executor: released on peer departure.
+    /// Populated after transport handshake in serve_one.
+    session_bindings: Arc<Mutex<SessionBindingTable>>,
+    /// Pending evictions queued by the eviction callback for processing.
+    pending_evictions: Arc<Mutex<Vec<(SocketAddr, EvictionAction)>>>,
+    /// Roster-to-session registry shared between PeerJoinHandshake and ConnectionAcceptor.
+    roster_session_registry: Arc<std::sync::RwLock<RosterSessionRegistry>>,
+    /// Session acceptor wrapping the roster registry for roster-verified bindings.
+    session_acceptor: Arc<std::sync::RwLock<SessionAcceptor>>,
+    /// First-time peer-join handshake for unknown peers.
+    peer_join_handshake: Arc<PeerJoinHandshake>,
+    /// Known-peer reconnect acceptor: delivers ReconnectStatePushMessage on reconnect.
+    connection_acceptor: Arc<ConnectionAcceptor>,
+    /// Placement version tracker for consistent rebalance across nodes.
+    placement_version_tracker: Arc<PlacementVersionTracker>,
+    active_barrier: Arc<Mutex<Option<SnapshotCoordinator>>>,
+}
+
+/// Build a ReachabilityMatrix from the membership failure detector and
+/// evaluate the split-brain guard. Called after each membership tick to
+/// keep the partition fence in sync with live peer health.
+fn sync_partition_state_from_membership(
+    membership: &MembershipRuntime,
+    split_brain_guard: &std::sync::Mutex<SplitBrainGuard>,
+    my_id: MemberId,
+) {
+    use tidefs_partition_runtime::types::ReachabilityEntry;
+
+    let peers: Vec<_> = membership.detector.all_peers().collect();
+    let my_reachable: Vec<MemberId> = peers
+        .iter()
+        .filter(|p| p.is_alive())
+        .map(|p| p.member_id)
+        .collect();
+
+    let entry = ReachabilityEntry {
+        observer: my_id,
+        reachable: my_reachable,
+        observed_at_millis: 0,
+        epoch: tidefs_membership_epoch::EpochId::new(1),
+    };
+
+    let matrix = tidefs_partition_runtime::types::ReachabilityMatrix {
+        entries: vec![entry],
+        computed_at_millis: 0,
+    };
+
+    let mut guard = split_brain_guard.lock().unwrap();
+    let members: Vec<_> = peers
+        .iter()
+        .map(|p| tidefs_membership_epoch::ClusterMemberRecord {
+            member_id: p.member_id,
+            member_class: p.member_class,
+            current_membership_epoch_ref: p.epoch,
+            log_frontier: 0,
+            health: p.health,
+            failure_domain_vector: tidefs_membership_epoch::FailureDomainVector::new(
+                tidefs_membership_epoch::DomainId::new(p.failure_domain),
+                tidefs_membership_epoch::DomainId::ZERO,
+                tidefs_membership_epoch::DomainId::ZERO,
+                tidefs_membership_epoch::DomainId::ZERO,
+                tidefs_membership_epoch::DomainId::ZERO,
+                tidefs_membership_epoch::DomainId::ZERO,
+            ),
+            digest: 0,
+        })
+        .collect();
+
+    let (_state, _hazard) = guard.evaluate(&matrix, &membership.detector, &members);
+}
+
+struct MembershipServiceHandle {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl MembershipServiceHandle {
+    fn spawn(
+        membership: Arc<Mutex<MembershipRuntime>>,
+        membership_transport: Arc<Mutex<MembershipTransport>>,
+        placement_version_tracker: Arc<PlacementVersionTracker>,
+        period: Duration,
+        split_brain_guard: Option<Arc<Mutex<SplitBrainGuard>>>,
+        my_id: MemberId,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_worker = Arc::clone(&stop);
+        // Poll interval for inbound message dispatch. Much tighter than the
+        // tick period so membership protocol messages (Ack, Proposal, etc.)
+        // are dispatched without multi-tick latency.
+        let poll_interval = Duration::from_millis(10);
+        let handle = thread::spawn(move || {
+            let mut last_tick = Instant::now();
+            while !stop_worker.load(Ordering::Relaxed) {
+                // Continuously receive and dispatch inbound membership
+                // messages on all connected peer sessions.
+                recv_and_dispatch_membership_msgs(&membership, &membership_transport);
+
+                // Sync placement version from the tracker into the
+                // membership runtime so views carry the current version.
+                {
+                    let version = placement_version_tracker.current_version();
+                    if version > 0 {
+                        let mut runtime = membership.lock().unwrap();
+                        runtime.set_placement_version(version);
+                    }
+                }
+
+                // Tick the runtime (accept peers, send pings, broadcast
+                // views) only at the configured period.
+                if last_tick.elapsed() >= period {
+                    run_membership_service_once(&membership, &membership_transport);
+
+                    if let Some(ref guard) = split_brain_guard {
+                        let runtime = membership.lock().unwrap();
+                        sync_partition_state_from_membership(&runtime, guard, my_id);
+                    }
+
+                    last_tick = Instant::now();
+                }
+
+                thread::sleep(poll_interval);
+            }
+        });
+
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for MembershipServiceHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_membership_service_once(
+    membership: &Arc<Mutex<MembershipRuntime>>,
+    membership_transport: &Arc<Mutex<MembershipTransport>>,
+) {
+    let mut accepted_peers = Vec::new();
+
+    {
+        let mut transport = membership_transport.lock().unwrap();
+        loop {
+            match transport.try_accept_peer() {
+                Ok(Some((peer_id, _))) => accepted_peers.push(peer_id),
+                Ok(None) => break,
+                Err(e) => {
+                    if !is_optional_accept_poll(&e) {
+                        eprintln!("[storage-node] membership accept error: {e:?}");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    if !accepted_peers.is_empty() {
+        let mut runtime = membership.lock().unwrap();
+        for peer_id in accepted_peers {
+            let member_id = MemberId::new(peer_id);
+            if !runtime.detector.has_peer(member_id) {
+                runtime.add_peer(member_id, MemberClass::Voter, peer_id);
+            }
+        }
+    }
+
+    let view = {
+        let mut runtime = membership.lock().unwrap();
+        let mut transport = membership_transport.lock().unwrap();
+        let _ = transport.tick_runtime(&mut runtime);
+        runtime.view()
+    };
+
+    {
+        let mut transport = membership_transport.lock().unwrap();
+        transport.broadcast_view(&view);
+    }
+}
+
+/// Receive and dispatch inbound membership protocol messages on all connected
+/// peer sessions. Sets non-blocking I/O so the membership service loop never
+/// stalls on an idle session.
+fn recv_and_dispatch_membership_msgs(
+    membership: &Arc<Mutex<MembershipRuntime>>,
+    membership_transport: &Arc<Mutex<MembershipTransport>>,
+) {
+    // Collect messages under the transport lock, then dispatch outside it
+    // so handlers (Ping->Ack, etc.) can safely re-acquire the lock.
+    let messages: Vec<(tidefs_transport::SessionId, MembershipWireMessage)> = {
+        let mut transport = membership_transport.lock().unwrap();
+        let session_ids: Vec<tidefs_transport::SessionId> =
+            transport.peer_sessions.values().copied().collect();
+        let _ = transport.transport.set_nonblocking(true);
+
+        let mut msgs = Vec::new();
+        for sid in session_ids {
+            match recv_membership_msg(&mut transport.transport, sid) {
+                Ok(wire_msg) => msgs.push((sid, wire_msg)),
+                Err(tidefs_transport::TransportError::WouldBlock(_)) => {
+                    // No data available on this session.
+                }
+                Err(e) => {
+                    eprintln!("[storage-node] membership recv error on session {sid}: {e:?}");
+                }
+            }
+        }
+        msgs
+    };
+
+    for (sid, wire_msg) in messages {
+        dispatch_inbound_membership_msg(membership, membership_transport, sid, wire_msg);
+    }
+}
+
+/// Dispatch a single inbound membership wire message to the runtime and
+/// transport. Handles Ping→Ack response generation, Ack processing,
+/// and epoch-transition message routing.
+fn dispatch_inbound_membership_msg(
+    membership: &Arc<Mutex<MembershipRuntime>>,
+    membership_transport: &Arc<Mutex<MembershipTransport>>,
+    sid: tidefs_transport::SessionId,
+    wire_msg: MembershipWireMessage,
+) {
+    match wire_msg {
+        MembershipWireMessage::Ping(ping) => {
+            // Build an Ack and send it back on the same session.
+            let ack = {
+                let runtime = membership.lock().unwrap();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                SwimAck {
+                    ping_seq_no: ping.seq_no,
+                    acker: runtime.my_id,
+                    acker_epoch: runtime.current_epoch(),
+                    acker_epoch_receipt: 0,
+                    suspicion_list: vec![],
+                    membership_delta: vec![],
+                    acked_at_millis: now,
+                    signature: vec![],
+                }
+            };
+            let mut transport = membership_transport.lock().unwrap();
+            let ack_msg = MembershipWireMessage::Ack(ack);
+            if let Err(e) = send_membership_msg(&mut transport.transport, sid, &ack_msg) {
+                eprintln!("[storage-node] failed to send ack on session {sid}: {e:?}");
+            }
+        }
+        MembershipWireMessage::Ack(ack) => {
+            let mut runtime = membership.lock().unwrap();
+            if let Err(e) = runtime.process_ack(&ack) {
+                eprintln!("[storage-node] process_ack error: {e:?}");
+            }
+        }
+        MembershipWireMessage::Proposal(proposal) => {
+            let mut runtime = membership.lock().unwrap();
+            if let Err(e) = runtime.receive_proposal(&proposal) {
+                eprintln!("[storage-node] receive_proposal error: {e:?}");
+            }
+        }
+        MembershipWireMessage::Accept(accept) => {
+            let mut runtime = membership.lock().unwrap();
+            if let Err(e) = runtime.receive_accept(accept) {
+                eprintln!("[storage-node] receive_accept error: {e:?}");
+            }
+        }
+        MembershipWireMessage::Commit(commit) => {
+            let mut runtime = membership.lock().unwrap();
+            if let Err(e) = runtime.receive_commit(&commit) {
+                eprintln!("[storage-node] receive_commit error: {e:?}");
+            }
+        }
+        MembershipWireMessage::View(view) => {
+            // Inbound view snapshots are informational; the runtime's own
+            // view is authoritative. No-op for now.
+            let _ = view;
+        }
+        MembershipWireMessage::IndirectPingRequest(req) => {
+            // Processed via FailureDetector when full indirect-ping relay
+            // is wired through the runtime. No-op for now.
+            let _ = req;
+        }
+        MembershipWireMessage::IndirectPingResponse(resp) => {
+            // Requires verifying_key routing through the runtime.
+            let _ = resp;
+        }
+        MembershipWireMessage::GossipBroadcast(gossip) => {
+            // Requires full gossip engine wiring.
+            let _ = gossip;
+        }
+    }
+}
+
+/// Derive a [`TransportReplicatedStoreConfig`] from the runtime authority's
+/// replication factor. Uses majority quorum: write_quorum = (rf / 2) + 1.
+fn transport_store_config_from_authority(
+    a: &RuntimeAuthority,
+    rdma: bool,
+) -> TransportReplicatedStoreConfig {
+    let rf = a.replication_factor() as usize;
+    let write_quorum = if rf <= 1 { 1 } else { rf / 2 + 1 };
+    TransportReplicatedStoreConfig {
+        write_quorum,
+        total_replicas: rf,
+        enable_degraded_reads: true,
+        rdma,
+        store_options: tidefs_local_object_store::StoreOptions::default(),
+    }
+}
+
+impl StorageNode {
+    /// Create and start a storage node.
+    pub fn start(config: StorageNodeConfig) -> Result<Self, String> {
+        // ── Extract the runtime authority spine ──────────────────────
+        let authority = config.authority.clone();
+
+        let store_backend = if let Some(ref a) = authority {
+            if a.is_live() {
+                // Transport-backed live path: use TransportReplicatedStore
+                let primary_path = config
+                    .store_paths
+                    .first()
+                    .ok_or_else(|| "store_paths must not be empty for live backend".to_string())?;
+                let ts_cfg = transport_store_config_from_authority(a, config.rdma);
+                let mut ts = TransportReplicatedStore::open(primary_path, a.node_id(), ts_cfg)?;
+                // Connect to explicit replica peers as the storage data path.
+                // Fall back to membership peers for older configurations.
+                let replica_peers = if config.replica_peers.is_empty() {
+                    &config.membership_peers
+                } else {
+                    &config.replica_peers
+                };
+                if replica_peers.is_empty() {
+                    eprintln!(
+                        "[storage-node] WARNING: live backend {:?} with zero replica peers;                          TransportReplicatedStore will have no remote replicas",
+                        a.backend(),
+                    );
+                }
+                for peer in replica_peers {
+                    ts.connect_replica(peer.node_id, peer.addr)
+                        .map_err(|e| format!("connect replica {}: {e}", peer.node_id))?;
+                }
+                StoreBackend::TransportBacked(Box::new(ts))
+            } else {
+                // Local/harness path: use path-backed ReplicatedObjectStore
+                let store_cfg = ReplicatedStoreConfig {
+                    replica_count: a.replication_factor() as usize,
+                    ..Default::default()
+                };
+                let store = ReplicatedObjectStore::open(&config.store_paths, store_cfg)
+                    .map_err(|e| format!("failed to open replicated store: {e}"))?;
+                StoreBackend::Local(Box::new(store))
+            }
+        } else {
+            // No authority: default to local path-backed
+            let store_cfg = ReplicatedStoreConfig::default();
+            let store = ReplicatedObjectStore::open(&config.store_paths, store_cfg)
+                .map_err(|e| format!("failed to open replicated store: {e}"))?;
+            StoreBackend::Local(Box::new(store))
+        };
+
+        // Pool import: if a pool device path is configured, import the pool
+        // to verify superblock consistency and activate the pool.
+        //
+        // Split-brain prevention: read the persisted epoch anchor to
+        // reject stale committed roots from partitioned writers.
+        let imported_pool = if let Some(ref pool_path) = config.pool_device_path {
+            let lock_dir = config
+                .pool_lock_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("/dev/tidefs/import"));
+            let epoch_anchor_path = lock_dir.join("epoch_anchor");
+            let min_epoch = read_epoch_anchor(&epoch_anchor_path);
+            let imported = pool_import(&[pool_path.clone()], &lock_dir, false, None, min_epoch)
+                .map_err(|e| format!("pool import failed for {}: {e}", pool_path.display()))?;
+            // Persist the committed-root epoch for the next import.
+            if let Some(epoch) = imported.stats.committed_root_epoch {
+                write_epoch_anchor(&epoch_anchor_path, epoch);
+            }
+            Some(imported)
+        } else {
+            None
+        };
+
+        let mut transport = if config.rdma {
+            Transport::with_rdma_or_tcp(config.node_id, Duration::from_secs(5))
+        } else {
+            Transport::new(config.node_id)
+        };
+        // Apply carrier policy from config (defaults to Prefer when unset).
+        match config.carrier_policy.as_deref() {
+            Some("enforce") => {
+                transport = transport.with_carrier_policy(
+                    tidefs_transport::carrier_selection::CarrierPolicy::Enforce,
+                );
+                eprintln!("[storage-node] carrier_policy=enforce: RDMA claim will fail closed on silent TCP fallback");
+            }
+            _ => {
+                transport = transport.with_carrier_policy(
+                    tidefs_transport::carrier_selection::CarrierPolicy::Prefer,
+                );
+            }
+        }
+        transport
+            .configure_generated_attestation(true)
+            .map_err(|e| format!("transport attestation setup failed: {e}"))?;
+
+        // Gate outbound sends with a concurrency limit to prevent a fast
+        // sender from exhausting transport memory when the receiver or
+        // network is slow (B5: Transport Flow Control Not Wired).
+        // Default 256 in-flight sends; configurable via future config field.
+        transport.set_send_concurrency_limit(256);
+
+        transport
+            .bind(tidefs_transport::TransportAddr::Tcp(config.bind_addr))
+            .map_err(|e| format!("transport bind failed: {e:?}"))?;
+
+        if let Some(ref a) = authority {
+            eprintln!(
+                "[storage-node] authority spine: backend={} live={} rf={}",
+                a.backend(),
+                a.is_live(),
+                a.replication_factor(),
+            );
+        }
+
+        let member_class = authority
+            .as_ref()
+            .and_then(|a| a.member_class())
+            .or(config.member_class)
+            .unwrap_or(MemberClass::Voter);
+        let failure_domain = authority
+            .as_ref()
+            .and_then(|a| a.failure_domain())
+            .or(config.failure_domain)
+            .unwrap_or(config.node_id);
+        let membership_config = MembershipConfig::default();
+        let membership_period =
+            Duration::from_millis((membership_config.ping_interval_ms / 4).max(1));
+        let mut membership = if let Some(ref checkpoint_dir) = config.membership_checkpoint_dir {
+            // Cold-start recovery: open checkpoint persistence and load latest
+            // epoch snapshot plus transition journal so the runtime recovers
+            // roster, epoch, and incarnation without manual repair.
+            let checkpoint_store = tidefs_membership_live::CheckpointPersistence::open(
+                checkpoint_dir,
+            )
+            .map_err(|e| {
+                format!(
+                    "membership checkpoint persistence open at {}: {e}",
+                    checkpoint_dir.display()
+                )
+            })?;
+            let journal =
+                tidefs_membership_epoch::transition_journal::MembershipTransitionJournal::new();
+            MembershipRuntime::load_from_checkpoint_store(
+                Box::new(checkpoint_store),
+                journal,
+                membership_config,
+                MemberId::new(config.node_id),
+                member_class,
+                failure_domain,
+            )
+        } else {
+            MembershipRuntime::new(
+                membership_config,
+                MemberId::new(config.node_id),
+                member_class,
+                failure_domain,
+            )
+        };
+        for peer in &config.membership_peers {
+            membership.add_peer(
+                MemberId::new(peer.node_id),
+                peer.member_class,
+                peer.failure_domain,
+            );
+        }
+
+        let membership_transport =
+            if config.membership_bind_addr.is_some() || !config.membership_peers.is_empty() {
+                let mut transport = MembershipTransport::new(config.node_id);
+                if let Some(addr) = config.membership_bind_addr {
+                    transport
+                        .bind(addr)
+                        .map_err(|e| format!("membership transport bind failed: {e:?}"))?;
+                }
+                for peer in &config.membership_peers {
+                    transport
+                        .connect_to_peer(peer.node_id, peer.addr)
+                        .map_err(|e| {
+                            format!(
+                                "membership transport connect to node {} at {} failed: {e:?}",
+                                peer.node_id, peer.addr
+                            )
+                        })?;
+                }
+                Some(Arc::new(Mutex::new(transport)))
+            } else {
+                None
+            };
+
+        let membership = Arc::new(Mutex::new(membership));
+
+        // Wire eviction executor into the membership runtime.
+        let connection_registry = Arc::new(ConnectionRegistry::new());
+        let session_bindings = Arc::new(Mutex::new(SessionBindingTable::new()));
+        let pending_evictions: Arc<Mutex<Vec<(SocketAddr, EvictionAction)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        // Roster-session bridge: shared registry + session acceptor used by
+        // both PeerJoinHandshake (first-time joins) and ConnectionAcceptor
+        // (known-peer reconnects).
+        let roster_session_registry =
+            Arc::new(std::sync::RwLock::new(RosterSessionRegistry::new()));
+        let session_acceptor = Arc::new(std::sync::RwLock::new(SessionAcceptor::new(Arc::clone(
+            &roster_session_registry,
+        ))));
+
+        // First-time peer-join handshake: accepts unknown peers, pushes
+        // epoch state, and queues them for roster inclusion.
+        let peer_join_handshake =
+            Arc::new(PeerJoinHandshake::new(Arc::clone(&roster_session_registry)));
+
+        // Known-peer reconnect acceptor: delivers ReconnectStatePushMessage
+        // to peers that are already in the committed roster.
+        let connection_acceptor = Arc::new(ConnectionAcceptor::new(Arc::clone(&session_acceptor)));
+        {
+            let pending = Arc::clone(&pending_evictions);
+            let mut rt = membership.lock().unwrap();
+            rt.wire_eviction_executor(
+                Arc::clone(&connection_registry),
+                Arc::clone(&session_bindings),
+                Box::new(move |addr, action| {
+                    pending.lock().unwrap().push((addr, action));
+                }),
+            );
+
+            // Subscribe ConnectionAcceptor to the EpochAdvanceCoordinator so the
+            // cached roster stays synchronized across epoch transitions. Both the
+            // known-peer reconnect path and first-time join path consult this
+            // roster to distinguish reconnects from new joins.
+            if let Some(ref mut coordinator) = rt.epoch_coordinator {
+                // ConnectionAcceptor implements both EpochCommitSubscriber traits,
+                // so it can be registered directly with the coordinator.
+                coordinator.subscribe(Box::new(AcceptorCoordinatorBridge {
+                    acceptor: Arc::clone(&connection_acceptor),
+                }));
+            }
+        }
+
+        // Wire roster-update bridge: when the ConnectionAcceptor receives a
+        // new roster from any source (EpochCommitBus or EpochAdvanceCoordinator),
+        // also forward it to PeerJoinHandshake so first-time joins see the
+        // current committed roster.
+        {
+            let pjh: Arc<PeerJoinHandshake> = Arc::clone(&peer_join_handshake);
+            connection_acceptor.set_roster_update_hook(move |roster| {
+                pjh.update_roster(roster.clone());
+            });
+        }
+
+        // ── Placement version tracker ──────────────────────────────
+        let placement_version_tracker = Arc::new(PlacementVersionTracker::new());
+
+        // ── Split-brain guard for partition-based fencing ─────
+        let split_brain_guard: Option<Arc<Mutex<SplitBrainGuard>>> =
+            if config.cluster_lease_config.is_some() {
+                let guard = Arc::new(Mutex::new(SplitBrainGuard::new(
+                    tidefs_membership_epoch::MemberId::new(config.node_id),
+                    EpochId::new(1),
+                    2,
+                )));
+                Some(Arc::clone(&guard))
+            } else {
+                None
+            };
+
+        let membership_service = membership_transport.as_ref().map(|transport| {
+            MembershipServiceHandle::spawn(
+                Arc::clone(&membership),
+                Arc::clone(transport),
+                Arc::clone(&placement_version_tracker),
+                membership_period,
+                split_brain_guard.clone(),
+                tidefs_membership_epoch::MemberId::new(config.node_id),
+            )
+        });
+
+        // ── Cluster lease runtime for pool import ownership ─────
+        let (cluster_lease_runtime, fence_validator) =
+            if let Some(ref lease_config) = config.cluster_lease_config {
+                use tokio::sync::mpsc;
+                let (outgoing_tx, _outgoing_rx) = mpsc::unbounded_channel();
+                let fence_authority = FenceAuthority::new();
+                let fence_validator = fence_authority.validator();
+                let rt = ClusterLeaseRuntime::new(
+                    config.node_id,
+                    tidefs_membership_epoch::EpochId(1),
+                    lease_config.clone(),
+                    outgoing_tx,
+                )
+                .with_fence_authority(fence_authority);
+                (Some(Arc::new(Mutex::new(rt))), Some(fence_validator))
+            } else {
+                (None, None)
+            };
+
+
+        Ok(Self {
+            transport: Arc::new(Mutex::new(transport)),
+            store: Arc::new(Mutex::new(store_backend)),
+            membership,
+            membership_transport,
+            _membership_service: membership_service,
+            config,
+            authority,
+            imported_pool,
+            start_time: Instant::now(),
+            connection_registry: Arc::clone(&connection_registry),
+            session_bindings: Arc::clone(&session_bindings),
+            pending_evictions,
+            roster_session_registry: Arc::clone(&roster_session_registry),
+            session_acceptor: Arc::clone(&session_acceptor),
+            peer_join_handshake: Arc::clone(&peer_join_handshake),
+            connection_acceptor: Arc::clone(&connection_acceptor),
+            placement_version_tracker,
+            active_barrier: Arc::new(Mutex::new(None)),
+            join_pipeline: JoinPipeline::new(),
+            stop: Arc::new(AtomicBool::new(false)),
+            cluster_lease_runtime,
+            fence_validator,
+            split_brain_guard,
+        })
+    }
+
+    /// Initiate a multi-node snapshot barrier.
+    ///
+    /// Collects the current peer set from active transport sessions,
+    /// creates a [`SnapshotCoordinator`], fans out
+    /// [`Frame::SnapshotBarrier`] requests to every peer, and stores the
+    /// coordinator in [`active_barrier`] for asynchronous response
+    /// collection by [`serve_session`].
+    ///
+    /// Returns the encoded barrier request bytes for diagnostics.
+    pub fn initiate_snapshot_barrier(
+        &self,
+        barrier_id: u64,
+        snapshot_name: String,
+        config: SnapshotBarrierConfig,
+    ) -> Result<Vec<u8>, String> {
+        use tidefs_transport::SessionId;
+        // Collect peer ids and session bindings from live transport sessions.
+        let mut t = self.transport.lock().unwrap();
+        let stats = t.all_stats();
+        let mut peer_ids: Vec<u64> = Vec::new();
+        let mut peer_sessions: Vec<(u64, SessionId)> = Vec::new();
+        for sid in stats.sessions.keys() {
+            if let Some(peer_id) = t.peer_node(*sid) {
+                if !peer_ids.contains(&peer_id) {
+                    peer_ids.push(peer_id);
+                }
+                peer_sessions.push((peer_id, *sid));
+            }
+        }
+        // Build the coordinator and encode the barrier request.
+        let coord =
+            SnapshotCoordinator::new(barrier_id, snapshot_name.clone(), peer_ids.clone(), config);
+        let request_bytes = coord.request_bytes();
+        // Fan out the barrier request to every peer session.
+        let mut send_errors = 0usize;
+        for (peer_id, session_id) in &peer_sessions {
+            if let Err(e) = t.send_message(*session_id, &request_bytes) {
+                eprintln!(
+                    "[storage-node] barrier {barrier_id}: send to peer {peer_id} failed: {e:?}"
+                );
+                send_errors += 1;
+            }
+        }
+        drop(t); // release transport lock before locking active_barrier
+                 // Store the coordinator for asynchronous response collection.
+        *self.active_barrier.lock().unwrap() = Some(coord);
+        if send_errors > 0 {
+            eprintln!(
+                "[storage-node] barrier {barrier_id}: {send_errors}/{total} sends failed",
+                total = peer_sessions.len(),
+            );
+        }
+        eprintln!(
+            "[storage-node] barrier {barrier_id} initiated: {count} peers",
+            count = peer_ids.len(),
+        );
+        Ok(request_bytes)
+    }
+
+    /// Accept one incoming connection, complete handshake, then spawn a
+    /// session handler thread and return immediately so the next connection
+    /// can be accepted. This enables multi-session protocols (e.g.,
+    /// TransportReplicatedStore's Control/Data/Shadow session families) to
+    /// complete handshake against this storage-node peer.
+    /// Set the split-brain guard to minority-fenced state, causing all
+    /// write-gating operations (create, import, lease, catalog delta)
+    /// to be refused with a typed minority-fenced error.
+    ///
+    /// This is a test/diagnostic injection point for partition campaign
+    /// validation; the production path uses the full partition runtime.
+    pub fn set_partition_fenced(&mut self) {
+        if let Some(ref guard) = self.split_brain_guard {
+            let mut g = guard.lock().unwrap();
+            g.partition_state = tidefs_partition_runtime::types::PartitionState::MinorityFenced {
+                quorum_side_voter_count: 3,
+                since_millis: 0,
+            };
+            g.fence = PartitionFence::raise_all();
+        }
+    }
+
+    /// Clear the partition fence, restoring write capability.
+    pub fn clear_partition_fence(&mut self) {
+        if let Some(ref guard) = self.split_brain_guard {
+            let mut g = guard.lock().unwrap();
+            g.partition_state = tidefs_partition_runtime::types::PartitionState::Connected;
+            g.fence = PartitionFence::default();
+        }
+    }
+
+    pub fn serve_one(&mut self) -> Result<(), String> {
+        let accept_result = {
+            let mut t = self.transport.lock().unwrap();
+            t.accept_incoming()
+        };
+        let session_id = match accept_result {
+            Ok(sid) => sid,
+            Err(e) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                if is_accept_poll(&e) {
+                    return Ok(());
+                }
+                return Err(format!("accept failed: {e:?}"));
+            }
+        };
+
+        eprintln!("[storage-node] accepted session {session_id}");
+
+        {
+            let mut t = self.transport.lock().unwrap();
+            t.perform_handshake(session_id)
+                .map_err(|e| format!("handshake failed: {e:?}"))?;
+        }
+
+        eprintln!("[storage-node] session {session_id} established");
+
+        // Log the transport backend actually negotiated for this session.
+        // This closes the "silent TCP fallback" gap (B9): when --rdma is
+        // requested but the session falls back to TCP, the operator can
+        // see the actual backend in the logs.
+        {
+            let t = self.transport.lock().unwrap();
+            if let Some(backend_kind) = t.session_backend_kind(session_id) {
+                let peer_info = t
+                    .peer_node(session_id)
+                    .map(|p| format!(" peer={p}"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "[storage-node] session {session_id}{peer_info} transport_backend={backend_kind}"
+                );
+                if let Some(peer_node) = t.peer_node(session_id) {
+                    if let Some(disclosure) = t.carrier_disclosure(peer_node) {
+                        eprintln!(
+                            "[storage-node] session {session_id} peer={peer_node} carrier_disclosure: {disclosure}"
+                        );
+                    }
+                }
+            }
+        }
+        // --- Join/reconnect dispatch: determine whether this is a known-peer
+        //     reconnect or a first-time peer join, and deliver the appropriate
+        //     epoch state push message.
+        if let Some(peer_node) = {
+            let t = self.transport.lock().unwrap();
+            t.peer_node(session_id)
+        } {
+            // Build identity for join/reconnect dispatch.
+            let identity = MemberIdentity::new(peer_node, 1);
+
+            // Try known-peer reconnect first.
+            let reconnect_outcome =
+                self.connection_acceptor
+                    .accept_connection(peer_node, session_id.0, identity);
+
+            match reconnect_outcome {
+                Ok(outcome) => match outcome {
+                    PeerReconnectOutcome::Known { push_message, .. } => {
+                        eprintln!(
+                            "[storage-node] session {session_id}: known peer {peer_node} reconnecting, pushing epoch state"
+                        );
+                        placement_version_bump_on_reconnect(
+                            &self.placement_version_tracker,
+                            peer_node,
+                        );
+                        let encoded = push_message.encode();
+                        if let Err(e) = {
+                            let mut t = self.transport.lock().unwrap();
+                            t.send_message(session_id, &encoded)
+                        } {
+                            eprintln!("[storage-node] session {session_id}: failed to send reconnect push: {e:?}");
+                            return Err(format!("reconnect push send failed: {e:?}"));
+                        }
+                    }
+                    PeerReconnectOutcome::AlreadyBound { .. } => {
+                        eprintln!(
+                            "[storage-node] session {session_id}: duplicate session for known peer {peer_node}, rejecting"
+                        );
+                        return Err(format!(
+                            "duplicate session {session_id} for peer {peer_node}"
+                        ));
+                    }
+                    PeerReconnectOutcome::Unknown => {
+                        // Peer not in committed roster — skip join dispatch.
+                        // Unknown peers (e.g. simple Frame clients) do not
+                        // need a membership epoch push. They connect for
+                        // Frame protocol only. Membership join happens
+                        // through the explicit join protocol when needed.
+                        eprintln!(
+                            "[storage-node] session {session_id}: unknown peer {peer_node}, proceeding without membership push"
+                        );
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "[storage-node] session {session_id}: reconnect error for peer {peer_node}: {e:?}"
+                    );
+                    return Err(format!("reconnect error: {e:?}"));
+                }
+            }
+        }
+
+        // Register peer in eviction tracking tables so the eviction
+        // executor can tear down connections and release bindings when
+        // the peer is removed from the membership roster.
+        let peer_node = { self.transport.lock().unwrap().peer_node(session_id) };
+        if let Some(peer_node) = peer_node {
+            let addr = { self.transport.lock().unwrap().session_addr(session_id) };
+            if let Some(addr) = addr {
+                use tidefs_membership_live::session_binding::{PeerSessionBinding, SessionId};
+                use tidefs_transport::connection_registry::ConnectionId;
+                use tidefs_transport::peer_admission::AdmittedPeer;
+
+                let admitted = AdmittedPeer::new(peer_node, 1);
+                let _ =
+                    self.connection_registry
+                        .insert(&admitted, ConnectionId::new(peer_node), addr);
+
+                let binding = PeerSessionBinding::new(
+                    peer_node,
+                    tidefs_membership_epoch::MemberId::new(peer_node),
+                    SessionId::new(session_id.0),
+                    tidefs_membership_epoch::EpochId::new(1),
+                );
+                self.session_bindings.lock().unwrap().insert(binding);
+            }
+        }
+
+        // Build the session context, cloning shared state for the handler thread.
+        let ctx = SessionContext {
+            transport: Arc::clone(&self.transport),
+            store: Arc::clone(&self.store),
+            membership: Arc::clone(&self.membership),
+            membership_transport: self.membership_transport.as_ref().map(Arc::clone),
+            split_brain_guard: self.split_brain_guard.clone(),
+            authority: self.authority.clone(),
+            config: self.config.clone(),
+            imported_pool: self.imported_pool.clone(),
+            start_time: self.start_time,
+            pending_evictions: Arc::clone(&self.pending_evictions),
+            roster_session_registry: Arc::clone(&self.roster_session_registry),
+            session_acceptor: Arc::clone(&self.session_acceptor),
+            peer_join_handshake: Arc::clone(&self.peer_join_handshake),
+            connection_acceptor: Arc::clone(&self.connection_acceptor),
+            placement_version_tracker: Arc::clone(&self.placement_version_tracker),
+            active_barrier: Arc::clone(&self.active_barrier),
+            fence_validator: self.fence_validator.clone(),
+            lease_runtime: self
+                .cluster_lease_runtime
+                .as_ref()
+                .map(Arc::clone),
+        };
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _guard = rt.enter();
+            serve_session(session_id, ctx);
+        });
+
+        Ok(())
+    }
+}
+
+/// Handle all messages on an established session until the client
+/// disconnects or sends Bye. Runs on a dedicated thread spawned by
+/// [`StorageNode::serve_one`].
+fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
+    loop {
+        let raw = match recv_session_frame_unlocked(&ctx, session_id) {
+            Ok(r) => r,
+            Err(e) => {
+                if is_read_poll(&e) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                eprintln!("[storage-node] session {session_id}: recv error: {e:?}");
+                let peer_node = ctx.transport.lock().unwrap().peer_node(session_id);
+                if let Some(peer_node) = peer_node {
+                    eprintln!(
+                        "[storage-node] session {session_id}: marking peer {peer_node} dead on store"
+                    );
+                    placement_version_bump_on_disconnect(&ctx.placement_version_tracker, peer_node);
+                }
+                break;
+            }
+        };
+
+        // Tick membership
+        {
+            let mut m = ctx.membership.lock().unwrap();
+            if let Some(ref mt) = ctx.membership_transport {
+                let mut transport = mt.lock().unwrap();
+                let _ = transport.tick_runtime(&mut m);
+            } else {
+                m.tick();
+            }
+        }
+
+        // Process pending peer evictions from membership epoch commits.
+        process_evictions(&ctx);
+
+        // Try Frame protocol first (4-byte ASCII tag prefix)
+        if let Some(frame) = protocol::decode(&raw) {
+            let store = Arc::clone(&ctx.store);
+            let response = handle_frame_ctx(session_id, &frame, &store, &ctx);
+
+            // Route snapshot barrier responses to the active coordinator.
+            if matches!(&frame, Frame::SnapshotBarrierResponse { .. }) {
+                let peer_id = {
+                    let t = ctx.transport.lock().unwrap();
+                    t.peer_node(session_id).unwrap_or(0)
+                };
+                if let Some(ref mut coord) = *ctx.active_barrier.lock().unwrap() {
+                    if coord.record_response(peer_id, &frame) {
+                        eprintln!("[storage-node] barrier: recorded response from peer {peer_id}");
+                    }
+                }
+            }
+
+            if let Some(resp) = response {
+                if matches!(resp, Frame::Bye) {
+                    let mut t = ctx.transport.lock().unwrap();
+                    t.send_message(session_id, &protocol::encode(&resp)).ok();
+                    eprintln!("[storage-node] session {session_id} closing");
+                    t.close_session(session_id, SessionCloseReason::LocalShutdown)
+                        .ok();
+                    return;
+                }
+                let mut t = ctx.transport.lock().unwrap();
+                t.send_message(session_id, &protocol::encode(&resp))
+                    .map_err(|e| {
+                        eprintln!("[storage-node] session {session_id}: send error: {e:?}");
+                    })
+                    .ok();
+            }
+
+            if let Frame::Bye = frame {
+                return;
+            }
+            continue;
+        }
+
+        // ── VSNP: TideFS Snapshot Network Protocol push/pull handler ──
+        // Client sends raw VSNP messages (magic b"VSNP") for dataset
+        // send/receive over the transport layer. This handler processes
+        // push (receive export into local pool) and pull-request (export
+        // from local pool and return).
+        if raw.len() >= 4 && raw[..4] == *b"VSNP" {
+            match handle_vsnp_message(session_id, &raw, &ctx) {
+                Ok(Some(response)) => {
+                    let mut t = ctx.transport.lock().unwrap();
+                    t.send_message(session_id, &response)
+                        .map_err(|e| {
+                            eprintln!(
+                                "[storage-node] session {session_id}: vsnp send error: {e:?}"
+                            );
+                        })
+                        .ok();
+                }
+                Ok(None) => {
+                    // No response needed (e.g., internal processing).
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[storage-node] session {session_id}: vsnp error: {e}"
+                    );
+                    // Send error response back to client.
+                    let error_bytes =
+                        build_vsnp_error(&format!("vsnp handler error: {e}"));
+                    let mut t = ctx.transport.lock().unwrap();
+                    t.send_message(session_id, &error_bytes).ok();
+                }
+            }
+            continue;
+        }
+
+        // SegmentFetchRequest: 4-byte SF01 magic prefix
+        if raw.len() >= 4 && raw[..4] == SEGMENT_FETCH_REQUEST_MAGIC {
+            let request = match SegmentFetchRequest::decode(&raw) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!(
+                        "[storage-node] session {session_id}: segment fetch decode error: {e}"
+                    );
+                    continue;
+                }
+            };
+            match handle_segment_fetch_ctx(session_id, request, &ctx) {
+                Ok(obj_id) => {
+                    eprintln!(
+                        "[storage-node] session {session_id}: served segment fetch for object {obj_id}"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[storage-node] session {session_id}: segment fetch error: {e}");
+                }
+            }
+            continue;
+        }
+
+        // ── ReplicationMessage handler: peer replication receive ────
+        // Inbound replication messages from peer storage nodes MUST
+        // use *_local methods on TransportBacked to avoid
+        // re-replication loops. Never use *_named fan-out methods
+        // here — client fan-out is handled exclusively by
+        // handle_frame_ctx. See LOCAL-ONLY boundary.
+        if let Ok(msg) = bincode::deserialize::<ReplicationMessage>(&raw) {
+            let response = match &msg {
+                ReplicationMessage::Put { name, payload } => {
+                    let mut s = ctx.store.lock().unwrap();
+                    let result = match &mut *s {
+                        StoreBackend::Local(rs) => {
+                            rs.put_local(name, payload).map_err(|e| e.to_string())
+                        }
+                        StoreBackend::TransportBacked(ts) => ts.put_local(name, payload),
+                    };
+                    match result {
+                        Ok(()) => ReplicationMessage::Ack {
+                            key_hash: name.clone(),
+                            success: true,
+                        },
+                        Err(_e) => ReplicationMessage::Ack {
+                            key_hash: name.clone(),
+                            success: false,
+                        },
+                    }
+                }
+                ReplicationMessage::Get { name } => {
+                    let mut s = ctx.store.lock().unwrap();
+                    let result = match &mut *s {
+                        StoreBackend::Local(rs) => rs.get_local(name),
+                        StoreBackend::TransportBacked(ts) => ts.get_local(name),
+                    };
+                    match result {
+                        Ok(Some(payload)) => ReplicationMessage::GetResponse {
+                            found: true,
+                            payload,
+                        },
+                        Ok(None) => ReplicationMessage::GetResponse {
+                            found: false,
+                            payload: vec![],
+                        },
+                        Err(e) => ReplicationMessage::GetResponse {
+                            found: false,
+                            payload: e.into_bytes(),
+                        },
+                    }
+                }
+                ReplicationMessage::Delete { name, generation } => {
+                    let mut s = ctx.store.lock().unwrap();
+                    let result = match &mut *s {
+                        StoreBackend::Local(rs) => rs.delete_local(name),
+                        StoreBackend::TransportBacked(ts) => ts.delete_local(name),
+                    };
+                    match result {
+                        Ok(deleted) => ReplicationMessage::DeleteAck {
+                            deleted,
+                            generation: *generation,
+                        },
+                        Err(_e) => ReplicationMessage::DeleteAck {
+                            deleted: false,
+                            generation: *generation,
+                        },
+                    }
+                }
+                ReplicationMessage::SyncRequest => {
+                    let s = ctx.store.lock().unwrap();
+                    let entries = sync_entries_from_store(&s);
+                    ReplicationMessage::SyncResponse { entries }
+                }
+                ReplicationMessage::ScrubRequest => {
+                    // Run local segment integrity scrub and report findings.
+                    let store_dir = &ctx.config.store_paths[0];
+                    let segments_dir = store_dir.join(tidefs_local_object_store::STORE_DIR_NAME);
+                    let scrubber =
+                        tidefs_local_object_store::SegmentIntegrityScrubber::new(&segments_dir);
+                    let mut suspect_log = tidefs_local_object_store::SuspectLog::new();
+                    let (report_json, findings_count) = match scrubber.scrub_full(&mut suspect_log)
+                    {
+                        Ok(report) => {
+                            let findings = report.outcomes.len() as u64;
+                            let json = serde_json::json!({
+                                "segments_scanned": report.segments_scanned,
+                                "records_verified": report.records_verified,
+                                "bytes_scanned": report.bytes_scanned,
+                                "chain_breaks_detected": report.chain_breaks_detected,
+                                "completed": report.completed,
+                                "findings_count": findings,
+                            });
+                            (json.to_string(), findings)
+                        }
+                        Err(e) => {
+                            let json = serde_json::json!({"error": format!("{e}")});
+                            (json.to_string(), 0)
+                        }
+                    };
+                    ReplicationMessage::ScrubResponse {
+                        report_json,
+                        findings_count,
+                    }
+                }
+                ReplicationMessage::RepairObject {
+                    name,
+                    authoritative_payload,
+                } => {
+                    let mut s = ctx.store.lock().unwrap();
+                    let success = match &mut *s {
+                        StoreBackend::Local(rs) => {
+                            rs.put_local(name, authoritative_payload).is_ok()
+                        }
+                        StoreBackend::TransportBacked(ts) => {
+                            ts.put_local(name, authoritative_payload).is_ok()
+                        }
+                    };
+                    ReplicationMessage::RepairObjectAck {
+                        name: name.clone(),
+                        success,
+                    }
+                }
+                ReplicationMessage::ScrubResponse { .. } => {
+                    // Multi-node scrub: initiator receives peer scrub report.
+                    // Review debt TFR-017: add cross-replica comparison.
+                    eprintln!(
+                        "[storage-node] session {session_id}: received scrub response from peer"
+                    );
+                    ReplicationMessage::Ack {
+                        key_hash: "scrub-ack".into(),
+                        success: true,
+                    }
+                }
+                ReplicationMessage::RepairObjectAck { .. } => {
+                    eprintln!("[storage-node] session {session_id}: received repair ack from peer");
+                    ReplicationMessage::Ack {
+                        key_hash: "repair-ack".into(),
+                        success: true,
+                    }
+                }
+                _ => ReplicationMessage::Ack {
+                    key_hash: String::new(),
+                    success: false,
+                },
+            };
+            let mut t = ctx.transport.lock().unwrap();
+            send_replication_msg(&mut t, session_id, &response)
+                .map_err(|e| {
+                    eprintln!(
+                        "[storage-node] session {session_id}: send replication response: {e:?}"
+                    );
+                })
+                .ok();
+            continue;
+        }
+
+        // -- ClusterPoolMessage handler: cluster pool create/import dispatch --
+        if raw.len() >= 4 && raw[..4] == *CLUSTER_POOL_MESSAGE_MAGIC {
+            let msg_bytes = &raw[4..];
+            match ClusterPoolMessage::decode(msg_bytes) {
+                Ok(msg) => {
+                    let peer_node_id = {
+                        let t = ctx.transport.lock().unwrap();
+                        t.peer_node(session_id)
+                    };
+                    let response = handle_cluster_pool_message(session_id, peer_node_id, &msg, &ctx);
+                    if let Some(resp) = response {
+                        if let Ok(encoded) = resp.encode() {
+                            let mut wire = Vec::with_capacity(4 + encoded.len());
+                            wire.extend_from_slice(CLUSTER_POOL_MESSAGE_MAGIC);
+                            wire.extend_from_slice(&encoded);
+                            let mut t = ctx.transport.lock().unwrap();
+                            t.send_message(session_id, &wire)
+                                .map_err(|e| {
+                                    eprintln!("[storage-node] session {session_id}: send cluster pool response: {e:?}");
+                                })
+                                .ok();
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[storage-node] session {session_id}: cluster pool message decode error: {e:?}");
+                }
+            }
+            continue;
+        }
+
+        eprintln!(
+            "[storage-node] session {session_id}: failed to decode message: {} bytes starting with {:02x?}",
+            raw.len(),
+            &raw[..raw.len().min(8)]
+        );
+        // Don't close the session on unrecognized messages — keep
+        // accepting in case this is a protocol we don't handle yet.
+    }
+
+    let mut t = ctx.transport.lock().unwrap();
+    let _ = t.close_session(session_id, SessionCloseReason::TransportError);
+}
+
+/// Handle a cluster pool protocol message received from a peer node.
+/// Dispatches to real pool create/import code and returns the response.
+/// Check whether the partition guard allows write-gating operations.
+///
+/// Returns `Ok(())` when writes are allowed or no guard is active.
+/// Returns `Err(error_message)` with a typed MinorityFenced error when
+/// the node is on the minority side of a network partition.
+fn check_partition_fence(ctx: &SessionContext) -> Result<(), String> {
+    if let Some(ref guard) = ctx.split_brain_guard {
+        let guard = guard.lock().unwrap();
+        if !guard.can_accept_writes() {
+            let state = format!("{:?}", guard.partition_state);
+            return Err(format!(
+                "minority-fenced: node is on the minority side of a partition (state: {state}); \
+                 writes, imports, catalog mutations, and lease grants are refused"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn handle_cluster_pool_message(
+    session_id: tidefs_transport::SessionId,
+    peer_node_id: Option<u64>,
+    msg: &ClusterPoolMessage,
+    ctx: &SessionContext,
+) -> Option<ClusterPoolMessage> {
+    match msg {
+        ClusterPoolMessage::CreateRequest(req) => {
+            eprintln!(
+                "[storage-node] session {session_id}: cluster pool create request pool={} node={}",
+                req.pool_name, req.target_node_id
+            );
+            if let Err(fence_err) = check_partition_fence(ctx) {
+                eprintln!("[storage-node] session {session_id}: create refused: {fence_err}");
+                return Some(ClusterPoolMessage::CreateResponse(ClusterPoolCreateResponse {
+                    request_id: req.request_id,
+                    node_id: req.target_node_id,
+                    pool_guid: req.pool_guid,
+                    success: false,
+                    device_guids: vec![],
+                    error: Some(fence_err),
+                }));
+            }
+            let device_paths: Vec<std::path::PathBuf> = req
+                .node_devices
+                .iter()
+                .map(|d| std::path::PathBuf::from(&d.device_path))
+                .collect();
+            let redundancy = match req.placement {
+                ClusterPlacementPolicy::Stripe => RedundancyPolicy::None,
+                ClusterPlacementPolicy::MirrorAcrossNodes { copies } => {
+                    RedundancyPolicy::Mirror { copies: copies as u8 }
+                }
+                ClusterPlacementPolicy::ErasureCoded { .. } => RedundancyPolicy::None,
+            };
+            let config = PoolCreateConfig {
+                pool_name: req.pool_name.clone(),
+                pool_guid: Some(req.pool_guid),
+                redundancy,
+                encryption_key: None,
+                clustered: true,
+            };
+            let (success, device_guids, error) =
+                match PoolCreator::create_pool(&device_paths, &config) {
+                    Ok(outcome) => {
+                        (true, outcome.device_guids, None)
+                    }
+                    Err(e) => (false, vec![], Some(format!("{e:?}"))),
+                };
+            Some(ClusterPoolMessage::CreateResponse(ClusterPoolCreateResponse {
+                request_id: req.request_id,
+                node_id: req.target_node_id,
+                pool_guid: req.pool_guid,
+                success,
+                device_guids,
+                error,
+            }))
+        }
+        ClusterPoolMessage::ImportRequest(req) => {
+            eprintln!(
+                "[storage-node] session {session_id}: cluster pool import request pool_guid={:02x?} node={} peer={:?}",
+                &req.pool_guid[..4], req.target_node_id, peer_node_id
+            );
+
+            // ── Partition fence check ──────────────────────────
+            if let Err(fence_err) = check_partition_fence(ctx) {
+                eprintln!("[storage-node] session {session_id}: import refused: {fence_err}");
+                return Some(ClusterPoolMessage::ImportResponse(ClusterPoolImportResponse {
+                    request_id: req.request_id,
+                    node_id: req.target_node_id,
+                    pool_guid: req.pool_guid,
+                    success: false,
+                    committed_root_epoch: None,
+                    intent_log_replayed: None,
+                    error: Some(fence_err),
+                }));
+            }
+
+            // ── Membership verification ──────────────────────────
+            // The requesting peer's authenticated node ID must match the
+            // target_node_id in the import request.  A mismatch indicates
+            // a misrouted message or an unauthorized node attempting to
+            // import devices it does not own.
+            if let Some(actual_peer) = peer_node_id {
+                if actual_peer != req.target_node_id {
+                    eprintln!(
+                        "[storage-node] session {session_id}: import request node mismatch:                          peer={actual_peer} != target={}",
+                        req.target_node_id
+                    );
+                    return Some(ClusterPoolMessage::ImportResponse(
+                        ClusterPoolImportResponse {
+                            request_id: req.request_id,
+                            node_id: req.target_node_id,
+                            pool_guid: req.pool_guid,
+                            success: false,
+                            committed_root_epoch: None,
+                            intent_log_replayed: None,
+                            error: Some(format!(
+                                "node mismatch: authenticated peer {actual_peer} != target {}",
+                                req.target_node_id
+                            )),
+                        },
+                    ));
+                }
+            }
+
+            // ── Lease/fence verification ─────────────────────────
+            // When a FenceValidator is active (cluster lease runtime
+            // configured), the importing node must hold a valid write
+            // fence.  Absence of an active fence means no cluster
+            // lease has been acquired, so clustered import is refused.
+            if let Some(ref validator) = ctx.fence_validator {
+                if validator.active_fence().is_none() {
+                    eprintln!(
+                        "[storage-node] session {session_id}: import refused:                          no active write fence (cluster lease not held)"
+                    );
+                    return Some(ClusterPoolMessage::ImportResponse(
+                        ClusterPoolImportResponse {
+                            request_id: req.request_id,
+                            node_id: req.target_node_id,
+                            pool_guid: req.pool_guid,
+                            success: false,
+                            committed_root_epoch: None,
+                            intent_log_replayed: None,
+                            error: Some(
+                                "cluster lease not held; acquire a pool lease before import"
+                                    .to_string(),
+                            ),
+                        },
+                    ));
+                }
+            }
+            let device_paths: Vec<std::path::PathBuf> = req
+                .device_paths
+                .iter()
+                .map(|p| std::path::PathBuf::from(p))
+                .collect();
+            let lock_dir = ctx.config.pool_lock_dir.clone().unwrap_or_else(|| {
+                std::path::PathBuf::from("/tmp/tidefs-import-locks")
+            });
+            let (success, committed_root_epoch, intent_log_replayed, error) =
+                match pool_import(&device_paths, &lock_dir, req.read_only, None, None) {
+                    Ok(imported) => {
+                        (true, imported.stats.committed_root_epoch, Some(0), None)
+                    }
+                    Err(e) => (false, None, None, Some(format!("{e:?}"))),
+                };
+            Some(ClusterPoolMessage::ImportResponse(ClusterPoolImportResponse {
+                request_id: req.request_id,
+                node_id: req.target_node_id,
+                pool_guid: req.pool_guid,
+                success,
+                committed_root_epoch,
+                intent_log_replayed,
+                error,
+            }))
+        }
+        ClusterPoolMessage::LeaseRequest(req) => {
+            eprintln!(
+                "[storage-node] session {session_id}: cluster pool lease request pool_guid={:02x?} requesting_node={}",
+                &req.pool_guid[..4], req.requesting_node_id
+            );
+
+            if let Err(fence_err) = check_partition_fence(ctx) {
+                eprintln!("[storage-node] session {session_id}: lease refused: {fence_err}");
+                return Some(ClusterPoolMessage::LeaseResponse(ClusterPoolLeaseResponse {
+                    request_id: req.request_id,
+                    node_id: req.requesting_node_id,
+                    pool_guid: req.pool_guid,
+                    success: false,
+                    lease_token_bytes: None,
+                    lease_expiration_ms: None,
+                    error: Some(fence_err),
+                }));
+            }
+
+            let (success, lease_token_bytes, lease_expiration_ms, error) =
+                if let Some(ref lease_rt) = ctx.lease_runtime {
+                    let mut rt = lease_rt.lock().unwrap();
+                    match rt.try_get_pool_lease_token(req.pool_guid) {
+                        Some(token) => {
+                            if token.authorizes_pool(&req.pool_guid) {
+                                let token_bytes = bincode::serialize(&token)
+                                    .unwrap_or_default();
+                                // Track this remote client in the active-client mode tracker.
+                                // Derive a dataset_id from the pool_guid for per-pool tracking.
+                                let dataset_id = u64::from_le_bytes([
+                                    req.pool_guid[0], req.pool_guid[1],
+                                    req.pool_guid[2], req.pool_guid[3],
+                                    req.pool_guid[4], req.pool_guid[5],
+                                    req.pool_guid[6], req.pool_guid[7],
+                                ]);
+                                let _ = rt.remote_client_mounted(
+                                    dataset_id,
+                                    req.requesting_node_id,
+                                );
+                                (
+                                    true,
+                                    Some(token_bytes),
+                                    Some(token.expiration_deadline_ms),
+                                    None,
+                                )
+                            } else {
+                                (
+                                    false,
+                                    None,
+                                    None,
+                                    Some("lease token pool GUID mismatch".to_string()),
+                                )
+                            }
+                        }
+                        None => (
+                            false,
+                            None,
+                            None,
+                            Some("no active lease for this pool; acquire cluster membership first".to_string()),
+                        ),
+                    }
+                } else {
+                    (
+                        false,
+                        None,
+                        None,
+                        Some("cluster lease runtime not configured on this node".to_string()),
+                    )
+                };
+
+            Some(ClusterPoolMessage::LeaseResponse(ClusterPoolLeaseResponse {
+                request_id: req.request_id,
+                node_id: req.requesting_node_id,
+                pool_guid: req.pool_guid,
+                success,
+                lease_token_bytes,
+                lease_expiration_ms,
+                error,
+            }))
+        }
+        ClusterPoolMessage::CatalogDeltaRequest(req) => {
+            eprintln!(
+                "[storage-node] session {session_id}: catalog delta request pool_guid={:02x?} requesting_node={}",
+                &req.pool_guid[..4], req.requesting_node_id
+            );
+
+            if let Err(fence_err) = check_partition_fence(ctx) {
+                eprintln!("[storage-node] session {session_id}: catalog delta refused: {fence_err}");
+                return Some(ClusterPoolMessage::CatalogDeltaResponse(ClusterPoolCatalogDeltaResponse {
+                    request_id: req.request_id,
+                    node_id: req.requesting_node_id,
+                    pool_guid: req.pool_guid,
+                    success: false,
+                    catalog_version: None,
+                    error: Some(fence_err),
+                }));
+            }
+
+            let (success, catalog_version, error) =
+                if let Some(ref lease_rt) = ctx.lease_runtime {
+                    let mut rt = lease_rt.lock().unwrap();
+                    match rt.apply_committed_catalog_delta(&req.delta_bytes) {
+                        Some(Ok(version)) => (true, Some(version), None),
+                        Some(Err(e)) => (false, None, Some(format!("{e}"))),
+                        None => (
+                            false,
+                            None,
+                            Some("no pool catalog configured on this node".to_string()),
+                        ),
+                    }
+                } else {
+                    (
+                        false,
+                        None,
+                        Some("cluster lease runtime not configured on this node".to_string()),
+                    )
+                };
+
+            Some(ClusterPoolMessage::CatalogDeltaResponse(
+                ClusterPoolCatalogDeltaResponse {
+                    request_id: req.request_id,
+                    node_id: req.requesting_node_id,
+                    pool_guid: req.pool_guid,
+                    success,
+                    catalog_version,
+                    error,
+                },
+            ))
+        }
+
+        ClusterPoolMessage::CatalogQueryRequest(req) => {
+            eprintln!(
+                "[storage-node] session {session_id}: catalog query request pool_guid={:02x?} requesting_node={} query_type={}",
+                &req.pool_guid[..4], req.requesting_node_id, req.query_type_u8
+            );
+
+            let (success, entries, catalog_version, error) =
+                if let Some(ref lease_rt) = ctx.lease_runtime {
+                    let rt = lease_rt.lock().unwrap();
+                    match rt.pool_catalog() {
+                        Some(pool_cat) => {
+                            let entries: Vec<CatalogEntryRow> = pool_cat
+                                .catalog()
+                                .catalog()
+                                .list_all()
+                                .into_iter()
+                                .map(|(path, id, dtype, txg, flags, lc_state)| {
+                                    CatalogEntryRow {
+                                        path,
+                                        dataset_id_bytes: id.as_bytes().to_vec(),
+                                        dataset_type_u8: dtype.to_u8(),
+                                        creation_txg: txg,
+                                        lifecycle_state_u8: lc_state.to_u8(),
+                                        flags_u16: flags.bits(),
+                                    }
+                                })
+                                .collect();
+                            let version = pool_cat.version();
+                            (true, entries, version, None)
+                        }
+                        None => (
+                            false,
+                            vec![],
+                            0,
+                            Some("no pool catalog configured on this node".to_string()),
+                        ),
+                    }
+                } else {
+                    (
+                        false,
+                        vec![],
+                        0,
+                        Some("cluster lease runtime not configured on this node".to_string()),
+                    )
+                };
+
+            Some(ClusterPoolMessage::CatalogQueryResponse(
+                ClusterPoolCatalogQueryResponse {
+                    request_id: req.request_id,
+                    node_id: req.requesting_node_id,
+                    pool_guid: req.pool_guid,
+                    success,
+                    entries,
+                    catalog_version,
+                    error,
+                },
+            ))
+        }
+
+        ClusterPoolMessage::CreateResponse(_) | ClusterPoolMessage::ImportResponse(_) | ClusterPoolMessage::LeaseResponse(_) | ClusterPoolMessage::CatalogDeltaResponse(_) | ClusterPoolMessage::CatalogQueryResponse(_) => {
+            eprintln!(
+                "[storage-node] session {session_id}: unexpected cluster pool response; ignoring"
+            );
+            None
+        }
+    }
+}
+
+/// Drain pending peer evictions and close the associated transport
+/// sessions. Called from `serve_session` after tick_membership.
+fn process_evictions(ctx: &SessionContext) {
+    let mut pending = ctx.pending_evictions.lock().unwrap();
+    let drained: Vec<(SocketAddr, EvictionAction)> = std::mem::take(&mut *pending);
+    drop(pending);
+    for (addr, action) in &drained {
+        let reason = match action {
+            EvictionAction::Close => SessionCloseReason::PeerRemoved,
+            EvictionAction::Drain => SessionCloseReason::LocalShutdown,
+        };
+        let mut t = ctx.transport.lock().unwrap();
+        match t.close_session_by_addr(*addr, reason) {
+            Ok(()) => {
+                eprintln!("[storage-node] evicted peer session at {addr}: {action:?}");
+            }
+            Err(e) => {
+                eprintln!("[storage-node] eviction close for {addr} failed: {e:?}");
+            }
+        }
+    }
+}
+
+fn recv_session_frame_unlocked(
+    ctx: &SessionContext,
+    session_id: tidefs_transport::SessionId,
+) -> Result<Vec<u8>, TransportError> {
+    loop {
+        let mut conn = {
+            let mut t = ctx.transport.lock().unwrap();
+            t.active_connections.remove(&session_id).ok_or_else(|| {
+                TransportError::Generic(format!("no active connection for session {session_id}"))
+            })?
+        };
+
+        let raw_frame = conn.read_frame();
+
+        let mut t = ctx.transport.lock().unwrap();
+        t.active_connections.insert(session_id, conn);
+        let raw_frame = raw_frame?;
+
+        if let Some(payload) = t.decode_received_frame(session_id, raw_frame)? {
+            return Ok(payload);
+        }
+    }
+}
+
+fn is_accept_poll(error: &TransportError) -> bool {
+    match error {
+        TransportError::WouldBlock(_) => true,
+        TransportError::Generic(msg) => msg.contains("no pending connections"),
+        _ => false,
+    }
+}
+
+fn is_optional_accept_poll(error: &TransportError) -> bool {
+    match error {
+        TransportError::Generic(msg) if msg.contains("listener not bound") => true,
+        _ => is_accept_poll(error),
+    }
+}
+
+fn is_read_poll(error: &TransportError) -> bool {
+    match error {
+        TransportError::WouldBlock(_) => true,
+        TransportError::Generic(msg) => {
+            msg.contains("WouldBlock")
+                || msg.contains("Resource temporarily unavailable")
+                || msg.contains("os error 11")
+        }
+        _ => false,
+    }
+}
+
+/// Record a placement version change when a peer disconnects.
+/// Bumps the placement version tracker so membership views reflect
+/// the updated peer set for rebalance consistency.
+fn placement_version_bump_on_disconnect(tracker: &PlacementVersionTracker, node_id: u64) {
+    let next_version = tracker.current_version().saturating_add(1);
+    tracker.update(next_version);
+    eprintln!(
+        "[storage-node] placement version bumped to {next_version} after peer {node_id} disconnect"
+    );
+}
+
+/// Record a placement version change when a peer reconnects.
+fn placement_version_bump_on_reconnect(tracker: &PlacementVersionTracker, node_id: u64) {
+    let next_version = tracker.current_version().saturating_add(1);
+    tracker.update(next_version);
+    eprintln!(
+        "[storage-node] placement version bumped to {next_version} after peer {node_id} reconnect"
+    );
+}
+
+impl StorageNode {
+    /// Run the accept loop: continuously accept and serve clients.
+    pub fn run(&mut self) -> Result<(), String> {
+        eprintln!(
+            "[storage-node] listening on {}, node_id={}",
+            self.config.bind_addr, self.config.node_id
+        );
+        while !self.stop.load(Ordering::Relaxed) {
+            match self.serve_one() {
+                Ok(()) => {}
+                Err(e) => {
+                    if !self.stop.load(Ordering::Relaxed) {
+                        eprintln!("[storage-node] session error: {e}");
+                    }
+                }
+            }
+        }
+        // Release the cluster lease and clear the write fence before exit.
+        // This prevents split-brain writes from a zombie node and allows
+        // another cluster member to immediately acquire the pool lease.
+        if let Some(ref rt) = self.cluster_lease_runtime {
+            let _ = rt.lock().unwrap().release_lease(0); // lease_authority_peer=0 for local-only release
+            eprintln!(
+                "[storage-node] cluster lease released for node {}",
+                self.config.node_id,
+            );
+        }
+
+        eprintln!("[storage-node] graceful shutdown complete");
+        Ok(())
+    }
+
+    /// Signal the daemon to stop accepting new connections.
+    pub fn shutdown(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Run the staged node-join protocol, advancing through ShadowOnly → VoterSpread → ReplicaTarget.
+    /// This is called after startup to onboard this node into the cluster.
+    pub fn begin_join_protocol(&mut self) {
+        self.join_pipeline.begin_discovery();
+        eprintln!(
+            "[storage-node] node-join protocol started: phase={:?}",
+            self.join_pipeline.phase
+        );
+    }
+
+    /// Return the current join phase from the pipeline.
+    pub fn join_phase(&self) -> JoinPipelinePhase {
+        self.join_pipeline.phase
+    }
+
+    /// Write the ready-marker file if configured, signaling to operators/harnesses
+    /// that the daemon has completed startup.
+    pub fn write_ready_marker(&self) {
+        if let Some(ref ready_path) = self.config.ready_file {
+            match std::fs::write(ready_path, b"ready\n") {
+                Ok(()) => {
+                    eprintln!(
+                        "[storage-node] ready marker written: {}",
+                        ready_path.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[storage-node] failed to write ready marker {}: {e}",
+                        ready_path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Initiate graceful node drain, then shutdown.
+    ///
+    /// When membership peers are configured, the daemon transitions through the
+    /// node-drain stages (leases → data → cache → admin → done) before stopping.
+    /// Falls back to immediate shutdown when no membership is active or drain
+    /// is not supported on this platform.
+    /// Initiate graceful shutdown with node-drain intent.
+    ///
+    /// When membership peers are configured, the daemon signals its intent to
+    /// drain before stopping. The full drain pipeline (leases → data → cache →
+    /// admin → done) is driven by the []
+    /// orchestrator with trait implementations provided by the caller.
+    /// For the daemon, the drain is initiated externally via operator command
+    /// before SIGTERM; here we log and proceed to immediate shutdown.
+    pub fn shutdown_with_drain(&mut self) {
+        if self.membership_transport.is_some() || !self.config.membership_peers.is_empty() {
+            eprintln!(
+                "[storage-node] drain intent signaled for node {} (timeout={}s).",
+                self.config.node_id, self.config.drain_timeout_secs
+            );
+            eprintln!(
+                "[storage-node] run 'tidefsctl drain --node {}' before shutdown for graceful drain.",
+                self.config.node_id
+            );
+        } else {
+            eprintln!("[storage-node] no membership peers configured, skipping drain");
+        }
+
+        self.shutdown();
+    }
+
+    /// Return a clone of the stop flag for use by signal handlers.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
+    /// Returns the runtime authority spine, if constructed.
+    #[must_use]
+    pub fn authority(&self) -> Option<&RuntimeAuthority> {
+        self.authority.as_ref()
+    }
+}
+// ── Frame handler: client-facing public API ──────────────────
+// Client Frame operations route through the full replication
+// authority (put_named / get_named / delete_named) for fan-out
+// to remote replicas when the backend is TransportBacked.
+// Never use *_local methods here — those are for peer
+// ReplicationMessage receive only (see serve_session).
+
+/// Frame-protocol handler for session handler threads. Uses SessionContext
+/// can access shared state without holding `&mut self` on the node.
+fn handle_frame_ctx(
+    session_id: tidefs_transport::SessionId,
+    frame: &Frame,
+    store: &Arc<Mutex<StoreBackend>>,
+    ctx: &SessionContext,
+) -> Option<Frame> {
+    match frame {
+        Frame::Put { key, value } => {
+            let mut s = store.lock().unwrap();
+            let result = match &mut *s {
+                StoreBackend::Local(rs) => rs
+                    .put_named(key, value)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                StoreBackend::TransportBacked(ts) => ts.put_named(key, value).and_then(|outcome| {
+                    if outcome.quorum_reached {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "write quorum not reached: {}/{} acknowledgements (need {})",
+                            outcome.acks, outcome.total_targets, outcome.quorum_size
+                        ))
+                    }
+                }),
+            };
+            match result {
+                Ok(()) => Some(Frame::Ok),
+                Err(e) => Some(Frame::Error { message: e }),
+            }
+        }
+        Frame::Get { key } => {
+            let mut s = store.lock().unwrap();
+            let result = match &mut *s {
+                StoreBackend::Local(rs) => rs.get_named(key).map_err(|e| e.to_string()),
+                StoreBackend::TransportBacked(ts) => ts.get_named(key),
+            };
+            match result {
+                Ok(Some(value)) => Some(Frame::GetResponse { value }),
+                Ok(None) => Some(Frame::Error {
+                    message: "not found".into(),
+                }),
+                Err(e) => Some(Frame::Error { message: e }),
+            }
+        }
+        Frame::Delete { key } => {
+            let mut s = store.lock().unwrap();
+            let result = match &mut *s {
+                StoreBackend::Local(rs) => rs.delete_named(key).map_err(|e| e.to_string()),
+                StoreBackend::TransportBacked(ts) => ts.delete_named(key),
+            };
+            match result {
+                Ok(existed) => Some(Frame::DeleteResponse { existed }),
+                Err(e) => Some(Frame::Error { message: e }),
+            }
+        }
+        Frame::List => {
+            let s = store.lock().unwrap();
+            let keys: Vec<Vec<u8>> = match &*s {
+                StoreBackend::Local(rs) => match rs.list_keys() {
+                    Ok(keys) => keys.into_iter().map(|k| k.as_bytes32().to_vec()).collect(),
+                    Err(e) => return Some(Frame::Error { message: e }),
+                },
+                StoreBackend::TransportBacked(ts) => ts
+                    .list_keys_local()
+                    .into_iter()
+                    .map(|k| k.as_bytes32().to_vec())
+                    .collect(),
+            };
+            Some(Frame::ListResponse { keys })
+        }
+        Frame::Stats => {
+            let s = store.lock().unwrap();
+            let backend_disclosure = ctx
+                .authority
+                .as_ref()
+                .map(|a| format!("{}", a.backend()))
+                .unwrap_or_else(|| "not-run".to_string());
+            let json = match &*s {
+                StoreBackend::Local(rs) => {
+                    let stats = rs.stats();
+                    serde_json::json!({
+                        "backend": backend_disclosure,
+                        "object_count": stats.object_count,
+                        "committed_writes": stats.committed_writes,
+                        "degraded_writes": stats.degraded_writes,
+                        "refused_writes": stats.refused_writes,
+                        "bytes_written": stats.bytes_written,
+                        "replica_healthy": stats.replica_healthy,
+                    })
+                }
+                StoreBackend::TransportBacked(ts) => {
+                    let stats = ts.stats();
+                    serde_json::json!({
+                        "backend": backend_disclosure,
+                        "object_count": stats.object_count,
+                        "committed_writes": stats.committed_writes,
+                        "degraded_writes": stats.degraded_writes,
+                        "failed_writes": stats.failed_writes,
+                        "degraded_reads": stats.degraded_reads,
+                        "bytes_written": stats.bytes_written,
+                    })
+                }
+            };
+            Some(Frame::StatsResponse {
+                json: json.to_string(),
+            })
+        }
+        Frame::Bye => Some(Frame::Bye),
+        Frame::HealthCheck => {
+            let node_identity = ctx
+                .config
+                .node_identity
+                .clone()
+                .unwrap_or_else(|| format!("node-{}", ctx.config.node_id));
+            let pool_state = match &ctx.imported_pool {
+                Some(pool) => {
+                    if pool.config.health.is_operational() {
+                        "imported".to_string()
+                    } else {
+                        "degraded".to_string()
+                    }
+                }
+                None => "not-imported".to_string(),
+            };
+            let uptime_secs = ctx.start_time.elapsed().as_secs();
+            let backend = ctx
+                .authority
+                .as_ref()
+                .map(|a| format!("{}", a.backend()))
+                .unwrap_or_else(|| "not-run".to_string());
+
+            // Build multi-node operator health and topology report (MN-028).
+            // Uses the membership runtime's failure detector for per-peer liveness,
+            // the roster for topology/carrier state, placement version, and the
+            // authority spine for node-level carrier/placement metadata.
+            let carrier = ctx
+                .authority
+                .as_ref()
+                .map(|a| a.backend().name())
+                .unwrap_or("not-run");
+            let carrier_is_live = ctx.authority.as_ref().map(|a| a.is_live()).unwrap_or(false);
+            let node_id = ctx
+                .authority
+                .as_ref()
+                .map(|a| a.node_id())
+                .unwrap_or(ctx.config.node_id);
+            let node_member_class = ctx
+                .authority
+                .as_ref()
+                .and_then(|a| a.member_class())
+                .map(|mc| format!("{mc:?}"));
+            let node_failure_domain = ctx.authority.as_ref().and_then(|a| a.failure_domain());
+            let replication_factor = ctx
+                .authority
+                .as_ref()
+                .map(|a| a.replication_factor())
+                .unwrap_or(0);
+            // Collect per-session transport backend info for operator
+            // observability. This closes the "silent TCP fallback" gap (B9):
+            // even when --rdma is requested, the actual negotiated backend
+            // per connected peer is disclosed here.
+            let transport_backends: Vec<serde_json::Value> = {
+                let t = ctx.transport.lock().unwrap();
+                let mut backends = Vec::new();
+                for sid in t.sessions.keys() {
+                    if let Some(backend_kind) = t.session_backend_kind(*sid) {
+                        let peer = t.peer_node(*sid);
+                        let disclosure = peer.and_then(|p| t.carrier_disclosure(p).cloned());
+                        backends.push(serde_json::json!({
+                            "session_id": sid.0,
+                            "peer_node": peer,
+                            "backend_kind": backend_kind.to_string(),
+                            "disclosure": disclosure.map(|d| d.to_string()),
+                        }));
+                    }
+                }
+                backends
+            };
+
+            let report_json = {
+                let membership = ctx.membership.lock().unwrap();
+                let detector = &membership.detector;
+                let placement_version = membership.placement_version();
+                let peers: Vec<serde_json::Value> = detector
+                    .all_peers()
+                    .map(|p| {
+                        serde_json::json!({
+                            "member_id": p.member_id.0,
+                            "member_class": format!("{:?}", p.member_class),
+                            "health": format!("{:?}", p.health),
+                            "failure_domain": p.failure_domain,
+                            "failed_pings": p.failed_ping_count,
+                            "joining": p.joining,
+                            "draining": p.draining,
+                            "epoch": p.epoch.0,
+                        })
+                    })
+                    .collect();
+                let alive_voters: Vec<u64> =
+                    detector.alive_voters().into_iter().map(|m| m.0).collect();
+                let degraded_peers: Vec<serde_json::Value> = detector
+                    .all_peers()
+                    .filter(|p| {
+                        matches!(
+                            p.health,
+                            tidefs_membership_epoch::HealthClass::Suspect
+                                | tidefs_membership_epoch::HealthClass::Down
+                        )
+                    })
+                    .map(|p| {
+                        serde_json::json!({
+                            "member_id": p.member_id.0,
+                            "health": format!("{:?}", p.health),
+                            "failed_pings": p.failed_ping_count,
+                        })
+                    })
+                    .collect();
+                let health_counts = {
+                    let mut healthy = 0u64;
+                    let mut suspect = 0u64;
+                    let mut down = 0u64;
+                    for p in detector.all_peers() {
+                        match p.health {
+                            tidefs_membership_epoch::HealthClass::Healthy => healthy += 1,
+                            tidefs_membership_epoch::HealthClass::Suspect => suspect += 1,
+                            tidefs_membership_epoch::HealthClass::Down => down += 1,
+                        }
+                    }
+                    serde_json::json!({
+                        "healthy": healthy,
+                        "suspect": suspect,
+                        "down": down,
+                    })
+                };
+                let failure_domains: Vec<serde_json::Value> = {
+                    let mut domains: std::collections::BTreeMap<u64, Vec<u64>> =
+                        std::collections::BTreeMap::new();
+                    for p in detector.all_peers() {
+                        domains
+                            .entry(p.failure_domain)
+                            .or_default()
+                            .push(p.member_id.0);
+                    }
+                    domains
+                        .into_iter()
+                        .map(|(fd, members)| {
+                            serde_json::json!({
+                                "failure_domain": fd,
+                                "member_count": members.len(),
+                                "members": members,
+                            })
+                        })
+                        .collect()
+                };
+                let quorum_lost = detector.quorum_lost();
+                // Roster state snapshot: count members in each lifecycle state.
+                let roster_snapshot = membership.roster.snapshot();
+                let mut roster_active = 0u64;
+                let mut roster_suspected = 0u64;
+                let mut roster_failed = 0u64;
+                let mut roster_left = 0u64;
+                for (_, state) in roster_snapshot.iter() {
+                    match state {
+                        tidefs_membership_live::roster::RosterState::Active => roster_active += 1,
+                        tidefs_membership_live::roster::RosterState::Suspected => {
+                            roster_suspected += 1
+                        }
+                        tidefs_membership_live::roster::RosterState::Failed => roster_failed += 1,
+                        tidefs_membership_live::roster::RosterState::Left => roster_left += 1,
+                    }
+                }
+                serde_json::json!({
+                    "node_id": node_id,
+                    "node_member_class": node_member_class,
+                    "node_failure_domain": node_failure_domain,
+                    "carrier": carrier,
+                    "carrier_is_live": carrier_is_live,
+                    "replication_factor": replication_factor,
+                    "placement_version": placement_version,
+                    "peers": peers,
+                    "peer_count": detector.peer_count(),
+                    "alive_voters": alive_voters,
+                    "quorum_lost": quorum_lost,
+                    "roster_size": roster_snapshot.len(),
+                    "roster_state_summary": {
+                        "active": roster_active,
+                        "suspected": roster_suspected,
+                        "failed": roster_failed,
+                        "left": roster_left,
+                    },
+                    "health_summary": health_counts,
+                    "degraded_peers": degraded_peers,
+                    "failure_domains": failure_domains,
+                    "transport_backends": transport_backends,
+                })
+                .to_string()
+            };
+
+            Some(Frame::HealthCheckResponse {
+                node_identity,
+                pool_state,
+                uptime_secs,
+                backend,
+                report_json,
+            })
+        }
+        Frame::Send { key } => {
+            let fs_root = ctx.config.fs_root.as_ref()?;
+            let auth_key = ctx.config.root_auth_key?;
+            let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
+                fs_root,
+                StoreOptions::default(),
+                auth_key,
+            ) {
+                Ok(fs) => fs,
+                Err(e) => {
+                    return Some(Frame::Error {
+                        message: format!("open fs for send: {e}"),
+                    })
+                }
+            };
+            if key.is_empty() {
+                match fs.export_changed_records() {
+                    Ok(export) => Some(Frame::SendResponse {
+                        export: export.encode(),
+                    }),
+                    Err(e) => Some(Frame::Error {
+                        message: format!("export: {e}"),
+                    }),
+                }
+            } else if key.len() == 24 {
+                let tid = u64::from_le_bytes(key[0..8].try_into().unwrap());
+                let gen = u64::from_le_bytes(key[8..16].try_into().unwrap());
+                let csum = u64::from_le_bytes(key[16..24].try_into().unwrap());
+                let audit = match vfs::audit_recovery_with_root_authentication_key(
+                    fs_root,
+                    StoreOptions::default(),
+                    auth_key,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return Some(Frame::Error {
+                            message: format!("audit: {e}"),
+                        })
+                    }
+                };
+                let from_root = match audit.valid_committed_roots.iter().find(|r| {
+                    r.transaction_id == tid
+                        && r.generation == gen
+                        && r.superblock_checksum.0 == csum
+                }) {
+                    Some(r) => r.clone(),
+                    None => {
+                        return Some(Frame::Error {
+                            message: format!(
+                                "from_root not found: tid={tid} gen={gen} csum={csum:#016x}"
+                            ),
+                        })
+                    }
+                };
+                match fs.export_incremental_changed_records(&from_root) {
+                    Ok(export) => Some(Frame::SendResponse {
+                        export: export.encode(),
+                    }),
+                    Err(e) => Some(Frame::Error {
+                        message: format!("incremental export: {e}"),
+                    }),
+                }
+            } else {
+                Some(Frame::Error {
+                    message: format!("send key must be 0 or 24 bytes, got {}", key.len()),
+                })
+            }
+        }
+        Frame::Receive {
+            export,
+            root_authentication_key,
+        } => {
+            let fs_root = ctx.config.fs_root.as_ref()?;
+            if root_authentication_key.len() != 32 {
+                return Some(Frame::Error {
+                    message: format!(
+                        "root auth key must be 32 bytes, got {}",
+                        root_authentication_key.len()
+                    ),
+                });
+            }
+            let mut key_bytes = [0u8; 32];
+            key_bytes.copy_from_slice(root_authentication_key);
+            let auth_key = RootAuthenticationKey::from_bytes32(key_bytes);
+            let decoded = match ChangedRecordExport::decode(export) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Some(Frame::Error {
+                        message: format!("decode export: {e}"),
+                    })
+                }
+            };
+            let report = if decoded.incremental {
+                vfs::LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+                    fs_root, StoreOptions::default(), &decoded, auth_key,
+                )
+            } else {
+                vfs::LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
+                    fs_root, StoreOptions::default(), &decoded, auth_key,
+                )
+            };
+            match report {
+                Ok(r) => {
+                    let json = serde_json::json!({
+                        "spec": r.spec,
+                        "imported_roots": r.imported_roots,
+                        "imported_records": r.imported_records,
+                        "imported_payload_bytes": r.imported_payload_bytes,
+                        "selected_generation": r.selected_generation,
+                        "selected_transaction_id": r.selected_transaction_id,
+                        "snapshot_catalog_entries": r.snapshot_catalog_entries,
+                        "stream_version": r.stream_version,
+                        "staging_validated_before_publish": r.staging_validated_before_publish,
+                        "destination_root_reauthentication": r.destination_root_reauthentication,
+                        "production_fsck_required": r.production_fsck_required,
+                    });
+                    Some(Frame::ReceiveResponse {
+                        report_json: json.to_string(),
+                    })
+                }
+                Err(e) => Some(Frame::Error {
+                    message: format!("receive: {e}"),
+                }),
+            }
+        }
+        Frame::SnapshotBarrier {
+            barrier_id,
+            snapshot_name,
+        } => {
+            let _snap_name = snapshot_name.clone();
+            let mut s = store.lock().unwrap();
+            let (committed_root_txg, committed_root_generation, object_count) = match &mut *s {
+                StoreBackend::Local(rs) => {
+                    let _ = rs.sync_all();
+                    let txg = rs.committed_root_txg();
+                    let gen = rs.committed_root_generation();
+                    let count = rs.stats().object_count;
+                    (txg, gen, count)
+                }
+                StoreBackend::TransportBacked(ts) => {
+                    let _ = ts.sync_all();
+                    let txg = ts.committed_root_txg();
+                    let gen = ts.committed_root_generation();
+                    let count = ts.stats().object_count;
+                    (txg, gen, count)
+                }
+            };
+            Some(Frame::SnapshotBarrierResponse {
+                barrier_id: *barrier_id,
+                committed_root_txg,
+                committed_root_generation,
+                object_count,
+            })
+        }
+        // ── Multi-node scrub fanout ──
+        Frame::ScrubRequest => {
+            let store_dir = &ctx.config.store_paths[0];
+            let segments_dir = store_dir.join(tidefs_local_object_store::STORE_DIR_NAME);
+            let scrubber = tidefs_local_object_store::SegmentIntegrityScrubber::new(&segments_dir);
+            let mut suspect_log = tidefs_local_object_store::SuspectLog::new();
+            let (report_json, findings_count) = match scrubber.scrub_full(&mut suspect_log) {
+                Ok(report) => {
+                    let findings = report.outcomes.len() as u64;
+                    let json = serde_json::json!({
+                        "segments_scanned": report.segments_scanned,
+                        "records_verified": report.records_verified,
+                        "bytes_scanned": report.bytes_scanned,
+                        "chain_breaks_detected": report.chain_breaks_detected,
+                        "completed": report.completed,
+                        "findings_count": findings,
+                    });
+                    (json.to_string(), findings)
+                }
+                Err(e) => {
+                    let json = serde_json::json!({"error": format!("{e}")});
+                    (json.to_string(), 0)
+                }
+            };
+            eprintln!(
+                "[storage-node] session {session_id}: scrub request completed findings_count={findings_count}"
+            );
+            Some(Frame::ScrubResponse {
+                report_json,
+                findings_count,
+            })
+        }
+        Frame::RepairObject {
+            key,
+            authoritative_payload,
+        } => {
+            let mut s = store.lock().unwrap();
+            let name = String::from_utf8_lossy(key).to_string();
+            let success = match &mut *s {
+                StoreBackend::Local(rs) => rs.put_local(&name, authoritative_payload).is_ok(),
+                StoreBackend::TransportBacked(ts) => {
+                    ts.put_local(&name, authoritative_payload).is_ok()
+                }
+            };
+            eprintln!(
+                "[storage-node] session {session_id}: repair object key={name} success={success}"
+            );
+            Some(Frame::RepairObjectAck {
+                key: key.clone(),
+                success,
+            })
+        }
+        // ── Snapshot lifecycle operations (clustered dataset path) ──
+        Frame::SnapshotCreate { snapshot_name } => {
+            let fs_root = ctx.config.fs_root.as_ref()?;
+            let auth_key = ctx.config.root_auth_key?;
+            let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
+                fs_root,
+                StoreOptions::default(),
+                auth_key,
+            ) {
+                Ok(fs) => fs,
+                Err(e) => {
+                    return Some(Frame::Error {
+                        message: format!("open fs for snapshot create: {e}"),
+                    })
+                }
+            };
+            match fs.create_snapshot(snapshot_name) {
+                Ok(summary) => {
+                    let json = serde_json::json!({
+                        "name": summary.name,
+                        "source_transaction_id": summary.source_transaction_id,
+                        "source_generation": summary.source_generation,
+                        "created_at_generation": summary.created_at_generation,
+                    });
+                    Some(Frame::SnapshotCreateResponse {
+                        summary_json: json.to_string(),
+                    })
+                }
+                Err(e) => Some(Frame::Error {
+                    message: format!("create snapshot: {e}"),
+                }),
+            }
+        }
+        Frame::SnapshotDestroy { snapshot_name } => {
+            let fs_root = ctx.config.fs_root.as_ref()?;
+            let auth_key = ctx.config.root_auth_key?;
+            let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
+                fs_root,
+                StoreOptions::default(),
+                auth_key,
+            ) {
+                Ok(fs) => fs,
+                Err(e) => {
+                    return Some(Frame::Error {
+                        message: format!("open fs for snapshot destroy: {e}"),
+                    })
+                }
+            };
+            match fs.delete_snapshot(snapshot_name) {
+                Ok(summary) => {
+                    let json = serde_json::json!({
+                        "name": summary.name,
+                        "source_transaction_id": summary.source_transaction_id,
+                        "source_generation": summary.source_generation,
+                        "created_at_generation": summary.created_at_generation,
+                    });
+                    Some(Frame::SnapshotDestroyResponse {
+                        summary_json: json.to_string(),
+                    })
+                }
+                Err(e) => Some(Frame::Error {
+                    message: format!("destroy snapshot: {e}"),
+                }),
+            }
+        }
+        Frame::SnapshotRollback { snapshot_name } => {
+            let fs_root = ctx.config.fs_root.as_ref()?;
+            let auth_key = ctx.config.root_auth_key?;
+            let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
+                fs_root,
+                StoreOptions::default(),
+                auth_key,
+            ) {
+                Ok(fs) => fs,
+                Err(e) => {
+                    return Some(Frame::Error {
+                        message: format!("open fs for snapshot rollback: {e}"),
+                    })
+                }
+            };
+            match fs.rollback_to_snapshot(snapshot_name) {
+                Ok(report) => {
+                    let json = serde_json::json!({
+                        "spec": report.spec,
+                        "snapshot": {
+                            "name": report.snapshot.name,
+                            "source_transaction_id": report.snapshot.source_transaction_id,
+                            "source_generation": report.snapshot.source_generation,
+                            "created_at_generation": report.snapshot.created_at_generation,
+                        },
+                        "generation_before": report.generation_before,
+                        "restored_source_generation": report.restored_source_generation,
+                        "published_generation": report.published_generation,
+                        "snapshot_catalog_entries": report.snapshot_catalog_entries,
+                        "production_fsck_required": report.production_fsck_required,
+                    });
+                    Some(Frame::SnapshotRollbackResponse {
+                        report_json: json.to_string(),
+                    })
+                }
+                Err(e) => Some(Frame::Error {
+                    message: format!("rollback to snapshot: {e}"),
+                }),
+            }
+        }
+        // ── Snapshot clone operation ──
+        // ── Chunked send/receive with cursor-based resume ──
+        Frame::SendChunked { key } => {
+            let fs_root = ctx.config.fs_root.as_ref()?;
+            let auth_key = ctx.config.root_auth_key?;
+            let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
+                fs_root, StoreOptions::default(), auth_key,
+            ) {
+                Ok(fs) => fs,
+                Err(e) => return Some(Frame::Error { message: format!("open fs for chunked send: {e}") }),
+            };
+            let export = if key.is_empty() {
+                match fs.export_changed_records() {
+                    Ok(e) => e.encode(),
+                    Err(e) => return Some(Frame::Error { message: format!("export: {e}") }),
+                }
+            } else if key.len() == 24 {
+                let tid = u64::from_le_bytes(key[0..8].try_into().unwrap());
+                let gen = u64::from_le_bytes(key[8..16].try_into().unwrap());
+                let csum = u64::from_le_bytes(key[16..24].try_into().unwrap());
+                let audit = match vfs::audit_recovery_with_root_authentication_key(
+                    fs_root, StoreOptions::default(), auth_key,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => return Some(Frame::Error { message: format!("audit: {e}") }),
+                };
+                let from_root = match audit.valid_committed_roots.iter().find(|r| {
+                    r.transaction_id == tid && r.generation == gen && r.superblock_checksum.0 == csum
+                }) {
+                    Some(r) => r.clone(),
+                    None => return Some(Frame::Error {
+                        message: format!("from_root not found: tid={tid} gen={gen}"),
+                    }),
+                };
+                match fs.export_incremental_changed_records(&from_root) {
+                    Ok(e) => e.encode(),
+                    Err(e) => return Some(Frame::Error { message: format!("incremental export: {e}") }),
+                }
+            } else {
+                return Some(Frame::Error {
+                    message: format!("send key must be 0 or 24 bytes, got {}", key.len()),
+                });
+            };
+            let cursor: Vec<u8> = if export.len() >= 8 {
+                let mut c = vec![0u8; 16];
+                c[0..8].copy_from_slice(&0u64.to_le_bytes());
+                c[8..16].copy_from_slice(&export[..8]);
+                c
+            } else {
+                vec![0u8; 16]
+            };
+            Some(Frame::SendChunkedResponse { chunk: export, cursor, more: false })
+        }
+        Frame::SendResume { cursor: _cursor } => {
+            Some(Frame::Error {
+                message: "send resume: re-send with incremental key (tid+gen+csum) from last received root".into(),
+            })
+        }
+
+        Frame::SnapshotClone { clone_name, source_snapshot } => {
+            let fs_root = ctx.config.fs_root.as_ref()?;
+            let auth_key = ctx.config.root_auth_key?;
+            let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
+                fs_root,
+                StoreOptions::default(),
+                auth_key,
+            ) {
+                Ok(fs) => fs,
+                Err(e) => {
+                    return Some(Frame::Error {
+                        message: format!("open fs for snapshot clone: {e}"),
+                    })
+                }
+            };
+            match fs.create_clone(&clone_name, &source_snapshot) {
+                Ok(summary) => {
+                    let json = serde_json::json!({
+                        "name": summary.name,
+                        "origin": summary.origin,
+                        "source_transaction_id": summary.source_transaction_id,
+                        "source_generation": summary.source_generation,
+                        "created_at_generation": summary.created_at_generation,
+                    });
+                    Some(Frame::SnapshotCloneResponse {
+                        summary_json: json.to_string(),
+                    })
+                }
+                Err(e) => Some(Frame::Error {
+                    message: format!("create clone: {e}"),
+                }),
+            }
+        }
+        Frame::Ok
+        | Frame::GetResponse { .. }
+        | Frame::DeleteResponse { .. }
+        | Frame::ListResponse { .. }
+        | Frame::StatsResponse { .. }
+        | Frame::SendResponse { .. }
+        | Frame::ReceiveResponse { .. }
+        | Frame::SnapshotBarrierResponse { .. }
+        | Frame::HealthCheckResponse { .. }
+        | Frame::Error { .. }
+        | Frame::ScrubResponse { .. }
+        | Frame::RepairObjectAck { .. }
+        | Frame::SnapshotCreateResponse { .. }
+        | Frame::SnapshotDestroyResponse { .. }
+        | Frame::SnapshotRollbackResponse { .. }
+        | Frame::SnapshotCloneResponse { .. }
+        | Frame::SendChunkedResponse { .. }
+        | Frame::SendResumeResponse { .. } => None,
+    }
+}
+
+/// Segment-fetch handler for session handler threads.
+fn handle_segment_fetch_ctx(
+    session_id: tidefs_transport::SessionId,
+    request: SegmentFetchRequest,
+    ctx: &SessionContext,
+) -> Result<u64, String> {
+    let obj_id = request.object_id;
+    let full_payload = {
+        let store_guard = ctx.store.lock().map_err(|e| format!("lock: {e}"))?;
+        match &*store_guard {
+            StoreBackend::Local(rs) => rs
+                .get_local(obj_id.to_le_bytes())
+                .map_err(|e| format!("primary get for object {obj_id}: {e}"))?
+                .unwrap_or_default(),
+            StoreBackend::TransportBacked(ts) => ts
+                .get_local(obj_id.to_le_bytes())
+                .map_err(|e| format!("primary get for object {obj_id}: {e}"))?
+                .unwrap_or_default(),
+        }
+    };
+
+    let start = request.segment_offset as usize;
+    let end = start.saturating_add(request.segment_length as usize);
+    let segment_payload = if start < full_payload.len() {
+        let slice_end = end.min(full_payload.len());
+        full_payload[start..slice_end].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let actual_length = segment_payload.len() as u64;
+    let response = SegmentFetchResponse::new(
+        obj_id,
+        request.segment_offset,
+        actual_length,
+        segment_payload,
+    );
+
+    let mut t = ctx.transport.lock().map_err(|e| format!("lock: {e}"))?;
+    send_segment_fetch_response(&mut t, session_id, &response)
+        .map_err(|e| format!("send segment fetch response: {e}"))?;
+
+    Ok(obj_id)
+}
+impl StorageNode {
+    /// Return a clone of the `Arc<Mutex<MembershipRuntime>>` handle,
+    /// usable by other daemon subsystems that need the membership view.
+    pub fn membership_handle(&self) -> Arc<Mutex<MembershipRuntime>> {
+        Arc::clone(&self.membership)
+    }
+
+    /// Return a clone of the membership transport handle when configured.
+    pub fn membership_transport_handle(&self) -> Option<Arc<Mutex<MembershipTransport>>> {
+        self.membership_transport.as_ref().map(Arc::clone)
+    }
+
+    /// Return the current membership view snapshot.
+    pub fn membership_view(&self) -> MembershipView {
+        self.membership.lock().unwrap().view()
+    }
+
+    /// Tick the membership runtime to advance failure detection and epoch state.
+    pub fn tick_membership(&self) {
+        let mut m = self.membership.lock().unwrap();
+        if let Some(transport) = &self.membership_transport {
+            let mut transport = transport.lock().unwrap();
+            let _ = transport.tick_runtime(&mut m);
+        } else {
+            m.tick();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Epoch anchor helpers — split-brain prevention
+// ---------------------------------------------------------------------------
+
+/// Read the persisted committed-root epoch anchor file.
+///
+/// Returns `Some(epoch)` if the file exists and contains a valid u64,
+/// or `None` if the file is absent or unreadable (first import, no anchor).
+fn read_epoch_anchor(path: &std::path::Path) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    text.trim().parse::<u64>().ok()
+}
+
+/// Persist the committed-root epoch as an anchor for future imports.
+///
+/// The anchor file records the last known good committed-root epoch so
+/// that subsequent pool imports can reject stale roots from partitioned
+/// writers (split-brain prevention gate).
+fn write_epoch_anchor(path: &std::path::Path, epoch: u64) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{epoch}\n"));
+}
+
+// ---------------------------------------------------------------------------
+// VSNP (TideFS Snapshot Network Protocol) handler
+// ---------------------------------------------------------------------------
+
+const VSNP_KIND_ERROR: u8 = 0;
+const VSNP_KIND_PUSH: u8 = 1;
+const VSNP_KIND_PULL_REQUEST: u8 = 2;
+const VSNP_KIND_PULL_RESPONSE: u8 = 3;
+const VSNP_KIND_ACK: u8 = 4;
+const VSNP_KIND_BLOCK_PUSH: u8 = 5;
+const VSNP_KIND_BLOCK_PULL_REQUEST: u8 = 6;
+const VSNP_KIND_BLOCK_PULL_RESPONSE: u8 = 7;
+
+fn build_vsnp_ack(message: &str) -> Vec<u8> {
+    let b = message.as_bytes();
+    let mut msg = Vec::with_capacity(4 + 1 + 4 + b.len());
+    msg.extend_from_slice(b"VSNP");
+    msg.push(VSNP_KIND_ACK);
+    msg.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    msg.extend_from_slice(b);
+    msg
+}
+
+
+fn build_vsnp_block_pull_response(block_data: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(4 + 1 + 4 + block_data.len());
+    msg.extend_from_slice(b"VSNP");
+    msg.push(VSNP_KIND_BLOCK_PULL_RESPONSE);
+    msg.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
+    msg.extend_from_slice(block_data);
+    msg
+}
+
+fn build_vsnp_error(message: &str) -> Vec<u8> {
+    let b = message.as_bytes();
+    let mut msg = Vec::with_capacity(4 + 1 + 4 + b.len());
+    msg.extend_from_slice(b"VSNP");
+    msg.push(VSNP_KIND_ERROR);
+    msg.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    msg.extend_from_slice(b);
+    msg
+}
+
+fn build_vsnp_pull_response(export: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(4 + 1 + 4 + export.len());
+    msg.extend_from_slice(b"VSNP");
+    msg.push(VSNP_KIND_PULL_RESPONSE);
+    msg.extend_from_slice(&(export.len() as u32).to_le_bytes());
+    msg.extend_from_slice(export);
+    msg
+}
+
+fn handle_vsnp_message(
+    session_id: tidefs_transport::SessionId,
+    raw: &[u8],
+    ctx: &SessionContext,
+) -> Result<Option<Vec<u8>>, String> {
+    if raw.len() < 5 {
+        return Err("VSNP message too short".into());
+    }
+    let kind = raw[4];
+
+    match kind {
+        VSNP_KIND_PUSH => {
+            if raw.len() < 9 + 4 {
+                return Err("VSNP push: too short for key_len".into());
+            }
+            let key_len = u32::from_le_bytes(raw[5..9].try_into().unwrap()) as usize;
+            if key_len != 32 {
+                return Err(format!("VSNP push: expected key_len=32, got {key_len}"));
+            }
+            if raw.len() < 9 + 32 + 4 {
+                return Err("VSNP push: too short for auth key + export_len".into());
+            }
+            let mut auth_key = [0u8; 32];
+            auth_key.copy_from_slice(&raw[9..9 + 32]);
+            let export_len =
+                u32::from_le_bytes(raw[9 + 32..13 + 32].try_into().unwrap()) as usize;
+            let export_start = 13 + 32;
+            if raw.len() < export_start + export_len {
+                return Err(format!(
+                    "VSNP push: need {} bytes, got {}",
+                    export_start + export_len,
+                    raw.len()
+                ));
+            }
+            let export_bytes = &raw[export_start..export_start + export_len];
+            handle_vsnp_push(session_id, export_bytes, auth_key, ctx)
+        }
+        VSNP_KIND_PULL_REQUEST => {
+            if raw.len() < 9 + 4 {
+                return Err("VSNP pull_request: too short".into());
+            }
+            let key_len = u32::from_le_bytes(raw[5..9].try_into().unwrap()) as usize;
+            if key_len != 32 {
+                return Err(format!("VSNP pull_request: expected key_len=32, got {key_len}"));
+            }
+            if raw.len() < 9 + 32 {
+                return Err("VSNP pull_request: too short for auth key".into());
+            }
+            let mut auth_key = [0u8; 32];
+            auth_key.copy_from_slice(&raw[9..9 + 32]);
+            handle_vsnp_pull_request(session_id, auth_key, ctx)
+        }
+        VSNP_KIND_BLOCK_PUSH => {
+            // Parse block push: [magic(4)][kind(1)][key_len(4)][key(32)][name_len(4)][name][data_len(4)][data]
+            if raw.len() < 9 + 4 { return Err("VSNP block_push: too short".into()); }
+            let key_len = u32::from_le_bytes(raw[5..9].try_into().unwrap()) as usize;
+            if key_len != 32 { return Err(format!("VSNP block_push: key_len={key_len}")); }
+            if raw.len() < 9 + 32 + 4 { return Err("VSNP block_push: too short for name_len".into()); }
+            let mut auth_key = [0u8; 32];
+            auth_key.copy_from_slice(&raw[9..9 + 32]);
+            let name_len = u32::from_le_bytes(raw[9 + 32..13 + 32].try_into().unwrap()) as usize;
+            let name_start = 13 + 32;
+            if raw.len() < name_start + name_len + 4 {
+                return Err("VSNP block_push: too short for data_len".into());
+            }
+            let _device_name = String::from_utf8_lossy(
+                &raw[name_start..name_start + name_len]
+            ).into_owned();
+            let data_len = u32::from_le_bytes(
+                raw[name_start + name_len..name_start + name_len + 4].try_into().unwrap()
+            ) as usize;
+            let data_start = name_start + name_len + 4;
+            if raw.len() < data_start + data_len {
+                return Err(format!(
+                    "VSNP block_push: need {} bytes, got {}",
+                    data_start + data_len, raw.len()
+                ));
+            }
+            let block_data = &raw[data_start..data_start + data_len];
+            handle_vsnp_block_push(session_id, block_data, auth_key, ctx)
+        }
+        VSNP_KIND_BLOCK_PULL_REQUEST => {
+            if raw.len() < 9 + 4 { return Err("VSNP block_pull_request: too short".into()); }
+            let key_len = u32::from_le_bytes(raw[5..9].try_into().unwrap()) as usize;
+            if key_len != 32 { return Err(format!("VSNP block_pull_request: key_len={key_len}")); }
+            if raw.len() < 9 + 32 + 4 { return Err("VSNP block_pull_request: too short for name_len".into()); }
+            let mut auth_key = [0u8; 32];
+            auth_key.copy_from_slice(&raw[9..9 + 32]);
+            let name_len = u32::from_le_bytes(raw[9 + 32..13 + 32].try_into().unwrap()) as usize;
+            let name_start = 13 + 32;
+            if raw.len() < name_start + name_len {
+                return Err("VSNP block_pull_request: too short".into());
+            }
+            let _device_name = String::from_utf8_lossy(
+                &raw[name_start..name_start + name_len]
+            ).into_owned();
+            handle_vsnp_block_pull_request(session_id, auth_key, ctx)
+        }
+        other => Err(format!("unknown VSNP kind: {other}")),
+    }
+}
+
+fn handle_vsnp_push(
+    _session_id: tidefs_transport::SessionId,
+    export_bytes: &[u8],
+    auth_key_bytes: [u8; 32],
+    ctx: &SessionContext,
+) -> Result<Option<Vec<u8>>, String> {
+    let fs_root = ctx.config.fs_root.as_ref().ok_or("no fs_root configured")?;
+    let auth_key = RootAuthenticationKey::from_bytes32(auth_key_bytes);
+
+    let export = vfs::vfssend2_bridge::decode_any_stream_to_changed_records(export_bytes)
+        .map_err(|e| format!("decode stream: {e}"))?;
+
+    let report = if export.incremental {
+        vfs::LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+            fs_root,
+            tidefs_local_object_store::StoreOptions::default(),
+            &export,
+            auth_key,
+        )
+    } else {
+        vfs::LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
+            fs_root,
+            tidefs_local_object_store::StoreOptions::default(),
+            &export,
+            auth_key,
+        )
+    };
+
+    match report {
+        Ok(r) => {
+            let ack = format!(
+                "received stream (roots={}, records={}, payload={}, snapshots={}, tx={})",
+                r.imported_roots,
+                r.imported_records,
+                r.imported_payload_bytes,
+                r.snapshot_catalog_entries,
+                r.selected_transaction_id,
+            );
+            Ok(Some(build_vsnp_ack(&ack)))
+        }
+        Err(e) => Err(format!("receive: {e}")),
+    }
+}
+
+fn handle_vsnp_pull_request(
+    _session_id: tidefs_transport::SessionId,
+    auth_key_bytes: [u8; 32],
+    ctx: &SessionContext,
+) -> Result<Option<Vec<u8>>, String> {
+    let fs_root = ctx.config.fs_root.as_ref().ok_or("no fs_root configured")?;
+    let auth_key = RootAuthenticationKey::from_bytes32(auth_key_bytes);
+
+    let mut fs = vfs::LocalFileSystem::open_with_root_authentication_key(
+        fs_root,
+        tidefs_local_object_store::StoreOptions::default(),
+        auth_key,
+    )
+    .map_err(|e| format!("open fs for send: {e}"))?;
+
+    let export = fs
+        .export_changed_records()
+        .map_err(|e| format!("export: {e}"))?;
+    let encoded = export.encode();
+
+    Ok(Some(build_vsnp_pull_response(&encoded)))
+}
+
+fn handle_vsnp_block_push(
+    _session_id: tidefs_transport::SessionId,
+    block_data: &[u8],
+    _auth_key_bytes: [u8; 32],
+    ctx: &SessionContext,
+) -> Result<Option<Vec<u8>>, String> {
+    let fs_root = ctx.config.fs_root.as_ref().ok_or("no fs_root configured")?;
+    let block_file = std::path::Path::new(fs_root).join("block-volume-data");
+
+    std::fs::write(&block_file, block_data)
+        .map_err(|e| format!("write block data: {e}"))?;
+
+    let ack = format!(
+        "received block volume ({} bytes)",
+        block_data.len()
+    );
+    Ok(Some(build_vsnp_ack(&ack)))
+}
+
+fn handle_vsnp_block_pull_request(
+    _session_id: tidefs_transport::SessionId,
+    _auth_key_bytes: [u8; 32],
+    ctx: &SessionContext,
+) -> Result<Option<Vec<u8>>, String> {
+    let fs_root = ctx.config.fs_root.as_ref().ok_or("no fs_root configured")?;
+    let block_file = std::path::Path::new(fs_root).join("block-volume-data");
+
+    let block_data = std::fs::read(&block_file)
+        .map_err(|e| format!("read block data: {e}"))?;
+
+    if block_data.is_empty() {
+        return Err("no block data found".into());
+    }
+
+    Ok(Some(build_vsnp_block_pull_response(&block_data)))
+}
+
+
+#[cfg(test)]
+mod cluster_pool_handler_tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    use tidefs_cluster::pool_protocol::{
+        ClusterPoolCreateResponse, ClusterPoolImportResponse,
+    };
+    use tidefs_local_object_store::ObjectKey;
+    use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
+
+    /// Minimum device size for pool creation: 2 * 256KB labels + 8KB offset + 256KB commit region.
+    const DEVICE_BYTES: u64 = 2_000_000;
+
+    fn make_device(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let mut f = File::create(&path).unwrap();
+        f.set_len(DEVICE_BYTES).unwrap();
+        f.flush().unwrap();
+        path
+    }
+
+    #[test]
+    fn sync_entries_preserve_object_key_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().join("store")];
+        let mut store =
+            ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
+        store.put_named("alpha", b"payload").unwrap();
+        let backend = StoreBackend::Local(Box::new(store));
+
+        let entries = sync_entries_from_store(&backend);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, ObjectKey::from_name("alpha").as_bytes32());
+        assert_eq!(entries[0].1, b"payload".to_vec());
+    }
+
+    #[test]
+    fn handler_create_request_calls_real_pool_api_and_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = make_device(&dir, "dev0");
+
+        let device_paths: Vec<std::path::PathBuf> = vec![dev.clone()];
+        let config = PoolCreateConfig {
+            pool_name: "test-pool".into(),
+            pool_guid: Some([0xA1; 16]),
+            redundancy: RedundancyPolicy::None,
+            encryption_key: None,
+            clustered: false,
+        };
+        let outcome = PoolCreator::create_pool(&device_paths, &config).unwrap();
+        assert_eq!(outcome.pool_guid, [0xA1; 16]);
+        assert_eq!(outcome.pool_name, "test-pool");
+        assert_eq!(outcome.device_count, 1);
+    }
+
+    #[test]
+    fn handler_create_request_fails_on_invalid_device() {
+        let device_paths: Vec<std::path::PathBuf> =
+            vec![std::path::PathBuf::from("/nonexistent/device/path")];
+        let config = PoolCreateConfig {
+            pool_name: "bad-pool".into(),
+            pool_guid: Some([0xB2; 16]),
+            redundancy: RedundancyPolicy::None,
+            encryption_key: None,
+            clustered: false,
+        };
+        let result = PoolCreator::create_pool(&device_paths, &config);
+        assert!(result.is_err(), "expected error on nonexistent device");
+    }
+
+    #[test]
+    fn handler_create_and_import_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = make_device(&dir, "dev0");
+        let device_paths = vec![dev.clone()];
+
+        // Create the pool.
+        let create_config = PoolCreateConfig {
+            pool_name: "roundtrip".into(),
+            pool_guid: Some([0xC3; 16]),
+            redundancy: RedundancyPolicy::None,
+            encryption_key: None,
+            clustered: false,
+        };
+        let outcome = PoolCreator::create_pool(&device_paths, &create_config).unwrap();
+        assert_eq!(outcome.device_count, 1);
+
+        // Import the pool.
+        let lock_dir = dir.path().join("locks");
+        let imported = pool_import(&device_paths, &lock_dir, false, None, None).unwrap();
+        assert!(imported.stats.committed_root_epoch.is_some());
+    }
+
+    #[test]
+    fn handler_import_fails_on_unlabeled_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = make_device(&dir, "dev0");
+        let device_paths = vec![dev];
+        let lock_dir = dir.path().join("locks");
+        let result = pool_import(&device_paths, &lock_dir, false, None, None);
+        assert!(result.is_err(), "expected error importing unlabeled device");
+    }
+
+    #[test]
+    fn handler_create_response_encoding_roundtrip() {
+        let resp = ClusterPoolCreateResponse {
+            request_id: 42,
+            node_id: 7,
+            pool_guid: [0xDD; 16],
+            success: true,
+            device_guids: vec![[0x01; 16], [0x02; 16]],
+            error: None,
+        };
+        let msg = ClusterPoolMessage::CreateResponse(resp.clone());
+        let encoded = msg.encode().unwrap();
+        let decoded = ClusterPoolMessage::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn handler_import_response_encoding_roundtrip() {
+        let resp = ClusterPoolImportResponse {
+            request_id: 1,
+            node_id: 5,
+            pool_guid: [0xEE; 16],
+            success: true,
+            committed_root_epoch: Some(3),
+            intent_log_replayed: Some(10),
+            error: None,
+        };
+        let msg = ClusterPoolMessage::ImportResponse(resp.clone());
+        let encoded = msg.encode().unwrap();
+        let decoded = ClusterPoolMessage::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn handler_error_response_encoding_roundtrip() {
+        let resp = ClusterPoolCreateResponse {
+            request_id: 99,
+            node_id: 3,
+            pool_guid: [0xFF; 16],
+            success: false,
+            device_guids: vec![],
+            error: Some("device too small".into()),
+        };
+        let msg = ClusterPoolMessage::CreateResponse(resp.clone());
+        let encoded = msg.encode().unwrap();
+        let decoded = ClusterPoolMessage::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+}

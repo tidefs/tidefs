@@ -1,0 +1,10 @@
+; ublk fio verification: trim/discard workload against ublk block device
+[global]
+ioengine=psync
+direct=1
+bs=4k
+
+[trim-test]
+rw=trim
+size=2M
+offset=1M

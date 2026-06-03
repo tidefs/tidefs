@@ -1,0 +1,22 @@
+[package]
+name = "tidefs-permission"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Unix discretionary-access-control engine: mode-bit permission checking,
+POSIX ACL evaluation, unified access-decision API, and xattr namespace
+validation. Re-exports the canonical ACL types and codec from
+tidefs-posix-acl so callers only need a single permission dependency.
+no_std / forbid(unsafe_code).
+"""
+
+[features]
+default = []
+alloc = []
+
+[dependencies]
+tidefs-posix-acl = { path = "../tidefs-posix-acl" }

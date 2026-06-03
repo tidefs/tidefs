@@ -1,0 +1,26 @@
+[package]
+name = "tidefs-dedup"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Post-process dedup scanner for TideFS.
+Maps BLAKE3 content hashes to physical object locators (DDT),
+detects duplicate extents written across different inodes,
+and merges them by redirecting extent maps to the canonical
+copy. Implements IncrementalJob (JobKind::Dedup, BestEffort).
+"""
+
+[dependencies]
+tidefs-types-extent-map-core = { path = "../tidefs-types-extent-map-core" }
+tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core" }
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
+tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
+blake3 = { version = "1", default-features = false }
+
+[lib]
+name = "tidefs_dedup"
+path = "src/lib.rs"

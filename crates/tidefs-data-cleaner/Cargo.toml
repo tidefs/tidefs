@@ -1,0 +1,20 @@
+[package]
+name = "tidefs-data-cleaner"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "DataCleaner incremental background job: processes refcount deltas from the reclaim queue and frees zero-refcount segments"
+
+[dependencies]
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
+tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core" }
+tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
+tidefs-reclaim-queue-core = { path = "../tidefs-reclaim-queue-core" }
+tidefs-reclaim = { path = "../tidefs-reclaim" }
+tidefs-spacemap-allocator = { path = "../tidefs-spacemap-allocator" }
+
+[lib]
+path = "src/lib.rs"

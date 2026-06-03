@@ -1,0 +1,12 @@
+; ublk fio verification: sequential write with verify metadata against ublk block device
+[global]
+ioengine=psync
+direct=1
+bs=4k
+
+[seq-write-verify]
+rw=write
+verify=crc32c
+verify_fatal=1
+size=3M
+offset=0

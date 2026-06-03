@@ -1,0 +1,22 @@
+[package]
+name = "tidefs-replica-health"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Per-chunk replica health tracking with adaptive failure detection, lag computation, and flap suppression — P8-03 data_copy_3"
+
+[dependencies]
+tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+blake3 = "1"
+getrandom = "0.2"
+
+[dev-dependencies]
+
+[lib]
+path = "src/lib.rs"

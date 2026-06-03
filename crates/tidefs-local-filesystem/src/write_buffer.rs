@@ -1,0 +1,643 @@
+use std::time::Duration;
+
+/// Configuration for write-buffer coalescing thresholds.
+#[derive(Debug, Clone)]
+pub struct WriteBufferConfig {
+    /// Flush foreground writes when total accumulated dirty bytes reaches this limit.
+    pub flush_threshold_bytes: usize,
+    /// Age threshold for background/tick-driven dirty epoch sealing.
+    ///
+    /// The foreground write path deliberately does not synchronously flush
+    /// just because this age elapsed; doing so turns slow mmap writeback into
+    /// tiny object-store rewrites.
+    pub flush_threshold_age: Duration,
+}
+
+impl Default for WriteBufferConfig {
+    fn default() -> Self {
+        Self {
+            flush_threshold_bytes: 8 * 1024 * 1024,
+            flush_threshold_age: Duration::from_millis(32),
+        }
+    }
+}
+
+/// A single contiguous dirty segment within the write buffer.
+#[derive(Debug, Clone)]
+struct Segment {
+    offset: u64,
+    data: Vec<u8>,
+}
+
+impl Segment {
+    fn end(&self) -> u64 {
+        self.offset.saturating_add(self.data.len() as u64)
+    }
+}
+
+/// Per-inode write coalescing buffer.
+///
+/// Accumulates small sequential writes and flushes them in fewer,
+/// larger object-store operations when a foreground byte-count threshold
+/// is crossed. Read-your-writes is preserved by serving dirty segments
+/// directly. The age threshold remains available for background/tick
+/// scheduling, but foreground writes do not enforce it synchronously.
+#[derive(Debug, Clone)]
+pub struct WriteBuffer {
+    config: WriteBufferConfig,
+    segments: Vec<Segment>,
+    total_bytes: usize,
+}
+
+impl WriteBuffer {
+    pub fn new(config: WriteBufferConfig) -> Self {
+        Self {
+            config,
+            segments: Vec::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// Ingest a write at the given byte offset.
+    ///
+    /// Contiguous or overlapping writes are merged into sorted dirty segments.
+    /// Newer bytes overwrite older buffered bytes in the overlapping range.
+    /// Zero-length writes are ignored.
+    pub fn ingest(&mut self, buf: &[u8], offset: u64) {
+        if buf.is_empty() {
+            return;
+        }
+
+        let write_end = offset.saturating_add(buf.len() as u64);
+
+        let mut index = 0;
+        while index < self.segments.len() {
+            if self.segments[index].end() < offset {
+                index += 1;
+                continue;
+            }
+            break;
+        }
+
+        if index == self.segments.len() || self.segments[index].offset > write_end {
+            self.segments.insert(
+                index,
+                Segment {
+                    offset,
+                    data: buf.to_vec(),
+                },
+            );
+            self.total_bytes = self.segments.iter().map(|segment| segment.data.len()).sum();
+            return;
+        }
+
+        if self.segments[index].offset <= offset {
+            let segment = &mut self.segments[index];
+            let write_start = (offset - segment.offset) as usize;
+            let required_len = write_start.saturating_add(buf.len());
+            if required_len > segment.data.len() {
+                segment.data.resize(required_len, 0);
+            }
+            segment.data[write_start..write_start + buf.len()].copy_from_slice(buf);
+        } else {
+            self.segments.insert(
+                index,
+                Segment {
+                    offset,
+                    data: buf.to_vec(),
+                },
+            );
+        }
+
+        while index + 1 < self.segments.len() {
+            let base_end = self.segments[index].end();
+            if self.segments[index + 1].offset > base_end {
+                break;
+            }
+
+            let next = self.segments.remove(index + 1);
+            let next_end = next.end();
+            if next_end <= base_end {
+                continue;
+            }
+
+            let copy_start = (base_end - next.offset) as usize;
+            self.segments[index]
+                .data
+                .extend_from_slice(&next.data[copy_start..]);
+        }
+
+        self.total_bytes = self.segments.iter().map(|segment| segment.data.len()).sum();
+    }
+
+    /// Returns `true` when the foreground byte-count threshold is crossed.
+    pub fn should_flush(&self) -> bool {
+        !self.is_empty() && self.total_bytes >= self.config.flush_threshold_bytes
+    }
+
+    /// True when no dirty data is buffered.
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Total unique buffered dirty bytes.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// Return the highest byte offset covered by any buffered segment
+    /// (offset + length). Returns `None` when the buffer is empty.
+    pub fn max_offset(&self) -> Option<u64> {
+        self.segments
+            .iter()
+            .map(|seg| seg.offset + seg.data.len() as u64)
+            .max()
+    }
+
+    /// Drain all segments, returning `(offset, data)` pairs and resetting
+    /// internal state.
+    pub fn drain(&mut self) -> Vec<(u64, Vec<u8>)> {
+        let result: Vec<_> = self
+            .segments
+            .drain(..)
+            .map(|seg| (seg.offset, seg.data))
+            .collect();
+        self.total_bytes = 0;
+        result
+    }
+
+    /// Drain one foreground writeback batch, leaving later dirty segments buffered.
+    ///
+    /// This is used by byte-threshold flushes. Explicit fences still use
+    /// [`WriteBuffer::drain`] so fsync/truncate/unmount publish all pending bytes.
+    pub fn drain_flush_batch(&mut self) -> Vec<(u64, Vec<u8>)> {
+        if self.segments.is_empty() {
+            return Vec::new();
+        }
+
+        let mut remaining = self.config.flush_threshold_bytes;
+        if remaining == 0 {
+            return self.drain();
+        }
+
+        let mut drained = Vec::new();
+        while remaining > 0 && !self.segments.is_empty() {
+            if self.segments[0].data.len() <= remaining {
+                let segment = self.segments.remove(0);
+                remaining -= segment.data.len();
+                drained.push((segment.offset, segment.data));
+                continue;
+            }
+
+            let split_len = remaining;
+            let segment = &mut self.segments[0];
+            let tail = segment.data.split_off(split_len);
+            let drained_data = std::mem::replace(&mut segment.data, tail);
+            let drained_offset = segment.offset;
+            segment.offset = segment.offset.saturating_add(split_len as u64);
+            drained.push((drained_offset, drained_data));
+            remaining = 0;
+        }
+
+        self.total_bytes = self.segments.iter().map(|segment| segment.data.len()).sum();
+        drained
+    }
+
+    /// Truncate buffered writes to at most `size` bytes.
+    ///
+    /// Removes segments whose offset is beyond `size`, and truncates any
+    /// segment that straddles the size boundary.  Used by setattr(size)
+    /// to prevent fsync from restoring data past a truncation point.
+    pub fn truncate(&mut self, size: u64) {
+        self.segments.retain_mut(|seg| {
+            if seg.offset >= size {
+                return false;
+            }
+            let seg_end = seg.offset + seg.data.len() as u64;
+            if seg_end > size {
+                let keep = (size - seg.offset) as usize;
+                seg.data.truncate(keep);
+            }
+            true
+        });
+        self.total_bytes = self.segments.iter().map(|s| s.data.len()).sum();
+    }
+
+    /// Read buffered data overlapping `[read_offset, read_offset + read_len)`.
+    ///
+    /// Returns a byte vector covering the requested range. Gaps (ranges not
+    /// covered by any segment) are filled with zeros. Returns `None` when
+    /// no segment covers any part of the requested range.
+    pub fn read_overlap(&self, read_offset: u64, read_len: usize) -> Option<Vec<u8>> {
+        let read_end = read_offset + read_len as u64;
+        let mut buf = vec![0u8; read_len];
+        let mut any_hit = false;
+
+        for seg in &self.segments {
+            let seg_end = seg.offset + seg.data.len() as u64;
+            if seg.offset < read_end && seg_end > read_offset {
+                any_hit = true;
+                let copy_src_start = if seg.offset > read_offset {
+                    0usize
+                } else {
+                    (read_offset - seg.offset) as usize
+                };
+                let copy_dst_start = if seg.offset > read_offset {
+                    (seg.offset - read_offset) as usize
+                } else {
+                    0usize
+                };
+                let copy_src_end = if seg_end < read_end {
+                    seg.data.len()
+                } else {
+                    (read_end - seg.offset) as usize
+                };
+                let copy_len = copy_src_end - copy_src_start;
+                let dst_slice = &mut buf[copy_dst_start..copy_dst_start + copy_len];
+                dst_slice.copy_from_slice(&seg.data[copy_src_start..copy_src_end]);
+            }
+        }
+
+        if any_hit {
+            Some(buf)
+        } else {
+            None
+        }
+    }
+
+    /// Overlay dirty buffered bytes onto an existing read buffer.
+    ///
+    /// Returns `true` when at least one dirty segment intersected the requested
+    /// range. Unlike `read_overlap`, this leaves non-dirty gaps untouched so
+    /// callers can preserve bytes already loaded from the object store.
+    pub fn overlay_range(&self, read_offset: u64, buf: &mut [u8]) -> bool {
+        if buf.is_empty() {
+            return false;
+        }
+        let read_end = read_offset.saturating_add(buf.len() as u64);
+        let mut any_hit = false;
+
+        for seg in &self.segments {
+            let seg_end = seg.offset.saturating_add(seg.data.len() as u64);
+            if seg.offset < read_end && seg_end > read_offset {
+                any_hit = true;
+                let copy_src_start = if seg.offset > read_offset {
+                    0usize
+                } else {
+                    (read_offset - seg.offset) as usize
+                };
+                let copy_dst_start = if seg.offset > read_offset {
+                    (seg.offset - read_offset) as usize
+                } else {
+                    0usize
+                };
+                let copy_src_end = if seg_end < read_end {
+                    seg.data.len()
+                } else {
+                    (read_end - seg.offset) as usize
+                };
+                let copy_len = copy_src_end - copy_src_start;
+                let dst_slice = &mut buf[copy_dst_start..copy_dst_start + copy_len];
+                dst_slice.copy_from_slice(&seg.data[copy_src_start..copy_src_end]);
+            }
+        }
+
+        any_hit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> WriteBufferConfig {
+        WriteBufferConfig {
+            flush_threshold_bytes: 1024,
+            flush_threshold_age: Duration::from_millis(50),
+        }
+    }
+
+    #[test]
+    fn default_thresholds_match_writeback_batch_policy() {
+        let config = WriteBufferConfig::default();
+        assert_eq!(config.flush_threshold_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.flush_threshold_age, Duration::from_millis(32));
+    }
+
+    #[test]
+    fn sequential_writes_coalesce_into_single_segment() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"hello ", 0);
+        wb.ingest(b"world", 6);
+        assert_eq!(wb.len(), 11);
+        assert!(!wb.is_empty());
+
+        let drained = wb.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, 0);
+        assert_eq!(&drained[0].1, b"hello world");
+        assert!(wb.is_empty());
+        assert_eq!(wb.len(), 0);
+    }
+
+    #[test]
+    fn single_write_below_threshold_no_flush() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(&[0u8; 512], 0);
+        assert!(!wb.should_flush());
+    }
+
+    #[test]
+    fn multiple_small_writes_below_threshold_no_flush() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"aaa", 0);
+        wb.ingest(b"bbb", 3);
+        wb.ingest(b"ccc", 6);
+        assert_eq!(wb.len(), 9);
+        assert!(!wb.should_flush());
+    }
+
+    #[test]
+    fn byte_threshold_triggers_flush() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(&[0u8; 1023], 0);
+        assert!(!wb.should_flush());
+        wb.ingest(b"x", 1023);
+        assert_eq!(wb.len(), 1024);
+        assert!(wb.should_flush());
+    }
+
+    #[test]
+    fn non_contiguous_writes_produce_separate_segments() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"aaaa", 0);
+        wb.ingest(b"bbbb", 100);
+        assert_eq!(wb.len(), 8);
+
+        let drained = wb.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].0, 0);
+        assert_eq!(&drained[0].1, b"aaaa");
+        assert_eq!(drained[1].0, 100);
+        assert_eq!(&drained[1].1, b"bbbb");
+    }
+
+    #[test]
+    fn gap_between_sequential_writes_splits_segments() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"first", 0);
+        wb.ingest(b"second", 20);
+        assert_eq!(wb.len(), 11);
+
+        let drained = wb.drain();
+        assert_eq!(drained.len(), 2);
+    }
+
+    #[test]
+    fn overlapping_write_replaces_prior_bytes() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"hello", 0);
+        wb.ingest(b"XX", 2);
+        assert_eq!(wb.len(), 5);
+
+        let drained = wb.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, 0);
+        assert_eq!(&drained[0].1, b"heXXo");
+    }
+
+    #[test]
+    fn out_of_order_adjacent_writes_merge_sorted() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"BBBB", 8);
+        wb.ingest(b"AAAA", 0);
+        wb.ingest(b"CCCC", 4);
+
+        let drained = wb.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, 0);
+        assert_eq!(&drained[0].1, b"AAAACCCCBBBB");
+    }
+
+    #[test]
+    fn sparse_markers_merge_with_full_page_writeback() {
+        let mut wb = WriteBuffer::new(WriteBufferConfig {
+            flush_threshold_bytes: 128 * 1024,
+            flush_threshold_age: Duration::from_millis(50),
+        });
+        let page_size = 4096usize;
+        let pages = 4usize;
+        let pwrite_offset = 1024usize;
+        let mmap_offset = 3072usize;
+        let pwrite_marker = 0x1122_3344_5566_7788_u64.to_le_bytes();
+        let mmap_marker = 0x8877_6655_4433_2211_u64.to_le_bytes();
+
+        for page in 0..pages {
+            let offset = (page * page_size + pwrite_offset) as u64;
+            wb.ingest(&pwrite_marker, offset);
+        }
+
+        for page in 0..pages {
+            let mut page_bytes = vec![0_u8; page_size];
+            page_bytes[pwrite_offset..pwrite_offset + pwrite_marker.len()]
+                .copy_from_slice(&pwrite_marker);
+            page_bytes[mmap_offset..mmap_offset + mmap_marker.len()].copy_from_slice(&mmap_marker);
+            wb.ingest(&page_bytes, (page * page_size) as u64);
+        }
+
+        assert_eq!(wb.len(), pages * page_size);
+        let drained = wb.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, 0);
+        assert_eq!(drained[0].1.len(), pages * page_size);
+        for page in 0..pages {
+            let base = page * page_size;
+            assert_eq!(
+                &drained[0].1[base + pwrite_offset..base + pwrite_offset + pwrite_marker.len()],
+                &pwrite_marker
+            );
+            assert_eq!(
+                &drained[0].1[base + mmap_offset..base + mmap_offset + mmap_marker.len()],
+                &mmap_marker
+            );
+        }
+    }
+
+    #[test]
+    fn batch_drain_leaves_future_sparse_markers_buffered() {
+        let mut wb = WriteBuffer::new(WriteBufferConfig {
+            flush_threshold_bytes: 8192,
+            flush_threshold_age: Duration::from_millis(50),
+        });
+        let page_size = 4096usize;
+        let pwrite_offset = 1024usize;
+        let marker = 0xaabb_ccdd_eeff_0011_u64.to_le_bytes();
+
+        for page in 0..4 {
+            wb.ingest(&marker, (page * page_size + pwrite_offset) as u64);
+        }
+        for page in 0..2 {
+            let mut page_bytes = vec![0_u8; page_size];
+            page_bytes[pwrite_offset..pwrite_offset + marker.len()].copy_from_slice(&marker);
+            wb.ingest(&page_bytes, (page * page_size) as u64);
+        }
+
+        assert!(wb.should_flush());
+        let batch = wb.drain_flush_batch();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].0, 0);
+        assert_eq!(batch[0].1.len(), 8192);
+        assert_eq!(wb.len(), marker.len() * 2);
+
+        let remaining = wb.drain();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].0, (2 * page_size + pwrite_offset) as u64);
+        assert_eq!(remaining[1].0, (3 * page_size + pwrite_offset) as u64);
+    }
+
+    #[test]
+    fn batch_drain_splits_large_segment_at_threshold() {
+        let mut wb = WriteBuffer::new(WriteBufferConfig {
+            flush_threshold_bytes: 4,
+            flush_threshold_age: Duration::from_millis(50),
+        });
+
+        wb.ingest(b"abcdefghij", 0);
+        let batch = wb.drain_flush_batch();
+
+        assert_eq!(batch, vec![(0, b"abcd".to_vec())]);
+        assert_eq!(wb.len(), 6);
+        assert_eq!(wb.drain(), vec![(4, b"efghij".to_vec())]);
+    }
+
+    #[test]
+    fn age_threshold_does_not_trigger_foreground_flush() {
+        let config = WriteBufferConfig {
+            flush_threshold_bytes: 1024 * 1024,
+            flush_threshold_age: Duration::from_millis(1),
+        };
+        let mut wb = WriteBuffer::new(config);
+        wb.ingest(b"tiny", 0);
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(!wb.should_flush());
+    }
+
+    #[test]
+    fn empty_buffer_never_triggers_age_flush() {
+        let config = WriteBufferConfig {
+            flush_threshold_bytes: 1024,
+            flush_threshold_age: Duration::from_millis(1),
+        };
+        let wb = WriteBuffer::new(config);
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(!wb.should_flush());
+    }
+
+    #[test]
+    fn drain_clears_state() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"data", 0);
+        assert!(!wb.is_empty());
+        assert_eq!(wb.len(), 4);
+
+        let result = wb.drain();
+        assert_eq!(result.len(), 1);
+
+        assert!(wb.is_empty());
+        assert_eq!(wb.len(), 0);
+        assert!(!wb.should_flush());
+    }
+
+    #[test]
+    fn drain_then_reingest_remains_below_byte_threshold() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"first", 0);
+        let _ = wb.drain();
+        wb.ingest(b"second", 0);
+        assert!(!wb.should_flush());
+    }
+
+    #[test]
+    fn zero_length_ingest_is_ignored() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"", 0);
+        assert!(wb.is_empty());
+        assert_eq!(wb.len(), 0);
+        assert!(!wb.should_flush());
+    }
+
+    #[test]
+    fn truncate_to_empty_clears_age_state() {
+        let config = WriteBufferConfig {
+            flush_threshold_bytes: 1024,
+            flush_threshold_age: Duration::from_millis(1),
+        };
+        let mut wb = WriteBuffer::new(config);
+        wb.ingest(b"dirty", 0);
+        wb.truncate(0);
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(wb.is_empty());
+        assert!(!wb.should_flush());
+    }
+
+    #[test]
+    fn read_overlap_full_match() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"hello world", 0);
+        let result = wb.read_overlap(0, 11);
+        assert_eq!(result, Some(b"hello world".to_vec()));
+    }
+
+    #[test]
+    fn read_overlap_partial_from_start() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"hello world", 0);
+        let result = wb.read_overlap(0, 5);
+        assert_eq!(result, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn read_overlap_partial_from_middle() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"hello world", 0);
+        let result = wb.read_overlap(6, 5);
+        assert_eq!(result, Some(b"world".to_vec()));
+    }
+
+    #[test]
+    fn read_overlap_across_segments() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"AAAA", 0);
+        wb.ingest(b"BBBB", 10);
+        let result = wb.read_overlap(2, 12);
+        assert_eq!(result, Some(b"AA\x00\x00\x00\x00\x00\x00BBBB".to_vec()));
+    }
+
+    #[test]
+    fn read_overlap_no_hit_returns_none() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"data", 100);
+        let result = wb.read_overlap(0, 50);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn read_overlap_gap_filled_with_zero() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"AA", 0);
+        let result = wb.read_overlap(0, 5);
+        assert_eq!(result, Some(b"AA\x00\x00\x00".to_vec()));
+    }
+
+    #[test]
+    fn overlay_range_preserves_clean_gaps() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"dirty", 4);
+        let mut base = b"abcdefghijkl".to_vec();
+
+        assert!(wb.overlay_range(0, &mut base));
+
+        assert_eq!(&base, b"abcddirtyjkl");
+    }
+}

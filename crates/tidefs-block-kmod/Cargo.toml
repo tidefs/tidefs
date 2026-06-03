@@ -1,0 +1,31 @@
+[package]
+name = "tidefs-block-kmod"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "TideFS block-volume kernel module (c8 / kmod.block_volume_adapter.block.k0) — fixed-capacity block device export consuming the s2 bridge"
+
+[lib]
+name = "tidefs_block_kmod"
+path = "src/lib.rs"
+
+[dependencies]
+tidefs-kmod-bridge = { path = "../../kmod" }
+tidefs-vfs-engine = { path = "../tidefs-vfs-engine" }
+blake3 = { version = "1", default-features = false }
+tidefs-kernel-storage-io = { path = "../tidefs-kernel-storage-io" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Historical compatibility no-op. The Linux 7.0 .ko is built by Kbuild from
+# tidefs_block_kmod.rs under CONFIG_RUST; do not add module registration code
+# behind this Cargo feature.
+kernel-module = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(CONFIG_RUST)"] }

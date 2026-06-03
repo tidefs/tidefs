@@ -1,0 +1,21 @@
+[package]
+name = "tidefs-encryption"
+version = "0.1.0"
+edition = "2021"
+description = "Transparent ChaCha20-Poly1305 AEAD encryption wrapper for the TideFS local object store"
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+chacha20poly1305 = "0.10"
+rand = "0.8"
+blake3 = "1.5"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+hmac = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
+tempfile = "3"

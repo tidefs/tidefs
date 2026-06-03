@@ -1,0 +1,156 @@
+[package]
+name = "tidefs-validation"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Userspace validation harness: no-run compile tests, trace oracle for
+peer-crate operation recording/replay, and cargo-based smoke framework
+exercising peer crates as they land.
+"""
+
+[features]
+default = []
+
+# Capability-named features (at most 8).  Each groups related optional
+# dependencies so callers enable what they need without document-reference
+# names.
+
+# Core storage structures: btree, block-allocator, dir-index, extent-map.
+storage-core = [
+    "dep:tidefs-btree",
+    "dep:tidefs-block-allocator",
+    "dep:tidefs-types-vfs-core",
+    "dep:tidefs-dir-index",
+    "dep:tidefs-types-polymorphic-directory-index-core",
+    "dep:tidefs-extent-map",
+    "dep:tidefs-types-extent-map-core",
+]
+
+# ublk block-volume adapter validation.
+ublk = [
+    "dep:tidefs-block-volume-adapter-core",
+    "dep:tidefs-ublk-abi",
+    "dep:tidefs-block-volume-adapter-ublk-control-runtime",
+]
+
+# Multi-node transport cache-coherency and transport-pipeline validation.
+transport = ["dep:tidefs-types-cache-lattice-core", "dep:tidefs-cache-core", "dep:tidefs-transport", "dep:tidefs-send-stream"]
+
+# Cluster placement/heal validation.
+cluster-placement-heal = ["dep:tidefs-cluster"]
+
+# Full FUSE userspace POSIX validation: VfsEngine, all POSIX adapter workers,
+# and every storage backend needed by the FUSE data path.
+fuse = [
+    "dep:tidefs-posix-filesystem-adapter-daemon",
+    "storage-core",
+    "dep:tidefs-local-object-store",
+    "dep:tidefs-encryption",
+    "dep:tidefs-space-accounting",
+    "dep:tidefs-types-space-accounting-core",
+    "dep:tidefs-compression",
+    "dep:tidefs-frame",
+    "dep:tidefs-object-io",
+    "dep:tidefs-local-filesystem",
+    "dep:tidefs-intent-log",
+    "dep:tidefs-reclaim",
+    "dep:tidefs-namespace",
+    "dep:tidefs-inode-attributes",
+    "dep:tidefs-inode-table",
+    "dep:tidefs-commit_group",
+    "dep:tidefs-trace-oracle",
+    "dep:tidefs-vfs-engine",
+    "dep:tidefs-posix-semantics",
+    "dep:tidefs-posix-acl",
+    "dep:tidefs-permission",
+    "dep:tidefs-xattr-storage",
+    "dep:tidefs-types-polymorphic-xattr-core",
+    "dep:tidefs-types-control-plane-core",
+    "dep:tidefs-types-posix-filesystem-adapter-core",
+    "dep:tidefs-posix-filesystem-adapter-workers-io",
+    "dep:tidefs-posix-filesystem-adapter-workers-locks",
+]
+
+# All features enabled.
+full = [
+    "fuse",
+    "ublk",
+    "storage-core",
+    "transport",
+    "cluster-placement-heal",
+]
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+blake3 = "=1.5.5"
+serde_json = "1"
+tempfile = "3"
+tidefs-checksum-tree = { path = "../tidefs-checksum-tree" }
+tidefs-btree = { path = "../tidefs-btree", optional = true }
+tidefs-block-allocator = { path = "../tidefs-block-allocator", optional = true }
+tidefs-block-volume-adapter-core = { path = "../tidefs-block-volume-adapter-core", optional = true }
+tidefs-ublk-abi = { path = "../tidefs-ublk-abi", optional = true }
+tidefs-block-volume-adapter-ublk-control-runtime = { path = "../tidefs-block-volume-adapter-ublk-control-runtime", optional = true }
+tidefs-dir-index = { path = "../tidefs-dir-index", optional = true }
+tidefs-types-polymorphic-directory-index-core = { path = "../tidefs-types-polymorphic-directory-index-core", optional = true }
+tidefs-extent-map = { path = "../tidefs-extent-map", optional = true }
+tidefs-types-extent-map-core = { path = "../tidefs-types-extent-map-core", optional = true }
+tidefs-local-object-store = { path = "../tidefs-local-object-store", optional = true }
+tidefs-encryption = { path = "../tidefs-encryption", optional = true }
+tidefs-compression = { path = "../tidefs-compression", optional = true }
+tidefs-space-accounting = { path = "../tidefs-space-accounting", optional = true }
+tidefs-types-space-accounting-core = { path = "../tidefs-types-space-accounting-core", optional = true }
+tidefs-frame = { path = "../tidefs-frame", optional = true }
+tidefs-object-io = { path = "../tidefs-object-io", optional = true }
+tidefs-local-filesystem = { path = "../tidefs-local-filesystem", optional = true }
+tidefs-intent-log = { path = "../tidefs-intent-log", optional = true }
+tidefs-reclaim = { path = "../tidefs-reclaim", optional = true }
+tidefs-namespace = { path = "../tidefs-namespace", optional = true }
+tidefs-inode-attributes = { path = "../tidefs-inode-attributes", optional = true }
+tidefs-inode-table = { path = "../tidefs-inode-table", optional = true }
+tidefs-commit_group = { path = "../tidefs-commit_group", optional = true }
+tidefs-trace-oracle = { path = "../tidefs-trace-oracle", optional = true }
+tidefs-vfs-engine = { path = "../tidefs-vfs-engine", optional = true }
+tidefs-posix-semantics = { path = "../tidefs-posix-semantics", optional = true }
+tidefs-posix-acl = { path = "../tidefs-posix-acl", optional = true }
+tidefs-permission = { path = "../tidefs-permission", optional = true }
+tidefs-xattr-storage = { path = "../tidefs-xattr-storage", optional = true }
+tidefs-types-polymorphic-xattr-core = { path = "../tidefs-types-polymorphic-xattr-core", features = ["alloc"], optional = true }
+tidefs-types-control-plane-core = { path = "../tidefs-types-control-plane-core", optional = true }
+tidefs-types-posix-filesystem-adapter-core = { path = "../tidefs-types-posix-filesystem-adapter-core", optional = true }
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core", optional = true }
+tidefs-cluster = { path = "../tidefs-cluster", optional = true }
+tidefs-types-cache-lattice-core = { path = "../tidefs-types-cache-lattice-core", optional = true }
+tidefs-cache-core = { path = "../tidefs-cache-core", optional = true }
+tidefs-transport = { path = "../tidefs-transport", optional = true }
+
+tidefs-posix-filesystem-adapter-daemon = { path = "../../apps/tidefs-posix-filesystem-adapter-daemon", optional = true }
+tidefs-posix-filesystem-adapter-workers-io = { path = "../tidefs-posix-filesystem-adapter-workers-io", optional = true }
+tidefs-posix-filesystem-adapter-workers-locks = { path = "../tidefs-posix-filesystem-adapter-workers-locks", optional = true }
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+
+tokio = { version = "1", features = ["sync", "rt"] }
+tidefs-cluster = { path = "../tidefs-cluster" }
+proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
+
+tidefs-xattr-storage = { path = "../tidefs-xattr-storage" }
+tidefs-intent-log = { path = "../tidefs-intent-log" }
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+tidefs-vfs-engine = { path = "../tidefs-vfs-engine" }
+tidefs-two-node-harness = { path = "../tidefs-two-node-harness" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-block-volume-adapter-daemon = { path = "../../apps/tidefs-block-volume-adapter-daemon" }
+tidefs-block-volume-adapter-core = { path = "../tidefs-block-volume-adapter-core" }
+tidefs-ublk-abi = { path = "../tidefs-ublk-abi" }
+
+[dependencies.tidefs-send-stream]
+path = "../tidefs-send-stream"
+optional = true

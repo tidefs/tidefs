@@ -1,0 +1,12 @@
+; Mixed read/write storm with high concurrency
+; TideFS fio benchmarking — profile 2 pressure
+[randrw-storm]
+rw=randrw
+rwmixread=70
+bs=4k
+iodepth=64
+size=64M
+offset=0
+runtime=30s
+time_based=1
+rate_iops=5000

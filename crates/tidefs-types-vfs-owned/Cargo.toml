@@ -1,0 +1,15 @@
+[package]
+name = "tidefs-types-vfs-owned"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Portable alloc-backed VFS boundary owned mirrors for tidefs"
+
+[dependencies]
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+
+[lib]
+path = "src/lib.rs"

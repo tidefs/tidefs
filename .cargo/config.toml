@@ -1,0 +1,16 @@
+# ── TideFS validation cargo aliases ────────────────────────────────────────
+
+[alias]
+validate-smoke = "test -p tidefs-validation --features full --test '*'"
+validate-trace = "test -p tidefs-validation --lib -- trace"
+validate-full = "test -p tidefs-validation --features full"
+validate-check = "check -p tidefs-validation --features full"
+
+# ── Workspace warning denial (issue #4065) ─────────────────────────────────
+[build]
+rustflags = [
+  "-D", "dead_code",
+  "-D", "unused_imports",
+  "-D", "unused_variables",
+  "-D", "unused_mut",
+]

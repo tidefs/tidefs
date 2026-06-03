@@ -1,0 +1,53 @@
+name: RDMA
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '43 2 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rdma:
+    name: ${{ matrix.name }}
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1' }}
+    runs-on: [self-hosted, linux, x64, tidefs, nix, kvm, rdma]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: static-carrier-check
+            command: nix build -L .#checks.x86_64-linux.rdmaCarrierTwoNode
+          - name: host-probe
+            command: nix run .#rdma-probe
+          - name: qemu-two-node
+            command: nix run .#qemu-rdma-two-node-nixos -- --validation-dir /tmp/tidefs-rdma-two-node
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Host preflight
+        run: |
+          test -c /dev/kvm
+          command -v modinfo >/dev/null
+
+      - name: Run RDMA target
+        run: timeout --foreground 10800s bash -lc '${{ matrix.command }}'
+
+      - name: Upload RDMA output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rdma-${{ matrix.name }}
+          path: |
+            /tmp/tidefs-rdma-two-node/**
+            /tmp/tidefs-validation/**
+          if-no-files-found: ignore
+          retention-days: 7

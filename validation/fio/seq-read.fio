@@ -1,0 +1,15 @@
+; ublk fio verification: sequential read verify against ublk block device
+; Depends on seq-write having been run first to lay down verifiable data.
+[global]
+ioengine=psync
+direct=1
+bs=4k
+runtime=10s
+time_based=0
+
+[seq-read-verify]
+rw=read
+verify=crc32c
+verify_fatal=1
+size=3M
+offset=0

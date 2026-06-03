@@ -1,0 +1,22 @@
+[package]
+name = "tidefs-shard-group"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Shard group lifecycle: ingest durability ladder, ShardGroupV1 on-media format, erasure-coded shard encoding and decoding"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+blake3 = "1"
+tidefs-erasure-coding = { path = "../tidefs-erasure-coding" }
+tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core" }
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"

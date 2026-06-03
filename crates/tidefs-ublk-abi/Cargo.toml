@@ -1,0 +1,11 @@
+[package]
+name = "tidefs-ublk-abi"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Typed Linux ublk userspace ABI constants and dry-run control plans for TideFS"
+
+[lib]
+path = "src/lib.rs"

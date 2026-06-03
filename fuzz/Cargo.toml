@@ -1,0 +1,113 @@
+[workspace]
+[package]
+name = "tidefs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "GPL-2.0-only WITH Linux-syscall-note"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Crates under fuzz
+tidefs-ublk-abi = { path = "../crates/tidefs-ublk-abi" }
+tidefs-schema-codec-vfs = { path = "../crates/tidefs-schema-codec-vfs" }
+tidefs-encryption = { path = "../crates/tidefs-encryption" }
+tidefs-compression = { path = "../crates/tidefs-compression" }
+tidefs-local-object-store = { path = "../crates/tidefs-local-object-store" }
+tidefs-lease = { path = "../crates/tidefs-lease" }
+tidefs-witness-set = { path = "../crates/tidefs-witness-set" }
+tidefs-quorum-write = { path = "../crates/tidefs-quorum-write" }
+tidefs-membership-epoch = { path = "../crates/tidefs-membership-epoch" }
+tidefs-transport = { path = "../crates/tidefs-transport" }
+tidefs-types-transport-session = { path = "../crates/tidefs-types-transport-session" }
+bincode = "1"
+tempfile = "3"
+
+# Prevent this from being caught by workspace resolution
+[lib]
+path = "fake_lib.rs"
+
+[[bin]]
+name = "ublk_command_parse"
+path = "fuzz_targets/ublk_command_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "object_store_record_decode"
+path = "fuzz_targets/object_store_record_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encryption_roundtrip"
+path = "fuzz_targets/encryption_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encryption_tamper"
+path = "fuzz_targets/encryption_tamper.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "compression_roundtrip"
+path = "fuzz_targets/compression_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "lease_lifecycle"
+path = "fuzz_targets/lease_lifecycle.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "witness_quorum"
+path = "fuzz_targets/witness_quorum.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "quorum_write"
+path = "fuzz_targets/quorum_write.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "transport_handshake_decode"
+path = "fuzz_targets/transport_handshake_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "transport_session_state_machine"
+path = "fuzz_targets/transport_session_state_machine.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "transport_frame_decode"
+path = "fuzz_targets/transport_frame_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "transport_lane_demux"
+path = "fuzz_targets/transport_lane_demux.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "transport_chunk_shipper"
+path = "fuzz_targets/transport_chunk_shipper.rs"
+test = false
+doc = false

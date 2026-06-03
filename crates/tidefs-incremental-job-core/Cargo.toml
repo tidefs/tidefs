@@ -1,0 +1,21 @@
+[package]
+name = "tidefs-incremental-job-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Control-plane IncrementalJob trait and checkpoint serialization contract
+for the universal incremental cursor framework (Phase 2 of #1239).
+All 8+ background subsystems implement this single trait.
+Uses tidefs-types-incremental-job-core for data-plane types.
+"""
+
+[features]
+default = ["alloc"]
+alloc = ["tidefs-types-incremental-job-core/alloc"]
+
+[dependencies]
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core", default-features = false }

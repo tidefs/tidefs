@@ -1,0 +1,14 @@
+; Discard/TRIM pressure workload
+; TideFS fio benchmarking — profile 2 pressure
+[trim-pressure]
+rw=trim
+bs=4k
+iodepth=4
+size=32M
+offset=0
+[write-after-trim]
+rw=write
+bs=4k
+iodepth=4
+size=16M
+offset=0

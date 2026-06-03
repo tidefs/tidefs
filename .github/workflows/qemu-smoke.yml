@@ -1,0 +1,48 @@
+name: QEMU Smoke
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: ${{ matrix.name }}
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1' }}
+    runs-on: [self-hosted, linux, x64, tidefs, nix, kvm]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: kmod-xfstests-smoke
+            command: nix run .#kmod-xfstests-smoke -- --timeout 1800
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Host preflight
+        run: |
+          test -c /dev/kvm
+          test -c /dev/fuse
+
+      - name: Run smoke target
+        run: timeout --foreground 7200s bash -lc '${{ matrix.command }}'
+
+      - name: Upload runtime output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qemu-smoke-${{ matrix.name }}
+          path: |
+            /tmp/tidefs-validation/**
+          if-no-files-found: ignore
+          retention-days: 7

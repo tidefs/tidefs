@@ -1,0 +1,25 @@
+[package]
+name = "tidefs-dataset-catalog"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Pool-wide dataset catalog with B+tree path-to-ID mapping and online rename
+without unmount. Maps dataset paths to stable dataset IDs so file handles
+survive renames.
+"""
+
+[dependencies]
+tidefs-btree = { path = "../tidefs-btree" }
+tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
+blake3 = { version = "1", default-features = false }
+tidefs-dataset-properties = { path = "../tidefs-dataset-properties" }
+
+[dev-dependencies]
+
+[lib]
+path = "src/lib.rs"

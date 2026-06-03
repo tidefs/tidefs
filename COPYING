@@ -1,0 +1,27 @@
+TideFS is licensed under the GNU General Public License version 2 only,
+with the Linux-style syscall/interface exception for applications that use the
+clear syscall-like public interface boundary.
+
+The clear interface boundary includes ordinary application use through POSIX
+system calls, kernel UAPI/ioctl-style interfaces, FUSE/ublk protocol entry
+points, stable command-line tools, and documented wire protocols. Independent
+applications that use only those boundaries are not treated as derived works
+merely because they communicate with TideFS.
+
+Code that links to TideFS internal crates, embeds TideFS implementation code,
+or depends on non-public implementation interfaces is not covered by that
+interface exception merely by calling into Rust APIs.
+
+SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+
+The GPLv2 text is kept in:
+
+  LICENSES/preferred/GPL-2.0
+
+The syscall exception text is kept in:
+
+  LICENSES/exceptions/Linux-syscall-note
+
+Individual vendored or imported files may carry their own compatible SPDX
+license identifiers. Those file-local notices remain authoritative for those
+files.

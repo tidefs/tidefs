@@ -1,0 +1,43 @@
+[package]
+name = "tidefsctl"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "TideFS operator CLI — pool lifecycle, snapshot management, device/block operations, and userspace harness"
+
+[dependencies]
+tidefs-posix-filesystem-adapter-daemon = { path = "../../apps/tidefs-posix-filesystem-adapter-daemon" }
+tidefs-block-volume-adapter-core = { path = "../../crates/tidefs-block-volume-adapter-core" }
+tidefs-pool-import = { path = "../../crates/tidefs-pool-import" }
+tidefs-pool-scan = { path = "../../crates/tidefs-pool-scan" }
+tidefs-validation = { path = "../../crates/tidefs-validation" }
+tidefs-recovery-loop = { path = "../../crates/tidefs-recovery-loop" }
+tidefs-replication-model = { path = "../../crates/tidefs-replication-model" }
+tidefs-types-pool-label-core = { path = "../../crates/tidefs-types-pool-label-core" }
+tidefs-local-object-store = { path = "../../crates/tidefs-local-object-store" }
+tidefs-local-filesystem = { path = "../../crates/tidefs-local-filesystem" }
+tidefs-dataset-lifecycle = { path = "../../crates/tidefs-dataset-lifecycle" }
+tidefs-dataset-properties = { path = "../../crates/tidefs-dataset-properties" }
+tidefs-dataset-feature-flags = { path = "../../crates/tidefs-dataset-feature-flags" }
+tidefs-types-dataset-feature-flags-core = { path = "../../crates/tidefs-types-dataset-feature-flags-core" }
+tidefs-cluster = { path = "../../crates/tidefs-cluster" }
+tidefs-membership-epoch = { path = "../../crates/tidefs-membership-epoch" }
+blake3 = "=1.5.5"
+tidefs-transport = { path = "../../crates/tidefs-transport" }
+tidefs-block-volume-adapter-daemon = { path = "../../apps/tidefs-block-volume-adapter-daemon" }
+tidefs-block-volume-adapter-ublk-control-runtime = { path = "../../crates/tidefs-block-volume-adapter-ublk-control-runtime" }
+clap = { version = "4", features = ["derive"] }
+bincode = "1"
+serde_json = "1"
+tidefs-encryption = { path = "../../crates/tidefs-encryption" }
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "tidefsctl"
+path = "src/main.rs"

@@ -1,0 +1,33 @@
+[package]
+name = "tidefs-replicated-object-store"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "N-replica replicated object store wrapping N LocalObjectStore instances with quorum write protocol I/O coordination"
+
+[dependencies]
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tidefs-quorum-write = { path = "../tidefs-quorum-write" }
+tidefs-quorum-write-runtime = { path = "../tidefs-quorum-write-runtime" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-replica-health = { path = "../tidefs-replica-health" }
+tidefs-transport = { path = "../tidefs-transport" }
+tidefs-replication = { path = "../tidefs-replication" }
+tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-verification-engine = { path = "../tidefs-verification-engine" }
+tidefs-types-transport-session = { path = "../tidefs-types-transport-session" }
+tracing = "0.1"
+bincode = "1"
+blake3 = "1"
+tidefs-witness-set = { path = "../tidefs-witness-set" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,7934 @@
+//! VfsEngine trait implementation wrapping LocalFileSystem.
+//!
+//! Wraps `LocalFileSystem` in a `RefCell` to provide interior mutability,
+//! matching the VfsEngine `&self` contract. Maps all 30 canonical VFS
+//! operations to existing LocalFileSystem path-based methods using a
+//! lazy inode-to-path resolution layer.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use tidefs_local_object_store::StoreError;
+use tidefs_types_extent_map_core::ExtentMapOps;
+use tidefs_types_vfs_core::{
+    DirEntry, DirHandleId, EngineDirHandle, EngineFileHandle, Errno, Generation, InodeAttr,
+    InodeFlags, InodeId, LockSpec, NodeKind, PosixAttrs, RequestCtx, SetAttr, StatFs,
+    FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_INSERT_RANGE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE,
+    FALLOC_FL_ZERO_RANGE, FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID,
+    FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID,
+    ROOT_INODE_ID, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
+};
+use tidefs_types_vfs_core::{LockRange, LockType};
+use tidefs_vfs_engine::{LseekDataRange, VfsEngine, VfsEngineStatFs};
+
+use crate::error::FileSystemError;
+use crate::fuse_getattr;
+use crate::fuse_setattr;
+use crate::fuse_statfs;
+use crate::helpers::{kind_bits, validate_name};
+use crate::open_dispatch::{self, FileHandleState, FileHandleTable};
+use crate::readahead::ReadaheadTracker;
+use crate::release_dispatch;
+use crate::types::{InodeRecord, NamespaceEntry};
+use crate::xattr_dispatch;
+use tidefs_inode_attributes::timestamp::{TimestampPolicy, TimestampUpdate};
+use tidefs_posix_semantics::apply_setgid_inheritance_for_create;
+use tidefs_posix_semantics::sticky_dir_allows_unlink_or_rename;
+
+use crate::namespace::rename::RenameAt2Flags;
+use tidefs_dataset_lifecycle::SyncGuarantee;
+
+// DirCursor-backed readdir with BLAKE3-verified entry iteration.
+use crate::{CopyFileRangeIntent, LocalFileSystem};
+use tidefs_dir_index::{DatasetDirPolicy, DirCursor, DirIndex};
+
+use tidefs_inode_table::{Ino, InodeTable};
+
+#[cfg(test)]
+const O_RDONLY: u32 = 0;
+const O_WRONLY: u32 = 0o1;
+const O_RDWR: u32 = 0o2;
+const O_ACCMODE: u32 = 0o3;
+const O_EXCL: u32 = 0o200;
+const O_TRUNC: u32 = 0o1000;
+const O_APPEND: u32 = 0o2000;
+
+fn open_flags_allow_read(flags: u32) -> bool {
+    flags & O_ACCMODE != O_WRONLY
+}
+
+fn open_flags_allow_write(flags: u32) -> bool {
+    matches!(flags & O_ACCMODE, O_WRONLY | O_RDWR)
+}
+
+// ── Path helpers ─────────────────────────────────────────────────────────
+
+fn bytes_to_str(bytes: &[u8]) -> std::result::Result<&str, Errno> {
+    std::str::from_utf8(bytes).map_err(|_| Errno::EINVAL)
+}
+
+fn child_name_to_str(bytes: &[u8]) -> std::result::Result<&str, Errno> {
+    let name_str = bytes_to_str(bytes)?;
+    validate_name(bytes).map_err(|err| match err {
+        FileSystemError::InvalidName { reason, .. } if reason.contains("too long") => {
+            Errno::ENAMETOOLONG
+        }
+        FileSystemError::InvalidName { .. } => Errno::EINVAL,
+        _ => Errno::EINVAL,
+    })?;
+    Ok(name_str)
+}
+
+fn build_child_path(parent_path: &str, name: &[u8]) -> std::result::Result<String, Errno> {
+    let name_str = child_name_to_str(name)?;
+    if parent_path == "/" {
+        Ok(format!("/{name_str}"))
+    } else {
+        Ok(format!("{parent_path}/{name_str}"))
+    }
+}
+
+/// Map a LocalFileSystem error to the canonical VFS Errno.
+fn map_errno(err: &FileSystemError) -> Errno {
+    match err {
+        FileSystemError::NotFound { .. } => Errno::ENOENT,
+        FileSystemError::AlreadyExists { .. } => Errno::EEXIST,
+        FileSystemError::NotDirectory { .. } => Errno::ENOTDIR,
+        FileSystemError::AclValidationFailed { .. } => Errno::EINVAL,
+        FileSystemError::IsDirectory { .. } => Errno::EISDIR,
+        FileSystemError::DirectoryNotEmpty { .. } => Errno::ENOTEMPTY,
+        FileSystemError::NoSpace { .. } => Errno::ENOSPC,
+        FileSystemError::NotFile { .. } => Errno::EINVAL,
+        FileSystemError::QuotaExceeded { .. } => Errno::ENOSPC,
+        FileSystemError::InvalidName { .. } => Errno::ENAMETOOLONG,
+        FileSystemError::InvalidPath { .. } => Errno::EINVAL,
+        FileSystemError::CorruptState { .. } => Errno::EIO,
+        FileSystemError::CorruptContent { .. } => Errno::EIO,
+        FileSystemError::Unsupported { .. } => Errno::EOPNOTSUPP,
+        FileSystemError::SizeOverflow { .. } => Errno::EFBIG,
+        FileSystemError::Store(StoreError::NoSpace) => Errno::ENOSPC,
+        _ => Errno::EIO,
+    }
+}
+
+// ── VfsLocalFileSystem ────────────────────────────────────────────────────
+
+/// VfsEngine adapter wrapping `LocalFileSystem` with interior mutability.
+///
+/// Maintains a lazy inode→path cache that bridges the VfsEngine inode
+/// space to LocalFileSystem path space.  The cache is populated by a
+/// single tree walk from root on first miss and invalidated as needed.
+pub struct VfsLocalFileSystem {
+    fs: RefCell<LocalFileSystem>,
+    path_cache: RefCell<BTreeMap<InodeId, String>>,
+    file_handle_table: RefCell<FileHandleTable>,
+    active_dir_handles: RefCell<BTreeMap<DirHandleId, InodeId>>,
+    next_dir_handle_id: RefCell<u64>,
+    anonymous_tmpfiles: RefCell<BTreeMap<InodeId, AnonymousTmpfile>>,
+    next_anonymous_inode_id: RefCell<u64>,
+    /// Optional inode table for metadata prefetch during readdir.
+    /// When set, `readdir` issues a best-effort `prefetch_batch` call
+    /// to prime the in-memory attribute cache for listed entries.
+    inode_table: Option<Arc<InodeTable>>,
+    /// When set, all path resolution is scoped to this filesystem directory,
+    /// typically the backing directory of a non-root dataset.  The root inode
+    /// (ROOT_INODE_ID) maps to this path instead of "/".
+    dataset_root_path: Option<String>,
+    /// Mount-level atime policy (relatime, noatime, strictatime).
+    timestamp_policy: TimestampPolicy,
+    /// Per-dataset write-acknowledgment durability guarantee.
+    sync_guarantee: SyncGuarantee,
+    readahead_tracker: ReadaheadTracker,
+}
+
+// ActiveFileHandle replaced by FileHandleState from open_dispatch
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AnonymousTmpfile {
+    attr: InodeAttr,
+    data: Vec<u8>,
+}
+
+impl VfsLocalFileSystem {
+    const POSIX_ACL_ACCESS_XATTR: &[u8] = b"system.posix_acl_access";
+    const POSIX_ACL_DEFAULT_XATTR: &[u8] = b"system.posix_acl_default";
+
+    /// Wrap an open `LocalFileSystem` into a VfsEngine adapter.
+    pub fn new(fs: LocalFileSystem) -> Self {
+        let mut path_cache = BTreeMap::new();
+        path_cache.insert(ROOT_INODE_ID, "/".to_string());
+        Self {
+            fs: RefCell::new(fs),
+            path_cache: RefCell::new(path_cache),
+            file_handle_table: RefCell::new(FileHandleTable::new()),
+            active_dir_handles: RefCell::new(BTreeMap::new()),
+            next_dir_handle_id: RefCell::new(1),
+            anonymous_tmpfiles: RefCell::new(BTreeMap::new()),
+            next_anonymous_inode_id: RefCell::new(1_u64 << 63),
+            dataset_root_path: None,
+            inode_table: None,
+            timestamp_policy: TimestampPolicy::Relatime,
+            readahead_tracker: ReadaheadTracker::new(),
+            sync_guarantee: SyncGuarantee::Local,
+        }
+    }
+
+    /// Scope all path resolution to a dataset directory within the pool.
+    ///
+    /// When set, `ROOT_INODE_ID` maps to `root_path` instead of `"/"`,
+    /// so the FUSE mount root exposes only that dataset's contents.
+    /// `root_path` must be an absolute path relative to the pool root.
+    pub fn with_dataset_root(mut self, root_path: &str) -> Self {
+        let root = root_path.to_string();
+        self.path_cache.borrow_mut().clear();
+        self.path_cache
+            .borrow_mut()
+            .insert(ROOT_INODE_ID, root.clone());
+        self.dataset_root_path = Some(root);
+        self
+    }
+
+    /// Set the per-dataset write-acknowledgment durability guarantee.
+    ///
+    /// Controls when write/flush/fsync operations acknowledge completion.
+    /// Default: [`SyncGuarantee::Local`].
+    pub fn with_sync_guarantee(mut self, guarantee: SyncGuarantee) -> Self {
+        self.sync_guarantee = guarantee;
+        self
+    }
+
+    /// Return the effective root path for path resolution.
+    ///
+    /// When [`dataset_root_path`] is set, it is the dataset directory.
+    /// Otherwise it is `"/"` (the pool root).
+    fn root_path(&self) -> String {
+        self.dataset_root_path
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| "/".to_string())
+    }
+
+    /// Consume the adapter and return the inner `LocalFileSystem`.
+    pub fn into_inner(self) -> LocalFileSystem {
+        self.fs.into_inner()
+    }
+
+    /// Set an inode table for metadata prefetch during readdir.
+    ///
+    /// When set, each [`readdir`](VfsEngine::readdir) call issues a
+    /// best-effort batch prefetch of the inode attributes for the listed
+    /// entries to warm the in-memory cache.
+    pub fn set_inode_table(&mut self, table: Arc<InodeTable>) {
+        self.inode_table = Some(table);
+    }
+
+    /// Set the mount-level atime policy for automatic timestamp updates.
+    ///
+    /// Defaults to [`TimestampPolicy::Relatime`].
+    pub fn set_timestamp_policy(&mut self, policy: TimestampPolicy) {
+        self.timestamp_policy = policy;
+    }
+
+    /// Access the file-handle table for inspection or direct validation.
+    ///
+    /// The adapter layer typically validates handles through the engine's
+    /// IO methods (read, write, etc.), which query this table internally.
+    /// This accessor is only needed when callers must inspect handle state
+    /// without performing IO.
+    pub fn file_handle_table(&self) -> &RefCell<FileHandleTable> {
+        &self.file_handle_table
+    }
+
+    /// Direct inode-ID-based attribute lookup (bypasses path resolution).
+    ///
+    /// Calls `engine_getattr` on the inner
+    /// [`LocalFileSystem`], resolving the inode through the ARC cache
+    /// and inode table without converting to a path first.
+    ///
+    /// This is the preferred entry point for FUSE GETATTR dispatch when
+    /// the caller already has an inode number.
+    pub fn getattr_by_ino(&self, ino: u64) -> std::result::Result<InodeAttr, Errno> {
+        fuse_getattr::engine_getattr(&self.fs.borrow(), ino).map_err(|e| e.to_errno())
+    }
+
+    /// Direct inode-ID-based attribute mutation (bypasses path resolution).
+    ///
+    /// Calls `engine_setattr` on the inner
+    /// [`LocalFileSystem`], applying the metadata-only fields of `set`
+    /// (mode, uid, gid, timestamps) through the mutation machinery.
+    ///
+    /// `FATTR_SIZE` is not handled here; the caller is responsible for
+    /// file-content manipulation before invoking this method.
+    ///
+    /// This is the preferred entry point for FUSE SETATTR metadata dispatch.
+    pub fn setattr_by_ino(&self, ino: u64, set: &SetAttr) -> std::result::Result<InodeAttr, Errno> {
+        fuse_setattr::engine_setattr(&mut self.fs.borrow_mut(), ino, set).map_err(|e| e.to_errno())
+    }
+
+    fn allocate_dir_handle_id(&self) -> std::result::Result<DirHandleId, Errno> {
+        let mut next = self.next_dir_handle_id.borrow_mut();
+        let id = *next;
+        if id == 0 {
+            return Err(Errno::EIO);
+        }
+        *next = next.checked_add(1).unwrap_or(0);
+        Ok(DirHandleId::new(id))
+    }
+
+    // allocate_file_handle_id replaced by FileHandleTable::register()
+
+    fn allocate_anonymous_inode_id(&self) -> std::result::Result<InodeId, Errno> {
+        let mut next = self.next_anonymous_inode_id.borrow_mut();
+        let id = *next;
+        if id == 0 {
+            return Err(Errno::EIO);
+        }
+        *next = next.checked_add(1).unwrap_or(0);
+        Ok(InodeId::new(id))
+    }
+
+    fn anonymous_attr(inode_id: InodeId, mode: u32, ctx: &RequestCtx) -> InodeAttr {
+        let generation = Generation::new(inode_id.get());
+        let masked_permissions = (mode & 0o7777) & !ctx.umask;
+        let now_ns = crate::types::current_posix_time_ns();
+        InodeAttr {
+            inode_id,
+            generation,
+            kind: NodeKind::File,
+            posix: PosixAttrs {
+                mode: kind_bits(NodeKind::File) | masked_permissions,
+                uid: ctx.uid,
+                gid: ctx.gid,
+                nlink: 0,
+                rdev: 0,
+                atime_ns: now_ns,
+                mtime_ns: now_ns,
+                ctime_ns: now_ns,
+                btime_ns: now_ns,
+                size: 0,
+                blocks_512: 0,
+                blksize: 4096,
+            },
+            flags: InodeFlags::default(),
+            subtree_rev: generation.get(),
+            dir_rev: 0,
+        }
+    }
+
+    fn update_anonymous_size(file: &mut AnonymousTmpfile, size: u64) {
+        file.attr.posix.size = size;
+        file.attr.posix.blocks_512 = size.saturating_add(511) / 512;
+        let next_version = file.attr.posix.mtime_ns.saturating_add(1).max(1);
+        file.attr.posix.mtime_ns = next_version;
+        file.attr.posix.ctime_ns = next_version;
+        file.attr.subtree_rev = u64::try_from(next_version).unwrap_or(u64::MAX);
+    }
+
+    fn register_file_handle(
+        &self,
+        inode: InodeId,
+        open_flags: u32,
+        enforce_access_mode: bool,
+    ) -> std::result::Result<EngineFileHandle, Errno> {
+        self.file_handle_table
+            .borrow_mut()
+            .register(inode, open_flags, enforce_access_mode)
+            .map_err(|e| e.to_errno())
+    }
+
+    fn validate_file_handle(
+        &self,
+        fh: &EngineFileHandle,
+    ) -> std::result::Result<FileHandleState, Errno> {
+        self.file_handle_table
+            .borrow()
+            .validate(fh)
+            .map_err(|e| e.to_errno())
+    }
+
+    fn validate_optional_file_handle(
+        &self,
+        inode: InodeId,
+        handle: Option<&EngineFileHandle>,
+    ) -> std::result::Result<(), Errno> {
+        if let Some(fh) = handle {
+            let live = self.validate_file_handle(fh)?;
+            if live.inode_id != inode {
+                return Err(Errno::EBADF);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_dir_handle(&self, dh: &EngineDirHandle) -> std::result::Result<(), Errno> {
+        if self
+            .active_dir_handles
+            .borrow()
+            .get(&dh.dh_id)
+            .is_some_and(|inode| *inode == dh.inode_id)
+        {
+            Ok(())
+        } else {
+            Err(Errno::EBADF)
+        }
+    }
+
+    /// Walk the entire directory tree from root, populating the path cache.
+    /// Called once on first cache miss.
+    fn rebuild_path_cache(&self) {
+        let mut cache = self.path_cache.borrow_mut();
+        let fs = self.fs.borrow();
+
+        // BFS from root.
+        let mut queue: Vec<(InodeId, String)> = Vec::new();
+        let root_path = self.root_path();
+        queue.push((ROOT_INODE_ID, root_path.clone()));
+
+        // When a dataset root is configured, also register the real pool
+        // inode for the root directory so inode-based operations
+        // (list_dir_by_inode) can resolve it back to the dataset path.
+        if self.dataset_root_path.is_some() {
+            if let Ok(record) = fs.stat(&root_path) {
+                cache.insert(record.inode_id, root_path);
+            }
+        }
+
+        while let Some((_dir_id, dir_path)) = queue.pop() {
+            let entries = match fs.list_dir(&dir_path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for entry in entries {
+                let child_path = if dir_path == "/" {
+                    if let Ok(s) = std::str::from_utf8(&entry.name) {
+                        format!("/{s}")
+                    } else {
+                        continue;
+                    }
+                } else if let Ok(s) = std::str::from_utf8(&entry.name) {
+                    format!("{dir_path}/{s}")
+                } else {
+                    continue;
+                };
+                cache.insert(entry.inode_id, child_path.clone());
+                if entry.kind() == NodeKind::Dir {
+                    queue.push((entry.inode_id, child_path));
+                }
+            }
+        }
+    }
+
+    /// Resolve an `InodeId` to its absolute path.
+    fn inode_path(&self, inode_id: InodeId) -> std::result::Result<String, Errno> {
+        // Fast path: root.
+        if inode_id == ROOT_INODE_ID {
+            return Ok(self.root_path());
+        }
+
+        // Check cache.
+        {
+            let cache = self.path_cache.borrow();
+            if let Some(path) = cache.get(&inode_id) {
+                return Ok(path.clone());
+            }
+        }
+
+        // Cache miss — rebuild from root and check again.
+        self.rebuild_path_cache();
+
+        let cache = self.path_cache.borrow();
+        cache.get(&inode_id).cloned().ok_or(Errno::ENOENT)
+    }
+
+    /// Invalidate path cache for a single inode.
+    fn invalidate_path(&self, inode_id: InodeId) {
+        self.path_cache.borrow_mut().remove(&inode_id);
+    }
+
+    /// Invalidate non-root path cache entries.
+    fn invalidate_all_paths(&self) {
+        let root_path = self.root_path();
+        self.path_cache.borrow_mut().retain(|_, p| *p == root_path);
+    }
+
+    #[allow(dead_code)] // INTENT: VFS engine helpers for planned FUSE operation dispatch
+    /// Validate an xattr name against Linux namespace and size rules.
+    fn validate_xattr_name(name: &[u8]) -> std::result::Result<(), Errno> {
+        const XATTR_NAME_MAX: usize = 255;
+
+        if name.is_empty() || name.contains(&0) {
+            return Err(Errno::EINVAL);
+        }
+        if name.len() > XATTR_NAME_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        if (name.starts_with(b"user.") && name.len() > b"user.".len())
+            || (name.starts_with(b"system.") && name.len() > b"system.".len())
+            || (name.starts_with(b"security.") && name.len() > b"security.".len())
+            || (name.starts_with(b"trusted.") && name.len() > b"trusted.".len())
+        {
+            return Ok(());
+        }
+
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    fn validate_posix_acl_xattr_value(name: &[u8], value: &[u8]) -> std::result::Result<(), Errno> {
+        if name != Self::POSIX_ACL_ACCESS_XATTR && name != Self::POSIX_ACL_DEFAULT_XATTR {
+            return Ok(());
+        }
+
+        let acl = tidefs_posix_acl::decode_posix_acl_xattr(value).map_err(|_| Errno::EINVAL)?;
+        tidefs_posix_acl::validate_posix_acl_access_structure(&acl).map_err(|_| Errno::EINVAL)
+    }
+
+    fn apply_metadata_setattr(
+        fs: &mut LocalFileSystem,
+        path: &str,
+        attr: &SetAttr,
+    ) -> std::result::Result<(), Errno> {
+        const METADATA_SETATTR_BITS: u32 = FATTR_MODE
+            | FATTR_UID
+            | FATTR_GID
+            | FATTR_ATIME
+            | FATTR_MTIME
+            | FATTR_CTIME
+            | FATTR_ATIME_NOW
+            | FATTR_MTIME_NOW;
+
+        if attr.valid & METADATA_SETATTR_BITS == 0 {
+            return Ok(());
+        }
+
+        let inode_id = fs.lookup(path).map_err(|e| map_errno(&e))?;
+        let record = fs.inode(inode_id).map_err(|e| map_errno(&e))?;
+        let mut updated = record.clone();
+
+        let now_ns = crate::types::current_posix_time_ns();
+        let mut changed = false;
+        let mut should_bump_ctime = false;
+
+        if attr.valid & FATTR_MODE != 0 {
+            let mode = (updated.mode & S_IFMT) | (attr.mode & !S_IFMT);
+            if updated.mode != mode {
+                updated.mode = mode;
+                changed = true;
+                should_bump_ctime = true;
+            }
+        }
+        if attr.valid & FATTR_UID != 0 {
+            if updated.uid != attr.uid {
+                updated.uid = attr.uid;
+                changed = true;
+                should_bump_ctime = true;
+            }
+        }
+        if attr.valid & FATTR_GID != 0 {
+            if updated.gid != attr.gid {
+                updated.gid = attr.gid;
+                changed = true;
+                should_bump_ctime = true;
+            }
+        }
+        if attr.valid & FATTR_ATIME != 0 {
+            if updated.posix_time.atime_ns != attr.atime_ns {
+                updated.posix_time.atime_ns = attr.atime_ns;
+                changed = true;
+                should_bump_ctime = true;
+            }
+        }
+        if attr.valid & FATTR_CTIME != 0 {
+            if updated.posix_time.ctime_ns != attr.ctime_ns {
+                updated.posix_time.ctime_ns = attr.ctime_ns;
+                changed = true;
+            }
+        }
+        if attr.valid & FATTR_ATIME_NOW != 0 {
+            if updated.posix_time.atime_ns != now_ns {
+                updated.posix_time.atime_ns = now_ns;
+                changed = true;
+                should_bump_ctime = true;
+            }
+        }
+        if attr.valid & FATTR_MTIME != 0 {
+            if updated.posix_time.mtime_ns != attr.mtime_ns {
+                updated.posix_time.mtime_ns = attr.mtime_ns;
+                changed = true;
+                should_bump_ctime = true;
+            }
+        }
+        if attr.valid & FATTR_MTIME_NOW != 0 {
+            if updated.posix_time.mtime_ns != now_ns {
+                updated.posix_time.mtime_ns = now_ns;
+                changed = true;
+                should_bump_ctime = true;
+            }
+        }
+        // Advance ctime via a fresh tick when any metadata field changed
+        // but the caller did not supply an explicit ctime value. This
+        // preserves the explicit-value path for atime while still
+        // ensuring ctime advances per POSIX semantics.
+        if should_bump_ctime && attr.valid & FATTR_CTIME == 0 {
+            if updated.posix_time.ctime_ns != now_ns {
+                updated.posix_time.ctime_ns = now_ns;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            return Ok(());
+        }
+
+        fs.begin_mutation();
+        let tick = fs.bump_generation();
+        updated.metadata_version = updated.metadata_version.max(tick);
+
+        fs.mark_inode_metadata_dirty(inode_id);
+        Arc::make_mut(&mut fs.state.inodes).insert(inode_id, updated);
+        fs.inode_cache.borrow_mut().invalidate(inode_id);
+        fs.commit_mutation(()).map_err(|e| map_errno(&e))
+    }
+
+    fn create_metadata_only_node(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        kind: NodeKind,
+        mode: u32,
+        rdev: u32,
+        ctx: &RequestCtx,
+    ) -> std::result::Result<InodeAttr, Errno> {
+        let parent_path = self.inode_path(parent)?;
+        let child_path = build_child_path(&parent_path, name)?;
+
+        let parent_record = self
+            .fs
+            .borrow()
+            .stat(&parent_path)
+            .map_err(|e| map_errno(&e))?;
+        let permissions = (mode & 0o7777) & !ctx.umask;
+        let initial_mode = kind_bits(kind) | permissions;
+        let (effective_mode, effective_gid) = apply_setgid_inheritance_for_create(
+            parent_record.mode,
+            parent_record.gid,
+            initial_mode,
+            ctx.gid,
+        );
+
+        let mut fs = self.fs.borrow_mut();
+        let (parent_id, name) = fs
+            .resolve_parent_and_name(&child_path)
+            .map_err(|e| map_errno(&e))?;
+        if fs
+            .directory(parent_id, &child_path)
+            .map_err(|e| map_errno(&e))?
+            .contains_key(&name)
+        {
+            return Err(Errno::EEXIST);
+        }
+        fs.ensure_inode_capacity_for_new_inode()
+            .map_err(|e| map_errno(&e))?;
+
+        fs.begin_mutation();
+        let tick = fs.bump_generation();
+        let inode_id = fs.allocate_inode_id();
+        let generation = Generation::new(tick);
+        let new_mode = effective_mode;
+        let record = InodeRecord {
+            dir_storage_kind: 0,
+            inode_id,
+            generation,
+            facets: kind.to_facets(),
+            mode: new_mode,
+            uid: ctx.uid,
+            gid: effective_gid,
+            nlink: 1,
+            size: 0,
+            data_version: tick,
+            metadata_version: tick,
+            posix_time: crate::types::PosixTimeRecord::now(),
+            xattr_storage_kind: 0,
+            xattrs: BTreeMap::new(),
+            dir_rev: 0,
+            rdev,
+        };
+        let entry = NamespaceEntry {
+            name: name.clone(),
+            inode_id,
+            generation,
+            facets: kind.to_facets(),
+            mode: new_mode,
+        };
+
+        fs.mark_inode_metadata_dirty(inode_id);
+        fs.mark_dir_dirty(parent_id);
+        fs.mark_inode_metadata_dirty(parent_id);
+        Arc::make_mut(&mut fs.state.inodes).insert(inode_id, record.clone());
+        fs.inode_cache.borrow_mut().invalidate(inode_id);
+        if let Err(err) = fs.insert_directory_entry(parent_id, name, entry, tick) {
+            fs.rollback_mutation_delta();
+            return Err(map_errno(&err));
+        }
+
+        fs.commit_mutation(record)
+            .map(|record| record.to_inode_attr())
+            .map_err(|e| map_errno(&e))
+            .inspect(|attr| {
+                self.path_cache
+                    .borrow_mut()
+                    .insert(attr.inode_id, child_path.clone());
+            })
+    }
+
+    /// Return the configured sync guarantee for this dataset mount.
+    pub fn sync_guarantee(&self) -> SyncGuarantee {
+        self.sync_guarantee
+    }
+
+    /// Wait for the required sync guarantee level before acknowledging.
+    ///
+    /// For [`SyncGuarantee::Local`], this is a no-op: the write is already
+    /// durable after local intent-log append + commit.
+    ///
+    /// For [`SyncGuarantee::RemoteCopy`] and [`SyncGuarantee::FullRedundancy`],
+    /// callers should additionally wait on placement receipt acknowledgments
+    /// from peer nodes.  Currently returns `Ok(())` unconditionally;
+    /// the distributed confirmation path is tracked by Review debt TFR-017
+    /// (historical issue #6654).
+    fn wait_for_sync_guarantee(&self) -> std::result::Result<(), Errno> {
+        match self.sync_guarantee {
+            SyncGuarantee::Local => Ok(()),
+            SyncGuarantee::RemoteCopy | SyncGuarantee::FullRedundancy => {
+                eprintln!(
+                    "tidefs-vfs: sync_guarantee={} — distributed confirmation not yet wired; using local-only durability",
+                    self.sync_guarantee
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+// ── VfsEngine for VfsLocalFileSystem ──────────────────────────────────────
+
+impl VfsEngine for VfsLocalFileSystem {
+    // == Namespace operations ==============================================
+
+    fn get_root_inode(&self, _ctx: &RequestCtx) -> std::result::Result<InodeId, Errno> {
+        Ok(ROOT_INODE_ID)
+    }
+
+    fn lookup(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<InodeAttr, Errno> {
+        if name.is_empty() && parent == ROOT_INODE_ID {
+            let root_path = self.root_path();
+            let attr = self
+                .fs
+                .borrow()
+                .stat_attr(&root_path)
+                .map_err(|e| map_errno(&e))?;
+            // Register the dataset root inode in the path cache so
+            // subsequent inode-based operations (readdir, list_dir_by_inode)
+            // can resolve the real pool inode back to the dataset root path.
+            self.path_cache
+                .borrow_mut()
+                .insert(attr.inode_id, root_path);
+            return Ok(attr);
+        }
+
+        let parent_path = self.inode_path(parent)?;
+        let child_path = build_child_path(&parent_path, name)?;
+        self.fs
+            .borrow()
+            .stat_attr(&child_path)
+            .inspect(|attr| {
+                // Register child in path cache.
+                self.path_cache
+                    .borrow_mut()
+                    .insert(attr.inode_id, child_path.clone());
+            })
+            .map_err(|e| map_errno(&e))
+    }
+
+    fn getattr(
+        &self,
+        inode: InodeId,
+        handle: Option<&EngineFileHandle>,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<InodeAttr, Errno> {
+        self.validate_optional_file_handle(inode, handle)?;
+        if let Some(file) = self.anonymous_tmpfiles.borrow().get(&inode) {
+            return Ok(file.attr);
+        }
+        let path = self.inode_path(inode)?;
+        self.fs.borrow().stat_attr(&path).map_err(|e| map_errno(&e))
+    }
+
+    fn setattr(
+        &self,
+        inode: InodeId,
+        attr: &SetAttr,
+        handle: Option<&EngineFileHandle>,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<InodeAttr, Errno> {
+        self.validate_optional_file_handle(inode, handle)?;
+        let path = self.inode_path(inode)?;
+        let mut fs = self.fs.borrow_mut();
+
+        const SUPPORTED_SETATTR_BITS: u32 = FATTR_MODE
+            | FATTR_UID
+            | FATTR_GID
+            | FATTR_SIZE
+            | FATTR_ATIME
+            | FATTR_MTIME
+            | FATTR_FH
+            | FATTR_ATIME_NOW
+            | FATTR_MTIME_NOW
+            | FATTR_LOCKOWNER
+            | FATTR_CTIME;
+        if attr.valid & !SUPPORTED_SETATTR_BITS != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        if attr.valid & FATTR_SIZE != 0 {
+            // Use effective size accounting for buffered writes so the
+            // size comparison is correct when truncate follows a buffered
+            // write that extended the file but hasn't been flushed yet.
+            let logical_size = fs.effective_file_size(inode);
+            if attr.size != logical_size {
+                fs.truncate_file(&path, attr.size)
+                    .map_err(|e| map_errno(&e))?;
+            }
+        }
+        Self::apply_metadata_setattr(&mut fs, &path, attr)?;
+
+        drop(fs);
+        self.fs.borrow().stat_attr(&path).map_err(|e| map_errno(&e))
+    }
+
+    fn mkdir(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        ctx: &RequestCtx,
+    ) -> std::result::Result<InodeAttr, Errno> {
+        let parent_path = self.inode_path(parent)?;
+        let parent_record = self
+            .fs
+            .borrow()
+            .stat(&parent_path)
+            .map_err(|e| map_errno(&e))?;
+        let child_mode = (mode & 0o7777) & !ctx.umask;
+        let (child_mode, child_gid) = apply_setgid_inheritance_for_create(
+            parent_record.mode,
+            parent_record.gid,
+            S_IFDIR | child_mode,
+            ctx.gid,
+        );
+        let child_path = build_child_path(&parent_path, name)?;
+        let record = self
+            .fs
+            .borrow_mut()
+            .create_dir(&child_path, child_mode & 0o7777)
+            .map_err(|e| map_errno(&e))?;
+        let mut attr_update = SetAttr::new();
+        attr_update.valid = FATTR_MODE | FATTR_UID | FATTR_GID;
+        attr_update.mode = child_mode;
+        attr_update.uid = ctx.uid;
+        attr_update.gid = child_gid;
+        Self::apply_metadata_setattr(&mut self.fs.borrow_mut(), &child_path, &attr_update)?;
+        let attr = self
+            .fs
+            .borrow()
+            .stat_attr(&child_path)
+            .map_err(|e| map_errno(&e))?;
+        self.path_cache
+            .borrow_mut()
+            .insert(record.inode_id, child_path);
+        Ok(attr)
+    }
+
+    fn create(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
+        let parent_path = self.inode_path(parent)?;
+        let child_path = build_child_path(&parent_path, name)?;
+
+        let parent_record = self
+            .fs
+            .borrow()
+            .stat(&parent_path)
+            .map_err(|e| map_errno(&e))?;
+        let child_mode = (mode & 0o7777) & !ctx.umask;
+        let (child_mode, child_gid) = apply_setgid_inheritance_for_create(
+            parent_record.mode,
+            parent_record.gid,
+            S_IFREG | child_mode,
+            ctx.gid,
+        );
+        let existing = self.fs.borrow().stat(&child_path);
+        match existing {
+            Ok(record) => {
+                if flags & O_EXCL != 0 {
+                    return Err(Errno::EEXIST);
+                }
+                if flags & O_TRUNC == 0 {
+                    // Existing file, no O_EXCL, no O_TRUNC: open existing.
+                    let attr = record.to_inode_attr();
+                    let fh = self.register_file_handle(record.inode_id, flags, false)?;
+                    self.path_cache
+                        .borrow_mut()
+                        .insert(record.inode_id, child_path);
+                    return Ok((attr, fh));
+                }
+
+                let attr = self
+                    .fs
+                    .borrow_mut()
+                    .truncate_file(&child_path, 0)
+                    .map(|record| record.to_inode_attr())
+                    .map_err(|e| map_errno(&e))?;
+                let fh = self.register_file_handle(record.inode_id, flags, false)?;
+                self.path_cache
+                    .borrow_mut()
+                    .insert(record.inode_id, child_path);
+                return Ok((attr, fh));
+            }
+            Err(err) => {
+                if !matches!(err, FileSystemError::NotFound { .. }) {
+                    return Err(map_errno(&err));
+                }
+            }
+        }
+
+        let record = self
+            .fs
+            .borrow_mut()
+            .create_file(&child_path, child_mode & 0o7777)
+            .map_err(|e| map_errno(&e))?;
+        let mut attr_update = SetAttr::new();
+        attr_update.valid = FATTR_MODE | FATTR_UID | FATTR_GID;
+        attr_update.mode = child_mode;
+        attr_update.uid = ctx.uid;
+        attr_update.gid = child_gid;
+        Self::apply_metadata_setattr(&mut self.fs.borrow_mut(), &child_path, &attr_update)?;
+        let attr = self
+            .fs
+            .borrow()
+            .stat_attr(&child_path)
+            .map_err(|e| map_errno(&e))?;
+        let fh = self.register_file_handle(record.inode_id, flags, false)?;
+        self.path_cache
+            .borrow_mut()
+            .insert(record.inode_id, child_path);
+        Ok((attr, fh))
+    }
+
+    fn create_excl(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
+        let parent_path = self.inode_path(parent)?;
+        let child_path = build_child_path(&parent_path, name)?;
+
+        let parent_record = self
+            .fs
+            .borrow()
+            .stat(&parent_path)
+            .map_err(|e| map_errno(&e))?;
+        let child_mode = (mode & 0o7777) & !ctx.umask;
+        let (child_mode, child_gid) = apply_setgid_inheritance_for_create(
+            parent_record.mode,
+            parent_record.gid,
+            S_IFREG | child_mode,
+            ctx.gid,
+        );
+
+        // Hold a single mutable borrow across existence check and creation
+        // to close the TOCTOU window between stat and create_file.
+        let mut fs = self.fs.borrow_mut();
+        if fs.stat(&child_path).is_ok() {
+            return Err(Errno::EEXIST);
+        }
+
+        let record = fs
+            .create_file(&child_path, child_mode & 0o7777)
+            .map_err(|e| map_errno(&e))?;
+        drop(fs);
+
+        let mut attr_update = SetAttr::new();
+        attr_update.valid = FATTR_MODE | FATTR_UID | FATTR_GID;
+        attr_update.mode = child_mode;
+        attr_update.uid = ctx.uid;
+        attr_update.gid = child_gid;
+        Self::apply_metadata_setattr(&mut self.fs.borrow_mut(), &child_path, &attr_update)?;
+        let attr = self
+            .fs
+            .borrow()
+            .stat_attr(&child_path)
+            .map_err(|e| map_errno(&e))?;
+        // Preserve the caller's open flags so subsequent data-plane operations
+        // validate against the same (inode, flags, fh_id) triple.
+        let fh = self.register_file_handle(record.inode_id, flags, false)?;
+        self.path_cache
+            .borrow_mut()
+            .insert(record.inode_id, child_path);
+        Ok((attr, fh))
+    }
+
+    fn tmpfile(
+        &self,
+        parent: InodeId,
+        mode: u32,
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
+        let parent_path = self.inode_path(parent)?;
+        let parent_record = self
+            .fs
+            .borrow()
+            .stat(&parent_path)
+            .map_err(|e| map_errno(&e))?;
+        if !parent_record.is_directory() {
+            return Err(Errno::ENOTDIR);
+        }
+
+        let inode_id = self.allocate_anonymous_inode_id()?;
+        let attr = Self::anonymous_attr(inode_id, mode, ctx);
+        let fh = self.register_file_handle(inode_id, flags, true)?;
+        self.anonymous_tmpfiles.borrow_mut().insert(
+            inode_id,
+            AnonymousTmpfile {
+                attr,
+                data: Vec::new(),
+            },
+        );
+
+        // Track in the persistent orphan index for crash-safe recovery.
+        let ino_u64 = inode_id.get();
+        let generation = Generation::new(ino_u64);
+        self.fs
+            .borrow()
+            .orphan_index
+            .lock()
+            .unwrap()
+            .insert_tmpfile(ino_u64, generation.get(), ctx.pid, 0);
+
+        Ok((attr, fh))
+    }
+
+    fn unlink(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        let parent_path = self.inode_path(parent)?;
+        let child_path = build_child_path(&parent_path, name)?;
+        let record = self
+            .fs
+            .borrow()
+            .stat(&child_path)
+            .map_err(|e| map_errno(&e))?;
+        let parent_record = self
+            .fs
+            .borrow()
+            .stat(&parent_path)
+            .map_err(|e| map_errno(&e))?;
+        if !sticky_dir_allows_unlink_or_rename(
+            parent_record.mode,
+            parent_record.uid,
+            record.uid,
+            ctx.uid,
+        ) {
+            return Err(Errno::EPERM);
+        }
+        let has_open_handles = self
+            .file_handle_table
+            .borrow()
+            .contains_inode(record.inode_id);
+        if has_open_handles {
+            let data = self
+                .fs
+                .borrow()
+                .read_file_range(&child_path, 0, record.size as usize)
+                .map_err(|e| map_errno(&e))?;
+            let attr = self
+                .fs
+                .borrow()
+                .stat_attr(&child_path)
+                .map_err(|e| map_errno(&e))?;
+            self.fs
+                .borrow_mut()
+                .unlink(&child_path)
+                .map_err(|e| map_errno(&e))?;
+            self.anonymous_tmpfiles
+                .borrow_mut()
+                .insert(record.inode_id, AnonymousTmpfile { attr, data });
+        } else {
+            self.fs
+                .borrow_mut()
+                .unlink(&child_path)
+                .map_err(|e| map_errno(&e))?;
+        }
+        self.invalidate_path(record.inode_id);
+        self.invalidate_all_paths();
+        Ok(())
+    }
+
+    fn rmdir(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        let parent_path = self.inode_path(parent)?;
+        let child_path = build_child_path(&parent_path, name)?;
+        let record = self
+            .fs
+            .borrow()
+            .stat(&child_path)
+            .map_err(|e| map_errno(&e))?;
+        let parent_record = self
+            .fs
+            .borrow()
+            .stat(&parent_path)
+            .map_err(|e| map_errno(&e))?;
+        if !sticky_dir_allows_unlink_or_rename(
+            parent_record.mode,
+            parent_record.uid,
+            record.uid,
+            ctx.uid,
+        ) {
+            return Err(Errno::EPERM);
+        }
+        self.fs
+            .borrow_mut()
+            .remove_dir(&child_path)
+            .map_err(|e| map_errno(&e))?;
+        self.invalidate_path(record.inode_id);
+        self.invalidate_all_paths();
+        Ok(())
+    }
+
+    fn rename(
+        &self,
+        old_parent: InodeId,
+        old_name: &[u8],
+        new_parent: InodeId,
+        new_name: &[u8],
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        let old_parent_path = self.inode_path(old_parent)?;
+        let new_parent_path = self.inode_path(new_parent)?;
+        let old_path = build_child_path(&old_parent_path, old_name)?;
+        let new_path = build_child_path(&new_parent_path, new_name)?;
+
+        // Map POSIX renameat2 flags to RenameAt2Flags.
+        // RENAME_WHITEOUT (4) is not yet supported.
+        const RENAME_NOREPLACE_BIT: u32 = 1;
+        const RENAME_EXCHANGE_BIT: u32 = 2;
+        const SUPPORTED_MASK: u32 = RENAME_NOREPLACE_BIT | RENAME_EXCHANGE_BIT;
+
+        if flags & !SUPPORTED_MASK != 0
+            || (flags & RENAME_NOREPLACE_BIT != 0 && flags & RENAME_EXCHANGE_BIT != 0)
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        let renameat2_flags = if flags & RENAME_EXCHANGE_BIT != 0 {
+            RenameAt2Flags::EXCHANGE
+        } else if flags & RENAME_NOREPLACE_BIT != 0 {
+            RenameAt2Flags::NOREPLACE
+        } else {
+            RenameAt2Flags::EMPTY
+        };
+
+        let old_record = self
+            .fs
+            .borrow()
+            .stat(&old_path)
+            .map_err(|e| map_errno(&e))?;
+
+        // Sticky-bit check: when overwriting a target, the caller must
+        // pass the sticky-bit gate on the target's parent directory.
+        if renameat2_flags != RenameAt2Flags::EXCHANGE {
+            let new_target = self.fs.borrow().stat(&new_path);
+            if let Ok(target_record) = new_target {
+                let new_parent_record = self
+                    .fs
+                    .borrow()
+                    .stat(&new_parent_path)
+                    .map_err(|e| map_errno(&e))?;
+                if !sticky_dir_allows_unlink_or_rename(
+                    new_parent_record.mode,
+                    new_parent_record.uid,
+                    target_record.uid,
+                    ctx.uid,
+                ) {
+                    return Err(Errno::EPERM);
+                }
+            }
+        }
+
+        self.fs
+            .borrow_mut()
+            .renameat2(&old_path, &new_path, renameat2_flags)
+            .map_err(|e| map_errno(&e))?;
+
+        // Update cache: old inode now at new path.
+        self.invalidate_all_paths();
+        let mut cache = self.path_cache.borrow_mut();
+        cache.insert(old_record.inode_id, new_path);
+        Ok(())
+    }
+
+    fn link(
+        &self,
+        target: InodeId,
+        new_parent: InodeId,
+        new_name: &[u8],
+        ctx: &RequestCtx,
+    ) -> std::result::Result<InodeAttr, Errno> {
+        // Materialize anonymous tmpfiles: when an O_TMPFILE inode is
+        // linked into the namespace, use the engine's own create+write
+        // path to build a proper filesystem inode and directory entry,
+        // then remap the handle table so the open fd stays valid.
+        let tmpfile_opt = self.anonymous_tmpfiles.borrow_mut().remove(&target);
+        if let Some(tmpfile) = tmpfile_opt {
+            // Remove from persistent orphan index: the inode is no longer
+            // orphaned once it has a directory entry.
+            self.fs
+                .borrow()
+                .orphan_index
+                .lock()
+                .unwrap()
+                .remove_on_link(target.get(), 0);
+            // Check for duplicate before calling create().
+            {
+                let new_parent_path = self.inode_path(new_parent)?;
+                let new_path_check = build_child_path(&new_parent_path, new_name)?;
+                if self.fs.borrow().stat(&new_path_check).is_ok() {
+                    return Err(Errno::EEXIST);
+                }
+            }
+
+            // Use create() to allocate a proper filesystem inode with a
+            // directory entry.  With flags=0, this creates-or-opens the
+            // file — the duplicate check above ensures we only create.
+            let (_new_attr, new_fh) =
+                self.create(new_parent, new_name, tmpfile.attr.posix.mode, 0, ctx)?;
+            let new_ino = _new_attr.inode_id;
+
+            // Write buffered data through the engine's write path.
+            if !tmpfile.data.is_empty() {
+                self.write(&new_fh, 0, &tmpfile.data, ctx)?;
+            }
+
+            // Release the engine handle we allocated for the write.
+            self.release(&new_fh)?;
+
+            // Get updated attributes after write+setattr+release.
+            let linked_attr = self.getattr(new_ino, None, ctx)?;
+
+            // Add path cache entry for the original tmpfile inode so
+            // that lookups by the FUSE kernel can find the path.
+            let new_parent_path = self.inode_path(new_parent)?;
+            let new_path = build_child_path(&new_parent_path, new_name)?;
+            self.path_cache.borrow_mut().insert(target, new_path);
+
+            // Return attributes with the original inode ID.
+            let mut reply_attr = linked_attr;
+            reply_attr.inode_id = target;
+            return Ok(reply_attr);
+        }
+
+        let target_path = self.inode_path(target)?;
+        let new_parent_path = self.inode_path(new_parent)?;
+        let new_path = build_child_path(&new_parent_path, new_name)?;
+
+        /* POSIX link(2) pre-checks: directory targets return EPERM,
+         * nlink overflow returns EMLINK. */
+        {
+            let fs = self.fs.borrow();
+            let target_attr = fs.stat_attr(&target_path).map_err(|e| map_errno(&e))?;
+            if target_attr.kind == NodeKind::Dir {
+                return Err(Errno::EPERM);
+            }
+            if target_attr.posix.nlink == u32::MAX {
+                return Err(Errno::EMLINK);
+            }
+        }
+
+        self.fs
+            .borrow_mut()
+            .link_file(&target_path, &new_path)
+            .map_err(|e| map_errno(&e))?;
+        self.invalidate_all_paths();
+
+        self.fs
+            .borrow()
+            .stat_attr(&target_path)
+            .map_err(|e| map_errno(&e))
+    }
+
+    fn symlink(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        target: &[u8],
+        ctx: &RequestCtx,
+    ) -> std::result::Result<InodeAttr, Errno> {
+        let parent_path = self.inode_path(parent)?;
+        let child_path = build_child_path(&parent_path, name)?;
+        let target_str = bytes_to_str(target)?;
+
+        let parent_record = self
+            .fs
+            .borrow()
+            .stat(&parent_path)
+            .map_err(|e| map_errno(&e))?;
+        let child_mode = crate::constants::DEFAULT_SYMLINK_PERMISSIONS & !ctx.umask;
+        let (child_mode, child_gid) = apply_setgid_inheritance_for_create(
+            parent_record.mode,
+            parent_record.gid,
+            tidefs_types_vfs_core::S_IFLNK | child_mode,
+            ctx.gid,
+        );
+
+        let record = self
+            .fs
+            .borrow_mut()
+            .create_symlink(&child_path, target_str)
+            .map_err(|e| map_errno(&e))?;
+
+        let mut attr_update = SetAttr::new();
+        attr_update.valid = FATTR_MODE | FATTR_UID | FATTR_GID;
+        attr_update.mode = child_mode;
+        attr_update.uid = ctx.uid;
+        attr_update.gid = child_gid;
+        Self::apply_metadata_setattr(&mut self.fs.borrow_mut(), &child_path, &attr_update)?;
+
+        let attr = self
+            .fs
+            .borrow()
+            .stat_attr(&child_path)
+            .map_err(|e| map_errno(&e))?;
+        self.path_cache
+            .borrow_mut()
+            .insert(record.inode_id, child_path);
+        Ok(attr)
+    }
+
+    fn readlink(&self, inode: InodeId, _ctx: &RequestCtx) -> std::result::Result<Vec<u8>, Errno> {
+        let path = self.inode_path(inode)?;
+        self.fs.borrow().read_symlink(&path).map_err(|e| match e {
+            FileSystemError::NotFile { .. } => Errno::EINVAL,
+            _ => map_errno(&e),
+        })
+    }
+
+    fn mknod(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        mode: u32,
+        rdev: u32,
+        ctx: &RequestCtx,
+    ) -> std::result::Result<InodeAttr, Errno> {
+        match mode & S_IFMT {
+            S_IFREG => {
+                self.create_metadata_only_node(parent, name, NodeKind::File, mode, rdev, ctx)
+            }
+            S_IFIFO => {
+                self.create_metadata_only_node(parent, name, NodeKind::Fifo, mode, rdev, ctx)
+            }
+            S_IFCHR => {
+                self.create_metadata_only_node(parent, name, NodeKind::CharDev, mode, rdev, ctx)
+            }
+            S_IFBLK => {
+                self.create_metadata_only_node(parent, name, NodeKind::BlockDev, mode, rdev, ctx)
+            }
+            S_IFSOCK => {
+                self.create_metadata_only_node(parent, name, NodeKind::Socket, mode, rdev, ctx)
+            }
+            _ => Err(Errno::EOPNOTSUPP),
+        }
+    }
+
+    // == File I/O operations ================================================
+
+    fn open(
+        &self,
+        inode: InodeId,
+        flags: u32,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<EngineFileHandle, Errno> {
+        let path = self.inode_path(inode)?;
+        let kind = {
+            let record = self.fs.borrow().stat(&path).map_err(|e| map_errno(&e))?;
+            record.kind()
+        };
+
+        // Reject directories before mutating anything.
+        if kind == NodeKind::Dir {
+            return Err(Errno::EISDIR);
+        }
+
+        // O_TRUNC: truncate before allocating the handle.
+        if flags & O_TRUNC != 0 {
+            self.fs
+                .borrow_mut()
+                .truncate_file(&path, 0)
+                .map_err(|e| map_errno(&e))?;
+        }
+
+        // Delegate handle allocation to the open dispatch module.
+        open_dispatch::engine_open(
+            &self.fs.borrow(),
+            &self.file_handle_table,
+            kind,
+            inode,
+            flags,
+            true,
+        )
+    }
+
+    fn release(&self, fh: &EngineFileHandle) -> std::result::Result<(), Errno> {
+        // Delegate handle release to the release dispatch module.
+        let released = release_dispatch::engine_release(&self.file_handle_table, fh)?;
+
+        // Reclaim anonymous tmpfiles when the last handle is released.
+        let should_reclaim = self.anonymous_tmpfiles.borrow().contains_key(&released)
+            && !self.file_handle_table.borrow().contains_inode(released);
+        if should_reclaim {
+            self.anonymous_tmpfiles.borrow_mut().remove(&released);
+        }
+        Ok(())
+    }
+
+    fn read(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        size: u32,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<Vec<u8>, Errno> {
+        let live = self.validate_file_handle(fh)?;
+        if live.enforce_access_mode && !open_flags_allow_read(live.open_flags) {
+            return Err(Errno::EBADF);
+        }
+        if let Some(file) = self.anonymous_tmpfiles.borrow().get(&fh.inode_id) {
+            if size == 0 || offset >= file.attr.posix.size {
+                return Ok(Vec::new());
+            }
+            let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
+            let requested_end = offset.checked_add(size as u64).ok_or(Errno::EFBIG)?;
+            let end_u64 = requested_end.min(file.attr.posix.size);
+            let end = usize::try_from(end_u64).map_err(|_| Errno::EFBIG)?;
+            return Ok(file.data[start..end].to_vec());
+        }
+        let path = self.inode_path(fh.inode_id)?;
+
+        // Record read access for sequential detection and readahead planning.
+        let file_size = self
+            .fs
+            .borrow()
+            .inode(fh.inode_id)
+            .map_err(|e| map_errno(&e))?
+            .size;
+        let readahead_plan =
+            self.readahead_tracker
+                .record_read(fh.inode_id, offset, size, file_size);
+
+        let data = self
+            .fs
+            .borrow()
+            .read_file_range(&path, offset, size as usize)
+            .map_err(|e| map_errno(&e))?;
+        let _ = self.fs.borrow_mut().apply_timestamp_update(
+            fh.inode_id,
+            TimestampUpdate::Read,
+            self.timestamp_policy,
+        );
+
+        // Issue best-effort readahead to warm caches for sequential streams.
+        if let Some((ra_offset, ra_len)) = readahead_plan {
+            crate::readahead::issue_readahead(&self.fs.borrow(), &path, ra_offset, ra_len);
+        }
+
+        Ok(data)
+    }
+
+    fn write(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        data: &[u8],
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<u32, Errno> {
+        let live = self.validate_file_handle(fh)?;
+        if live.enforce_access_mode && !open_flags_allow_write(live.open_flags) {
+            return Err(Errno::EBADF);
+        }
+        if let Some(file) = self.anonymous_tmpfiles.borrow_mut().get_mut(&fh.inode_id) {
+            let write_offset = if live.enforce_access_mode && live.open_flags & O_APPEND != 0 {
+                file.attr.posix.size
+            } else {
+                offset
+            };
+            let start = usize::try_from(write_offset).map_err(|_| Errno::EFBIG)?;
+            let end = start.checked_add(data.len()).ok_or(Errno::EFBIG)?;
+            if end > file.data.len() {
+                file.data.resize(end, 0);
+            }
+            file.data[start..end].copy_from_slice(data);
+            let size = file.data.len() as u64;
+            if !data.is_empty() {
+                Self::update_anonymous_size(file, size);
+            }
+            return Ok(data.len() as u32);
+        }
+        let path = self.inode_path(fh.inode_id)?;
+        if live.enforce_access_mode && live.open_flags & O_APPEND != 0 {
+            // Hold the mutable borrow across both stat and write so that
+            // the file-size read and the subsequent write are atomic with
+            // respect to other append writers (POSIX O_APPEND semantics).
+            let mut fs = self.fs.borrow_mut();
+            let write_offset = fs.stat(&path).map_err(|e| map_errno(&e))?.size;
+            fs.write_file(&path, write_offset, data)
+                .map_err(|e| map_errno(&e))?;
+            if !data.is_empty() {
+                let _ = fs.apply_deferred_timestamp_update(
+                    fh.inode_id,
+                    TimestampUpdate::Write,
+                    self.timestamp_policy,
+                );
+            }
+            return Ok(data.len() as u32);
+        }
+
+        let mut fs = self.fs.borrow_mut();
+        fs.write_file(&path, offset, data)
+            .map_err(|e| map_errno(&e))?;
+        if !data.is_empty() {
+            let _ = fs.apply_deferred_timestamp_update(
+                fh.inode_id,
+                TimestampUpdate::Write,
+                self.timestamp_policy,
+            );
+        }
+        Ok(data.len() as u32)
+    }
+
+    fn flush(&self, fh: &EngineFileHandle, _ctx: &RequestCtx) -> std::result::Result<(), Errno> {
+        self.validate_file_handle(fh)?;
+        // Anonymous tmpfiles have no path and no backing store;
+        // they are reclaimed on release so flush is a no-op.
+        if self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
+            return Ok(());
+        }
+        let path = self.inode_path(fh.inode_id)?;
+        self.fs
+            .borrow_mut()
+            .flush_file(&path, fh.inode_id.0, fh.fh_id.0, fh.lock_owner)
+            .map_err(|e| map_errno(&e))?;
+        Ok(())
+    }
+
+    fn fsync(
+        &self,
+        fh: &EngineFileHandle,
+        datasync: bool,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        self.validate_file_handle(fh)?;
+        if self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
+            return Ok(());
+        }
+        let path = self.inode_path(fh.inode_id)?;
+        if datasync {
+            self.fs
+                .borrow_mut()
+                .fsync_data_only_file(&path)
+                .map_err(|e| map_errno(&e))?;
+        } else {
+            self.fs
+                .borrow_mut()
+                .fsync_file(&path)
+                .map_err(|e| map_errno(&e))?;
+        }
+        self.wait_for_sync_guarantee()?;
+        Ok(())
+    }
+
+    fn fallocate(
+        &self,
+        fh: &EngineFileHandle,
+        mode: u32,
+        offset: u64,
+        length: u64,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        self.validate_file_handle(fh)?;
+        if let Some(file) = self.anonymous_tmpfiles.borrow_mut().get_mut(&fh.inode_id) {
+            let end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
+            let known_mask = FALLOC_FL_COLLAPSE_RANGE
+                | FALLOC_FL_INSERT_RANGE
+                | FALLOC_FL_KEEP_SIZE
+                | FALLOC_FL_PUNCH_HOLE
+                | FALLOC_FL_ZERO_RANGE;
+            if mode & !known_mask != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+                if mode & FALLOC_FL_KEEP_SIZE == 0 || mode & FALLOC_FL_ZERO_RANGE != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
+                let end =
+                    usize::try_from(end.min(file.attr.posix.size)).map_err(|_| Errno::EFBIG)?;
+                if start < end && start < file.data.len() {
+                    let clipped_end = end.min(file.data.len());
+                    file.data[start..clipped_end].fill(0);
+                }
+            } else if mode & FALLOC_FL_ZERO_RANGE != 0 {
+                let zero_end = if mode & FALLOC_FL_KEEP_SIZE != 0 {
+                    file.data.len().min(end as usize)
+                } else {
+                    if file.data.len() < end as usize {
+                        file.data.resize(end as usize, 0);
+                    }
+                    end as usize
+                };
+                let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
+                if start < zero_end {
+                    file.data[start..zero_end].fill(0);
+                }
+                if mode & FALLOC_FL_KEEP_SIZE == 0 {
+                    Self::update_anonymous_size(file, end);
+                }
+            } else if mode & FALLOC_FL_COLLAPSE_RANGE != 0 {
+                // In-memory collapse: remove [offset, offset+length) and shift tail left.
+                let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
+                let end_clamped = end.min(file.attr.posix.size);
+                let eff_len =
+                    (end_clamped - offset).min(file.attr.posix.size.saturating_sub(offset));
+                let eff_len_u = usize::try_from(eff_len).map_err(|_| Errno::EFBIG)?;
+                if start < file.data.len() && eff_len_u > 0 {
+                    let tail_start = (start + eff_len_u).min(file.data.len());
+                    if tail_start < file.data.len() {
+                        let tail = file.data[tail_start..].to_vec();
+                        file.data.truncate(start);
+                        file.data.extend_from_slice(&tail);
+                    } else {
+                        file.data.truncate(start);
+                    }
+                    let new_size = file.attr.posix.size.saturating_sub(eff_len);
+                    Self::update_anonymous_size(file, new_size);
+                }
+            } else if mode & FALLOC_FL_INSERT_RANGE != 0 {
+                // In-memory insert: insert `length` zero bytes at `offset`, shift tail right.
+                let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
+                let len_u = usize::try_from(length).map_err(|_| Errno::EFBIG)?;
+                if offset > file.attr.posix.size {
+                    // Offset beyond EOF: extend with zeros (same as default allocate).
+                    let end_usize = usize::try_from(end).map_err(|_| Errno::EFBIG)?;
+                    file.data.resize(end_usize, 0);
+                    Self::update_anonymous_size(file, end);
+                } else if len_u > 0 {
+                    let tail = if start < file.data.len() {
+                        file.data[start..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    file.data.truncate(start);
+                    file.data.resize(start + len_u, 0);
+                    file.data.extend_from_slice(&tail);
+                    let new_size = file
+                        .attr
+                        .posix
+                        .size
+                        .checked_add(length)
+                        .ok_or(Errno::EFBIG)?;
+                    Self::update_anonymous_size(file, new_size);
+                }
+            } else if mode & FALLOC_FL_KEEP_SIZE == 0 && end > file.attr.posix.size {
+                let end_usize = usize::try_from(end).map_err(|_| Errno::EFBIG)?;
+                file.data.resize(end_usize, 0);
+                Self::update_anonymous_size(file, end);
+            }
+            return Ok(());
+        }
+        let path = self.inode_path(fh.inode_id)?;
+        let mut fs = self.fs.borrow_mut();
+
+        // Known modes: COLLAPSE_RANGE, INSERT_RANGE, KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE.
+        let known_mask = FALLOC_FL_COLLAPSE_RANGE
+            | FALLOC_FL_INSERT_RANGE
+            | FALLOC_FL_KEEP_SIZE
+            | FALLOC_FL_PUNCH_HOLE
+            | FALLOC_FL_ZERO_RANGE;
+        if mode & !known_mask != 0 {
+            // Unknown or unsupported flag combination.
+            return Err(Errno::EOPNOTSUPP);
+        }
+
+        if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+            // PUNCH_HOLE requires KEEP_SIZE per POSIX; reject otherwise.
+            if mode & FALLOC_FL_KEEP_SIZE == 0 || mode & FALLOC_FL_ZERO_RANGE != 0 {
+                return Err(Errno::EINVAL);
+            }
+            fs.punch_hole(&path, offset, length)
+                .map_err(|e| map_errno(&e))?;
+            let _ = fs.apply_timestamp_update(
+                fh.inode_id,
+                TimestampUpdate::Write,
+                self.timestamp_policy,
+            );
+        } else if mode & FALLOC_FL_ZERO_RANGE != 0 {
+            fs.zero_range(&path, offset, length)
+                .map_err(|e| map_errno(&e))?;
+            let _ = fs.apply_timestamp_update(
+                fh.inode_id,
+                TimestampUpdate::Write,
+                self.timestamp_policy,
+            );
+        } else if mode & FALLOC_FL_COLLAPSE_RANGE != 0 {
+            // COLLAPSE_RANGE: remove bytes in [offset, offset+length) and shift
+            // tail left.  collapse_range() internally clamps to EOF and handles
+            // offset>=size as a no-op.
+            fs.collapse_range(&path, offset, length)
+                .map_err(|e| map_errno(&e))?;
+            let _ = fs.apply_timestamp_update(
+                fh.inode_id,
+                TimestampUpdate::Write,
+                self.timestamp_policy,
+            );
+        } else if mode & FALLOC_FL_INSERT_RANGE != 0 {
+            // INSERT_RANGE: insert `length` zero bytes at `offset`, shifting
+            // tail right.  insert_range() handles offset beyond EOF as
+            // allocate+extend.
+            fs.insert_range(&path, offset, length)
+                .map_err(|e| map_errno(&e))?;
+            let _ = fs.apply_timestamp_update(
+                fh.inode_id,
+                TimestampUpdate::Write,
+                self.timestamp_policy,
+            );
+        } else if mode & FALLOC_FL_KEEP_SIZE != 0 {
+            // Allocate Unwritten extents without extending file size.
+            fs.reserve_unwritten(&path, offset, length)
+                .map_err(|e| map_errno(&e))?;
+            let _ = fs.apply_timestamp_update(
+                fh.inode_id,
+                TimestampUpdate::MetadataChange,
+                self.timestamp_policy,
+            );
+        } else {
+            // Default (mode 0): allocate + extend file size.
+            let record = fs.stat(&path).map_err(|e| map_errno(&e))?;
+            let extend_by = (offset + length).saturating_sub(record.size);
+            if extend_by > 0 {
+                fs.fallocate_file(&path, record.size, extend_by)
+                    .map_err(|e| map_errno(&e))?;
+                let _ = fs.apply_timestamp_update(
+                    fh.inode_id,
+                    TimestampUpdate::Write,
+                    self.timestamp_policy,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_file_range(
+        &self,
+        source_fh: &EngineFileHandle,
+        offset_in: u64,
+        dest_fh: &EngineFileHandle,
+        offset_out: u64,
+        length: u64,
+        ctx: &RequestCtx,
+    ) -> std::result::Result<u32, Errno> {
+        if length == 0 {
+            return Ok(0);
+        }
+
+        let src = self.validate_file_handle(source_fh)?;
+        let dst = self.validate_file_handle(dest_fh)?;
+        if src.enforce_access_mode && !open_flags_allow_read(src.open_flags) {
+            return Err(Errno::EBADF);
+        }
+        if dst.enforce_access_mode && !open_flags_allow_write(dst.open_flags) {
+            return Err(Errno::EBADF);
+        }
+
+        let requested = length.min(u64::from(u32::MAX));
+        let source_end = offset_in.checked_add(requested).ok_or(Errno::EINVAL)?;
+        let dest_end = offset_out.checked_add(requested).ok_or(Errno::EINVAL)?;
+        if source_fh.inode_id == dest_fh.inode_id && offset_in < dest_end && offset_out < source_end
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        // Record intent-log entry for crash-recovery replay (non-tmpfile only).
+        if !self
+            .anonymous_tmpfiles
+            .borrow()
+            .contains_key(&source_fh.inode_id)
+            && !self
+                .anonymous_tmpfiles
+                .borrow()
+                .contains_key(&dest_fh.inode_id)
+        {
+            self.fs
+                .borrow_mut()
+                .record_copy_file_range_intent(CopyFileRangeIntent {
+                    src_ino: source_fh.inode_id,
+                    src_fh: source_fh.fh_id.0,
+                    dst_ino: dest_fh.inode_id,
+                    dst_fh: dest_fh.fh_id.0,
+                    src_offset: offset_in,
+                    dst_offset: offset_out,
+                    len: length,
+                });
+        }
+
+        // Perform the copy via the read/write path.
+        let mut copied = 0_u64;
+        while copied < requested {
+            let remaining = requested - copied;
+            let chunk_len = remaining.min(131072);
+            let chunk_size = u32::try_from(chunk_len).map_err(|_| Errno::EFBIG)?;
+            let read_offset = offset_in.checked_add(copied).ok_or(Errno::EINVAL)?;
+            let chunk = self.read(source_fh, read_offset, chunk_size, ctx)?;
+            if chunk.is_empty() {
+                break;
+            }
+            let write_offset = offset_out.checked_add(copied).ok_or(Errno::EINVAL)?;
+            let written = self.write(dest_fh, write_offset, &chunk, ctx)?;
+            copied = copied.checked_add(u64::from(written)).ok_or(Errno::EFBIG)?;
+            if written == 0 || u64::from(written) < chunk.len() as u64 {
+                break;
+            }
+        }
+
+        u32::try_from(copied).map_err(|_| Errno::EFBIG)
+    }
+
+    fn data_ranges(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        length: u64,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<Vec<LseekDataRange>, Errno> {
+        self.validate_file_handle(fh)?;
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
+        if let Some(file) = self.anonymous_tmpfiles.borrow().get(&fh.inode_id) {
+            let end = end.min(file.attr.posix.size);
+            if offset >= end {
+                return Ok(Vec::new());
+            }
+            let mut ranges = Vec::new();
+            let mut cursor = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
+            let end_usize = usize::try_from(end).map_err(|_| Errno::EFBIG)?;
+            while cursor < end_usize {
+                while cursor < end_usize && file.data[cursor] == 0 {
+                    cursor += 1;
+                }
+                if cursor >= end_usize {
+                    break;
+                }
+                let data_start = cursor;
+                while cursor < end_usize && file.data[cursor] != 0 {
+                    cursor += 1;
+                }
+                ranges.push(LseekDataRange::new(data_start as u64, cursor as u64));
+            }
+            return Ok(ranges);
+        }
+        let fs = self.fs.borrow();
+        let mut ranges = Vec::new();
+        let mut cursor = offset;
+
+        while cursor < end {
+            let Some(data_start) = fs
+                .find_next_data_offset(fh.inode_id, cursor)
+                .map_err(|e| map_errno(&e))?
+            else {
+                break;
+            };
+            if data_start >= end {
+                break;
+            }
+
+            let data_end = fs
+                .find_next_hole_offset(fh.inode_id, data_start)
+                .map_err(|e| map_errno(&e))?;
+            if data_end <= data_start {
+                return Err(Errno::EIO);
+            }
+
+            ranges.push(LseekDataRange::new(data_start, data_end.min(end)));
+            cursor = data_end;
+        }
+
+        Ok(ranges)
+    }
+
+    fn fiemap_file(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        length: u64,
+        max_extents: u32,
+        ctx: &RequestCtx,
+    ) -> std::result::Result<Vec<tidefs_types_extent_map_core::FiemapExtent>, Errno> {
+        self.validate_file_handle(fh)?;
+        if length == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let fs = self.fs.borrow();
+        // Prefer the authoritative extent map when it exists (fallocate-managed).
+        if let Some(extent_map) = fs.state.extent_maps.get(&fh.inode_id) {
+            let mut extents = extent_map
+                .inner()
+                .fiemap(offset, length)
+                .map_err(|e| match e {
+                    tidefs_types_extent_map_core::ExtentMapError::InvalidRange => Errno::EINVAL,
+                    _ => Errno::EIO,
+                })?;
+            if max_extents > 0 && extents.len() > max_extents as usize {
+                extents.truncate(max_extents as usize);
+            }
+            return Ok(extents);
+        }
+        drop(fs);
+        // Fallback: when no explicit extent map exists, report a single
+        // dense extent covering the queried range up to the file size.
+        let attr = self.getattr(fh.inode_id, Some(fh), ctx)?;
+        let file_size = attr.posix.size;
+        if offset >= file_size {
+            return Ok(Vec::new());
+        }
+        let range_end = (offset + length).min(file_size);
+        let len = range_end - offset;
+        let mut extents = vec![tidefs_types_extent_map_core::FiemapExtent::new(
+            offset,
+            0,
+            len,
+            tidefs_types_extent_map_core::FiemapExtent::FLAG_LAST,
+        )];
+        if max_extents > 0 && extents.len() > max_extents as usize {
+            extents.truncate(max_extents as usize);
+        }
+        Ok(extents)
+    }
+
+    // == Directory operations ===============================================
+
+    fn opendir(
+        &self,
+        inode: InodeId,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<EngineDirHandle, Errno> {
+        let path = self.inode_path(inode)?;
+        let record = self.fs.borrow().stat(&path).map_err(|e| map_errno(&e))?;
+        if !record.is_directory() {
+            return Err(Errno::ENOTDIR);
+        }
+        // Use the real pool inode for the dir handle so readdir can
+        // call list_dir_by_inode with the authoritative pool inode.
+        let real_inode = record.inode_id;
+        let dh_id = self.allocate_dir_handle_id()?;
+        let dh = EngineDirHandle {
+            inode_id: real_inode,
+            dh_id,
+        };
+        self.active_dir_handles
+            .borrow_mut()
+            .insert(dh_id, real_inode);
+        Ok(dh)
+    }
+
+    fn releasedir(&self, dh: &EngineDirHandle) -> std::result::Result<(), Errno> {
+        let mut active = self.active_dir_handles.borrow_mut();
+        match active.get(&dh.dh_id).copied() {
+            Some(inode) if inode == dh.inode_id => {
+                active.remove(&dh.dh_id);
+                Ok(())
+            }
+            _ => Err(Errno::EBADF),
+        }
+    }
+
+    fn readdir(
+        &self,
+        dh: &EngineDirHandle,
+        offset: u64,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<(Vec<DirEntry>, bool), Errno> {
+        self.validate_dir_handle(dh)?;
+
+        // Validate the inode still exists and is a directory.
+        let inode_id = dh.inode_id;
+        let path = self.inode_path(inode_id)?;
+        let entries = {
+            let fs = self.fs.borrow();
+            let record = fs.stat(&path).map_err(|e| map_errno(&e))?;
+            if !record.is_directory() {
+                return Err(Errno::ENOTDIR);
+            }
+            // Use by-inode listing to avoid repeated path resolution.
+            fs.list_dir_by_inode(inode_id).map_err(|e| map_errno(&e))?
+        };
+
+        // Build a DirIndex from the directory entries for
+        // BLAKE3-verified ordered iteration with DirCursor.
+        let mut dir_index = DirIndex::new(inode_id.get(), DatasetDirPolicy::DEFAULT);
+        for entry in &entries {
+            let kind_u32 = node_kind_to_dir_entry_kind(entry.kind());
+            let _ = dir_index.insert(
+                &entry.name,
+                entry.inode_id.get(),
+                entry.generation.get(),
+                kind_u32,
+            );
+        }
+
+        // Fire-and-forget metadata prefetch: if an inode table is
+        // configured, prime the cache for every inode returned.
+        // Best-effort; failures are silently ignored.
+        if let Some(ref tbl) = self.inode_table {
+            let inos: Vec<Ino> = entries.iter().map(|e| Ino(e.inode_id.0)).collect();
+            if !inos.is_empty() {
+                let _ = tbl.prefetch_batch(&inos);
+            }
+        }
+
+        // Create a bounded DirCursor window with BLAKE3 checksum verification.
+        // The shared dir-index cursor reserves offsets 0 and 1 for synthetic
+        // dots; the VFS engine API leaves dots to adapters, so translate to
+        // 1-based real-entry cookies at this boundary.
+        let batch_limit = 128usize;
+        let cursor_offset = offset.checked_add(2).unwrap_or(u64::MAX);
+        let (mut cursor, has_more) = DirCursor::new_window(&dir_index, cursor_offset, batch_limit)
+            .map_err(|_| Errno::EIO)?;
+
+        // Collect the bounded cursor window for this batch.
+        let mut dir_entries: Vec<DirEntry> = Vec::with_capacity(batch_limit);
+        while let Some(entry) = cursor.next_entry() {
+            if entry.name.as_slice() == b"." || entry.name.as_slice() == b".." {
+                continue;
+            }
+            let kind = dir_entry_kind_to_node_kind(entry.entry_type);
+            dir_entries.push(DirEntry {
+                name: entry.name.clone(),
+                inode_id: InodeId::new(entry.inode_id),
+                kind,
+                generation: Generation::new(entry.generation),
+                cookie: entry.offset.saturating_sub(1),
+            });
+        }
+
+        Ok((dir_entries, has_more))
+    }
+    fn fdatasync_inode(
+        &self,
+        fh: &EngineFileHandle,
+        datasync: bool,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        self.validate_file_handle(fh)?;
+        if self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
+            return Ok(());
+        }
+        self.fs
+            .borrow_mut()
+            .fdatasync_inode(fh.inode_id, datasync)
+            .map_err(|e| map_errno(&e))
+    }
+
+    fn fsyncdir(
+        &self,
+        dh: &EngineDirHandle,
+        _datasync: bool,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        self.validate_dir_handle(dh)?;
+        let path = self.inode_path(dh.inode_id)?;
+        self.fs
+            .borrow_mut()
+            .fsync_directory(&path)
+            .map_err(|e| map_errno(&e))
+    }
+
+    fn syncfs(&self, _ctx: &RequestCtx) -> std::result::Result<(), Errno> {
+        self.fs.borrow_mut().sync_all().map_err(|e| map_errno(&e))
+    }
+
+    // == Extended attribute operations ======================================
+
+    fn getxattr(
+        &self,
+        inode: InodeId,
+        name: &[u8],
+        ctx: &RequestCtx,
+    ) -> std::result::Result<Vec<u8>, Errno> {
+        if name.starts_with(b"trusted.") && ctx.uid != 0 {
+            return Err(Errno::EPERM);
+        }
+        let path = self.inode_path(inode)?;
+        xattr_dispatch::engine_getxattr(&self.fs.borrow(), &path, name)
+            .map_err(xattr_dispatch::errno_from_dispatch_error)?
+            .ok_or(Errno::ENODATA)
+    }
+    fn setxattr(
+        &self,
+        inode: InodeId,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+        ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        if name.starts_with(b"trusted.") && ctx.uid != 0 {
+            return Err(Errno::EPERM);
+        }
+        Self::validate_posix_acl_xattr_value(name, value)?;
+        let path = self.inode_path(inode)?;
+        xattr_dispatch::engine_setxattr(&mut self.fs.borrow_mut(), &path, name, value, flags)
+            .map_err(xattr_dispatch::errno_from_dispatch_error)
+    }
+    fn listxattr(&self, inode: InodeId, ctx: &RequestCtx) -> std::result::Result<Vec<u8>, Errno> {
+        let path = self.inode_path(inode)?;
+        let names = xattr_dispatch::engine_listxattr(&self.fs.borrow(), &path)
+            .map_err(xattr_dispatch::errno_from_dispatch_error)?;
+
+        if ctx.uid == 0 {
+            return Ok(names);
+        }
+
+        // Filter trusted.* for non-root callers.
+        let mut filtered = Vec::new();
+        for name in names
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+        {
+            if !name.starts_with(b"trusted.") {
+                filtered.extend_from_slice(name);
+                filtered.push(0);
+            }
+        }
+        Ok(filtered)
+    }
+    fn removexattr(
+        &self,
+        inode: InodeId,
+        name: &[u8],
+        ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        if name.starts_with(b"trusted.") && ctx.uid != 0 {
+            return Err(Errno::EPERM);
+        }
+        let path = self.inode_path(inode)?;
+        xattr_dispatch::engine_removexattr(&mut self.fs.borrow_mut(), &path, name)
+            .map_err(xattr_dispatch::errno_from_dispatch_error)
+    }
+
+    fn getlk(
+        &self,
+        inode: InodeId,
+        lock: &LockSpec,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<Option<LockSpec>, Errno> {
+        let requested = lock_range_from_spec(lock)?;
+        let fs = self.fs.borrow();
+        match fs.getlk(inode, requested) {
+            Some(conflict) => {
+                let existing = conflict.existing;
+                let end = existing
+                    .end_exclusive()
+                    .map_or(u64::MAX, |e| e.saturating_sub(1));
+                Ok(Some(LockSpec {
+                    typ: existing.lock_type.as_fcntl() as u32,
+                    whence: 0,
+                    start: existing.start,
+                    end,
+                    pid: existing.pid,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn setlk(
+        &self,
+        inode: InodeId,
+        lock: &LockSpec,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        let requested = lock_range_from_spec(lock)?;
+        let fs = self.fs.borrow_mut();
+        fs.setlk(inode, requested).map_err(|_| Errno::EAGAIN)
+    }
+    fn setlkw(
+        &self,
+        inode: InodeId,
+        lock: &LockSpec,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        let requested = lock_range_from_spec(lock)?;
+        let fs = self.fs.borrow();
+        fs.lock_wait_acquire(inode, requested, Some(std::time::Duration::from_secs(30)))
+            .map_err(|_| Errno::EAGAIN)
+    }
+
+    fn check_write_admission(&self, byte_count: u64) -> std::result::Result<(), Errno> {
+        self.fs
+            .borrow()
+            .check_write_admission(byte_count)
+            .map_err(|_| Errno::ENOSPC)
+    }
+
+    fn defrag_file(
+        &self,
+        ino: InodeId,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<(u64, u64), Errno> {
+        let mut fs = self.fs.borrow_mut();
+        let before_after = fs.defrag_extent_map(ino).map_err(|_e| Errno::EIO)?;
+        if before_after.1 < before_after.0 {
+            fs.state.dirty_extent_maps.insert(ino);
+        }
+        Ok(before_after)
+    }
+
+    fn lookup_extents(
+        &self,
+        inode: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Vec<tidefs_types_extent_map_core::ExtentMapEntryV2> {
+        self.fs.borrow().lookup_extents(inode.get(), offset, length)
+    }
+}
+
+impl VfsLocalFileSystem {
+    /// Set the pool free-space low-watermark threshold in bytes.
+    /// Data writes that would reduce available capacity below this
+    /// threshold are refused with `ENOSPC`.  Set to 0 to disable.
+    pub fn set_low_watermark_bytes(&self, bytes: u64) {
+        self.fs.borrow_mut().set_low_watermark_bytes(bytes);
+    }
+}
+
+// ── VfsEngineStatFs ───────────────────────────────────────────────────────
+
+impl VfsEngineStatFs for VfsLocalFileSystem {
+    fn statfs(&self, _ctx: &RequestCtx) -> std::result::Result<StatFs, Errno> {
+        let mut fs = self.fs.borrow_mut();
+        fuse_statfs::engine_statfs(&mut fs).map_err(|e| e.to_errno())
+    }
+}
+
+/// Convert a LockSpec (FUSE protocol) to a LockRange (internal tracker type).
+/// Returns `EINVAL` on bad whence or type.
+fn lock_range_from_spec(lock: &LockSpec) -> Result<LockRange, Errno> {
+    if lock.whence != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let lock_type = LockType::from_fcntl(lock.typ as u16).ok_or(Errno::EINVAL)?;
+    let len = if lock.end < lock.start {
+        return Err(Errno::EINVAL);
+    } else if lock.end == u64::MAX {
+        0
+    } else {
+        lock.end.saturating_sub(lock.start).saturating_add(1)
+    };
+    Ok(LockRange::new(lock.start, len, lock_type, 0, lock.pid))
+}
+// ── DirCursor conversion helpers ────────────────────────────────────
+
+/// Map a VfsEngine NodeKind to a DirIndex entry kind (u32).
+/// Uses 0=Dir, 1=File, 2=Symlink, 3=Fifo, 4=CharDev, 5=BlockDev, 6=Socket.
+/// Whiteout maps to 1 (File) as it is an internal sentinel.
+fn node_kind_to_dir_entry_kind(kind: NodeKind) -> u32 {
+    match kind {
+        NodeKind::Dir => 0,
+        NodeKind::File => 1,
+        NodeKind::Symlink => 2,
+        NodeKind::Fifo => 3,
+        NodeKind::CharDev => 4,
+        NodeKind::BlockDev => 5,
+        NodeKind::Socket => 6,
+        NodeKind::Whiteout => 1,
+    }
+}
+
+/// Map a DirIndex entry kind (u32) to a VfsEngine NodeKind.
+fn dir_entry_kind_to_node_kind(kind: u32) -> NodeKind {
+    match kind {
+        0 => NodeKind::Dir,
+        1 => NodeKind::File,
+        2 => NodeKind::Symlink,
+        3 => NodeKind::Fifo,
+        4 => NodeKind::CharDev,
+        5 => NodeKind::BlockDev,
+        6 => NodeKind::Socket,
+        _ => NodeKind::File,
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RootAuthenticationKey;
+    use std::path::PathBuf;
+    use tidefs_space_accounting::{DatasetQuotaConfig, DatasetQuotaHierarchy};
+    use tidefs_types_vfs_core::{
+        FileHandleId, FATTR_ATIME, FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE,
+        FATTR_UID, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFMT, S_ISGID, XATTR_CREATE,
+        XATTR_REPLACE,
+    };
+    use tidefs_vfs_engine::VfsEngine;
+
+    fn ctx() -> RequestCtx {
+        RequestCtx {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+            umask: 0o022,
+            groups: vec![1000],
+        }
+    }
+
+    fn temp_fs() -> (VfsLocalFileSystem, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fs = LocalFileSystem::open(dir.path()).expect("open");
+        (VfsLocalFileSystem::new(fs), dir)
+    }
+
+    fn root_ctx() -> RequestCtx {
+        RequestCtx {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+            umask: 0o022,
+            groups: vec![0],
+        }
+    }
+
+    fn create_xattr_file(engine: &VfsLocalFileSystem, name: &[u8]) -> InodeId {
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, name, 0o644, 0, &ctx()).unwrap();
+        attr.inode_id
+    }
+
+    fn assert_attr_has_wall_clock_posix_times(attr: &InodeAttr, before_ns: i64, after_ns: i64) {
+        let timestamps = [
+            attr.posix.atime_ns,
+            attr.posix.mtime_ns,
+            attr.posix.ctime_ns,
+            attr.posix.btime_ns,
+        ];
+        for timestamp in timestamps {
+            assert!(
+                timestamp >= before_ns && timestamp <= after_ns,
+                "timestamp {timestamp} outside [{before_ns}, {after_ns}]"
+            );
+            assert!(
+                timestamp / 1_000_000_000 > 0,
+                "timestamp seconds should not truncate to zero"
+            );
+        }
+    }
+
+    // ── Namespace tests ───────────────────────────────────────────────
+
+    #[test]
+    fn root_inode_is_known() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        assert_eq!(root, ROOT_INODE_ID);
+        assert_eq!(engine.inode_path(root).unwrap(), "/");
+    }
+
+    #[test]
+    fn mkdir_and_lookup() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let attr = engine.mkdir(root, b"subdir", 0o755, &ctx()).unwrap();
+        assert_eq!(attr.kind, NodeKind::Dir);
+
+        let looked_up = engine.lookup(root, b"subdir", &ctx()).unwrap();
+        assert_eq!(looked_up.inode_id, attr.inode_id);
+    }
+
+    #[test]
+    fn mkdir_under_nonexistent_parent_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let missing_parent = InodeId::new(999_999);
+
+        let result = engine.mkdir(missing_parent, b"subdir", 0o755, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn mkdir_under_file_parent_returns_enotdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (file_attr, _fh) = engine.create(root, b"not-dir", 0o644, 0, &ctx()).unwrap();
+
+        let result = engine.mkdir(file_attr.inode_id, b"child", 0o755, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOTDIR);
+    }
+
+    #[test]
+    fn mkdir_creates_directory_with_mode_and_umask_applied() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let caller = RequestCtx {
+            uid: 4242,
+            gid: 4343,
+            pid: 77,
+            umask: 0o022,
+            groups: vec![4343],
+        };
+
+        let attr = engine.mkdir(root, b"owned-dir", 0o777, &caller).unwrap();
+
+        assert_eq!(attr.kind, NodeKind::Dir);
+        assert_eq!(attr.posix.mode & S_IFMT, S_IFDIR);
+        assert_eq!(attr.posix.mode & 0o777, 0o755);
+        assert_eq!(attr.posix.uid, 4242);
+        assert_eq!(attr.posix.gid, 4343);
+    }
+
+    #[test]
+    fn mkdir_name_with_invalid_characters_returns_einval() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let result = engine.mkdir(root, b"bad/name", 0o755, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn mkdir_setgid_parent_inherits_gid_and_sgid() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create parent directory with S_ISGID and a specific GID
+        let parent_attr = engine.mkdir(root, b"sgiddir", 0o2755, &ctx()).unwrap();
+        // Set the parent GID to a value different from the caller
+        let mut set = SetAttr::new();
+        set.valid = FATTR_GID | FATTR_MODE;
+        set.gid = 4242;
+        set.mode = S_IFDIR | S_ISGID | 0o755;
+        engine
+            .setattr(parent_attr.inode_id, &set, None, &ctx())
+            .unwrap();
+        // Create subdirectory under the setgid parent
+        let child_attr = engine
+            .mkdir(parent_attr.inode_id, b"child", 0o777, &ctx())
+            .unwrap();
+        assert_eq!(
+            child_attr.posix.gid, 4242,
+            "child inherits parent GID via setgid"
+        );
+        assert!(
+            child_attr.posix.mode & S_ISGID != 0,
+            "child directory inherits S_ISGID from setgid parent"
+        );
+    }
+
+    #[test]
+    fn mkdir_no_setgid_parent_keeps_caller_gid() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create parent directory without S_ISGID
+        let parent_attr = engine.mkdir(root, b"normaldir", 0o755, &ctx()).unwrap();
+        let mut set = SetAttr::new();
+        set.valid = FATTR_GID;
+        set.gid = 9999;
+        engine
+            .setattr(parent_attr.inode_id, &set, None, &ctx())
+            .unwrap();
+        // Create subdirectory under non-setgid parent
+        let child_attr = engine
+            .mkdir(parent_attr.inode_id, b"child", 0o777, &ctx())
+            .unwrap();
+        assert_eq!(
+            child_attr.posix.gid,
+            ctx().gid,
+            "child keeps caller GID without setgid"
+        );
+        assert!(
+            child_attr.posix.mode & S_ISGID == 0,
+            "child does NOT inherit S_ISGID from non-setgid parent"
+        );
+    }
+
+    #[test]
+    fn create_file_setgid_parent_inherits_gid_but_not_sgid() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create parent directory with S_ISGID and a specific GID
+        let parent_attr = engine.mkdir(root, b"sgiddir", 0o2755, &ctx()).unwrap();
+        let mut set = SetAttr::new();
+        set.valid = FATTR_GID | FATTR_MODE;
+        set.gid = 4242;
+        set.mode = S_IFDIR | S_ISGID | 0o755;
+        engine
+            .setattr(parent_attr.inode_id, &set, None, &ctx())
+            .unwrap();
+        // Create regular file under the setgid parent
+        let (child_attr, _fh) = engine
+            .create(parent_attr.inode_id, b"file", 0o644, 0, &ctx())
+            .unwrap();
+        assert_eq!(
+            child_attr.posix.gid, 4242,
+            "regular file inherits parent GID via setgid"
+        );
+        assert!(
+            child_attr.posix.mode & S_ISGID == 0,
+            "regular file does NOT inherit S_ISGID from setgid parent"
+        );
+    }
+
+    #[test]
+    fn create_file_no_setgid_parent_keeps_caller_gid() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create parent directory without S_ISGID and a different GID
+        let parent_attr = engine.mkdir(root, b"normaldir", 0o755, &ctx()).unwrap();
+        let mut set = SetAttr::new();
+        set.valid = FATTR_GID;
+        set.gid = 9999;
+        engine
+            .setattr(parent_attr.inode_id, &set, None, &ctx())
+            .unwrap();
+        // Create regular file under non-setgid parent
+        let (child_attr, _fh) = engine
+            .create(parent_attr.inode_id, b"file", 0o644, 0, &ctx())
+            .unwrap();
+        assert_eq!(
+            child_attr.posix.gid,
+            ctx().gid,
+            "regular file keeps caller GID without setgid"
+        );
+    }
+
+    // ── Sticky-bit (S_ISVTX) enforcement tests ────────────────────────
+
+    #[test]
+    fn sticky_bit_owner_can_unlink() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create a sticky directory owned by uid 1000
+        let dir = engine.mkdir(root, b"sticky", 0o1777, &ctx()).unwrap();
+        // Create a file owned by uid 4242 inside the sticky dir
+        let other_ctx = RequestCtx {
+            uid: 4242,
+            gid: 4242,
+            pid: 1,
+            umask: 0,
+            groups: vec![4242],
+        };
+        let (_file_attr, _fh) = engine
+            .create(dir.inode_id, b"victim", 0o644, 0, &other_ctx)
+            .unwrap();
+        // Owner of the directory (uid 1000) can unlink
+        let result = engine.unlink(dir.inode_id, b"victim", &ctx());
+        assert!(result.is_ok(), "dir owner can unlink in sticky dir");
+    }
+
+    #[test]
+    fn sticky_bit_file_owner_can_unlink() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create a sticky directory, owner uid 4242
+        let other_ctx = RequestCtx {
+            uid: 4242,
+            gid: 4242,
+            pid: 1,
+            umask: 0,
+            groups: vec![4242],
+        };
+        let dir = engine.mkdir(root, b"sticky2", 0o1777, &other_ctx).unwrap();
+        // Create a file inside also owned by uid 4242
+        let (_file_attr, _fh) = engine
+            .create(dir.inode_id, b"mine", 0o644, 0, &other_ctx)
+            .unwrap();
+        // File owner can unlink their own file
+        let result = engine.unlink(dir.inode_id, b"mine", &other_ctx);
+        assert!(
+            result.is_ok(),
+            "file owner can unlink own file in sticky dir"
+        );
+    }
+
+    #[test]
+    fn sticky_bit_root_can_unlink() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create a sticky directory owned by uid 4242
+        let other_ctx = RequestCtx {
+            uid: 4242,
+            gid: 4242,
+            pid: 1,
+            umask: 0,
+            groups: vec![4242],
+        };
+        let dir = engine.mkdir(root, b"sticky3", 0o1777, &other_ctx).unwrap();
+        let (_file_attr, _fh) = engine
+            .create(dir.inode_id, b"nobody", 0o644, 0, &other_ctx)
+            .unwrap();
+        // Root (uid 0) can always unlink
+        let result = engine.unlink(dir.inode_id, b"nobody", &root_ctx());
+        assert!(result.is_ok(), "root can unlink in sticky dir");
+    }
+
+    #[test]
+    fn sticky_bit_stranger_denied_unlink() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create a sticky directory owned by uid 1000
+        let dir = engine.mkdir(root, b"sticky4", 0o1777, &ctx()).unwrap();
+        // Create a file owned by uid 4242 inside
+        let owner_ctx = RequestCtx {
+            uid: 4242,
+            gid: 4242,
+            pid: 1,
+            umask: 0,
+            groups: vec![4242],
+        };
+        let (_file_attr, _fh) = engine
+            .create(dir.inode_id, b"target", 0o644, 0, &owner_ctx)
+            .unwrap();
+        // Third party uid 9999 tries to unlink
+        let stranger_ctx = RequestCtx {
+            uid: 9999,
+            gid: 9999,
+            pid: 1,
+            umask: 0,
+            groups: vec![9999],
+        };
+        let result = engine.unlink(dir.inode_id, b"target", &stranger_ctx);
+        assert_eq!(result.unwrap_err(), Errno::EPERM);
+    }
+
+    #[test]
+    fn sticky_bit_stranger_denied_rmdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create a sticky directory owned by uid 1000
+        let dir = engine.mkdir(root, b"sticky5", 0o1777, &ctx()).unwrap();
+        // Create a subdir owned by uid 4242
+        let owner_ctx = RequestCtx {
+            uid: 4242,
+            gid: 4242,
+            pid: 1,
+            umask: 0,
+            groups: vec![4242],
+        };
+        let _sub = engine
+            .mkdir(dir.inode_id, b"subdir", 0o755, &owner_ctx)
+            .unwrap();
+        // Third party tries to rmdir
+        let stranger_ctx = RequestCtx {
+            uid: 9999,
+            gid: 9999,
+            pid: 1,
+            umask: 0,
+            groups: vec![9999],
+        };
+        let result = engine.rmdir(dir.inode_id, b"subdir", &stranger_ctx);
+        assert_eq!(result.unwrap_err(), Errno::EPERM);
+    }
+
+    #[test]
+    fn sticky_bit_stranger_denied_rename_overwrite() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create sticky dir owned by uid 1000
+        let dir = engine.mkdir(root, b"sticky6", 0o1777, &ctx()).unwrap();
+        // Create a file owned by uid 4242 inside sticky dir
+        let owner_ctx = RequestCtx {
+            uid: 4242,
+            gid: 4242,
+            pid: 1,
+            umask: 0,
+            groups: vec![4242],
+        };
+        let (_target_attr, _fh) = engine
+            .create(dir.inode_id, b"target", 0o644, 0, &owner_ctx)
+            .unwrap();
+        // Third party creates their own file in root
+        let stranger_ctx = RequestCtx {
+            uid: 9999,
+            gid: 9999,
+            pid: 1,
+            umask: 0,
+            groups: vec![9999],
+        };
+        let (_src_attr, _fh2) = engine
+            .create(root, b"source", 0o644, 0, &stranger_ctx)
+            .unwrap();
+        // Third party tries to rename over target in sticky dir
+        let result = engine.rename(root, b"source", dir.inode_id, b"target", 0, &stranger_ctx);
+        assert_eq!(result.unwrap_err(), Errno::EPERM);
+    }
+
+    #[test]
+    fn non_sticky_dir_allows_anyone_to_unlink() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create non-sticky directory, owner uid 1000, mode 0o777
+        let dir = engine.mkdir(root, b"public", 0o777, &ctx()).unwrap();
+        // Create file owned by uid 4242
+        let owner_ctx = RequestCtx {
+            uid: 4242,
+            gid: 4242,
+            pid: 1,
+            umask: 0,
+            groups: vec![4242],
+        };
+        let (_file_attr, _fh) = engine
+            .create(dir.inode_id, b"loose", 0o644, 0, &owner_ctx)
+            .unwrap();
+        // Third party can unlink (sticky-bit not set)
+        let stranger_ctx = RequestCtx {
+            uid: 9999,
+            gid: 9999,
+            pid: 1,
+            umask: 0,
+            groups: vec![9999],
+        };
+        let result = engine.unlink(dir.inode_id, b"loose", &stranger_ctx);
+        assert!(result.is_ok(), "anyone can unlink in non-sticky dir");
+    }
+
+    // ── Symlink setgid inheritance tests ───────────────────────────────
+
+    #[test]
+    fn symlink_setgid_parent_inherits_gid_but_not_sgid() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create parent directory with S_ISGID and a specific GID
+        let parent_attr = engine.mkdir(root, b"sgid-sym", 0o2755, &ctx()).unwrap();
+        let mut set = SetAttr::new();
+        set.valid = FATTR_GID | FATTR_MODE;
+        set.gid = 4242;
+        set.mode = S_IFDIR | S_ISGID | 0o755;
+        engine
+            .setattr(parent_attr.inode_id, &set, None, &ctx())
+            .unwrap();
+        // Create symlink under setgid parent
+        let sym_attr = engine
+            .symlink(parent_attr.inode_id, b"link", b"/tmp/target", &ctx())
+            .unwrap();
+        assert_eq!(
+            sym_attr.posix.gid, 4242,
+            "symlink inherits parent GID via setgid"
+        );
+        assert!(
+            sym_attr.posix.mode & S_ISGID == 0,
+            "symlink does NOT inherit S_ISGID"
+        );
+    }
+
+    #[test]
+    fn symlink_no_setgid_parent_keeps_caller_gid() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // Create parent without S_ISGID, different GID
+        let parent_attr = engine.mkdir(root, b"normal-sym", 0o755, &ctx()).unwrap();
+        let mut set = SetAttr::new();
+        set.valid = FATTR_GID;
+        set.gid = 9999;
+        engine
+            .setattr(parent_attr.inode_id, &set, None, &ctx())
+            .unwrap();
+        // Create symlink
+        let sym_attr = engine
+            .symlink(parent_attr.inode_id, b"link", b"/tmp/target", &ctx())
+            .unwrap();
+        assert_eq!(
+            sym_attr.posix.gid,
+            ctx().gid,
+            "symlink keeps caller GID without setgid"
+        );
+    }
+
+    #[test]
+    fn lookup_root_returns_dir_attrs() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let looked_up = engine.lookup(root, b"", &ctx()).unwrap();
+
+        assert_eq!(looked_up.inode_id, root);
+        assert_eq!(looked_up.kind, NodeKind::Dir);
+        assert!(looked_up.posix.is_dir());
+        assert_eq!(engine.inode_path(looked_up.inode_id).unwrap(), "/");
+    }
+
+    // ── Dataset-root mount tests ──────────────────────────────────────
+
+    /// Create a temp filesystem with a subdirectory, then wrap it with
+    /// with_dataset_root to simulate a per-dataset mount.
+    /// The dataset directory is created through the VFS engine so it is
+    /// visible to the LocalFileSystem layer.
+    fn temp_dataset_fs(ds_name: &str) -> (VfsLocalFileSystem, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fs = LocalFileSystem::open(dir.path()).expect("open");
+        let ds_path = format!("/{ds_name}");
+
+        // Create the dataset directory through the VFS engine.
+        {
+            let engine = VfsLocalFileSystem::new(fs);
+            let root = engine.get_root_inode(&ctx()).unwrap();
+            engine
+                .mkdir(root, ds_name.as_bytes(), 0o755, &ctx())
+                .expect("create dataset dir via engine");
+        }
+
+        // Re-open and wrap with dataset root.
+        let fs = LocalFileSystem::open(dir.path()).expect("reopen");
+        let engine = VfsLocalFileSystem::new(fs).with_dataset_root(&ds_path);
+        (engine, dir)
+    }
+
+    #[test]
+    fn dataset_root_lookup_returns_dataset_root_attrs() {
+        let (engine, _td) = temp_dataset_fs("ds1");
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        assert_eq!(
+            root, ROOT_INODE_ID,
+            "get_root_inode must return ROOT_INODE_ID for FUSE protocol"
+        );
+
+        let attr = engine.lookup(root, b"", &ctx()).unwrap();
+        // The real pool inode is returned; the path cache maps it to /ds1.
+        assert_eq!(attr.kind, NodeKind::Dir, "dataset root must be a directory");
+        let cached_path = engine.inode_path(attr.inode_id).unwrap();
+        assert_eq!(
+            cached_path, "/ds1",
+            "real pool inode must resolve to dataset root path"
+        );
+    }
+
+    #[test]
+    fn dataset_root_getattr_via_root_inode() {
+        let (engine, _td) = temp_dataset_fs("ds1");
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        // getattr via ROOT_INODE_ID resolves through root_path() to /ds1
+        let attr = engine.getattr(root, None, &ctx()).unwrap();
+        assert_eq!(
+            attr.kind,
+            NodeKind::Dir,
+            "getattr on ROOT_INODE_ID must return dataset root attrs"
+        );
+    }
+
+    #[test]
+    fn dataset_root_inode_path_uses_dataset_dir() {
+        let (engine, _td) = temp_dataset_fs("ds1");
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let path = engine.inode_path(root).unwrap();
+        assert_eq!(
+            path, "/ds1",
+            "root inode path must be the dataset directory"
+        );
+    }
+
+    #[test]
+    fn dataset_root_create_and_lookup_stays_within_dataset() {
+        let (engine, _td) = temp_dataset_fs("ds1");
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        // Create a file in the dataset root
+        let (created, fh) = engine
+            .create(root, b"dataset-file.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"dataset content", &ctx()).unwrap();
+
+        // Lookup must find the file within the dataset
+        let looked_up = engine.lookup(root, b"dataset-file.txt", &ctx()).unwrap();
+        assert_eq!(looked_up.inode_id, created.inode_id);
+        assert_eq!(looked_up.kind, NodeKind::File);
+
+        // Inode path should be within the dataset
+        let file_path = engine.inode_path(looked_up.inode_id).unwrap();
+        assert_eq!(
+            file_path, "/ds1/dataset-file.txt",
+            "file path must be scoped within the dataset directory"
+        );
+    }
+
+    #[test]
+    fn dataset_root_readdir_shows_dataset_contents() {
+        let (engine, _td) = temp_dataset_fs("ds1");
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        // Create entries within the dataset
+        engine.create(root, b"a.txt", 0o644, 0, &ctx()).unwrap();
+        engine.mkdir(root, b"sub", 0o755, &ctx()).unwrap();
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        let (entries, _more) = engine.readdir(&dh, 0, &ctx()).unwrap();
+        let names: Vec<String> = entries
+            .into_iter()
+            .map(|e| String::from_utf8_lossy(&e.name).to_string())
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n == "a.txt"),
+            "readdir must show entries within the dataset"
+        );
+        assert!(
+            names.iter().any(|n| n == "sub"),
+            "readdir must show subdirectories within the dataset"
+        );
+    }
+
+    #[test]
+    fn dataset_root_path_does_not_escape() {
+        let (engine, _td) = temp_dataset_fs("ds1");
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        // Create a file OUTSIDE the dataset (at pool root)
+        // via direct LocalFileSystem access, then verify it's not visible
+        // through the VFS engine.
+        let mut fs = engine.fs.borrow_mut();
+        fs.create_file("/outside.txt", 0o644)
+            .expect("create outside file");
+        drop(fs);
+
+        // Lookup within dataset should NOT find the outside file
+        let result = engine.lookup(root, b"outside.txt", &ctx());
+        assert!(
+            result.is_err(),
+            "lookup must not escape the dataset boundary"
+        );
+    }
+
+    #[test]
+    fn lookup_regular_file_after_create() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (created, fh) = engine
+            .create(root, b"lookup-file.txt", 0o640, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"lookup bytes", &ctx()).unwrap();
+
+        let looked_up = engine.lookup(root, b"lookup-file.txt", &ctx()).unwrap();
+
+        assert_eq!(looked_up.inode_id, created.inode_id);
+        assert_eq!(looked_up.kind, NodeKind::File);
+        assert!(looked_up.posix.is_file());
+        assert_eq!(looked_up.posix.mode & !S_IFMT, 0o640);
+        assert_eq!(looked_up.posix.size, b"lookup bytes".len() as u64);
+    }
+
+    #[test]
+    fn lookup_directory_after_mkdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dir = engine.mkdir(root, b"lookup-dir", 0o750, &ctx()).unwrap();
+
+        let looked_up = engine.lookup(root, b"lookup-dir", &ctx()).unwrap();
+
+        assert_eq!(looked_up.inode_id, dir.inode_id);
+        assert_eq!(looked_up.kind, NodeKind::Dir);
+        assert!(looked_up.posix.is_dir());
+        assert_eq!(looked_up.posix.mode & !S_IFMT, 0o750);
+        assert!(looked_up.posix.nlink >= 2);
+    }
+
+    #[test]
+    fn lookup_symlink_after_symlink() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let symlink = engine
+            .symlink(root, b"lookup-link", b"/target/path", &ctx())
+            .unwrap();
+
+        let looked_up = engine.lookup(root, b"lookup-link", &ctx()).unwrap();
+
+        assert_eq!(looked_up.inode_id, symlink.inode_id);
+        assert_eq!(looked_up.kind, NodeKind::Symlink);
+        assert!(looked_up.posix.is_symlink());
+        assert_eq!(
+            engine.inode_path(looked_up.inode_id).unwrap(),
+            "/lookup-link"
+        );
+        assert_eq!(
+            engine.readlink(looked_up.inode_id, &ctx()).unwrap(),
+            b"/target/path"
+        );
+    }
+
+    #[test]
+    fn lookup_after_rename_cross_directory() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let source_dir = engine.mkdir(root, b"lookup-source", 0o755, &ctx()).unwrap();
+        let target_dir = engine.mkdir(root, b"lookup-target", 0o755, &ctx()).unwrap();
+        let (created, _fh) = engine
+            .create(source_dir.inode_id, b"before.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine
+            .rename(
+                source_dir.inode_id,
+                b"before.txt",
+                target_dir.inode_id,
+                b"after.txt",
+                0,
+                &ctx(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .lookup(source_dir.inode_id, b"before.txt", &ctx())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        let moved = engine
+            .lookup(target_dir.inode_id, b"after.txt", &ctx())
+            .unwrap();
+        assert_eq!(moved.inode_id, created.inode_id);
+        assert_eq!(
+            engine.inode_path(moved.inode_id).unwrap(),
+            "/lookup-target/after.txt"
+        );
+    }
+
+    #[test]
+    fn lookup_after_unlink_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (created, _fh) = engine
+            .create(root, b"lookup-gone.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .lookup(root, b"lookup-gone.txt", &ctx())
+                .unwrap()
+                .inode_id,
+            created.inode_id
+        );
+        engine.unlink(root, b"lookup-gone.txt", &ctx()).unwrap();
+        assert_eq!(
+            engine.lookup(root, b"lookup-gone.txt", &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn create_file_and_read() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine.create(root, b"hello.txt", 0o644, 0, &ctx()).unwrap();
+        assert_eq!(attr.kind, NodeKind::File);
+
+        let w = engine.write(&fh, 0, b"hello world", &ctx()).unwrap();
+        assert_eq!(w, 11);
+
+        let data = engine.read(&fh, 0, 11, &ctx()).unwrap();
+        assert_eq!(data, b"hello world");
+    }
+
+    #[test]
+    fn create_file_initializes_posix_times_from_wall_clock() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let before_ns = crate::types::current_posix_time_ns();
+
+        let (attr, _fh) = engine
+            .create(root, b"wall-clock.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let observed = engine.getattr(attr.inode_id, None, &ctx()).unwrap();
+        let after_ns = crate::types::current_posix_time_ns().saturating_add(1_000_000_000);
+
+        assert_attr_has_wall_clock_posix_times(&attr, before_ns, after_ns);
+        assert_attr_has_wall_clock_posix_times(&observed, before_ns, after_ns);
+    }
+
+    #[test]
+    fn create_file_excl() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine.create(root, b"file.txt", 0o644, 0, &ctx()).unwrap();
+
+        const O_EXCL: u32 = 0o200;
+        let result = engine.create(root, b"file.txt", 0o644, O_EXCL, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EEXIST);
+    }
+
+    #[test]
+    fn create_duplicate_name_returns_eexist() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine
+            .create(root, b"file.txt", 0o644, O_EXCL, &ctx())
+            .unwrap();
+
+        // O_EXCL on existing name must return EEXIST.
+        let result = engine.create(root, b"file.txt", 0o644, O_EXCL, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EEXIST);
+    }
+
+    #[test]
+    fn create_existing_file_without_flags_opens_existing_file() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (original, fh) = engine
+            .create(root, b"existing.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"data", &ctx()).unwrap();
+
+        let (attr, reopen_fh) = engine
+            .create(root, b"existing.txt", 0o644, O_WRONLY, &ctx())
+            .expect("create on existing file without O_EXCL should open it");
+        assert_eq!(attr.inode_id, original.inode_id);
+        // Data preserved (no truncation)
+        assert_eq!(engine.read(&reopen_fh, 0, 16, &ctx()).unwrap(), b"data");
+    }
+
+    #[test]
+    fn create_with_trunc_truncates_existing_file() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (created, fh) = engine.create(root, b"file.txt", 0o644, 0, &ctx()).unwrap();
+        assert_eq!(engine.write(&fh, 0, b"payload", &ctx()).unwrap(), 7);
+
+        const O_TRUNC: u32 = 0o1000;
+        let (truncated, trunc_fh) = engine
+            .create(root, b"file.txt", 0o644, O_TRUNC, &ctx())
+            .unwrap();
+
+        assert_eq!(truncated.inode_id, created.inode_id);
+        assert_eq!(truncated.posix.size, 0);
+        assert_eq!(engine.read(&trunc_fh, 0, 16, &ctx()).unwrap(), b"");
+    }
+
+    #[test]
+    fn create_in_nonexistent_parent_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let missing_parent = InodeId::new(999_999);
+
+        let result = engine.create(missing_parent, b"file.txt", 0o644, 0, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn create_under_file_parent_returns_enotdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (file_attr, _fh) = engine.create(root, b"not-dir", 0o644, 0, &ctx()).unwrap();
+
+        let result = engine.create(file_attr.inode_id, b"child.txt", 0o644, 0, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOTDIR);
+    }
+
+    #[test]
+    fn create_empty_name_returns_einval() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let result = engine.create(root, b"", 0o644, 0, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn create_name_with_invalid_characters_returns_einval() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let result = engine.create(root, b"bad/name.txt", 0o644, 0, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn create_returns_usable_handle() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine.create(root, b"file.txt", 0o644, 0, &ctx()).unwrap();
+
+        assert_eq!(fh.inode_id, attr.inode_id);
+        assert_ne!(fh.fh_id.get(), 0);
+        assert_eq!(engine.write(&fh, 0, b"vfs-create", &ctx()).unwrap(), 10);
+        assert_eq!(engine.read(&fh, 0, 10, &ctx()).unwrap(), b"vfs-create");
+    }
+
+    #[test]
+    fn create_mode_and_ownership_reflected_in_attrs() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let caller = RequestCtx {
+            uid: 4242,
+            gid: 4343,
+            pid: 77,
+            umask: 0o027,
+            groups: vec![4343],
+        };
+
+        let (attr, _fh) = engine
+            .create(root, b"owned.txt", 0o666, 0, &caller)
+            .unwrap();
+
+        assert_eq!(attr.kind, NodeKind::File);
+        assert_eq!(attr.posix.mode & 0o777, 0o640);
+        assert_eq!(attr.posix.uid, 4242);
+        assert_eq!(attr.posix.gid, 4343);
+    }
+
+    #[test]
+    fn mknod_fifo_creates_lookup_and_readdir_visible_inode() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let attr = engine
+            .mknod(root, b"pipe", S_IFIFO | 0o666, 0, &ctx())
+            .unwrap();
+
+        assert_eq!(attr.kind, NodeKind::Fifo);
+        assert_eq!(attr.posix.mode & S_IFMT, S_IFIFO);
+        assert_eq!(attr.posix.mode & 0o777, 0o644);
+        assert_eq!(attr.posix.uid, 1000);
+        assert_eq!(attr.posix.gid, 1000);
+        assert_eq!(attr.posix.rdev, 0);
+
+        let looked_up = engine.lookup(root, b"pipe", &ctx()).unwrap();
+        assert_eq!(looked_up.inode_id, attr.inode_id);
+        assert_eq!(looked_up.kind, NodeKind::Fifo);
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        let (entries, has_more) = engine.readdir(&dh, 0, &ctx()).unwrap();
+        assert!(!has_more);
+        let pipe = entries
+            .iter()
+            .find(|entry| entry.name.as_slice() == b"pipe")
+            .expect("pipe entry");
+        assert_eq!(pipe.inode_id, attr.inode_id);
+        assert_eq!(pipe.kind, NodeKind::Fifo);
+    }
+
+    #[test]
+    fn mknod_fifo_duplicate_name_returns_eexist() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine
+            .mknod(root, b"pipe", S_IFIFO | 0o644, 0, &ctx())
+            .unwrap();
+
+        let result = engine.mknod(root, b"pipe", S_IFIFO | 0o644, 0, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EEXIST);
+    }
+
+    #[test]
+    fn mknod_fifo_under_file_parent_returns_enotdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (file_attr, _fh) = engine.create(root, b"not-dir", 0o644, 0, &ctx()).unwrap();
+
+        let result = engine.mknod(file_attr.inode_id, b"pipe", S_IFIFO | 0o644, 0, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOTDIR);
+    }
+
+    #[test]
+    fn mknod_fifo_under_nonexistent_parent_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let missing_parent = InodeId::new(999_999);
+
+        let result = engine.mknod(missing_parent, b"pipe", S_IFIFO | 0o644, 0, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn mknod_fifo_explicit_mode_and_umask_reflected_in_attrs() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let caller = RequestCtx {
+            uid: 4242,
+            gid: 4343,
+            pid: 77,
+            umask: 0o027,
+            groups: vec![4343],
+        };
+
+        let attr = engine
+            .mknod(root, b"mode-pipe", S_IFIFO | 0o666, 0, &caller)
+            .unwrap();
+
+        assert_eq!(attr.kind, NodeKind::Fifo);
+        assert_eq!(attr.posix.mode & S_IFMT, S_IFIFO);
+        assert_eq!(attr.posix.mode & 0o777, 0o640);
+        assert_eq!(attr.posix.uid, 4242);
+        assert_eq!(attr.posix.gid, 4343);
+    }
+
+    #[test]
+    fn mknod_fifo_in_subdirectory_is_lookup_and_readdir_visible() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let parent = engine.mkdir(root, b"pipes", 0o755, &ctx()).unwrap();
+
+        let attr = engine
+            .mknod(parent.inode_id, b"child-pipe", S_IFIFO | 0o600, 0, &ctx())
+            .unwrap();
+
+        let looked_up = engine
+            .lookup(parent.inode_id, b"child-pipe", &ctx())
+            .unwrap();
+        assert_eq!(looked_up.inode_id, attr.inode_id);
+        assert_eq!(looked_up.kind, NodeKind::Fifo);
+        assert_eq!(looked_up.posix.mode & 0o777, 0o600);
+
+        let dh = engine.opendir(parent.inode_id, &ctx()).unwrap();
+        let (entries, has_more) = engine.readdir(&dh, 0, &ctx()).unwrap();
+        assert!(!has_more);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.name.as_slice() == b"child-pipe"
+                && entry.inode_id == attr.inode_id
+                && entry.kind == NodeKind::Fifo));
+    }
+
+    #[test]
+    fn mknod_fifo_multiple_in_same_directory_have_independent_inodes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let first = engine
+            .mknod(root, b"pipe-a", S_IFIFO | 0o600, 0, &ctx())
+            .unwrap();
+        let second = engine
+            .mknod(root, b"pipe-b", S_IFIFO | 0o644, 0, &ctx())
+            .unwrap();
+
+        assert_ne!(first.inode_id, second.inode_id);
+        assert_eq!(
+            engine.lookup(root, b"pipe-a", &ctx()).unwrap().inode_id,
+            first.inode_id
+        );
+        assert_eq!(
+            engine.lookup(root, b"pipe-b", &ctx()).unwrap().inode_id,
+            second.inode_id
+        );
+        assert_eq!(first.posix.mode & 0o777, 0o600);
+        assert_eq!(second.posix.mode & 0o777, 0o644);
+    }
+
+    #[test]
+    fn mknod_fifo_reuse_name_after_unlink_allocates_new_inode() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let original = engine
+            .mknod(root, b"pipe", S_IFIFO | 0o600, 0, &ctx())
+            .unwrap();
+
+        engine.unlink(root, b"pipe", &ctx()).unwrap();
+        assert_eq!(
+            engine.lookup(root, b"pipe", &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+
+        let recreated = engine
+            .mknod(root, b"pipe", S_IFIFO | 0o644, 0, &ctx())
+            .unwrap();
+
+        assert_ne!(recreated.inode_id, original.inode_id);
+        assert_eq!(
+            engine.lookup(root, b"pipe", &ctx()).unwrap().inode_id,
+            recreated.inode_id
+        );
+        assert_eq!(recreated.posix.mode & 0o777, 0o644);
+    }
+
+    #[test]
+    fn mknod_fifo_invalid_names_return_einval() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        assert_eq!(
+            engine
+                .mknod(root, b"", S_IFIFO | 0o644, 0, &ctx())
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            engine
+                .mknod(root, b"bad/name", S_IFIFO | 0o644, 0, &ctx())
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    #[test]
+    fn mknod_fifo_zero_permissions_creates_visible_inode() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let attr = engine
+            .mknod(root, b"zero-perm", S_IFIFO, 0, &ctx())
+            .unwrap();
+
+        assert_eq!(attr.kind, NodeKind::Fifo);
+        assert_eq!(attr.posix.mode & S_IFMT, S_IFIFO);
+        assert_eq!(attr.posix.mode & 0o777, 0);
+        assert_eq!(
+            engine.lookup(root, b"zero-perm", &ctx()).unwrap().inode_id,
+            attr.inode_id
+        );
+    }
+
+    #[test]
+    fn mknod_char_device_creates_and_persists_rdev() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&root_ctx()).unwrap();
+
+        let attr = engine
+            .mknod(root, b"null", S_IFCHR | 0o666, 0x0103, &root_ctx())
+            .unwrap();
+        assert_eq!(attr.kind, NodeKind::CharDev);
+        assert_eq!(attr.posix.mode & S_IFMT, S_IFCHR);
+        assert_eq!(attr.posix.rdev, 0x0103);
+
+        let looked_up = engine.lookup(root, b"null", &root_ctx()).unwrap();
+        assert_eq!(looked_up.inode_id, attr.inode_id);
+        assert_eq!(looked_up.posix.rdev, 0x0103);
+    }
+
+    #[test]
+    fn mknod_block_device_creates_and_persists_rdev() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&root_ctx()).unwrap();
+
+        let attr = engine
+            .mknod(root, b"sda1", S_IFBLK | 0o660, 0x0801, &root_ctx())
+            .unwrap();
+        assert_eq!(attr.kind, NodeKind::BlockDev);
+        assert_eq!(attr.posix.mode & S_IFMT, S_IFBLK);
+        assert_eq!(attr.posix.rdev, 0x0801);
+
+        let looked_up = engine.lookup(root, b"sda1", &root_ctx()).unwrap();
+        assert_eq!(looked_up.inode_id, attr.inode_id);
+        assert_eq!(looked_up.posix.rdev, 0x0801);
+    }
+
+    #[test]
+    fn mknod_socket_creates_lookupable_inode() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&root_ctx()).unwrap();
+
+        let attr = engine
+            .mknod(root, b"mysock", S_IFSOCK | 0o700, 0, &root_ctx())
+            .unwrap();
+        assert_eq!(attr.kind, NodeKind::Socket);
+        assert_eq!(attr.posix.mode & S_IFMT, S_IFSOCK);
+        assert_eq!(attr.posix.rdev, 0);
+
+        let looked_up = engine.lookup(root, b"mysock", &root_ctx()).unwrap();
+        assert_eq!(looked_up.inode_id, attr.inode_id);
+    }
+
+    #[test]
+    fn mknod_rejects_unsupported_type_bits() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&root_ctx()).unwrap();
+
+        assert_eq!(
+            engine
+                .mknod(root, b"dir-node", S_IFDIR | 0o755, 0, &root_ctx())
+                .unwrap_err(),
+            Errno::EOPNOTSUPP
+        );
+        assert_eq!(
+            engine
+                .mknod(
+                    root,
+                    b"symlink-node",
+                    tidefs_types_vfs_core::S_IFLNK | 0o777,
+                    0,
+                    &root_ctx()
+                )
+                .unwrap_err(),
+            Errno::EOPNOTSUPP
+        );
+    }
+
+    #[test]
+    fn mknod_device_and_socket_nodes_create_correct_node_kinds() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&root_ctx()).unwrap();
+
+        let cases: &[(&[u8], u32, u32, NodeKind)] = &[
+            (b"char-dev", S_IFCHR | 0o600, 0x0103, NodeKind::CharDev),
+            (b"block-dev", S_IFBLK | 0o660, 0x0801, NodeKind::BlockDev),
+            (b"unix-sock", S_IFSOCK | 0o700, 0, NodeKind::Socket),
+        ];
+
+        for &(name, mode, rdev, kind) in cases {
+            let attr = engine.mknod(root, name, mode, rdev, &root_ctx()).unwrap();
+            assert_eq!(attr.kind, kind, "wrong NodeKind for {name:?}");
+            assert_eq!(attr.posix.rdev, rdev, "wrong rdev for {name:?}");
+            let looked_up = engine.lookup(root, name, &root_ctx()).unwrap();
+            assert_eq!(looked_up.inode_id, attr.inode_id);
+        }
+    }
+
+    #[test]
+    fn unlink_file() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine.create(root, b"gone.txt", 0o644, 0, &ctx()).unwrap();
+        engine.unlink(root, b"gone.txt", &ctx()).unwrap();
+
+        let result = engine.lookup(root, b"gone.txt", &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn unlink_directory_returns_eisdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dir = engine.mkdir(root, b"directory", 0o755, &ctx()).unwrap();
+
+        let result = engine.unlink(root, b"directory", &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::EISDIR);
+        assert_eq!(
+            engine.lookup(root, b"directory", &ctx()).unwrap().inode_id,
+            dir.inode_id
+        );
+    }
+
+    #[test]
+    fn unlink_nonexistent_entry_returns_enoent_and_preserves_parent() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (survivor, _fh) = engine
+            .create(root, b"survivor.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        let result = engine.unlink(root, b"missing.txt", &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+        assert_eq!(
+            engine
+                .lookup(root, b"survivor.txt", &ctx())
+                .unwrap()
+                .inode_id,
+            survivor.inode_id
+        );
+    }
+
+    #[test]
+    fn unlink_nonexistent_parent_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let missing_parent = InodeId::new(999_999);
+
+        let result = engine.unlink(missing_parent, b"child.txt", &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn unlink_empty_name_returns_einval() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let result = engine.unlink(root, b"", &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn unlink_symlink_removes_link_not_target() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (target, target_fh) = engine
+            .create(root, b"target.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&target_fh, 0, b"target-data", &ctx()).unwrap();
+        let link = engine
+            .symlink(root, b"link.txt", b"/target.txt", &ctx())
+            .unwrap();
+
+        engine.unlink(root, b"link.txt", &ctx()).unwrap();
+
+        assert_eq!(
+            engine.lookup(root, b"link.txt", &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(
+            engine.readlink(link.inode_id, &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+        let target_after = engine.lookup(root, b"target.txt", &ctx()).unwrap();
+        assert_eq!(target_after.inode_id, target.inode_id);
+        assert_eq!(
+            engine
+                .read(&target_fh, 0, b"target-data".len() as u32, &ctx())
+                .unwrap(),
+            b"target-data"
+        );
+    }
+
+    #[test]
+    fn unlink_open_file_allows_release_and_removes_name() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"open-gone.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"before unlink", &ctx()).unwrap();
+
+        engine.unlink(root, b"open-gone.txt", &ctx()).unwrap();
+
+        // Name is gone from the directory.
+        assert_eq!(
+            engine.lookup(root, b"open-gone.txt", &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+        // Inode is still reachable through the live handle (preserved as anonymous tmpfile).
+        let attr_after = engine.getattr(attr.inode_id, None, &ctx()).unwrap();
+        assert_eq!(attr_after.inode_id, attr.inode_id);
+        assert_eq!(
+            engine
+                .read(&fh, 0, b"before unlink".len() as u32, &ctx())
+                .unwrap(),
+            b"before unlink"
+        );
+        engine.release(&fh).unwrap();
+        // After release the anonymous tmpfile is reclaimed; getattr should fail.
+        assert_eq!(
+            engine.getattr(attr.inode_id, None, &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(engine.release(&fh).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn rmdir_empty() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine.mkdir(root, b"emptydir", 0o755, &ctx()).unwrap();
+        engine.rmdir(root, b"emptydir", &ctx()).unwrap();
+
+        let result = engine.lookup(root, b"emptydir", &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn rmdir_non_empty_directory_returns_enotempty() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dir = engine.mkdir(root, b"parent", 0o755, &ctx()).unwrap();
+        engine
+            .create(dir.inode_id, b"child.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        let result = engine.rmdir(root, b"parent", &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOTEMPTY);
+
+        let looked_up = engine.lookup(root, b"parent", &ctx()).unwrap();
+        assert_eq!(looked_up.inode_id, dir.inode_id);
+    }
+
+    #[test]
+    fn rmdir_regular_file_returns_enotdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (file_attr, _fh) = engine.create(root, b"file.txt", 0o644, 0, &ctx()).unwrap();
+
+        let result = engine.rmdir(root, b"file.txt", &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOTDIR);
+
+        let looked_up = engine.lookup(root, b"file.txt", &ctx()).unwrap();
+        assert_eq!(looked_up.inode_id, file_attr.inode_id);
+    }
+
+    #[test]
+    fn rmdir_nonexistent_entry_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let result = engine.rmdir(root, b"missing", &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn rmdir_dot_and_dotdot_names_return_einval() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let dot = engine.rmdir(root, b".", &ctx());
+        assert_eq!(dot.unwrap_err(), Errno::EINVAL);
+
+        let dotdot = engine.rmdir(root, b"..", &ctx());
+        assert_eq!(dotdot.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn rmdir_empty_name_returns_einval() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let result = engine.rmdir(root, b"", &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn rmdir_rejects_slash_and_nul_names() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let slash = engine.rmdir(root, b"bad/name", &ctx());
+        assert_eq!(slash.unwrap_err(), Errno::EINVAL);
+
+        let nul = engine.rmdir(root, b"bad\0name", &ctx());
+        assert_eq!(nul.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn rmdir_name_too_long_returns_enametoolong() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let name = vec![b'a'; 256];
+
+        let result = engine.rmdir(root, &name, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENAMETOOLONG);
+    }
+
+    #[test]
+    fn rmdir_nonexistent_parent_returns_enoent() {
+        let (engine, _td) = temp_fs();
+
+        let result = engine.rmdir(InodeId::new(999_999), b"child", &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn rmdir_after_unlinking_last_child_succeeds() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let parent = engine.mkdir(root, b"parent", 0o755, &ctx()).unwrap();
+        engine
+            .create(parent.inode_id, b"child.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine
+            .unlink(parent.inode_id, b"child.txt", &ctx())
+            .unwrap();
+        engine.rmdir(root, b"parent", &ctx()).unwrap();
+
+        assert_eq!(
+            engine.lookup(root, b"parent", &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn rmdir_nested_leaf_preserves_parent_directory() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let parent = engine.mkdir(root, b"parent", 0o755, &ctx()).unwrap();
+        let leaf = engine
+            .mkdir(parent.inode_id, b"leaf", 0o755, &ctx())
+            .unwrap();
+
+        engine.rmdir(parent.inode_id, b"leaf", &ctx()).unwrap();
+
+        assert_eq!(
+            engine.lookup(root, b"parent", &ctx()).unwrap().inode_id,
+            parent.inode_id
+        );
+        assert_eq!(
+            engine.lookup(parent.inode_id, b"leaf", &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(
+            engine.getattr(leaf.inode_id, None, &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn rename_file() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"old.txt", 0o644, 0, &ctx()).unwrap();
+        engine
+            .rename(root, b"old.txt", root, b"new.txt", 0, &ctx())
+            .unwrap();
+
+        let looked = engine.lookup(root, b"new.txt", &ctx()).unwrap();
+        assert_eq!(looked.inode_id, attr.inode_id);
+        assert!(engine.lookup(root, b"old.txt", &ctx()).is_err());
+    }
+
+    #[test]
+    fn rename_source_enoent_preserves_destination_absence() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let result = engine.rename(root, b"missing.txt", root, b"new.txt", 0, &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+        assert_eq!(
+            engine.lookup(root, b"new.txt", &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn rename_into_nonempty_dir_returns_enotempty_and_preserves_entries() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let source_dir = engine.mkdir(root, b"source-dir", 0o755, &ctx()).unwrap();
+        let target_dir = engine.mkdir(root, b"target-dir", 0o755, &ctx()).unwrap();
+        let (nested, _nested_fh) = engine
+            .create(target_dir.inode_id, b"nested.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        let result = engine.rename(root, b"source-dir", root, b"target-dir", 0, &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::ENOTEMPTY);
+        assert_eq!(
+            engine.lookup(root, b"source-dir", &ctx()).unwrap().inode_id,
+            source_dir.inode_id
+        );
+        assert_eq!(
+            engine.lookup(root, b"target-dir", &ctx()).unwrap().inode_id,
+            target_dir.inode_id
+        );
+        assert_eq!(
+            engine
+                .lookup(target_dir.inode_id, b"nested.txt", &ctx())
+                .unwrap()
+                .inode_id,
+            nested.inode_id
+        );
+    }
+
+    #[test]
+    fn rename_cross_directory_moves_file_and_preserves_inode() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let source_dir = engine.mkdir(root, b"source-dir", 0o755, &ctx()).unwrap();
+        let target_dir = engine.mkdir(root, b"target-dir", 0o755, &ctx()).unwrap();
+        let (file, _fh) = engine
+            .create(source_dir.inode_id, b"file.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine
+            .rename(
+                source_dir.inode_id,
+                b"file.txt",
+                target_dir.inode_id,
+                b"file.txt",
+                0,
+                &ctx(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .lookup(target_dir.inode_id, b"file.txt", &ctx())
+                .unwrap()
+                .inode_id,
+            file.inode_id
+        );
+        assert_eq!(
+            engine
+                .lookup(source_dir.inode_id, b"file.txt", &ctx())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn rename_noreplace_rejects_existing_target() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (alpha, alpha_fh) = engine.create(root, b"alpha.txt", 0o644, 0, &ctx()).unwrap();
+        let (beta, beta_fh) = engine.create(root, b"beta.txt", 0o644, 0, &ctx()).unwrap();
+        engine.write(&alpha_fh, 0, b"alpha", &ctx()).unwrap();
+        engine.write(&beta_fh, 0, b"beta", &ctx()).unwrap();
+
+        let result = engine.rename(
+            root,
+            b"alpha.txt",
+            root,
+            b"beta.txt",
+            RENAME_NOREPLACE,
+            &ctx(),
+        );
+
+        assert_eq!(result.unwrap_err(), Errno::EEXIST);
+        assert_eq!(
+            engine.lookup(root, b"alpha.txt", &ctx()).unwrap().inode_id,
+            alpha.inode_id
+        );
+        assert_eq!(
+            engine.lookup(root, b"beta.txt", &ctx()).unwrap().inode_id,
+            beta.inode_id
+        );
+        assert_eq!(
+            engine.read(&alpha_fh, 0, 16, &ctx()).unwrap(),
+            b"alpha".to_vec()
+        );
+        assert_eq!(
+            engine.read(&beta_fh, 0, 16, &ctx()).unwrap(),
+            b"beta".to_vec()
+        );
+    }
+
+    #[test]
+    fn rename_noreplace_cross_directory_rejects_existing_target() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let source_dir = engine.mkdir(root, b"source-dir", 0o755, &ctx()).unwrap();
+        let target_dir = engine.mkdir(root, b"target-dir", 0o755, &ctx()).unwrap();
+        let (alpha, _alpha_fh) = engine
+            .create(source_dir.inode_id, b"file.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let (beta, _beta_fh) = engine
+            .create(target_dir.inode_id, b"file.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        let result = engine.rename(
+            source_dir.inode_id,
+            b"file.txt",
+            target_dir.inode_id,
+            b"file.txt",
+            RENAME_NOREPLACE,
+            &ctx(),
+        );
+
+        assert_eq!(result.unwrap_err(), Errno::EEXIST);
+        assert_eq!(
+            engine
+                .lookup(source_dir.inode_id, b"file.txt", &ctx())
+                .unwrap()
+                .inode_id,
+            alpha.inode_id
+        );
+        assert_eq!(
+            engine
+                .lookup(target_dir.inode_id, b"file.txt", &ctx())
+                .unwrap()
+                .inode_id,
+            beta.inode_id
+        );
+    }
+
+    #[test]
+    fn rename_exchange_swaps_file_entries() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (alpha, _alpha_fh) = engine.create(root, b"alpha.txt", 0o644, 0, &ctx()).unwrap();
+        let (beta, _beta_fh) = engine.create(root, b"beta.txt", 0o644, 0, &ctx()).unwrap();
+
+        engine
+            .rename(
+                root,
+                b"alpha.txt",
+                root,
+                b"beta.txt",
+                RENAME_EXCHANGE,
+                &ctx(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            engine.lookup(root, b"alpha.txt", &ctx()).unwrap().inode_id,
+            beta.inode_id
+        );
+        assert_eq!(
+            engine.lookup(root, b"beta.txt", &ctx()).unwrap().inode_id,
+            alpha.inode_id
+        );
+    }
+
+    #[test]
+    fn rename_exchange_cross_directory_swaps_files() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let source_dir = engine.mkdir(root, b"source-dir", 0o755, &ctx()).unwrap();
+        let target_dir = engine.mkdir(root, b"target-dir", 0o755, &ctx()).unwrap();
+        let (alpha, alpha_fh) = engine
+            .create(source_dir.inode_id, b"alpha.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let (beta, beta_fh) = engine
+            .create(target_dir.inode_id, b"beta.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&alpha_fh, 0, b"alpha", &ctx()).unwrap();
+        engine.write(&beta_fh, 0, b"beta", &ctx()).unwrap();
+
+        engine
+            .rename(
+                source_dir.inode_id,
+                b"alpha.txt",
+                target_dir.inode_id,
+                b"beta.txt",
+                RENAME_EXCHANGE,
+                &ctx(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .lookup(source_dir.inode_id, b"alpha.txt", &ctx())
+                .unwrap()
+                .inode_id,
+            beta.inode_id
+        );
+        assert_eq!(
+            engine
+                .lookup(target_dir.inode_id, b"beta.txt", &ctx())
+                .unwrap()
+                .inode_id,
+            alpha.inode_id
+        );
+        assert_eq!(
+            engine.read(&alpha_fh, 0, 16, &ctx()).unwrap(),
+            b"alpha".to_vec()
+        );
+        assert_eq!(
+            engine.read(&beta_fh, 0, 16, &ctx()).unwrap(),
+            b"beta".to_vec()
+        );
+    }
+
+    #[test]
+    fn rename_exchange_swaps_directories() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let left_dir = engine.mkdir(root, b"left", 0o755, &ctx()).unwrap();
+        let right_dir = engine.mkdir(root, b"right", 0o755, &ctx()).unwrap();
+        let (left_child, _left_child_fh) = engine
+            .create(left_dir.inode_id, b"left-child.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let (right_child, _right_child_fh) = engine
+            .create(right_dir.inode_id, b"right-child.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine
+            .rename(root, b"left", root, b"right", RENAME_EXCHANGE, &ctx())
+            .unwrap();
+
+        assert_eq!(
+            engine.lookup(root, b"left", &ctx()).unwrap().inode_id,
+            right_dir.inode_id
+        );
+        assert_eq!(
+            engine.lookup(root, b"right", &ctx()).unwrap().inode_id,
+            left_dir.inode_id
+        );
+        assert_eq!(
+            engine
+                .lookup(left_dir.inode_id, b"left-child.txt", &ctx())
+                .unwrap()
+                .inode_id,
+            left_child.inode_id
+        );
+        assert_eq!(
+            engine
+                .lookup(right_dir.inode_id, b"right-child.txt", &ctx())
+                .unwrap()
+                .inode_id,
+            right_child.inode_id
+        );
+        assert_eq!(engine.inode_path(left_dir.inode_id).unwrap(), "/right");
+        assert_eq!(engine.inode_path(right_dir.inode_id).unwrap(), "/left");
+    }
+
+    #[test]
+    fn rename_exchange_swaps_symlinks() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let alpha = engine
+            .symlink(root, b"alpha.link", b"/alpha-target", &ctx())
+            .unwrap();
+        let beta = engine
+            .symlink(root, b"beta.link", b"/beta-target", &ctx())
+            .unwrap();
+
+        engine
+            .rename(
+                root,
+                b"alpha.link",
+                root,
+                b"beta.link",
+                RENAME_EXCHANGE,
+                &ctx(),
+            )
+            .unwrap();
+
+        let alpha_name = engine.lookup(root, b"alpha.link", &ctx()).unwrap();
+        let beta_name = engine.lookup(root, b"beta.link", &ctx()).unwrap();
+        assert_eq!(alpha_name.inode_id, beta.inode_id);
+        assert_eq!(beta_name.inode_id, alpha.inode_id);
+        assert_eq!(
+            engine.readlink(alpha_name.inode_id, &ctx()).unwrap(),
+            b"/beta-target".to_vec()
+        );
+        assert_eq!(
+            engine.readlink(beta_name.inode_id, &ctx()).unwrap(),
+            b"/alpha-target".to_vec()
+        );
+    }
+
+    #[test]
+    fn rename_exchange_same_name_is_noop() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (file, fh) = engine.create(root, b"same.txt", 0o644, 0, &ctx()).unwrap();
+        engine.write(&fh, 0, b"same bytes", &ctx()).unwrap();
+        let before = engine.getattr(file.inode_id, None, &ctx()).unwrap();
+
+        engine
+            .rename(
+                root,
+                b"same.txt",
+                root,
+                b"same.txt",
+                RENAME_EXCHANGE,
+                &ctx(),
+            )
+            .unwrap();
+
+        let after = engine.lookup(root, b"same.txt", &ctx()).unwrap();
+        assert_eq!(after.inode_id, file.inode_id);
+        assert_eq!(after.posix.size, before.posix.size);
+        assert_eq!(
+            engine.read(&fh, 0, 32, &ctx()).unwrap(),
+            b"same bytes".to_vec()
+        );
+        assert_eq!(engine.inode_path(file.inode_id).unwrap(), "/same.txt");
+    }
+
+    #[test]
+    fn rename_updates_moved_inode_ctime() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (file, fh) = engine
+            .create(root, b"original.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let before = engine.getattr(file.inode_id, None, &ctx()).unwrap();
+
+        // Sleep to ensure any time-based ctime would advance, but TideFS
+        // uses a monotonic metadata version so the sleep is just insurance.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        engine
+            .rename(root, b"original.txt", root, b"renamed.txt", 0, &ctx())
+            .unwrap();
+
+        let after = engine.getattr(file.inode_id, None, &ctx()).unwrap();
+        assert!(
+            after.posix.ctime_ns > before.posix.ctime_ns,
+            "renamed inode ctime must advance: before={}, after={}",
+            before.posix.ctime_ns,
+            after.posix.ctime_ns
+        );
+        // Verify the file is at the new path
+        assert!(engine.lookup(root, b"renamed.txt", &ctx()).is_ok());
+        assert!(engine.lookup(root, b"original.txt", &ctx()).is_err());
+        // Clean up
+        let _ = engine.release(&fh);
+    }
+
+    #[test]
+    fn rename_exchange_updates_both_inode_ctimes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (left, _fh_l) = engine.create(root, b"left.txt", 0o644, 0, &ctx()).unwrap();
+        let (right, _fh_r) = engine.create(root, b"right.txt", 0o644, 0, &ctx()).unwrap();
+        let left_before = engine.getattr(left.inode_id, None, &ctx()).unwrap();
+        let right_before = engine.getattr(right.inode_id, None, &ctx()).unwrap();
+
+        engine
+            .rename(
+                root,
+                b"left.txt",
+                root,
+                b"right.txt",
+                RENAME_EXCHANGE,
+                &ctx(),
+            )
+            .unwrap();
+
+        let left_after = engine.getattr(left.inode_id, None, &ctx()).unwrap();
+        let right_after = engine.getattr(right.inode_id, None, &ctx()).unwrap();
+        assert!(
+            left_after.posix.ctime_ns > left_before.posix.ctime_ns,
+            "exchanged left inode ctime must advance"
+        );
+        assert!(
+            right_after.posix.ctime_ns > right_before.posix.ctime_ns,
+            "exchanged right inode ctime must advance"
+        );
+    }
+
+    #[test]
+    fn link_creates_hard_link_and_both_names_share_inode_attributes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (original, fh) = engine
+            .create(root, b"original.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"linked bytes", &ctx()).unwrap();
+
+        let linked = engine
+            .link(original.inode_id, root, b"alias.txt", &ctx())
+            .unwrap();
+
+        let original_lookup = engine.lookup(root, b"original.txt", &ctx()).unwrap();
+        let alias_lookup = engine.lookup(root, b"alias.txt", &ctx()).unwrap();
+        assert_eq!(linked.inode_id, original.inode_id);
+        assert_eq!(alias_lookup.inode_id, original.inode_id);
+        assert_eq!(original_lookup.inode_id, original.inode_id);
+        assert_eq!(alias_lookup.kind, NodeKind::File);
+        assert_eq!(alias_lookup.posix.mode, original_lookup.posix.mode);
+        assert_eq!(alias_lookup.posix.size, original_lookup.posix.size);
+    }
+
+    #[test]
+    fn link_increments_nlink_on_target_inode() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (original, _fh) = engine
+            .create(root, b"original.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        let linked = engine
+            .link(original.inode_id, root, b"alias.txt", &ctx())
+            .unwrap();
+
+        assert_eq!(linked.posix.nlink, 2);
+        assert_eq!(
+            engine
+                .getattr(original.inode_id, None, &ctx())
+                .unwrap()
+                .posix
+                .nlink,
+            2
+        );
+    }
+
+    #[test]
+    fn link_nonexistent_target_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let result = engine.link(InodeId::new(99_999), root, b"alias.txt", &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+        assert_eq!(
+            engine.lookup(root, b"alias.txt", &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn link_to_existing_destination_returns_eexist() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (original, _fh) = engine
+            .create(root, b"original.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine
+            .create(root, b"existing.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        let result = engine.link(original.inode_id, root, b"existing.txt", &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::EEXIST);
+        assert_eq!(
+            engine
+                .getattr(original.inode_id, None, &ctx())
+                .unwrap()
+                .posix
+                .nlink,
+            1
+        );
+    }
+
+    #[test]
+    fn link_on_directory_returns_eopnotsupp() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dir = engine.mkdir(root, b"dir", 0o755, &ctx()).unwrap();
+
+        let result = engine.link(dir.inode_id, root, b"dir-link", &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::EPERM);
+        assert_eq!(
+            engine.lookup(root, b"dir-link", &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn unlink_after_link_preserves_inode_until_last_link_removed() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (original, fh) = engine
+            .create(root, b"original.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"survives unlink", &ctx()).unwrap();
+        engine
+            .link(original.inode_id, root, b"alias.txt", &ctx())
+            .unwrap();
+
+        engine.unlink(root, b"original.txt", &ctx()).unwrap();
+
+        assert_eq!(
+            engine.lookup(root, b"original.txt", &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+        let alias = engine.lookup(root, b"alias.txt", &ctx()).unwrap();
+        assert_eq!(alias.inode_id, original.inode_id);
+        assert_eq!(alias.posix.nlink, 1);
+        let alias_fh = engine.open(alias.inode_id, 0, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .read(&alias_fh, 0, b"survives unlink".len() as u32, &ctx())
+                .unwrap(),
+            b"survives unlink"
+        );
+    }
+
+    #[test]
+    fn link_updates_path_cache_for_new_link_name() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (original, _fh) = engine
+            .create(root, b"original.txt", 0o644, 0, &ctx())
+            .unwrap();
+        assert_eq!(
+            engine.inode_path(original.inode_id).unwrap(),
+            "/original.txt"
+        );
+
+        engine
+            .link(original.inode_id, root, b"alias.txt", &ctx())
+            .unwrap();
+        let alias = engine.lookup(root, b"alias.txt", &ctx()).unwrap();
+
+        assert_eq!(alias.inode_id, original.inode_id);
+        assert_eq!(engine.inode_path(original.inode_id).unwrap(), "/alias.txt");
+    }
+
+    #[test]
+    fn link_across_directories_preserves_shared_inode_and_content() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let source_dir = engine.mkdir(root, b"source", 0o755, &ctx()).unwrap();
+        let alias_dir = engine.mkdir(root, b"alias", 0o755, &ctx()).unwrap();
+        let (original, fh) = engine
+            .create(source_dir.inode_id, b"data.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine
+            .write(&fh, 0, b"cross-directory link", &ctx())
+            .unwrap();
+
+        let linked = engine
+            .link(
+                original.inode_id,
+                alias_dir.inode_id,
+                b"data-alias.txt",
+                &ctx(),
+            )
+            .unwrap();
+
+        let original_lookup = engine
+            .lookup(source_dir.inode_id, b"data.txt", &ctx())
+            .unwrap();
+        let alias_lookup = engine
+            .lookup(alias_dir.inode_id, b"data-alias.txt", &ctx())
+            .unwrap();
+        assert_eq!(linked.inode_id, original.inode_id);
+        assert_eq!(alias_lookup.inode_id, original.inode_id);
+        assert_eq!(original_lookup.inode_id, original.inode_id);
+        assert_eq!(linked.posix.nlink, 2);
+        assert_eq!(alias_lookup.posix.nlink, 2);
+
+        let alias_fh = engine
+            .open(alias_lookup.inode_id, O_RDONLY, &ctx())
+            .unwrap();
+        assert_eq!(
+            engine
+                .read(&alias_fh, 0, b"cross-directory link".len() as u32, &ctx())
+                .unwrap(),
+            b"cross-directory link"
+        );
+    }
+
+    #[test]
+    fn symlink_create_and_read() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let attr = engine.symlink(root, b"mylink", b"/target", &ctx()).unwrap();
+        assert_eq!(attr.kind, NodeKind::Symlink);
+
+        let target = engine.readlink(attr.inode_id, &ctx()).unwrap();
+        assert_eq!(target, b"/target");
+    }
+
+    #[test]
+    fn symlink_under_nonexistent_parent_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let missing_parent = InodeId::new(999_999);
+
+        let result = engine.symlink(missing_parent, b"orphan-link", b"target", &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn symlink_with_empty_name_returns_einval() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let result = engine.symlink(root, b"", b"target", &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn symlink_with_existing_name_returns_eexist() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine.create(root, b"taken", 0o644, 0, &ctx()).unwrap();
+
+        let result = engine.symlink(root, b"taken", b"target", &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::EEXIST);
+    }
+
+    #[test]
+    fn readlink_returns_target_for_valid_symlink() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let attr = engine
+            .symlink(root, b"readlink-target", b"../target/path", &ctx())
+            .unwrap();
+
+        let target = engine.readlink(attr.inode_id, &ctx()).unwrap();
+
+        assert_eq!(target, b"../target/path");
+    }
+
+    #[test]
+    fn readlink_on_regular_file_returns_einval() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"not-a-link.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        let result = engine.readlink(attr.inode_id, &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn readlink_on_directory_returns_einval() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let attr = engine
+            .mkdir(root, b"not-a-link-dir", 0o755, &ctx())
+            .unwrap();
+
+        let result = engine.readlink(attr.inode_id, &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn readlink_on_nonexistent_inode_returns_enoent() {
+        let (engine, _td) = temp_fs();
+
+        let result = engine.readlink(InodeId::new(999_999), &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn readlink_preserves_long_target_path() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let target = vec![b'a'; 1024];
+        let attr = engine
+            .symlink(root, b"long-target", target.as_slice(), &ctx())
+            .unwrap();
+
+        let result = engine.readlink(attr.inode_id, &ctx()).unwrap();
+
+        assert_eq!(result, target);
+    }
+
+    #[test]
+    fn readlink_after_symlink_overwrite_returns_new_target() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine
+            .symlink(root, b"replace-link", b"old-target", &ctx())
+            .unwrap();
+        engine.unlink(root, b"replace-link", &ctx()).unwrap();
+        let replacement = engine
+            .symlink(root, b"replace-link", b"new-target", &ctx())
+            .unwrap();
+
+        let target = engine.readlink(replacement.inode_id, &ctx()).unwrap();
+
+        assert_eq!(target, b"new-target");
+    }
+
+    #[test]
+    fn readlink_after_symlink_unlink_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let attr = engine
+            .symlink(root, b"removed-link", b"target-before-unlink", &ctx())
+            .unwrap();
+
+        engine.unlink(root, b"removed-link", &ctx()).unwrap();
+        let result = engine.readlink(attr.inode_id, &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn getattr_for_root() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let attr = engine.getattr(root, None, &ctx()).unwrap();
+        assert_eq!(attr.inode_id, root);
+        assert_eq!(attr.kind, NodeKind::Dir);
+    }
+
+    #[test]
+    fn getattr_regular_file_returns_correct_attrs() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (created, fh) = engine.create(root, b"file.txt", 0o640, 0, &ctx()).unwrap();
+        engine.write(&fh, 0, b"hello", &ctx()).unwrap();
+
+        let attr = engine.getattr(created.inode_id, None, &ctx()).unwrap();
+
+        assert_eq!(attr.inode_id, created.inode_id);
+        assert_eq!(attr.kind, NodeKind::File);
+        assert_eq!(attr.posix.size, 5);
+        assert_eq!(attr.posix.mode & !S_IFMT, 0o640);
+        assert_eq!(attr.posix.nlink, 1);
+    }
+
+    #[test]
+    fn getattr_directory_returns_dir_kind_and_nlink() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dir = engine.mkdir(root, b"dir", 0o750, &ctx()).unwrap();
+
+        let attr = engine.getattr(dir.inode_id, None, &ctx()).unwrap();
+
+        assert_eq!(attr.inode_id, dir.inode_id);
+        assert_eq!(attr.kind, NodeKind::Dir);
+        assert_eq!(attr.posix.mode & !S_IFMT, 0o750);
+        assert!(attr.posix.nlink >= 2);
+    }
+
+    #[test]
+    fn getattr_symlink_returns_symlink_kind() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let symlink = engine.symlink(root, b"link", b"/target", &ctx()).unwrap();
+
+        let attr = engine.getattr(symlink.inode_id, None, &ctx()).unwrap();
+
+        assert_eq!(attr.inode_id, symlink.inode_id);
+        assert_eq!(attr.kind, NodeKind::Symlink);
+        assert_eq!(attr.posix.size, b"/target".len() as u64);
+    }
+
+    #[test]
+    fn getattr_after_setattr_size_reflects_new_size() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (created, _fh) = engine.create(root, b"size.txt", 0o644, 0, &ctx()).unwrap();
+
+        let mut update = SetAttr::new();
+        update.valid = FATTR_SIZE;
+        update.size = 8192;
+        engine
+            .setattr(created.inode_id, &update, None, &ctx())
+            .unwrap();
+
+        let attr = engine.getattr(created.inode_id, None, &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 8192);
+    }
+
+    #[test]
+    fn getattr_after_setattr_mode_reflects_mode_with_file_type_preserved() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (created, _fh) = engine.create(root, b"mode.txt", 0o644, 0, &ctx()).unwrap();
+
+        let mut update = SetAttr::new();
+        update.valid = FATTR_MODE;
+        update.mode = S_IFDIR | 0o600;
+        engine
+            .setattr(created.inode_id, &update, None, &ctx())
+            .unwrap();
+
+        let attr = engine.getattr(created.inode_id, None, &ctx()).unwrap();
+        assert_eq!(attr.kind, NodeKind::File);
+        assert_eq!(attr.posix.mode & S_IFMT, created.posix.mode & S_IFMT);
+        assert_eq!(attr.posix.mode & !S_IFMT, 0o600);
+    }
+
+    #[test]
+    fn getattr_hard_linked_file_reports_nlink_two() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (created, _fh) = engine.create(root, b"file.txt", 0o644, 0, &ctx()).unwrap();
+        engine
+            .link(created.inode_id, root, b"alias.txt", &ctx())
+            .unwrap();
+
+        let attr = engine.getattr(created.inode_id, None, &ctx()).unwrap();
+
+        assert_eq!(attr.inode_id, created.inode_id);
+        assert_eq!(attr.kind, NodeKind::File);
+        assert_eq!(attr.posix.nlink, 2);
+    }
+
+    #[test]
+    fn getattr_missing_inode_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (created, fh) = engine.create(root, b"gone.txt", 0o644, 0, &ctx()).unwrap();
+        // Release before unlink so no open handles keep the inode alive.
+        engine.release(&fh).unwrap();
+
+        engine.unlink(root, b"gone.txt", &ctx()).unwrap();
+
+        assert_eq!(
+            engine.getattr(created.inode_id, None, &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn getattr_with_released_file_handle_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"released-getattr.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine.release(&fh).unwrap();
+
+        assert_eq!(
+            engine
+                .getattr(attr.inode_id, Some(&fh), &ctx())
+                .unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn getattr_with_unknown_file_handle_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"unknown-getattr.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let unknown = EngineFileHandle::new(attr.inode_id, 0, FileHandleId::new(999_999), 0);
+
+        assert_eq!(
+            engine
+                .getattr(attr.inode_id, Some(&unknown), &ctx())
+                .unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn getattr_via_handle_after_write_reflects_updated_size() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"handle-size.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine.write(&fh, 0, b"handle-sized", &ctx()).unwrap();
+
+        let updated = engine.getattr(attr.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(updated.posix.size, b"handle-sized".len() as u64);
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(attr.inode_id, 0, b"handle-sized".len())
+                .as_deref(),
+            Some(&b"handle-sized"[..]),
+            "ordinary VFS writes should remain buffered until flush/fsync"
+        );
+    }
+
+    // ── Setattr tests ───────────────────────────────────────────────
+
+    #[test]
+    fn setattr_mode_preserves_file_type_bits() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"mode.txt", 0o644, 0, &ctx()).unwrap();
+
+        let mut update = SetAttr::new();
+        update.valid = FATTR_MODE;
+        update.mode = S_IFDIR | 0o600;
+
+        let updated = engine
+            .setattr(attr.inode_id, &update, None, &ctx())
+            .unwrap();
+
+        assert_eq!(updated.kind, NodeKind::File);
+        assert_eq!(updated.posix.mode & S_IFMT, attr.posix.mode & S_IFMT);
+        assert_eq!(updated.posix.mode & !S_IFMT, 0o600);
+    }
+
+    #[test]
+    fn setattr_uid_gid_updates_owner_fields() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"owner.txt", 0o644, 0, &ctx()).unwrap();
+
+        let mut update = SetAttr::new();
+        update.valid = FATTR_UID | FATTR_GID;
+        update.uid = 42;
+        update.gid = 43;
+
+        let updated = engine
+            .setattr(attr.inode_id, &update, None, &ctx())
+            .unwrap();
+
+        assert_eq!(updated.posix.uid, 42);
+        assert_eq!(updated.posix.gid, 43);
+    }
+
+    #[test]
+    fn setattr_size_truncates_and_extends_file() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine.create(root, b"size.txt", 0o644, 0, &ctx()).unwrap();
+        engine.write(&fh, 0, b"abcdef", &ctx()).unwrap();
+
+        let mut shrink = SetAttr::new();
+        shrink.valid = FATTR_SIZE;
+        shrink.size = 3;
+        let shrunk = engine
+            .setattr(attr.inode_id, &shrink, None, &ctx())
+            .unwrap();
+        assert_eq!(shrunk.posix.size, 3);
+        assert_eq!(engine.read(&fh, 0, 8, &ctx()).unwrap(), b"abc");
+
+        let mut grow = SetAttr::new();
+        grow.valid = FATTR_SIZE;
+        grow.size = 8;
+        let grown = engine.setattr(attr.inode_id, &grow, None, &ctx()).unwrap();
+        assert_eq!(grown.posix.size, 8);
+        assert_eq!(engine.read(&fh, 0, 8, &ctx()).unwrap(), b"abc\0\0\0\0\0");
+    }
+
+    #[test]
+    fn setattr_truncate_after_buffered_write_keeps_extent_map_consistent() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine.create(root, b"buf.dat", 0o644, 0, &ctx()).unwrap();
+
+        // Buffered write that extends the file — below the 256 KiB flush
+        // threshold so data stays in the write buffer.
+        let payload = vec![b'X'; 4096];
+        engine.write(&fh, 0, &payload, &ctx()).unwrap();
+
+        // Truncate to a smaller size while the write is still buffered.
+        let mut shrink = SetAttr::new();
+        shrink.valid = FATTR_SIZE;
+        shrink.size = 1024;
+        let shrunk = engine
+            .setattr(attr.inode_id, &shrink, None, &ctx())
+            .unwrap();
+        assert_eq!(shrunk.posix.size, 1024);
+
+        // Read must return only the first 1024 bytes, not stale buffered
+        // data past the truncation point.
+        let content = engine.read(&fh, 0, 4096, &ctx()).unwrap();
+        assert_eq!(content.len(), 1024);
+        assert!(content.iter().all(|&b| b == b'X'));
+
+        // Fsync and re-stat to ensure committed state is clean.
+        engine.fsync(&fh, false, &ctx()).unwrap();
+        let after = engine.getattr(attr.inode_id, None, &ctx()).unwrap();
+        assert_eq!(after.posix.size, 1024);
+
+        // The extent allocator must have no extents beyond the new size.
+        let fs = engine.fs.borrow();
+        let extents = fs
+            .extent_allocator()
+            .lookup_extents(attr.inode_id.0, 1024, 4096);
+        assert!(
+            extents.is_empty(),
+            "extent allocator has extents beyond truncated size 1024: {extents:?}"
+        );
+    }
+
+    #[test]
+    fn setattr_truncate_after_buffered_write_then_extend() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine.create(root, b"buf2.dat", 0o644, 0, &ctx()).unwrap();
+
+        // Buffered write extending to 4096.
+        let payload = vec![b'Y'; 4096];
+        engine.write(&fh, 0, &payload, &ctx()).unwrap();
+
+        // Truncate down to 512.
+        let mut shrink = SetAttr::new();
+        shrink.valid = FATTR_SIZE;
+        shrink.size = 512;
+        engine
+            .setattr(attr.inode_id, &shrink, None, &ctx())
+            .unwrap();
+
+        // Extend back to 2048 — zeros should fill the gap.
+        let mut grow = SetAttr::new();
+        grow.valid = FATTR_SIZE;
+        grow.size = 2048;
+        let grown = engine.setattr(attr.inode_id, &grow, None, &ctx()).unwrap();
+        assert_eq!(grown.posix.size, 2048);
+
+        // Read: first 512 are Y, next 1536 should be zeros.
+        let content = engine.read(&fh, 0, 2048, &ctx()).unwrap();
+        assert_eq!(content.len(), 2048);
+        assert!(content[..512].iter().all(|&b| b == b'Y'));
+        assert!(content[512..].iter().all(|&b| b == 0));
+
+        // Fsync + stat round-trip.
+        engine.fsync(&fh, false, &ctx()).unwrap();
+        let after = engine.getattr(attr.inode_id, None, &ctx()).unwrap();
+        assert_eq!(after.posix.size, 2048);
+    }
+
+    #[test]
+    fn setattr_size_on_directory_returns_eisdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let mut update = SetAttr::new();
+        update.valid = FATTR_SIZE;
+        update.size = 1;
+
+        let result = engine.setattr(root, &update, None, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EISDIR);
+    }
+
+    #[test]
+    fn setattr_timestamps_update_attr_versions() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"time.txt", 0o644, 0, &ctx()).unwrap();
+
+        let mut update = SetAttr::new();
+        update.valid = FATTR_ATIME | FATTR_MTIME | FATTR_CTIME;
+        update.atime_ns = 100;
+        update.mtime_ns = 200;
+        update.ctime_ns = 100;
+
+        let updated = engine
+            .setattr(attr.inode_id, &update, None, &ctx())
+            .unwrap();
+
+        assert_eq!(updated.posix.atime_ns, 100);
+        assert_eq!(updated.posix.ctime_ns, 100);
+        assert_eq!(updated.posix.mtime_ns, 200);
+    }
+
+    #[test]
+    fn setattr_missing_inode_returns_enoent() {
+        let (engine, _td) = temp_fs();
+
+        let mut update = SetAttr::new();
+        update.valid = FATTR_MODE;
+        update.mode = 0o600;
+
+        let result = engine.setattr(InodeId::new(99_999), &update, None, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn setattr_with_released_file_handle_and_fh_bit_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"released-setattr.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let mut update = SetAttr::new();
+        update.valid = FATTR_FH | FATTR_MODE;
+        update.mode = 0o600;
+
+        engine.release(&fh).unwrap();
+
+        assert_eq!(
+            engine
+                .setattr(attr.inode_id, &update, Some(&fh), &ctx())
+                .unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn setattr_with_unknown_file_handle_and_fh_bit_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"unknown-setattr.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let unknown = EngineFileHandle::new(attr.inode_id, 0, FileHandleId::new(999_999), 0);
+        let mut update = SetAttr::new();
+        update.valid = FATTR_FH | FATTR_MODE;
+        update.mode = 0o600;
+
+        assert_eq!(
+            engine
+                .setattr(attr.inode_id, &update, Some(&unknown), &ctx())
+                .unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    // ── File I/O tests ────────────────────────────────────────────────
+
+    #[test]
+    fn read_partial() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine.create(root, b"data.bin", 0o644, 0, &ctx()).unwrap();
+        engine.write(&fh, 0, b"abcdefghij", &ctx()).unwrap();
+
+        let data = engine.read(&fh, 2, 5, &ctx()).unwrap();
+        assert_eq!(data, b"cdefg");
+    }
+
+    #[test]
+    fn read_beyond_eof() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine.create(root, b"small.txt", 0o644, 0, &ctx()).unwrap();
+        engine.write(&fh, 0, b"abc", &ctx()).unwrap();
+
+        let data = engine.read(&fh, 10, 5, &ctx()).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn read_zero_size_returns_empty() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"zero-size.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"abcdef", &ctx()).unwrap();
+
+        let data = engine.read(&fh, 2, 0, &ctx()).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn read_at_eof_boundary_returns_empty() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine.create(root, b"eof.txt", 0o644, 0, &ctx()).unwrap();
+        engine.write(&fh, 0, b"abcdef", &ctx()).unwrap();
+
+        let data = engine.read(&fh, 6, 4, &ctx()).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn read_that_extends_past_eof_returns_available_tail() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine.create(root, b"tail.txt", 0o644, 0, &ctx()).unwrap();
+        engine.write(&fh, 0, b"abcdef", &ctx()).unwrap();
+
+        let data = engine.read(&fh, 4, 16, &ctx()).unwrap();
+        assert_eq!(data, b"ef");
+    }
+
+    #[test]
+    fn read_large_payload_across_content_chunks() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"large-read.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let chunk = crate::constants::content_chunk_size() as usize;
+        let payload: Vec<u8> = (0..(chunk * 2 + 17)).map(|i| (i % 251) as u8).collect();
+        engine.write(&fh, 0, &payload, &ctx()).unwrap();
+
+        let data = engine
+            .read(&fh, (chunk - 9) as u64, (chunk + 20) as u32, &ctx())
+            .unwrap();
+        assert_eq!(data, payload[(chunk - 9)..(chunk * 2 + 11)].to_vec());
+    }
+
+    #[test]
+    fn read_sparse_hole_returns_zeroes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"sparse-read.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let chunk = crate::constants::content_chunk_size() as usize;
+        engine
+            .write(&fh, (chunk + 2) as u64, b"tail", &ctx())
+            .unwrap();
+
+        let data = engine.read(&fh, 0, (chunk + 6) as u32, &ctx()).unwrap();
+        assert_eq!(data.len(), chunk + 6);
+        assert!(data[..(chunk + 2)].iter().all(|byte| *byte == 0));
+        assert_eq!(&data[(chunk + 2)..], b"tail");
+    }
+
+    #[test]
+    fn read_after_truncate_does_not_return_removed_tail() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"truncate-read.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"abcdef", &ctx()).unwrap();
+
+        let mut shrink = SetAttr::new();
+        shrink.valid = FATTR_SIZE;
+        shrink.size = 4;
+        engine
+            .setattr(attr.inode_id, &shrink, None, &ctx())
+            .unwrap();
+
+        assert_eq!(engine.read(&fh, 0, 16, &ctx()).unwrap(), b"abcd");
+        assert!(engine.read(&fh, 4, 4, &ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_empty_file_returns_empty() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine.create(root, b"empty.txt", 0o644, 0, &ctx()).unwrap();
+
+        let data = engine.read(&fh, 0, 16, &ctx()).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn read_after_release_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"released-read.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"data", &ctx()).unwrap();
+
+        engine.release(&fh).unwrap();
+
+        assert_eq!(engine.read(&fh, 0, 4, &ctx()).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn copy_file_range_copies_between_open_file_handles() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_source_attr, source_create) = engine
+            .create(root, b"copy-source.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let (_dest_attr, dest_create) = engine
+            .create(root, b"copy-dest.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine
+            .write(&source_create, 0, b"0123456789", &ctx())
+            .unwrap();
+        engine
+            .write(&dest_create, 0, b"abcdefghij", &ctx())
+            .unwrap();
+        // Copy between open file handles; write buffers serve read-your-writes.
+        let copied = engine
+            .copy_file_range(&source_create, 2, &dest_create, 3, 4, &ctx())
+            .unwrap();
+
+        assert_eq!(copied, 4);
+        assert_eq!(
+            engine.read(&dest_create, 0, 10, &ctx()).unwrap(),
+            b"abc2345hij"
+        );
+    }
+
+    #[test]
+    fn copy_file_range_short_copies_at_source_eof() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_source_attr, source_create) = engine
+            .create(root, b"copy-short-source.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let (_dest_attr, dest_create) = engine
+            .create(root, b"copy-short-dest.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine.write(&source_create, 0, b"abc", &ctx()).unwrap();
+        // Copy between open handles; write buffer serves read-your-writes for short copies.
+        let copied = engine
+            .copy_file_range(&source_create, 1, &dest_create, 0, 16, &ctx())
+            .unwrap();
+
+        assert_eq!(copied, 2);
+        assert_eq!(engine.read(&dest_create, 0, 16, &ctx()).unwrap(), b"bc");
+    }
+
+    #[test]
+    fn copy_file_range_rejects_bad_access_released_handles_and_overlap() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (source_attr, source_create) = engine
+            .create(root, b"copy-errors-source.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let (dest_attr, dest_create) = engine
+            .create(root, b"copy-errors-dest.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine
+            .write(&source_create, 0, b"abcdefgh", &ctx())
+            .unwrap();
+        engine.write(&dest_create, 0, b"target", &ctx()).unwrap();
+        // Flush before release so subsequent open sees durable data.
+        engine.flush(&source_create, &ctx()).unwrap();
+        engine.flush(&dest_create, &ctx()).unwrap();
+        engine.release(&source_create).unwrap();
+        engine.release(&dest_create).unwrap();
+
+        // Bad access: source write-only.
+        let source_write_only = engine.open(source_attr.inode_id, O_WRONLY, &ctx()).unwrap();
+        let dest_read_write = engine.open(dest_attr.inode_id, O_RDWR, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .copy_file_range(&source_write_only, 0, &dest_read_write, 0, 1, &ctx())
+                .unwrap_err(),
+            Errno::EBADF
+        );
+        engine.release(&source_write_only).unwrap();
+
+        // Bad access: dest read-only.
+        let source_read_only = engine.open(source_attr.inode_id, O_RDONLY, &ctx()).unwrap();
+        let dest_read_only = engine.open(dest_attr.inode_id, O_RDONLY, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .copy_file_range(&source_read_only, 0, &dest_read_only, 0, 1, &ctx())
+                .unwrap_err(),
+            Errno::EBADF
+        );
+        engine.release(&dest_read_only).unwrap();
+
+        // Successful copy via flushed open handles.
+        assert_eq!(
+            engine
+                .copy_file_range(&source_read_only, 0, &dest_read_write, 0, 1, &ctx())
+                .unwrap(),
+            1
+        );
+        engine.release(&dest_read_write).unwrap();
+
+        // Released handles: fail.
+        assert_eq!(
+            engine
+                .copy_file_range(&source_read_only, 0, &dest_read_write, 0, 1, &ctx())
+                .unwrap_err(),
+            Errno::EBADF
+        );
+
+        // Self-overlap: same inode, overlapping ranges.
+        let same_inode_source = engine.open(source_attr.inode_id, O_RDWR, &ctx()).unwrap();
+        let same_inode_dest = engine.open(source_attr.inode_id, O_RDWR, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .copy_file_range(&same_inode_source, 0, &same_inode_dest, 1, 4, &ctx())
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    #[test]
+    fn open_and_release() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine.create(root, b"file.txt", 0o644, 0, &ctx()).unwrap();
+        engine.write(&fh, 0, b"hello", &ctx()).unwrap();
+        let fh2 = engine.open(fh.inode_id, 0, &ctx()).unwrap();
+        assert_eq!(fh2.inode_id, fh.inode_id);
+        assert_ne!(fh2.fh_id, FileHandleId::default());
+        assert_eq!(engine.read(&fh2, 0, 5, &ctx()).unwrap(), b"hello");
+        engine.release(&fh2).unwrap();
+        assert_eq!(engine.read(&fh2, 0, 5, &ctx()).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn open_rdonly_allows_read_rejects_write() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, create_fh) = engine
+            .create(root, b"rdonly.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine.write(&create_fh, 0, b"readable", &ctx()).unwrap();
+        engine.release(&create_fh).unwrap();
+
+        let rdonly = engine.open(attr.inode_id, 0, &ctx()).unwrap();
+
+        assert_eq!(engine.read(&rdonly, 0, 8, &ctx()).unwrap(), b"readable");
+        assert_eq!(
+            engine.write(&rdonly, 0, b"denied", &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn open_wronly_allows_write_rejects_read() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, create_fh) = engine
+            .create(root, b"wronly.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine.write(&create_fh, 0, b"before", &ctx()).unwrap();
+        engine.release(&create_fh).unwrap();
+
+        let wronly = engine.open(attr.inode_id, O_WRONLY, &ctx()).unwrap();
+
+        assert_eq!(engine.write(&wronly, 6, b"-after", &ctx()).unwrap(), 6);
+        assert_eq!(
+            engine.read(&wronly, 0, 5, &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+
+        engine.release(&wronly).unwrap();
+        let rdonly = engine.open(attr.inode_id, 0, &ctx()).unwrap();
+        assert_eq!(
+            engine.read(&rdonly, 0, 12, &ctx()).unwrap(),
+            b"before-after"
+        );
+    }
+
+    #[test]
+    fn open_rdwr_allows_read_and_write() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, create_fh) = engine
+            .create(root, b"rdwr.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine.write(&create_fh, 0, b"alpha", &ctx()).unwrap();
+        engine.release(&create_fh).unwrap();
+
+        let rdwr = engine.open(attr.inode_id, O_RDWR, &ctx()).unwrap();
+
+        assert_eq!(engine.read(&rdwr, 0, 5, &ctx()).unwrap(), b"alpha");
+        assert_eq!(engine.write(&rdwr, 5, b"-beta", &ctx()).unwrap(), 5);
+        assert_eq!(engine.read(&rdwr, 0, 10, &ctx()).unwrap(), b"alpha-beta");
+    }
+
+    #[test]
+    fn open_directory_returns_eisdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        assert_eq!(
+            engine.open(root, O_RDONLY, &ctx()).unwrap_err(),
+            Errno::EISDIR
+        );
+    }
+
+    #[test]
+    fn open_nonexistent_inode_returns_enoent() {
+        let (engine, _td) = temp_fs();
+
+        assert_eq!(
+            engine
+                .open(InodeId::new(999_999), O_RDONLY, &ctx())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+    }
+
+    #[test]
+    fn open_append_writes_extend_at_eof() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, create_fh) = engine
+            .create(root, b"append.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine.write(&create_fh, 0, b"head", &ctx()).unwrap();
+        engine.fsync(&create_fh, false, &ctx()).unwrap();
+        engine.release(&create_fh).unwrap();
+
+        let append = engine
+            .open(attr.inode_id, O_WRONLY | O_APPEND, &ctx())
+            .unwrap();
+        assert_eq!(engine.write(&append, 0, b"-tail", &ctx()).unwrap(), 5);
+        engine.release(&append).unwrap();
+
+        let rdonly = engine.open(attr.inode_id, O_RDONLY, &ctx()).unwrap();
+        assert_eq!(engine.read(&rdonly, 0, 9, &ctx()).unwrap(), b"head-tail");
+    }
+
+    #[test]
+    fn open_append_concurrent_handles_do_not_overwrite() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, create_fh) = engine
+            .create(root, b"concurrent-append.bin", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        // Seed the file with content and fsync so the size is durable.
+        engine.write(&create_fh, 0, b"SEED", &ctx()).unwrap();
+        engine.fsync(&create_fh, false, &ctx()).unwrap();
+        engine.release(&create_fh).unwrap();
+
+        // Open two separate O_APPEND handles.
+        let fh_a = engine
+            .open(attr.inode_id, O_WRONLY | O_APPEND, &ctx())
+            .unwrap();
+        let fh_b = engine
+            .open(attr.inode_id, O_WRONLY | O_APPEND, &ctx())
+            .unwrap();
+
+        // Both writes specify offset 0 but O_APPEND must ignore it and
+        // atomically resolve the current file size (4 bytes from SEED).
+        let wrote_a = engine.write(&fh_a, 0, b"AAAA", &ctx()).unwrap();
+        assert_eq!(wrote_a, 4);
+
+        // Flush so the second handle sees the updated size.
+        engine.fsync(&fh_a, false, &ctx()).unwrap();
+
+        let wrote_b = engine.write(&fh_b, 0, b"BBBB", &ctx()).unwrap();
+        assert_eq!(wrote_b, 4);
+
+        engine.fsync(&fh_b, false, &ctx()).unwrap();
+        engine.release(&fh_a).unwrap();
+        engine.release(&fh_b).unwrap();
+
+        let rdonly = engine.open(attr.inode_id, O_RDONLY, &ctx()).unwrap();
+        let attr_after = engine
+            .getattr(attr.inode_id, Some(&rdonly), &ctx())
+            .unwrap();
+        // SEED (4) + AAAA (4) + BBBB (4) = 12
+        assert_eq!(attr_after.posix.size, 12, "file must be exactly 12 bytes");
+        let data = engine.read(&rdonly, 0, 12, &ctx()).unwrap();
+        assert_eq!(&data[0..4], b"SEED", "SEED must be at offset 0");
+        assert_eq!(&data[4..8], b"AAAA", "AAAA must be at offset 4");
+        assert_eq!(&data[8..12], b"BBBB", "BBBB must be at offset 8");
+        engine.release(&rdonly).unwrap();
+    }
+
+    #[test]
+    fn open_trunc_zeroes_existing_file_content() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, create_fh) = engine
+            .create(root, b"truncate-open.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine.write(&create_fh, 0, b"remove this", &ctx()).unwrap();
+        engine.release(&create_fh).unwrap();
+
+        let truncated = engine
+            .open(attr.inode_id, O_RDWR | O_TRUNC, &ctx())
+            .unwrap();
+        let truncated_attr = engine
+            .getattr(attr.inode_id, Some(&truncated), &ctx())
+            .unwrap();
+
+        assert_eq!(truncated_attr.posix.size, 0);
+        assert!(engine.read(&truncated, 0, 16, &ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn released_file_handle_is_rejected_by_file_io_operations() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"released.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine.release(&fh).unwrap();
+
+        assert_eq!(engine.read(&fh, 0, 1, &ctx()).unwrap_err(), Errno::EBADF);
+        assert_eq!(
+            engine.write(&fh, 0, b"x", &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+        assert_eq!(engine.flush(&fh, &ctx()).unwrap_err(), Errno::EBADF);
+        assert_eq!(engine.fsync(&fh, false, &ctx()).unwrap_err(), Errno::EBADF);
+        assert_eq!(
+            engine
+                .fallocate(&fh, FALLOC_FL_KEEP_SIZE, 0, 1, &ctx())
+                .unwrap_err(),
+            Errno::EBADF
+        );
+        assert_eq!(
+            engine.data_ranges(&fh, 0, 0, &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn multi_handle_same_file_release_one_other_still_works() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, create_fh) = engine
+            .create(root, b"multi.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine.write(&create_fh, 0, b"shared", &ctx()).unwrap();
+
+        // Open a second handle on the same inode.
+        let fh2 = engine.open(create_fh.inode_id, O_RDONLY, &ctx()).unwrap();
+
+        // Release the first handle.
+        engine.release(&create_fh).unwrap();
+
+        // The second handle should still be valid.
+        assert_eq!(engine.read(&fh2, 0, 6, &ctx()).unwrap(), b"shared");
+
+        // Release the second handle.
+        engine.release(&fh2).unwrap();
+
+        // Both handles are now released.
+        assert_eq!(engine.read(&fh2, 0, 1, &ctx()).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn release_twice_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine.create(root, b"twice.txt", 0o644, 0, &ctx()).unwrap();
+
+        engine.release(&fh).unwrap();
+        assert_eq!(engine.release(&fh).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn stale_handle_after_release_and_reopen_rejected() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh1) = engine
+            .create(root, b"stale.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let inode = attr.inode_id;
+
+        engine.write(&fh1, 0, b"xyz", &ctx()).unwrap();
+        engine.release(&fh1).unwrap();
+
+        // Open a new handle for the same inode.
+        let fh2 = engine.open(inode, O_RDONLY, &ctx()).unwrap();
+        assert_eq!(engine.read(&fh2, 0, 3, &ctx()).unwrap(), b"xyz");
+
+        // The old (released) handle should be rejected.
+        assert_eq!(engine.read(&fh1, 0, 1, &ctx()).unwrap_err(), Errno::EBADF);
+        assert_eq!(
+            engine.write(&fh1, 0, b"a", &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+
+        engine.release(&fh2).unwrap();
+    }
+
+    #[test]
+    fn flush_after_write_succeeds_and_keeps_data_visible() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"flush-write.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+
+        engine.write(&fh, 0, b"flush-visible", &ctx()).unwrap();
+        engine.flush(&fh, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .read(&fh, 0, b"flush-visible".len() as u32, &ctx())
+                .unwrap(),
+            b"flush-visible"
+        );
+
+        engine.release(&fh).unwrap();
+        let reopened = engine.open(attr.inode_id, O_RDONLY, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .read(&reopened, 0, b"flush-visible".len() as u32, &ctx())
+                .unwrap(),
+            b"flush-visible"
+        );
+    }
+
+    #[test]
+    fn flush_does_not_record_fsync_durability_barrier() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"flush-not-fsync.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+
+        engine.write(&fh, 0, b"flush-only", &ctx()).unwrap();
+        let before = engine.fs.borrow().fsync_stats_snapshot();
+        engine.flush(&fh, &ctx()).unwrap();
+        let after = engine.fs.borrow().fsync_stats_snapshot();
+
+        assert_eq!(after.fsync_count, before.fsync_count);
+        assert_eq!(
+            after.fsync_do_commit_fallback_count,
+            before.fsync_do_commit_fallback_count
+        );
+    }
+
+    #[test]
+    fn flush_on_read_only_handle_succeeds() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, create_fh) = engine
+            .create(root, b"flush-readonly.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine
+            .write(&create_fh, 0, b"readonly-flush", &ctx())
+            .unwrap();
+        engine.release(&create_fh).unwrap();
+
+        let readonly = engine.open(attr.inode_id, O_RDONLY, &ctx()).unwrap();
+
+        engine.flush(&readonly, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .read(&readonly, 0, b"readonly-flush".len() as u32, &ctx())
+                .unwrap(),
+            b"readonly-flush"
+        );
+    }
+
+    #[test]
+    fn flush_on_anonymous_tmpfile_succeeds() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap();
+
+        engine.write(&fh, 0, b"tmpfile-flush", &ctx()).unwrap();
+        engine.flush(&fh, &ctx()).unwrap();
+
+        assert_eq!(
+            engine
+                .read(&fh, 0, b"tmpfile-flush".len() as u32, &ctx())
+                .unwrap(),
+            b"tmpfile-flush"
+        );
+        let after_flush = engine.getattr(attr.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(after_flush.posix.size, b"tmpfile-flush".len() as u64);
+    }
+
+    #[test]
+    fn flush_with_unknown_file_handle_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"flush-unknown.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let unknown = EngineFileHandle::new(attr.inode_id, O_RDWR, FileHandleId::new(999), 0);
+
+        assert_eq!(engine.flush(&unknown, &ctx()).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn flush_after_release_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"flush-released.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+
+        engine.release(&fh).unwrap();
+
+        assert_eq!(engine.flush(&fh, &ctx()).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn fsync_file_handle_succeeds_for_data_and_metadata_modes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"sync-modes.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine.write(&fh, 0, b"durable", &ctx()).unwrap();
+
+        engine.fsync(&fh, false, &ctx()).unwrap();
+        engine.fsync(&fh, true, &ctx()).unwrap();
+    }
+
+    #[test]
+    fn fsync_written_data_survives_close_and_reopen() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"sync-reopen.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine.write(&fh, 0, b"persist me", &ctx()).unwrap();
+        engine.fsync(&fh, false, &ctx()).unwrap();
+        engine.release(&fh).unwrap();
+
+        let reopened = engine.open(attr.inode_id, O_RDONLY, &ctx()).unwrap();
+        assert_eq!(
+            engine.read(&reopened, 0, 16, &ctx()).unwrap(),
+            b"persist me"
+        );
+    }
+
+    #[test]
+    fn fsync_after_release_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"sync-released.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine.release(&fh).unwrap();
+
+        assert_eq!(engine.fsync(&fh, false, &ctx()).unwrap_err(), Errno::EBADF);
+        assert_eq!(engine.fsync(&fh, true, &ctx()).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn fsync_with_mismatched_file_handle_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"sync-mismatch.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let mismatched_flags = EngineFileHandle::new(attr.inode_id, O_RDONLY, fh.fh_id, 0);
+
+        assert_eq!(
+            engine.fsync(&mismatched_flags, false, &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+        assert_eq!(
+            engine.fsync(&mismatched_flags, true, &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn fsync_anonymous_tmpfile_succeeds_for_data_and_metadata_modes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap();
+
+        engine.write(&fh, 0, b"anonymous", &ctx()).unwrap();
+
+        engine.fsync(&fh, false, &ctx()).unwrap();
+        engine.fsync(&fh, true, &ctx()).unwrap();
+        assert_eq!(engine.read(&fh, 0, 9, &ctx()).unwrap(), b"anonymous");
+    }
+
+    #[test]
+    fn fsync_open_unlinked_file_succeeds_via_anonymous_tmpfile() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"sync-unlinked.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"before unlink", &ctx()).unwrap();
+
+        engine.unlink(root, b"sync-unlinked.txt", &ctx()).unwrap();
+
+        // fsync should succeed for an unlinked-but-open file preserved as anonymous tmpfile.
+        engine.fsync(&fh, false, &ctx()).unwrap();
+        engine.fsync(&fh, true, &ctx()).unwrap();
+        engine.release(&fh).unwrap();
+    }
+
+    #[test]
+    fn fallocate_mode_zero_extends_file_and_reads_as_zeroes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"fallocate-zeroes.bin", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine.fallocate(&fh, 0, 4, 8, &ctx()).unwrap();
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 12);
+        assert_eq!(engine.read(&fh, 0, 12, &ctx()).unwrap(), vec![0; 12]);
+    }
+
+    #[test]
+    fn fallocate_keep_size_preserves_existing_data_and_size() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"fallocate-keep-size.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"abcdef", &ctx()).unwrap();
+
+        engine
+            .fallocate(&fh, FALLOC_FL_KEEP_SIZE, 2, 3, &ctx())
+            .unwrap();
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 6, "KEEP_SIZE must not extend file size");
+        assert_eq!(engine.read(&fh, 0, 6, &ctx()).unwrap(), b"abcdef");
+
+        // Verify Unwritten extents were reserved.
+        let fs = engine.fs.borrow();
+        let extents = fs.extent_allocator().lookup_extents(fh.inode_id.0, 2, 3);
+        assert!(
+            !extents.is_empty(),
+            "KEEP_SIZE must create Unwritten extents"
+        );
+        for e in &extents {
+            assert!(e.is_unwritten(), "KEEP_SIZE extents must be Unwritten");
+        }
+    }
+
+    #[test]
+    fn fallocate_keep_size_beyond_eof_reserves_unwritten() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"falloc-keep-beyondeof.bin", 0o644, 0, &ctx())
+            .unwrap();
+        // Empty file, KEEP_SIZE far beyond EOF.
+        engine
+            .fallocate(&fh, FALLOC_FL_KEEP_SIZE, 100, 4096, &ctx())
+            .unwrap();
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 0, "KEEP_SIZE must not extend file size");
+
+        // Extents must be reserved in the range [100, 4196).
+        let fs = engine.fs.borrow();
+        let extents = fs
+            .extent_allocator()
+            .lookup_extents(fh.inode_id.0, 100, 4096);
+        assert!(
+            !extents.is_empty(),
+            "KEEP_SIZE beyond EOF must reserve extents"
+        );
+        for e in &extents {
+            assert!(e.is_unwritten(), "KEEP_SIZE extents must be Unwritten");
+        }
+    }
+
+    #[test]
+    fn fallocate_punch_hole_keep_size_creates_sparse_gap() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"fallocate-hole.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let chunk = crate::constants::content_chunk_size() as usize;
+        let payload = vec![0xAB; chunk * 3];
+        engine.write(&fh, 0, &payload, &ctx()).unwrap();
+
+        engine
+            .fallocate(
+                &fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                chunk as u64,
+                chunk as u64,
+                &ctx(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            engine.read(&fh, chunk as u64, 4, &ctx()).unwrap(),
+            vec![0; 4]
+        );
+        assert_eq!(
+            engine
+                .data_ranges(&fh, 0, (chunk * 3) as u64, &ctx())
+                .unwrap(),
+            vec![
+                LseekDataRange::new(0, chunk as u64),
+                LseekDataRange::new((chunk * 2) as u64, (chunk * 3) as u64),
+            ]
+        );
+    }
+
+    #[test]
+    fn fallocate_after_release_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"fallocate-released.bin", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine.release(&fh).unwrap();
+
+        assert_eq!(
+            engine.fallocate(&fh, 0, 0, 1, &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn fallocate_on_directory_handle_returns_eisdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let fh = engine.register_file_handle(root, 0, false).unwrap();
+
+        assert_eq!(
+            engine.fallocate(&fh, 0, 0, 1, &ctx()).unwrap_err(),
+            Errno::EISDIR
+        );
+    }
+
+    #[test]
+    fn fallocate_collapse_range_removes_middle_bytes_and_shifts_tail() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"collapse-middle.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.fallocate(&fh, 0, 0, 16, &ctx()).unwrap();
+        engine
+            .write(&fh, 0, &(0..16u8).collect::<Vec<_>>(), &ctx())
+            .unwrap();
+        engine.flush(&fh, &ctx()).unwrap();
+
+        engine
+            .fallocate(&fh, FALLOC_FL_COLLAPSE_RANGE, 4, 8, &ctx())
+            .unwrap();
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 8);
+        let data = engine.read(&fh, 0, 8, &ctx()).unwrap();
+        assert_eq!(data, vec![0, 1, 2, 3, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn fallocate_collapse_range_beyond_eof_is_noop() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"collapse-beyondeof.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.fallocate(&fh, 0, 0, 6, &ctx()).unwrap();
+        engine.write(&fh, 0, b"abcdef", &ctx()).unwrap();
+        engine.flush(&fh, &ctx()).unwrap();
+
+        engine
+            .fallocate(&fh, FALLOC_FL_COLLAPSE_RANGE, 100, 4, &ctx())
+            .unwrap();
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 6);
+        assert_eq!(engine.read(&fh, 0, 6, &ctx()).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn fallocate_collapse_range_zero_length_is_noop() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"collapse-zerolen.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.fallocate(&fh, 0, 0, 4, &ctx()).unwrap();
+        engine.write(&fh, 0, b"data", &ctx()).unwrap();
+        engine.flush(&fh, &ctx()).unwrap();
+
+        engine
+            .fallocate(&fh, FALLOC_FL_COLLAPSE_RANGE, 0, 0, &ctx())
+            .unwrap();
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 4);
+        assert_eq!(engine.read(&fh, 0, 4, &ctx()).unwrap(), b"data");
+    }
+
+    #[test]
+    fn fallocate_insert_range_allocates_zeros_and_shifts_tail() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"insert-middle.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.fallocate(&fh, 0, 0, 8, &ctx()).unwrap();
+        engine
+            .write(&fh, 0, &(0..8u8).collect::<Vec<_>>(), &ctx())
+            .unwrap();
+        engine.flush(&fh, &ctx()).unwrap();
+
+        engine
+            .fallocate(&fh, FALLOC_FL_INSERT_RANGE, 4, 4, &ctx())
+            .unwrap();
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 12);
+        let data = engine.read(&fh, 0, 12, &ctx()).unwrap();
+        assert_eq!(data, vec![0, 1, 2, 3, 0, 0, 0, 0, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn fallocate_insert_range_zero_length_is_noop() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"insert-zerolen.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.fallocate(&fh, 0, 0, 4, &ctx()).unwrap();
+        engine.write(&fh, 0, b"data", &ctx()).unwrap();
+        engine.flush(&fh, &ctx()).unwrap();
+
+        engine
+            .fallocate(&fh, FALLOC_FL_INSERT_RANGE, 2, 0, &ctx())
+            .unwrap();
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 4);
+        assert_eq!(engine.read(&fh, 0, 4, &ctx()).unwrap(), b"data");
+    }
+
+    #[test]
+    fn fallocate_collapse_range_after_release_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"collapse-released.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.release(&fh).unwrap();
+        assert_eq!(
+            engine
+                .fallocate(&fh, FALLOC_FL_COLLAPSE_RANGE, 0, 1, &ctx())
+                .unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn fallocate_collapse_range_on_directory_returns_eisdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let fh = engine.register_file_handle(root, 0, false).unwrap();
+        assert_eq!(
+            engine
+                .fallocate(&fh, FALLOC_FL_COLLAPSE_RANGE, 0, 1, &ctx())
+                .unwrap_err(),
+            Errno::EISDIR
+        );
+    }
+
+    #[test]
+    fn fallocate_insert_range_after_release_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"insert-released.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.release(&fh).unwrap();
+        assert_eq!(
+            engine
+                .fallocate(&fh, FALLOC_FL_INSERT_RANGE, 0, 1, &ctx())
+                .unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn fallocate_insert_range_on_directory_returns_eisdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let fh = engine.register_file_handle(root, 0, false).unwrap();
+        assert_eq!(
+            engine
+                .fallocate(&fh, FALLOC_FL_INSERT_RANGE, 0, 1, &ctx())
+                .unwrap_err(),
+            Errno::EISDIR
+        );
+    }
+
+    // ── Fallocate timestamp authority regression ─────────────────────
+
+    /// Fallocate default (mode 0, extend) advances mtime and ctime
+    /// through the same timestamp authority as dispatch_write.
+    #[test]
+    fn fallocate_extend_advances_mtime_and_ctime() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"falloc-extend.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let before = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+
+        // Fallocate 4096 bytes at offset 0 (default mode, extends file).
+        engine
+            .fallocate(&fh, 0, 0, 4096, &ctx())
+            .expect("fallocate extend");
+
+        let after = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert!(
+            after.posix.mtime_ns > before.posix.mtime_ns,
+            "mtime_ns must advance after fallocate extend: before={before}, after={after}",
+            before = before.posix.mtime_ns,
+            after = after.posix.mtime_ns
+        );
+        assert!(
+            after.posix.ctime_ns > before.posix.ctime_ns,
+            "ctime_ns must advance after fallocate extend: before={before}, after={after}",
+            before = before.posix.ctime_ns,
+            after = after.posix.ctime_ns
+        );
+    }
+
+    /// Fallocate PUNCH_HOLE advances mtime and ctime (data is modified).
+    #[test]
+    fn fallocate_punch_hole_advances_mtime_and_ctime() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"falloc-punch.txt", 0o644, 0, &ctx())
+            .unwrap();
+        // Allocate some data first then punch a hole.
+        engine
+            .write(&fh, 0, &[0xAAu8; 4096], &ctx())
+            .expect("write before punch");
+        let before = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+
+        engine
+            .fallocate(
+                &fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                0,
+                2048,
+                &ctx(),
+            )
+            .expect("fallocate punch hole");
+
+        let after = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert!(
+            after.posix.mtime_ns > before.posix.mtime_ns,
+            "mtime_ns must advance after fallocate punch hole"
+        );
+        assert!(
+            after.posix.ctime_ns > before.posix.ctime_ns,
+            "ctime_ns must advance after fallocate punch hole"
+        );
+    }
+
+    #[test]
+    fn double_release_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"double-release.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine.release(&fh).unwrap();
+
+        assert_eq!(engine.release(&fh).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn unknown_file_handle_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"unknown-handle.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let unknown = EngineFileHandle::new(attr.inode_id, 0, FileHandleId::new(999_999), 0);
+
+        assert_eq!(
+            engine.read(&unknown, 0, 1, &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+        assert_eq!(engine.release(&unknown).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn releasing_one_file_handle_keeps_other_handles_live() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh1) = engine
+            .create(root, b"multi-handle.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let fh2 = engine.open(attr.inode_id, 0, &ctx()).unwrap();
+        assert_ne!(fh1.fh_id, fh2.fh_id);
+
+        engine.write(&fh1, 0, b"live", &ctx()).unwrap();
+        engine.release(&fh1).unwrap();
+
+        assert_eq!(
+            engine.write(&fh1, 0, b"dead", &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+        assert_eq!(engine.read(&fh2, 0, 4, &ctx()).unwrap(), b"live");
+        engine.release(&fh2).unwrap();
+    }
+
+    #[test]
+    fn write_multiple() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine.create(root, b"multi.bin", 0o644, 0, &ctx()).unwrap();
+        engine.write(&fh, 0, b"AAAA", &ctx()).unwrap();
+        engine.write(&fh, 4, b"BBBB", &ctx()).unwrap();
+
+        let data = engine.read(&fh, 0, 8, &ctx()).unwrap();
+        assert_eq!(data, b"AAAABBBB");
+    }
+
+    #[test]
+    fn write_beyond_eof_extends_size_and_zero_fills_gap() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"beyond-eof.bin", 0o644, 0, &ctx())
+            .unwrap();
+
+        assert_eq!(engine.write(&fh, 5, b"xyz", &ctx()).unwrap(), 3);
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 8);
+        assert_eq!(
+            engine.read(&fh, 0, 8, &ctx()).unwrap(),
+            vec![0, 0, 0, 0, 0, b'x', b'y', b'z']
+        );
+    }
+
+    #[test]
+    fn write_empty_payload_is_noop() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"empty-write.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"abc", &ctx()).unwrap();
+
+        assert_eq!(engine.write(&fh, 1, b"", &ctx()).unwrap(), 0);
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 3);
+        assert_eq!(engine.read(&fh, 0, 3, &ctx()).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn write_overwrite_then_read_preserves_surrounding_bytes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"overwrite.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"abcdef", &ctx()).unwrap();
+
+        assert_eq!(engine.write(&fh, 2, b"XY", &ctx()).unwrap(), 2);
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, 6);
+        assert_eq!(engine.read(&fh, 0, 6, &ctx()).unwrap(), b"abXYef");
+    }
+
+    #[test]
+    fn write_at_chunk_boundary_extends_to_exact_end() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"chunk-boundary.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let chunk = crate::constants::content_chunk_size() as u64;
+
+        assert_eq!(engine.write(&fh, chunk, b"edge", &ctx()).unwrap(), 4);
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, chunk + 4);
+        assert_eq!(engine.read(&fh, chunk, 4, &ctx()).unwrap(), b"edge");
+        assert_eq!(
+            engine.read(&fh, chunk - 1, 5, &ctx()).unwrap(),
+            vec![0, b'e', b'd', b'g', b'e']
+        );
+    }
+
+    #[test]
+    fn write_unaligned_offset_across_chunk_boundary_preserves_neighbors() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"unaligned-boundary.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let chunk = crate::constants::content_chunk_size() as usize;
+        let payload = vec![b'a'; chunk + 8];
+        engine.write(&fh, 0, &payload, &ctx()).unwrap();
+
+        assert_eq!(
+            engine
+                .write(&fh, (chunk - 3) as u64, b"xyzpq", &ctx())
+                .unwrap(),
+            5
+        );
+
+        assert_eq!(
+            engine.read(&fh, (chunk - 5) as u64, 9, &ctx()).unwrap(),
+            vec![b'a', b'a', b'x', b'y', b'z', b'p', b'q', b'a', b'a']
+        );
+    }
+
+    // ── Extent allocation verification ──────────────────────────────
+
+    #[test]
+    fn write_triggers_extent_allocation() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"extent-check.bin", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine.write(&fh, 0, &[0xAA_u8; 4096], &ctx()).unwrap();
+
+        let fs = engine.fs.borrow();
+        let extents = fs
+            .extent_allocator()
+            .lookup_extents(attr.inode_id.0, 0, 4096);
+        assert!(!extents.is_empty(), "extent must be allocated after write");
+        assert_eq!(extents.len(), 1, "single write should create single extent");
+        assert_eq!(extents[0].logical_offset, 0);
+        assert_eq!(extents[0].length, 4096);
+    }
+
+    #[test]
+    fn multiple_writes_produce_multiple_extents() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"multi-extent.bin", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine.write(&fh, 0, &[0x11_u8; 4096], &ctx()).unwrap();
+        engine.write(&fh, 8192, &[0x22_u8; 4096], &ctx()).unwrap();
+
+        let fs = engine.fs.borrow();
+        let extents = fs
+            .extent_allocator()
+            .lookup_extents(attr.inode_id.0, 0, 12288);
+        assert_eq!(extents.len(), 2, "two non-contiguous writes -> two extents");
+
+        let first = extents.iter().find(|e| e.logical_offset == 0).unwrap();
+        assert_eq!(first.length, 4096);
+        let second = extents.iter().find(|e| e.logical_offset == 8192).unwrap();
+        assert_eq!(second.length, 4096);
+    }
+
+    // ── Error mapping tests ─────────────────────────────────────────
+
+    #[test]
+    fn map_errno_maps_corrupt_state_to_eio() {
+        use crate::error::FileSystemError;
+
+        let err = FileSystemError::CorruptState { reason: "test" };
+        assert_eq!(map_errno(&err), Errno::EIO);
+    }
+
+    #[test]
+    fn map_errno_maps_corrupt_content_to_eio() {
+        use crate::error::FileSystemError;
+
+        let err = FileSystemError::CorruptContent {
+            inode_id: tidefs_types_vfs_core::InodeId::new(1),
+        };
+        assert_eq!(map_errno(&err), Errno::EIO);
+    }
+
+    #[test]
+    fn map_errno_maps_unknown_error_to_eio() {
+        use crate::error::FileSystemError;
+
+        let err = FileSystemError::Store(StoreError::ReadOnly { operation: "write" });
+        assert_eq!(map_errno(&err), Errno::EIO);
+    }
+
+    #[test]
+    fn data_ranges_reports_sparse_chunks() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"sparse.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let chunk = crate::constants::content_chunk_size() as usize;
+        let payload = vec![0xAB; chunk * 3];
+        engine
+            .fs
+            .borrow_mut()
+            .write_file("/sparse.bin", 0, &payload)
+            .unwrap();
+        engine
+            .fallocate(
+                &fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                chunk as u64,
+                chunk as u64,
+                &ctx(),
+            )
+            .unwrap();
+
+        let ranges = engine
+            .data_ranges(&fh, 0, (chunk * 3) as u64, &ctx())
+            .unwrap();
+
+        assert_eq!(
+            ranges,
+            vec![
+                LseekDataRange::new(0, chunk as u64),
+                LseekDataRange::new((chunk * 2) as u64, (chunk * 3) as u64),
+            ]
+        );
+    }
+
+    #[test]
+    fn data_ranges_clips_to_requested_window() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"window.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let chunk = crate::constants::content_chunk_size() as usize;
+        let payload = vec![0xCD; chunk * 2];
+        engine.write(&fh, 0, &payload, &ctx()).unwrap();
+
+        let ranges = engine
+            .data_ranges(&fh, (chunk / 2) as u64, chunk as u64, &ctx())
+            .unwrap();
+
+        assert_eq!(
+            ranges,
+            vec![LseekDataRange::new(
+                (chunk / 2) as u64,
+                (chunk + chunk / 2) as u64
+            )]
+        );
+    }
+
+    #[test]
+    fn data_ranges_returns_empty_past_eof() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"past-eof.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"abc", &ctx()).unwrap();
+
+        assert_eq!(engine.data_ranges(&fh, 3, 10, &ctx()).unwrap(), Vec::new());
+        assert_eq!(engine.data_ranges(&fh, 10, 10, &ctx()).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn data_ranges_empty_file_returns_empty() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"empty-data-ranges.bin", 0o644, 0, &ctx())
+            .unwrap();
+
+        assert_eq!(engine.data_ranges(&fh, 0, 1, &ctx()).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn data_ranges_fully_written_file_returns_single_range() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"dense-data-ranges.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let chunk = crate::constants::content_chunk_size() as usize;
+        let payload = vec![0xEF; chunk * 2 + 17];
+        engine.write(&fh, 0, &payload, &ctx()).unwrap();
+
+        let ranges = engine
+            .data_ranges(&fh, 0, payload.len() as u64, &ctx())
+            .unwrap();
+
+        assert_eq!(ranges, vec![LseekDataRange::new(0, payload.len() as u64)]);
+    }
+
+    #[test]
+    fn data_ranges_hole_only_file_returns_empty() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"hole-only-data-ranges.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let chunk = crate::constants::content_chunk_size() as u64;
+        engine
+            .fs
+            .borrow_mut()
+            .truncate_file("/hole-only-data-ranges.bin", chunk)
+            .unwrap();
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, chunk);
+        assert_eq!(
+            engine.data_ranges(&fh, 0, chunk, &ctx()).unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn data_ranges_start_equals_end_returns_empty() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"zero-window-data-ranges.bin", 0o644, 0, &ctx())
+            .unwrap();
+        engine.write(&fh, 0, b"abc", &ctx()).unwrap();
+
+        assert_eq!(engine.data_ranges(&fh, 1, 0, &ctx()).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn data_ranges_offset_plus_length_overflow_returns_einval() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"overflow-data-ranges.bin", 0o644, 0, &ctx())
+            .unwrap();
+
+        assert_eq!(
+            engine.data_ranges(&fh, u64::MAX, 1, &ctx()).unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    #[test]
+    fn data_ranges_window_at_chunk_boundary() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"boundary-data-ranges.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let chunk = crate::constants::content_chunk_size() as u64;
+        engine.write(&fh, chunk, b"edge", &ctx()).unwrap();
+
+        let ranges = engine.data_ranges(&fh, chunk, 4, &ctx()).unwrap();
+
+        assert_eq!(ranges, vec![LseekDataRange::new(chunk, chunk + 4)]);
+    }
+
+    // ── Directory tests ─────────────────────────────────────────────
+
+    fn assert_statfs_invariants(st: StatFs) {
+        assert!(st.block_size > 0);
+        assert!(st.fragment_size > 0);
+        assert!(st.total_blocks > 0);
+        assert!(st.free_blocks <= st.total_blocks);
+        assert!(st.avail_blocks <= st.free_blocks);
+        assert!(st.files > 0);
+        assert!(st.files_free <= st.files);
+        assert!(st.name_max > 0);
+        assert_eq!(st.fsid_hi, 0);
+        assert!(
+            st.fsid_lo > 0,
+            "fsid_lo should be non-zero, got {}",
+            st.fsid_lo
+        );
+    }
+
+    #[test]
+    fn statfs_reports_valid_info() {
+        let (engine, _td) = temp_fs();
+        let st = VfsEngineStatFs::statfs(&engine, &ctx()).unwrap();
+        assert_statfs_invariants(st);
+    }
+
+    #[test]
+    fn statfs_preserves_quota_clamped_engine_counters() {
+        let quota_bytes = 8 * u64::from(crate::constants::content_chunk_size());
+        let (engine, _td) = temp_fs();
+        let mut hierarchy = DatasetQuotaHierarchy::new();
+        hierarchy.set_quota(
+            crate::ROOT_DATASET_ID,
+            DatasetQuotaConfig {
+                hard_limit_bytes: quota_bytes,
+                ..Default::default()
+            },
+        );
+
+        let canonical = {
+            let mut fs = engine.fs.borrow_mut();
+            fs.set_quota_hierarchy(hierarchy);
+            fs.statfs().unwrap()
+        };
+        let st = VfsEngineStatFs::statfs(&engine, &ctx()).unwrap();
+
+        assert_eq!(canonical.blocks, quota_bytes / u64::from(canonical.bsize));
+        assert_eq!(st.total_blocks, canonical.blocks);
+        assert_eq!(st.free_blocks, canonical.bfree);
+        assert_eq!(st.avail_blocks, canonical.bavail);
+        assert!(st.free_blocks <= st.total_blocks);
+        assert!(st.avail_blocks <= st.free_blocks);
+    }
+
+    #[test]
+    fn statfs_reports_inode_capacity_fields() {
+        let (engine, _td) = temp_fs();
+        let st = VfsEngineStatFs::statfs(&engine, &ctx()).unwrap();
+
+        assert_statfs_invariants(st);
+        assert!(st.files_free > 0);
+        assert!(
+            st.files_free <= st.files,
+            "files_free {0} must be <= files {1}",
+            st.files_free,
+            st.files
+        );
+    }
+
+    #[test]
+    fn statfs_reflects_written_file_block_usage() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let before = VfsEngineStatFs::statfs(&engine, &ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"statfs-data.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let payload = vec![0x5a; 16 * 1024];
+
+        assert_eq!(
+            engine.write(&fh, 0, &payload, &ctx()).unwrap(),
+            payload.len() as u32
+        );
+
+        let after = VfsEngineStatFs::statfs(&engine, &ctx()).unwrap();
+        assert_statfs_invariants(after);
+        assert!(after.free_blocks <= before.free_blocks);
+        assert!(after.avail_blocks <= before.avail_blocks);
+    }
+
+    #[test]
+    fn statfs_free_blocks_recover_after_unlink() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"statfs-delete.bin", 0o644, 0, &ctx())
+            .unwrap();
+        let payload = vec![0x33; 16 * 1024];
+        engine.write(&fh, 0, &payload, &ctx()).unwrap();
+        let after_write = VfsEngineStatFs::statfs(&engine, &ctx()).unwrap();
+
+        engine.release(&fh).unwrap();
+        engine.unlink(root, b"statfs-delete.bin", &ctx()).unwrap();
+
+        let after_unlink = VfsEngineStatFs::statfs(&engine, &ctx()).unwrap();
+        assert_statfs_invariants(after_unlink);
+        assert!(after_unlink.free_blocks >= after_write.free_blocks);
+        assert!(after_unlink.avail_blocks >= after_write.avail_blocks);
+    }
+
+    #[test]
+    fn statfs_is_independent_of_request_credentials() {
+        let (engine, _td) = temp_fs();
+        let user_st = VfsEngineStatFs::statfs(&engine, &ctx()).unwrap();
+        let root_st = VfsEngineStatFs::statfs(&engine, &root_ctx()).unwrap();
+
+        assert_statfs_invariants(user_st);
+        assert_eq!(user_st, root_st);
+    }
+
+    #[test]
+    fn readdir_empty_root() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        let (entries, has_more) = engine.readdir(&dh, 0, &ctx()).unwrap();
+        assert!(entries.is_empty());
+        assert!(!has_more);
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn readdir_with_entries() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine.create(root, b"aaa.txt", 0o644, 0, &ctx()).unwrap();
+        engine.create(root, b"bbb.txt", 0o644, 0, &ctx()).unwrap();
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        let (entries, has_more) = engine.readdir(&dh, 0, &ctx()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, b"aaa.txt");
+        assert_eq!(entries[1].name, b"bbb.txt");
+        assert!(!has_more);
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn readdir_offset_zero_returns_entries_with_sequential_cookies() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine.create(root, b"aaa.txt", 0o644, 0, &ctx()).unwrap();
+        engine.create(root, b"bbb.txt", 0o644, 0, &ctx()).unwrap();
+        engine.create(root, b"ccc.txt", 0o644, 0, &ctx()).unwrap();
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        let (entries, has_more) = engine.readdir(&dh, 0, &ctx()).unwrap();
+
+        let names: Vec<Vec<u8>> = entries.iter().map(|entry| entry.name.clone()).collect();
+        let cookies: Vec<u64> = entries.iter().map(|entry| entry.cookie).collect();
+        assert_eq!(
+            names,
+            vec![
+                b"aaa.txt".to_vec(),
+                b"bbb.txt".to_vec(),
+                b"ccc.txt".to_vec()
+            ]
+        );
+        assert_eq!(cookies, vec![1, 2, 3]);
+        assert!(!has_more);
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn readdir_offset_continuation_returns_remaining_entries() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine.create(root, b"aaa.txt", 0o644, 0, &ctx()).unwrap();
+        engine.create(root, b"bbb.txt", 0o644, 0, &ctx()).unwrap();
+        engine.create(root, b"ccc.txt", 0o644, 0, &ctx()).unwrap();
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        let (first_batch, has_more) = engine.readdir(&dh, 0, &ctx()).unwrap();
+        assert_eq!(first_batch.len(), 3);
+        assert!(!has_more);
+
+        let resume_offset = first_batch[0].cookie; // aaa.txt cookie = 1
+        let (second_batch, has_more) = engine.readdir(&dh, resume_offset, &ctx()).unwrap();
+
+        let names: Vec<Vec<u8>> = second_batch
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        let cookies: Vec<u64> = second_batch.iter().map(|entry| entry.cookie).collect();
+        assert_eq!(names, vec![b"bbb.txt".to_vec(), b"ccc.txt".to_vec()]);
+        assert_eq!(cookies, vec![2, 3]);
+        assert!(!has_more);
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn readdir_offset_past_end_returns_empty_batch() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine.create(root, b"aaa.txt", 0o644, 0, &ctx()).unwrap();
+        engine.create(root, b"bbb.txt", 0o644, 0, &ctx()).unwrap();
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        let (entries, has_more) = engine.readdir(&dh, 9999, &ctx()).unwrap();
+
+        assert!(entries.is_empty());
+        assert!(!has_more);
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn readdir_large_directory_batches_at_cursor_window_limit() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        for i in 0..140u64 {
+            let name = format!("bulk_{i:04}.txt").into_bytes();
+            let entry = NamespaceEntry {
+                name: name.clone(),
+                inode_id: InodeId::new(10_000 + i),
+                generation: Generation::new(i + 1),
+                facets: NodeKind::File.to_facets(),
+                mode: S_IFREG | 0o644,
+            };
+            engine
+                .fs
+                .borrow_mut()
+                .insert_dir_entry(root, name, entry)
+                .unwrap();
+        }
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        let (first, has_more) = engine.readdir(&dh, 0, &ctx()).unwrap();
+        assert_eq!(first.len(), 128);
+        assert!(has_more);
+        assert_eq!(first[0].name, b"bulk_0000.txt");
+        assert_eq!(first.last().unwrap().name, b"bulk_0127.txt");
+        assert_eq!(first.last().unwrap().cookie, 128);
+
+        let (second, has_more) = engine
+            .readdir(&dh, first.last().unwrap().cookie, &ctx())
+            .unwrap();
+        assert_eq!(second.len(), 12);
+        assert!(!has_more);
+        assert_eq!(second[0].name, b"bulk_0128.txt");
+        assert_eq!(second.last().unwrap().name, b"bulk_0139.txt");
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn opendir_on_valid_directory_allocates_live_handle() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dir = engine.mkdir(root, b"subdir", 0o755, &ctx()).unwrap();
+
+        let dh = engine.opendir(dir.inode_id, &ctx()).unwrap();
+
+        assert_eq!(dh.inode_id, dir.inode_id);
+        assert_ne!(dh.dh_id, DirHandleId::default());
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn opendir_on_nonexistent_inode_returns_enoent() {
+        let (engine, _td) = temp_fs();
+
+        let result = engine.opendir(InodeId::new(999_999), &ctx());
+
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn opendir_on_file_fails() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"file.txt", 0o644, 0, &ctx()).unwrap();
+        let result = engine.opendir(attr.inode_id, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOTDIR);
+    }
+
+    #[test]
+    fn releasedir_after_valid_opendir_succeeds_once() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+
+        engine.releasedir(&dh).unwrap();
+        assert_eq!(engine.releasedir(&dh).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn releasedir_with_unknown_dir_handle_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dh = EngineDirHandle::new(root, DirHandleId::new(999));
+
+        assert_eq!(engine.releasedir(&dh).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn fsyncdir_on_valid_directory_handle_succeeds() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dir = engine
+            .mkdir(root, b"fsyncdir-subdir", 0o755, &ctx())
+            .unwrap();
+        let dh = engine.opendir(dir.inode_id, &ctx()).unwrap();
+
+        engine.fsyncdir(&dh, false, &ctx()).unwrap();
+        engine.fsyncdir(&dh, true, &ctx()).unwrap();
+    }
+
+    #[test]
+    fn fsyncdir_after_releasedir_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dh = engine.opendir(root, &ctx()).unwrap();
+
+        engine.releasedir(&dh).unwrap();
+
+        assert_eq!(
+            engine.fsyncdir(&dh, false, &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+        assert_eq!(
+            engine.fsyncdir(&dh, true, &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn fsyncdir_with_mismatched_dir_handle_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dir = engine
+            .mkdir(root, b"fsyncdir-mismatch", 0o755, &ctx())
+            .unwrap();
+        let root_handle = engine.opendir(root, &ctx()).unwrap();
+        let mismatched = EngineDirHandle::new(dir.inode_id, root_handle.dh_id);
+
+        assert_eq!(
+            engine.fsyncdir(&mismatched, false, &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+        assert_eq!(
+            engine.fsyncdir(&mismatched, true, &ctx()).unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn fsyncdir_open_removed_directory_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dir = engine
+            .mkdir(root, b"fsyncdir-removed", 0o755, &ctx())
+            .unwrap();
+        let dh = engine.opendir(dir.inode_id, &ctx()).unwrap();
+
+        engine.rmdir(root, b"fsyncdir-removed", &ctx()).unwrap();
+
+        assert_eq!(
+            engine.fsyncdir(&dh, false, &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(
+            engine.fsyncdir(&dh, true, &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn readdir_after_releasedir_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        engine.releasedir(&dh).unwrap();
+
+        assert_eq!(engine.readdir(&dh, 0, &ctx()).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn readdir_with_unknown_dir_handle_returns_ebadf() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dh = EngineDirHandle::new(root, DirHandleId::new(999));
+
+        assert_eq!(engine.readdir(&dh, 0, &ctx()).unwrap_err(), Errno::EBADF);
+    }
+
+    // ── Xattr tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn setxattr_getxattr_roundtrip() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"xfile.txt", 0o644, 0, &ctx()).unwrap();
+        engine
+            .setxattr(attr.inode_id, b"user.test", b"hello", 0, &ctx())
+            .unwrap();
+        let val = engine
+            .getxattr(attr.inode_id, b"user.test", &ctx())
+            .unwrap();
+        assert_eq!(val, b"hello");
+    }
+
+    #[test]
+    fn listxattr_returns_set_keys() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"listfile.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine
+            .setxattr(attr.inode_id, b"user.a", b"1", 0, &ctx())
+            .unwrap();
+        engine
+            .setxattr(attr.inode_id, b"user.b", b"2", 0, &ctx())
+            .unwrap();
+        let list = engine.listxattr(attr.inode_id, &ctx()).unwrap();
+        // Null-separated list
+        let names: Vec<&[u8]> = list.split(|b| *b == 0).filter(|s| !s.is_empty()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&b"user.a".as_slice()));
+        assert!(names.contains(&b"user.b".as_slice()));
+    }
+
+    #[test]
+    fn removexattr_then_getxattr_returns_enodata() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"remfile.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine
+            .setxattr(attr.inode_id, b"user.del", b"val", 0, &ctx())
+            .unwrap();
+        engine
+            .removexattr(attr.inode_id, b"user.del", &ctx())
+            .unwrap();
+        let result = engine.getxattr(attr.inode_id, b"user.del", &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENODATA);
+    }
+
+    #[test]
+    fn setxattr_create_fails_on_existing() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"dupfile.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine
+            .setxattr(attr.inode_id, b"user.dup", b"first", 0, &ctx())
+            .unwrap();
+        let result = engine.setxattr(attr.inode_id, b"user.dup", b"second", XATTR_CREATE, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EEXIST);
+    }
+
+    #[test]
+    fn setxattr_replace_fails_on_missing() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"repfile.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let result = engine.setxattr(
+            attr.inode_id,
+            b"user.missing",
+            b"val",
+            XATTR_REPLACE,
+            &ctx(),
+        );
+        assert_eq!(result.unwrap_err(), Errno::ENODATA);
+    }
+
+    #[test]
+    fn large_xattr_value_roundtrip() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"bigfile.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let big = vec![0xABu8; 8192];
+        engine
+            .setxattr(attr.inode_id, b"user.big", &big, 0, &ctx())
+            .unwrap();
+        let val = engine.getxattr(attr.inode_id, b"user.big", &ctx()).unwrap();
+        assert_eq!(val, big);
+    }
+
+    #[test]
+    fn trusted_xattr_requires_cap_sys_admin() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"trustfile.txt", 0o644, 0, &ctx())
+            .unwrap();
+        // non-root uid=1000 should be denied
+        let result = engine.setxattr(attr.inode_id, b"trusted.myattr", b"val", 0, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EPERM);
+    }
+
+    #[test]
+    fn setxattr_rejects_empty_and_nul_names() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"badname.txt");
+
+        let empty = engine.setxattr(inode, b"", b"value", 0, &ctx());
+        assert_eq!(empty.unwrap_err(), Errno::EINVAL);
+
+        let nul = engine.setxattr(inode, b"user.bad\0name", b"value", 0, &ctx());
+        assert_eq!(nul.unwrap_err(), Errno::EINVAL);
+
+        let get_empty = engine.getxattr(inode, b"", &ctx());
+        assert_eq!(get_empty.unwrap_err(), Errno::EINVAL);
+
+        let remove_nul = engine.removexattr(inode, b"user.bad\0name", &ctx());
+        assert_eq!(remove_nul.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn setxattr_rejects_unsupported_namespaces() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"namespace.txt");
+
+        let no_prefix = engine.setxattr(inode, b"plain", b"value", 0, &ctx());
+        assert_eq!(no_prefix.unwrap_err(), Errno::EOPNOTSUPP);
+
+        let unknown_prefix = engine.setxattr(inode, b"custom.attr", b"value", 0, &ctx());
+        assert_eq!(unknown_prefix.unwrap_err(), Errno::EOPNOTSUPP);
+
+        let empty_suffix = engine.setxattr(inode, b"user.", b"value", 0, &ctx());
+        assert_eq!(empty_suffix.unwrap_err(), Errno::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn setxattr_rejects_invalid_flag_combinations() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"flags.txt");
+
+        let create_and_replace = engine.setxattr(
+            inode,
+            b"user.flags",
+            b"value",
+            XATTR_CREATE | XATTR_REPLACE,
+            &ctx(),
+        );
+        assert_eq!(create_and_replace.unwrap_err(), Errno::EINVAL);
+
+        let unsupported = engine.setxattr(inode, b"user.flags", b"value", 4, &ctx());
+        assert_eq!(unsupported.unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn setxattr_rejects_oversized_value() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"huge-xattr.txt");
+        let value = vec![0xCD; 64 * 1024 + 1];
+
+        let result = engine.setxattr(inode, b"user.huge", &value, 0, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::E2BIG);
+    }
+
+    #[test]
+    fn trusted_xattr_root_roundtrips_and_nonroot_is_hidden() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"trusted-root.txt");
+
+        engine
+            .setxattr(inode, b"trusted.visible", b"secret", 0, &root_ctx())
+            .unwrap();
+        let value = engine
+            .getxattr(inode, b"trusted.visible", &root_ctx())
+            .unwrap();
+        assert_eq!(value, b"secret");
+
+        let nonroot_get = engine.getxattr(inode, b"trusted.visible", &ctx());
+        assert_eq!(nonroot_get.unwrap_err(), Errno::EPERM);
+
+        engine
+            .setxattr(inode, b"user.visible", b"public", 0, &ctx())
+            .unwrap();
+        assert_eq!(engine.listxattr(inode, &ctx()).unwrap(), b"user.visible\0");
+        assert_eq!(
+            engine.listxattr(inode, &root_ctx()).unwrap(),
+            b"trusted.visible\0user.visible\0"
+        );
+    }
+
+    #[test]
+    fn posix_acl_xattr_accepts_structurally_valid_payload() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"acl-valid.txt");
+        let acl = tidefs_posix_acl::minimal_access_acl_from_mode(0o640);
+        let encoded = tidefs_posix_acl::encode_posix_acl_xattr(&acl);
+
+        engine
+            .setxattr(inode, b"system.posix_acl_access", &encoded, 0, &root_ctx())
+            .unwrap();
+
+        let attr = engine.getattr(inode, None, &root_ctx()).unwrap();
+        assert_eq!(attr.posix.mode & 0o777, 0o640);
+        assert_eq!(
+            engine
+                .getxattr(inode, b"system.posix_acl_access", &root_ctx())
+                .unwrap(),
+            encoded
+        );
+    }
+
+    #[test]
+    fn setxattr_rejects_structurally_invalid_posix_acl_payloads() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"acl-invalid.txt");
+        let invalid_acl = tidefs_posix_acl::encode_posix_acl_xattr(&[]);
+
+        let access = engine.setxattr(
+            inode,
+            b"system.posix_acl_access",
+            &invalid_acl,
+            0,
+            &root_ctx(),
+        );
+        assert_eq!(access.unwrap_err(), Errno::EINVAL);
+
+        let default = engine.setxattr(
+            inode,
+            b"system.posix_acl_default",
+            &invalid_acl,
+            0,
+            &root_ctx(),
+        );
+        assert_eq!(default.unwrap_err(), Errno::EINVAL);
+
+        let missing = engine.getxattr(inode, b"system.posix_acl_access", &root_ctx());
+        assert_eq!(missing.unwrap_err(), Errno::ENODATA);
+    }
+
+    #[test]
+    fn listxattr_preserves_linux_null_terminated_layout() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"layout.txt");
+
+        engine.setxattr(inode, b"user.a", b"1", 0, &ctx()).unwrap();
+        engine
+            .setxattr(inode, b"security.b", b"2", 0, &ctx())
+            .unwrap();
+
+        assert_eq!(
+            engine.listxattr(inode, &ctx()).unwrap(),
+            b"security.b\0user.a\0"
+        );
+    }
+
+    #[test]
+    fn getxattr_not_found() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let result = engine.getxattr(root, b"user.nonexistent", &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENODATA);
+    }
+
+    #[test]
+    fn listxattr_empty_by_default() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let list = engine.listxattr(root, &ctx()).unwrap();
+        assert!(list.is_empty());
+    }
+    // ── Error mapping tests ──────────────────────────────────────────
+
+    #[test]
+    fn lookup_nonexistent_returns_enoent() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let result = engine.lookup(root, b"no-such-file", &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn mkdir_duplicate_returns_eexist() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        engine.mkdir(root, b"dupdir", 0o755, &ctx()).unwrap();
+        let result = engine.mkdir(root, b"dupdir", 0o755, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EEXIST);
+    }
+
+    #[test]
+    fn mknod_returns_eopnotsupp() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let result = engine.mknod(root, b"dev", 0o600, 0, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn tmpfile_creates_unnamed_read_write_file() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap();
+
+        assert_eq!(attr.kind, NodeKind::File);
+        assert_eq!(attr.posix.mode & S_IFMT, tidefs_types_vfs_core::S_IFREG);
+        assert_eq!(attr.posix.mode & !S_IFMT, 0o600);
+        assert_eq!(attr.posix.nlink, 0);
+        assert_eq!(fh.inode_id, attr.inode_id);
+
+        let written = engine.write(&fh, 0, b"tmpfile bytes", &ctx()).unwrap();
+        assert_eq!(written, b"tmpfile bytes".len() as u32);
+        let data = engine
+            .read(&fh, 0, b"tmpfile bytes".len() as u32, &ctx())
+            .unwrap();
+        assert_eq!(data, b"tmpfile bytes");
+
+        let after_write = engine.getattr(attr.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(after_write.posix.size, b"tmpfile bytes".len() as u64);
+    }
+
+    #[test]
+    fn tmpfile_does_not_publish_directory_entry() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap();
+
+        assert_eq!(engine.inode_path(attr.inode_id).unwrap_err(), Errno::ENOENT);
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        let (entries, has_more) = engine.readdir(&dh, 0, &ctx()).unwrap();
+        assert!(entries.is_empty());
+        assert!(!has_more);
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn tmpfile_parent_not_directory_returns_enotdir() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (file, _fh) = engine
+            .create(root, b"not-a-dir", 0o600, O_RDWR, &ctx())
+            .unwrap();
+
+        let result = engine.tmpfile(file.inode_id, 0o600, O_RDWR, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOTDIR);
+    }
+
+    #[test]
+    fn tmpfile_missing_parent_returns_enoent() {
+        let (engine, _td) = temp_fs();
+
+        let result = engine.tmpfile(InodeId::new(999_999), 0o600, O_RDWR, &ctx());
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
+    }
+
+    #[test]
+    fn tmpfile_applies_umask_and_request_owner() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let caller = RequestCtx {
+            uid: 4242,
+            gid: 4343,
+            pid: 77,
+            umask: 0o027,
+            groups: vec![4343],
+        };
+
+        let (attr, _fh) = engine.tmpfile(root, 0o777, O_RDWR, &caller).unwrap();
+
+        assert_eq!(attr.posix.mode & !S_IFMT, 0o750);
+        assert_eq!(attr.posix.uid, 4242);
+        assert_eq!(attr.posix.gid, 4343);
+    }
+
+    #[test]
+    fn tmpfile_release_reclaims_anonymous_handle() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap();
+        engine.write(&fh, 0, b"released", &ctx()).unwrap();
+
+        engine.release(&fh).unwrap();
+
+        assert_eq!(engine.read(&fh, 0, 8, &ctx()).unwrap_err(), Errno::EBADF);
+        assert_eq!(engine.inode_path(attr.inode_id).unwrap_err(), Errno::ENOENT);
+    }
+
+    // ── tmpfile materialization via link ─────────────────────────────
+
+    #[test]
+    fn tmpfile_link_materializes_into_namespace() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine.tmpfile(root, 0o644, O_RDWR, &ctx()).unwrap();
+        let ino = attr.inode_id;
+        engine
+            .write(&fh, 0, b"materialized content", &ctx())
+            .unwrap();
+
+        assert_eq!(engine.inode_path(ino).unwrap_err(), Errno::ENOENT);
+
+        let linked_attr = engine.link(ino, root, b"linked-tmpfile", &ctx()).unwrap();
+        assert_eq!(linked_attr.inode_id, ino);
+        assert_eq!(linked_attr.posix.nlink, 1);
+        assert_eq!(linked_attr.posix.size, b"materialized content".len() as u64);
+        assert_eq!(engine.inode_path(ino).unwrap(), "/linked-tmpfile");
+
+        let read_fh = engine.open(ino, O_RDONLY, &ctx()).unwrap();
+        let data = engine.read(&read_fh, 0, 30, &ctx()).unwrap();
+        assert_eq!(data, b"materialized content");
+        engine.release(&read_fh).unwrap();
+    }
+
+    #[test]
+    fn tmpfile_link_duplicate_name_returns_eexist() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_fa, fh) = engine.create(root, b"existing", 0o644, 0, &ctx()).unwrap();
+        engine.release(&fh).unwrap();
+        let (attr, _fh) = engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap();
+        let err = engine
+            .link(attr.inode_id, root, b"existing", &ctx())
+            .unwrap_err();
+        assert_eq!(err, Errno::EEXIST);
+    }
+
+    #[test]
+    fn tmpfile_link_preserves_ownership() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let caller = RequestCtx {
+            uid: 1234,
+            gid: 5678,
+            pid: 77,
+            umask: 0o022,
+            groups: vec![5678],
+        };
+        let (tattr, tfh) = engine.tmpfile(root, 0o640, O_RDWR, &caller).unwrap();
+        engine.write(&tfh, 0, b"owned", &caller).unwrap();
+        let linked = engine
+            .link(tattr.inode_id, root, b"owned-file", &caller)
+            .unwrap();
+        assert_eq!(linked.posix.uid, 1234);
+        assert_eq!(linked.posix.gid, 5678);
+    }
+
+    #[test]
+    fn tmpfile_link_empty_file_is_accessible() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap();
+        let linked = engine
+            .link(attr.inode_id, root, b"empty-linked", &ctx())
+            .unwrap();
+        assert_eq!(linked.posix.size, 0);
+        assert_eq!(engine.inode_path(attr.inode_id).unwrap(), "/empty-linked");
+    }
+
+    // ── Path cache tests ─────────────────────────────────────────────
+
+    #[test]
+    fn path_cache_populated_for_new_inodes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let child = engine.mkdir(root, b"sub", 0o755, &ctx()).unwrap();
+        let grandchild = engine
+            .mkdir(child.inode_id, b"nested", 0o755, &ctx())
+            .unwrap();
+
+        assert_eq!(engine.inode_path(child.inode_id).unwrap(), "/sub");
+        assert_eq!(
+            engine.inode_path(grandchild.inode_id).unwrap(),
+            "/sub/nested"
+        );
+    }
+
+    #[test]
+    fn path_cache_updated_on_rename() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"oldname", 0o644, 0, &ctx()).unwrap();
+        engine
+            .rename(root, b"oldname", root, b"newname", 0, &ctx())
+            .unwrap();
+
+        let path = engine.inode_path(attr.inode_id).unwrap();
+        assert_eq!(path, "/newname");
+    }
+
+    // ── ctime advancement on setattr (#3566) ──────────────────────────────────
+
+    #[test]
+    fn setattr_ctime_advances_on_mode_change() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"mode-file", 0o644, 0, &ctx()).unwrap();
+        let orig_ctime = attr.posix.ctime_ns;
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MODE;
+        set.mode = 0o600;
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert!(
+            updated.posix.ctime_ns > orig_ctime,
+            "ctime should advance on mode change"
+        );
+    }
+
+    #[test]
+    fn setattr_chmod_synchronizes_acl_access_xattr() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"acl-file", 0o640, 0, &ctx()).unwrap();
+
+        // Set a posix_acl_access xattr with mode-matching entries.
+        let acl = tidefs_posix_acl::encode_posix_acl_xattr(
+            &tidefs_posix_acl::minimal_access_acl_from_mode(0o640),
+        );
+        engine
+            .setxattr(attr.inode_id, b"system.posix_acl_access", &acl, 0, &ctx())
+            .unwrap();
+
+        // chmod to 0o751 should update the ACL entry permissions.
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MODE;
+        set.mode = 0o751;
+        let _updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+
+        let acl_raw = engine
+            .getxattr(attr.inode_id, b"system.posix_acl_access", &ctx())
+            .unwrap();
+        let decoded = tidefs_posix_acl::decode_posix_acl_xattr(&acl_raw).unwrap();
+
+        // After chmod to 0o751, ACL entries should reflect new mode bits:
+        // user_obj = 7 (rwx), group_obj = 5 (r-x), other = 1 (--x)
+        assert_eq!(decoded[0].perm, 7); // user_obj
+        assert_eq!(decoded[1].perm, 5); // group_obj
+        assert_eq!(decoded[2].perm, 1); // other
+    }
+
+    #[test]
+    fn setattr_chmod_no_acl_leaves_xattrs_untouched() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"noacl-file", 0o644, 0, &ctx())
+            .unwrap();
+
+        // Set a non-ACL xattr; chmod should not disturb it.
+        engine
+            .setxattr(attr.inode_id, b"user.comment", b"hello", 0, &ctx())
+            .unwrap();
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MODE;
+        set.mode = 0o600;
+        let _updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+
+        let val = engine
+            .getxattr(attr.inode_id, b"user.comment", &ctx())
+            .unwrap();
+        assert_eq!(val, b"hello");
+
+        // No ACL should have been created.
+        assert_eq!(
+            engine
+                .getxattr(attr.inode_id, b"system.posix_acl_access", &ctx())
+                .unwrap_err(),
+            Errno::ENODATA,
+        );
+    }
+
+    #[test]
+    fn setattr_ctime_advances_on_uid_change() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"uid-file", 0o644, 0, &ctx()).unwrap();
+        let orig_ctime = attr.posix.ctime_ns;
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_UID;
+        set.uid = 999;
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert!(
+            updated.posix.ctime_ns > orig_ctime,
+            "ctime should advance on uid change"
+        );
+    }
+
+    #[test]
+    fn setattr_ctime_advances_on_gid_change() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"gid-file", 0o644, 0, &ctx()).unwrap();
+        let orig_ctime = attr.posix.ctime_ns;
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_GID;
+        set.gid = 999;
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert!(
+            updated.posix.ctime_ns > orig_ctime,
+            "ctime should advance on gid change"
+        );
+    }
+
+    #[test]
+    fn setattr_ctime_advances_on_size_change() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"size-file", 0o644, 0, &ctx()).unwrap();
+        let orig_ctime = attr.posix.ctime_ns;
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_SIZE;
+        set.size = 8192;
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert!(
+            updated.posix.ctime_ns > orig_ctime,
+            "ctime should advance on size change"
+        );
+    }
+
+    #[test]
+    fn setattr_ctime_advances_on_mtime_change() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"mtime-file", 0o644, 0, &ctx())
+            .unwrap();
+        let orig_ctime = attr.posix.ctime_ns;
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MTIME;
+        set.mtime_ns = 9_000_000_000;
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert!(
+            updated.posix.ctime_ns > orig_ctime,
+            "ctime should advance on mtime change (POSIX semantics)"
+        );
+        assert_eq!(
+            updated.posix.mtime_ns, 9_000_000_000,
+            "mtime should be set to explicit value"
+        );
+    }
+
+    #[test]
+    fn setattr_preserves_signed_explicit_times_without_data_version_drift() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"signed-time-file", 0o644, 0, &ctx())
+            .unwrap();
+
+        let stored_before = engine
+            .fs
+            .borrow()
+            .get_inode_by_id(attr.inode_id)
+            .expect("created inode present")
+            .clone();
+        let data_version_before = stored_before.data_version;
+        let metadata_version_before = stored_before.metadata_version;
+
+        let atime_1960_ns = -315_619_200_000_000_000_i64;
+        let mtime_1960_ns = atime_1960_ns + 123_456_789;
+        let mut set = SetAttr::new();
+        set.valid = FATTR_ATIME | FATTR_MTIME;
+        set.atime_ns = atime_1960_ns;
+        set.mtime_ns = mtime_1960_ns;
+
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert_eq!(updated.posix.atime_ns, atime_1960_ns);
+        assert_eq!(updated.posix.mtime_ns, mtime_1960_ns);
+        assert!(
+            updated.posix.ctime_ns > attr.posix.ctime_ns,
+            "ctime should advance on explicit timestamp mutation"
+        );
+
+        let stored_after = engine
+            .fs
+            .borrow()
+            .get_inode_by_id(attr.inode_id)
+            .expect("updated inode present")
+            .clone();
+        assert_eq!(stored_after.posix_time.atime_ns, atime_1960_ns);
+        assert_eq!(stored_after.posix_time.mtime_ns, mtime_1960_ns);
+        assert_eq!(
+            stored_after.data_version, data_version_before,
+            "timestamp-only setattr must not rewrite content version identity"
+        );
+        assert!(
+            stored_after.metadata_version > metadata_version_before,
+            "metadata revision should advance separately from POSIX time"
+        );
+    }
+
+    #[test]
+    fn setattr_ctime_advances_on_mtime_now() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"mtime-now-file", 0o644, 0, &ctx())
+            .unwrap();
+        let orig_mtime = attr.posix.mtime_ns;
+        let orig_ctime = attr.posix.ctime_ns;
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MTIME_NOW;
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert!(
+            updated.posix.mtime_ns > orig_mtime,
+            "mtime should advance with MTIME_NOW"
+        );
+        assert!(
+            updated.posix.ctime_ns > orig_ctime,
+            "ctime should advance on MTIME_NOW (POSIX semantics)"
+        );
+    }
+
+    #[test]
+    fn setattr_ctime_advances_on_atime_change() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"atime-file", 0o644, 0, &ctx())
+            .unwrap();
+        let orig_ctime = attr.posix.ctime_ns;
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_ATIME;
+        set.atime_ns = 9_000_000_000;
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert!(
+            updated.posix.ctime_ns > orig_ctime,
+            "ctime should advance on atime change"
+        );
+    }
+
+    #[test]
+    fn setattr_ctime_advances_on_atime_now() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"atime-now-file", 0o644, 0, &ctx())
+            .unwrap();
+        let orig_ctime = attr.posix.ctime_ns;
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_ATIME_NOW;
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert!(
+            updated.posix.ctime_ns > orig_ctime,
+            "ctime should advance on ATIME_NOW"
+        );
+    }
+
+    #[test]
+    fn setattr_noop_does_not_bump_ctime() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"noop-file", 0o644, 0, &ctx()).unwrap();
+        let orig_ctime = attr.posix.ctime_ns;
+        let orig_atime = attr.posix.atime_ns;
+        let orig_mtime = attr.posix.mtime_ns;
+
+        let set = SetAttr::new(); // valid == 0, no changes
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert_eq!(
+            updated.posix.ctime_ns, orig_ctime,
+            "ctime should not advance on no-op setattr"
+        );
+        assert_eq!(
+            updated.posix.atime_ns, orig_atime,
+            "atime should not change on no-op setattr"
+        );
+        assert_eq!(
+            updated.posix.mtime_ns, orig_mtime,
+            "mtime should not change on no-op setattr"
+        );
+    }
+
+    #[test]
+    fn setattr_unchanged_explicit_times_preserves_ctime_and_versions() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"unchanged-times-file", 0o644, 0, &ctx())
+            .unwrap();
+        let stored_before = engine
+            .fs
+            .borrow()
+            .get_inode_by_id(attr.inode_id)
+            .expect("created inode present")
+            .clone();
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_ATIME | FATTR_MTIME;
+        set.atime_ns = attr.posix.atime_ns;
+        set.mtime_ns = attr.posix.mtime_ns;
+
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert_eq!(updated.posix.atime_ns, attr.posix.atime_ns);
+        assert_eq!(updated.posix.mtime_ns, attr.posix.mtime_ns);
+        assert_eq!(updated.posix.ctime_ns, attr.posix.ctime_ns);
+
+        let stored_after = engine
+            .fs
+            .borrow()
+            .get_inode_by_id(attr.inode_id)
+            .expect("updated inode present")
+            .clone();
+        assert_eq!(stored_after.data_version, stored_before.data_version);
+        assert_eq!(
+            stored_after.metadata_version,
+            stored_before.metadata_version
+        );
+    }
+
+    #[test]
+    fn setattr_ctime_advances_on_multi_field_update() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"multi-file", 0o644, 0, &ctx())
+            .unwrap();
+        let orig_ctime = attr.posix.ctime_ns;
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MODE | FATTR_UID | FATTR_SIZE;
+        set.mode = 0o755;
+        set.uid = 2000;
+        set.size = 100;
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert!(
+            updated.posix.ctime_ns > orig_ctime,
+            "ctime should advance on multi-field setattr"
+        );
+        assert_eq!(updated.posix.mode & 0o777, 0o755);
+        assert_eq!(updated.posix.uid, 2000);
+        assert_eq!(updated.posix.size, 100);
+    }
+
+    // ── readdir metadata prefetch smoke test ─────────────────────────
+
+    #[test]
+    fn readdir_with_inode_table_does_not_panic() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        // Create a few files in the root directory.
+        for i in 0..10u64 {
+            let name = format!("file_{i:03}").into_bytes();
+            engine.create(root, &name, 0o644, 0, &ctx()).unwrap();
+        }
+
+        // Set an inode table for metadata prefetch.
+        let inode_table = std::sync::Arc::new(tidefs_inode_table::InodeTable::new(
+            64,
+            Box::new(tidefs_inode_table::SystemTimeSource),
+        ));
+        let mut engine_mut = engine;
+        engine_mut.set_inode_table(inode_table);
+
+        // Open and read the root directory. Prefetch is fire-and-forget;
+        // the assertion is that this does not panic or error.
+        let dh = engine_mut.opendir(root, &ctx()).unwrap();
+        let result = engine_mut.readdir(&dh, 0, &ctx());
+        assert!(
+            result.is_ok(),
+            "readdir should succeed with inode table set"
+        );
+
+        let (entries, _has_more) = result.unwrap();
+        assert!(
+            !entries.is_empty(),
+            "root dir should have entries after creating files"
+        );
+
+        engine_mut.releasedir(&dh).unwrap();
+    }
+
+    // ── readdir metadata prefetch large-directory integration test ───
+
+    #[test]
+    fn readdir_prefetch_with_30_entries_does_not_panic() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+
+        // Create 30 files in the root directory.
+        for i in 0..30u64 {
+            let name = format!("prefetch_test_{i:03}").into_bytes();
+            engine.create(root, &name, 0o644, 0, &ctx()).unwrap();
+        }
+
+        // Set an inode table for metadata prefetch.
+        let inode_table = std::sync::Arc::new(tidefs_inode_table::InodeTable::new(
+            128,
+            Box::new(tidefs_inode_table::SystemTimeSource),
+        ));
+        let mut engine_mut = engine;
+        engine_mut.set_inode_table(inode_table.clone());
+
+        // Open and read.
+        let dh = engine_mut.opendir(root, &ctx()).unwrap();
+        let (entries, has_more) = engine_mut.readdir(&dh, 0, &ctx()).unwrap();
+
+        assert!(entries.len() >= 30, "should list at least 30 files");
+        assert!(!has_more, "should fit in one batch");
+
+        // After readdir, the inode table should have been called with
+        // prefetch_batch (fire-and-forget). Verify the table is still
+        // functional by creating and looking up an entry directly.
+        let ino = inode_table.create(
+            tidefs_inode_table::InodeKind::File,
+            tidefs_inode_table::InodeAttributes::new(
+                0o644,
+                0,
+                0,
+                tidefs_inode_table::InodeKind::File,
+            ),
+        );
+        assert!(
+            ino.is_ok(),
+            "inode table should be functional after prefetch"
+        );
+
+        engine_mut.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn map_errno_converts_store_nospace_to_enospc() {
+        // StoreError::NoSpace wrapped as FileSystemError::Store must map to
+        // ENOSPC, not EIO. This is the key fix for issue #4957.
+        let store_err = StoreError::NoSpace;
+        let fs_err = FileSystemError::Store(store_err);
+        assert_eq!(map_errno(&fs_err), Errno::ENOSPC);
+
+        // Verify that other StoreError variants still map to EIO.
+        let io_err = StoreError::ReadOnly { operation: "write" };
+        let fs_io_err = FileSystemError::Store(io_err);
+        assert_eq!(map_errno(&fs_io_err), Errno::EIO);
+
+        // Verify that FileSystemError::NoSpace still maps correctly.
+        let fs_nospace = FileSystemError::NoSpace {
+            resource: crate::types::LocalStorageResource::ContentBytes,
+            requested: 1024,
+            available: 0,
+            capacity: 1024,
+            allocated: 1024,
+        };
+        assert_eq!(map_errno(&fs_nospace), Errno::ENOSPC);
+    }
+
+    // ── Write admission watermark tests ─────────────────────────────
+
+    static NEXT_WATERMARK_TEMP_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+
+    /// Create a temp filesystem for watermark tests.
+    fn watermark_temp_fs() -> (VfsLocalFileSystem, PathBuf) {
+        let temp_id = NEXT_WATERMARK_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-watermark-test-{}-{temp_id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let local_fs = LocalFileSystem::open_with_root_authentication_key(
+            &root,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open local filesystem");
+        let engine = VfsLocalFileSystem::new(local_fs);
+        (engine, root)
+    }
+
+    #[test]
+    fn write_admission_default_allows_all_writes() {
+        let (engine, root) = watermark_temp_fs();
+        let _ctx = RequestCtx {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+            umask: 0o022,
+            groups: vec![0],
+        };
+
+        // Default watermark (0) means all writes are admitted.
+        assert_eq!(engine.check_write_admission(4096), Ok(()));
+        assert_eq!(engine.check_write_admission(u64::MAX / 2), Ok(()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_admission_refuses_when_watermark_breached() {
+        let (engine, root) = watermark_temp_fs();
+        let _ctx = RequestCtx {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+            umask: 0o022,
+            groups: vec![0],
+        };
+
+        engine.set_low_watermark_bytes(u64::MAX);
+
+        assert_eq!(engine.check_write_admission(1), Err(Errno::ENOSPC));
+        assert_eq!(engine.check_write_admission(4096), Err(Errno::ENOSPC));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_admission_allows_metadata_bypass() {
+        let (engine, root) = watermark_temp_fs();
+        let _ctx = RequestCtx {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+            umask: 0o022,
+            groups: vec![0],
+        };
+
+        engine.set_low_watermark_bytes(u64::MAX);
+
+        // At the VfsEngine level, check_write_admission checks data writes.
+        // The pool-level bypass for metadata is tested in pool/mod.rs.
+        assert_eq!(engine.check_write_admission(1), Err(Errno::ENOSPC));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_admission_pool_put_rejects_after_watermark_set() {
+        let (engine, root) = watermark_temp_fs();
+        let ctx = RequestCtx {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+            umask: 0o022,
+            groups: vec![0],
+        };
+
+        // Create a test file and write some data normally.
+        let root_inode = engine.get_root_inode(&ctx).expect("root inode");
+        let (_attr, fh) = engine
+            .create(root_inode, b"test.bin", 0o644, O_WRONLY, &ctx)
+            .expect("create file");
+
+        // Write data first to verify writes work normally.
+        assert!(engine.write(&fh, 0, b"hello", &ctx).is_ok());
+
+        // Flush to persist buffered writes to the pool.
+        engine.flush(&fh, &ctx).expect("flush");
+
+        // Now set watermark to block all subsequent data writes.
+        engine.set_low_watermark_bytes(u64::MAX);
+
+        // check_write_admission should reject.
+        assert_eq!(engine.check_write_admission(1), Err(Errno::ENOSPC));
+
+        // A subsequent write buffers and succeeds at the VFS level
+        // (buffered write goes into write buffer, not pool).
+        // The pool-level enforcement happens at flush time.
+        assert!(engine.write(&fh, 10, b"buffered", &ctx).is_ok());
+
+        // Flush should fail because the pool watermark rejects the put.
+        let flush_result = engine.flush(&fh, &ctx);
+        assert!(
+            flush_result.is_err(),
+            "flush should fail after watermark set"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

@@ -1,0 +1,216 @@
+# TideFS K7-INSTRUMENTED: Linux 7.0 kernel config with lockdep, KCSAN, KASAN
+# Base: x86_64, QEMU virtio, FUSE, ublk, RDMA (SoftRoCE), ext4, tmpfs
+# Format: nixpkgs generate-config.pl (OPTION value, no CONFIG_ prefix, no =)
+
+X86_64 y
+
+# ── Minimum arch support ──────────────────────────────────────────────
+MULTIUSER y
+SMP y
+HYPERVISOR_GUEST y
+PARAVIRT y
+KVM_GUEST y
+BLK_DEV_INITRD y
+
+# ── NixOS/systemd guest baseline ──────────────────────────────────────
+SYSVIPC y
+CGROUPS y
+CGROUP_SCHED y
+FAIR_GROUP_SCHED y
+CGROUP_PIDS y
+CGROUP_FREEZER y
+CGROUP_DEVICE y
+CPUSETS y
+MEMCG y
+NAMESPACES y
+UTS_NS y
+IPC_NS y
+PID_NS y
+NET_NS y
+USER_NS y
+DEVPTS_FS? y
+FILE_LOCKING y
+FSNOTIFY y
+DNOTIFY y
+INOTIFY_USER y
+ANON_INODES? y
+FHANDLE y
+SECCOMP y
+SECCOMP_FILTER y
+BPF y
+BPF_SYSCALL y
+CGROUP_BPF y
+
+# ── Timers / clocksources ─────────────────────────────────────────────
+HZ_100 y
+POSIX_TIMERS y
+NO_HZ y
+HIGH_RES_TIMERS y
+
+# ── CPU / NUMA ────────────────────────────────────────────────────────
+NR_CPUS 8
+X86_X2APIC y
+
+# ── Memory ────────────────────────────────────────────────────────────
+TRANSPARENT_HUGEPAGE y
+COMPACTION y
+
+# ── Power management ──────────────────────────────────────────────────
+ACPI y
+
+# ── PCI ───────────────────────────────────────────────────────────────
+PCI y
+PCI_MSI y
+
+# ── Virtio ────────────────────────────────────────────────────────────
+VIRTIO_MENU y
+VIRTIO_PCI y
+VIRTIO_BALLOON y
+VIRTIO_BLK y
+VIRTIO_CONSOLE y
+VIRTIO_NET y
+VIRTIO_INPUT y
+
+# ── Network ───────────────────────────────────────────────────────────
+NET y
+UNIX y
+INET y
+NETDEVICES y
+
+# ── Block layer ───────────────────────────────────────────────────────
+BLOCK y
+BLK_DEV y
+BLK_DEV_NVME y
+BLK_DEV_LOOP y
+MD y
+BLK_DEV_DM y
+
+# ── Filesystems ───────────────────────────────────────────────────────
+EXT4_FS y
+AUTOFS_FS y
+OVERLAY_FS y
+TMPFS y
+TMPFS_XATTR y
+TMPFS_POSIX_ACL y
+PROC_FS y
+SYSFS y
+DEVTMPFS y
+DEVTMPFS_MOUNT y
+CONFIGFS_FS y
+DEVPTS_MULTIPLE_INSTANCES? y
+
+# ── NixOS test-driver store/share transport ───────────────────────────
+NET_9P y
+NET_9P_VIRTIO y
+9P_FS y
+9P_FS_POSIX_ACL y
+VIRTIO_FS y
+
+# ── FUSE / ublk ───────────────────────────────────────────────────────
+FUSE_FS y
+BLK_DEV_UBLK y
+
+# ── RDMA / SoftRoCE ───────────────────────────────────────────────────
+INFINIBAND y
+INFINIBAND_USER_ACCESS y
+RDMA_RXE y
+INFINIBAND_ADDR_TRANS y
+
+# ── Networking for RDMA ───────────────────────────────────────────────
+IPV6 y
+NET_IPIP y
+
+# ── Stack protection / hardening ──────────────────────────────────────
+STACKPROTECTOR y
+STACKPROTECTOR_STRONG y
+
+# ── ELF core / binaries ───────────────────────────────────────────────
+BINFMT_ELF y
+BINFMT_SCRIPT y
+
+# ── TTY / console ─────────────────────────────────────────────────────
+TTY y
+SERIAL_8250 y
+SERIAL_8250_CONSOLE y
+VT y
+VT_CONSOLE y
+
+# ── Kernel features ───────────────────────────────────────────────────
+PRINTK y
+BUG y
+ELF_CORE? y
+FUTEX y
+EPOLL y
+SIGNALFD y
+TIMERFD y
+EVENTFD y
+SHMEM y
+AIO y
+IO_URING? y
+ADVISE_SYSCALLS y
+MEMBARRIER y
+KALLSYMS y
+KALLSYMS_ALL y
+
+# ── Rust support ──────────────────────────────────────────────────────
+MODULES y
+RUST? y
+
+# ── Debug / instrumentation ───────────────────────────────────────────
+# Generic kernel debug
+DEBUG_KERNEL y
+DEBUG_INFO y
+DEBUG_INFO_DWARF5 y
+
+# ── Lockdep (CONFIG_PROVE_LOCKING) ───────────────────────────────────
+PROVE_LOCKING y
+DEBUG_LOCK_ALLOC y
+LOCK_STAT y
+LOCKDEP y
+LOCKDEP_SMALL y
+DEBUG_LOCKING_API_SELFTESTS y
+
+# ── KCSAN (Kernel Concurrency Sanitizer) ─────────────────────────────
+KCSAN y
+KCSAN_SELFTEST y
+KCSAN_REPORT_VALUE_CHANGE_ONLY y
+KCSAN_INTERRUPT_WATCHER y
+
+# ── KASAN (Kernel Address Sanitizer) ─────────────────────────────────
+KASAN y
+KASAN_GENERIC y
+KASAN_OUTLINE y
+KASAN_STACK y
+KASAN_VMALLOC y
+
+# ── KFENCE (low-overhead alternative, complementary to KASAN) ────────
+KFENCE y
+KFENCE_SAMPLE_INTERVAL 100
+KFENCE_NUM_OBJECTS 255
+
+# ── Additional debug helpers ──────────────────────────────────────────
+DETECT_HUNG_TASK y
+BOOTPARAM_HUNG_TASK_PANIC y
+DEFAULT_HUNG_TASK_TIMEOUT 30
+SCHED_STACK_END_CHECK y
+DEBUG_OBJECTS y
+DEBUG_OBJECTS_FREE y
+DEBUG_OBJECTS_TIMERS y
+DEBUG_OBJECTS_WORK y
+DEBUG_VM y
+DEBUG_VM_RB y
+DEBUG_MEMORY_INIT y
+DEBUG_LIST y
+DEBUG_SG y
+DEBUG_NOTIFIERS y
+DEBUG_CREDENTIALS y
+DEBUG_MUTEXES y
+DEBUG_RT_MUTEXES y
+DEBUG_SPINLOCK y
+DEBUG_ATOMIC_SLEEP y
+STACK_VALIDATION y
+SCHEDSTATS y
+
+# Override nixpkgs common config mismatches
+IPV6_FOU_TUNNEL? y
+NVME_AUTH? y

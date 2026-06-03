@@ -1,0 +1,22 @@
+[package]
+name = "tidefs-derived-catalog"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Derived catalog view builder: IncrementalJob that walks the authoritative
+directory B-tree, populates a ViewCache of directory entries, evicts cold
+entries, and serves cached lookups.
+"""
+
+[dependencies]
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core", features = ["alloc"] }
+tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core", features = ["alloc"] }
+tidefs-dataset-catalog = { path = "../tidefs-dataset-catalog" }
+tidefs-types-polymorphic-directory-index-core = { path = "../tidefs-types-polymorphic-directory-index-core", features = ["alloc"] }
+
+[lib]
+path = "src/lib.rs"

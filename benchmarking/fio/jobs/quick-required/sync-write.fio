@@ -1,0 +1,16 @@
+; Sync-heavy writes: each write followed by fsync/fdatasync
+; TideFS fio benchmarking — profile 1 quick-required
+[sync-write-qd1]
+rw=write
+bs=4k
+iodepth=1
+fsync=1
+size=8M
+offset=0
+[dsync-write-qd1]
+rw=write
+bs=4k
+iodepth=1
+fdatasync=1
+size=8M
+offset=0

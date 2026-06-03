@@ -1,0 +1,19 @@
+[package]
+name = "tidefs-cleanup-job-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "CleanupJob: deferred cleanup IncrementalJob that drains work items and frees extents within a per-tick budget"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
+tidefs-types-deferred-cleanup-core = { path = "../tidefs-types-deferred-cleanup-core" }
+tidefs-cleanup-queue-core = { path = "../tidefs-cleanup-queue-core" }
+
+[dev-dependencies]
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }

@@ -1,0 +1,42 @@
+name: Nix Checks
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Flake checks
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1' }}
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Show flake outputs
+        run: nix flake show . --all-systems
+
+      - name: Build pure check derivations
+        run: |
+          nix build -L \
+            .#checks.x86_64-linux.rdmaCarrierTwoNode
+
+      - name: Build core packages
+        run: |
+          nix build -L \
+            .#packages.x86_64-linux.default \
+            .#packages.x86_64-linux.tidefsFuseRuntime \
+            .#packages.x86_64-linux.tidefsUblkRuntime \
+            .#packages.x86_64-linux.tidefsPosixVfsKmod

@@ -1,0 +1,25 @@
+[package]
+name = "tidefs-erasure-coded-store"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Erasure-coded object store: stripes data with parity across N LocalObjectStore instances using GF(2^8) Reed-Solomon"
+
+[dependencies]
+blake3 = "1"
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+tidefs-durability-layout = { path = "../tidefs-durability-layout" }
+tidefs-erasure-coding = { path = "../tidefs-erasure-coding" }
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tidefs-placement-planner = { path = "../tidefs-placement-planner" }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
+tokio-test = "0.4"
+
+[lib]
+path = "src/lib.rs"

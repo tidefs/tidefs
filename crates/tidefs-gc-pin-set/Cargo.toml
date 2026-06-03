@@ -1,0 +1,24 @@
+[package]
+name = "tidefs-gc-pin-set"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+GC-barrier pinned traversal root set for dataset destroy: const-generic
+bounded set with pin/unpin/is_pinned protocol, crash-recovery repin from
+DestroyJobRecordV1, and simulated GC mark-set validation.
+no_std / forbid(unsafe_code).
+"""
+
+[features]
+default = ["alloc"]
+alloc = ["tidefs-types-dataset-lifecycle-core/alloc"]
+
+[dev-dependencies]
+proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
+
+[dependencies]
+tidefs-types-dataset-lifecycle-core = { path = "../tidefs-types-dataset-lifecycle-core", default-features = false }

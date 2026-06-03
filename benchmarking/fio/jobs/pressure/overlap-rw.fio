@@ -1,0 +1,11 @@
+; Overlapping read/write within the same region
+; TideFS fio benchmarking — profile 2 pressure
+[overlap-randrw]
+rw=randrw
+rwmixread=50
+bs=4k
+iodepth=16
+size=8M
+offset=0
+runtime=15s
+time_based=1

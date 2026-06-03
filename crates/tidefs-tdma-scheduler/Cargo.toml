@@ -1,0 +1,23 @@
+[package]
+name = "tidefs-tdma-scheduler"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Per-object TDMA time-slot scheduler: fair round-robin allocation across contending nodes, configurable slot duration, bounded starvation prevention"
+
+[dependencies]
+blake3 = { version = "1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tidefs-coordination-strategy = { path = "../tidefs-coordination-strategy" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-clock-timing = { path = "../tidefs-clock-timing" }
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+serde_json = "1"

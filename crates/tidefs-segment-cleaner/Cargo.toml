@@ -1,0 +1,23 @@
+[package]
+name = "tidefs-segment-cleaner"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Segment-level garbage collection for the TideFS local object store:
+identifies dead segments, compacts live records from fragmented segments,
+and frees fully-dead segments back to the pool allocator.
+"""
+
+[dependencies]
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
+tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core" }
+tidefs-reclaim-queue-core = { path = "../tidefs-reclaim-queue-core" }
+tidefs-gc-pin-set = { path = "../tidefs-gc-pin-set" }
+tidefs-types-dataset-lifecycle-core = { path = "../tidefs-types-dataset-lifecycle-core" }
+tidefs-cleanup-queue-core = { path = "../tidefs-cleanup-queue-core" }
+tidefs-commit_group = { path = "../tidefs-commit_group" }
+blake3 = "1"

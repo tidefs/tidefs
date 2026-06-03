@@ -1,0 +1,23 @@
+[package]
+name = "tidefs-rebuild-planner"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Rebuild planner: loss/suspect event rebuild flow orchestration — P8-03 data_copy_4"
+
+[dependencies]
+tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-replica-health = { path = "../tidefs-replica-health" }
+tidefs-durability-layout = { path = "../tidefs-durability-layout" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-transport = { path = "../tidefs-transport" }
+blake3 = { version = "1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+
+[lib]
+path = "src/lib.rs"

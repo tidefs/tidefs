@@ -1,0 +1,16 @@
+[package]
+name = "tidefs-posix-filesystem-adapter-workers-locks"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "P5-02 FUSE lock-wait worker pool (queue_class_6.lock_wait)"
+
+[dependencies]
+tidefs-types-posix-filesystem-adapter-core = { path = "../tidefs-types-posix-filesystem-adapter-core" }
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+
+[lib]
+path = "src/lib.rs"

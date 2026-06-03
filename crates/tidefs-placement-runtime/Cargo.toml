@@ -1,0 +1,29 @@
+[package]
+name = "tidefs-placement-runtime"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Placement runtime engine: executes deterministic placement plans across nodes with budget tracking, plan conflict resolution, and 5-phase lifecycle"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+blake3 = "1"
+thiserror = "2"
+tidefs-lease = { path = "../tidefs-lease" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-placement-planner = { path = "../tidefs-placement-planner" }
+tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-flow-commit-coordinator = { path = "../tidefs-flow-commit-coordinator" }
+tidefs-rebalance-planner = { path = "../tidefs-rebalance-planner" }
+tidefs-node-join = { path = "../tidefs-node-join" }
+tidefs-rebuild-planner = { path = "../tidefs-rebuild-planner" }
+tidefs-replica-health = { path = "../tidefs-replica-health" }
+tidefs-durability-layout = { path = "../tidefs-durability-layout" }
+
+[dev-dependencies]
+
+[lib]
+path = "src/lib.rs"

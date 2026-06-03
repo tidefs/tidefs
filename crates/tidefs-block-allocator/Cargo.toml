@@ -1,0 +1,32 @@
+[package]
+name = "tidefs-block-allocator"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Userspace block allocator: free-block bitmap tracking, contiguous/near-contiguous
+allocation, per-inode quota gating, statfs accumulation, and dirty-bitmap flush.
+Pacing component that gates all write-path work.
+"""
+
+[dependencies]
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+tidefs-spacemap-allocator = { path = "../tidefs-spacemap-allocator" }
+
+[dev-dependencies]
+proptest = "=1.9.0"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+# Deny-level enforcement: keep the crate warning-free and
+# prevent dead code / unused imports / unused mut / unused must_use
+# from accumulating unnoticed.
+rust.dead_code = "deny"
+rust.unused_imports = "deny"
+rust.unused_mut = "deny"
+rust.unused_must_use = "deny"

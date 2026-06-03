@@ -1,0 +1,4 @@
+# TideFS K7-04B: Smoke module Kbuild for out-of-tree Rust-for-Linux build.
+# Built with: make -C <linux-7.0-tree> M=$PWD modules
+
+obj-m := rust_tidefs_smoke.o

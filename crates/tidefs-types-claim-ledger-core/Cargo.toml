@@ -1,0 +1,15 @@
+[package]
+name = "tidefs-types-claim-ledger-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Claim, reserve, and witness ledger types: obligation tracking for the space-as-claimed-capital design rule (Rule 8). Kernel-portable: StorageAuthorityToken replaces ControlPlaneReceiptId for kernel-bound callers."
+
+[dependencies]
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+
+[lib]
+path = "src/lib.rs"

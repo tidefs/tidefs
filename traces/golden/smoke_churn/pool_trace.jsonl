@@ -1,0 +1,15 @@
+{"args":{"schema":"pool_trace_v1","version":1},"op":"trace_meta"}
+{"args":{"bootstrap_b64":"dmliZWZzLWJvb3RzdHJhcA==","device_count":2,"device_size_bytes":12582912},"op":"create_pool"}
+{"args":{"name":"ds"},"op":"create_dataset"}
+{"args":{"dataset":"ds","key":"k0.0","value_b64":"dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnY="},"op":"put"}
+{"args":{"dataset":"ds","key":"k0.1","value_b64":"dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnY="},"op":"put"}
+{"args":{"dataset":"ds","key":"k0.2","value_b64":"dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnY="},"op":"put"}
+{"args":{"dataset":"ds","key":"k1.0","value_b64":"dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnY="},"op":"put"}
+{"args":{"dataset":"ds","key":"k1.1","value_b64":"dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnY="},"op":"put"}
+{"args":{"dataset":"ds","key":"k1.2","value_b64":"dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnY="},"op":"put"}
+{"args":{"dataset":"ds","key":"k2.0","value_b64":"dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnY="},"op":"put"}
+{"args":{"dataset":"ds","key":"k2.1","value_b64":"dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnY="},"op":"put"}
+{"args":{"dataset":"ds","key":"k2.2","value_b64":"dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnY="},"op":"put"}
+{"expect":{"fingerprint":"121de8759b1761c923c9094c230aa122cb3c5774ef4a0317d5ead6734fb728d2"},"op":"assert_fingerprint"}
+{"op":"restart_pool"}
+{"expect":{"fingerprint":"121de8759b1761c923c9094c230aa122cb3c5774ef4a0317d5ead6734fb728d2"},"op":"assert_fingerprint"}

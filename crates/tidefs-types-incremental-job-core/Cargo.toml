@@ -1,0 +1,25 @@
+[package]
+name = "tidefs-types-incremental-job-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Authority type definitions for the universal incremental cursor framework:
+WorkBudget, Checkpoint, CursorState, StepResult, JobId,
+JobKind, JobProgress, JobError, and the IncrementalJob trait.
+no_std / forbid(unsafe_code).
+"""
+
+[features]
+default = ["alloc"]
+alloc = []
+serde = ["dep:serde", "alloc"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"

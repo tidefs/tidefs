@@ -1,0 +1,26 @@
+#!/bin/sh
+# TideFS mount wrapper: route -t fuse to /usr/sbin/mount.fuse (fuse3).
+# The Nix util-linux mount binary lacks FUSE support, so this wrapper
+# intercepts FUSE mount requests and delegates them to the fuse3 helper.
+# The xfstests _mount function passes "-t fuse" as separate arguments.
+is_fuse=""
+found_t=""
+for a do
+  if [ "$found_t" = "1" ]; then
+    if [ "$a" = "fuse" ]; then
+      is_fuse=1
+      break
+    fi
+    found_t=""  # -t was not followed by fuse
+  fi
+  if [ "$a" = "-t" ]; then
+    found_t=1
+  fi
+done
+if [ "$is_fuse" = "1" ]; then
+  for last do :; done; mnt="$last"
+  set -- "$@"; eval dev="\${$(( $# - 1 ))}"
+  exec /usr/sbin/mount.fuse "$dev" "$mnt"
+else
+  exec /nix/store/g9h37kjrpvyzhsq4a79v2qkrpl4y1s7k-util-linux-2.42-bin/bin/mount "$@"
+fi

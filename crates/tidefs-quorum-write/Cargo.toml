@@ -1,0 +1,18 @@
+[package]
+name = "tidefs-quorum-write"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Deterministic 4-phase quorum write protocol model: PREPARE-TRANSFER-COMMIT-WITNESS with 3 durability modes (quorum_full, quorum_witness, quorum_chain)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"

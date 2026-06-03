@@ -1,0 +1,18 @@
+[package]
+name = "tidefs-lease-manager"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Distributed lease manager: GRANT/REVOKE/RENEW lifecycle, quorum-acknowledged acquisition, automatic node-failure revocation, and lease priority inheritance for lock chains"
+
+[dependencies]
+thiserror = "2"
+tidefs-lease = { path = "../tidefs-lease" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-cache-coherency = { path = "../tidefs-cache-coherency" }
+
+[lib]
+path = "src/lib.rs"

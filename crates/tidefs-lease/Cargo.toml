@@ -1,0 +1,25 @@
+[package]
+name = "tidefs-lease"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Cluster-wide lease mechanism: time-bounded grants of exclusive/shared authority over mutation domains with quorum-backed issuance, automatic renewal, fencing, and receipt integration"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tidefs-clock-timing = { path = "../tidefs-clock-timing" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+bincode = "1"
+tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
+tidefs-binary_schema-framing = { path = "../tidefs-binary_schema-framing" }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"

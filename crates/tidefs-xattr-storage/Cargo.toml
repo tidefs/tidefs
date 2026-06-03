@@ -1,0 +1,36 @@
+[package]
+name = "tidefs-xattr-storage"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Runtime polymorphic xattr storage wrapping XattrStorage with get, set,
+remove, list, and hysteresis-driven representation switching between
+inline bundle (O(n), n <= 16) and B+tree (O(log n), any size).
+Phase 2 of the polymorphic xattr storage design. In-memory only;
+persistence deferred to locator-table integration. no_std / forbid(unsafe_code).
+"""
+
+[dependencies]
+tidefs-types-polymorphic-xattr-core = { path = "../tidefs-types-polymorphic-xattr-core", features = ["alloc"] }
+tidefs-btree = { path = "../tidefs-btree" }
+
+tidefs-local-object-store = { path = "../tidefs-local-object-store", optional = true }
+tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core", optional = true }
+tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum", optional = true }
+tidefs-intent-log = { path = "../tidefs-intent-log", optional = true }
+blake3 = { version = "=1.5.5", optional = true }
+
+[features]
+default = []
+persistence = ["tidefs-local-object-store", "tidefs-binary_schema-core", "tidefs-binary_schema-checksum", "tidefs-intent-log", "blake3"]
+
+[dev-dependencies]
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
+tidefs-intent-log = { path = "../tidefs-intent-log" }
+blake3 = "=1.5.5"

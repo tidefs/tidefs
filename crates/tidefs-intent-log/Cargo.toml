@@ -1,0 +1,34 @@
+[package]
+name = "tidefs-intent-log"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+TideFS intent-log record types, BLAKE3-authenticated framing, and in-memory
+append buffer. Defines IntentLogRecord covering all mutating filesystem
+operations and IntentLogFrame for checksummed per-record integrity.
+Provides IntentLogBuffer as a lock-free append/drain ring that the
+TxgCoordinator drains during two-phase commit.
+"""
+
+[dependencies]
+tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+blake3 = { version = "1", default-features = false }
+tidefs-kernel-storage-io = { path = "../tidefs-kernel-storage-io", optional = true }
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core", optional = true }
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = ["blake3/std"]
+kernel-io = ["tidefs-kernel-storage-io", "tidefs-types-vfs-core"]
+replication = ["std", "tidefs-transport"]
+
+[dependencies.tidefs-transport]
+path = "../tidefs-transport"
+optional = true

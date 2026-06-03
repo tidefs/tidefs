@@ -1,0 +1,92 @@
+{
+  "format_version": "v1",
+  "generator": "tidefs-format-golden v1",
+  "description": "Format golden vector corpus for cross-implementation encode/decode validation",
+  "entries": {
+    "DirHandleId": {
+      "group": "vfs",
+      "file": "vfs_dirhandleid.bin",
+      "encoded_length": 8,
+      "sha256": "ca8923d6c4447d6fa6d0540cafff01f647f2bbfe8f19939686ce6fa7b0daee28",
+      "description": "Golden binary for DirHandleId",
+      "canonical_field_values": {
+        "dh_id": 200
+      }
+    },
+    "EngineDirHandle": {
+      "group": "vfs",
+      "file": "vfs_enginedirhandle.bin",
+      "encoded_length": 16,
+      "sha256": "304f1d2f05544567c85a826392c9143ba49010e2b43f8fba109076857b480a0d",
+      "description": "Golden binary for EngineDirHandle",
+      "canonical_field_values": {
+        "dh_id": 20,
+        "inode_id": 2
+      }
+    },
+    "EngineFileHandle": {
+      "group": "vfs",
+      "file": "vfs_enginefilehandle.bin",
+      "encoded_length": 28,
+      "sha256": "c3ec774203148a788a68581895ddf2969d8b744c94b37cd1addcb31430fec99c",
+      "description": "Golden binary for EngineFileHandle",
+      "canonical_field_values": {
+        "fh_id": 10,
+        "inode_id": 1,
+        "lock_owner": 0,
+        "open_flags": 32768
+      }
+    },
+    "FileHandleId": {
+      "group": "vfs",
+      "file": "vfs_filehandleid.bin",
+      "encoded_length": 8,
+      "sha256": "26ab39150b6330152576e4c7fa7e0caa804b5e9db0476a3e48e6b53f1cda8279",
+      "description": "Golden binary for FileHandleId",
+      "canonical_field_values": {
+        "fh_id": 100
+      }
+    },
+    "Generation": {
+      "group": "vfs",
+      "file": "vfs_generation.bin",
+      "encoded_length": 8,
+      "sha256": "aae89fc0f03e2959ae4d701a80cc3915918c950b159f6abb6c92c1433b1a8534",
+      "description": "Golden binary for Generation",
+      "canonical_field_values": {
+        "generation": 7
+      }
+    },
+    "InodeId": {
+      "group": "vfs",
+      "file": "vfs_inodeid.bin",
+      "encoded_length": 8,
+      "sha256": "ed049108bc18f2c64369e8d0ea42850bdd1a7d1dd340cfde716315579702a76c",
+      "description": "Golden binary for InodeId",
+      "canonical_field_values": {
+        "inode_id": 42
+      }
+    },
+    "NodeKind": {
+      "group": "vfs",
+      "file": "vfs_nodekind.bin",
+      "encoded_length": 4,
+      "sha256": "26b25d457597a7b0463f9620f666dd10aa2c4373a505967c7c8d70922a2d6ece",
+      "description": "Golden binary for NodeKind",
+      "canonical_field_values": {
+        "kind": "File",
+        "tag": 0
+      }
+    },
+    "PosixFilesystemAdapterProductWakeReceiptRecord": {
+      "group": "posix-filesystem-adapter",
+      "file": "posix-filesystem-adapter_posixfilesystemadapterproductwakereceiptrecord.bin",
+      "encoded_length": 256,
+      "sha256": "d90181c0ccc416ef5ffae2d17d3b0ae63e666bae55985740cb7a61e6266d7989",
+      "description": "Golden binary for PosixFilesystemAdapterProductWakeReceiptRecord",
+      "canonical_field_values": {
+        "wake_receipt_id": 161
+      }
+    }
+  }
+}

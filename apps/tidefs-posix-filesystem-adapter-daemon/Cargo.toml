@@ -1,0 +1,79 @@
+[package]
+name = "tidefs-posix-filesystem-adapter-daemon"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Wave Zero POSIX Filesystem Adapter userspace mirror surface stub for TideFS"
+
+[dependencies]
+tidefs-workload = { path = "../../crates/tidefs-workload" }
+tidefs-intent-log = { path = "../../crates/tidefs-intent-log" }
+blake3 = { version = "1", default-features = false }
+fuser = { version = "0.14.0", features = ["abi-7-30", "abi-7-32"] }
+libc = "0.2"
+rustix = { version = "0.38.44", features = ["fs"] }
+tidefs-local-filesystem = { path = "../../crates/tidefs-local-filesystem" }
+tidefs-dataset-lifecycle = { path = "../../crates/tidefs-dataset-lifecycle" }
+tidefs-dataset-catalog = { path = "../../crates/tidefs-dataset-catalog" }
+tidefs-inode-table = { path = "../../crates/tidefs-inode-table" }
+tidefs-invalidation-feed = { path = "../../crates/tidefs-invalidation-feed" }
+tidefs-dir-index = { path = "../../crates/tidefs-dir-index" }
+tidefs-posix-acl = { path = "../../crates/tidefs-posix-acl" }
+tidefs-commit_group = { path = "../../crates/tidefs-commit_group" }
+tidefs-cache-core = { path = "../../crates/tidefs-cache-core" }
+tidefs-extent-map = { path = "../../crates/tidefs-extent-map" }
+tidefs-types-extent-map-core = { path = "../../crates/tidefs-types-extent-map-core" }
+tidefs-permission = { path = "../../crates/tidefs-permission" }
+tidefs-lock-service = { path = "../../crates/tidefs-lock-service" }
+tidefs-posix-semantics = { path = "../../crates/tidefs-posix-semantics" }
+tidefs-background-scheduler = { path = "../../crates/tidefs-background-scheduler" }
+tidefs-block-allocator = { path = "../../crates/tidefs-block-allocator" }
+tidefs-block-volume-adapter-core = { path = "../../crates/tidefs-block-volume-adapter-core" }
+tidefs-local-object-store = { path = "../../crates/tidefs-local-object-store" }
+tidefs-orphan-index = { path = "../../crates/tidefs-orphan-index" }
+
+tidefs-recovery-loop = { path = "../../crates/tidefs-recovery-loop" }
+
+tidefs-inode-attributes = { path = "../../crates/tidefs-inode-attributes" }
+tidefs-posix-filesystem-adapter-workers-io = { path = "../../crates/tidefs-posix-filesystem-adapter-workers-io" }
+tidefs-posix-filesystem-adapter-workers-locks = { path = "../../crates/tidefs-posix-filesystem-adapter-workers-locks" }
+tidefs-schema-codec-posix-filesystem-adapter = { path = "../../crates/tidefs-schema-codec-posix-filesystem-adapter", optional = true }
+tidefs-types-package-profile-catalog = { path = "../../crates/tidefs-types-package-profile-catalog" }
+tidefs-types-posix-filesystem-adapter-core = { path = "../../crates/tidefs-types-posix-filesystem-adapter-core" }
+tidefs-types-vfs-core = { path = "../../crates/tidefs-types-vfs-core" }
+tidefs-types-dataset-feature-flags-core = { path = "../../crates/tidefs-types-dataset-feature-flags-core" }
+tidefs-vfs-engine = { path = "../../crates/tidefs-vfs-engine" }
+tidefs-namespace = { path = "../../crates/tidefs-namespace", features = ["persistent-dir-index"] }
+tracing = "0.1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tidefs-flow-commit-coordinator = { path = "../../crates/tidefs-flow-commit-coordinator" }
+tidefs-cluster = { path = "../../crates/tidefs-cluster" }
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+
+[features]
+default = []
+receipt-demo = [
+    "tidefs-types-posix-filesystem-adapter-core/wake-receipt",
+    "dep:tidefs-schema-codec-posix-filesystem-adapter",
+]
+
+[dev-dependencies]
+tidefs-validation = { path = "../../crates/tidefs-validation" }
+tempfile = "3"
+tidefs-block-volume-adapter-core = { path = "../../crates/tidefs-block-volume-adapter-core" }
+
+tidefs-inode-attributes = { path = "../../crates/tidefs-inode-attributes" }
+
+[lib]
+path = "src/lib.rs"
+name = "tidefs_posix_filesystem_adapter_daemon"
+[[bin]]
+name = "tidefs-posix-filesystem-adapter-daemon"
+path = "src/main.rs"

@@ -1,0 +1,13 @@
+[package]
+name = "tidefs-block-volume-adapter-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tidefs-block-allocator = { path = "../tidefs-block-allocator" }
+
+[dev-dependencies]
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }

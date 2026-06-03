@@ -1,0 +1,197 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/tidefs-transport",
+  "crates/tidefs-kmod-posix-vfs",
+  "crates/tidefs-types-vfs-core",
+  "crates/tidefs-types-vfs-owned",
+  "crates/tidefs-types-package-profile-catalog",
+  "crates/tidefs-kernel-cutover-runtime",
+  "crates/tidefs-kernel-storage-io",
+  "crates/tidefs-types-posix-filesystem-adapter-core",
+  "crates/tidefs-types-reclaim-queue-core",
+  "crates/tidefs-types-cache-lattice-core",
+  "crates/tidefs-cache-coherency",
+  "crates/tidefs-cache-core",
+  "crates/tidefs-invalidation-feed",
+  "crates/tidefs-reclaim-queue-core",
+  "crates/tidefs-background-scheduler",
+  "crates/tidefs-data-cleaner",
+  "crates/tidefs-derived-catalog",
+  "crates/tidefs-dataset-catalog",
+  "crates/tidefs-dataset-properties",
+  "crates/tidefs-types-orphan-index-core",
+  "crates/tidefs-schema-codec-vfs",
+  "crates/tidefs-schema-codec-posix-filesystem-adapter",
+  "crates/tidefs-scrub-core",
+  "crates/tidefs-shard-group",
+  "crates/tidefs-binary_schema-core",
+  "crates/tidefs-binary_schema-checksum",
+  "crates/tidefs-binary_schema-framing",
+  "crates/tidefs-posix-filesystem-adapter-reply",
+  "crates/tidefs-posix-filesystem-adapter-workers-io",
+  "crates/tidefs-posix-filesystem-adapter-workers-locks",
+  "crates/tidefs-posix-acl",
+  "crates/tidefs-permission",
+  "crates/tidefs-posix-semantics",
+  "crates/tidefs-membership-epoch",
+  "crates/tidefs-membership-live",
+  "crates/tidefs-partition-runtime",
+  "crates/tidefs-membership-types",
+  "crates/tidefs-two-node-harness",
+  "crates/tidefs-node-join",
+  "crates/tidefs-node-drain",
+  "crates/tidefs-claim-ledger",
+  "crates/tidefs-witness-set",
+  "crates/tidefs-lease",
+  "crates/tidefs-lease-manager",
+  "crates/tidefs-cluster",
+  "crates/tidefs-lock-service",
+  "crates/tidefs-coordination-strategy",
+  "crates/tidefs-replication-model",
+  "crates/tidefs-replication",
+  "crates/tidefs-replica-health",
+  "crates/tidefs-rebuild-planner",
+  "crates/tidefs-rebalance-planner",
+  "crates/tidefs-rebuild-runtime",
+  "crates/tidefs-recovery-loop",
+  "crates/tidefs-reserve-ledger",
+  "crates/tidefs-anti-entropy-auditor",
+  "crates/tidefs-relocation-planner",
+  "crates/tidefs-placement-planner",
+  "crates/tidefs-placement-runtime",
+  "crates/tidefs-verification-engine",
+  "crates/tidefs-flow-commit-coordinator",
+  "crates/tidefs-extent-map",
+  "crates/tidefs-locator-table",
+  "crates/tidefs-space-accounting",
+  "crates/tidefs-send-stream",
+  "crates/tidefs-receive-stream",
+  "crates/tidefs-snapshot-pruner",
+  "crates/tidefs-vfs-engine",
+  "crates/tidefs-vfs-rpc",
+  "crates/tidefs-spacemap-allocator",
+  "crates/tidefs-pool-allocator",
+  "crates/tidefs-pool-scan",
+  "crates/tidefs-pool-import",
+  "crates/tidefs-reclaim",
+  "crates/tidefs-segment-cleaner",
+  "crates/tidefs-trace-oracle",
+  "crates/tidefs-clock-timing",
+  "crates/tidefs-chunk-shipper",
+  "crates/tidefs-checksum-tree",
+  "crates/tidefs-erasure-coding",
+  "crates/tidefs-erasure-coded-store",
+  "crates/tidefs-geometry-convert",
+  "crates/tidefs-btree",
+  "crates/tidefs-cleanup-queue-core",
+  "crates/tidefs-block-allocator",
+  "crates/tidefs-block-volume-adapter-core",
+  "crates/tidefs-block-volume-adapter-ublk-control-runtime",
+  "crates/tidefs-ublk-abi",
+  "crates/tidefs-local-object-store",
+  "crates/tidefs-local-filesystem",
+  "crates/tidefs-commit_group",
+  "crates/tidefs-types-transport-session",
+  "crates/tidefs-validation",
+  "crates/tidefs-workload",
+  "crates/tidefs-types-claim-ledger-core",
+  "crates/tidefs-types-dataset-feature-flags-core",
+  "crates/tidefs-dataset-feature-flags",
+  "crates/tidefs-types-polymorphic-directory-index-core",
+  "crates/tidefs-dir-index",
+  "crates/tidefs-durability-layout",
+  "crates/tidefs-intent-log",
+  "crates/tidefs-namespace",
+  "crates/tidefs-inode-table",
+  "crates/tidefs-xattr-storage",
+  "crates/tidefs-types-polymorphic-xattr-core",
+  "crates/tidefs-types-extent-map-core",
+  # Review debt TFR-002: Cargo already resolves these scaffold type crates as
+  # workspace members through path dependencies. Keep them explicit until their
+  # consumers are migrated and the crates can be removed or reclassified.
+  "crates/tidefs-types-control-plane-core",
+  "crates/tidefs-types-publication-pipeline-core",
+  "crates/tidefs-types-response-registry-core",
+  "crates/tidefs-types-secret-key-policy-core",
+  "crates/tidefs-types-space-accounting-core",
+  "crates/tidefs-types-dataset-lifecycle-core",
+  "crates/tidefs-types-pool-label-core",
+  "crates/tidefs-dataset-lifecycle",
+  "crates/tidefs-gc-pin-set",
+  "crates/tidefs-cleanup-job-core",
+  "crates/tidefs-cleanup-engine",
+  "crates/tidefs-types-deferred-cleanup-core",
+  "crates/tidefs-types-incremental-job-core",
+  "crates/tidefs-secret-key-policy-runtime",
+  "crates/tidefs-quorum-write",
+  "crates/tidefs-quorum-write-runtime",
+  "apps/tidefs-posix-filesystem-adapter-daemon",
+  "apps/tidefs-block-volume-adapter-daemon",
+  "apps/tidefsctl",
+  "apps/tidefs-storage-node",
+  "apps/tidefs-store-demo",
+  "apps/tidefs-filesystem-demo",
+  "apps/tidefs-scrub",
+  "xtask/tidefs-xtask",
+  "crates/tidefs-encryption",
+  "crates/tidefs-compaction",
+  "crates/tidefs-compression",
+  "crates/tidefs-frame",
+  "crates/tidefs-incremental-job-core",
+  "crates/tidefs-replicated-object-store",
+  "crates/tidefs-orphan-index",
+  "crates/tidefs-auth",
+  "crates/tidefs-device-removal",
+  "crates/tidefs-inode-attributes",
+  "crates/tidefs-object-io",
+  "crates/tidefs-online-defrag",
+  "crates/tidefs-dedup",
+  "crates/tidefs-tdma-scheduler",
+  "crates/tidefs-posix-guarantee-verifier",
+  "crates/tidefs-fuser",
+  "kmod",
+  "crates/tidefs-block-kmod",
+]
+# Review debt TFR-002: these manifests are present on disk but are not current
+# workspace members. Keep the quarantine explicit until each is restored,
+# fixed as a standalone tool/fuzzer, archived, or deleted.
+exclude = [
+  "crates/tidefs-binary_schema-core/fuzz",
+  "crates/tidefs-local-filesystem/fuzz",
+  "crates/tidefs-local-object-store/fuzz",
+  "crates/tidefs-validation/fuzz",
+  "fuzz",
+]
+
+[workspace.package]
+version = "0.421.0"
+edition = "2021"
+publish = false
+repository = "https://github.com/tidefs/tidefs"
+license = "GPL-2.0-only WITH Linux-syscall-note"
+authors = ["TideFS Contributors"]
+
+
+[workspace.lints.rust]
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+unused_mut = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "warn"
+invalid_codeblock_attributes = "warn"
+[workspace.metadata.tidefs]
+mode = "implementation-active"
+authorized_by = "user"
+authorized_on = "2026-06-01"
+notes = [
+  "fresh TideFS repository created on master from audited source import",
+  "validation output artifacts are not a repo policy; runtime output is ephemeral unless an operator explicitly saves it outside the repository",
+  "known architectural debt is tracked in docs/REVIEW_TODO_REGISTER.md before deeper implementation work",
+]
+
+[patch.crates-io]
+fuser = { path = "crates/tidefs-fuser" }

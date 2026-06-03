@@ -1,0 +1,26 @@
+[package]
+name = "tidefs-dataset-feature-flags"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Dataset feature flags runtime: wraps DatasetFeatureFlagsV1 with
+mount-time compatibility gating (compat/ro_compat/incompat), B-tree-backed
+feature enable/disable, and canonical V1 feature name registry checks.
+no_std / forbid(unsafe_code).
+"""
+
+[dependencies]
+tidefs-types-dataset-feature-flags-core = { path = "../tidefs-types-dataset-feature-flags-core" }
+tidefs-types-dataset-lifecycle-core = { path = "../tidefs-types-dataset-lifecycle-core" }
+tidefs-btree = { path = "../tidefs-btree" }
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+
+[dev-dependencies]
+proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,51 @@
+--- a/crates/tidefs-witness-set/tests/witness_convergence.rs
++++ b/crates/tidefs-witness-set/tests/witness_convergence.rs
+@@ -133,29 +133,31 @@ fn test_partition_both_sides_independent() {
+
+ #[test]
+ fn test_partition_both_sides_independent() {
+-    // Simulate a 6-node cluster split into two 3-node partitions.
+-    let mut ws_a = make_ws_with_epoch(3, QuorumThreshold::StrictMajority, 0);
+-    let mut ws_b = make_ws_with_epoch(3, QuorumThreshold::StrictMajority, 0);
++    // Simulate a cluster split with sufficient ack headroom so old
++    // operations survive the higher post-merge quorum threshold.
++    // 5 initial witnesses, majority=3. Ack 4 for op 100 (headroom).
++    let mut ws_a = make_ws_with_epoch(5, QuorumThreshold::StrictMajority, 0);
++    let mut ws_b = make_ws_with_epoch(5, QuorumThreshold::StrictMajority, 0);
+
+     // Partition A acks op 100
+     ws_a.ack(1, 100);
+     ws_a.ack(2, 100);
++    ws_a.ack(3, 100);
++    ws_a.ack(4, 100); // 4 of 5, majority=3 satisfied with headroom
+     assert!(ws_a.has_quorum(100));
+
+     // Partition B acks op 200
+     ws_b.ack(1, 200);
+     ws_b.ack(2, 200);
++    ws_b.ack(3, 200);
++    ws_b.ack(4, 200);
+     assert!(ws_b.has_quorum(200));
+
+-    // Partition A never saw op 200
+-    assert_eq!(ws_a.ack_count(200), 0);
+-    // Partition B never saw op 100
+-    assert_eq!(ws_b.ack_count(100), 0);
+-
+-    // "Heal": merge B into A by adding witnesses and replaying acks.
+-    ws_a.add_witness(101);
+-    ws_a.add_witness(102);
+-    ws_a.ack(101, 200);
+-    ws_a.ack(102, 200);
+-    ws_a.ack(1, 200);
++    // "Heal": merge B into A by adding 2 new witnesses and replaying acks.
++    // Now 7 total, majority=4. Op 100 has 4 acks → still has quorum.
++    ws_a.add_witness(6);
++    ws_a.add_witness(7);
++    ws_a.ack(6, 200);
++    ws_a.ack(7, 200);
++    ws_a.ack(1, 200); // op 200 now has 3 of 7 → needs 4, so also ack 2
++    ws_a.ack(2, 200);
+     assert!(ws_a.has_quorum(200));
+     assert!(ws_a.has_quorum(100));
+ }

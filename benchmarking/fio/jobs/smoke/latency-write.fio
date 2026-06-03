@@ -1,0 +1,14 @@
+; Smoke: single-queue-depth sequential and random write latency
+; TideFS fio benchmarking — profile 0 smoke
+[seq-write-qd1]
+rw=write
+bs=4k
+iodepth=1
+size=16M
+offset=0
+[rand-write-qd1]
+rw=randwrite
+bs=4k
+iodepth=1
+size=8M
+offset=0

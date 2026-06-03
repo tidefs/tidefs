@@ -1,0 +1,66 @@
+name: xfstests
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Target to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - fuse
+          - kmod-smoke
+          - k7-vfs
+  schedule:
+    - cron: '17 1 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.target || 'scheduled' }}
+  cancel-in-progress: false
+
+jobs:
+  xfstests:
+    name: ${{ matrix.target }}
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1' }}
+    runs-on: [self-hosted, linux, x64, tidefs, nix, kvm, xfstests]
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: fuse
+            command: nix run .#fuse-xfstests-validation
+          - target: kmod-smoke
+            command: nix run .#kmod-xfstests-smoke -- --timeout 3600
+          - target: k7-vfs
+            command: nix run .#k7-vfs-xfstests-validation
+
+    steps:
+      - name: Checkout
+        if: ${{ github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target }}
+        uses: actions/checkout@v6
+
+      - name: Host preflight
+        if: ${{ github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target }}
+        run: |
+          test -c /dev/kvm
+          test -c /dev/fuse
+
+      - name: Run target
+        if: ${{ github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target }}
+        run: timeout --foreground 14400s bash -lc '${{ matrix.command }}'
+
+      - name: Upload xfstests output
+        if: ${{ always() && (github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target) }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: xfstests-${{ matrix.target }}
+          path: |
+            /tmp/tidefs-validation/**
+          if-no-files-found: ignore
+          retention-days: 7

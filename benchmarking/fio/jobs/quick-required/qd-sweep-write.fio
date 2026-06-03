@@ -1,0 +1,26 @@
+; Queue-depth sweep: sequential write at QD 1, 4, 16, 64
+; TideFS fio benchmarking — profile 1 quick-required
+[seq-write-qd1]
+rw=write
+bs=4k
+iodepth=1
+size=16M
+offset=0
+[seq-write-qd4]
+rw=write
+bs=4k
+iodepth=4
+size=16M
+offset=0
+[seq-write-qd16]
+rw=write
+bs=4k
+iodepth=16
+size=16M
+offset=0
+[seq-write-qd64]
+rw=write
+bs=4k
+iodepth=64
+size=16M
+offset=0

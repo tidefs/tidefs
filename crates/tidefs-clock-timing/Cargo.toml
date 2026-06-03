@@ -1,0 +1,19 @@
+[package]
+name = "tidefs-clock-timing"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "HLC, clock health, drift estimation, lease/fence deadlines, and timeout escalation (P8-04)"
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
+serde_json = "1"

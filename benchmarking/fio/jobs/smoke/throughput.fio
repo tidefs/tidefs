@@ -1,0 +1,14 @@
+; Smoke: high-queue-depth sequential throughput
+; TideFS fio benchmarking — profile 0 smoke
+[seq-read-qd32]
+rw=read
+bs=128k
+iodepth=32
+size=64M
+offset=0
+[seq-write-qd32]
+rw=write
+bs=128k
+iodepth=32
+size=64M
+offset=0

@@ -1,0 +1,22 @@
+[package]
+name = "tidefs-rebuild-runtime"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Async rebuild/backfill/rebalance runtime: executes ReplicaMovementIntent records via IncrementalJob"
+
+[dependencies]
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
+tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core" }
+tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-object-io = { path = "../tidefs-object-io" }
+tidefs-verification-engine = { path = "../tidefs-verification-engine" }
+blake3 = "=1.5.5"
+serde = { version = "1", features = ["derive"] }
+
+[lib]
+path = "src/lib.rs"

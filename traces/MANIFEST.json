@@ -1,0 +1,42 @@
+{
+  "generated_by": "tidefs-trace-oracle-rust-v0.421",
+  "items": [
+    {
+      "description": "smoke suite churn scenario (pool trace, Rust-native, 9 puts)",
+      "expected_fingerprint": "121de8759b1761c923c9094c230aa122cb3c5774ef4a0317d5ead6734fb728d2",
+      "id": "smoke_churn_pool",
+      "kind": "pool",
+      "path": "traces/golden/smoke_churn/pool_trace.jsonl",
+      "schema": "pool_trace_v1",
+      "sha256": "5c0a64f8b81c332d3307796dee2279fc2b7b132265c0a4c3a853177cfb7ca48f"
+    },
+    {
+      "description": "smoke suite churn scenario (cluster trace, deferred)",
+      "expected_fingerprint": "ccc9ad56166b8dbb294aaa2eabb0392ee714a13793d16976db13c28cee2d5b6f",
+      "id": "smoke_churn_cluster",
+      "kind": "cluster",
+      "path": "traces/golden/smoke_churn/cluster_trace.jsonl",
+      "schema": "cluster_trace_v1",
+      "sha256": "a141c662c59a88b9742f49ddb231bf90838ce3e8269904709a5409f79bf70641"
+    },
+    {
+      "description": "smoke suite storm scenario (pool trace, Rust-native, 24 puts)",
+      "expected_fingerprint": "d4ce35234fd5c677d88ede749ea908630820403cf616f3cff55f4a9b94d28ba9",
+      "id": "smoke_storm_pool",
+      "kind": "pool",
+      "path": "traces/golden/smoke_storm/pool_trace.jsonl",
+      "schema": "pool_trace_v1",
+      "sha256": "d18db065532c2ab56c8433c1eae9b1a9f83539bcd84f15e5f45d5c4352b4881c"
+    },
+    {
+      "description": "smoke suite storm scenario (cluster trace, deferred)",
+      "expected_fingerprint": "cd850d677b00fa3da4c8ea44581b2379127070676f2870cc68d47d3c8dae96b1",
+      "id": "smoke_storm_cluster",
+      "kind": "cluster",
+      "path": "traces/golden/smoke_storm/cluster_trace.jsonl",
+      "schema": "cluster_trace_v1",
+      "sha256": "5b224d7f090a3cef09f475ca6aee9c7e32f6e23ddb0efe3db8cd0b053dc9f8f1"
+    }
+  ],
+  "manifest_version": 1
+}

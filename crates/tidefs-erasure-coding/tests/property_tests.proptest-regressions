@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cf5d692bab804fcf07dc70fc0ae6a812821c0ac70946ef9d3b509ca5e8f55964 # shrinks to (ref config, ref payload) = (StripeConfig { data_shards: 8, parity_count: Single, shard_len: 11 }, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 141, 140, 54, 243, 75, 18, 8, 184, 91, 216, 4, 234, 37, 224, 152, 177, 190, 218, 146, 179, 20, 22, 26, 175, 130, 203, 201, 192, 133, 127, 216, 45, 234, 249, 61, 182, 153, 194, 182, 218, 5, 204, 42, 231, 159, 5, 218, 204, 226, 6, 207, 229, 42, 20, 127])

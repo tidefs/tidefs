@@ -1,0 +1,35 @@
+[package]
+name = "tidefs-local-object-store-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-only WITH Linux-syscall-note"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.tidefs-local-object-store]
+path = ".."
+
+# Prevent this from being built as part of the workspace's default members
+# (cargo-fuzz targets require nightly and are built separately)
+[workspace]
+
+[lib]
+path = "fake_lib.rs"
+
+[[bin]]
+name = "intent_log_record_decode"
+path = "fuzz_targets/intent_log_record_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pool_label_decode"
+path = "fuzz_targets/pool_label_decode.rs"
+test = false
+doc = false

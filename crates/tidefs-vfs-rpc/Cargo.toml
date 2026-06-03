@@ -1,0 +1,15 @@
+[package]
+name = "tidefs-vfs-rpc"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "VFS_RPC wire protocol and request/response multiplexer for forwarding VfsEngine operations over transport sessions"
+
+[dependencies]
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core", features = ["alloc"] }
+
+[lib]
+path = "src/lib.rs"

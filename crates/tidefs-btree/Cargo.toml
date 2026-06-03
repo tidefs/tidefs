@@ -1,0 +1,21 @@
+[package]
+name = "tidefs-btree"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+General-purpose B+tree implementation extracted from tidefs-extent-map.
+Generic over key (K: Ord + Clone) and value (V: Clone) types with
+configurable leaf/internal fanout via const generics. Used by extent
+maps, cleanup queues, directory index, orphan index, and xattr storage.
+no_std / forbid(unsafe_code).
+"""
+
+[dependencies]
+blake3 = { version = "1", default-features = false }
+
+[dev-dependencies]
+proptest = { version = "=1.9.0", default-features = false, features = ["std"] }

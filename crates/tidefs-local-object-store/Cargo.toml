@@ -1,0 +1,62 @@
+[package]
+name = "tidefs-local-object-store"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Append-only durable local object-store prototype for TideFS"
+
+[dependencies]
+tidefs-auth = { path = "../tidefs-auth" }
+tidefs-cluster = { path = "../tidefs-cluster" }
+tidefs-block-allocator = { path = "../tidefs-block-allocator" }
+tidefs-spacemap-allocator = { path = "../tidefs-spacemap-allocator" }
+tidefs-pool-allocator = { path = "../tidefs-pool-allocator" }
+tidefs-reclaim = { path = "../tidefs-reclaim" }
+tidefs-segment-cleaner = { path = "../tidefs-segment-cleaner" }
+tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
+tidefs-reclaim-queue-core = { path = "../tidefs-reclaim-queue-core" }
+tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
+tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
+tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+tidefs-binary_schema-framing = { path = "../tidefs-binary_schema-framing" }
+tidefs-space-accounting = { path = "../tidefs-space-accounting" }
+serde = { version = "1", features = ["derive"] }
+blake3 = "=1.5.5"
+tidefs-frame = { path = "../tidefs-frame" }
+tidefs-checksum-tree = { path = "../tidefs-checksum-tree" }
+tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core" }
+tidefs-commit_group = { path = "../tidefs-commit_group" }
+tidefs-reserve-ledger = { path = "../tidefs-reserve-ledger" }
+chacha20poly1305 = "0.10"
+tidefs-erasure-coding = { path = "../tidefs-erasure-coding" }
+tidefs-durability-layout = { path = "../tidefs-durability-layout" }
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+zstd = { version = "0.13", default-features = false }
+tracing = "0.1"
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
+tidefs-extent-map = { path = "../tidefs-extent-map" }
+tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core" }
+criterion = "0.4"
+
+[[bench]]
+name = "object_store"
+harness = false
+
+[[bench]]
+name = "write_durability_bench"
+harness = false
+
+[[bench]]
+name = "storage_budget"
+harness = false

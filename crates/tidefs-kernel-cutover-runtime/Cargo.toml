@@ -1,0 +1,14 @@
+[package]
+name = "tidefs-kernel-cutover-runtime"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Userspace kernel-cutover runtime: state-machine executor, fence manager, dry-run gate evaluator, and rollback engine"
+[lib]
+name = "tidefs_kernel_cutover_runtime"
+path = "src/lib.rs"
+[dependencies]
+[dev-dependencies]
+blake3 = "1"

@@ -1,0 +1,27 @@
+[package]
+name = "tidefs-verification-engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "P8-03 data_copy_2 verification engine: digest/witness/range/quorum verification of replicated chunks with ReplicaVerificationReceipt emission, plus pool-level segment integrity verification"
+
+[dependencies]
+tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-witness-set = { path = "../tidefs-witness-set" }
+tidefs-object-io = { path = "../tidefs-object-io" }
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tidefs-pool-scan = { path = "../tidefs-pool-scan" }
+tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+serde = { version = "1", features = ["derive"] }
+blake3 = "1"
+
+[dev-dependencies]
+tidefs-replica-health = { path = "../tidefs-replica-health" }
+tempfile = "3"
+
+[lib]
+path = "src/lib.rs"

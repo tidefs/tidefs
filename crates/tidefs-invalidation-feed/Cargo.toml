@@ -1,0 +1,15 @@
+[package]
+name = "tidefs-invalidation-feed"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Cluster cache invalidation feed service with subscribe/event/ack/resync protocol"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[lib]
+path = "src/lib.rs"

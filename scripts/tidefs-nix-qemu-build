@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# Build TideFS QEMU validation artifacts with release-loop defaults.
+#
+# The normal Nix daemon on development hosts may be configured for very
+# conservative global scheduling.  QEMU validation targets are expensive enough
+# that they need explicit, bounded parallelism and stable out-links so a cleanup
+# does not repeatedly force a cold NixOS VM closure rebuild.
+#
+# Runtime validation must not execute QEMU inside a Nix builder. Nix may build
+# VM closures, kernels, initrds, modules, and runner scripts; the actual
+# qemu-system-* process must be launched by a normal host process outside the
+# Nix build sandbox.
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  tidefs-nix-qemu-build --target PACKAGE_ATTR [options]
+  tidefs-nix-qemu-build PACKAGE_ATTR [options]
+
+Options:
+  --target ATTR         Package attr under packages.<system>, e.g. qemuUblkSmoke.
+  --name NAME          Human-readable target name for logs/out-link names.
+  --system SYSTEM      Nix system attr, default x86_64-linux.
+  --repo PATH          Repository path, default current git root.
+  --max-jobs N         Nix scheduler parallelism, default TIDEFS_NIX_QEMU_MAX_JOBS or 8.
+  --cores N            Cores per derivation, default TIDEFS_NIX_QEMU_CORES or 8.
+  --timeout SECONDS    Outer timeout, default TIDEFS_NIX_QEMU_TIMEOUT or 7200.
+  --root-dir DIR       Out-link/GC-root directory, default XDG state dir.
+  --build-dir DIR      Nix build scratch directory, default ~/ai/tmp/nix-build-tidefs.
+  --nofile-limit N     Clamp soft open-file limit before Nix builds, default 65536.
+  --no-warm-kernel     Do not prebuild/pin linuxKernel_7_0 first.
+  --no-link            Do not create/update an out-link for the target.
+  --dry-run            Print the commands that would run, then exit.
+  -h, --help           Show this help.
+
+Environment:
+  TIDEFS_NIX_QEMU_MAX_JOBS       Default --max-jobs.
+  TIDEFS_NIX_QEMU_CORES          Default --cores.
+  TIDEFS_NIX_QEMU_TIMEOUT        Default --timeout.
+  TIDEFS_NIX_QEMU_ROOT_DIR       Default --root-dir.
+  TIDEFS_NIX_QEMU_BUILD_DIR      Default --build-dir.
+  TIDEFS_NIX_QEMU_NOFILE_LIMIT   Default --nofile-limit; set 0 to disable.
+  TIDEFS_NIX_QEMU_WARM_KERNEL    Set to 0 to skip kernel prewarm.
+  Legacy runNixOSTest package targets are refused because they launch QEMU
+  from inside the Nix build sandbox.
+EOF
+}
+
+die() {
+  printf 'tidefs-nix-qemu-build: %s\n' "$*" >&2
+  exit 2
+}
+
+repo_default() {
+  git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+sanitize_name() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+clamp_nofile() {
+  local limit="$1"
+  [[ "$limit" == "0" ]] && return 0
+
+  local soft hard effective
+  soft="$(ulimit -Sn)"
+  hard="$(ulimit -Hn)"
+  [[ "$soft" == "unlimited" ]] && soft=2147483647
+  [[ "$hard" == "unlimited" ]] && hard=2147483647
+  [[ "$soft" =~ ^[0-9]+$ ]] || die "could not read soft open-file limit: $soft"
+  [[ "$hard" =~ ^[0-9]+$ ]] || die "could not read hard open-file limit: $hard"
+
+  effective="$limit"
+  if (( effective > hard )); then
+    effective="$hard"
+  fi
+  if (( soft > effective )); then
+    ulimit -Sn "$effective" || die "failed to clamp soft open-file limit to $effective"
+  fi
+}
+
+run_with_timeout() {
+  local timeout_secs="$1"
+  shift
+  if [[ "$timeout_secs" == "0" ]]; then
+    "$@"
+  else
+    timeout --foreground --kill-after=60s "$timeout_secs" "$@"
+  fi
+}
+
+target=""
+name=""
+system="${TIDEFS_NIX_SYSTEM:-x86_64-linux}"
+repo=""
+max_jobs="${TIDEFS_NIX_QEMU_MAX_JOBS:-8}"
+cores="${TIDEFS_NIX_QEMU_CORES:-8}"
+timeout_secs="${TIDEFS_NIX_QEMU_TIMEOUT:-7200}"
+home_dir="${HOME:-/root}"
+state_home="${XDG_STATE_HOME:-$home_dir/.local/state}"
+root_dir="${TIDEFS_NIX_QEMU_ROOT_DIR:-$state_home/tidefs/nix-qemu-roots}"
+build_dir="${TIDEFS_NIX_QEMU_BUILD_DIR:-$home_dir/ai/tmp/nix-build-tidefs}"
+nofile_limit="${TIDEFS_NIX_QEMU_NOFILE_LIMIT:-65536}"
+warm_kernel="${TIDEFS_NIX_QEMU_WARM_KERNEL:-1}"
+link_target=1
+dry_run=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target)
+      [[ $# -ge 2 ]] || die "--target requires an argument"
+      target="$2"
+      shift 2
+      ;;
+    --name)
+      [[ $# -ge 2 ]] || die "--name requires an argument"
+      name="$2"
+      shift 2
+      ;;
+    --system)
+      [[ $# -ge 2 ]] || die "--system requires an argument"
+      system="$2"
+      shift 2
+      ;;
+    --repo)
+      [[ $# -ge 2 ]] || die "--repo requires an argument"
+      repo="$2"
+      shift 2
+      ;;
+    --max-jobs)
+      [[ $# -ge 2 ]] || die "--max-jobs requires an argument"
+      max_jobs="$2"
+      shift 2
+      ;;
+    --cores)
+      [[ $# -ge 2 ]] || die "--cores requires an argument"
+      cores="$2"
+      shift 2
+      ;;
+    --timeout)
+      [[ $# -ge 2 ]] || die "--timeout requires an argument"
+      timeout_secs="$2"
+      shift 2
+      ;;
+    --root-dir)
+      [[ $# -ge 2 ]] || die "--root-dir requires an argument"
+      root_dir="$2"
+      shift 2
+      ;;
+    --build-dir)
+      [[ $# -ge 2 ]] || die "--build-dir requires an argument"
+      build_dir="$2"
+      shift 2
+      ;;
+    --nofile-limit)
+      [[ $# -ge 2 ]] || die "--nofile-limit requires an argument"
+      nofile_limit="$2"
+      shift 2
+      ;;
+    --no-warm-kernel)
+      warm_kernel=0
+      shift
+      ;;
+    --no-link)
+      link_target=0
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      if [[ -n "$target" ]]; then
+        die "unexpected positional argument: $1"
+      fi
+      target="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$target" ]] || die "missing --target PACKAGE_ATTR"
+[[ "$max_jobs" =~ ^[0-9]+$ ]] || die "--max-jobs must be numeric"
+[[ "$cores" =~ ^[0-9]+$ ]] || die "--cores must be numeric"
+[[ "$timeout_secs" =~ ^[0-9]+$ ]] || die "--timeout must be numeric"
+[[ "$nofile_limit" =~ ^[0-9]+$ ]] || die "--nofile-limit must be numeric"
+
+case "$target" in
+  qemuSmoke|tidefsFuseVmTest|tidefsFuseFioBenchmark|tidefsFuseFioBenchmarkNixOSTestDeprecated|qemuXfstestsLockSymlinkFallocate|tidefsXfstestsLockGroup|qemuUblkSmoke|qemuUblkExt4Smoke|qemuUblkMultiDevicePlacement|qemuUblkCrashConsistency|qemuUblkFsMatrix|rdmaCarrierTwoNodeTest|multiNodeCluster|kernel7Validation|clusterE2EValidation|rdmaTwoNodeValidation)
+    die "target $target is a legacy runNixOSTest/sandbox-runtime target; port it to a Nix-built outside-sandbox QEMU runner before using it for autonomous validation"
+    ;;
+esac
+
+nofile_before="$(ulimit -Sn)"
+clamp_nofile "$nofile_limit"
+nofile_after="$(ulimit -Sn)"
+
+repo="${repo:-$(repo_default)}"
+[[ -d "$repo" ]] || die "repo does not exist: $repo"
+[[ -f "$repo/flake.nix" ]] || die "repo is not a flake checkout: $repo"
+name="${name:-$target}"
+safe_name="$(sanitize_name "$name")"
+mkdir -p "$root_dir"
+mkdir -p "$build_dir"
+
+kernel_ref="$repo#packages.$system.linuxKernel_7_0"
+target_ref="$repo#packages.$system.$target"
+kernel_link="$root_dir/linuxKernel_7_0"
+target_link="$root_dir/$safe_name"
+
+common_args=(
+  --max-jobs "$max_jobs"
+  --cores "$cores"
+  --option build-dir "$build_dir"
+  --option download-buffer-size "${TIDEFS_NIX_QEMU_DOWNLOAD_BUFFER_SIZE:-268435456}"
+)
+
+printf 'tidefs_nix_qemu.target=%s\n' "$target"
+printf 'tidefs_nix_qemu.repo=%s\n' "$repo"
+printf 'tidefs_nix_qemu.system=%s\n' "$system"
+printf 'tidefs_nix_qemu.max_jobs=%s\n' "$max_jobs"
+printf 'tidefs_nix_qemu.cores=%s\n' "$cores"
+printf 'tidefs_nix_qemu.timeout_seconds=%s\n' "$timeout_secs"
+printf 'tidefs_nix_qemu.root_dir=%s\n' "$root_dir"
+printf 'tidefs_nix_qemu.build_dir=%s\n' "$build_dir"
+printf 'tidefs_nix_qemu.nofile_limit=%s\n' "$nofile_limit"
+printf 'tidefs_nix_qemu.nofile_soft_before=%s\n' "$nofile_before"
+printf 'tidefs_nix_qemu.nofile_soft_after=%s\n' "$nofile_after"
+
+if [[ "$warm_kernel" != "0" ]]; then
+  kernel_cmd=(nix build "$kernel_ref" -L "${common_args[@]}" --out-link "$kernel_link")
+  printf 'tidefs_nix_qemu.kernel_command=%q' "${kernel_cmd[0]}"
+  printf ' %q' "${kernel_cmd[@]:1}"
+  printf '\n'
+  if [[ "$dry_run" == "0" ]]; then
+    run_with_timeout "$timeout_secs" "${kernel_cmd[@]}"
+  fi
+fi
+
+target_cmd=(nix build "$target_ref" -L "${common_args[@]}")
+if [[ "$link_target" != "0" ]]; then
+  target_cmd+=(--out-link "$target_link")
+fi
+
+printf 'tidefs_nix_qemu.target_command=%q' "${target_cmd[0]}"
+printf ' %q' "${target_cmd[@]:1}"
+printf '\n'
+
+if [[ "$dry_run" == "0" ]]; then
+  run_with_timeout "$timeout_secs" "${target_cmd[@]}"
+fi
+
+if [[ "$link_target" != "0" ]]; then
+  printf 'tidefs_nix_qemu.result_link=%s\n' "$target_link"
+fi

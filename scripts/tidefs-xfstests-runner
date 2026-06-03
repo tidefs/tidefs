@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# tidefs-xfstests-runner — Standalone TideFS xfstests runner
+#
+# Builds tidefs, runs xfstests against a TideFS FUSE mount, and generates
+# a scoreboard with pass/fail/skip results.
+#
+# Usage:
+#   TIDEFS_XFSTESTS_TESTS="generic/001 generic/002" \\
+#   TIDEFS_XFSTESTS_CHECK_ARGS="-fuse -g quick" \\
+#     nix run .#xfstests-runner
+#
+# Or directly:
+#   scripts/tidefs-xfstests-runner [--tests "generic/001 ..."] [--quick] [--out <dir>]
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+run_id="${TIDEFS_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-xfstests}"
+out_dir="${TIDEFS_OUT_DIR:-/root/ai/tmp/tidefs-validation/$run_id/xfstests-scoreboard}"
+
+tests="${TIDEFS_XFSTESTS_TESTS:-generic/001}"
+check_args="${TIDEFS_XFSTESTS_CHECK_ARGS:--fuse}"
+exclude_file="${TIDEFS_XFSTESTS_EXCLUDE:-$SCRIPT_DIR/tidefs-xfstests-exclude}"
+
+# Parse CLI args
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --tests)
+            tests="$2"; shift 2 ;;
+        --quick)
+            check_args="-fuse -g quick"; shift ;;
+        --per-test)
+            export TIDEFS_SCOREBOARD_PER_TEST=1; shift ;;
+        --auto)
+            check_args="-fuse -g auto"; shift ;;
+        --out)
+            out_dir="$2"; shift 2 ;;
+        --help|-h)
+            cat <<'HELP'
+tidefs-xfstests-runner — run xfstests against TideFS FUSE
+
+Environment:
+  TIDEFS_XFSTESTS_TESTS        tests to run (space-separated, default: generic/001)
+  TIDEFS_XFSTESTS_CHECK_ARGS   args for xfstests-check (default: -fuse)
+  TIDEFS_XFSTESTS_EXCLUDE      path to exclude list (default: scripts/tidefs-xfstests-exclude)
+  TIDEFS_OUT_DIR               output directory for scoreboard
+
+Options:
+  --tests "generic/001 generic/002"   tests to run
+  --quick                             run quick group with -fuse
+  --auto                              run auto group with -fuse
+  --per-test                          enable per-test output parsing
+  --out <dir>                         output directory
+HELP
+            exit 0 ;;
+        *)
+            echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
+
+mkdir -p "$out_dir"
+
+echo "=== TideFS xfstests runner ==="
+echo "run_id=$run_id"
+echo "out_dir=$out_dir"
+echo "tests=$tests"
+echo "check_args=$check_args"
+
+# Run through posix-scoreboard with xfstests nix-package mode
+export TIDEFS_RUN_ID="$run_id"
+export TIDEFS_POSIX_SCOREBOARD_DIR="$out_dir"
+export TIDEFS_XFSTESTS_NIX_PACKAGE=1
+export TIDEFS_XFSTESTS_TESTS="$tests"
+export TIDEFS_XFSTESTS_CHECK_ARGS="$check_args"
+export TIDEFS_XFSTESTS_EXCLUDE="$exclude_file"
+
+echo "Running posix-scoreboard with xfstests..."
+"$REPO_ROOT/nix/tidefs-posix-scoreboard.sh"
+
+echo "=== Results ==="
+if [ -f "$out_dir/scoreboard.md" ]; then
+    cat "$out_dir/scoreboard.md"
+fi

@@ -1,0 +1,18 @@
+[package]
+name = "tidefs-types-deferred-cleanup-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Authority type definitions for deferred cleanup work queues:
+CleanupWorkItemV1, WorkItemKind, WorkItemFlags. Fixed-size 128-byte
+on-media records for O(1) syscall latency under unlink/truncate/rmdir.
+no_std / forbid(unsafe_code).
+"""
+
+[dependencies]
+tidefs-types-dataset-feature-flags-core = { path = "../tidefs-types-dataset-feature-flags-core" }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }

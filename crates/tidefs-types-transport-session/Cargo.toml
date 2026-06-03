@@ -1,0 +1,18 @@
+[package]
+name = "tidefs-types-transport-session"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Deterministic transport_session_cohort_graph model: endpoint families, session/cohort/lane classes, message families, envelope grammar, and resume/closure law (P8-01)"
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"

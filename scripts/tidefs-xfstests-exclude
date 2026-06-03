@@ -1,0 +1,144 @@
+# TideFS xfstests exclude list for FUSE preview baseline
+#
+# Tests excluded because they require features not yet in the tidefs FUSE adapter.
+# Format: one test pattern per line. Comments start with #.
+# Tag legend: [ACL] [CAP] [ENCRYPT] [IMMUTABLE] [IOCTL] [KERNEL] [MMAP] [MKNOD] [QUOTA] [SWAP] [TIMESTAMPS]
+#
+# Removed as delivered:
+#   file locks (#491/#791): generic/131, generic/150, generic/167
+#   FIEMAP (#500): generic/317
+#   O_DIRECT (#876): generic/095, generic/130, generic/208-213, generic/240
+#   sub-second timestamps (#3184): generic/258 (atimensec/mtimensec/ctimensec confirmed
+#     wired through full FUSE attr path — fuse_vfs_adapter.rs:782-784,839-841)
+
+# --- ACLs ---
+#   ACL evaluation IS wired via tidefs-posix-acl + tidefs-permission check_access()
+#   (fuse_preview.rs:759-796,2029-2048). These exclusions remain until the full ACL
+#   xfstests suite (set/get/inherit/default) is verified passing end-to-end.
+generic/099
+generic/237
+generic/307
+generic/318
+generic/319
+generic/375
+generic/444
+
+# --- Capabilities ---
+generic/694
+
+# --- Encryption (fscrypt) ---
+generic/397
+generic/398
+generic/399
+generic/400
+generic/401
+
+# --- Immutable/append-only flags ---
+#   FS_IMMUTABLE_FL/FS_APPEND_FL enforcement is now wired into the FUSE adapter
+#   (write/truncate/chmod/chown/unlink/rmdir/rename/symlink/mkdir/link/fallocate).
+#   generic/079 exercises immutable/append-only behavior and should pass.
+
+
+# --- FS_IOC ioctls ---
+generic/009
+
+# --- Kernel-specific (user ns, device mapper, etc.) ---
+generic/048
+generic/054
+generic/058
+generic/062
+
+# --- mmap coherency (deferred; returns EOPNOTSUPP) ---
+generic/091
+generic/215
+generic/216
+generic/223
+generic/224
+generic/225
+generic/226
+generic/228
+generic/229
+generic/230
+generic/231
+generic/235
+generic/239
+generic/247
+generic/248
+generic/252
+generic/255
+generic/263
+
+# --- mknod device/fifo/socket (explicitly unsupported) ---
+
+# --- Quota ---
+generic/244
+generic/245
+generic/383
+
+# --- Swap ---
+generic/472
+generic/493
+generic/494
+
+# --- Freeze (FS_IOC_FREEZE/FS_IOC_THAW not supported on FUSE) ---
+generic/068
+generic/085
+
+# --- Insert/collapse range (FALLOC_FL_INSERT_RANGE/FALLOC_FL_COLLAPSE_RANGE
+#     not supported; returns EOPNOTSUPP) ---
+generic/060
+generic/061
+generic/063
+generic/064
+generic/072
+
+# --- RENAME_WHITEOUT (returns EINVAL) ---
+generic/078
+
+# --- Shutdown/repair (FS_IOC_GOINGDOWN, recovery/repair not applicable on FUSE) ---
+generic/051
+generic/052
+generic/053
+
+# --- Additional ACL (already in the ACL section above for 053/077/099) ---
+
+# --- Additional Kernel-specific ---
+generic/076
+
+# --- Additional Quota ---
+generic/055
+generic/082
+
+# --- Additional Capabilities ---
+generic/093
+
+# --- Additional mmap ---
+generic/080
+
+# --- Reflink (FICLONE/FICLONERANGE not wired through FUSE adapter) ---
+# Tests 288-300 exercise reflink/dedupe/COW clone operations.
+# Storage-layer clone_file_range_via_store exists but has no FUSE dispatch path.
+generic/288
+generic/289
+generic/290
+generic/291
+generic/292
+generic/293
+generic/294
+generic/295
+generic/296
+generic/297
+generic/298
+generic/299
+generic/300
+
+# --- Quota (not implemented in TideFS FUSE) ---
+generic/270
+generic/280
+
+# --- Freeze/thaw (FIFREEZE/FITHAW not implemented) ---
+generic/275
+
+# --- ENOSPC (pool capacity tracking exists but no per-filesystem ENOSPC return path) ---
+generic/269
+generic/274
