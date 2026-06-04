@@ -4071,9 +4071,10 @@ fn remove_xattr_clears_attribute() {
         None
     );
 
-    // Removing a non-existent xattr is a no-op
-    fs.remove_xattr("/f", b"user.nonexistent")
-        .expect("remove nonexistent");
+    let err = fs
+        .remove_xattr("/f", b"user.nonexistent")
+        .expect_err("missing xattr removal must fail");
+    assert!(matches!(err, FileSystemError::NotFound { .. }));
 
     cleanup(&root);
 }

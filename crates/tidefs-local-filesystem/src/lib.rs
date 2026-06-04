@@ -7124,6 +7124,10 @@ impl LocalFileSystem {
         }
     }
 
+    fn next_metadata_ctime_ns(previous: i64) -> i64 {
+        crate::types::current_posix_time_ns().max(previous.saturating_add(1))
+    }
+
     pub fn set_xattr(
         &mut self,
         path: impl AsRef<str>,
@@ -7240,6 +7244,7 @@ impl LocalFileSystem {
             updated.mode = new_mode;
         }
 
+        updated.posix_time.ctime_ns = Self::next_metadata_ctime_ns(updated.posix_time.ctime_ns);
         updated.metadata_version = tick;
         // Capture old record in mutation delta BEFORE replacing it
         self.mark_inode_metadata_dirty(inode_id);
@@ -7286,27 +7291,10 @@ impl LocalFileSystem {
         self.flush_write_buffer(inode_id)?;
         let record = self.inode(inode_id)?.clone();
 
-        // ACL intercept: removing system.posix_acl_access resets the ACL
-        // to the minimal mode-derived representation.
-        const ACL_ACCESS: &[u8] = b"system.posix_acl_access";
-        if name == ACL_ACCESS {
-            let mode = record.mode;
-            self.begin_mutation();
-            let tick = self.bump_generation();
-            let mut updated = record;
-            let minimal = tidefs_posix_acl::encode_posix_acl_xattr(
-                &tidefs_posix_acl::minimal_access_acl_from_mode(mode),
-            );
-            updated.xattrs.insert(name.to_vec(), minimal);
-            updated.metadata_version = tick;
-            self.mark_inode_metadata_dirty(inode_id);
-            Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated);
-            self.inode_cache.borrow_mut().invalidate(inode_id);
-            return self.commit_mutation(());
-        }
-
         if !record.xattrs.contains_key(name) {
-            return Ok(());
+            return Err(FileSystemError::NotFound {
+                path: format!("{path}:{}", String::from_utf8_lossy(name)),
+            });
         }
 
         // Record intent-log entry for crash-safe xattr removal
@@ -7330,6 +7318,7 @@ impl LocalFileSystem {
         let tick = self.bump_generation();
         let mut updated = record;
         updated.xattrs.remove(name);
+        updated.posix_time.ctime_ns = Self::next_metadata_ctime_ns(updated.posix_time.ctime_ns);
         updated.metadata_version = tick;
         // Capture old record in mutation delta BEFORE replacing it
         self.mark_inode_metadata_dirty(inode_id);
@@ -7358,6 +7347,7 @@ impl LocalFileSystem {
         let tick = self.bump_generation();
         let mut updated = record;
         updated.xattrs.clear();
+        updated.posix_time.ctime_ns = Self::next_metadata_ctime_ns(updated.posix_time.ctime_ns);
         updated.metadata_version = tick;
         self.mark_inode_metadata_dirty(inode_id);
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated);

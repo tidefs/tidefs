@@ -358,18 +358,20 @@ function apply_chmod_to_acl(acl: &[PosixAclEntry], new_mode: u32) -> PosixAcl:
     owner_perm  = (new_mode >> 6) & 0x7
     group_perm  = (new_mode >> 3) & 0x7
     other_perm  = new_mode & 0x7
+    has_mask    = any(entry.tag == ACL_MASK for entry in acl)
 
     result = clone each entry from acl
     for entry in result:
-        if entry.tag == ACL_USER_OBJ:  entry.perm = owner_perm
-        if entry.tag == ACL_GROUP_OBJ: entry.perm = group_perm
-        if entry.tag == ACL_OTHER:     entry.perm = other_perm
-        if entry.tag == ACL_MASK:      entry.perm = group_perm
+        if entry.tag == ACL_USER_OBJ:              entry.perm = owner_perm
+        if entry.tag == ACL_GROUP_OBJ && !has_mask: entry.perm = group_perm
+        if entry.tag == ACL_OTHER:                 entry.perm = other_perm
+        if entry.tag == ACL_MASK:                  entry.perm = group_perm
     return result
 ```
 
 **Tradeoff**: Named user/group entries are preserved unchanged. This matches
-Linux kernel behaviour: `chmod` only affects the "class representative" entries.
+Linux kernel behaviour: `chmod` updates `ACL_MASK` for the group class when a
+mask exists, otherwise it updates `ACL_GROUP_OBJ`.
 
 ### 6.7 Default ACL inheritance (`default_acl_inheritance_for_parent`)
 
@@ -817,8 +819,8 @@ For `system.posix_acl_default`:
 Removing `system.posix_acl_access`:
 
 1. Call `XattrStore::remove("system.posix_acl_access")`.
-2. Recompute `st_mode` from the remaining ACL (or from a minimal ACL derived
-   from the current mode, preserving only owner/group/other bits).
+2. Leave `st_mode` unchanged; after the ACL is absent, permission evaluation
+   falls back to the existing mode bits.
 3. Clear the ACL flag if no ACL xattrs remain.
 
 Removing `system.posix_acl_default`:

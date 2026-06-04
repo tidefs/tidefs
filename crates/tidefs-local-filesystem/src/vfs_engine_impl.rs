@@ -813,6 +813,18 @@ impl VfsLocalFileSystem {
             let mode = (updated.mode & S_IFMT) | (attr.mode & !S_IFMT);
             if updated.mode != mode {
                 updated.mode = mode;
+                if let Some(raw_acl) = updated.xattrs.get(b"system.posix_acl_access" as &[u8]) {
+                    if let Ok(decoded) = tidefs_posix_acl::decode_posix_acl_xattr(raw_acl) {
+                        if let Ok(sync_plan) =
+                            tidefs_posix_acl::plan_posix_acl_mode_sync(&decoded, mode)
+                        {
+                            updated.xattrs.insert(
+                                b"system.posix_acl_access".to_vec(),
+                                tidefs_posix_acl::encode_posix_acl_xattr(&sync_plan.updated_acl),
+                            );
+                        }
+                    }
+                }
                 changed = true;
                 should_bump_ctime = true;
             }
@@ -870,8 +882,9 @@ impl VfsLocalFileSystem {
         // preserves the explicit-value path for atime while still
         // ensuring ctime advances per POSIX semantics.
         if should_bump_ctime && attr.valid & FATTR_CTIME == 0 {
-            if updated.posix_time.ctime_ns != now_ns {
-                updated.posix_time.ctime_ns = now_ns;
+            let next_ctime = now_ns.max(updated.posix_time.ctime_ns.saturating_add(1));
+            if updated.posix_time.ctime_ns != next_ctime {
+                updated.posix_time.ctime_ns = next_ctime;
                 changed = true;
             }
         }
@@ -7395,6 +7408,128 @@ mod tests {
     }
 
     #[test]
+    fn posix_acl_xattr_accepts_linux_undefined_special_ids() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"acl-linux-ids.txt");
+        let acl = vec![
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_USER_OBJ,
+                perm: 4,
+                id: tidefs_posix_acl::ACL_UNDEFINED_ID,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_GROUP_OBJ,
+                perm: 7,
+                id: tidefs_posix_acl::ACL_UNDEFINED_ID,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_OTHER,
+                perm: 6,
+                id: tidefs_posix_acl::ACL_UNDEFINED_ID,
+            },
+        ];
+        let encoded = tidefs_posix_acl::encode_posix_acl_xattr(&acl);
+
+        engine
+            .setxattr(inode, b"system.posix_acl_access", &encoded, 0, &root_ctx())
+            .unwrap();
+
+        let attr = engine.getattr(inode, None, &root_ctx()).unwrap();
+        assert_eq!(attr.posix.mode & 0o777, 0o476);
+        assert_eq!(
+            engine
+                .getxattr(inode, b"system.posix_acl_access", &root_ctx())
+                .unwrap(),
+            encoded
+        );
+    }
+
+    #[test]
+    fn setxattr_advances_ctime() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"xattr-ctime.txt");
+        let before = engine.getattr(inode, None, &root_ctx()).unwrap();
+
+        engine
+            .setxattr(inode, b"user.ctime", b"value", 0, &root_ctx())
+            .unwrap();
+
+        let after = engine.getattr(inode, None, &root_ctx()).unwrap();
+        assert!(
+            after.posix.ctime_ns > before.posix.ctime_ns,
+            "setxattr must advance ctime: before={}, after={}",
+            before.posix.ctime_ns,
+            after.posix.ctime_ns
+        );
+    }
+
+    #[test]
+    fn removexattr_advances_ctime_and_missing_reports_enodata() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"xattr-remove-ctime.txt");
+
+        engine
+            .setxattr(inode, b"user.remove", b"value", 0, &root_ctx())
+            .unwrap();
+        let before = engine.getattr(inode, None, &root_ctx()).unwrap();
+
+        engine
+            .removexattr(inode, b"user.remove", &root_ctx())
+            .unwrap();
+
+        let after = engine.getattr(inode, None, &root_ctx()).unwrap();
+        assert!(
+            after.posix.ctime_ns > before.posix.ctime_ns,
+            "removexattr must advance ctime: before={}, after={}",
+            before.posix.ctime_ns,
+            after.posix.ctime_ns
+        );
+        assert_eq!(
+            engine
+                .getxattr(inode, b"user.remove", &root_ctx())
+                .unwrap_err(),
+            Errno::ENODATA
+        );
+        assert_eq!(
+            engine
+                .removexattr(inode, b"user.remove", &root_ctx())
+                .unwrap_err(),
+            Errno::ENODATA
+        );
+    }
+
+    #[test]
+    fn removexattr_posix_acl_access_removes_acl_without_mode_drift() {
+        let (engine, _td) = temp_fs();
+        let inode = create_xattr_file(&engine, b"acl-remove.txt");
+        let acl = tidefs_posix_acl::minimal_access_acl_from_mode(0o640);
+        let encoded = tidefs_posix_acl::encode_posix_acl_xattr(&acl);
+
+        engine
+            .setxattr(inode, b"system.posix_acl_access", &encoded, 0, &root_ctx())
+            .unwrap();
+        let before = engine.getattr(inode, None, &root_ctx()).unwrap();
+        assert_eq!(before.posix.mode & 0o777, 0o640);
+
+        engine
+            .removexattr(inode, b"system.posix_acl_access", &root_ctx())
+            .unwrap();
+
+        let after = engine.getattr(inode, None, &root_ctx()).unwrap();
+        assert_eq!(after.posix.mode & 0o777, 0o640);
+        assert!(
+            after.posix.ctime_ns > before.posix.ctime_ns,
+            "ACL removexattr must advance ctime"
+        );
+        assert_eq!(
+            engine
+                .getxattr(inode, b"system.posix_acl_access", &root_ctx())
+                .unwrap_err(),
+            Errno::ENODATA
+        );
+    }
+
+    #[test]
     fn setxattr_rejects_structurally_invalid_posix_acl_payloads() {
         let (engine, _td) = temp_fs();
         let inode = create_xattr_file(&engine, b"acl-invalid.txt");
@@ -7721,6 +7856,75 @@ mod tests {
         assert_eq!(decoded[0].perm, 7); // user_obj
         assert_eq!(decoded[1].perm, 5); // group_obj
         assert_eq!(decoded[2].perm, 1); // other
+    }
+
+    #[test]
+    fn setattr_chmod_updates_acl_mask_without_group_obj_drift() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"acl-mask-file", 0o755, 0, &ctx())
+            .unwrap();
+        let acl = vec![
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_USER,
+                perm: 7,
+                id: 1234,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_GROUP_OBJ,
+                perm: 5,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_GROUP,
+                perm: 6,
+                id: 2222,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_MASK,
+                perm: 7,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_OTHER,
+                perm: 5,
+                id: 0,
+            },
+        ];
+        let encoded = tidefs_posix_acl::encode_posix_acl_xattr(&acl);
+        engine
+            .setxattr(
+                attr.inode_id,
+                b"system.posix_acl_access",
+                &encoded,
+                0,
+                &ctx(),
+            )
+            .unwrap();
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MODE;
+        set.mode = 0o640;
+        let updated = engine.setattr(attr.inode_id, &set, None, &ctx()).unwrap();
+        assert_eq!(updated.posix.mode & 0o777, 0o640);
+
+        let acl_raw = engine
+            .getxattr(attr.inode_id, b"system.posix_acl_access", &ctx())
+            .unwrap();
+        let decoded = tidefs_posix_acl::decode_posix_acl_xattr(&acl_raw).unwrap();
+
+        assert_eq!(decoded[0].perm, 6); // user_obj
+        assert_eq!(decoded[1].perm, 7); // named user unchanged
+        assert_eq!(decoded[2].perm, 5); // group_obj unchanged when mask exists
+        assert_eq!(decoded[3].perm, 6); // named group unchanged
+        assert_eq!(decoded[4].perm, 4); // mask receives chmod group bits
+        assert_eq!(decoded[5].perm, 0); // other
     }
 
     #[test]

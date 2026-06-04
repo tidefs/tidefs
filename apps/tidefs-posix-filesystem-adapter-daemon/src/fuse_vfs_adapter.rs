@@ -4276,19 +4276,6 @@ impl FuseVfsAdapter {
         }
         self.path_lookup_cache.lock().unwrap().remove_by_ino(ino);
 
-        // Synchronize ACL mask when mode bits changed on an ACL-bearing inode.
-        if effective_attr.valid & FATTR_MODE != 0 {
-            let inode_id = InodeId::new(ino);
-            if let Ok(raw_acl) = e.getxattr(inode_id, b"system.posix_acl_access", ctx) {
-                if let Ok(decoded) = tidefs_permission::decode_posix_acl_xattr(&raw_acl) {
-                    let updated_acl =
-                        tidefs_permission::apply_chmod_to_acl(&decoded, effective_attr.mode);
-                    let encoded = tidefs_permission::encode_posix_acl_xattr(&updated_acl);
-                    let _ = e.setxattr(inode_id, b"system.posix_acl_access", &encoded, 0, ctx);
-                }
-            }
-        }
-
         Ok(crate::workers_meta::fuse_attr_out(
             ino,
             &updated.posix,

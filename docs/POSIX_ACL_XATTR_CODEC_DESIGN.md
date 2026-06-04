@@ -266,7 +266,10 @@ When `setattr` changes `st_mode` permission bits and the inode carries a
 `system.posix_acl_access` xattr:
 
 1. Read the existing access ACL.
-2. Apply `apply_chmod_to_acl` with the new mode.
+2. Apply Linux chmod synchronization with the new mode: `USER_OBJ` and
+   `OTHER` receive the owner/other mode bits, `ACL_MASK` receives the group
+   mode bits when present, and `GROUP_OBJ` receives the group mode bits only
+   when no `ACL_MASK` entry exists.
 3. Store the updated ACL via the xattr path.
 4. The mode bits are updated through the existing setattr path.
 
@@ -347,7 +350,7 @@ Wire-up crates (in separate implementation issues):
 - **ACL inheritance on mkdir**: dir with default ACL → new dir inherits
   both access (chmod-applied) and default (copied verbatim).
 - **Chmod updates ACL**: file with access ACL → chmod 600 → ACL USER_OBJ,
-  GROUP_OBJ, MASK, OTHER entries updated to match.
+  MASK, and OTHER entries update; GROUP_OBJ updates only when no MASK exists.
 - **Setxattr updates mode**: file → setxattr access ACL with USER_OBJ=7,
   GROUP_OBJ=5, MASK=3, OTHER=5 → mode bits show 0o735.
 - **Removexattr leaves mode unchanged**: file with access ACL → removexattr

@@ -41,6 +41,8 @@ pub const ACL_GROUP: u16 = 0x08;
 pub const ACL_MASK: u16 = 0x10;
 /// Everyone else.
 pub const ACL_OTHER: u16 = 0x20;
+/// Undefined qualifier id used by Linux for entries without a uid/gid.
+pub const ACL_UNDEFINED_ID: u32 = u32::MAX;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,7 +51,8 @@ pub const ACL_OTHER: u16 = 0x20;
 /// One entry in a POSIX ACL.
 ///
 /// Each entry is 8 bytes on-wire: tag (u16 LE), perm (u16 LE, only bits
-/// 0..2 used), id (u32 LE, uid/gid for USER/GROUP; 0 otherwise).
+/// 0..2 used), id (u32 LE, uid/gid for USER/GROUP; 0 or
+/// `ACL_UNDEFINED_ID` otherwise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PosixAclEntry {
     /// Tag: one of `ACL_USER_OBJ`, `ACL_USER`, `ACL_GROUP_OBJ`,
@@ -57,7 +60,8 @@ pub struct PosixAclEntry {
     pub tag: u16,
     /// Permissions: `0..7` (rwx bits).
     pub perm: u16,
-    /// uid or gid for `ACL_USER` / `ACL_GROUP`; 0 for other tags.
+    /// uid or gid for `ACL_USER` / `ACL_GROUP`; 0 or `ACL_UNDEFINED_ID`
+    /// for other tags.
     pub id: u32,
 }
 
@@ -873,9 +877,11 @@ pub fn validate_posix_acl_access_structure(
             return Err(PosixAclStructureError::InvalidPerm);
         }
 
+        let special_id_is_valid = entry.id == 0 || entry.id == ACL_UNDEFINED_ID;
+
         match entry.tag {
             ACL_USER_OBJ => {
-                if entry.id != 0 {
+                if !special_id_is_valid {
                     return Err(PosixAclStructureError::InvalidSpecialEntryId);
                 }
                 user_obj_count += 1;
@@ -884,7 +890,7 @@ pub fn validate_posix_acl_access_structure(
                 has_named_entry = true;
             }
             ACL_GROUP_OBJ => {
-                if entry.id != 0 {
+                if !special_id_is_valid {
                     return Err(PosixAclStructureError::InvalidSpecialEntryId);
                 }
                 group_obj_count += 1;
@@ -893,13 +899,13 @@ pub fn validate_posix_acl_access_structure(
                 has_named_entry = true;
             }
             ACL_MASK => {
-                if entry.id != 0 {
+                if !special_id_is_valid {
                     return Err(PosixAclStructureError::InvalidSpecialEntryId);
                 }
                 mask_count += 1;
             }
             ACL_OTHER => {
-                if entry.id != 0 {
+                if !special_id_is_valid {
                     return Err(PosixAclStructureError::InvalidSpecialEntryId);
                 }
                 other_count += 1;
@@ -981,13 +987,13 @@ pub fn apply_chmod_to_acl(acl: &[PosixAclEntry], new_mode: u32) -> PosixAcl {
     let owner_perm = ((new_mode >> 6) & 0x7) as u16;
     let group_perm = ((new_mode >> 3) & 0x7) as u16;
     let other_perm = (new_mode & 0x7) as u16;
-    let _has_acl_mask = find_entry(acl, ACL_MASK).is_some();
+    let has_acl_mask = find_entry(acl, ACL_MASK).is_some();
 
     acl.iter()
         .map(|e| {
             let perm = match e.tag {
                 ACL_USER_OBJ => owner_perm,
-                ACL_GROUP_OBJ => group_perm,
+                ACL_GROUP_OBJ if !has_acl_mask => group_perm,
                 ACL_OTHER => other_perm,
                 ACL_MASK => group_perm,
                 _ => e.perm, // named USER / GROUP unchanged
@@ -1020,14 +1026,15 @@ pub fn plan_posix_acl_mode_sync(
     let owner_perm = ((new_mode >> 6) & 0x7) as u16;
     let group_perm = ((new_mode >> 3) & 0x7) as u16;
     let other_perm = (new_mode & 0x7) as u16;
-    let _has_acl_mask = find_entry(acl, ACL_MASK).is_some();
+    let has_acl_mask = find_entry(acl, ACL_MASK).is_some();
     let mut updated_acl = Vec::with_capacity(acl.len());
     let mut changes = Vec::new();
 
     for (index, entry) in acl.iter().copied().enumerate() {
         let planned = match entry.tag {
             ACL_USER_OBJ => Some((PosixAclModeSyncTarget::UserObj, owner_perm)),
-            ACL_GROUP_OBJ => Some((PosixAclModeSyncTarget::GroupObj, group_perm)),
+            ACL_GROUP_OBJ if !has_acl_mask => Some((PosixAclModeSyncTarget::GroupObj, group_perm)),
+            ACL_GROUP_OBJ => None,
             ACL_MASK => Some((PosixAclModeSyncTarget::Mask, group_perm)),
             ACL_OTHER => Some((PosixAclModeSyncTarget::Other, other_perm)),
             ACL_USER | ACL_GROUP => None,
@@ -1580,7 +1587,7 @@ mod phase2_tests {
         let updated = apply_chmod_to_acl(&acl, 0o640);
         assert_eq!(updated[0].perm, 6); // USER_OBJ ← rw-
         assert_eq!(updated[1].perm, 5); // named USER unchanged
-        assert_eq!(updated[2].perm, 4); // GROUP_OBJ updated to group bits even when MASK exists
+        assert_eq!(updated[2].perm, 5); // GROUP_OBJ unchanged when MASK exists
         assert_eq!(updated[3].perm, 3); // named GROUP unchanged
         assert_eq!(updated[4].perm, 4); // MASK ← r--
         assert_eq!(updated[5].perm, 0); // OTHER ← ---
@@ -1721,7 +1728,7 @@ mod phase2_tests {
         assert_eq!(plan.group_perm, 4);
         assert_eq!(plan.other_perm, 0);
         assert_eq!(plan.updated_acl[0].perm, 6);
-        assert_eq!(plan.updated_acl[2].perm, 4);
+        assert_eq!(plan.updated_acl[2].perm, 5);
         assert_eq!(plan.updated_acl[4].perm, 4);
         assert_eq!(plan.updated_acl[5].perm, 0);
         assert_eq!(
@@ -1734,14 +1741,6 @@ mod phase2_tests {
                     target: PosixAclModeSyncTarget::UserObj,
                     old_perm: 7,
                     new_perm: 6,
-                },
-                PosixAclModeSyncChange {
-                    index: 2,
-                    tag: ACL_GROUP_OBJ,
-                    id: 0,
-                    target: PosixAclModeSyncTarget::GroupObj,
-                    old_perm: 5,
-                    new_perm: 4,
                 },
                 PosixAclModeSyncChange {
                     index: 4,
@@ -1916,7 +1915,7 @@ mod phase2_tests {
             find_posix_acl_entry(&plan.updated_acl, ACL_GROUP_OBJ)
                 .unwrap()
                 .perm,
-            4
+            7
         );
         assert_eq!(
             find_posix_acl_entry(&plan.updated_acl, ACL_MASK)
@@ -2203,6 +2202,30 @@ mod phase2_tests {
         ];
 
         assert_eq!(validate_posix_acl_access_structure(&acl), Ok(()));
+    }
+
+    #[test]
+    fn validate_access_structure_accepts_linux_undefined_special_ids() {
+        let acl = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 4,
+                id: ACL_UNDEFINED_ID,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 7,
+                id: ACL_UNDEFINED_ID,
+            },
+            PosixAclEntry {
+                tag: ACL_OTHER,
+                perm: 6,
+                id: ACL_UNDEFINED_ID,
+            },
+        ];
+
+        assert_eq!(validate_posix_acl_access_structure(&acl), Ok(()));
+        assert_eq!(posix_mode_from_access_acl(&acl, 0o100644), 0o100476);
     }
 
     #[test]
