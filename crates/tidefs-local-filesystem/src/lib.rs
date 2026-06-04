@@ -5424,6 +5424,10 @@ impl LocalFileSystem {
         self.write_buffer_config = config;
     }
 
+    pub fn set_write_buffer_flush_threshold_bytes(&mut self, bytes: usize) {
+        self.write_buffer_config.flush_threshold_bytes = bytes;
+    }
+
     pub fn read_from_write_buffer(
         &self,
         inode_id: InodeId,

@@ -1282,6 +1282,36 @@ fn fsync_triggers_buffer_flush() {
 }
 
 #[test]
+fn write_buffer_flush_threshold_setter_changes_autoflush_batch_size() {
+    let (mut fs, root) = wb_open_temp("flush-threshold-setter");
+    fs.set_write_buffer_flush_threshold_bytes(2 * 1024 * 1024);
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/batched.bin", 0o644).expect("create");
+    let data = vec![0x5a; 1024 * 1024];
+
+    fs.write_file("/batched.bin", 0, &data)
+        .expect("first chunk");
+    assert_eq!(
+        fs.stat("/batched.bin").expect("stat first").data_version,
+        record.data_version,
+        "first 1 MiB write must stay buffered below the 2 MiB threshold"
+    );
+
+    fs.write_file("/batched.bin", data.len() as u64, &data)
+        .expect("second chunk");
+    assert_eq!(
+        fs.stat("/batched.bin").expect("stat second").data_version,
+        record.data_version + 1,
+        "second 1 MiB write crosses the configured threshold and flushes once"
+    );
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn read_sees_buffered_data_before_flush() {
     let (mut fs, root) = wb_open_temp("read-sees-buffered");
     fs.set_write_buffer_config(WriteBufferConfig {

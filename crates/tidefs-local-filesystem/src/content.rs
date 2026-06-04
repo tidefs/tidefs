@@ -1107,37 +1107,78 @@ pub(crate) fn read_content_range_from_layout(
                 let in_chunk = usize::try_from(cursor % chunk_size)
                     .map_err(|_| FileSystemError::SizeOverflow { requested: cursor })?;
                 let chunk_ref = find_chunk_in_manifest(manifest, chunk_index);
-                let chunk_bytes: Vec<u8> = if let Some(chunk_ref) = chunk_ref {
+                if let Some(chunk_ref) = chunk_ref {
+                    let chunk_available = chunk_ref.len as usize;
+                    if chunk_ref.is_hole() {
+                        if in_chunk > chunk_available {
+                            return Err(FileSystemError::CorruptState {
+                                reason: "content range starts beyond hole chunk length",
+                            });
+                        }
+                        let take = remaining.min(chunk_available.saturating_sub(in_chunk));
+                        if take == 0 {
+                            return Err(FileSystemError::CorruptState {
+                                reason: "content range made no progress",
+                            });
+                        }
+                        out.resize(out.len() + take, 0);
+                        remaining -= take;
+                        cursor = cursor.checked_add(take as u64).ok_or(
+                            FileSystemError::SizeOverflow {
+                                requested: u64::MAX,
+                            },
+                        )?;
+                        continue;
+                    }
+
                     let chunk = read_content_chunk_from_store(store, manifest.inode_id, chunk_ref)?;
                     if in_chunk > chunk.bytes.len() {
                         return Err(FileSystemError::CorruptState {
                             reason: "content range starts beyond chunk length",
                         });
                     }
-                    chunk.bytes
+                    let take = remaining.min(chunk.bytes.len().saturating_sub(in_chunk));
+                    if take == 0 {
+                        return Err(FileSystemError::CorruptState {
+                            reason: "content range made no progress",
+                        });
+                    }
+                    out.extend_from_slice(&chunk.bytes[in_chunk..in_chunk + take]);
+                    remaining -= take;
+                    cursor =
+                        cursor
+                            .checked_add(take as u64)
+                            .ok_or(FileSystemError::SizeOverflow {
+                                requested: u64::MAX,
+                            })?;
                 } else {
                     let chunk_start = chunk_index.checked_mul(chunk_size).ok_or(
                         FileSystemError::SizeOverflow {
                             requested: u64::MAX,
                         },
                     )?;
-                    let remaining = manifest.file_size.saturating_sub(chunk_start);
-                    let chunk_len = remaining.min(chunk_size) as usize;
-                    vec![0u8; chunk_len]
-                };
-                let take = remaining.min(chunk_bytes.len().saturating_sub(in_chunk));
-                if take == 0 {
-                    return Err(FileSystemError::CorruptState {
-                        reason: "content range made no progress",
-                    });
+                    let chunk_remaining = manifest.file_size.saturating_sub(chunk_start);
+                    let chunk_len = chunk_remaining.min(chunk_size) as usize;
+                    if in_chunk > chunk_len {
+                        return Err(FileSystemError::CorruptState {
+                            reason: "content range starts beyond sparse chunk length",
+                        });
+                    }
+                    let take = remaining.min(chunk_len.saturating_sub(in_chunk));
+                    if take == 0 {
+                        return Err(FileSystemError::CorruptState {
+                            reason: "content range made no progress",
+                        });
+                    }
+                    out.resize(out.len() + take, 0);
+                    remaining -= take;
+                    cursor =
+                        cursor
+                            .checked_add(take as u64)
+                            .ok_or(FileSystemError::SizeOverflow {
+                                requested: u64::MAX,
+                            })?;
                 }
-                out.extend_from_slice(&chunk_bytes[in_chunk..in_chunk + take]);
-                remaining -= take;
-                cursor = cursor
-                    .checked_add(take as u64)
-                    .ok_or(FileSystemError::SizeOverflow {
-                        requested: u64::MAX,
-                    })?;
             }
             Ok(out)
         }
@@ -1397,4 +1438,56 @@ pub(crate) fn reflink_chunked_content(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_store(label: &str) -> LocalObjectStore {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-content-{label}-{nanos}-{}",
+            std::process::id()
+        ));
+        LocalObjectStore::open(root).expect("open temp object store")
+    }
+
+    #[test]
+    fn sparse_range_read_from_hole_ref_only_materializes_requested_bytes() {
+        let store = temp_store("hole-ref-range");
+        let layout = ContentLayout::Chunked(ContentManifestObject {
+            inode_id: InodeId::new(1),
+            data_version: 1,
+            file_size: u32::MAX as u64,
+            chunk_size: u32::MAX,
+            chunks: vec![ContentChunkRef::hole(0, u32::MAX)],
+        });
+
+        let bytes = read_content_range_from_layout(&store, &layout, u32::MAX as u64 - 1, 1)
+            .expect("read tail byte from sparse hole ref");
+
+        assert_eq!(bytes, vec![0]);
+    }
+
+    #[test]
+    fn sparse_range_read_from_missing_chunk_only_materializes_requested_bytes() {
+        let store = temp_store("missing-hole-range");
+        let layout = ContentLayout::Chunked(ContentManifestObject {
+            inode_id: InodeId::new(2),
+            data_version: 1,
+            file_size: u32::MAX as u64,
+            chunk_size: u32::MAX,
+            chunks: Vec::new(),
+        });
+
+        let bytes = read_content_range_from_layout(&store, &layout, u32::MAX as u64 - 1, 1)
+            .expect("read tail byte from implicit sparse chunk");
+
+        assert_eq!(bytes, vec![0]);
+    }
 }

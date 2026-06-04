@@ -66,6 +66,9 @@ use tidefs_types_posix_filesystem_adapter_core::{
 use crate::mount_options::MountOptions;
 use tidefs_dataset_lifecycle::SyncGuarantee;
 use tidefs_inode_attributes::timestamp::TimestampPolicy as EngineTimestampPolicy;
+
+const MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
+
 /// RAII guard that removes a PID file on drop (clean shutdown).
 /// On SIGKILL the guard never runs, leaving the PID file as validation.
 struct PidFileGuard(Option<PathBuf>);
@@ -296,6 +299,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("open store: {e}"))?;
+    lfs.set_write_buffer_flush_threshold_bytes(MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES);
 
     // Enable org.tidefs:dedup dataset feature when requested by the operator.
     if config.enable_dedup {
