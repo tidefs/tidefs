@@ -16,7 +16,6 @@ use tidefs_local_filesystem::{
 use tidefs_local_object_store::StoreOptions;
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
 
-
 // ---------------------------------------------------------------------------
 // Snapshot network transfer protocol (simple VFSSEND1 push/pull via VSNP)
 // ---------------------------------------------------------------------------
@@ -64,7 +63,11 @@ pub(crate) fn build_ack(message: &str) -> Vec<u8> {
 
 #[allow(dead_code)]
 
-pub(crate) fn build_block_push_message(block_data: &[u8], device_name: &str, auth_key: &[u8; 32]) -> Vec<u8> {
+pub(crate) fn build_block_push_message(
+    block_data: &[u8],
+    device_name: &str,
+    auth_key: &[u8; 32],
+) -> Vec<u8> {
     let name_bytes = device_name.as_bytes();
     let mut msg = Vec::with_capacity(4 + 1 + 4 + 32 + 4 + name_bytes.len() + 4 + block_data.len());
     msg.extend_from_slice(SNAP_NET_MAGIC);
@@ -130,16 +133,26 @@ pub(crate) fn parse_snap_net_message(data: &[u8]) -> Result<SnapNetMessage, Stri
     let kind = data[4];
     match kind {
         SNAP_KIND_PUSH => {
-            if data.len() < 9 + 4 { return Err("push too short".into()); }
+            if data.len() < 9 + 4 {
+                return Err("push too short".into());
+            }
             let key_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
-            if key_len != 32 { return Err(format!("push: key_len={key_len}, want 32")); }
-            if data.len() < 9 + 32 + 4 { return Err("push too short for key+export_len".into()); }
+            if key_len != 32 {
+                return Err(format!("push: key_len={key_len}, want 32"));
+            }
+            if data.len() < 9 + 32 + 4 {
+                return Err("push too short for key+export_len".into());
+            }
             let mut auth_key = [0u8; 32];
             auth_key.copy_from_slice(&data[9..9 + 32]);
             let export_len = u32::from_le_bytes(data[9 + 32..13 + 32].try_into().unwrap()) as usize;
             let start = 13 + 32;
             if data.len() < start + export_len {
-                return Err(format!("push: need {} bytes, got {}", start + export_len, data.len()));
+                return Err(format!(
+                    "push: need {} bytes, got {}",
+                    start + export_len,
+                    data.len()
+                ));
             }
             Ok(SnapNetMessage::Push {
                 auth_key,
@@ -147,16 +160,24 @@ pub(crate) fn parse_snap_net_message(data: &[u8]) -> Result<SnapNetMessage, Stri
             })
         }
         SNAP_KIND_PULL_REQUEST => {
-            if data.len() < 9 + 4 { return Err("pull_request too short".into()); }
+            if data.len() < 9 + 4 {
+                return Err("pull_request too short".into());
+            }
             let key_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
-            if key_len != 32 { return Err(format!("pull_request: key_len={key_len}")); }
-            if data.len() < 9 + 32 { return Err("pull_request too short for key".into()); }
+            if key_len != 32 {
+                return Err(format!("pull_request: key_len={key_len}"));
+            }
+            if data.len() < 9 + 32 {
+                return Err("pull_request too short for key".into());
+            }
             let mut auth_key = [0u8; 32];
             auth_key.copy_from_slice(&data[9..9 + 32]);
             Ok(SnapNetMessage::PullRequest { auth_key })
         }
         SNAP_KIND_PULL_RESPONSE => {
-            if data.len() < 9 + 4 { return Err("pull_response too short".into()); }
+            if data.len() < 9 + 4 {
+                return Err("pull_response too short".into());
+            }
             let export_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
             let start = 9;
             if data.len() < start + export_len {
@@ -167,18 +188,25 @@ pub(crate) fn parse_snap_net_message(data: &[u8]) -> Result<SnapNetMessage, Stri
             })
         }
         SNAP_KIND_BLOCK_PULL_RESPONSE => {
-            if data.len() < 9 + 4 { return Err("block_pull_response too short".into()); }
+            if data.len() < 9 + 4 {
+                return Err("block_pull_response too short".into());
+            }
             let data_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
             let start = 9;
             if data.len() < start + data_len {
-                return Err(format!("block_pull_response: need {} bytes", start + data_len));
+                return Err(format!(
+                    "block_pull_response: need {} bytes",
+                    start + data_len
+                ));
             }
             Ok(SnapNetMessage::PullResponse {
                 export: data[start..start + data_len].to_vec(),
             })
         }
         _ => {
-            if data.len() < 9 + 4 { return Err("response too short".into()); }
+            if data.len() < 9 + 4 {
+                return Err("response too short".into());
+            }
             let msg_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
             let start = 9;
             if data.len() < start + msg_len {
@@ -363,7 +391,11 @@ pub struct SnapshotSendArgs {
     pub output: Option<PathBuf>,
 
     /// Push the stream to a remote storage-node via transport.
-    #[arg(long = "target-addr", requires = "node_id", requires = "server_node_id")]
+    #[arg(
+        long = "target-addr",
+        requires = "node_id",
+        requires = "server_node_id"
+    )]
     pub target_addr: Option<SocketAddr>,
 
     #[arg(long = "node-id", requires = "target-addr")]
@@ -406,7 +438,11 @@ pub struct SnapshotReceiveArgs {
     pub input: Option<PathBuf>,
 
     /// Pull a stream from a remote storage-node via transport.
-    #[arg(long = "source-addr", requires = "node_id", requires = "server_node_id")]
+    #[arg(
+        long = "source-addr",
+        requires = "node_id",
+        requires = "server_node_id"
+    )]
     pub source_addr: Option<SocketAddr>,
 
     #[arg(long = "node-id", requires = "source-addr")]
@@ -598,11 +634,13 @@ fn send_export_summary(export: &ChangedRecordExport) -> String {
     )
 }
 
-
 fn hex_to_bytes(hex_str: &str) -> Result<Vec<u8>, String> {
     let hex = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     if hex.len() % 2 != 0 {
-        return Err(format!("hex string must have even length, got {}", hex.len()));
+        return Err(format!(
+            "hex string must have even length, got {}",
+            hex.len()
+        ));
     }
     (0..hex.len())
         .step_by(2)
@@ -616,13 +654,15 @@ fn hex_to_bytes(hex_str: &str) -> Result<Vec<u8>, String> {
 fn parse_hex_128(hex_str: &str) -> Result<[u8; 16], String> {
     let bytes = hex_to_bytes(hex_str)?;
     if bytes.len() != 16 {
-        return Err(format!("expected 32 hex chars (16 bytes), got {} hex chars", hex_str.len()));
+        return Err(format!(
+            "expected 32 hex chars (16 bytes), got {} hex chars",
+            hex_str.len()
+        ));
     }
     let mut out = [0u8; 16];
     out.copy_from_slice(&bytes);
     Ok(out)
 }
-
 
 fn snapshot_backing_path(backing_dir: Option<&PathBuf>, pool: Option<&str>) -> PathBuf {
     match backing_dir {
@@ -638,7 +678,9 @@ fn parse_incremental_from_root(
     hex_key: &Option<String>,
     backing_path: &std::path::Path,
 ) -> Result<tidefs_local_filesystem::CommittedRootSummary, String> {
-    let hex = hex_key.as_deref().ok_or("--from-root required for incremental send")?;
+    let hex = hex_key
+        .as_deref()
+        .ok_or("--from-root required for incremental send")?;
     let key_bytes = hex_to_bytes(hex)?;
     if key_bytes.len() != 24 {
         return Err(format!(
@@ -653,7 +695,8 @@ fn parse_incremental_from_root(
     let audit = tidefs_local_filesystem::audit_recovery(backing_path, StoreOptions::default())
         .map_err(|e| format!("audit recovery: {e}"))?;
 
-    audit.valid_committed_roots
+    audit
+        .valid_committed_roots
         .iter()
         .find(|r| r.transaction_id == tid && r.generation == gen && r.superblock_checksum.0 == csum)
         .cloned()
@@ -778,10 +821,18 @@ fn handle_send(args: SnapshotSendArgs) {
 
     // Export: VFSSEND2 path or VFSSEND1 path, full or incremental.
     let encoded = if args.format == "vfssend2" {
-        let pool_id = parse_hex_128(args.pool_id.as_deref().unwrap_or("00000000000000000000000000000000"))
-            .unwrap_or([0u8; 16]);
-        let dataset_id = parse_hex_128(args.dataset_id.as_deref().unwrap_or("00000000000000000000000000000000"))
-            .unwrap_or([0u8; 16]);
+        let pool_id = parse_hex_128(
+            args.pool_id
+                .as_deref()
+                .unwrap_or("00000000000000000000000000000000"),
+        )
+        .unwrap_or([0u8; 16]);
+        let dataset_id = parse_hex_128(
+            args.dataset_id
+                .as_deref()
+                .unwrap_or("00000000000000000000000000000000"),
+        )
+        .unwrap_or([0u8; 16]);
 
         if args.incremental {
             let path = snapshot_backing_path(args.backing_dir.as_ref(), args.pool.as_deref());
@@ -872,7 +923,10 @@ fn handle_send(args: SnapshotSendArgs) {
         // Also write to local file if --output was given.
         if let Some(output) = &args.output {
             if let Err(err) = fs::write(output, &encoded) {
-                eprintln!("tidefsctl snapshot send: also wrote to {}: {err}", output.display());
+                eprintln!(
+                    "tidefsctl snapshot send: also wrote to {}: {err}",
+                    output.display()
+                );
             }
         }
         return;
@@ -888,7 +942,10 @@ fn handle_send(args: SnapshotSendArgs) {
     };
 
     if let Err(err) = fs::write(&output, &encoded) {
-        eprintln!("tidefsctl snapshot send: failed to write stream to {}: {err}", output.display());
+        eprintln!(
+            "tidefsctl snapshot send: failed to write stream to {}: {err}",
+            output.display()
+        );
         process::exit(1);
     }
 
@@ -928,13 +985,16 @@ fn handle_receive(args: SnapshotReceiveArgs) {
             }
         };
 
-        let export = match tidefs_local_filesystem::vfssend2_bridge::decode_any_stream_to_changed_records(&export_bytes) {
-            Ok(e) => e,
-            Err(err) => {
-                eprintln!("tidefsctl snapshot receive: decode from {addr}: {err}");
-                process::exit(1);
-            }
-        };
+        let export =
+            match tidefs_local_filesystem::vfssend2_bridge::decode_any_stream_to_changed_records(
+                &export_bytes,
+            ) {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!("tidefsctl snapshot receive: decode from {addr}: {err}");
+                    process::exit(1);
+                }
+            };
 
         let report =
             match LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
@@ -968,7 +1028,10 @@ fn handle_receive(args: SnapshotReceiveArgs) {
         // Also save to local file if --input was given.
         if let Some(input) = &args.input {
             if let Err(err) = fs::write(input, &export_bytes) {
-                eprintln!("tidefsctl snapshot receive: also saved to {}: {err}", input.display());
+                eprintln!(
+                    "tidefsctl snapshot receive: also saved to {}: {err}",
+                    input.display()
+                );
             }
         }
         return;
@@ -986,17 +1049,22 @@ fn handle_receive(args: SnapshotReceiveArgs) {
     let bytes = match fs::read(&input) {
         Ok(b) => b,
         Err(err) => {
-            eprintln!("tidefsctl snapshot receive: failed to read {}: {err}", input.display());
+            eprintln!(
+                "tidefsctl snapshot receive: failed to read {}: {err}",
+                input.display()
+            );
             process::exit(1);
         }
     };
-    let export = match tidefs_local_filesystem::vfssend2_bridge::decode_any_stream_to_changed_records(&bytes) {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("tidefsctl snapshot receive: decode: {err}");
-            process::exit(1);
-        }
-    };
+    let export =
+        match tidefs_local_filesystem::vfssend2_bridge::decode_any_stream_to_changed_records(&bytes)
+        {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("tidefsctl snapshot receive: decode: {err}");
+                process::exit(1);
+            }
+        };
     let report =
         match LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
             &args.backing_dir,
@@ -1096,7 +1164,8 @@ mod tests {
             SnapshotCommand::Create(_)
             | SnapshotCommand::List(_)
             | SnapshotCommand::Send(_)
-            | SnapshotCommand::Receive(_) | SnapshotCommand::Rollback(_) => {
+            | SnapshotCommand::Receive(_)
+            | SnapshotCommand::Rollback(_) => {
                 panic!("expected destroy command")
             }
         }

@@ -33,8 +33,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Notify;
 use tidefs_membership_epoch::MemberId;
+use tokio::sync::Notify;
 
 use crate::types::SessionId;
 

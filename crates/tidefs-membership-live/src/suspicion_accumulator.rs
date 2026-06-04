@@ -582,7 +582,10 @@ mod tests {
     #[test]
     fn validation_for_unknown_member_is_ignored() {
         let mut a = SuspicionAccumulator::new(SuspicionConfig::default());
-        a.record_validation(mid(999), SuspicionValidation::DirectPingFailure { round: 1 });
+        a.record_validation(
+            mid(999),
+            SuspicionValidation::DirectPingFailure { round: 1 },
+        );
         assert!(a.drain_events().is_empty());
     }
 
@@ -600,7 +603,10 @@ mod tests {
             .any(|e| matches!(e, SuspicionEvent::MemberFailed { .. })));
 
         // Additional validation should be ignored.
-        a.record_validation(mid(1), SuspicionValidation::DirectPingFailure { round: 100 });
+        a.record_validation(
+            mid(1),
+            SuspicionValidation::DirectPingFailure { round: 100 },
+        );
         assert!(a.drain_events().is_empty());
     }
 

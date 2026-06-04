@@ -168,7 +168,9 @@ pub enum SecurityError {
     #[error("unsupported security mode: {mode}")]
     UnsupportedMode { mode: u8 },
 
-    #[error("TLS peer identity missing: tcp_mtls requires a transport-provided peer certificate DN")]
+    #[error(
+        "TLS peer identity missing: tcp_mtls requires a transport-provided peer certificate DN"
+    )]
     TlsPeerIdentityMissing,
 }
 

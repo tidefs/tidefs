@@ -35,8 +35,8 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use tidefs_membership_epoch::{
-    EpochId, FailureDomainPlacementPolicy, FailureDomainRecord, MemberId,
-    StorageTier, StorageTierPolicy, VerdictClass,
+    EpochId, FailureDomainPlacementPolicy, FailureDomainRecord, MemberId, StorageTier,
+    StorageTierPolicy, VerdictClass,
 };
 use tidefs_placement_planner::{compute_replica_target_set, PlacementError, TierGoal};
 use tidefs_rebuild_planner::{CapacityRebalanceSkew, RebuildPlanner};
@@ -825,12 +825,12 @@ mod tests {
 
     #[test]
     fn rebalance_tiering_filters_by_target_tier() {
+        use tidefs_membership_epoch::EpochId;
         use tidefs_membership_epoch::{
-            DomainId, FailureDomainClass, FailureDomainRecord, HealthClass,
-            AntiAffinityClass, StorageTier, StorageTierPolicy, ReceiptId,
+            AntiAffinityClass, DomainId, FailureDomainClass, FailureDomainRecord, HealthClass,
+            ReceiptId, StorageTier, StorageTierPolicy,
         };
         use tidefs_placement_planner::{compute_replica_target_set, PlacementError, TierGoal};
-        use tidefs_membership_epoch::EpochId;
 
         let nvme_domain = DomainId::new(1);
         let hdd_domain = DomainId::new(2);
@@ -863,31 +863,36 @@ mod tests {
         let epoch = EpochId::new(1);
 
         // Tier-unconstrained: both domains qualify
-        let policy = FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Device);
+        let policy =
+            FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Device);
         let plan = compute_replica_target_set(&policy, &domains, TierGoal::Primary, epoch).unwrap();
         assert!(!plan.selected_member_refs.is_empty());
 
         // NVMe tier: only NVMe qualifiers
         let mut nvme_policy = policy;
         nvme_policy.target_tier = Some(StorageTier::NvmePerformance);
-        let plan = compute_replica_target_set(&nvme_policy, &domains, TierGoal::Primary, epoch).unwrap();
+        let plan =
+            compute_replica_target_set(&nvme_policy, &domains, TierGoal::Primary, epoch).unwrap();
         assert!(plan.selected_member_refs.iter().all(|m| m.0 == 10));
 
         // HDD tier: only HDD qualifiers
         let mut hdd_policy = policy;
         hdd_policy.target_tier = Some(StorageTier::HddArchive);
-        let plan = compute_replica_target_set(&hdd_policy, &domains, TierGoal::Primary, epoch).unwrap();
+        let plan =
+            compute_replica_target_set(&hdd_policy, &domains, TierGoal::Primary, epoch).unwrap();
         assert!(plan.selected_member_refs.iter().all(|m| m.0 == 20));
 
         // Missing tier: NoMatchingTier error
         let mut missing_policy = policy;
         missing_policy.target_tier = Some(StorageTier::SsdCapacity);
-        let err = compute_replica_target_set(&missing_policy, &domains, TierGoal::Primary, epoch).unwrap_err();
+        let err = compute_replica_target_set(&missing_policy, &domains, TierGoal::Primary, epoch)
+            .unwrap_err();
         assert!(matches!(err, PlacementError::NoMatchingTier));
 
         // RebalancePlanner tiered_placement_policy
         let planner = RebalancePlanner::default_for_epoch(epoch);
-        let base = FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Device);
+        let base =
+            FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Device);
         let result = planner.tiered_placement_policy(&base, None);
         assert_eq!(result.target_tier, None);
         let result = planner.tiered_placement_policy(&base, Some(StorageTier::NvmePerformance));

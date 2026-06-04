@@ -7,8 +7,8 @@
 mod common;
 
 use common::{
-    build_cache, build_live_lifecycle, standard_geometry, timed, CharterClause, ValidationLane,
-    HarnessContext, HarnessProfile, ReleaseGate,
+    build_cache, build_live_lifecycle, standard_geometry, timed, CharterClause, HarnessContext,
+    HarnessProfile, ReleaseGate, ValidationLane,
 };
 use std::env;
 use std::fs;

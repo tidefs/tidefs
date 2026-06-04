@@ -20,13 +20,10 @@ use tidefs_cluster::pool_lease_client::ClusterLeaseClient;
 use tidefs_cluster::pool_lease_token::PoolLeaseToken;
 use tidefs_cluster::pool_protocol::ClusterPoolLeaseRequest;
 use tidefs_cluster::pool_protocol::{
-    CatalogQueryType, ClusterPoolCatalogDeltaRequest,
-    ClusterPoolCatalogQueryRequest, ClusterPoolCreateRequest,
-    ClusterPoolMessage, NodeDeviceSpec,
+    CatalogQueryType, ClusterPoolCatalogDeltaRequest, ClusterPoolCatalogQueryRequest,
+    ClusterPoolCreateRequest, ClusterPoolMessage, NodeDeviceSpec,
 };
-use tidefs_cluster::{
-    ClusterLeaseConfig, LossEvent, PlacementHealCoordinator, PlacementMap,
-};
+use tidefs_cluster::{ClusterLeaseConfig, LossEvent, PlacementHealCoordinator, PlacementMap};
 use tidefs_membership_epoch::HealthClass;
 use tidefs_storage_node::server::{StorageNode, StorageNodeConfig};
 
@@ -252,16 +249,8 @@ fn cluster_full_flow_create_lease_catalog_heal() {
         placement: ClusterPlacementPolicy::Stripe,
     };
 
-    send_cp01(
-        &mut client,
-        sid1,
-        &ClusterPoolMessage::CreateRequest(req1),
-    );
-    send_cp01(
-        &mut client,
-        sid2,
-        &ClusterPoolMessage::CreateRequest(req2),
-    );
+    send_cp01(&mut client, sid1, &ClusterPoolMessage::CreateRequest(req1));
+    send_cp01(&mut client, sid2, &ClusterPoolMessage::CreateRequest(req2));
 
     let resp1 = recv_cp01(&mut client, sid1, 100);
     let resp2 = recv_cp01(&mut client, sid2, 100);
@@ -276,9 +265,7 @@ fn cluster_full_flow_create_lease_catalog_heal() {
             assert_eq!(r1.device_guids.len(), 1);
             assert_eq!(r2.device_guids.len(), 1);
         }
-        _ => panic!(
-            "unexpected responses: resp1={resp1:?}, resp2={resp2:?}"
-        ),
+        _ => panic!("unexpected responses: resp1={resp1:?}, resp2={resp2:?}"),
     }
 
     // -- Phase 2: Verify pool labels via scan --
@@ -302,7 +289,11 @@ fn cluster_full_flow_create_lease_catalog_heal() {
         pool_guid,
         requesting_node_id: 9990,
     };
-    send_cp01(&mut client, sid1, &ClusterPoolMessage::LeaseRequest(lease_req));
+    send_cp01(
+        &mut client,
+        sid1,
+        &ClusterPoolMessage::LeaseRequest(lease_req),
+    );
     let lease_resp = recv_cp01(&mut client, sid1, 100);
     match lease_resp {
         Some(ClusterPoolMessage::LeaseResponse(ref resp)) => {
@@ -311,7 +302,10 @@ fn cluster_full_flow_create_lease_catalog_heal() {
                     match bincode::deserialize::<PoolLeaseToken>(token_bytes) {
                         Ok(token) => {
                             assert_eq!(token.node_id, 1, "lease must be from node 1");
-                            assert!(token.authorizes_pool(&pool_guid), "token must authorize pool");
+                            assert!(
+                                token.authorizes_pool(&pool_guid),
+                                "token must authorize pool"
+                            );
                             eprintln!(
                                 "[test] lease OK via session: node={} epoch={} lease_id={}",
                                 token.node_id, token.epoch.0, token.lease_id
@@ -486,11 +480,7 @@ fn cluster_no_lease_config_lifecycle() {
         }],
         placement: ClusterPlacementPolicy::Stripe,
     };
-    send_cp01(
-        &mut client,
-        sid,
-        &ClusterPoolMessage::CreateRequest(req),
-    );
+    send_cp01(&mut client, sid, &ClusterPoolMessage::CreateRequest(req));
     let create_resp = recv_cp01(&mut client, sid, 100);
     match create_resp {
         Some(ClusterPoolMessage::CreateResponse(ref r)) => {
@@ -554,11 +544,7 @@ fn cluster_full_flow_mirror_create_and_verify() {
             }],
             placement: ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 },
         };
-        send_cp01(
-            &mut client,
-            sid,
-            &ClusterPoolMessage::CreateRequest(req),
-        );
+        send_cp01(&mut client, sid, &ClusterPoolMessage::CreateRequest(req));
     }
 
     let mut successes = 0u32;
@@ -575,8 +561,7 @@ fn cluster_full_flow_mirror_create_and_verify() {
 
     // Verify all labels.
     let device_paths: Vec<PathBuf> = vec![dev0.clone(), dev1.clone(), dev2.clone()];
-    let scan_results =
-        tidefs_pool_scan::scan_labels(&device_paths).expect("scan labels");
+    let scan_results = tidefs_pool_scan::scan_labels(&device_paths).expect("scan labels");
     assert_eq!(scan_results.len(), 3);
     for r in &scan_results {
         assert!(r.label_valid, "label must be valid: {}", r.label_status);
@@ -673,10 +658,17 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
         }],
         placement: ClusterPlacementPolicy::Stripe,
     };
-    send_cp01(&mut client, sid, &ClusterPoolMessage::CreateRequest(create_req));
+    send_cp01(
+        &mut client,
+        sid,
+        &ClusterPoolMessage::CreateRequest(create_req),
+    );
     let resp = recv_cp01(&mut client, sid, 100);
     let pre_ok = matches!(&resp, Some(ClusterPoolMessage::CreateResponse(r)) if r.success);
-    assert!(pre_ok, "Phase 1 (pre-fence): create must succeed, got: {resp:?}");
+    assert!(
+        pre_ok,
+        "Phase 1 (pre-fence): create must succeed, got: {resp:?}"
+    );
     eprintln!("[partition-fence] Phase 1 PASS: pre-fence create succeeds");
 
     // Close and stop the session to force a new session context on reconnect.
@@ -730,7 +722,11 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
         }],
         placement: ClusterPlacementPolicy::Stripe,
     };
-    send_cp01(&mut client2, sid2, &ClusterPoolMessage::CreateRequest(create_req2));
+    send_cp01(
+        &mut client2,
+        sid2,
+        &ClusterPoolMessage::CreateRequest(create_req2),
+    );
     let resp2 = recv_cp01(&mut client2, sid2, 100);
     match &resp2 {
         Some(ClusterPoolMessage::CreateResponse(r)) => {
@@ -786,10 +782,17 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
         }],
         placement: ClusterPlacementPolicy::Stripe,
     };
-    send_cp01(&mut client3, sid3, &ClusterPoolMessage::CreateRequest(create_req3));
+    send_cp01(
+        &mut client3,
+        sid3,
+        &ClusterPoolMessage::CreateRequest(create_req3),
+    );
     let resp3 = recv_cp01(&mut client3, sid3, 100);
     let post_ok = matches!(&resp3, Some(ClusterPoolMessage::CreateResponse(r)) if r.success);
-    assert!(post_ok, "Phase 3 (healed): create must succeed, got: {resp3:?}");
+    assert!(
+        post_ok,
+        "Phase 3 (healed): create must succeed, got: {resp3:?}"
+    );
     eprintln!("[partition-fence] Phase 3 PASS: post-heal create succeeds");
 
     drop(client3);

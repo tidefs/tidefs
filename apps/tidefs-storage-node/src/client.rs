@@ -329,18 +329,23 @@ pub fn run_client(
             }
         }
         "snapshot-create" => {
-            let name = args.first().cloned()
+            let name = args
+                .first()
+                .cloned()
                 .ok_or("usage: snapshot-create <snapshot-name>")?;
             let resp = request(
                 node_id,
                 server_node_id,
                 server_addr,
-                Frame::SnapshotCreate { snapshot_name: name },
+                Frame::SnapshotCreate {
+                    snapshot_name: name,
+                },
                 rdma,
             )?;
             match resp {
                 Frame::SnapshotCreateResponse { summary_json } => {
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), summary_json.as_bytes());
+                    let _ =
+                        std::io::Write::write_all(&mut std::io::stdout(), summary_json.as_bytes());
                     let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
                 }
                 Frame::Error { message } => return Err(format!("server error: {message}")),
@@ -348,18 +353,23 @@ pub fn run_client(
             }
         }
         "snapshot-destroy" => {
-            let name = args.first().cloned()
+            let name = args
+                .first()
+                .cloned()
                 .ok_or("usage: snapshot-destroy <snapshot-name>")?;
             let resp = request(
                 node_id,
                 server_node_id,
                 server_addr,
-                Frame::SnapshotDestroy { snapshot_name: name },
+                Frame::SnapshotDestroy {
+                    snapshot_name: name,
+                },
                 rdma,
             )?;
             match resp {
                 Frame::SnapshotDestroyResponse { summary_json } => {
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), summary_json.as_bytes());
+                    let _ =
+                        std::io::Write::write_all(&mut std::io::stdout(), summary_json.as_bytes());
                     let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
                 }
                 Frame::Error { message } => return Err(format!("server error: {message}")),
@@ -367,18 +377,23 @@ pub fn run_client(
             }
         }
         "snapshot-rollback" => {
-            let name = args.first().cloned()
+            let name = args
+                .first()
+                .cloned()
                 .ok_or("usage: snapshot-rollback <snapshot-name>")?;
             let resp = request(
                 node_id,
                 server_node_id,
                 server_addr,
-                Frame::SnapshotRollback { snapshot_name: name },
+                Frame::SnapshotRollback {
+                    snapshot_name: name,
+                },
                 rdma,
             )?;
             match resp {
                 Frame::SnapshotRollbackResponse { report_json } => {
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), report_json.as_bytes());
+                    let _ =
+                        std::io::Write::write_all(&mut std::io::stdout(), report_json.as_bytes());
                     let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
                 }
                 Frame::Error { message } => return Err(format!("server error: {message}")),
@@ -387,7 +402,8 @@ pub fn run_client(
         }
         "send-chunked" => {
             let key = if args.first().map(|s| s.as_str()) == Some("--incremental") {
-                let hex = args.get(1)
+                let hex = args
+                    .get(1)
                     .ok_or("usage: send-chunked [--incremental <hex-key-48-chars>]")?;
                 if hex.len() != 48 {
                     return Err("--incremental key must be 48 hex characters (24 bytes)".into());
@@ -406,7 +422,11 @@ pub fn run_client(
                 };
                 let resp = request(node_id, server_node_id, server_addr, frame, rdma)?;
                 match resp {
-                    Frame::SendChunkedResponse { chunk, cursor: c, more } => {
+                    Frame::SendChunkedResponse {
+                        chunk,
+                        cursor: c,
+                        more,
+                    } => {
                         all_chunks.extend_from_slice(&chunk);
                         cursor = Some(c);
                         if !more {
@@ -414,7 +434,11 @@ pub fn run_client(
                             break;
                         }
                     }
-                    Frame::SendResumeResponse { chunk, cursor: c, more } => {
+                    Frame::SendResumeResponse {
+                        chunk,
+                        cursor: c,
+                        more,
+                    } => {
                         all_chunks.extend_from_slice(&chunk);
                         cursor = Some(c);
                         if !more {
@@ -428,10 +452,12 @@ pub fn run_client(
             }
         }
         "send-resume" => {
-            let cursor_hex = args.first().cloned()
+            let cursor_hex = args
+                .first()
+                .cloned()
                 .ok_or("usage: send-resume <cursor-hex>")?;
-            let cursor = hex::decode(&cursor_hex)
-                .map_err(|e| format!("invalid cursor hex: {e}"))?;
+            let cursor =
+                hex::decode(&cursor_hex).map_err(|e| format!("invalid cursor hex: {e}"))?;
             let resp = request(
                 node_id,
                 server_node_id,
@@ -440,7 +466,11 @@ pub fn run_client(
                 rdma,
             )?;
             match resp {
-                Frame::SendResumeResponse { chunk, cursor: _c, more: _ } => {
+                Frame::SendResumeResponse {
+                    chunk,
+                    cursor: _c,
+                    more: _,
+                } => {
                     let _ = std::io::Write::write_all(&mut std::io::stdout(), &chunk);
                 }
                 Frame::Error { message } => return Err(format!("server error: {message}")),
@@ -448,20 +478,28 @@ pub fn run_client(
             }
         }
         "snapshot-clone" => {
-            let clone_name = args.first().cloned()
+            let clone_name = args
+                .first()
+                .cloned()
                 .ok_or("usage: snapshot-clone <clone-name> <source-snapshot>")?;
-            let source = args.get(1).cloned()
+            let source = args
+                .get(1)
+                .cloned()
                 .ok_or("usage: snapshot-clone <clone-name> <source-snapshot>")?;
             let resp = request(
                 node_id,
                 server_node_id,
                 server_addr,
-                Frame::SnapshotClone { clone_name, source_snapshot: source },
+                Frame::SnapshotClone {
+                    clone_name,
+                    source_snapshot: source,
+                },
                 rdma,
             )?;
             match resp {
                 Frame::SnapshotCloneResponse { summary_json } => {
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), summary_json.as_bytes());
+                    let _ =
+                        std::io::Write::write_all(&mut std::io::stdout(), summary_json.as_bytes());
                     let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
                 }
                 Frame::Error { message } => return Err(format!("server error: {message}")),

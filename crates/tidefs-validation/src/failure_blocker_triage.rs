@@ -460,9 +460,9 @@ impl FailureBlockerTriage {
                     .copied()
                     .collect();
 
-                all_tokens.iter().any(|token| {
-                    title_lower.contains(token) || domain_label.contains(token)
-                })
+                all_tokens
+                    .iter()
+                    .any(|token| title_lower.contains(token) || domain_label.contains(token))
             })
             .cloned()
             .collect();

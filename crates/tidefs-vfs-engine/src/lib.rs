@@ -1296,7 +1296,6 @@ pub trait VfsEngine {
         })
     }
 
-
     /// Look up extent map entries for `inode` in the given logical range.
     ///
     /// Returns [`tidefs_types_extent_map_core::ExtentMapEntryV2`] entries that

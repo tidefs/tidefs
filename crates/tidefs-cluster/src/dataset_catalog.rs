@@ -38,8 +38,8 @@
 use serde::{Deserialize, Serialize};
 
 use tidefs_dataset_catalog::{
-    CatalogError, DatasetCatalog, DatasetChildDetails, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
-    LifecycleState,
+    CatalogError, DatasetCatalog, DatasetChildDetails, DatasetFlags, DatasetId, DatasetType,
+    LifecycleState, SyncGuarantee,
 };
 
 use crate::write_fence::WriteFence;
@@ -1020,7 +1020,7 @@ mod tests {
                 42,
                 empty_props(),
                 DatasetFlags::default_create(),
-                            ),
+            ),
         );
         assert_eq!(result, Err(ClusterCatalogError::NotLeaseHolder));
     }
@@ -1038,7 +1038,7 @@ mod tests {
                 42,
                 empty_props(),
                 DatasetFlags::default_create(),
-                            ),
+            ),
         );
         assert_eq!(result, Err(ClusterCatalogError::FenceMismatch));
     }
@@ -1057,7 +1057,7 @@ mod tests {
                 42,
                 empty_props(),
                 DatasetFlags::default_create(),
-                            ),
+            ),
         );
         assert_eq!(result, Err(ClusterCatalogError::NotLeaseHolder));
     }
@@ -1077,7 +1077,7 @@ mod tests {
                 1,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         cat.on_lease_lost();
@@ -1098,7 +1098,7 @@ mod tests {
                 100,
                 empty_props(),
                 DatasetFlags::default_create(),
-                            ),
+            ),
         )
         .unwrap();
         assert!(cat.contains("pool/fs1"));
@@ -1119,7 +1119,7 @@ mod tests {
                 200,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         assert!(cat.contains("pool/leaf"));
@@ -1141,7 +1141,7 @@ mod tests {
                 300,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         cat.create(
@@ -1153,7 +1153,7 @@ mod tests {
                 301,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         let result = cat.destroy(&f, "pool/parent");
@@ -1180,7 +1180,7 @@ mod tests {
                 400,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         cat.rename(&f, "pool/orig", "pool/renamed").unwrap();
@@ -1204,7 +1204,7 @@ mod tests {
                 500,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         cat.create(
@@ -1216,7 +1216,7 @@ mod tests {
                 501,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         let result = cat.rename(&f, "pool/a", "pool/b");
@@ -1242,7 +1242,7 @@ mod tests {
                 600,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         cat.transition_to_destroying(&f, "pool/ds").unwrap();
@@ -1266,7 +1266,7 @@ mod tests {
                 700,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         cat.transition_to_destroying(&f, "pool/ds2").unwrap();
@@ -1302,7 +1302,7 @@ mod tests {
                 100,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         cat.create(
@@ -1314,7 +1314,7 @@ mod tests {
                 101,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         cat.on_lease_lost();
@@ -1342,7 +1342,7 @@ mod tests {
                 800,
                 empty_props(),
                 DatasetFlags::default_create(),
-                            ),
+            ),
         )
         .unwrap();
         cat.create(
@@ -1354,7 +1354,7 @@ mod tests {
                 801,
                 empty_props(),
                 DatasetFlags::READONLY,
-                            ),
+            ),
         )
         .unwrap();
         cat.transition_to_destroying(&f, "pool/fs1").unwrap();
@@ -1465,7 +1465,7 @@ mod tests {
                 200,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
 
@@ -1490,7 +1490,7 @@ mod tests {
                 300,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
 
@@ -1522,7 +1522,7 @@ mod tests {
                 400,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
 
@@ -1606,7 +1606,7 @@ mod tests {
                 1,
                 vec![],
                 DatasetFlags::NONE,
-                            ),
+            ),
         );
         assert_eq!(result, Err(ClusterCatalogError::NotLeaseHolder));
     }
@@ -1625,7 +1625,7 @@ mod tests {
                 1,
                 vec![],
                 DatasetFlags::NONE,
-                            ),
+            ),
         );
         assert_eq!(result, Err(ClusterCatalogError::FenceMismatch));
     }
@@ -1786,7 +1786,7 @@ mod tests {
                 100,
                 empty_props(),
                 DatasetFlags::NONE,
-                            ),
+            ),
         )
         .unwrap();
         cat.on_lease_lost();

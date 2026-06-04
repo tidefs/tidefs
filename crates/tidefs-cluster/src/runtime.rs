@@ -26,10 +26,11 @@ use crate::dataset_catalog::{
     DatasetCreateRequest,
 };
 use crate::lease_state_machine::LeaseStateMachine;
-use crate::pool_config::{ClusterPlacementPolicy, ClusterPoolConfig, FailureDomain};
 use crate::placement_heal::{
     HealState, HealStats, LossEvent, PlacementHealCoordinator, PlacementMap,
 };
+use crate::pool_config::{ClusterPlacementPolicy, ClusterPoolConfig, FailureDomain};
+use crate::pool_lease_token::PoolLeaseToken;
 use crate::protocol::MembershipLeaseMessage;
 use crate::rebuild_backfill::{
     BackfillBatch, BackfillError, BackfillState, RebuildBackfillInitiator, RebuildPlan,
@@ -37,7 +38,6 @@ use crate::rebuild_backfill::{
 use crate::types::{LeaseState, LeaseStatus, MembershipLease};
 use crate::write_fence::FenceAuthority;
 use crate::write_fence::FenceValidator;
-use crate::pool_lease_token::PoolLeaseToken;
 use crate::write_fence::WriteFence;
 
 /// The direction a message is traveling.
@@ -158,21 +158,16 @@ impl ClusterLeaseRuntime {
     /// and voter knowledge.
 
     pub fn with_authority_snapshot(
-
         mut self,
 
         snapshot: &crate::cluster_authority_snapshot::ClusterAuthoritySnapshot,
-
     ) -> Self {
-
         let authority = LeaseAuthority::from_snapshot(snapshot);
 
         self.authority = Some(authority);
 
         self
-
     }
-
 
     pub fn with_authority(mut self, authority: LeaseAuthority) -> Self {
         self.authority = Some(authority);
@@ -206,10 +201,7 @@ impl ClusterLeaseRuntime {
     /// Register per-member failure-domain vectors for the heal coordinator.
     ///
     /// Delegates to [`PlacementHealCoordinator::with_member_failure_domains`].
-    pub fn with_member_failure_domains(
-        mut self,
-        domains: BTreeMap<u64, FailureDomain>,
-    ) -> Self {
+    pub fn with_member_failure_domains(mut self, domains: BTreeMap<u64, FailureDomain>) -> Self {
         self.heal_coordinator = self.heal_coordinator.with_member_failure_domains(domains);
         self
     }
@@ -250,9 +242,16 @@ impl ClusterLeaseRuntime {
         &mut self,
         dataset_id: u64,
     ) -> Result<crate::client_mode::ClientMode, crate::client_mode::ModeTransitionError> {
-        self.client_mode_tracker.register(dataset_id, self.node_id)?;
-        if let Some(fence) = self.fence_authority.as_ref().and_then(|fa| fa.active_fence()) {
-            let _ = self.client_mode_tracker.set_writer(dataset_id, self.node_id, fence);
+        self.client_mode_tracker
+            .register(dataset_id, self.node_id)?;
+        if let Some(fence) = self
+            .fence_authority
+            .as_ref()
+            .and_then(|fa| fa.active_fence())
+        {
+            let _ = self
+                .client_mode_tracker
+                .set_writer(dataset_id, self.node_id, fence);
         }
         Ok(self.client_mode_tracker.active_mode(dataset_id).unwrap())
     }
@@ -267,7 +266,8 @@ impl ClusterLeaseRuntime {
         if self.client_mode_tracker.active_mode(dataset_id).is_none() {
             self.register_client_dataset(dataset_id)?;
         }
-        self.client_mode_tracker.client_mounted(dataset_id, remote_node_id)
+        self.client_mode_tracker
+            .client_mounted(dataset_id, remote_node_id)
     }
 
     /// Record that a remote node has unmounted the given dataset.
@@ -276,13 +276,12 @@ impl ClusterLeaseRuntime {
         dataset_id: u64,
         remote_node_id: u64,
     ) -> Result<crate::client_mode::ClientMode, crate::client_mode::ModeTransitionError> {
-        self.client_mode_tracker.client_unmounted(dataset_id, remote_node_id)
+        self.client_mode_tracker
+            .client_unmounted(dataset_id, remote_node_id)
     }
 
     /// Return a reference to the client mode tracker.
-    pub fn client_mode_tracker(
-        &self,
-    ) -> &crate::client_mode::ClientModeTracker {
+    pub fn client_mode_tracker(&self) -> &crate::client_mode::ClientModeTracker {
         &self.client_mode_tracker
     }
     /// Return the current lease state.

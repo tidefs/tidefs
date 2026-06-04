@@ -32,13 +32,13 @@ use crate::device_health::{DeviceHealth, DeviceHealthState, DeviceHealthTransiti
 use crate::device_layout::{
     DeviceClassPolicy, DeviceLayoutStats, DeviceMediaClass, WriteAllocator,
 };
+use crate::device_manager::{DeviceManager, SparePolicy};
 use crate::io_scheduler::IoClass as SchedClass;
 use crate::log_device::LogDeviceWriter;
 use crate::{
     LocalObjectStore, ObjectKey, ObjectLocation, Result, ScrubStats, StoreError, StoreOptions,
     StoreRetentionCompactionReport, StoreStats, StoredObject,
 };
-use crate::device_manager::{DeviceManager, SparePolicy};
 use tidefs_block_allocator::{BlockAllocator, BlockId, TrimRequest};
 use tidefs_space_accounting::{PoolCounters, StatfsResult};
 
@@ -388,9 +388,8 @@ impl Pool {
 
         // Generate a random pool GUID for persistent identity.
         let pool_guid: [u8; 16] = rand::random();
-        let device_guids: Vec<[u8; 16]> = (0..config.devices.len())
-            .map(|_| rand::random())
-            .collect();
+        let device_guids: Vec<[u8; 16]> =
+            (0..config.devices.len()).map(|_| rand::random()).collect();
 
         let classes: Vec<DeviceClass> = config.devices.iter().map(|vc| vc.class).collect();
         let class_map = build_class_map(&classes);
@@ -1190,20 +1189,29 @@ impl Pool {
         let new_device_guid: [u8; 16] = rand::random();
 
         // Collect existing device configs for label updates.
-        let existing_configs: Vec<DeviceConfig> = self.devices.iter().map(|d| {
-            DeviceConfig {
+        let existing_configs: Vec<DeviceConfig> = self
+            .devices
+            .iter()
+            .map(|d| DeviceConfig {
                 path: d.root().to_path_buf(),
                 media_class: Default::default(),
-                class: self.classes.get(
-                    self.devices.iter().position(|v| v.root() == d.root()).unwrap_or(0)
-                ).copied().unwrap_or(DeviceClass::Data),
+                class: self
+                    .classes
+                    .get(
+                        self.devices
+                            .iter()
+                            .position(|v| v.root() == d.root())
+                            .unwrap_or(0),
+                    )
+                    .copied()
+                    .unwrap_or(DeviceClass::Data),
                 kind: DeviceKind::Single {
                     path: d.root().to_path_buf(),
                 },
                 compression: None,
                 encryption: None,
-            }
-        }).collect();
+            })
+            .collect();
 
         // Add the device in-memory first.
         self.add_device(config.clone(), options)?;
@@ -1254,17 +1262,27 @@ impl Pool {
             })?;
 
         // Collect existing device configs.
-        let existing_configs: Vec<DeviceConfig> = self.devices.iter().map(|d| {
-            let idx = self.devices.iter().position(|v| v.root() == d.root()).unwrap_or(0);
-            DeviceConfig {
-                path: d.root().to_path_buf(),
-                media_class: Default::default(),
-                class: self.classes.get(idx).copied().unwrap_or(DeviceClass::Data),
-                kind: DeviceKind::Single { path: d.root().to_path_buf() },
-                compression: None,
-                encryption: None,
-            }
-        }).collect();
+        let existing_configs: Vec<DeviceConfig> = self
+            .devices
+            .iter()
+            .map(|d| {
+                let idx = self
+                    .devices
+                    .iter()
+                    .position(|v| v.root() == d.root())
+                    .unwrap_or(0);
+                DeviceConfig {
+                    path: d.root().to_path_buf(),
+                    media_class: Default::default(),
+                    class: self.classes.get(idx).copied().unwrap_or(DeviceClass::Data),
+                    kind: DeviceKind::Single {
+                        path: d.root().to_path_buf(),
+                    },
+                    compression: None,
+                    encryption: None,
+                }
+            })
+            .collect();
 
         // Delegate to DeviceManager for label persistence.
         let request = crate::device_manager::SpareActivationRequest {
@@ -1292,10 +1310,15 @@ impl Pool {
             self.media_classes[faulted_index] = spare_config.media_class;
         }
         if faulted_index < self.device_layout_stats.len() {
-            self.device_layout_stats[faulted_index] =
-                DeviceLayoutStats::with_segment_size(spare_config.media_class.default_segment_size());
+            self.device_layout_stats[faulted_index] = DeviceLayoutStats::with_segment_size(
+                spare_config.media_class.default_segment_size(),
+            );
         }
-        let total_bytes: Vec<u64> = self.devices.iter().map(|d| d.store().capacity_bytes()).collect();
+        let total_bytes: Vec<u64> = self
+            .devices
+            .iter()
+            .map(|d| d.store().capacity_bytes())
+            .collect();
         self.write_allocator = WriteAllocator::new(self.media_classes.clone(), total_bytes);
 
         self.health = compute_health(&self.devices);

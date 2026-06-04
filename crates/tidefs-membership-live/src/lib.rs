@@ -234,8 +234,8 @@ pub use session_binding::{
     SessionPolicy,
 };
 pub use suspicion_accumulator::{
-    SuspicionAccumulator, SuspicionConfig, SuspicionEvent, SuspicionValidation, SuspicionScore,
-    SuspicionState,
+    SuspicionAccumulator, SuspicionConfig, SuspicionEvent, SuspicionScore, SuspicionState,
+    SuspicionValidation,
 };
 pub use transport_bridge::{MembershipTransportBridge, TransportSessionManager};
 pub use transport_event_recorder::{

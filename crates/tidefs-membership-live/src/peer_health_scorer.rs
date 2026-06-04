@@ -28,8 +28,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::broadcast;
 use tidefs_membership_epoch::MemberId;
+use tokio::sync::broadcast;
 
 // ---------------------------------------------------------------------------
 // ScorerConfig

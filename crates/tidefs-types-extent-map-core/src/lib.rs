@@ -254,11 +254,7 @@ impl ExtentMapEntryV2 {
     /// are placeholders to be finalized by [`finalize_data`] after content
     /// is written and hashed.
     #[must_use]
-    pub fn new_pending_data(
-        logical_offset: u64,
-        length: u64,
-        locator_id: LocatorId,
-    ) -> Self {
+    pub fn new_pending_data(logical_offset: u64, length: u64, locator_id: LocatorId) -> Self {
         Self {
             logical_offset,
             length,

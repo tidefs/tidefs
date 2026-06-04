@@ -381,7 +381,12 @@ impl StateTransferSender {
         let full_checksum = compute_segment_checksum(payload);
 
         // Split into fixed-size chunks with per-chunk digests.
-        let chunks = split_into_chunks(self.config.epoch_id, segment_id, payload, self.config.chunk_size);
+        let chunks = split_into_chunks(
+            self.config.epoch_id,
+            segment_id,
+            payload,
+            self.config.chunk_size,
+        );
 
         Ok(SegmentChunkPlan {
             segment_id,
@@ -415,7 +420,12 @@ fn compute_segment_checksum(payload: &[u8]) -> [u8; DIGEST_SIZE] {
 
 /// Split segment payload into fixed-size chunks with domain-separated
 /// BLAKE3 per-chunk digests.
-fn split_into_chunks(epoch_id: u64, segment_id: u64, payload: &[u8], chunk_size: usize) -> Vec<SegmentChunk> {
+fn split_into_chunks(
+    epoch_id: u64,
+    segment_id: u64,
+    payload: &[u8],
+    chunk_size: usize,
+) -> Vec<SegmentChunk> {
     let total_size = payload.len() as u64;
     if payload.is_empty() {
         return vec![new_segment_chunk(epoch_id, segment_id, 0, 0, vec![], true)];
@@ -1394,19 +1404,27 @@ mod tests {
     fn receiver_rejects_zero_epoch_chunk() {
         let mut receiver = StateTransferReceiver::new(7);
         let chunk = SegmentChunk::new(
-            0,                                // epoch_id = 0 (stale)
-            1,                                // object_id = 1
-            0,                                // offset
-            10,                               // total_size
-            b"test data".to_vec(),            // payload
-            true,                             // is_last
+            0,                     // epoch_id = 0 (stale)
+            1,                     // object_id = 1
+            0,                     // offset
+            10,                    // total_size
+            b"test data".to_vec(), // payload
+            true,                  // is_last
         );
         let offer = SegmentOffer::new(1, chunk.payload_digest, 10);
         receiver.accept_offer(offer).unwrap();
         let err = receiver.accept_chunk(&chunk).unwrap_err();
         assert!(
-            matches!(err, SegmentTransferError::EpochMismatch { expected: 7, got: 0, .. }),
-            "expected EpochMismatch with expected=7 got=0, got {:?}", err
+            matches!(
+                err,
+                SegmentTransferError::EpochMismatch {
+                    expected: 7,
+                    got: 0,
+                    ..
+                }
+            ),
+            "expected EpochMismatch with expected=7 got=0, got {:?}",
+            err
         );
     }
 
@@ -1415,7 +1433,7 @@ mod tests {
     fn receiver_rejects_stale_epoch_chunk() {
         let mut receiver = StateTransferReceiver::new(7);
         let chunk = SegmentChunk::new(
-            3,                                // epoch_id = 3 (stale, expected 7)
+            3, // epoch_id = 3 (stale, expected 7)
             1,
             0,
             10,
@@ -1426,8 +1444,16 @@ mod tests {
         receiver.accept_offer(offer).unwrap();
         let err = receiver.accept_chunk(&chunk).unwrap_err();
         assert!(
-            matches!(err, SegmentTransferError::EpochMismatch { expected: 7, got: 3, .. }),
-            "expected EpochMismatch with expected=7 got=3, got {:?}", err
+            matches!(
+                err,
+                SegmentTransferError::EpochMismatch {
+                    expected: 7,
+                    got: 3,
+                    ..
+                }
+            ),
+            "expected EpochMismatch with expected=7 got=3, got {:?}",
+            err
         );
     }
 
@@ -1436,7 +1462,7 @@ mod tests {
     fn receiver_rejects_future_epoch_chunk() {
         let mut receiver = StateTransferReceiver::new(7);
         let chunk = SegmentChunk::new(
-            99,                               // epoch_id = 99 (future, expected 7)
+            99, // epoch_id = 99 (future, expected 7)
             1,
             0,
             10,
@@ -1447,8 +1473,16 @@ mod tests {
         receiver.accept_offer(offer).unwrap();
         let err = receiver.accept_chunk(&chunk).unwrap_err();
         assert!(
-            matches!(err, SegmentTransferError::EpochMismatch { expected: 7, got: 99, .. }),
-            "expected EpochMismatch with expected=7 got=99, got {:?}", err
+            matches!(
+                err,
+                SegmentTransferError::EpochMismatch {
+                    expected: 7,
+                    got: 99,
+                    ..
+                }
+            ),
+            "expected EpochMismatch with expected=7 got=99, got {:?}",
+            err
         );
     }
 
@@ -1461,7 +1495,7 @@ mod tests {
         // Compute the full-segment checksum via the same domain as the sender.
         let segment_checksum = compute_segment_checksum(&payload);
         let chunk = SegmentChunk::new(
-            7,                                // epoch_id = 7 (matches expected)
+            7, // epoch_id = 7 (matches expected)
             1,
             0,
             payload_len,

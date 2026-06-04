@@ -13,8 +13,8 @@
 //! production send/receive code paths against in-memory data.
 
 use super::benchmark_harness::BenchmarkResult;
-use super::validation_tier::ValidationTier;
 use super::gate_entry::MeasuredKpi;
+use super::validation_tier::ValidationTier;
 
 use std::collections::BTreeMap;
 use std::time::Instant;

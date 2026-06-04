@@ -43,8 +43,8 @@
 //! - Publication pipeline (#915): Epoch-gated publication during partition.
 //! - Operator audit (#898): Operator audit trail.
 
-pub mod partition_detector;
 pub mod partition_audit;
+pub mod partition_detector;
 pub mod partition_healing;
 pub mod partition_runtime;
 pub mod post_heal_placement;
@@ -54,8 +54,8 @@ pub mod split_brain_guard;
 pub mod types;
 
 // Re-exports
-pub use partition_detector::PartitionDetector;
 pub use partition_audit::PartitionAuditRecorder;
+pub use partition_detector::PartitionDetector;
 pub use partition_healing::PartitionHealingProtocol;
 pub use partition_runtime::{PartitionRuntime, PartitionTickResult};
 pub use post_heal_placement::{PostHealPending, PostHealPlacementRecompute};

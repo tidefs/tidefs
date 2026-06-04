@@ -900,13 +900,8 @@ mod tests {
 
     #[test]
     fn test_from_mode_tls_peer_dn_missing_refused() {
-        let result = AuthenticatedPeer::from_mode(
-            SecurityMode::TcpMtls,
-            None,
-            None,
-            "10.0.0.1",
-            9000,
-        );
+        let result =
+            AuthenticatedPeer::from_mode(SecurityMode::TcpMtls, None, None, "10.0.0.1", 9000);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -962,12 +957,8 @@ mod tests {
 
     #[test]
     fn test_verify_hello_security_tcp_mtls_with_dn() {
-        let client_tlvs = vec![
-            HelloTlv::auth_mode(SecurityMode::TcpMtls),
-        ];
-        let server_tlvs = vec![
-            HelloTlv::auth_mode_ack(SecurityMode::TcpMtls),
-        ];
+        let client_tlvs = vec![HelloTlv::auth_mode(SecurityMode::TcpMtls)];
+        let server_tlvs = vec![HelloTlv::auth_mode_ack(SecurityMode::TcpMtls)];
         let client_nonce = [0xAAu8; 32];
         let server_nonce = [0xBBu8; 32];
         let psk_store = PskStore::new();
@@ -992,12 +983,8 @@ mod tests {
 
     #[test]
     fn test_verify_hello_security_tcp_mtls_missing_dn_refused() {
-        let client_tlvs = vec![
-            HelloTlv::auth_mode(SecurityMode::TcpMtls),
-        ];
-        let server_tlvs = vec![
-            HelloTlv::auth_mode_ack(SecurityMode::TcpMtls),
-        ];
+        let client_tlvs = vec![HelloTlv::auth_mode(SecurityMode::TcpMtls)];
+        let server_tlvs = vec![HelloTlv::auth_mode_ack(SecurityMode::TcpMtls)];
         let client_nonce = [0xAAu8; 32];
         let server_nonce = [0xBBu8; 32];
         let psk_store = PskStore::new();
@@ -1019,12 +1006,8 @@ mod tests {
 
     #[test]
     fn test_verify_hello_security_distinct_tls_dn_distinct_peers() {
-        let client_tlvs = vec![
-            HelloTlv::auth_mode(SecurityMode::TcpMtls),
-        ];
-        let server_tlvs = vec![
-            HelloTlv::auth_mode_ack(SecurityMode::TcpMtls),
-        ];
+        let client_tlvs = vec![HelloTlv::auth_mode(SecurityMode::TcpMtls)];
+        let server_tlvs = vec![HelloTlv::auth_mode_ack(SecurityMode::TcpMtls)];
         let client_nonce = [0xAAu8; 32];
         let server_nonce = [0xBBu8; 32];
         let psk_store = PskStore::new();

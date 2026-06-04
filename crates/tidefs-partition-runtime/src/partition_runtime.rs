@@ -5,8 +5,8 @@
 //! [`PartitionHealingProtocol`], and [`PartitionAuditRecorder`] into
 //! a single long-running service.
 
-use crate::partition_detector::PartitionDetector;
 use crate::partition_audit::PartitionAuditRecorder;
+use crate::partition_detector::PartitionDetector;
 use crate::partition_healing::PartitionHealingProtocol;
 use crate::split_brain_guard::SplitBrainGuard;
 use crate::types::{now_millis, PartitionDetectionConfig, PartitionHazardClass, PartitionState};

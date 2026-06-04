@@ -47,9 +47,7 @@ pub enum ImportError {
         reason: String,
     },
     /// The cluster lease token presented for import is invalid (zero fields).
-    LeaseTokenInvalid {
-        detail: String,
-    },
+    LeaseTokenInvalid { detail: String },
     /// The pool GUID in the lease token does not match the pool being imported.
     LeaseTokenPoolMismatch {
         token_pool_guid: [u8; 16],
@@ -679,7 +677,7 @@ mod tests {
             device_count: 2,
             recovery_commit_group: 101,
             topology_complete: false,
-                cluster_authorized: false,
+            cluster_authorized: false,
         };
 
         assert!(pool.validate().is_ok());
@@ -697,7 +695,7 @@ mod tests {
             device_count: 0,
             recovery_commit_group: 0,
             topology_complete: false,
-                cluster_authorized: false,
+            cluster_authorized: false,
         };
 
         let result = pool.validate();
@@ -781,7 +779,7 @@ mod tests {
             device_count: 2, // pool-level count differs from device sdb
             recovery_commit_group: 100,
             topology_complete: false,
-                cluster_authorized: false,
+            cluster_authorized: false,
         };
 
         assert!(pool.validate().is_err());
@@ -840,11 +838,14 @@ mod tests {
             device_count: 1,
             recovery_commit_group: 100,
             topology_complete: false,
-                cluster_authorized: false,
+            cluster_authorized: false,
         };
 
         let result = pool.validate();
-        assert!(result.is_err(), "clustered pool must be refused by standalone importer");
+        assert!(
+            result.is_err(),
+            "clustered pool must be refused by standalone importer"
+        );
         match result {
             Err(ImportError::ClusterPoolRequired { pool_guid: guid }) => {
                 assert_eq!(guid, pool_guid);
@@ -904,11 +905,15 @@ mod tests {
             device_count: 1,
             recovery_commit_group: 100,
             topology_complete: false,
-                cluster_authorized: true,
+            cluster_authorized: true,
         };
 
         // With cluster authority, validation must succeed
         let result = pool.validate();
-        assert!(result.is_ok(), "clustered pool with cluster_authorized must pass validation, got {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "clustered pool with cluster_authorized must pass validation, got {:?}",
+            result.err()
+        );
     }
 }

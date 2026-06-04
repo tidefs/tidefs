@@ -5,8 +5,8 @@
 // percentiles (p50, p95, p99).
 
 use super::benchmark_harness::BenchmarkResult;
-use super::validation_tier::ValidationTier;
 use super::gate_entry::MeasuredKpi;
+use super::validation_tier::ValidationTier;
 use std::time::Instant;
 
 /// Default file count for a lightweight smoke run.

@@ -365,7 +365,10 @@ canonical_feature!(
 );
 canonical_feature!(FEATURE_COMPRESSION_LZ4, "org.tidefs:compression_lz4");
 canonical_feature!(FEATURE_COMPRESSION_ZSTD, "org.tidefs:compression_zstd");
-canonical_feature!(FEATURE_ENCRYPTION_CHACHA20, "org.tidefs:encryption_chacha20");
+canonical_feature!(
+    FEATURE_ENCRYPTION_CHACHA20,
+    "org.tidefs:encryption_chacha20"
+);
 canonical_feature!(
     FEATURE_INTENT_LOG_LOG_DEVICE,
     "org.tidefs:intent_log_log_device"
@@ -376,7 +379,10 @@ canonical_feature!(
 );
 canonical_feature!(FEATURE_LOCATOR_TABLE, "org.tidefs:locator_table");
 canonical_feature!(FEATURE_CHECKSUM_BLAKE3, "org.tidefs:checksum_blake3");
-canonical_feature!(FEATURE_CHUNKED_FILE_LAYOUT, "org.tidefs:chunked_file_layout");
+canonical_feature!(
+    FEATURE_CHUNKED_FILE_LAYOUT,
+    "org.tidefs:chunked_file_layout"
+);
 canonical_feature!(FEATURE_EXTENT_MAP_V2, "org.tidefs:extent_map_v2");
 canonical_feature!(FEATURE_SNAPSHOT_V2, "org.tidefs:snapshot_v2");
 canonical_feature!(FEATURE_SEND_RECV_V2, "org.tidefs:send_recv_v2");

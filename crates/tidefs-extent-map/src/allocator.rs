@@ -135,11 +135,7 @@ impl ExtentAllocator {
             let locator_id = LocatorId(self.next_locator);
             self.next_locator = self.next_locator.wrapping_add(chunk_len);
 
-            let mut entry = ExtentMapEntryV2::new_pending_data(
-                chunk_offset,
-                chunk_len,
-                locator_id,
-            );
+            let mut entry = ExtentMapEntryV2::new_pending_data(chunk_offset, chunk_len, locator_id);
 
             entry.set_ingest();
 
@@ -193,12 +189,8 @@ impl ExtentAllocator {
             let locator_id = LocatorId(self.next_locator);
             self.next_locator = self.next_locator.wrapping_add(chunk_len);
 
-            let entry = ExtentMapEntryV2::new_unwritten(
-                chunk_offset,
-                chunk_len,
-                birth_commit_group,
-            );
-
+            let entry =
+                ExtentMapEntryV2::new_unwritten(chunk_offset, chunk_len, birth_commit_group);
 
             let map = self.maps.entry(inode).or_default();
             map.insert_extent(&[entry])?;
@@ -854,7 +846,9 @@ mod tests {
 
         let candidates = allocator.ingest_candidates();
         assert_eq!(candidates.len(), 2);
-        assert!(candidates.iter().all(|(_, e)| e.is_data() || e.is_pending_data()));
+        assert!(candidates
+            .iter()
+            .all(|(_, e)| e.is_data() || e.is_pending_data()));
         assert!(candidates
             .iter()
             .all(|(_, e)| e.lifecycle_state() == ExtentLifecycleState::Ingest));
@@ -872,7 +866,10 @@ mod tests {
 
         // First extent is now BaseComplete.
         let entries = allocator.lookup_extents(1, 0, 4096);
-        assert_eq!(entries[0].lifecycle_state(), ExtentLifecycleState::BaseComplete);
+        assert_eq!(
+            entries[0].lifecycle_state(),
+            ExtentLifecycleState::BaseComplete
+        );
         assert!((entries[0].flags & ExtentMapEntryV2::FLAG_BASE_COMPLETE) != 0);
         assert!((entries[0].flags & ExtentMapEntryV2::FLAG_INGEST) == 0);
 
@@ -899,13 +896,7 @@ mod tests {
     #[test]
     fn historic_extents_without_flags_are_base_complete() {
         // Simulate a pre-existing entry with no lifecycle flags set.
-        let entry = ExtentMapEntryV2::new_data(
-            0,
-            4096,
-            LocatorId(100),
-            [0u8; 32],
-            0,
-        );
+        let entry = ExtentMapEntryV2::new_data(0, 4096, LocatorId(100), [0u8; 32], 0);
         // No call to set_ingest() — flags are 0.
         assert_eq!(entry.lifecycle_state(), ExtentLifecycleState::BaseComplete);
     }
@@ -923,5 +914,4 @@ mod tests {
         assert!(entries[0].is_unwritten());
         assert_eq!(entries[0].birth_commit_group, 42);
     }
-
 }

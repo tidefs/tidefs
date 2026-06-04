@@ -282,10 +282,8 @@ impl DeviceManager {
         }
 
         // Find the faulted device's index in the pool.
-        let faulted_index = Self::find_device_index_by_guid(
-            request.device_guids,
-            &request.faulted_device_guid,
-        )?;
+        let faulted_index =
+            Self::find_device_index_by_guid(request.device_guids, &request.faulted_device_guid)?;
 
         let device_count = request.existing_device_configs.len() as u32;
         let new_topology_gen = request.commit_group.wrapping_add(1);
@@ -333,10 +331,7 @@ impl DeviceManager {
                 path: PathBuf::from("<guid-lookup>"),
                 source: std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    format!(
-                        "faulted device guid {:02x?} not found in pool",
-                        target_guid
-                    ),
+                    format!("faulted device guid {:02x?} not found in pool", target_guid),
                 ),
             })
     }
@@ -1073,5 +1068,4 @@ mod tests {
         let _ = fs::remove_dir_all(&dir1);
         let _ = fs::remove_dir_all(&spare_dir);
     }
-
 }

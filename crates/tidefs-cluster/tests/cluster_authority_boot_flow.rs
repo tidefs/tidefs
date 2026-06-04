@@ -15,7 +15,6 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 
-use tidefs_membership_epoch::EpochId;
 use tidefs_cluster::cluster_authority_record::{
     validate_authority_record, ClusterAuthorityRecord, ClusterAuthorityVerdict,
 };
@@ -27,6 +26,7 @@ use tidefs_cluster::cluster_authority_store::{
     append_authority_record_to_device, read_all_records_from_device,
     write_authority_chain_to_device, CLUSTER_AUTHORITY_REGION_OFFSET,
 };
+use tidefs_membership_epoch::EpochId;
 
 fn voters(ids: &[u64]) -> BTreeSet<u64> {
     ids.iter().copied().collect()
@@ -86,7 +86,10 @@ fn full_boot_flow_genesis_advance_restart() {
     // ── Phase 2: boot — all nodes scan devices ─────────────────
     let outcome = ClusterAuthorityBootstrapper::discover(&[&dev1, &dev2, &dev3]);
     let snapshot = match outcome {
-        BootAuthorityOutcome::Discovered { snapshot, per_device } => {
+        BootAuthorityOutcome::Discovered {
+            snapshot,
+            per_device,
+        } => {
             // dev3 should report NoRecord
             match per_device.get(&dev3.display().to_string()) {
                 Some(DeviceAuthorityStatus::NoRecord) => {}
@@ -139,7 +142,10 @@ fn full_boot_flow_genesis_advance_restart() {
     // ── Phase 4: full cluster restart — all nodes reboot, rescan ─
     let outcome = ClusterAuthorityBootstrapper::discover(&[&dev1, &dev2, &dev3]);
     let snapshot2 = match outcome {
-        BootAuthorityOutcome::Discovered { snapshot, per_device } => {
+        BootAuthorityOutcome::Discovered {
+            snapshot,
+            per_device,
+        } => {
             // dev1 should have seq=1 (advanced), dev2 seq=0 (genesis only)
             match per_device.get(&dev1.display().to_string()) {
                 Some(DeviceAuthorityStatus::Valid { sequence, .. }) => {
@@ -172,7 +178,10 @@ fn full_boot_flow_genesis_advance_restart() {
     assert!(!snapshot2.is_voter(3)); // node 3 was removed from voters
 
     // Authority digest must be consistent with the record.
-    assert_eq!(snapshot2.authority_digest, hex_encode(&advanced.self_digest));
+    assert_eq!(
+        snapshot2.authority_digest,
+        hex_encode(&advanced.self_digest)
+    );
 
     // ── Phase 5: verify chain integrity on dev1 ─────────────────
     {
@@ -199,10 +208,7 @@ fn fail_closed_rejects_corrupt_authority() {
 
     // Tamper: overwrite the authority region with garbage.
     {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&dev)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().write(true).open(&dev).unwrap();
         use std::io::Seek;
         f.seek(std::io::SeekFrom::Start(CLUSTER_AUTHORITY_REGION_OFFSET))
             .unwrap();
@@ -235,14 +241,8 @@ fn reject_stale_authority_against_current() {
     // (that's the caller's job at the cluster level), but the chain
     // validation ensures tampered chains are rejected.
 
-    let genesis = ClusterAuthorityRecord::genesis(
-        [0x01; 16],
-        voters(&[1]),
-        BTreeSet::new(),
-        1,
-        [0u8; 32],
-        0,
-    );
+    let genesis =
+        ClusterAuthorityRecord::genesis([0x01; 16], voters(&[1]), BTreeSet::new(), 1, [0u8; 32], 0);
 
     // Stand-alone validation of the genesis passes.
     let v = validate_authority_record(&genesis);
@@ -258,10 +258,7 @@ fn reject_stale_authority_against_current() {
     let v = tidefs_cluster::validate_authority_chain(&genesis, &bad);
     match v {
         ClusterAuthorityVerdict::Refused { reason, .. } => {
-            assert_eq!(
-                reason,
-                tidefs_cluster::AuthorityRefusalReason::ChainBroken
-            );
+            assert_eq!(reason, tidefs_cluster::AuthorityRefusalReason::ChainBroken);
         }
         other => panic!("expected ChainBroken, got {:?}", other),
     }

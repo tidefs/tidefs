@@ -1485,7 +1485,7 @@ pub fn check_pool_intent_log_pending(
                     ),
                 }
             }
-        },
+        }
     };
 
     Ok(Some(result))

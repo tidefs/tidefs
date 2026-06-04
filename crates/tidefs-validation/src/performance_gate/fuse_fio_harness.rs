@@ -1,6 +1,6 @@
 use super::benchmark_harness::{BenchmarkResult, FioHarness};
-use super::validation_tier::ValidationTier;
 use super::gate_entry::MeasuredKpi;
+use super::validation_tier::ValidationTier;
 use std::process::Command;
 use std::time::Instant;
 

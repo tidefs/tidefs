@@ -30,8 +30,8 @@ pub fn renegotiate_lease_on_epoch(runtime: &mut ClusterLeaseRuntime, new_epoch: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
     use tidefs_cluster::{ClusterLeaseConfig, ClusterLeaseRuntime};
+    use tokio::sync::mpsc;
 
     #[test]
     fn renegotiate_updates_epoch() {

@@ -44,9 +44,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::broadcast;
 use tidefs_membership_epoch::EpochMemberSet;
 use tidefs_membership_types::NodeIdentity;
+use tokio::sync::broadcast;
 
 use crate::connection_registry::{ConnectionRegistry, ConnectionState};
 

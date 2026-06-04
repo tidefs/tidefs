@@ -10,14 +10,14 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Args, Subcommand};
+use tidefs_cluster::dataset_catalog::CatalogDelta;
+use tidefs_cluster::pool_lease_client::ClusterLeaseClient;
+use tidefs_cluster::pool_protocol::CatalogQueryType;
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType, SyncGuarantee};
+use tidefs_dataset_properties;
 use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy, RootAuthenticationKey};
 use tidefs_local_object_store::StoreOptions;
-use tidefs_cluster::dataset_catalog::CatalogDelta;
-use tidefs_cluster::pool_protocol::CatalogQueryType;
-use tidefs_cluster::pool_lease_client::ClusterLeaseClient;
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
-use tidefs_dataset_properties;
 
 use bincode;
 
@@ -432,7 +432,10 @@ fn dataset_id_from_name(name: &str) -> DatasetId {
 fn resolve_cluster_pool_guid(devices: &[std::path::PathBuf], operation: &str) -> [u8; 16] {
     let lock_dir = std::env::temp_dir().join("tidefs-import-cluster");
     if let Err(err) = std::fs::create_dir_all(&lock_dir) {
-        eprintln!("tidefsctl dataset {operation}: cannot create import lock dir {}: {err}", lock_dir.display());
+        eprintln!(
+            "tidefsctl dataset {operation}: cannot create import lock dir {}: {err}",
+            lock_dir.display()
+        );
         process::exit(1);
     }
     match tidefs_pool_import::pool_import(devices, &lock_dir, false, None, None) {
@@ -510,7 +513,6 @@ fn submit_cluster_delta(
     }
 }
 
-
 fn handle_create(args: DatasetCreateArgs) {
     let devices_ref = args.devices.as_deref();
     let name = &args.name;
@@ -523,8 +525,8 @@ fn handle_create(args: DatasetCreateArgs) {
 
     // ── Cluster-authoritative path ─────────────────────────────────
     if args.cluster {
-        let (node_addr, node_id) = validate_cluster_args(
-            &args.cluster_node_addr, args.cluster_node_id, "create");
+        let (node_addr, node_id) =
+            validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "create");
         let devs = require_devices_for_cluster(devices_ref.map(|d| d), "create");
         let pool_guid = resolve_cluster_pool_guid(devs, "create");
 
@@ -543,8 +545,7 @@ fn handle_create(args: DatasetCreateArgs) {
             flags_u16: DatasetFlags::default_create().bits(),
         };
 
-        let catalog_version = submit_cluster_delta(
-            node_addr, node_id, pool_guid, &delta, "create");
+        let catalog_version = submit_cluster_delta(node_addr, node_id, pool_guid, &delta, "create");
 
         println!(
             "dataset '{full_path}' created in clustered pool '{}' (catalog_version={catalog_version})",
@@ -617,13 +618,18 @@ fn handle_create(args: DatasetCreateArgs) {
 fn handle_list(args: DatasetListArgs) {
     // ── Cluster-authoritative path ─────────────────────────────────
     if args.cluster {
-        let (node_addr, node_id) = validate_cluster_args(
-            &args.cluster_node_addr, args.cluster_node_id, "list");
+        let (node_addr, node_id) =
+            validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "list");
         let devs = require_devices_for_cluster(args.devices.as_deref(), "list");
         let pool_guid = resolve_cluster_pool_guid(devs, "list");
 
         match ClusterLeaseClient::query_catalog(
-            node_addr, node_id, pool_guid, CatalogQueryType::ListAll, "") {
+            node_addr,
+            node_id,
+            pool_guid,
+            CatalogQueryType::ListAll,
+            "",
+        ) {
             Ok(resp) => {
                 if !resp.success {
                     let err = resp.error.unwrap_or_else(|| "unknown error".to_string());
@@ -635,9 +641,14 @@ fn handle_list(args: DatasetListArgs) {
                 } else {
                     let mut sorted: Vec<_> = resp.entries.iter().collect();
                     sorted.sort_by(|a, b| a.path.cmp(&b.path));
-                    println!("pool '{}' datasets (catalog_version={}):", args.pool, resp.catalog_version);
+                    println!(
+                        "pool '{}' datasets (catalog_version={}):",
+                        args.pool, resp.catalog_version
+                    );
                     for entry in &sorted {
-                        let id_str: String = entry.dataset_id_bytes.iter()
+                        let id_str: String = entry
+                            .dataset_id_bytes
+                            .iter()
                             .take(4)
                             .map(|b| format!("{b:02x}"))
                             .collect();
@@ -647,8 +658,10 @@ fn handle_list(args: DatasetListArgs) {
                             2 => "Destroyed",
                             _ => "???",
                         };
-                        println!("  dataset '{}' id={} type={} state={lc}",
-                            entry.path, id_str, entry.dataset_type_u8);
+                        println!(
+                            "  dataset '{}' id={} type={} state={lc}",
+                            entry.path, id_str, entry.dataset_type_u8
+                        );
                     }
                 }
                 return;
@@ -684,7 +697,10 @@ fn handle_list(args: DatasetListArgs) {
             Ok(state) => format!("{state:?}"),
             Err(_) => "---".to_string(),
         };
-        println!("  dataset '{path}' id={} sync={sg} state={lc}", format_dataset_id(id));
+        println!(
+            "  dataset '{path}' id={} sync={sg} state={lc}",
+            format_dataset_id(id)
+        );
     }
 }
 fn handle_rename(args: DatasetRenameArgs) {
@@ -702,8 +718,8 @@ fn handle_rename(args: DatasetRenameArgs) {
 
     // ── Cluster-authoritative path ─────────────────────────────────
     if args.cluster {
-        let (node_addr, node_id) = validate_cluster_args(
-            &args.cluster_node_addr, args.cluster_node_id, "rename");
+        let (node_addr, node_id) =
+            validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "rename");
         let devs = require_devices_for_cluster(args.devices.as_deref(), "rename");
         let pool_guid = resolve_cluster_pool_guid(devs, "rename");
 
@@ -712,8 +728,7 @@ fn handle_rename(args: DatasetRenameArgs) {
             new_path: new_name.clone(),
         };
 
-        let catalog_version = submit_cluster_delta(
-            node_addr, node_id, pool_guid, &delta, "rename");
+        let catalog_version = submit_cluster_delta(node_addr, node_id, pool_guid, &delta, "rename");
 
         println!(
             "dataset '{old_name}' renamed to '{new_name}' in clustered pool '{}' (catalog_version={catalog_version})",
@@ -1030,7 +1045,6 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
     }
 }
 
-
 fn handle_get(args: DatasetGetArgs) {
     let fs = open_filesystem(
         &args.pool,
@@ -1044,7 +1058,10 @@ fn handle_get(args: DatasetGetArgs) {
     let effective = match fs.dataset_catalog().get_properties_with_inheritance(&path) {
         Ok(props) => props,
         Err(e) => {
-            eprintln!("tidefsctl dataset get: cannot read properties for '{}': {e}", &args.name);
+            eprintln!(
+                "tidefsctl dataset get: cannot read properties for '{}': {e}",
+                &args.name
+            );
             process::exit(1);
         }
     };
@@ -1070,11 +1087,14 @@ fn handle_get(args: DatasetGetArgs) {
         }
         None => {
             // Should not happen since get_properties_with_inheritance fills all registry keys.
-            eprintln!("tidefsctl dataset get: internal error resolving '{}'", &args.property);
+            eprintln!(
+                "tidefsctl dataset get: internal error resolving '{}'",
+                &args.property
+            );
             process::exit(1);
         }
     }
-        }
+}
 fn handle_set(args: DatasetSetArgs) {
     let mut fs = open_filesystem(
         &args.pool,
@@ -1106,10 +1126,7 @@ fn handle_set(args: DatasetSetArgs) {
     let def = match tidefs_dataset_properties::lookup_property(&registry, &key) {
         Some(def) => def,
         None => {
-            eprintln!(
-                "tidefsctl dataset set: unknown property '{}'",
-                prop_name
-            );
+            eprintln!("tidefsctl dataset set: unknown property '{}'", prop_name);
             process::exit(1);
         }
     };
@@ -1130,12 +1147,7 @@ fn handle_set(args: DatasetSetArgs) {
         .get_properties(&path)
         .unwrap_or_default();
 
-    if let Err(verr) = tidefs_dataset_properties::validate_set(
-        &key,
-        &value,
-        def,
-        &existing_props,
-    ) {
+    if let Err(verr) = tidefs_dataset_properties::validate_set(&key, &value, def, &existing_props) {
         eprintln!("tidefsctl dataset set: validation failed: {verr}");
         process::exit(1);
     }
@@ -1151,19 +1163,23 @@ fn handle_set(args: DatasetSetArgs) {
     match fs.dataset_catalog_mut().set_properties(&path, &props) {
         Ok(()) => {
             if let Err(e) = fs.persist_dataset_catalog() {
-                eprintln!(
-                    "tidefsctl dataset set: property set but catalog persist failed: {e}"
-                );
+                eprintln!("tidefsctl dataset set: property set but catalog persist failed: {e}");
                 process::exit(1);
             }
             if is_clear {
-                println!("cleared '{}' (now using default/inherited value)", prop_name);
+                println!(
+                    "cleared '{}' (now using default/inherited value)",
+                    prop_name
+                );
             } else {
                 println!("{} = {}", prop_name, value);
             }
         }
         Err(e) => {
-            eprintln!("tidefsctl dataset set: cannot write properties for '{}': {e}", &args.name);
+            eprintln!(
+                "tidefsctl dataset set: cannot write properties for '{}': {e}",
+                &args.name
+            );
             process::exit(1);
         }
     }
@@ -1203,10 +1219,7 @@ fn handle_list_props(args: DatasetListPropsArgs) {
             "performance" | "perf" => tidefs_dataset_properties::PropertyFamily::Performance,
             "snapshot" => tidefs_dataset_properties::PropertyFamily::Snapshot,
             other => {
-                eprintln!(
-                    "tidefsctl dataset list-props: unknown family '{}'",
-                    other
-                );
+                eprintln!("tidefsctl dataset list-props: unknown family '{}'", other);
                 eprintln!("  valid families: compression, encryption, space, layout, integrity, access, performance, snapshot");
                 process::exit(1);
             }
@@ -1222,14 +1235,20 @@ fn handle_list_props(args: DatasetListPropsArgs) {
     }
 
     // Print header.
-    println!("{:<35} {:<20} {:<12} {}", "PROPERTY", "VALUE", "TYPE", "SOURCE");
+    println!(
+        "{:<35} {:<20} {:<12} {}",
+        "PROPERTY", "VALUE", "TYPE", "SOURCE"
+    );
     println!("{:-<35} {:-<20} {:-<12} {:-<20}", "", "", "", "");
 
     for def in &defs {
         let local_entry = props.get(&def.name);
         let (value, source) = match local_entry {
             Some(entry) => (entry.value.clone(), entry.source.clone()),
-            None => (def.default_value.clone(), tidefs_dataset_properties::PropertySource::Default),
+            None => (
+                def.default_value.clone(),
+                tidefs_dataset_properties::PropertySource::Default,
+            ),
         };
 
         let source_str = match &source {
@@ -1260,17 +1279,15 @@ fn handle_destroy(args: DatasetDestroyArgs) {
 
     // ── Cluster-authoritative path ─────────────────────────────────
     if args.cluster {
-        let (node_addr, node_id) = validate_cluster_args(
-            &args.cluster_node_addr, args.cluster_node_id, "destroy");
+        let (node_addr, node_id) =
+            validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "destroy");
         let devs = require_devices_for_cluster(args.devices.as_deref(), "destroy");
         let pool_guid = resolve_cluster_pool_guid(devs, "destroy");
 
-        let delta = CatalogDelta::Destroy {
-            path: name.clone(),
-        };
+        let delta = CatalogDelta::Destroy { path: name.clone() };
 
-        let catalog_version = submit_cluster_delta(
-            node_addr, node_id, pool_guid, &delta, "destroy");
+        let catalog_version =
+            submit_cluster_delta(node_addr, node_id, pool_guid, &delta, "destroy");
 
         println!(
             "dataset '{name}' destroyed in clustered pool '{}' (catalog_version={catalog_version})",

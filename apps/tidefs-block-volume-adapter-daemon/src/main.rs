@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::kernel_check::HostKernelClass;
 use crate::kernel_check::{
     classify_host_identity, classify_kernel_release_str, ObserveHostIdentity,
 };
@@ -53,14 +54,13 @@ use tidefs_block_volume_adapter_ublk_control_runtime::{
     BLOCK_VOLUME_UBLK_DATA_QUEUE_FETCH_REQ_SUBMIT_GATE_OW_301W,
     BLOCK_VOLUME_UBLK_DATA_QUEUE_OPEN_GATE_OW_301V,
 };
-use crate::kernel_check::HostKernelClass;
 use tidefs_types_package_profile_catalog::BLOCK_VOLUME_ADAPTER_DAEMON_SURFACE;
 use tidefs_ublk_abi::{
     control_command_size, params_size, ublk_control_plan_steps, UblkFeatureFlags, UblkParamBasic,
     UblkParamDiscard, UblkParamSegment, UblkParams, UblkSrvCtrlDevInfo, UblkSrvIoCmd,
-    UblkSrvIoDesc, UBLK_ABI_GATE_OW_301I, UBLK_ATTR_FUA, UBLK_FEATURES_LEN, UBLK_IO_BUF_BITS,
-    UBLK_MAX_NR_QUEUES, UBLK_MAX_QUEUE_DEPTH, UBLK_MIN_SEGMENT_SIZE, UBLK_PARAM_TYPE_BASIC,
-    UBLK_PARAM_TYPE_DISCARD, UBLK_PARAM_TYPE_SEGMENT, TIDEFS_UBLK_CONTROL_PLAN_REQUIRED_FEATURES,
+    UblkSrvIoDesc, TIDEFS_UBLK_CONTROL_PLAN_REQUIRED_FEATURES, UBLK_ABI_GATE_OW_301I,
+    UBLK_ATTR_FUA, UBLK_FEATURES_LEN, UBLK_IO_BUF_BITS, UBLK_MAX_NR_QUEUES, UBLK_MAX_QUEUE_DEPTH,
+    UBLK_MIN_SEGMENT_SIZE, UBLK_PARAM_TYPE_BASIC, UBLK_PARAM_TYPE_DISCARD, UBLK_PARAM_TYPE_SEGMENT,
 };
 
 use crate::block_device_validation::run_block_device_appearance_validation;
@@ -900,33 +900,32 @@ struct HostPreflightReport {
 
 fn evaluate_host_preflight(inputs: &HostPreflightInputs) -> HostPreflightReport {
     let kernel_class = classify_kernel_release_str(&inputs.kernel_release);
-    let (admission_class, refusal_class) =
-        if kernel_class != HostKernelClass::Linux700OrNewer {
-            (
-                HostPreflightAdmissionClass::Refused,
-                HostPreflightRefusalClass::KernelBelowLinux700,
-            )
-        } else if !inputs.dev_ublk_control_present {
-            (
-                HostPreflightAdmissionClass::Refused,
-                HostPreflightRefusalClass::MissingUblkControl,
-            )
-        } else if !inputs.dev_ublk_control_is_char_device {
-            (
-                HostPreflightAdmissionClass::Refused,
-                HostPreflightRefusalClass::UblkControlNotCharacterDevice,
-            )
-        } else if !inputs.sys_module_ublk_drv_present || !inputs.sys_class_ublk_char_present {
-            (
-                HostPreflightAdmissionClass::Degraded,
-                HostPreflightRefusalClass::None,
-            )
-        } else {
-            (
-                HostPreflightAdmissionClass::Admitted,
-                HostPreflightRefusalClass::None,
-            )
-        };
+    let (admission_class, refusal_class) = if kernel_class != HostKernelClass::Linux700OrNewer {
+        (
+            HostPreflightAdmissionClass::Refused,
+            HostPreflightRefusalClass::KernelBelowLinux700,
+        )
+    } else if !inputs.dev_ublk_control_present {
+        (
+            HostPreflightAdmissionClass::Refused,
+            HostPreflightRefusalClass::MissingUblkControl,
+        )
+    } else if !inputs.dev_ublk_control_is_char_device {
+        (
+            HostPreflightAdmissionClass::Refused,
+            HostPreflightRefusalClass::UblkControlNotCharacterDevice,
+        )
+    } else if !inputs.sys_module_ublk_drv_present || !inputs.sys_class_ublk_char_present {
+        (
+            HostPreflightAdmissionClass::Degraded,
+            HostPreflightRefusalClass::None,
+        )
+    } else {
+        (
+            HostPreflightAdmissionClass::Admitted,
+            HostPreflightRefusalClass::None,
+        )
+    };
 
     HostPreflightReport {
         kernel_release: inputs.kernel_release.clone(),
@@ -1716,10 +1715,7 @@ fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), A
         }
 
         // Check whether this exit was a resize request (file-backed only)
-        if resize_requested.load(Ordering::Relaxed)
-            && resize_policy.reason.is_none()
-
-        {
+        if resize_requested.load(Ordering::Relaxed) && resize_policy.reason.is_none() {
             resize_requested.store(false, Ordering::Relaxed);
 
             // Grow: double the backing file block count
@@ -2138,10 +2134,7 @@ mod tests {
             sys_class_block_present: true,
             host_identity: ObserveHostIdentity::Unknown,
         });
-        assert_eq!(
-            report.kernel_class,
-            HostKernelClass::LinuxTooPrevious
-        );
+        assert_eq!(report.kernel_class, HostKernelClass::LinuxTooPrevious);
         assert_eq!(report.admission_class, HostPreflightAdmissionClass::Refused);
         assert_eq!(
             report.refusal_class,

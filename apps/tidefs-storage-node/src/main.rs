@@ -15,12 +15,12 @@ use std::thread;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
+use tidefs_cluster::ClusterLeaseConfig;
 use tidefs_local_filesystem::RootAuthenticationKey;
 use tidefs_membership_epoch::MemberClass;
 use tidefs_membership_live::BackendDisclosure;
 use tidefs_storage_node::authority_spine::RuntimeAuthority;
 use tidefs_storage_node::client;
-use tidefs_cluster::ClusterLeaseConfig;
 use tidefs_storage_node::server::{MembershipPeerConfig, StorageNode, StorageNodeConfig};
 
 fn parse_socket_addr(s: &str) -> Result<SocketAddr, String> {

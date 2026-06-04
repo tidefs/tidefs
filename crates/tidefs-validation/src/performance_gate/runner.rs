@@ -2,13 +2,13 @@ use super::benchmark_harness::BenchmarkResult;
 use super::comparator_harness::{ComparatorHarness, ComparatorManifest, ComparatorRun};
 use super::consolidation::DegradationSummary;
 use super::degradation_budget::DegradationComparison;
-use super::validation_tier::ValidationTier;
 use super::gate_entry::{
-    default_numeric_budget_for, ArtifactRequirement, ComparatorRef, BudgetClass, BudgetDecision,
+    default_numeric_budget_for, ArtifactRequirement, BudgetClass, BudgetDecision, ComparatorRef,
     EnvironmentManifest, MeasuredKpi, MeasurementSource, MultiNodeDegradationBudget, OpMix,
     PendingPerformanceGateEntry, PerformanceGateEntry, RegressionLock, RowStatus,
 };
 use super::matrix::{PerformanceMatrix, REQUIRED_SUBJECTS};
+use super::validation_tier::ValidationTier;
 use crate::carrier_comparison::{self, CarrierComparisonReport};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -349,13 +349,14 @@ impl GateRunner {
             RunVerdict::Failed => RowStatus::Fail,
             _ => RowStatus::Refuse,
         };
-        let ms =
-            if validation_tier.is_live_runtime() && verdict == RunVerdict::Passed && !kpis.is_empty()
-            {
-                MeasurementSource::Measured
-            } else {
-                MeasurementSource::SchemaOnly
-            };
+        let ms = if validation_tier.is_live_runtime()
+            && verdict == RunVerdict::Passed
+            && !kpis.is_empty()
+        {
+            MeasurementSource::Measured
+        } else {
+            MeasurementSource::SchemaOnly
+        };
         let artifact_req = if validation_tier.is_live_runtime() {
             ArtifactRequirement::live_runtime()
         } else {
@@ -581,7 +582,8 @@ impl GateRunner {
         let ih = ms.is_empty();
         let artifact_gap = s.artifact_gap;
         let budget_gap = s.budget_gap;
-        let release_ready = m.has_runtime_validation() && ih && artifact_gap == 0 && budget_gap == 0;
+        let release_ready =
+            m.has_runtime_validation() && ih && artifact_gap == 0 && budget_gap == 0;
         let rows: Vec<GateReceiptRow> = self
             .entries
             .iter()
@@ -731,18 +733,10 @@ impl GateRunner {
     /// Attach a comparator ref to every entry whose subject matches one of the
     /// given subject names. Used by baseline-package loading so external
     /// baseline KPIs feed into budget evaluation and regression locks.
-    pub fn set_comparator_for(
-        &mut self,
-        subjects: &[&str],
-        comp: ComparatorRef,
-    ) {
+    pub fn set_comparator_for(&mut self, subjects: &[&str], comp: ComparatorRef) {
         for entry in &mut self.entries {
             if subjects.contains(&entry.subject.as_str()) {
-                if !entry
-                    .comparators
-                    .iter()
-                    .any(|c| c.ref_id == comp.ref_id)
-                {
+                if !entry.comparators.iter().any(|c| c.ref_id == comp.ref_id) {
                     entry.comparators.push(comp.clone());
                     entry.evaluate_budget();
                 }

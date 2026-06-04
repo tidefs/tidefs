@@ -45,7 +45,11 @@ impl PerformanceMatrix {
             .iter()
             .filter(|r| r.status == RowStatus::Pass)
             .count();
-        let runtime_pass = self.rows.iter().filter(|r| r.is_release_validation()).count();
+        let runtime_pass = self
+            .rows
+            .iter()
+            .filter(|r| r.is_release_validation())
+            .count();
         let code_only_pass = pass_all.saturating_sub(runtime_pass);
         let fail = self
             .rows
@@ -186,8 +190,13 @@ pub const REQUIRED_SUBJECTS: &[&str] = &[
 mod tests {
     use super::super::gate_entry::{NoisePolicy, OpMix, PendingPerformanceGateEntry};
     use super::*;
-    use crate::performance_gate::{ValidationTier, MeasurementSource};
-    fn me(s: &str, st: RowStatus, t: ValidationTier, ms: MeasurementSource) -> PerformanceGateEntry {
+    use crate::performance_gate::{MeasurementSource, ValidationTier};
+    fn me(
+        s: &str,
+        st: RowStatus,
+        t: ValidationTier,
+        ms: MeasurementSource,
+    ) -> PerformanceGateEntry {
         let np = NoisePolicy {
             ref_id: "n".into(),
             warmup_samples: 5,

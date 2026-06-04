@@ -10,12 +10,12 @@
 //! Review debt TFR-017: import, lease ownership, and clustered mount remain
 //! historical POOLCLUSTER tracker work (#6605-#6610).
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process;
 use std::time::Duration;
-use std::cell::RefCell;
 
 use clap::Subcommand;
 
@@ -207,9 +207,9 @@ fn parse_node_addresses(raw: &[String]) -> Result<BTreeMap<u64, SocketAddr>, Str
             format!("invalid node_id \"{node_str}\" at position {i}: expected unsigned integer")
         })?;
 
-        let addr: SocketAddr = addr_str.parse().map_err(|_| {
-            format!("invalid socket address \"{addr_str}\" at position {i}")
-        })?;
+        let addr: SocketAddr = addr_str
+            .parse()
+            .map_err(|_| format!("invalid socket address \"{addr_str}\" at position {i}"))?;
 
         if map.contains_key(&node_id) {
             return Err(format!(
@@ -278,11 +278,7 @@ impl TcpClusterTransport {
         let mut sessions = BTreeMap::new();
 
         for (&node_id, &addr) in node_addrs {
-            transport.add_node(NodeInfo::new(
-                node_id,
-                vec![TransportAddr::Tcp(addr)],
-                0,
-            ));
+            transport.add_node(NodeInfo::new(node_id, vec![TransportAddr::Tcp(addr)], 0));
 
             let session_id = transport
                 .connect(node_id)
@@ -302,9 +298,7 @@ impl TcpClusterTransport {
     }
 
     fn frame_message(msg: &ClusterPoolMessage) -> Result<Vec<u8>, String> {
-        let payload = msg
-            .encode()
-            .map_err(|e| format!("encode: {e}"))?;
+        let payload = msg.encode().map_err(|e| format!("encode: {e}"))?;
         let mut wire = Vec::with_capacity(4 + payload.len());
         wire.extend_from_slice(CLUSTER_POOL_MAGIC);
         wire.extend_from_slice(&payload);
@@ -315,29 +309,24 @@ impl TcpClusterTransport {
 impl PoolTransport for TcpClusterTransport {
     type Error = tidefs_cluster::OrchestratorError;
 
-    fn send(
-        &self,
-        target_node_id: u64,
-        message: ClusterPoolMessage,
-    ) -> Result<(), Self::Error> {
-        let session_id = self
-            .sessions
-            .get(&target_node_id)
-            .copied()
-            .ok_or(tidefs_cluster::OrchestratorError::UnknownNode {
+    fn send(&self, target_node_id: u64, message: ClusterPoolMessage) -> Result<(), Self::Error> {
+        let session_id = self.sessions.get(&target_node_id).copied().ok_or(
+            tidefs_cluster::OrchestratorError::UnknownNode {
                 node_id: target_node_id,
-            })?;
+            },
+        )?;
 
         let wire = Self::frame_message(&message)
             .map_err(|e| tidefs_cluster::OrchestratorError::Transport(e))?;
 
-        self.transport.borrow_mut().send_message(session_id, &wire)
+        self.transport
+            .borrow_mut()
+            .send_message(session_id, &wire)
             .map_err(|e| tidefs_cluster::OrchestratorError::Transport(format!("send: {e:?}")))
     }
 
     fn recv(&self) -> Result<Option<(u64, ClusterPoolMessage)>, Self::Error> {
-        let sessions: Vec<(u64, SessionId)> =
-            self.sessions.iter().map(|(k, v)| (*k, *v)).collect();
+        let sessions: Vec<(u64, SessionId)> = self.sessions.iter().map(|(k, v)| (*k, *v)).collect();
         let mut transport = self.transport.borrow_mut();
 
         for (node_id, session_id) in &sessions {
@@ -349,9 +338,7 @@ impl PoolTransport for TcpClusterTransport {
                                 return Ok(Some((*node_id, msg)));
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "tidefsctl: decode error from node {node_id}: {e:?}"
-                                );
+                                eprintln!("tidefsctl: decode error from node {node_id}: {e:?}");
                             }
                         }
                     }
@@ -480,7 +467,6 @@ fn handle_cluster_pool_create(
         process::exit(1);
     }
 
-
     if config.has_duplicate_global_indices() {
         eprintln!(
             "tidefsctl: pool \"{pool_name}\" has duplicate global device indices; each device must have a unique index"
@@ -490,11 +476,8 @@ fn handle_cluster_pool_create(
 
     // 6. Connect to target nodes via transport.
     let local_client_id = u64::MAX; // operator CLI node ID
-    let transport = match TcpClusterTransport::new(
-        local_client_id,
-        &addrs,
-        Duration::from_secs(10),
-    ) {
+    let transport = match TcpClusterTransport::new(local_client_id, &addrs, Duration::from_secs(10))
+    {
         Ok(t) => t,
         Err(e) => {
             eprintln!("tidefsctl: transport setup failed: {e}");
@@ -503,7 +486,10 @@ fn handle_cluster_pool_create(
     };
 
     // 7. Dispatch create requests through transport.
-    eprintln!("tidefsctl: dispatching cluster pool create to {} node(s)...", config.node_count());
+    eprintln!(
+        "tidefsctl: dispatching cluster pool create to {} node(s)...",
+        config.node_count()
+    );
 
     let request_id = {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -526,11 +512,8 @@ fn handle_cluster_pool_create(
             if json {
                 let mut node_results_json = serde_json::Map::new();
                 for (&node_id, result) in &outcome.node_results {
-                    let device_hexes: Vec<String> = result
-                        .device_guids
-                        .iter()
-                        .map(hex_guid)
-                        .collect();
+                    let device_hexes: Vec<String> =
+                        result.device_guids.iter().map(hex_guid).collect();
                     node_results_json.insert(
                         node_id.to_string(),
                         serde_json::json!({
@@ -554,17 +537,17 @@ fn handle_cluster_pool_create(
             } else {
                 println!("cluster pool created: {}", outcome.pool_name);
                 println!("  pool GUID:      {}", hex_guid(&outcome.pool_guid));
-                println!("  nodes:          {}/{} succeeded", outcome.succeeded, outcome.total_nodes);
+                println!(
+                    "  nodes:          {}/{} succeeded",
+                    outcome.succeeded, outcome.total_nodes
+                );
                 println!("  placement:      {:?}", config.placement);
                 println!("  topology gen:   {}", config.topology_generation);
 
                 for (&node_id, result) in &outcome.node_results {
                     let status = if result.success { "OK" } else { "FAILED" };
-                    let device_str: Vec<String> = result
-                        .device_guids
-                        .iter()
-                        .map(hex_guid)
-                        .collect();
+                    let device_str: Vec<String> =
+                        result.device_guids.iter().map(hex_guid).collect();
                     println!("  node {node_id}: {status}");
                     if result.success {
                         println!("    device guids:  {:?}", device_str);
@@ -577,9 +560,16 @@ fn handle_cluster_pool_create(
         }
         Err(e) => {
             // When quorum fails, report per-node partial results.
-            if let tidefs_cluster::OrchestratorError::QuorumNotReached { outcome: Some(outcome), .. } = &e {
+            if let tidefs_cluster::OrchestratorError::QuorumNotReached {
+                outcome: Some(outcome),
+                ..
+            } = &e
+            {
                 eprintln!("tidefsctl: cluster pool create partially failed: {e}");
-                eprintln!("  nodes: {}/{} succeeded", outcome.succeeded, outcome.total_nodes);
+                eprintln!(
+                    "  nodes: {}/{} succeeded",
+                    outcome.succeeded, outcome.total_nodes
+                );
                 for (&node_id, result) in &outcome.node_results {
                     let status = if result.success { "OK" } else { "FAILED" };
                     eprintln!("  node {node_id}: {status}");
@@ -949,7 +939,9 @@ mod tests {
 
     #[test]
     fn parse_addr_duplicate_node_rejected() {
-        assert!(parse_node_addresses(&["1=10.0.0.1:8000".into(), "1=10.0.0.2:8000".into()]).is_err());
+        assert!(
+            parse_node_addresses(&["1=10.0.0.1:8000".into(), "1=10.0.0.2:8000".into()]).is_err()
+        );
     }
 
     // -- parse_placement tests --

@@ -512,10 +512,7 @@ impl PerformanceGateEntry {
 
                 // Check latency regression against comparator p95
                 if lock.p95_latency_regression_pct > 0.0 {
-                    let comp_p95 = prev
-                        .baseline_kpis
-                        .iter()
-                        .find(|k| k.name.contains("p95"));
+                    let comp_p95 = prev.baseline_kpis.iter().find(|k| k.name.contains("p95"));
                     let our_p95 = self.kpis.iter().find(|k| {
                         k.percentile.as_deref() == Some("p95")
                             || k.name.contains("p95")

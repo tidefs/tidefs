@@ -366,8 +366,8 @@ impl StorageTier {
 #[must_use]
 pub const fn storage_tier_from_device_class(device_class: u8) -> Option<StorageTier> {
     match device_class {
-        0 => Some(StorageTier::HddArchive),  // DeviceClass::Hdd
-        1 => Some(StorageTier::SsdCapacity), // DeviceClass::Ssd
+        0 => Some(StorageTier::HddArchive),      // DeviceClass::Hdd
+        1 => Some(StorageTier::SsdCapacity),     // DeviceClass::Ssd
         2 => Some(StorageTier::NvmePerformance), // DeviceClass::Nvme
         3 => Some(StorageTier::SpecialDevice),   // DeviceClass::Special
         _ => None,
@@ -525,8 +525,6 @@ impl StorageTierPolicy {
     }
 }
 
-
-
 #[repr(u32)]
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlacementIntentClass {
@@ -553,7 +551,9 @@ impl PlacementIntentClass {
             Self::RebuildRelocateTarget => {
                 "placement.membership_placement_0.rebuild_relocate_target.p6"
             }
-            Self::ShadowValidationOnly => "placement.membership_placement_0.shadow_validation_only.p7",
+            Self::ShadowValidationOnly => {
+                "placement.membership_placement_0.shadow_validation_only.p7"
+            }
         }
     }
 }
@@ -3554,18 +3554,30 @@ mod tests {
     fn from_device_entries_maps_device_class_to_tiers() {
         use super::*;
         let entries: &[(DomainId, u8)] = &[
-            (DomainId::new(1), 0), // Hdd -> HddArchive
-            (DomainId::new(2), 1), // Ssd -> SsdCapacity
-            (DomainId::new(3), 2), // Nvme -> NvmePerformance
-            (DomainId::new(4), 3), // Special -> SpecialDevice
+            (DomainId::new(1), 0),  // Hdd -> HddArchive
+            (DomainId::new(2), 1),  // Ssd -> SsdCapacity
+            (DomainId::new(3), 2),  // Nvme -> NvmePerformance
+            (DomainId::new(4), 3),  // Special -> SpecialDevice
             (DomainId::new(5), 99), // unknown -> skipped
         ];
 
         let policy = StorageTierPolicy::from_device_entries(entries);
-        assert_eq!(policy.tier_for_domain(DomainId::new(1)), Some(StorageTier::HddArchive));
-        assert_eq!(policy.tier_for_domain(DomainId::new(2)), Some(StorageTier::SsdCapacity));
-        assert_eq!(policy.tier_for_domain(DomainId::new(3)), Some(StorageTier::NvmePerformance));
-        assert_eq!(policy.tier_for_domain(DomainId::new(4)), Some(StorageTier::SpecialDevice));
+        assert_eq!(
+            policy.tier_for_domain(DomainId::new(1)),
+            Some(StorageTier::HddArchive)
+        );
+        assert_eq!(
+            policy.tier_for_domain(DomainId::new(2)),
+            Some(StorageTier::SsdCapacity)
+        );
+        assert_eq!(
+            policy.tier_for_domain(DomainId::new(3)),
+            Some(StorageTier::NvmePerformance)
+        );
+        assert_eq!(
+            policy.tier_for_domain(DomainId::new(4)),
+            Some(StorageTier::SpecialDevice)
+        );
         assert!(policy.tier_for_domain(DomainId::new(5)).is_none());
         assert!(!policy.auto_promote);
         assert!(!policy.auto_demote);

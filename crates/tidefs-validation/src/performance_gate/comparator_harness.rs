@@ -12,8 +12,8 @@
 //! - CephStaged: Ceph unavailable — release blocker for superiority claims
 
 use super::benchmark_harness::FioHarness;
-use super::validation_tier::ValidationTier;
 use super::gate_entry::{BaselineKpi, ComparatorRef};
+use super::validation_tier::ValidationTier;
 use serde::{Deserialize, Serialize};
 
 /// Kind of comparator filesystem or baseline.

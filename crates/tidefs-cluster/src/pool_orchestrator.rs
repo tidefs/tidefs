@@ -64,7 +64,11 @@ pub enum OrchestratorError {
     NodeImportFailed { node_id: u64, reason: String },
 
     #[error("quorum not reached: {succeeded}/{total} nodes succeeded")]
-    QuorumNotReached { succeeded: usize, total: usize, outcome: Option<CreateOutcome> },
+    QuorumNotReached {
+        succeeded: usize,
+        total: usize,
+        outcome: Option<CreateOutcome>,
+    },
 
     #[error("response from unknown node {node_id}")]
     UnknownNode { node_id: u64 },
@@ -346,22 +350,20 @@ impl ClusterPoolOrchestrator {
                 break;
             }
             match transport.recv() {
-                Ok(Some((node_id, msg))) => {
-                    match msg {
-                        ClusterPoolMessage::CreateResponse(resp) => {
-                            if !responses.contains_key(&node_id) {
-                                remaining -= 1;
-                                responses.insert(node_id, resp);
-                            }
-                        }
-                        other => {
-                            eprintln!(
-                                "tidefsctl: unexpected response type from node {node_id}: {:?}",
-                                std::mem::discriminant(&other)
-                            );
+                Ok(Some((node_id, msg))) => match msg {
+                    ClusterPoolMessage::CreateResponse(resp) => {
+                        if !responses.contains_key(&node_id) {
+                            remaining -= 1;
+                            responses.insert(node_id, resp);
                         }
                     }
-                }
+                    other => {
+                        eprintln!(
+                            "tidefsctl: unexpected response type from node {node_id}: {:?}",
+                            std::mem::discriminant(&other)
+                        );
+                    }
+                },
                 Ok(None) => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }

@@ -743,7 +743,13 @@ pub struct RelocationCandidate {
 impl RelocationCandidate {
     /// Create a new relocation candidate, computing derived fields.
     #[must_use]
-    pub fn new(segment_id: u64, total_bytes: u64, live_bytes: u64, age: u64, live_ranges: Vec<(u64, u64)>) -> Self {
+    pub fn new(
+        segment_id: u64,
+        total_bytes: u64,
+        live_bytes: u64,
+        age: u64,
+        live_ranges: Vec<(u64, u64)>,
+    ) -> Self {
         let live_byte_ratio = if total_bytes > 0 {
             live_bytes as f64 / total_bytes as f64
         } else {
@@ -835,7 +841,15 @@ impl SegmentLivenessScanner {
     pub fn compute_liveness(&self, usage: &[SegmentUsageRecord]) -> Vec<RelocationCandidate> {
         let mut candidates: Vec<RelocationCandidate> = usage
             .iter()
-            .map(|r| RelocationCandidate::new(r.segment_id, r.total_bytes, r.live_bytes, r.age, r.live_ranges.clone()))
+            .map(|r| {
+                RelocationCandidate::new(
+                    r.segment_id,
+                    r.total_bytes,
+                    r.live_bytes,
+                    r.age,
+                    r.live_ranges.clone(),
+                )
+            })
             .collect();
         candidates.sort_by(|a, b| {
             a.live_byte_ratio
@@ -853,7 +867,15 @@ impl SegmentLivenessScanner {
     pub fn scan(&self, usage: &[SegmentUsageRecord]) -> Vec<RelocationCandidate> {
         let mut candidates: Vec<RelocationCandidate> = usage
             .iter()
-            .map(|r| RelocationCandidate::new(r.segment_id, r.total_bytes, r.live_bytes, r.age, r.live_ranges.clone()))
+            .map(|r| {
+                RelocationCandidate::new(
+                    r.segment_id,
+                    r.total_bytes,
+                    r.live_bytes,
+                    r.age,
+                    r.live_ranges.clone(),
+                )
+            })
             .filter(|c| c.is_dead(self.max_live_byte_ratio))
             .collect();
         candidates.sort_by(|a, b| {
@@ -2704,10 +2726,10 @@ mod tests {
 
         // Candidate with two non-contiguous ranges at offsets 512 and 2048
         let candidates = vec![RelocationCandidate::new(
-            42,   // segment_id
-            4096, // total_bytes
-            1024, // live_bytes: 512 + 512 = 1024
-            5,    // age
+            42,                            // segment_id
+            4096,                          // total_bytes
+            1024,                          // live_bytes: 512 + 512 = 1024
+            5,                             // age
             vec![(512, 512), (2048, 512)], // non-contiguous live ranges
         )];
 
@@ -2733,10 +2755,10 @@ mod tests {
         let mut planner = SegmentRelocationPlanner::new(alloc);
 
         let candidates = vec![RelocationCandidate::new(
-            10,   // segment_id
-            4096, // total_bytes
-            2048, // live_bytes
-            3,    // age
+            10,     // segment_id
+            4096,   // total_bytes
+            2048,   // live_bytes
+            3,      // age
             vec![], // empty live_ranges -> fallback
         )];
 
@@ -2756,7 +2778,11 @@ mod tests {
         let mut planner = SegmentRelocationPlanner::new(alloc);
 
         let candidates = vec![RelocationCandidate::new(
-            99, 0, 0, 1, vec![], // fully dead, no ranges
+            99,
+            0,
+            0,
+            1,
+            vec![], // fully dead, no ranges
         )];
 
         let plan = planner.plan(&candidates);
@@ -4231,7 +4257,7 @@ mod tests {
 
     #[test]
     fn tiering_relocation_flow_promote_and_demote() {
-        use tidefs_membership_epoch::{StorageTier, StorageTierPolicy, TieringDecision, DomainId};
+        use tidefs_membership_epoch::{DomainId, StorageTier, StorageTierPolicy, TieringDecision};
         use tidefs_replication_model::RelocationReasonClass;
 
         // Create a tier policy with NVMe and HDD domains
@@ -4244,37 +4270,32 @@ mod tests {
         // Promotion: HDD → NVMe
         let decision = policy.compute_tiering_decision(
             Some(StorageTier::HddArchive),
-            9000,  // hot score above default threshold
-            5000,  // promotion threshold
-            1000,  // demotion threshold
+            9000, // hot score above default threshold
+            5000, // promotion threshold
+            1000, // demotion threshold
         );
-        assert_eq!(decision, TieringDecision::Promote(StorageTier::NvmePerformance));
+        assert_eq!(
+            decision,
+            TieringDecision::Promote(StorageTier::NvmePerformance)
+        );
 
         // Demotion: NVMe → HDD
         let decision = policy.compute_tiering_decision(
             Some(StorageTier::NvmePerformance),
-            500,   // cold score below threshold
+            500, // cold score below threshold
             5000,
             1000,
         );
         assert_eq!(decision, TieringDecision::Demote(StorageTier::HddArchive));
 
         // NoChange: NVMe with hot data
-        let decision = policy.compute_tiering_decision(
-            Some(StorageTier::NvmePerformance),
-            9000,
-            5000,
-            1000,
-        );
+        let decision =
+            policy.compute_tiering_decision(Some(StorageTier::NvmePerformance), 9000, 5000, 1000);
         assert_eq!(decision, TieringDecision::NoChange);
 
         // NoChange: HDD with cold data
-        let decision = policy.compute_tiering_decision(
-            Some(StorageTier::HddArchive),
-            500,
-            5000,
-            1000,
-        );
+        let decision =
+            policy.compute_tiering_decision(Some(StorageTier::HddArchive), 500, 5000, 1000);
         assert_eq!(decision, TieringDecision::NoChange);
 
         // NoChange: auto_promote disabled
@@ -4285,21 +4306,19 @@ mod tests {
         policy_no_promote.set_domain_tier(DomainId::new(2), StorageTier::HddArchive);
         let decision = policy_no_promote.compute_tiering_decision(
             Some(StorageTier::HddArchive),
-            9000, 5000, 1000,
+            9000,
+            5000,
+            1000,
         );
         assert_eq!(decision, TieringDecision::NoChange);
 
         // NoChange: unknown tier
-        let decision = policy.compute_tiering_decision(
-            None, 9000, 5000, 1000,
-        );
+        let decision = policy.compute_tiering_decision(None, 9000, 5000, 1000);
         assert_eq!(decision, TieringDecision::NoChange);
 
         // NoChange: SpecialDevice tier
-        let decision = policy.compute_tiering_decision(
-            Some(StorageTier::SpecialDevice),
-            9000, 5000, 1000,
-        );
+        let decision =
+            policy.compute_tiering_decision(Some(StorageTier::SpecialDevice), 9000, 5000, 1000);
         assert_eq!(decision, TieringDecision::NoChange);
 
         // ── Relocation planner tiering flow ──────────────────────────
@@ -4311,8 +4330,8 @@ mod tests {
         let flow_id = planner.open_tiering_flow(
             StorageTier::HddArchive,
             StorageTier::NvmePerformance,
-            vec![MemberId::new(10)],  // source member on HDD
-            vec![MemberId::new(20)],  // target member on NVMe
+            vec![MemberId::new(10)], // source member on HDD
+            vec![MemberId::new(20)], // target member on NVMe
             1,
         );
         assert!(flow_id.is_some(), "should open a tiering promotion flow");
@@ -4344,9 +4363,7 @@ mod tests {
 
     #[test]
     fn end_to_end_tiering_integration() {
-        use tidefs_membership_epoch::{
-            DomainId, StorageTier, StorageTierPolicy, TieringDecision,
-        };
+        use tidefs_membership_epoch::{DomainId, StorageTier, StorageTierPolicy, TieringDecision};
         use tidefs_replication_model::RelocationReasonClass;
 
         // ── 1. Build tier policy from pool-scan-like device entries ────
@@ -4359,29 +4376,33 @@ mod tests {
         policy.auto_promote = true;
         policy.auto_demote = true;
 
-        assert_eq!(policy.tier_for_domain(DomainId::new(1)), Some(StorageTier::HddArchive));
-        assert_eq!(policy.tier_for_domain(DomainId::new(2)), Some(StorageTier::NvmePerformance));
-        assert_eq!(policy.tier_for_domain(DomainId::new(3)), Some(StorageTier::SsdCapacity));
+        assert_eq!(
+            policy.tier_for_domain(DomainId::new(1)),
+            Some(StorageTier::HddArchive)
+        );
+        assert_eq!(
+            policy.tier_for_domain(DomainId::new(2)),
+            Some(StorageTier::NvmePerformance)
+        );
+        assert_eq!(
+            policy.tier_for_domain(DomainId::new(3)),
+            Some(StorageTier::SsdCapacity)
+        );
         assert!(policy.auto_promote);
         assert!(policy.auto_demote);
 
         // ── 2. Compute tiering decisions ───────────────────────────────
         // Hot data on HDD → promote to NVMe
-        let dec = policy.compute_tiering_decision(
-            Some(StorageTier::HddArchive), 9000, 5000, 1000,
-        );
+        let dec = policy.compute_tiering_decision(Some(StorageTier::HddArchive), 9000, 5000, 1000);
         assert_eq!(dec, TieringDecision::Promote(StorageTier::NvmePerformance));
 
         // Cold data on NVMe → demote to HDD
-        let dec = policy.compute_tiering_decision(
-            Some(StorageTier::NvmePerformance), 500, 5000, 1000,
-        );
+        let dec =
+            policy.compute_tiering_decision(Some(StorageTier::NvmePerformance), 500, 5000, 1000);
         assert_eq!(dec, TieringDecision::Demote(StorageTier::HddArchive));
 
         // Warm data on SSD → no change
-        let dec = policy.compute_tiering_decision(
-            Some(StorageTier::SsdCapacity), 3000, 5000, 1000,
-        );
+        let dec = policy.compute_tiering_decision(Some(StorageTier::SsdCapacity), 3000, 5000, 1000);
         assert_eq!(dec, TieringDecision::NoChange);
 
         // ── 3. Relocation planner with tier policy ────────────────────

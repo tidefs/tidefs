@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use tidefs_cluster::pool_config::{ClusterPlacementPolicy, FailureDomain};
 use tidefs_cluster::pool_protocol::{
-    ClusterPoolCreateRequest, ClusterPoolCreateResponse, ClusterPoolImportRequest, ClusterPoolImportResponse, ClusterPoolMessage, NodeDeviceSpec,
+    ClusterPoolCreateRequest, ClusterPoolCreateResponse, ClusterPoolImportRequest,
+    ClusterPoolImportResponse, ClusterPoolMessage, NodeDeviceSpec,
 };
 use tidefs_storage_node::server::{StorageNode, StorageNodeConfig};
 use tidefs_transport::{NodeInfo, Transport, TransportAddr};
@@ -210,7 +211,14 @@ fn cluster_pool_create_two_nodes_both_succeed() {
             local_device_index: 0,
             global_device_index: 0,
             capacity_bytes: TEST_DEVICE_BYTES,
-            failure_domain: FailureDomain { device: 0, node: 1, chassis: 0, rack: 0, zone: 0, region: 0 },
+            failure_domain: FailureDomain {
+                device: 0,
+                node: 1,
+                chassis: 0,
+                rack: 0,
+                zone: 0,
+                region: 0,
+            },
         }],
         placement: ClusterPlacementPolicy::Stripe,
     };
@@ -224,7 +232,14 @@ fn cluster_pool_create_two_nodes_both_succeed() {
             local_device_index: 0,
             global_device_index: 1,
             capacity_bytes: TEST_DEVICE_BYTES,
-            failure_domain: FailureDomain { device: 0, node: 2, chassis: 0, rack: 0, zone: 0, region: 0 },
+            failure_domain: FailureDomain {
+                device: 0,
+                node: 2,
+                chassis: 0,
+                rack: 0,
+                zone: 0,
+                region: 0,
+            },
         }],
         placement: ClusterPlacementPolicy::Stripe,
     };
@@ -312,12 +327,23 @@ fn cluster_pool_create_duplicate_device_rejected() {
             local_device_index: 0,
             global_device_index: 0,
             capacity_bytes: TEST_DEVICE_BYTES,
-            failure_domain: FailureDomain { device: 0, node: 1, chassis: 0, rack: 0, zone: 0, region: 0 },
+            failure_domain: FailureDomain {
+                device: 0,
+                node: 1,
+                chassis: 0,
+                rack: 0,
+                zone: 0,
+                region: 0,
+            },
         }],
         placement: ClusterPlacementPolicy::Stripe,
     };
     let resp1 = send_create_request(&mut client, sid1, &req);
-    assert!(resp1.success, "first create must succeed: {:?}", resp1.error);
+    assert!(
+        resp1.success,
+        "first create must succeed: {:?}",
+        resp1.error
+    );
 
     // Second create on same device path with different pool GUID must fail.
     let req2 = ClusterPoolCreateRequest {
@@ -330,14 +356,25 @@ fn cluster_pool_create_duplicate_device_rejected() {
             local_device_index: 0,
             global_device_index: 0,
             capacity_bytes: TEST_DEVICE_BYTES,
-            failure_domain: FailureDomain { device: 0, node: 1, chassis: 0, rack: 0, zone: 0, region: 0 },
+            failure_domain: FailureDomain {
+                device: 0,
+                node: 1,
+                chassis: 0,
+                rack: 0,
+                zone: 0,
+                region: 0,
+            },
         }],
         placement: ClusterPlacementPolicy::Stripe,
     };
     let resp2 = send_create_request(&mut client, sid1, &req2);
     assert!(!resp2.success, "second create on same device must fail");
     assert!(
-        resp2.error.as_deref().unwrap_or("").contains("DeviceAlreadyLabeled"),
+        resp2
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("DeviceAlreadyLabeled"),
         "error must mention already-labeled device, got: {:?}",
         resp2.error
     );
@@ -371,12 +408,23 @@ fn cluster_pool_create_partial_success_one_node_rejects() {
                 local_device_index: 0,
                 global_device_index: 1,
                 capacity_bytes: TEST_DEVICE_BYTES,
-                failure_domain: FailureDomain { device: 0, node: 2, chassis: 0, rack: 0, zone: 0, region: 0 },
+                failure_domain: FailureDomain {
+                    device: 0,
+                    node: 2,
+                    chassis: 0,
+                    rack: 0,
+                    zone: 0,
+                    region: 0,
+                },
             }],
             placement: ClusterPlacementPolicy::Stripe,
         };
         let resp_pre = send_create_request(&mut client, sid2, &req_pre);
-        assert!(resp_pre.success, "pre-label must succeed: {:?}", resp_pre.error);
+        assert!(
+            resp_pre.success,
+            "pre-label must succeed: {:?}",
+            resp_pre.error
+        );
     }
 
     // Now create with target pool GUID: node 1 succeeds, node 2 fails (device already labeled).
@@ -390,7 +438,14 @@ fn cluster_pool_create_partial_success_one_node_rejects() {
             local_device_index: 0,
             global_device_index: 0,
             capacity_bytes: TEST_DEVICE_BYTES,
-            failure_domain: FailureDomain { device: 0, node: 1, chassis: 0, rack: 0, zone: 0, region: 0 },
+            failure_domain: FailureDomain {
+                device: 0,
+                node: 1,
+                chassis: 0,
+                rack: 0,
+                zone: 0,
+                region: 0,
+            },
         }],
         placement: ClusterPlacementPolicy::Stripe,
     };
@@ -404,7 +459,14 @@ fn cluster_pool_create_partial_success_one_node_rejects() {
             local_device_index: 0,
             global_device_index: 1,
             capacity_bytes: TEST_DEVICE_BYTES,
-            failure_domain: FailureDomain { device: 0, node: 2, chassis: 0, rack: 0, zone: 0, region: 0 },
+            failure_domain: FailureDomain {
+                device: 0,
+                node: 2,
+                chassis: 0,
+                rack: 0,
+                zone: 0,
+                region: 0,
+            },
         }],
         placement: ClusterPlacementPolicy::Stripe,
     };
@@ -412,25 +474,34 @@ fn cluster_pool_create_partial_success_one_node_rejects() {
     let resp1 = send_create_request(&mut client, sid1, &req1);
     let resp2 = send_create_request(&mut client, sid2, &req2);
 
-    assert!(resp1.success, "node 1 create must succeed: {:?}", resp1.error);
-    assert!(!resp2.success, "node 2 create must fail (device already labeled)");
     assert!(
-        resp2.error.as_deref().unwrap_or("").contains("DeviceAlreadyLabeled"),
+        resp1.success,
+        "node 1 create must succeed: {:?}",
+        resp1.error
+    );
+    assert!(
+        !resp2.success,
+        "node 2 create must fail (device already labeled)"
+    );
+    assert!(
+        resp2
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("DeviceAlreadyLabeled"),
         "node 2 error must mention already-labeled device, got: {:?}",
         resp2.error
     );
 
     // Verify node 1's label is discoverable even though the overall quorum would fail.
-    let scan_results =
-        tidefs_pool_scan::scan_labels(&[dev1.clone()]).expect("scan node 1");
+    let scan_results = tidefs_pool_scan::scan_labels(&[dev1.clone()]).expect("scan node 1");
     assert_eq!(scan_results.len(), 1);
     assert!(scan_results[0].label_valid);
     assert_eq!(scan_results[0].pool_guid, Some(pool_guid));
     assert_eq!(scan_results[0].pool_name.as_deref(), Some("partialpool"));
 
     // Node 2's device should still have the pre-label GUID, not the new one.
-    let scan2 =
-        tidefs_pool_scan::scan_labels(&[dev2.clone()]).expect("scan node 2");
+    let scan2 = tidefs_pool_scan::scan_labels(&[dev2.clone()]).expect("scan node 2");
     assert_eq!(scan2.len(), 1);
     assert_eq!(scan2[0].pool_guid, Some([0xDD; 16]));
 
@@ -502,7 +573,12 @@ fn cluster_pool_create_import_and_restart_reimport() {
             global_device_index: gi,
             capacity_bytes: TEST_DEVICE_BYTES,
             failure_domain: FailureDomain {
-                device: 0, node: target, chassis: 0, rack: 0, zone: 0, region: 0,
+                device: 0,
+                node: target,
+                chassis: 0,
+                rack: 0,
+                zone: 0,
+                region: 0,
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
@@ -510,14 +586,26 @@ fn cluster_pool_create_import_and_restart_reimport() {
 
     let create_resp1 = send_create_request(&mut client, sid1, &create_req(1, &dev0, 0));
     let create_resp2 = send_create_request(&mut client, sid2, &create_req(2, &dev1, 1));
-    assert!(create_resp1.success, "node 1 create: {:?}", create_resp1.error);
-    assert!(create_resp2.success, "node 2 create: {:?}", create_resp2.error);
+    assert!(
+        create_resp1.success,
+        "node 1 create: {:?}",
+        create_resp1.error
+    );
+    assert!(
+        create_resp2.success,
+        "node 2 create: {:?}",
+        create_resp2.error
+    );
 
     // Import pool directly to verify committed root is established.
     let import_dir = dir.path().join("import-locks");
     std::fs::create_dir_all(&import_dir).expect("create import lock dir");
     let imported = tidefs_pool_import::pool_import(
-        &[dev0.clone(), dev1.clone()], &import_dir, false, None, None,
+        &[dev0.clone(), dev1.clone()],
+        &import_dir,
+        false,
+        None,
+        None,
     )
     .expect("initial pool import");
     assert!(
@@ -533,9 +621,12 @@ fn cluster_pool_create_import_and_restart_reimport() {
 
     // Phase 3: restart -- scan labels to prove durability
     let device_paths: Vec<PathBuf> = vec![dev0.clone(), dev1.clone()];
-    let scan_results =
-        tidefs_pool_scan::scan_labels(&device_paths).expect("scan after restart");
-    assert_eq!(scan_results.len(), 2, "both devices should have labels after restart");
+    let scan_results = tidefs_pool_scan::scan_labels(&device_paths).expect("scan after restart");
+    assert_eq!(
+        scan_results.len(),
+        2,
+        "both devices should have labels after restart"
+    );
     for r in &scan_results {
         assert!(r.label_valid, "label must be valid: {}", r.label_status);
         assert_eq!(r.pool_guid, Some(pool_guid));
@@ -591,7 +682,12 @@ fn cluster_pool_import_fails_on_unlabeled_device_after_restart() {
             global_device_index: 0,
             capacity_bytes: TEST_DEVICE_BYTES,
             failure_domain: FailureDomain {
-                device: 0, node: 1, chassis: 0, rack: 0, zone: 0, region: 0,
+                device: 0,
+                node: 1,
+                chassis: 0,
+                rack: 0,
+                zone: 0,
+                region: 0,
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
@@ -610,7 +706,10 @@ fn cluster_pool_import_fails_on_unlabeled_device_after_restart() {
     let scan = scan_both.unwrap();
     assert_eq!(scan.len(), 2);
     assert!(scan[0].label_valid, "node 1 device must be labeled");
-    assert!(!scan[1].label_valid, "node 2 device must report unlabeled after restart");
+    assert!(
+        !scan[1].label_valid,
+        "node 2 device must report unlabeled after restart"
+    );
     assert!(
         scan[1].label_status.contains("NoPoolLabel")
             || scan[1].label_status.contains("no pool label")
@@ -622,9 +721,16 @@ fn cluster_pool_import_fails_on_unlabeled_device_after_restart() {
 
     // Node 1's labeled device alone imports fine (safe partial recovery).
     let single_import = tidefs_pool_import::pool_import(
-        &[dev0.clone()], &dir.path().join("import-locks-ok"), false, None, None,
+        &[dev0.clone()],
+        &dir.path().join("import-locks-ok"),
+        false,
+        None,
+        None,
     );
-    assert!(single_import.is_ok(), "node 1 alone must import successfully");
+    assert!(
+        single_import.is_ok(),
+        "node 1 alone must import successfully"
+    );
     assert_eq!(single_import.unwrap().config.pool_uuid, pool_guid);
 }
 
@@ -648,37 +754,59 @@ fn cluster_pool_import_refuses_mismatched_guid_after_restart() {
     let sid2 = connect_client(&mut client, 2, server2.addr());
 
     // Create pool A on node 1.
-    let resp_a = send_create_request(&mut client, sid1, &ClusterPoolCreateRequest {
-        request_id: 1,
-        pool_guid: guid_a,
-        pool_name: "pool-a".to_string(),
-        target_node_id: 1,
-        node_devices: vec![NodeDeviceSpec {
-            device_path: dev_a.to_string_lossy().to_string(),
-            local_device_index: 0,
-            global_device_index: 0,
-            capacity_bytes: TEST_DEVICE_BYTES,
-            failure_domain: FailureDomain { device: 0, node: 1, chassis: 0, rack: 0, zone: 0, region: 0 },
-        }],
-        placement: ClusterPlacementPolicy::Stripe,
-    });
+    let resp_a = send_create_request(
+        &mut client,
+        sid1,
+        &ClusterPoolCreateRequest {
+            request_id: 1,
+            pool_guid: guid_a,
+            pool_name: "pool-a".to_string(),
+            target_node_id: 1,
+            node_devices: vec![NodeDeviceSpec {
+                device_path: dev_a.to_string_lossy().to_string(),
+                local_device_index: 0,
+                global_device_index: 0,
+                capacity_bytes: TEST_DEVICE_BYTES,
+                failure_domain: FailureDomain {
+                    device: 0,
+                    node: 1,
+                    chassis: 0,
+                    rack: 0,
+                    zone: 0,
+                    region: 0,
+                },
+            }],
+            placement: ClusterPlacementPolicy::Stripe,
+        },
+    );
     assert!(resp_a.success, "pool A create: {:?}", resp_a.error);
 
     // Create pool B on node 2.
-    let resp_b = send_create_request(&mut client, sid2, &ClusterPoolCreateRequest {
-        request_id: 1,
-        pool_guid: guid_b,
-        pool_name: "pool-b".to_string(),
-        target_node_id: 2,
-        node_devices: vec![NodeDeviceSpec {
-            device_path: dev_b.to_string_lossy().to_string(),
-            local_device_index: 0,
-            global_device_index: 0,
-            capacity_bytes: TEST_DEVICE_BYTES,
-            failure_domain: FailureDomain { device: 0, node: 2, chassis: 0, rack: 0, zone: 0, region: 0 },
-        }],
-        placement: ClusterPlacementPolicy::Stripe,
-    });
+    let resp_b = send_create_request(
+        &mut client,
+        sid2,
+        &ClusterPoolCreateRequest {
+            request_id: 1,
+            pool_guid: guid_b,
+            pool_name: "pool-b".to_string(),
+            target_node_id: 2,
+            node_devices: vec![NodeDeviceSpec {
+                device_path: dev_b.to_string_lossy().to_string(),
+                local_device_index: 0,
+                global_device_index: 0,
+                capacity_bytes: TEST_DEVICE_BYTES,
+                failure_domain: FailureDomain {
+                    device: 0,
+                    node: 2,
+                    chassis: 0,
+                    rack: 0,
+                    zone: 0,
+                    region: 0,
+                },
+            }],
+            placement: ClusterPlacementPolicy::Stripe,
+        },
+    );
     assert!(resp_b.success, "pool B create: {:?}", resp_b.error);
 
     server1.stop.store(true, Ordering::Relaxed);
@@ -688,15 +816,16 @@ fn cluster_pool_import_refuses_mismatched_guid_after_restart() {
     // After restart: attempt to import both devices as one pool.
     let import_dir = dir.path().join("import-locks");
     std::fs::create_dir_all(&import_dir).expect("create import lock dir");
-    let result = tidefs_pool_import::pool_import(
-        &[dev_a, dev_b], &import_dir, false, None, None,
-    );
+    let result = tidefs_pool_import::pool_import(&[dev_a, dev_b], &import_dir, false, None, None);
     assert!(result.is_err(), "import must fail on GUID mismatch");
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("multiple pools") || err.contains("belong to")
-            || err.contains("mismatch") || err.contains("uuid")
-            || err.contains("GUID") || err.contains("guid")
+        err.contains("multiple pools")
+            || err.contains("belong to")
+            || err.contains("mismatch")
+            || err.contains("uuid")
+            || err.contains("GUID")
+            || err.contains("guid")
             || err.contains("inconsistent"),
         "error must indicate GUID mismatch / multiple pools, got: {err}"
     );
@@ -732,7 +861,12 @@ fn cluster_pool_restart_varied_order_nodes_reimport() {
             global_device_index: gi,
             capacity_bytes: TEST_DEVICE_BYTES,
             failure_domain: FailureDomain {
-                device: 0, node: target, chassis: 0, rack: 0, zone: 0, region: 0,
+                device: 0,
+                node: target,
+                chassis: 0,
+                rack: 0,
+                zone: 0,
+                region: 0,
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
@@ -740,14 +874,26 @@ fn cluster_pool_restart_varied_order_nodes_reimport() {
 
     let create_resp1 = send_create_request(&mut client, sid1, &create_req(1, &dev0, 0));
     let create_resp2 = send_create_request(&mut client, sid2, &create_req(2, &dev1, 1));
-    assert!(create_resp1.success, "node 1 create: {:?}", create_resp1.error);
-    assert!(create_resp2.success, "node 2 create: {:?}", create_resp2.error);
+    assert!(
+        create_resp1.success,
+        "node 1 create: {:?}",
+        create_resp1.error
+    );
+    assert!(
+        create_resp2.success,
+        "node 2 create: {:?}",
+        create_resp2.error
+    );
 
     // Import the pool to establish committed root.
     let import_dir = dir.path().join("import-locks");
     std::fs::create_dir_all(&import_dir).expect("create import lock dir");
     let imported = tidefs_pool_import::pool_import(
-        &[dev0.clone(), dev1.clone()], &import_dir, false, None, None,
+        &[dev0.clone(), dev1.clone()],
+        &import_dir,
+        false,
+        None,
+        None,
     )
     .expect("initial pool import");
     assert!(imported.stats.committed_root_epoch.is_some());
@@ -772,7 +918,11 @@ fn cluster_pool_restart_varied_order_nodes_reimport() {
     let reimport_dir = dir.path().join("import-locks-restart");
     std::fs::create_dir_all(&reimport_dir).expect("create reimport lock dir");
     let reimported = tidefs_pool_import::pool_import(
-        &[dev1.clone(), dev0.clone()], &reimport_dir, false, None, None,
+        &[dev1.clone(), dev0.clone()],
+        &reimport_dir,
+        false,
+        None,
+        None,
     )
     .expect("re-import after restart (varied order)");
     assert!(reimported.stats.committed_root_epoch.is_some());

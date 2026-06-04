@@ -25,7 +25,10 @@ impl SessionPoolTransport {
     }
 
     pub fn register_node(&self, node_id: u64, session_id: SessionId) {
-        self.node_sessions.lock().unwrap().insert(node_id, session_id);
+        self.node_sessions
+            .lock()
+            .unwrap()
+            .insert(node_id, session_id);
     }
 
     fn frame_message(&self, msg: &ClusterPoolMessage) -> Result<Vec<u8>, OrchestratorError> {
@@ -42,11 +45,7 @@ impl SessionPoolTransport {
 impl PoolTransport for SessionPoolTransport {
     type Error = OrchestratorError;
 
-    fn send(
-        &self,
-        target_node_id: u64,
-        message: ClusterPoolMessage,
-    ) -> Result<(), Self::Error> {
+    fn send(&self, target_node_id: u64, message: ClusterPoolMessage) -> Result<(), Self::Error> {
         let session_id = {
             let map = self.node_sessions.lock().unwrap();
             map.get(&target_node_id)
@@ -93,9 +92,7 @@ impl PoolTransport for SessionPoolTransport {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[session-pool-transport] recv error on node {node_id}: {e:?}"
-                    );
+                    eprintln!("[session-pool-transport] recv error on node {node_id}: {e:?}");
                 }
             }
         }
@@ -107,10 +104,10 @@ impl PoolTransport for SessionPoolTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_cluster::pool_config::ClusterPlacementPolicy;
     use tidefs_cluster::pool_protocol::{
         ClusterPoolCreateRequest, ClusterPoolCreateResponse, ClusterPoolImportResponse,
     };
-    use tidefs_cluster::pool_config::ClusterPlacementPolicy;
 
     #[test]
     fn frame_and_decode_roundtrip() {

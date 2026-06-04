@@ -50,7 +50,6 @@ use tidefs_kmod_bridge::{BridgeError, BridgeResult};
 #[cfg(not(CONFIG_RUST))]
 use tidefs_vfs_engine::Errno;
 
-
 // ── KernelStorageIoCompat ──────────────────────────────────────────────
 
 /// Kbuild-compatible mirror of [`tidefs_kernel_storage_io::KernelStorageIo`].
@@ -449,11 +448,7 @@ impl<S: KernelStorageIoCompat> PoolCoreOps for KernelStoragePoolCoreAdapter<S> {
         true
     }
 
-    fn write_zeroes_volume_blocks(
-        &self,
-        offset_bytes: u64,
-        len_bytes: u64,
-    ) -> Result<(), Errno> {
+    fn write_zeroes_volume_blocks(&self, offset_bytes: u64, len_bytes: u64) -> Result<(), Errno> {
         self.write_zeroes_range(offset_bytes, len_bytes)
     }
 
@@ -473,8 +468,6 @@ impl<S: KernelStorageIoCompat + core::fmt::Debug> core::fmt::Debug
             .finish()
     }
 }
-
-
 
 // ── PoolCoreBackend ───────────────────────────────────────────────────
 
@@ -1302,6 +1295,4 @@ mod tests {
         // Discard of zero length should be a no-op, not an error
         assert!(backend.discard_sectors(0, 0).is_ok());
     }
-
-
 }

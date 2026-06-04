@@ -12,7 +12,7 @@
 
 use tidefs_validation::runtime_artifact_source::RuntimeArtifactSource;
 use tidefs_validation::ublk_discard_validation::{
-    DiscardValidationRow, DiscardValidationTier, DiscardOpKind, DiscardOutcome,
+    DiscardOpKind, DiscardOutcome, DiscardValidationRow, DiscardValidationTier,
 };
 
 fn genuine_artifact() -> RuntimeArtifactSource {

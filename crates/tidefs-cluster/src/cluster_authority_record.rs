@@ -433,9 +433,7 @@ impl std::fmt::Display for AuthorityRefusalReason {
 /// Validate a stand-alone authority record (no chain context).
 ///
 /// Checks magic, version, self-digest, and internal invariants.
-pub fn validate_authority_record(
-    record: &ClusterAuthorityRecord,
-) -> ClusterAuthorityVerdict {
+pub fn validate_authority_record(record: &ClusterAuthorityRecord) -> ClusterAuthorityVerdict {
     if record.magic != CLUSTER_AUTHORITY_MAGIC {
         return ClusterAuthorityVerdict::Refused {
             reason: AuthorityRefusalReason::BadMagic,
@@ -464,10 +462,7 @@ pub fn validate_authority_record(
     if record.membership_epoch.0 > 0 && record.voter_set.is_empty() {
         return ClusterAuthorityVerdict::Refused {
             reason: AuthorityRefusalReason::NonZeroEpochEmptyVoters,
-            detail: format!(
-                "epoch {:?} with empty voter set",
-                record.membership_epoch
-            ),
+            detail: format!("epoch {:?} with empty voter set", record.membership_epoch),
         };
     }
     // Invariant: if epoch == 0, voter set must be empty.
@@ -481,10 +476,7 @@ pub fn validate_authority_record(
     if record.import_owner != 0 && record.is_fenced(record.import_owner) {
         return ClusterAuthorityVerdict::Refused {
             reason: AuthorityRefusalReason::ImportOwnerFenced,
-            detail: format!(
-                "import owner {} is in fenced set",
-                record.import_owner
-            ),
+            detail: format!("import owner {} is in fenced set", record.import_owner),
         };
     }
     // Invariant: placement map epoch cannot exceed membership epoch
@@ -664,10 +656,7 @@ mod tests {
         assert!(!rec.is_fenced(2));
 
         // Successor with fencing
-        let succ = rec
-            .successor()
-            .fenced_nodes(voters(&[2]))
-            .build();
+        let succ = rec.successor().fenced_nodes(voters(&[2])).build();
         assert!(succ.is_fenced(2));
         assert!(!succ.is_fenced(1));
         assert!(!succ.is_fenced(3));
@@ -712,10 +701,7 @@ mod tests {
             [0u8; 32],
             1,
         );
-        let mut succ = genesis
-            .successor()
-            .membership_epoch(EpochId(2))
-            .build();
+        let mut succ = genesis.successor().membership_epoch(EpochId(2)).build();
 
         // Tamper: break the prev_digest link
         succ.prev_digest = [0xFF; 32];
@@ -837,10 +823,7 @@ mod tests {
             0,
         );
         // Fence the import owner
-        let succ = rec
-            .successor()
-            .fenced_nodes(voters(&[2]))
-            .build();
+        let succ = rec.successor().fenced_nodes(voters(&[2])).build();
 
         let verdict = validate_authority_record(&succ);
         match verdict {
@@ -870,7 +853,10 @@ mod tests {
             ClusterAuthorityVerdict::Refused { reason, .. } => {
                 assert_eq!(reason, AuthorityRefusalReason::MapEpochAheadOfMembership);
             }
-            other => panic!("expected MapEpochAheadOfMembership refusal, got {:?}", other),
+            other => panic!(
+                "expected MapEpochAheadOfMembership refusal, got {:?}",
+                other
+            ),
         }
     }
 
@@ -902,10 +888,7 @@ mod tests {
             [0u8; 32],
             0,
         );
-        let succ = genesis
-            .successor()
-            .fenced_nodes(voters(&[3]))
-            .build();
+        let succ = genesis.successor().fenced_nodes(voters(&[3])).build();
 
         let encoded = succ.encode().unwrap();
         let decoded = ClusterAuthorityRecord::decode(&encoded).unwrap();
@@ -1022,10 +1005,7 @@ mod tests {
 
     #[test]
     fn refusal_reason_display() {
-        assert_eq!(
-            AuthorityRefusalReason::BadMagic.to_string(),
-            "bad_magic"
-        );
+        assert_eq!(AuthorityRefusalReason::BadMagic.to_string(), "bad_magic");
         assert_eq!(
             AuthorityRefusalReason::ChainBroken.to_string(),
             "chain_broken"
@@ -1083,10 +1063,7 @@ mod tests {
             [0u8; 32],
             1,
         );
-        let r1 = r0
-            .successor()
-            .membership_epoch(EpochId(2))
-            .build();
+        let r1 = r0.successor().membership_epoch(EpochId(2)).build();
         assert_eq!(r1.sequence, 1);
 
         // Try to validate r0 as successor to r1 (sequence goes backward)

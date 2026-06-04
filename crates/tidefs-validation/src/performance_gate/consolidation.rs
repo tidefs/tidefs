@@ -8,7 +8,6 @@
 //! comparator matrix with blocker documentation.
 
 use super::degradation_budget::DegradationComparison;
-use super::validation_tier::ValidationTier;
 use super::gate_entry::MultiNodeDegradationBudget;
 use super::gate_entry::{
     ArtifactRequirement, BudgetClass, ComparatorRef, EnvironmentManifest, MeasuredKpi,
@@ -16,6 +15,7 @@ use super::gate_entry::{
     RowStatus,
 };
 use super::matrix::{PerformanceMatrix, REQUIRED_SUBJECTS};
+use super::validation_tier::ValidationTier;
 use serde::{Deserialize, Serialize};
 
 /// Product lane for organising performance gate subjects.

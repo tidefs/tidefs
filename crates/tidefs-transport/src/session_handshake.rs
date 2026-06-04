@@ -32,8 +32,8 @@
 
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tidefs_binary_schema_core::{U16Le, U32Le, U64Le};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // ---------------------------------------------------------------------------
 // Wire format constants

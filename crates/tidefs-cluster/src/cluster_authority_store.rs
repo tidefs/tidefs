@@ -35,9 +35,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::cluster_authority_record::{
-    validate_authority_chain, validate_authority_record,
-    ClusterAuthorityRecord, ClusterAuthorityVerdict, CLUSTER_AUTHORITY_MAGIC,
-    CLUSTER_AUTHORITY_VERSION,
+    validate_authority_chain, validate_authority_record, ClusterAuthorityRecord,
+    ClusterAuthorityVerdict, CLUSTER_AUTHORITY_MAGIC, CLUSTER_AUTHORITY_VERSION,
 };
 
 // ── On-disk constants ─────────────────────────────────────────────
@@ -71,9 +70,7 @@ pub enum AuthorityStoreError {
     /// I/O error.
     Io(String),
     /// The region is too small to contain a valid header.
-    TruncatedHeader {
-        found: usize,
-    },
+    TruncatedHeader { found: usize },
     /// Magic bytes do not match CLUSTER_AUTHORITY_MAGIC.
     BadMagic,
     /// Unsupported format version.
@@ -81,15 +78,11 @@ pub enum AuthorityStoreError {
     /// Header checksum mismatch (corrupt header).
     HeaderChecksumMismatch,
     /// A record in the chain is truncated or unparseable.
-    TruncatedRecord {
-        index: usize,
-    },
+    TruncatedRecord { index: usize },
     /// Bincode deserialization of a record failed.
     RecordDecode(String),
     /// Record checksum mismatch (corrupt record).
-    RecordChecksumMismatch {
-        index: usize,
-    },
+    RecordChecksumMismatch { index: usize },
     /// The region is empty (no records or zero-filled).
     NoRecords,
 }
@@ -123,7 +116,7 @@ fn encode_header_into(record_count: u32, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&CLUSTER_AUTHORITY_VERSION.to_le_bytes());
     buf.extend_from_slice(&record_count.to_le_bytes());
     buf.extend_from_slice(&[0u8; 12]); // reserved
-    // Compute header checksum over bytes written so far (24 bytes).
+                                       // Compute header checksum over bytes written so far (24 bytes).
     let header_bytes = &buf[buf.len() - 24..];
     let mut hasher = blake3::Hasher::new();
     hasher.update(HEADER_DOMAIN);
@@ -165,8 +158,9 @@ fn decode_header(data: &[u8]) -> Result<(u32, &[u8]), AuthorityStoreError> {
 
 /// Encode a single authority record envelope into `buf`.
 fn encode_record_envelope_into(record: &ClusterAuthorityRecord, buf: &mut Vec<u8>) {
-    let encoded =
-        record.encode().expect("bincode encode of ClusterAuthorityRecord must succeed");
+    let encoded = record
+        .encode()
+        .expect("bincode encode of ClusterAuthorityRecord must succeed");
     // record_len: u32 LE
     buf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
     // record_csum: BLAKE3-256 over encoded bytes
@@ -405,8 +399,10 @@ pub fn scan_authority_from_devices(
     ),
     AuthorityStoreError,
 > {
-    let mut per_device: BTreeMap<String, Result<Option<ClusterAuthorityRecord>, AuthorityStoreError>> =
-        BTreeMap::new();
+    let mut per_device: BTreeMap<
+        String,
+        Result<Option<ClusterAuthorityRecord>, AuthorityStoreError>,
+    > = BTreeMap::new();
     let mut best: Option<ClusterAuthorityRecord> = None;
 
     let mut first_fatal: Option<AuthorityStoreError> = None;
@@ -627,7 +623,7 @@ mod tests {
         buf.extend_from_slice(&99u32.to_le_bytes()); // wrong version
         buf.extend_from_slice(&0u32.to_le_bytes()); // record_count
         buf.extend_from_slice(&[0u8; 12]); // reserved
-        // Compute checksum with wrong version
+                                           // Compute checksum with wrong version
         let header_bytes = &buf[buf.len() - 24..];
         let mut hasher = blake3::Hasher::new();
         hasher.update(HEADER_DOMAIN);
@@ -701,29 +697,38 @@ mod tests {
 
         {
             let mut f1 = std::fs::File::create(&dev1_path).unwrap();
-            f1.write_all(&vec![0u8; CLUSTER_AUTHORITY_REGION_OFFSET as usize]).unwrap();
+            f1.write_all(&vec![0u8; CLUSTER_AUTHORITY_REGION_OFFSET as usize])
+                .unwrap();
             write_authority_chain_to_device(&mut f1, &[r0.clone()]).unwrap();
         }
         {
             let mut f2 = std::fs::File::create(&dev2_path).unwrap();
-            f2.write_all(&vec![0u8; CLUSTER_AUTHORITY_REGION_OFFSET as usize]).unwrap();
+            f2.write_all(&vec![0u8; CLUSTER_AUTHORITY_REGION_OFFSET as usize])
+                .unwrap();
             write_authority_chain_to_device(&mut f2, &[r0.clone(), r1.clone()]).unwrap();
         }
 
-        let (best, per_device) =
-            scan_authority_from_devices(&[&dev1_path, &dev2_path]).unwrap();
+        let (best, per_device) = scan_authority_from_devices(&[&dev1_path, &dev2_path]).unwrap();
         assert!(best.is_some());
         assert_eq!(best.unwrap(), r1);
         assert_eq!(per_device.len(), 2);
 
         let dev1_result = per_device
             .get(&dev1_path.display().to_string())
-            .unwrap().as_ref().unwrap().as_ref().unwrap();
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap();
         assert_eq!(dev1_result.sequence, 0);
 
         let dev2_result = per_device
             .get(&dev2_path.display().to_string())
-            .unwrap().as_ref().unwrap().as_ref().unwrap();
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap();
         assert_eq!(dev2_result.sequence, 1);
     }
 
@@ -749,13 +754,15 @@ mod tests {
 
     #[test]
     fn error_display() {
-        assert!(AuthorityStoreError::BadMagic.to_string().contains("bad authority"));
-        assert!(AuthorityStoreError::NoRecords.to_string().contains("no authority records"));
-        assert!(
-            AuthorityStoreError::HeaderChecksumMismatch
-                .to_string()
-                .contains("checksum")
-        );
+        assert!(AuthorityStoreError::BadMagic
+            .to_string()
+            .contains("bad authority"));
+        assert!(AuthorityStoreError::NoRecords
+            .to_string()
+            .contains("no authority records"));
+        assert!(AuthorityStoreError::HeaderChecksumMismatch
+            .to_string()
+            .contains("checksum"));
         let e = AuthorityStoreError::Io("test".into());
         assert!(e.to_string().contains("test"));
     }

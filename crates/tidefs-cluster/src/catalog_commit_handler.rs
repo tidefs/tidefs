@@ -101,9 +101,9 @@ impl EpochCommitSubscriber for CatalogDeltaSubscriber {
 mod tests {
     use super::*;
     use crate::dataset_catalog::{CatalogDelta, ClusterPoolCatalog};
-    use tokio::sync::mpsc;
     use tidefs_dataset_catalog::{DatasetFlags, DatasetType};
     use tidefs_membership_epoch::EpochId;
+    use tokio::sync::mpsc;
 
     fn make_runtime() -> ClusterLeaseRuntime {
         let (tx, _rx) = mpsc::unbounded_channel();

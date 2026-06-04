@@ -19,7 +19,6 @@ use std::sync::Arc;
 use clap::Subcommand;
 use tidefs_local_filesystem::RootAuthenticationKey;
 
-
 /// Subcommands for the `tidefsctl block` group.
 #[derive(Subcommand, Debug)]
 pub enum BlockCommand {
@@ -138,7 +137,8 @@ pub fn handle_block(cmd: BlockCommand) {
             node_id,
             server_node_id,
         } => {
-            if let Err(err) = handle_block_receive(&pool_path, source_addr, node_id, server_node_id) {
+            if let Err(err) = handle_block_receive(&pool_path, source_addr, node_id, server_node_id)
+            {
                 eprintln!("tidefsctl block receive: {err}");
                 process::exit(1);
             }
@@ -357,17 +357,15 @@ fn read_block_device_size(dev_path: &Path) -> Result<u64, ()> {
     Ok(sectors * 512)
 }
 
-
 // ── Block send/receive over VSNP ─────────────────────────────────────
 
 use crate::commands::snapshot::{
-    build_block_pull_request, build_block_push_message,
-    parse_snap_net_message, transport_request, SnapNetMessage,
+    build_block_pull_request, build_block_push_message, parse_snap_net_message, transport_request,
+    SnapNetMessage,
 };
 
 fn block_root_auth_key() -> RootAuthenticationKey {
-    RootAuthenticationKey::from_environment()
-        .unwrap_or_else(|_| RootAuthenticationKey::demo_key())
+    RootAuthenticationKey::from_environment().unwrap_or_else(|_| RootAuthenticationKey::demo_key())
 }
 
 fn handle_block_send(
@@ -463,17 +461,18 @@ fn read_pool_block_data(pool_path: &Path) -> Result<Vec<u8>, String> {
     // adapter's read path. The current approach reads object store files
     // directly as a simple block-level replication.
     let mut block_data = Vec::new();
-    let dir_entries = std::fs::read_dir(pool_path)
-        .map_err(|e| format!("read pool dir: {e}"))?;
+    let dir_entries = std::fs::read_dir(pool_path).map_err(|e| format!("read pool dir: {e}"))?;
 
     for entry in dir_entries {
         let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
         let path = entry.path();
         if path.is_file()
-            && path.file_name().map(|n| n != "tidefs-committed-root").unwrap_or(true)
+            && path
+                .file_name()
+                .map(|n| n != "tidefs-committed-root")
+                .unwrap_or(true)
         {
-            let data = std::fs::read(&path)
-                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            let data = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
             block_data.extend_from_slice(&data);
         }
     }
@@ -487,13 +486,11 @@ fn read_pool_block_data(pool_path: &Path) -> Result<Vec<u8>, String> {
 
 /// Write raw block data to a TideFS pool.
 fn write_pool_block_data(pool_path: &Path, data: &[u8]) -> Result<(), String> {
-    std::fs::create_dir_all(pool_path)
-        .map_err(|e| format!("create pool dir: {e}"))?;
+    std::fs::create_dir_all(pool_path).map_err(|e| format!("create pool dir: {e}"))?;
 
     // Write block data as a single object file in the pool.
     let data_path = pool_path.join("block-volume-data");
-    std::fs::write(&data_path, data)
-        .map_err(|e| format!("write block data: {e}"))?;
+    std::fs::write(&data_path, data).map_err(|e| format!("write block data: {e}"))?;
 
     Ok(())
 }

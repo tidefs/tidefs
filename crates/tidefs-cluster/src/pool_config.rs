@@ -607,7 +607,10 @@ mod tests {
             devices,
             ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 },
         );
-        assert!(!config.has_sufficient_nodes(), "mirror with 1 node must be insufficient");
+        assert!(
+            !config.has_sufficient_nodes(),
+            "mirror with 1 node must be insufficient"
+        );
         assert_eq!(config.redundancy.min_nodes(), 2);
     }
 
@@ -620,7 +623,10 @@ mod tests {
             devices,
             ClusterPlacementPolicy::Stripe,
         );
-        assert!(config.has_sufficient_nodes(), "stripe with 1 node must be sufficient");
+        assert!(
+            config.has_sufficient_nodes(),
+            "stripe with 1 node must be sufficient"
+        );
         assert_eq!(config.redundancy.min_nodes(), 1);
     }
 

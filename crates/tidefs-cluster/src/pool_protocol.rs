@@ -234,7 +234,6 @@ pub struct ClusterPoolLeaseResponse {
     pub error: Option<String>,
 }
 
-
 // ---------------------------------------------------------------------------
 // CatalogQueryType
 // ---------------------------------------------------------------------------
@@ -323,7 +322,6 @@ pub struct ClusterPoolCatalogQueryResponse {
     /// Error message if the query failed.
     pub error: Option<String>,
 }
-
 
 // ClusterPoolMessage — union type for dispatch
 // ---------------------------------------------------------------------------

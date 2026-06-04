@@ -592,17 +592,15 @@ mod tests {
         let config = ClusterPoolConfig::new(
             [0xBA; 16],
             "rt".into(),
-            vec![
-                NodeDevice::new(
-                    "/dev/sde".into(),
-                    [0xC0; 16],
-                    0,
-                    0,
-                    100_000_000,
-                    1,
-                    FailureDomain::for_node(1),
-                ),
-            ],
+            vec![NodeDevice::new(
+                "/dev/sde".into(),
+                [0xC0; 16],
+                0,
+                0,
+                100_000_000,
+                1,
+                FailureDomain::for_node(1),
+            )],
             ClusterPlacementPolicy::Stripe,
         );
 
@@ -650,10 +648,7 @@ mod tests {
 
     #[test]
     fn bridge_error_display() {
-        assert_eq!(
-            BridgeError::EmptyLabels.to_string(),
-            "no labels provided"
-        );
+        assert_eq!(BridgeError::EmptyLabels.to_string(), "no labels provided");
         assert_eq!(
             BridgeError::PoolGuidMismatch.to_string(),
             "pool GUID mismatch across labels"

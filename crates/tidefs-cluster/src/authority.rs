@@ -75,18 +75,16 @@ impl LeaseAuthority {
 
     /// during lease acquisition, not pre-populated from the snapshot).
 
-    pub fn from_snapshot(snapshot: &crate::cluster_authority_snapshot::ClusterAuthoritySnapshot) -> Self {
-
+    pub fn from_snapshot(
+        snapshot: &crate::cluster_authority_snapshot::ClusterAuthoritySnapshot,
+    ) -> Self {
         Self {
-
             slots: BTreeMap::new(),
 
             current_epoch: EpochId(snapshot.membership_epoch),
 
             next_lease_id: 1,
-
         }
-
     }
     /// Create a new lease authority for the given epoch.
     pub fn new(current_epoch: EpochId) -> Self {

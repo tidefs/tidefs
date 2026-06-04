@@ -8,7 +8,7 @@ mod common;
 
 use common::{
     build_cache, build_live_lifecycle, build_live_resize_runtime, standard_geometry, timed,
-    CharterClause, ValidationLane, HarnessContext, HarnessProfile, ReleaseGate,
+    CharterClause, HarnessContext, HarnessProfile, ReleaseGate, ValidationLane,
 };
 use tidefs_block_volume_adapter_core::{
     BlockRangeRecord, BlockVolumeDurabilityClass, BlockVolumeExportTransitionClass,

@@ -72,12 +72,12 @@
 
 use std::sync::Arc;
 
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
 use tidefs_binary_schema_core::SchemaFamilyId;
 use tidefs_binary_schema_framing::{
     EnvelopeBuilder, FramedMessage, FramingDecoder, MAX_FRAME_BODY_BYTES,
 };
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
 
 use crate::channel::{ChannelId, SharedChannelTable};
 use crate::connection::ConnectionHandle;

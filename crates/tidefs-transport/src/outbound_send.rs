@@ -1719,9 +1719,9 @@ mod tests {
     use crate::connection_registry::ConnectionState;
     use crate::envelope::MessageFamily;
     use std::sync::Arc;
+    use tidefs_types_transport_session::SessionClass;
     use tokio::net::TcpListener;
     use tokio::sync::RwLock;
-    use tidefs_types_transport_session::SessionClass;
 
     // -------------------------------------------------------------------
     // SendFramer tests

@@ -12,8 +12,8 @@
 //! for the performance gate matrix.
 
 use super::benchmark_harness::BenchmarkResult;
-use super::validation_tier::ValidationTier;
 use super::gate_entry::MeasuredKpi;
+use super::validation_tier::ValidationTier;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

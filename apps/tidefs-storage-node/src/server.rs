@@ -9,9 +9,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tidefs_cluster::pool_protocol::{
+    CatalogEntryRow, ClusterPoolCatalogDeltaResponse, ClusterPoolCatalogQueryResponse,
+    ClusterPoolCreateResponse, ClusterPoolImportResponse, ClusterPoolLeaseResponse,
+    ClusterPoolMessage,
+};
+use tidefs_cluster::ClusterPlacementPolicy;
+use tidefs_cluster::{ClusterLeaseConfig, ClusterLeaseRuntime, FenceAuthority, FenceValidator};
 use tidefs_local_filesystem::{self as vfs, ChangedRecordExport, RootAuthenticationKey};
 use tidefs_local_object_store::StoreOptions;
 use tidefs_membership_epoch::session_binding::{RosterSessionRegistry, SessionAcceptor};
+use tidefs_membership_epoch::EpochId;
 use tidefs_membership_epoch::{MemberClass, MemberId};
 use tidefs_membership_live::connection_acceptance::ConnectionAcceptor;
 use tidefs_membership_live::peer_eviction::EvictionAction;
@@ -24,14 +32,10 @@ use tidefs_membership_live::{
 };
 use tidefs_membership_types::MemberIdentity;
 use tidefs_node_join::{JoinPipeline, JoinPipelinePhase};
-use tidefs_pool_import::{pool_import, ImportedPool};
-use tidefs_cluster::ClusterPlacementPolicy;
-use tidefs_cluster::pool_protocol::{CatalogEntryRow, ClusterPoolCatalogDeltaResponse, ClusterPoolCatalogQueryResponse, ClusterPoolCreateResponse, ClusterPoolImportResponse, ClusterPoolLeaseResponse, ClusterPoolMessage};
-use tidefs_cluster::{ClusterLeaseConfig, ClusterLeaseRuntime, FenceAuthority, FenceValidator};
-use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
 use tidefs_partition_runtime::split_brain_guard::SplitBrainGuard;
 use tidefs_partition_runtime::types::PartitionFence;
-use tidefs_membership_epoch::EpochId;
+use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
+use tidefs_pool_import::{pool_import, ImportedPool};
 use tidefs_replicated_object_store::{
     ReplicatedObjectStore, ReplicatedStoreConfig, TransportReplicatedStore,
     TransportReplicatedStoreConfig,
@@ -866,7 +870,6 @@ impl StorageNode {
                 (None, None)
             };
 
-
         Ok(Self {
             transport: Arc::new(Mutex::new(transport)),
             store: Arc::new(Mutex::new(store_backend)),
@@ -1140,10 +1143,7 @@ impl StorageNode {
             placement_version_tracker: Arc::clone(&self.placement_version_tracker),
             active_barrier: Arc::clone(&self.active_barrier),
             fence_validator: self.fence_validator.clone(),
-            lease_runtime: self
-                .cluster_lease_runtime
-                .as_ref()
-                .map(Arc::clone),
+            lease_runtime: self.cluster_lease_runtime.as_ref().map(Arc::clone),
         };
 
         thread::spawn(move || {
@@ -1259,12 +1259,9 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     // No response needed (e.g., internal processing).
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[storage-node] session {session_id}: vsnp error: {e}"
-                    );
+                    eprintln!("[storage-node] session {session_id}: vsnp error: {e}");
                     // Send error response back to client.
-                    let error_bytes =
-                        build_vsnp_error(&format!("vsnp handler error: {e}"));
+                    let error_bytes = build_vsnp_error(&format!("vsnp handler error: {e}"));
                     let mut t = ctx.transport.lock().unwrap();
                     t.send_message(session_id, &error_bytes).ok();
                 }
@@ -1458,7 +1455,8 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                         let t = ctx.transport.lock().unwrap();
                         t.peer_node(session_id)
                     };
-                    let response = handle_cluster_pool_message(session_id, peer_node_id, &msg, &ctx);
+                    let response =
+                        handle_cluster_pool_message(session_id, peer_node_id, &msg, &ctx);
                     if let Some(resp) = response {
                         if let Ok(encoded) = resp.encode() {
                             let mut wire = Vec::with_capacity(4 + encoded.len());
@@ -1528,14 +1526,16 @@ fn handle_cluster_pool_message(
             );
             if let Err(fence_err) = check_partition_fence(ctx) {
                 eprintln!("[storage-node] session {session_id}: create refused: {fence_err}");
-                return Some(ClusterPoolMessage::CreateResponse(ClusterPoolCreateResponse {
-                    request_id: req.request_id,
-                    node_id: req.target_node_id,
-                    pool_guid: req.pool_guid,
-                    success: false,
-                    device_guids: vec![],
-                    error: Some(fence_err),
-                }));
+                return Some(ClusterPoolMessage::CreateResponse(
+                    ClusterPoolCreateResponse {
+                        request_id: req.request_id,
+                        node_id: req.target_node_id,
+                        pool_guid: req.pool_guid,
+                        success: false,
+                        device_guids: vec![],
+                        error: Some(fence_err),
+                    },
+                ));
             }
             let device_paths: Vec<std::path::PathBuf> = req
                 .node_devices
@@ -1544,9 +1544,9 @@ fn handle_cluster_pool_message(
                 .collect();
             let redundancy = match req.placement {
                 ClusterPlacementPolicy::Stripe => RedundancyPolicy::None,
-                ClusterPlacementPolicy::MirrorAcrossNodes { copies } => {
-                    RedundancyPolicy::Mirror { copies: copies as u8 }
-                }
+                ClusterPlacementPolicy::MirrorAcrossNodes { copies } => RedundancyPolicy::Mirror {
+                    copies: copies as u8,
+                },
                 ClusterPlacementPolicy::ErasureCoded { .. } => RedundancyPolicy::None,
             };
             let config = PoolCreateConfig {
@@ -1558,19 +1558,19 @@ fn handle_cluster_pool_message(
             };
             let (success, device_guids, error) =
                 match PoolCreator::create_pool(&device_paths, &config) {
-                    Ok(outcome) => {
-                        (true, outcome.device_guids, None)
-                    }
+                    Ok(outcome) => (true, outcome.device_guids, None),
                     Err(e) => (false, vec![], Some(format!("{e:?}"))),
                 };
-            Some(ClusterPoolMessage::CreateResponse(ClusterPoolCreateResponse {
-                request_id: req.request_id,
-                node_id: req.target_node_id,
-                pool_guid: req.pool_guid,
-                success,
-                device_guids,
-                error,
-            }))
+            Some(ClusterPoolMessage::CreateResponse(
+                ClusterPoolCreateResponse {
+                    request_id: req.request_id,
+                    node_id: req.target_node_id,
+                    pool_guid: req.pool_guid,
+                    success,
+                    device_guids,
+                    error,
+                },
+            ))
         }
         ClusterPoolMessage::ImportRequest(req) => {
             eprintln!(
@@ -1581,15 +1581,17 @@ fn handle_cluster_pool_message(
             // ── Partition fence check ──────────────────────────
             if let Err(fence_err) = check_partition_fence(ctx) {
                 eprintln!("[storage-node] session {session_id}: import refused: {fence_err}");
-                return Some(ClusterPoolMessage::ImportResponse(ClusterPoolImportResponse {
-                    request_id: req.request_id,
-                    node_id: req.target_node_id,
-                    pool_guid: req.pool_guid,
-                    success: false,
-                    committed_root_epoch: None,
-                    intent_log_replayed: None,
-                    error: Some(fence_err),
-                }));
+                return Some(ClusterPoolMessage::ImportResponse(
+                    ClusterPoolImportResponse {
+                        request_id: req.request_id,
+                        node_id: req.target_node_id,
+                        pool_guid: req.pool_guid,
+                        success: false,
+                        committed_root_epoch: None,
+                        intent_log_replayed: None,
+                        error: Some(fence_err),
+                    },
+                ));
             }
 
             // ── Membership verification ──────────────────────────
@@ -1651,25 +1653,27 @@ fn handle_cluster_pool_message(
                 .iter()
                 .map(|p| std::path::PathBuf::from(p))
                 .collect();
-            let lock_dir = ctx.config.pool_lock_dir.clone().unwrap_or_else(|| {
-                std::path::PathBuf::from("/tmp/tidefs-import-locks")
-            });
+            let lock_dir = ctx
+                .config
+                .pool_lock_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/tidefs-import-locks"));
             let (success, committed_root_epoch, intent_log_replayed, error) =
                 match pool_import(&device_paths, &lock_dir, req.read_only, None, None) {
-                    Ok(imported) => {
-                        (true, imported.stats.committed_root_epoch, Some(0), None)
-                    }
+                    Ok(imported) => (true, imported.stats.committed_root_epoch, Some(0), None),
                     Err(e) => (false, None, None, Some(format!("{e:?}"))),
                 };
-            Some(ClusterPoolMessage::ImportResponse(ClusterPoolImportResponse {
-                request_id: req.request_id,
-                node_id: req.target_node_id,
-                pool_guid: req.pool_guid,
-                success,
-                committed_root_epoch,
-                intent_log_replayed,
-                error,
-            }))
+            Some(ClusterPoolMessage::ImportResponse(
+                ClusterPoolImportResponse {
+                    request_id: req.request_id,
+                    node_id: req.target_node_id,
+                    pool_guid: req.pool_guid,
+                    success,
+                    committed_root_epoch,
+                    intent_log_replayed,
+                    error,
+                },
+            ))
         }
         ClusterPoolMessage::LeaseRequest(req) => {
             eprintln!(
@@ -1679,15 +1683,17 @@ fn handle_cluster_pool_message(
 
             if let Err(fence_err) = check_partition_fence(ctx) {
                 eprintln!("[storage-node] session {session_id}: lease refused: {fence_err}");
-                return Some(ClusterPoolMessage::LeaseResponse(ClusterPoolLeaseResponse {
-                    request_id: req.request_id,
-                    node_id: req.requesting_node_id,
-                    pool_guid: req.pool_guid,
-                    success: false,
-                    lease_token_bytes: None,
-                    lease_expiration_ms: None,
-                    error: Some(fence_err),
-                }));
+                return Some(ClusterPoolMessage::LeaseResponse(
+                    ClusterPoolLeaseResponse {
+                        request_id: req.request_id,
+                        node_id: req.requesting_node_id,
+                        pool_guid: req.pool_guid,
+                        success: false,
+                        lease_token_bytes: None,
+                        lease_expiration_ms: None,
+                        error: Some(fence_err),
+                    },
+                ));
             }
 
             let (success, lease_token_bytes, lease_expiration_ms, error) =
@@ -1696,20 +1702,21 @@ fn handle_cluster_pool_message(
                     match rt.try_get_pool_lease_token(req.pool_guid) {
                         Some(token) => {
                             if token.authorizes_pool(&req.pool_guid) {
-                                let token_bytes = bincode::serialize(&token)
-                                    .unwrap_or_default();
+                                let token_bytes = bincode::serialize(&token).unwrap_or_default();
                                 // Track this remote client in the active-client mode tracker.
                                 // Derive a dataset_id from the pool_guid for per-pool tracking.
                                 let dataset_id = u64::from_le_bytes([
-                                    req.pool_guid[0], req.pool_guid[1],
-                                    req.pool_guid[2], req.pool_guid[3],
-                                    req.pool_guid[4], req.pool_guid[5],
-                                    req.pool_guid[6], req.pool_guid[7],
+                                    req.pool_guid[0],
+                                    req.pool_guid[1],
+                                    req.pool_guid[2],
+                                    req.pool_guid[3],
+                                    req.pool_guid[4],
+                                    req.pool_guid[5],
+                                    req.pool_guid[6],
+                                    req.pool_guid[7],
                                 ]);
-                                let _ = rt.remote_client_mounted(
-                                    dataset_id,
-                                    req.requesting_node_id,
-                                );
+                                let _ =
+                                    rt.remote_client_mounted(dataset_id, req.requesting_node_id);
                                 (
                                     true,
                                     Some(token_bytes),
@@ -1729,7 +1736,10 @@ fn handle_cluster_pool_message(
                             false,
                             None,
                             None,
-                            Some("no active lease for this pool; acquire cluster membership first".to_string()),
+                            Some(
+                                "no active lease for this pool; acquire cluster membership first"
+                                    .to_string(),
+                            ),
                         ),
                     }
                 } else {
@@ -1741,15 +1751,17 @@ fn handle_cluster_pool_message(
                     )
                 };
 
-            Some(ClusterPoolMessage::LeaseResponse(ClusterPoolLeaseResponse {
-                request_id: req.request_id,
-                node_id: req.requesting_node_id,
-                pool_guid: req.pool_guid,
-                success,
-                lease_token_bytes,
-                lease_expiration_ms,
-                error,
-            }))
+            Some(ClusterPoolMessage::LeaseResponse(
+                ClusterPoolLeaseResponse {
+                    request_id: req.request_id,
+                    node_id: req.requesting_node_id,
+                    pool_guid: req.pool_guid,
+                    success,
+                    lease_token_bytes,
+                    lease_expiration_ms,
+                    error,
+                },
+            ))
         }
         ClusterPoolMessage::CatalogDeltaRequest(req) => {
             eprintln!(
@@ -1758,36 +1770,39 @@ fn handle_cluster_pool_message(
             );
 
             if let Err(fence_err) = check_partition_fence(ctx) {
-                eprintln!("[storage-node] session {session_id}: catalog delta refused: {fence_err}");
-                return Some(ClusterPoolMessage::CatalogDeltaResponse(ClusterPoolCatalogDeltaResponse {
-                    request_id: req.request_id,
-                    node_id: req.requesting_node_id,
-                    pool_guid: req.pool_guid,
-                    success: false,
-                    catalog_version: None,
-                    error: Some(fence_err),
-                }));
+                eprintln!(
+                    "[storage-node] session {session_id}: catalog delta refused: {fence_err}"
+                );
+                return Some(ClusterPoolMessage::CatalogDeltaResponse(
+                    ClusterPoolCatalogDeltaResponse {
+                        request_id: req.request_id,
+                        node_id: req.requesting_node_id,
+                        pool_guid: req.pool_guid,
+                        success: false,
+                        catalog_version: None,
+                        error: Some(fence_err),
+                    },
+                ));
             }
 
-            let (success, catalog_version, error) =
-                if let Some(ref lease_rt) = ctx.lease_runtime {
-                    let mut rt = lease_rt.lock().unwrap();
-                    match rt.apply_committed_catalog_delta(&req.delta_bytes) {
-                        Some(Ok(version)) => (true, Some(version), None),
-                        Some(Err(e)) => (false, None, Some(format!("{e}"))),
-                        None => (
-                            false,
-                            None,
-                            Some("no pool catalog configured on this node".to_string()),
-                        ),
-                    }
-                } else {
-                    (
+            let (success, catalog_version, error) = if let Some(ref lease_rt) = ctx.lease_runtime {
+                let mut rt = lease_rt.lock().unwrap();
+                match rt.apply_committed_catalog_delta(&req.delta_bytes) {
+                    Some(Ok(version)) => (true, Some(version), None),
+                    Some(Err(e)) => (false, None, Some(format!("{e}"))),
+                    None => (
                         false,
                         None,
-                        Some("cluster lease runtime not configured on this node".to_string()),
-                    )
-                };
+                        Some("no pool catalog configured on this node".to_string()),
+                    ),
+                }
+            } else {
+                (
+                    false,
+                    None,
+                    Some("cluster lease runtime not configured on this node".to_string()),
+                )
+            };
 
             Some(ClusterPoolMessage::CatalogDeltaResponse(
                 ClusterPoolCatalogDeltaResponse {
@@ -1817,15 +1832,13 @@ fn handle_cluster_pool_message(
                                 .catalog()
                                 .list_all()
                                 .into_iter()
-                                .map(|(path, id, dtype, txg, flags, lc_state)| {
-                                    CatalogEntryRow {
-                                        path,
-                                        dataset_id_bytes: id.as_bytes().to_vec(),
-                                        dataset_type_u8: dtype.to_u8(),
-                                        creation_txg: txg,
-                                        lifecycle_state_u8: lc_state.to_u8(),
-                                        flags_u16: flags.bits(),
-                                    }
+                                .map(|(path, id, dtype, txg, flags, lc_state)| CatalogEntryRow {
+                                    path,
+                                    dataset_id_bytes: id.as_bytes().to_vec(),
+                                    dataset_type_u8: dtype.to_u8(),
+                                    creation_txg: txg,
+                                    lifecycle_state_u8: lc_state.to_u8(),
+                                    flags_u16: flags.bits(),
                                 })
                                 .collect();
                             let version = pool_cat.version();
@@ -1860,7 +1873,11 @@ fn handle_cluster_pool_message(
             ))
         }
 
-        ClusterPoolMessage::CreateResponse(_) | ClusterPoolMessage::ImportResponse(_) | ClusterPoolMessage::LeaseResponse(_) | ClusterPoolMessage::CatalogDeltaResponse(_) | ClusterPoolMessage::CatalogQueryResponse(_) => {
+        ClusterPoolMessage::CreateResponse(_)
+        | ClusterPoolMessage::ImportResponse(_)
+        | ClusterPoolMessage::LeaseResponse(_)
+        | ClusterPoolMessage::CatalogDeltaResponse(_)
+        | ClusterPoolMessage::CatalogQueryResponse(_) => {
             eprintln!(
                 "[storage-node] session {session_id}: unexpected cluster pool response; ignoring"
             );
@@ -2710,37 +2727,61 @@ fn handle_frame_ctx(
             let fs_root = ctx.config.fs_root.as_ref()?;
             let auth_key = ctx.config.root_auth_key?;
             let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
-                fs_root, StoreOptions::default(), auth_key,
+                fs_root,
+                StoreOptions::default(),
+                auth_key,
             ) {
                 Ok(fs) => fs,
-                Err(e) => return Some(Frame::Error { message: format!("open fs for chunked send: {e}") }),
+                Err(e) => {
+                    return Some(Frame::Error {
+                        message: format!("open fs for chunked send: {e}"),
+                    })
+                }
             };
             let export = if key.is_empty() {
                 match fs.export_changed_records() {
                     Ok(e) => e.encode(),
-                    Err(e) => return Some(Frame::Error { message: format!("export: {e}") }),
+                    Err(e) => {
+                        return Some(Frame::Error {
+                            message: format!("export: {e}"),
+                        })
+                    }
                 }
             } else if key.len() == 24 {
                 let tid = u64::from_le_bytes(key[0..8].try_into().unwrap());
                 let gen = u64::from_le_bytes(key[8..16].try_into().unwrap());
                 let csum = u64::from_le_bytes(key[16..24].try_into().unwrap());
                 let audit = match vfs::audit_recovery_with_root_authentication_key(
-                    fs_root, StoreOptions::default(), auth_key,
+                    fs_root,
+                    StoreOptions::default(),
+                    auth_key,
                 ) {
                     Ok(a) => a,
-                    Err(e) => return Some(Frame::Error { message: format!("audit: {e}") }),
+                    Err(e) => {
+                        return Some(Frame::Error {
+                            message: format!("audit: {e}"),
+                        })
+                    }
                 };
                 let from_root = match audit.valid_committed_roots.iter().find(|r| {
-                    r.transaction_id == tid && r.generation == gen && r.superblock_checksum.0 == csum
+                    r.transaction_id == tid
+                        && r.generation == gen
+                        && r.superblock_checksum.0 == csum
                 }) {
                     Some(r) => r.clone(),
-                    None => return Some(Frame::Error {
-                        message: format!("from_root not found: tid={tid} gen={gen}"),
-                    }),
+                    None => {
+                        return Some(Frame::Error {
+                            message: format!("from_root not found: tid={tid} gen={gen}"),
+                        })
+                    }
                 };
                 match fs.export_incremental_changed_records(&from_root) {
                     Ok(e) => e.encode(),
-                    Err(e) => return Some(Frame::Error { message: format!("incremental export: {e}") }),
+                    Err(e) => {
+                        return Some(Frame::Error {
+                            message: format!("incremental export: {e}"),
+                        })
+                    }
                 }
             } else {
                 return Some(Frame::Error {
@@ -2755,15 +2796,22 @@ fn handle_frame_ctx(
             } else {
                 vec![0u8; 16]
             };
-            Some(Frame::SendChunkedResponse { chunk: export, cursor, more: false })
-        }
-        Frame::SendResume { cursor: _cursor } => {
-            Some(Frame::Error {
-                message: "send resume: re-send with incremental key (tid+gen+csum) from last received root".into(),
+            Some(Frame::SendChunkedResponse {
+                chunk: export,
+                cursor,
+                more: false,
             })
         }
+        Frame::SendResume { cursor: _cursor } => Some(Frame::Error {
+            message:
+                "send resume: re-send with incremental key (tid+gen+csum) from last received root"
+                    .into(),
+        }),
 
-        Frame::SnapshotClone { clone_name, source_snapshot } => {
+        Frame::SnapshotClone {
+            clone_name,
+            source_snapshot,
+        } => {
             let fs_root = ctx.config.fs_root.as_ref()?;
             let auth_key = ctx.config.root_auth_key?;
             let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
@@ -2939,7 +2987,6 @@ fn build_vsnp_ack(message: &str) -> Vec<u8> {
     msg
 }
 
-
 fn build_vsnp_block_pull_response(block_data: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(4 + 1 + 4 + block_data.len());
     msg.extend_from_slice(b"VSNP");
@@ -2992,8 +3039,7 @@ fn handle_vsnp_message(
             }
             let mut auth_key = [0u8; 32];
             auth_key.copy_from_slice(&raw[9..9 + 32]);
-            let export_len =
-                u32::from_le_bytes(raw[9 + 32..13 + 32].try_into().unwrap()) as usize;
+            let export_len = u32::from_le_bytes(raw[9 + 32..13 + 32].try_into().unwrap()) as usize;
             let export_start = 13 + 32;
             if raw.len() < export_start + export_len {
                 return Err(format!(
@@ -3011,7 +3057,9 @@ fn handle_vsnp_message(
             }
             let key_len = u32::from_le_bytes(raw[5..9].try_into().unwrap()) as usize;
             if key_len != 32 {
-                return Err(format!("VSNP pull_request: expected key_len=32, got {key_len}"));
+                return Err(format!(
+                    "VSNP pull_request: expected key_len=32, got {key_len}"
+                ));
             }
             if raw.len() < 9 + 32 {
                 return Err("VSNP pull_request: too short for auth key".into());
@@ -3022,10 +3070,16 @@ fn handle_vsnp_message(
         }
         VSNP_KIND_BLOCK_PUSH => {
             // Parse block push: [magic(4)][kind(1)][key_len(4)][key(32)][name_len(4)][name][data_len(4)][data]
-            if raw.len() < 9 + 4 { return Err("VSNP block_push: too short".into()); }
+            if raw.len() < 9 + 4 {
+                return Err("VSNP block_push: too short".into());
+            }
             let key_len = u32::from_le_bytes(raw[5..9].try_into().unwrap()) as usize;
-            if key_len != 32 { return Err(format!("VSNP block_push: key_len={key_len}")); }
-            if raw.len() < 9 + 32 + 4 { return Err("VSNP block_push: too short for name_len".into()); }
+            if key_len != 32 {
+                return Err(format!("VSNP block_push: key_len={key_len}"));
+            }
+            if raw.len() < 9 + 32 + 4 {
+                return Err("VSNP block_push: too short for name_len".into());
+            }
             let mut auth_key = [0u8; 32];
             auth_key.copy_from_slice(&raw[9..9 + 32]);
             let name_len = u32::from_le_bytes(raw[9 + 32..13 + 32].try_into().unwrap()) as usize;
@@ -3033,27 +3087,35 @@ fn handle_vsnp_message(
             if raw.len() < name_start + name_len + 4 {
                 return Err("VSNP block_push: too short for data_len".into());
             }
-            let _device_name = String::from_utf8_lossy(
-                &raw[name_start..name_start + name_len]
-            ).into_owned();
+            let _device_name =
+                String::from_utf8_lossy(&raw[name_start..name_start + name_len]).into_owned();
             let data_len = u32::from_le_bytes(
-                raw[name_start + name_len..name_start + name_len + 4].try_into().unwrap()
+                raw[name_start + name_len..name_start + name_len + 4]
+                    .try_into()
+                    .unwrap(),
             ) as usize;
             let data_start = name_start + name_len + 4;
             if raw.len() < data_start + data_len {
                 return Err(format!(
                     "VSNP block_push: need {} bytes, got {}",
-                    data_start + data_len, raw.len()
+                    data_start + data_len,
+                    raw.len()
                 ));
             }
             let block_data = &raw[data_start..data_start + data_len];
             handle_vsnp_block_push(session_id, block_data, auth_key, ctx)
         }
         VSNP_KIND_BLOCK_PULL_REQUEST => {
-            if raw.len() < 9 + 4 { return Err("VSNP block_pull_request: too short".into()); }
+            if raw.len() < 9 + 4 {
+                return Err("VSNP block_pull_request: too short".into());
+            }
             let key_len = u32::from_le_bytes(raw[5..9].try_into().unwrap()) as usize;
-            if key_len != 32 { return Err(format!("VSNP block_pull_request: key_len={key_len}")); }
-            if raw.len() < 9 + 32 + 4 { return Err("VSNP block_pull_request: too short for name_len".into()); }
+            if key_len != 32 {
+                return Err(format!("VSNP block_pull_request: key_len={key_len}"));
+            }
+            if raw.len() < 9 + 32 + 4 {
+                return Err("VSNP block_pull_request: too short for name_len".into());
+            }
             let mut auth_key = [0u8; 32];
             auth_key.copy_from_slice(&raw[9..9 + 32]);
             let name_len = u32::from_le_bytes(raw[9 + 32..13 + 32].try_into().unwrap()) as usize;
@@ -3061,9 +3123,8 @@ fn handle_vsnp_message(
             if raw.len() < name_start + name_len {
                 return Err("VSNP block_pull_request: too short".into());
             }
-            let _device_name = String::from_utf8_lossy(
-                &raw[name_start..name_start + name_len]
-            ).into_owned();
+            let _device_name =
+                String::from_utf8_lossy(&raw[name_start..name_start + name_len]).into_owned();
             handle_vsnp_block_pull_request(session_id, auth_key, ctx)
         }
         other => Err(format!("unknown VSNP kind: {other}")),
@@ -3146,13 +3207,9 @@ fn handle_vsnp_block_push(
     let fs_root = ctx.config.fs_root.as_ref().ok_or("no fs_root configured")?;
     let block_file = std::path::Path::new(fs_root).join("block-volume-data");
 
-    std::fs::write(&block_file, block_data)
-        .map_err(|e| format!("write block data: {e}"))?;
+    std::fs::write(&block_file, block_data).map_err(|e| format!("write block data: {e}"))?;
 
-    let ack = format!(
-        "received block volume ({} bytes)",
-        block_data.len()
-    );
+    let ack = format!("received block volume ({} bytes)", block_data.len());
     Ok(Some(build_vsnp_ack(&ack)))
 }
 
@@ -3164,8 +3221,7 @@ fn handle_vsnp_block_pull_request(
     let fs_root = ctx.config.fs_root.as_ref().ok_or("no fs_root configured")?;
     let block_file = std::path::Path::new(fs_root).join("block-volume-data");
 
-    let block_data = std::fs::read(&block_file)
-        .map_err(|e| format!("read block data: {e}"))?;
+    let block_data = std::fs::read(&block_file).map_err(|e| format!("read block data: {e}"))?;
 
     if block_data.is_empty() {
         return Err("no block data found".into());
@@ -3174,15 +3230,12 @@ fn handle_vsnp_block_pull_request(
     Ok(Some(build_vsnp_block_pull_response(&block_data)))
 }
 
-
 #[cfg(test)]
 mod cluster_pool_handler_tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
-    use tidefs_cluster::pool_protocol::{
-        ClusterPoolCreateResponse, ClusterPoolImportResponse,
-    };
+    use tidefs_cluster::pool_protocol::{ClusterPoolCreateResponse, ClusterPoolImportResponse};
     use tidefs_local_object_store::ObjectKey;
     use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
 

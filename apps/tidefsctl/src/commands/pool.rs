@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::Parser;
-use tidefs_local_filesystem::LocalFileSystem;
 use tidefs_dataset_properties;
+use tidefs_local_filesystem::LocalFileSystem;
 
 #[derive(Parser, Debug)]
 pub enum PoolCommand {
@@ -333,13 +333,19 @@ pub fn handle_pool(cmd: PoolCommand) {
             handle_pool_integrity_check(path, json, max_records, max_bytes, devices);
         }
         PoolCommand::Get {
-            property, pool, devices,
+            property,
+            pool,
+            devices,
         } => handle_pool_get(&pool, devices.as_deref(), &property),
         PoolCommand::Set {
-            assignment, pool, devices,
+            assignment,
+            pool,
+            devices,
         } => handle_pool_set(&pool, devices.as_deref(), &assignment),
         PoolCommand::ListProps {
-            pool, devices, family,
+            pool,
+            devices,
+            family,
         } => handle_pool_list_props(&pool, devices.as_deref(), family.as_deref()),
     }
 }
@@ -652,26 +658,52 @@ fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "devices": json_entries }))
-                .unwrap()
+            serde_json::to_string_pretty(&serde_json::json!({ "devices": json_entries })).unwrap()
         );
     } else {
         for entry in &entries {
             println!("device: {}", entry.device_path.display());
             if entry.has_tidefs_label {
-                println!("  pool_guid={}", entry.pool_guid.map_or_else(|| "-".into(), |g| hex_guid(&g)));
+                println!(
+                    "  pool_guid={}",
+                    entry.pool_guid.map_or_else(|| "-".into(), |g| hex_guid(&g))
+                );
                 println!("  pool_name={}", entry.pool_name.as_deref().unwrap_or("-"));
-                println!("  pool_state={}", entry.pool_state.map_or_else(|| "-".into(), |s| s.to_string()));
-                println!("  device_guid={}", entry.device_guid.map_or_else(|| "-".into(), |g| hex_guid(&g)));
-                println!("  device_index={}", entry.device_index.map_or_else(|| "-".into(), |i| i.to_string()));
-                println!("  device_count={}", entry.device_count.map_or_else(|| "-".into(), |c| c.to_string()));
+                println!(
+                    "  pool_state={}",
+                    entry
+                        .pool_state
+                        .map_or_else(|| "-".into(), |s| s.to_string())
+                );
+                println!(
+                    "  device_guid={}",
+                    entry
+                        .device_guid
+                        .map_or_else(|| "-".into(), |g| hex_guid(&g))
+                );
+                println!(
+                    "  device_index={}",
+                    entry
+                        .device_index
+                        .map_or_else(|| "-".into(), |i| i.to_string())
+                );
+                println!(
+                    "  device_count={}",
+                    entry
+                        .device_count
+                        .map_or_else(|| "-".into(), |c| c.to_string())
+                );
                 println!("  label_valid={}", entry.label_valid);
             } else {
                 println!("  label: none ({})", entry.label_status);
             }
             println!();
         }
-        println!("{} device(s) scanned, {} labeled", entries.len(), entries.iter().filter(|e| e.has_tidefs_label).count());
+        println!(
+            "{} device(s) scanned, {} labeled",
+            entries.len(),
+            entries.iter().filter(|e| e.has_tidefs_label).count()
+        );
     }
 }
 
@@ -768,7 +800,8 @@ fn read_vcrl_committed_txg(device_path: &std::path::Path) -> Option<u64> {
 
     // Read the last VCRL entry (highest txg is typically the last one).
     let entry_off = VCRL_HEADER_SIZE + (entry_count as usize - 1) * VCRL_ENTRY_SIZE;
-    file.seek(SeekFrom::Start(sa_ptr + entry_off as u64 + 40)).ok()?;
+    file.seek(SeekFrom::Start(sa_ptr + entry_off as u64 + 40))
+        .ok()?;
     let mut txg_buf = [0u8; 8];
     file.read_exact(&mut txg_buf).ok()?;
     Some(u64::from_le_bytes(txg_buf))
@@ -797,10 +830,7 @@ fn scan_block_devices_for_integrity(
     let mut any_device_opened = false;
 
     for dev_path in device_paths {
-        let store = match LocalObjectStore::open_block_device(
-            dev_path,
-            StoreOptions::default(),
-        ) {
+        let store = match LocalObjectStore::open_block_device(dev_path, StoreOptions::default()) {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -826,8 +856,7 @@ fn scan_block_devices_for_integrity(
         }
 
         let log_stats = suspect_log.stats();
-        total_checksum_errors =
-            total_checksum_errors.saturating_add(log_stats.total_entries);
+        total_checksum_errors = total_checksum_errors.saturating_add(log_stats.total_entries);
         suspect_entries = suspect_entries.saturating_add(log_stats.total_entries);
         suspect_unresolved = suspect_unresolved.saturating_add(log_stats.unresolved);
     }
@@ -1007,8 +1036,7 @@ fn handle_pool_integrity_check(
     let overall_pass = if device_checks_skipped {
         false
     } else {
-        let device_checks_pass =
-            label_pass && committed_root_pass && intent_log_pass && vrbt_pass;
+        let device_checks_pass = label_pass && committed_root_pass && intent_log_pass && vrbt_pass;
         if segment_scan_available {
             segment_pass && device_checks_pass
         } else {
@@ -1070,7 +1098,13 @@ fn print_combined_integrity_text(
     println!("pool integrity-check: {}", store_root.display());
     println!(
         "  overall pass:  {}",
-        if overall_pass { "yes" } else if device_checks_skipped { "incomplete (device checks skipped)" } else { "no" }
+        if overall_pass {
+            "yes"
+        } else if device_checks_skipped {
+            "incomplete (device checks skipped)"
+        } else {
+            "no"
+        }
     );
     println!();
 
@@ -1128,10 +1162,7 @@ fn print_combined_integrity_text(
     // ── Segment scan ──
     println!();
     if let Some(r) = report {
-        println!(
-            "  scan duration: {:.2}s",
-            r.scan_duration.as_secs_f64()
-        );
+        println!("  scan duration: {:.2}s", r.scan_duration.as_secs_f64());
         println!("  segments:      {}", r.total_segments);
         println!("  records:       {}", r.total_records);
         println!(
@@ -1164,7 +1195,9 @@ fn print_combined_integrity_text(
     if !overall_pass {
         eprintln!();
         if device_checks_skipped {
-            eprintln!("tidefsctl: pool integrity-check INCOMPLETE (device checks skipped; use --devices)");
+            eprintln!(
+                "tidefsctl: pool integrity-check INCOMPLETE (device checks skipped; use --devices)"
+            );
         } else {
             eprintln!("tidefsctl: pool integrity-check FAILED");
         }
@@ -1328,7 +1361,6 @@ fn handle_pool_destroy(
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Pool property handlers
 // ---------------------------------------------------------------------------
@@ -1382,7 +1414,10 @@ fn handle_pool_set(pool: &str, _devices: Option<&[PathBuf]>, assignment: &str) {
     let (prop_name, prop_val_str) = match assignment.split_once('=') {
         Some((k, v)) => (k.trim(), v.trim()),
         None => {
-            eprintln!("tidefsctl pool set: invalid assignment '{}' (expected key=value)", assignment);
+            eprintln!(
+                "tidefsctl pool set: invalid assignment '{}' (expected key=value)",
+                assignment
+            );
             process::exit(1);
         }
     };
@@ -1430,7 +1465,10 @@ fn handle_pool_set(pool: &str, _devices: Option<&[PathBuf]>, assignment: &str) {
     }
 
     if is_clear {
-        println!("cleared '{}' (now using default/inherited value)", prop_name);
+        println!(
+            "cleared '{}' (now using default/inherited value)",
+            prop_name
+        );
     } else {
         println!("{} = {}", prop_name, value);
     }
@@ -1442,7 +1480,10 @@ fn handle_pool_list_props(pool: &str, _devices: Option<&[PathBuf]>, family: Opti
     let fs = match LocalFileSystem::open(&path) {
         Ok(fs) => fs,
         Err(e) => {
-            eprintln!("tidefsctl pool list-props: cannot open pool '{}': {e}", pool);
+            eprintln!(
+                "tidefsctl pool list-props: cannot open pool '{}': {e}",
+                pool
+            );
             process::exit(1);
         }
     };
@@ -1476,14 +1517,20 @@ fn handle_pool_list_props(pool: &str, _devices: Option<&[PathBuf]>, family: Opti
     }
 
     let props = fs.pool_properties();
-    println!("{:<35} {:<20} {:<12} {}", "PROPERTY", "VALUE", "TYPE", "SOURCE");
+    println!(
+        "{:<35} {:<20} {:<12} {}",
+        "PROPERTY", "VALUE", "TYPE", "SOURCE"
+    );
     println!("{:-<35} {:-<20} {:-<12} {:-<20}", "", "", "", "");
 
     for def in &defs {
         let local_entry = props.get(&def.name);
         let (value, source) = match local_entry {
             Some(entry) => (entry.value.clone(), entry.source.clone()),
-            None => (def.default_value.clone(), tidefs_dataset_properties::PropertySource::Default),
+            None => (
+                def.default_value.clone(),
+                tidefs_dataset_properties::PropertySource::Default,
+            ),
         };
 
         let source_str = match &source {
@@ -1598,8 +1645,11 @@ mod tests {
     fn integrity_check_device_flag_parsed_single() {
         use clap::Parser;
         let args = vec![
-            "pool", "integrity-check", "/data/pool",
-            "--devices", "/dev/sdb",
+            "pool",
+            "integrity-check",
+            "/data/pool",
+            "--devices",
+            "/dev/sdb",
         ];
         let cmd = PoolCommand::try_parse_from(args).expect("parse");
         match cmd {
@@ -1615,17 +1665,25 @@ mod tests {
     fn integrity_check_device_flag_parsed_multiple() {
         use clap::Parser;
         let args = vec![
-            "pool", "integrity-check", "/data/pool",
-            "--devices", "/dev/sdb", "/dev/sdc", "/dev/sdd",
+            "pool",
+            "integrity-check",
+            "/data/pool",
+            "--devices",
+            "/dev/sdb",
+            "/dev/sdc",
+            "/dev/sdd",
         ];
         let cmd = PoolCommand::try_parse_from(args).expect("parse");
         match cmd {
             PoolCommand::IntegrityCheck { devices, .. } => {
-                assert_eq!(devices, Some(vec![
-                    PathBuf::from("/dev/sdb"),
-                    PathBuf::from("/dev/sdc"),
-                    PathBuf::from("/dev/sdd"),
-                ]));
+                assert_eq!(
+                    devices,
+                    Some(vec![
+                        PathBuf::from("/dev/sdb"),
+                        PathBuf::from("/dev/sdc"),
+                        PathBuf::from("/dev/sdd"),
+                    ])
+                );
             }
             _ => panic!("wrong command variant"),
         }
@@ -1634,9 +1692,7 @@ mod tests {
     #[test]
     fn integrity_check_without_devices_flag() {
         use clap::Parser;
-        let args = vec![
-            "pool", "integrity-check", "/data/pool",
-        ];
+        let args = vec!["pool", "integrity-check", "/data/pool"];
         let cmd = PoolCommand::try_parse_from(args).expect("parse");
         match cmd {
             PoolCommand::IntegrityCheck { devices, .. } => {

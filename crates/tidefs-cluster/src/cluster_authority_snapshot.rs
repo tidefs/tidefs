@@ -17,13 +17,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 use std::path::Path;
 
-
-use crate::cluster_authority_record::{
-    ClusterAuthorityRecord,
-};
-use crate::cluster_authority_store::{
-    scan_authority_from_devices, AuthorityStoreError,
-};
+use crate::cluster_authority_record::ClusterAuthorityRecord;
+use crate::cluster_authority_store::{scan_authority_from_devices, AuthorityStoreError};
 
 // ── ClusterAuthoritySnapshot ───────────────────────────────────────
 
@@ -160,22 +155,14 @@ pub enum BootAuthorityOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceAuthorityStatus {
     /// A valid authority record was found.
-    Valid {
-        sequence: u64,
-        txg: u64,
-        epoch: u64,
-    },
+    Valid { sequence: u64, txg: u64, epoch: u64 },
     /// No authority region exists on this device (fresh pool or
     /// standalone pool).
     NoRecord,
     /// The authority region is present but corrupt or invalid.
-    Corrupt {
-        error: String,
-    },
+    Corrupt { error: String },
     /// An I/O error occurred reading the device.
-    IoError {
-        error: String,
-    },
+    IoError { error: String },
 }
 
 impl ClusterAuthorityBootstrapper {
@@ -185,9 +172,7 @@ impl ClusterAuthorityBootstrapper {
     /// This is the primary entry point for boot-time authority discovery.
     /// It calls [`scan_authority_from_devices`] and converts the raw
     /// results into a typed [`BootAuthorityOutcome`].
-    pub fn discover(
-        device_paths: &[impl AsRef<Path>],
-    ) -> BootAuthorityOutcome {
+    pub fn discover(device_paths: &[impl AsRef<Path>]) -> BootAuthorityOutcome {
         let (best, per_device) = match scan_authority_from_devices(device_paths) {
             Ok(result) => result,
             Err(_e) => {
@@ -249,7 +234,9 @@ impl ClusterAuthorityBootstrapper {
 mod tests {
     use super::*;
     use crate::cluster_authority_record::ClusterAuthorityRecord;
-    use crate::cluster_authority_store::{write_authority_chain_to_device, CLUSTER_AUTHORITY_REGION_OFFSET};
+    use crate::cluster_authority_store::{
+        write_authority_chain_to_device, CLUSTER_AUTHORITY_REGION_OFFSET,
+    };
     use std::collections::BTreeSet;
     use std::io::Write;
 
@@ -343,7 +330,10 @@ mod tests {
 
         let outcome = ClusterAuthorityBootstrapper::discover(&[&dev_path]);
         match outcome {
-            BootAuthorityOutcome::Discovered { snapshot, per_device } => {
+            BootAuthorityOutcome::Discovered {
+                snapshot,
+                per_device,
+            } => {
                 assert_eq!(snapshot.membership_epoch, 2);
                 assert_eq!(snapshot.voter_set, voters(&[1, 2, 3, 4]));
                 assert_eq!(snapshot.sequence, 1);
@@ -387,7 +377,10 @@ mod tests {
             txg: 42,
             epoch: 7,
         };
-        assert_eq!(format!("{:?}", valid), "Valid { sequence: 3, txg: 42, epoch: 7 }");
+        assert_eq!(
+            format!("{:?}", valid),
+            "Valid { sequence: 3, txg: 42, epoch: 7 }"
+        );
 
         let no_rec = DeviceAuthorityStatus::NoRecord;
         assert_eq!(format!("{:?}", no_rec), "NoRecord");
@@ -435,7 +428,10 @@ mod tests {
 
         let outcome = ClusterAuthorityBootstrapper::discover(&[&dev1, &dev2, &dev3]);
         match outcome {
-            BootAuthorityOutcome::Discovered { snapshot, per_device } => {
+            BootAuthorityOutcome::Discovered {
+                snapshot,
+                per_device,
+            } => {
                 // Should pick the best (dev1 with seq=1)
                 assert_eq!(snapshot.sequence, 1);
                 assert_eq!(snapshot.membership_epoch, 2);
@@ -476,10 +472,7 @@ mod tests {
     #[test]
     fn snapshot_fenced_detection() {
         let rec = make_genesis();
-        let succ = rec
-            .successor()
-            .fenced_nodes(voters(&[2]))
-            .build();
+        let succ = rec.successor().fenced_nodes(voters(&[2])).build();
         let snap = ClusterAuthoritySnapshot::from_record(&succ);
         assert!(snap.is_fenced(2));
         assert!(!snap.is_fenced(1));

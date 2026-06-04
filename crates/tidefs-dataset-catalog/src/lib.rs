@@ -560,7 +560,6 @@ impl DatasetCatalog {
         self.tree.get(&path.to_string()).cloned()
     }
 
-
     /// Get the typed property set for a dataset, deserialized from the
     /// catalog blob. Returns an empty `PropertySet` if the dataset has no
     /// properties recorded.
@@ -572,11 +571,7 @@ impl DatasetCatalog {
     /// Set the typed property set for a dataset, serializing it into the
     /// catalog blob. Only `PropertySource::Local` entries are persisted;
     /// inherited and default entries are discarded during serialization.
-    pub fn set_properties(
-        &mut self,
-        path: &str,
-        props: &PropertySet,
-    ) -> Result<(), CatalogError> {
+    pub fn set_properties(&mut self, path: &str, props: &PropertySet) -> Result<(), CatalogError> {
         let blob = props.to_key_value_blob();
         let path_owned = path.to_string();
         let updated = self.tree.update(&path_owned, |entry| {
@@ -597,10 +592,7 @@ impl DatasetCatalog {
     ///
     /// The returned set contains entries for every property in the global
     /// registry, not only the locally-set ones.
-    pub fn get_properties_with_inheritance(
-        &self,
-        path: &str,
-    ) -> Result<PropertySet, CatalogError> {
+    pub fn get_properties_with_inheritance(&self, path: &str) -> Result<PropertySet, CatalogError> {
         use tidefs_dataset_properties::{build_registry, resolve_effective};
         let local = self.get_properties(path)?;
         let mut parent_sets: Vec<PropertySet> = Vec::new();
@@ -1255,7 +1247,8 @@ impl DatasetCatalog {
             if offset >= payload.len() {
                 return Err(CatalogError::CorruptEncoding);
             }
-            let sync_guarantee = SyncGuarantee::from_u8(payload[offset]).ok_or(CatalogError::CorruptEncoding)?;
+            let sync_guarantee =
+                SyncGuarantee::from_u8(payload[offset]).ok_or(CatalogError::CorruptEncoding)?;
             offset += 1;
 
             // lifecycle_state (u8)
@@ -3626,10 +3619,7 @@ mod tests {
         let encoded = cat.encode();
         let decoded = DatasetCatalog::decode(&encoded).unwrap();
 
-        assert_eq!(
-            decoded.sync_guarantee("pool"),
-            Ok(SyncGuarantee::Local)
-        );
+        assert_eq!(decoded.sync_guarantee("pool"), Ok(SyncGuarantee::Local));
         assert_eq!(
             decoded.sync_guarantee("pool/remote"),
             Ok(SyncGuarantee::RemoteCopy)

@@ -234,8 +234,10 @@ mod tests {
 
     #[test]
     fn pass_refuses_live_guest() {
-        let row =
-            DiscardValidationRow::pass(DiscardValidationTier::LiveGuest, DiscardOpKind::WriteZeroes);
+        let row = DiscardValidationRow::pass(
+            DiscardValidationTier::LiveGuest,
+            DiscardOpKind::WriteZeroes,
+        );
         assert_eq!(row.outcome, DiscardOutcome::Refusal);
         assert!(row.refusal_reason.is_some());
         assert!(row.artifact.is_none());
@@ -266,8 +268,10 @@ mod tests {
 
     #[test]
     fn pass_allows_source_model() {
-        let row =
-            DiscardValidationRow::pass(DiscardValidationTier::SourceModel, DiscardOpKind::TrimSingle);
+        let row = DiscardValidationRow::pass(
+            DiscardValidationTier::SourceModel,
+            DiscardOpKind::TrimSingle,
+        );
         assert_eq!(row.outcome, DiscardOutcome::Pass);
         assert!(row.refusal_reason.is_none());
         assert!(row.artifact.is_none());
@@ -275,8 +279,10 @@ mod tests {
 
     #[test]
     fn pass_allows_cargo_unit() {
-        let row =
-            DiscardValidationRow::pass(DiscardValidationTier::CargoUnit, DiscardOpKind::WriteZeroes);
+        let row = DiscardValidationRow::pass(
+            DiscardValidationTier::CargoUnit,
+            DiscardOpKind::WriteZeroes,
+        );
         assert_eq!(row.outcome, DiscardOutcome::Pass);
     }
 

@@ -84,10 +84,7 @@ fn refuses_old_kernel_without_open_attempt() {
 
     let report = evaluate_ublk_control_open_preflight(&inputs);
 
-    assert_eq!(
-        report.kernel_class,
-        HostKernelClass::LinuxTooPrevious
-    );
+    assert_eq!(report.kernel_class, HostKernelClass::LinuxTooPrevious);
     assert_eq!(
         report.admission_class,
         UblkControlOpenAdmissionClass::Refused

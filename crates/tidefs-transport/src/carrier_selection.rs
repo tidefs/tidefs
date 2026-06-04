@@ -72,9 +72,7 @@ impl CarrierPolicy {
         match self {
             Self::Prefer => Ok(()),
             Self::Enforce => {
-                if configured == selected
-                    || (!configured.is_rdma() && !selected.is_rdma())
-                {
+                if configured == selected || (!configured.is_rdma() && !selected.is_rdma()) {
                     Ok(())
                 } else if configured.is_rdma() && !selected.is_rdma() {
                     Err(CarrierSelectionError::CarrierPolicyViolation {
@@ -244,7 +242,10 @@ impl CarrierSelector {
     /// Create a new selector bound to the given local backend.
     #[must_use]
     pub fn new(local_backend: TransportBackendKind) -> Self {
-        Self { local_backend, policy: None }
+        Self {
+            local_backend,
+            policy: None,
+        }
     }
 
     /// Return the local backend kind.
@@ -513,8 +514,12 @@ impl fmt::Display for CarrierDisclosure {
         write!(
             f,
             "carrier: {} (local={} peer={} requested={}{})",
-            self.selected_backend, self.local_backend, self.peer_carriers, self.local_requested,
-            self.policy.map_or("", |p| if p.is_enforce() { " enforce" } else { "" }),
+            self.selected_backend,
+            self.local_backend,
+            self.peer_carriers,
+            self.local_requested,
+            self.policy
+                .map_or("", |p| if p.is_enforce() { " enforce" } else { "" }),
         )?;
         match self.fallback {
             CarrierSelectionFallback::Direct => write!(f, " direct"),

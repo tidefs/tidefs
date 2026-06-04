@@ -19,13 +19,9 @@
 
 use crate::pool_lease_token::PoolLeaseToken;
 use crate::pool_protocol::{
-    CatalogQueryType,
-    ClusterPoolCatalogDeltaRequest,
-    ClusterPoolCatalogDeltaResponse,
-    ClusterPoolCatalogQueryRequest,
-    ClusterPoolCatalogQueryResponse,
-    ClusterPoolLeaseRequest, ClusterPoolMessage,
-    PoolProtocolError,
+    CatalogQueryType, ClusterPoolCatalogDeltaRequest, ClusterPoolCatalogDeltaResponse,
+    ClusterPoolCatalogQueryRequest, ClusterPoolCatalogQueryResponse, ClusterPoolLeaseRequest,
+    ClusterPoolMessage, PoolProtocolError,
 };
 
 /// Magic prefix for cluster pool protocol messages (CP01 = Cluster Pool v1).
@@ -290,7 +286,9 @@ impl ClusterLeaseClient {
 mod tests {
 
     use crate::pool_lease_token::PoolLeaseToken;
-    use crate::pool_protocol::{ClusterPoolLeaseRequest, ClusterPoolLeaseResponse, ClusterPoolMessage};
+    use crate::pool_protocol::{
+        ClusterPoolLeaseRequest, ClusterPoolLeaseResponse, ClusterPoolMessage,
+    };
     use crate::write_fence::WriteFence;
     use tidefs_membership_epoch::EpochId;
 

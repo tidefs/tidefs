@@ -31,8 +31,8 @@ use crate::tdma_gate::TdmaSendGate;
 use crate::types::{CohortMembership, FamilyVersion, HlcTimestamp, NodeIdentityPublic, SessionId};
 use crate::unreachable_peer::UnreachablePeerCallbackRef;
 use crate::SendGate;
-use tracing;
 use tidefs_types_transport_session::EndpointFamily;
+use tracing;
 // ---------------------------------------------------------------------------
 // Connection: wraps the transport backend connection with metadata
 // ---------------------------------------------------------------------------
@@ -747,10 +747,7 @@ impl Transport {
     /// on silent TCP fallback when an RDMA claim is being made" requirement
     /// from #6672.
     #[must_use]
-    pub fn with_carrier_policy(
-        mut self,
-        policy: crate::carrier_selection::CarrierPolicy,
-    ) -> Self {
+    pub fn with_carrier_policy(mut self, policy: crate::carrier_selection::CarrierPolicy) -> Self {
         self.carrier_policy = policy;
         self
     }
@@ -932,11 +929,9 @@ impl Transport {
             .peer_capabilities
             .get(&peer_node_id)
             .map(|caps| {
-                let result = crate::carrier_selection::CarrierSelector::new(
-                    self.backend_kind,
-                )
-                .with_policy(self.carrier_policy)
-                .select(caps.transport_carriers)?;
+                let result = crate::carrier_selection::CarrierSelector::new(self.backend_kind)
+                    .with_policy(self.carrier_policy)
+                    .select(caps.transport_carriers)?;
                 let disclosure = crate::carrier_selection::CarrierDisclosure::from_selection(
                     result,
                     self.backend_kind,

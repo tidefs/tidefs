@@ -149,18 +149,11 @@ pub enum ModeTransitionError {
         required: usize,
     },
     /// The transition is not allowed from the current mode to the target.
-    InvalidTransition {
-        from: ClientMode,
-        to: ClientMode,
-    },
+    InvalidTransition { from: ClientMode, to: ClientMode },
     /// The dataset or volume is not known to the tracker.
-    UnknownDataset {
-        dataset_id: u64,
-    },
+    UnknownDataset { dataset_id: u64 },
     /// A concurrent transition is already in progress.
-    TransitionInProgress {
-        dataset_id: u64,
-    },
+    TransitionInProgress { dataset_id: u64 },
 }
 
 impl core::fmt::Display for ModeTransitionError {

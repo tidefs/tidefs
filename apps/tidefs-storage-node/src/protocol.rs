@@ -195,7 +195,9 @@ pub enum Frame {
         snapshot_name: String,
     },
     /// Response to SnapshotRollback: JSON report of the rollback operation.
-    SnapshotRollbackResponse { report_json: String },
+    SnapshotRollbackResponse {
+        report_json: String,
+    },
     /// Create a writable clone from a named snapshot.
     SnapshotClone {
         clone_name: String,
@@ -436,7 +438,10 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(bytes);
         }
-        Frame::SnapshotClone { clone_name, source_snapshot } => {
+        Frame::SnapshotClone {
+            clone_name,
+            source_snapshot,
+        } => {
             buf.extend_from_slice(tag::SNPCL);
             let cn_bytes = clone_name.as_bytes();
             buf.push(cn_bytes.len() as u8);
@@ -458,7 +463,11 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
             buf.extend_from_slice(key);
         }
-        Frame::SendChunkedResponse { chunk, cursor, more } => {
+        Frame::SendChunkedResponse {
+            chunk,
+            cursor,
+            more,
+        } => {
             buf.extend_from_slice(tag::SNDC);
             buf.push(1u8); // ok marker
             buf.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
@@ -472,7 +481,11 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             buf.push(cursor.len() as u8);
             buf.extend_from_slice(cursor);
         }
-        Frame::SendResumeResponse { chunk, cursor, more } => {
+        Frame::SendResumeResponse {
+            chunk,
+            cursor,
+            more,
+        } => {
             buf.extend_from_slice(tag::SNDR);
             buf.push(1u8);
             buf.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
@@ -919,8 +932,12 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
                 if payload.len() < ss_off + 1 + ss_len {
                     return None;
                 }
-                let source_snapshot = String::from_utf8(payload[ss_off + 1..ss_off + 1 + ss_len].to_vec()).ok()?;
-                Some(Frame::SnapshotClone { clone_name, source_snapshot })
+                let source_snapshot =
+                    String::from_utf8(payload[ss_off + 1..ss_off + 1 + ss_len].to_vec()).ok()?;
+                Some(Frame::SnapshotClone {
+                    clone_name,
+                    source_snapshot,
+                })
             } else {
                 None
             }
@@ -944,7 +961,11 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
                 }
                 let cursor = payload[co + 1..co + 1 + cl].to_vec();
                 let more = payload[co + 1 + cl] != 0;
-                Some(Frame::SendChunkedResponse { chunk, cursor, more })
+                Some(Frame::SendChunkedResponse {
+                    chunk,
+                    cursor,
+                    more,
+                })
             } else if payload.len() >= 2 {
                 // Request: key_len(u16 LE) + key
                 let klen = u16::from_le_bytes(payload[0..2].try_into().ok()?) as usize;
@@ -976,7 +997,11 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
                 }
                 let cursor = payload[co + 1..co + 1 + cl].to_vec();
                 let more = payload[co + 1 + cl] != 0;
-                Some(Frame::SendResumeResponse { chunk, cursor, more })
+                Some(Frame::SendResumeResponse {
+                    chunk,
+                    cursor,
+                    more,
+                })
             } else if payload.len() >= 1 {
                 // Request: cursor_len(u8) + cursor
                 let cl = payload[0] as usize;
@@ -1322,7 +1347,8 @@ mod tests {
     #[test]
     fn roundtrip_snapshot_clone_response() {
         let f = Frame::SnapshotCloneResponse {
-            summary_json: r#"{"name":"myclone","origin":"origin-snap","source_generation":42}"#.into(),
+            summary_json: r#"{"name":"myclone","origin":"origin-snap","source_generation":42}"#
+                .into(),
         };
         assert_eq!(decode(&encode(&f)), Some(f));
     }

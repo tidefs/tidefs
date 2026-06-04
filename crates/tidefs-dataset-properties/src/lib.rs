@@ -2108,7 +2108,7 @@ mod tests {
         );
         ps.set_local(
             PropertyKey::new("compression.algorithm"),
-            PropertyValue::String("zstd".into())
+            PropertyValue::String("zstd".into()),
         );
 
         let blob = ps.to_key_value_blob();
@@ -2121,11 +2121,15 @@ mod tests {
         assert_eq!(ro.value, PropertyValue::Bool(true));
         assert!(matches!(ro.source, PropertySource::Local));
 
-        let rs = restored.get(&PropertyKey::new("layout.recordsize")).unwrap();
+        let rs = restored
+            .get(&PropertyKey::new("layout.recordsize"))
+            .unwrap();
         // Size values round-trip as u64 (parsed numerically from string).
         assert_eq!(rs.value, PropertyValue::U64(131072));
 
-        let comp = restored.get(&PropertyKey::new("compression.algorithm")).unwrap();
+        let comp = restored
+            .get(&PropertyKey::new("compression.algorithm"))
+            .unwrap();
         assert_eq!(comp.value, PropertyValue::String("zstd".into()));
     }
 
@@ -2141,11 +2145,16 @@ mod tests {
     #[test]
     fn blob_only_serializes_local_entries() {
         let mut ps = PropertySet::new();
-        ps.set_local(PropertyKey::new("access.readonly"), PropertyValue::Bool(true));
+        ps.set_local(
+            PropertyKey::new("access.readonly"),
+            PropertyValue::Bool(true),
+        );
         ps.set_with_source(
             PropertyKey::new("access.atime"),
             PropertyValue::Bool(false),
-            PropertySource::Inherited { parent_dataset_id: 1 },
+            PropertySource::Inherited {
+                parent_dataset_id: 1,
+            },
         );
         ps.set_with_source(
             PropertyKey::new("layout.recordsize"),
@@ -2159,6 +2168,8 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert!(restored.get(&PropertyKey::new("access.readonly")).is_some());
         assert!(restored.get(&PropertyKey::new("access.atime")).is_none());
-        assert!(restored.get(&PropertyKey::new("layout.recordsize")).is_none());
+        assert!(restored
+            .get(&PropertyKey::new("layout.recordsize"))
+            .is_none());
     }
 }

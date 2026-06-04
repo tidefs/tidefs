@@ -4,8 +4,8 @@
 //! and parses the JSON KPI output.  Discloses carrier mode (loopback, TCP, RDMA).
 
 use super::benchmark_harness::BenchmarkResult;
-use super::validation_tier::ValidationTier;
 use super::gate_entry::MeasuredKpi;
+use super::validation_tier::ValidationTier;
 use std::process::Command;
 
 pub struct TransportHarness {

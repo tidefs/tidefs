@@ -43,9 +43,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
 use tidefs_membership_epoch::MemberId;
 use tidefs_transport::addr::TransportAddr;
+use tokio::sync::Notify;
 
 use crate::event_bridge::{MembershipEvent, MembershipEventSubscriber};
 use crate::session_binding::SessionId;

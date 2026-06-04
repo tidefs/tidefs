@@ -595,7 +595,10 @@ mod tests {
             EscalationMemberState::BelowThreshold
         ));
         for _ in 0..3 {
-            acc.record_validation(mid(1), SuspicionValidation::DirectPingFailure { round: 100 });
+            acc.record_validation(
+                mid(1),
+                SuspicionValidation::DirectPingFailure { round: 100 },
+            );
         }
         engine.poll(&acc, &roster);
         assert!(matches!(
@@ -621,7 +624,10 @@ mod tests {
             engine.poll(&acc, &roster);
         }
         for _ in 0..3 {
-            acc.record_validation(mid(1), SuspicionValidation::DirectPingFailure { round: 200 });
+            acc.record_validation(
+                mid(1),
+                SuspicionValidation::DirectPingFailure { round: 200 },
+            );
         }
         engine.poll(&acc, &roster);
         assert!(matches!(

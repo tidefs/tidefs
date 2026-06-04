@@ -46,11 +46,11 @@ use crate::lifecycle::{DeviceLifecycle, LifecycleState};
 use crate::open_release::{BlockLifecycle, BlockOpenGuard, OpenError, ReleaseOutcome};
 use crate::pool_core_backend::PoolCoreBackend;
 use crate::request_completion::RequestCompletion;
-use crate::timeout::{InflightTracker, TimeoutOutcome};
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge::kernel_types::KmodVec as Vec;
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge::{BridgeError, BridgeResult};
+use crate::timeout::{InflightTracker, TimeoutOutcome};
 use crate::DEFAULT_CAPACITY_SECTORS;
 use crate::{BlockBio, BlockExport, BlockQueueLimits};
 #[cfg(not(CONFIG_RUST))]

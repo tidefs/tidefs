@@ -9,12 +9,12 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::Args;
-use tidefs_cluster::pool_lease_token::PoolLeaseToken;
-use tidefs_encryption;
-use tidefs_cluster::pool_protocol::{ClusterPoolLeaseRequest, ClusterPoolMessage};
-use tidefs_transport::{NodeInfo, Transport, TransportAddr};
 use std::net::SocketAddr;
+use tidefs_cluster::pool_lease_token::PoolLeaseToken;
+use tidefs_cluster::pool_protocol::{ClusterPoolLeaseRequest, ClusterPoolMessage};
+use tidefs_encryption;
 use tidefs_local_filesystem::RootAuthenticationKey;
+use tidefs_transport::{NodeInfo, Transport, TransportAddr};
 use tidefs_types_pool_label_core::features;
 
 /// `pool mount [<pool_name>] <mount_point> [--devices <dev>...] [--read-only] [--relatime]`
@@ -407,22 +407,27 @@ pub fn handle_mount(args: PoolMountArgs) {
         // server's transport handshake. Using a proper transport session
         // ensures the lease request reaches the CP01 dispatch handler.
         let addr: SocketAddr = node_addr.parse().unwrap_or_else(|e| {
-            eprintln!("tidefsctl pool mount: invalid cluster-node-addr '{}': {e}", node_addr);
+            eprintln!(
+                "tidefsctl pool mount: invalid cluster-node-addr '{}': {e}",
+                node_addr
+            );
             process::exit(1);
         });
         let operator_client_id = node_id.wrapping_add(10_000);
         let mut transport = Transport::new(operator_client_id);
-        transport.add_node(NodeInfo::new(
-            node_id,
-            vec![TransportAddr::Tcp(addr)],
-            0,
-        ));
+        transport.add_node(NodeInfo::new(node_id, vec![TransportAddr::Tcp(addr)], 0));
         let sid = transport.connect(node_id).unwrap_or_else(|e| {
-            eprintln!("tidefsctl pool mount: connect to cluster node {}: {e:?}", node_addr);
+            eprintln!(
+                "tidefsctl pool mount: connect to cluster node {}: {e:?}",
+                node_addr
+            );
             process::exit(1);
         });
         transport.perform_handshake(sid).unwrap_or_else(|e| {
-            eprintln!("tidefsctl pool mount: handshake with cluster node {}: {e:?}", node_addr);
+            eprintln!(
+                "tidefsctl pool mount: handshake with cluster node {}: {e:?}",
+                node_addr
+            );
             process::exit(1);
         });
 
@@ -469,7 +474,10 @@ pub fn handle_mount(args: PoolMountArgs) {
         let token: PoolLeaseToken = match resp {
             ClusterPoolMessage::LeaseResponse(lease_resp) => {
                 if !lease_resp.success {
-                    eprintln!("tidefsctl pool mount: lease refused: {:?}", lease_resp.error);
+                    eprintln!(
+                        "tidefsctl pool mount: lease refused: {:?}",
+                        lease_resp.error
+                    );
                     process::exit(1);
                 }
                 let token_bytes = lease_resp.lease_token_bytes.unwrap_or_else(|| {
@@ -489,17 +497,14 @@ pub fn handle_mount(args: PoolMountArgs) {
 
         println!(
             "cluster: lease granted (node={}, epoch={}, lease_id={}, expires_ms={})",
-            token.node_id,
-            token.epoch.0,
-            token.lease_id,
-            token.expiration_deadline_ms
+            token.node_id, token.epoch.0, token.lease_id, token.expiration_deadline_ms
         );
 
         // Validate cluster ownership via import_pool_clustered.
-        let device_paths: Vec<std::path::PathBuf> =
-            args.devices.clone().unwrap_or_else(|| {
-                find_device_files(&backing_dir)
-            });
+        let device_paths: Vec<std::path::PathBuf> = args
+            .devices
+            .clone()
+            .unwrap_or_else(|| find_device_files(&backing_dir));
         match tidefs_local_object_store::pool_importer::PoolImporter::import_pool_clustered(
             &device_paths,
             Some(pool_guid),
@@ -513,9 +518,7 @@ pub fn handle_mount(args: PoolMountArgs) {
                 );
             }
             Err(e) => {
-                eprintln!(
-                    "tidefsctl pool mount: cluster pool import validation failed: {e}"
-                );
+                eprintln!("tidefsctl pool mount: cluster pool import validation failed: {e}");
                 eprintln!(
                     "tidefsctl pool mount: the lease token may not authorize this pool,                              or the pool labels may be stale"
                 );
@@ -532,7 +535,6 @@ pub fn handle_mount(args: PoolMountArgs) {
     } else {
         None
     };
-
 
     let config = tidefs_posix_filesystem_adapter_daemon::MountConfig {
         backing_dir,

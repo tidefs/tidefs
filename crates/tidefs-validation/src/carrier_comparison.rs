@@ -386,7 +386,10 @@ pub fn render_markdown(report: &CarrierComparisonReport) -> String {
     let mut md = String::new();
     md.push_str("# RDMA vs TCP Carrier Performance Comparison\n\n");
     md.push_str(&format!("**Commit**: `{}`\n", report.commit_sha));
-    md.push_str(&format!("**Validation Tier**: {}\n", report.validation_tier));
+    md.push_str(&format!(
+        "**Validation Tier**: {}\n",
+        report.validation_tier
+    ));
     md.push_str(&format!("**Verdict**: {:?}\n\n", report.verdict));
 
     // Probe section
@@ -665,7 +668,9 @@ mod tests {
         let commit_sha =
             std::env::var("TIDEFS_VALIDATION_COMMIT_SHA").unwrap_or_else(|_| "unknown".to_string());
         let validation_dir = std::env::var("TIDEFS_CARRIER_COMPARISON_VALIDATION_DIR")
-            .unwrap_or_else(|_| format!("{repo_root}//root/ai/tmp/tidefs-validation/6502-carrier-comparison"));
+            .unwrap_or_else(|_| {
+                format!("{repo_root}//root/ai/tmp/tidefs-validation/6502-carrier-comparison")
+            });
         std::fs::create_dir_all(&validation_dir).expect("create validation dir");
         let report = compare_carriers(&repo_root, &target_dir, &commit_sha, Some(&validation_dir));
         let json_path = format!("{validation_dir}/carrier-comparison-report.json");

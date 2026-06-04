@@ -633,9 +633,7 @@ impl BlockVolumeStorageBackend for BlockVolumeObjectStoreBackend {
     fn resize_to(&mut self, new_block_count: usize) -> Result<(), BackendError> {
         // Only grow is supported; refuse shrink
         if new_block_count <= self.geometry.block_count {
-            return Err(BackendError::Other(
-                "online shrink is not supported".into(),
-            ));
+            return Err(BackendError::Other("online shrink is not supported".into()));
         }
         self.geometry.block_count = new_block_count;
         self.written_index_dirty = true;

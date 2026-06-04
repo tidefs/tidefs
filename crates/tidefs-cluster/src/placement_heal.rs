@@ -34,7 +34,6 @@ use crate::rebuild_backfill::{
     BackfillError, RebuildBackfillInitiator, RebuildPlan, ReconstructionTask,
 };
 
-
 // ── PlacementObjectReceipt ───────────────────────────────────────────
 
 /// A placement receipt that binds a file extent to a member/device.
@@ -67,7 +66,14 @@ impl PlacementObjectReceipt {
         logical_length: u64,
         epoch: u64,
     ) -> Self {
-        Self { object_id, member_id, inode_id, logical_offset, logical_length, epoch }
+        Self {
+            object_id,
+            member_id,
+            inode_id,
+            logical_offset,
+            logical_length,
+            epoch,
+        }
     }
 
     /// True if the given byte range overlaps this receipt's extent.
@@ -212,7 +218,10 @@ impl PlacementMap {
 
     /// Find all receipts for a given inode.
     pub fn receipts_for_inode(&self, inode_id: u64) -> Vec<&PlacementObjectReceipt> {
-        self.receipts.values().filter(|r| r.inode_id == inode_id).collect()
+        self.receipts
+            .values()
+            .filter(|r| r.inode_id == inode_id)
+            .collect()
     }
 
     /// Find which members hold data for the given (inode, byte_range).
@@ -461,10 +470,7 @@ impl PlacementHealCoordinator {
     }
 
     /// Register per-member failure-domain vectors.
-    pub fn with_member_failure_domains(
-        mut self,
-        domains: BTreeMap<u64, FailureDomain>,
-    ) -> Self {
+    pub fn with_member_failure_domains(mut self, domains: BTreeMap<u64, FailureDomain>) -> Self {
         self.member_failure_domains = domains;
         self
     }
@@ -642,9 +648,7 @@ impl PlacementHealCoordinator {
                 continue;
             }
 
-            tasks.push(ReconstructionTask::new_full(
-                object_id, sources, targets, 0,
-            ));
+            tasks.push(ReconstructionTask::new_full(object_id, sources, targets, 0));
         }
 
         if tasks.is_empty() {
@@ -661,7 +665,6 @@ impl PlacementHealCoordinator {
         self.state = HealState::Planning;
         Some(RebuildPlan::new(plan_id, tasks, now_ns))
     }
-
 
     // ── Backfill integration ─────────────────────────────────────
 
@@ -1138,210 +1141,218 @@ mod tests {
     }
 }
 
-    // ── Policy-aware target selection tests ──────────────────
+// ── Policy-aware target selection tests ──────────────────
 
-    /// Stripe policy (desired=1) should NOT rebuild objects that still
-    /// have one surviving replica. Only wholly-lost objects appear in stats.
-    #[test]
-    fn stripe_policy_skips_objects_with_surviving_replica() {
-        let mut coord = PlacementHealCoordinator::new(1, None)
-            .with_placement_policy(ClusterPlacementPolicy::Stripe);
-        coord.placement_mut().insert(1, 10);
-        coord.placement_mut().insert(1, 20);
+/// Stripe policy (desired=1) should NOT rebuild objects that still
+/// have one surviving replica. Only wholly-lost objects appear in stats.
+#[test]
+fn stripe_policy_skips_objects_with_surviving_replica() {
+    let mut coord = PlacementHealCoordinator::new(1, None)
+        .with_placement_policy(ClusterPlacementPolicy::Stripe);
+    coord.placement_mut().insert(1, 10);
+    coord.placement_mut().insert(1, 20);
 
-        let mut lost = BTreeSet::new();
-        lost.insert(10);
-        let mut available = BTreeMap::new();
-        available.insert(20, HealthClass::Healthy);
-        available.insert(30, HealthClass::Healthy);
+    let mut lost = BTreeSet::new();
+    lost.insert(10);
+    let mut available = BTreeMap::new();
+    available.insert(20, HealthClass::Healthy);
+    available.insert(30, HealthClass::Healthy);
 
-        coord.detect_loss(LossEvent {
-            lost_members: lost,
-            epoch: 1,
-            detected_at_ns: 1_000_000_000,
-            available_members: available,
-        });
-        assert_eq!(coord.state(), HealState::Assessing);
-        assert!(coord.stats().objects_affected > 0);
+    coord.detect_loss(LossEvent {
+        lost_members: lost,
+        epoch: 1,
+        detected_at_ns: 1_000_000_000,
+        available_members: available,
+    });
+    assert_eq!(coord.state(), HealState::Assessing);
+    assert!(coord.stats().objects_affected > 0);
 
-        // With Stripe, object 1 still has member 20 → no rebuild needed
-        let plan = coord.build_rebuild_plan(1, 1_000_000_001);
-        assert!(plan.is_none(), "stripe should not rebuild when survivor exists");
-        assert_eq!(coord.state(), HealState::Complete);
+    // With Stripe, object 1 still has member 20 → no rebuild needed
+    let plan = coord.build_rebuild_plan(1, 1_000_000_001);
+    assert!(
+        plan.is_none(),
+        "stripe should not rebuild when survivor exists"
+    );
+    assert_eq!(coord.state(), HealState::Complete);
+}
+
+/// Mirror-3 policy should rebuild to restore 3 replicas when a member is lost.
+#[test]
+fn mirror_3_restores_all_replicas() {
+    let mut coord = PlacementHealCoordinator::new(1, None)
+        .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 3 });
+    coord.placement_mut().insert(1, 10);
+    coord.placement_mut().insert(1, 20);
+    coord.placement_mut().insert(1, 30);
+
+    let mut lost = BTreeSet::new();
+    lost.insert(10);
+    let mut available = BTreeMap::new();
+    available.insert(20, HealthClass::Healthy);
+    available.insert(30, HealthClass::Healthy);
+    available.insert(40, HealthClass::Healthy);
+    available.insert(50, HealthClass::Healthy);
+
+    coord.detect_loss(LossEvent {
+        lost_members: lost,
+        epoch: 1,
+        detected_at_ns: 1_000_000_000,
+        available_members: available,
+    });
+    assert_eq!(coord.state(), HealState::Assessing);
+
+    let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
+    // Object 1 had replicas on 10, 20, 30; lost 10.
+    // Surviving: 20, 30 (2 replicas). Desired: 3. Need: 1 more.
+    // Healthy members not holding: 40, 50
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].target_nodes.len(), 1);
+    assert!(plan.tasks[0]
+        .target_nodes
+        .iter()
+        .any(|m| *m == 40 || *m == 50));
+}
+
+/// Failure-domain-aware selection avoids placing replicas on nodes
+/// that share the same failure domain as existing replicas.
+#[test]
+fn failure_domain_avoids_same_node_domain() {
+    use tidefs_membership_epoch::HealthClass;
+
+    let mut domains = BTreeMap::new();
+    domains.insert(20, FailureDomain::for_node(20));
+    domains.insert(30, FailureDomain::for_node(30));
+    domains.insert(40, FailureDomain::for_node(20)); // same node domain as 20!
+    domains.insert(50, FailureDomain::for_node(50));
+
+    let mut coord = PlacementHealCoordinator::new(1, None)
+        .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 })
+        .with_member_failure_domains(domains);
+    coord.placement_mut().insert(1, 10);
+    coord.placement_mut().insert(1, 20);
+
+    let mut lost = BTreeSet::new();
+    lost.insert(10);
+    let mut available = BTreeMap::new();
+    available.insert(20, HealthClass::Healthy);
+    available.insert(30, HealthClass::Healthy);
+    available.insert(40, HealthClass::Healthy);
+    available.insert(50, HealthClass::Healthy);
+
+    coord.detect_loss(LossEvent {
+        lost_members: lost,
+        epoch: 1,
+        detected_at_ns: 1_000_000_000,
+        available_members: available,
+    });
+
+    let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
+    // Object 1 had {10, 20}. After losing 10, surviving: {20}.
+    // Desired: 2, need 1 more.
+    // Candidates: 30, 40, 50 (not 20 because it already holds the object).
+    // 40 shares failure domain with 20 → should be sorted last.
+    // 50 should be preferred (distinct domain, low load).
+    assert_eq!(plan.tasks.len(), 1);
+    let targets = &plan.tasks[0].target_nodes;
+    assert_eq!(targets.len(), 1);
+    // Should prefer 30 or 50, not 40 (same domain as 20)
+    assert!(
+        targets[0] == 30 || targets[0] == 50,
+        "target should be from distinct failure domain, got {}",
+        targets[0]
+    );
+}
+
+/// Load balancing distributes rebuild targets evenly across nodes.
+#[test]
+fn rebuild_load_is_distributed_evenly() {
+    use tidefs_membership_epoch::HealthClass;
+
+    let mut coord = PlacementHealCoordinator::new(1, None)
+        .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
+    // 4 objects all on {10, 20}. Lose 10.
+    for obj in 1..=4u64 {
+        coord.placement_mut().insert(obj, 10);
+        coord.placement_mut().insert(obj, 20);
     }
 
-    /// Mirror-3 policy should rebuild to restore 3 replicas when a member is lost.
-    #[test]
-    fn mirror_3_restores_all_replicas() {
-        let mut coord = PlacementHealCoordinator::new(1, None)
-            .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 3 });
-        coord.placement_mut().insert(1, 10);
-        coord.placement_mut().insert(1, 20);
-        coord.placement_mut().insert(1, 30);
+    let mut lost = BTreeSet::new();
+    lost.insert(10);
+    let mut available = BTreeMap::new();
+    available.insert(20, HealthClass::Healthy);
+    available.insert(30, HealthClass::Healthy);
+    available.insert(40, HealthClass::Healthy);
 
-        let mut lost = BTreeSet::new();
-        lost.insert(10);
-        let mut available = BTreeMap::new();
-        available.insert(20, HealthClass::Healthy);
-        available.insert(30, HealthClass::Healthy);
-        available.insert(40, HealthClass::Healthy);
-        available.insert(50, HealthClass::Healthy);
+    coord.detect_loss(LossEvent {
+        lost_members: lost,
+        epoch: 1,
+        detected_at_ns: 1_000_000_000,
+        available_members: available,
+    });
 
-        coord.detect_loss(LossEvent {
-            lost_members: lost,
-            epoch: 1,
-            detected_at_ns: 1_000_000_000,
-            available_members: available,
-        });
-        assert_eq!(coord.state(), HealState::Assessing);
-
-        let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
-        // Object 1 had replicas on 10, 20, 30; lost 10.
-        // Surviving: 20, 30 (2 replicas). Desired: 3. Need: 1 more.
-        // Healthy members not holding: 40, 50
-        assert_eq!(plan.tasks.len(), 1);
-        assert_eq!(plan.tasks[0].target_nodes.len(), 1);
-        assert!(plan.tasks[0].target_nodes.iter().any(|m| *m == 40 || *m == 50));
-    }
-
-    /// Failure-domain-aware selection avoids placing replicas on nodes
-    /// that share the same failure domain as existing replicas.
-    #[test]
-    fn failure_domain_avoids_same_node_domain() {
-        use tidefs_membership_epoch::HealthClass;
-
-        let mut domains = BTreeMap::new();
-        domains.insert(20, FailureDomain::for_node(20));
-        domains.insert(30, FailureDomain::for_node(30));
-        domains.insert(40, FailureDomain::for_node(20)); // same node domain as 20!
-        domains.insert(50, FailureDomain::for_node(50));
-
-        let mut coord = PlacementHealCoordinator::new(1, None)
-            .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 })
-            .with_member_failure_domains(domains);
-        coord.placement_mut().insert(1, 10);
-        coord.placement_mut().insert(1, 20);
-
-        let mut lost = BTreeSet::new();
-        lost.insert(10);
-        let mut available = BTreeMap::new();
-        available.insert(20, HealthClass::Healthy);
-        available.insert(30, HealthClass::Healthy);
-        available.insert(40, HealthClass::Healthy);
-        available.insert(50, HealthClass::Healthy);
-
-        coord.detect_loss(LossEvent {
-            lost_members: lost,
-            epoch: 1,
-            detected_at_ns: 1_000_000_000,
-            available_members: available,
-        });
-
-        let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
-        // Object 1 had {10, 20}. After losing 10, surviving: {20}.
-        // Desired: 2, need 1 more.
-        // Candidates: 30, 40, 50 (not 20 because it already holds the object).
-        // 40 shares failure domain with 20 → should be sorted last.
-        // 50 should be preferred (distinct domain, low load).
-        assert_eq!(plan.tasks.len(), 1);
-        let targets = &plan.tasks[0].target_nodes;
-        assert_eq!(targets.len(), 1);
-        // Should prefer 30 or 50, not 40 (same domain as 20)
-        assert!(
-            targets[0] == 30 || targets[0] == 50,
-            "target should be from distinct failure domain, got {}",
-            targets[0]
-        );
-    }
-
-    /// Load balancing distributes rebuild targets evenly across nodes.
-    #[test]
-    fn rebuild_load_is_distributed_evenly() {
-        use tidefs_membership_epoch::HealthClass;
-
-        let mut coord = PlacementHealCoordinator::new(1, None)
-            .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
-        // 4 objects all on {10, 20}. Lose 10.
-        for obj in 1..=4u64 {
-            coord.placement_mut().insert(obj, 10);
-            coord.placement_mut().insert(obj, 20);
-        }
-
-        let mut lost = BTreeSet::new();
-        lost.insert(10);
-        let mut available = BTreeMap::new();
-        available.insert(20, HealthClass::Healthy);
-        available.insert(30, HealthClass::Healthy);
-        available.insert(40, HealthClass::Healthy);
-
-        coord.detect_loss(LossEvent {
-            lost_members: lost,
-            epoch: 1,
-            detected_at_ns: 1_000_000_000,
-            available_members: available,
-        });
-
-        let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
-        // 4 objects, each needs 1 target. Available: 30, 40.
-        // Should distribute: ~2 objects each.
-        assert_eq!(plan.tasks.len(), 4);
-        let mut count_30 = 0u64;
-        let mut count_40 = 0u64;
-        for task in &plan.tasks {
-            for t in &task.target_nodes {
-                match *t {
-                    30 => count_30 += 1,
-                    40 => count_40 += 1,
-                    _ => {}
-                }
+    let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
+    // 4 objects, each needs 1 target. Available: 30, 40.
+    // Should distribute: ~2 objects each.
+    assert_eq!(plan.tasks.len(), 4);
+    let mut count_30 = 0u64;
+    let mut count_40 = 0u64;
+    for task in &plan.tasks {
+        for t in &task.target_nodes {
+            match *t {
+                30 => count_30 += 1,
+                40 => count_40 += 1,
+                _ => {}
             }
         }
-        assert_eq!(count_30, 2, "member 30 should get 2 objects");
-        assert_eq!(count_40, 2, "member 40 should get 2 objects");
+    }
+    assert_eq!(count_30, 2, "member 30 should get 2 objects");
+    assert_eq!(count_40, 2, "member 40 should get 2 objects");
+}
+
+/// ErasureCoded policy (4+2) should rebuild to restore 6 replicas.
+#[test]
+fn erasure_policy_restores_full_width() {
+    let mut coord = PlacementHealCoordinator::new(1, None)
+        .with_placement_policy(ClusterPlacementPolicy::ErasureCoded { data: 4, parity: 2 });
+    coord.placement_mut().insert(1, 10);
+    coord.placement_mut().insert(1, 20);
+    coord.placement_mut().insert(1, 30);
+    coord.placement_mut().insert(1, 40);
+    coord.placement_mut().insert(1, 50);
+    coord.placement_mut().insert(1, 60);
+
+    let mut lost = BTreeSet::new();
+    lost.insert(10);
+    lost.insert(20);
+    let mut available = BTreeMap::new();
+    for m in 30..=70u64 {
+        available.insert(m, HealthClass::Healthy);
     }
 
-    /// ErasureCoded policy (4+2) should rebuild to restore 6 replicas.
-    #[test]
-    fn erasure_policy_restores_full_width() {
-        let mut coord = PlacementHealCoordinator::new(1, None)
-            .with_placement_policy(ClusterPlacementPolicy::ErasureCoded {
-                data: 4, parity: 2,
-            });
-        coord.placement_mut().insert(1, 10);
-        coord.placement_mut().insert(1, 20);
-        coord.placement_mut().insert(1, 30);
-        coord.placement_mut().insert(1, 40);
-        coord.placement_mut().insert(1, 50);
-        coord.placement_mut().insert(1, 60);
+    coord.detect_loss(LossEvent {
+        lost_members: lost,
+        epoch: 1,
+        detected_at_ns: 1_000_000_000,
+        available_members: available,
+    });
+    assert_eq!(coord.state(), HealState::Assessing);
 
-        let mut lost = BTreeSet::new();
-        lost.insert(10);
-        lost.insert(20);
-        let mut available = BTreeMap::new();
-        for m in 30..=70u64 {
-            available.insert(m, HealthClass::Healthy);
-        }
-
-        coord.detect_loss(LossEvent {
-            lost_members: lost,
-            epoch: 1,
-            detected_at_ns: 1_000_000_000,
-            available_members: available,
-        });
-        assert_eq!(coord.state(), HealState::Assessing);
-
-        let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
-        // Object 1 had 6 replicas on {10, 20, 30, 40, 50, 60}.
-        // Lost 10, 20. Surviving: 30, 40, 50, 60 (4 replicas).
-        // Desired: 6 (data+parity). Need: 2 more.
-        assert_eq!(plan.tasks.len(), 1);
-        assert_eq!(plan.tasks[0].target_nodes.len(), 2);
-        // Targets must not be among the existing replica set.
-        let existing: BTreeSet<u64> = [30, 40, 50, 60].into();
-        for t in &plan.tasks[0].target_nodes {
-            assert!(!existing.contains(t), "target {} already holds the object", t);
-        }
+    let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
+    // Object 1 had 6 replicas on {10, 20, 30, 40, 50, 60}.
+    // Lost 10, 20. Surviving: 30, 40, 50, 60 (4 replicas).
+    // Desired: 6 (data+parity). Need: 2 more.
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].target_nodes.len(), 2);
+    // Targets must not be among the existing replica set.
+    let existing: BTreeSet<u64> = [30, 40, 50, 60].into();
+    for t in &plan.tasks[0].target_nodes {
+        assert!(
+            !existing.contains(t),
+            "target {} already holds the object",
+            t
+        );
     }
+}
 
 // ── Placement-heal scenario tests ────────────────────────────────────
 ///
@@ -1354,8 +1365,8 @@ mod scenario_tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use tokio::sync::mpsc;
     use tidefs_membership_epoch::{EpochId, HealthClass};
+    use tokio::sync::mpsc;
 
     use crate::runtime::{ClusterLeaseConfig, ClusterLeaseRuntime};
 
@@ -1653,126 +1664,142 @@ mod scenario_tests {
     }
 }
 
-    // ── Scenario: exactly-once rebuild ownership across restart ──
-    //
-    // After a full power loss restart, the rebuild plan for a given
-    // loss event must be identical to the original — same targets,
-    // same source/target assignments, same object set. This proves
-    // rebuild ownership is deterministic and exactly-once.
+// ── Scenario: exactly-once rebuild ownership across restart ──
+//
+// After a full power loss restart, the rebuild plan for a given
+// loss event must be identical to the original — same targets,
+// same source/target assignments, same object set. This proves
+// rebuild ownership is deterministic and exactly-once.
 
-    #[test]
-    fn rebuild_plan_deterministic_across_restart() {
-        // Build a 3-member cluster with 10 objects (2 replicas each).
-        let mut pm = PlacementMap::new(1);
-        for obj_id in 0..10u64 {
-            pm.insert(obj_id, 1);
-            pm.insert(obj_id, 2 + (obj_id % 2)); // member 2 or 3
-        }
+#[test]
+fn rebuild_plan_deterministic_across_restart() {
+    // Build a 3-member cluster with 10 objects (2 replicas each).
+    let mut pm = PlacementMap::new(1);
+    for obj_id in 0..10u64 {
+        pm.insert(obj_id, 1);
+        pm.insert(obj_id, 2 + (obj_id % 2)); // member 2 or 3
+    }
 
-        let policy = ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 };
+    let policy = ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 };
 
-        // First run: detect loss and build plan.
-        let mut coord1 = PlacementHealCoordinator::new(1, None)
-            .with_placement_policy(policy);
-        *coord1.placement_mut() = pm.clone();
+    // First run: detect loss and build plan.
+    let mut coord1 = PlacementHealCoordinator::new(1, None).with_placement_policy(policy);
+    *coord1.placement_mut() = pm.clone();
 
-        let lost = BTreeSet::from([1u64]);
-        let available = BTreeMap::from([
+    let lost = BTreeSet::from([1u64]);
+    let available = BTreeMap::from([(2u64, HealthClass::Healthy), (3u64, HealthClass::Healthy)]);
+    let loss = LossEvent {
+        lost_members: lost.clone(),
+        available_members: available.clone(),
+        epoch: 1,
+        detected_at_ns: 1_000_000_000,
+    };
+
+    let affected1 = coord1.detect_loss(loss.clone());
+    assert!(affected1.is_some(), "loss must be detected");
+    let plan1 = coord1.build_rebuild_plan(100, 1_000_000_000);
+    assert!(plan1.is_some(), "rebuild plan must be generated");
+    let plan1 = plan1.unwrap();
+    assert!(!plan1.is_empty(), "plan must have tasks");
+
+    // Second run (simulated restart): same map, same loss → same plan.
+    let mut coord2 = PlacementHealCoordinator::new(1, None).with_placement_policy(policy);
+    *coord2.placement_mut() = pm;
+
+    let affected2 = coord2.detect_loss(loss);
+    assert!(affected2.is_some(), "loss must be detected after restart");
+    let plan2 = coord2.build_rebuild_plan(100, 1_000_000_000);
+    assert!(
+        plan2.is_some(),
+        "rebuild plan must be generated after restart"
+    );
+    let plan2 = plan2.unwrap();
+
+    // Verify plans are identical — same tasks, same target assignments.
+    assert_eq!(
+        plan1.task_count(),
+        plan2.task_count(),
+        "plan task counts must match across restart"
+    );
+    assert_eq!(
+        plan1.total_target_replicas(),
+        plan2.total_target_replicas(),
+        "total target replicas must match across restart"
+    );
+
+    // Per-task comparison: same object_id, same sources, same targets.
+    for (t1, t2) in plan1.tasks.iter().zip(plan2.tasks.iter()) {
+        assert_eq!(t1.object_id, t2.object_id, "object_id must match");
+        assert_eq!(
+            t1.source_nodes, t2.source_nodes,
+            "source nodes must match for obj {}",
+            t1.object_id
+        );
+        assert_eq!(
+            t1.target_nodes, t2.target_nodes,
+            "target nodes must match for obj {}",
+            t1.object_id
+        );
+    }
+}
+
+#[test]
+fn rebuild_plan_exactly_one_backfill_per_loss() {
+    // Verify that a single loss event produces at most one active
+    // rebuild backfill — repeated detect_loss calls on the same loss
+    // do not create duplicate plans.
+    // Use 3 members with 2 replicas so that when member 1 fails,
+    // surviving members 2 and 3 can receive rebuild targets.
+    let mut pm = PlacementMap::new(1);
+    for obj_id in 0..5u64 {
+        pm.insert(obj_id, 1);
+        pm.insert(obj_id, 2 + (obj_id % 2)); // member 2 or 3
+    }
+
+    let mut coord = PlacementHealCoordinator::new(1, None)
+        .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
+    *coord.placement_mut() = pm;
+
+    let loss = LossEvent {
+        lost_members: BTreeSet::from([1u64]),
+        available_members: BTreeMap::from([
             (2u64, HealthClass::Healthy),
             (3u64, HealthClass::Healthy),
-        ]);
-        let loss = LossEvent {
-            lost_members: lost.clone(),
-            available_members: available.clone(),
-            epoch: 1,
-            detected_at_ns: 1_000_000_000,
-        };
+        ]),
+        epoch: 1,
+        detected_at_ns: 1_000_000_000,
+    };
 
-        let affected1 = coord1.detect_loss(loss.clone());
-        assert!(affected1.is_some(), "loss must be detected");
-        let plan1 = coord1.build_rebuild_plan(100, 1_000_000_000);
-        assert!(plan1.is_some(), "rebuild plan must be generated");
-        let plan1 = plan1.unwrap();
-        assert!(!plan1.is_empty(), "plan must have tasks");
+    // First detection works.
+    let aff1 = coord.detect_loss(loss.clone());
+    assert!(aff1.is_some());
 
-        // Second run (simulated restart): same map, same loss → same plan.
-        let mut coord2 = PlacementHealCoordinator::new(1, None)
-            .with_placement_policy(policy);
-        *coord2.placement_mut() = pm;
+    // Second detection while already in Assessing state must be refused.
+    let aff2 = coord.detect_loss(loss.clone());
+    assert!(
+        aff2.is_none(),
+        "second detect_loss must be refused while heal is active"
+    );
 
-        let affected2 = coord2.detect_loss(loss);
-        assert!(affected2.is_some(), "loss must be detected after restart");
-        let plan2 = coord2.build_rebuild_plan(100, 1_000_000_000);
-        assert!(plan2.is_some(), "rebuild plan must be generated after restart");
-        let plan2 = plan2.unwrap();
-
-        // Verify plans are identical — same tasks, same target assignments.
-        assert_eq!(
-            plan1.task_count(), plan2.task_count(),
-            "plan task counts must match across restart"
+    // Build the plan — it must exist (exactly once) even if no
+    // new replicas are needed (all replicas survive on other members).
+    // The plan may be empty if objects already satisfy the policy,
+    // but build_rebuild_plan must still be callable exactly once.
+    let plan = coord.build_rebuild_plan(200, 2_000_000_000);
+    // Note: if all objects already have desired replica count on
+    // surviving members, build_rebuild_plan returns None (Complete).
+    // Either way, there is at most one plan — exactly-once ownership.
+    if let Some(ref p) = plan {
+        assert!(
+            p.task_count() > 0 || p.task_count() == 0,
+            "plan must be valid if present"
         );
-        assert_eq!(
-            plan1.total_target_replicas(), plan2.total_target_replicas(),
-            "total target replicas must match across restart"
-        );
-
-        // Per-task comparison: same object_id, same sources, same targets.
-        for (t1, t2) in plan1.tasks.iter().zip(plan2.tasks.iter()) {
-            assert_eq!(t1.object_id, t2.object_id, "object_id must match");
-            assert_eq!(t1.source_nodes, t2.source_nodes, "source nodes must match for obj {}", t1.object_id);
-            assert_eq!(t1.target_nodes, t2.target_nodes, "target nodes must match for obj {}", t1.object_id);
-        }
     }
 
-    #[test]
-    fn rebuild_plan_exactly_one_backfill_per_loss() {
-        // Verify that a single loss event produces at most one active
-        // rebuild backfill — repeated detect_loss calls on the same loss
-        // do not create duplicate plans.
-        // Use 3 members with 2 replicas so that when member 1 fails,
-        // surviving members 2 and 3 can receive rebuild targets.
-        let mut pm = PlacementMap::new(1);
-        for obj_id in 0..5u64 {
-            pm.insert(obj_id, 1);
-            pm.insert(obj_id, 2 + (obj_id % 2)); // member 2 or 3
-        }
-
-        let mut coord = PlacementHealCoordinator::new(1, None)
-            .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
-        *coord.placement_mut() = pm;
-
-        let loss = LossEvent {
-            lost_members: BTreeSet::from([1u64]),
-            available_members: BTreeMap::from([
-                (2u64, HealthClass::Healthy),
-                (3u64, HealthClass::Healthy),
-            ]),
-            epoch: 1,
-            detected_at_ns: 1_000_000_000,
-        };
-
-        // First detection works.
-        let aff1 = coord.detect_loss(loss.clone());
-        assert!(aff1.is_some());
-
-        // Second detection while already in Assessing state must be refused.
-        let aff2 = coord.detect_loss(loss.clone());
-        assert!(aff2.is_none(), "second detect_loss must be refused while heal is active");
-
-        // Build the plan — it must exist (exactly once) even if no
-        // new replicas are needed (all replicas survive on other members).
-        // The plan may be empty if objects already satisfy the policy,
-        // but build_rebuild_plan must still be callable exactly once.
-        let plan = coord.build_rebuild_plan(200, 2_000_000_000);
-        // Note: if all objects already have desired replica count on
-        // surviving members, build_rebuild_plan returns None (Complete).
-        // Either way, there is at most one plan — exactly-once ownership.
-        if let Some(ref p) = plan {
-            assert!(p.task_count() > 0 || p.task_count() == 0,
-                "plan must be valid if present");
-        }
-
-        // Third detection while still active must also be refused.
-        let aff3 = coord.detect_loss(loss.clone());
-        assert!(aff3.is_none(), "third detect_loss must be refused while heal is active");
-    }
+    // Third detection while still active must also be refused.
+    let aff3 = coord.detect_loss(loss.clone());
+    assert!(
+        aff3.is_none(),
+        "third detect_loss must be refused while heal is active"
+    );
+}

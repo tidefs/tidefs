@@ -7,6 +7,7 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
+use crate::kernel_check::HostKernelClass;
 use crate::kernel_check::{
     classify_host_identity, classify_kernel_release_str, ObserveHostIdentity,
 };
@@ -50,7 +51,6 @@ use tidefs_block_volume_adapter_ublk_control_runtime::{
     BLOCK_VOLUME_UBLK_DATA_QUEUE_FETCH_REQ_SUBMIT_GATE_OW_301W,
     BLOCK_VOLUME_UBLK_DATA_QUEUE_OPEN_GATE_OW_301V, TIDEFS_UBLK_ADD_DEV_REQUIRED_FEATURES,
 };
-use crate::kernel_check::HostKernelClass;
 use tidefs_types_package_profile_catalog::BLOCK_VOLUME_ADAPTER_DAEMON_SURFACE;
 use tidefs_ublk_abi::{
     ublk_control_plan_steps, UblkFeatureFlags, UblkParams,
