@@ -5903,21 +5903,6 @@ impl LocalFileSystem {
         self.flush_write_buffer(inode_id)?;
         let record = self.inode(inode_id)?.clone();
         let old_size = record.size;
-        // Capacity reservation: atomically reserve and commit bytes for
-        // truncate-extend, replacing the former check-then-record pattern.
-        if size > old_size {
-            let handle = self.reserve_with_hierarchy(size - old_size).map_err(|_e| {
-                FileSystemError::NoSpace {
-                    resource: LocalStorageResource::ContentBytes,
-                    requested: size - old_size,
-                    available: self.capacity_authority.available_bytes(),
-                    capacity: self.capacity_authority.total_bytes(),
-                    allocated: self.capacity_authority.used_bytes(),
-                }
-            })?;
-            // Immediately commit: reserved bytes become used bytes.
-            handle.commit();
-        }
         let result = self.rewrite_content_with_overlay(inode_id, record, 0, &[], size, true)?;
         // Accumulate space delta for truncation: free or write depending on direction.
         if size < old_size {
@@ -5998,14 +5983,6 @@ impl LocalFileSystem {
                     .raw_primary_store_mut()
                     .delete(intent_log_data_object_key(*entry_id));
             }
-        } else if size > old_size {
-            self.state
-                .space_accounting
-                .accumulate_delta(SpaceDelta::new_write(size - old_size));
-            self.state
-                .space_accounting
-                .track_physical_write(size - old_size);
-            // Capacity reservation was committed inline before truncate-extend.
         }
         // Truncate buffered writes to the new size so fsync does not
         // restore pre-truncation data. Must run after the inode write

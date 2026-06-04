@@ -600,6 +600,46 @@ pub(crate) fn write_chunked_content_with_overlay(
         compression_policy,
     } = request;
     let old_layout = read_content_layout_from_store(store, inode_id, old_record, true)?;
+    if allow_holes && overlay_bytes.is_empty() && new_record.size >= old_record.size {
+        if let ContentLayout::Chunked(ref old_manifest) = old_layout {
+            let mut chunks = Vec::new();
+            let mut can_retain_all_data = true;
+            for old_ref in &old_manifest.chunks {
+                if old_ref.is_hole() {
+                    continue;
+                }
+                let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
+                let chunk_start = content_chunk_start(old_ref.chunk_index)?;
+                let chunk_end = chunk_start.checked_add(u64::from(new_len)).ok_or(
+                    FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    },
+                )?;
+                if old_ref.len != new_len || chunk_end > old_record.size {
+                    can_retain_all_data = false;
+                    break;
+                }
+                chunks.push(old_ref.clone());
+            }
+            if can_retain_all_data {
+                let manifest = ContentManifestObject {
+                    inode_id: new_record.inode_id,
+                    data_version: new_record.data_version,
+                    file_size: new_record.size,
+                    chunk_size: content_chunk_size(),
+                    chunks,
+                };
+                let manifest_key =
+                    content_object_key_for_version(new_record.inode_id, new_record.data_version);
+                let manifest_encoded = encode_content_manifest_sparse(&manifest);
+                store.put(manifest_key, &manifest_encoded)?;
+                if let Some(ref mut qs) = quorum_store {
+                    let _ = qs.quorum_put(manifest_key, &manifest_encoded);
+                }
+                return Ok(());
+            }
+        }
+    }
     if allow_holes && old_record.size == new_record.size && !overlay_bytes.is_empty() {
         if let ContentLayout::Chunked(ref old_manifest) = old_layout {
             return write_same_size_sparse_overlay(
@@ -633,23 +673,25 @@ pub(crate) fn write_chunked_content_with_overlay(
         }
 
         if allow_holes {
-            // Preserve pre-existing holes that the write doesn't touch (#873).
-            // A chunk that was absent from the old manifest (hole) and lies
-            // entirely outside the overlay region stays absent.  This keeps
-            // the manifest sparse and avoids needless zero-filled chunks.
-            {
-                let cstart = content_chunk_start(chunk_index)?;
-                let cend = cstart
-                    .checked_add(u64::from(content_chunk_len(new_record.size, chunk_index)?))
-                    .ok_or(FileSystemError::SizeOverflow {
-                        requested: u64::MAX,
-                    })?;
-                if !range_intersects_overlay(cstart, cend, overlay_offset, overlay_bytes)? {
-                    if let ContentLayout::Chunked(ref manifest) = old_layout {
-                        if find_chunk_in_manifest(manifest, chunk_index).is_none() {
-                            continue;
-                        }
+            // Preserve sparse holes that the write doesn't touch. Chunks that
+            // have no old data and no overlay stay absent from the manifest and
+            // consume no capacity.
+            let cstart = content_chunk_start(chunk_index)?;
+            let cend = cstart
+                .checked_add(u64::from(content_chunk_len(new_record.size, chunk_index)?))
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            if !range_intersects_overlay(cstart, cend, overlay_offset, overlay_bytes)? {
+                let can_skip_hole = match old_layout {
+                    ContentLayout::Chunked(ref manifest) => {
+                        find_chunk_in_manifest(manifest, chunk_index).is_none()
+                            || cstart >= old_record.size
                     }
+                    ContentLayout::Inline(_) => cstart >= old_record.size,
+                };
+                if can_skip_hole {
+                    continue;
                 }
             }
         }

@@ -6236,7 +6236,7 @@ impl FuseVfsAdapter {
     ) -> Result<(), Errno> {
         match new_size.cmp(&current_size) {
             std::cmp::Ordering::Less => {
-                // Shrink: punch-hole deallocation from new size to old size
+                // Shrink: punch-hole deallocation from new size to old size.
                 e.fallocate(
                     efh,
                     FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
@@ -6246,8 +6246,9 @@ impl FuseVfsAdapter {
                 )?;
             }
             std::cmp::Ordering::Greater => {
-                // Grow: allocate and zero-fill from old size to new size
-                e.fallocate(efh, 0, current_size, new_size - current_size, ctx)?;
+                // Grow: truncate(2)/ftruncate(2) creates a sparse zero tail.
+                // Do not preallocate the range here; the setattr below records
+                // the new EOF and reads synthesize zeros for holes.
             }
             std::cmp::Ordering::Equal => {}
         }
@@ -9302,6 +9303,36 @@ mod tests {
             &root,
             StoreOptions::test_fast(),
             RootAuthenticationKey::demo_key(),
+        )
+        .expect("open local filesystem");
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
+        AdapterFixture { adapter, root }
+    }
+
+    fn adapter_fixture_with_content_capacity(content_capacity_bytes: u64) -> AdapterFixture {
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-vfs-adapter-cap-{}-{temp_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let default_policy = LocalStorageAllocatorPolicy::default();
+        let local_fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+            &root,
+            LocalFileSystemOpenConfig {
+                options: StoreOptions::test_fast(),
+                allocator_policy: LocalStorageAllocatorPolicy::new(
+                    content_capacity_bytes,
+                    default_policy.inode_capacity,
+                ),
+                root_authentication_key: RootAuthenticationKey::demo_key(),
+                encryption: None,
+                compression: None,
+                log_device_device_path: None,
+                recovery_policy: RecoveryPolicy::default(),
+                block_devices: None,
+            },
         )
         .expect("open local filesystem");
         let engine = VfsLocalFileSystem::new(local_fs);
@@ -26671,6 +26702,33 @@ mod tests {
                 "extended region must be zero-filled"
             );
         }
+    }
+
+    #[test]
+    fn dispatch_ftruncate_file_large_grow_is_sparse() {
+        let fixture = adapter_fixture_with_content_capacity(8 * 1024 * 1024);
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"ftruncate-large-sparse.bin",
+            libc::O_RDWR as u32,
+        );
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, inode.get(), adapter_fh, 1024 * 1024 * 1024)
+            .expect("large sparse ftruncate grow");
+
+        let engine = fixture.adapter.engine.lock().unwrap();
+        let attr = engine
+            .getattr(inode, Some(&engine_fh), &ctx)
+            .expect("getattr after sparse grow");
+        assert_eq!(attr.posix.size, 1024 * 1024 * 1024);
+        let tail = engine
+            .read(&engine_fh, 1024 * 1024 * 1024 - 4096, 4096, &ctx)
+            .expect("read sparse tail");
+        assert_eq!(tail, vec![0_u8; 4096]);
     }
 
     #[test]

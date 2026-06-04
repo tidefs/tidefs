@@ -1138,7 +1138,6 @@ fn truncate_rewrites_boundary_chunk_and_drops_tail_refs() {
     }
     fs.write_file("/truncate.bin", 0, &expected)
         .expect("write initial chunks");
-    let full_record = fs.stat("/truncate.bin").expect("stat full file");
 
     let new_len = content_chunk_size() as usize + 7;
     fs.truncate_file("/truncate.bin", new_len as u64)
@@ -1148,8 +1147,9 @@ fn truncate_rewrites_boundary_chunk_and_drops_tail_refs() {
     let manifest = current_content_manifest(&fs, "/truncate.bin");
 
     assert_eq!(manifest.chunks.len(), 2);
-    assert_eq!(manifest.chunks[0].data_version, full_record.data_version);
+    assert_eq!(manifest.chunks[0].chunk_index, 0);
     assert_eq!(manifest.chunks[0].len, content_chunk_size());
+    assert_eq!(manifest.chunks[1].chunk_index, 1);
     assert_eq!(
         manifest.chunks[1].data_version,
         truncated_record.data_version
@@ -5053,14 +5053,17 @@ fn truncate_to_larger_size_uses_hole_chunks_instead_of_allocating_zeros() {
         "tail should be zeros"
     );
 
-    // Verify sparse: used blocks should reflect only the originally allocated
-    // chunks, not 100 chunks of zeros that naive truncate would allocate.
-    let statfs = fs.statfs().expect("statfs");
-    let used_blocks = statfs.blocks - statfs.bfree;
-    assert!(
-        used_blocks < 20,
-        "sparse truncate should use holes, not allocate 100+ zero-filled chunks; got {} used blocks (bfree={})",
-        used_blocks, statfs.bfree
+    // Verify sparse: only the originally materialized chunk should remain in
+    // the live content manifest.
+    let manifest = current_content_manifest(&fs, "/sparse.dat");
+    let materialized_chunks = manifest
+        .chunks
+        .iter()
+        .filter(|chunk_ref| !chunk_ref.is_hole())
+        .count();
+    assert_eq!(
+        materialized_chunks, 1,
+        "sparse truncate should not materialize zero-filled tail chunks"
     );
 
     // Reopen and verify data persists correctly
@@ -5084,6 +5087,67 @@ fn truncate_to_larger_size_uses_hole_chunks_instead_of_allocating_zeros() {
     // Verify online verifier passes
     let report = fs2.online_verifier_report().expect("online verifier");
     assert!(report.invalid_root_candidates == 0, "no invalid roots");
+    cleanup(&root);
+}
+
+#[test]
+fn truncate_empty_file_to_large_sparse_size_does_not_require_content_capacity() {
+    let root = temp_root("large-empty-sparse-truncate");
+    let policy =
+        LocalStorageAllocatorPolicy::new(8 * 1024 * 1024, DEFAULT_LOCAL_FILESYSTEM_INODE_CAPACITY);
+    let mut fs =
+        LocalFileSystem::open_with_allocator_policy(&root, options(), policy).expect("open fs");
+
+    fs.create_file("/large.dat", 0o644).expect("create file");
+    fs.truncate_file("/large.dat", 1024 * 1024 * 1024)
+        .expect("sparse 1GiB truncate should not require 1GiB capacity");
+
+    let manifest = current_content_manifest(&fs, "/large.dat");
+    assert_eq!(manifest.file_size, 1024 * 1024 * 1024);
+    assert!(
+        manifest.chunks.is_empty(),
+        "all-hole sparse file should not materialize chunk refs"
+    );
+    assert_eq!(
+        fs.read_file_range("/large.dat", 1024 * 1024 * 1024 - 4096, 4096)
+            .expect("read sparse tail"),
+        vec![0_u8; 4096]
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn truncate_inline_file_to_larger_sparse_size_preserves_prefix() {
+    let root = temp_root("inline-sparse-truncate");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let payload = b"inline prefix survives sparse growth";
+    let new_size = content_chunk_size() as u64 * 8 + 17;
+
+    fs.create_file("/inline.dat", 0o644).expect("create file");
+    fs.write_file("/inline.dat", 0, payload)
+        .expect("write inline payload");
+    fs.truncate_file("/inline.dat", new_size)
+        .expect("truncate inline file to sparse size");
+
+    let read_back = fs.read_file("/inline.dat").expect("read sparse file");
+    assert_eq!(read_back.len(), new_size as usize);
+    assert_eq!(&read_back[..payload.len()], payload);
+    assert!(
+        read_back[payload.len()..].iter().all(|byte| *byte == 0),
+        "sparse tail should read as zeros"
+    );
+    let manifest = current_content_manifest(&fs, "/inline.dat");
+    assert_eq!(
+        manifest
+            .chunks
+            .iter()
+            .filter(|chunk_ref| !chunk_ref.is_hole())
+            .count(),
+        1,
+        "only the prefix chunk should be materialized"
+    );
+
     cleanup(&root);
 }
 
@@ -7090,7 +7154,7 @@ fn admission_check_create_within_quota_succeeds() {
 }
 
 #[test]
-fn admission_check_truncate_expand_quota_is_checked() {
+fn admission_check_sparse_truncate_expand_does_not_charge_quota() {
     let root = temp_root("admit_trunc_expand");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/test", 0o644).expect("create file");
@@ -7100,14 +7164,14 @@ fn admission_check_truncate_expand_quota_is_checked() {
     let record = fs.write_file("/test", 0, &[65u8; 64]).unwrap();
     assert_eq!(record.size, 64);
 
-    // Try to expand beyond quota
-    let result = fs.truncate_file("/test", 4096); // way beyond 512 quota
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("quota") || msg.contains("Quota") || msg.contains("space"),
-        "expected quota-related error, got: {msg}"
+    // Sparse EOF growth does not allocate the intervening hole and therefore
+    // does not charge quota until bytes are written or reserved.
+    fs.truncate_file("/test", 4096)
+        .expect("sparse truncate growth should not charge quota");
+    assert_eq!(
+        fs.read_file_range("/test", 64, 64)
+            .expect("read sparse tail"),
+        vec![0_u8; 64]
     );
 
     cleanup(&root);

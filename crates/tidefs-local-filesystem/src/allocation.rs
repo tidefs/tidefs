@@ -116,6 +116,44 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
 ) -> Result<BTreeMap<ObjectKey, u64>> {
     let old_layout = read_content_layout_from_store(store, old_record.inode_id, old_record, true)?;
     let mut entries = BTreeMap::new();
+    if allow_holes && overlay_bytes.is_empty() && new_record.size >= old_record.size {
+        if let crate::records::ContentLayout::Chunked(ref manifest) = old_layout {
+            let mut retained = BTreeMap::new();
+            let mut can_retain_all_data = true;
+            for old_ref in &manifest.chunks {
+                if old_ref.is_hole() {
+                    continue;
+                }
+                let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
+                let chunk_start = content_chunk_start(old_ref.chunk_index)?;
+                let chunk_end = chunk_start.checked_add(u64::from(new_len)).ok_or(
+                    FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    },
+                )?;
+                if old_ref.len != new_len || chunk_end > old_record.size {
+                    can_retain_all_data = false;
+                    break;
+                }
+                let grains = allocation_grains_for_len(u64::from(old_ref.len))?;
+                debug_assert!(
+                    grains % content_chunk_size() as u64 == 0,
+                    "sparse truncate retained chunk allocation grains must be grain-aligned"
+                );
+                retained.insert(
+                    content_chunk_object_key_for_version(
+                        new_record.inode_id,
+                        old_ref.data_version,
+                        old_ref.chunk_index,
+                    ),
+                    grains,
+                );
+            }
+            if can_retain_all_data {
+                return Ok(retained);
+            }
+        }
+    }
     if allow_holes && old_record.size == new_record.size && !overlay_bytes.is_empty() {
         if let crate::records::ContentLayout::Chunked(ref manifest) = old_layout {
             for old_ref in &manifest.chunks {
@@ -201,23 +239,25 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
             continue;
         }
         if allow_holes {
-            // Preserve pre-existing holes that the write doesn't touch (#873).
-            // A chunk that was absent from the old manifest (hole) and lies
-            // entirely outside the overlay region stays absent.  This avoids
-            // over-counting capacity that won't be used.
-            {
-                let cstart = content_chunk_start(chunk_index)?;
-                let cend = cstart
-                    .checked_add(u64::from(content_chunk_len(new_record.size, chunk_index)?))
-                    .ok_or(FileSystemError::SizeOverflow {
-                        requested: u64::MAX,
-                    })?;
-                if !range_intersects_overlay(cstart, cend, overlay_offset, overlay_bytes)? {
-                    if let crate::records::ContentLayout::Chunked(ref manifest) = old_layout {
-                        if find_chunk_in_manifest(manifest, chunk_index).is_none() {
-                            continue;
-                        }
+            // Preserve sparse holes that the write doesn't touch. Chunks that
+            // have no old data and no overlay stay absent from the manifest and
+            // consume no capacity.
+            let cstart = content_chunk_start(chunk_index)?;
+            let cend = cstart
+                .checked_add(u64::from(content_chunk_len(new_record.size, chunk_index)?))
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            if !range_intersects_overlay(cstart, cend, overlay_offset, overlay_bytes)? {
+                let can_skip_hole = match old_layout {
+                    crate::records::ContentLayout::Chunked(ref manifest) => {
+                        find_chunk_in_manifest(manifest, chunk_index).is_none()
+                            || cstart >= old_record.size
                     }
+                    crate::records::ContentLayout::Inline(_) => cstart >= old_record.size,
+                };
+                if can_skip_hole {
+                    continue;
                 }
             }
         }
