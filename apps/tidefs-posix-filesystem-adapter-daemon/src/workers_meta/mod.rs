@@ -5382,7 +5382,7 @@ mod tests {
 
         assert_eq!(updated[0], acl_entry(ACL_USER_OBJ, 6, 0));
         assert_eq!(updated[1], acl_entry(ACL_USER, 6, 2000));
-        assert_eq!(updated[2], acl_entry(ACL_GROUP_OBJ, 4, 0));
+        assert_eq!(updated[2], acl_entry(ACL_GROUP_OBJ, 0, 0));
         assert_eq!(updated[3], acl_entry(ACL_GROUP, 5, 500));
         assert_eq!(updated[4], acl_entry(ACL_MASK, 4, 0));
         assert_eq!(updated[5], acl_entry(ACL_OTHER, 0, 0));

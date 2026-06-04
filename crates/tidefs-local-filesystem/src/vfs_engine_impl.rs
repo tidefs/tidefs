@@ -783,6 +783,26 @@ impl VfsLocalFileSystem {
         tidefs_posix_acl::validate_posix_acl_access_structure(&acl).map_err(|_| Errno::EINVAL)
     }
 
+    fn parent_default_acl_entries(record: &InodeRecord) -> Option<tidefs_posix_acl::PosixAcl> {
+        record
+            .xattrs
+            .get(Self::POSIX_ACL_DEFAULT_XATTR)
+            .and_then(|raw| tidefs_posix_acl::decode_posix_acl_xattr(raw).ok())
+    }
+
+    fn creation_permissions_for_parent(
+        parent_default_acl_entries: Option<&tidefs_posix_acl::PosixAcl>,
+        mode: u32,
+        umask: u32,
+    ) -> u32 {
+        let requested = mode & 0o7777;
+        if parent_default_acl_entries.is_some() {
+            requested
+        } else {
+            requested & !umask
+        }
+    }
+
     fn apply_metadata_setattr(
         fs: &mut LocalFileSystem,
         path: &str,
@@ -920,7 +940,12 @@ impl VfsLocalFileSystem {
             .borrow()
             .stat(&parent_path)
             .map_err(|e| map_errno(&e))?;
-        let permissions = (mode & 0o7777) & !ctx.umask;
+        let parent_default_acl_entries = Self::parent_default_acl_entries(&parent_record);
+        let permissions = Self::creation_permissions_for_parent(
+            parent_default_acl_entries.as_ref(),
+            mode,
+            ctx.umask,
+        );
         let initial_mode = kind_bits(kind) | permissions;
         let (effective_mode, effective_gid) = apply_setgid_inheritance_for_create(
             parent_record.mode,
@@ -947,7 +972,21 @@ impl VfsLocalFileSystem {
         let tick = fs.bump_generation();
         let inode_id = fs.allocate_inode_id();
         let generation = Generation::new(tick);
-        let new_mode = effective_mode;
+        let mut new_mode = effective_mode;
+        let mut xattrs = BTreeMap::new();
+        if let Some(ref acl_entries) = parent_default_acl_entries {
+            for (name, value) in
+                tidefs_posix_acl::default_acl_inheritance_for_parent(acl_entries, new_mode, false)
+            {
+                if name == Self::POSIX_ACL_ACCESS_XATTR {
+                    if let Ok(access_acl) = tidefs_posix_acl::decode_posix_acl_xattr(&value) {
+                        new_mode =
+                            tidefs_posix_acl::posix_mode_from_access_acl(&access_acl, new_mode);
+                    }
+                }
+                xattrs.insert(name.to_vec(), value);
+            }
+        }
         let record = InodeRecord {
             dir_storage_kind: 0,
             inode_id,
@@ -962,7 +1001,7 @@ impl VfsLocalFileSystem {
             metadata_version: tick,
             posix_time: crate::types::PosixTimeRecord::now(),
             xattr_storage_kind: 0,
-            xattrs: BTreeMap::new(),
+            xattrs,
             dir_rev: 0,
             rdev,
         };
@@ -1145,11 +1184,16 @@ impl VfsEngine for VfsLocalFileSystem {
             .borrow()
             .stat(&parent_path)
             .map_err(|e| map_errno(&e))?;
-        let child_mode = (mode & 0o7777) & !ctx.umask;
+        let parent_default_acl_entries = Self::parent_default_acl_entries(&parent_record);
+        let child_permissions = Self::creation_permissions_for_parent(
+            parent_default_acl_entries.as_ref(),
+            mode,
+            ctx.umask,
+        );
         let (child_mode, child_gid) = apply_setgid_inheritance_for_create(
             parent_record.mode,
             parent_record.gid,
-            S_IFDIR | child_mode,
+            S_IFDIR | child_permissions,
             ctx.gid,
         );
         let child_path = build_child_path(&parent_path, name)?;
@@ -1159,8 +1203,11 @@ impl VfsEngine for VfsLocalFileSystem {
             .create_dir(&child_path, child_mode & 0o7777)
             .map_err(|e| map_errno(&e))?;
         let mut attr_update = SetAttr::new();
-        attr_update.valid = FATTR_MODE | FATTR_UID | FATTR_GID;
-        attr_update.mode = child_mode;
+        attr_update.valid = FATTR_UID | FATTR_GID;
+        if parent_default_acl_entries.is_none() {
+            attr_update.valid |= FATTR_MODE;
+            attr_update.mode = child_mode;
+        }
         attr_update.uid = ctx.uid;
         attr_update.gid = child_gid;
         Self::apply_metadata_setattr(&mut self.fs.borrow_mut(), &child_path, &attr_update)?;
@@ -1191,11 +1238,16 @@ impl VfsEngine for VfsLocalFileSystem {
             .borrow()
             .stat(&parent_path)
             .map_err(|e| map_errno(&e))?;
-        let child_mode = (mode & 0o7777) & !ctx.umask;
+        let parent_default_acl_entries = Self::parent_default_acl_entries(&parent_record);
+        let child_permissions = Self::creation_permissions_for_parent(
+            parent_default_acl_entries.as_ref(),
+            mode,
+            ctx.umask,
+        );
         let (child_mode, child_gid) = apply_setgid_inheritance_for_create(
             parent_record.mode,
             parent_record.gid,
-            S_IFREG | child_mode,
+            S_IFREG | child_permissions,
             ctx.gid,
         );
         let existing = self.fs.borrow().stat(&child_path);
@@ -1239,8 +1291,11 @@ impl VfsEngine for VfsLocalFileSystem {
             .create_file(&child_path, child_mode & 0o7777)
             .map_err(|e| map_errno(&e))?;
         let mut attr_update = SetAttr::new();
-        attr_update.valid = FATTR_MODE | FATTR_UID | FATTR_GID;
-        attr_update.mode = child_mode;
+        attr_update.valid = FATTR_UID | FATTR_GID;
+        if parent_default_acl_entries.is_none() {
+            attr_update.valid |= FATTR_MODE;
+            attr_update.mode = child_mode;
+        }
         attr_update.uid = ctx.uid;
         attr_update.gid = child_gid;
         Self::apply_metadata_setattr(&mut self.fs.borrow_mut(), &child_path, &attr_update)?;
@@ -1272,11 +1327,16 @@ impl VfsEngine for VfsLocalFileSystem {
             .borrow()
             .stat(&parent_path)
             .map_err(|e| map_errno(&e))?;
-        let child_mode = (mode & 0o7777) & !ctx.umask;
+        let parent_default_acl_entries = Self::parent_default_acl_entries(&parent_record);
+        let child_permissions = Self::creation_permissions_for_parent(
+            parent_default_acl_entries.as_ref(),
+            mode,
+            ctx.umask,
+        );
         let (child_mode, child_gid) = apply_setgid_inheritance_for_create(
             parent_record.mode,
             parent_record.gid,
-            S_IFREG | child_mode,
+            S_IFREG | child_permissions,
             ctx.gid,
         );
 
@@ -1293,8 +1353,11 @@ impl VfsEngine for VfsLocalFileSystem {
         drop(fs);
 
         let mut attr_update = SetAttr::new();
-        attr_update.valid = FATTR_MODE | FATTR_UID | FATTR_GID;
-        attr_update.mode = child_mode;
+        attr_update.valid = FATTR_UID | FATTR_GID;
+        if parent_default_acl_entries.is_none() {
+            attr_update.valid |= FATTR_MODE;
+            attr_update.mode = child_mode;
+        }
         attr_update.uid = ctx.uid;
         attr_update.gid = child_gid;
         Self::apply_metadata_setattr(&mut self.fs.borrow_mut(), &child_path, &attr_update)?;
@@ -2628,6 +2691,36 @@ mod tests {
         attr.inode_id
     }
 
+    fn default_acl_for_inheritance_regression() -> tidefs_posix_acl::PosixAcl {
+        vec![
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_USER,
+                perm: 7,
+                id: 1234,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_GROUP_OBJ,
+                perm: 5,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_MASK,
+                perm: 7,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_OTHER,
+                perm: 7,
+                id: 0,
+            },
+        ]
+    }
+
     fn assert_attr_has_wall_clock_posix_times(attr: &InodeAttr, before_ns: i64, after_ns: i64) {
         let timestamps = [
             attr.posix.atime_ns,
@@ -3574,6 +3667,51 @@ mod tests {
         assert_eq!(attr.posix.mode & 0o777, 0o640);
         assert_eq!(attr.posix.uid, 4242);
         assert_eq!(attr.posix.gid, 4343);
+    }
+
+    #[test]
+    fn mknod_fifo_inherits_parent_default_acl_with_umask_masked_access_acl() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&root_ctx()).unwrap();
+        let parent_default_acl = default_acl_for_inheritance_regression();
+        let parent_default_raw = tidefs_posix_acl::encode_posix_acl_xattr(&parent_default_acl);
+        engine
+            .setxattr(
+                root,
+                b"system.posix_acl_default",
+                &parent_default_raw,
+                0,
+                &root_ctx(),
+            )
+            .unwrap();
+        let caller = RequestCtx {
+            uid: 4242,
+            gid: 4343,
+            pid: 77,
+            umask: 0o077,
+            groups: vec![4343],
+        };
+
+        let attr = engine
+            .mknod(root, b"acl-pipe", S_IFIFO | 0o666, 0, &caller)
+            .unwrap();
+
+        assert_eq!(attr.posix.mode & 0o777, 0o666);
+        let raw_acl = engine
+            .getxattr(attr.inode_id, b"system.posix_acl_access", &root_ctx())
+            .unwrap();
+        let decoded = tidefs_posix_acl::decode_posix_acl_xattr(&raw_acl).unwrap();
+        assert_eq!(decoded[0].perm, 6);
+        assert_eq!(decoded[1].perm, 7);
+        assert_eq!(decoded[2].perm, 5);
+        assert_eq!(decoded[3].perm, 6);
+        assert_eq!(decoded[4].perm, 6);
+        assert_eq!(
+            engine
+                .getxattr(attr.inode_id, b"system.posix_acl_default", &root_ctx())
+                .unwrap_err(),
+            Errno::ENODATA
+        );
     }
 
     #[test]
@@ -7040,6 +7178,42 @@ mod tests {
         assert!(!has_more);
         assert_eq!(second[0].name, b"bulk_0128.txt");
         assert_eq!(second.last().unwrap().name, b"bulk_0139.txt");
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn readdir_exact_cursor_window_limit_reports_eof_on_resume() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        for i in 0..128u64 {
+            let name = format!("exact_{i:04}.txt").into_bytes();
+            let entry = NamespaceEntry {
+                name: name.clone(),
+                inode_id: InodeId::new(20_000 + i),
+                generation: Generation::new(i + 1),
+                facets: NodeKind::File.to_facets(),
+                mode: S_IFREG | 0o644,
+            };
+            engine
+                .fs
+                .borrow_mut()
+                .insert_dir_entry(root, name, entry)
+                .unwrap();
+        }
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        let (first, has_more) = engine.readdir(&dh, 0, &ctx()).unwrap();
+        assert_eq!(first.len(), 128);
+        assert!(!has_more);
+        assert_eq!(first[0].name, b"exact_0000.txt");
+        assert_eq!(first.last().unwrap().name, b"exact_0127.txt");
+        assert_eq!(first.last().unwrap().cookie, 128);
+
+        let (tail, has_more) = engine
+            .readdir(&dh, first.last().unwrap().cookie, &ctx())
+            .unwrap();
+        assert!(tail.is_empty());
+        assert!(!has_more);
         engine.releasedir(&dh).unwrap();
     }
 

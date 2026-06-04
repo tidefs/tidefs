@@ -211,6 +211,75 @@ fn check_sticky_rename(
 fn is_posix_acl_xattr_name(name: &[u8]) -> bool {
     name == b"system.posix_acl_access" || name == b"system.posix_acl_default"
 }
+
+fn caller_is_member_of_group(ctx: &RequestCtx, gid: u32) -> bool {
+    ctx.gid == gid || ctx.groups.contains(&gid)
+}
+
+fn caller_can_keep_sgid(ctx: &RequestCtx, gid: u32) -> bool {
+    ctx.uid == 0 || caller_is_member_of_group(ctx, gid)
+}
+
+fn request_groups_from_status_text(status: &str, primary_gid: u32) -> Vec<u32> {
+    let mut groups = vec![primary_gid];
+    let Some(line) = status.lines().find(|line| line.starts_with("Groups:")) else {
+        return groups;
+    };
+
+    for field in line["Groups:".len()..].split_whitespace() {
+        if let Ok(gid) = field.parse::<u32>() {
+            if !groups.contains(&gid) {
+                groups.push(gid);
+            }
+        }
+    }
+    groups
+}
+
+fn request_groups_from_pid(pid: u32, primary_gid: u32) -> Vec<u32> {
+    if pid == 0 {
+        return vec![primary_gid];
+    }
+    let path = format!("/proc/{pid}/status");
+    match std::fs::read_to_string(path) {
+        Ok(status) => request_groups_from_status_text(&status, primary_gid),
+        Err(_) => vec![primary_gid],
+    }
+}
+
+fn apply_setattr_privilege_mode_rules(
+    attr: &SetAttr,
+    current: &InodeAttr,
+    ctx: &RequestCtx,
+) -> SetAttr {
+    let mut effective = *attr;
+    let mut mode = if attr.valid & FATTR_MODE != 0 {
+        (current.posix.mode & S_IFMT) | (attr.mode & !S_IFMT)
+    } else {
+        current.posix.mode
+    };
+    let mut force_mode = false;
+
+    if (attr.valid & (FATTR_UID | FATTR_GID)) != 0 && ctx.uid != 0 {
+        mode = (current.posix.mode & S_IFMT) | (mode & !S_IFMT & !(S_ISUID | S_ISGID));
+        force_mode = true;
+    }
+
+    if attr.valid & FATTR_MODE != 0
+        && mode & S_ISGID != 0
+        && !caller_can_keep_sgid(ctx, current.posix.gid)
+    {
+        mode &= !S_ISGID;
+        force_mode = true;
+    }
+
+    if force_mode || attr.valid & FATTR_MODE != 0 {
+        effective.valid |= FATTR_MODE;
+        effective.mode = mode;
+    }
+
+    effective
+}
 /// Check that the caller has write+execute access on a parent directory,
 /// with POSIX ACL support. Retrieves the parent's access ACL from xattr
 /// storage when present; falls back to mode-bit checking otherwise.
@@ -238,45 +307,6 @@ fn check_parent_write_execute(
         ACCESS_WRITE | ACCESS_EXECUTE,
         acl.as_deref(),
     )
-}
-
-/// Apply POSIX default-ACL inheritance from a parent directory to a newly
-/// created child inode. Reads the parent's `system.posix_acl_default` xattr;
-/// when present, computes the inherited access (and for directories, default)
-/// ACL and sets them on the child via `setxattr`.
-///
-/// No-op when the parent has no default ACL or the ACL is corrupt.
-fn apply_acl_inheritance(
-    engine: &dyn VfsEngine,
-    parent: InodeId,
-    child: InodeId,
-    child_mode: u32,
-    is_directory: bool,
-    ctx: &RequestCtx,
-) {
-    let parent_default_data = match engine.getxattr(parent, b"system.posix_acl_default", ctx) {
-        Ok(data) => data,
-        Err(Errno::ENODATA) | Err(_) => return,
-    };
-
-    let parent_default_acl = match tidefs_permission::decode_posix_acl_xattr(&parent_default_data) {
-        Ok(acl) => acl,
-        Err(_) => return,
-    };
-
-    let inherited_xattrs = match tidefs_permission::plan_default_acl_inheritance_for_parent(
-        &parent_default_acl,
-        child_mode,
-        is_directory,
-    ) {
-        Ok(xattrs) => xattrs,
-        Err(_) => return,
-    };
-
-    for (name, value) in inherited_xattrs {
-        // Use flags=0 (create-or-replace) for inherited ACLs on a new inode.
-        let _ = engine.setxattr(child, name, &value, 0, ctx);
-    }
 }
 
 /// Map a namespace `kind` field to a VFS [`NodeKind`].
@@ -1256,11 +1286,24 @@ const fn fuse_open_reply_flags(linux_open_flags: u32) -> u32 {
 
 fn fuse_open_requested_access(open_flags: u32) -> u8 {
     let mut requested = 0;
-    if open_flags_allow_read(open_flags).unwrap_or(false) {
-        requested |= ACCESS_READ;
+    let exec_requested = open_flags & LINUX_FMODE_EXEC_OPEN_FLAG != 0;
+    let engine_open_flags = FuseVfsAdapter::engine_open_flags(open_flags);
+    match engine_open_flags & (libc::O_ACCMODE as u32) {
+        mode if mode == libc::O_RDONLY as u32 => {
+            if !exec_requested {
+                requested |= ACCESS_READ;
+            }
+        }
+        mode if mode == libc::O_WRONLY as u32 => {
+            requested |= ACCESS_WRITE;
+        }
+        mode if mode == libc::O_RDWR as u32 => {
+            requested |= ACCESS_READ | ACCESS_WRITE;
+        }
+        _ => {}
     }
-    if open_flags_allow_write(open_flags).unwrap_or(false) {
-        requested |= ACCESS_WRITE;
+    if exec_requested {
+        requested |= ACCESS_EXECUTE;
     }
     requested
 }
@@ -2363,10 +2406,11 @@ impl FuseVfsAdapter {
         self
     }
 
-    /// Attach a [`tidefs_namespace::Namespace`] for namespace-aware directory listing.
+    /// Attach a [`tidefs_namespace::Namespace`] for legacy namespace fallback.
     ///
-    /// When set, [`dispatch_readdir`] will prefer namespace iteration over
-    /// the engine path for directory entry enumeration.
+    /// Mounted mutations remain engine-authoritative.  The namespace handle is
+    /// consulted only as a fallback, or merged into a single exhausted engine
+    /// page for legacy namespace-only test surfaces.
     #[must_use]
     pub fn with_namespace(mut self, ns: Arc<Namespace>) -> Self {
         self.rename_dispatch = FuseRenameDispatch::new().with_namespace(Arc::clone(&ns));
@@ -2617,12 +2661,13 @@ impl FuseVfsAdapter {
     }
 
     fn ctx_from_req(req: &Request<'_>) -> RequestCtx {
+        let gid = req.gid();
         RequestCtx {
             uid: req.uid(),
-            gid: req.gid(),
+            gid,
             pid: req.pid(),
             umask: 0o022,
-            groups: vec![req.gid()],
+            groups: request_groups_from_pid(req.pid(), gid),
         }
     }
 
@@ -2662,26 +2707,29 @@ impl FuseVfsAdapter {
         reply_flags
     }
 
-    fn sync_namespace_attrs_after_engine_write(&self, ino: u64, attr: &InodeAttr) {
-        let Some(ns) = self.namespace.as_ref() else {
-            return;
-        };
-        let Some(mut ns_attrs) = ns.get_attrs(ino) else {
-            return;
-        };
-
-        ns_attrs.mode = attr.posix.mode;
-        ns_attrs.uid = attr.posix.uid;
-        ns_attrs.gid = attr.posix.gid;
-        ns_attrs.nlink = attr.posix.nlink;
-        ns_attrs.size = attr.posix.size;
-        ns_attrs.atime = time_from_ns(attr.posix.atime_ns);
-        ns_attrs.mtime = time_from_ns(attr.posix.mtime_ns);
-        ns_attrs.ctime = time_from_ns(attr.posix.ctime_ns);
-
-        let _ = ns.update_attrs(ino, ns_attrs);
+    fn invalidate_inode_metadata_after_engine_write(&self, ino: u64) {
         self.getattr_cache.lock().unwrap().remove(&ino);
         self.path_lookup_cache.lock().unwrap().remove_by_ino(ino);
+        self.try_inval_inode_attrs(ino);
+    }
+
+    fn sync_namespace_attrs_after_engine_write(&self, ino: u64, attr: &InodeAttr) {
+        if let Some(ns) = self.namespace.as_ref() {
+            if let Some(mut ns_attrs) = ns.get_attrs(ino) {
+                ns_attrs.mode = attr.posix.mode;
+                ns_attrs.uid = attr.posix.uid;
+                ns_attrs.gid = attr.posix.gid;
+                ns_attrs.nlink = attr.posix.nlink;
+                ns_attrs.size = attr.posix.size;
+                ns_attrs.atime = time_from_ns(attr.posix.atime_ns);
+                ns_attrs.mtime = time_from_ns(attr.posix.mtime_ns);
+                ns_attrs.ctime = time_from_ns(attr.posix.ctime_ns);
+
+                let _ = ns.update_attrs(ino, ns_attrs);
+            }
+        }
+
+        self.invalidate_inode_metadata_after_engine_write(ino);
     }
 
     /// Conditionally update atime on a parent directory after a
@@ -2859,9 +2907,6 @@ impl FuseVfsAdapter {
         target: &[u8],
     ) -> Result<InodeAttr, Errno> {
         self.check_not_read_only()?;
-        if let Some(ref ns) = self.namespace {
-            return self.dispatch_symlink_via_namespace(ns, parent, name, target);
-        }
         if target.len() > PATH_MAX_BYTES {
             return Err(Errno::ENAMETOOLONG);
         }
@@ -2884,7 +2929,6 @@ impl FuseVfsAdapter {
         .into_iter()
         .next()
         .unwrap()?;
-        apply_acl_inheritance(&**e, InodeId::new(parent), attr.inode_id, 0o777, false, ctx);
         self.record_dentry_child_mutation(parent, name);
         Ok(attr)
     }
@@ -2913,10 +2957,15 @@ impl FuseVfsAdapter {
     #[tracing::instrument(skip(self, ctx), fields(ino = %ino, op = "readlink"))]
     pub fn dispatch_readlink(&self, ctx: &RequestCtx, ino: u64) -> Result<Vec<u8>, Errno> {
         let e = self.engine.lock().unwrap();
-        if let Some(ref ns) = self.namespace {
-            return self.dispatch_readlink_via_namespace(ns, ino);
-        }
-        let target = e.readlink(InodeId::new(ino), ctx)?;
+        let target = match e.readlink(InodeId::new(ino), ctx) {
+            Ok(target) => target,
+            Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) if self.namespace.is_some() => {
+                drop(e);
+                let ns = self.namespace.as_ref().expect("namespace checked");
+                return self.dispatch_readlink_via_namespace(ns, ino);
+            }
+            Err(errno) => return Err(errno),
+        };
         if target.len() > PATH_MAX_BYTES {
             return Err(Errno::ENAMETOOLONG);
         }
@@ -3295,9 +3344,10 @@ impl FuseVfsAdapter {
         newparent: u64,
         newname: &[u8],
     ) -> Result<InodeAttr, Errno> {
-        if let Some(ref ns) = self.namespace {
-            return self.dispatch_link_via_namespace(ns, ino, newparent, newname);
-        }
+        // Mounted hard links use the engine as the authoritative inode,
+        // metadata, and persistence boundary. Namespace-only hard-link
+        // support remains available through dispatch_link_via_namespace for
+        // legacy tests.
         self.dispatch_link_entry(ctx, ino, newparent, newname)
     }
 
@@ -3514,7 +3564,6 @@ impl FuseVfsAdapter {
         .into_iter()
         .next()
         .unwrap()?;
-        apply_acl_inheritance(&**e, InodeId::new(parent), attr.inode_id, mode, true, ctx);
         self.record_dentry_child_mutation(parent, name);
         Ok(attr)
     }
@@ -3925,24 +3974,6 @@ impl FuseVfsAdapter {
     ) -> Result<(), Errno> {
         let requested = fuse_access_requested_from_mask(mask)?;
 
-        // Route through namespace when available so access(2) evaluates
-        // caller credentials against authoritative inode attributes (mode,
-        // uid, gid).  Without this, chmod/chown mutations persisted in the
-        // namespace are invisible to the access check because the engine
-        // path reads stale or missing attributes.
-        if let Some(ref ns) = self.namespace {
-            let attrs = ns.get_attrs(ino).ok_or(Errno::ESTALE)?;
-            let inode_attr = namespace_attrs_to_inode_attr(&attrs);
-            let e = self.engine.lock().unwrap();
-            let acl: Option<Vec<PosixAclEntry>> =
-                match e.getxattr(InodeId::new(ino), b"system.posix_acl_access", ctx) {
-                    Ok(data) => tidefs_permission::decode_posix_acl_xattr(&data).ok(),
-                    Err(Errno::ENODATA) => None,
-                    Err(_) => None,
-                };
-            return plan_fuse_access_result(Ok(inode_attr), ctx, requested, acl.as_deref());
-        }
-
         let e = self.engine.lock().unwrap();
         let acl: Option<Vec<PosixAclEntry>> =
             match e.getxattr(InodeId::new(ino), b"system.posix_acl_access", ctx) {
@@ -3950,12 +3981,17 @@ impl FuseVfsAdapter {
                 Err(Errno::ENODATA) => None,
                 Err(_) => None,
             };
-        plan_fuse_access_result(
-            e.getattr(InodeId::new(ino), None, ctx),
-            ctx,
-            requested,
-            acl.as_deref(),
-        )
+        match e.getattr(InodeId::new(ino), None, ctx) {
+            Ok(attr) => plan_fuse_access_result(Ok(attr), ctx, requested, acl.as_deref()),
+            Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) if self.namespace.is_some() => {
+                drop(e);
+                let ns = self.namespace.as_ref().expect("namespace checked");
+                let attrs = ns.get_attrs(ino).ok_or(Errno::ESTALE)?;
+                let inode_attr = namespace_attrs_to_inode_attr(&attrs);
+                plan_fuse_access_result(Ok(inode_attr), ctx, requested, None)
+            }
+            Err(errno) => Err(errno),
+        }
     }
 
     pub fn dispatch_access(&self, ctx: &RequestCtx, ino: u64, mask: i32) -> Result<(), Errno> {
@@ -4103,83 +4139,58 @@ impl FuseVfsAdapter {
         fh: Option<u64>,
     ) -> Result<FuseAttrOut, Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
-        // When namespace is present AND FATTR_SIZE is set, perform extent
-        // mutation through the engine before routing to the namespace
-        // layer (which owns only metadata). Without this, truncate/extend
-        // would update the inode size field but never touch the underlying
-        // file content extents.
-        if attr.valid & FATTR_SIZE != 0 && self.namespace.is_some() {
-            let engine_fh = fh
-                .map(|fh| self.resolve_file_handle(ino, fh, 0))
-                .and_then(|x| x.ok());
-            let e = self.engine.lock().unwrap();
-            let inode_id = InodeId::new(ino);
-            // Namespace-managed inodes not yet opened for I/O have no
-            // extents to manage. If the engine does not know this inode,
-            // skip extent mutation and fall through.
-            if let Ok(current_attr) = e.getattr(inode_id, engine_fh.as_ref(), ctx) {
-                if current_attr.kind == NodeKind::Dir {
-                    return Err(Errno::EISDIR);
-                }
-                // POSIX: immutable files reject truncation through setattr.
-                // Append-only files reject shrink.
-                {
-                    let raw_flags = current_attr.flags.to_raw_flags();
-                    enforce_immutable_guard(raw_flags)?;
-                    if attr.size < current_attr.posix.size {
-                        enforce_append_only_write_guard(raw_flags, false)?;
-                    }
-                }
-                if self.read_only {
-                    return Err(Errno::EROFS);
-                }
-                if let Some(ref efh) = engine_fh {
-                    // Reject read-only file handles: truncate is a write operation per POSIX.
-                    match open_flags_allow_write(efh.open_flags) {
-                        Ok(true) => {}
-                        Ok(false) | Err(_) => return Err(Errno::EBADF),
-                    }
-                    let old_sz = current_attr.posix.size;
-                    let new_sz = attr.size;
-                    Self::truncate_extents(&**e, inode_id, efh, old_sz, new_sz, ctx)?;
-                    if new_sz < old_sz {
-                        self.clear_dirty_for_deallocate_range(ino, new_sz, old_sz - new_sz);
-                    }
-                } else {
-                    let efh = e.open(inode_id, libc::O_RDWR as u32, ctx)?;
-                    let old_sz = current_attr.posix.size;
-                    let new_sz = attr.size;
-                    let result = Self::truncate_extents(&**e, inode_id, &efh, old_sz, new_sz, ctx);
-                    let _ = e.release(&efh);
-                    if result.is_ok() && new_sz < old_sz {
-                        self.clear_dirty_for_deallocate_range(ino, new_sz, old_sz - new_sz);
-                    }
-                    result?;
-                }
-            }
-            // If engine does not know this inode, the namespace path below
-            // handles the metadata size update.
+        let mutation_requested = attr.valid
+            & (FATTR_SIZE
+                | FATTR_MODE
+                | FATTR_UID
+                | FATTR_GID
+                | FATTR_ATIME
+                | FATTR_MTIME
+                | FATTR_CTIME
+                | FATTR_ATIME_NOW
+                | FATTR_MTIME_NOW)
+            != 0;
+        if mutation_requested {
+            self.check_not_read_only()?;
         }
-        // Route through namespace when available.
-        if let Some(ref ns) = self.namespace {
-            match self.dispatch_setattr_via_namespace(
-                ns,
-                ino,
-                attr,
-                ctx.uid,
-                ctx.gid,
-                ctx.groups.as_slice(),
-            ) {
-                Ok(attr) => return Ok(attr),
-                Err(Errno::ESTALE) => {} // fall through to engine
-                Err(e) => return Err(e),
-            }
-        }
-
         let engine_fh = fh
             .map(|fh| self.resolve_file_handle(ino, fh, 0))
             .and_then(|x| x.ok());
+        let inode_id = InodeId::new(ino);
         let e = self.engine.lock().unwrap();
+        let current_attr = match e.getattr(inode_id, engine_fh.as_ref(), ctx) {
+            Ok(attr) => attr,
+            Err(Errno::ENOENT | Errno::EIO) if self.namespace.is_some() => {
+                drop(e);
+                let ns = self.namespace.as_ref().expect("namespace checked");
+                return self.dispatch_setattr_via_namespace(
+                    ns,
+                    ino,
+                    attr,
+                    ctx.uid,
+                    ctx.gid,
+                    ctx.groups.as_slice(),
+                );
+            }
+            Err(errno) => return Err(errno),
+        };
+
+        if mutation_requested {
+            enforce_immutable_guard(current_attr.flags.to_raw_flags())?;
+        }
+        if crate::workers_meta::can_setattr(
+            ctx.uid,
+            ctx.gid,
+            ctx.groups.as_slice(),
+            current_attr.posix.uid,
+            current_attr.posix.gid,
+            attr.valid,
+            attr,
+        )
+        .is_err()
+        {
+            return Err(Errno::EPERM);
+        }
 
         // Capacity admission and tracking for size changes are handled by the
         // engine's CapacityAuthority during truncate_extents dispatch.
@@ -4189,17 +4200,18 @@ impl FuseVfsAdapter {
         // we call truncate_extents directly instead of going through
         // dispatch_ftruncate_file / dispatch_truncate (which would deadlock).
         if attr.valid & FATTR_SIZE != 0 {
-            let inode_id = InodeId::new(ino);
+            if current_attr.kind == NodeKind::Dir {
+                return Err(Errno::EISDIR);
+            }
+            if attr.size < current_attr.posix.size {
+                enforce_append_only_write_guard(current_attr.flags.to_raw_flags(), false)?;
+            }
             if let Some(ref efh) = engine_fh {
                 // File-handle-based truncate (ftruncate).
                 // Reject read-only file handles: truncate is a write operation per POSIX.
                 match open_flags_allow_write(efh.open_flags) {
                     Ok(true) => {}
                     Ok(false) | Err(_) => return Err(Errno::EBADF),
-                }
-                let current_attr = e.getattr(inode_id, Some(efh), ctx)?;
-                if current_attr.kind == NodeKind::Dir {
-                    return Err(Errno::EISDIR);
                 }
                 let old_sz = current_attr.posix.size;
                 let new_sz = attr.size;
@@ -4221,28 +4233,9 @@ impl FuseVfsAdapter {
                 result?;
             }
         }
-        // POSIX chown/chmod privilege-bit clearing: non-root ownership
-        // changes must clear S_ISUID and S_ISGID (killpriv).
-        let mut killpriv_attr;
-        let effective_attr: &SetAttr =
-            if (attr.valid & (FATTR_UID | FATTR_GID)) != 0 && ctx.uid != 0 {
-                let current = e.getattr(InodeId::new(ino), engine_fh.as_ref(), ctx)?;
-                let current_mode = current.posix.mode;
-                let request_mode = if attr.valid & FATTR_MODE != 0 {
-                    attr.mode
-                } else {
-                    current_mode
-                };
-                killpriv_attr = *attr;
-                killpriv_attr.valid |= FATTR_MODE;
-                killpriv_attr.mode =
-                    (current_mode & S_IFMT) | (request_mode & !S_IFMT & !(S_ISUID | S_ISGID));
-                &killpriv_attr
-            } else {
-                attr
-            };
+        let effective_attr = apply_setattr_privilege_mode_rules(attr, &current_attr, ctx);
 
-        let updated = match e.setattr(InodeId::new(ino), effective_attr, engine_fh.as_ref(), ctx) {
+        let updated = match e.setattr(inode_id, &effective_attr, engine_fh.as_ref(), ctx) {
             Ok(updated) => updated,
             Err(Errno::EIO) => {
                 // Best-effort timestamp updates: tar(1) commonly issues fd-based
@@ -4259,7 +4252,7 @@ impl FuseVfsAdapter {
                     | FATTR_FH
                     | FATTR_LOCKOWNER;
                 if (effective_attr.valid & !time_bits) == 0 {
-                    e.getattr(InodeId::new(ino), engine_fh.as_ref(), ctx)?
+                    e.getattr(inode_id, engine_fh.as_ref(), ctx)?
                 } else {
                     return Err(Errno::EIO);
                 }
@@ -4275,6 +4268,8 @@ impl FuseVfsAdapter {
             cache.remove(&ino);
         }
         self.path_lookup_cache.lock().unwrap().remove_by_ino(ino);
+        self.sync_namespace_attrs_after_engine_write(ino, &updated);
+        self.try_inval_inode_attrs(ino);
 
         Ok(crate::workers_meta::fuse_attr_out(
             ino,
@@ -4650,7 +4645,6 @@ impl FuseVfsAdapter {
         let e = self.engine.lock().unwrap();
         check_parent_write_execute(&**e, InodeId::new(parent), ctx)?;
         let attr = e.mknod(InodeId::new(parent), name, mode, rdev, ctx)?;
-        apply_acl_inheritance(&**e, InodeId::new(parent), attr.inode_id, mode, false, ctx);
         self.record_dentry_child_mutation(parent, name);
         Ok(attr)
     }
@@ -4697,6 +4691,7 @@ impl FuseVfsAdapter {
     ) -> Result<VfsCreateDispatch, Errno> {
         self.check_not_read_only()?;
         Self::validate_open_flags(open_flags)?;
+        let engine_open_flags = Self::engine_open_flags(open_flags);
         // Capacity admission handled by engine CapacityAuthority during create dispatch.
         let e = self.engine.lock().unwrap();
         check_parent_write_execute(&**e, InodeId::new(parent), ctx)?;
@@ -4706,7 +4701,7 @@ impl FuseVfsAdapter {
                 parent: InodeId::new(parent),
                 name,
                 mode,
-                flags: open_flags,
+                flags: engine_open_flags,
                 ctx: ctx.clone(),
             }],
         )
@@ -4715,13 +4710,13 @@ impl FuseVfsAdapter {
         .unwrap()
         {
             Ok((attr, fh)) => {
-                apply_acl_inheritance(&**e, InodeId::new(parent), attr.inode_id, mode, false, ctx);
                 self.record_dentry_child_mutation(parent, name);
                 let adapter_fh = {
                     let mut handles = self.file_handles.lock().unwrap();
-                    let adapter_fh = handles.allocate(attr.inode_id.get(), open_flags, fh);
+                    let adapter_fh = handles.allocate(attr.inode_id.get(), engine_open_flags, fh);
                     if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
-                        handle.fuse_open_flags = self.fuse_open_flags_for_request(open_flags);
+                        handle.fuse_open_flags =
+                            self.fuse_open_flags_for_request(engine_open_flags);
                     }
                     adapter_fh
                 };
@@ -4730,7 +4725,7 @@ impl FuseVfsAdapter {
                     adapter_fh,
                     fh,
                 ));
-                let fuse_open_flags = self.fuse_open_flags_for_request(open_flags);
+                let fuse_open_flags = self.fuse_open_flags_for_request(engine_open_flags);
                 Ok(VfsCreateDispatch {
                     attr,
                     adapter_fh,
@@ -6856,9 +6851,8 @@ impl FuseVfsAdapter {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
         // The VFS engine is authoritative for mounted mutations.  The
         // namespace handle remains a fallback for legacy namespace-only test
-        // surfaces, but must not hide engine-created children from readdir.
-        let engine_offset = if self.namespace.is_some() { 0 } else { offset };
-        let engine_error = match self.dispatch_readdir_via_engine(ctx, ino, fh, engine_offset) {
+        // surfaces, but must not reset or renumber engine pagination.
+        let engine_error = match self.dispatch_readdir_via_engine(ctx, ino, fh, offset) {
             Ok(engine_entries) => {
                 if let Some(ref ns) = self.namespace {
                     return self.merge_namespace_readdir_entries(
@@ -6894,6 +6888,10 @@ impl FuseVfsAdapter {
         engine_entries: (Vec<DirEntry>, bool),
     ) -> Result<(Vec<DirEntry>, bool), Errno> {
         let (mut entries, engine_has_more) = engine_entries;
+        if offset != 0 || engine_has_more {
+            return Ok((entries, engine_has_more));
+        }
+
         let (namespace_entries, namespace_has_more) =
             match self.dispatch_readdir_via_namespace(ns, ino, fh, DirCookie::START) {
                 Ok(entries) => entries,
@@ -7202,20 +7200,43 @@ impl FuseVfsAdapter {
     ) -> Result<(), Errno> {
         self.check_not_read_only()?;
         let e = self.engine.lock().unwrap();
+        let inode_id = InodeId::new(ino);
+        let engine_attr = match e.getattr(inode_id, None, ctx) {
+            Ok(attr) => Some(attr),
+            Err(Errno::ENOENT | Errno::EIO) => None,
+            Err(errno) => return Err(errno),
+        };
         // POSIX ACL xattrs require file owner or CAP_FOWNER (root) to modify.
-        // Route through namespace when available for authoritative owner uid.
         if is_posix_acl_xattr_name(name) && ctx.uid != 0 {
-            let owner_uid = if let Some(ref ns) = self.namespace {
-                let attrs = ns.get_attrs(ino).ok_or(Errno::ESTALE)?;
-                namespace_attrs_to_inode_attr(&attrs).posix.uid
+            let owner_uid = if let Some(ref attr) = engine_attr {
+                attr.posix.uid
+            } else if let Some(ref ns) = self.namespace {
+                ns.get_attrs(ino)
+                    .map(|attrs| namespace_attrs_to_inode_attr(&attrs).posix.uid)
+                    .ok_or(Errno::ESTALE)?
             } else {
-                e.getattr(InodeId::new(ino), None, ctx)?.posix.uid
+                return Err(Errno::ENOENT);
             };
             if ctx.uid != owner_uid {
                 return Err(Errno::EACCES);
             }
         }
-        e.setxattr(InodeId::new(ino), name, value, flags, ctx)
+        e.setxattr(inode_id, name, value, flags, ctx)?;
+
+        let mut updated = e.getattr(inode_id, None, ctx)?;
+        if name == b"system.posix_acl_access"
+            && updated.posix.mode & S_ISGID != 0
+            && !caller_can_keep_sgid(ctx, updated.posix.gid)
+        {
+            let mut clear_sgid = SetAttr::new();
+            clear_sgid.valid = FATTR_MODE;
+            clear_sgid.mode = updated.posix.mode & !S_ISGID;
+            updated = e.setattr(inode_id, &clear_sgid, None, ctx)?;
+        }
+        drop(e);
+
+        self.sync_namespace_attrs_after_engine_write(ino, &updated);
+        Ok(())
     }
 
     /// Dispatch `getxattr` through the VFS engine.
@@ -7251,7 +7272,17 @@ impl FuseVfsAdapter {
     ) -> Result<(), Errno> {
         self.check_not_read_only()?;
         let e = self.engine.lock().unwrap();
-        e.removexattr(InodeId::new(ino), name, ctx)
+        let inode_id = InodeId::new(ino);
+        e.removexattr(inode_id, name, ctx)?;
+        let updated = e.getattr(inode_id, None, ctx).ok();
+        drop(e);
+
+        if let Some(updated) = updated {
+            self.sync_namespace_attrs_after_engine_write(ino, &updated);
+        } else {
+            self.invalidate_inode_metadata_after_engine_write(ino);
+        }
+        Ok(())
     }
     /// Dispatch a `statfs` request through the VFS engine.
     ///
@@ -7308,20 +7339,22 @@ impl FuseVfsAdapter {
     }
 
     fn validate_open_flags(open_flags: u32) -> Result<(), Errno> {
-        if open_flags & LINUX_FMODE_EXEC_OPEN_FLAG != 0 {
-            return Err(Errno::EACCES);
-        }
-        if open_flags & LINUX_O_TMPFILE != 0 {
+        let engine_open_flags = Self::engine_open_flags(open_flags);
+        if engine_open_flags & LINUX_O_TMPFILE != 0 {
             // O_TMPFILE requires O_WRONLY or O_RDWR; O_RDONLY is invalid.
             // Reject reserved access modes (mode 3) as well.
-            if !open_flags_allow_write(open_flags).unwrap_or(false) {
+            if !open_flags_allow_write(engine_open_flags).unwrap_or(false) {
                 return Err(Errno::EINVAL);
             }
             return Ok(());
         }
-        open_flags_allow_read(open_flags)
+        open_flags_allow_read(engine_open_flags)
             .map(|_| ())
             .map_err(|_| Errno::EINVAL)
+    }
+
+    fn engine_open_flags(open_flags: u32) -> u32 {
+        open_flags & !LINUX_FMODE_EXEC_OPEN_FLAG
     }
 
     fn check_open_allowed(&self, ino: u64, open_flags: u32) -> Result<(), Errno> {
@@ -7338,14 +7371,15 @@ impl FuseVfsAdapter {
         open_flags: u32,
     ) -> Result<VfsOpenDispatch, Errno> {
         Self::validate_open_flags(open_flags)?;
+        let engine_open_flags = Self::engine_open_flags(open_flags);
         // Route O_TMPFILE to the anonymous temporary-file path.
         // The `ino` is the parent directory; the engine creates an
         // unlinked inode and returns (attr, handle).
-        if open_flags & LINUX_O_TMPFILE != 0 {
+        if engine_open_flags & LINUX_O_TMPFILE != 0 {
             let file_mode = 0o666 & !ctx.umask;
-            return self.dispatch_tmpfile(ctx, ino, file_mode, open_flags);
+            return self.dispatch_tmpfile(ctx, ino, file_mode, engine_open_flags);
         }
-        self.check_open_allowed(ino, open_flags)?;
+        self.check_open_allowed(ino, engine_open_flags)?;
         let engine_fh = {
             let e = self.engine.lock().unwrap();
             let acl: Option<Vec<PosixAclEntry>> =
@@ -7360,13 +7394,13 @@ impl FuseVfsAdapter {
                 open_flags,
                 acl.as_deref(),
             )?;
-            e.open(InodeId::new(ino), open_flags, ctx)?
+            e.open(InodeId::new(ino), engine_open_flags, ctx)?
         };
         let adapter_fh = {
             let mut handles = self.file_handles.lock().unwrap();
-            let adapter_fh = handles.allocate(ino, open_flags, engine_fh);
+            let adapter_fh = handles.allocate(ino, engine_open_flags, engine_fh);
             if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
-                handle.fuse_open_flags = self.fuse_open_flags_for_request(open_flags);
+                handle.fuse_open_flags = self.fuse_open_flags_for_request(engine_open_flags);
             }
             adapter_fh
         };
@@ -7882,12 +7916,14 @@ impl Filesystem for FuseVfsAdapter {
         const CAP_PARALLEL_DIROPS: u32 = 1 << 18;
         const CAP_DO_READDIRPLUS: u32 = 1 << 13;
         const CAP_HANDLE_KILLPRIV: u32 = 1 << 19;
+        const CAP_DONT_MASK: u32 = 1 << 6;
         let required = CAP_POSIX_LOCKS
             | CAP_FLOCK_LOCKS
             | CAP_POSIX_ACL
             | CAP_PARALLEL_DIROPS
             | CAP_DO_READDIRPLUS
-            | CAP_HANDLE_KILLPRIV;
+            | CAP_HANDLE_KILLPRIV
+            | CAP_DONT_MASK;
 
         // Perf: best-effort, mount proceeds either way.
         const CAP_WRITEBACK_CACHE: u32 = 1 << 16;
@@ -9182,6 +9218,64 @@ mod tests {
             umask,
             ..root_ctx()
         }
+    }
+
+    fn default_acl_for_inheritance_regression() -> tidefs_posix_acl::PosixAcl {
+        vec![
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_USER,
+                perm: 7,
+                id: 1234,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_GROUP_OBJ,
+                perm: 5,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_MASK,
+                perm: 7,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_OTHER,
+                perm: 7,
+                id: 0,
+            },
+        ]
+    }
+
+    fn assert_file_inherited_acl_from_raw_create_mode(raw_acl: &[u8]) {
+        let decoded = tidefs_posix_acl::decode_posix_acl_xattr(raw_acl).expect("decode ACL");
+        assert_eq!(decoded[0].tag, tidefs_posix_acl::ACL_USER_OBJ);
+        assert_eq!(decoded[0].perm, 6);
+        assert_eq!(decoded[1].tag, tidefs_posix_acl::ACL_USER);
+        assert_eq!(decoded[1].perm, 7);
+        assert_eq!(decoded[2].tag, tidefs_posix_acl::ACL_GROUP_OBJ);
+        assert_eq!(decoded[2].perm, 5);
+        assert_eq!(decoded[3].tag, tidefs_posix_acl::ACL_MASK);
+        assert_eq!(decoded[3].perm, 6);
+        assert_eq!(decoded[4].tag, tidefs_posix_acl::ACL_OTHER);
+        assert_eq!(decoded[4].perm, 6);
+    }
+
+    fn assert_dir_inherited_acl_from_raw_create_mode(raw_acl: &[u8]) {
+        let decoded = tidefs_posix_acl::decode_posix_acl_xattr(raw_acl).expect("decode ACL");
+        assert_eq!(decoded[0].tag, tidefs_posix_acl::ACL_USER_OBJ);
+        assert_eq!(decoded[0].perm, 7);
+        assert_eq!(decoded[1].tag, tidefs_posix_acl::ACL_USER);
+        assert_eq!(decoded[1].perm, 7);
+        assert_eq!(decoded[2].tag, tidefs_posix_acl::ACL_GROUP_OBJ);
+        assert_eq!(decoded[2].perm, 5);
+        assert_eq!(decoded[3].tag, tidefs_posix_acl::ACL_MASK);
+        assert_eq!(decoded[3].perm, 7);
+        assert_eq!(decoded[4].tag, tidefs_posix_acl::ACL_OTHER);
+        assert_eq!(decoded[4].perm, 7);
     }
 
     struct AdapterFixture {
@@ -11855,6 +11949,49 @@ mod tests {
                 .adapter
                 .dispatch_access_check(&creator, root.get(), 0x08),
             Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_access_with_namespace_falls_back_to_engine_attrs() {
+        let fixture = adapter_fixture_with_namespace();
+        let root = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &root,
+            b"engine-access-with-stale-namespace.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut chown = SetAttr::new();
+        chown.valid = FATTR_UID | FATTR_GID;
+        chown.uid = 500;
+        chown.gid = 100;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 18_300, inode.get(), &chown, None)
+            .expect("engine chown");
+
+        let mut chmod = SetAttr::new();
+        chmod.valid = FATTR_MODE;
+        chmod.mode = 0;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 18_301, inode.get(), &chmod, None)
+            .expect("engine chmod");
+
+        let owner = access_ctx(500, 100, &[100]);
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_access_check(&owner, inode.get(), libc::F_OK),
+            Ok(())
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_access_check(&owner, inode.get(), libc::R_OK),
+            Err(Errno::EACCES)
         );
     }
 
@@ -16631,7 +16768,33 @@ mod tests {
             fuse_open_requested_access((libc::O_CREAT | libc::O_EXCL | libc::O_RDWR) as u32),
             ACCESS_READ | ACCESS_WRITE
         );
+        assert_eq!(
+            fuse_open_requested_access(libc::O_RDONLY as u32 | LINUX_FMODE_EXEC_OPEN_FLAG),
+            ACCESS_EXECUTE
+        );
+        assert_eq!(
+            fuse_open_requested_access(libc::O_WRONLY as u32 | LINUX_FMODE_EXEC_OPEN_FLAG),
+            ACCESS_WRITE | ACCESS_EXECUTE
+        );
+        assert_eq!(
+            fuse_open_requested_access(libc::O_RDWR as u32 | LINUX_FMODE_EXEC_OPEN_FLAG),
+            ACCESS_READ | ACCESS_WRITE | ACCESS_EXECUTE
+        );
         assert_eq!(fuse_open_requested_access(0x3), 0);
+    }
+
+    #[test]
+    fn request_groups_from_status_text_includes_primary_and_deduplicates() {
+        let status = "Name:\ttest\nGroups:\t20 30 20 40\n";
+
+        assert_eq!(
+            request_groups_from_status_text(status, 30),
+            vec![30, 20, 40]
+        );
+        assert_eq!(
+            request_groups_from_status_text("Name:\ttest\n", 99),
+            vec![99]
+        );
     }
 
     #[test]
@@ -16659,6 +16822,42 @@ mod tests {
         );
         assert_eq!(
             plan_fuse_open_access(Ok(attr), &other, libc::O_RDONLY as u32, None),
+            Err(Errno::EACCES)
+        );
+    }
+
+    #[test]
+    fn open_access_plan_checks_execute_for_fmode_exec() {
+        let executable = test_attr_with_mode(42, 7, 0o111, 1000, 1001);
+        let non_readable_user = access_ctx(3000, 3001, &[3001]);
+
+        assert_eq!(
+            plan_fuse_open_access(
+                Ok(executable),
+                &non_readable_user,
+                libc::O_RDONLY as u32 | LINUX_FMODE_EXEC_OPEN_FLAG,
+                None
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            plan_fuse_open_access(
+                Ok(executable),
+                &non_readable_user,
+                libc::O_RDONLY as u32,
+                None
+            ),
+            Err(Errno::EACCES)
+        );
+
+        let not_executable = test_attr_with_mode(43, 7, 0o444, 1000, 1001);
+        assert_eq!(
+            plan_fuse_open_access(
+                Ok(not_executable),
+                &non_readable_user,
+                libc::O_RDONLY as u32 | LINUX_FMODE_EXEC_OPEN_FLAG,
+                None
+            ),
             Err(Errno::EACCES)
         );
     }
@@ -17111,14 +17310,18 @@ mod tests {
     }
 
     #[test]
-    fn open_guard_rejects_fmode_exec_open_flags() {
+    fn open_guard_accepts_fmode_exec_open_flags() {
         assert_eq!(
             FuseVfsAdapter::validate_open_flags(libc::O_RDONLY as u32),
             Ok(())
         );
         assert_eq!(
             FuseVfsAdapter::validate_open_flags(libc::O_RDONLY as u32 | LINUX_FMODE_EXEC_OPEN_FLAG),
-            Err(Errno::EACCES)
+            Ok(())
+        );
+        assert_eq!(
+            FuseVfsAdapter::engine_open_flags(libc::O_RDONLY as u32 | LINUX_FMODE_EXEC_OPEN_FLAG),
+            libc::O_RDONLY as u32
         );
     }
 
@@ -17863,6 +18066,50 @@ mod tests {
     }
 
     #[test]
+    fn vfs_adapter_dispatch_setxattr_acl_invalidates_cached_attrs() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, _fh) =
+            create_file_with_data_and_open(&fixture, b"acl-mode-cache.txt", b"content", 0);
+
+        let before = fixture
+            .adapter
+            .dispatch_getattr(&ctx, inode.get(), 18_400, None)
+            .expect("populate getattr cache");
+        assert_eq!(before.attr.mode & 0o777, 0o644);
+
+        let acl = [
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_USER_OBJ,
+                perm: 4,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_GROUP_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_OTHER,
+                perm: 6,
+                id: 0,
+            },
+        ];
+        let encoded = tidefs_permission::encode_posix_acl_xattr(&acl);
+
+        fixture
+            .adapter
+            .dispatch_setxattr(&ctx, inode.get(), b"system.posix_acl_access", &encoded, 0)
+            .expect("set access ACL");
+
+        let after = fixture
+            .adapter
+            .dispatch_getattr(&ctx, inode.get(), 18_401, None)
+            .expect("getattr after ACL setxattr");
+        assert_eq!(after.attr.mode & 0o777, 0o476);
+    }
+
+    #[test]
     fn vfs_adapter_dispatch_getxattr_missing_returns_enodata() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -18201,6 +18448,46 @@ mod tests {
         assert_eq!(value, b"symval");
     }
 
+    #[test]
+    fn vfs_adapter_dispatch_symlink_with_namespace_uses_engine_for_xattrs() {
+        let fixture = adapter_fixture_with_namespace();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+
+        let attr = fixture
+            .adapter
+            .dispatch_symlink(&ctx, root.get(), b"engine-symlink", b"some/target")
+            .expect("symlink");
+
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let lookup = engine
+                .lookup(root, b"engine-symlink", &ctx)
+                .expect("symlink must be engine-visible");
+            assert_eq!(lookup.inode_id, attr.inode_id);
+            assert_eq!(lookup.kind, NodeKind::Symlink);
+        }
+
+        fixture
+            .adapter
+            .dispatch_setxattr(&ctx, attr.inode_id.get(), b"user.symattr", b"symval", 0)
+            .expect("setxattr on engine symlink");
+        let value = fixture
+            .adapter
+            .dispatch_getxattr(&ctx, attr.inode_id.get(), b"user.symattr")
+            .expect("getxattr on engine symlink");
+        assert_eq!(value, b"symval");
+
+        let target = fixture
+            .adapter
+            .dispatch_readlink(&ctx, attr.inode_id.get())
+            .expect("readlink engine symlink");
+        assert_eq!(target, b"some/target");
+    }
+
     // ── dispatch_xattr unit tests (continued) ──────────────────────────────────
 
     #[test]
@@ -18219,6 +18506,69 @@ mod tests {
             ),
             Err(Errno::EACCES)
         );
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_setattr_and_acl_use_engine_owner_when_namespace_is_stale() {
+        let fixture = adapter_fixture_with_namespace();
+        let ctx = root_ctx();
+        let ns = fixture
+            .adapter
+            .namespace
+            .as_ref()
+            .expect("namespace")
+            .clone();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"stale-ns-owner.txt",
+            libc::O_RDWR as u32,
+        );
+        let ns_ino = ns
+            .create_file(
+                1,
+                "stale-ns-owner.txt",
+                tidefs_namespace::InodeAttributes::new_file(0),
+            )
+            .expect("create stale namespace entry");
+        assert_eq!(ns_ino, inode.get());
+
+        let mut chown = SetAttr::new();
+        chown.valid = FATTR_UID | FATTR_GID;
+        chown.uid = 100;
+        chown.gid = 100;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 18_100, inode.get(), &chown, None)
+            .expect("engine chown");
+
+        let mut stale = ns.get_attrs(inode.get()).expect("namespace attrs");
+        stale.uid = 0;
+        stale.gid = 0;
+        ns.update_attrs(inode.get(), stale)
+            .expect("make namespace owner stale");
+
+        let owner = access_ctx(100, 100, &[100]);
+        let mut chmod = SetAttr::new();
+        chmod.valid = FATTR_MODE;
+        chmod.mode = 0o640;
+        fixture
+            .adapter
+            .dispatch_setattr(&owner, 18_101, inode.get(), &chmod, None)
+            .expect("owner chmod uses engine owner");
+
+        let mut stale = ns.get_attrs(inode.get()).expect("namespace attrs");
+        stale.uid = 0;
+        stale.gid = 0;
+        ns.update_attrs(inode.get(), stale)
+            .expect("make namespace owner stale again");
+
+        let acl = tidefs_posix_acl::minimal_access_acl_from_mode(0o640);
+        let encoded = tidefs_permission::encode_posix_acl_xattr(&acl);
+        fixture
+            .adapter
+            .dispatch_setxattr(&owner, inode.get(), b"system.posix_acl_access", &encoded, 0)
+            .expect("owner setfacl uses engine owner");
     }
 
     #[test]
@@ -18298,6 +18648,153 @@ mod tests {
             other.perm, 0,
             "ACL_OTHER should reflect new other mode bits"
         );
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_mkdir_inherits_default_acl_once() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx_with_umask(0);
+        let parent = fixture
+            .adapter
+            .dispatch_mkdir(&ctx, 1, b"acl-parent", 0o777)
+            .expect("mkdir parent");
+        let default_acl = vec![
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_GROUP_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_OTHER,
+                perm: 0,
+                id: 0,
+            },
+        ];
+        let encoded = tidefs_permission::encode_posix_acl_xattr(&default_acl);
+        fixture
+            .adapter
+            .dispatch_setxattr(
+                &ctx,
+                parent.inode_id.get(),
+                b"system.posix_acl_default",
+                &encoded,
+                0,
+            )
+            .expect("set default ACL");
+
+        let child = fixture
+            .adapter
+            .dispatch_mkdir(&ctx, parent.inode_id.get(), b"child", 0o777)
+            .expect("mkdir child");
+        let raw_acl = fixture
+            .adapter
+            .dispatch_getxattr(&ctx, child.inode_id.get(), b"system.posix_acl_access")
+            .expect("get inherited access ACL");
+        let decoded = tidefs_permission::decode_posix_acl_xattr(&raw_acl).expect("decode ACL");
+        let group_obj = decoded
+            .iter()
+            .find(|entry| entry.tag == tidefs_posix_acl::ACL_GROUP_OBJ)
+            .expect("ACL_GROUP_OBJ exists");
+        assert_eq!(group_obj.perm, 7);
+        assert_eq!(child.posix.mode & 0o777, 0o770);
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_setxattr_acl_preserves_sgid_for_group_member() {
+        let fixture = adapter_fixture();
+        let root = root_ctx();
+        let owner = access_ctx(100, 100, &[100]);
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &root,
+            b"acl-sgid-keep.txt",
+            libc::O_RDWR as u32,
+        );
+        let mut chown = SetAttr::new();
+        chown.valid = FATTR_UID | FATTR_GID;
+        chown.uid = 100;
+        chown.gid = 100;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 18_200, inode.get(), &chown, None)
+            .expect("set owner");
+        let mut chmod = SetAttr::new();
+        chmod.valid = FATTR_MODE;
+        chmod.mode = libc::S_ISGID | 0o775;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 18_201, inode.get(), &chmod, None)
+            .expect("set sgid");
+
+        let acl = tidefs_posix_acl::minimal_access_acl_from_mode(0o775);
+        let encoded = tidefs_permission::encode_posix_acl_xattr(&acl);
+        fixture
+            .adapter
+            .dispatch_setxattr(&owner, inode.get(), b"system.posix_acl_access", &encoded, 0)
+            .expect("set ACL");
+        let stored = fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .getattr(inode, None, &root)
+            .expect("stored attr");
+        assert_eq!(stored.posix.mode & libc::S_ISGID, libc::S_ISGID);
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_setxattr_acl_clears_sgid_for_owner_outside_group() {
+        let fixture = adapter_fixture();
+        let root = root_ctx();
+        let owner_outside_group = access_ctx(100, 101, &[101]);
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &root,
+            b"acl-sgid-clear.txt",
+            libc::O_RDWR as u32,
+        );
+        let mut chown = SetAttr::new();
+        chown.valid = FATTR_UID | FATTR_GID;
+        chown.uid = 100;
+        chown.gid = 100;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 18_202, inode.get(), &chown, None)
+            .expect("set owner");
+        let mut chmod = SetAttr::new();
+        chmod.valid = FATTR_MODE;
+        chmod.mode = libc::S_ISGID | 0o775;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 18_203, inode.get(), &chmod, None)
+            .expect("set sgid");
+
+        let acl = tidefs_posix_acl::minimal_access_acl_from_mode(0o775);
+        let encoded = tidefs_permission::encode_posix_acl_xattr(&acl);
+        fixture
+            .adapter
+            .dispatch_setxattr(
+                &owner_outside_group,
+                inode.get(),
+                b"system.posix_acl_access",
+                &encoded,
+                0,
+            )
+            .expect("set ACL");
+        let stored = fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .getattr(inode, None, &root)
+            .expect("stored attr");
+        assert_eq!(stored.posix.mode & libc::S_ISGID, 0);
+        assert_eq!(stored.posix.mode & 0o777, 0o775);
     }
 
     #[test]
@@ -18470,6 +18967,55 @@ mod tests {
             .adapter
             .dispatch_open_entry(&user_ctx, inode.get(), libc::O_RDONLY as u32)
             .expect("mode other bits should grant read when no ACL present");
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_open_fmode_exec_checks_execute_not_read() {
+        let fixture = adapter_fixture();
+        let root = {
+            let ctx = root_ctx();
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let inode = {
+            let ctx = root_ctx();
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let (attr, fh) = engine
+                .create(root, b"exec-only.bin", 0o111, libc::O_RDWR as u32, &ctx)
+                .expect("create exec-only file");
+            engine.release(&fh).expect("release");
+            attr.inode_id
+        };
+        let user_ctx = access_ctx(2000, 2000, &[2000]);
+
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_open_entry(&user_ctx, inode.get(), libc::O_RDONLY as u32),
+            Err(Errno::EACCES)
+        );
+
+        let dispatch = fixture
+            .adapter
+            .dispatch_open_entry(
+                &user_ctx,
+                inode.get(),
+                libc::O_RDONLY as u32 | LINUX_FMODE_EXEC_OPEN_FLAG,
+            )
+            .expect("execute-only open should check execute permission");
+        let handle = fixture.adapter.file_handles.lock().unwrap();
+        let stored = handle
+            .handles
+            .get(&dispatch.adapter_fh)
+            .expect("adapter handle");
+        assert_eq!(
+            stored.engine_handle.open_flags & LINUX_FMODE_EXEC_OPEN_FLAG,
+            0
+        );
+        assert_eq!(
+            stored.engine_handle.open_flags & libc::O_ACCMODE as u32,
+            libc::O_RDONLY as u32
+        );
     }
 
     #[test]
@@ -21386,6 +21932,76 @@ mod tests {
     }
 
     #[test]
+    fn vfs_adapter_create_and_mkdir_preserve_umask_masked_default_acl_inheritance() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx_with_umask(0o077);
+        let parent_default_acl = default_acl_for_inheritance_regression();
+        let parent_default_raw = tidefs_posix_acl::encode_posix_acl_xattr(&parent_default_acl);
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let root = engine.get_root_inode(&ctx).expect("root inode");
+            engine
+                .setxattr(
+                    root,
+                    b"system.posix_acl_default",
+                    &parent_default_raw,
+                    0,
+                    &ctx,
+                )
+                .expect("set parent default ACL");
+            root
+        };
+
+        let file = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"acl-inherit-file",
+                0o666,
+                libc::O_RDWR as u32,
+            )
+            .expect("create dispatch");
+        let dir = fixture
+            .adapter
+            .dispatch_mkdir_entry(&ctx, root.get(), b"acl-inherit-dir", 0o777)
+            .expect("mkdir dispatch");
+
+        let engine = fixture.adapter.engine.lock().unwrap();
+        assert_eq!(file.attr.posix.mode & 0o777, 0o666);
+        let file_attr = engine
+            .getattr(file.attr.inode_id, None, &ctx)
+            .expect("file getattr after create");
+        assert_eq!(file_attr.posix.mode & 0o777, 0o666);
+        let file_access = engine
+            .getxattr(file.attr.inode_id, b"system.posix_acl_access", &ctx)
+            .expect("file inherited access ACL");
+        assert_file_inherited_acl_from_raw_create_mode(&file_access);
+        assert_eq!(
+            engine
+                .getxattr(file.attr.inode_id, b"system.posix_acl_default", &ctx)
+                .unwrap_err(),
+            Errno::ENODATA
+        );
+
+        assert_eq!(dir.posix.mode & 0o777, 0o777);
+        let dir_attr = engine
+            .getattr(dir.inode_id, None, &ctx)
+            .expect("dir getattr after mkdir");
+        assert_eq!(dir_attr.posix.mode & 0o777, 0o777);
+        let dir_access = engine
+            .getxattr(dir.inode_id, b"system.posix_acl_access", &ctx)
+            .expect("dir inherited access ACL");
+        assert_dir_inherited_acl_from_raw_create_mode(&dir_access);
+        let dir_default = engine
+            .getxattr(dir.inode_id, b"system.posix_acl_default", &ctx)
+            .expect("dir inherited default ACL");
+        let decoded_dir_default =
+            tidefs_posix_acl::decode_posix_acl_xattr(&dir_default).expect("decode dir default ACL");
+        assert_eq!(decoded_dir_default, parent_default_acl);
+    }
+
+    #[test]
     fn vfs_adapter_dispatch_mkdir_name_too_long_enametoolong() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -23227,6 +23843,200 @@ mod tests {
     }
 
     #[test]
+    fn vfs_adapter_dispatch_setattr_chmod_preserves_sgid_for_group_member() {
+        let fixture = adapter_fixture();
+        let root = root_ctx();
+        let owner = access_ctx(100, 100, &[100]);
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &root,
+            b"setattr-chmod-sgid-keep.txt",
+            libc::O_RDWR as u32,
+        );
+        let mut chown = SetAttr::new();
+        chown.valid = FATTR_UID | FATTR_GID;
+        chown.uid = 100;
+        chown.gid = 100;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8230, inode.get(), &chown, None)
+            .expect("set owner");
+
+        let mut chmod = SetAttr::new();
+        chmod.valid = FATTR_MODE;
+        chmod.mode = libc::S_ISGID | 0o775;
+        let attr_out = fixture
+            .adapter
+            .dispatch_setattr(&owner, 8231, inode.get(), &chmod, None)
+            .expect("owner group-member chmod");
+        assert_eq!(attr_out.attr.mode & libc::S_ISGID, libc::S_ISGID);
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_chmod_and_setfacl_match_generic_375_file_sgid_rules() {
+        let fixture = adapter_fixture();
+        let root = root_ctx();
+        let owner_in_group = access_ctx(100, 100, &[100]);
+        let owner_outside_group = access_ctx(100, 101, &[101]);
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &root,
+            b"setattr-generic-375-file.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut chown = SetAttr::new();
+        chown.valid = FATTR_UID | FATTR_GID;
+        chown.uid = 100;
+        chown.gid = 100;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8236, inode.get(), &chown, None)
+            .expect("set owner");
+
+        let mut root_set_sgid = SetAttr::new();
+        root_set_sgid.valid = FATTR_MODE;
+        root_set_sgid.mode = libc::S_ISGID | 0o755;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8237, inode.get(), &root_set_sgid, None)
+            .expect("root set sgid baseline");
+
+        let mut chmod = SetAttr::new();
+        chmod.valid = FATTR_MODE;
+        chmod.mode = libc::S_ISGID | 0o777;
+        let kept = fixture
+            .adapter
+            .dispatch_setattr(&owner_in_group, 8238, inode.get(), &chmod, None)
+            .expect("owner in group chmod");
+        assert_eq!(kept.attr.mode & libc::S_ISGID, libc::S_ISGID);
+        assert_eq!(kept.attr.mode & 0o777, 0o777);
+
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8239, inode.get(), &root_set_sgid, None)
+            .expect("root reset sgid baseline");
+        let acl = tidefs_posix_acl::minimal_access_acl_from_mode(0o777);
+        let encoded = tidefs_posix_acl::encode_posix_acl_xattr(&acl);
+        fixture
+            .adapter
+            .dispatch_setxattr(
+                &owner_in_group,
+                inode.get(),
+                b"system.posix_acl_access",
+                &encoded,
+                0,
+            )
+            .expect("owner in group setfacl");
+        let kept_after_acl = fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .getattr(inode, None, &root)
+            .expect("attr after setfacl");
+        assert_eq!(kept_after_acl.posix.mode & libc::S_ISGID, libc::S_ISGID);
+        assert_eq!(kept_after_acl.posix.mode & 0o777, 0o777);
+
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8240, inode.get(), &root_set_sgid, None)
+            .expect("root reset sgid baseline");
+        let cleared = fixture
+            .adapter
+            .dispatch_setattr(&owner_outside_group, 8241, inode.get(), &chmod, None)
+            .expect("owner outside group chmod");
+        assert_eq!(cleared.attr.mode & libc::S_ISGID, 0);
+        assert_eq!(cleared.attr.mode & 0o777, 0o777);
+
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8242, inode.get(), &root_set_sgid, None)
+            .expect("root reset sgid baseline");
+        fixture
+            .adapter
+            .dispatch_setxattr(
+                &owner_outside_group,
+                inode.get(),
+                b"system.posix_acl_access",
+                &encoded,
+                0,
+            )
+            .expect("owner outside group setfacl");
+        let cleared_after_acl = fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .getattr(inode, None, &root)
+            .expect("attr after outside-group setfacl");
+        assert_eq!(cleared_after_acl.posix.mode & libc::S_ISGID, 0);
+        assert_eq!(cleared_after_acl.posix.mode & 0o777, 0o777);
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_setattr_chmod_clears_sgid_for_owner_outside_group() {
+        let fixture = adapter_fixture();
+        let root = root_ctx();
+        let owner_outside_group = access_ctx(100, 101, &[101]);
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &root,
+            b"setattr-chmod-sgid-clear.txt",
+            libc::O_RDWR as u32,
+        );
+        let mut chown = SetAttr::new();
+        chown.valid = FATTR_UID | FATTR_GID;
+        chown.uid = 100;
+        chown.gid = 100;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8232, inode.get(), &chown, None)
+            .expect("set owner");
+
+        let mut chmod = SetAttr::new();
+        chmod.valid = FATTR_MODE;
+        chmod.mode = libc::S_ISGID | 0o775;
+        let attr_out = fixture
+            .adapter
+            .dispatch_setattr(&owner_outside_group, 8233, inode.get(), &chmod, None)
+            .expect("owner outside group chmod");
+        assert_eq!(attr_out.attr.mode & libc::S_ISGID, 0);
+        assert_eq!(attr_out.attr.mode & 0o777, 0o775);
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_setattr_chmod_rejects_non_owner() {
+        let fixture = adapter_fixture();
+        let root = root_ctx();
+        let stranger = access_ctx(101, 101, &[101]);
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &root,
+            b"setattr-chmod-stranger.txt",
+            libc::O_RDWR as u32,
+        );
+        let mut chown = SetAttr::new();
+        chown.valid = FATTR_UID | FATTR_GID;
+        chown.uid = 100;
+        chown.gid = 100;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8234, inode.get(), &chown, None)
+            .expect("set owner");
+
+        let mut chmod = SetAttr::new();
+        chmod.valid = FATTR_MODE;
+        chmod.mode = 0o777;
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_setattr(&stranger, 8235, inode.get(), &chmod, None),
+            Err(Errno::EPERM)
+        );
+    }
+
+    #[test]
     fn vfs_adapter_dispatch_setattr_ctime_bumped_on_metadata_change() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -23265,16 +24075,25 @@ mod tests {
     }
 
     #[test]
-    fn vfs_adapter_dispatch_setattr_nonroot_chown_clears_setuid_setgid() {
+    fn vfs_adapter_dispatch_setattr_owner_chgrp_clears_setuid_setgid() {
         let fixture = adapter_fixture();
         let root = root_ctx();
-        let nonroot = access_ctx(1000, 1000, &[1000]);
+        let owner = access_ctx(1000, 1000, &[1000, 3000]);
         let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &root,
-            b"setattr-chown-killpriv.txt",
+            b"setattr-chgrp-killpriv.txt",
             libc::O_RDWR as u32,
         );
+        let mut set_owner = SetAttr::new();
+        set_owner.valid = FATTR_UID | FATTR_GID;
+        set_owner.uid = 1000;
+        set_owner.gid = 1000;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8500, inode.get(), &set_owner, None)
+            .expect("set owner as root");
+
         // Set initial mode with S_ISUID|S_ISGID as root
         {
             let mut update = SetAttr::new();
@@ -23298,47 +24117,55 @@ mod tests {
             "expected S_ISUID|S_ISGID to be set initially"
         );
 
-        // Non-root chown: privilege bits should be cleared
+        // File owner may chgrp to a group they belong to; privilege bits clear.
         let mut update = SetAttr::new();
-        update.valid = FATTR_UID | FATTR_GID;
-        update.uid = 2000;
+        update.valid = FATTR_GID;
         update.gid = 3000;
 
         let attr_out = fixture
             .adapter
-            .dispatch_setattr(&nonroot, 8502, inode.get(), &update, None)
-            .expect("setattr chown as non-root");
+            .dispatch_setattr(&owner, 8502, inode.get(), &update, None)
+            .expect("setattr chgrp as owner");
 
         // Verify privilege bits are cleared
         assert_eq!(
             attr_out.attr.mode & (libc::S_ISUID | libc::S_ISGID),
             0,
-            "S_ISUID|S_ISGID should be cleared after non-root chown"
+            "S_ISUID|S_ISGID should be cleared after owner chgrp"
         );
         // Verify ownership was updated
-        assert_eq!(attr_out.attr.uid, 2000);
+        assert_eq!(attr_out.attr.uid, 1000);
         assert_eq!(attr_out.attr.gid, 3000);
         // Verify persistence
         let engine = fixture.adapter.engine.lock().unwrap();
         let stored = engine
             .getattr(inode, None, &root)
-            .expect("stored attr after killpriv chown");
+            .expect("stored attr after killpriv chgrp");
         assert_eq!(stored.posix.mode & (libc::S_ISUID | libc::S_ISGID), 0);
-        assert_eq!(stored.posix.uid, 2000);
+        assert_eq!(stored.posix.uid, 1000);
         assert_eq!(stored.posix.gid, 3000);
     }
 
     #[test]
-    fn vfs_adapter_dispatch_setattr_nonroot_chown_with_explicit_mode_clears_privilege_bits() {
+    fn vfs_adapter_dispatch_setattr_owner_chgrp_with_explicit_mode_clears_privilege_bits() {
         let fixture = adapter_fixture();
         let root = root_ctx();
-        let nonroot = access_ctx(1000, 1000, &[1000]);
+        let owner = access_ctx(1000, 1000, &[1000, 2000]);
         let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &root,
-            b"setattr-chown-killpriv-mode.txt",
+            b"setattr-chgrp-killpriv-mode.txt",
             libc::O_RDWR as u32,
         );
+        let mut set_owner = SetAttr::new();
+        set_owner.valid = FATTR_UID | FATTR_GID;
+        set_owner.uid = 1000;
+        set_owner.gid = 1000;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8503, inode.get(), &set_owner, None)
+            .expect("set owner as root");
+
         // Set initial mode with S_ISUID|S_ISGID as root
         {
             let mut update = SetAttr::new();
@@ -23346,27 +24173,27 @@ mod tests {
             update.mode = libc::S_ISUID | libc::S_ISGID | 0o755;
             fixture
                 .adapter
-                .dispatch_setattr(&root, 8503, inode.get(), &update, None)
+                .dispatch_setattr(&root, 8504, inode.get(), &update, None)
                 .expect("set suid+sgid mode as root");
         }
 
-        // Non-root chown WITH explicit mode change: privilege bits in
+        // Owner chgrp WITH explicit mode change: privilege bits in the
         // requested mode should be cleared.
         let mut update = SetAttr::new();
-        update.valid = FATTR_UID | FATTR_MODE;
-        update.uid = 2000;
-        update.mode = libc::S_ISUID | 0o644; // tries to set SUID
+        update.valid = FATTR_GID | FATTR_MODE;
+        update.gid = 2000;
+        update.mode = libc::S_ISUID | libc::S_ISGID | 0o644;
 
         let attr_out = fixture
             .adapter
-            .dispatch_setattr(&nonroot, 8504, inode.get(), &update, None)
-            .expect("setattr chown+chmod as non-root");
+            .dispatch_setattr(&owner, 8505, inode.get(), &update, None)
+            .expect("setattr chgrp+chmod as owner");
 
         // S_ISUID in the requested mode should have been cleared
         assert_eq!(
             attr_out.attr.mode & libc::S_ISUID,
             0,
-            "S_ISUID should be cleared from requested mode on non-root chown"
+            "S_ISUID should be cleared from requested mode on owner chgrp"
         );
         // S_ISGID should also be cleared (killpriv strips both)
         assert_eq!(attr_out.attr.mode & libc::S_ISGID, 0);
@@ -23374,7 +24201,8 @@ mod tests {
         assert_eq!(attr_out.attr.mode & 0o777, 0o644);
         // File type should be preserved
         assert_eq!(attr_out.attr.mode & libc::S_IFMT, libc::S_IFREG);
-        assert_eq!(attr_out.attr.uid, 2000);
+        assert_eq!(attr_out.attr.uid, 1000);
+        assert_eq!(attr_out.attr.gid, 2000);
     }
 
     #[test]
@@ -24839,6 +25667,85 @@ mod tests {
             .expect("dir readdirplus entry");
         assert_eq!(dir_pair.0.inode_id, dir_attr.inode_id);
         assert_eq!(dir_pair.1.kind, NodeKind::Dir);
+
+        fixture
+            .adapter
+            .dispatch_releasedir(dh.dh_id.get())
+            .expect("releasedir");
+    }
+
+    #[test]
+    fn dispatch_readdir_with_attached_namespace_resumes_engine_pages() {
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let fixture_root = std::env::temp_dir().join(format!(
+            "tidefs-vfs-adapter-ns-bulk-{}-{temp_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&fixture_root).expect("create temp root");
+        let mut local_fs = LocalFileSystem::open_with_root_authentication_key(
+            &fixture_root,
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open local filesystem");
+        let root = tidefs_types_vfs_core::ROOT_INODE_ID;
+        for i in 0..140u64 {
+            let name = format!("bulk_{i:04}.txt").into_bytes();
+            let entry = tidefs_local_filesystem::NamespaceEntry {
+                name: name.clone(),
+                inode_id: InodeId::new(10_000 + i),
+                generation: Generation::new(i + 1),
+                facets: NodeKind::File.to_facets(),
+                mode: S_IFREG | 0o644,
+            };
+            local_fs
+                .insert_dir_entry(root, name, entry)
+                .expect("insert bulk entry");
+        }
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_namespace(Arc::new(Namespace::new()));
+        let mut fixture = AdapterFixture {
+            adapter,
+            root: fixture_root,
+        };
+        let ctx = root_ctx();
+
+        let dh = fixture
+            .adapter
+            .dispatch_opendir(&ctx, root.get())
+            .expect("opendir root");
+        let (first, has_more) = fixture
+            .adapter
+            .dispatch_readdir(&ctx, root.get(), dh.dh_id.get(), 0)
+            .expect("first readdir page");
+        assert_eq!(first.len(), 130);
+        assert!(has_more);
+        assert_eq!(first[0].name, b".");
+        assert_eq!(first[1].name, b"..");
+        assert_eq!(first[2].name, b"bulk_0000.txt");
+        assert_eq!(first.last().unwrap().name, b"bulk_0127.txt");
+        assert_eq!(first.last().unwrap().cookie, 130);
+
+        let resume = first.last().unwrap().cookie;
+        let (second, has_more) = fixture
+            .adapter
+            .dispatch_readdir(&ctx, root.get(), dh.dh_id.get(), resume)
+            .expect("second readdir page");
+        assert_eq!(second.len(), 12);
+        assert!(!has_more);
+        assert_eq!(second[0].name, b"bulk_0128.txt");
+        assert_eq!(second[0].cookie, 131);
+        assert_eq!(second.last().unwrap().name, b"bulk_0139.txt");
+
+        let tail_offset = second.last().unwrap().cookie;
+        let (tail, has_more) = fixture
+            .adapter
+            .dispatch_readdir(&ctx, root.get(), dh.dh_id.get(), tail_offset)
+            .expect("tail readdir page");
+        assert!(tail.is_empty());
+        assert!(!has_more);
 
         fixture
             .adapter
@@ -27171,6 +28078,47 @@ mod tests {
         assert_eq!(
             reply.stx_mask,
             statx_mask::STATX_BASIC_STATS | statx_mask::STATX_BTIME | statx_mask::STATX_ATTRS
+        );
+    }
+
+    #[test]
+    fn dispatch_statx_reports_engine_xattr_and_acl_metadata() {
+        let f = adapter_fixture();
+        let c = root_ctx();
+        let created = f
+            .adapter
+            .dispatch_create_entry(&c, 1, b"statx_acl_flags", 0o644, libc::O_RDWR as u32)
+            .expect("create file");
+        let ino = created.inode();
+
+        f.adapter
+            .dispatch_setxattr(&c, ino, b"user.statx", b"value", 0)
+            .expect("set user xattr");
+        let access_acl = tidefs_posix_acl::minimal_access_acl_from_mode(0o640);
+        let encoded_access_acl = tidefs_posix_acl::encode_posix_acl_xattr(&access_acl);
+        f.adapter
+            .dispatch_setxattr(&c, ino, b"system.posix_acl_access", &encoded_access_acl, 0)
+            .expect("set access ACL");
+
+        let file_statx = f.adapter.dispatch_statx(&c, ino, 0).expect("statx file");
+        assert!(
+            file_statx.stx_attributes & statx_attr::STATX_ATTR_XATTR_PRESENT != 0,
+            "user xattr should set internal xattr-present metadata"
+        );
+        assert!(
+            file_statx.stx_attributes & statx_attr::STATX_ATTR_POSIX_ACL_ACCESS != 0,
+            "access ACL should set internal ACL metadata"
+        );
+
+        let default_acl = tidefs_posix_acl::minimal_access_acl_from_mode(0o750);
+        let encoded_default_acl = tidefs_posix_acl::encode_posix_acl_xattr(&default_acl);
+        f.adapter
+            .dispatch_setxattr(&c, 1, b"system.posix_acl_default", &encoded_default_acl, 0)
+            .expect("set root default ACL");
+        let root_statx = f.adapter.dispatch_statx(&c, 1, 0).expect("statx root");
+        assert!(
+            root_statx.stx_attributes & statx_attr::STATX_ATTR_POSIX_ACL_DEFAULT != 0,
+            "default ACL should set internal default-ACL metadata"
         );
     }
 
@@ -30453,6 +31401,24 @@ mod tests {
     }
 
     #[test]
+    fn namespace_dispatch_readlink_falls_back_for_namespace_only_inode() {
+        let (ns, fixture) = namespace_fixture();
+        let ctx = root_ctx();
+        let root_ino = 1u64;
+
+        let attr = fixture
+            .adapter
+            .dispatch_symlink_via_namespace(&ns, root_ino, b"legacy-link", b"/legacy/target")
+            .expect("namespace symlink");
+
+        let target = fixture
+            .adapter
+            .dispatch_readlink(&ctx, attr.inode_id.get())
+            .expect("readlink namespace-only inode");
+        assert_eq!(target, b"/legacy/target");
+    }
+
+    #[test]
     fn namespace_dispatch_symlink_empty_target_returns_einval() {
         let (_ns, fixture) = namespace_fixture();
         let ctx = root_ctx();
@@ -30488,18 +31454,17 @@ mod tests {
     #[test]
     fn namespace_dispatch_link_creates_hard_link() {
         let (ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
         let root_ino = 1u64;
 
         let sym_attr = fixture
             .adapter
-            .dispatch_symlink(&ctx, root_ino, b"origin", b"/target")
+            .dispatch_symlink_via_namespace(&ns, root_ino, b"origin", b"/target")
             .expect("symlink");
         let target_ino = sym_attr.inode_id.get();
 
         let link_attr = fixture
             .adapter
-            .dispatch_link(&ctx, target_ino, root_ino, b"alias")
+            .dispatch_link_via_namespace(&ns, target_ino, root_ino, b"alias")
             .expect("link");
         assert_eq!(link_attr.inode_id.get(), target_ino);
 
@@ -30510,19 +31475,18 @@ mod tests {
 
     #[test]
     fn namespace_dispatch_link_directory_returns_eisdir() {
-        let (_ns, fixture) = namespace_fixture();
-        let ctx = root_ctx();
+        let (ns, fixture) = namespace_fixture();
         let root_ino = 1u64;
 
         let attr = fixture
             .adapter
-            .dispatch_mkdir(&ctx, root_ino, b"somedir", 0o755)
+            .dispatch_mkdir_via_namespace(&ns, root_ino, b"somedir", 0o755)
             .expect("mkdir");
         let dir_ino = attr.inode_id.get();
 
         let err = fixture
             .adapter
-            .dispatch_link(&ctx, dir_ino, root_ino, b"dir-link")
+            .dispatch_link_via_namespace(&ns, dir_ino, root_ino, b"dir-link")
             .unwrap_err();
         assert_eq!(err, Errno::EISDIR);
     }
@@ -31788,11 +32752,11 @@ mod tests {
             self
         }
 
-        fn with_attr(mut self, uid: u32, gid: u32, mode: u32) -> Self {
+        fn with_attr_kind(mut self, uid: u32, gid: u32, mode: u32, kind: NodeKind) -> Self {
             self.attr = Ok(InodeAttr {
                 inode_id: InodeId::new(1),
                 generation: Generation::new(0),
-                kind: NodeKind::File,
+                kind,
                 posix: PosixAttrs {
                     mode,
                     uid,
@@ -31812,6 +32776,14 @@ mod tests {
                 dir_rev: 0,
             });
             self
+        }
+
+        fn with_attr(self, uid: u32, gid: u32, mode: u32) -> Self {
+            self.with_attr_kind(uid, gid, mode, NodeKind::File)
+        }
+
+        fn with_dir_attr(self, uid: u32, gid: u32, mode: u32) -> Self {
+            self.with_attr_kind(uid, gid, mode | libc::S_IFDIR, NodeKind::Dir)
         }
 
         fn with_acl_encoded(mut self, entries: Vec<PosixAclEntry>) -> Self {
@@ -32547,7 +33519,7 @@ mod tests {
         ];
         let engine = AclMockEngine::new()
             .with_root(1)
-            .with_attr(1000, 100, 0o000)
+            .with_dir_attr(1000, 100, 0o000)
             .with_acl_encoded(parent_acl);
         let adapter = make_adapter(engine);
         let ctx = test_ctx(2000, 200);
@@ -32572,7 +33544,7 @@ mod tests {
     fn parent_dir_no_acl_allows_create_for_owner() {
         let engine = AclMockEngine::new()
             .with_root(1)
-            .with_attr(1000, 100, 0o755)
+            .with_dir_attr(1000, 100, 0o755)
             .with_no_acl()
             .with_create_ok(10);
         let adapter = make_adapter(engine);
@@ -32596,7 +33568,7 @@ mod tests {
     fn parent_dir_mode_denies_create_for_other() {
         let engine = AclMockEngine::new()
             .with_root(1)
-            .with_attr(1000, 100, 0o700)
+            .with_dir_attr(1000, 100, 0o700)
             .with_no_acl();
         let adapter = make_adapter(engine);
         let ctx = test_ctx(2000, 200);
@@ -32642,7 +33614,7 @@ mod tests {
         ];
         let engine = AclMockEngine::new()
             .with_root(1)
-            .with_attr(1000, 100, 0o000)
+            .with_dir_attr(1000, 100, 0o000)
             .with_acl_encoded(parent_acl)
             .with_create_ok(20);
         let adapter = make_adapter(engine);
@@ -32693,7 +33665,7 @@ mod tests {
         ];
         let engine = AclMockEngine::new()
             .with_root(1)
-            .with_attr(1000, 100, 0o000)
+            .with_dir_attr(1000, 100, 0o000)
             .with_acl_encoded(parent_acl)
             .with_create_ok(30);
         let adapter = make_adapter(engine);
@@ -32739,7 +33711,7 @@ mod tests {
         ];
         let engine = AclMockEngine::new()
             .with_root(1)
-            .with_attr(1000, 100, 0o000)
+            .with_dir_attr(1000, 100, 0o000)
             .with_acl_encoded(parent_acl);
         let adapter = make_adapter(engine);
         let ctx = test_ctx(2000, 100);
@@ -32790,7 +33762,7 @@ mod tests {
         ];
         let engine = AclMockEngine::new()
             .with_root(1)
-            .with_attr(1000, 100, 0o000)
+            .with_dir_attr(1000, 100, 0o000)
             .with_acl_encoded(parent_acl)
             .with_create_ok(40);
         let adapter = make_adapter(engine);
@@ -32836,7 +33808,7 @@ mod tests {
         ];
         let engine = AclMockEngine::new()
             .with_root(1)
-            .with_attr(1000, 100, 0o000)
+            .with_dir_attr(1000, 100, 0o000)
             .with_acl_encoded(parent_acl);
         let adapter = make_adapter(engine);
         let ctx = test_ctx(2000, 200);
@@ -32875,7 +33847,7 @@ mod tests {
         ];
         let engine = AclMockEngine::new()
             .with_root(1)
-            .with_attr(1000, 100, 0o000)
+            .with_dir_attr(1000, 100, 0o000)
             .with_acl_encoded(parent_acl)
             .with_create_ok(50);
         let adapter = make_adapter(engine);

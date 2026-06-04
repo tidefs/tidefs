@@ -213,37 +213,48 @@ When an object is created inside a directory that carries a
 ### 4.1 File creation
 
 1. Read parent's `system.posix_acl_default`.
-2. Apply `apply_chmod_to_acl` with the new file's mode (adjusted by umask)
-   to produce the file's access ACL.
+2. Apply `apply_chmod_to_acl` with the raw requested create mode to produce
+   the file's access ACL. When a parent default ACL exists, Linux ignores the
+   process umask for this inheritance calculation; the explicit mode argument
+   still limits the inherited ACL.
 3. Store the result as `system.posix_acl_access` on the new file.
-4. The file does **not** inherit `system.posix_acl_default`.
+4. Derive the visible permission bits from the inherited access ACL with
+   `posix_mode_from_access_acl`.
+5. The file does **not** inherit `system.posix_acl_default`.
 
 ### 4.2 Directory creation
 
 1. Read parent's `system.posix_acl_default`.
 2. Copy it verbatim as the new directory's `system.posix_acl_default`.
-3. Apply `apply_chmod_to_acl` with the new directory's mode to produce the
-   new directory's `system.posix_acl_access`.
-4. Store both `system.posix_acl_access` and `system.posix_acl_default` on
+3. Apply `apply_chmod_to_acl` with the raw requested mkdir mode to produce
+   the new directory's `system.posix_acl_access`.
+4. Derive the visible permission bits from the inherited access ACL.
+5. Store both `system.posix_acl_access` and `system.posix_acl_default` on
    the new directory.
 
 ### 4.3 No-parent-ACL case
 
 When the parent directory has no `system.posix_acl_default`, the new object
-is created with traditional mode bits only. No ACL xattrs are set on the new
-object. This is the default behaviour and matches Linux ext4/xfs semantics.
+is created with traditional mode bits only, including the process umask. No
+ACL xattrs are set on the new object. This is the default behaviour and
+matches Linux ext4/xfs semantics.
 
 ### 4.4 Inheritance integration point
 
-Inheritance must fire during `create` and `mkdir` in the local filesystem
-(not in the FUSE adapter), because it requires atomic xattr writes within
-the same transaction as the inode creation. The integration point is:
+Inheritance must fire during `create`, `mkdir`, and metadata-only `mknod`
+creation in the local filesystem (not in the FUSE adapter), because it
+requires atomic xattr writes within the same transaction as the inode
+creation. The integration point is:
 
 - `LocalFileSystem::create()` — after inode allocation, before commit
 - `LocalFileSystem::mkdir()` — after inode allocation, before commit
+- `VfsLocalFileSystem::mknod()` / metadata-only node creation — after inode
+  allocation, before commit
 
-The parent directory's default ACL is read via the existing `getxattr` path
-and processed through the codec functions above.
+The parent directory's default ACL is read via the existing xattr storage path
+and processed through the codec functions above. FUSE passes the raw request
+mode through to the local filesystem when the parent has a default ACL, then
+skips a follow-up `FATTR_MODE` chmod so the inherited ACL is not overwritten.
 
 ## 5. ACL ↔ mode synchronisation
 
@@ -321,7 +332,7 @@ Wire-up crates (in separate implementation issues):
 |---|---|
 | `tidefs-local-filesystem` — xattr/mode sync hooks | #NEW |
 | `tidefs-posix-filesystem-adapter-daemon` — ACL eval in permission check | #NEW |
-| `tidefs-posix-filesystem-adapter-daemon` — default ACL inheritance on create/mkdir | #NEW |
+| `tidefs-local-filesystem` — default ACL inheritance on create/mkdir/mknod | #NEW |
 
 
 ### 7.1 Unit tests (in `tidefs-posix-acl`)
@@ -346,9 +357,10 @@ Wire-up crates (in separate implementation issues):
 ### 7.2 Integration tests (in `tidefs-local-filesystem`)
 
 - **ACL inheritance on create**: dir with default ACL → new file inherits
-  access ACL (chmod-applied), no default ACL on file.
+  access ACL limited by the raw requested mode, no default ACL on file.
 - **ACL inheritance on mkdir**: dir with default ACL → new dir inherits
-  both access (chmod-applied) and default (copied verbatim).
+  both access ACL limited by the raw requested mode and default ACL copied
+  verbatim.
 - **Chmod updates ACL**: file with access ACL → chmod 600 → ACL USER_OBJ,
   MASK, and OTHER entries update; GROUP_OBJ updates only when no MASK exists.
 - **Setxattr updates mode**: file → setxattr access ACL with USER_OBJ=7,
@@ -356,7 +368,7 @@ Wire-up crates (in separate implementation issues):
 - **Removexattr leaves mode unchanged**: file with access ACL → removexattr
   → mode bits unchanged, ACL evaluation falls back to mode bits.
 - **No-default-ACL case**: parent without default ACL → new file/dir
-  created with mode bits only, no ACL xattrs.
+  created with traditional umask-adjusted mode bits only, no ACL xattrs.
 
 ### 7.3 xfstests gate
 

@@ -49,6 +49,55 @@ fn name_c(name: &str) -> CString {
     CString::new(name).expect("name nul")
 }
 
+fn encoded_named_user_acl() -> Vec<u8> {
+    use tidefs_posix_acl::{
+        PosixAclEntry, ACL_GROUP_OBJ, ACL_MASK, ACL_OTHER, ACL_USER, ACL_USER_OBJ,
+    };
+
+    tidefs_posix_acl::encode_posix_acl_xattr(&[
+        PosixAclEntry {
+            tag: ACL_USER_OBJ,
+            perm: 6,
+            id: 0,
+        },
+        PosixAclEntry {
+            tag: ACL_USER,
+            perm: 4,
+            id: 1234,
+        },
+        PosixAclEntry {
+            tag: ACL_GROUP_OBJ,
+            perm: 0,
+            id: 0,
+        },
+        PosixAclEntry {
+            tag: ACL_MASK,
+            perm: 4,
+            id: 0,
+        },
+        PosixAclEntry {
+            tag: ACL_OTHER,
+            perm: 0,
+            id: 0,
+        },
+    ])
+}
+
+fn assert_acl_semantics_eq(actual: &[u8], expected: &[u8]) {
+    use tidefs_posix_acl::{ACL_GROUP, ACL_USER};
+
+    let actual = tidefs_posix_acl::decode_posix_acl_xattr(actual).expect("decode actual ACL");
+    let expected = tidefs_posix_acl::decode_posix_acl_xattr(expected).expect("decode expected ACL");
+    assert_eq!(actual.len(), expected.len(), "ACL entry count");
+    for (actual, expected) in actual.iter().zip(expected.iter()) {
+        assert_eq!(actual.tag, expected.tag, "ACL tag");
+        assert_eq!(actual.perm, expected.perm, "ACL permission bits");
+        if actual.tag == ACL_USER || actual.tag == ACL_GROUP {
+            assert_eq!(actual.id, expected.id, "named ACL entry id");
+        }
+    }
+}
+
 unsafe fn setxattr_sys(
     path: &CString,
     name: &CString,
@@ -69,6 +118,26 @@ unsafe fn setxattr_sys(
     }
 }
 
+unsafe fn getxattr_sys(path: &CString, name: &CString) -> std::io::Result<Vec<u8>> {
+    let size = libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0);
+    if size < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut value = vec![0u8; size as usize];
+    let read = libc::getxattr(
+        path.as_ptr(),
+        name.as_ptr(),
+        value.as_mut_ptr() as *mut libc::c_void,
+        value.len(),
+    );
+    if read < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        value.truncate(read as usize);
+        Ok(value)
+    }
+}
+
 /// statx via libc syscall(2). Returns (stx_mask, stx_attributes).
 unsafe fn statx_probe(path: &CString, flags: i32) -> std::io::Result<(u32, u64)> {
     let mut buf = vec![0u8; 256];
@@ -83,7 +152,7 @@ unsafe fn statx_probe(path: &CString, flags: i32) -> std::io::Result<(u32, u64)>
     if r == 0 {
         let stx_mask = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let stx_attributes = u64::from_le_bytes([
-            buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
         ]);
         Ok((stx_mask, stx_attributes))
     } else {
@@ -104,11 +173,11 @@ fn create_file(path: &Path, mode: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: statx reports xattr presence after setxattr
+// Test: statx remains usable after setxattr
 // ---------------------------------------------------------------------------
 
 #[test]
-fn statx_reports_xattr_present_after_setxattr() {
+fn mounted_statx_remains_usable_after_setxattr() {
     let root = unique_test_root();
     let store = root.join("store");
     let mount = root.join("mnt");
@@ -151,14 +220,19 @@ fn statx_reports_xattr_present_after_setxattr() {
 
         // Set a user xattr.
         setxattr_sys(&pc, &name_c("user.statx-test"), b"hello", 0).expect("setxattr");
+        assert_eq!(
+            getxattr_sys(&pc, &name_c("user.statx-test")).expect("getxattr"),
+            b"hello"
+        );
 
-        // After setxattr: stx_attributes should have XATTR_PRESENT.
+        // Linux statx does not expose TideFS-private xattr markers through
+        // userspace; adapter unit tests cover those internal bits.
         let (mask2, attrs2) = statx_probe(&pc, 0x1000).expect("statx after setxattr");
         assert!(mask2 & 0x1000 != 0);
         assert_eq!(
-            attrs2 & 0x1,
-            0x1,
-            "STATX_ATTR_XATTR_PRESENT should be set, got {attrs2:#x}"
+            attrs2 & 0x3,
+            0,
+            "private xattr bits should not leak, got {attrs2:#x}"
         );
     }
 
@@ -167,11 +241,11 @@ fn statx_reports_xattr_present_after_setxattr() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: statx reports ACL presence when ACL xattrs are set
+// Test: statx remains usable after ACL xattrs are set
 // ---------------------------------------------------------------------------
 
 #[test]
-fn statx_reports_acl_presence_when_acl_xattrs_set() {
+fn mounted_statx_remains_usable_when_acl_xattrs_set() {
     // ACL xattrs require root (CAP_SYS_ADMIN). This test is skipped
     // when running as non-root.
     if unsafe { libc::geteuid() } != 0 {
@@ -199,28 +273,16 @@ fn statx_reports_acl_presence_when_acl_xattrs_set() {
     create_file(&file_path, 0o644);
     let pc = path_c(&file_path);
 
-    // Minimal valid access ACL: version=2, user::rwx, mask::rwx, other::rwx
-    // Encoded in Linux ACL xattr format: 4-byte version + 3x8-byte entries.
-    let mut acl_blob = Vec::new();
-    acl_blob.extend_from_slice(&0x0002u32.to_le_bytes()); // version
-                                                          // ACL_USER_OBJ (tag 1), perm 7 (rwx), id 0
-    acl_blob.extend_from_slice(&1u16.to_le_bytes());
-    acl_blob.extend_from_slice(&7u16.to_le_bytes());
-    acl_blob.extend_from_slice(&0u32.to_le_bytes());
-    // ACL_MASK (tag 0x10), perm 7, id 0
-    acl_blob.extend_from_slice(&0x10u16.to_le_bytes());
-    acl_blob.extend_from_slice(&7u16.to_le_bytes());
-    acl_blob.extend_from_slice(&0u32.to_le_bytes());
-    // ACL_OTHER (tag 0x20), perm 7, id 0
-    acl_blob.extend_from_slice(&0x20u16.to_le_bytes());
-    acl_blob.extend_from_slice(&7u16.to_le_bytes());
-    acl_blob.extend_from_slice(&0u32.to_le_bytes());
+    let acl_blob = encoded_named_user_acl();
 
     unsafe {
         setxattr_sys(&pc, &name_c("system.posix_acl_access"), &acl_blob, 0)
             .expect("setxattr system.posix_acl_access");
+        let stored_acl =
+            getxattr_sys(&pc, &name_c("system.posix_acl_access")).expect("getxattr ACL");
+        assert_acl_semantics_eq(&stored_acl, &acl_blob);
 
-        let (_mask, attrs) = match statx_probe(&pc, 0x1000) {
+        let (mask, attrs) = match statx_probe(&pc, 0x1000) {
             Ok(v) => v,
             Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
                 eprintln!("statx not available, skipping");
@@ -228,10 +290,14 @@ fn statx_reports_acl_presence_when_acl_xattrs_set() {
             }
             Err(e) => panic!("statx after ACL set failed: {e:?}"),
         };
+        assert!(
+            mask & 0x1000 != 0,
+            "stx_mask should include STATX_ATTRS, got {mask:#x}"
+        );
         assert_eq!(
-            attrs & 0x2,
-            0x2,
-            "STATX_ATTR_POSIX_ACL_ACCESS (0x2) should be set when ACL xattr exists, got {attrs:#x}"
+            attrs & 0x3,
+            0,
+            "private ACL bits should not leak, got {attrs:#x}"
         );
     }
 

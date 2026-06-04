@@ -44,6 +44,8 @@ let
     MV_BIN="${pkgs.coreutils}/bin/mv"
     TRUNCATE_BIN="${pkgs.coreutils}/bin/truncate"
     MD5SUM_BIN="${pkgs.coreutils}/bin/md5sum"
+    CHMOD_BIN="${pkgs.coreutils}/bin/chmod"
+    GAWK_BIN="${pkgs.gawk}/bin/gawk"
     TIMEOUT_BIN="${pkgs.coreutils}/bin/timeout"
     OD_BIN="${pkgs.lib.getBin pkgs.coreutils}/bin/od"
     TAC_BIN="${pkgs.lib.getBin pkgs.coreutils}/bin/tac"
@@ -299,7 +301,7 @@ GROUP
 set -e
 dev="tidefs-xfstests-root"
 mnt=""
-daemon_opts="atime,dev"
+daemon_opts="atime,dev,allow_other"
 daemon_coherency="writeback"
 daemon_content_capacity_bytes="2147483648"
 merge_mount_opts() {
@@ -310,7 +312,7 @@ merge_mount_opts() {
             atime|strictatime|relatime|noatime)
                 daemon_opts="$opt"
                 ;;
-            sync|async|dev|nodev)
+            sync|async|allow_other|noallow_other|dev|nodev)
                 daemon_opts="$daemon_opts,$opt"
                 ;;
         esac
@@ -778,6 +780,8 @@ UMOUNTWRAP
     copy_runtime_binary "$MV_BIN" mv
     copy_runtime_binary "$TRUNCATE_BIN" truncate
     copy_runtime_binary "$MD5SUM_BIN" md5sum
+    copy_runtime_binary "$CHMOD_BIN" chmod
+    copy_runtime_binary "$GAWK_BIN" awk
     copy_runtime_binary "$OD_BIN" od
     copy_runtime_binary "$TAC_BIN" tac
     copy_runtime_binary "$TAR_BIN" tar
@@ -1386,6 +1390,7 @@ INITSCRIPT
       -nographic \
       -drive "file=$STORE_IMG,format=raw,if=virtio,cache=unsafe" \
       -no-reboot \
+      < /dev/null \
       > "$VAL_LOG" 2>&1 || true
 
     echo "  QEMU boot completed"

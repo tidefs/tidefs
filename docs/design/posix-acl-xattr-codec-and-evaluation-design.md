@@ -41,7 +41,8 @@ feature-flag system.
 - `default_acl_inheritance_for_parent` — compute child ACLs during creation
 - Integration contract: read ACL from xattr storage → evaluate → return permission mask
 - Integration contract: deserialise ACL xattr → apply chmod → re-serialise → write back
-- Integration contract: on file/directory create, inherit from parent default ACL
+- Integration contract: on file/directory/special-node create, inherit from
+  parent default ACL
 - Feature gate: dataset feature flag `org.tidefs:posix_acl`
 
 ### Explicitly out of scope
@@ -375,18 +376,20 @@ mask exists, otherwise it updates `ACL_GROUP_OBJ`.
 
 ### 6.7 Default ACL inheritance (`default_acl_inheritance_for_parent`)
 
-When creating a file or directory inside a directory that has a default ACL
-(`system.posix_acl_default`), the new object inherits:
+When creating a file, directory, or special node inside a directory that has a
+default ACL (`system.posix_acl_default`), the new object inherits:
 
-- **For files**: an access ACL derived from the parent's default ACL, modified
-  by the creation mode (umask applied).
+- **For files and special nodes**: an access ACL derived from the parent's
+  default ACL, modified by the raw requested creation mode. When a parent
+  default ACL exists, Linux ignores process umask for this inheritance
+  calculation.
 - **For directories**: both an access ACL (as above) AND a copy of the parent's
   default ACL as the child's default ACL.
 
 ```
 function default_acl_inheritance_for_parent(
     parent_default: &[PosixAclEntry],  // decoded parent default ACL
-    creation_mode: u32,                 // mode with umask already applied
+    creation_mode: u32,                 // raw requested create/mkdir/mknod mode
     is_directory: bool,
 ) -> Vec<(key: &[u8], value: Vec<u8>)>:
 
@@ -408,11 +411,13 @@ function default_acl_inheritance_for_parent(
 
 **Key invariants**:
 - The access ACL always gets `chmod` applied after inheritance; the creation
-  mode (with umask) limits permissions.
+  mode supplied by the caller limits permissions.
+- The resulting visible mode is derived from the inherited access ACL.
 - The default ACL is copied unchanged to subdirectories; this is the mechanism
   for recursive ACL inheritance.
 - Empty parent default ACL → no xattrs set on child → traditional mode-based
-  permissions apply.
+  permissions apply, including normal umask handling before the mode-only
+  create.
 
 ## 7. Integration contracts
 
@@ -497,12 +502,16 @@ When `chmod(new_mode)` is called on an inode:
 
 ### 7.6 Create-with-inheritance hook
 
-When `create()` / `mkdir()` is called inside a directory:
+When `create()` / `mkdir()` / `mknod()` is called inside a directory:
 
 1. Read the parent directory's default ACL xattr.
-2. If present: call `default_acl_inheritance_for_parent()`.
-3. Write the resulting xattrs to the new child inode atomically with the
-   create transaction.
+2. If present: pass the raw requested mode to
+   `default_acl_inheritance_for_parent()`.
+3. Derive the child's visible permission bits from the inherited access ACL.
+4. Write the resulting xattrs and mode to the new child inode atomically with
+   the create transaction.
+5. If no parent default ACL exists, use the traditional umask-adjusted mode-only
+   create path.
 
 
 Before accepting a `setxattr` for `system.posix_acl_access` or
@@ -645,17 +654,21 @@ model and avoids the complexity of per-inode ACL state tracking.
 ### 11.6 Default ACL inheritance: access ACL gets chmod'd
 
 **Decision**: During file creation, the inherited access ACL is modified by
-`apply_chmod_to_acl()` using the creation mode (with umask applied).
+`apply_chmod_to_acl()` using the raw requested creation mode when the parent
+directory has a default ACL.
 
-**Rationale**: This ensures that the umask and explicit mode argument to
-`open()`/`creat()`/`mkdir()` are respected. Without this step, a default ACL
-with `USER_OBJ=rwx` would create world-writable files even when the caller
-specifies mode 0600.
+**Rationale**: This matches Linux default-ACL semantics. The process umask is
+ignored when a parent default ACL exists, but the explicit mode argument to
+`open()`/`creat()`/`mkdir()`/`mknod()` still limits the inherited access ACL.
+Without this step, a permissive default ACL could create broader permissions
+than the caller's requested mode allows.
 
 **Tradeoff**: The creation mode limits the inherited ACL but cannot expand it.
 If the default ACL specifies `USER_OBJ=r--` and the caller passes mode 0700,
 the resulting ACL has `USER_OBJ=r--`. This matches POSIX.1e semantics: the
-default ACL is an upper bound; the mode can only further restrict.
+default ACL is an upper bound; the mode can only further restrict. When the
+parent has no default ACL, TideFS follows the traditional umask-adjusted
+mode-only create path.
 
 ## 12. Wire-up checklist
 
@@ -666,7 +679,7 @@ documented here for completeness:
 |---|---|---|
 | 1 | Wire `getxattr`/`listxattr` for `system.posix_acl_*` in FUSE adapter | TBD |
 | 3 | Integrate ACL evaluation into VFS access() path | TBD |
-| 4 | Integrate default ACL inheritance into create()/mkdir() path | TBD |
+| 4 | Integrate default ACL inheritance into create()/mkdir()/mknod() path | TBD |
 | 5 | Add `setfacl`/`getfacl` CLI subcommands | TBD |
 | 7 | Cluster replication for ACL xattrs (namespace sync) | TBD |
 
@@ -828,16 +841,22 @@ Removing `system.posix_acl_default`:
 1. Call `XattrStore::remove("system.posix_acl_default")`.
 2. No mode change required (default ACLs do not affect current permissions).
 
-### 16.4 create/mkdir path
+### 16.4 create/mkdir/mknod local filesystem path
 
 During file creation:
 
 1. Look up parent directory's default ACL via `XattrStore::get("system.posix_acl_default")`.
-2. If present, decode and call `default_acl_inheritance_for_parent()`.
+2. If present, decode and call `default_acl_inheritance_for_parent()` with the
+   raw requested mode.
 3. Apply owner/group substitution to the inherited ACL entries.
-4. Store the resulting access ACL (and default ACL for directories) in the
-   new inode's xattr store.
-5. Set the ACL flag on the new inode.
+4. Derive the new inode's visible permission bits from the inherited access ACL.
+5. Store the resulting access ACL (and default ACL for directories) in the
+   new inode's xattr store as part of the local filesystem create transaction.
+6. Set the ACL flag on the new inode.
+
+The FUSE adapter must not perform a second adapter-local inheritance pass or
+follow-up `FATTR_MODE` chmod when the parent default ACL path was used, because
+that can overwrite the ACL computed by the local filesystem transaction.
 
 ## 17. Security considerations
 

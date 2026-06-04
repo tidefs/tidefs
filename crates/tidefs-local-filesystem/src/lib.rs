@@ -4734,7 +4734,23 @@ impl LocalFileSystem {
         let tick = self.bump_generation();
         let inode_id = self.allocate_inode_id();
         let generation = Generation::new(tick);
-        let new_mode = mode_for_kind(NodeKind::Dir, permissions);
+        let mut new_mode = mode_for_kind(NodeKind::Dir, permissions);
+        let mut xattrs = BTreeMap::new();
+        if let Some(ref acl_entries) = parent_default_acl_entries {
+            for (name, value) in tidefs_posix_acl::default_acl_inheritance_for_parent(
+                acl_entries,
+                new_mode,
+                true, // is_directory
+            ) {
+                if name == b"system.posix_acl_access" {
+                    if let Ok(access_acl) = tidefs_posix_acl::decode_posix_acl_xattr(&value) {
+                        new_mode =
+                            tidefs_posix_acl::posix_mode_from_access_acl(&access_acl, new_mode);
+                    }
+                }
+                xattrs.insert(name.to_vec(), value);
+            }
+        }
         let record = InodeRecord {
             rdev: 0,
             inode_id,
@@ -4748,19 +4764,7 @@ impl LocalFileSystem {
             data_version: tick,
             metadata_version: tick,
             posix_time: PosixTimeRecord::now(),
-            xattrs: {
-                let mut xattrs = BTreeMap::new();
-                if let Some(ref acl_entries) = parent_default_acl_entries {
-                    for (name, value) in tidefs_posix_acl::default_acl_inheritance_for_parent(
-                        acl_entries,
-                        new_mode,
-                        true, // is_directory
-                    ) {
-                        xattrs.insert(name.to_vec(), value);
-                    }
-                }
-                xattrs
-            },
+            xattrs,
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
@@ -7403,7 +7407,23 @@ impl LocalFileSystem {
             .and_then(|raw| tidefs_posix_acl::decode_posix_acl_xattr(raw).ok());
         let planned_tick = next_generation_after(self.state.generation);
         let planned_inode_id = InodeId::new(next_allocated_inode_id(&self.state));
-        let new_mode = mode_for_kind(kind, permissions);
+        let mut new_mode = mode_for_kind(kind, permissions);
+        let mut xattrs = BTreeMap::new();
+        if let Some(ref acl_entries) = parent_default_acl_entries {
+            for (name, value) in tidefs_posix_acl::default_acl_inheritance_for_parent(
+                acl_entries,
+                new_mode,
+                false, // is_directory
+            ) {
+                if name == b"system.posix_acl_access" {
+                    if let Ok(access_acl) = tidefs_posix_acl::decode_posix_acl_xattr(&value) {
+                        new_mode =
+                            tidefs_posix_acl::posix_mode_from_access_acl(&access_acl, new_mode);
+                    }
+                }
+                xattrs.insert(name.to_vec(), value);
+            }
+        }
         let record = InodeRecord {
             rdev: 0,
             inode_id: planned_inode_id,
@@ -7417,19 +7437,7 @@ impl LocalFileSystem {
             data_version: planned_tick,
             metadata_version: planned_tick,
             posix_time: PosixTimeRecord::now(),
-            xattrs: {
-                let mut xattrs = BTreeMap::new();
-                if let Some(ref acl_entries) = parent_default_acl_entries {
-                    for (name, value) in tidefs_posix_acl::default_acl_inheritance_for_parent(
-                        acl_entries,
-                        new_mode,
-                        false, // is_directory
-                    ) {
-                        xattrs.insert(name.to_vec(), value);
-                    }
-                }
-                xattrs
-            },
+            xattrs,
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,

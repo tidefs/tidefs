@@ -44,6 +44,44 @@ fn xattr_name_cstr(name: &str) -> CString {
     CString::new(name).expect("xattr name contains nul byte")
 }
 
+fn encoded_minimal_acl(mode: u32) -> Vec<u8> {
+    tidefs_posix_acl::encode_posix_acl_xattr(&tidefs_posix_acl::minimal_access_acl_from_mode(mode))
+}
+
+fn encoded_named_user_acl() -> Vec<u8> {
+    use tidefs_posix_acl::{
+        PosixAclEntry, ACL_GROUP_OBJ, ACL_MASK, ACL_OTHER, ACL_USER, ACL_USER_OBJ,
+    };
+
+    tidefs_posix_acl::encode_posix_acl_xattr(&[
+        PosixAclEntry {
+            tag: ACL_USER_OBJ,
+            perm: 6,
+            id: 0,
+        },
+        PosixAclEntry {
+            tag: ACL_USER,
+            perm: 4,
+            id: 1234,
+        },
+        PosixAclEntry {
+            tag: ACL_GROUP_OBJ,
+            perm: 0,
+            id: 0,
+        },
+        PosixAclEntry {
+            tag: ACL_MASK,
+            perm: 4,
+            id: 0,
+        },
+        PosixAclEntry {
+            tag: ACL_OTHER,
+            perm: 0,
+            id: 0,
+        },
+    ])
+}
+
 unsafe fn setxattr_raw(path: &CString, name: &CString, value: &[u8], flags: i32) -> io::Result<()> {
     let rc = libc::setxattr(
         path.as_ptr(),
@@ -219,11 +257,11 @@ fn system_posix_acl_access_set_get() {
     let path_c = path_cstr(&file_path);
     let name_c = xattr_name_cstr("system.posix_acl_access");
 
-    // Minimal valid ACL: owner read+write, group none, mask none, other none.
-    let acl_value: &[u8] = &[2, 0, 6, 0, 4, 0, 0, 0, 16, 0, 0, 0, 32, 0, 0, 0];
+    // Nontrivial ACL: includes a named user, so it cannot collapse to mode bits.
+    let acl_value = encoded_named_user_acl();
 
     unsafe {
-        setxattr_raw(&path_c, &name_c, acl_value, 0).expect("set system.posix_acl_access");
+        setxattr_raw(&path_c, &name_c, &acl_value, 0).expect("set system.posix_acl_access");
     }
 
     unsafe {
@@ -250,10 +288,10 @@ fn system_posix_acl_default_on_directory() {
     let path_c = path_cstr(&dir_path);
     let name_c = xattr_name_cstr("system.posix_acl_default");
 
-    let acl_value: &[u8] = &[2, 0, 7, 0, 4, 0, 5, 0, 16, 0, 5, 0, 32, 0, 0, 0];
+    let acl_value = encoded_minimal_acl(0o750);
 
     unsafe {
-        setxattr_raw(&path_c, &name_c, acl_value, 0)
+        setxattr_raw(&path_c, &name_c, &acl_value, 0)
             .expect("set system.posix_acl_default on directory");
     }
 
@@ -437,10 +475,10 @@ fn fsync_crash_system_xattr_persists() {
     let file_path = harness.mount_path().join("crash_xattr_sys.bin");
     let path_c = path_cstr(&file_path);
     let name_c = xattr_name_cstr("system.posix_acl_access");
-    let acl_value: &[u8] = &[2, 0, 6, 0, 4, 0, 0, 0, 16, 0, 0, 0, 32, 0, 0, 0];
+    let acl_value = encoded_named_user_acl();
 
     unsafe {
-        setxattr_raw(&path_c, &name_c, acl_value, 0)
+        setxattr_raw(&path_c, &name_c, &acl_value, 0)
             .expect("set system.posix_acl_access before crash");
     }
 
@@ -467,7 +505,7 @@ fn fsync_crash_system_xattr_persists() {
         assert_eq!(n, size);
         assert_eq!(
             &buf[..n],
-            acl_value,
+            acl_value.as_slice(),
             "system.posix_acl_access value should survive byte-for-byte"
         );
     }

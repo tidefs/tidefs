@@ -171,8 +171,8 @@ the engine `write()` path) to advance `mtime` and `ctime` uniformly.
 | FUSE fallocate (PUNCH_HOLE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE, default extend) | `fallocate()` | `apply_timestamp_update(…, Write)` after data mutation | Covered (#6543) |
 | FUSE fallocate (KEEP_SIZE only) | `fallocate()` | `apply_timestamp_update(…, MetadataChange)` | Covered (#6543) |
 | FUSE copy_file_range | `copy_file_range()` → `write()` | Chained through `write()` → `apply_timestamp_update(…, Write)` | Covered |
-| FUSE setattr/FATTR_SIZE (truncate, namespace path) | `setattr()` → namespace layer | Adapter sets mtime+ctime explicitly before engine dispatch | Covered |
-| FUSE setattr/FATTR_SIZE (truncate, non-namespace path) | `setattr()` → `apply_metadata_setattr()` | `apply_metadata_setattr` does not include FATTR_SIZE in its mask | **Nonclaim**: the current daemon always uses the namespace path. The non-namespace fallback would need explicit FATTR_SIZE timestamp rules in `apply_metadata_setattr` if ever exercised. |
+| FUSE setattr/FATTR_SIZE (truncate, mounted engine path) | `setattr()` → engine truncate + `apply_metadata_setattr()` | Engine metadata is authoritative; namespace attrs are mirrored only after successful engine mutation | Covered |
+| FUSE setattr/FATTR_SIZE (namespace-only fallback) | namespace layer | Namespace metadata updates are used only when the engine cannot resolve the inode | **Fallback**: legacy namespace-only test surfaces remain supported, but mounted mutations must not use stale namespace attrs as the permission or timestamp authority. |
 | `fuse_write.rs` `FuseWriteDispatch` | N/A (direct inode-table manipulation) | Own `update_inode_after_write` with saturating mtime increment, no ctime authority | **Nonclaim**: this module is not wired into the FUSE daemon. Its timestamp logic is separate from the canonical authority. |
 
 ### Regression guard

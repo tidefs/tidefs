@@ -4,8 +4,9 @@
 //! Gated behind the `local-fs-persist` feature flag.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
-use tidefs_local_filesystem::LocalFileSystem;
+use tidefs_local_filesystem::{LocalFileSystem, PosixTimeRecord};
 use tidefs_types_vfs_core::{
     Generation, InodeId, NodeFacets, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
     S_IFSOCK,
@@ -119,6 +120,12 @@ fn attrs_to_inode_record(
         size: attrs.size,
         data_version: 0,
         metadata_version: 0,
+        posix_time: PosixTimeRecord::new(
+            system_time_to_ns(attrs.atime),
+            system_time_to_ns(attrs.mtime),
+            system_time_to_ns(attrs.ctime),
+            system_time_to_ns(attrs.ctime),
+        ),
         xattr_storage_kind: 0,
         xattrs: std::collections::BTreeMap::new(),
         dir_rev: 0,
@@ -134,10 +141,28 @@ fn inode_record_to_attrs(record: &tidefs_local_filesystem::InodeRecord) -> Inode
         gid: record.gid,
         size: record.size,
         nlink: record.nlink,
-        atime: std::time::SystemTime::UNIX_EPOCH,
-        mtime: std::time::SystemTime::UNIX_EPOCH,
-        ctime: std::time::SystemTime::UNIX_EPOCH,
+        atime: ns_to_system_time(record.posix_time.atime_ns),
+        mtime: ns_to_system_time(record.posix_time.mtime_ns),
+        ctime: ns_to_system_time(record.posix_time.ctime_ns),
         rdev: record.rdev,
+    }
+}
+
+fn system_time_to_ns(time: SystemTime) -> i64 {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos().try_into().unwrap_or(i64::MAX),
+        Err(error) => {
+            let nanos: i64 = error.duration().as_nanos().try_into().unwrap_or(i64::MAX);
+            -nanos
+        }
+    }
+}
+
+fn ns_to_system_time(ns: i64) -> SystemTime {
+    if ns >= 0 {
+        SystemTime::UNIX_EPOCH + Duration::from_nanos(ns as u64)
+    } else {
+        SystemTime::UNIX_EPOCH - Duration::from_nanos(ns.unsigned_abs())
     }
 }
 
@@ -354,7 +379,7 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
             return Ok((Vec::new(), cookie));
         }
         let end = total.min(skip + page_size);
-        let next_cookie = if end >= total { cookie } else { end as u64 };
+        let next_cookie = end as u64;
         Ok((p_entries[skip..end].to_vec(), next_cookie))
     }
 
@@ -663,6 +688,40 @@ mod integration_tests {
                 .expect("listed special node");
             assert_eq!(entry.kind, kind, "wrong kind for {name:?}");
         }
+
+        drop(dir_store);
+        drop(inode_store);
+        finish_bridge_conversion_test(fs);
+    }
+
+    #[test]
+    fn real_directory_store_full_final_page_advances_cookie() {
+        let temp = tempfile::TempDir::with_prefix("tidefs-ns-cookie-").unwrap();
+        let fs = test_fs(&temp);
+        let inode_store = LocalFilesystemInodeStore::new(Arc::clone(&fs));
+        let dir_store = LocalFilesystemDirectoryStore::new(Arc::clone(&fs));
+
+        for i in 0..126u64 {
+            let name = format!("entry_{i:03}");
+            let (ino, generation) = inode_store.alloc_inode(&test_attrs_file()).unwrap();
+            dir_store
+                .insert(
+                    ROOT_INODE,
+                    name.as_bytes(),
+                    ino,
+                    generation,
+                    crate::KIND_FILE,
+                )
+                .unwrap();
+        }
+
+        let (entries, next_cookie) = dir_store.list_dir(ROOT_INODE, 0).unwrap();
+        assert_eq!(entries.len(), 128);
+        assert_eq!(next_cookie, 128);
+
+        let (tail, tail_cookie) = dir_store.list_dir(ROOT_INODE, next_cookie).unwrap();
+        assert!(tail.is_empty());
+        assert_eq!(tail_cookie, next_cookie);
 
         drop(dir_store);
         drop(inode_store);
