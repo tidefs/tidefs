@@ -185,9 +185,13 @@ passes `generic/192`. A focused patched-tree run at
 `/root/ai/tmp/tidefs-validation/fuse-generic-169-20260603T192830Z-fsgetxattr.json`
 passes `generic/169` after `FS_IOC_FSGETXATTR` reports a Linux-shaped empty
 `struct fsxattr` and the xfstests helper keeps a stable per-device backing
-store across remounts. The remaining #6590 FUSE product defect is
-`generic/198`, exposing AIO sparse-file `Bus error` behavior. This is
-classification
+store across remounts. A focused patched-tree rerun at
+`/root/ai/tmp/tidefs-validation/fuse-generic-198-20260604T004023Z-final.json`
+passes `generic/198` with `passed=12`, `failed=0`, `blocked=0`,
+`unsupported=0`, and `skipped=0` after sparse same-size direct-write overlays,
+open-unlink sparse anonymous data, deferred O_DIRECT flush behavior, and
+empty-mountpoint cleanup landed. This does not turn the original #6590 tranche
+into an all-pass run and is not TFR-018 closure.
 
 On commit `2bb253a6`, after the FUSE xfstests guest started using the
 coreutils `mv` binary instead of the BusyBox applet, an outside-sandbox

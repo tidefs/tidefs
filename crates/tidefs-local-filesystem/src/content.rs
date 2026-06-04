@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::vec;
 
@@ -443,6 +444,145 @@ pub(crate) fn write_chunked_content(
     Ok(())
 }
 
+fn write_same_size_sparse_overlay(
+    dedup_enabled: bool,
+    store: &mut LocalObjectStore,
+    old_layout: &ContentLayout,
+    old_manifest: &ContentManifestObject,
+    old_record: &InodeRecord,
+    new_record: &InodeRecord,
+    overlay_offset: u64,
+    overlay_bytes: &[u8],
+    dedup_index: &mut DedupIndex,
+    mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    compression_policy: &ContentCompressionPolicy,
+) -> Result<()> {
+    let chunk_count = content_chunk_count(new_record.size)?;
+    let mut chunks_by_index = BTreeMap::new();
+    for old_ref in &old_manifest.chunks {
+        if old_ref.chunk_index >= chunk_count {
+            continue;
+        }
+        let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
+        if old_ref.len != new_len {
+            continue;
+        }
+        let chunk_start = content_chunk_start(old_ref.chunk_index)?;
+        let chunk_end =
+            chunk_start
+                .checked_add(u64::from(new_len))
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+        if range_intersects_overlay(chunk_start, chunk_end, overlay_offset, overlay_bytes)? {
+            continue;
+        }
+        chunks_by_index.insert(old_ref.chunk_index, old_ref.clone());
+    }
+
+    let Some((first_overlay_chunk, last_overlay_chunk)) =
+        overlay_chunk_index_bounds(new_record.size, overlay_offset, overlay_bytes.len())?
+    else {
+        return Ok(());
+    };
+
+    for chunk_index in first_overlay_chunk..=last_overlay_chunk {
+        let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
+        let mut chunk_bytes = vec![0_u8; chunk_len];
+        copy_old_content_into_chunk(
+            store,
+            old_layout,
+            old_record.size,
+            chunk_index,
+            &mut chunk_bytes,
+        )?;
+        overlay_chunk_bytes(chunk_index, overlay_offset, overlay_bytes, &mut chunk_bytes)?;
+
+        let per_inode_key = content_chunk_object_key_for_version(
+            new_record.inode_id,
+            new_record.data_version,
+            chunk_index,
+        );
+        let encoded = if dedup_enabled {
+            let fingerprint = crate::encoding::compute_content_fingerprint(&chunk_bytes);
+            if let Some(canonical_key) = dedup_index.lookup(&fingerprint) {
+                if store.contains_key(canonical_key) {
+                    dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    crate::encoding::encode_dedup_redirect(canonical_key)
+                } else {
+                    dedup_index.remove(&fingerprint);
+                    let canon_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+                    let enc = encode_content_chunk(
+                        new_record,
+                        chunk_index,
+                        &chunk_bytes,
+                        compression_policy,
+                    );
+                    store.put(canon_key, &enc)?;
+                    dedup_index.insert(fingerprint, canon_key);
+                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::encoding::encode_dedup_redirect(canon_key)
+                }
+            } else {
+                let canon_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+                if store.contains_key(canon_key) {
+                    dedup_index.insert(fingerprint, canon_key);
+                    dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    crate::encoding::encode_dedup_redirect(canon_key)
+                } else {
+                    let enc = encode_content_chunk(
+                        new_record,
+                        chunk_index,
+                        &chunk_bytes,
+                        compression_policy,
+                    );
+                    store.put(canon_key, &enc)?;
+                    if let Some(ref mut qs) = quorum_store {
+                        let _ = qs.quorum_put(canon_key, &enc);
+                    }
+                    dedup_index.insert(fingerprint, canon_key);
+                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::encoding::encode_dedup_redirect(canon_key)
+                }
+            }
+        } else {
+            encode_content_chunk(new_record, chunk_index, &chunk_bytes, compression_policy)
+        };
+        dedup_index.record_chunk_written();
+        let checksum = checksum64(&encoded);
+        store.put(per_inode_key, &encoded)?;
+        if let Some(ref mut qs) = quorum_store {
+            let _ = qs.quorum_put(per_inode_key, &encoded);
+        }
+        chunks_by_index.insert(
+            chunk_index,
+            ContentChunkRef {
+                chunk_index,
+                data_version: new_record.data_version,
+                len: chunk_bytes.len() as u32,
+                checksum,
+            },
+        );
+    }
+
+    let manifest = ContentManifestObject {
+        inode_id: new_record.inode_id,
+        data_version: new_record.data_version,
+        file_size: new_record.size,
+        chunk_size: content_chunk_size(),
+        chunks: chunks_by_index.into_values().collect(),
+    };
+    let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
+    let manifest_encoded = encode_content_manifest_sparse(&manifest);
+    store.put(manifest_key, &manifest_encoded)?;
+    if let Some(ref mut qs) = quorum_store {
+        let _ = qs.quorum_put(manifest_key, &manifest_encoded);
+    }
+    Ok(())
+}
+
 pub(crate) fn write_chunked_content_with_overlay(
     request: WriteChunkedContentOverlay<'_>,
 ) -> Result<()> {
@@ -460,6 +600,23 @@ pub(crate) fn write_chunked_content_with_overlay(
         compression_policy,
     } = request;
     let old_layout = read_content_layout_from_store(store, inode_id, old_record, true)?;
+    if allow_holes && old_record.size == new_record.size && !overlay_bytes.is_empty() {
+        if let ContentLayout::Chunked(ref old_manifest) = old_layout {
+            return write_same_size_sparse_overlay(
+                dedup_enabled,
+                store,
+                &old_layout,
+                old_manifest,
+                old_record,
+                new_record,
+                overlay_offset,
+                overlay_bytes,
+                dedup_index,
+                quorum_store,
+                compression_policy,
+            );
+        }
+    }
     let chunk_count = content_chunk_count(new_record.size)?;
     let mut chunks = Vec::new();
     for chunk_index in 0..chunk_count {
@@ -957,6 +1114,33 @@ pub(crate) fn range_intersects_overlay(
             requested: u64::MAX,
         })?;
     Ok(!overlay_bytes.is_empty() && start < overlay_end && overlay_offset < end)
+}
+
+pub(crate) fn overlay_chunk_index_bounds(
+    file_size: u64,
+    overlay_offset: u64,
+    overlay_len: usize,
+) -> Result<Option<(u64, u64)>> {
+    if file_size == 0 || overlay_len == 0 || overlay_offset >= file_size {
+        return Ok(None);
+    }
+    let overlay_len = u64::try_from(overlay_len).map_err(|_| FileSystemError::SizeOverflow {
+        requested: u64::MAX,
+    })?;
+    let overlay_end = overlay_offset
+        .checked_add(overlay_len)
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?
+        .min(file_size);
+    if overlay_end <= overlay_offset {
+        return Ok(None);
+    }
+    let chunk_size = content_chunk_size() as u64;
+    Ok(Some((
+        overlay_offset / chunk_size,
+        (overlay_end - 1) / chunk_size,
+    )))
 }
 
 /// Find a chunk reference in a (possibly sparse) manifest by chunk_index.

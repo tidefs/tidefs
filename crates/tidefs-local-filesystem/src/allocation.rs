@@ -6,8 +6,8 @@ use tidefs_types_vfs_core::{InodeId, ROOT_INODE_ID};
 use crate::constants::*;
 use crate::content::{
     content_chunk_count, content_chunk_len, content_chunk_start, decode_content_layout,
-    find_chunk_in_manifest, range_intersects_overlay, read_content_layout_from_store,
-    retained_content_chunk_ref, validate_content_layout,
+    find_chunk_in_manifest, overlay_chunk_index_bounds, range_intersects_overlay,
+    read_content_layout_from_store, retained_content_chunk_ref, validate_content_layout,
 };
 use crate::error::FileSystemError;
 use crate::object_keys::{content_chunk_object_key_for_version, content_object_key_for_version};
@@ -116,6 +116,63 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
 ) -> Result<BTreeMap<ObjectKey, u64>> {
     let old_layout = read_content_layout_from_store(store, old_record.inode_id, old_record, true)?;
     let mut entries = BTreeMap::new();
+    if allow_holes && old_record.size == new_record.size && !overlay_bytes.is_empty() {
+        if let crate::records::ContentLayout::Chunked(ref manifest) = old_layout {
+            for old_ref in &manifest.chunks {
+                if old_ref.is_hole() {
+                    continue;
+                }
+                let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
+                if old_ref.len != new_len {
+                    continue;
+                }
+                let chunk_start = content_chunk_start(old_ref.chunk_index)?;
+                let chunk_end = chunk_start.checked_add(u64::from(new_len)).ok_or(
+                    FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    },
+                )?;
+                if range_intersects_overlay(chunk_start, chunk_end, overlay_offset, overlay_bytes)?
+                {
+                    continue;
+                }
+                let grains = allocation_grains_for_len(u64::from(old_ref.len))?;
+                debug_assert!(
+                    grains % content_chunk_size() as u64 == 0,
+                    "retained sparse overlay chunk allocation grains must be grain-aligned"
+                );
+                entries.insert(
+                    content_chunk_object_key_for_version(
+                        new_record.inode_id,
+                        old_ref.data_version,
+                        old_ref.chunk_index,
+                    ),
+                    grains,
+                );
+            }
+            if let Some((first_overlay_chunk, last_overlay_chunk)) =
+                overlay_chunk_index_bounds(new_record.size, overlay_offset, overlay_bytes.len())?
+            {
+                for chunk_index in first_overlay_chunk..=last_overlay_chunk {
+                    let len = content_chunk_len(new_record.size, chunk_index)?;
+                    let grains = allocation_grains_for_len(u64::from(len))?;
+                    debug_assert!(
+                        grains % content_chunk_size() as u64 == 0,
+                        "new sparse overlay chunk allocation grains must be grain-aligned"
+                    );
+                    entries.insert(
+                        content_chunk_object_key_for_version(
+                            new_record.inode_id,
+                            new_record.data_version,
+                            chunk_index,
+                        ),
+                        grains,
+                    );
+                }
+            }
+            return Ok(entries);
+        }
+    }
     for chunk_index in 0..content_chunk_count(new_record.size)? {
         if let Some(retained) = retained_content_chunk_ref(
             &old_layout,
@@ -125,6 +182,9 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
             overlay_bytes,
             chunk_index,
         )? {
+            if retained.is_hole() {
+                continue;
+            }
             let grains = allocation_grains_for_len(u64::from(retained.len))?;
             debug_assert!(
                 grains % content_chunk_size() as u64 == 0,
@@ -189,7 +249,12 @@ pub(crate) fn dirty_overlay_allocation_bytes(
     }
 
     let mut total = 0_u64;
-    for chunk_index in 0..content_chunk_count(new_size)? {
+    let Some((first_overlay_chunk, last_overlay_chunk)) =
+        overlay_chunk_index_bounds(new_size, overlay_offset, overlay_bytes.len())?
+    else {
+        return Ok(0);
+    };
+    for chunk_index in first_overlay_chunk..=last_overlay_chunk {
         let chunk_start = content_chunk_start(chunk_index)?;
         let chunk_len = content_chunk_len(new_size, chunk_index)?;
         let chunk_end =

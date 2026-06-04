@@ -5171,8 +5171,9 @@ impl FuseVfsAdapter {
 
         // ── POSIX O_DIRECT alignment and write path ──────────────────────
         // FOPEN_DIRECT_IO only tells the kernel to bypass its page cache.
-        // POSIX O_DIRECT is stricter: sector alignment and synchronous flush
-        // before returning to the caller.
+        // POSIX O_DIRECT is stricter about sector alignment, but it is not
+        // O_SYNC/O_DSYNC: durability still belongs to explicit sync/flush
+        // boundaries.
         let posix_direct_io = (resolved_open_flags & libc::O_DIRECT as u32) != 0
             || (request_open_flags & libc::O_DIRECT as u32) != 0;
 
@@ -5239,9 +5240,12 @@ impl FuseVfsAdapter {
                         let wrote_data = written > 0;
                         if written > 0 {
                             if posix_direct_io {
-                                // O_DIRECT implies O_SYNC: flush before returning.
-                                // Bypass dirty-page tracking and writeback entirely.
-                                let _ = e.flush(write_efh, ctx);
+                                // Direct I/O bypasses the adapter page cache.
+                                // The engine write is authoritative for
+                                // read-after-write; flush/fsync/close publish
+                                // it instead of forcing every O_DIRECT write
+                                // through a committed-root cycle.
+                                self.invalidate_caches_after_direct_write(ino);
                             } else {
                                 self.mark_dirty_after_write(
                                     ino,
@@ -5320,9 +5324,9 @@ impl FuseVfsAdapter {
                     .lock()
                     .unwrap()
                     .record_write_buf(written);
-                // Direct I/O conflict guard: clear dirty ranges that were
-                // made durable by this direct write+flush, so the writeback
-                // dirty_state stays coherent with on-disk state.
+                // Direct I/O conflict guard: clear stale cached dirty ranges
+                // covered by this authoritative direct write, so later
+                // writeback cannot replay old page-cache bytes over it.
                 if posix_direct_io {
                     let mut ds = self.dirty_state.lock().unwrap();
                     if let Some(dr) = ds.get_mut(&ino) {
@@ -5343,7 +5347,8 @@ impl FuseVfsAdapter {
             // handles this via dispatch_fsync_file; we mirror it here
             // for the writeback-cached path so synchronous writes are
             // durable regardless of cache mode.
-            // O_DIRECT writes are handled inline above (implied O_SYNC flush).
+            // O_DIRECT writes bypass adapter page-cache staging above; explicit
+            // O_SYNC/O_DSYNC remains the durability boundary here.
             if !posix_direct_io {
                 if let Some(datasync) = sync_datasync {
                     let sync_result =
@@ -5374,9 +5379,12 @@ impl FuseVfsAdapter {
                         let wrote_data = written > 0;
                         if written > 0 {
                             if posix_direct_io {
-                                // O_DIRECT implies O_SYNC: flush before returning.
-                                // Bypass dirty-page tracking and writeback entirely.
-                                let _ = e.flush(&efh, ctx);
+                                // Direct I/O bypasses the adapter page cache.
+                                // The engine write is authoritative for
+                                // read-after-write; flush/fsync/close publish
+                                // it instead of forcing every O_DIRECT write
+                                // through a committed-root cycle.
+                                self.invalidate_caches_after_direct_write(ino);
                             } else {
                                 self.mark_dirty_after_write(
                                     ino,
@@ -5403,8 +5411,6 @@ impl FuseVfsAdapter {
                                 }
                             }
                             post_write_attr = e.getattr(InodeId::new(ino), Some(&efh), ctx).ok();
-                        }
-                        if written > 0 {
                             // Record write intent before acknowledging to kernel.
                             if self.intent_log_write_enabled {
                                 if let Some(ref buf) = self.intent_log_buffer {
@@ -5424,9 +5430,11 @@ impl FuseVfsAdapter {
                                     }
                                 }
                             }
-                            // Direct I/O conflict guard: clear dirty ranges that were
-                            // made durable by this direct write+flush, so the writeback
-                            // dirty_state stays coherent with on-disk state.
+                            // Direct I/O conflict guard: clear stale
+                            // cached dirty ranges covered by this
+                            // authoritative direct write, so later
+                            // writeback cannot replay old page-cache
+                            // bytes over it.
                             if posix_direct_io {
                                 let mut ds = self.dirty_state.lock().unwrap();
                                 if let Some(dr) = ds.get_mut(&ino) {
@@ -5455,7 +5463,8 @@ impl FuseVfsAdapter {
             // O_SYNC / O_DSYNC durability: when the file descriptor was opened
             // with O_SYNC or O_DSYNC, each write must be durable before the
             // syscall returns to userspace (POSIX synchronous I/O semantics).
-            // O_DIRECT writes are handled inline above (implied O_SYNC flush).
+            // O_DIRECT writes bypass adapter page-cache staging above; explicit
+            // O_SYNC/O_DSYNC remains the durability boundary here.
             if !posix_direct_io && write_result.is_ok() {
                 if let Some(datasync) = sync_datasync {
                     self.dispatch_fsync_file(ctx, ino, fh, datasync)?;
@@ -5463,6 +5472,25 @@ impl FuseVfsAdapter {
             }
             write_result
         }
+    }
+
+    /// Invalidate adapter-side caches after a direct engine write.
+    ///
+    /// O_DIRECT bypasses page-cache/writeback staging but still changes
+    /// engine-visible file bytes and possibly size. Readers through another
+    /// handle must not observe stale cached data.
+    fn invalidate_caches_after_direct_write(&self, ino: u64) {
+        if let Ok(mut cache) = self.page_cache.lock() {
+            cache.invalidate(ino);
+        }
+        if let Some(ref rd) = self.fuse_read_dispatch {
+            rd.page_cache().remove_pages_for_inode(ino);
+        }
+        {
+            let mut cache = self.getattr_cache.lock().unwrap();
+            cache.remove(&ino);
+        }
+        self.path_lookup_cache.lock().unwrap().remove_by_ino(ino);
     }
 
     /// Track dirty pages after a write: update writeback scheduler,
@@ -6570,7 +6598,9 @@ impl FuseVfsAdapter {
                 let ds = self.dirty_state.lock().unwrap();
                 ds.get(&ino).map(|dr| !dr.is_empty()).unwrap_or(false)
             };
-            if is_dirty {
+            let direct_flush = (efh.open_flags & libc::O_DIRECT as u32) != 0
+                || (flags & libc::O_DIRECT as u32) != 0;
+            if is_dirty || direct_flush {
                 let e = self.engine.lock().unwrap();
                 // Ignore flush errors during release; the kernel already
                 // decided to close the file. Engine-level errors are logged
@@ -31746,6 +31776,8 @@ mod tests {
         attr: Result<InodeAttr, Errno>,
         acl_xattr: Result<Vec<u8>, Errno>,
         open_result: Result<EngineFileHandle, Errno>,
+        write_result: Result<u32, Errno>,
+        flush_result: Result<(), Errno>,
         create_result: Result<(InodeAttr, EngineFileHandle), Errno>,
         mkdir_result: Result<InodeAttr, Errno>,
     }
@@ -31757,6 +31789,8 @@ mod tests {
                 attr: Err(Errno::ENOSYS),
                 acl_xattr: Err(Errno::ENOSYS),
                 open_result: Err(Errno::ENOSYS),
+                write_result: Err(Errno::ENOSYS),
+                flush_result: Err(Errno::ENOSYS),
                 create_result: Err(Errno::ENOSYS),
                 mkdir_result: Err(Errno::ENOSYS),
             }
@@ -31815,6 +31849,16 @@ mod tests {
                 FileHandleId::new(100),
                 0,
             ));
+            self
+        }
+
+        fn with_write_ok(mut self, written: u32) -> Self {
+            self.write_result = Ok(written);
+            self
+        }
+
+        fn with_flush_error(mut self, errno: Errno) -> Self {
+            self.flush_result = Err(errno);
             self
         }
 
@@ -31982,10 +32026,10 @@ mod tests {
             data: &[u8],
             ctx: &RequestCtx,
         ) -> Result<u32, Errno> {
-            Err(Errno::ENOSYS)
+            self.write_result
         }
         fn flush(&self, fh: &EngineFileHandle, ctx: &RequestCtx) -> Result<(), Errno> {
-            Err(Errno::ENOSYS)
+            self.flush_result
         }
         fn fsync(
             &self,
@@ -34862,6 +34906,27 @@ mod tests {
             .dispatch_write(&ctx, inode.get(), open.adapter_fh, 0, &[], 0)
             .expect("zero-length write");
         assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn direct_io_write_defers_flush_error_to_flush_boundary() {
+        let ctx = root_ctx();
+        let engine = AclMockEngine::new()
+            .with_root(1)
+            .with_attr(0, 0, 0o666)
+            .with_no_acl()
+            .with_open_ok()
+            .with_write_ok(512)
+            .with_flush_error(Errno::EIO);
+        let mut adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
+        let open = adapter
+            .dispatch_open_entry(&ctx, 1, libc::O_RDWR as u32 | libc::O_DIRECT as u32)
+            .expect("open O_DIRECT");
+
+        let result = adapter.dispatch_write(&ctx, 1, open.adapter_fh, 0, &[0x5a; 512], 0);
+        assert_eq!(result, Ok(512));
+        let flush_result = adapter.dispatch_flush(&ctx, 1, open.adapter_fh, 0);
+        assert_eq!(flush_result, Err(Errno::EIO));
     }
 
     // ── Defrag ioctl tests ──────────────────────────────────────────────

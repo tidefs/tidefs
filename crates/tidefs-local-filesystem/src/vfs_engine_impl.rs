@@ -22,6 +22,9 @@ use tidefs_types_vfs_core::{
 use tidefs_types_vfs_core::{LockRange, LockType};
 use tidefs_vfs_engine::{LseekDataRange, VfsEngine, VfsEngineStatFs};
 
+use crate::content::{
+    content_chunk_start, read_content_chunk_from_store, read_content_layout_from_store,
+};
 use crate::error::FileSystemError;
 use crate::fuse_getattr;
 use crate::fuse_setattr;
@@ -32,6 +35,7 @@ use crate::readahead::ReadaheadTracker;
 use crate::release_dispatch;
 use crate::types::{InodeRecord, NamespaceEntry};
 use crate::xattr_dispatch;
+use crate::ContentLayout;
 use tidefs_inode_attributes::timestamp::{TimestampPolicy, TimestampUpdate};
 use tidefs_posix_semantics::apply_setgid_inheritance_for_create;
 use tidefs_posix_semantics::sticky_dir_allows_unlink_or_rename;
@@ -147,7 +151,303 @@ pub struct VfsLocalFileSystem {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AnonymousTmpfile {
     attr: InodeAttr,
-    data: Vec<u8>,
+    data: SparseAnonymousData,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SparseAnonymousData {
+    extents: BTreeMap<u64, Vec<u8>>,
+}
+
+impl SparseAnonymousData {
+    fn new() -> Self {
+        Self {
+            extents: BTreeMap::new(),
+        }
+    }
+
+    fn from_vec(bytes: Vec<u8>) -> Self {
+        let mut data = Self::new();
+        data.insert_if_data(0, bytes);
+        data
+    }
+
+    fn from_local_file(fs: &LocalFileSystem, record: &InodeRecord) -> crate::Result<Self> {
+        let layout = read_content_layout_from_store(
+            fs.store.raw_primary_store(),
+            record.inode_id,
+            record,
+            true,
+        )?;
+        match layout {
+            ContentLayout::Inline(content) => Ok(Self::from_vec(content.bytes)),
+            ContentLayout::Chunked(manifest) => {
+                let mut data = Self::new();
+                for chunk_ref in manifest
+                    .chunks
+                    .iter()
+                    .filter(|chunk_ref| !chunk_ref.is_hole())
+                {
+                    let chunk = read_content_chunk_from_store(
+                        fs.store.raw_primary_store(),
+                        record.inode_id,
+                        chunk_ref,
+                    )?;
+                    let offset = content_chunk_start(chunk_ref.chunk_index)?;
+                    data.insert_if_data(offset, chunk.bytes);
+                }
+                Ok(data)
+            }
+        }
+    }
+
+    fn insert_if_data(&mut self, offset: u64, bytes: Vec<u8>) {
+        if !bytes.is_empty() && bytes.iter().any(|&byte| byte != 0) {
+            self.extents.insert(offset, bytes);
+        }
+    }
+
+    fn read_at(
+        &self,
+        offset: u64,
+        size: u32,
+        file_size: u64,
+    ) -> std::result::Result<Vec<u8>, Errno> {
+        if size == 0 || offset >= file_size {
+            return Ok(Vec::new());
+        }
+        let requested_end = offset.checked_add(u64::from(size)).ok_or(Errno::EFBIG)?;
+        let end = requested_end.min(file_size);
+        let len = usize::try_from(end - offset).map_err(|_| Errno::EFBIG)?;
+        let mut out = vec![0_u8; len];
+        for (&extent_start, bytes) in self.extents.range(..end) {
+            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
+            let extent_end = extent_start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
+            if extent_end <= offset {
+                continue;
+            }
+            let copy_start = extent_start.max(offset);
+            let copy_end = extent_end.min(end);
+            if copy_start >= copy_end {
+                continue;
+            }
+            let src = usize::try_from(copy_start - extent_start).map_err(|_| Errno::EFBIG)?;
+            let dst = usize::try_from(copy_start - offset).map_err(|_| Errno::EFBIG)?;
+            let copy_len = usize::try_from(copy_end - copy_start).map_err(|_| Errno::EFBIG)?;
+            out[dst..dst + copy_len].copy_from_slice(&bytes[src..src + copy_len]);
+        }
+        Ok(out)
+    }
+
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::result::Result<u64, Errno> {
+        let len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
+        let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
+        self.clear_range(offset, end)?;
+        if bytes.iter().any(|&byte| byte != 0) {
+            self.extents.insert(offset, bytes.to_vec());
+        }
+        Ok(end)
+    }
+
+    fn clear_range(&mut self, start: u64, end: u64) -> std::result::Result<(), Errno> {
+        if start >= end {
+            return Ok(());
+        }
+        let keys = self
+            .extents
+            .range(..end)
+            .filter_map(|(&extent_start, bytes)| {
+                let extent_len = u64::try_from(bytes.len()).ok()?;
+                let extent_end = extent_start.checked_add(extent_len)?;
+                (extent_end > start).then_some(extent_start)
+            })
+            .collect::<Vec<_>>();
+        for extent_start in keys {
+            let Some(bytes) = self.extents.remove(&extent_start) else {
+                continue;
+            };
+            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
+            let extent_end = extent_start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
+            if extent_start < start {
+                let prefix_len = usize::try_from(start - extent_start).map_err(|_| Errno::EFBIG)?;
+                self.insert_if_data(extent_start, bytes[..prefix_len].to_vec());
+            }
+            if extent_end > end {
+                let suffix_start = usize::try_from(end - extent_start).map_err(|_| Errno::EFBIG)?;
+                self.insert_if_data(end, bytes[suffix_start..].to_vec());
+            }
+        }
+        Ok(())
+    }
+
+    fn truncate(&mut self, size: u64) -> std::result::Result<(), Errno> {
+        let keys = self.extents.keys().copied().collect::<Vec<_>>();
+        for start in keys {
+            let Some(bytes) = self.extents.remove(&start) else {
+                continue;
+            };
+            if start >= size {
+                continue;
+            }
+            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
+            let extent_end = start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
+            if extent_end <= size {
+                self.insert_if_data(start, bytes);
+            } else {
+                let keep = usize::try_from(size - start).map_err(|_| Errno::EFBIG)?;
+                self.insert_if_data(start, bytes[..keep].to_vec());
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_zeros(
+        &mut self,
+        offset: u64,
+        length: u64,
+        file_size: u64,
+    ) -> std::result::Result<u64, Errno> {
+        let end = offset.checked_add(length).ok_or(Errno::EFBIG)?;
+        if offset >= file_size {
+            return Ok(end);
+        }
+        let mut shifted = BTreeMap::new();
+        for (start, bytes) in std::mem::take(&mut self.extents) {
+            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
+            let extent_end = start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
+            if extent_end <= offset {
+                if bytes.iter().any(|&byte| byte != 0) {
+                    shifted.insert(start, bytes);
+                }
+            } else if start >= offset {
+                let new_start = start.checked_add(length).ok_or(Errno::EFBIG)?;
+                if bytes.iter().any(|&byte| byte != 0) {
+                    shifted.insert(new_start, bytes);
+                }
+            } else {
+                let prefix_len = usize::try_from(offset - start).map_err(|_| Errno::EFBIG)?;
+                let suffix_start = offset.checked_add(length).ok_or(Errno::EFBIG)?;
+                let suffix = bytes[prefix_len..].to_vec();
+                let prefix = bytes[..prefix_len].to_vec();
+                if prefix.iter().any(|&byte| byte != 0) {
+                    shifted.insert(start, prefix);
+                }
+                if suffix.iter().any(|&byte| byte != 0) {
+                    shifted.insert(suffix_start, suffix);
+                }
+            }
+        }
+        self.extents = shifted;
+        file_size.checked_add(length).ok_or(Errno::EFBIG)
+    }
+
+    fn collapse_range(
+        &mut self,
+        offset: u64,
+        length: u64,
+        file_size: u64,
+    ) -> std::result::Result<u64, Errno> {
+        if offset >= file_size || length == 0 {
+            return Ok(file_size);
+        }
+        let end = offset
+            .checked_add(length)
+            .unwrap_or(u64::MAX)
+            .min(file_size);
+        let removed = end.saturating_sub(offset);
+        if removed == 0 {
+            return Ok(file_size);
+        }
+        let mut shifted = BTreeMap::new();
+        for (start, bytes) in std::mem::take(&mut self.extents) {
+            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
+            let extent_end = start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
+            if extent_end <= offset {
+                if bytes.iter().any(|&byte| byte != 0) {
+                    shifted.insert(start, bytes);
+                }
+            } else if start >= end {
+                let new_start = start.checked_sub(removed).ok_or(Errno::EIO)?;
+                if bytes.iter().any(|&byte| byte != 0) {
+                    shifted.insert(new_start, bytes);
+                }
+            } else {
+                if start < offset {
+                    let prefix_len = usize::try_from(offset - start).map_err(|_| Errno::EFBIG)?;
+                    let prefix = bytes[..prefix_len].to_vec();
+                    if prefix.iter().any(|&byte| byte != 0) {
+                        shifted.insert(start, prefix);
+                    }
+                }
+                if extent_end > end {
+                    let suffix_start = usize::try_from(end - start).map_err(|_| Errno::EFBIG)?;
+                    let new_start = if start < offset {
+                        offset
+                    } else {
+                        start.checked_sub(removed).ok_or(Errno::EIO)?
+                    };
+                    let suffix = bytes[suffix_start..].to_vec();
+                    if suffix.iter().any(|&byte| byte != 0) {
+                        shifted.insert(new_start, suffix);
+                    }
+                }
+            }
+        }
+        self.extents = shifted;
+        Ok(file_size - removed)
+    }
+
+    fn data_ranges(
+        &self,
+        offset: u64,
+        length: u64,
+        file_size: u64,
+    ) -> std::result::Result<Vec<LseekDataRange>, Errno> {
+        let end = offset
+            .checked_add(length)
+            .ok_or(Errno::EINVAL)?
+            .min(file_size);
+        if offset >= end {
+            return Ok(Vec::new());
+        }
+        let mut ranges = Vec::new();
+        for (&extent_start, bytes) in self.extents.range(..end) {
+            let extent_len = u64::try_from(bytes.len()).map_err(|_| Errno::EFBIG)?;
+            let extent_end = extent_start.checked_add(extent_len).ok_or(Errno::EFBIG)?;
+            if extent_end <= offset {
+                continue;
+            }
+            let scan_start = extent_start.max(offset);
+            let scan_end = extent_end.min(end);
+            let mut cursor =
+                usize::try_from(scan_start - extent_start).map_err(|_| Errno::EFBIG)?;
+            let scan_end_idx =
+                usize::try_from(scan_end - extent_start).map_err(|_| Errno::EFBIG)?;
+            while cursor < scan_end_idx {
+                while cursor < scan_end_idx && bytes[cursor] == 0 {
+                    cursor += 1;
+                }
+                if cursor >= scan_end_idx {
+                    break;
+                }
+                let data_start = cursor;
+                while cursor < scan_end_idx && bytes[cursor] != 0 {
+                    cursor += 1;
+                }
+                ranges.push(LseekDataRange::new(
+                    extent_start + data_start as u64,
+                    extent_start + cursor as u64,
+                ));
+            }
+        }
+        Ok(ranges)
+    }
+
+    fn extents(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.extents
+            .iter()
+            .map(|(&offset, bytes)| (offset, bytes.as_slice()))
+    }
 }
 
 impl VfsLocalFileSystem {
@@ -777,9 +1077,6 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
         self.validate_optional_file_handle(inode, handle)?;
-        let path = self.inode_path(inode)?;
-        let mut fs = self.fs.borrow_mut();
-
         const SUPPORTED_SETATTR_BITS: u32 = FATTR_MODE
             | FATTR_UID
             | FATTR_GID
@@ -794,6 +1091,17 @@ impl VfsEngine for VfsLocalFileSystem {
         if attr.valid & !SUPPORTED_SETATTR_BITS != 0 {
             return Err(Errno::EINVAL);
         }
+
+        if let Some(file) = self.anonymous_tmpfiles.borrow_mut().get_mut(&inode) {
+            if attr.valid & FATTR_SIZE != 0 && attr.size != file.attr.posix.size {
+                file.data.truncate(attr.size)?;
+                Self::update_anonymous_size(file, attr.size);
+            }
+            return Ok(file.attr);
+        }
+
+        let path = self.inode_path(inode)?;
+        let mut fs = self.fs.borrow_mut();
 
         if attr.valid & FATTR_SIZE != 0 {
             // Use effective size accounting for buffered writes so the
@@ -1015,7 +1323,7 @@ impl VfsEngine for VfsLocalFileSystem {
             inode_id,
             AnonymousTmpfile {
                 attr,
-                data: Vec::new(),
+                data: SparseAnonymousData::new(),
             },
         );
 
@@ -1063,16 +1371,24 @@ impl VfsEngine for VfsLocalFileSystem {
             .borrow()
             .contains_inode(record.inode_id);
         if has_open_handles {
-            let data = self
+            self.fs
+                .borrow_mut()
+                .flush_write_buffer(record.inode_id)
+                .map_err(|e| map_errno(&e))?;
+            let record = self
                 .fs
                 .borrow()
-                .read_file_range(&child_path, 0, record.size as usize)
+                .stat(&child_path)
                 .map_err(|e| map_errno(&e))?;
             let attr = self
                 .fs
                 .borrow()
                 .stat_attr(&child_path)
                 .map_err(|e| map_errno(&e))?;
+            let data = {
+                let fs = self.fs.borrow();
+                SparseAnonymousData::from_local_file(&fs, &record).map_err(|e| map_errno(&e))?
+            };
             self.fs
                 .borrow_mut()
                 .unlink(&child_path)
@@ -1236,9 +1552,16 @@ impl VfsEngine for VfsLocalFileSystem {
                 self.create(new_parent, new_name, tmpfile.attr.posix.mode, 0, ctx)?;
             let new_ino = _new_attr.inode_id;
 
+            if tmpfile.attr.posix.size > 0 {
+                let mut size_attr = SetAttr::new();
+                size_attr.valid = FATTR_SIZE;
+                size_attr.size = tmpfile.attr.posix.size;
+                self.setattr(new_ino, &size_attr, Some(&new_fh), ctx)?;
+            }
+
             // Write buffered data through the engine's write path.
-            if !tmpfile.data.is_empty() {
-                self.write(&new_fh, 0, &tmpfile.data, ctx)?;
+            for (extent_offset, extent_bytes) in tmpfile.data.extents() {
+                self.write(&new_fh, extent_offset, extent_bytes, ctx)?;
             }
 
             // Release the engine handle we allocated for the write.
@@ -1441,14 +1764,7 @@ impl VfsEngine for VfsLocalFileSystem {
             return Err(Errno::EBADF);
         }
         if let Some(file) = self.anonymous_tmpfiles.borrow().get(&fh.inode_id) {
-            if size == 0 || offset >= file.attr.posix.size {
-                return Ok(Vec::new());
-            }
-            let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
-            let requested_end = offset.checked_add(size as u64).ok_or(Errno::EFBIG)?;
-            let end_u64 = requested_end.min(file.attr.posix.size);
-            let end = usize::try_from(end_u64).map_err(|_| Errno::EFBIG)?;
-            return Ok(file.data[start..end].to_vec());
+            return file.data.read_at(offset, size, file.attr.posix.size);
         }
         let path = self.inode_path(fh.inode_id)?;
 
@@ -1499,15 +1815,9 @@ impl VfsEngine for VfsLocalFileSystem {
             } else {
                 offset
             };
-            let start = usize::try_from(write_offset).map_err(|_| Errno::EFBIG)?;
-            let end = start.checked_add(data.len()).ok_or(Errno::EFBIG)?;
-            if end > file.data.len() {
-                file.data.resize(end, 0);
-            }
-            file.data[start..end].copy_from_slice(data);
-            let size = file.data.len() as u64;
+            let write_end = file.data.write_at(write_offset, data)?;
             if !data.is_empty() {
-                Self::update_anonymous_size(file, size);
+                Self::update_anonymous_size(file, file.attr.posix.size.max(write_end));
             }
             return Ok(data.len() as u32);
         }
@@ -1607,77 +1917,36 @@ impl VfsEngine for VfsLocalFileSystem {
                 if mode & FALLOC_FL_KEEP_SIZE == 0 || mode & FALLOC_FL_ZERO_RANGE != 0 {
                     return Err(Errno::EINVAL);
                 }
-                let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
-                let end =
-                    usize::try_from(end.min(file.attr.posix.size)).map_err(|_| Errno::EFBIG)?;
-                if start < end && start < file.data.len() {
-                    let clipped_end = end.min(file.data.len());
-                    file.data[start..clipped_end].fill(0);
-                }
+                file.data
+                    .clear_range(offset, end.min(file.attr.posix.size))?;
             } else if mode & FALLOC_FL_ZERO_RANGE != 0 {
                 let zero_end = if mode & FALLOC_FL_KEEP_SIZE != 0 {
-                    file.data.len().min(end as usize)
+                    end.min(file.attr.posix.size)
                 } else {
-                    if file.data.len() < end as usize {
-                        file.data.resize(end as usize, 0);
-                    }
-                    end as usize
+                    end
                 };
-                let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
-                if start < zero_end {
-                    file.data[start..zero_end].fill(0);
-                }
+                file.data.clear_range(offset, zero_end)?;
                 if mode & FALLOC_FL_KEEP_SIZE == 0 {
                     Self::update_anonymous_size(file, end);
                 }
             } else if mode & FALLOC_FL_COLLAPSE_RANGE != 0 {
                 // In-memory collapse: remove [offset, offset+length) and shift tail left.
-                let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
-                let end_clamped = end.min(file.attr.posix.size);
-                let eff_len =
-                    (end_clamped - offset).min(file.attr.posix.size.saturating_sub(offset));
-                let eff_len_u = usize::try_from(eff_len).map_err(|_| Errno::EFBIG)?;
-                if start < file.data.len() && eff_len_u > 0 {
-                    let tail_start = (start + eff_len_u).min(file.data.len());
-                    if tail_start < file.data.len() {
-                        let tail = file.data[tail_start..].to_vec();
-                        file.data.truncate(start);
-                        file.data.extend_from_slice(&tail);
-                    } else {
-                        file.data.truncate(start);
-                    }
-                    let new_size = file.attr.posix.size.saturating_sub(eff_len);
-                    Self::update_anonymous_size(file, new_size);
-                }
+                let new_size = file
+                    .data
+                    .collapse_range(offset, length, file.attr.posix.size)?;
+                Self::update_anonymous_size(file, new_size);
             } else if mode & FALLOC_FL_INSERT_RANGE != 0 {
                 // In-memory insert: insert `length` zero bytes at `offset`, shift tail right.
-                let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
-                let len_u = usize::try_from(length).map_err(|_| Errno::EFBIG)?;
                 if offset > file.attr.posix.size {
                     // Offset beyond EOF: extend with zeros (same as default allocate).
-                    let end_usize = usize::try_from(end).map_err(|_| Errno::EFBIG)?;
-                    file.data.resize(end_usize, 0);
                     Self::update_anonymous_size(file, end);
-                } else if len_u > 0 {
-                    let tail = if start < file.data.len() {
-                        file.data[start..].to_vec()
-                    } else {
-                        Vec::new()
-                    };
-                    file.data.truncate(start);
-                    file.data.resize(start + len_u, 0);
-                    file.data.extend_from_slice(&tail);
+                } else if length > 0 {
                     let new_size = file
-                        .attr
-                        .posix
-                        .size
-                        .checked_add(length)
-                        .ok_or(Errno::EFBIG)?;
+                        .data
+                        .insert_zeros(offset, length, file.attr.posix.size)?;
                     Self::update_anonymous_size(file, new_size);
                 }
             } else if mode & FALLOC_FL_KEEP_SIZE == 0 && end > file.attr.posix.size {
-                let end_usize = usize::try_from(end).map_err(|_| Errno::EFBIG)?;
-                file.data.resize(end_usize, 0);
                 Self::update_anonymous_size(file, end);
             }
             return Ok(());
@@ -1852,27 +2121,7 @@ impl VfsEngine for VfsLocalFileSystem {
         }
         let end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
         if let Some(file) = self.anonymous_tmpfiles.borrow().get(&fh.inode_id) {
-            let end = end.min(file.attr.posix.size);
-            if offset >= end {
-                return Ok(Vec::new());
-            }
-            let mut ranges = Vec::new();
-            let mut cursor = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
-            let end_usize = usize::try_from(end).map_err(|_| Errno::EFBIG)?;
-            while cursor < end_usize {
-                while cursor < end_usize && file.data[cursor] == 0 {
-                    cursor += 1;
-                }
-                if cursor >= end_usize {
-                    break;
-                }
-                let data_start = cursor;
-                while cursor < end_usize && file.data[cursor] != 0 {
-                    cursor += 1;
-                }
-                ranges.push(LseekDataRange::new(data_start as u64, cursor as u64));
-            }
-            return Ok(ranges);
+            return file.data.data_ranges(offset, length, file.attr.posix.size);
         }
         let fs = self.fs.borrow();
         let mut ranges = Vec::new();
@@ -2334,6 +2583,19 @@ mod tests {
     fn temp_fs() -> (VfsLocalFileSystem, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let fs = LocalFileSystem::open(dir.path()).expect("open");
+        (VfsLocalFileSystem::new(fs), dir)
+    }
+
+    fn temp_fs_with_content_capacity(
+        content_capacity_bytes: u64,
+    ) -> (VfsLocalFileSystem, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fs = LocalFileSystem::open_with_allocator_policy(
+            dir.path(),
+            crate::human::local_filesystem::StoreOptions::default(),
+            crate::types::LocalStorageAllocatorPolicy::new(content_capacity_bytes, 1_000_000),
+        )
+        .expect("open with allocator policy");
         (VfsLocalFileSystem::new(fs), dir)
     }
 
@@ -3641,6 +3903,67 @@ mod tests {
             Errno::ENOENT
         );
         assert_eq!(engine.release(&fh).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn unlink_open_sparse_file_keeps_anonymous_content_sparse() {
+        let (engine, _td) = temp_fs_with_content_capacity(2_u64 * 1024 * 1024 * 1024);
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"sparse-open-gone.dat", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let file_size = 100_u64 * 1024 * 1024;
+        let chunk_len = 64_usize * 1024;
+        let stride = 5_u64 * 1024 * 1024;
+        let payload = vec![0x5a; chunk_len];
+        let mut set = SetAttr::new();
+        set.valid = FATTR_SIZE;
+        set.size = file_size;
+        engine
+            .setattr(attr.inode_id, &set, Some(&fh), &ctx())
+            .unwrap();
+
+        for i in 0..16_u64 {
+            engine.write(&fh, i * stride, &payload, &ctx()).unwrap();
+        }
+
+        engine
+            .unlink(root, b"sparse-open-gone.dat", &ctx())
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .lookup(root, b"sparse-open-gone.dat", &ctx())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        let anonymous = engine.anonymous_tmpfiles.borrow();
+        let file = anonymous
+            .get(&attr.inode_id)
+            .expect("anonymous sparse file");
+        assert_eq!(file.attr.posix.size, file_size);
+        assert_eq!(file.data.extents.len(), 16);
+        assert_eq!(
+            file.data.extents.values().map(Vec::len).sum::<usize>(),
+            16 * chunk_len
+        );
+        drop(anonymous);
+
+        assert_eq!(
+            engine.read(&fh, 0, chunk_len as u32, &ctx()).unwrap(),
+            payload
+        );
+        assert_eq!(
+            engine
+                .read(&fh, chunk_len as u64, chunk_len as u32, &ctx())
+                .unwrap(),
+            vec![0; chunk_len]
+        );
+        engine.release(&fh).unwrap();
+        assert_eq!(
+            engine.getattr(attr.inode_id, None, &ctx()).unwrap_err(),
+            Errno::ENOENT
+        );
     }
 
     #[test]

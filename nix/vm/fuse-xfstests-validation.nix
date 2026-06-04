@@ -975,12 +975,23 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             [ -n "$store_tag" ] || store_tag=tidefs
             rm -rf "/store/tidefs-store-$store_tag" "/store/tidefs-store-$store_tag-"* 2>/dev/null || true
         }
+        cleanup_mount_dir() {
+            mount_dir="$1"
+            [ -e "$mount_dir" ] || return 0
+            rmdir "$mount_dir" 2>/dev/null || {
+                if [ -d "$mount_dir" ]; then
+                    echo "cleanup: mount directory not empty or busy: $mount_dir"
+                fi
+            }
+        }
 
+        echo "cleanup: stop xfstests helpers"
         pkill -f "xfstests-check" 2>/dev/null || true
         pkill -f "/tmp/xfstests\\." 2>/dev/null || true
         pkill -f "/tmp/xfstests\\..*/src/" 2>/dev/null || true
         pkill -f "/tmp/xfstests\\..*/ltp/" 2>/dev/null || true
         sleep 1
+        echo "cleanup: unmount nested test mounts"
         for nested_mnt in "$SCRATCH_MNT" "$TEST_DIR"; do
             if mountpoint -q "$nested_mnt" 2>/dev/null; then
                 umount "$nested_mnt" 2>/dev/null || umount -l "$nested_mnt" 2>/dev/null || true
@@ -992,12 +1003,20 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
                 umount "$nested_mnt" 2>/dev/null || umount -l "$nested_mnt" 2>/dev/null || true
             fi
         done
+        echo "cleanup: stop nested TideFS daemons"
         pkill -f "tidefs-posix-filesystem-adapter-daemon.*--mount $TEST_DIR" 2>/dev/null || true
         pkill -f "tidefs-posix-filesystem-adapter-daemon.*--mount $SCRATCH_MNT" 2>/dev/null || true
+        echo "cleanup: remove xfstests tmp"
         rm -rf /tmp/xfstests.* /tmp/cutmp* 2>/dev/null || true
-        rm -rf "$RESULT_BASE" "$TEST_DIR" "$SCRATCH_MNT" 2>/dev/null || true
+        echo "cleanup: remove xfstests results"
+        rm -rf "$RESULT_BASE" 2>/dev/null || true
+        echo "cleanup: remove empty mounted test directories"
+        cleanup_mount_dir "$TEST_DIR"
+        cleanup_mount_dir "$SCRATCH_MNT"
+        echo "cleanup: remove TideFS stores"
         cleanup_tidefs_store "$TEST_DEV"
         cleanup_tidefs_store "$SCRATCH_DEV"
+        echo "cleanup: done"
     }
 
     dump_xfstests_test_state() {
@@ -1096,6 +1115,33 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         kill "-$signal" "$tree_pid" 2>/dev/null || true
     }
 
+    run_cleanup_xfstests_test_bounded() {
+        cleanup_label="$1"
+        cleanup_test="$2"
+        cleanup_result_base="$3"
+        cleanup_test_log="$4"
+        cleanup_timeout="$((PER_TEST_TIMEOUT / 2))"
+        [ "$cleanup_timeout" -ge 30 ] || cleanup_timeout=30
+        cleanup_xfstests_test &
+        cleanup_pid=$!
+        elapsed=0
+        while kill -0 "$cleanup_pid" 2>/dev/null; do
+            if [ "$elapsed" -ge "$cleanup_timeout" ]; then
+                echo "cleanup timeout: $cleanup_label after ''${cleanup_timeout}s"
+                dump_xfstests_test_state "$cleanup_test" "$cleanup_result_base" "$cleanup_test_log"
+                terminate_process_tree "$cleanup_pid" TERM
+                sleep 2
+                terminate_process_tree "$cleanup_pid" KILL
+                wait "$cleanup_pid" 2>/dev/null || true
+                return 124
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        wait "$cleanup_pid"
+        return "$?"
+    }
+
     run_xfstests_check_bounded() {
         bounded_test="$1"
         bounded_result_base="$2"
@@ -1137,7 +1183,11 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         # Bound each test so one stuck row cannot consume the whole VM run.
         # Run test with output visible on console for debugging
         echo "=== Running $test ==="
-        cleanup_xfstests_test
+        if ! run_cleanup_xfstests_test_bounded "pre-$test" "$test" "$RESULT_BASE" /dev/null; then
+            fail "xfstests_$test" "pre-test cleanup timed out"
+            TESTS_FAIL=$((TESTS_FAIL + 1))
+            continue
+        fi
         rm -rf "$TEST_DIR" "$SCRATCH_MNT" 2>/dev/null || true
         if ! mkdir -p "$TEST_DIR" "$SCRATCH_MNT"; then
             blocked "xfstests_$test" "could not recreate per-test xfstests directories"
@@ -1184,7 +1234,10 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
                     else
                         skip "xfstests_$test" "xfstests notrun: $NOTRUN_DETAIL"
                     fi
-                    cleanup_xfstests_test
+                    if ! run_cleanup_xfstests_test_bounded "notrun-$test" "$test" "$RESULT_BASE" "$TEST_LOG"; then
+                        fail "xfstests_$test" "notrun cleanup timed out"
+                        TESTS_FAIL=$((TESTS_FAIL + 1))
+                    fi
                     continue
                 fi
                 # Capture failure details from the test output
@@ -1225,7 +1278,10 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             fi
             TESTS_FAIL=$((TESTS_FAIL + 1))
         fi
-        cleanup_xfstests_test
+        if ! run_cleanup_xfstests_test_bounded "post-$test" "$test" "$RESULT_BASE" "$TEST_LOG"; then
+            fail "xfstests_$test" "post-test cleanup timed out"
+            TESTS_FAIL=$((TESTS_FAIL + 1))
+        fi
     done
 
     echo "xfstests completed: $TESTS_RUN run, $TESTS_PASS passed, $TESTS_FAIL failed"
@@ -1244,7 +1300,9 @@ echo "--- Phase 4: Unmount and stop daemon ---"
 if [ "$MOUNTED" -eq 1 ]; then
     # xfstests may leave nested TEST_DIR/SCRATCH_MNT mounts active; unmount
     # those before the parent FUSE mount so teardown failures stay meaningful.
-    cleanup_xfstests_test
+    if ! run_cleanup_xfstests_test_bounded "phase4" "teardown" "$RESULTS" /dev/null; then
+        fail "cleanup" "phase4 cleanup timed out"
+    fi
     umount "$MNT/xfstests-test" 2>/dev/null || true
     umount "$MNT/xfstests-scratch" 2>/dev/null || true
     # Unmount the main mountpoint

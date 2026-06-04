@@ -3193,8 +3193,32 @@ impl LocalFileSystem {
     /// For full-inode deletion (nlink reaches 0), also inserts per-chunk
     /// keys via `content_chunk_object_key_for_version()`.
     fn record_reclaim_delta(&mut self, inode_id: InodeId, _freed_bytes: u64) {
+        let record = self.state.inodes.get(&inode_id).cloned();
+        let dv = record.as_ref().map(|r| r.data_version);
+        let chunk_reclaim_indexes = match record.as_ref().filter(|record| record.nlink == 0) {
+            Some(record) => match read_content_layout_from_store(
+                self.store.raw_primary_store(),
+                inode_id,
+                record,
+                true,
+            ) {
+                Ok(ContentLayout::Chunked(manifest)) => Some(
+                    manifest
+                        .chunks
+                        .iter()
+                        .filter(|chunk_ref| !chunk_ref.is_hole())
+                        .map(|chunk_ref| chunk_ref.chunk_index)
+                        .collect::<Vec<_>>(),
+                ),
+                Ok(ContentLayout::Inline(_)) => Some(Vec::new()),
+                Err(_) => content_chunk_count(record.size)
+                    .ok()
+                    .map(|chunk_count| (0..chunk_count).collect()),
+            },
+            None => None,
+        };
+
         let mut rq = self.reclaim_queue.lock().unwrap();
-        let dv = self.state.inodes.get(&inode_id).map(|r| r.data_version);
 
         // Legacy unversioned content key — matches the object-key prefix
         // used by older content writes before per-version chunking.
@@ -3223,19 +3247,16 @@ impl LocalFileSystem {
         // delete objects here: this runs before commit rollback is impossible,
         // and foreground unlink must not leave a namespace entry pointing at
         // tombstoned content if the commit fails.
-        if let Some(record) = self.state.inodes.get(&inode_id) {
-            if record.nlink == 0 {
-                if let Ok(chunk_count) = content_chunk_count(record.size) {
-                    for ci in 0..chunk_count {
-                        let ckey =
-                            content_chunk_object_key_for_version(inode_id, record.data_version, ci);
-                        rq.insert(ReclaimQueueEntry::new(
-                            ReclaimObjectKey(*ckey.as_bytes()),
-                            -1,
-                            ReclaimQueueFamily::Extent,
-                        ));
-                    }
-                }
+        if let (Some(record), Some(chunk_reclaim_indexes)) =
+            (record.as_ref(), chunk_reclaim_indexes)
+        {
+            for ci in chunk_reclaim_indexes {
+                let ckey = content_chunk_object_key_for_version(inode_id, record.data_version, ci);
+                rq.insert(ReclaimQueueEntry::new(
+                    ReclaimObjectKey(*ckey.as_bytes()),
+                    -1,
+                    ReclaimQueueFamily::Extent,
+                ));
             }
         }
         drop(rq);
@@ -5290,6 +5311,15 @@ impl LocalFileSystem {
                 return Err(err);
             }
         };
+        let batch_transaction = self.auto_commit && !self.in_transaction && patches.len() > 1;
+        if batch_transaction {
+            self.auto_commit = false;
+            if let Err(err) = self.begin_transaction() {
+                self.auto_commit = true;
+                self.restore_drained_write_segments(inode_id, &segments);
+                return Err(err);
+            }
+        }
         for patch in patches {
             let record = self.inode(inode_id)?.clone();
             let patch_len =
@@ -5310,11 +5340,23 @@ impl LocalFileSystem {
                 patch.offset,
                 &patch.bytes,
                 new_size,
-                false,
+                true,
             ) {
+                if batch_transaction {
+                    let _ = self.rollback_transaction();
+                    self.auto_commit = true;
+                }
                 self.restore_drained_write_segments(inode_id, &segments);
                 return Err(err);
             }
+        }
+        if batch_transaction {
+            if let Err(err) = self.commit_transaction() {
+                self.auto_commit = true;
+                self.restore_drained_write_segments(inode_id, &segments);
+                return Err(err);
+            }
+            self.auto_commit = true;
         }
 
         for (offset, data) in segments {

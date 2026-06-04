@@ -5131,6 +5131,78 @@ fn sparse_read_zero_fills_unwritten_middle_between_extents() {
 }
 
 #[test]
+fn flushed_sparse_strided_writes_keep_unwritten_holes_sparse() {
+    let root = temp_root("sparse-strided-flush");
+    let chunk = content_chunk_size() as u64;
+    let step = 5 * 1024 * 1024;
+    let write_count = 16_u64;
+    let file_size = 100 * 1024 * 1024;
+
+    let policy = LocalStorageAllocatorPolicy::new(
+        2 * 1024 * 1024 * 1024,
+        DEFAULT_LOCAL_FILESYSTEM_INODE_CAPACITY,
+    );
+    let mut fs =
+        LocalFileSystem::open_with_allocator_policy(&root, options(), policy).expect("open fs");
+    fs.create_file("/aio.dat", 0o644).expect("create file");
+    fs.truncate_file("/aio.dat", file_size)
+        .expect("sparse extend");
+    let inode_id = fs.stat("/aio.dat").expect("stat sparse file").inode_id;
+
+    for index in 0..write_count {
+        let offset = index * step;
+        let payload = vec![index as u8 + 1; chunk as usize];
+        fs.write_file("/aio.dat", offset, &payload)
+            .expect("write sparse stride");
+    }
+    fs.flush_write_buffer(inode_id)
+        .expect("flush sparse strided writes");
+
+    let manifest = current_content_manifest(&fs, "/aio.dat");
+    let chunk_indexes: Vec<u64> = manifest
+        .chunks
+        .iter()
+        .filter(|chunk_ref| !chunk_ref.is_hole())
+        .map(|chunk_ref| chunk_ref.chunk_index)
+        .collect();
+    let expected_indexes: Vec<u64> = (0..write_count).map(|index| index * step / chunk).collect();
+    assert_eq!(chunk_indexes, expected_indexes);
+    assert_eq!(
+        fs.stat("/aio.dat").expect("stat written sparse file").size,
+        file_size
+    );
+
+    for index in 0..write_count {
+        let offset = index * step;
+        let expected = vec![index as u8 + 1; chunk as usize];
+        assert_eq!(
+            fs.read_file_range("/aio.dat", offset, chunk as usize)
+                .expect("read written stride"),
+            expected
+        );
+    }
+    assert!(
+        fs.read_file_range("/aio.dat", chunk, chunk as usize)
+            .expect("read unwritten hole")
+            .iter()
+            .all(|&byte| byte == 0),
+        "unwritten chunk between strided writes must remain a zero hole"
+    );
+
+    assert_eq!(fs.reclaim_queue_depth(), 0);
+    fs.set_auto_commit(false);
+    fs.unlink("/aio.dat").expect("unlink sparse stride file");
+    let reclaim_depth = fs.reclaim_queue_depth();
+    assert!(
+        reclaim_depth <= write_count as usize + 4,
+        "sparse unlink should queue only materialized chunks plus metadata keys; depth={reclaim_depth}"
+    );
+
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
 fn explicit_threshold_compaction_after_repeated_unlinks() {
     let root = temp_root("explicit-threshold-compaction-unlinks");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
