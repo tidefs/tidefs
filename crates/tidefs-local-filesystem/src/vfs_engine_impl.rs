@@ -780,6 +780,9 @@ impl VfsLocalFileSystem {
         }
 
         let acl = tidefs_posix_acl::decode_posix_acl_xattr(value).map_err(|_| Errno::EINVAL)?;
+        if name == Self::POSIX_ACL_DEFAULT_XATTR && acl.is_empty() {
+            return Ok(());
+        }
         tidefs_posix_acl::validate_posix_acl_access_structure(&acl).map_err(|_| Errno::EINVAL)
     }
 
@@ -7704,7 +7707,7 @@ mod tests {
     }
 
     #[test]
-    fn setxattr_rejects_structurally_invalid_posix_acl_payloads() {
+    fn setxattr_rejects_structurally_invalid_access_acl_payloads() {
         let (engine, _td) = temp_fs();
         let inode = create_xattr_file(&engine, b"acl-invalid.txt");
         let invalid_acl = tidefs_posix_acl::encode_posix_acl_xattr(&[]);
@@ -7718,17 +7721,120 @@ mod tests {
         );
         assert_eq!(access.unwrap_err(), Errno::EINVAL);
 
-        let default = engine.setxattr(
-            inode,
-            b"system.posix_acl_default",
-            &invalid_acl,
-            0,
-            &root_ctx(),
-        );
-        assert_eq!(default.unwrap_err(), Errno::EINVAL);
-
         let missing = engine.getxattr(inode, b"system.posix_acl_access", &root_ctx());
         assert_eq!(missing.unwrap_err(), Errno::ENODATA);
+    }
+
+    #[test]
+    fn setxattr_empty_default_acl_removes_default_acl() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&root_ctx()).unwrap();
+        let default_acl = default_acl_for_inheritance_regression();
+        let default_raw = tidefs_posix_acl::encode_posix_acl_xattr(&default_acl);
+        engine
+            .setxattr(
+                root,
+                b"system.posix_acl_default",
+                &default_raw,
+                0,
+                &root_ctx(),
+            )
+            .unwrap();
+
+        let empty_default = tidefs_posix_acl::encode_posix_acl_xattr(&[]);
+        engine
+            .setxattr(
+                root,
+                b"system.posix_acl_default",
+                &empty_default,
+                0,
+                &root_ctx(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .getxattr(root, b"system.posix_acl_default", &root_ctx())
+                .unwrap_err(),
+            Errno::ENODATA
+        );
+        let caller = RequestCtx {
+            uid: 4242,
+            gid: 4343,
+            pid: 77,
+            umask: 0o077,
+            groups: vec![4343],
+        };
+        let child = engine
+            .mkdir(root, b"mode-masked-after-empty-default", 0o777, &caller)
+            .unwrap();
+        assert_eq!(child.posix.mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn setxattr_minimal_default_acl_allows_generic319_inheritance() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&root_ctx()).unwrap();
+        let testdir = engine
+            .mkdir(root, b"generic319-testdir", 0o755, &root_ctx())
+            .unwrap();
+        let empty_default = tidefs_posix_acl::encode_posix_acl_xattr(&[]);
+        engine
+            .setxattr(
+                testdir.inode_id,
+                b"system.posix_acl_default",
+                &empty_default,
+                0,
+                &root_ctx(),
+            )
+            .unwrap();
+
+        let generic319_default_acl = vec![
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_GROUP_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            tidefs_posix_acl::PosixAclEntry {
+                tag: tidefs_posix_acl::ACL_OTHER,
+                perm: 0,
+                id: 0,
+            },
+        ];
+        let default_raw = tidefs_posix_acl::encode_posix_acl_xattr(&generic319_default_acl);
+        engine
+            .setxattr(
+                testdir.inode_id,
+                b"system.posix_acl_default",
+                &default_raw,
+                0,
+                &root_ctx(),
+            )
+            .unwrap();
+
+        let child = engine
+            .mkdir(testdir.inode_id, b"testsubdir", 0o777, &root_ctx())
+            .unwrap();
+        assert_eq!(child.posix.mode & 0o777, 0o770);
+        let child_access = engine
+            .getxattr(child.inode_id, b"system.posix_acl_access", &root_ctx())
+            .unwrap();
+        assert_eq!(
+            tidefs_posix_acl::decode_posix_acl_xattr(&child_access).unwrap(),
+            generic319_default_acl
+        );
+        let child_default = engine
+            .getxattr(child.inode_id, b"system.posix_acl_default", &root_ctx())
+            .unwrap();
+        assert_eq!(
+            tidefs_posix_acl::decode_posix_acl_xattr(&child_default).unwrap(),
+            generic319_default_acl
+        );
     }
 
     #[test]

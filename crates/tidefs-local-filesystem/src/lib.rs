@@ -7157,6 +7157,13 @@ impl LocalFileSystem {
                 }
             };
 
+            if name == ACL_DEFAULT && acl_entries.is_empty() {
+                if record.xattrs.contains_key(ACL_DEFAULT) {
+                    return self.remove_xattr(path, name);
+                }
+                return Ok(());
+            }
+
             if name == ACL_ACCESS {
                 let new_mode =
                     tidefs_posix_acl::posix_mode_from_access_acl(&acl_entries, record.mode);
@@ -11190,6 +11197,25 @@ mod orphan_index_integration_tests {
 
         let list = fs.list_xattr("/f").unwrap();
         assert!(list.is_empty());
+    }
+
+    #[test]
+    fn set_empty_default_acl_removes_default_acl() {
+        let (_root, mut fs) = make_test_fs("xra_empty_default_acl").expect("open");
+        fs.create_dir("/d", 0o755).expect("create dir");
+        let default_acl = tidefs_posix_acl::minimal_access_acl_from_mode(0o750);
+        let encoded_default_acl = tidefs_posix_acl::encode_posix_acl_xattr(&default_acl);
+        fs.set_xattr("/d", b"system.posix_acl_default", &encoded_default_acl, 0)
+            .expect("set default ACL");
+
+        let empty_default_acl = tidefs_posix_acl::encode_posix_acl_xattr(&[]);
+        fs.set_xattr("/d", b"system.posix_acl_default", &empty_default_acl, 0)
+            .expect("empty default ACL removes xattr");
+
+        assert!(fs
+            .get_xattr("/d", b"system.posix_acl_default")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
