@@ -259,14 +259,17 @@ reclassified `generic/360` from a missing guest command to a product or
 exact-output failure: the row still emits a missing temporary-file cleanup
 line. A committed-head tail run under
 classified `generic/396` through `generic/418` without blocked rows. The final
-#6598 xfstests row classification is: `generic/377` and `generic/403` pass; 8
-rows fail as product or exact-output defects (`generic/354`, `360`, `375`,
-`391`, `393`, `394`, `401`, `412`); 20 rows are unsupported
-feature/precondition rows; and 38 rows are environment or feature skips. The
-failures currently expose ENOSPC/ftruncate/file-exists behavior, missing temp
-cleanup after checksum, ACL/SGID permission drift, a direct-I/O timeout hang,
-ftruncate EIO/ENOSPC behavior, special-node/find-by-type setup drift, and
-pass claim.
+historical #6598 xfstests row classification was: `generic/377` and
+`generic/403` pass; 8 rows fail as product or exact-output defects
+(`generic/354`, `360`, `375`, `391`, `393`, `394`, `401`, `412`); 20 rows are
+unsupported feature/precondition rows; and 38 rows are environment or feature
+skips. On 2026-06-04, current head rechecked the `generic/375` SGID chmod and
+setfacl sequence with both adapter file/directory regressions and a direct
+mounted FUSE reproduction; `generic/375` is no longer carried as an expected
+ACL failure. The remaining #6598 product or exact-output failures expose
+ENOSPC/ftruncate/file-exists behavior, missing temp cleanup after checksum, a
+direct-I/O timeout hang, ftruncate EIO/ENOSPC behavior, special-node/find-by-type
+setup drift, and checksum read EIO.
 
 The #6587 kernel VFS tranche (`generic/051` through `generic/100`) ran through
 the Linux 7.0.0 mounted-kernel VFS runner with the Nix-built

@@ -265,14 +265,6 @@ impl XfstestsTieringPolicy {
                         target_tier: Some(ValidationTier::Tier3),
                     },
                     ExpectedFailureEntry {
-                        test: "generic/375".to_string(),
-                        feature_area: "ACL".to_string(),
-                        reason: "ACL set/get/inherit/default suite not yet passing end-to-end"
-                            .to_string(),
-                        groups: vec!["auto".to_string()],
-                        target_tier: Some(ValidationTier::Tier3),
-                    },
-                    ExpectedFailureEntry {
                         test: "generic/444".to_string(),
                         feature_area: "ACL".to_string(),
                         reason: "ACL set/get/inherit/default suite not yet passing end-to-end"
@@ -338,7 +330,9 @@ pub fn validate_against_policy(
     policy: &XfstestsTieringPolicy,
     group: &str,
 ) -> PolicyValidationReport {
-    let tier = policy.tier_for_group(group).unwrap_or(ValidationTier::Tier0);
+    let tier = policy
+        .tier_for_group(group)
+        .unwrap_or(ValidationTier::Tier0);
 
     let mut report = PolicyValidationReport {
         group: group.to_string(),

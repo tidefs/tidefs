@@ -165,9 +165,12 @@ Status: DONE = implemented and tested, GAP = implemented with known issues,
    truncate-down timestamp drift, ACL inheritance/userns errno drift, and
    ENOSPC/ftruncate/file-exists behavior. The #6598 failures add
    ENOSPC/ftruncate/file-exists behavior, missing temp cleanup after checksum,
-   ACL/SGID permission drift, a direct-I/O timeout hang, ftruncate EIO/ENOSPC
-   behavior, special-node/find-by-type setup drift, and checksum read EIO. The
-   #6587, #6589, #6591, #6593, #6595, #6597, and #6599 mounted-kernel VFS
+   a direct-I/O timeout hang, ftruncate EIO/ENOSPC behavior,
+   special-node/find-by-type setup drift, and checksum read EIO; the
+   `generic/375` ACL/SGID drift was rechecked on 2026-06-04 with adapter
+   file/directory regressions plus direct mounted FUSE reproduction and is no
+   longer carried as an expected ACL failure. The #6587, #6589, #6591, #6593,
+   #6595, #6597, and #6599 mounted-kernel VFS
    23 pass rows, 11 product failures, 12 unsupported rows, and 4 skipped rows;
    #6589 has 14 pass rows, 3 product failures, 29 unsupported rows, and 4
    skipped rows; #6591 has 4 pass rows, no product failures, 43 unsupported

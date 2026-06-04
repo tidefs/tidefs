@@ -24185,6 +24185,121 @@ mod tests {
     }
 
     #[test]
+    fn vfs_adapter_dispatch_chmod_and_setfacl_match_generic_375_dir_sgid_rules() {
+        let fixture = adapter_fixture();
+        let root = root_ctx();
+        let owner_in_group = access_ctx(100, 100, &[100]);
+        let owner_outside_group = access_ctx(100, 101, &[101]);
+        let stranger = access_ctx(101, 101, &[101]);
+        let root_ino = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&root).expect("root inode").get()
+        };
+        let dir = fixture
+            .adapter
+            .dispatch_mkdir(&root, root_ino, b"setattr-generic-375-dir", 0o755)
+            .expect("mkdir generic/375 dir");
+        let dir_ino = dir.inode_id.get();
+
+        let mut chown = SetAttr::new();
+        chown.valid = FATTR_UID | FATTR_GID;
+        chown.uid = 100;
+        chown.gid = 100;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8243, dir_ino, &chown, None)
+            .expect("set owner");
+
+        let mut root_set_sgid = SetAttr::new();
+        root_set_sgid.valid = FATTR_MODE;
+        root_set_sgid.mode = libc::S_ISGID | 0o755;
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8244, dir_ino, &root_set_sgid, None)
+            .expect("root set sgid baseline");
+
+        let mut chmod = SetAttr::new();
+        chmod.valid = FATTR_MODE;
+        chmod.mode = libc::S_ISGID | 0o777;
+        let kept = fixture
+            .adapter
+            .dispatch_setattr(&owner_in_group, 8245, dir_ino, &chmod, None)
+            .expect("owner in group chmod");
+        assert_eq!(kept.attr.mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(kept.attr.mode & libc::S_ISGID, libc::S_ISGID);
+        assert_eq!(kept.attr.mode & 0o777, 0o777);
+
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8246, dir_ino, &root_set_sgid, None)
+            .expect("root reset sgid baseline");
+        let acl = tidefs_posix_acl::minimal_access_acl_from_mode(0o777);
+        let encoded = tidefs_posix_acl::encode_posix_acl_xattr(&acl);
+        fixture
+            .adapter
+            .dispatch_setxattr(
+                &owner_in_group,
+                dir_ino,
+                b"system.posix_acl_access",
+                &encoded,
+                0,
+            )
+            .expect("owner in group setfacl");
+        let kept_after_acl = fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .getattr(dir.inode_id, None, &root)
+            .expect("attr after setfacl");
+        assert_eq!(kept_after_acl.posix.mode & libc::S_ISGID, libc::S_ISGID);
+        assert_eq!(kept_after_acl.posix.mode & 0o777, 0o777);
+
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8247, dir_ino, &root_set_sgid, None)
+            .expect("root reset sgid baseline");
+        let cleared = fixture
+            .adapter
+            .dispatch_setattr(&owner_outside_group, 8248, dir_ino, &chmod, None)
+            .expect("owner outside group chmod");
+        assert_eq!(cleared.attr.mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(cleared.attr.mode & libc::S_ISGID, 0);
+        assert_eq!(cleared.attr.mode & 0o777, 0o777);
+
+        fixture
+            .adapter
+            .dispatch_setattr(&root, 8249, dir_ino, &root_set_sgid, None)
+            .expect("root reset sgid baseline");
+        fixture
+            .adapter
+            .dispatch_setxattr(
+                &owner_outside_group,
+                dir_ino,
+                b"system.posix_acl_access",
+                &encoded,
+                0,
+            )
+            .expect("owner outside group setfacl");
+        let cleared_after_acl = fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .getattr(dir.inode_id, None, &root)
+            .expect("attr after outside-group setfacl");
+        assert_eq!(cleared_after_acl.posix.mode & libc::S_ISGID, 0);
+        assert_eq!(cleared_after_acl.posix.mode & 0o777, 0o777);
+
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_setattr(&stranger, 8250, dir_ino, &chmod, None),
+            Err(Errno::EPERM)
+        );
+    }
+
+    #[test]
     fn vfs_adapter_dispatch_setattr_chmod_clears_sgid_for_owner_outside_group() {
         let fixture = adapter_fixture();
         let root = root_ctx();

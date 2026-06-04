@@ -1057,13 +1057,16 @@ Important 2026-06-01 findings:
   product or exact-output failure rather than a missing-command harness
   failure. A committed-head tail run at
   classified `generic/396` through `generic/418` without blocked rows. The
-  final #6598 xfstests-row classification has 2 PASS rows (`generic/377`,
-  `403`), 8 FAIL rows (`generic/354`, `360`, `375`, `391`, `393`, `394`,
-  `401`, `412`), 0 BLOCKED rows, 20 unsupported rows, and 38 skipped rows.
-  The failures currently point at ENOSPC/ftruncate/file-exists behavior,
-  missing temp cleanup after checksum, ACL/SGID permission drift, direct-I/O
-  timeout, ftruncate EIO/ENOSPC behavior, special-node/find-by-type setup
-  drift, and checksum read EIO. This classifies the #6598 tranche as no-go
+  historical final #6598 xfstests-row classification had 2 PASS rows
+  (`generic/377`, `403`), 8 FAIL rows (`generic/354`, `360`, `375`, `391`,
+  `393`, `394`, `401`, `412`), 0 BLOCKED rows, 20 unsupported rows, and 38
+  skipped rows. On 2026-06-04, current head rechecked `generic/375` with
+  adapter file/directory regressions and a direct mounted FUSE reproduction;
+  `generic/375` is no longer carried as an expected ACL failure. Remaining
+  #6598 failures point at ENOSPC/ftruncate/file-exists behavior, missing temp
+  cleanup after checksum, direct-I/O timeout, ftruncate EIO/ENOSPC behavior,
+  special-node/find-by-type setup drift, and checksum read EIO. This classifies
+  the #6598 tranche as no-go
 - `TFR-018`: the #6587 Linux 7.0 mounted-kernel VFS xfstests tranche now has
   `tidefs_posix_vfs.ko` matching the generated NixOS VM kernel. The accepted
   matrix uses
