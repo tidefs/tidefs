@@ -1131,6 +1131,67 @@ fn non_contiguous_buffered_writes_in_one_chunk_flush_once() {
 }
 
 #[test]
+fn multi_chunk_writeback_batch_updates_touched_chunks_once() {
+    let (mut fs, root) = wb_open_temp("partial-multi-chunk-batch");
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: 1024 * 1024,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/batch.bin", 0o644).expect("create");
+    let chunk = content_chunk_size() as usize;
+    let mut expected = vec![0x31_u8; chunk * 4];
+    fs.write_file("/batch.bin", 0, &expected)
+        .expect("write baseline");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush baseline");
+    let base_record = fs.stat("/batch.bin").expect("stat baseline");
+    let base_manifest = wd_current_content_manifest(&fs, "/batch.bin");
+    assert_eq!(base_manifest.chunks.len(), 4);
+
+    let first_patch = [0xa5_u8; 64];
+    let second_patch = [0x5a_u8; 128];
+    let first_offset = chunk / 2;
+    let second_offset = chunk * 2 + 4096;
+    fs.write_file("/batch.bin", first_offset as u64, &first_patch)
+        .expect("write first patch");
+    fs.write_file("/batch.bin", second_offset as u64, &second_patch)
+        .expect("write second patch");
+    expected[first_offset..first_offset + first_patch.len()].copy_from_slice(&first_patch);
+    expected[second_offset..second_offset + second_patch.len()].copy_from_slice(&second_patch);
+
+    assert_eq!(
+        fs.read_file("/batch.bin").expect("read buffered image"),
+        expected
+    );
+
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush batched patches");
+    let patched_record = fs.stat("/batch.bin").expect("stat patched");
+    let patched_manifest = wd_current_content_manifest(&fs, "/batch.bin");
+    assert_eq!(
+        patched_record.data_version,
+        base_record.data_version + 1,
+        "multi-chunk writeback batch should publish one content version"
+    );
+    let by_index: BTreeMap<u64, _> = patched_manifest
+        .chunks
+        .iter()
+        .map(|chunk_ref| (chunk_ref.chunk_index, chunk_ref))
+        .collect();
+    assert_eq!(by_index[&0].data_version, patched_record.data_version);
+    assert_eq!(by_index[&1].data_version, base_record.data_version);
+    assert_eq!(by_index[&2].data_version, patched_record.data_version);
+    assert_eq!(by_index[&3].data_version, base_record.data_version);
+    assert_eq!(fs.read_file("/batch.bin").expect("read final"), expected);
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn holetest_style_mixed_writeback_flushes_one_coalesced_image() {
     let (mut fs, root) = wb_open_temp("mixed-writeback-coalesced");
     fs.set_write_buffer_config(WriteBufferConfig {
@@ -1251,6 +1312,156 @@ fn holetest_style_autoflush_keeps_future_markers_buffered() {
         "three chunk-sized foreground batches should publish three rewrites"
     );
     assert_eq!(fs.read_file("/mixed.bin").expect("read final"), expected);
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
+fn zero_writeback_over_sparse_holes_stays_sparse() {
+    let (mut fs, root) = wb_open_temp("zero-writeback-sparse-hole");
+    let chunk = content_chunk_size() as usize;
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: chunk * 8,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/sparse.bin", 0o644).expect("create");
+    let file_len = chunk * 4;
+    fs.truncate_file("/sparse.bin", file_len as u64)
+        .expect("sparse truncate");
+    assert!(
+        wd_current_content_manifest(&fs, "/sparse.bin")
+            .chunks
+            .is_empty(),
+        "sparse truncate should start as all holes"
+    );
+
+    let zeros = vec![0_u8; file_len];
+    fs.write_file("/sparse.bin", 0, &zeros)
+        .expect("zero page writeback");
+    assert!(
+        fs.read_from_write_buffer(record.inode_id, 0, file_len)
+            .is_none(),
+        "zero writeback over sparse holes should not stage buffered bytes"
+    );
+    assert!(
+        fs.lookup_extents(record.inode_id.get(), 0, file_len as u64)
+            .is_empty(),
+        "zero writeback over sparse holes should not allocate DATA extents"
+    );
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush zero writeback");
+
+    let manifest = wd_current_content_manifest(&fs, "/sparse.bin");
+    assert!(
+        manifest.chunks.is_empty(),
+        "all-zero writeback over holes should not materialize chunks"
+    );
+    assert!(
+        fs.lookup_extents(record.inode_id.get(), 0, file_len as u64)
+            .is_empty(),
+        "flush should preserve sparse extent map for no-op zero writeback"
+    );
+    assert_eq!(
+        fs.read_file_range("/sparse.bin", 0, file_len)
+            .expect("read sparse zeros"),
+        zeros
+    );
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
+fn sparse_range_reads_reuse_layout_without_whole_file_materialization() {
+    let (mut fs, root) = wb_open_temp("sparse-range-layout-cache");
+    let chunk = content_chunk_size() as usize;
+    let page = 4096usize;
+    let file_len = 256 * 1024 * 1024usize;
+    assert!(file_len % chunk == 0);
+
+    fs.create_file("/sparse.bin", 0o644).expect("create");
+    fs.truncate_file("/sparse.bin", file_len as u64)
+        .expect("sparse truncate");
+    assert_eq!(
+        fs.content_layout_cache_len_for_test(),
+        0,
+        "range layout cache starts empty"
+    );
+    assert!(
+        wd_current_content_manifest(&fs, "/sparse.bin")
+            .chunks
+            .is_empty(),
+        "truncate-created sparse file should have no materialized chunks"
+    );
+
+    for offset in [0usize, page, file_len - page] {
+        let data = fs
+            .read_file_range("/sparse.bin", offset as u64, page)
+            .expect("read sparse page");
+        assert_eq!(data, vec![0_u8; page], "sparse page must read as zeros");
+        assert_eq!(
+            fs.content_layout_cache_len_for_test(),
+            1,
+            "first sparse range read should cache the decoded chunked layout"
+        );
+    }
+
+    let report = fs.hot_read_cache_report();
+    assert_eq!(
+        report.insertions, 0,
+        "range sparse reads must not materialize/admit a 256 MiB whole-file cache entry"
+    );
+    assert_eq!(report.resident_bytes, 0);
+    let record = fs.stat("/sparse.bin").expect("stat sparse file");
+    assert!(
+        fs.lookup_extents(record.inode_id.get(), 0, file_len as u64)
+            .is_empty(),
+        "sparse reads must not allocate extents"
+    );
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
+fn zero_writeback_over_materialized_data_stays_materialized() {
+    let (mut fs, root) = wb_open_temp("zero-writeback-materialized");
+    let chunk = content_chunk_size() as usize;
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: chunk * 8,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/data.bin", 0o644).expect("create");
+    let initial = vec![0x5a_u8; chunk];
+    fs.write_file("/data.bin", 0, &initial)
+        .expect("write materialized chunk");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush materialized chunk");
+
+    let zeros = vec![0_u8; chunk];
+    fs.write_file("/data.bin", 0, &zeros)
+        .expect("zero existing chunk");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush zeroed chunk");
+
+    let manifest = wd_current_content_manifest(&fs, "/data.bin");
+    assert_eq!(manifest.chunks.len(), 1);
+    assert!(
+        !manifest.chunks[0].is_hole(),
+        "zeroing materialized data is a real write, not hole punching"
+    );
+    assert_eq!(
+        fs.read_file_range("/data.bin", 0, chunk)
+            .expect("read zeroed data"),
+        zeros
+    );
 
     drop(fs);
     wd_cleanup(&root);

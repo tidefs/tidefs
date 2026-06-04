@@ -248,19 +248,6 @@ fn engine_err_to_flush_err(e: Errno) -> PageFlushError {
 }
 
 // ---------------------------------------------------------------------------
-// page_flush_err_to_fsync_dispatch_err — map PageCache errors to dispatch errors
-// ---------------------------------------------------------------------------
-
-#[inline]
-fn page_flush_err_to_fsync_dispatch_err(e: PageFlushError) -> FsyncDispatchError {
-    match e {
-        PageFlushError::IoError => FsyncDispatchError::IoError,
-        PageFlushError::NoSpace => FsyncDispatchError::NoSpace,
-        PageFlushError::Interrupted => FsyncDispatchError::Interrupted,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // dispatch_flush — drain dirty pages and commit for a single file handle
 // ---------------------------------------------------------------------------
 
@@ -433,13 +420,12 @@ use tidefs_local_filesystem::fuse_fsync::{DirtyFlush, FsyncDispatchError};
 /// borrowed references to the adapter's page cache, engine, file handle,
 /// and request context.
 ///
-/// The bridge performs two phases:
-/// 1. Writeback: iterate dirty [`PageCache`] pages for the target inode,
-///    write them through the engine, and mark them clean.
-/// 2. Commit: call `engine.flush()` to persist any per-mount state.
-///
-/// For filesystem-wide flush (`flush_all`), all dirty pages across all
-/// inodes are written back.
+/// The adapter daemon has already written incoming FUSE write payloads through
+/// the engine before acknowledging the request. The optional page cache
+/// attached here is therefore a userspace mirror of kernel writeback-cache
+/// dirtiness, not authoritative byte storage. This bridge commits the engine
+/// boundary and clears successful mirror dirtiness without replaying whole
+/// cached pages back into the engine.
 pub struct PageCacheDirtyFlush<'a> {
     page_cache: Option<&'a Arc<PageCache>>,
     engine: &'a dyn VfsEngine,
@@ -484,25 +470,6 @@ impl DirtyFlush for PageCacheDirtyFlush<'_> {
             .as_ref()
             .map(|t| t.lock().unwrap().take_boundary());
 
-        // Phase 1: Writeback dirty pages through the PageCache.
-        // flush_dirty_range handles start_writeback, write, and
-        // complete_writeback in a single coordinated pass.
-        if let Some(wb_cache) = self.page_cache {
-            wb_cache
-                .flush_dirty_range(ino, 0, u64::MAX, |offset, data| {
-                    self.engine
-                        .write(self.efh, offset, data, self.ctx)
-                        .map(|_| ())
-                        .map_err(engine_err_to_flush_err)
-                })
-                .map_err(|e| match e {
-                    PageFlushError::IoError => FsyncDispatchError::IoError,
-                    PageFlushError::NoSpace => FsyncDispatchError::NoSpace,
-                    PageFlushError::Interrupted => FsyncDispatchError::Interrupted,
-                })?;
-        }
-
-        // Phase 2: Commit through the engine flush path.
         self.engine.flush(self.efh, self.ctx).map_err(|e| {
             if e == Errno::ENOSPC {
                 FsyncDispatchError::NoSpace
@@ -512,6 +479,10 @@ impl DirtyFlush for PageCacheDirtyFlush<'_> {
                 FsyncDispatchError::IoError
             }
         })?;
+
+        if let Some(wb_cache) = self.page_cache {
+            wb_cache.clear_dirty_for_inode(ino);
+        }
 
         // Clear dirty ranges up to the snapshotted boundary.
         if let (Some(tracker), Some(token)) = (self.dirty_page_tracker, boundary_token) {
@@ -527,41 +498,11 @@ impl DirtyFlush for PageCacheDirtyFlush<'_> {
             .as_ref()
             .map(|t| t.lock().unwrap().take_boundary());
 
-        // Filesystem-wide flush: drain dirty pages with real writable handles
-        // for the inode each page belongs to.  syncfs has no caller file
-        // handle, so using the bridge's per-file handle here would either
-        // write through the wrong inode or, for synthetic handles, fail handle
-        // validation and leave data dirty.
         if let Some(wb_cache) = self.page_cache {
             let all_dirty = wb_cache.dirty_pages();
             let dirty_inodes: BTreeSet<u64> = all_dirty.iter().map(|key| key.inode).collect();
             for ino in dirty_inodes {
-                let handle = self
-                    .engine
-                    .open(InodeId::new(ino), libc::O_RDWR as OpenFlags, self.ctx)
-                    .map_err(|e| {
-                        page_flush_err_to_fsync_dispatch_err(engine_err_to_flush_err(e))
-                    })?;
-
-                let flush_result = wb_cache.flush_dirty_range(ino, 0, u64::MAX, |offset, data| {
-                    let written = self
-                        .engine
-                        .write(&handle, offset, data, self.ctx)
-                        .map_err(engine_err_to_flush_err)?;
-                    if written as usize == data.len() {
-                        Ok(())
-                    } else {
-                        Err(PageFlushError::IoError)
-                    }
-                });
-                let release_result = self.engine.release(&handle);
-
-                if let Err(e) = flush_result {
-                    return Err(page_flush_err_to_fsync_dispatch_err(e));
-                }
-                if release_result.is_err() {
-                    return Err(FsyncDispatchError::IoError);
-                }
+                wb_cache.clear_dirty_for_inode(ino);
             }
         }
 
@@ -1712,6 +1653,50 @@ mod tests {
     }
 
     #[test]
+    fn page_cache_dirty_flush_flush_inode_clears_mirror_without_replay() {
+        let engine = InMemoryTestEngine::new();
+        let pc = Arc::new(PageCache::new(64, 4096));
+        let handle = test_handle(42);
+        let efh = handle.to_engine_file_handle();
+        let ctx = test_ctx();
+
+        let _key = pc.insert(42, 0).expect("insert dirty page");
+        {
+            let mut page = pc.lookup(42, 0).expect("lookup dirty page");
+            page.data_mut()[..5].copy_from_slice(b"short");
+            page.mark_dirty();
+        }
+
+        let bridge = PageCacheDirtyFlush::new(Some(&pc), &engine, &efh, &ctx);
+        let result = bridge.flush_inode(InodeId::new(42), false);
+        assert!(result.is_ok());
+
+        assert!(pc.dirty_pages_for_inode(42).is_empty());
+        assert!(engine.write_calls.lock().unwrap().is_empty());
+        assert!(engine.data.lock().unwrap().is_empty());
+        assert_eq!(engine.flush_calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn page_cache_dirty_flush_flush_inode_error_retains_dirty_mirror() {
+        let engine = InMemoryTestEngine::new();
+        *engine.flush_error.lock().unwrap() = Some(Errno::EIO);
+        let pc = Arc::new(PageCache::new(64, 4096));
+        let handle = test_handle(42);
+        let efh = handle.to_engine_file_handle();
+        let ctx = test_ctx();
+
+        let _key = pc.insert(42, 0).expect("insert dirty page");
+        pc.mark_dirty(42, 0);
+
+        let bridge = PageCacheDirtyFlush::new(Some(&pc), &engine, &efh, &ctx);
+        let result = bridge.flush_inode(InodeId::new(42), false);
+        assert_eq!(result, Err(FsyncDispatchError::IoError));
+        assert_eq!(pc.dirty_pages_for_inode(42).len(), 1);
+        assert!(engine.write_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn page_cache_dirty_flush_flush_all_without_pagecache() {
         let engine = InMemoryTestEngine::new();
         let handle = test_handle(99);
@@ -1729,7 +1714,7 @@ mod tests {
     }
 
     #[test]
-    fn page_cache_dirty_flush_flush_all_uses_per_inode_write_handles() {
+    fn page_cache_dirty_flush_flush_all_clears_all_mirrors_without_replay() {
         let engine = InMemoryTestEngine::new();
         let pc = Arc::new(PageCache::new(64, 4096));
         let synthetic = EngineFileHandle::new(InodeId::new(0), 0, FileHandleId::new(0), 0);
@@ -1751,65 +1736,10 @@ mod tests {
 
         assert!(pc.dirty_pages_for_inode(21).is_empty());
         assert!(pc.dirty_pages_for_inode(22).is_empty());
-        assert_eq!(
-            *engine.open_calls.lock().unwrap(),
-            vec![(21, libc::O_RDWR as u32), (22, libc::O_RDWR as u32),]
-        );
-        let writes = engine.write_calls.lock().unwrap();
-        assert_eq!(writes.len(), 2);
-        assert_eq!(writes[0].0, 21);
-        assert_eq!(writes[0].2, 0);
-        assert_eq!(writes[1].0, 22);
-        assert_eq!(writes[1].2, 4096);
-        assert!(
-            writes.iter().all(|(ino, _, _, _)| *ino != 0),
-            "flush_all must not write dirty data through the synthetic syncfs handle"
-        );
-        assert_eq!(engine.release_calls.lock().unwrap().len(), 2);
-        assert!(engine.flush_calls.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn page_cache_dirty_flush_flush_all_open_failure_retains_dirty_page() {
-        let engine = InMemoryTestEngine::new();
-        *engine.open_error.lock().unwrap() = Some(Errno::ENOENT);
-        let pc = Arc::new(PageCache::new(64, 4096));
-        let synthetic = EngineFileHandle::new(InodeId::new(0), 0, FileHandleId::new(0), 0);
-        let ctx = test_ctx();
-
-        let _key = pc.insert(31, 0).expect("insert dirty page");
-        let mut page = pc.lookup(31, 0).expect("lookup dirty page");
-        page.data_mut()[..4].copy_from_slice(b"data");
-        page.mark_dirty();
-        drop(page);
-
-        let bridge = PageCacheDirtyFlush::new(Some(&pc), &engine, &synthetic, &ctx);
-        let result = bridge.flush_all();
-        assert_eq!(result, Err(FsyncDispatchError::IoError));
-        assert_eq!(pc.dirty_pages_for_inode(31).len(), 1);
+        assert!(engine.open_calls.lock().unwrap().is_empty());
         assert!(engine.write_calls.lock().unwrap().is_empty());
         assert!(engine.release_calls.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn page_cache_dirty_flush_flush_all_write_enospc_retains_dirty_page() {
-        let engine = InMemoryTestEngine::new();
-        *engine.write_error.lock().unwrap() = Some(Errno::ENOSPC);
-        let pc = Arc::new(PageCache::new(64, 4096));
-        let synthetic = EngineFileHandle::new(InodeId::new(0), 0, FileHandleId::new(0), 0);
-        let ctx = test_ctx();
-
-        let _key = pc.insert(32, 0).expect("insert dirty page");
-        let mut page = pc.lookup(32, 0).expect("lookup dirty page");
-        page.data_mut()[..4].copy_from_slice(b"data");
-        page.mark_dirty();
-        drop(page);
-
-        let bridge = PageCacheDirtyFlush::new(Some(&pc), &engine, &synthetic, &ctx);
-        let result = bridge.flush_all();
-        assert_eq!(result, Err(FsyncDispatchError::NoSpace));
-        assert_eq!(pc.dirty_pages_for_inode(32).len(), 1);
-        assert_eq!(engine.release_calls.lock().unwrap().len(), 1);
+        assert!(engine.flush_calls.lock().unwrap().is_empty());
     }
 
     // ── FlushError/ FsyncError Error-like impls ─────────────────────

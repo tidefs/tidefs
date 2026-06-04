@@ -304,6 +304,7 @@ dev="tidefs-xfstests-root"
 mnt=""
 daemon_opts="atime,dev,allow_other"
 daemon_coherency="writeback"
+daemon_writeback_cache="1"
 daemon_content_capacity_bytes="2147483648"
 merge_mount_opts() {
     old_ifs="$IFS"
@@ -372,11 +373,12 @@ daemon_log="/tmp/tidefs-daemon-$log_tag.log"
     echo "tidefs-preview: store=$store"
     echo "tidefs-preview: daemon_opts=$daemon_opts"
     echo "tidefs-preview: daemon_coherency=$daemon_coherency"
+    echo "tidefs-preview: daemon_writeback_cache=$daemon_writeback_cache"
     echo "tidefs-preview: daemon_content_capacity_bytes=$daemon_content_capacity_bytes"
     echo "tidefs-preview: daemon_log=$daemon_log"
 } > "$helper_log"
 mkdir -p "$store"
-/bin/tidefs-posix-filesystem-adapter-daemon mount-vfs     --store "$store" --mount "$mnt"     --fs-name "$dev"     --coherency "$daemon_coherency"     --content-capacity-bytes "$daemon_content_capacity_bytes"     --options "$daemon_opts"     --root-auth-key-hex "$AUTH"     >"$daemon_log" 2>&1 &
+/bin/tidefs-posix-filesystem-adapter-daemon mount-vfs     --store "$store" --mount "$mnt"     --fs-name "$dev"     --coherency "$daemon_coherency"     --writeback-cache     --content-capacity-bytes "$daemon_content_capacity_bytes"     --options "$daemon_opts"     --root-auth-key-hex "$AUTH"     >"$daemon_log" 2>&1 &
 daemon_pid=$!
 echo "tidefs-preview: daemon_pid=$daemon_pid" >> "$helper_log"
 report_mount_failure() {

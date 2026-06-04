@@ -6,8 +6,9 @@ use tidefs_types_vfs_core::{InodeId, ROOT_INODE_ID};
 use crate::constants::*;
 use crate::content::{
     content_chunk_count, content_chunk_len, content_chunk_start, decode_content_layout,
-    find_chunk_in_manifest, overlay_chunk_index_bounds, range_intersects_overlay,
-    read_content_layout_from_store, retained_content_chunk_ref, validate_content_layout,
+    find_chunk_in_manifest, overlay_chunk_index_bounds, overlay_chunk_writes_only_zeros,
+    range_intersects_overlay, read_content_layout_from_store, retained_content_chunk_ref,
+    validate_content_layout, ContentOverlayPatch,
 };
 use crate::error::FileSystemError;
 use crate::object_keys::{content_chunk_object_key_for_version, content_object_key_for_version};
@@ -193,6 +194,22 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
             {
                 for chunk_index in first_overlay_chunk..=last_overlay_chunk {
                     let len = content_chunk_len(new_record.size, chunk_index)?;
+                    let old_chunk_is_sparse_zero =
+                        match find_chunk_in_manifest(manifest, chunk_index) {
+                            Some(chunk_ref) => chunk_ref.is_hole(),
+                            None => true,
+                        };
+                    if old_chunk_is_sparse_zero
+                        && overlay_chunk_writes_only_zeros(
+                            chunk_index,
+                            len,
+                            overlay_offset,
+                            overlay_bytes,
+                        )?
+                    {
+                        continue;
+                    }
+
                     let grains = allocation_grains_for_len(u64::from(len))?;
                     debug_assert!(
                         grains % content_chunk_size() as u64 == 0,
@@ -266,6 +283,101 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
         debug_assert!(
             grains % content_chunk_size() as u64 == 0,
             "new overlay chunk allocation grains must be grain-aligned"
+        );
+        entries.insert(
+            content_chunk_object_key_for_version(
+                new_record.inode_id,
+                new_record.data_version,
+                chunk_index,
+            ),
+            grains,
+        );
+    }
+    Ok(entries)
+}
+
+pub(crate) fn planned_chunk_allocation_entries_for_patch_batch(
+    store: &LocalObjectStore,
+    old_record: &InodeRecord,
+    new_record: &InodeRecord,
+    patches: &[ContentOverlayPatch<'_>],
+    allow_holes: bool,
+) -> Result<BTreeMap<ObjectKey, u64>> {
+    let old_layout = read_content_layout_from_store(store, old_record.inode_id, old_record, true)?;
+    let mut entries = BTreeMap::new();
+    if !allow_holes || old_record.size != new_record.size {
+        return Err(FileSystemError::Unsupported {
+            operation: "patch batch allocation planning",
+            reason: "batch writeback optimization requires same-size sparse content",
+        });
+    }
+    let crate::records::ContentLayout::Chunked(ref manifest) = old_layout else {
+        return Err(FileSystemError::Unsupported {
+            operation: "patch batch allocation planning",
+            reason: "batch writeback optimization requires chunked content",
+        });
+    };
+
+    let mut patched_chunks: BTreeMap<u64, Vec<ContentOverlayPatch<'_>>> = BTreeMap::new();
+    for patch in patches {
+        let Some((first_chunk, last_chunk)) =
+            overlay_chunk_index_bounds(new_record.size, patch.offset, patch.bytes.len())?
+        else {
+            continue;
+        };
+        for chunk_index in first_chunk..=last_chunk {
+            patched_chunks.entry(chunk_index).or_default().push(*patch);
+        }
+    }
+
+    for old_ref in &manifest.chunks {
+        if old_ref.is_hole() || patched_chunks.contains_key(&old_ref.chunk_index) {
+            continue;
+        }
+        let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
+        if old_ref.len != new_len {
+            continue;
+        }
+        let grains = allocation_grains_for_len(u64::from(old_ref.len))?;
+        debug_assert!(
+            grains % content_chunk_size() as u64 == 0,
+            "retained patch-batch chunk allocation grains must be grain-aligned"
+        );
+        entries.insert(
+            content_chunk_object_key_for_version(
+                new_record.inode_id,
+                old_ref.data_version,
+                old_ref.chunk_index,
+            ),
+            grains,
+        );
+    }
+
+    for (chunk_index, chunk_patches) in patched_chunks {
+        let len = content_chunk_len(new_record.size, chunk_index)?;
+        let old_chunk_is_sparse_zero = match find_chunk_in_manifest(manifest, chunk_index) {
+            Some(chunk_ref) => chunk_ref.is_hole(),
+            None => true,
+        };
+        let patch_bytes_all_zero = chunk_patches.iter().try_fold(true, |all_zero, patch| {
+            Ok::<bool, FileSystemError>(
+                all_zero
+                    && overlay_chunk_writes_only_zeros(
+                        chunk_index,
+                        len,
+                        patch.offset,
+                        patch.bytes,
+                    )?,
+            )
+        })?;
+        if old_chunk_is_sparse_zero && patch_bytes_all_zero {
+            continue;
+        }
+
+        let grains = allocation_grains_for_len(u64::from(len))?;
+        debug_assert!(
+            grains % content_chunk_size() as u64 == 0,
+            "new patch-batch chunk allocation grains must be grain-aligned"
         );
         entries.insert(
             content_chunk_object_key_for_version(

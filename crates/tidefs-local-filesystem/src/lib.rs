@@ -1333,6 +1333,7 @@ pub struct LocalFileSystem {
     root_authentication_key: RootAuthenticationKey,
     encryption_key: Option<StoreEncryptionKey>,
     hot_read_cache: RefCell<HotReadCache>,
+    content_layout_cache: RefCell<BTreeMap<HotReadCacheKey, ContentLayout>>,
     dedup_index: RefCell<DedupIndex>,
     dedup_enabled: bool,
     inode_cache: RefCell<InodeCache>,
@@ -2759,6 +2760,7 @@ impl LocalFileSystem {
             root_authentication_key,
             encryption_key: key_for_struct,
             hot_read_cache: RefCell::new(HotReadCache::new(HotReadCachePolicy::default())),
+            content_layout_cache: RefCell::new(BTreeMap::new()),
             dedup_index: RefCell::new(DedupIndex::new()),
             dedup_enabled: false,
             inode_cache: RefCell::new(InodeCache::new(InodeCachePolicy::default())),
@@ -5299,6 +5301,140 @@ impl LocalFileSystem {
         }
     }
 
+    fn finalize_drained_write_segments(
+        &mut self,
+        inode_id: InodeId,
+        segments: Vec<(u64, Vec<u8>)>,
+    ) {
+        for (offset, data) in segments {
+            // Finalize PendingData extents with the real BLAKE3 content
+            // checksum and current commit-group provenance.
+            let data_len = data.len() as u64;
+            let blake3_hash = blake3::hash(&data);
+            let birth_txg = self.commit_group.current_commit_group().0;
+            let _ = self.extent_allocator.finalize_data_extent(
+                inode_id.0,
+                offset,
+                data_len,
+                *blake3_hash.as_bytes(),
+                birth_txg,
+            );
+            // Clear the dirty range only after the authoritative data path
+            // (content layout + extent allocation) has succeeded (#5940).
+            self.writeback_range_tracker
+                .lock()
+                .expect("locked")
+                .clear_range(inode_id, offset, data_len);
+        }
+    }
+
+    fn rewrite_content_with_patch_batch(
+        &mut self,
+        inode_id: InodeId,
+        mut record: InodeRecord,
+        patches: &[CoalescedBufferedWritePatch],
+        new_size: u64,
+        allow_holes: bool,
+    ) -> Result<InodeRecord> {
+        let old_record = record.clone();
+        let planned_tick = next_generation_after(self.state.generation);
+        let mut planned_record = record.clone();
+        planned_record.size = new_size;
+        planned_record.data_version = planned_tick;
+        planned_record.metadata_version = planned_tick;
+        let content_patches: Vec<ContentOverlayPatch<'_>> = patches
+            .iter()
+            .map(|patch| ContentOverlayPatch {
+                offset: patch.offset,
+                bytes: &patch.bytes,
+            })
+            .collect();
+        let planned_entries = planned_chunk_allocation_entries_for_patch_batch(
+            self.store.raw_primary_store(),
+            &old_record,
+            &planned_record,
+            &content_patches,
+            allow_holes,
+        )?;
+        let allocation_bytes = allocation_bytes(&planned_entries).unwrap_or(0);
+        let dirty_allocation_bytes = patches.iter().try_fold(0_u64, |sum, patch| {
+            let bytes = dirty_overlay_allocation_bytes(new_size, patch.offset, &patch.bytes)?;
+            sum.checked_add(bytes).ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })
+        })?;
+        let new_blocks = allocation_bytes / content_chunk_size() as u64;
+        self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(inode_id))?;
+        self.ensure_content_capacity_with_planned_inode(Some(inode_id), planned_entries.clone())?;
+
+        self.begin_mutation();
+        let tick = self.bump_generation();
+        debug_assert_eq!(tick, planned_tick);
+        record.size = new_size;
+        record.data_version = tick;
+        record.metadata_version = tick;
+        let result = {
+            let mut dedup = self.dedup_index.borrow_mut();
+            write_chunked_content_with_patch_batch(WriteChunkedContentPatchBatch {
+                dedup_enabled: self.dedup_enabled,
+                store: self.store.raw_primary_store_mut(),
+                inode_id,
+                old_record: &old_record,
+                new_record: &record,
+                patches: &content_patches,
+                allow_holes,
+                dedup_index: &mut dedup,
+                quorum_store: self.quorum_store.as_mut(),
+                compression_policy: &self.content_compression_policy,
+            })
+        };
+        if let Err(err) = result {
+            self.rollback_mutation_delta();
+            return Err(err);
+        }
+        if dirty_allocation_bytes > 0 {
+            self.dirty_set
+                .record_data_write(inode_id, dirty_allocation_bytes);
+            let _accepted_by_commit_group = self.commit_group.record_write(dirty_allocation_bytes);
+        }
+        self.obligation_ledger.release_claims_for_inode(inode_id);
+        if new_blocks > 0 {
+            self.obligation_ledger
+                .claim(ClaimEntry {
+                    claim_id: ClaimId::new(),
+                    budget_domain: BudgetDomainId::from_str("staging_dirty"),
+                    blocks: new_blocks,
+                    inode_id,
+                    reason: ClaimReason::Write,
+                    authorized_by: StorageAuthorityToken::ABSENT,
+                    generation: tick,
+                })
+                .ok();
+        }
+        let _ = self.budget_domain.admit_claim(ClaimEntryRecord {
+            claim_id: ClaimId::new(),
+            claimant_ref: ClaimantRef::Service {
+                service_name: "staging_dirty".into(),
+            },
+            claim_class: ClaimClass::Product,
+            claimed_bytes: new_blocks * content_chunk_size() as u64,
+            committed_bytes: 0,
+            inode_id: Some(inode_id),
+            freshness_fence_ref: None,
+            claim_receipt_ref: StorageAuthorityToken::ABSENT,
+            expiration_deadline: None,
+        });
+
+        self.invalidate_hot_read_cache_for_inode(inode_id);
+        self.inode_cache.borrow_mut().invalidate(inode_id);
+        self.mark_inode_metadata_dirty(inode_id);
+        Arc::make_mut(&mut self.state.inodes).insert(inode_id, record.clone());
+        self.inode_cache.borrow_mut().invalidate(inode_id);
+        self.mark_inode_content_dirty(inode_id);
+        self.invalidate_hot_read_cache_for_inode(inode_id);
+        self.commit_mutation(record)
+    }
+
     fn flush_drained_write_segments(
         &mut self,
         inode_id: InodeId,
@@ -5315,6 +5451,39 @@ impl LocalFileSystem {
                 return Err(err);
             }
         };
+        let batch_new_size = patches.iter().try_fold(base_record.size, |size, patch| {
+            let patch_len =
+                u64::try_from(patch.bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            let patch_end =
+                patch
+                    .offset
+                    .checked_add(patch_len)
+                    .ok_or(FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    })?;
+            Ok::<u64, FileSystemError>(size.max(patch_end))
+        })?;
+        if patches.len() > 1 && batch_new_size == base_record.size {
+            match self.rewrite_content_with_patch_batch(
+                inode_id,
+                base_record.clone(),
+                &patches,
+                batch_new_size,
+                true,
+            ) {
+                Ok(_) => {
+                    self.finalize_drained_write_segments(inode_id, segments);
+                    return Ok(());
+                }
+                Err(FileSystemError::Unsupported { .. }) => {}
+                Err(err) => {
+                    self.restore_drained_write_segments(inode_id, &segments);
+                    return Err(err);
+                }
+            }
+        }
         let batch_transaction = self.auto_commit && !self.in_transaction && patches.len() > 1;
         if batch_transaction {
             self.auto_commit = false;
@@ -5363,26 +5532,7 @@ impl LocalFileSystem {
             self.auto_commit = true;
         }
 
-        for (offset, data) in segments {
-            // Finalize PendingData extents with the real BLAKE3 content
-            // checksum and current commit-group provenance.
-            let data_len = data.len() as u64;
-            let blake3_hash = blake3::hash(&data);
-            let birth_txg = self.commit_group.current_commit_group().0;
-            let _ = self.extent_allocator.finalize_data_extent(
-                inode_id.0,
-                offset,
-                data_len,
-                *blake3_hash.as_bytes(),
-                birth_txg,
-            );
-            // Clear the dirty range only after the authoritative data path
-            // (content layout + extent allocation) has succeeded (#5940).
-            self.writeback_range_tracker
-                .lock()
-                .expect("locked")
-                .clear_range(inode_id, offset, data_len);
-        }
+        self.finalize_drained_write_segments(inode_id, segments);
         Ok(())
     }
 
@@ -5437,6 +5587,60 @@ impl LocalFileSystem {
         self.write_buffers
             .get(&inode_id)
             .and_then(|wb| wb.read_overlap(offset, len))
+    }
+
+    fn sparse_zero_write_is_noop(
+        &self,
+        inode_id: InodeId,
+        record: &InodeRecord,
+        offset: u64,
+        len: usize,
+    ) -> Result<bool> {
+        if len == 0 {
+            return Ok(false);
+        }
+        let write_len = u64::try_from(len).map_err(|_| FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+        let write_end = offset
+            .checked_add(write_len)
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+        if write_end > record.size {
+            return Ok(false);
+        }
+        if self
+            .write_buffers
+            .get(&inode_id)
+            .is_some_and(|buffer| !buffer.is_empty())
+        {
+            return Ok(false);
+        }
+        if !self
+            .extent_allocator
+            .lookup_extents(inode_id.0, offset, write_len)
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        let layout =
+            read_content_layout_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+        let ContentLayout::Chunked(manifest) = layout else {
+            return Ok(false);
+        };
+        let Some((first_chunk, last_chunk)) = overlay_chunk_index_bounds(record.size, offset, len)?
+        else {
+            return Ok(false);
+        };
+        for chunk_index in first_chunk..=last_chunk {
+            if find_chunk_in_manifest(&manifest, chunk_index)
+                .is_some_and(|chunk_ref| !chunk_ref.is_hole())
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Return the effective (logical) file size, accounting for buffered
@@ -5569,6 +5773,11 @@ impl LocalFileSystem {
         let _end_len =
             usize::try_from(end).map_err(|_| FileSystemError::SizeOverflow { requested: end })?;
         let new_size = record.size.max(end);
+        if bytes.iter().all(|byte| *byte == 0)
+            && self.sparse_zero_write_is_noop(inode_id, &record, offset, bytes.len())?
+        {
+            return Ok(record);
+        }
         // Quota: check byte grain delta for write
         let old_grains = crate::quota::allocation_grains_for_len(record.size);
         let new_grains = crate::quota::allocation_grains_for_len(new_size);
@@ -9223,6 +9432,12 @@ impl LocalFileSystem {
         let length_u64 = u64::try_from(length).map_err(|_| FileSystemError::SizeOverflow {
             requested: u64::MAX,
         })?;
+        let available = record.size - offset;
+        let clipped_len_u64 = available.min(length_u64);
+        let clipped_len =
+            usize::try_from(clipped_len_u64).map_err(|_| FileSystemError::SizeOverflow {
+                requested: clipped_len_u64,
+            })?;
         if offset == 0 && length_u64 >= record.size {
             return self.read_content(inode_id, record);
         }
@@ -9242,11 +9457,9 @@ impl LocalFileSystem {
         if let Some(bytes) = self.hot_read_cache.borrow_mut().get(key) {
             let start = usize::try_from(offset)
                 .map_err(|_| FileSystemError::SizeOverflow { requested: offset })?;
-            let available = record.size - offset;
-            let clipped_len = available.min(length_u64);
             let end_offset =
                 offset
-                    .checked_add(clipped_len)
+                    .checked_add(clipped_len_u64)
                     .ok_or(FileSystemError::SizeOverflow {
                         requested: u64::MAX,
                     })?;
@@ -9261,22 +9474,44 @@ impl LocalFileSystem {
             return Ok(bytes[start..end].to_vec());
         }
 
-        read_content_range_from_store(
+        if let Some(layout) = self.content_layout_cache.borrow().get(&key).cloned() {
+            return read_content_range_from_layout(
+                self.store.raw_primary_store(),
+                &layout,
+                offset,
+                clipped_len,
+            );
+        }
+
+        let layout =
+            read_content_layout_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+        let bytes = read_content_range_from_layout(
             self.store.raw_primary_store(),
-            inode_id,
-            record,
+            &layout,
             offset,
-            length,
-            true,
-        )
+            clipped_len,
+        )?;
+        if matches!(layout, ContentLayout::Chunked(_)) {
+            self.content_layout_cache.borrow_mut().insert(key, layout);
+        }
+        Ok(bytes)
     }
 
     fn invalidate_hot_read_cache_for_inode(&self, inode_id: InodeId) {
         self.hot_read_cache.borrow_mut().invalidate_inode(inode_id);
+        self.content_layout_cache
+            .borrow_mut()
+            .retain(|key, _layout| key.inode_id != inode_id.get());
     }
 
     fn clear_hot_read_cache(&self) {
         self.hot_read_cache.borrow_mut().clear();
+        self.content_layout_cache.borrow_mut().clear();
+    }
+
+    #[cfg(test)]
+    fn content_layout_cache_len_for_test(&self) -> usize {
+        self.content_layout_cache.borrow().len()
     }
 
     fn resolve_parent_and_name(&self, path: &str) -> Result<(InodeId, Vec<u8>)> {

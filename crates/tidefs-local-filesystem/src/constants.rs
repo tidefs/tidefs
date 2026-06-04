@@ -20,16 +20,16 @@ pub const FILESYSTEM_CONTENT_OBJECT_PREFIX: &str = "tidefs.local-filesystem.v1.c
 pub const FILESYSTEM_ORPHAN_INDEX_OBJECT_NAME: &str = "tidefs.local-filesystem.v1.orphan-index";
 
 // Chunk size is now runtime-configurable via content_chunk_size() below.
-// Default: DEFAULT_FILESYSTEM_CONTENT_CHUNK_SIZE (64 KiB).
+// Default: DEFAULT_FILESYSTEM_CONTENT_CHUNK_SIZE (128 KiB).
 // Override with TIDEFS_CONTENT_CHUNK_SIZE env var.
-pub const DEFAULT_FILESYSTEM_CONTENT_CHUNK_SIZE: u32 = 65536;
+pub const DEFAULT_FILESYSTEM_CONTENT_CHUNK_SIZE: u32 = 131_072;
 
 static CONTENT_CHUNK_SIZE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
 /// Returns the current content chunk size.
 ///
 /// On first call reads `TIDEFS_CONTENT_CHUNK_SIZE` from the environment.
-/// Falls back to [`DEFAULT_FILESYSTEM_CONTENT_CHUNK_SIZE`] (64 KiB).
+/// Falls back to [`DEFAULT_FILESYSTEM_CONTENT_CHUNK_SIZE`] (128 KiB).
 pub fn content_chunk_size() -> u32 {
     *CONTENT_CHUNK_SIZE.get_or_init(|| {
         if let Ok(val) = std::env::var("TIDEFS_CONTENT_CHUNK_SIZE") {

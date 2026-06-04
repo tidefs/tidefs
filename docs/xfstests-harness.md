@@ -57,8 +57,9 @@ next row. The generated guest `umount` wrapper waits for the matching daemon
 to exit before remounting the same store, so short scratch mount cycles do not
 race a previous writer.
 The generated helper mounts with the daemon's `writeback` coherency profile
-without enabling the FUSE kernel writeback-cache flag; ordinary opens therefore
-remain mmap-capable instead of advertising `FOPEN_DIRECT_IO`, while explicit
+and explicitly enables the FUSE kernel writeback-cache flag so writable
+`MAP_SHARED` fsx rows can exercise the kernel page-cache writeback and `msync`
+path. Ordinary opens still avoid advertising `FOPEN_DIRECT_IO`, while explicit
 `O_DIRECT` opens still use the direct-I/O path. It also provisions a 2 GiB
 content-capacity ceiling for each per-row TideFS store, so sparse/truncate
 xfstests rows that require 256 MiB scratch files do not fail against the

@@ -6,7 +6,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ pub struct CommitGroupCycle {
     durability: Mutex<DurabilitySequence>,
     pub current_commit_group_id: AtomicU64,
     pub committed_count: AtomicU64,
+    queued_dirty_bytes: AtomicUsize,
     store_root: Mutex<Option<PathBuf>>,
     barrier_active: AtomicU64,
 }
@@ -34,6 +35,7 @@ impl CommitGroupCycle {
             durability: Mutex::new(DurabilitySequence::new()),
             current_commit_group_id: AtomicU64::new(CommitGroupId::FIRST.0),
             committed_count: AtomicU64::new(0),
+            queued_dirty_bytes: AtomicUsize::new(0),
             store_root: Mutex::new(None),
             barrier_active: AtomicU64::new(0),
         }
@@ -59,6 +61,7 @@ impl CommitGroupCycle {
         Self {
             current_commit_group_id: AtomicU64::new(starting_id.0),
             committed_count: AtomicU64::new(0),
+            queued_dirty_bytes: AtomicUsize::new(0),
             store_root: Mutex::new(Some(store_root)),
             mgr: Mutex::new(mgr),
             durability: Mutex::new(DurabilitySequence::new()),
@@ -107,6 +110,31 @@ impl CommitGroupCycle {
         self.queue_write_with_flush_threshold(ino, offset, data, COMMIT_GROUP_DIRTY_FLUSH_BYTES);
     }
 
+    fn encode_write_descriptor(ino: u64, offset: u64, len: u64) -> [u8; 32] {
+        let mut descriptor = [0_u8; 32];
+        descriptor[0..8].copy_from_slice(b"twdesc01");
+        descriptor[8..16].copy_from_slice(&ino.to_le_bytes());
+        descriptor[16..24].copy_from_slice(&offset.to_le_bytes());
+        descriptor[24..32].copy_from_slice(&len.to_le_bytes());
+        descriptor
+    }
+
+    fn add_queued_dirty_bytes(&self, dirty_bytes: usize) -> usize {
+        let mut current = self.queued_dirty_bytes.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(dirty_bytes);
+            match self.queued_dirty_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     fn queue_write_with_flush_threshold(
         &self,
         ino: u64,
@@ -119,11 +147,14 @@ impl CommitGroupCycle {
         }
         if let Ok(mut mgr) = self.mgr.lock() {
             let key = crate::dispatch_helpers::derive_commit_group_object_key(ino, offset);
-            match mgr.queue_put(key, data) {
+            let descriptor = Self::encode_write_descriptor(ino, offset, data.len() as u64);
+            match mgr.queue_put(key, &descriptor) {
                 Ok(_) => {
-                    if mgr.current_bytes() >= flush_bytes {
+                    let queued_dirty_bytes = self.add_queued_dirty_bytes(data.len());
+                    if queued_dirty_bytes >= flush_bytes {
                         match mgr.commit_current() {
                             Ok(Some(root)) => {
+                                self.queued_dirty_bytes.store(0, Ordering::Relaxed);
                                 if let Err(e) = self.publish_committed_root(root) {
                                     eprintln!("commit_group threshold commit publish error: {e}");
                                 } else {
@@ -180,6 +211,7 @@ impl CommitGroupCycle {
         let mut mgr = self.mgr.lock().unwrap();
         let result = mgr.commit_current()?;
         if let Some(root) = result {
+            self.queued_dirty_bytes.store(0, Ordering::Relaxed);
             self.publish_committed_root(root)?;
             Ok(Some(root))
         } else {
@@ -321,6 +353,26 @@ mod tests {
         assert_eq!(cycle.committed_count.load(Ordering::Relaxed), 1);
         let result = cycle.commit_current().unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn queue_write_stages_descriptor_not_full_payload() {
+        let cycle = CommitGroupCycle::new();
+        let payload = vec![0xA5; 8192];
+
+        cycle.queue_write_with_flush_threshold(1, 0, &payload, usize::MAX);
+
+        let mgr = cycle.mgr.lock().unwrap();
+        assert_eq!(mgr.current_write_count(), 1);
+        assert_eq!(mgr.current_bytes(), 32);
+        assert!(
+            mgr.current_bytes() < payload.len(),
+            "txg staging must not retain the full authoritative payload"
+        );
+        assert_eq!(
+            cycle.queued_dirty_bytes.load(Ordering::Relaxed),
+            payload.len()
+        );
     }
 
     #[test]

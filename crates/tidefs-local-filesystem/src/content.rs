@@ -33,6 +33,25 @@ pub(crate) struct WriteChunkedContentOverlay<'a> {
     pub compression_policy: &'a ContentCompressionPolicy,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ContentOverlayPatch<'a> {
+    pub offset: u64,
+    pub bytes: &'a [u8],
+}
+
+pub(crate) struct WriteChunkedContentPatchBatch<'a> {
+    pub dedup_enabled: bool,
+    pub store: &'a mut LocalObjectStore,
+    pub inode_id: InodeId,
+    pub old_record: &'a InodeRecord,
+    pub new_record: &'a InodeRecord,
+    pub patches: &'a [ContentOverlayPatch<'a>],
+    pub allow_holes: bool,
+    pub dedup_index: &'a mut DedupIndex,
+    pub quorum_store: Option<&'a mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    pub compression_policy: &'a ContentCompressionPolicy,
+}
+
 pub(crate) struct PunchHoleContent<'a> {
     pub store: &'a mut LocalObjectStore,
     pub inode_id: InodeId,
@@ -488,6 +507,21 @@ fn write_same_size_sparse_overlay(
 
     for chunk_index in first_overlay_chunk..=last_overlay_chunk {
         let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
+        let old_chunk_is_sparse_zero = match find_chunk_in_manifest(old_manifest, chunk_index) {
+            Some(chunk_ref) => chunk_ref.is_hole(),
+            None => true,
+        };
+        if old_chunk_is_sparse_zero
+            && overlay_chunk_writes_only_zeros(
+                chunk_index,
+                chunk_len as u32,
+                overlay_offset,
+                overlay_bytes,
+            )?
+        {
+            continue;
+        }
+
         let mut chunk_bytes = vec![0_u8; chunk_len];
         copy_old_content_into_chunk(
             store,
@@ -497,6 +531,170 @@ fn write_same_size_sparse_overlay(
             &mut chunk_bytes,
         )?;
         overlay_chunk_bytes(chunk_index, overlay_offset, overlay_bytes, &mut chunk_bytes)?;
+
+        let per_inode_key = content_chunk_object_key_for_version(
+            new_record.inode_id,
+            new_record.data_version,
+            chunk_index,
+        );
+        let encoded = if dedup_enabled {
+            let fingerprint = crate::encoding::compute_content_fingerprint(&chunk_bytes);
+            if let Some(canonical_key) = dedup_index.lookup(&fingerprint) {
+                if store.contains_key(canonical_key) {
+                    dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    crate::encoding::encode_dedup_redirect(canonical_key)
+                } else {
+                    dedup_index.remove(&fingerprint);
+                    let canon_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+                    let enc = encode_content_chunk(
+                        new_record,
+                        chunk_index,
+                        &chunk_bytes,
+                        compression_policy,
+                    );
+                    store.put(canon_key, &enc)?;
+                    dedup_index.insert(fingerprint, canon_key);
+                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::encoding::encode_dedup_redirect(canon_key)
+                }
+            } else {
+                let canon_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+                if store.contains_key(canon_key) {
+                    dedup_index.insert(fingerprint, canon_key);
+                    dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    crate::encoding::encode_dedup_redirect(canon_key)
+                } else {
+                    let enc = encode_content_chunk(
+                        new_record,
+                        chunk_index,
+                        &chunk_bytes,
+                        compression_policy,
+                    );
+                    store.put(canon_key, &enc)?;
+                    if let Some(ref mut qs) = quorum_store {
+                        let _ = qs.quorum_put(canon_key, &enc);
+                    }
+                    dedup_index.insert(fingerprint, canon_key);
+                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::encoding::encode_dedup_redirect(canon_key)
+                }
+            }
+        } else {
+            encode_content_chunk(new_record, chunk_index, &chunk_bytes, compression_policy)
+        };
+        dedup_index.record_chunk_written();
+        let checksum = checksum64(&encoded);
+        store.put(per_inode_key, &encoded)?;
+        if let Some(ref mut qs) = quorum_store {
+            let _ = qs.quorum_put(per_inode_key, &encoded);
+        }
+        chunks_by_index.insert(
+            chunk_index,
+            ContentChunkRef {
+                chunk_index,
+                data_version: new_record.data_version,
+                len: chunk_bytes.len() as u32,
+                checksum,
+            },
+        );
+    }
+
+    let manifest = ContentManifestObject {
+        inode_id: new_record.inode_id,
+        data_version: new_record.data_version,
+        file_size: new_record.size,
+        chunk_size: content_chunk_size(),
+        chunks: chunks_by_index.into_values().collect(),
+    };
+    let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
+    let manifest_encoded = encode_content_manifest_sparse(&manifest);
+    store.put(manifest_key, &manifest_encoded)?;
+    if let Some(ref mut qs) = quorum_store {
+        let _ = qs.quorum_put(manifest_key, &manifest_encoded);
+    }
+    Ok(())
+}
+
+fn write_same_size_sparse_patch_batch(
+    dedup_enabled: bool,
+    store: &mut LocalObjectStore,
+    old_layout: &ContentLayout,
+    old_manifest: &ContentManifestObject,
+    old_record: &InodeRecord,
+    new_record: &InodeRecord,
+    patches: &[ContentOverlayPatch<'_>],
+    dedup_index: &mut DedupIndex,
+    mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    compression_policy: &ContentCompressionPolicy,
+) -> Result<()> {
+    let chunk_count = content_chunk_count(new_record.size)?;
+    let mut patches_by_chunk: BTreeMap<u64, Vec<ContentOverlayPatch<'_>>> = BTreeMap::new();
+    for patch in patches {
+        let Some((first_chunk, last_chunk)) =
+            overlay_chunk_index_bounds(new_record.size, patch.offset, patch.bytes.len())?
+        else {
+            continue;
+        };
+        for chunk_index in first_chunk..=last_chunk {
+            patches_by_chunk
+                .entry(chunk_index)
+                .or_default()
+                .push(*patch);
+        }
+    }
+
+    let mut chunks_by_index = BTreeMap::new();
+    for old_ref in &old_manifest.chunks {
+        if old_ref.chunk_index >= chunk_count {
+            continue;
+        }
+        let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
+        if old_ref.len != new_len {
+            continue;
+        }
+        if patches_by_chunk.contains_key(&old_ref.chunk_index) {
+            continue;
+        }
+        chunks_by_index.insert(old_ref.chunk_index, old_ref.clone());
+    }
+
+    for (chunk_index, chunk_patches) in patches_by_chunk {
+        let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
+        let old_chunk_is_sparse_zero = match find_chunk_in_manifest(old_manifest, chunk_index) {
+            Some(chunk_ref) => chunk_ref.is_hole(),
+            None => true,
+        };
+        let patch_bytes_all_zero = chunk_patches.iter().try_fold(true, |all_zero, patch| {
+            Ok::<bool, FileSystemError>(
+                all_zero
+                    && overlay_chunk_writes_only_zeros(
+                        chunk_index,
+                        chunk_len as u32,
+                        patch.offset,
+                        patch.bytes,
+                    )?,
+            )
+        })?;
+        if old_chunk_is_sparse_zero && patch_bytes_all_zero {
+            continue;
+        }
+
+        let mut chunk_bytes = vec![0_u8; chunk_len];
+        copy_old_content_into_chunk(
+            store,
+            old_layout,
+            old_record.size,
+            chunk_index,
+            &mut chunk_bytes,
+        )?;
+        for patch in chunk_patches {
+            overlay_chunk_bytes(chunk_index, patch.offset, patch.bytes, &mut chunk_bytes)?;
+        }
+        if old_chunk_is_sparse_zero && chunk_bytes.iter().all(|byte| *byte == 0) {
+            continue;
+        }
 
         let per_inode_key = content_chunk_object_key_for_version(
             new_record.inode_id,
@@ -807,6 +1005,44 @@ pub(crate) fn write_chunked_content_with_overlay(
     Ok(())
 }
 
+pub(crate) fn write_chunked_content_with_patch_batch(
+    request: WriteChunkedContentPatchBatch<'_>,
+) -> Result<()> {
+    let WriteChunkedContentPatchBatch {
+        dedup_enabled,
+        store,
+        inode_id,
+        old_record,
+        new_record,
+        patches,
+        allow_holes,
+        dedup_index,
+        quorum_store,
+        compression_policy,
+    } = request;
+    let old_layout = read_content_layout_from_store(store, inode_id, old_record, true)?;
+    if allow_holes && old_record.size == new_record.size {
+        if let ContentLayout::Chunked(ref old_manifest) = old_layout {
+            return write_same_size_sparse_patch_batch(
+                dedup_enabled,
+                store,
+                &old_layout,
+                old_manifest,
+                old_record,
+                new_record,
+                patches,
+                dedup_index,
+                quorum_store,
+                compression_policy,
+            );
+        }
+    }
+    Err(FileSystemError::Unsupported {
+        operation: "chunked content patch batch",
+        reason: "batch writeback optimization requires same-size chunked content",
+    })
+}
+
 pub(crate) fn punch_hole_content(request: PunchHoleContent<'_>) -> Result<()> {
     let PunchHoleContent {
         store,
@@ -1010,6 +1246,44 @@ pub(crate) fn overlay_chunk_bytes(
     chunk_bytes[chunk_dst..chunk_dst + len]
         .copy_from_slice(&overlay_bytes[overlay_src..overlay_src + len]);
     Ok(())
+}
+
+pub(crate) fn overlay_chunk_writes_only_zeros(
+    chunk_index: u64,
+    chunk_len: u32,
+    overlay_offset: u64,
+    overlay_bytes: &[u8],
+) -> Result<bool> {
+    if overlay_bytes.is_empty() || chunk_len == 0 {
+        return Ok(true);
+    }
+    let chunk_start = content_chunk_start(chunk_index)?;
+    let chunk_end =
+        chunk_start
+            .checked_add(u64::from(chunk_len))
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+    let overlay_end = overlay_offset
+        .checked_add(overlay_bytes.len() as u64)
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+    let start = chunk_start.max(overlay_offset);
+    let end = chunk_end.min(overlay_end);
+    if start >= end {
+        return Ok(true);
+    }
+    let overlay_src =
+        usize::try_from(start - overlay_offset).map_err(|_| FileSystemError::SizeOverflow {
+            requested: start - overlay_offset,
+        })?;
+    let len = usize::try_from(end - start).map_err(|_| FileSystemError::SizeOverflow {
+        requested: end - start,
+    })?;
+    Ok(overlay_bytes[overlay_src..overlay_src + len]
+        .iter()
+        .all(|byte| *byte == 0))
 }
 
 pub(crate) fn read_chunked_content(
@@ -1233,8 +1507,9 @@ pub(crate) fn find_chunk_in_manifest(
 ) -> Option<&ContentChunkRef> {
     manifest
         .chunks
-        .iter()
-        .find(|c| c.chunk_index == chunk_index)
+        .binary_search_by_key(&chunk_index, |chunk| chunk.chunk_index)
+        .ok()
+        .map(|index| &manifest.chunks[index])
 }
 
 /// Returns true if `chunk_size` is a power of two in [512, 1048576].

@@ -169,7 +169,7 @@ Tunable environment variables for development and debugging:
 | `RUST_LOG` | `tracing` verbosity (`trace`, `debug`, `info`, `warn`, `error`) | `error` |
 | `RUST_BACKTRACE` | Emit backtraces on panic (`1` or `full`) | unset |
 | `TIDEFS_ROOT_AUTHENTICATION_KEY_HEX` | Root authentication key (64 hex chars, 32 bytes) | required for mount |
-| `TIDEFS_CONTENT_CHUNK_SIZE` | Override content chunk size in bytes (512–1 MiB, multiple of 512) | 65536 (64 KiB) |
+| `TIDEFS_CONTENT_CHUNK_SIZE` | Override content chunk size in bytes (512–1 MiB, multiple of 512) | 131072 (128 KiB) |
 
 Example: test with 4 KiB chunks to stress the chunking path:
 

@@ -1271,9 +1271,12 @@ fn fuse_access_requested_from_mask(mask: i32) -> Result<u8, Errno> {
 /// - O_APPEND under kernel writeback-cache -> FOPEN_DIRECT_IO: keep append
 ///   offset authority in the daemon because the engine size is stale until
 ///   the kernel writes dirty cached pages back.
-/// - Otherwise: no special flags (0). FOPEN_KEEP_CACHE is NOT set by
-///   default because the adapter uses a non-authoritative read cache
-///   that is invalidated on writes, not closes.
+/// - Kernel writeback-cache ordinary opens -> FOPEN_KEEP_CACHE: preserving
+///   the kernel page cache across reopen is required so dirty cached bytes
+///   are not discarded before the kernel writes them back to the daemon.
+/// - Otherwise: no special flags (0). FOPEN_KEEP_CACHE is not set without
+///   explicit kernel writeback-cache because the adapter uses a
+///   non-authoritative read cache that is invalidated on writes, not closes.
 ///
 /// See Linux include/uapi/linux/fuse.h for the FOPEN_* constants.
 const fn fuse_open_reply_flags(linux_open_flags: u32) -> u32 {
@@ -2704,6 +2707,9 @@ impl FuseVfsAdapter {
         if self.writeback_cache_enabled && (open_flags & libc::O_APPEND as u32) != 0 {
             reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
         }
+        if self.writeback_cache_enabled && (reply_flags & fuser::consts::FOPEN_DIRECT_IO) == 0 {
+            reply_flags |= fuser::consts::FOPEN_KEEP_CACHE;
+        }
         reply_flags
     }
 
@@ -2730,6 +2736,103 @@ impl FuseVfsAdapter {
         }
 
         self.invalidate_inode_metadata_after_engine_write(ino);
+    }
+
+    fn sync_namespace_attrs_from_engine(
+        &self,
+        ctx: &RequestCtx,
+        ino: u64,
+        handle: Option<&EngineFileHandle>,
+    ) {
+        let updated = {
+            let e = self.engine.lock().unwrap();
+            e.getattr(InodeId::new(ino), handle, ctx).ok()
+        };
+        if let Some(attr) = updated {
+            self.sync_namespace_attrs_after_engine_write(ino, &attr);
+        } else {
+            self.invalidate_inode_metadata_after_engine_write(ino);
+        }
+    }
+
+    fn write_requires_namespace_attr_sync(
+        is_writeback_cached: bool,
+        posix_direct_io: bool,
+        write_flags: u32,
+        old_size: u64,
+        offset: u64,
+        written: u32,
+    ) -> bool {
+        if written == 0 {
+            return false;
+        }
+        if !is_writeback_cached || posix_direct_io || (write_flags & FUSE_WRITE_KILL_PRIV) != 0 {
+            return true;
+        }
+        offset.saturating_add(u64::from(written)) > old_size
+    }
+
+    fn writeback_sparse_zero_write_is_noop(
+        engine: &(dyn VfsEngineStatFs + Send),
+        write_efh: &EngineFileHandle,
+        ino: u64,
+        offset: u64,
+        len: usize,
+        file_size: u64,
+        ctx: &RequestCtx,
+    ) -> bool {
+        let Ok(len_u64) = u64::try_from(len) else {
+            return false;
+        };
+        let Some(end) = offset.checked_add(len_u64) else {
+            return false;
+        };
+        if len == 0 || end > file_size {
+            return false;
+        }
+        if !engine
+            .lookup_extents(InodeId::new(ino), offset, len_u64)
+            .is_empty()
+        {
+            return false;
+        }
+        matches!(
+            engine.data_ranges(write_efh, offset, len_u64, ctx),
+            Ok(ranges) if ranges.is_empty()
+        )
+    }
+
+    fn apply_write_killpriv_before_write(
+        engine: &dyn VfsEngine,
+        ctx: &RequestCtx,
+        ino: u64,
+        handle: &EngineFileHandle,
+        write_flags: u32,
+    ) -> Result<(), Errno> {
+        if (write_flags & FUSE_WRITE_KILL_PRIV) == 0 {
+            return Ok(());
+        }
+        let current = engine.getattr(InodeId::new(ino), Some(handle), ctx)?;
+        if ctx.uid == 0 || ctx.uid == current.posix.uid {
+            return Ok(());
+        }
+        let mode = current.posix.mode;
+        if (mode & (S_ISUID | S_ISGID)) == 0 {
+            return Ok(());
+        }
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MODE;
+        set.mode = (mode & S_IFMT) | (mode & !S_IFMT & !(S_ISUID | S_ISGID));
+        let clear_ctx = RequestCtx {
+            uid: 0,
+            gid: 0,
+            pid: ctx.pid,
+            umask: ctx.umask,
+            groups: vec![0],
+        };
+        engine
+            .setattr(InodeId::new(ino), &set, Some(handle), &clear_ctx)
+            .map(|_| ())
     }
 
     /// Conditionally update atime on a parent directory after a
@@ -4087,17 +4190,6 @@ impl FuseVfsAdapter {
         fh: Option<u64>,
     ) -> Result<FuseAttrOut, Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
-        // Route through namespace when available; fall through
-        // to the engine when the namespace entry is stale (e.g. fresh
-        // pool with an empty namespace but authoritative engine data).
-        if let Some(ref ns) = self.namespace {
-            match self.dispatch_getattr_via_namespace(ns, ino) {
-                Ok(attr) => return Ok(attr),
-                Err(Errno::ESTALE) => {} // fall through to engine
-                Err(e) => return Err(e),
-            }
-            let _ = (ctx, unique, fh);
-        }
 
         // Check the short-lived getattr cache before acquiring engine lock.
         {
@@ -4112,9 +4204,21 @@ impl FuseVfsAdapter {
         let engine_fh = fh
             .map(|fh| self.resolve_file_handle(ino, fh, 0))
             .and_then(|x| x.ok());
-        let e = self.engine.lock().unwrap();
-        let inode_attr = e.getattr(InodeId::new(ino), engine_fh.as_ref(), ctx)?;
-        drop(e);
+        let engine_attr = {
+            let e = self.engine.lock().unwrap();
+            e.getattr(InodeId::new(ino), engine_fh.as_ref(), ctx)
+        };
+        let inode_attr = match engine_attr {
+            Ok(attr) => attr,
+            Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) => {
+                if let Some(ref ns) = self.namespace {
+                    return self.dispatch_getattr_via_namespace(ns, ino);
+                }
+                let _ = unique;
+                return Err(Errno::ESTALE);
+            }
+            Err(errno) => return Err(errno),
+        };
 
         // Populate cache with TTL from the coherency profile.
         let cache_ttl = self.dentry_policy.positive_attr_ttl;
@@ -5129,7 +5233,7 @@ impl FuseVfsAdapter {
         // Fetch current inode attributes to check flags before admitting the write.
         // POSIX: immutable files reject all writes; append-only files reject
         // writes that do not land at end-of-file.
-        let effective_offset = {
+        let (effective_offset, pre_write_size) = {
             let e = self.engine.lock().unwrap();
             let attr = e.getattr(InodeId::new(ino), resolved_efh.as_ref(), ctx)?;
             let raw_flags = attr.flags.to_raw_flags();
@@ -5147,7 +5251,7 @@ impl FuseVfsAdapter {
             } else {
                 enforce_append_only_write_guard(raw_flags, true)?;
             }
-            eof_offset
+            (eof_offset, size)
         };
         let _requested_size = Self::checked_write_end(effective_offset, data.len())?;
 
@@ -5189,6 +5293,7 @@ impl FuseVfsAdapter {
                 should_update_write_atime,
                 sync_efh,
                 mut fallback_to_release,
+                sparse_zero_noop,
                 post_write_attr,
             ) = {
                 let e = self.engine.lock().unwrap();
@@ -5216,58 +5321,76 @@ impl FuseVfsAdapter {
                     None => return Err(Errno::EBADF),
                 };
                 let sync_efh = *write_efh;
+                let sparse_zero_noop = is_writeback_cached
+                    && !append_open
+                    && !posix_direct_io
+                    && data.iter().all(|byte| *byte == 0)
+                    && Self::writeback_sparse_zero_write_is_noop(
+                        &**e,
+                        write_efh,
+                        ino,
+                        effective_offset as u64,
+                        data.len(),
+                        pre_write_size,
+                        ctx,
+                    );
                 let mut post_write_attr = None;
-                let result = match e.write(write_efh, effective_offset as u64, data, ctx) {
-                    Ok(written) => {
-                        let wrote_data = written > 0;
-                        if written > 0 {
-                            if posix_direct_io {
-                                // Direct I/O bypasses the adapter page cache.
-                                // The engine write is authoritative for
-                                // read-after-write; flush/fsync/close publish
-                                // it instead of forcing every O_DIRECT write
-                                // through a committed-root cycle.
-                                self.invalidate_caches_after_direct_write(ino);
-                            } else {
-                                self.mark_dirty_after_write(
-                                    ino,
-                                    effective_offset as u64,
-                                    written,
-                                    data,
-                                    write_flags,
-                                );
-                            }
-                            // Killpriv: clear S_ISUID and S_ISGID when FUSE_WRITE_KILL_PRIV
-                            // is set and the writer is not the file owner.
-                            if (write_flags & FUSE_WRITE_KILL_PRIV) != 0 && ctx.uid != 0 {
-                                if let Ok(current) =
-                                    e.getattr(InodeId::new(ino), Some(write_efh), ctx)
+                let metadata_error = if data.is_empty() {
+                    None
+                } else {
+                    Self::apply_write_killpriv_before_write(&**e, ctx, ino, write_efh, write_flags)
+                        .err()
+                };
+                let result = if let Some(errno) = metadata_error {
+                    (Err(errno), false)
+                } else {
+                    match e.write(write_efh, effective_offset as u64, data, ctx) {
+                        Ok(written) => {
+                            let wrote_data = written > 0;
+                            if written > 0 {
+                                if posix_direct_io {
+                                    // Direct I/O bypasses the adapter page cache.
+                                    // The engine write is authoritative for
+                                    // read-after-write; flush/fsync/close publish
+                                    // it instead of forcing every O_DIRECT write
+                                    // through a committed-root cycle.
+                                    self.invalidate_caches_after_direct_write(ino);
+                                } else if !sparse_zero_noop {
+                                    self.mark_dirty_after_write(
+                                        ino,
+                                        effective_offset as u64,
+                                        written,
+                                        data,
+                                        write_flags,
+                                    );
+                                }
+                                if post_write_attr.is_none()
+                                    && Self::write_requires_namespace_attr_sync(
+                                        is_writeback_cached,
+                                        posix_direct_io,
+                                        write_flags,
+                                        pre_write_size,
+                                        effective_offset as u64,
+                                        written,
+                                    )
                                 {
-                                    let mode = current.posix.mode;
-                                    if (mode & (S_ISUID | S_ISGID)) != 0
-                                        && ctx.uid != current.posix.uid
-                                    {
-                                        let mut set = SetAttr::new();
-                                        set.valid = FATTR_MODE;
-                                        set.mode = (mode & S_IFMT)
-                                            | (mode & !S_IFMT & !(S_ISUID | S_ISGID));
-                                        let _ = e.setattr(
-                                            InodeId::new(ino),
-                                            &set,
-                                            Some(write_efh),
-                                            ctx,
-                                        );
-                                    }
+                                    post_write_attr =
+                                        e.getattr(InodeId::new(ino), Some(write_efh), ctx).ok();
                                 }
                             }
-                            post_write_attr =
-                                e.getattr(InodeId::new(ino), Some(write_efh), ctx).ok();
+                            (Ok(written), wrote_data)
                         }
-                        (Ok(written), wrote_data)
+                        Err(errno) => (Err(errno), false),
                     }
-                    Err(errno) => (Err(errno), false),
                 };
-                (result.0, result.1, sync_efh, fallback_efh, post_write_attr)
+                (
+                    result.0,
+                    result.1,
+                    sync_efh,
+                    fallback_efh,
+                    sparse_zero_noop,
+                    post_write_attr,
+                )
             };
             let written = match write_result {
                 Ok(written) => written,
@@ -5283,7 +5406,7 @@ impl FuseVfsAdapter {
                 self.sync_namespace_attrs_after_engine_write(ino, &attr);
             }
             // Record write intent before acknowledging to kernel.
-            if written > 0 && self.intent_log_write_enabled {
+            if written > 0 && self.intent_log_write_enabled && !sparse_zero_noop {
                 if let Some(ref buf) = self.intent_log_buffer {
                     let txg_id = self
                         .txg_cycle
@@ -5301,7 +5424,7 @@ impl FuseVfsAdapter {
                     }
                 }
             }
-            if written > 0 && is_writeback_cached {
+            if written > 0 && is_writeback_cached && !sparse_zero_noop {
                 self.writeback_cache_stats
                     .lock()
                     .unwrap()
@@ -5356,80 +5479,85 @@ impl FuseVfsAdapter {
                 // engine's CapacityAuthority during write dispatch; the adapter
                 // no longer maintains a parallel reservation lifecycle on
                 // CapacityFacade.
-                match e.write(&efh, effective_offset as u64, data, ctx) {
-                    Ok(written) => {
-                        let wrote_data = written > 0;
-                        if written > 0 {
-                            if posix_direct_io {
-                                // Direct I/O bypasses the adapter page cache.
-                                // The engine write is authoritative for
-                                // read-after-write; flush/fsync/close publish
-                                // it instead of forcing every O_DIRECT write
-                                // through a committed-root cycle.
-                                self.invalidate_caches_after_direct_write(ino);
-                            } else {
-                                self.mark_dirty_after_write(
-                                    ino,
-                                    effective_offset as u64,
-                                    written,
-                                    data,
-                                    write_flags,
-                                );
-                            }
-                            // Killpriv: clear S_ISUID and S_ISGID when FUSE_WRITE_KILL_PRIV
-                            // is set and the writer is not the file owner.
-                            if (write_flags & FUSE_WRITE_KILL_PRIV) != 0 && ctx.uid != 0 {
-                                if let Ok(current) = e.getattr(InodeId::new(ino), Some(&efh), ctx) {
-                                    let mode = current.posix.mode;
-                                    if (mode & (S_ISUID | S_ISGID)) != 0
-                                        && ctx.uid != current.posix.uid
-                                    {
-                                        let mut set = SetAttr::new();
-                                        set.valid = FATTR_MODE;
-                                        set.mode = (mode & S_IFMT)
-                                            | (mode & !S_IFMT & !(S_ISUID | S_ISGID));
-                                        let _ = e.setattr(InodeId::new(ino), &set, Some(&efh), ctx);
+                let metadata_error = if data.is_empty() {
+                    None
+                } else {
+                    Self::apply_write_killpriv_before_write(&**e, ctx, ino, &efh, write_flags).err()
+                };
+                if let Some(errno) = metadata_error {
+                    (Err(errno), false)
+                } else {
+                    match e.write(&efh, effective_offset as u64, data, ctx) {
+                        Ok(written) => {
+                            let wrote_data = written > 0;
+                            if written > 0 {
+                                if posix_direct_io {
+                                    // Direct I/O bypasses the adapter page cache.
+                                    // The engine write is authoritative for
+                                    // read-after-write; flush/fsync/close publish
+                                    // it instead of forcing every O_DIRECT write
+                                    // through a committed-root cycle.
+                                    self.invalidate_caches_after_direct_write(ino);
+                                } else {
+                                    self.mark_dirty_after_write(
+                                        ino,
+                                        effective_offset as u64,
+                                        written,
+                                        data,
+                                        write_flags,
+                                    );
+                                }
+                                if post_write_attr.is_none()
+                                    && Self::write_requires_namespace_attr_sync(
+                                        is_writeback_cached,
+                                        posix_direct_io,
+                                        write_flags,
+                                        pre_write_size,
+                                        effective_offset as u64,
+                                        written,
+                                    )
+                                {
+                                    post_write_attr =
+                                        e.getattr(InodeId::new(ino), Some(&efh), ctx).ok();
+                                }
+                                // Record write intent before acknowledging to kernel.
+                                if self.intent_log_write_enabled {
+                                    if let Some(ref buf) = self.intent_log_buffer {
+                                        let txg_id = self
+                                            .txg_cycle
+                                            .current_commit_group_id
+                                            .load(Ordering::Relaxed);
+                                        let written_data = &data[..written as usize];
+                                        if written_data.len() <= 256 {
+                                            let record = IlRecord::BufferedWrite {
+                                                ino,
+                                                offset: effective_offset as u64,
+                                                length: written as u64,
+                                                data: written_data.to_vec(),
+                                            };
+                                            buf.append(record, txg_id);
+                                        }
+                                    }
+                                }
+                                // Direct I/O conflict guard: clear stale
+                                // cached dirty ranges covered by this
+                                // authoritative direct write, so later
+                                // writeback cannot replay old page-cache
+                                // bytes over it.
+                                if posix_direct_io {
+                                    let mut ds = self.dirty_state.lock().unwrap();
+                                    if let Some(dr) = ds.get_mut(&ino) {
+                                        dr.clear_overlap(effective_offset as u64, written as u64);
+                                        if dr.is_empty() {
+                                            ds.remove(&ino);
+                                        }
                                     }
                                 }
                             }
-                            post_write_attr = e.getattr(InodeId::new(ino), Some(&efh), ctx).ok();
-                            // Record write intent before acknowledging to kernel.
-                            if self.intent_log_write_enabled {
-                                if let Some(ref buf) = self.intent_log_buffer {
-                                    let txg_id = self
-                                        .txg_cycle
-                                        .current_commit_group_id
-                                        .load(Ordering::Relaxed);
-                                    let written_data = &data[..written as usize];
-                                    if written_data.len() <= 256 {
-                                        let record = IlRecord::BufferedWrite {
-                                            ino,
-                                            offset: effective_offset as u64,
-                                            length: written as u64,
-                                            data: written_data.to_vec(),
-                                        };
-                                        buf.append(record, txg_id);
-                                    }
-                                }
-                            }
-                            // Direct I/O conflict guard: clear stale
-                            // cached dirty ranges covered by this
-                            // authoritative direct write, so later
-                            // writeback cannot replay old page-cache
-                            // bytes over it.
-                            if posix_direct_io {
-                                let mut ds = self.dirty_state.lock().unwrap();
-                                if let Some(dr) = ds.get_mut(&ino) {
-                                    dr.clear_overlap(effective_offset as u64, written as u64);
-                                    if dr.is_empty() {
-                                        ds.remove(&ino);
-                                    }
-                                }
-                            }
+                            (Ok(written), wrote_data)
                         }
-                        (Ok(written), wrote_data)
+                        Err(errno) => (Err(errno), false),
                     }
-                    Err(errno) => (Err(errno), false),
                 }
             }; // engine lock dropped here
 
@@ -5786,6 +5914,7 @@ impl FuseVfsAdapter {
         };
         flush_result?;
         release_result?;
+        self.sync_namespace_attrs_from_engine(ctx, ino, None);
         self.writeback_cache.lock().unwrap().mark_clean(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
 
@@ -5976,6 +6105,7 @@ impl FuseVfsAdapter {
         // configured, this is a no-op (the engine's sync path already
         // provides durability).
         self.commit_current_txg_barrier("fsync")?;
+        self.sync_namespace_attrs_from_engine(ctx, ino, Some(efh));
         self.fsync_handler.handle_fsync(ino, datasync)?;
         Ok(())
     }
@@ -36159,6 +36289,41 @@ mod tests {
     }
 
     #[test]
+    fn writeback_cached_overwrite_defers_namespace_attr_sync_until_flush() {
+        assert!(
+            !FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 512),
+            "writeback-cache overwrite within EOF can defer namespace mirror sync"
+        );
+        assert!(
+            FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 3840, 512),
+            "writeback-cache size extension must sync namespace mirror"
+        );
+        assert!(
+            FuseVfsAdapter::write_requires_namespace_attr_sync(false, false, 0, 4096, 1024, 512),
+            "non-writeback writes keep immediate namespace mirror sync"
+        );
+        assert!(
+            FuseVfsAdapter::write_requires_namespace_attr_sync(true, true, 0, 4096, 1024, 512),
+            "direct I/O keeps immediate namespace mirror sync"
+        );
+        assert!(
+            FuseVfsAdapter::write_requires_namespace_attr_sync(
+                true,
+                false,
+                FUSE_WRITE_KILL_PRIV,
+                4096,
+                1024,
+                512,
+            ),
+            "killpriv writes keep immediate namespace mirror sync"
+        );
+        assert!(
+            !FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 0),
+            "zero-byte writes do not need namespace mirror sync"
+        );
+    }
+
+    #[test]
     fn writeback_writable_open_keeps_kernel_writeback_cache_without_posix_direct_io() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
@@ -36181,6 +36346,11 @@ mod tests {
             dispatch.fuse_open_flags & fuser::consts::FOPEN_DIRECT_IO,
             0,
             "writable writeback-cache opens must leave the kernel writeback path enabled"
+        );
+        assert_ne!(
+            dispatch.fuse_open_flags & fuser::consts::FOPEN_KEEP_CACHE,
+            0,
+            "writeback-cache opens must preserve dirty kernel pages across reopen"
         );
 
         let payload = b"abcdef";
@@ -36208,6 +36378,41 @@ mod tests {
             )
             .expect("writeback-cache must not impose POSIX O_DIRECT alignment");
         assert_eq!(read_back, b"bcd");
+    }
+
+    #[test]
+    fn writeback_readonly_open_preserves_kernel_page_cache() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let create = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"wb-readonly-keep-cache.txt",
+                0o644,
+                libc::O_RDWR as u32,
+            )
+            .expect("create writeback-cache file");
+
+        let read_open = fixture
+            .adapter
+            .dispatch_open(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
+            .expect("open read-only under writeback cache");
+        assert_eq!(
+            read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
+            0,
+            "read-only writeback-cache opens must not force direct I/O"
+        );
+        assert_ne!(
+            read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
+            0,
+            "read-only reopen must preserve dirty kernel writeback-cache pages"
+        );
     }
 
     #[test]
@@ -36301,6 +36506,71 @@ mod tests {
             .dispatch_read(&ctx, ino, adapter_fh, 0, data.len() as u32, None)
             .expect("read after writeback-cached write");
         assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn writeback_sparse_zero_over_hole_is_engine_noop() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-sparse-zero-noop.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let file_len = 256 * 1024_u64;
+        let mut truncate = SetAttr::new();
+        truncate.valid = FATTR_SIZE | FATTR_FH;
+        truncate.size = file_len;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 40_354, ino, &truncate, Some(adapter_fh))
+            .expect("ftruncate sparse file");
+
+        let zeros = vec![0_u8; 64 * 1024];
+        let written = fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0, &zeros, FUSE_WRITE_CACHE)
+            .expect("writeback sparse zero write");
+
+        assert_eq!(written, zeros.len() as u32);
+        let stats = fixture.adapter.writeback_cache_stats();
+        assert_eq!(
+            stats.write_buf_calls, 0,
+            "sparse-zero no-op should not count as cached dirty payload"
+        );
+        assert_eq!(stats.bytes_cached, 0);
+        assert!(
+            fixture
+                .adapter
+                .dirty_state
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .is_none(),
+            "sparse-zero no-op should not dirty adapter state"
+        );
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            assert!(
+                engine.lookup_extents(inode, 0, file_len).is_empty(),
+                "sparse-zero no-op should not allocate extents"
+            );
+            assert!(
+                engine
+                    .data_ranges(&engine_fh, 0, file_len, &ctx)
+                    .expect("data ranges")
+                    .is_empty(),
+                "sparse-zero no-op should preserve HOLE data-ranges semantics"
+            );
+        }
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0, zeros.len() as u32, None)
+            .expect("read sparse zero range");
+        assert_eq!(read_back, zeros);
     }
 
     #[test]

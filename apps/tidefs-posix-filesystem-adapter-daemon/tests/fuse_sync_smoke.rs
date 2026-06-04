@@ -82,6 +82,10 @@ impl MountedVfs {
 
     fn with_writeback_page_cache(mut self, cache: Arc<PageCache>) -> Self {
         self.writeback_page_cache = Some(cache);
+        if self.session.is_some() {
+            self.unmount();
+            self.mount();
+        }
         self
     }
 
