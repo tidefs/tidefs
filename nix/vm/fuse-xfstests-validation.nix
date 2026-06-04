@@ -42,6 +42,7 @@ let
     READLINK_BIN="${pkgs.coreutils}/bin/readlink"
     DF_BIN="${pkgs.coreutils}/bin/df"
     MV_BIN="${pkgs.coreutils}/bin/mv"
+    RM_BIN="${pkgs.coreutils}/bin/rm"
     TRUNCATE_BIN="${pkgs.coreutils}/bin/truncate"
     MD5SUM_BIN="${pkgs.coreutils}/bin/md5sum"
     CHMOD_BIN="${pkgs.coreutils}/bin/chmod"
@@ -778,6 +779,7 @@ UMOUNTWRAP
     # symlinks so the guest PATH can find them.
     copy_runtime_binary "$TIMEOUT_BIN" timeout
     copy_runtime_binary "$MV_BIN" mv
+    copy_runtime_binary "$RM_BIN" rm
     copy_runtime_binary "$TRUNCATE_BIN" truncate
     copy_runtime_binary "$MD5SUM_BIN" md5sum
     copy_runtime_binary "$CHMOD_BIN" chmod

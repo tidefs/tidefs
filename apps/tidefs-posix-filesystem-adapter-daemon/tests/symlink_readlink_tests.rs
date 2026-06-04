@@ -163,6 +163,31 @@ fn symlink_to_nonexistent_target_succeeds() {
 }
 
 #[test]
+fn unlink_dangling_symlink_after_target_removed_succeeds() {
+    let mnt = MountedVfs::new();
+    let target = mnt.path("/target");
+    let link = mnt.path("/link");
+
+    fs::write(&target, b"target content").expect("create target");
+    unix_fs::symlink("target", &link).expect("create symlink");
+
+    fs::remove_file(&target).expect("remove target first");
+    assert!(
+        fs::symlink_metadata(&link)
+            .expect("dangling symlink metadata")
+            .file_type()
+            .is_symlink(),
+        "symlink entry must remain after target removal"
+    );
+    fs::remove_file(&link).expect("remove dangling symlink");
+
+    assert!(
+        fs::symlink_metadata(&link).is_err(),
+        "dangling symlink entry should be gone"
+    );
+}
+
+#[test]
 fn readlink_on_regular_file_returns_einval() {
     let mnt = MountedVfs::new_with_seed(|engine| {
         seed_file(engine, b"regular.txt", b"not a symlink");
