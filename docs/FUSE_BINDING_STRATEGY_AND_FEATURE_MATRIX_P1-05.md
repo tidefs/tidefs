@@ -90,6 +90,7 @@ page cache behavior) and must be explicitly opted into.
 | Capability flag | FUSE protocol | fuser exposure | Purpose | Status |
 |---|---|---|---|---|
 | `FUSE_CAP_POSIX_ACL` | protocol ≥ 7.8 | `KernelConfig` writable | ACL xattr ops over FUSE | **Required** — xfstests ACL suite |
+| `FUSE_CAP_DONT_MASK` | protocol ≥ 7.12 | `KernelConfig` writable | Daemon receives raw create/mkdir/mknod mode plus umask | **Required** — default ACL inheritance ignores umask when parent default ACL exists |
 | `FUSE_CAP_HANDLE_KILLPRIV_V2` | protocol ≥ 7.38 | `KernelConfig` writable | Proper SGID/security.capability clearing on chown/truncate | **Required** — xfstests killpriv |
 | `FUSE_CAP_SETXATTR_EXT` | protocol ≥ 7.40 | `KernelConfig` writable | Extended xattr flags for ACL | **Required** — ACL flag passthrough |
 | `FUSE_CAP_WRITEBACK_CACHE` | protocol ≥ 7.26 | `KernelConfig` writable | Kernel page cache for writes | **Perf gate** — §6.1 |
