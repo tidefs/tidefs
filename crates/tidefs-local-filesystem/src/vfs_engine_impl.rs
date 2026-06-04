@@ -2057,6 +2057,13 @@ impl VfsEngine for VfsLocalFileSystem {
                 self.timestamp_policy,
             );
         } else if mode & FALLOC_FL_ZERO_RANGE != 0 {
+            if mode & FALLOC_FL_KEEP_SIZE == 0 && length > 0 {
+                let end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
+                let record = fs.stat(&path).map_err(|e| map_errno(&e))?;
+                if end > record.size {
+                    fs.truncate_file(&path, end).map_err(|e| map_errno(&e))?;
+                }
+            }
             fs.zero_range(&path, offset, length)
                 .map_err(|e| map_errno(&e))?;
             let _ = fs.apply_timestamp_update(
@@ -5606,6 +5613,338 @@ mod tests {
 
         assert_eq!(copied, 2);
         assert_eq!(engine.read(&dest_create, 0, 16, &ctx()).unwrap(), b"bc");
+    }
+
+    #[test]
+    fn copy_file_range_after_fsx075_prefix_preserves_sparse_bytes() {
+        fn pattern(len: usize, seed: u8) -> Vec<u8> {
+            (0..len)
+                .map(|idx| seed.wrapping_add((idx % 251) as u8))
+                .collect()
+        }
+
+        fn overlay(expected: &mut Vec<u8>, offset: usize, data: &[u8]) {
+            let end = offset.checked_add(data.len()).expect("overlay end");
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[offset..end].copy_from_slice(data);
+        }
+
+        fn zero(expected: &mut [u8], offset: usize, len: usize) {
+            let end = offset.saturating_add(len).min(expected.len());
+            if offset < end {
+                expected[offset..end].fill(0);
+            }
+        }
+
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"fsx075-prefix.bin", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let mut expected = Vec::new();
+
+        let first = pattern(0xb92e, 0x31);
+        engine.write(&fh, 0x1db8f, &first, &ctx()).unwrap();
+        overlay(&mut expected, 0x1db8f, &first);
+
+        engine
+            .fallocate(
+                &fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                0x2a3a,
+                0xf74,
+                &ctx(),
+            )
+            .unwrap();
+        zero(&mut expected, 0x2a3a, 0xf74);
+
+        assert_eq!(
+            engine.read(&fh, 0x17ffa, 0xb584, &ctx()).unwrap(),
+            expected[0x17ffa..0x17ffa + 0xb584]
+        );
+
+        engine
+            .fallocate(
+                &fh,
+                FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE,
+                0x12e33,
+                0x62c8,
+                &ctx(),
+            )
+            .unwrap();
+        zero(&mut expected, 0x12e33, 0x62c8);
+
+        assert_eq!(
+            engine.read(&fh, 0x20525, 0xe46, &ctx()).unwrap(),
+            expected[0x20525..0x20525 + 0xe46]
+        );
+        assert_eq!(
+            engine.read(&fh, 0x19fc7, 0xf4f6, &ctx()).unwrap(),
+            expected[0x19fc7..0x19fc7 + 0xf4f6]
+        );
+
+        let mut shrink = SetAttr::new();
+        shrink.valid = FATTR_SIZE;
+        shrink.size = 0xb4e4;
+        engine
+            .setattr(fh.inode_id, &shrink, Some(&fh), &ctx())
+            .unwrap();
+        expected.truncate(0xb4e4);
+
+        let second = pattern(0x94bd, 0x73);
+        engine.write(&fh, 0x36b43, &second, &ctx()).unwrap();
+        overlay(&mut expected, 0x36b43, &second);
+
+        assert_eq!(
+            engine.read(&fh, 0x3985f, 0x67a1, &ctx()).unwrap(),
+            expected[0x3985f..0x3985f + 0x67a1]
+        );
+
+        let copied = engine
+            .copy_file_range(&fh, 0x2bb0b, &fh, 0x170e0, 0xb520, &ctx())
+            .unwrap();
+        assert_eq!(copied, 0xb520);
+        let copied_bytes = expected[0x2bb0b..0x2bb0b + 0xb520].to_vec();
+        overlay(&mut expected, 0x170e0, &copied_bytes);
+
+        assert_eq!(
+            engine.read(&fh, 0x170e0, 0xb520, &ctx()).unwrap(),
+            copied_bytes
+        );
+    }
+
+    #[test]
+    fn copy_file_range_after_fsx075_writeback_prefix_preserves_sparse_bytes() {
+        fn pattern(len: usize, seed: u8) -> Vec<u8> {
+            (0..len)
+                .map(|idx| seed.wrapping_add((idx % 251) as u8))
+                .collect()
+        }
+
+        fn overlay(expected: &mut Vec<u8>, offset: usize, data: &[u8]) {
+            let end = offset.checked_add(data.len()).expect("overlay end");
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[offset..end].copy_from_slice(data);
+        }
+
+        fn zero(expected: &mut [u8], offset: usize, len: usize) {
+            let end = offset.saturating_add(len).min(expected.len());
+            if offset < end {
+                expected[offset..end].fill(0);
+            }
+        }
+
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"fsx075-writeback-prefix.bin", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let mut expected = Vec::new();
+
+        let first = pattern(0x6ae8, 0x41);
+        engine.write(&fh, 0x39518, &first, &ctx()).unwrap();
+        overlay(&mut expected, 0x39518, &first);
+
+        let mut shrink = SetAttr::new();
+        shrink.valid = FATTR_SIZE;
+        shrink.size = 0x25bf;
+        engine
+            .setattr(fh.inode_id, &shrink, Some(&fh), &ctx())
+            .unwrap();
+        expected.truncate(0x25bf);
+
+        assert_eq!(
+            engine.read(&fh, 0x17f2, 0xdcd, &ctx()).unwrap(),
+            expected[0x17f2..0x17f2 + 0xdcd]
+        );
+        assert_eq!(
+            engine.read(&fh, 0x31f, 0x22a0, &ctx()).unwrap(),
+            expected[0x31f..0x31f + 0x22a0]
+        );
+
+        let mut grow = SetAttr::new();
+        grow.valid = FATTR_SIZE;
+        grow.size = 0x22a95;
+        engine
+            .setattr(fh.inode_id, &grow, Some(&fh), &ctx())
+            .unwrap();
+        expected.resize(0x22a95, 0);
+
+        shrink.size = 0x219e6;
+        engine
+            .setattr(fh.inode_id, &shrink, Some(&fh), &ctx())
+            .unwrap();
+        expected.truncate(0x219e6);
+
+        let second = pattern(0x3aac, 0x91);
+        engine.write(&fh, 0x216fc, &second, &ctx()).unwrap();
+        overlay(&mut expected, 0x216fc, &second);
+
+        assert_eq!(
+            engine.read(&fh, 0xd117, 0xa010, &ctx()).unwrap(),
+            expected[0xd117..0xd117 + 0xa010]
+        );
+
+        grow.size = 0x32888;
+        engine
+            .setattr(fh.inode_id, &grow, Some(&fh), &ctx())
+            .unwrap();
+        expected.resize(0x32888, 0);
+
+        assert_eq!(
+            engine.read(&fh, 0x1d8fc, 0xa8e9, &ctx()).unwrap(),
+            expected[0x1d8fc..0x1d8fc + 0xa8e9]
+        );
+
+        grow.size = 0x3f390;
+        engine
+            .setattr(fh.inode_id, &grow, Some(&fh), &ctx())
+            .unwrap();
+        expected.resize(0x3f390, 0);
+
+        assert_eq!(
+            engine.read(&fh, 0x1927e, 0x9d6e, &ctx()).unwrap(),
+            expected[0x1927e..0x1927e + 0x9d6e]
+        );
+
+        engine
+            .fallocate(
+                &fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                0x1f6d6,
+                0xe322,
+                &ctx(),
+            )
+            .unwrap();
+        zero(&mut expected, 0x1f6d6, 0xe322);
+
+        engine
+            .fallocate(
+                &fh,
+                FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE,
+                0x1a2b0,
+                0xd85e,
+                &ctx(),
+            )
+            .unwrap();
+        zero(&mut expected, 0x1a2b0, 0xd85e);
+
+        let copied = engine
+            .copy_file_range(&fh, 0x4c6b, &fh, 0x2f46d, 0x6457, &ctx())
+            .unwrap();
+        assert_eq!(copied, 0x6457);
+        let copied_bytes = expected[0x4c6b..0x4c6b + 0x6457].to_vec();
+        overlay(&mut expected, 0x2f46d, &copied_bytes);
+
+        assert_eq!(
+            engine.read(&fh, 0x2f46d, 0x6457, &ctx()).unwrap(),
+            copied_bytes
+        );
+    }
+
+    #[test]
+    fn zero_range_without_keep_size_extends_before_fsx075_sparse_copy() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"fsx075-zero-copy.bin", 0o644, O_RDWR, &ctx())
+            .unwrap();
+
+        engine
+            .fallocate(&fh, FALLOC_FL_ZERO_RANGE, 0x25c2d, 0x6201, &ctx())
+            .unwrap();
+        assert_eq!(
+            engine
+                .getattr(fh.inode_id, Some(&fh), &ctx())
+                .unwrap()
+                .posix
+                .size,
+            0x2be2e
+        );
+        assert_eq!(
+            engine.read(&fh, 0x25c2d, 0x6201, &ctx()).unwrap(),
+            vec![0; 0x6201]
+        );
+
+        engine
+            .fallocate(
+                &fh,
+                FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE,
+                0x2afd7,
+                0x530f,
+                &ctx(),
+            )
+            .unwrap();
+        engine
+            .fallocate(
+                &fh,
+                FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE,
+                0x12f42,
+                0x6239,
+                &ctx(),
+            )
+            .unwrap();
+
+        let copied = engine
+            .copy_file_range(&fh, 0x28341, &fh, 0x3b1e6, 0x1e91, &ctx())
+            .unwrap();
+        assert_eq!(copied, 0x1e91);
+        assert_eq!(
+            engine
+                .getattr(fh.inode_id, Some(&fh), &ctx())
+                .unwrap()
+                .posix
+                .size,
+            0x3d077
+        );
+        assert_eq!(
+            engine.read(&fh, 0x3b1e6, 0x1e91, &ctx()).unwrap(),
+            vec![0; 0x1e91]
+        );
+    }
+
+    #[test]
+    fn copy_file_range_after_fsx075_sparse_truncate_copies_zeroes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(
+                root,
+                b"fsx075-sparse-truncate-copy.bin",
+                0o644,
+                O_RDWR,
+                &ctx(),
+            )
+            .unwrap();
+
+        let mut truncate = SetAttr::new();
+        truncate.valid = FATTR_SIZE;
+        truncate.size = 0x351e5;
+        engine
+            .setattr(fh.inode_id, &truncate, Some(&fh), &ctx())
+            .unwrap();
+
+        assert_eq!(
+            engine.read(&fh, 0x22535, 0xd1bc, &ctx()).unwrap(),
+            vec![0; 0xd1bc]
+        );
+        assert_eq!(
+            engine.read(&fh, 0x10713, 0x808a, &ctx()).unwrap(),
+            vec![0; 0x808a]
+        );
+
+        let copied = engine
+            .copy_file_range(&fh, 0x20c96, &fh, 0x1351e, 0xb039, &ctx())
+            .unwrap();
+        assert_eq!(copied, 0xb039);
+        assert_eq!(
+            engine.read(&fh, 0x1351e, 0xb039, &ctx()).unwrap(),
+            vec![0; 0xb039]
+        );
     }
 
     #[test]

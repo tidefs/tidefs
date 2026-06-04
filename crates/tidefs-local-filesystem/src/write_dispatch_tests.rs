@@ -1577,6 +1577,135 @@ fn fsync_all_flushes_all_buffers() {
 }
 
 #[test]
+fn oversized_autoflush_uses_committed_base_size() {
+    let (mut fs, root) = wb_open_temp("oversized-autoflush-committed-base");
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: 4096,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let data: Vec<u8> = (0..8192).map(|idx| (idx % 251) as u8).collect();
+    fs.create_file("/large.bin", 0o644).expect("create");
+
+    fs.write_file("/large.bin", 0, &data)
+        .expect("write should flush in multiple foreground batches");
+    fs.fsync_all().expect("fsync_all");
+
+    let record = fs.stat("/large.bin").expect("stat");
+    let manifest = wd_current_content_manifest(&fs, "/large.bin");
+    assert_eq!(record.size, data.len() as u64);
+    assert_eq!(manifest.file_size, record.size);
+    assert_eq!(fs.read_file("/large.bin").expect("read"), data);
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
+fn truncate_discards_buffered_tail_before_flush() {
+    let (mut fs, root) = wb_open_temp("truncate-discards-buffered-tail");
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: 1024 * 1024,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let data = vec![0x5a; 8192];
+    let record = fs.create_file("/shrink.bin", 0o644).expect("create");
+    fs.write_file("/shrink.bin", 0, &data)
+        .expect("buffer write");
+    assert!(fs
+        .writeback_range_tracker
+        .lock()
+        .expect("locked")
+        .is_dirty(record.inode_id));
+
+    fs.truncate_file("/shrink.bin", 4096).expect("truncate");
+    fs.fsync_all().expect("fsync_all");
+
+    let record = fs.stat("/shrink.bin").expect("stat");
+    let manifest = wd_current_content_manifest(&fs, "/shrink.bin");
+    assert_eq!(record.size, 4096);
+    assert_eq!(manifest.file_size, 4096);
+    assert_eq!(fs.read_file("/shrink.bin").expect("read"), vec![0x5a; 4096]);
+    assert!(!fs
+        .writeback_range_tracker
+        .lock()
+        .expect("locked")
+        .is_dirty(record.inode_id));
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
+fn final_unlink_forgets_transient_writeback_state() {
+    let (mut fs, root) = wb_open_temp("final-unlink-forgets-transient");
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: 1024 * 1024,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/doomed.bin", 0o644).expect("create");
+    fs.write_file("/doomed.bin", 0, &[0x11; 8192])
+        .expect("buffer write");
+    fs.unlink("/doomed.bin").expect("unlink");
+
+    assert!(!fs.state.inodes.contains_key(&record.inode_id));
+    assert!(!fs.state.dirty_content.contains(&record.inode_id));
+    assert!(!fs.state.dirty_inodes.contains(&record.inode_id));
+    assert!(!fs.state.dirty_extent_maps.contains(&record.inode_id));
+    assert!(!fs.write_buffers.contains_key(&record.inode_id));
+    assert!(!fs.dirty_set.dirty_inodes.contains(&record.inode_id));
+    assert!(!fs.dirty_set.per_inode_bytes.contains_key(&record.inode_id));
+    assert!(!fs
+        .writeback_range_tracker
+        .lock()
+        .expect("locked")
+        .is_dirty(record.inode_id));
+
+    fs.fsync_all().expect("fsync_all");
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
+fn keep_size_prealloc_flushes_buffered_growth_first() {
+    let (mut fs, root) = wb_open_temp("keep-size-prealloc-flushes-buffered-growth");
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: 1024 * 1024,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/prealloc.bin", 0o644).expect("create");
+    let data = vec![0x77; 8192];
+    fs.write_file("/prealloc.bin", 0, &data)
+        .expect("buffered write");
+    assert!(fs.write_buffers.contains_key(&record.inode_id));
+
+    fs.reserve_unwritten("/prealloc.bin", 16 * 1024, 4096)
+        .expect("keep-size prealloc");
+
+    let record = fs.stat("/prealloc.bin").expect("stat");
+    let manifest = wd_current_content_manifest(&fs, "/prealloc.bin");
+    assert_eq!(record.size, data.len() as u64);
+    assert_eq!(manifest.file_size, record.size);
+    assert!(!fs.write_buffers.contains_key(&record.inode_id));
+    assert_eq!(fs.read_file("/prealloc.bin").expect("read"), data);
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn buffer_cleared_after_flush() {
     let (mut fs, root) = wb_open_temp("buffer-cleared");
     // Trigger flush on every write to test clear-then-rewrite

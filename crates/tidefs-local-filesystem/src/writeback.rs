@@ -91,6 +91,13 @@ impl DirtySet {
         self.per_inode_bytes.clear();
     }
 
+    pub fn forget_inode(&mut self, inode_id: InodeId) {
+        if let Some(bytes) = self.per_inode_bytes.remove(&inode_id) {
+            self.data_bytes = self.data_bytes.saturating_sub(bytes);
+        }
+        self.dirty_inodes.remove(&inode_id);
+    }
+
     #[allow(dead_code)] // INTENT: writeback/dirty-set types for planned writeback daemon integration
     /// Derive the durability class from the current dirty profile.
     ///
@@ -226,6 +233,20 @@ mod tests {
         assert!(!ds.catalog_dirty);
         assert_eq!(ds.dirty_op_count, 0);
         assert!(ds.per_inode_bytes.is_empty());
+    }
+
+    #[test]
+    fn forget_inode_drops_per_inode_data_bytes() {
+        let mut ds = DirtySet::default();
+        ds.record_data_write(id(1), 4096);
+        ds.record_data_write(id(2), 1024);
+
+        ds.forget_inode(id(1));
+
+        assert_eq!(ds.data_bytes, 1024);
+        assert!(!ds.dirty_inodes.contains(&id(1)));
+        assert_eq!(ds.per_inode_bytes.get(&id(1)), None);
+        assert!(ds.dirty_inodes.contains(&id(2)));
     }
 
     #[test]

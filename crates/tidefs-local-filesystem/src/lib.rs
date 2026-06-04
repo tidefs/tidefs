@@ -5443,7 +5443,7 @@ impl LocalFileSystem {
         if segments.is_empty() {
             return Ok(());
         }
-        let base_record = self.inode(inode_id)?.clone();
+        let base_record = self.committed_inode_record(inode_id)?;
         let patches = match self.coalesced_write_buffer_patches(inode_id, &base_record, &segments) {
             Ok(patches) => patches,
             Err(err) => {
@@ -5494,7 +5494,7 @@ impl LocalFileSystem {
             }
         }
         for patch in patches {
-            let record = self.inode(inode_id)?.clone();
+            let record = self.committed_inode_record(inode_id)?;
             let patch_len =
                 u64::try_from(patch.bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
                     requested: u64::MAX,
@@ -5540,16 +5540,32 @@ impl LocalFileSystem {
     pub fn flush_write_buffer(&mut self, inode_id: InodeId) -> Result<()> {
         let segments = match self.write_buffers.get_mut(&inode_id) {
             Some(wb) if !wb.is_empty() => wb.drain(),
-            _ => return Ok(()),
+            Some(_) => {
+                self.write_buffers.remove(&inode_id);
+                return Ok(());
+            }
+            None => return Ok(()),
         };
+        self.write_buffers.remove(&inode_id);
         self.flush_drained_write_segments(inode_id, segments)
     }
 
     fn flush_write_buffer_batch(&mut self, inode_id: InodeId) -> Result<()> {
-        let segments = match self.write_buffers.get_mut(&inode_id) {
-            Some(wb) if !wb.is_empty() => wb.drain_flush_batch(),
-            _ => return Ok(()),
+        let (segments, drained_empty) = match self.write_buffers.get_mut(&inode_id) {
+            Some(wb) if !wb.is_empty() => {
+                let segments = wb.drain_flush_batch();
+                let drained_empty = wb.is_empty();
+                (segments, drained_empty)
+            }
+            Some(_) => {
+                self.write_buffers.remove(&inode_id);
+                return Ok(());
+            }
+            None => return Ok(()),
         };
+        if drained_empty {
+            self.write_buffers.remove(&inode_id);
+        }
         self.flush_drained_write_segments(inode_id, segments)
     }
 
@@ -5674,6 +5690,59 @@ impl LocalFileSystem {
             return cached.inode;
         }
         adjusted_record.clone()
+    }
+
+    fn committed_inode_record(&self, inode_id: InodeId) -> Result<InodeRecord> {
+        if let Some(record) = self.state.inodes.get(&inode_id) {
+            return Ok(record.clone());
+        }
+        if let Some(cached) = self.inode_cache.borrow_mut().get(inode_id) {
+            return Ok(cached.inode);
+        }
+        if !self.state.known_inode_ids.contains(&inode_id) && inode_id != ROOT_INODE_ID {
+            return Err(FileSystemError::CorruptState {
+                reason: "inode id is missing from the inode table",
+            });
+        }
+        let key = inode_object_key(inode_id);
+        let bytes =
+            self.store
+                .raw_primary_store()
+                .get(key)?
+                .ok_or(FileSystemError::CorruptState {
+                    reason: "known inode id references a missing inode object in store",
+                })?;
+        let record = decode_inode(&bytes)?;
+        if record.inode_id != inode_id {
+            return Err(FileSystemError::CorruptState {
+                reason: "inode object id does not match requested id",
+            });
+        }
+        Ok(record)
+    }
+
+    fn truncate_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) {
+        let remove = match self.write_buffers.get_mut(&inode_id) {
+            Some(wb) => {
+                wb.truncate(size);
+                wb.is_empty()
+            }
+            None => false,
+        };
+        if remove {
+            self.write_buffers.remove(&inode_id);
+        }
+    }
+
+    fn clear_writeback_ranges_from(&self, inode_id: InodeId, offset: u64) {
+        let length = u64::MAX.saturating_sub(offset);
+        if length == 0 {
+            return;
+        }
+        self.writeback_range_tracker
+            .lock()
+            .expect("locked")
+            .clear_range(inode_id, offset, length);
     }
 
     fn read_with_write_buffer_overlay(
@@ -5993,6 +6062,7 @@ impl LocalFileSystem {
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        self.flush_write_buffer(inode_id)?;
         let record = self.inode(inode_id)?.clone();
         if record.kind() != NodeKind::File {
             if record.kind() == NodeKind::Dir {
@@ -6111,99 +6181,69 @@ impl LocalFileSystem {
         }
         let _new_len =
             usize::try_from(size).map_err(|_| FileSystemError::SizeOverflow { requested: size })?;
-        // Flush buffered writes so the store has the latest data before
-        // the rewrite, and so old_size reflects committed content.
+        let old_effective_size = self.effective_file_size(inode_id);
+        if size < old_effective_size {
+            self.truncate_write_buffer_for_inode(inode_id, size);
+            self.clear_writeback_ranges_from(inode_id, size);
+        }
+        // Flush buffered writes that still fall within the new EOF so the
+        // rewrite sees the latest surviving data.
         self.flush_write_buffer(inode_id)?;
-        let record = self.inode(inode_id)?.clone();
-        let old_size = record.size;
-        let result = self.rewrite_content_with_overlay(inode_id, record, 0, &[], size, true)?;
-        // Accumulate space delta for truncation: free or write depending on direction.
+        let record = self.committed_inode_record(inode_id)?;
+        let old_size = record.size.max(old_effective_size);
+        let mut committed_truncate_only = false;
         if size < old_size {
             let truncated_len = old_size - size;
-            self.record_reclaim_delta(inode_id, truncated_len);
-            // Free extents for the truncated range.
-            let mut data_bytes = 0u64;
-            let mut reserved_bytes = 0u64;
-            for extent in self
-                .extent_allocator
-                .lookup_extents(inode_id.0, size, truncated_len)
-            {
-                let start = extent.logical_offset.max(size);
-                let end = extent.end_offset().min(old_size);
-                let len = end.saturating_sub(start);
-                if extent.is_unwritten() {
-                    reserved_bytes = reserved_bytes.saturating_add(len);
-                } else if extent.is_data() || extent.is_pending_data() {
-                    data_bytes = data_bytes.saturating_add(len);
-                }
-            }
-            let _ = self
-                .extent_allocator
-                .free_extent(inode_id.0, size, truncated_len);
-            self.state.dirty_extent_maps.insert(inode_id);
-            // Track freed bytes in the production capacity authority.
+            let (data_bytes, reserved_bytes) =
+                self.accounted_extent_bytes(inode_id, size, truncated_len);
             let freed_bytes = data_bytes.saturating_add(reserved_bytes);
-            if freed_bytes > 0 {
-                self.capacity_authority.record_free(freed_bytes);
-            }
-            let mapped_bytes = data_bytes.saturating_add(reserved_bytes);
-            let logical_free = if mapped_bytes == 0 {
-                truncated_len
-            } else {
-                data_bytes
-            };
-            self.state
-                .space_accounting
-                .accumulate_delta(SpaceDelta::new_punch_hole(logical_free, reserved_bytes));
-            self.state
-                .space_accounting
-                .track_physical_free(logical_free);
-            // Clear write-buffer data beyond new size so a subsequent
-            // fsync does not replay pre-truncation bytes.
-            if let Some(wb) = self.write_buffers.get_mut(&inode_id) {
-                let kept: Vec<(u64, Vec<u8>)> = wb
-                    .drain()
-                    .into_iter()
-                    .filter_map(|(offset, data)| {
-                        let end = offset + data.len() as u64;
-                        if offset >= size {
-                            None // entirely beyond new size
-                        } else if end > size {
-                            // truncate overlapping segment
-                            let keep_len = (size - offset) as usize;
-                            Some((offset, data[..keep_len].to_vec()))
-                        } else {
-                            Some((offset, data)) // entirely within new size
-                        }
-                    })
-                    .collect();
-                for (offset, data) in kept {
-                    wb.ingest(&data, offset);
+            let truncates_committed_record = record.size > size;
+
+            if freed_bytes > 0 || truncates_committed_record {
+                self.begin_mutation();
+                if data_bytes > 0 && truncates_committed_record {
+                    self.record_reclaim_delta(inode_id, data_bytes);
+                }
+                if freed_bytes > 0 {
+                    let _ = self
+                        .extent_allocator
+                        .free_extent(inode_id.0, size, truncated_len);
+                    self.state.dirty_extent_maps.insert(inode_id);
+                    self.capacity_authority.record_free(freed_bytes);
+                    self.state
+                        .space_accounting
+                        .accumulate_delta(SpaceDelta::new_punch_hole(data_bytes, reserved_bytes));
+                    self.state.space_accounting.track_physical_free(data_bytes);
+                    if record.size == size {
+                        self.mark_inode_content_dirty(inode_id);
+                        committed_truncate_only = true;
+                    }
+                }
+                // Also remove intent log entries for this inode so the
+                // fsync fast path does not replay pre-truncation writes.
+                let removed_ids = self.intent_log.remove_entries_for_inode(inode_id);
+                for entry_id in &removed_ids {
+                    let _ = self
+                        .store
+                        .raw_primary_store_mut()
+                        .delete(intent_log_entry_object_key(*entry_id));
+                    let _ = self
+                        .store
+                        .raw_primary_store_mut()
+                        .delete(intent_log_data_object_key(*entry_id));
                 }
             }
-            // Also remove intent log entries for this inode so the
-            // fsync fast path does not replay pre-truncation writes.
-            // Also remove intent log entries for this inode so the
-            // fsync fast path does not replay pre-truncation writes.
-            let removed_ids = self.intent_log.remove_entries_for_inode(inode_id);
-            for entry_id in &removed_ids {
-                let _ = self
-                    .store
-                    .raw_primary_store_mut()
-                    .delete(intent_log_entry_object_key(*entry_id));
-                let _ = self
-                    .store
-                    .raw_primary_store_mut()
-                    .delete(intent_log_data_object_key(*entry_id));
+        }
+        let result = if record.size == size {
+            if committed_truncate_only {
+                self.commit_mutation(record)?
+            } else {
+                record
             }
-        }
-        // Truncate buffered writes to the new size so fsync does not
-        // restore pre-truncation data. Must run after the inode write
-        // even when old_size < size because auto_commit=false defers
-        // size updates from buffered writes.
-        if let Some(wb) = self.write_buffers.get_mut(&inode_id) {
-            wb.truncate(size);
-        }
+        } else {
+            self.rewrite_content_with_overlay(inode_id, record, 0, &[], size, true)?
+        };
+        self.truncate_write_buffer_for_inode(inode_id, size);
         // ── Intent-log: record truncate for crash recovery replay ──
         // Record the truncate after all extent and write-buffer mutations
         // are applied so that a crash before the next txg commit will replay
@@ -6347,21 +6387,27 @@ impl LocalFileSystem {
         }
         let effective_length = record.size.saturating_sub(offset).min(length);
 
-        // Accumulate space delta: punch_hole frees data bytes in range.
+        // Accumulate space delta only for extents that actually existed in the
+        // punched range. Sparse holes must stay accounting-neutral.
         if effective_length > 0 {
-            self.record_reclaim_delta(inode_id, effective_length);
+            let (data_bytes, reserved_bytes) =
+                self.accounted_extent_bytes(inode_id, offset, effective_length);
+            let freed_bytes = data_bytes.saturating_add(reserved_bytes);
+            if data_bytes > 0 {
+                self.record_reclaim_delta(inode_id, data_bytes);
+            }
             let _ = self
                 .extent_allocator
                 .free_extent(inode_id.0, offset, effective_length);
             self.state.dirty_extent_maps.insert(inode_id);
-            self.state
-                .space_accounting
-                .accumulate_delta(SpaceDelta::new_free(effective_length));
-            self.state
-                .space_accounting
-                .track_physical_free(effective_length);
-            // Track freed bytes in the production capacity authority
-            self.capacity_authority.record_free(effective_length);
+            if freed_bytes > 0 {
+                self.state
+                    .space_accounting
+                    .accumulate_delta(SpaceDelta::new_punch_hole(data_bytes, reserved_bytes));
+                self.state.space_accounting.track_physical_free(data_bytes);
+                // Track freed bytes in the production capacity authority.
+                self.capacity_authority.record_free(freed_bytes);
+            }
             // Intent-log: record punch_hole for crash-recovery replay.
             let _ = self.intent_log_buffer.as_ref().map(|buf| {
                 let _frame = buf.append(
@@ -6947,10 +6993,7 @@ impl LocalFileSystem {
             }
             self.page_cache_evict_inode(entry.inode_id);
             Arc::make_mut(&mut self.state.inodes).remove(&entry.inode_id);
-            self.state.last_inode_write_tx.remove(&entry.inode_id);
-            self.state.last_dir_write_tx.remove(&entry.inode_id);
-            self.state.extent_maps.remove(&entry.inode_id);
-            self.state.dirty_extent_maps.remove(&entry.inode_id);
+            self.forget_removed_inode_state(entry.inode_id);
         }
         self.commit_mutation(())
     }
@@ -7011,8 +7054,7 @@ impl LocalFileSystem {
             stored.xattrs.clear();
         }
         Arc::make_mut(&mut self.state.inodes).remove(&entry.inode_id);
-        self.state.last_inode_write_tx.remove(&entry.inode_id);
-        self.state.last_dir_write_tx.remove(&entry.inode_id);
+        self.forget_removed_inode_state(entry.inode_id);
         self.mark_dir_dirty(parent_id);
         self.mark_inode_metadata_dirty(parent_id);
         self.commit_mutation(())
@@ -9161,6 +9203,26 @@ impl LocalFileSystem {
         self.dirty_set.clear();
     }
 
+    fn forget_removed_inode_state(&mut self, inode_id: InodeId) {
+        self.write_buffers.remove(&inode_id);
+        self.state.dirty_content.remove(&inode_id);
+        self.state.dirty_inodes.remove(&inode_id);
+        self.state.dirty_extent_maps.remove(&inode_id);
+        self.state.last_inode_write_tx.remove(&inode_id);
+        self.state.last_dir_write_tx.remove(&inode_id);
+        self.state.last_extent_map_write_tx.remove(&inode_id);
+        self.state.extent_maps.remove(&inode_id);
+        self.state.known_inode_ids.remove(&inode_id);
+        self.dirty_set.forget_inode(inode_id);
+        self.inode_cache.borrow_mut().invalidate(inode_id);
+        self.invalidate_hot_read_cache_for_inode(inode_id);
+        self.page_cache_evict_inode(inode_id);
+        self.writeback_range_tracker
+            .lock()
+            .expect("locked")
+            .flush_inode(inode_id);
+    }
+
     fn mark_all_state_dirty(&mut self) {
         for id in self.state.inodes.keys() {
             self.state.dirty_content.insert(*id);
@@ -9292,7 +9354,7 @@ impl LocalFileSystem {
         let mut current_entries =
             content_allocation_entries_for_state(self.store.raw_primary_store(), &self.state)?;
         if let Some(inode_id) = replaced_inode {
-            let old_record = self.inode(inode_id)?;
+            let old_record = self.committed_inode_record(inode_id)?;
             for key in
                 content_allocation_entries_for_inode(self.store.raw_primary_store(), &old_record)?
                     .keys()

@@ -17842,6 +17842,55 @@ mod tests {
     }
 
     #[test]
+    fn copy_file_range_dispatch_after_fsx075_sparse_truncate_copies_zeroes() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"fsx075-sparse-copy.bin",
+            libc::O_RDWR as u32,
+        );
+
+        let mut truncate = SetAttr::new();
+        truncate.valid = FATTR_SIZE | FATTR_FH;
+        truncate.size = 0x351e5;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 75, inode.get(), &truncate, Some(adapter_fh))
+            .expect("sparse truncate through adapter");
+
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan: FuseCopyFileRangePlan {
+                unique: 76,
+                ino_in: inode.get(),
+                fh_in: adapter_fh,
+                offset_in: 0x20c96,
+                ino_out: inode.get(),
+                fh_out: adapter_fh,
+                offset_out: 0x1351e,
+                len: 0xb039,
+            },
+            source_fh: engine_fh,
+            dest_fh: engine_fh,
+        };
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("sparse copy through adapter dispatch")
+        };
+        assert_eq!(copied, 0xb039);
+
+        let engine = fixture.adapter.engine.lock().unwrap();
+        assert_eq!(
+            engine.read(&engine_fh, 0x1351e, 0xb039, &ctx).unwrap(),
+            vec![0; 0xb039]
+        );
+    }
+
+    #[test]
     fn plan_fuse_read_dispatch_preserves_handle_identity() {
         let plan =
             plan_fuse_read_dispatch(42, 77, 128, 4096, libc::O_RDONLY, Some(900)).expect("plan");
