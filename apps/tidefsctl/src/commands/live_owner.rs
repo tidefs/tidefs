@@ -135,16 +135,40 @@ pub(crate) fn route_if_owner_exists_for_uuid(
     );
 }
 
-pub(crate) fn route_if_owner_exists_for_uuid_with_args(
+pub(crate) fn route_or_refuse_active_for_uuid_with_args(
     command: &str,
     operation: &str,
     pool: &str,
     pool_uuid: [u8; 16],
+    active_label: bool,
     args: serde_json::Value,
 ) {
-    route_if_owner_exists_for_uuid_with_format_and_args(
-        command, operation, pool, pool_uuid, false, args,
+    route_or_refuse_active_for_uuid_with_format_and_args(
+        command,
+        operation,
+        pool,
+        pool_uuid,
+        active_label,
+        false,
+        args,
     );
+}
+
+pub(crate) fn route_or_refuse_active_for_uuid_with_format_and_args(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    pool_uuid: [u8; 16],
+    active_label: bool,
+    json: bool,
+    args: serde_json::Value,
+) {
+    if owner_manifest_exists_for_uuid_at(&pool_runtime_root(), pool, &pool_uuid) {
+        route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
+    }
+    if active_label {
+        refuse_active_without_owner(command, operation, pool, pool_uuid, json);
+    }
 }
 
 pub(crate) fn route_if_owner_exists_for_uuid_with_format_and_args(
@@ -176,6 +200,41 @@ pub(crate) fn route_imported_with_format_and_args(
         json,
         args,
     })
+}
+
+fn refuse_active_without_owner(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    pool_uuid: [u8; 16],
+    json: bool,
+) -> ! {
+    let pool_uuid_hex = hex_uuid(&pool_uuid);
+    if json {
+        let out = serde_json::json!({
+            "ok": false,
+            "command": command,
+            "operation": operation,
+            "pool_name": pool,
+            "pool_uuid": pool_uuid_hex,
+            "state": "ACTIVE",
+            "owner_required": true,
+            "error": "devices identify an imported pool but no live owner interface is reachable",
+            "recovery": "recover or create the owner with pool mount --devices, or export the pool cleanly before offline work",
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    } else {
+        eprintln!(
+            "tidefsctl {command} {operation}: devices identify imported pool '{pool}' uuid {pool_uuid_hex}, but no live owner interface is reachable"
+        );
+        eprintln!(
+            "tidefsctl {command} {operation}: imported pool state is cached and must be owned by the kernel UAPI or userspace daemon"
+        );
+        eprintln!(
+            "tidefsctl {command} {operation}: refusing to open devices directly; use 'tidefsctl pool mount {pool} <mountpoint> --devices ...' to recover/create the owner, or export the pool cleanly before offline work"
+        );
+    }
+    process::exit(1);
 }
 
 fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {

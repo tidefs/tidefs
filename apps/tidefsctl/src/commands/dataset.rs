@@ -2,8 +2,8 @@
 //!
 //! Pool-name-only dataset commands must route through the runtime owner that
 //! imported the pool. Explicit `--devices` are the offline/not-yet-imported
-//! escape hatch; if a live owner is already published for those devices, the
-//! command must use that owner instead of opening storage directly.
+//! escape hatch; if those devices are already imported, the command must use
+//! the live owner instead of opening storage directly.
 
 use std::path::PathBuf;
 use std::process;
@@ -350,11 +350,12 @@ fn open_filesystem_with_live_args(
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
-        super::live_owner::route_if_owner_exists_for_uuid_with_args(
+        super::live_owner::route_or_refuse_active_for_uuid_with_args(
             "dataset",
             operation,
             pool,
             config.pool_uuid,
+            config.state == tidefs_types_pool_label_core::PoolState::Active,
             live_args,
         );
 
@@ -1524,11 +1525,12 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
 fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -> PathBuf {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
-        super::live_owner::route_if_owner_exists_for_uuid_with_args(
+        super::live_owner::route_or_refuse_active_for_uuid_with_args(
             "dataset",
             operation,
             pool,
             config.pool_uuid,
+            config.state == tidefs_types_pool_label_core::PoolState::Active,
             serde_json::Value::Null,
         );
 

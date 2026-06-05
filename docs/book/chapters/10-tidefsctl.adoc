@@ -57,12 +57,13 @@ imported must say how to find it with arguments such as `--devices` or
 `--backing-dir`. Those arguments authorize offline work on exported storage,
 repair, discovery, or an owner-creating import-and-mount harness. Dataset,
 snapshot, and property commands must not turn an exported device set into an
-imported runtime as a side effect. An on-disk `ACTIVE` label is cached label
-state and can be stale after a crash; it is not by itself proof that the pool
-is currently imported. If the live-owner registry names the pool UUID or name,
-the command must route through that owner. If no live owner is reachable, the
-explicit storage arguments remain offline/recovery inputs instead of being
-treated as hidden imported state.
+imported runtime as a side effect. If explicit devices assemble as an
+imported `ACTIVE` pool, or if the live-owner registry already names that pool
+UUID/name, the command still has to route through the owner of that live state
+instead of opening the devices directly. If an `ACTIVE` label is stale after a
+crash and no owner is reachable, the operator must recover or create the owner
+through the import-and-mount path before operating on live state, or export
+the pool cleanly before offline work.
 
 The current userspace path that both imports and creates a live owner is
 `pool mount <pool> <mountpoint> --devices ...`. `pool import --devices ...`
@@ -109,13 +110,11 @@ tidefsctl block receive <pool> --backing-dir <object-store> --source-addr <addr>
 ----
 
 The device-removal offline form first probes existing labels without creating
-or opening the store writable. If the labels identify a pool that already has
-a reachable live owner, the command routes to that owner and does not continue
-into direct evacuation. If no owner is reachable, the explicit
-`--backing-dir` and `--surviving-dirs` paths are offline/recovery storage
-handles, even when cached labels still say `ACTIVE`. The block attach offline
-form is an explicit object-store development path and still checks for an
-existing live owner by pool name before opening the backing directory.
+or opening the store writable. If those labels identify an imported `ACTIVE`
+pool, the command routes to the owner interface or fails closed; it does not
+continue into direct evacuation from cached live state. The block attach
+offline form is an explicit object-store development path and still checks for
+an existing live owner by pool name before opening the backing directory.
 
 The old `--pool <pool>` spelling is not the operator form. It must not be
 kept as a parallel control path for imported state.
