@@ -41,7 +41,9 @@ fail closed instead of falling back to direct device access.
 The current userspace FUSE owner exposes an imported-pool JSON socket under
 `/run/tidefs/pools/<pool-uuid>/owner.sock`, with a manifest at
 `owner.json`. Owner discovery may use the pool UUID or a pool-name registry
-entry, but the reachable socket is the interface. A manifest alone is only
+entry, but the reachable socket is the userspace interface. In kernel mode the
+interface is the declared kernel UAPI client, not the cached manifest. A
+manifest alone is only
 runtime residue and is not authorization to reopen devices directly. That
 socket currently handles live `pool status`, pool properties, dataset catalog
 create/list/rename/destroy and dataset property

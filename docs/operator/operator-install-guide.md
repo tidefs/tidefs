@@ -155,10 +155,11 @@ tidefsctl pool status mypool --json  # machine-readable
 Use `--devices` only for exported/offline status or discovery. Once the pool is
 imported, `tidefsctl pool status mypool` routes to the live owner instead of
 opening the devices. A stale `/run/tidefs/pools/.../owner.json` file is not
-itself a live owner; the owner socket must be reachable. If labels still show an
-imported pool and no owner socket responds, repair or restart the kernel UAPI
-or userspace daemon owner before running live-state commands. Do not open the
-cached imported state directly.
+itself a live owner interface. For userspace owners the socket must be
+reachable; for kernel owners the kernel UAPI client must be wired and usable.
+If labels still show an imported pool and no supported owner interface responds,
+repair or restart the kernel UAPI or userspace daemon owner before running
+live-state commands. Do not open the cached imported state directly.
 
 ---
 

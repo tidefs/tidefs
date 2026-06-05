@@ -361,7 +361,7 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
     let operation = route.operation;
     let pool = route.pool;
     eprintln!(
-        "tidefsctl {command} {operation}: cannot reach live owner for imported pool '{pool}': {lookup_error}"
+        "tidefsctl {command} {operation}: cannot use a live-owner interface for imported pool '{pool}': {lookup_error}"
     );
     if let Some(pool_uuid) = route.pool_uuid {
         eprintln!(
@@ -370,10 +370,10 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
         );
     }
     eprintln!(
-        "tidefsctl {command} {operation}: live pool state is cached and owned by the active runtime"
+        "tidefsctl {command} {operation}: cached imported-pool state is evidence, not an authority interface"
     );
     eprintln!(
-        "tidefsctl {command} {operation}: route through the kernel UAPI in kernel mode, or the FUSE/ublk daemon owner in userspace mode"
+        "tidefsctl {command} {operation}: live state must be requested through the kernel UAPI client in kernel mode, or the FUSE/ublk daemon owner in userspace mode"
     );
     eprintln!(
         "tidefsctl {command} {operation}: use --devices or --backing-dir only for offline, discovery, owner-creating import-and-mount, or not-yet-imported work"

@@ -729,9 +729,16 @@ fn snapshot_backing_path(
     pool: Option<&str>,
     devices: Option<&[PathBuf]>,
     operation: &str,
+    live_args: serde_json::Value,
 ) -> PathBuf {
     match (backing_dir, pool, devices.filter(|devs| !devs.is_empty())) {
-        (Some(p), _, _) => p.clone(),
+        (Some(p), _, _) => {
+            super::live_owner::route_if_owner_exists_for_backing_dir_with_args(
+                "snapshot", operation, p, live_args,
+            );
+            super::offline_pool::refuse_runtime_pool_path("snapshot", operation, p);
+            p.clone()
+        }
         (None, pool_name, Some(devs)) => import_devices_metadata_dir(
             devs,
             pool_name.unwrap_or("<unnamed>"),
@@ -917,7 +924,7 @@ fn handle_send(args: SnapshotSendArgs) {
         args.devices.as_deref(),
         "send",
         RecoveryPolicy::default(),
-        live_args,
+        live_args.clone(),
     );
 
     // Export: VFSSEND2 path or VFSSEND1 path, full or incremental.
@@ -941,6 +948,7 @@ fn handle_send(args: SnapshotSendArgs) {
                 args.pool.as_deref(),
                 args.devices.as_deref(),
                 "send",
+                live_args.clone(),
             );
             let from_root = match parse_incremental_from_root(&args.from_root, &path) {
                 Ok(r) => r,
@@ -972,6 +980,7 @@ fn handle_send(args: SnapshotSendArgs) {
                 args.pool.as_deref(),
                 args.devices.as_deref(),
                 "send",
+                live_args.clone(),
             );
             match parse_incremental_from_root(&args.from_root, &path) {
                 Ok(r) => r,
