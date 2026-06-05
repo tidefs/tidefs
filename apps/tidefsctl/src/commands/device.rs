@@ -290,11 +290,12 @@ fn handle_remove(
     // before any offline evacuation store is opened writable.
     let pre_config = import_offline_pool_config(pool_name, backing_dir)?;
 
-    super::live_owner::route_if_owner_exists_for_uuid_with_args(
+    super::live_owner::route_or_refuse_active_for_uuid_with_args(
         "device",
         "remove",
         pool_name,
         pre_config.pool_uuid,
+        pre_config.state == tidefs_types_pool_label_core::PoolState::Active,
         live_args,
     );
 
