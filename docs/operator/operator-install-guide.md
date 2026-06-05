@@ -363,6 +363,10 @@ The offline form probes existing labels without creating or opening the store
 writable. Those labels provide topology and recovery evidence. If they identify
 `ACTIVE` imported state, the request routes to the owner interface or fails
 closed; it does not evacuate through direct storage access.
+`--surviving-dirs`, `device rebuild --surviving-dir`, and
+`device rebuild --replacement-dir` are offline object-store paths as well. They
+must not point into `/run/tidefs/pools` or any backing directory named by an
+imported-pool owner manifest.
 
 ### 6.5 Pool export (deactivate)
 

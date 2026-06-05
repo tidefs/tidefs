@@ -27,6 +27,19 @@ pub(crate) trait LivePoolOwnerClient {
     fn route_live_pool(self, route: LivePoolRoute<'_>) -> !;
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct ImportedBackingDirOwner {
+    pub(crate) pool: String,
+    pub(crate) pool_uuid: [u8; 16],
+    pub(crate) reachable: bool,
+}
+
+impl ImportedBackingDirOwner {
+    pub(crate) fn pool_uuid_hex(&self) -> String {
+        hex_uuid(&self.pool_uuid)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MissingLivePoolOwnerClient;
 
@@ -142,6 +155,10 @@ pub(crate) fn route_if_owner_exists_for_backing_dir_with_args(
     if let Some((pool, pool_uuid)) = cached_owner_by_backing_dir_at(&root, backing_dir) {
         refuse_cached_without_owner(command, operation, &pool, Some(pool_uuid), false);
     }
+}
+
+pub(crate) fn imported_owner_by_backing_dir(backing_dir: &Path) -> Option<ImportedBackingDirOwner> {
+    imported_owner_by_backing_dir_at(&pool_runtime_root(), backing_dir)
 }
 
 pub(crate) fn route_or_refuse_active_for_uuid_with_args(
@@ -705,6 +722,27 @@ fn cached_owner_by_backing_dir_at(root: &Path, backing_dir: &Path) -> Option<(St
     owner_by_backing_dir_at(root, backing_dir, false)
 }
 
+fn imported_owner_by_backing_dir_at(
+    root: &Path,
+    backing_dir: &Path,
+) -> Option<ImportedBackingDirOwner> {
+    if let Some((pool, pool_uuid)) = owner_interface_reachable_by_backing_dir_at(root, backing_dir)
+    {
+        return Some(ImportedBackingDirOwner {
+            pool,
+            pool_uuid,
+            reachable: true,
+        });
+    }
+    cached_owner_by_backing_dir_at(root, backing_dir).map(|(pool, pool_uuid)| {
+        ImportedBackingDirOwner {
+            pool,
+            pool_uuid,
+            reachable: false,
+        }
+    })
+}
+
 fn owner_by_backing_dir_at(
     root: &Path,
     backing_dir: &Path,
@@ -1133,6 +1171,33 @@ mod tests {
             owner_interface_reachable_by_pool_backing_dir_at(dir.path(), "tank", &backing_dir),
             None
         );
+    }
+
+    #[test]
+    fn imported_backing_dir_owner_reports_cached_owner_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing_dir = dir.path().join("backing");
+        std::fs::create_dir_all(&backing_dir).unwrap();
+        let uuid = [0x55; 16];
+        let manifest_path = owner_manifest_path(dir.path(), &uuid);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "pool_name": "tank",
+                "pool_uuid": "55555555555555555555555555555555",
+                "backing_dir": backing_dir,
+                "socket_path": dir.path().join("missing-owner.sock"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let owner = imported_owner_by_backing_dir_at(dir.path(), &backing_dir).unwrap();
+
+        assert_eq!(owner.pool, "tank");
+        assert_eq!(owner.pool_uuid, uuid);
+        assert!(!owner.reachable);
     }
 
     #[test]

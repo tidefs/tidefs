@@ -208,6 +208,9 @@ fn handle_rebuild(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tidefs_local_object_store::{LocalObjectStore, StoreOptions};
 
+    ensure_unowned_offline_store_path("rebuild", "surviving-dir", surviving_dir)?;
+    ensure_unowned_offline_store_path("rebuild", "replacement-dir", replacement_dir)?;
+
     let surviving = LocalObjectStore::open_with_options(surviving_dir, StoreOptions::test_fast())
         .map_err(|e| {
         format!(
@@ -286,7 +289,25 @@ fn handle_remove(
         }
     };
 
-    super::offline_pool::refuse_runtime_pool_path("device", "remove", backing_dir);
+    super::live_owner::route_if_owner_exists_for_pool_backing_dir_with_args(
+        "device",
+        "remove",
+        pool_name,
+        backing_dir,
+        live_args.clone(),
+    );
+    ensure_unowned_offline_store_path("remove", "backing-dir", backing_dir)?;
+
+    for surviving_dir in surviving_dirs {
+        super::live_owner::route_if_owner_exists_for_pool_backing_dir_with_args(
+            "device",
+            "remove",
+            pool_name,
+            surviving_dir,
+            live_args.clone(),
+        );
+        ensure_unowned_offline_store_path("remove", "surviving-dir", surviving_dir)?;
+    }
 
     // Read labels without creating or mutating the store. If those labels say
     // the pool is imported, live state belongs to the owner interface.
@@ -618,6 +639,29 @@ fn handle_remove(
 
     eprintln!("Device removal complete (phase: {}).", state.phase);
     let _ = result;
+    Ok(())
+}
+
+fn ensure_unowned_offline_store_path(
+    operation: &str,
+    role: &str,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    super::offline_pool::refuse_runtime_pool_path("device", operation, path);
+    if let Some(owner) = super::live_owner::imported_owner_by_backing_dir(path) {
+        let state = if owner.reachable {
+            "reachable live owner"
+        } else {
+            "cached owner record"
+        };
+        return Err(format!(
+            "{role} {} is imported-pool state for pool '{}' uuid {} ({state}); use the live owner or export the pool before offline device work",
+            path.display(),
+            owner.pool,
+            owner.pool_uuid_hex()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -1096,6 +1140,47 @@ mod tests {
             msg.contains("no existing target store"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn offline_store_path_refuses_cached_owner_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing_dir = dir.path().join("owned-backing");
+        std::fs::create_dir_all(&backing_dir).unwrap();
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let runtime_dir =
+            std::path::PathBuf::from("/run/tidefs/pools").join(format!("test-device-{nonce}"));
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(
+            runtime_dir.join("owner.json"),
+            serde_json::json!({
+                "pool_name": "tank",
+                "pool_uuid": "56565656565656565656565656565656",
+                "backing_dir": backing_dir,
+                "socket_path": runtime_dir.join("missing-owner.sock"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let result = ensure_unowned_offline_store_path(
+            "rebuild",
+            "surviving-dir",
+            &dir.path().join("owned-backing"),
+        );
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+
+        assert!(result.is_err(), "cached owner state must fail closed");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("imported-pool state"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("tank"), "unexpected error: {msg}");
     }
 }
 
