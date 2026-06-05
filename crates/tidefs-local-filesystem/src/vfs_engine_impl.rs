@@ -1095,6 +1095,10 @@ impl VfsLocalFileSystem {
             ("pool", "get") => self.live_pool_get(args),
             ("pool", "set") => self.live_pool_set(args),
             ("pool", "list-props") => self.live_pool_list_props(args),
+            ("device", "remove") => live_admin_error(
+                1,
+                "device remove: live owner interface is reached, but live evacuation/removal is not implemented yet",
+            ),
             _ => live_admin_error(
                 1,
                 format!("live engine does not implement tidefsctl {command} {operation}"),

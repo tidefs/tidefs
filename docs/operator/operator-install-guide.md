@@ -314,7 +314,10 @@ tidefsctl block detach <dev-name>
 ### 6.4 Device management
 
 ```sh
-# Remove a device from the pool
+# Request live owner-mediated removal from an imported pool
+tidefsctl device remove mypool /dev/sdc
+
+# Exported/offline removal spells its storage handles explicitly
 tidefsctl device remove mypool /dev/sdc --backing-dir /var/lib/tidefs/device-sdc --surviving-dirs /var/lib/tidefs/device-sdb
 
 # Trigger rebuild after device replacement

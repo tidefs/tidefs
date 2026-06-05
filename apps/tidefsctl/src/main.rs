@@ -740,6 +740,16 @@ mod tests {
     // -- Device CLI parse tests -------------------------------------------
 
     #[test]
+    fn cli_parse_device_remove_imported_pool_shape() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "device", "remove", "mypool", "/dev/sdc"]);
+        assert!(
+            args.is_ok(),
+            "device remove for imported pool should parse without offline store arguments"
+        );
+    }
+
+    #[test]
     fn cli_parse_device_remove_positional_pool() {
         use clap::Parser;
         let args = Cli::try_parse_from([

@@ -263,9 +263,8 @@ fn dispatch_request(
         ("pool", "export") => pool_export(request.json, manifest, shutdown),
         ("pool", "get" | "set" | "list-props")
         | ("dataset", "create" | "list" | "rename" | "destroy" | "get" | "set" | "list-props")
-        | ("snapshot", "create" | "list" | "destroy" | "rollback") => {
-            delegate_admin_request(&request, engine)
-        }
+        | ("snapshot", "create" | "list" | "destroy" | "rollback")
+        | ("device", "remove") => delegate_admin_request(&request, engine),
         _ => LiveOwnerResponse::error(
             1,
             format!(

@@ -1,15 +1,19 @@
 //! `tidefsctl device` subcommands: operator-triggered device removal from a
 //! TideFS pool with data evacuation and committed-root anchoring.
 //!
-//! ## Real evacuation contract
+//! ## Offline evacuation contract
 //!
-//! Device removal requires at least one surviving device backing directory
-//! (--surviving-dirs). Evacuated objects are read from the target device's
-//! store and persisted to the surviving device stores via round-robin
+//! For imported pools, the pool name is routed to the live owner before this
+//! module opens any store. The target-device backing directory and surviving
+//! directories are only for exported/offline device removal after no live
+//! owner exists for the pool.
+//!
+//! Offline device removal requires at least one surviving device backing
+//! directory (--surviving-dirs). Evacuated objects are read from the target
+//! device's store and persisted to the surviving device stores via round-robin
 //! assignment consistent with the evacuation plan. The committed removal
-//! record is only marked complete when all objects have been durably
-//! relocated, pool labels have been updated, and the commit-group sync
-//! has succeeded.
+//! record is only marked complete when all objects have been durably relocated,
+//! pool labels have been updated, and the commit-group sync has succeeded.
 //!
 //! If no surviving directories are provided, the command refuses evacuation
 //! and reports the planning failure (NoObjectsOnDevice when empty, or
@@ -34,11 +38,10 @@ use tidefs_types_pool_label_core::PoolState;
 /// Device management subcommands.
 #[derive(Subcommand, Debug)]
 pub enum DeviceCommand {
-    /// Remove a device from the pool, evacuating its data to surviving devices.
+    /// Remove a device from a pool.
     ///
-    /// Objects residing on the target device are read and copied to surviving
-    /// devices. Once evacuation completes, the pool membership is updated and
-    /// the removal is anchored in a committed root for crash safety.
+    /// Imported pools route to the live owner. Exported/offline pools use
+    /// --backing-dir and --surviving-dirs to run the local evacuation path.
     Remove {
         /// Pool name. If the pool is imported, the request is routed to its live owner.
         pool_name: String,
@@ -46,11 +49,11 @@ pub enum DeviceCommand {
         /// Path to the block device to remove.
         device_path: PathBuf,
 
-        /// Backing directory for the target device's local object store.
+        /// Backing directory for exported/offline removal of the target device's store.
         #[arg(short = 'b', long = "backing-dir")]
-        backing_dir: PathBuf,
+        backing_dir: Option<PathBuf>,
 
-        /// Comma-separated paths to surviving device backing directories.
+        /// Comma-separated paths to surviving exported/offline backing directories.
         /// Each path must point to a distinct LocalObjectStore directory.
         /// At least one surviving dir is required for evacuation of
         /// populated target devices.
@@ -100,7 +103,7 @@ pub fn handle_device(cmd: DeviceCommand) {
             if let Err(e) = handle_remove(
                 &pool_name,
                 &device_path,
-                &backing_dir,
+                backing_dir.as_ref(),
                 &surviving_dirs,
                 replication_factor,
                 &failure_domain,
@@ -257,7 +260,7 @@ fn handle_rebuild(
 fn handle_remove(
     pool_name: &str,
     device_path: &PathBuf,
-    backing_dir: &PathBuf,
+    backing_dir: Option<&PathBuf>,
     surviving_dirs: &[PathBuf],
     replication_factor: u8,
     failure_domain: &str,
@@ -274,6 +277,12 @@ fn handle_remove(
             "force": force,
         }),
     );
+
+    let backing_dir = backing_dir.ok_or_else(|| {
+        format!(
+            "pool '{pool_name}' has no reachable live owner; --backing-dir is required only for exported/offline device removal"
+        )
+    })?;
 
     let domain = match failure_domain {
         "device" => FailureDomain::Device,
@@ -318,7 +327,7 @@ fn handle_remove(
         }
         None => {
             return Err(format!(
-                "no pool labels found in target store at {}; device removal requires                  an imported pool with authoritative labels. Create the pool with                  'tidefsctl pool create' before removing devices.",
+                "no pool labels found in target store at {}; offline device removal requires authoritative pool labels. Create the pool with 'tidefsctl pool create' before removing devices.",
                 backing_dir.display(),
             )
             .into());
@@ -756,7 +765,7 @@ mod tests {
         let result = handle_remove(
             "testpool",
             &device_path,
-            &target_dir,
+            Some(&target_dir),
             &[surv0_dir.clone(), surv1_dir.clone()],
             2,
             "device",
@@ -870,7 +879,7 @@ mod tests {
         let result = handle_remove(
             "testpool",
             &device_path,
-            &target_dir,
+            Some(&target_dir),
             &[surv_dir],
             2,
             "device",
@@ -898,7 +907,7 @@ mod tests {
         let result = handle_remove(
             "testpool",
             &PathBuf::from("/dev/nonexistent"),
-            &target_dir,
+            Some(&target_dir),
             &[surv_dir],
             2,
             "device",
@@ -940,7 +949,7 @@ mod tests {
         let result = handle_remove(
             "testpool",
             &device_path,
-            &target_dir,
+            Some(&target_dir),
             &[surv0_dir.clone(), surv1_dir.clone()],
             2,
             "device",
@@ -1001,7 +1010,7 @@ mod tests {
         let result = handle_remove(
             "testpool",
             &device_path,
-            &target_dir,
+            Some(&target_dir),
             &[bad_dir],
             2,
             "device",
@@ -1010,6 +1019,29 @@ mod tests {
         assert!(
             result.is_err(),
             "expected error opening non-directory as store"
+        );
+    }
+
+    #[test]
+    fn removal_without_owner_requires_offline_backing_dir() {
+        let result = handle_remove(
+            "testpool",
+            &PathBuf::from("/dev/disk0"),
+            None,
+            &[],
+            2,
+            "device",
+            false,
+        );
+
+        assert!(
+            result.is_err(),
+            "offline removal should require an explicit backing dir"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--backing-dir"),
+            "expected --backing-dir refusal, got {msg}"
         );
     }
 }
