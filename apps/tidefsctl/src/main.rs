@@ -208,6 +208,8 @@ fn handle_mount(
     dataset: String,
     encryption_envelope: Option<PathBuf>,
 ) {
+    commands::refuse_runtime_pool_path("mount", "mount", &backing_dir);
+
     let encryption_config = if let Some(ref envelope_path) = encryption_envelope {
         let root_auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_environment()
             .unwrap_or_else(|_| tidefs_local_filesystem::RootAuthenticationKey::demo_key());

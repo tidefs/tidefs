@@ -9,3 +9,5 @@ pub mod mount;
 mod offline_pool;
 pub mod pool;
 pub mod snapshot;
+
+pub(crate) use offline_pool::refuse_runtime_pool_path;

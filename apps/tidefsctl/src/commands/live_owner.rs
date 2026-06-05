@@ -276,7 +276,7 @@ fn exit_owner_error(route: LivePoolRoute<'_>, exit_code: i32, message: &str) -> 
 
 fn send_live_owner_request(route: &LivePoolRoute<'_>) -> Result<(), LiveOwnerRequestError> {
     let manifest = find_live_owner_manifest(route)?;
-    let socket_path = manifest_socket_path(&manifest)?;
+    let socket_path = manifest_socket_endpoint(&manifest, route)?;
     let mut stream = UnixStream::connect(&socket_path).map_err(|err| {
         LiveOwnerRequestError::Unavailable(format!("connect {}: {err}", socket_path.display()))
     })?;
@@ -387,7 +387,7 @@ fn find_live_owner_manifest_at(
         let manifest_path = owner_manifest_path(root, &pool_uuid);
         if let Some(manifest) = read_manifest_if_exists(&manifest_path)? {
             if manifest_matches_route(&manifest, route) {
-                if manifest_has_reachable_socket(&manifest) {
+                if manifest_has_reachable_interface(&manifest) {
                     return Ok(manifest);
                 }
                 cached_match = Some(manifest);
@@ -426,7 +426,7 @@ fn find_live_owner_manifest_at(
             continue;
         };
         if manifest_matches_route(&manifest, route) {
-            if manifest_has_reachable_socket(&manifest) {
+            if manifest_has_reachable_interface(&manifest) {
                 return Ok(manifest);
             }
             if cached_match.is_none() {
@@ -470,7 +470,7 @@ fn owner_interface_reachable_by_uuid_at(root: &Path, uuid: &[u8; 16]) -> bool {
     let Ok(Some(manifest)) = read_manifest_if_exists(&manifest_path) else {
         return false;
     };
-    manifest_uuid_matches(&manifest, uuid) && manifest_has_reachable_socket(&manifest)
+    manifest_uuid_matches(&manifest, uuid) && manifest_has_reachable_interface(&manifest)
 }
 
 fn owner_interface_reachable_by_pool_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16]) -> bool {
@@ -502,7 +502,7 @@ fn owner_interface_reachable_by_pool_uuid_at(root: &Path, pool: &str, uuid: &[u8
             .get("pool_uuid")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|manifest_uuid| manifest_uuid.eq_ignore_ascii_case(&expected_uuid));
-        if name_matches && uuid_matches && manifest_has_reachable_socket(&manifest) {
+        if name_matches && uuid_matches && manifest_has_reachable_interface(&manifest) {
             return true;
         }
     }
@@ -569,7 +569,7 @@ fn owner_interface_reachable_by_pool_at(root: &Path, pool: &str) -> bool {
             .get("pool_name")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|name| name == pool)
-            && manifest_has_reachable_socket(&manifest)
+            && manifest_has_reachable_interface(&manifest)
         {
             return true;
         }
@@ -651,7 +651,7 @@ fn owner_by_backing_dir_at(
         let Some(pool_uuid) = manifest_pool_uuid_bytes(&manifest) else {
             continue;
         };
-        if require_reachable_socket && !manifest_has_reachable_socket(&manifest) {
+        if require_reachable_socket && !manifest_has_reachable_interface(&manifest) {
             continue;
         }
         return Some((pool_name.to_string(), pool_uuid));
@@ -703,11 +703,50 @@ fn manifest_socket_path(manifest: &serde_json::Value) -> Result<PathBuf, LiveOwn
         })
 }
 
-fn manifest_has_reachable_socket(manifest: &serde_json::Value) -> bool {
+fn manifest_socket_endpoint(
+    manifest: &serde_json::Value,
+    route: &LivePoolRoute<'_>,
+) -> Result<PathBuf, LiveOwnerRequestError> {
+    match manifest_owner_kind(manifest) {
+        Some("kernel") => {
+            let endpoint = manifest_kernel_uapi_path(manifest)
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "undeclared kernel UAPI endpoint".to_string());
+            Err(LiveOwnerRequestError::Unavailable(format!(
+                "kernel live owner for imported pool '{}' is declared at {endpoint}, but tidefsctl has no kernel UAPI admin client wired yet",
+                route.pool
+            )))
+        }
+        Some("fuse" | "ublk" | "daemon" | "userspace") | None => manifest_socket_path(manifest),
+        Some(other) => Err(LiveOwnerRequestError::Unavailable(format!(
+            "unsupported live owner kind '{other}' for imported pool '{}'",
+            route.pool
+        ))),
+    }
+}
+
+fn manifest_has_reachable_interface(manifest: &serde_json::Value) -> bool {
+    if matches!(manifest_owner_kind(manifest), Some("kernel")) {
+        return manifest_kernel_uapi_path(manifest).is_some_and(|path| path.exists());
+    }
     let Ok(socket_path) = manifest_socket_path(manifest) else {
         return false;
     };
     UnixStream::connect(socket_path).is_ok()
+}
+
+fn manifest_owner_kind(manifest: &serde_json::Value) -> Option<&str> {
+    manifest
+        .get("owner_kind")
+        .and_then(serde_json::Value::as_str)
+}
+
+fn manifest_kernel_uapi_path(manifest: &serde_json::Value) -> Option<PathBuf> {
+    manifest
+        .get("kernel_uapi_path")
+        .or_else(|| manifest.get("uapi_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
 }
 
 fn manifest_uuid_matches(manifest: &serde_json::Value, uuid: &[u8; 16]) -> bool {
@@ -1067,6 +1106,91 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(expected_socket.as_str())
         );
+    }
+
+    #[test]
+    fn owner_lookup_prefers_reachable_kernel_owner_over_stale_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = [0x42; 16];
+        let stale_manifest_path = owner_manifest_path(dir.path(), &uuid);
+        std::fs::create_dir_all(stale_manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &stale_manifest_path,
+            serde_json::json!({
+                "owner_kind": "fuse",
+                "pool_name": "tank",
+                "pool_uuid": "42424242424242424242424242424242",
+                "socket_path": dir.path().join("missing-owner.sock"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let kernel_uapi_path = dir.path().join("kernel-uapi");
+        std::fs::write(&kernel_uapi_path, b"placeholder").unwrap();
+        let reachable_manifest_path = dir.path().join("kernel-entry").join("owner.json");
+        std::fs::create_dir_all(reachable_manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &reachable_manifest_path,
+            serde_json::json!({
+                "owner_kind": "kernel",
+                "pool_name": "tank",
+                "pool_uuid": "42424242424242424242424242424242",
+                "kernel_uapi_path": kernel_uapi_path,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some(uuid),
+            json: false,
+            args: serde_json::Value::Null,
+        };
+
+        let manifest = find_live_owner_manifest_at(dir.path(), &route).unwrap();
+
+        assert_eq!(
+            manifest
+                .get("owner_kind")
+                .and_then(serde_json::Value::as_str),
+            Some("kernel")
+        );
+    }
+
+    #[test]
+    fn kernel_owner_manifest_refuses_socket_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel_uapi_path = dir.path().join("kernel-uapi");
+        std::fs::write(&kernel_uapi_path, b"placeholder").unwrap();
+        let manifest = serde_json::json!({
+            "owner_kind": "kernel",
+            "pool_name": "tank",
+            "pool_uuid": "42424242424242424242424242424242",
+            "kernel_uapi_path": kernel_uapi_path,
+        });
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: false,
+            args: serde_json::Value::Null,
+        };
+
+        let err = manifest_socket_endpoint(&manifest, &route).unwrap_err();
+
+        match err {
+            LiveOwnerRequestError::Unavailable(message) => {
+                assert!(message.contains("kernel live owner"));
+                assert!(message.contains("no kernel UAPI admin client"));
+            }
+            LiveOwnerRequestError::Owner { .. } => {
+                panic!("kernel owner should not use socket transport")
+            }
+        }
     }
 
     #[test]

@@ -533,6 +533,7 @@ fn open_filesystem_with_live_args(
             super::live_owner::route_if_owner_exists_for_backing_dir_with_args(
                 "snapshot", operation, path, live_args,
             );
+            super::offline_pool::refuse_runtime_pool_path("snapshot", operation, path);
             path.clone()
         }
         (None, Some(pool_name)) => {
@@ -1079,6 +1080,7 @@ fn handle_receive(args: SnapshotReceiveArgs) {
             "server_node_id": args.server_node_id,
         }),
     );
+    super::offline_pool::refuse_runtime_pool_path("snapshot", "receive", &args.backing_dir);
 
     // Network pull: fetch stream from a remote storage-node.
     if let Some(addr) = args.source_addr {

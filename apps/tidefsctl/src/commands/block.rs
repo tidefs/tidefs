@@ -203,6 +203,7 @@ fn handle_attach(
         pool_path,
         live_args.clone(),
     );
+    super::offline_pool::refuse_runtime_pool_path("block", "attach", pool_path);
 
     if !pool_path.exists() {
         return Err(format!(
@@ -444,6 +445,7 @@ fn handle_block_send(
         pool_path,
         live_args.clone(),
     );
+    super::offline_pool::refuse_runtime_pool_path("block", "send", pool_path);
 
     if !pool_path.exists() {
         return Err(format!(
@@ -505,6 +507,7 @@ fn handle_block_receive(
         pool_path,
         live_args.clone(),
     );
+    super::offline_pool::refuse_runtime_pool_path("block", "receive", pool_path);
 
     if pool_path.exists() {
         return Err(format!(

@@ -286,6 +286,8 @@ fn handle_remove(
         }
     };
 
+    super::offline_pool::refuse_runtime_pool_path("device", "remove", backing_dir);
+
     // Read labels without creating or mutating the store. If those labels say
     // the pool is imported, live state belongs to the owner interface.
     let pre_config = import_offline_pool_config(pool_name, backing_dir)?;
