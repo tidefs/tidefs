@@ -1183,6 +1183,7 @@ impl VfsLocalFileSystem {
             ("pool", "get") => self.live_pool_get(args),
             ("pool", "set") => self.live_pool_set(args),
             ("pool", "list-props") => self.live_pool_list_props(args),
+            ("pool", "integrity-check") => self.live_pool_integrity_check(pool, args, wants_json),
             ("device", "remove") => self.live_device_remove(args, wants_json),
             _ => live_admin_error(
                 1,
@@ -2191,6 +2192,217 @@ impl VfsLocalFileSystem {
         let family = live_admin_optional_arg(args, "family");
         let fs = self.fs.borrow();
         live_property_table("pool list-props", fs.pool_properties(), family)
+    }
+
+    fn live_pool_integrity_check(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
+        let max_records = args.get("max_records").and_then(Value::as_u64);
+        let max_bytes = args.get("max_bytes").and_then(Value::as_u64);
+        let backing_dir_arg = live_admin_optional_arg(args, "backing_dir").map(ToString::to_string);
+        let device_arg_count = args
+            .get("devices")
+            .and_then(Value::as_array)
+            .map(|devices| {
+                devices
+                    .iter()
+                    .filter(|value| value.as_str().is_some_and(|path| !path.is_empty()))
+                    .count()
+            })
+            .unwrap_or(0);
+
+        let mut fs = self.fs.borrow_mut();
+        let verifier = match fs.online_verifier_report() {
+            Ok(report) => report,
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("pool integrity-check: live verifier failed for '{pool}': {err}"),
+                )
+            }
+        };
+        let statfs = match fs.statfs() {
+            Ok(statfs) => statfs,
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("pool integrity-check: live statfs failed for '{pool}': {err}"),
+                )
+            }
+        };
+        let fs_stats = fs.stats();
+        let suspect_stats = fs.object_store().suspect_log().stats();
+        let intent_log_pending = fs.intent_log_pending();
+        let pass = verifier.passed()
+            && !verifier.production_fsck_required
+            && suspect_stats.unresolved == 0;
+
+        if wants_json {
+            let selected_root = verifier.selected_root.as_ref().map(|root| {
+                json!({
+                    "slot": root.slot,
+                    "transaction_id": root.transaction_id,
+                    "generation": root.generation,
+                    "next_inode_id": root.next_inode_id,
+                    "inode_count": root.inode_count,
+                    "has_transaction_manifest": root.has_transaction_manifest,
+                    "manifest_entry_count": root.manifest_entry_count,
+                    "has_root_authentication": root.has_root_authentication,
+                })
+            });
+            let issues: Vec<_> = verifier
+                .issues
+                .iter()
+                .map(|issue| {
+                    json!({
+                        "severity": issue.severity.human_name(),
+                        "kind": issue.kind.human_name(),
+                        "slot": issue.slot,
+                        "transaction_id": issue.transaction_id,
+                        "generation": issue.generation,
+                        "reason": &issue.reason,
+                    })
+                })
+                .collect();
+
+            return live_admin_ok_json(json!({
+                "pool": pool,
+                "pass": pass,
+                "state_source": "live-owner",
+                "owner_state": "mounted LocalFileSystem",
+                "offline_inputs_ignored": backing_dir_arg.is_some() || device_arg_count > 0,
+                "requested_limits": {
+                    "max_records": max_records,
+                    "max_bytes": max_bytes,
+                    "applied": false,
+                    "reason": "current live verifier API is full-scope",
+                },
+                "offline_inputs": {
+                    "backing_dir": backing_dir_arg,
+                    "device_count": device_arg_count,
+                },
+                "verifier": {
+                    "outcome": verifier.outcome.human_name(),
+                    "root_slot_count": verifier.root_slot_count,
+                    "root_slots_seen": verifier.root_slots_seen,
+                    "root_slot_records_seen": verifier.root_slot_records_seen,
+                    "root_candidates_seen": verifier.root_candidates_seen,
+                    "verified_committed_roots": verifier.verified_committed_roots.len(),
+                    "invalid_root_candidates": verifier.invalid_root_candidates,
+                    "checked_transaction_manifests": verifier.checked_transaction_manifests,
+                    "checked_content_objects": verifier.checked_content_objects,
+                    "checked_content_chunks": verifier.checked_content_chunks,
+                    "verified_snapshot_roots": verifier.verified_snapshot_roots,
+                    "production_fsck_required": verifier.production_fsck_required,
+                    "mutating_repair_attempted": verifier.mutating_repair_attempted,
+                    "selected_root": selected_root,
+                    "issues": issues,
+                },
+                "statfs": {
+                    "blocks": statfs.blocks,
+                    "bfree": statfs.bfree,
+                    "bavail": statfs.bavail,
+                    "files": statfs.files,
+                    "ffree": statfs.ffree,
+                    "bsize": statfs.bsize,
+                    "frsize": statfs.frsize,
+                    "namelen": statfs.namelen,
+                    "fsid_hi": statfs.fsid_hi,
+                    "fsid_lo": statfs.fsid_lo,
+                },
+                "filesystem": {
+                    "inode_count": fs_stats.inode_count,
+                    "directory_count": fs_stats.directory_count,
+                    "file_count": fs_stats.file_count,
+                    "symlink_count": fs_stats.symlink_count,
+                    "snapshot_count": fs_stats.snapshot_count,
+                    "next_inode_id": fs_stats.next_inode_id,
+                    "generation": fs_stats.filesystem_generation,
+                    "intent_log_pending": intent_log_pending,
+                },
+                "object_store": {
+                    "live_objects": fs_stats.object_store.live_objects,
+                    "live_bytes": fs_stats.object_store.live_bytes,
+                    "segment_count": fs_stats.object_store.segment_count,
+                    "free_segments": fs_stats.object_store.free_segments,
+                    "free_bytes": fs_stats.object_store.free_bytes,
+                    "next_sequence": fs_stats.object_store.next_sequence,
+                    "tombstone_count": fs_stats.object_store.tombstone_count,
+                    "mirror_degraded": fs_stats.object_store.mirror_degraded,
+                    "mirror_live_objects": fs_stats.object_store.mirror_live_objects,
+                    "mirror_live_bytes": fs_stats.object_store.mirror_live_bytes,
+                    "replica_healthy": fs_stats.object_store.replica_healthy,
+                    "replica_live_objects": fs_stats.object_store.replica_live_objects,
+                    "last_scrub_secs": fs_stats.object_store.last_scrub_secs,
+                    "committed_root_txg": fs_stats.object_store.committed_root_txg,
+                    "committed_root_generation": fs_stats.object_store.committed_root_generation,
+                },
+                "suspect_log": {
+                    "total_entries": suspect_stats.total_entries,
+                    "unresolved": suspect_stats.unresolved,
+                    "resolved": suspect_stats.resolved,
+                    "oldest_unresolved_age": suspect_stats.oldest_unresolved_age,
+                },
+            }));
+        }
+
+        let mut out = format!(
+            "pool integrity-check: {pool}\n  source:        live owner (mounted LocalFileSystem)\n  pass:          {}\n  verifier:      {}\n  roots:         verified={} candidates={} invalid={}\n  objects:       checked={} chunks={}\n  suspect-log:   unresolved={} total={}\n  intent-log:    pending={}\n  statfs:        blocks={} free={} avail={}\n  inodes:        count={} next={}\n  object-store:  live_objects={} live_bytes={} segments={}",
+            if pass { "yes" } else { "no" },
+            verifier.outcome.human_name(),
+            verifier.verified_committed_roots.len(),
+            verifier.root_candidates_seen,
+            verifier.invalid_root_candidates,
+            verifier.checked_content_objects,
+            verifier.checked_content_chunks,
+            suspect_stats.unresolved,
+            suspect_stats.total_entries,
+            intent_log_pending,
+            statfs.blocks,
+            statfs.bfree,
+            statfs.bavail,
+            fs_stats.inode_count,
+            fs_stats.next_inode_id,
+            fs_stats.object_store.live_objects,
+            fs_stats.object_store.live_bytes,
+            fs_stats.object_store.segment_count,
+        );
+        if backing_dir_arg.is_some() || device_arg_count > 0 {
+            let _ = write!(
+                out,
+                "\n  offline args: ignored by live owner (backing_dir={} devices={device_arg_count})",
+                backing_dir_arg.as_deref().unwrap_or("-"),
+            );
+        }
+        if max_records.is_some() || max_bytes.is_some() {
+            let _ = write!(
+                out,
+                "\n  limits:       requested max_records={} max_bytes={} (not applied; live verifier is full-scope)",
+                max_records
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                max_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+        }
+        if verifier.production_fsck_required {
+            out.push_str("\n  recovery:     production fsck/operator repair required");
+        }
+        if !verifier.issues.is_empty() {
+            out.push_str("\n  issues:");
+            for issue in verifier.issues.iter().take(8) {
+                let _ = write!(
+                    out,
+                    "\n    {} {}: {}",
+                    issue.severity.human_name(),
+                    issue.kind.human_name(),
+                    issue.reason
+                );
+            }
+            if verifier.issues.len() > 8 {
+                let _ = write!(out, "\n    ... {} more", verifier.issues.len() - 8);
+            }
+        }
+        live_admin_ok_text(out)
     }
 
     fn live_device_remove(&self, args: &Value, wants_json: bool) -> Vec<u8> {
@@ -4334,6 +4546,26 @@ mod tests {
         serde_json::from_slice(&response).expect("decode live admin response")
     }
 
+    fn live_pool_admin(
+        engine: &VfsLocalFileSystem,
+        operation: &str,
+        args: Value,
+        wants_json: bool,
+    ) -> Value {
+        let request = json!({
+            "command": "pool",
+            "operation": operation,
+            "pool": "tank",
+            "json": wants_json,
+            "args": args,
+        });
+        let request = serde_json::to_vec(&request).expect("encode live admin request");
+        let response = engine
+            .handle_live_pool_admin_request(&request)
+            .expect("dispatch live admin request");
+        serde_json::from_slice(&response).expect("decode live admin response")
+    }
+
     fn temp_fs_with_block_devices(
         device_count: usize,
     ) -> (VfsLocalFileSystem, tempfile::TempDir, Vec<PathBuf>) {
@@ -4409,6 +4641,43 @@ mod tests {
                 .get(&key)
                 .is_some(),
             "property should be stored on pool-local dataset path",
+        );
+    }
+
+    #[test]
+    fn live_pool_integrity_check_uses_mounted_owner_state() {
+        let (engine, _td) = temp_fs();
+        {
+            let mut fs = engine.fs.borrow_mut();
+            fs.create_file("/live.txt", 0o644)
+                .expect("create live file");
+            fs.write_file("/live.txt", 0, b"live owner integrity check")
+                .expect("write live file");
+            fs.sync_all().expect("sync live file");
+        }
+
+        let checked = live_pool_admin(
+            &engine,
+            "integrity-check",
+            json!({
+                "backing_dir": "/run/tidefs/pools/ignored-by-owner",
+                "devices": ["/dev/ignored-by-owner"],
+                "max_records": 4,
+                "max_bytes": 4096,
+            }),
+            true,
+        );
+
+        assert_eq!(checked["ok"], true, "integrity response: {checked}");
+        let report = &checked["json"];
+        assert_eq!(report["state_source"], "live-owner");
+        assert_eq!(report["owner_state"], "mounted LocalFileSystem");
+        assert_eq!(report["offline_inputs_ignored"], true);
+        assert_eq!(report["requested_limits"]["applied"], false);
+        assert!(report["filesystem"]["file_count"].as_u64().unwrap_or(0) >= 1);
+        assert!(
+            report["object_store"]["live_objects"].as_u64().unwrap_or(0) > 0,
+            "live owner report should reflect mounted object-store state: {report}"
         );
     }
 

@@ -275,7 +275,7 @@ fn dispatch_request(
         ("pool", "mount") => already_owned("mount", manifest, request.json),
         ("pool", "export") => pool_export(request.json, manifest, shutdown),
         ("pool", "destroy") => pool_destroy_refused(request.json, manifest),
-        ("pool", "get" | "set" | "list-props")
+        ("pool", "get" | "set" | "list-props" | "integrity-check")
         | (
             "dataset",
             "create" | "list" | "rename" | "destroy" | "set-strategy" | "upgrade" | "get" | "set"
