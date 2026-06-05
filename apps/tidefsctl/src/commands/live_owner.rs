@@ -172,8 +172,12 @@ pub(crate) fn route_or_refuse_active_for_uuid_with_format_and_args(
     json: bool,
     args: serde_json::Value,
 ) {
-    if owner_interface_reachable_for_uuid_at(&pool_runtime_root(), pool, &pool_uuid) {
+    let root = pool_runtime_root();
+    if owner_interface_reachable_for_uuid_at(&root, pool, &pool_uuid) {
         route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
+    }
+    if owner_record_cached_for_uuid_at(&root, pool, &pool_uuid) {
+        refuse_cached_without_owner(command, operation, pool, Some(pool_uuid), json);
     }
     if active_label {
         refuse_active_without_owner(command, operation, pool, pool_uuid, json);
@@ -591,7 +595,6 @@ fn owner_record_cached_by_pool_at(root: &Path, pool: &str) -> bool {
     false
 }
 
-#[cfg(test)]
 fn owner_record_cached_for_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16]) -> bool {
     match owner_manifest_path(root, uuid).try_exists() {
         Ok(true) => return true,
@@ -935,6 +938,31 @@ mod tests {
             serde_json::json!({
                 "pool_name": "tank",
                 "pool_uuid": "42424242424242424242424242424242",
+                "socket_path": dir.path().join("missing-owner.sock"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(owner_record_cached_for_uuid_at(dir.path(), "tank", &uuid));
+        assert!(!owner_interface_reachable_for_uuid_at(
+            dir.path(),
+            "tank",
+            &uuid
+        ));
+    }
+
+    #[test]
+    fn exact_cached_owner_record_for_uuid_is_imported_state_even_when_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = [0x42; 16];
+        let manifest_path = owner_manifest_path(dir.path(), &uuid);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "pool_name": "old-name",
+                "pool_uuid": "24242424242424242424242424242424",
                 "socket_path": dir.path().join("missing-owner.sock"),
             })
             .to_string(),

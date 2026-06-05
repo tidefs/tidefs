@@ -313,18 +313,9 @@ fn delegate_admin_request(
     request: &LiveOwnerRequest,
     engine: &LiveOwnerEngine,
 ) -> LiveOwnerResponse {
-    let payload = json!({
-        "command": request.command.as_str(),
-        "operation": request.operation.as_str(),
-        "pool": request.pool.as_str(),
-        "json": request.json,
-        "args": &request.args,
-    });
-    let bytes = match serde_json::to_vec(&payload) {
+    let bytes = match delegate_admin_payload(request) {
         Ok(bytes) => bytes,
-        Err(err) => {
-            return LiveOwnerResponse::error(2, format!("encode live admin request: {err}"))
-        }
+        Err(err) => return LiveOwnerResponse::error(2, err),
     };
     let response_bytes = match engine.lock() {
         Ok(engine) => match engine.live_pool_admin_request(&bytes) {
@@ -341,6 +332,20 @@ fn delegate_admin_request(
     serde_json::from_slice::<LiveOwnerResponse>(&response_bytes).unwrap_or_else(|err| {
         LiveOwnerResponse::error(2, format!("decode live admin response: {err}"))
     })
+}
+
+fn delegate_admin_payload(request: &LiveOwnerRequest) -> Result<Vec<u8>, String> {
+    let mut payload = json!({
+        "command": request.command.as_str(),
+        "operation": request.operation.as_str(),
+        "pool": request.pool.as_str(),
+        "json": request.json,
+        "args": &request.args,
+    });
+    if let Some(pool_uuid) = request.pool_uuid.as_deref() {
+        payload["pool_uuid"] = serde_json::Value::String(pool_uuid.to_string());
+    }
+    serde_json::to_vec(&payload).map_err(|err| format!("encode live admin request: {err}"))
 }
 
 fn pool_status(
@@ -529,5 +534,25 @@ mod tests {
 
         assert!(err.contains("owns uuid 0123456789abcdeffedcba9876543210"));
         assert!(err.contains("not requested uuid aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn delegated_admin_payload_preserves_pool_uuid() {
+        let request = LiveOwnerRequest {
+            command: "dataset".to_string(),
+            operation: "list".to_string(),
+            pool: "tank".to_string(),
+            pool_uuid: Some("0123456789abcdeffedcba9876543210".to_string()),
+            json: true,
+            args: serde_json::Value::Null,
+        };
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&delegate_admin_payload(&request).unwrap()).unwrap();
+
+        assert_eq!(
+            payload.get("pool_uuid").and_then(serde_json::Value::as_str),
+            Some("0123456789abcdeffedcba9876543210")
+        );
     }
 }
