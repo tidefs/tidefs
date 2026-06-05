@@ -278,36 +278,28 @@ pub enum SnapshotCommand {
     Rollback(SnapshotRollbackArgs),
 }
 
-/// `snapshot create <name> (--backing-dir <path> | --pool <pool> [--devices <dev>...])`
+/// `snapshot create (<pool> <name> [--devices <dev>...] | <name> --backing-dir <path>)`
 #[derive(Args, Debug)]
 pub struct SnapshotCreateArgs {
-    /// Snapshot name to create
-    pub name: String,
+    /// Pool and snapshot name for live pool mode, or snapshot name for --backing-dir mode
+    #[arg(value_name = "POOL_AND_SNAPSHOT", num_args = 1..=2, required = true)]
+    pub operands: Vec<String>,
 
     /// Offline/development backing directory for the local object store
-    #[arg(
-        long = "backing-dir",
-        short = 'b',
-        conflicts_with = "pool",
-        required_unless_present = "pool"
-    )]
+    #[arg(long = "backing-dir", short = 'b')]
     pub backing_dir: Option<PathBuf>,
 
-    /// Pool name for imported-pool snapshots routed through the live owner
-    #[arg(
-        long = "pool",
-        short = 'p',
-        conflicts_with = "backing_dir",
-        required_unless_present = "backing_dir"
-    )]
-    pub pool: Option<String>,
-
     /// Block devices for offline/not-yet-imported snapshot access
-    #[arg(short = 'd', long = "devices", num_args = 1.., requires = "pool")]
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
     pub devices: Option<Vec<PathBuf>>,
 }
 
-/// `snapshot list (--backing-dir <path> | --pool <pool> [--devices <dev>...])`
+/// `snapshot list (<pool> [--devices <dev>...] | --backing-dir <path>)`
 #[derive(Args, Debug)]
 pub struct SnapshotListArgs {
     /// Offline/development backing directory for the local object store
@@ -321,48 +313,45 @@ pub struct SnapshotListArgs {
 
     /// Pool name for imported-pool snapshots routed through the live owner
     #[arg(
-        long = "pool",
-        short = 'p',
+        value_name = "POOL",
         conflicts_with = "backing_dir",
         required_unless_present = "backing_dir"
     )]
     pub pool: Option<String>,
 
     /// Block devices for offline/not-yet-imported snapshot access
-    #[arg(short = 'd', long = "devices", num_args = 1.., requires = "pool")]
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir",
+        requires = "pool"
+    )]
     pub devices: Option<Vec<PathBuf>>,
 }
 
-/// `snapshot destroy <name> (--backing-dir <path> | --pool <pool> [--devices <dev>...])`
+/// `snapshot destroy (<pool> <name> [--devices <dev>...] | <name> --backing-dir <path>)`
 #[derive(Args, Debug)]
 pub struct SnapshotDestroyArgs {
-    /// Snapshot name to destroy
-    pub name: String,
+    /// Pool and snapshot name for live pool mode, or snapshot name for --backing-dir mode
+    #[arg(value_name = "POOL_AND_SNAPSHOT", num_args = 1..=2, required = true)]
+    pub operands: Vec<String>,
 
     /// Offline/development backing directory for the local object store
-    #[arg(
-        long = "backing-dir",
-        short = 'b',
-        conflicts_with = "pool",
-        required_unless_present = "pool"
-    )]
+    #[arg(long = "backing-dir", short = 'b')]
     pub backing_dir: Option<PathBuf>,
 
-    /// Pool name for imported-pool snapshots routed through the live owner
-    #[arg(
-        long = "pool",
-        short = 'p',
-        conflicts_with = "backing_dir",
-        required_unless_present = "backing_dir"
-    )]
-    pub pool: Option<String>,
-
     /// Block devices for offline/not-yet-imported snapshot access
-    #[arg(short = 'd', long = "devices", num_args = 1.., requires = "pool")]
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
     pub devices: Option<Vec<PathBuf>>,
 }
 
-/// `snapshot send (--backing-dir <path> | --pool <pool> [--devices <dev>...]) --output <path>`
+/// `snapshot send (<pool> [--devices <dev>...] | --backing-dir <path>) --output <path>`
 #[derive(Args, Debug)]
 pub struct SnapshotSendArgs {
     /// Offline/development backing directory for the local object store
@@ -376,15 +365,20 @@ pub struct SnapshotSendArgs {
 
     /// Pool name for imported-pool snapshots routed through the live owner
     #[arg(
-        long = "pool",
-        short = 'p',
+        value_name = "POOL",
         conflicts_with = "backing_dir",
         required_unless_present = "backing_dir"
     )]
     pub pool: Option<String>,
 
     /// Block devices for offline/not-yet-imported snapshot stream export
-    #[arg(short = 'd', long = "devices", num_args = 1.., requires = "pool")]
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir",
+        requires = "pool"
+    )]
     pub devices: Option<Vec<PathBuf>>,
 
     /// Output path for the encoded changed-record stream
@@ -453,32 +447,24 @@ pub struct SnapshotReceiveArgs {
     pub server_node_id: Option<u64>,
 }
 
-/// `snapshot rollback <name> (--backing-dir <path> | --pool <pool> [--devices <dev>...])`
+/// `snapshot rollback (<pool> <name> [--devices <dev>...] | <name> --backing-dir <path>)`
 #[derive(Args, Debug)]
 pub struct SnapshotRollbackArgs {
-    /// Snapshot name to rollback to
-    pub name: String,
+    /// Pool and snapshot name for live pool mode, or snapshot name for --backing-dir mode
+    #[arg(value_name = "POOL_AND_SNAPSHOT", num_args = 1..=2, required = true)]
+    pub operands: Vec<String>,
 
     /// Offline/development backing directory for the local object store
-    #[arg(
-        long = "backing-dir",
-        short = 'b',
-        conflicts_with = "pool",
-        required_unless_present = "pool"
-    )]
+    #[arg(long = "backing-dir", short = 'b')]
     pub backing_dir: Option<PathBuf>,
 
-    /// Pool name for imported-pool snapshots routed through the live owner
-    #[arg(
-        long = "pool",
-        short = 'p',
-        conflicts_with = "backing_dir",
-        required_unless_present = "backing_dir"
-    )]
-    pub pool: Option<String>,
-
     /// Block devices for offline/not-yet-imported rollback
-    #[arg(short = 'd', long = "devices", num_args = 1.., requires = "pool")]
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
     pub devices: Option<Vec<PathBuf>>,
 }
 
@@ -549,7 +535,7 @@ fn open_filesystem_with_live_args(
             super::live_owner::route_with_args("snapshot", operation, pool_name, live_args)
         }
         (None, None) => {
-            eprintln!("tidefsctl snapshot {operation}: --backing-dir or --pool is required");
+            eprintln!("tidefsctl snapshot {operation}: POOL or --backing-dir is required");
             process::exit(1);
         }
     };
@@ -635,6 +621,43 @@ fn root_authentication_key() -> RootAuthenticationKey {
     RootAuthenticationKey::from_environment().unwrap_or_else(|_| RootAuthenticationKey::demo_key())
 }
 
+fn parse_named_snapshot_operands(
+    operation: &str,
+    backing_dir: Option<&PathBuf>,
+    operands: &[String],
+) -> (Option<String>, String) {
+    match (backing_dir.is_some(), operands) {
+        (true, [name]) => (None, name.clone()),
+        (true, []) => {
+            eprintln!("tidefsctl snapshot {operation}: snapshot name is required");
+            process::exit(1);
+        }
+        (true, _) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: --backing-dir mode expects one snapshot name"
+            );
+            process::exit(1);
+        }
+        (false, [pool, name]) => (Some(pool.clone()), name.clone()),
+        (false, [single]) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: '{single}' is ambiguous; use '<pool> <snapshot>' for live pools or '<snapshot> --backing-dir <path>' for offline storage"
+            );
+            process::exit(1);
+        }
+        (false, []) => {
+            eprintln!("tidefsctl snapshot {operation}: pool and snapshot name are required");
+            process::exit(1);
+        }
+        (false, _) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: expected '<pool> <snapshot>' for live pool mode"
+            );
+            process::exit(1);
+        }
+    }
+}
+
 fn snapshot_summary_line(summary: &SnapshotSummary) -> String {
     format!(
         "snapshot '{}' (source tx={}, source gen={}, created gen={})",
@@ -718,7 +741,7 @@ fn snapshot_backing_path(
             serde_json::Value::Null,
         ),
         (None, None, None) => {
-            eprintln!("tidefsctl snapshot send: --backing-dir or --pool required");
+            eprintln!("tidefsctl snapshot send: POOL or --backing-dir required");
             process::exit(1);
         }
     }
@@ -754,19 +777,20 @@ fn parse_incremental_from_root(
 }
 
 fn handle_create(args: SnapshotCreateArgs) {
-    let snapshot_name = &args.name;
+    let (pool, snapshot_name) =
+        parse_named_snapshot_operands("create", args.backing_dir.as_ref(), &args.operands);
     let mut fs = open_filesystem_with_live_args(
         args.backing_dir.as_ref(),
-        args.pool.as_deref(),
+        pool.as_deref(),
         args.devices.as_deref(),
         "create",
         RecoveryPolicy::default(),
         serde_json::json!({
-            "name": &args.name,
+            "name": &snapshot_name,
         }),
     );
 
-    match fs.create_snapshot(snapshot_name) {
+    match fs.create_snapshot(&snapshot_name) {
         Ok(summary) => {
             println!("{} created", snapshot_summary_line(&summary));
         }
@@ -805,22 +829,23 @@ fn handle_list(args: SnapshotListArgs) {
 }
 
 fn handle_destroy(args: SnapshotDestroyArgs) {
-    let snapshot_name = &args.name;
+    let (pool, snapshot_name) =
+        parse_named_snapshot_operands("destroy", args.backing_dir.as_ref(), &args.operands);
     let mut fs = open_filesystem_with_live_args(
         args.backing_dir.as_ref(),
-        args.pool.as_deref(),
+        pool.as_deref(),
         args.devices.as_deref(),
         "destroy",
         RecoveryPolicy::default(),
         serde_json::json!({
-            "name": &args.name,
+            "name": &snapshot_name,
         }),
     );
 
     // delete_snapshot validates the entry is a Snapshot (not clone/bookmark),
     // checks holds, unpins the SnapshotCatalog root from the GC pin set via
     // the embedded DatasetLifecycle, and removes the metadata from the catalog.
-    match fs.delete_snapshot(snapshot_name) {
+    match fs.delete_snapshot(&snapshot_name) {
         Ok(summary) => {
             println!("{} destroyed", snapshot_summary_line(&summary));
         }
@@ -834,19 +859,20 @@ fn handle_destroy(args: SnapshotDestroyArgs) {
 }
 
 fn handle_rollback(args: SnapshotRollbackArgs) {
-    let snapshot_name = &args.name;
+    let (pool, snapshot_name) =
+        parse_named_snapshot_operands("rollback", args.backing_dir.as_ref(), &args.operands);
     let mut fs = open_filesystem_with_live_args(
         args.backing_dir.as_ref(),
-        args.pool.as_deref(),
+        pool.as_deref(),
         args.devices.as_deref(),
         "rollback",
         RecoveryPolicy::default(),
         serde_json::json!({
-            "name": &args.name,
+            "name": &snapshot_name,
         }),
     );
 
-    match fs.rollback_to_snapshot(snapshot_name) {
+    match fs.rollback_to_snapshot(&snapshot_name) {
         Ok(report) => {
             println!(
                 "rolled back to snapshot '{}' (generation {} -> {}, restored source gen {}, {} snapshot entries)",
@@ -1171,12 +1197,11 @@ mod tests {
     #[test]
     fn snapshot_create_args_bindings() {
         let args = SnapshotCreateArgs {
-            name: "before-upgrade".into(),
+            operands: vec!["before-upgrade".into()],
             backing_dir: Some(PathBuf::from("/tmp/pool")),
-            pool: None,
             devices: None,
         };
-        assert_eq!(args.name, "before-upgrade");
+        assert_eq!(args.operands, vec!["before-upgrade"]);
         assert_eq!(args.backing_dir, Some(PathBuf::from("/tmp/pool")));
     }
 
@@ -1193,24 +1218,22 @@ mod tests {
     #[test]
     fn snapshot_destroy_args_bindings() {
         let args = SnapshotDestroyArgs {
-            name: "mysnap".into(),
+            operands: vec!["mysnap".into()],
             backing_dir: Some(PathBuf::from("/tmp/pool")),
-            pool: None,
             devices: None,
         };
-        assert_eq!(args.name, "mysnap");
+        assert_eq!(args.operands, vec!["mysnap"]);
         assert_eq!(args.backing_dir, Some(PathBuf::from("/tmp/pool")));
     }
 
     #[test]
     fn snapshot_create_pool_args_bindings() {
         let args = SnapshotCreateArgs {
-            name: "before-upgrade".into(),
+            operands: vec!["mypool".into(), "before-upgrade".into()],
             backing_dir: None,
-            pool: Some("mypool".into()),
             devices: Some(vec![PathBuf::from("/dev/sdb"), PathBuf::from("/dev/sdc")]),
         };
-        assert_eq!(args.pool.as_deref(), Some("mypool"));
+        assert_eq!(args.operands, vec!["mypool", "before-upgrade"]);
         assert_eq!(
             args.devices,
             Some(vec![PathBuf::from("/dev/sdb"), PathBuf::from("/dev/sdc")])
@@ -1220,14 +1243,13 @@ mod tests {
     #[test]
     fn snapshot_destroy_default_args() {
         let cmd = SnapshotCommand::Destroy(SnapshotDestroyArgs {
-            name: "test".into(),
+            operands: vec!["test".into()],
             backing_dir: Some(PathBuf::from("/backing")),
-            pool: None,
             devices: None,
         });
         match cmd {
             SnapshotCommand::Destroy(args) => {
-                assert_eq!(args.name, "test");
+                assert_eq!(args.operands, vec!["test"]);
                 assert_eq!(args.backing_dir, Some(PathBuf::from("/backing")));
             }
             SnapshotCommand::Create(_)

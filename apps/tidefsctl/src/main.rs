@@ -407,6 +407,49 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_pool_property_commands_use_positional_pool() {
+        use clap::Parser;
+        let get = Cli::try_parse_from(["tidefsctl", "pool", "get", "mypool", "space.quota"]);
+        assert!(get.is_ok(), "pool get with positional pool should parse");
+
+        let set = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "set",
+            "mypool",
+            "space.quota=1073741824",
+        ]);
+        assert!(set.is_ok(), "pool set with positional pool should parse");
+
+        let list = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "list-props",
+            "mypool",
+            "--family",
+            "space",
+        ]);
+        assert!(
+            list.is_ok(),
+            "pool list-props with positional pool should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_pool_property_commands_reject_pool_flag() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "get",
+            "space.quota",
+            "--pool",
+            "mypool",
+        ]);
+        assert!(args.is_err(), "pool get --pool should not parse");
+    }
+
+    #[test]
     fn cli_parse_pool_destroy_default() {
         use clap::Parser;
         let args = Cli::try_parse_from([
@@ -591,6 +634,16 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_snapshot_create_live_pool_positional() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "snapshot", "create", "mypool", "mysnap"]);
+        assert!(
+            args.is_ok(),
+            "snapshot create with positional pool and name should parse"
+        );
+    }
+
+    #[test]
     fn cli_parse_snapshot_list_minimum() {
         use clap::Parser;
         let args = Cli::try_parse_from([
@@ -601,6 +654,23 @@ mod tests {
             "/tmp/pool",
         ]);
         assert!(args.is_ok(), "snapshot list with backing-dir should parse");
+    }
+
+    #[test]
+    fn cli_parse_snapshot_list_live_pool_positional() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "snapshot", "list", "mypool"]);
+        assert!(
+            args.is_ok(),
+            "snapshot list with positional pool should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_snapshot_rejects_pool_flag() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "snapshot", "list", "--pool", "mypool"]);
+        assert!(args.is_err(), "snapshot list --pool should not parse");
     }
 
     #[test]
@@ -617,6 +687,16 @@ mod tests {
         assert!(
             args.is_ok(),
             "snapshot destroy with name and backing-dir should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_snapshot_destroy_live_pool_positional() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "snapshot", "destroy", "mypool", "mysnap"]);
+        assert!(
+            args.is_ok(),
+            "snapshot destroy with positional pool and name should parse"
         );
     }
 
@@ -650,12 +730,58 @@ mod tests {
     #[test]
     fn cli_parse_snapshot_destroy_rejects_no_backing_dir() {
         use clap::Parser;
-        let args = Cli::try_parse_from(["tidefsctl", "snapshot", "destroy", "mysnap"]);
-        // --backing-dir is required by clap; snapshot name alone should fail
+        let args = Cli::try_parse_from(["tidefsctl", "snapshot", "destroy"]);
         assert!(
             args.is_err(),
-            "snapshot destroy without --backing-dir should fail"
+            "snapshot destroy without operands should fail"
         );
+    }
+
+    // -- Dataset CLI parse tests ------------------------------------------
+
+    #[test]
+    fn cli_parse_dataset_create_positional_pool() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "dataset", "create", "mypool", "data"]);
+        assert!(
+            args.is_ok(),
+            "dataset create with positional pool should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_dataset_list_positional_pool() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "dataset", "list", "mypool"]);
+        assert!(
+            args.is_ok(),
+            "dataset list with positional pool should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_dataset_set_strategy_positional_pool() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "dataset",
+            "set-strategy",
+            "mypool",
+            "data",
+            "--enable",
+            "org.tidefs:compression_zstd",
+        ]);
+        assert!(
+            args.is_ok(),
+            "dataset set-strategy with positional pool should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_dataset_rejects_pool_flag() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "dataset", "list", "--pool", "mypool"]);
+        assert!(args.is_err(), "dataset list --pool should not parse");
     }
 
     // ── Pool mount CLI parse tests ─────────────────────────────────

@@ -235,7 +235,7 @@ tidefsctl dataset list <pool>  # shows per-dataset feature flags
 ### 5.2 Enable a feature
 
 ```sh
-tidefsctl dataset upgrade --pool <pool> --name <dataset> --enable org.tidefs:posix_acl
+tidefsctl dataset set-strategy <pool> <dataset> --enable org.tidefs:posix_acl
 ```
 
 ### 5.3 Check compatibility before upgrade

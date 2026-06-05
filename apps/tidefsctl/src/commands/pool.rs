@@ -208,12 +208,11 @@ pub enum PoolCommand {
 
     /// Get a typed pool property value with source annotation
     Get {
+        /// Pool name (imported-pool identity; routed through the live owner)
+        pool: String,
+
         /// Property name (e.g. "space.quota")
         property: String,
-
-        /// Pool name (imported-pool identity; routed through the live owner)
-        #[arg(long = "pool", short = 'p')]
-        pool: String,
 
         /// Block devices for offline/not-yet-imported property access
         #[arg(short = 'd', long = "devices", num_args = 1..)]
@@ -222,12 +221,11 @@ pub enum PoolCommand {
 
     /// Set a typed pool property value with validation
     Set {
+        /// Pool name (imported-pool identity; routed through the live owner)
+        pool: String,
+
         /// Property assignment in key=value form (e.g. "space.quota=1073741824")
         assignment: String,
-
-        /// Pool name (imported-pool identity; routed through the live owner)
-        #[arg(long = "pool", short = 'p')]
-        pool: String,
 
         /// Block devices for offline/not-yet-imported property access
         #[arg(short = 'd', long = "devices", num_args = 1..)]
@@ -237,7 +235,6 @@ pub enum PoolCommand {
     /// List all registry properties for the pool with effective values and sources
     ListProps {
         /// Pool name (imported-pool identity; routed through the live owner)
-        #[arg(long = "pool", short = 'p')]
         pool: String,
 
         /// Block devices for offline/not-yet-imported property access
@@ -372,7 +369,7 @@ fn handle_pool_create(
     if !feature_flags.is_empty() && !encrypt_pool {
         eprintln!(
             "tidefsctl pool create: --feature-flags is not a pool-level setting.\n\
-            Use 'tidefsctl dataset set-strategy <dataset> --enable <features>' to enable\n\
+            Use 'tidefsctl dataset set-strategy <pool> <dataset> --enable <features>' to enable\n\
             per-dataset feature flags after pool creation."
         );
         process::exit(1);

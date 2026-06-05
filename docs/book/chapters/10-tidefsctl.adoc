@@ -69,6 +69,23 @@ calling storage libraries behind the live owner. That would bypass cached
 state and split authority. Add the owner client first, then make the positional
 form call it.
 
+Common live-pool forms put the pool first:
+
+[source,sh]
+----
+tidefsctl pool status <pool>
+tidefsctl pool get <pool> <property>
+tidefsctl pool set <pool> <property>=<value>
+tidefsctl dataset create <pool> <dataset>
+tidefsctl dataset list <pool>
+tidefsctl dataset set <pool> <dataset> <property>=<value>
+tidefsctl snapshot create <pool> <snapshot>
+tidefsctl snapshot list <pool>
+----
+
+The old `--pool <pool>` spelling is not the operator form. It must not be
+kept as a parallel control path for imported state.
+
 === Command Classes
 
 [cols="1,2",options="header"]

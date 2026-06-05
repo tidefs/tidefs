@@ -50,15 +50,14 @@ pub enum DatasetCommand {
     /// List all registry properties for a dataset with effective values and sources
     ListProps(DatasetListPropsArgs),
 }
-/// `dataset create <name> --pool <pool> [--parent <parent>] [--devices <dev>...]`
+/// `dataset create <pool> <name> [--parent <parent>] [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetCreateArgs {
+    /// Pool name (imported-pool identity; routed through the live owner)
+    pub pool: String,
+
     /// Dataset name to create
     pub name: String,
-
-    /// Pool name (imported-pool identity; routed through the live owner)
-    #[arg(long = "pool", short = 'p')]
-    pub pool: String,
 
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
@@ -88,11 +87,10 @@ pub struct DatasetCreateArgs {
     #[arg(long = "sync", default_value = "local")]
     pub sync: String,
 }
-/// `dataset list --pool <pool> [--devices <dev>...]`
+/// `dataset list <pool> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetListArgs {
     /// Pool name (imported-pool identity; routed through the live owner)
-    #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
     /// Block devices for offline/not-yet-imported catalog access
@@ -114,19 +112,18 @@ pub struct DatasetListArgs {
     #[arg(long = "cluster-node-id")]
     pub cluster_node_id: Option<u64>,
 }
-/// `dataset rename <old-name> <new-name> --pool <pool> [--devices <dev>...]`
+/// `dataset rename <pool> <old-name> <new-name> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetRenameArgs {
+    /// Pool name (imported-pool identity; routed through the live owner)
+    pub pool: String,
+
     /// Current dataset name to rename
     pub old_name: String,
 
     /// New dataset name
     pub new_name: String,
 
-    /// Pool name (imported-pool identity; routed through the live owner)
-    #[arg(long = "pool", short = 'p')]
-    pub pool: String,
-
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
@@ -146,16 +143,15 @@ pub struct DatasetRenameArgs {
     #[arg(long = "cluster-node-id")]
     pub cluster_node_id: Option<u64>,
 }
-/// `dataset destroy <name> --pool <pool> [--devices <dev>...]`
+/// `dataset destroy <pool> <name> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetDestroyArgs {
+    /// Pool name (imported-pool identity; routed through the live owner)
+    pub pool: String,
+
     /// Dataset name to destroy
     pub name: String,
 
-    /// Pool name (imported-pool identity; routed through the live owner)
-    #[arg(long = "pool", short = 'p')]
-    pub pool: String,
-
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
@@ -175,15 +171,14 @@ pub struct DatasetDestroyArgs {
     #[arg(long = "cluster-node-id")]
     pub cluster_node_id: Option<u64>,
 }
-/// `dataset set-strategy <name> --pool <pool> [--devices <dev>...] [--enable <features>] [--disable <features>] [--list] [--class <class>]`
+/// `dataset set-strategy <pool> <name> [--devices <dev>...] [--enable <features>] [--disable <features>] [--list] [--class <class>]`
 #[derive(Args, Debug)]
 pub struct DatasetSetStrategyArgs {
+    /// Pool name (imported-pool identity; routed through the live owner)
+    pub pool: String,
+
     /// Dataset name to configure
     pub name: String,
-
-    /// Pool name (imported-pool identity; routed through the live owner)
-    #[arg(long = "pool", short = 'p')]
-    pub pool: String,
 
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
@@ -206,15 +201,14 @@ pub struct DatasetSetStrategyArgs {
     pub class: String,
 }
 
-/// `dataset seal-key <name> --pool <pool> [--devices <dev>...] --passphrase <phrase>`
+/// `dataset seal-key <pool> <name> [--devices <dev>...] --passphrase <phrase>`
 #[derive(Args, Debug)]
 pub struct DatasetSealKeyArgs {
+    /// Pool name (imported-pool identity; routed through the live owner)
+    pub pool: String,
+
     /// Dataset name whose DEK to seal
     pub name: String,
-
-    /// Pool name (imported-pool identity; routed through the live owner)
-    #[arg(long = "pool", short = 'p')]
-    pub pool: String,
 
     /// Block devices for offline/not-yet-imported key access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
@@ -224,11 +218,10 @@ pub struct DatasetSealKeyArgs {
     #[arg(long = "passphrase", short = 'P')]
     pub passphrase: String,
 }
-/// `dataset rotate-key --pool <pool> [--devices <dev>...] --old-passphrase <phrase> --old-salt <hex> --new-passphrase <phrase>`
+/// `dataset rotate-key <pool> [--devices <dev>...] --old-passphrase <phrase> --old-salt <hex> --new-passphrase <phrase>`
 #[derive(Args, Debug)]
 pub struct DatasetRotateKeyArgs {
     /// Pool name (imported-pool identity; routed through the live owner)
-    #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
     /// Block devices for offline/not-yet-imported key access
@@ -248,7 +241,7 @@ pub struct DatasetRotateKeyArgs {
     pub new_passphrase: String,
 }
 
-/// `dataset upgrade <name> --pool <pool> [--devices <dev>...]`
+/// `dataset upgrade <pool> <name> [--devices <dev>...]`
 ///
 /// Enables all canonical V1 features that are not yet enabled on the dataset.
 /// Uses the upgrade table ([`tidefs_dataset_feature_flags::SupportedFeaturesV1`])
@@ -256,62 +249,58 @@ pub struct DatasetRotateKeyArgs {
 /// enables each supported-but-not-yet-enabled feature with prerequisite checking.
 #[derive(Args, Debug)]
 pub struct DatasetUpgradeArgs {
+    /// Pool name (imported-pool identity; routed through the live owner)
+    pub pool: String,
+
     /// Dataset name to upgrade
     pub name: String,
-
-    /// Pool name (imported-pool identity; routed through the live owner)
-    #[arg(long = "pool", short = 'p')]
-    pub pool: String,
 
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 }
 
-/// `dataset get <name> <property> --pool <pool> [--devices <dev>...]`
+/// `dataset get <pool> <name> <property> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetGetArgs {
+    /// Pool name (imported-pool identity; routed through the live owner)
+    pub pool: String,
+
     /// Dataset name to query
     pub name: String,
 
     /// Property name (e.g. "access.readonly", "layout.recordsize")
     pub property: String,
 
-    /// Pool name (imported-pool identity; routed through the live owner)
-    #[arg(long = "pool", short = 'p')]
-    pub pool: String,
-
     /// Block devices for offline/not-yet-imported property access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 }
 
-/// `dataset set <name> <property>=<value> --pool <pool> [--devices <dev>...]`
+/// `dataset set <pool> <name> <property>=<value> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetSetArgs {
+    /// Pool name (imported-pool identity; routed through the live owner)
+    pub pool: String,
+
     /// Dataset name to configure
     pub name: String,
 
     /// Property assignment in key=value form (e.g. "access.readonly=on")
     pub assignment: String,
 
-    /// Pool name (imported-pool identity; routed through the live owner)
-    #[arg(long = "pool", short = 'p')]
-    pub pool: String,
-
     /// Block devices for offline/not-yet-imported property access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 }
-/// `dataset list-props <name> --pool <pool> [--devices <dev>...]`
+/// `dataset list-props <pool> <name> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetListPropsArgs {
+    /// Pool name (imported-pool identity; routed through the live owner)
+    pub pool: String,
+
     /// Dataset name to list properties for
     pub name: String,
-
-    /// Pool name (imported-pool identity; routed through the live owner)
-    #[arg(long = "pool", short = 'p')]
-    pub pool: String,
 
     /// Block devices for offline/not-yet-imported property access
     #[arg(short = 'd', long = "devices", num_args = 1..)]

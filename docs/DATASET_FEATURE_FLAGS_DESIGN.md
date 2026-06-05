@@ -206,7 +206,7 @@ after the pool is imported and the dataset record is loaded.
 The live operator path is `tidefsctl dataset set-strategy`:
 
 ```
-tidefsctl dataset set-strategy <dataset> --pool <pool> --enable <feature>
+tidefsctl dataset set-strategy <pool> <dataset> --enable <feature>
 ```
 
 The live command (implemented as of 2026-05-20):

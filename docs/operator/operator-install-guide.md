@@ -262,32 +262,32 @@ outside-sandbox runners.
 
 ```sh
 # Create a dataset
-tidefsctl dataset create mydataset --pool mypool
+tidefsctl dataset create mypool mydataset
 
 # List datasets
-tidefsctl dataset list --pool mypool
+tidefsctl dataset list mypool
 
 # Rename
-tidefsctl dataset rename mydataset newname --pool mypool
+tidefsctl dataset rename mypool mydataset newname
 
 # Destroy (requires empty dataset)
-tidefsctl dataset destroy mydataset --pool mypool
+tidefsctl dataset destroy mypool mydataset
 ```
 
 ### 6.2 Managing snapshots
 
 ```sh
 # Create a snapshot
-tidefsctl snapshot create mysnap --pool mypool
+tidefsctl snapshot create mypool mysnap
 
 # List snapshots
-tidefsctl snapshot list --pool mypool
+tidefsctl snapshot list mypool
 
 # Destroy
-tidefsctl snapshot destroy mysnap --pool mypool
+tidefsctl snapshot destroy mypool mysnap
 
 # Export and receive a changed-record snapshot stream
-tidefsctl snapshot send --pool mypool --output /tmp/mypool.vfssend1
+tidefsctl snapshot send mypool --output /tmp/mypool.vfssend1
 tidefsctl snapshot receive --backing-dir /tmp/received-pool --input /tmp/mypool.vfssend1
 ```
 
@@ -301,7 +301,7 @@ direct storage access and routes to the owner.
 
 ```sh
 # Attach a ublk block device backed by the pool
-tidefsctl block attach --pool mypool --devices /dev/sdb /dev/sdc
+tidefsctl block attach /var/lib/tidefs/mypool
 
 # List exported block devices
 tidefsctl block list
@@ -314,7 +314,7 @@ tidefsctl block detach <dev-name>
 
 ```sh
 # Remove a device from the pool
-tidefsctl device remove /dev/sdc --pool mypool
+tidefsctl device remove /dev/sdc --backing-dir /var/lib/tidefs/device-sdc --surviving-dirs /var/lib/tidefs/device-sdb
 
 # Trigger rebuild after device replacement
 tidefsctl device rebuild
@@ -369,7 +369,7 @@ After the software is updated, upgrade on-disk datasets to enable new
 features supported by the new version:
 
 ```sh
-tidefsctl dataset upgrade mydataset --pool mypool
+tidefsctl dataset upgrade mypool mydataset
 ```
 
 This uses the upgrade table (`SupportedFeaturesV1`) to enumerate every
