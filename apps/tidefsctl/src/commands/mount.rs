@@ -217,7 +217,7 @@ fn resolve_encryption_for_import(
 ///
 /// 1. Import explicit `--devices` when starting a not-yet-imported pool.
 /// 2. Launch the FUSE daemon on the runtime metadata directory.
-/// 3. Refuse pool-name-only live mounts until the owner client is wired.
+/// 3. Route already-imported pools through the live runtime owner.
 pub fn handle_mount(args: PoolMountArgs) {
     let mountpoint = args.mount_point.clone();
     let lock_dir = std::path::PathBuf::from("/run/tidefs/import");
@@ -236,7 +236,7 @@ pub fn handle_mount(args: PoolMountArgs) {
     }
 
     // Determine the backing directory: explicit --devices import or live-owner route.
-    let backing_dir = if let Some(ref devices) = args.devices {
+    let (backing_dir, owner_pool_uuid) = if let Some(ref devices) = args.devices {
         let existing_config = scan_device_pool_config(&args.pool_name, devices, "mount");
         if existing_config.state == PoolState::Active {
             super::live_owner::route_imported(
@@ -292,7 +292,7 @@ pub fn handle_mount(args: PoolMountArgs) {
             eprintln!("tidefsctl pool mount: cannot create pool runtime dir: {e}");
             process::exit(1);
         });
-        pool_dir
+        (pool_dir, Some(cfg.pool_uuid))
     } else {
         super::live_owner::route("pool", "mount", &args.pool_name);
     };
@@ -538,6 +538,8 @@ pub fn handle_mount(args: PoolMountArgs) {
     let config = tidefs_posix_filesystem_adapter_daemon::MountConfig {
         backing_dir,
         mountpoint,
+        pool_name: Some(args.pool_name.clone()),
+        pool_uuid: owner_pool_uuid,
         foreground: true,
         debug: false,
         writeback_cache: false,

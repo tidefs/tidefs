@@ -47,6 +47,11 @@ explicit devices assemble as an imported `ACTIVE` pool, the command still has
 to route through the owner of that live state instead of opening the devices
 directly.
 
+The current userspace path that both imports and creates a live owner is
+`pool mount <pool> <mountpoint> --devices ...`. A one-shot device import is
+not a substitute for a kernel UAPI or daemon endpoint; after a pool is live,
+follow-up commands must use the owner interface or fail closed.
+
 Do not implement positional pool-name usability by reopening
 `/run/tidefs/pools/<name>`, by treating the pool name as a backing path, or by
 calling storage libraries behind the live owner. That would bypass cached

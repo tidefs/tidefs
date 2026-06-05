@@ -314,6 +314,7 @@ pub mod fuse_rename;
 pub mod fuse_vfs_adapter;
 pub mod fuse_write;
 pub mod handler_prelude;
+pub mod live_owner;
 pub mod lock_dispatch;
 pub mod materialized_cache;
 pub mod mmap_coherency;
@@ -392,6 +393,13 @@ pub struct MountConfig {
     pub backing_dir: PathBuf,
     /// FUSE mountpoint directory (created if missing).
     pub mountpoint: PathBuf,
+    /// Pool name for a pool-aware mounted owner.
+    ///
+    /// When present with [`pool_uuid`], the daemon publishes a live-owner
+    /// endpoint so `tidefsctl <pool>` commands can talk to this runtime.
+    pub pool_name: Option<String>,
+    /// Pool UUID for a pool-aware mounted owner.
+    pub pool_uuid: Option<[u8; 16]>,
     /// Run in foreground (default true for CLI workflows).
     pub foreground: bool,
     /// Enable debug logging to stderr.
@@ -641,6 +649,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
 
     let shutdown = Arc::new(AtomicBool::new(false));
     install_signal_handlers(Arc::clone(&shutdown)).map_err(|e| format!("signal handler: {e}"))?;
+    let live_owner_engine = adapter.engine_handle();
 
     let mut options = vec![
         fuser::MountOption::FSName("tidefs".into()),
@@ -661,6 +670,23 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     // Refuse idmapped mounts: TideFS does not support idmapped mount
     // UID/GID translation (#6418, NEXT-FUSE-015).
     check_idmapped_mount(&config.mountpoint)?;
+    let live_owner = match (&config.pool_name, config.pool_uuid) {
+        (Some(pool_name), Some(pool_uuid)) => {
+            let runtime_dir = PathBuf::from("/run/tidefs/pools").join(hex_uuid(&pool_uuid));
+            let owner_config = live_owner::LiveOwnerConfig {
+                pool_name: pool_name.clone(),
+                pool_uuid,
+                mountpoint: config.mountpoint.clone(),
+                runtime_dir,
+            };
+            Some(live_owner::start_fuse_owner(
+                owner_config,
+                live_owner_engine,
+                Arc::clone(&shutdown),
+            )?)
+        }
+        _ => None,
+    };
 
     if config.debug {
         eprintln!("tidefsctl: FUSE session active, Ctrl-C to stop");
@@ -672,11 +698,21 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
 
     crate::observability::emit_all_summaries();
     session.join();
+    if let Some(live_owner) = live_owner {
+        live_owner.stop();
+    }
     eprintln!(
         "tidefsctl: filesystem unmounted from {}",
         config.mountpoint.display()
     );
     Ok(())
+}
+
+fn hex_uuid(uuid: &[u8; 16]) -> String {
+    uuid.iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn install_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<(), String> {

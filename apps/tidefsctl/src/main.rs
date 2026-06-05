@@ -234,6 +234,8 @@ fn handle_mount(
     let config = MountConfig {
         backing_dir,
         mountpoint,
+        pool_name: None,
+        pool_uuid: None,
         foreground,
         debug,
         writeback_cache: false,

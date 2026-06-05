@@ -122,21 +122,27 @@ tidefsctl pool create mypool --devices /tmp/pool1.img /tmp/pool2.img --file-devi
 
 The `--file-devices` flag is hidden and intended for development.
 
-### 3.3 Import the pool (activate it)
+### 3.3 Import the pool into a live owner
 
-A newly created pool is exported. Import it before use:
+A newly created pool is exported. In the current userspace path, importing for
+use means starting the runtime that owns the live state:
 
 ```sh
-tidefsctl pool import /dev/sdb /dev/sdc
+tidefsctl pool mount mypool /mnt/tidefs --devices /dev/sdb /dev/sdc
 # or with file devices:
-tidefsctl pool import /tmp/pool1.img /tmp/pool2.img
+tidefsctl pool mount mypool /mnt/tidefs --devices /tmp/pool1.img /tmp/pool2.img
 ```
 
 With encryption:
 
 ```sh
-tidefsctl pool import /dev/sdb /dev/sdc --encryption-envelope ./mypool.key
+tidefsctl pool mount mypool /mnt/tidefs \
+  --devices /dev/sdb /dev/sdc \
+  --encryption-envelope ./mypool.key
 ```
+
+Plain `tidefsctl pool import ...` is not a live-state owner by itself. Do not
+use it as a substitute for the kernel UAPI or a userspace daemon endpoint.
 
 ### 3.4 Check pool status
 
@@ -164,15 +170,15 @@ tidefsctl mount /tmp/tidefs-store /mnt/tidefs
 This starts the FUSE daemon in the foreground, mounting the pool at
 `/mnt/tidefs`. Use `Ctrl-C` or `fusermount3 -u /mnt/tidefs` to stop.
 
-### 4.2 Pool-aware mount (import + mount in one step)
+### 4.2 Pool-aware mount (import + live owner in one step)
 
 ```sh
 tidefsctl pool mount mypool /mnt/tidefs --devices /tmp/pool1.img /tmp/pool2.img
 ```
 
 The `--devices` form imports exported storage and starts the userspace FUSE
-owner. If the pool is already imported, omit `--devices`; the command must talk
-to the runtime owner instead of reopening the devices.
+owner. If the pool is already imported, omit `--devices`; the command talks to
+the runtime owner instead of reopening the devices.
 
 For a specific dataset:
 

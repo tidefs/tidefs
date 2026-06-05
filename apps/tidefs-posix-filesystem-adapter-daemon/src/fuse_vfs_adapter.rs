@@ -2220,7 +2220,7 @@ pub trait BlockVolumeWriteTarget {
 
 /// FUSE filesystem adapter backed by a `VfsEngine`.
 pub struct FuseVfsAdapter {
-    pub(crate) engine: Mutex<Box<dyn VfsEngineStatFs + Send>>,
+    pub(crate) engine: Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>,
     file_handles: Mutex<AdapterFileHandleTable>,
     dir_handles: Mutex<AdapterDirHandleTable>,
     dentry_policy: DentryPolicy,
@@ -2336,8 +2336,9 @@ impl FuseVfsAdapter {
         let _root = engine.get_root_inode(&ctx)?;
         let notifier = Arc::new(Mutex::new(None));
         let mmap_coherency = Arc::new(MmapCoherency::new(Arc::clone(&notifier)));
+        let engine = Arc::new(Mutex::new(engine));
         Ok(Self {
-            engine: Mutex::new(engine),
+            engine: Arc::clone(&engine),
             file_handles: Mutex::new(AdapterFileHandleTable::default()),
             dir_handles: Mutex::new(AdapterDirHandleTable::default()),
             dentry_policy: DentryPolicy::default(),
@@ -2383,6 +2384,10 @@ impl FuseVfsAdapter {
             workload_observer: Arc::new(WorkloadObserver::new()),
             signature_cache: Arc::new(MaterializedSignatureCache::new()),
         })
+    }
+
+    pub fn engine_handle(&self) -> crate::live_owner::LiveOwnerEngine {
+        Arc::clone(&self.engine)
     }
 
     pub fn with_block_volume(self, target: Box<dyn BlockVolumeWriteTarget + Send>) -> Self {

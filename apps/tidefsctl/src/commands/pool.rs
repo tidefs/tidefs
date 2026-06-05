@@ -566,7 +566,13 @@ fn handle_pool_import(
         Ok(imp) => imp,
         Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
             let config = assemble_device_pool_config(&devices, "import");
-            super::live_owner::route_imported("pool", "import", &config.pool_name, pool_uuid)
+            super::live_owner::route_imported_with_format(
+                "pool",
+                "import",
+                &config.pool_name,
+                pool_uuid,
+                json,
+            )
         }
         Err(err) => {
             eprintln!("tidefsctl: pool import failed: {err}");
@@ -721,13 +727,13 @@ fn handle_pool_status(pool_name: String, devices: Option<Vec<PathBuf>>, json: bo
     let device_paths = match devices {
         Some(d) if !d.is_empty() => d,
         _ => {
-            super::live_owner::route("pool", "status", &pool_name);
+            super::live_owner::route_with_format("pool", "status", &pool_name, json);
         }
     };
 
     let config = assemble_device_pool_config(&device_paths, "status");
     ensure_device_pool_name(&pool_name, "status", &config);
-    route_active_device_pool("status", &pool_name, &config);
+    route_active_device_pool_with_format("status", &pool_name, &config, json);
 
     if json {
         let json_out = serde_json::json!({
@@ -786,8 +792,23 @@ fn route_active_device_pool(
     pool_name: &str,
     config: &tidefs_pool_scan::PoolConfig,
 ) {
+    route_active_device_pool_with_format(operation, pool_name, config, false);
+}
+
+fn route_active_device_pool_with_format(
+    operation: &str,
+    pool_name: &str,
+    config: &tidefs_pool_scan::PoolConfig,
+    json: bool,
+) {
     if config.state == PoolState::Active {
-        super::live_owner::route_imported("pool", operation, pool_name, config.pool_uuid);
+        super::live_owner::route_imported_with_format(
+            "pool",
+            operation,
+            pool_name,
+            config.pool_uuid,
+            json,
+        );
     }
 }
 
