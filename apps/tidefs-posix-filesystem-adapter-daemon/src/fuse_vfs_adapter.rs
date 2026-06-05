@@ -6345,8 +6345,8 @@ impl FuseVfsAdapter {
                 poff = poff.saturating_add(page_size);
             }
         }
-        // Clear per-inode dirty status in WritebackInodeCache.
-        self.writeback_cache.lock().unwrap().mark_clean(ino);
+        // Do not mark the whole inode clean here: this helper clears only the
+        // deallocated byte range, and unrelated dirty ranges must survive.
         // Clear dirty ranges from the shared DirtyPageTracker.
         if let Some(ref tracker) = self.writeback_range_tracker {
             tracker
@@ -35760,6 +35760,78 @@ mod tests {
             .expect("flush on clean inode");
 
         assert!(!tracker.lock().unwrap().is_dirty(inode));
+    }
+
+    #[test]
+    fn clear_dirty_for_deallocate_range_preserves_unrelated_dirty_ranges() {
+        let (fixture, tracker) = adapter_fixture_with_writeback_tracker();
+        let ino = 100;
+        let inode = InodeId::new(ino);
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, 3);
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(8192, 4);
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(ino);
+            cache.mark_dirty(ino, 7);
+        }
+        {
+            let mut tracker = tracker.lock().unwrap();
+            tracker.mark_dirty(inode, 0, 3);
+            tracker.mark_dirty(inode, 8192, 4);
+        }
+
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(true)
+        );
+
+        fixture
+            .adapter
+            .clear_dirty_for_deallocate_range(ino, 0, 4096);
+
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(true),
+            "partial range clearing must not mark the whole inode clean"
+        );
+        {
+            let ds = fixture.adapter.dirty_state.lock().unwrap();
+            assert_eq!(
+                ds.get(&ino).expect("remaining daemon dirty range").ranges(),
+                &[(8192, 8196)]
+            );
+        }
+        {
+            let guard = tracker.lock().unwrap();
+            let ranges = guard.dirty_ranges(inode).expect("remaining dirty range");
+            assert_eq!(ranges.len(), 1);
+            assert_eq!(ranges[0].offset, 8192);
+            assert_eq!(ranges[0].length, 4);
+        }
     }
 
     #[test]
