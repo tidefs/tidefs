@@ -2,8 +2,8 @@
 //
 // This module implements the `tidefsctl pool` subcommand group, delegating
 // to the respective production crates for each operation.  The verb surface
-// mirrors the operator/UAPI lifecycle: create, import, export, destroy,
-// mount, scan, status, and integrity-check.
+// mirrors the operator/UAPI lifecycle: create, owner-mediated import/export,
+// destroy, mount, scan, status, and integrity-check.
 //
 // # Pool create
 //
@@ -107,7 +107,7 @@ pub enum PoolCommand {
         zero_superblock: bool,
     },
 
-    /// Import (activate) an existing pool
+    /// Import an existing pool through a live owner
     Import {
         /// One or more devices
         #[arg(required = true, num_args = 1..)]
@@ -513,20 +513,11 @@ fn hex_guid(bytes: &[u8; 16]) -> String {
 
 fn handle_pool_import(
     devices: Vec<PathBuf>,
-    read_only: bool,
-    lock_dir: Option<PathBuf>,
-    encryption_envelope: Option<PathBuf>,
+    _read_only: bool,
+    _lock_dir: Option<PathBuf>,
+    _encryption_envelope: Option<PathBuf>,
     json: bool,
 ) {
-    let lock_dir = lock_dir.unwrap_or_else(|| PathBuf::from("/run/tidefs/import"));
-    if let Err(e) = std::fs::create_dir_all(&lock_dir) {
-        eprintln!(
-            "tidefsctl: cannot create lock directory {}: {e}",
-            lock_dir.display()
-        );
-        process::exit(1);
-    }
-
     let config = assemble_device_pool_config(&devices, "import");
     super::live_owner::route_if_imported_with_format(
         "pool",
@@ -537,105 +528,34 @@ fn handle_pool_import(
         json,
     );
 
-    // Resolve encryption key from sealed envelope for import validation.
-    let (import_encryption_key, _enc_config) = if let Some(ref env_path) = encryption_envelope {
-        let root_auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_environment()
-            .unwrap_or_else(|_| tidefs_local_filesystem::RootAuthenticationKey::demo_key());
-        match tidefs_posix_filesystem_adapter_daemon::resolve_encryption_key_from_envelope(
-            env_path,
-            &root_auth_key,
-        ) {
-            Some(enc_config) => {
-                let store_key = tidefs_encryption::StoreKey::from_bytes(enc_config.key.as_bytes())
-                    .expect("StoreEncryptionKey is always 32 bytes");
-                (Some(store_key), Some(enc_config))
-            }
-            None => {
-                eprintln!(
-                    "tidefsctl pool import: failed to unseal encryption envelope {}",
-                    env_path.display()
-                );
-                eprintln!("tidefsctl pool import: wrong root auth key, corrupt envelope, or tampered file");
-                process::exit(1);
-            }
-        }
-    } else {
-        (None, None)
-    };
-
-    let imported = match tidefs_pool_import::pool_import(
-        &devices,
-        &lock_dir,
-        read_only,
-        import_encryption_key,
-        None,
-    ) {
-        Ok(imp) => imp,
-        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
-            super::live_owner::route_imported_with_format(
-                "pool",
-                "import",
-                &config.pool_name,
-                pool_uuid,
-                json,
-            )
-        }
-        Err(err) => {
-            eprintln!("tidefsctl: pool import failed: {err}");
-            process::exit(1);
-        }
-    };
-
-    let cfg = &imported.config;
-    let stats = &imported.stats;
-
     if json {
         let json_out = serde_json::json!({
-            "pool_name": cfg.pool_name,
-            "pool_uuid": hex_guid(&cfg.pool_uuid),
-            "state": cfg.state.to_string(),
-            "health": format!("{:?}", cfg.health),
-            "device_count": cfg.device_count,
-            "total_capacity_bytes": cfg.total_capacity_bytes,
-            "superblock_verified": stats.superblock_verified,
-            "intent_log_replayed": stats.intent_log_replayed,
-            "datasets_available": stats.datasets_available,
-            "import_time_ms": stats.import_time_ms,
-            "encrypted": stats.encrypted,
-            "key_fingerprint": stats.key_fingerprint,
-            "read_only": stats.read_only,
+            "ok": false,
+            "command": "pool import",
+            "pool_name": config.pool_name,
+            "pool_uuid": hex_guid(&config.pool_uuid),
+            "state": config.state.to_string(),
+            "error": "standalone import would activate a pool without a live owner",
+            "owner_required": true,
         });
         println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
     } else {
-        println!("pool imported: {}", cfg.pool_name);
-        println!("  pool uuid:      {}", hex_guid(&cfg.pool_uuid));
-        println!("  state:          {}", cfg.state);
-        println!("  health:         {:?}", cfg.health);
-        println!("  devices:        {}", cfg.device_count);
-        println!("  total capacity: {} bytes", cfg.total_capacity_bytes);
-        println!("  import time:    {} ms", stats.import_time_ms);
-        if !cfg.missing_indices.is_empty() {
-            println!("  missing:        {:?}", cfg.missing_indices);
-        }
-        if stats.encrypted {
-            println!("  encrypted:      yes");
-            if let Some(ref fp) = stats.key_fingerprint {
-                println!("  key fp:         {fp}");
-            }
-        }
-        if stats.read_only {
-            println!("  read-only:      yes");
-        }
-        if stats.intent_log_replayed > 0 {
-            println!(
-                "  intent log:     {} records replayed",
-                stats.intent_log_replayed
-            );
-        }
-        if stats.datasets_available > 0 {
-            println!("  datasets:       {} available", stats.datasets_available);
-        }
+        eprintln!(
+            "tidefsctl pool import: refusing standalone import of pool '{}'",
+            config.pool_name
+        );
+        eprintln!(
+            "tidefsctl pool import: import creates live state, and live state must be owned by the kernel UAPI or a userspace daemon"
+        );
+        eprintln!(
+            "tidefsctl pool import: use 'tidefsctl pool mount {} <mountpoint> --devices ...' for the current FUSE owner path",
+            config.pool_name
+        );
+        eprintln!(
+            "tidefsctl pool import: a future kernel import path must publish a live owner interface before this command can activate the pool"
+        );
     }
+    process::exit(1);
 }
 
 // ---------------------------------------------------------------------------

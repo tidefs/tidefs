@@ -53,17 +53,20 @@ imported pool.
 Offline inputs are explicit. Commands that operate on a pool that is not
 imported must say how to find it with arguments such as `--devices` or
 `--backing-dir`. Those arguments authorize offline work on exported storage,
-repair, discovery, or explicit import when the command is `pool import` or an
-import-and-mount harness. Dataset, snapshot, and property commands must not
-turn an exported device set into an imported runtime as a side effect. If
-explicit devices assemble as an imported `ACTIVE` pool, or if the live-owner
-registry already names that pool UUID/name, the command still has to route
-through the owner of that live state instead of opening the devices directly.
+repair, discovery, or an owner-creating import-and-mount harness. Dataset,
+snapshot, and property commands must not turn an exported device set into an
+imported runtime as a side effect. If explicit devices assemble as an
+imported `ACTIVE` pool, or if the live-owner registry already names that pool
+UUID/name, the command still has to route through the owner of that live state
+instead of opening the devices directly.
 
 The current userspace path that both imports and creates a live owner is
-`pool mount <pool> <mountpoint> --devices ...`. A one-shot device import is
-not a substitute for a kernel UAPI or daemon endpoint; after a pool is live,
-follow-up commands must use the owner interface or fail closed.
+`pool mount <pool> <mountpoint> --devices ...`. `pool import --devices ...`
+does not activate a pool by itself in the current CLI because a one-shot
+device import would create live state and then leave no owner for cached
+state. A future kernel import path must publish a kernel owner interface
+before `pool import` can activate storage. After a pool is live, follow-up
+commands must use the owner interface or fail closed.
 
 Do not implement positional pool-name usability by reopening
 `/run/tidefs/pools/<name>`, by treating the pool name as a backing path, or by
@@ -95,8 +98,8 @@ kept as a parallel control path for imported state.
 | Class | Commands
 
 | Current operator surface
-| `pool create`, `pool scan`, `pool status`, `pool import`, `pool export`,
-  `pool destroy`, `pool integrity-check`, `pool get`, `pool set`,
+| `pool create`, `pool scan`, `pool status`, owner-mediated `pool import`,
+  `pool export`, `pool destroy`, `pool integrity-check`, `pool get`, `pool set`,
   `pool list-props`; `dataset create`, `dataset list`, `dataset destroy`,
   `dataset rename`, `dataset set-strategy`, `dataset seal-key`,
   `dataset rotate-key`, `dataset upgrade`, `dataset get`, `dataset set`,
