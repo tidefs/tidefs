@@ -130,11 +130,17 @@ the owner interface or fails closed; it does not continue into direct
 evacuation from cached live state. Object-store `--backing-dir` forms are
 explicit development paths. If a reachable owner manifest names that backing
 directory, snapshot commands route to that owner; block commands route only
-when the manifest also names the requested pool. These forms must not route by
-pool name alone or make pool-name-only live state changes behind the owner.
+when the manifest also names the requested pool. If an owner manifest names
+the backing directory for a different pool, the command refuses instead of
+opening the cached imported state as exported storage. These forms must not
+route by pool name alone or make pool-name-only live state changes behind the
+owner.
 Device removal survivor directories and device rebuild source/replacement
 directories are offline object-store paths too, and must be refused when they
 point into `/run/tidefs/pools` or are named by an imported-pool owner manifest.
+`pool integrity-check <path>` follows the same rule: a path owned by an
+imported pool routes to that owner or fails closed, while direct scans are only
+for exported/offline storage.
 
 The old `--pool <pool>` spelling is not the operator form. It must not be
 kept as a parallel control path for imported state.

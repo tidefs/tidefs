@@ -332,7 +332,9 @@ owner does not implement block export yet, it fails closed instead of opening
 storage behind that owner. The `--backing-dir` form is only for exported or
 offline object-store development paths. If a reachable owner manifest names
 both that pool and the same backing directory, the command routes to that exact
-owner; it must not route by pool name alone.
+owner; it must not route by pool name alone. If any imported-pool owner
+manifest names the backing directory for a different pool, the command refuses
+instead of opening that cached imported state as offline storage.
 `tidefsctl block send` and
 `tidefsctl block receive` follow the same split: pool-name form through the
 owner, explicit `--backing-dir` for exported/offline object-store work.
@@ -367,6 +369,11 @@ closed; it does not evacuate through direct storage access.
 `device rebuild --replacement-dir` are offline object-store paths as well. They
 must not point into `/run/tidefs/pools` or any backing directory named by an
 imported-pool owner manifest.
+
+`tidefsctl pool integrity-check <path>` uses the same boundary. When `<path>`
+is runtime state or a backing directory named by an imported-pool owner
+manifest, the command routes to the owner interface or fails closed. Direct
+path scanning is only for exported/offline storage.
 
 ### 6.5 Pool export (deactivate)
 

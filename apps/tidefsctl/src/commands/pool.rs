@@ -761,14 +761,6 @@ fn ensure_device_pool_name(
     }
 }
 
-fn route_live_device_pool_owner(
-    operation: &str,
-    pool_name: &str,
-    config: &tidefs_pool_scan::PoolConfig,
-) {
-    route_live_device_pool_owner_with_format(operation, pool_name, config, false);
-}
-
 fn route_live_device_pool_owner_with_format(
     operation: &str,
     pool_name: &str,
@@ -925,9 +917,29 @@ fn handle_pool_integrity_check(
     max_bytes: Option<u64>,
     devices: Option<Vec<PathBuf>>,
 ) {
+    let live_args = serde_json::json!({
+        "path": path.display().to_string(),
+        "max_records": max_records,
+        "max_bytes": max_bytes,
+    });
+    super::live_owner::route_if_owner_exists_for_backing_dir_with_args(
+        "pool",
+        "integrity-check",
+        &path,
+        live_args.clone(),
+    );
+    super::offline_pool::refuse_runtime_pool_path("pool", "integrity-check", &path);
+
     if let Some(ref device_paths) = devices {
         let config = assemble_device_pool_config(device_paths, "integrity-check");
-        route_live_device_pool_owner("integrity-check", &config.pool_name, &config);
+        super::live_owner::route_or_refuse_active_for_uuid_with_args(
+            "pool",
+            "integrity-check",
+            &config.pool_name,
+            config.pool_uuid,
+            config.state == tidefs_types_pool_label_core::PoolState::Active,
+            live_args,
+        );
     }
 
     // ── Phase 1: device-level checks (labels, committed root, intent log) ──

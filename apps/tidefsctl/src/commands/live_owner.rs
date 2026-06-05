@@ -40,6 +40,12 @@ impl ImportedBackingDirOwner {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum ImportedBackingDirDecision {
+    Exact(ImportedBackingDirOwner),
+    Foreign(ImportedBackingDirOwner),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MissingLivePoolOwnerClient;
 
@@ -131,13 +137,24 @@ pub(crate) fn route_if_owner_exists_for_pool_backing_dir_with_args(
     args: serde_json::Value,
 ) {
     let root = pool_runtime_root();
-    if let Some(pool_uuid) =
-        owner_interface_reachable_by_pool_backing_dir_at(&root, pool, backing_dir)
-    {
-        route_imported_with_format_and_args(command, operation, pool, pool_uuid, false, args);
-    }
-    if let Some(pool_uuid) = cached_owner_by_pool_backing_dir_at(&root, pool, backing_dir) {
-        refuse_cached_without_owner(command, operation, pool, Some(pool_uuid), false);
+    match imported_backing_dir_decision_at(&root, pool, backing_dir) {
+        Some(ImportedBackingDirDecision::Exact(owner)) if owner.reachable => {
+            route_imported_with_format_and_args(
+                command,
+                operation,
+                pool,
+                owner.pool_uuid,
+                false,
+                args,
+            );
+        }
+        Some(ImportedBackingDirDecision::Exact(owner)) => {
+            refuse_cached_without_owner(command, operation, pool, Some(owner.pool_uuid), false);
+        }
+        Some(ImportedBackingDirDecision::Foreign(owner)) => {
+            refuse_foreign_imported_backing_dir(command, operation, pool, backing_dir, &owner);
+        }
+        None => {}
     }
 }
 
@@ -148,12 +165,27 @@ pub(crate) fn route_if_owner_exists_for_backing_dir_with_args(
     args: serde_json::Value,
 ) {
     let root = pool_runtime_root();
-    if let Some((pool, pool_uuid)) = owner_interface_reachable_by_backing_dir_at(&root, backing_dir)
-    {
-        route_imported_with_format_and_args(command, operation, &pool, pool_uuid, false, args);
-    }
-    if let Some((pool, pool_uuid)) = cached_owner_by_backing_dir_at(&root, backing_dir) {
-        refuse_cached_without_owner(command, operation, &pool, Some(pool_uuid), false);
+    match imported_owner_by_backing_dir_at(&root, backing_dir) {
+        Some(owner) if owner.reachable => {
+            route_imported_with_format_and_args(
+                command,
+                operation,
+                &owner.pool,
+                owner.pool_uuid,
+                false,
+                args,
+            );
+        }
+        Some(owner) => {
+            refuse_cached_without_owner(
+                command,
+                operation,
+                &owner.pool,
+                Some(owner.pool_uuid),
+                false,
+            );
+        }
+        None => {}
     }
 }
 
@@ -293,6 +325,34 @@ fn refuse_cached_without_owner(
             "tidefsctl {command} {operation}: refusing direct access to cached imported-pool state"
         );
     }
+    process::exit(1);
+}
+
+fn refuse_foreign_imported_backing_dir(
+    command: &str,
+    operation: &str,
+    requested_pool: &str,
+    backing_dir: &Path,
+    owner: &ImportedBackingDirOwner,
+) -> ! {
+    let state = if owner.reachable {
+        "reachable live owner"
+    } else {
+        "cached owner record"
+    };
+    eprintln!(
+        "tidefsctl {command} {operation}: {} is imported-pool state for pool '{}' uuid {}, not requested pool '{requested_pool}' ({state})",
+        backing_dir.display(),
+        owner.pool,
+        owner.pool_uuid_hex(),
+    );
+    eprintln!(
+        "tidefsctl {command} {operation}: live state must be handled by the kernel UAPI or userspace daemon that owns pool '{}'",
+        owner.pool
+    );
+    eprintln!(
+        "tidefsctl {command} {operation}: refusing to treat cached imported-pool state as exported/offline storage"
+    );
     process::exit(1);
 }
 
@@ -739,6 +799,20 @@ fn imported_owner_by_backing_dir_at(
             pool,
             pool_uuid,
             reachable: false,
+        }
+    })
+}
+
+fn imported_backing_dir_decision_at(
+    root: &Path,
+    pool: &str,
+    backing_dir: &Path,
+) -> Option<ImportedBackingDirDecision> {
+    imported_owner_by_backing_dir_at(root, backing_dir).map(|owner| {
+        if owner.pool == pool {
+            ImportedBackingDirDecision::Exact(owner)
+        } else {
+            ImportedBackingDirDecision::Foreign(owner)
         }
     })
 }
@@ -1198,6 +1272,41 @@ mod tests {
         assert_eq!(owner.pool, "tank");
         assert_eq!(owner.pool_uuid, uuid);
         assert!(!owner.reachable);
+    }
+
+    #[test]
+    fn pool_specific_backing_dir_decision_refuses_foreign_imported_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing_dir = dir.path().join("backing");
+        std::fs::create_dir_all(&backing_dir).unwrap();
+        let uuid = [0x65; 16];
+        let manifest_path = owner_manifest_path(dir.path(), &uuid);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "pool_name": "owner-pool",
+                "pool_uuid": "65656565656565656565656565656565",
+                "backing_dir": backing_dir,
+                "socket_path": dir.path().join("missing-owner.sock"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let decision =
+            imported_backing_dir_decision_at(dir.path(), "requested-pool", &backing_dir).unwrap();
+
+        match decision {
+            ImportedBackingDirDecision::Foreign(owner) => {
+                assert_eq!(owner.pool, "owner-pool");
+                assert_eq!(owner.pool_uuid, uuid);
+                assert!(!owner.reachable);
+            }
+            ImportedBackingDirDecision::Exact(owner) => {
+                panic!("foreign imported state was treated as exact: {owner:?}")
+            }
+        }
     }
 
     #[test]
