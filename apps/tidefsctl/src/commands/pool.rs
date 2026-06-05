@@ -26,7 +26,8 @@ use std::process;
 
 use clap::Parser;
 use tidefs_dataset_properties;
-use tidefs_local_filesystem::LocalFileSystem;
+use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy, RootAuthenticationKey};
+use tidefs_local_object_store::StoreOptions;
 
 #[derive(Parser, Debug)]
 pub enum PoolCommand {
@@ -78,7 +79,7 @@ pub enum PoolCommand {
         /// Pool name
         pool_name: String,
 
-        /// Devices to scan for pool labels
+        /// Devices for offline label scan; omit to query the live pool owner
         #[arg(short = 'd', long = "devices", num_args = 1..)]
         devices: Option<Vec<PathBuf>>,
 
@@ -136,7 +137,7 @@ pub enum PoolCommand {
         /// Pool name to export
         pool_name: String,
 
-        /// Devices that belong to the pool
+        /// Devices for offline export; omit to export through the live pool owner
         #[arg(short = 'd', long = "devices", num_args = 1..)]
         devices: Option<Vec<PathBuf>>,
 
@@ -157,7 +158,7 @@ pub enum PoolCommand {
         #[arg(long = "read-only")]
         read_only: bool,
 
-        /// Block devices that make up the pool
+        /// Block devices for importing and launching this development harness
         #[arg(short = 'd', long = "devices", num_args = 1..)]
         devices: Option<Vec<PathBuf>>,
 
@@ -209,11 +210,11 @@ pub enum PoolCommand {
         /// Property name (e.g. "space.quota")
         property: String,
 
-        /// Pool name (resolved to backing store)
+        /// Pool name (imported-pool identity; routed through the live owner)
         #[arg(long = "pool", short = 'p')]
         pool: String,
 
-        /// Block devices for the pool (import before access)
+        /// Block devices for offline/not-yet-imported property access
         #[arg(short = 'd', long = "devices", num_args = 1..)]
         devices: Option<Vec<PathBuf>>,
     },
@@ -223,22 +224,22 @@ pub enum PoolCommand {
         /// Property assignment in key=value form (e.g. "space.quota=1073741824")
         assignment: String,
 
-        /// Pool name (resolved to backing store)
+        /// Pool name (imported-pool identity; routed through the live owner)
         #[arg(long = "pool", short = 'p')]
         pool: String,
 
-        /// Block devices for the pool (import before access)
+        /// Block devices for offline/not-yet-imported property access
         #[arg(short = 'd', long = "devices", num_args = 1..)]
         devices: Option<Vec<PathBuf>>,
     },
 
     /// List all registry properties for the pool with effective values and sources
     ListProps {
-        /// Pool name (resolved to backing store)
+        /// Pool name (imported-pool identity; routed through the live owner)
         #[arg(long = "pool", short = 'p')]
         pool: String,
 
-        /// Block devices for the pool (import before access)
+        /// Block devices for offline/not-yet-imported property access
         #[arg(short = 'd', long = "devices", num_args = 1..)]
         devices: Option<Vec<PathBuf>>,
 
@@ -711,12 +712,11 @@ fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
 // pool status
 // ---------------------------------------------------------------------------
 
-fn handle_pool_status(_pool_name: String, devices: Option<Vec<PathBuf>>, json: bool) {
+fn handle_pool_status(pool_name: String, devices: Option<Vec<PathBuf>>, json: bool) {
     let device_paths = match devices {
         Some(d) if !d.is_empty() => d,
         _ => {
-            eprintln!("tidefsctl: pool status requires --devices to scan for labels");
-            process::exit(1);
+            super::live_owner::exit_missing_client("pool", "status", &pool_name);
         }
     };
 
@@ -1317,8 +1317,7 @@ fn handle_pool_export(pool_name: String, devices: Option<Vec<PathBuf>>, force: b
     let device_paths = match devices {
         Some(d) if !d.is_empty() => d,
         _ => {
-            eprintln!("tidefsctl: pool export requires --devices to identify the pool devices");
-            process::exit(1);
+            super::live_owner::exit_missing_client("pool", "export", &pool_name);
         }
     };
 
@@ -1365,16 +1364,65 @@ fn handle_pool_destroy(
 // Pool property handlers
 // ---------------------------------------------------------------------------
 
-fn handle_pool_get(pool: &str, _devices: Option<&[PathBuf]>, property: &str) {
-    let metadata_dir = PathBuf::from("/run/tidefs/pools");
-    let path = metadata_dir.join(pool);
-    let fs = match LocalFileSystem::open(&path) {
-        Ok(fs) => fs,
-        Err(e) => {
-            eprintln!("tidefsctl pool get: cannot open pool '{}': {e}", pool);
+fn open_pool_property_filesystem(
+    pool: &str,
+    devices: Option<&[PathBuf]>,
+    operation: &str,
+    recovery_policy: RecoveryPolicy,
+) -> LocalFileSystem {
+    let Some(devs) = devices.filter(|devs| !devs.is_empty()) else {
+        super::live_owner::exit_missing_client("pool", operation, pool);
+    };
+
+    let lock_dir = std::env::temp_dir().join("tidefs-import-pool-properties");
+    if let Err(err) = std::fs::create_dir_all(&lock_dir) {
+        eprintln!(
+            "tidefsctl pool {operation}: cannot create import lock dir {}: {err}",
+            lock_dir.display()
+        );
+        process::exit(1);
+    }
+
+    let pool_uuid = match tidefs_pool_import::pool_import(devs, &lock_dir, false, None, None) {
+        Ok(imported) => imported.config.pool_uuid,
+        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => pool_uuid,
+        Err(err) => {
+            eprintln!("tidefsctl pool {operation}: pool import failed for '{pool}': {err}");
             process::exit(1);
         }
     };
+
+    let metadata_dir = PathBuf::from("/run/tidefs/pools").join(hex_guid(&pool_uuid));
+    if let Err(err) = std::fs::create_dir_all(&metadata_dir) {
+        eprintln!(
+            "tidefsctl pool {operation}: cannot create pool metadata dir {}: {err}",
+            metadata_dir.display()
+        );
+        process::exit(1);
+    }
+
+    let root_auth_key = RootAuthenticationKey::from_environment()
+        .unwrap_or_else(|_| RootAuthenticationKey::demo_key());
+    match LocalFileSystem::open_with_block_devices_and_recovery_policy(
+        &metadata_dir,
+        devs,
+        StoreOptions::default(),
+        root_auth_key,
+        recovery_policy,
+    ) {
+        Ok(fs) => fs,
+        Err(err) => {
+            eprintln!(
+                "tidefsctl pool {operation}: failed to open block-device-backed pool '{pool}' at {}: {err}",
+                metadata_dir.display()
+            );
+            process::exit(1);
+        }
+    }
+}
+
+fn handle_pool_get(pool: &str, devices: Option<&[PathBuf]>, property: &str) {
+    let fs = open_pool_property_filesystem(pool, devices, "get", RecoveryPolicy::ReadOnly);
 
     let registry = tidefs_dataset_properties::build_registry();
     let key = tidefs_dataset_properties::PropertyKey::new(property);
@@ -1400,16 +1448,8 @@ fn handle_pool_get(pool: &str, _devices: Option<&[PathBuf]>, property: &str) {
     }
 }
 
-fn handle_pool_set(pool: &str, _devices: Option<&[PathBuf]>, assignment: &str) {
-    let metadata_dir = PathBuf::from("/run/tidefs/pools");
-    let path = metadata_dir.join(pool);
-    let mut fs = match LocalFileSystem::open(&path) {
-        Ok(fs) => fs,
-        Err(e) => {
-            eprintln!("tidefsctl pool set: cannot open pool '{}': {e}", pool);
-            process::exit(1);
-        }
-    };
+fn handle_pool_set(pool: &str, devices: Option<&[PathBuf]>, assignment: &str) {
+    let mut fs = open_pool_property_filesystem(pool, devices, "set", RecoveryPolicy::default());
 
     let (prop_name, prop_val_str) = match assignment.split_once('=') {
         Some((k, v)) => (k.trim(), v.trim()),
@@ -1474,19 +1514,8 @@ fn handle_pool_set(pool: &str, _devices: Option<&[PathBuf]>, assignment: &str) {
     }
 }
 
-fn handle_pool_list_props(pool: &str, _devices: Option<&[PathBuf]>, family: Option<&str>) {
-    let metadata_dir = PathBuf::from("/run/tidefs/pools");
-    let path = metadata_dir.join(pool);
-    let fs = match LocalFileSystem::open(&path) {
-        Ok(fs) => fs,
-        Err(e) => {
-            eprintln!(
-                "tidefsctl pool list-props: cannot open pool '{}': {e}",
-                pool
-            );
-            process::exit(1);
-        }
-    };
+fn handle_pool_list_props(pool: &str, devices: Option<&[PathBuf]>, family: Option<&str>) {
+    let fs = open_pool_property_filesystem(pool, devices, "list-props", RecoveryPolicy::ReadOnly);
 
     let registry = tidefs_dataset_properties::build_registry();
 

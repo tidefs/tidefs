@@ -62,10 +62,11 @@ Development harnesses:
   cluster heal exercise         run healing diagnostics
 
 Pool routing rule:
-  A pool name identifies an imported pool and should route to the live owner:
-  the kernel UAPI in kernel mode, or the userspace daemon owner in userspace
-  mode. Explicit --devices or --backing-dir inputs are for offline,
-  discovery, import, or not-yet-imported work.
+  A pool name identifies an imported pool. Imported state is cached and must
+  be queried or changed through the live owner: the kernel UAPI in kernel
+  mode, or the userspace daemon owner in userspace mode. Explicit --devices
+  or --backing-dir inputs are for offline, discovery, import, or
+  not-yet-imported work.
 
 TideFS is pre-alpha. Help text should mark harnesses as such instead of
 treating them as the final kernel runtime."#,

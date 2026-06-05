@@ -283,7 +283,7 @@ pub struct SnapshotCreateArgs {
     /// Snapshot name to create
     pub name: String,
 
-    /// Backing directory for the local object store
+    /// Offline/development backing directory for the local object store
     #[arg(
         long = "backing-dir",
         short = 'b',
@@ -292,7 +292,7 @@ pub struct SnapshotCreateArgs {
     )]
     pub backing_dir: Option<PathBuf>,
 
-    /// Pool name for pool-backed snapshots
+    /// Pool name for imported-pool snapshots routed through the live owner
     #[arg(
         long = "pool",
         short = 'p',
@@ -301,7 +301,7 @@ pub struct SnapshotCreateArgs {
     )]
     pub pool: Option<String>,
 
-    /// Block devices for the pool (import before snapshot catalog access)
+    /// Block devices for offline/not-yet-imported snapshot access
     #[arg(short = 'd', long = "devices", num_args = 1.., requires = "pool")]
     pub devices: Option<Vec<PathBuf>>,
 }
@@ -309,7 +309,7 @@ pub struct SnapshotCreateArgs {
 /// `snapshot list (--backing-dir <path> | --pool <pool> [--devices <dev>...])`
 #[derive(Args, Debug)]
 pub struct SnapshotListArgs {
-    /// Backing directory for the local object store
+    /// Offline/development backing directory for the local object store
     #[arg(
         long = "backing-dir",
         short = 'b',
@@ -318,7 +318,7 @@ pub struct SnapshotListArgs {
     )]
     pub backing_dir: Option<PathBuf>,
 
-    /// Pool name for pool-backed snapshots
+    /// Pool name for imported-pool snapshots routed through the live owner
     #[arg(
         long = "pool",
         short = 'p',
@@ -327,7 +327,7 @@ pub struct SnapshotListArgs {
     )]
     pub pool: Option<String>,
 
-    /// Block devices for the pool (import before snapshot catalog access)
+    /// Block devices for offline/not-yet-imported snapshot access
     #[arg(short = 'd', long = "devices", num_args = 1.., requires = "pool")]
     pub devices: Option<Vec<PathBuf>>,
 }
@@ -338,7 +338,7 @@ pub struct SnapshotDestroyArgs {
     /// Snapshot name to destroy
     pub name: String,
 
-    /// Backing directory for the local object store
+    /// Offline/development backing directory for the local object store
     #[arg(
         long = "backing-dir",
         short = 'b',
@@ -347,7 +347,7 @@ pub struct SnapshotDestroyArgs {
     )]
     pub backing_dir: Option<PathBuf>,
 
-    /// Pool name for pool-backed snapshots
+    /// Pool name for imported-pool snapshots routed through the live owner
     #[arg(
         long = "pool",
         short = 'p',
@@ -356,7 +356,7 @@ pub struct SnapshotDestroyArgs {
     )]
     pub pool: Option<String>,
 
-    /// Block devices for the pool (import before snapshot catalog access)
+    /// Block devices for offline/not-yet-imported snapshot access
     #[arg(short = 'd', long = "devices", num_args = 1.., requires = "pool")]
     pub devices: Option<Vec<PathBuf>>,
 }
@@ -364,7 +364,7 @@ pub struct SnapshotDestroyArgs {
 /// `snapshot send (--backing-dir <path> | --pool <pool> [--devices <dev>...]) --output <path>`
 #[derive(Args, Debug)]
 pub struct SnapshotSendArgs {
-    /// Backing directory for the local object store
+    /// Offline/development backing directory for the local object store
     #[arg(
         long = "backing-dir",
         short = 'b',
@@ -373,7 +373,7 @@ pub struct SnapshotSendArgs {
     )]
     pub backing_dir: Option<PathBuf>,
 
-    /// Pool name for pool-backed snapshots
+    /// Pool name for imported-pool snapshots routed through the live owner
     #[arg(
         long = "pool",
         short = 'p',
@@ -382,7 +382,7 @@ pub struct SnapshotSendArgs {
     )]
     pub pool: Option<String>,
 
-    /// Block devices for the pool (import before snapshot stream export)
+    /// Block devices for offline/not-yet-imported snapshot stream export
     #[arg(short = 'd', long = "devices", num_args = 1.., requires = "pool")]
     pub devices: Option<Vec<PathBuf>>,
 
@@ -458,7 +458,7 @@ pub struct SnapshotRollbackArgs {
     /// Snapshot name to rollback to
     pub name: String,
 
-    /// Backing directory for the local object store
+    /// Offline/development backing directory for the local object store
     #[arg(
         long = "backing-dir",
         short = 'b',
@@ -467,7 +467,7 @@ pub struct SnapshotRollbackArgs {
     )]
     pub backing_dir: Option<PathBuf>,
 
-    /// Pool name for pool-backed snapshots
+    /// Pool name for imported-pool snapshots routed through the live owner
     #[arg(
         long = "pool",
         short = 'p',
@@ -476,7 +476,7 @@ pub struct SnapshotRollbackArgs {
     )]
     pub pool: Option<String>,
 
-    /// Block devices for the pool (import before rollback)
+    /// Block devices for offline/not-yet-imported rollback
     #[arg(short = 'd', long = "devices", num_args = 1.., requires = "pool")]
     pub devices: Option<Vec<PathBuf>>,
 }
@@ -502,42 +502,7 @@ fn open_filesystem(
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let pool_name = pool.unwrap_or("<unnamed>");
-        let lock_dir = std::env::temp_dir().join("tidefs-import");
-        if let Err(err) = std::fs::create_dir_all(&lock_dir) {
-            eprintln!(
-                "tidefsctl snapshot {operation}: cannot create import lock dir {}: {err}",
-                lock_dir.display()
-            );
-            process::exit(1);
-        }
-
-        let pool_uuid = match tidefs_pool_import::pool_import(devs, &lock_dir, false, None, None) {
-            Ok(imported) => {
-                eprintln!(
-                    "tidefsctl snapshot {operation}: pool '{}' imported (uuid={}, devices={})",
-                    pool_name,
-                    hex_uuid(&imported.config.pool_uuid),
-                    imported.config.device_count
-                );
-                imported.config.pool_uuid
-            }
-            Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => pool_uuid,
-            Err(err) => {
-                eprintln!(
-                    "tidefsctl snapshot {operation}: pool import failed for '{pool_name}': {err}"
-                );
-                process::exit(1);
-            }
-        };
-
-        let metadata_dir = PathBuf::from("/run/tidefs/pools").join(hex_uuid(&pool_uuid));
-        if let Err(err) = std::fs::create_dir_all(&metadata_dir) {
-            eprintln!(
-                "tidefsctl snapshot {operation}: cannot create pool metadata dir {}: {err}",
-                metadata_dir.display()
-            );
-            process::exit(1);
-        }
+        let metadata_dir = import_devices_metadata_dir(devs, pool_name, operation);
 
         let root_auth_key = RootAuthenticationKey::from_environment()
             .unwrap_or_else(|_| RootAuthenticationKey::demo_key());
@@ -559,12 +524,15 @@ fn open_filesystem(
         };
     }
 
-    let path = match backing_dir {
-        Some(path) => path.clone(),
-        None => PathBuf::from(pool.unwrap_or_else(|| {
+    let path = match (backing_dir, pool) {
+        (Some(path), _) => path.clone(),
+        (None, Some(pool_name)) => {
+            super::live_owner::exit_missing_client("snapshot", operation, pool_name)
+        }
+        (None, None) => {
             eprintln!("tidefsctl snapshot {operation}: --backing-dir or --pool is required");
             process::exit(1);
-        })),
+        }
     };
 
     match LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
@@ -589,6 +557,46 @@ fn open_filesystem(
             process::exit(1);
         }
     }
+}
+
+fn import_devices_metadata_dir(devices: &[PathBuf], pool_name: &str, operation: &str) -> PathBuf {
+    let lock_dir = std::env::temp_dir().join("tidefs-import");
+    if let Err(err) = std::fs::create_dir_all(&lock_dir) {
+        eprintln!(
+            "tidefsctl snapshot {operation}: cannot create import lock dir {}: {err}",
+            lock_dir.display()
+        );
+        process::exit(1);
+    }
+
+    let pool_uuid = match tidefs_pool_import::pool_import(devices, &lock_dir, false, None, None) {
+        Ok(imported) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: pool '{}' imported (uuid={}, devices={})",
+                pool_name,
+                hex_uuid(&imported.config.pool_uuid),
+                imported.config.device_count
+            );
+            imported.config.pool_uuid
+        }
+        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => pool_uuid,
+        Err(err) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: pool import failed for '{pool_name}': {err}"
+            );
+            process::exit(1);
+        }
+    };
+
+    let metadata_dir = PathBuf::from("/run/tidefs/pools").join(hex_uuid(&pool_uuid));
+    if let Err(err) = std::fs::create_dir_all(&metadata_dir) {
+        eprintln!(
+            "tidefsctl snapshot {operation}: cannot create pool metadata dir {}: {err}",
+            metadata_dir.display()
+        );
+        process::exit(1);
+    }
+    metadata_dir
 }
 
 fn hex_uuid(uuid: &[u8; 16]) -> String {
@@ -664,13 +672,24 @@ fn parse_hex_128(hex_str: &str) -> Result<[u8; 16], String> {
     Ok(out)
 }
 
-fn snapshot_backing_path(backing_dir: Option<&PathBuf>, pool: Option<&str>) -> PathBuf {
-    match backing_dir {
-        Some(p) => p.clone(),
-        None => PathBuf::from(pool.unwrap_or_else(|| {
+fn snapshot_backing_path(
+    backing_dir: Option<&PathBuf>,
+    pool: Option<&str>,
+    devices: Option<&[PathBuf]>,
+    operation: &str,
+) -> PathBuf {
+    match (backing_dir, pool, devices.filter(|devs| !devs.is_empty())) {
+        (Some(p), _, _) => p.clone(),
+        (None, pool_name, Some(devs)) => {
+            import_devices_metadata_dir(devs, pool_name.unwrap_or("<unnamed>"), operation)
+        }
+        (None, Some(pool_name), None) => {
+            super::live_owner::exit_missing_client("snapshot", "send", pool_name)
+        }
+        (None, None, None) => {
             eprintln!("tidefsctl snapshot send: --backing-dir or --pool required");
             process::exit(1);
-        })),
+        }
     }
 }
 
@@ -835,7 +854,12 @@ fn handle_send(args: SnapshotSendArgs) {
         .unwrap_or([0u8; 16]);
 
         if args.incremental {
-            let path = snapshot_backing_path(args.backing_dir.as_ref(), args.pool.as_deref());
+            let path = snapshot_backing_path(
+                args.backing_dir.as_ref(),
+                args.pool.as_deref(),
+                args.devices.as_deref(),
+                "send",
+            );
             let from_root = match parse_incremental_from_root(&args.from_root, &path) {
                 Ok(r) => r,
                 Err(e) => {
@@ -861,7 +885,12 @@ fn handle_send(args: SnapshotSendArgs) {
         }
     } else if args.incremental {
         let from_root = {
-            let path = snapshot_backing_path(args.backing_dir.as_ref(), args.pool.as_deref());
+            let path = snapshot_backing_path(
+                args.backing_dir.as_ref(),
+                args.pool.as_deref(),
+                args.devices.as_deref(),
+                "send",
+            );
             match parse_incremental_from_root(&args.from_root, &path) {
                 Ok(r) => r,
                 Err(e) => {

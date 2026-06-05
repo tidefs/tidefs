@@ -1,10 +1,8 @@
-//! Dataset subcommands driven through imported/mounted pool authority.
+//! Dataset subcommands split imported-pool authority from offline access.
 //!
-//! Resolves pool identity to open [`LocalFileSystem::dataset_catalog`] and
-//! [`LocalFileSystem::dataset_catalog_mut`] to create, list, and destroy
-//! datasets in the durable B+tree catalog persisted in the pool store.
-//! This is the canonical dataset catalog authority for mounted TideFS
-//! (issue #5952).
+//! Pool-name-only dataset commands must route through the runtime owner that
+//! imported the pool. Explicit `--devices` are the offline/not-yet-imported
+//! escape hatch that opens storage directly for bring-up work.
 
 use std::path::PathBuf;
 use std::process;
@@ -56,11 +54,11 @@ pub struct DatasetCreateArgs {
     /// Dataset name to create
     pub name: String,
 
-    /// Pool name (resolved to backing store)
+    /// Pool name (imported-pool identity; routed through the live owner)
     #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
-    /// Block devices for the pool (import before catalog access)
+    /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
@@ -91,11 +89,11 @@ pub struct DatasetCreateArgs {
 /// `dataset list --pool <pool> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetListArgs {
-    /// Pool name (resolved to backing store)
+    /// Pool name (imported-pool identity; routed through the live owner)
     #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
-    /// Block devices for the pool (import before catalog access)
+    /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
@@ -123,11 +121,11 @@ pub struct DatasetRenameArgs {
     /// New dataset name
     pub new_name: String,
 
-    /// Pool name (resolved to backing store)
+    /// Pool name (imported-pool identity; routed through the live owner)
     #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
-    /// Block devices for the pool (import before catalog access)
+    /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
@@ -152,11 +150,11 @@ pub struct DatasetDestroyArgs {
     /// Dataset name to destroy
     pub name: String,
 
-    /// Pool name (resolved to backing store)
+    /// Pool name (imported-pool identity; routed through the live owner)
     #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
-    /// Block devices for the pool (import before catalog access)
+    /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
@@ -181,11 +179,11 @@ pub struct DatasetSetStrategyArgs {
     /// Dataset name to configure
     pub name: String,
 
-    /// Pool name (resolved to backing store)
+    /// Pool name (imported-pool identity; routed through the live owner)
     #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
-    /// Block devices for the pool (import before catalog access)
+    /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
@@ -212,11 +210,11 @@ pub struct DatasetSealKeyArgs {
     /// Dataset name whose DEK to seal
     pub name: String,
 
-    /// Pool name (resolved to backing store)
+    /// Pool name (imported-pool identity; routed through the live owner)
     #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
-    /// Block devices for the pool
+    /// Block devices for offline/not-yet-imported key access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
@@ -227,11 +225,11 @@ pub struct DatasetSealKeyArgs {
 /// `dataset rotate-key --pool <pool> [--devices <dev>...] --old-passphrase <phrase> --old-salt <hex> --new-passphrase <phrase>`
 #[derive(Args, Debug)]
 pub struct DatasetRotateKeyArgs {
-    /// Pool name (resolved to backing store)
+    /// Pool name (imported-pool identity; routed through the live owner)
     #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
-    /// Block devices for the pool
+    /// Block devices for offline/not-yet-imported key access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
@@ -259,11 +257,11 @@ pub struct DatasetUpgradeArgs {
     /// Dataset name to upgrade
     pub name: String,
 
-    /// Pool name (resolved to backing store)
+    /// Pool name (imported-pool identity; routed through the live owner)
     #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
-    /// Block devices for the pool (import before catalog access)
+    /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 }
@@ -277,11 +275,11 @@ pub struct DatasetGetArgs {
     /// Property name (e.g. "access.readonly", "layout.recordsize")
     pub property: String,
 
-    /// Pool name (resolved to backing store)
+    /// Pool name (imported-pool identity; routed through the live owner)
     #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
-    /// Block devices for the pool (import before catalog access)
+    /// Block devices for offline/not-yet-imported property access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 }
@@ -295,11 +293,11 @@ pub struct DatasetSetArgs {
     /// Property assignment in key=value form (e.g. "access.readonly=on")
     pub assignment: String,
 
-    /// Pool name (resolved to backing store)
+    /// Pool name (imported-pool identity; routed through the live owner)
     #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
-    /// Block devices for the pool (import before catalog access)
+    /// Block devices for offline/not-yet-imported property access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 }
@@ -309,11 +307,11 @@ pub struct DatasetListPropsArgs {
     /// Dataset name to list properties for
     pub name: String,
 
-    /// Pool name (resolved to backing store)
+    /// Pool name (imported-pool identity; routed through the live owner)
     #[arg(long = "pool", short = 'p')]
     pub pool: String,
 
-    /// Block devices for the pool (import before catalog access)
+    /// Block devices for offline/not-yet-imported property access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
@@ -400,17 +398,7 @@ fn open_filesystem(
         };
     }
 
-    let path = PathBuf::from(pool);
-    match LocalFileSystem::open(&path) {
-        Ok(fs) => fs,
-        Err(err) => {
-            eprintln!(
-                "tidefsctl dataset {operation}: failed to open pool '{pool}' at {}: {err}",
-                path.display()
-            );
-            process::exit(1);
-        }
-    }
+    super::live_owner::exit_missing_client("dataset", operation, pool)
 }
 fn hex_uuid(uuid: &[u8; 16]) -> String {
     uuid.iter()
@@ -1489,12 +1477,11 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-/// Resolve a pool name to a filesystem path suitable for opening a
+/// Resolve explicit offline pool storage to a filesystem path suitable for opening a
 /// [`tidefs_encryption::key_manager::KeyStore`].
 ///
-/// For block-device-backed pools, the metadata directory is inferred
-/// via pool import.  For directory-backed pools, the pool name is used
-/// as the path directly.
+/// Pool-name-only key commands must use the imported-pool owner client, not
+/// reopen the path named by the pool identity.
 fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -> PathBuf {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let lock_dir = std::env::temp_dir().join("tidefs-import-keys");
@@ -1515,10 +1502,10 @@ fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -
             }
         };
 
-        PathBuf::from("/run/tidefs/pools").join(hex_uuid(&pool_uuid))
-    } else {
-        PathBuf::from(pool)
+        return PathBuf::from("/run/tidefs/pools").join(hex_uuid(&pool_uuid));
     }
+
+    super::live_owner::exit_missing_client("dataset", operation, pool)
 }
 /// Decode a hex-encoded 16-byte salt string into `[u8; SALT_LEN]`.
 fn hex_to_salt(hex: &str) -> Result<[u8; tidefs_encryption::key_hierarchy::SALT_LEN], String> {

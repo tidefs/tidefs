@@ -26,12 +26,16 @@ The pool name should be the normal positional identity for operator commands,
 similar to established filesystem CLIs. The name is not a shorthand for
 opening some local directory behind the runtime.
 
-When a pool is imported or mounted, its live state belongs to the active
-runtime owner:
+When a pool is imported or mounted, its live state is cached by and belongs to
+the active runtime owner:
 
 * in final kernel mode, `tidefsctl` must talk to the declared kernel UAPI;
 * in userspace mode, `tidefsctl` must talk to the FUSE or ublk owner that
   imported the pool and holds its caches, admission state, and runtime view.
+
+That owner interface is not optional plumbing. A pool-name-only command must
+not reopen storage behind the owner and then guess at state; until the kernel
+or daemon client exists, that form should fail closed.
 
 Offline inputs are explicit. Commands that operate on a pool that is not
 imported must say how to find it with arguments such as `--devices` or

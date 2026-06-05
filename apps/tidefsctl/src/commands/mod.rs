@@ -4,6 +4,7 @@ pub mod dataset;
 pub mod defrag;
 pub mod device;
 pub mod diag;
+mod live_owner;
 pub mod mount;
 pub mod pool;
 pub mod snapshot;

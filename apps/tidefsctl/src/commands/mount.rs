@@ -17,15 +17,15 @@ use tidefs_local_filesystem::RootAuthenticationKey;
 use tidefs_transport::{NodeInfo, Transport, TransportAddr};
 use tidefs_types_pool_label_core::features;
 
-/// `pool mount [<pool_name>] <mount_point> [--devices <dev>...] [--read-only] [--relatime]`
+/// `pool mount <pool_name> <mount_point> [--devices <dev>...] [--read-only] [--relatime]`
 ///
 /// When `--devices` is provided, the pool is imported from the raw block
-/// devices.  When `--devices` is absent, `pool_name` is resolved as a
-/// backing-directory path (compatibility mode for directory-backed pools).
+/// devices and mounted through this userspace harness. When `--devices` is
+/// absent, `pool_name` identifies an already imported pool and must route
+/// through that pool's live runtime owner.
 #[derive(Args, Debug)]
 pub struct PoolMountArgs {
-    /// Pool name (optional when --devices is used; resolved as
-    /// backing-directory path when --devices is absent)
+    /// Pool name (imported-pool identity; not a backing-directory path)
     pub pool_name: String,
 
     /// FUSE mountpoint directory (created if missing)
@@ -75,7 +75,7 @@ pub struct PoolMountArgs {
 
     /// Request cluster-authoritative mount. When set, the pool must have
     /// CLUSTER_POOL_INCOMPAT labels and the mount must go through cluster
-    /// authority instead of a local backing-directory path.
+    /// authority instead of offline local storage.
     #[arg(long = "cluster", default_value_t = false)]
     pub cluster: bool,
 
@@ -88,15 +88,6 @@ pub struct PoolMountArgs {
     /// Required when --cluster is set.
     #[arg(long = "cluster-node-id")]
     pub cluster_node_id: Option<u64>,
-}
-
-/// Resolve a pool name to a backing-directory path.
-///
-/// For local filesystem pools the pool name is the path to the
-/// backing store directory.  Future multi-node pools will use a
-/// pool registry.
-fn resolve_backing_dir(pool_name: &str) -> PathBuf {
-    PathBuf::from(pool_name)
 }
 
 /// Find device-label files inside a pool backing directory.
@@ -194,10 +185,9 @@ fn resolve_encryption_for_import(
 
 /// Handle `tidefsctl pool mount`.
 ///
-/// 1. Resolve pool_name → backing directory.
-/// 2. Scan backing directory for device-label files; if found, run
-///    pool-import for integrity verification and intent-log replay.
-/// 3. Launch the FUSE daemon on the backing directory.
+/// 1. Import explicit `--devices` when starting a not-yet-imported pool.
+/// 2. Launch the FUSE daemon on the runtime metadata directory.
+/// 3. Refuse pool-name-only live mounts until the owner client is wired.
 pub fn handle_mount(args: PoolMountArgs) {
     let mountpoint = args.mount_point.clone();
     let lock_dir = std::path::PathBuf::from("/run/tidefs/import");
@@ -215,7 +205,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         }
     }
 
-    // Determine the backing directory: --devices path or pool_name-as-directory.
+    // Determine the backing directory: explicit --devices import or live-owner route.
     let backing_dir = if let Some(ref devices) = args.devices {
         // Block-device path: import from raw devices, then use a
         // runtime-managed backing directory keyed by pool UUID.
@@ -261,41 +251,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         });
         pool_dir
     } else {
-        // Compatibility mode: pool name as backing-directory path.
-        let dir = resolve_backing_dir(&args.pool_name);
-        // Resolve encryption before import.
-        let (import_enc_key, encryption_config) =
-            resolve_encryption_for_import(&args.encryption_envelope);
-        match try_import_pool(&dir, &lock_dir, args.read_only, import_enc_key) {
-            Ok(Some(imported)) => {
-                let cfg = &imported.config;
-                let stats = &imported.stats;
-                println!("pool \"{}\" imported", cfg.pool_name);
-                println!("  pool uuid:   {}", hex_uuid(&cfg.pool_uuid));
-                println!("  state:       {}", cfg.state);
-                println!("  devices:     {}", cfg.device_count);
-                println!("  import time: {} ms", stats.import_time_ms);
-                if stats.encrypted {
-                    println!("  encrypted:   yes");
-                }
-                if stats.read_only {
-                    println!("  read-only:   yes");
-                }
-                check_encryption_consistency(cfg, &args.encryption_envelope);
-            }
-            Ok(None) => {
-                println!(
-                    "pool \"{}\": no device labels found in {} -- skipping import",
-                    args.pool_name,
-                    dir.display(),
-                );
-            }
-            Err(err) => {
-                eprintln!("tidefsctl pool mount: pool import failed: {err}");
-                process::exit(1);
-            }
-        }
-        dir
+        super::live_owner::exit_missing_client("pool", "mount", &args.pool_name);
     };
 
     // --- Encryption passphrase verification ---
@@ -866,14 +822,6 @@ mod tests {
         assert_eq!(args.mount_point, PathBuf::from("/mnt/full"));
         assert!(args.read_only);
         assert!(args.relatime);
-    }
-
-    // ── resolve_backing_dir tests ──────────────────────────────────
-
-    #[test]
-    fn resolve_backing_dir_uses_pool_name() {
-        let dir = resolve_backing_dir("/tmp/mypool");
-        assert_eq!(dir, PathBuf::from("/tmp/mypool"));
     }
 
     // ── find_device_files tests ────────────────────────────────────
