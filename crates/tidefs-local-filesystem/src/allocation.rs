@@ -6,10 +6,9 @@ use tidefs_types_vfs_core::{InodeId, ROOT_INODE_ID};
 use crate::constants::*;
 use crate::content::{
     content_chunk_count, content_chunk_len, content_chunk_start, decode_content_layout,
-    find_chunk_in_manifest, overlay_chunk_covers_whole_chunk_with_zeros,
-    overlay_chunk_index_bounds, overlay_chunk_writes_only_zeros, range_intersects_overlay,
-    read_content_layout_from_store, retained_content_chunk_ref, validate_content_layout,
-    ContentOverlayPatch,
+    find_chunk_in_manifest, overlay_chunk_index_bounds, overlay_chunk_writes_only_zeros,
+    range_intersects_overlay, read_content_layout_from_store, retained_content_chunk_ref,
+    validate_content_layout, ContentOverlayPatch,
 };
 use crate::error::FileSystemError;
 use crate::object_keys::{content_chunk_object_key_for_version, content_object_key_for_version};
@@ -187,14 +186,6 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
             {
                 for chunk_index in first_overlay_chunk..=last_overlay_chunk {
                     let len = content_chunk_len(new_record.size, chunk_index)?;
-                    if overlay_chunk_covers_whole_chunk_with_zeros(
-                        chunk_index,
-                        len,
-                        overlay_offset,
-                        overlay_bytes,
-                    )? {
-                        continue;
-                    }
                     let old_chunk_is_sparse_zero =
                         match find_chunk_in_manifest(manifest, chunk_index) {
                             Some(chunk_ref) => chunk_ref.is_hole(),

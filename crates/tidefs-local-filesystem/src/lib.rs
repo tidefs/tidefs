@@ -4072,6 +4072,72 @@ impl LocalFileSystem {
         }
     }
 
+    fn materialized_content_bytes_in_ranges(
+        &self,
+        inode_id: InodeId,
+        record: &InodeRecord,
+        ranges: &[(u64, u64)],
+    ) -> Result<u64> {
+        if ranges.is_empty() {
+            return Ok(0);
+        }
+        let layout =
+            read_content_layout_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+        let mut bytes = 0_u64;
+        match layout {
+            ContentLayout::Inline(content) => {
+                let content_len = u64::try_from(content.bytes.len()).map_err(|_| {
+                    FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    }
+                })?;
+                for &(offset, length) in ranges {
+                    let end = offset.saturating_add(length).min(content_len);
+                    if end > offset {
+                        bytes = bytes.checked_add(end - offset).ok_or(
+                            FileSystemError::SizeOverflow {
+                                requested: u64::MAX,
+                            },
+                        )?;
+                    }
+                }
+            }
+            ContentLayout::Chunked(manifest) => {
+                let chunk_size = u64::from(manifest.chunk_size);
+                for &(offset, length) in ranges {
+                    let len = usize::try_from(length)
+                        .map_err(|_| FileSystemError::SizeOverflow { requested: length })?;
+                    let Some((first_chunk, last_chunk)) =
+                        overlay_chunk_index_bounds(record.size, offset, len)?
+                    else {
+                        continue;
+                    };
+                    let range_end = offset.saturating_add(length).min(record.size);
+                    for chunk_index in first_chunk..=last_chunk {
+                        let Some(chunk_ref) = find_chunk_in_manifest(&manifest, chunk_index) else {
+                            continue;
+                        };
+                        if chunk_ref.is_hole() {
+                            continue;
+                        }
+                        let chunk_start = chunk_index.saturating_mul(chunk_size);
+                        let chunk_end = chunk_start.saturating_add(u64::from(chunk_ref.len));
+                        let start = offset.max(chunk_start);
+                        let end = range_end.min(chunk_end);
+                        if end > start {
+                            bytes = bytes.checked_add(end - start).ok_or(
+                                FileSystemError::SizeOverflow {
+                                    requested: u64::MAX,
+                                },
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Return a reference to the internal extent allocator (for tests).
     #[must_use]
     pub fn extent_allocator(&self) -> &ExtentAllocator {
@@ -6205,16 +6271,15 @@ impl LocalFileSystem {
         let _end_len =
             usize::try_from(end).map_err(|_| FileSystemError::SizeOverflow { requested: end })?;
         let logical_size = self.effective_file_size(inode_id);
-        if end <= logical_size {
-            return Ok(record);
-        }
-        let reservation_ranges =
-            self.unaccounted_extent_ranges(inode_id, logical_size, end - logical_size);
+        let reservation_ranges = self.unaccounted_extent_ranges(inode_id, offset, length);
         let reserve_bytes = reservation_ranges.iter().try_fold(0_u64, |sum, (_, len)| {
             sum.checked_add(*len).ok_or(FileSystemError::SizeOverflow {
                 requested: u64::MAX,
             })
         })?;
+        if end <= logical_size && reserve_bytes == 0 {
+            return Ok(record);
+        }
 
         // Quota/admission covers only hole bytes that become new UNWRITTEN
         // reservations. Bytes already represented by DATA/UNWRITTEN extents
@@ -6281,7 +6346,8 @@ impl LocalFileSystem {
             self.state.dirty_extent_maps.insert(inode_id);
         }
         let committed = self.committed_inode_record(inode_id)?;
-        let _ = self.rewrite_content_with_overlay(inode_id, committed, 0, &[], end, true)?;
+        let new_size = committed.size.max(end);
+        let _ = self.rewrite_content_with_overlay(inode_id, committed, 0, &[], new_size, true)?;
         let result = self.committed_inode_record(inode_id)?;
         // Intent-log: record fallocate for crash-recovery replay.
         let _ = self.intent_log_buffer.as_ref().map(|buf| {
@@ -6304,115 +6370,7 @@ impl LocalFileSystem {
         offset: u64,
         length: u64,
     ) -> Result<InodeRecord> {
-        let path = path.as_ref();
-        let parts = parse_absolute_path(path)?;
-        let inode_id = self.resolve_parts(&parts, path)?;
-        let record = self.inode(inode_id)?.clone();
-        if record.kind() != NodeKind::File {
-            if record.kind() == NodeKind::Dir {
-                return Err(FileSystemError::IsDirectory {
-                    path: path.to_string(),
-                });
-            }
-            return Err(FileSystemError::NotFile {
-                path: path.to_string(),
-                kind: record.kind(),
-            });
-        }
-        if length == 0 {
-            return Ok(record);
-        }
-        let end = offset
-            .checked_add(length)
-            .ok_or(FileSystemError::SizeOverflow {
-                requested: u64::MAX,
-            })?;
-        let _end_len =
-            usize::try_from(end).map_err(|_| FileSystemError::SizeOverflow { requested: end })?;
-
-        let reservation_ranges = self.unaccounted_extent_ranges(inode_id, offset, length);
-        let reserve_bytes = reservation_ranges.iter().try_fold(0_u64, |sum, (_, len)| {
-            sum.checked_add(*len).ok_or(FileSystemError::SizeOverflow {
-                requested: u64::MAX,
-            })
-        })?;
-
-        // Quota and admission checks cover only holes that will become
-        // UNWRITTEN reservations. Existing DATA/UNWRITTEN extents already
-        // consumed quota and capacity when they were first allocated.
-        if reserve_bytes > 0 {
-            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
-            let pool_free = self.pool_free_bytes_for_quota();
-            let decision =
-                self.state
-                    .quota_table
-                    .check_delta(&inode_ancestors, reserve_bytes, 0, pool_free);
-            if decision.is_refusal() {
-                return Err(FileSystemError::from(decision));
-            }
-        }
-
-        if reserve_bytes > 0 {
-            // Capacity reservation: atomically reserve and commit bytes.
-            let handle = self.reserve_with_hierarchy(reserve_bytes).map_err(|_e| {
-                FileSystemError::NoSpace {
-                    resource: LocalStorageResource::ContentBytes,
-                    requested: reserve_bytes,
-                    available: self.capacity_authority.available_bytes(),
-                    capacity: self.capacity_authority.total_bytes(),
-                    allocated: self.capacity_authority.used_bytes(),
-                }
-            })?;
-            // Immediately commit: reserved bytes become used bytes.
-            handle.commit();
-        }
-        check_crash_hook(CrashInjectionPoint::OpAllocateBeforeSpaceUpdate);
-        if reserve_bytes > 0 {
-            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
-            self.state
-                .quota_table
-                .apply_delta(&inode_ancestors, reserve_bytes, 0);
-        }
-        // Accumulate space delta: fallocate is a reservation
-        if reserve_bytes > 0 {
-            self.state
-                .space_accounting
-                .accumulate_delta(SpaceDelta::new_reservation(reserve_bytes));
-            for (range_offset, range_length) in &reservation_ranges {
-                let _ = self.extent_allocator.allocate_unwritten_extent(
-                    inode_id.0,
-                    *range_offset,
-                    *range_length,
-                    None,
-                    self.commit_group.current_commit_group().0,
-                );
-            }
-            // Capacity reservation was committed inline before fallocate.
-            // On error paths the caller must rollback via capacity_authority.record_free.
-            {
-                let mut tracker = self.writeback_range_tracker.lock().expect("locked");
-                for (range_offset, range_length) in &reservation_ranges {
-                    tracker.mark_dirty(inode_id, *range_offset, *range_length);
-                }
-            }
-            self.state.dirty_extent_maps.insert(inode_id);
-        }
-        let committed = self.committed_inode_record(inode_id)?;
-        let _ = self.rewrite_content_with_overlay(inode_id, committed, 0, &[], end, true)?;
-        let result = self.committed_inode_record(inode_id)?;
-        // Intent-log: record fallocate for crash-recovery replay.
-        let _ = self.intent_log_buffer.as_ref().map(|buf| {
-            let _frame = buf.append(
-                tidefs_intent_log::IntentLogRecord::Fallocate {
-                    ino: inode_id.get(),
-                    offset,
-                    length,
-                    mode: 0, // default allocate (POSIX posix_fallocate)
-                },
-                0, // txg_id assigned by TxgCoordinator at drain time
-            );
-        });
-        Ok(result)
+        self.reserve_unwritten(path, offset, length)
     }
 
     /// Reserve space for future writes without changing file size.
@@ -6481,18 +6439,26 @@ impl LocalFileSystem {
         }
 
         if reserve_bytes > 0 {
+            self.begin_mutation();
             // Capacity reservation: atomically reserve and commit bytes.
-            let handle = self.reserve_with_hierarchy(reserve_bytes).map_err(|_e| {
-                FileSystemError::NoSpace {
+            let reservation_succeeded = self
+                .reserve_with_hierarchy(reserve_bytes)
+                .map(|handle| {
+                    // Immediately commit: reserved bytes become used bytes.
+                    handle.commit();
+                })
+                .is_ok();
+            if !reservation_succeeded {
+                let err = FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
                     requested: reserve_bytes,
                     available: self.capacity_authority.available_bytes(),
                     capacity: self.capacity_authority.total_bytes(),
                     allocated: self.capacity_authority.used_bytes(),
-                }
-            })?;
-            // Immediately commit: reserved bytes become used bytes.
-            handle.commit();
+                };
+                self.rollback_mutation_delta();
+                return Err(err);
+            }
         }
 
         check_crash_hook(CrashInjectionPoint::OpAllocateBeforeSpaceUpdate);
@@ -6531,6 +6497,12 @@ impl LocalFileSystem {
             }
             self.state.dirty_extent_maps.insert(inode_id);
         }
+        let result = if reserve_bytes > 0 {
+            let committed = self.committed_inode_record(inode_id)?;
+            self.rewrite_content_with_overlay(inode_id, committed, 0, &[], record.size, true)?
+        } else {
+            record
+        };
         // Intent-log: record fallocate with KEEP_SIZE for crash-recovery replay.
         let _ = self.intent_log_buffer.as_ref().map(|buf| {
             let _frame = buf.append(
@@ -6543,7 +6515,7 @@ impl LocalFileSystem {
                 0, // txg_id assigned by TxgCoordinator at drain time
             );
         });
-        Ok(record)
+        Ok(result)
     }
 
     pub fn truncate_file(&mut self, path: impl AsRef<str>, size: u64) -> Result<InodeRecord> {
@@ -6977,14 +6949,20 @@ impl LocalFileSystem {
             record = self.committed_inode_record(inode_id)?;
         }
         let record_size = record.size;
-        let (data_bytes, reserved_bytes) =
+        let (data_bytes, _reserved_bytes) =
             self.accounted_extent_bytes(inode_id, offset, effective_length);
-        let already_accounted = data_bytes
-            .saturating_add(reserved_bytes)
-            .min(effective_length);
-        let newly_allocated_bytes = effective_length.saturating_sub(already_accounted);
         let materialized_data =
             self.content_range_has_materialized_data(inode_id, &record, offset, effective_length)?;
+        let reservation_ranges = self.unaccounted_extent_ranges(inode_id, offset, effective_length);
+        let materialized_bytes =
+            self.materialized_content_bytes_in_ranges(inode_id, &record, &reservation_ranges)?;
+        let unaccounted_hole_bytes =
+            reservation_ranges.iter().try_fold(0_u64, |sum, (_, len)| {
+                sum.checked_add(*len).ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })
+            })?;
+        let newly_allocated_bytes = unaccounted_hole_bytes.saturating_sub(materialized_bytes);
         let will_mutate_capacity_or_content =
             newly_allocated_bytes > 0 || data_bytes > 0 || materialized_data;
         if will_mutate_capacity_or_content {
@@ -7011,8 +6989,6 @@ impl LocalFileSystem {
         }
 
         if data_bytes == 0 && !materialized_data {
-            let reservation_ranges =
-                self.unaccounted_extent_ranges(inode_id, offset, effective_length);
             if newly_allocated_bytes > 0 {
                 let birth_txg = self.commit_group.current_commit_group().0;
                 for (range_offset, range_length) in &reservation_ranges {
@@ -7051,45 +7027,31 @@ impl LocalFileSystem {
             return Ok(self.adjust_for_write_buffer(inode_id, record));
         }
 
-        let zeros = vec![0u8; effective_length as usize];
-        // Accumulate space delta: holes become data, while UNWRITTEN extents
-        // convert from reserved to data without increasing total allocation.
-        let written_from_unwritten = reserved_bytes;
-        let logical_write_bytes = newly_allocated_bytes.saturating_add(written_from_unwritten);
-        if logical_write_bytes > 0 {
-            self.state
-                .space_accounting
-                .accumulate_delta(SpaceDelta::new_write(logical_write_bytes));
+        let data_to_unwritten_bytes = data_bytes.saturating_add(materialized_bytes);
+        let reserved_delta = data_to_unwritten_bytes.saturating_add(newly_allocated_bytes);
+        if data_to_unwritten_bytes > 0 || reserved_delta > 0 {
+            self.state.space_accounting.accumulate_delta(SpaceDelta {
+                logical_used_delta: -(data_to_unwritten_bytes as i64),
+                reserved_delta: reserved_delta as i64,
+                ..SpaceDelta::ZERO
+            });
         }
-        if written_from_unwritten > 0 {
-            self.state
-                .space_accounting
-                .accumulate_delta(SpaceDelta::new_write_into_unwritten(written_from_unwritten));
-        }
-        if newly_allocated_bytes > 0 {
-            self.state
-                .space_accounting
-                .track_physical_write(newly_allocated_bytes);
-        }
-        // Capacity reservation was committed inline before the rewrite.
+        let birth_txg = self.commit_group.current_commit_group().0;
         let _ = self
             .extent_allocator
-            .allocate_extent(inode_id.0, offset, effective_length, None);
-        // Finalize zero-filled extents with BLAKE3 hash of zeros.
-        let zero_hash = blake3::hash(&zeros);
-        let birth_txg = self.commit_group.current_commit_group().0;
-        let _ = self.extent_allocator.finalize_data_extent(
+            .free_extent(inode_id.0, offset, effective_length);
+        let _ = self.extent_allocator.allocate_unwritten_extent(
             inode_id.0,
             offset,
             effective_length,
-            *zero_hash.as_bytes(),
+            None,
             birth_txg,
         );
         self.clear_write_buffer_range(inode_id, offset, effective_length);
         self.writeback_range_tracker
             .lock()
             .expect("locked")
-            .mark_dirty(inode_id, offset, effective_length);
+            .clear_range(inode_id, offset, effective_length);
         // Intent-log: record zero_range for crash-recovery replay.
         let _ = self.intent_log_buffer.as_ref().map(|buf| {
             let _frame = buf.append(
@@ -7103,9 +7065,27 @@ impl LocalFileSystem {
             );
         });
         self.state.dirty_extent_maps.insert(inode_id);
-        let result =
-            self.rewrite_content_with_overlay(inode_id, record, offset, &zeros, record_size, true)?;
-        Ok(result)
+        let tick = self.bump_generation();
+        let mut updated = record.clone();
+        updated.data_version = tick;
+        updated.metadata_version = tick;
+        updated.size = record_size;
+        punch_hole_content(PunchHoleContent {
+            store: self.store.raw_primary_store_mut(),
+            inode_id,
+            old_record: &record,
+            new_record: &updated,
+            hole_offset: offset,
+            hole_length: effective_length,
+            quorum_store: self.quorum_store.as_mut(),
+            compression_policy: &self.content_compression_policy,
+        })?;
+        self.mark_inode_metadata_dirty(inode_id);
+        Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated.clone());
+        self.inode_cache.borrow_mut().invalidate(inode_id);
+        self.mark_inode_content_dirty(inode_id);
+        self.invalidate_hot_read_cache_for_inode(inode_id);
+        self.commit_mutation(updated)
     }
 
     /// Collapse a range of bytes within the file, shifting subsequent data

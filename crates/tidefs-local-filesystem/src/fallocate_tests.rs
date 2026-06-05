@@ -201,7 +201,7 @@ fn zero_range_existing_data_does_not_charge_capacity_again() {
     );
     let mut fs =
         LocalFileSystem::open_with_allocator_policy(&root, ft_options(), policy).expect("open fs");
-    fs.create_file("/file.bin", 0o644).expect("create file");
+    let created = fs.create_file("/file.bin", 0o644).expect("create file");
 
     let chunk = content_chunk_size() as usize;
     let bytes = vec![0x7b; chunk];
@@ -210,6 +210,9 @@ fn zero_range_existing_data_does_not_charge_capacity_again() {
     fs.flush_all_write_buffers()
         .expect("flush initial one-chunk write");
     let before = fs.statfs().expect("statfs before zero range");
+    let before_used = fs.capacity_authority().used_bytes();
+    let before_free = fs.capacity_authority().free_bytes();
+    let before_available = fs.capacity_authority().available_bytes();
     assert_eq!(
         before.blocks,
         policy.content_capacity_bytes / u64::from(before.frsize)
@@ -223,6 +226,16 @@ fn zero_range_existing_data_does_not_charge_capacity_again() {
     assert_eq!(after.blocks, before.blocks);
     assert_eq!(after.bfree, before.bfree);
     assert_eq!(after.bavail, before.bavail);
+    assert_eq!(fs.capacity_authority().used_bytes(), before_used);
+    assert_eq!(fs.capacity_authority().free_bytes(), before_free);
+    assert_eq!(fs.capacity_authority().available_bytes(), before_available);
+    let extents = fs.lookup_extents(created.inode_id.get(), 0, chunk as u64);
+    assert_eq!(extents.len(), 1);
+    assert!(
+        extents[0].is_unwritten(),
+        "zeroing existing DATA keeps allocation as UNWRITTEN, got {:?}",
+        extents[0]
+    );
 
     let read = fs.read_file("/file.bin").expect("read after zero");
     assert_eq!(read.len(), chunk);
@@ -497,6 +510,87 @@ fn fallocate_default_zero_offset_extends_file_and_reads_zeros() {
 }
 
 #[test]
+fn fallocate_default_past_eof_reserves_requested_range_not_leading_hole() {
+    let root = ft_temp_root("alloc-offset-hole");
+    let mut fs = LocalFileSystem::open_with_options(&root, ft_options()).expect("open fs");
+    let created = fs.create_file("/file.bin", 0o644).expect("create file");
+
+    let chunk = content_chunk_size() as u64;
+    let offset = chunk * 2;
+    let length = chunk;
+    let record = fs
+        .fallocate_file("/file.bin", offset, length)
+        .expect("fallocate sparse offset");
+    assert_eq!(record.size, offset + length, "file extends to range end");
+
+    assert!(
+        fs.lookup_extents(created.inode_id.get(), 0, offset)
+            .is_empty(),
+        "bytes before requested fallocate range must remain an unreserved hole"
+    );
+    let extents = fs.lookup_extents(created.inode_id.get(), offset, length);
+    assert_eq!(extents.len(), 1, "requested range is reserved once");
+    assert_eq!(extents[0].logical_offset, offset);
+    assert_eq!(extents[0].length, length);
+    assert!(
+        extents[0].is_unwritten(),
+        "default fallocate reservation should be an unwritten extent"
+    );
+
+    let prefix = fs
+        .read_file_range("/file.bin", 0, offset as usize)
+        .expect("read leading hole");
+    assert!(prefix.iter().all(|&byte| byte == 0));
+    let reserved = fs
+        .read_file_range("/file.bin", offset, length as usize)
+        .expect("read reserved zeros");
+    assert!(reserved.iter().all(|&byte| byte == 0));
+
+    fs.sync_all().expect("sync");
+    drop(fs);
+    ft_cleanup(&root);
+}
+
+#[test]
+fn fallocate_default_inside_sparse_file_reserves_hole_without_size_change() {
+    let root = ft_temp_root("alloc-inside-sparse");
+    let mut fs = LocalFileSystem::open_with_options(&root, ft_options()).expect("open fs");
+    let created = fs.create_file("/file.bin", 0o644).expect("create file");
+
+    let chunk = content_chunk_size() as u64;
+    fs.truncate_file("/file.bin", chunk * 4)
+        .expect("sparse truncate");
+    let before_size = fs.stat("/file.bin").expect("stat").size;
+
+    let offset = chunk;
+    let length = chunk;
+    let record = fs
+        .fallocate_file("/file.bin", offset, length)
+        .expect("fallocate sparse interior range");
+    assert_eq!(record.size, before_size, "interior reservation keeps size");
+
+    assert!(
+        fs.lookup_extents(created.inode_id.get(), 0, offset)
+            .is_empty(),
+        "prefix hole remains unreserved"
+    );
+    let extents = fs.lookup_extents(created.inode_id.get(), offset, length);
+    assert_eq!(extents.len(), 1);
+    assert_eq!(extents[0].logical_offset, offset);
+    assert_eq!(extents[0].length, length);
+    assert!(extents[0].is_unwritten());
+    assert!(
+        fs.lookup_extents(created.inode_id.get(), offset + length, chunk * 2)
+            .is_empty(),
+        "suffix hole remains unreserved"
+    );
+
+    fs.sync_all().expect("sync");
+    drop(fs);
+    ft_cleanup(&root);
+}
+
+#[test]
 fn fallocate_default_extends_existing_file() {
     let root = ft_temp_root("alloc-extend");
     let mut fs = LocalFileSystem::open_with_options(&root, ft_options()).expect("open fs");
@@ -522,6 +616,29 @@ fn fallocate_default_extends_existing_file() {
         read[initial.len()..].iter().all(|&b| b == 0),
         "extended region reads zeros"
     );
+
+    fs.sync_all().expect("sync");
+    drop(fs);
+    ft_cleanup(&root);
+}
+
+#[test]
+fn fallocate_keep_size_helper_does_not_extend_file() {
+    let root = ft_temp_root("alloc-keep-helper");
+    let mut fs = LocalFileSystem::open_with_options(&root, ft_options()).expect("open fs");
+    let created = fs.create_file("/file.bin", 0o644).expect("create file");
+
+    let chunk = content_chunk_size() as u64;
+    let record = fs
+        .fallocate_keep_size("/file.bin", chunk * 3, chunk)
+        .expect("keep-size helper");
+    assert_eq!(record.size, 0, "keep-size allocation must not change size");
+
+    let extents = fs.lookup_extents(created.inode_id.get(), chunk * 3, chunk);
+    assert_eq!(extents.len(), 1);
+    assert_eq!(extents[0].logical_offset, chunk * 3);
+    assert_eq!(extents[0].length, chunk);
+    assert!(extents[0].is_unwritten());
 
     fs.sync_all().expect("sync");
     drop(fs);

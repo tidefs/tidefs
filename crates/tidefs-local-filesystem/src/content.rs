@@ -1470,44 +1470,6 @@ pub(crate) fn overlay_chunk_writes_only_zeros(
         .all(|byte| *byte == 0))
 }
 
-pub(crate) fn overlay_chunk_covers_whole_chunk_with_zeros(
-    chunk_index: u64,
-    chunk_len: u32,
-    overlay_offset: u64,
-    overlay_bytes: &[u8],
-) -> Result<bool> {
-    if overlay_bytes.is_empty() || chunk_len == 0 {
-        return Ok(false);
-    }
-    let chunk_start = content_chunk_start(chunk_index)?;
-    let chunk_end =
-        chunk_start
-            .checked_add(u64::from(chunk_len))
-            .ok_or(FileSystemError::SizeOverflow {
-                requested: u64::MAX,
-            })?;
-    let overlay_end = overlay_offset
-        .checked_add(overlay_bytes.len() as u64)
-        .ok_or(FileSystemError::SizeOverflow {
-            requested: u64::MAX,
-        })?;
-    if overlay_offset > chunk_start || overlay_end < chunk_end {
-        return Ok(false);
-    }
-    let overlay_src = usize::try_from(chunk_start - overlay_offset).map_err(|_| {
-        FileSystemError::SizeOverflow {
-            requested: chunk_start - overlay_offset,
-        }
-    })?;
-    let len =
-        usize::try_from(chunk_end - chunk_start).map_err(|_| FileSystemError::SizeOverflow {
-            requested: chunk_end - chunk_start,
-        })?;
-    Ok(overlay_bytes[overlay_src..overlay_src + len]
-        .iter()
-        .all(|byte| *byte == 0))
-}
-
 pub(crate) fn read_chunked_content(
     store: &LocalObjectStore,
     manifest: &ContentManifestObject,

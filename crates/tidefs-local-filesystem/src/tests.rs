@@ -1341,7 +1341,10 @@ fn fallocate_extends_through_allocator_and_reports_statfs() {
         content_chunk_size() as u64 * 2
     );
     let statfs = fs.statfs().expect("statfs");
-    assert_eq!(statfs.blocks, 2);
+    assert_eq!(
+        statfs.blocks,
+        policy.content_capacity_bytes / u64::from(statfs.frsize)
+    );
     assert_eq!(statfs.bfree, 0);
     assert_eq!(statfs.bavail, 0);
     assert!(statfs.ffree > 0);

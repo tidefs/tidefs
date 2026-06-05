@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::ops::Bound;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::time::Duration;
 
 /// Configuration for write-buffer coalescing thresholds.
@@ -22,19 +25,6 @@ impl Default for WriteBufferConfig {
     }
 }
 
-/// A single contiguous dirty segment within the write buffer.
-#[derive(Debug, Clone)]
-struct Segment {
-    offset: u64,
-    data: Vec<u8>,
-}
-
-impl Segment {
-    fn end(&self) -> u64 {
-        self.offset.saturating_add(self.data.len() as u64)
-    }
-}
-
 /// Per-inode write coalescing buffer.
 ///
 /// Accumulates small sequential writes and flushes them in fewer,
@@ -45,7 +35,7 @@ impl Segment {
 #[derive(Debug, Clone)]
 pub struct WriteBuffer {
     config: WriteBufferConfig,
-    segments: Vec<Segment>,
+    segments: BTreeMap<u64, Vec<u8>>,
     total_bytes: usize,
 }
 
@@ -53,37 +43,29 @@ impl WriteBuffer {
     pub fn new(config: WriteBufferConfig) -> Self {
         Self {
             config,
-            segments: Vec::new(),
+            segments: BTreeMap::new(),
             total_bytes: 0,
         }
     }
 
-    fn first_segment_ending_at_or_after(&self, offset: u64) -> usize {
-        let mut left = 0;
-        let mut right = self.segments.len();
-        while left < right {
-            let mid = left + (right - left) / 2;
-            if self.segments[mid].end() < offset {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-        left
+    fn segment_end(offset: u64, data: &[u8]) -> u64 {
+        offset.saturating_add(data.len() as u64)
     }
 
-    fn first_segment_ending_after(&self, offset: u64) -> usize {
-        let mut left = 0;
-        let mut right = self.segments.len();
-        while left < right {
-            let mid = left + (right - left) / 2;
-            if self.segments[mid].end() <= offset {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-        left
+    fn first_segment_start_ending_at_or_after(&self, offset: u64) -> u64 {
+        self.segments
+            .range(..=offset)
+            .next_back()
+            .and_then(|(&start, data)| (Self::segment_end(start, data) >= offset).then_some(start))
+            .unwrap_or(offset)
+    }
+
+    fn first_segment_start_ending_after(&self, offset: u64) -> u64 {
+        self.segments
+            .range(..=offset)
+            .next_back()
+            .and_then(|(&start, data)| (Self::segment_end(start, data) > offset).then_some(start))
+            .unwrap_or(offset)
     }
 
     /// Ingest a write at the given byte offset.
@@ -97,58 +79,54 @@ impl WriteBuffer {
         }
 
         let write_end = offset.saturating_add(buf.len() as u64);
+        let scan_start = self.first_segment_start_ending_at_or_after(offset);
+        let mut merged_start = offset;
+        let mut merged_end = write_end;
+        let mut candidate_starts = Vec::new();
+        let mut next_bound: Bound<u64> = Included(scan_start);
 
-        let index = self.first_segment_ending_at_or_after(offset);
-
-        if index == self.segments.len() || self.segments[index].offset > write_end {
-            self.segments.insert(
-                index,
-                Segment {
-                    offset,
-                    data: buf.to_vec(),
-                },
-            );
-            self.total_bytes = self.segments.iter().map(|segment| segment.data.len()).sum();
-            return;
-        }
-
-        if self.segments[index].offset <= offset {
-            let segment = &mut self.segments[index];
-            let write_start = (offset - segment.offset) as usize;
-            let required_len = write_start.saturating_add(buf.len());
-            if required_len > segment.data.len() {
-                segment.data.resize(required_len, 0);
-            }
-            segment.data[write_start..write_start + buf.len()].copy_from_slice(buf);
-        } else {
-            self.segments.insert(
-                index,
-                Segment {
-                    offset,
-                    data: buf.to_vec(),
-                },
-            );
-        }
-
-        while index + 1 < self.segments.len() {
-            let base_end = self.segments[index].end();
-            if self.segments[index + 1].offset > base_end {
+        loop {
+            let next = self
+                .segments
+                .range((next_bound, Unbounded))
+                .next()
+                .map(|(&start, data)| (start, Self::segment_end(start, data)));
+            let Some((segment_start, segment_end)) = next else {
+                break;
+            };
+            if segment_start > merged_end {
                 break;
             }
 
-            let next = self.segments.remove(index + 1);
-            let next_end = next.end();
-            if next_end <= base_end {
-                continue;
-            }
-
-            let copy_start = (base_end - next.offset) as usize;
-            self.segments[index]
-                .data
-                .extend_from_slice(&next.data[copy_start..]);
+            candidate_starts.push(segment_start);
+            merged_start = merged_start.min(segment_start);
+            merged_end = merged_end.max(segment_end);
+            next_bound = Excluded(segment_start);
         }
 
-        self.total_bytes = self.segments.iter().map(|segment| segment.data.len()).sum();
+        if candidate_starts.is_empty() {
+            self.segments.insert(offset, buf.to_vec());
+            self.total_bytes = self.total_bytes.saturating_add(buf.len());
+            return;
+        }
+
+        let merged_len = (merged_end - merged_start) as usize;
+        let mut merged = vec![0_u8; merged_len];
+
+        for segment_start in candidate_starts {
+            let Some(data) = self.segments.remove(&segment_start) else {
+                continue;
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(data.len());
+            let dst = (segment_start - merged_start) as usize;
+            let dst_end = dst.saturating_add(data.len());
+            merged[dst..dst_end].copy_from_slice(&data);
+        }
+
+        let write_dst = (offset - merged_start) as usize;
+        merged[write_dst..write_dst + buf.len()].copy_from_slice(buf);
+        self.total_bytes = self.total_bytes.saturating_add(merged.len());
+        self.segments.insert(merged_start, merged);
     }
 
     /// Returns `true` when the foreground byte-count threshold is crossed.
@@ -177,18 +155,14 @@ impl WriteBuffer {
     pub fn max_offset(&self) -> Option<u64> {
         self.segments
             .iter()
-            .map(|seg| seg.offset + seg.data.len() as u64)
+            .map(|(&offset, data)| Self::segment_end(offset, data))
             .max()
     }
 
     /// Drain all segments, returning `(offset, data)` pairs and resetting
     /// internal state.
     pub fn drain(&mut self) -> Vec<(u64, Vec<u8>)> {
-        let result: Vec<_> = self
-            .segments
-            .drain(..)
-            .map(|seg| (seg.offset, seg.data))
-            .collect();
+        let result: Vec<_> = std::mem::take(&mut self.segments).into_iter().collect();
         self.total_bytes = 0;
         result
     }
@@ -209,24 +183,28 @@ impl WriteBuffer {
 
         let mut drained = Vec::new();
         while remaining > 0 && !self.segments.is_empty() {
-            if self.segments[0].data.len() <= remaining {
-                let segment = self.segments.remove(0);
-                remaining -= segment.data.len();
-                drained.push((segment.offset, segment.data));
+            let Some((&offset, _)) = self.segments.iter().next() else {
+                break;
+            };
+            let mut data = self
+                .segments
+                .remove(&offset)
+                .expect("first segment key was present");
+            if data.len() <= remaining {
+                remaining -= data.len();
+                self.total_bytes = self.total_bytes.saturating_sub(data.len());
+                drained.push((offset, data));
                 continue;
             }
 
             let split_len = remaining;
-            let segment = &mut self.segments[0];
-            let tail = segment.data.split_off(split_len);
-            let drained_data = std::mem::replace(&mut segment.data, tail);
-            let drained_offset = segment.offset;
-            segment.offset = segment.offset.saturating_add(split_len as u64);
-            drained.push((drained_offset, drained_data));
+            let tail = data.split_off(split_len);
+            let tail_offset = offset.saturating_add(split_len as u64);
+            self.segments.insert(tail_offset, tail);
+            self.total_bytes = self.total_bytes.saturating_sub(data.len());
+            drained.push((offset, data));
             remaining = 0;
         }
-
-        self.total_bytes = self.segments.iter().map(|segment| segment.data.len()).sum();
         drained
     }
 
@@ -236,18 +214,18 @@ impl WriteBuffer {
     /// segment that straddles the size boundary.  Used by setattr(size)
     /// to prevent fsync from restoring data past a truncation point.
     pub fn truncate(&mut self, size: u64) {
-        self.segments.retain_mut(|seg| {
-            if seg.offset >= size {
+        self.segments.retain(|&offset, data| {
+            if offset >= size {
                 return false;
             }
-            let seg_end = seg.offset.saturating_add(seg.data.len() as u64);
+            let seg_end = Self::segment_end(offset, data);
             if seg_end > size {
-                let keep = (size - seg.offset) as usize;
-                seg.data.truncate(keep);
+                let keep = (size - offset) as usize;
+                data.truncate(keep);
             }
             true
         });
-        self.total_bytes = self.segments.iter().map(|s| s.data.len()).sum();
+        self.total_bytes = self.segments.values().map(Vec::len).sum();
     }
 
     /// Clear dirty bytes in `[offset, offset + length)`, preserving dirty
@@ -258,14 +236,13 @@ impl WriteBuffer {
         }
 
         let end = offset.checked_add(length).unwrap_or(u64::MAX);
-        let mut kept = Vec::with_capacity(self.segments.len());
+        let mut kept = BTreeMap::new();
         let mut cleared = 0usize;
 
-        for segment in self.segments.drain(..) {
-            let segment_start = segment.offset;
-            let segment_end = segment.end();
+        for (segment_start, data) in std::mem::take(&mut self.segments) {
+            let segment_end = Self::segment_end(segment_start, &data);
             if segment_end <= offset || segment_start >= end {
-                kept.push(segment);
+                kept.insert(segment_start, data);
                 continue;
             }
 
@@ -275,23 +252,17 @@ impl WriteBuffer {
 
             if segment_start < clear_start {
                 let left_len = (clear_start - segment_start) as usize;
-                kept.push(Segment {
-                    offset: segment_start,
-                    data: segment.data[..left_len].to_vec(),
-                });
+                kept.insert(segment_start, data[..left_len].to_vec());
             }
 
             if clear_end < segment_end {
                 let right_start = (clear_end - segment_start) as usize;
-                kept.push(Segment {
-                    offset: clear_end,
-                    data: segment.data[right_start..].to_vec(),
-                });
+                kept.insert(clear_end, data[right_start..].to_vec());
             }
         }
 
         self.segments = kept;
-        self.total_bytes = self.segments.iter().map(|segment| segment.data.len()).sum();
+        self.total_bytes = self.segments.values().map(Vec::len).sum();
         cleared
     }
 
@@ -305,32 +276,32 @@ impl WriteBuffer {
         let mut buf = vec![0u8; read_len];
         let mut any_hit = false;
 
-        let start = self.first_segment_ending_after(read_offset);
-        for seg in &self.segments[start..] {
-            if seg.offset >= read_end {
+        let start = self.first_segment_start_ending_after(read_offset);
+        for (&segment_offset, data) in self.segments.range(start..) {
+            if segment_offset >= read_end {
                 break;
             }
-            let seg_end = seg.offset + seg.data.len() as u64;
-            if seg.offset < read_end && seg_end > read_offset {
+            let seg_end = Self::segment_end(segment_offset, data);
+            if segment_offset < read_end && seg_end > read_offset {
                 any_hit = true;
-                let copy_src_start = if seg.offset > read_offset {
+                let copy_src_start = if segment_offset > read_offset {
                     0usize
                 } else {
-                    (read_offset - seg.offset) as usize
+                    (read_offset - segment_offset) as usize
                 };
-                let copy_dst_start = if seg.offset > read_offset {
-                    (seg.offset - read_offset) as usize
+                let copy_dst_start = if segment_offset > read_offset {
+                    (segment_offset - read_offset) as usize
                 } else {
                     0usize
                 };
                 let copy_src_end = if seg_end < read_end {
-                    seg.data.len()
+                    data.len()
                 } else {
-                    (read_end - seg.offset) as usize
+                    (read_end - segment_offset) as usize
                 };
                 let copy_len = copy_src_end - copy_src_start;
                 let dst_slice = &mut buf[copy_dst_start..copy_dst_start + copy_len];
-                dst_slice.copy_from_slice(&seg.data[copy_src_start..copy_src_end]);
+                dst_slice.copy_from_slice(&data[copy_src_start..copy_src_end]);
             }
         }
 
@@ -347,13 +318,13 @@ impl WriteBuffer {
             return false;
         }
         let read_end = read_offset.saturating_add(read_len);
-        let start = self.first_segment_ending_after(read_offset);
-        for seg in &self.segments[start..] {
-            if seg.offset >= read_end {
+        let start = self.first_segment_start_ending_after(read_offset);
+        for (&segment_offset, data) in self.segments.range(start..) {
+            if segment_offset >= read_end {
                 return false;
             }
-            let seg_end = seg.offset.saturating_add(seg.data.len() as u64);
-            if seg.offset < read_end && seg_end > read_offset {
+            let seg_end = Self::segment_end(segment_offset, data);
+            if segment_offset < read_end && seg_end > read_offset {
                 return true;
             }
         }
@@ -372,32 +343,32 @@ impl WriteBuffer {
         let read_end = read_offset.saturating_add(buf.len() as u64);
         let mut any_hit = false;
 
-        let start = self.first_segment_ending_after(read_offset);
-        for seg in &self.segments[start..] {
-            if seg.offset >= read_end {
+        let start = self.first_segment_start_ending_after(read_offset);
+        for (&segment_offset, data) in self.segments.range(start..) {
+            if segment_offset >= read_end {
                 break;
             }
-            let seg_end = seg.offset.saturating_add(seg.data.len() as u64);
-            if seg.offset < read_end && seg_end > read_offset {
+            let seg_end = Self::segment_end(segment_offset, data);
+            if segment_offset < read_end && seg_end > read_offset {
                 any_hit = true;
-                let copy_src_start = if seg.offset > read_offset {
+                let copy_src_start = if segment_offset > read_offset {
                     0usize
                 } else {
-                    (read_offset - seg.offset) as usize
+                    (read_offset - segment_offset) as usize
                 };
-                let copy_dst_start = if seg.offset > read_offset {
-                    (seg.offset - read_offset) as usize
+                let copy_dst_start = if segment_offset > read_offset {
+                    (segment_offset - read_offset) as usize
                 } else {
                     0usize
                 };
                 let copy_src_end = if seg_end < read_end {
-                    seg.data.len()
+                    data.len()
                 } else {
-                    (read_end - seg.offset) as usize
+                    (read_end - segment_offset) as usize
                 };
                 let copy_len = copy_src_end - copy_src_start;
                 let dst_slice = &mut buf[copy_dst_start..copy_dst_start + copy_len];
-                dst_slice.copy_from_slice(&seg.data[copy_src_start..copy_src_end]);
+                dst_slice.copy_from_slice(&data[copy_src_start..copy_src_end]);
             }
         }
 
@@ -479,6 +450,35 @@ mod tests {
         assert_eq!(&drained[0].1, b"aaaa");
         assert_eq!(drained[1].0, 100);
         assert_eq!(&drained[1].1, b"bbbb");
+    }
+
+    #[test]
+    fn fragmented_sparse_writes_remain_sparse_and_ordered() {
+        let mut wb = WriteBuffer::new(WriteBufferConfig {
+            flush_threshold_bytes: 8 * 1024 * 1024,
+            flush_threshold_age: Duration::from_millis(50),
+        });
+        let segment_count = 4096usize;
+        let segment_len = 512usize;
+        let stride = 4096u64;
+
+        for index in (0..segment_count).rev() {
+            let mut data = vec![0_u8; segment_len];
+            data[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            wb.ingest(&data, index as u64 * stride);
+        }
+
+        assert_eq!(wb.len(), segment_count * segment_len);
+        let drained = wb.drain();
+        assert_eq!(drained.len(), segment_count);
+        for (index, (offset, data)) in drained.iter().enumerate() {
+            assert_eq!(*offset, index as u64 * stride);
+            assert_eq!(data.len(), segment_len);
+            assert_eq!(
+                u64::from_le_bytes(data[..8].try_into().expect("marker width")),
+                index as u64
+            );
+        }
     }
 
     #[test]

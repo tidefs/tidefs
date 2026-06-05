@@ -5865,8 +5865,12 @@ impl FuseVfsAdapter {
         let mut ds = self.dirty_state.lock().unwrap();
         ds.entry(ino).or_default().mark_dirty(offset, written);
         drop(ds);
+        let writeback_cache_aliases_write_page_cache = self
+            .writeback_page_cache
+            .as_ref()
+            .is_some_and(|wb_cache| Arc::ptr_eq(wb_cache, &self.write_page_cache));
         // Dirty the write-page-cache pages for writeback coordination.
-        {
+        if !writeback_cache_aliases_write_page_cache {
             let page_size = self.write_page_cache.page_size() as u64;
             let start_page = (offset / page_size) * page_size;
             let end = offset.saturating_add(written as u64);
@@ -38011,6 +38015,52 @@ mod tests {
             .expect("write-through mirror remains resident");
         let start = offset as usize;
         assert_eq!(&page.data()[start..start + payload.len()], payload);
+        assert!(!page.is_dirty());
+    }
+
+    #[test]
+    fn writeback_cached_partial_page_preserves_authoritative_tails() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-partial-page-tails.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let seed: Vec<u8> = (0..page_size).map(|index| (index % 251) as u8).collect();
+
+        fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .write(&engine_fh, 0, &seed, &ctx)
+            .expect("seed authoritative engine page");
+        assert!(fixture.adapter.write_page_cache.lookup(ino, 0).is_none());
+
+        let offset = 1234i64;
+        let payload = b"partial writeback payload";
+        let written = fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, offset, payload, FUSE_WRITE_CACHE)
+            .expect("writeback-cache partial overwrite");
+        assert_eq!(written, payload.len() as u32);
+
+        let page = fixture
+            .adapter
+            .write_page_cache
+            .lookup(ino, 0)
+            .expect("partial writeback mirror remains resident");
+        let start = offset as usize;
+        assert_eq!(&page.data()[..start], &seed[..start]);
+        assert_eq!(&page.data()[start..start + payload.len()], payload);
+        assert_eq!(
+            &page.data()[start + payload.len()..page_size],
+            &seed[start + payload.len()..]
+        );
         assert!(!page.is_dirty());
     }
 

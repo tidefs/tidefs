@@ -3833,10 +3833,9 @@ impl VfsEngine for VfsLocalFileSystem {
             );
         } else {
             // Default (mode 0): allocate + extend file size.
-            let record = fs.stat(&path).map_err(|e| map_errno(&e))?;
-            let extend_by = (offset + length).saturating_sub(record.size);
-            if extend_by > 0 {
-                fs.fallocate_file(&path, record.size, extend_by)
+            if length > 0 {
+                let _end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
+                fs.fallocate_file(&path, offset, length)
                     .map_err(|e| map_errno(&e))?;
                 let _ = fs.apply_timestamp_update(
                     fh.inode_id,
@@ -9737,6 +9736,43 @@ mod tests {
         let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
         assert_eq!(attr.posix.size, 12);
         assert_eq!(engine.read(&fh, 0, 12, &ctx()).unwrap(), vec![0; 12]);
+    }
+
+    #[test]
+    fn fallocate_mode_zero_offset_past_eof_keeps_leading_hole_unreserved() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"fallocate-offset-hole.bin", 0o644, 0, &ctx())
+            .unwrap();
+
+        let chunk = crate::constants::content_chunk_size() as u64;
+        let offset = chunk * 2;
+        let length = chunk;
+        engine.fallocate(&fh, 0, offset, length, &ctx()).unwrap();
+
+        let attr = engine.getattr(fh.inode_id, Some(&fh), &ctx()).unwrap();
+        assert_eq!(attr.posix.size, offset + length);
+        assert_eq!(
+            engine.read(&fh, 0, 4096, &ctx()).unwrap(),
+            vec![0; 4096],
+            "leading hole must read as zeros"
+        );
+
+        let fs = engine.fs.borrow();
+        assert!(
+            fs.extent_allocator()
+                .lookup_extents(fh.inode_id.0, 0, offset)
+                .is_empty(),
+            "default fallocate must not reserve bytes before the requested range"
+        );
+        let extents = fs
+            .extent_allocator()
+            .lookup_extents(fh.inode_id.0, offset, length);
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].logical_offset, offset);
+        assert_eq!(extents[0].length, length);
+        assert!(extents[0].is_unwritten());
     }
 
     #[test]
