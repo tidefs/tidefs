@@ -6,5 +6,6 @@ pub mod device;
 pub mod diag;
 mod live_owner;
 pub mod mount;
+mod offline_pool;
 pub mod pool;
 pub mod snapshot;

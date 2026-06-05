@@ -350,42 +350,8 @@ fn open_filesystem(
             super::live_owner::route_imported("dataset", operation, pool, config.pool_uuid);
         }
 
-        let lock_dir = std::env::temp_dir().join("tidefs-import");
-        if let Err(err) = std::fs::create_dir_all(&lock_dir) {
-            eprintln!(
-                "tidefsctl dataset {operation}: cannot create import lock dir {}: {err}",
-                lock_dir.display()
-            );
-            process::exit(1);
-        }
-
-        let pool_uuid = match tidefs_pool_import::pool_import(devs, &lock_dir, false, None, None) {
-            Ok(imported) => {
-                eprintln!(
-                    "tidefsctl dataset {operation}: pool '{}' imported (uuid={}, devices={})",
-                    pool,
-                    hex_uuid(&imported.config.pool_uuid),
-                    imported.config.device_count
-                );
-                imported.config.pool_uuid
-            }
-            Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
-                super::live_owner::route_imported("dataset", operation, pool, pool_uuid)
-            }
-            Err(err) => {
-                eprintln!("tidefsctl dataset {operation}: pool import failed for '{pool}': {err}");
-                process::exit(1);
-            }
-        };
-
-        let metadata_dir = PathBuf::from("/run/tidefs/pools").join(hex_uuid(&pool_uuid));
-        if let Err(err) = std::fs::create_dir_all(&metadata_dir) {
-            eprintln!(
-                "tidefsctl dataset {operation}: cannot create pool metadata dir {}: {err}",
-                metadata_dir.display()
-            );
-            process::exit(1);
-        }
+        let metadata_dir =
+            super::offline_pool::metadata_dir("dataset", operation, &config.pool_uuid);
 
         let root_auth_key = RootAuthenticationKey::from_environment()
             .unwrap_or_else(|_| RootAuthenticationKey::demo_key());
@@ -439,12 +405,6 @@ fn scan_device_pool_config(
     config
 }
 
-fn hex_uuid(uuid: &[u8; 16]) -> String {
-    uuid.iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join("")
-}
 /// Derive a stable DatasetId from a dataset name using BLAKE3.
 fn dataset_id_from_name(name: &str) -> DatasetId {
     let mut id_bytes = [0u8; 16];
@@ -1526,27 +1486,7 @@ fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -
             super::live_owner::route_imported("dataset", operation, pool, config.pool_uuid);
         }
 
-        let lock_dir = std::env::temp_dir().join("tidefs-import-keys");
-        if let Err(err) = std::fs::create_dir_all(&lock_dir) {
-            eprintln!(
-                "tidefsctl dataset {operation}: cannot create import lock dir {}: {err}",
-                lock_dir.display()
-            );
-            process::exit(1);
-        }
-
-        let pool_uuid = match tidefs_pool_import::pool_import(devs, &lock_dir, false, None, None) {
-            Ok(imported) => imported.config.pool_uuid,
-            Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
-                super::live_owner::route_imported("dataset", operation, pool, pool_uuid)
-            }
-            Err(err) => {
-                eprintln!("tidefsctl dataset {operation}: pool import failed for '{pool}': {err}");
-                process::exit(1);
-            }
-        };
-
-        return PathBuf::from("/run/tidefs/pools").join(hex_uuid(&pool_uuid));
+        return super::offline_pool::metadata_dir("dataset", operation, &config.pool_uuid);
     }
 
     super::live_owner::route("dataset", operation, pool)

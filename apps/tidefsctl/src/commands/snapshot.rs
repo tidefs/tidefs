@@ -564,45 +564,7 @@ fn import_devices_metadata_dir(devices: &[PathBuf], pool_name: &str, operation: 
         super::live_owner::route_imported("snapshot", operation, pool_name, config.pool_uuid);
     }
 
-    let lock_dir = std::env::temp_dir().join("tidefs-import");
-    if let Err(err) = std::fs::create_dir_all(&lock_dir) {
-        eprintln!(
-            "tidefsctl snapshot {operation}: cannot create import lock dir {}: {err}",
-            lock_dir.display()
-        );
-        process::exit(1);
-    }
-
-    let pool_uuid = match tidefs_pool_import::pool_import(devices, &lock_dir, false, None, None) {
-        Ok(imported) => {
-            eprintln!(
-                "tidefsctl snapshot {operation}: pool '{}' imported (uuid={}, devices={})",
-                pool_name,
-                hex_uuid(&imported.config.pool_uuid),
-                imported.config.device_count
-            );
-            imported.config.pool_uuid
-        }
-        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
-            super::live_owner::route_imported("snapshot", operation, pool_name, pool_uuid)
-        }
-        Err(err) => {
-            eprintln!(
-                "tidefsctl snapshot {operation}: pool import failed for '{pool_name}': {err}"
-            );
-            process::exit(1);
-        }
-    };
-
-    let metadata_dir = PathBuf::from("/run/tidefs/pools").join(hex_uuid(&pool_uuid));
-    if let Err(err) = std::fs::create_dir_all(&metadata_dir) {
-        eprintln!(
-            "tidefsctl snapshot {operation}: cannot create pool metadata dir {}: {err}",
-            metadata_dir.display()
-        );
-        process::exit(1);
-    }
-    metadata_dir
+    super::offline_pool::metadata_dir("snapshot", operation, &config.pool_uuid)
 }
 
 fn scan_device_pool_config(
@@ -636,13 +598,6 @@ fn scan_device_pool_config(
         process::exit(1);
     }
     config
-}
-
-fn hex_uuid(uuid: &[u8; 16]) -> String {
-    uuid.iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 fn root_authentication_key() -> RootAuthenticationKey {

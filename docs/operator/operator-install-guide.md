@@ -286,8 +286,10 @@ tidefsctl snapshot receive --backing-dir /tmp/received-pool --input /tmp/mypool.
 ```
 
 For exported/offline pools, the same dataset and snapshot commands may take
-`--devices`. If those devices already identify an imported `ACTIVE` pool, the
-CLI refuses direct storage access and routes to the owner.
+`--devices`. That direct-device form stays offline; it does not import the pool
+or create `/run/tidefs/pools/<uuid>` runtime ownership as a side effect. If
+those devices already identify an imported `ACTIVE` pool, the CLI refuses
+direct storage access and routes to the owner.
 
 ### 6.3 Block device export
 

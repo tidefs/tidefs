@@ -564,6 +564,10 @@ fn handle_pool_import(
         None,
     ) {
         Ok(imp) => imp,
+        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
+            let config = assemble_device_pool_config(&devices, "import");
+            super::live_owner::route_imported("pool", "import", &config.pool_name, pool_uuid)
+        }
         Err(err) => {
             eprintln!("tidefsctl: pool import failed: {err}");
             process::exit(1);
@@ -1424,34 +1428,7 @@ fn open_pool_property_filesystem(
     ensure_device_pool_name(pool, operation, &config);
     route_active_device_pool(operation, pool, &config);
 
-    let lock_dir = std::env::temp_dir().join("tidefs-import-pool-properties");
-    if let Err(err) = std::fs::create_dir_all(&lock_dir) {
-        eprintln!(
-            "tidefsctl pool {operation}: cannot create import lock dir {}: {err}",
-            lock_dir.display()
-        );
-        process::exit(1);
-    }
-
-    let pool_uuid = match tidefs_pool_import::pool_import(devs, &lock_dir, false, None, None) {
-        Ok(imported) => imported.config.pool_uuid,
-        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
-            super::live_owner::route_imported("pool", operation, pool, pool_uuid)
-        }
-        Err(err) => {
-            eprintln!("tidefsctl pool {operation}: pool import failed for '{pool}': {err}");
-            process::exit(1);
-        }
-    };
-
-    let metadata_dir = PathBuf::from("/run/tidefs/pools").join(hex_guid(&pool_uuid));
-    if let Err(err) = std::fs::create_dir_all(&metadata_dir) {
-        eprintln!(
-            "tidefsctl pool {operation}: cannot create pool metadata dir {}: {err}",
-            metadata_dir.display()
-        );
-        process::exit(1);
-    }
+    let metadata_dir = super::offline_pool::metadata_dir("pool", operation, &config.pool_uuid);
 
     let root_auth_key = RootAuthenticationKey::from_environment()
         .unwrap_or_else(|_| RootAuthenticationKey::demo_key());

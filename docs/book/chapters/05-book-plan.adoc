@@ -52,7 +52,7 @@ The first useful book milestone is the operator guide:
 * top-level `tidefsctl` taxonomy;
 * imported-pool owner routing: pool-name commands talk to the live kernel or
   userspace owner, while `--devices`/`--backing-dir` spell offline or
-  not-yet-imported access;
+  not-yet-imported access and do not create hidden runtime ownership;
 * pool lifecycle commands;
 * dataset lifecycle and properties;
 * snapshot lifecycle;

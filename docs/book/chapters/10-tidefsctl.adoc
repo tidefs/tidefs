@@ -39,11 +39,13 @@ or daemon client exists, that form should fail closed.
 
 Offline inputs are explicit. Commands that operate on a pool that is not
 imported must say how to find it with arguments such as `--devices` or
-`--backing-dir`. Those arguments authorize import, repair, discovery, or
-offline inspection; they are not the ordinary path for mutating an already
-imported pool. If explicit devices assemble as an imported `ACTIVE` pool,
-the command still has to route through the owner of that live state instead
-of opening the devices directly.
+`--backing-dir`. Those arguments authorize offline work on exported storage,
+repair, discovery, or explicit import when the command is `pool import` or an
+import-and-mount harness. Dataset, snapshot, and property commands must not
+turn an exported device set into an imported runtime as a side effect. If
+explicit devices assemble as an imported `ACTIVE` pool, the command still has
+to route through the owner of that live state instead of opening the devices
+directly.
 
 Do not implement positional pool-name usability by reopening
 `/run/tidefs/pools/<name>`, by treating the pool name as a backing path, or by
