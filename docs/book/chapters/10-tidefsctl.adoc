@@ -45,11 +45,11 @@ registry entry; both are live-owner interfaces, not authorization to reopen
 devices directly. That socket currently handles live `pool status`, pool
 properties, dataset catalog create/list/rename/destroy and dataset property
 queries/mutations, dataset set-strategy/upgrade feature mutations, snapshot
-create/list/destroy/rollback, and owner-mediated `pool export` shutdown. Those
-operations run against the mounted engine that owns cached state. Snapshot
-send/receive, dataset key commands, live destroy, live device removal
-execution, and live block attach/export/send/receive still fail closed where
-the owner-side implementation is missing.
+create/list/destroy/rollback, dataset key sealing/rotation, and
+owner-mediated `pool export` shutdown. Those operations run against the
+mounted engine that owns cached state. Snapshot send/receive, live destroy,
+live device removal execution, and live block attach/export/send/receive still
+fail closed where the owner-side implementation is missing.
 
 Offline inputs are explicit. Commands that operate on a pool that is not
 imported must say how to find it with arguments such as `--devices` or
@@ -89,6 +89,8 @@ tidefsctl pool set <pool> <property>=<value>
 tidefsctl dataset create <pool> <dataset>
 tidefsctl dataset list <pool>
 tidefsctl dataset set <pool> <dataset> <property>=<value>
+tidefsctl dataset seal-key <pool> <dataset> --passphrase <phrase>
+tidefsctl dataset rotate-key <pool> --old-passphrase <phrase> --old-salt <hex> --new-passphrase <phrase>
 tidefsctl snapshot create <pool> <snapshot>
 tidefsctl snapshot list <pool>
 tidefsctl pool export <pool>

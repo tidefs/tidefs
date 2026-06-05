@@ -46,6 +46,30 @@ const KEYSTORE_PREFIX: &str = "__tidefs_keystore__";
 /// Object-store key for the dataset manifest.
 const MANIFEST_KEY: &str = "__tidefs_keystore_manifest__";
 
+fn sealed_dek_key(dataset_id: &str) -> String {
+    format!("{KEYSTORE_PREFIX}/{dataset_id}")
+}
+
+fn load_manifest_from_store(store: &LocalObjectStore) -> Result<Vec<String>> {
+    match store.get_named(MANIFEST_KEY)? {
+        Some(data) => {
+            let text = String::from_utf8(data).map_err(|_| EncryptionError::DecryptionFailed)?;
+            Ok(text
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+fn save_manifest_to_store(store: &mut LocalObjectStore, datasets: &[String]) -> Result<()> {
+    let text = datasets.join("\n");
+    store.put_named(MANIFEST_KEY, text.as_bytes())?;
+    Ok(())
+}
+
 // ── SealedDEK ──────────────────────────────────────────────────────────
 
 /// A [`DatasetDEK`] encrypted under a [`PoolWrappingKey`] with metadata.
@@ -270,30 +294,17 @@ impl KeyStore {
 
     /// Build the store key for a dataset's sealed DEK.
     fn sealed_dek_key(dataset_id: &str) -> String {
-        format!("{KEYSTORE_PREFIX}/{dataset_id}")
+        sealed_dek_key(dataset_id)
     }
 
     /// Read the manifest (newline-separated dataset ids).
     fn load_manifest(&self) -> Result<Vec<String>> {
-        match self.store.get_named(MANIFEST_KEY)? {
-            Some(data) => {
-                let text =
-                    String::from_utf8(data).map_err(|_| EncryptionError::DecryptionFailed)?;
-                Ok(text
-                    .lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .collect())
-            }
-            None => Ok(Vec::new()),
-        }
+        load_manifest_from_store(&self.store)
     }
 
     /// Write the manifest.
     fn save_manifest(&mut self, datasets: &[String]) -> Result<()> {
-        let text = datasets.join("\n");
-        self.store.put_named(MANIFEST_KEY, text.as_bytes())?;
-        Ok(())
+        save_manifest_to_store(&mut self.store, datasets)
     }
 
     // ── Operations ──────────────────────────────────────────────────
@@ -356,6 +367,158 @@ impl KeyStore {
     }
 }
 
+/// Borrowed sealed-DEK storage over an already-open object store.
+///
+/// This is the live-owner counterpart to [`KeyStore`]: callers that already
+/// own imported pool state can update the keystore through that owner instead
+/// of opening a second object-store handle behind it.
+pub struct BorrowedKeyStore<'a> {
+    store: &'a mut LocalObjectStore,
+    salt: [u8; SALT_LEN],
+    stats: KeyManagerStats,
+}
+
+impl<'a> BorrowedKeyStore<'a> {
+    /// Create a borrowed keystore over an owner-managed [`LocalObjectStore`].
+    pub fn new(store: &'a mut LocalObjectStore, salt: [u8; SALT_LEN]) -> Self {
+        Self {
+            store,
+            salt,
+            stats: KeyManagerStats::default(),
+        }
+    }
+
+    /// Return the salt used for wrapping-key derivation.
+    pub fn salt(&self) -> &[u8; SALT_LEN] {
+        &self.salt
+    }
+
+    /// Update the salt after a successful rekey.
+    pub fn set_salt(&mut self, salt: [u8; SALT_LEN]) {
+        self.salt = salt;
+    }
+
+    /// Return a reference to the borrowed object store.
+    pub fn store(&self) -> &LocalObjectStore {
+        &*self.store
+    }
+
+    /// Return a mutable reference to the borrowed object store.
+    pub fn store_mut(&mut self) -> &mut LocalObjectStore {
+        &mut *self.store
+    }
+
+    /// Return cumulative key-manager statistics for this borrowed view.
+    pub fn stats(&self) -> KeyManagerStats {
+        self.stats
+    }
+
+    fn load_manifest(&self) -> Result<Vec<String>> {
+        load_manifest_from_store(&*self.store)
+    }
+
+    fn save_manifest(&mut self, datasets: &[String]) -> Result<()> {
+        save_manifest_to_store(&mut *self.store, datasets)
+    }
+
+    /// Store a sealed DEK for a dataset in the borrowed owner store.
+    pub fn store_sealed_dek(&mut self, sealed: &SealedDEK) -> Result<()> {
+        let key = sealed_dek_key(&sealed.dataset_id);
+        self.store.put_named(&key, &sealed.to_bytes())?;
+
+        let mut ds = self.load_manifest()?;
+        if !ds.contains(&sealed.dataset_id) {
+            ds.push(sealed.dataset_id.clone());
+            self.save_manifest(&ds)?;
+        }
+
+        self.stats.keys_sealed = self.stats.keys_sealed.saturating_add(1);
+        self.stats.datasets_encrypted = self.stats.datasets_encrypted.saturating_add(1);
+        Ok(())
+    }
+
+    /// Load the sealed DEK for `dataset_id`, if one exists.
+    pub fn load_sealed_dek(&self, dataset_id: &str) -> Result<Option<SealedDEK>> {
+        let key = sealed_dek_key(dataset_id);
+        let data = match self.store.get_named(&key)? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        SealedDEK::from_bytes(&data).map(Some)
+    }
+
+    /// List all dataset ids that have a sealed DEK in the borrowed store.
+    pub fn list_datasets(&self) -> Result<Vec<String>> {
+        self.load_manifest()
+    }
+
+    /// Delete the sealed DEK for `dataset_id` from the borrowed store.
+    pub fn delete_sealed_dek(&mut self, dataset_id: &str) -> Result<bool> {
+        let key = sealed_dek_key(dataset_id);
+        let existed = self.store.delete_named(&key)?;
+
+        if existed {
+            let mut ds = self.load_manifest()?;
+            ds.retain(|d| d != dataset_id);
+            self.save_manifest(&ds)?;
+        }
+
+        Ok(existed)
+    }
+}
+
+trait KeyStoreAccess {
+    fn salt(&self) -> &[u8; SALT_LEN];
+    fn set_salt(&mut self, salt: [u8; SALT_LEN]);
+    fn store_sealed_dek(&mut self, sealed: &SealedDEK) -> Result<()>;
+    fn load_sealed_dek(&self, dataset_id: &str) -> Result<Option<SealedDEK>>;
+    fn list_datasets(&self) -> Result<Vec<String>>;
+}
+
+impl KeyStoreAccess for KeyStore {
+    fn salt(&self) -> &[u8; SALT_LEN] {
+        KeyStore::salt(self)
+    }
+
+    fn set_salt(&mut self, salt: [u8; SALT_LEN]) {
+        KeyStore::set_salt(self, salt);
+    }
+
+    fn store_sealed_dek(&mut self, sealed: &SealedDEK) -> Result<()> {
+        KeyStore::store_sealed_dek(self, sealed)
+    }
+
+    fn load_sealed_dek(&self, dataset_id: &str) -> Result<Option<SealedDEK>> {
+        KeyStore::load_sealed_dek(self, dataset_id)
+    }
+
+    fn list_datasets(&self) -> Result<Vec<String>> {
+        KeyStore::list_datasets(self)
+    }
+}
+
+impl KeyStoreAccess for BorrowedKeyStore<'_> {
+    fn salt(&self) -> &[u8; SALT_LEN] {
+        BorrowedKeyStore::salt(self)
+    }
+
+    fn set_salt(&mut self, salt: [u8; SALT_LEN]) {
+        BorrowedKeyStore::set_salt(self, salt);
+    }
+
+    fn store_sealed_dek(&mut self, sealed: &SealedDEK) -> Result<()> {
+        BorrowedKeyStore::store_sealed_dek(self, sealed)
+    }
+
+    fn load_sealed_dek(&self, dataset_id: &str) -> Result<Option<SealedDEK>> {
+        BorrowedKeyStore::load_sealed_dek(self, dataset_id)
+    }
+
+    fn list_datasets(&self) -> Result<Vec<String>> {
+        BorrowedKeyStore::list_datasets(self)
+    }
+}
+
 // ── KeyRotation ────────────────────────────────────────────────────────
 
 /// Key-rotation operations.
@@ -388,6 +551,25 @@ impl KeyRotation {
         new_passphrase: &str,
         new_salt: &[u8; SALT_LEN],
         keystore: &mut KeyStore,
+    ) -> Result<KeyManagerStats> {
+        Self::rekey_wrapping_key_impl(old_passphrase, new_passphrase, new_salt, keystore)
+    }
+
+    /// Rekey all sealed DEKs through a borrowed owner-managed store.
+    pub fn rekey_borrowed_wrapping_key(
+        old_passphrase: &str,
+        new_passphrase: &str,
+        new_salt: &[u8; SALT_LEN],
+        keystore: &mut BorrowedKeyStore<'_>,
+    ) -> Result<KeyManagerStats> {
+        Self::rekey_wrapping_key_impl(old_passphrase, new_passphrase, new_salt, keystore)
+    }
+
+    fn rekey_wrapping_key_impl(
+        old_passphrase: &str,
+        new_passphrase: &str,
+        new_salt: &[u8; SALT_LEN],
+        keystore: &mut impl KeyStoreAccess,
     ) -> Result<KeyManagerStats> {
         let old_wk = PoolWrappingKey::derive(old_passphrase, keystore.salt())?;
         let new_wk = PoolWrappingKey::derive(new_passphrase, new_salt)?;

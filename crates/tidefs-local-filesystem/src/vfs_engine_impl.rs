@@ -44,6 +44,10 @@ use tidefs_posix_semantics::sticky_dir_allows_unlink_or_rename;
 
 use crate::namespace::rename::RenameAt2Flags;
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType, SyncGuarantee};
+#[cfg(feature = "encryption")]
+use tidefs_encryption::key_hierarchy::{DatasetDEK, PoolWrappingKey, SALT_LEN};
+#[cfg(feature = "encryption")]
+use tidefs_encryption::key_manager::{BorrowedKeyStore, KeyManager, KeyRotation};
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 
 // DirCursor-backed readdir with BLAKE3-verified entry iteration.
@@ -1166,6 +1170,8 @@ impl VfsLocalFileSystem {
             ("dataset", "destroy") => self.live_dataset_destroy(args),
             ("dataset", "set-strategy") => self.live_dataset_set_strategy(args),
             ("dataset", "upgrade") => self.live_dataset_upgrade(args),
+            ("dataset", "seal-key") => self.live_dataset_seal_key(args),
+            ("dataset", "rotate-key") => self.live_dataset_rotate_key(args),
             ("dataset", "get") => self.live_dataset_get(pool, args),
             ("dataset", "set") => self.live_dataset_set(pool, args),
             ("dataset", "list-props") => self.live_dataset_list_props(pool, args),
@@ -1643,6 +1649,135 @@ impl VfsLocalFileSystem {
         }
     }
 
+    #[cfg(feature = "encryption")]
+    fn live_dataset_seal_key(&self, args: &Value) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let passphrase = match live_admin_arg(args, "passphrase") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+
+        if !self.fs.borrow().dataset_catalog().contains(name) {
+            return live_admin_error(
+                1,
+                format!("dataset seal-key: dataset '{name}' does not exist in the catalog"),
+            );
+        }
+
+        let salt = PoolWrappingKey::generate_salt();
+        let wk = match PoolWrappingKey::derive(passphrase, &salt) {
+            Ok(key) => key,
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("dataset seal-key: failed to derive wrapping key: {err}"),
+                )
+            }
+        };
+        let dek = DatasetDEK::generate();
+        let sealed = match KeyManager::seal_dek(&dek, &wk, name, 1) {
+            Ok(sealed) => sealed,
+            Err(err) => {
+                return live_admin_error(1, format!("dataset seal-key: failed to seal DEK: {err}"))
+            }
+        };
+
+        let mut fs = self.fs.borrow_mut();
+        let mut keystore = BorrowedKeyStore::new(fs.store.raw_primary_store_mut(), salt);
+        if let Err(err) = keystore.store_sealed_dek(&sealed) {
+            return live_admin_error(
+                1,
+                format!("dataset seal-key: failed to store sealed DEK: {err}"),
+            );
+        }
+
+        let salt_hex = salt_to_hex(&salt);
+        live_admin_ok_text(format!(
+            "dataset '{name}' encryption key sealed (kek_generation=1)\n  salt: {salt_hex}\n  save this salt; it is required for key rotation"
+        ))
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    fn live_dataset_seal_key(&self, _args: &Value) -> Vec<u8> {
+        live_admin_error(
+            1,
+            "dataset seal-key: live owner was built without encryption support",
+        )
+    }
+
+    #[cfg(feature = "encryption")]
+    fn live_dataset_rotate_key(&self, args: &Value) -> Vec<u8> {
+        let old_passphrase = match live_admin_arg(args, "old_passphrase") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let old_salt_hex = match live_admin_arg(args, "old_salt") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let new_passphrase = match live_admin_arg(args, "new_passphrase") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let old_salt = match live_admin_hex_to_salt(old_salt_hex) {
+            Ok(salt) => salt,
+            Err(err) => {
+                return live_admin_error(1, format!("dataset rotate-key: invalid old_salt: {err}"))
+            }
+        };
+        let new_salt = PoolWrappingKey::generate_salt();
+
+        let mut fs = self.fs.borrow_mut();
+        let mut keystore = BorrowedKeyStore::new(fs.store.raw_primary_store_mut(), old_salt);
+        let datasets = match keystore.list_datasets() {
+            Ok(datasets) => datasets,
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("dataset rotate-key: failed to list datasets: {err}"),
+                )
+            }
+        };
+        if datasets.is_empty() {
+            return live_admin_error(
+                1,
+                "dataset rotate-key: no datasets with sealed DEKs in imported pool",
+            );
+        }
+
+        let stats = match KeyRotation::rekey_borrowed_wrapping_key(
+            old_passphrase,
+            new_passphrase,
+            &new_salt,
+            &mut keystore,
+        ) {
+            Ok(stats) => stats,
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("dataset rotate-key: key rotation failed: {err}"),
+                )
+            }
+        };
+
+        let new_salt_hex = salt_to_hex(&new_salt);
+        live_admin_ok_text(format!(
+            "key rotation complete: {} dataset(s) re-wrapped\n  new salt: {new_salt_hex}\n  save this salt for future rotations",
+            stats.keys_rotated
+        ))
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    fn live_dataset_rotate_key(&self, _args: &Value) -> Vec<u8> {
+        live_admin_error(
+            1,
+            "dataset rotate-key: live owner was built without encryption support",
+        )
+    }
+
     fn live_dataset_get(&self, _pool: &str, args: &Value) -> Vec<u8> {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
@@ -2023,6 +2158,34 @@ fn live_admin_encode(value: Value) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap_or_else(|_| {
         br#"{"ok":false,"exit_code":2,"error":"encode live admin response"}"#.to_vec()
     })
+}
+
+#[cfg(feature = "encryption")]
+fn salt_to_hex(salt: &[u8; SALT_LEN]) -> String {
+    salt.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(feature = "encryption")]
+fn live_admin_hex_to_salt(hex: &str) -> Result<[u8; SALT_LEN], String> {
+    let hex = hex.trim();
+    if hex.len() != SALT_LEN * 2 {
+        return Err(format!(
+            "expected {} hex chars ({} bytes), got {}",
+            SALT_LEN * 2,
+            SALT_LEN,
+            hex.len()
+        ));
+    }
+    let mut salt = [0u8; SALT_LEN];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let byte = u8::from_str_radix(
+            std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in hex string".to_string())?,
+            16,
+        )
+        .map_err(|err| format!("invalid hex byte at position {}: {err}", i * 2))?;
+        salt[i] = byte;
+    }
+    Ok(salt)
 }
 
 fn parse_sync_guarantee(value: &str) -> Option<SyncGuarantee> {
@@ -4048,6 +4211,109 @@ mod tests {
                 "supported feature {feature} should be enabled",
             );
         }
+    }
+
+    #[cfg(feature = "encryption")]
+    fn live_response_salt(response: &Value, label: &str) -> [u8; SALT_LEN] {
+        let text = response["text"].as_str().expect("live admin text");
+        let hex = text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(label))
+            .map(str::trim)
+            .expect("salt line");
+        live_admin_hex_to_salt(hex).expect("salt hex")
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn live_dataset_seal_key_stores_mounted_keystore_entry() {
+        let (engine, _td) = temp_fs();
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "demo",
+                "parent": "root",
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true, "create response: {created}");
+
+        let sealed = live_dataset_admin(
+            &engine,
+            "seal-key",
+            json!({
+                "name": "demo",
+                "passphrase": "initial passphrase",
+            }),
+        );
+
+        assert_eq!(sealed["ok"], true, "seal-key response: {sealed}");
+        let _salt = live_response_salt(&sealed, "salt:");
+
+        let mut fs = engine.fs.borrow_mut();
+        let keystore = BorrowedKeyStore::new(fs.store.raw_primary_store_mut(), [0; SALT_LEN]);
+        let datasets = keystore.list_datasets().expect("list live keystore");
+        assert_eq!(datasets, vec!["demo".to_string()]);
+        let loaded = keystore
+            .load_sealed_dek("demo")
+            .expect("load live sealed DEK")
+            .expect("sealed DEK");
+        assert_eq!(loaded.dataset_id, "demo");
+        assert_eq!(loaded.kek_generation, 1);
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn live_dataset_rotate_key_rewraps_mounted_keystore_entry() {
+        let (engine, _td) = temp_fs();
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "demo",
+                "parent": "root",
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true, "create response: {created}");
+
+        let sealed = live_dataset_admin(
+            &engine,
+            "seal-key",
+            json!({
+                "name": "demo",
+                "passphrase": "initial passphrase",
+            }),
+        );
+        assert_eq!(sealed["ok"], true, "seal-key response: {sealed}");
+        let old_salt = live_response_salt(&sealed, "salt:");
+
+        let rotated = live_dataset_admin(
+            &engine,
+            "rotate-key",
+            json!({
+                "old_passphrase": "initial passphrase",
+                "old_salt": salt_to_hex(&old_salt),
+                "new_passphrase": "rotated passphrase",
+            }),
+        );
+
+        assert_eq!(rotated["ok"], true, "rotate-key response: {rotated}");
+        let new_salt = live_response_salt(&rotated, "new salt:");
+
+        let mut fs = engine.fs.borrow_mut();
+        let keystore = BorrowedKeyStore::new(fs.store.raw_primary_store_mut(), new_salt);
+        let loaded = keystore
+            .load_sealed_dek("demo")
+            .expect("load rotated sealed DEK")
+            .expect("sealed DEK");
+        assert_eq!(loaded.kek_generation, 2);
+
+        let new_wk = PoolWrappingKey::derive("rotated passphrase", &new_salt).unwrap();
+        assert!(KeyManager::unseal_dek(&loaded, &new_wk).is_ok());
+        let old_wk = PoolWrappingKey::derive("initial passphrase", &old_salt).unwrap();
+        assert!(KeyManager::unseal_dek(&loaded, &old_wk).is_err());
     }
 
     fn temp_fs_with_content_capacity(

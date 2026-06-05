@@ -272,7 +272,7 @@ fn dispatch_request(
         | (
             "dataset",
             "create" | "list" | "rename" | "destroy" | "set-strategy" | "upgrade" | "get" | "set"
-            | "list-props",
+            | "list-props" | "seal-key" | "rotate-key",
         )
         | ("snapshot", "create" | "list" | "destroy" | "rollback")
         | ("device", "remove") => delegate_admin_request(&request, engine),

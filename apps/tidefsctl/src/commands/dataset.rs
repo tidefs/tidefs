@@ -1429,6 +1429,14 @@ fn handle_seal_key(args: DatasetSealKeyArgs) {
     use tidefs_encryption::key_manager::{KeyManager, KeyStore};
     use tidefs_local_object_store::StoreOptions;
 
+    let live_args = serde_json::json!({
+        "name": args.name.as_str(),
+        "passphrase": args.passphrase.as_str(),
+    });
+    let devices_ref = args.devices.as_deref();
+    let pool_path =
+        resolve_pool_path_with_live_args(&args.pool, devices_ref, "seal-key", live_args);
+
     // Generate a random salt for the wrapping key derivation.
     let salt = PoolWrappingKey::generate_salt();
 
@@ -1452,10 +1460,6 @@ fn handle_seal_key(args: DatasetSealKeyArgs) {
             process::exit(1);
         }
     };
-
-    // Open the keystore at the pool path.
-    let devices_ref = args.devices.as_deref();
-    let pool_path = resolve_pool_path(&args.pool, devices_ref, "seal-key");
 
     let mut keystore = match KeyStore::open_with_options(&pool_path, StoreOptions::default(), salt)
     {
@@ -1490,6 +1494,15 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
     use tidefs_encryption::key_manager::{KeyRotation, KeyStore};
     use tidefs_local_object_store::StoreOptions;
 
+    let live_args = serde_json::json!({
+        "old_passphrase": args.old_passphrase.as_str(),
+        "old_salt": args.old_salt.as_str(),
+        "new_passphrase": args.new_passphrase.as_str(),
+    });
+    let devices_ref = args.devices.as_deref();
+    let pool_path =
+        resolve_pool_path_with_live_args(&args.pool, devices_ref, "rotate-key", live_args);
+
     // Decode the old salt from hex.
     let old_salt = match hex_to_salt(&args.old_salt) {
         Ok(s) => s,
@@ -1501,10 +1514,6 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
 
     // Generate a fresh salt for the new wrapping key.
     let new_salt = PoolWrappingKey::generate_salt();
-
-    // Open the keystore at the pool path with the old salt.
-    let devices_ref = args.devices.as_deref();
-    let pool_path = resolve_pool_path(&args.pool, devices_ref, "rotate-key");
 
     let mut keystore =
         match KeyStore::open_with_options(&pool_path, StoreOptions::default(), old_salt) {
@@ -1567,7 +1576,12 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
 ///
 /// Pool-name-only key commands must use the imported-pool owner client, not
 /// reopen the path named by the pool identity.
-fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -> PathBuf {
+fn resolve_pool_path_with_live_args(
+    pool: &str,
+    devices: Option<&[PathBuf]>,
+    operation: &str,
+    live_args: serde_json::Value,
+) -> PathBuf {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
         super::live_owner::route_or_refuse_active_for_uuid_with_args(
@@ -1576,13 +1590,13 @@ fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -
             pool,
             config.pool_uuid,
             config.state == tidefs_types_pool_label_core::PoolState::Active,
-            serde_json::Value::Null,
+            live_args,
         );
 
         return super::offline_pool::metadata_dir("dataset", operation, &config.pool_uuid);
     }
 
-    super::live_owner::route("dataset", operation, pool)
+    super::live_owner::route_with_args("dataset", operation, pool, live_args)
 }
 /// Decode a hex-encoded 16-byte salt string into `[u8; SALT_LEN]`.
 fn hex_to_salt(hex: &str) -> Result<[u8; tidefs_encryption::key_hierarchy::SALT_LEN], String> {
