@@ -182,10 +182,11 @@ impl DeviceRemovalHooks for CliRemovalHooks {
 }
 
 /// Build a post-removal PoolConfig by calling PoolConfig::remove_device on the
-/// imported pre-removal config. This preserves pool UUID, name, feature flags,
-/// device GUIDs, and topology generation from the authoritative pool labels.
+/// label-derived pre-removal config. This preserves pool UUID, name, feature
+/// flags, device GUIDs, and topology generation from the authoritative pool
+/// labels.
 ///
-/// Returns an error if the target device is not found in the imported config.
+/// Returns an error if the target device is not found in the label-derived config.
 fn build_post_removal_pool_config(
     pre_config: &PoolConfig,
     target_device_path: &std::path::Path,
@@ -290,12 +291,11 @@ fn handle_remove(
     // before any offline evacuation store is opened writable.
     let pre_config = import_offline_pool_config(pool_name, backing_dir)?;
 
-    super::live_owner::route_or_refuse_active_for_uuid_with_args(
+    super::live_owner::route_if_owner_exists_for_uuid_with_args(
         "device",
         "remove",
         pool_name,
         pre_config.pool_uuid,
-        pre_config.state == tidefs_types_pool_label_core::PoolState::Active,
         live_args,
     );
 
@@ -324,14 +324,14 @@ fn handle_remove(
     eprintln!("Replication intent: {intent}");
     eprintln!("Target device for removal: {}", device_path.display());
 
-    // Derive target and surviving devices from the imported pool membership.
-    // The target device path must match a leaf in the imported config.
+    // Derive target and surviving devices from the label-derived pool
+    // membership. The target device path must match a leaf in that config.
     let target_in_config = pre_config
         .device_tree
         .find_leaf(device_path)
         .ok_or_else(|| {
             format!(
-                "target device {} not found in imported pool config;                  pool has {} devices",
+                "target device {} not found in label-derived pool config; pool has {} devices",
                 device_path.display(),
                 pre_config.device_count,
             )
@@ -435,7 +435,7 @@ fn handle_remove(
         .map(|(i, p)| (p.clone(), i))
         .collect();
 
-    // Compute the plan using the imported topology generation.
+    // Compute the plan using the label-derived topology generation.
     let plan = DeviceRemovalPlanner::plan_removal(
         &device_tree,
         device_path,
@@ -462,7 +462,7 @@ fn handle_remove(
 
     let mut state = DeviceRemovalState::new(device_path.clone(), target_leaf_guid);
 
-    // Build the post-removal config by calling remove_device on the imported config.
+    // Build the post-removal config by calling remove_device on the label-derived config.
     let post_config = build_post_removal_pool_config(&pre_config, device_path)?;
 
     let mut hooks = CliRemovalHooks {
@@ -473,7 +473,7 @@ fn handle_remove(
     };
 
     // Map the plan's synthetic surviving device paths to store indices.
-    // The plan derives surviving paths from the imported config (e.g. /dev/disk1),
+    // The plan derives surviving paths from the label-derived config (e.g. /dev/disk1),
     // but we need them to point to the actual store directories.
     {
         let surv_indices: Vec<u32> = pre_config
@@ -939,11 +939,11 @@ mod tests {
         );
         assert!(
             result.is_err(),
-            "expected error when target not in imported config"
+            "expected error when target not in label-derived config"
         );
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("not found in imported pool config"),
+            msg.contains("not found in label-derived pool config"),
             "unexpected error: {msg}",
         );
     }

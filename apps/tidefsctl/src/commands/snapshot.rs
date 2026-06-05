@@ -570,12 +570,11 @@ fn import_devices_metadata_dir(
     live_args: serde_json::Value,
 ) -> PathBuf {
     let config = scan_device_pool_config(pool_name, devices, operation);
-    super::live_owner::route_or_refuse_active_for_uuid_with_args(
+    super::live_owner::route_if_owner_exists_for_uuid_with_args(
         "snapshot",
         operation,
         pool_name,
         config.pool_uuid,
-        config.state == tidefs_types_pool_label_core::PoolState::Active,
         live_args,
     );
 
