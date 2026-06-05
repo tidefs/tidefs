@@ -798,6 +798,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cli_parse_block_send_live_pool_positional() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "block",
+            "send",
+            "mypool",
+            "--target-addr",
+            "127.0.0.1:9000",
+        ]);
+        assert!(args.is_ok(), "block send with positional pool should parse");
+    }
+
+    #[test]
+    fn cli_parse_block_send_offline_backing_dir() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "block",
+            "send",
+            "mypool",
+            "--backing-dir",
+            "/var/lib/tidefs/mypool",
+            "--target-addr",
+            "127.0.0.1:9000",
+        ]);
+        assert!(args.is_ok(), "block send offline backing dir should parse");
+    }
+
+    #[test]
+    fn cli_parse_block_receive_live_pool_positional() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "block",
+            "receive",
+            "mypool",
+            "--source-addr",
+            "127.0.0.1:9000",
+        ]);
+        assert!(
+            args.is_ok(),
+            "block receive with positional pool should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_block_receive_offline_backing_dir() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "block",
+            "receive",
+            "mypool",
+            "--backing-dir",
+            "/var/lib/tidefs/received",
+            "--source-addr",
+            "127.0.0.1:9000",
+        ]);
+        assert!(
+            args.is_ok(),
+            "block receive offline backing dir should parse"
+        );
+    }
+
     // -- Dataset CLI parse tests ------------------------------------------
 
     #[test]

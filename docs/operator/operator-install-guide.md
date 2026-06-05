@@ -318,7 +318,9 @@ The pool-name form routes to the live owner. If the FUSE, ublk, or kernel
 owner does not implement block export yet, it fails closed instead of opening
 storage behind that owner. The `--backing-dir` form is only for exported or
 offline object-store development paths and checks for an existing owner before
-opening the backing directory.
+opening the backing directory. `tidefsctl block send` and
+`tidefsctl block receive` follow the same split: pool-name form through the
+owner, explicit `--backing-dir` for exported/offline object-store work.
 
 ### 6.4 Device management
 

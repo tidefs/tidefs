@@ -49,8 +49,8 @@ queries/mutations, snapshot create/list/destroy/rollback, owner-mediated
 boundaries. Those
 operations run against the mounted engine that owns cached state. Snapshot
 send/receive, dataset key commands, live destroy, live device removal
-execution, and live block export still fail closed where the owner-side
-implementation is missing.
+execution, and live block export/send/receive still fail closed where the
+owner-side implementation is missing.
 
 Offline inputs are explicit. Commands that operate on a pool that is not
 imported must say how to find it with arguments such as `--devices` or
@@ -91,6 +91,8 @@ tidefsctl snapshot list <pool>
 tidefsctl pool export <pool>
 tidefsctl device remove <pool> <device>
 tidefsctl block attach <pool>
+tidefsctl block send <pool> --target-addr <addr>
+tidefsctl block receive <pool> --source-addr <addr>
 ----
 
 The exported/offline device-removal form spells its storage handles
@@ -100,6 +102,8 @@ explicitly:
 ----
 tidefsctl device remove <pool> <device> --backing-dir <target-store> --surviving-dirs <stores>
 tidefsctl block attach <pool> --backing-dir <object-store>
+tidefsctl block send <pool> --backing-dir <object-store> --target-addr <addr>
+tidefsctl block receive <pool> --backing-dir <object-store> --source-addr <addr>
 ----
 
 The device-removal offline form first probes existing labels without creating

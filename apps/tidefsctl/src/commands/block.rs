@@ -61,8 +61,12 @@ pub enum BlockCommand {
 
     /// Send a block-volume snapshot over the network to a remote storage-node.
     Send {
-        /// Path to the pool object store directory (source).
-        pool_path: PathBuf,
+        /// Pool name. Imported pools route to the live owner.
+        pool: String,
+
+        /// Backing directory for exported/offline object-store send.
+        #[arg(short = 'b', long = "backing-dir")]
+        backing_dir: Option<PathBuf>,
 
         /// TCP address of the remote storage-node.
         #[arg(long = "target-addr")]
@@ -79,8 +83,12 @@ pub enum BlockCommand {
 
     /// Receive a block-volume snapshot over the network from a remote storage-node.
     Receive {
-        /// Path to the pool object store directory (destination).
-        pool_path: PathBuf,
+        /// Pool name. Imported pools route to the live owner.
+        pool: String,
+
+        /// Backing directory for exported/offline object-store receive.
+        #[arg(short = 'b', long = "backing-dir")]
+        backing_dir: Option<PathBuf>,
 
         /// TCP address of the remote storage-node.
         #[arg(long = "source-addr")]
@@ -129,24 +137,37 @@ pub fn handle_block(cmd: BlockCommand) {
             handle_list();
         }
         BlockCommand::Send {
-            pool_path,
+            pool,
+            backing_dir,
             target_addr,
             node_id,
             server_node_id,
         } => {
-            if let Err(err) = handle_block_send(&pool_path, target_addr, node_id, server_node_id) {
+            if let Err(err) = handle_block_send(
+                &pool,
+                backing_dir.as_deref(),
+                target_addr,
+                node_id,
+                server_node_id,
+            ) {
                 eprintln!("tidefsctl block send: {err}");
                 process::exit(1);
             }
         }
         BlockCommand::Receive {
-            pool_path,
+            pool,
+            backing_dir,
             source_addr,
             node_id,
             server_node_id,
         } => {
-            if let Err(err) = handle_block_receive(&pool_path, source_addr, node_id, server_node_id)
-            {
+            if let Err(err) = handle_block_receive(
+                &pool,
+                backing_dir.as_deref(),
+                source_addr,
+                node_id,
+                server_node_id,
+            ) {
                 eprintln!("tidefsctl block receive: {err}");
                 process::exit(1);
             }
@@ -394,13 +415,29 @@ fn block_root_auth_key() -> RootAuthenticationKey {
 }
 
 fn handle_block_send(
-    pool_path: &Path,
+    pool: &str,
+    backing_dir: Option<&Path>,
     target_addr: SocketAddr,
     node_id: u64,
     server_node_id: u64,
 ) -> Result<(), String> {
+    let live_args = serde_json::json!({
+        "target_addr": target_addr.to_string(),
+        "node_id": node_id,
+        "server_node_id": server_node_id,
+    });
+
+    let Some(pool_path) = backing_dir else {
+        super::live_owner::route_with_args("block", "send", pool, live_args);
+    };
+
+    super::live_owner::route_if_owner_exists_with_args("block", "send", pool, live_args.clone());
+
     if !pool_path.exists() {
-        return Err(format!("pool path does not exist: {}", pool_path.display()));
+        return Err(format!(
+            "backing directory does not exist: {}",
+            pool_path.display()
+        ));
     }
 
     // Read raw block data from the pool's block-volume storage.
@@ -433,14 +470,27 @@ fn handle_block_send(
 }
 
 fn handle_block_receive(
-    pool_path: &Path,
+    pool: &str,
+    backing_dir: Option<&Path>,
     source_addr: SocketAddr,
     node_id: u64,
     server_node_id: u64,
 ) -> Result<(), String> {
+    let live_args = serde_json::json!({
+        "source_addr": source_addr.to_string(),
+        "node_id": node_id,
+        "server_node_id": server_node_id,
+    });
+
+    let Some(pool_path) = backing_dir else {
+        super::live_owner::route_with_args("block", "receive", pool, live_args);
+    };
+
+    super::live_owner::route_if_owner_exists_with_args("block", "receive", pool, live_args.clone());
+
     if pool_path.exists() {
         return Err(format!(
-            "destination pool path already exists: {} (receive requires an empty target)",
+            "destination backing directory already exists: {} (receive requires an empty target)",
             pool_path.display()
         ));
     }
