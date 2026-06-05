@@ -4162,8 +4162,24 @@ impl LocalFileSystem {
         let mut fs = report.to_statfs();
         fs.bsize = cs.block_size;
         fs.frsize = cs.block_size;
+        let grain_bytes = u64::from(cs.block_size);
+        let total_bytes_limit = self
+            .capacity_authority
+            .total_bytes()
+            .min(report.policy.content_capacity_bytes);
+        let free_blocks_limit = if grain_bytes == 0 {
+            0
+        } else {
+            self.capacity_authority.free_bytes() / grain_bytes
+        };
+        let avail_blocks_limit = if grain_bytes == 0 {
+            0
+        } else {
+            (self.capacity_authority.available_bytes() / grain_bytes)
+                .min(report.reusable_free_bytes / grain_bytes)
+        };
         let (blocks, bfree, bavail) =
-            self.clamp_statfs_blocks(cs, phys.phys_total_bytes, fs.bfree, fs.bavail);
+            self.clamp_statfs_blocks(cs, total_bytes_limit, free_blocks_limit, avail_blocks_limit);
         fs.blocks = blocks;
         fs.bfree = bfree;
         fs.bavail = bavail;
