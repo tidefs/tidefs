@@ -528,7 +528,7 @@ fn handle_pool_import(
     }
 
     let config = assemble_device_pool_config(&devices, "import");
-    super::live_owner::route_if_owned_with_format(
+    super::live_owner::route_if_imported_with_format(
         "pool",
         "import",
         &config.pool_name,
@@ -807,7 +807,7 @@ fn route_active_device_pool_with_format(
     config: &tidefs_pool_scan::PoolConfig,
     json: bool,
 ) {
-    super::live_owner::route_if_owned_with_format(
+    super::live_owner::route_if_imported_with_format(
         "pool",
         operation,
         pool_name,
@@ -1453,7 +1453,7 @@ fn open_pool_property_filesystem_with_live_args(
 
     let config = assemble_device_pool_config(devs, operation);
     ensure_device_pool_name(pool, operation, &config);
-    super::live_owner::route_if_owned_with_args(
+    super::live_owner::route_if_imported_with_args(
         "pool",
         operation,
         pool,

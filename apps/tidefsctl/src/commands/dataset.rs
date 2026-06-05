@@ -351,7 +351,7 @@ fn open_filesystem_with_live_args(
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
-        super::live_owner::route_if_owned_with_args(
+        super::live_owner::route_if_imported_with_args(
             "dataset",
             operation,
             pool,
@@ -1526,7 +1526,7 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
 fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -> PathBuf {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
-        super::live_owner::route_if_owned(
+        super::live_owner::route_if_imported(
             "dataset",
             operation,
             pool,

@@ -571,7 +571,7 @@ fn import_devices_metadata_dir(
     live_args: serde_json::Value,
 ) -> PathBuf {
     let config = scan_device_pool_config(pool_name, devices, operation);
-    super::live_owner::route_if_owned_with_args(
+    super::live_owner::route_if_imported_with_args(
         "snapshot",
         operation,
         pool_name,
