@@ -286,16 +286,16 @@ fn handle_remove(
         }
     };
 
-    // Read labels without creating or mutating the store. Cached labels are
-    // recovery input; only a matching live owner manifest redirects this
-    // offline evacuation request to live state.
+    // Read labels without creating or mutating the store. If those labels say
+    // the pool is imported, live state belongs to the owner interface.
     let pre_config = import_offline_pool_config(pool_name, backing_dir)?;
 
-    super::live_owner::route_if_owner_exists_for_uuid_with_args(
+    super::live_owner::route_or_refuse_active_for_uuid_with_args(
         "device",
         "remove",
         pool_name,
         pre_config.pool_uuid,
+        pre_config.state == tidefs_types_pool_label_core::PoolState::Active,
         live_args,
     );
 
