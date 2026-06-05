@@ -1511,6 +1511,24 @@ policy, current implementation spec, historical design input, or delete
 candidate. Until that is done, doc links and source gates are review material,
 not proof.
 
+### TFR-020: Test Signal Authority
+
+TideFS has enough unit, integration, harness, xtask, and marker tests that test
+count no longer predicts product confidence. The current policy is
+`docs/TEST_SIGNAL_POLICY.md`.
+
+The review direction is to keep tests that prove mounted behavior, runtime
+durability, crash/reopen recovery, kernel/ublk/RDMA operation, xfstests rows,
+durable format rejection, real security boundaries, and compact internal
+invariants. Redundant branch-level tests, source-marker checks, scaffold tests,
+stale expected-output tests, and weakened-fixture tests should be compressed,
+demoted, or deleted when their owning surface is touched.
+
+`StoreOptions::test_fast()` and equivalent relaxed fixtures are allowed for
+narrow fast checks, but they must not support claims about production
+durability, checksum verification, recovery, or durable reads. Harness tests
+must be cited as harness signal, not product proof.
+
 ## Next Review Order
 
 1. Workspace authority: classify every manifest as product, harness, third
@@ -1527,5 +1545,7 @@ not proof.
    membership/fencing, replica mutation, scrub/repair, and operator CLI claims
 7. Documentation authority: audit imported docs for status/closeout language and
    rewrite or delete stale closeout claims.
-8. Kernel/POSIX edge review: pick up remaining kmod/xfstests changes only as
+8. Test signal authority: apply `docs/TEST_SIGNAL_POLICY.md` while touching
+   tests, compress low-value coverage, and keep product/runtime signal primary.
+9. Kernel/POSIX edge review: pick up remaining kmod/xfstests changes only as
    their own audited implementation commits.

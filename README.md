@@ -18,6 +18,8 @@ private until the operator gives an explicit public-release go-ahead.
 - License: `GPL-2.0-only WITH Linux-syscall-note`.
 - Durable review debt belongs in `docs/REVIEW_TODO_REGISTER.md`; inline notes
   are only short pointers to register entries.
+- Test changes must follow `docs/TEST_SIGNAL_POLICY.md`: prefer product and
+  invariant signal over test-count growth, marker checks, and stale fixtures.
 - Publishing-facing capability wording must pass
   `cargo run -p tidefs-xtask -- check-claims-gate`.
 - Commits should be clean, scoped, and bisectable in the same spirit as Linux
@@ -45,6 +47,7 @@ cargo check --workspace --locked
 ## Start Here
 
 - `docs/LICENSING.md`
+- `docs/TEST_SIGNAL_POLICY.md`
 - `docs/REVIEW_TODO_POLICY.md`
 - `docs/REVIEW_TODO_REGISTER.md`
 - `docs/INDEX.md`

@@ -20,6 +20,7 @@ OpenZFS/Ceph-class claims.
 | TFR-016 | Inline debt marker hygiene | Non-vendored source and active harness text still carried issue-era TODO/continuation wording. | Replace anonymous markers with register-addressed comments and treat old issue refs as historical context only. |
 | TFR-017 | Transport/cluster authority | Cluster CLI, storage-node, send-buffer, epoch-fence, and orchestrator paths still expose staged or placeholder distributed behavior. | Define the transport authority, cross-replica comparison, dispatch, and backpressure semantics before multi-node claims. |
 | TFR-019 | Documentation authority drift | Imported docs still mix design intent, issue closeout records, maturity labels, and current-status claims. | Reclassify every doc as current policy, current spec, historical input, or delete candidate before relying on it. |
+| TFR-020 | Test signal authority | Unit, integration, harness, policy, and marker tests are widespread enough that test count can outgrow product confidence. | Apply `docs/TEST_SIGNAL_POLICY.md`: keep product/invariant signal, demote marker/stale/scaffold signal, and make fixtures match the claim being proved. |
 
 ## Current Review Notes
 
@@ -30,6 +31,13 @@ Important 2026-06-01 findings:
 - `TFR-001`: `docs/00_user_requirements.md` still contained stale
   version-closeout and checked-in scoreboard wording; status must be rebuilt
   from current source behavior.
+- `TFR-020`: Test coverage is treated as signal quality, not test volume.
+  `docs/TEST_SIGNAL_POLICY.md` is the current policy for adding, refactoring,
+  deleting, or citing tests. The 2026-06-05 static review found heavy test mass
+  across normal source files, dedicated test targets, and fixture-heavy
+  surfaces; future cleanup should keep mounted/runtime/product and compact
+  invariant tests, compress redundant branch tests, and remove or demote
+  marker-only, stale-fixture, scaffold, and weakened-fixture claims.
 - `TFR-002`: Cargo metadata reports 148 packages and 148 workspace members.
   Five manifests are outside root workspace metadata after the abandoned POSIX
   adapter split-shard crates, broken `tidefs-chaos` app root, and five
