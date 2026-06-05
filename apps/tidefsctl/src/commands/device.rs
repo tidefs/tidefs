@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use clap::Subcommand;
 
 use tidefs_local_filesystem::device_removal::anchor_device_removal;
-use tidefs_local_object_store::{LocalObjectStore, ObjectKey};
+use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions};
 use tidefs_pool_scan::device_removal::DeviceRemovalRun;
 use tidefs_pool_scan::{
     run_device_removal, DeviceRemovalError, DeviceRemovalHooks, DeviceRemovalPlan,
@@ -280,9 +280,28 @@ fn handle_remove(
 
     let backing_dir = backing_dir.ok_or_else(|| {
         format!(
-            "pool '{pool_name}' has no reachable live owner; --backing-dir is required only for exported/offline device removal"
+            "pool-name device removal for '{pool_name}' requires a reachable live owner; route through the kernel UAPI or userspace daemon owner. Use --backing-dir only for exported/offline device removal."
         )
     })?;
+
+    // Read labels without creating or mutating the store. If labels say the
+    // pool is active/imported, the owner boundary below must route or fail
+    // closed before any offline evacuation store is opened writable.
+    let pre_config = import_offline_pool_config(pool_name, backing_dir)?;
+
+    super::live_owner::route_if_imported_with_args(
+        "device",
+        "remove",
+        pool_name,
+        pre_config.pool_uuid,
+        pre_config.state == PoolState::Active,
+        serde_json::json!({
+            "device_path": device_path.to_string_lossy(),
+            "replication_factor": replication_factor,
+            "failure_domain": failure_domain,
+            "force": force,
+        }),
+    );
 
     let domain = match failure_domain {
         "device" => FailureDomain::Device,
@@ -308,51 +327,6 @@ fn handle_remove(
     eprintln!("Opened target store at {}", backing_dir.display());
     eprintln!("Replication intent: {intent}");
     eprintln!("Target device for removal: {}", device_path.display());
-
-    // === Import pool config from authoritative labels ===
-    // Labels must exist in the target store (written during pool creation).
-    // If no labels are found, refuse removal — the CLI cannot fabricate config.
-    let pre_config = match tidefs_local_filesystem::device_removal::import_pool_config_from_store(
-        &target_store,
-    )? {
-        Some(cfg) => {
-            eprintln!(
-                "Imported pool config from labels: pool={} uuid={:02x?} gen={} devices={}",
-                cfg.pool_name,
-                &cfg.pool_uuid[..4],
-                cfg.topology_generation,
-                cfg.device_count,
-            );
-            cfg
-        }
-        None => {
-            return Err(format!(
-                "no pool labels found in target store at {}; offline device removal requires authoritative pool labels. Create the pool with 'tidefsctl pool create' before removing devices.",
-                backing_dir.display(),
-            )
-            .into());
-        }
-    };
-    if pre_config.pool_name != pool_name {
-        return Err(format!(
-            "target device belongs to pool '{}', not '{pool_name}'",
-            pre_config.pool_name
-        )
-        .into());
-    }
-    super::live_owner::route_if_imported_with_args(
-        "device",
-        "remove",
-        pool_name,
-        pre_config.pool_uuid,
-        pre_config.state == PoolState::Active,
-        serde_json::json!({
-            "device_path": device_path.to_string_lossy(),
-            "replication_factor": replication_factor,
-            "failure_domain": failure_domain,
-            "force": force,
-        }),
-    );
 
     // Derive target and surviving devices from the imported pool membership.
     // The target device path must match a leaf in the imported config.
@@ -647,6 +621,60 @@ fn handle_remove(
     eprintln!("Device removal complete (phase: {}).", state.phase);
     let _ = result;
     Ok(())
+}
+
+fn import_offline_pool_config(
+    pool_name: &str,
+    backing_dir: &std::path::Path,
+) -> Result<PoolConfig, Box<dyn std::error::Error>> {
+    let target_store =
+        match LocalObjectStore::open_read_only_with_options(backing_dir, StoreOptions::default()) {
+            Ok(Some(store)) => store,
+            Ok(None) => {
+                return Err(format!(
+                    "no existing target store at {}; offline device removal requires authoritative pool labels",
+                    backing_dir.display(),
+                )
+                .into())
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to open target store at {} read-only for label discovery: {err}",
+                    backing_dir.display(),
+                )
+                .into())
+            }
+        };
+
+    let pre_config = match tidefs_local_filesystem::device_removal::import_pool_config_from_store(
+        &target_store,
+    )? {
+        Some(cfg) => cfg,
+        None => {
+            return Err(format!(
+                "no pool labels found in target store at {}; offline device removal requires authoritative pool labels. Create the pool with 'tidefsctl pool create' before removing devices.",
+                backing_dir.display(),
+            )
+            .into());
+        }
+    };
+    if pre_config.pool_name != pool_name {
+        return Err(format!(
+            "target device belongs to pool '{}', not '{pool_name}'",
+            pre_config.pool_name
+        )
+        .into());
+    }
+
+    eprintln!(
+        "Imported pool config from labels: pool={} uuid={:02x?} gen={} devices={}",
+        pre_config.pool_name,
+        &pre_config.pool_uuid[..4],
+        pre_config.topology_generation,
+        pre_config.device_count,
+    );
+
+    Ok(pre_config)
 }
 
 #[cfg(test)]
@@ -1023,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn removal_without_owner_requires_offline_backing_dir() {
+    fn removal_without_offline_backing_dir_requires_live_owner() {
         let result = handle_remove(
             "testpool",
             &PathBuf::from("/dev/disk0"),
@@ -1036,12 +1064,39 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "offline removal should require an explicit backing dir"
+            "pool-name-only removal should require a live owner"
         );
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("--backing-dir"),
-            "expected --backing-dir refusal, got {msg}"
+            msg.contains("requires a reachable live owner"),
+            "expected live-owner refusal, got {msg}"
+        );
+    }
+
+    #[test]
+    fn removal_label_probe_does_not_create_missing_target_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("missing-target");
+
+        let result = handle_remove(
+            "testpool",
+            &PathBuf::from("/dev/disk0"),
+            Some(&target_dir),
+            &[],
+            2,
+            "device",
+            false,
+        );
+
+        assert!(result.is_err(), "missing target store should fail");
+        assert!(
+            !target_dir.exists(),
+            "offline label probe must not create a missing target store"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no existing target store"),
+            "unexpected error: {msg}"
         );
     }
 }

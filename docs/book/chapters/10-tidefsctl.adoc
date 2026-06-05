@@ -98,6 +98,11 @@ explicitly:
 tidefsctl device remove <pool> <device> --backing-dir <target-store> --surviving-dirs <stores>
 ----
 
+That offline form first probes existing labels without creating or opening the
+store writable. If those labels identify an imported `ACTIVE` pool, the command
+routes to the owner interface or fails closed; it does not continue into direct
+evacuation from cached label state.
+
 The old `--pool <pool>` spelling is not the operator form. It must not be
 kept as a parallel control path for imported state.
 

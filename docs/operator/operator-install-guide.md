@@ -327,6 +327,9 @@ tidefsctl device rebuild
 The pool name is the live-owner identity. If `mypool` is imported, device
 removal routes to that owner and fails closed until the owner implements the
 operation; the backing-directory form is only for exported/offline storage.
+The offline form probes existing labels without creating or opening the store
+writable, and an `ACTIVE` imported label only selects the owner route or closed
+failure. It is not permission to evacuate through cached state.
 
 ### 6.5 Pool export (deactivate)
 
