@@ -569,6 +569,14 @@ fn import_devices_metadata_dir(
     operation: &str,
     live_args: serde_json::Value,
 ) -> PathBuf {
+    if pool_name != "<unnamed>" {
+        super::live_owner::route_if_owner_exists_with_args(
+            "snapshot",
+            operation,
+            pool_name,
+            live_args.clone(),
+        );
+    }
     let config = scan_device_pool_config(pool_name, devices, operation);
     super::live_owner::route_or_refuse_active_for_uuid_with_args(
         "snapshot",

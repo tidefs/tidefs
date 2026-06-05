@@ -220,6 +220,12 @@ fn resolve_encryption_for_import(
 pub fn handle_mount(args: PoolMountArgs) {
     let mountpoint = args.mount_point.clone();
     let lock_dir = std::path::PathBuf::from("/run/tidefs/import");
+    let live_args = serde_json::json!({
+        "mountpoint": mountpoint.display().to_string(),
+        "read_only": args.read_only,
+        "relatime": args.relatime,
+        "dataset": &args.dataset,
+    });
 
     // Cluster mount parameter validation: when --cluster is set,
     // refuse missing or invalid parameters before any pool work.
@@ -236,16 +242,24 @@ pub fn handle_mount(args: PoolMountArgs) {
 
     // Determine the backing directory: explicit --devices import or live-owner route.
     let (backing_dir, owner_pool_uuid) = if let Some(ref devices) = args.devices {
+        super::live_owner::route_if_owner_exists_with_args(
+            "pool",
+            "mount",
+            &args.pool_name,
+            live_args.clone(),
+        );
         let existing_config = scan_device_pool_config(&args.pool_name, devices, "mount");
         // Mount with explicit devices is the userspace owner-creating path.
         // Route only when a live owner has already published its interface;
         // an ACTIVE label without an owner can be stale crash state and must
         // still flow through pool_import recovery before this process owns it.
-        super::live_owner::route_if_owner_exists_for_uuid(
+        super::live_owner::route_if_owner_exists_for_uuid_with_format_and_args(
             "pool",
             "mount",
             &args.pool_name,
             existing_config.pool_uuid,
+            false,
+            live_args.clone(),
         );
 
         // Block-device path: import from raw devices, then use a
@@ -262,7 +276,14 @@ pub fn handle_mount(args: PoolMountArgs) {
         ) {
             Ok(imp) => imp,
             Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
-                super::live_owner::route_imported("pool", "mount", &args.pool_name, pool_uuid)
+                super::live_owner::route_imported_with_format_and_args(
+                    "pool",
+                    "mount",
+                    &args.pool_name,
+                    pool_uuid,
+                    false,
+                    live_args,
+                )
             }
             Err(err) => {
                 eprintln!("tidefsctl pool mount: pool import failed: {err}");
@@ -295,7 +316,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         });
         (pool_dir, Some(cfg.pool_uuid))
     } else {
-        super::live_owner::route("pool", "mount", &args.pool_name);
+        super::live_owner::route_with_args("pool", "mount", &args.pool_name, live_args);
     };
 
     // --- Encryption passphrase verification ---

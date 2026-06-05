@@ -47,37 +47,12 @@ enum LiveOwnerRequestError {
     Owner { exit_code: i32, message: String },
 }
 
-pub(crate) fn route(command: &str, operation: &str, pool: &str) -> ! {
-    route_with_format(command, operation, pool, false)
-}
-
 pub(crate) fn route_with_format(command: &str, operation: &str, pool: &str, json: bool) -> ! {
     MissingLivePoolOwnerClient.route_live_pool(LivePoolRoute {
         command,
         operation,
         pool,
         pool_uuid: None,
-        json,
-        args: serde_json::Value::Null,
-    })
-}
-
-pub(crate) fn route_imported(command: &str, operation: &str, pool: &str, pool_uuid: [u8; 16]) -> ! {
-    route_imported_with_format(command, operation, pool, pool_uuid, false)
-}
-
-pub(crate) fn route_imported_with_format(
-    command: &str,
-    operation: &str,
-    pool: &str,
-    pool_uuid: [u8; 16],
-    json: bool,
-) -> ! {
-    MissingLivePoolOwnerClient.route_live_pool(LivePoolRoute {
-        command,
-        operation,
-        pool,
-        pool_uuid: Some(pool_uuid),
         json,
         args: serde_json::Value::Null,
     })
@@ -115,26 +90,20 @@ pub(crate) fn route_if_owner_exists_with_args(
     pool: &str,
     args: serde_json::Value,
 ) {
-    let root = pool_runtime_root();
-    if owner_manifest_exists_by_pool_at(&root, pool) {
-        route_with_format_and_args(command, operation, pool, false, args);
-    }
+    route_if_owner_exists_with_format_and_args(command, operation, pool, false, args);
 }
 
-pub(crate) fn route_if_owner_exists_for_uuid(
+pub(crate) fn route_if_owner_exists_with_format_and_args(
     command: &str,
     operation: &str,
     pool: &str,
-    pool_uuid: [u8; 16],
+    json: bool,
+    args: serde_json::Value,
 ) {
-    route_if_owner_exists_for_uuid_with_format_and_args(
-        command,
-        operation,
-        pool,
-        pool_uuid,
-        false,
-        serde_json::Value::Null,
-    );
+    let root = pool_runtime_root();
+    if owner_manifest_exists_by_pool_at(&root, pool) {
+        route_with_format_and_args(command, operation, pool, json, args);
+    }
 }
 
 pub(crate) fn route_or_refuse_active_for_uuid_with_args(

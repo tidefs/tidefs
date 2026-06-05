@@ -651,7 +651,16 @@ fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
 
 fn handle_pool_status(pool_name: String, devices: Option<Vec<PathBuf>>, json: bool) {
     let device_paths = match devices {
-        Some(d) if !d.is_empty() => d,
+        Some(d) if !d.is_empty() => {
+            super::live_owner::route_if_owner_exists_with_format_and_args(
+                "pool",
+                "status",
+                &pool_name,
+                json,
+                serde_json::Value::Null,
+            );
+            d
+        }
         _ => {
             super::live_owner::route_with_format("pool", "status", &pool_name, json);
         }
@@ -1304,7 +1313,17 @@ fn format_bytes(bytes: u64) -> String {
 
 fn handle_pool_export(pool_name: String, devices: Option<Vec<PathBuf>>, force: bool) {
     let device_paths = match devices {
-        Some(d) if !d.is_empty() => d,
+        Some(d) if !d.is_empty() => {
+            super::live_owner::route_if_owner_exists_with_args(
+                "pool",
+                "export",
+                &pool_name,
+                serde_json::json!({
+                    "force": force,
+                }),
+            );
+            d
+        }
         _ => {
             super::live_owner::route_with_args(
                 "pool",
@@ -1352,9 +1371,18 @@ fn handle_pool_export(pool_name: String, devices: Option<Vec<PathBuf>>, force: b
 fn handle_pool_destroy(
     pool_name: String,
     devices: Vec<PathBuf>,
-    _force: bool,
+    force: bool,
     zero_superblock: bool,
 ) {
+    super::live_owner::route_if_owner_exists_with_args(
+        "pool",
+        "destroy",
+        &pool_name,
+        serde_json::json!({
+            "force": force,
+            "zero_superblock": zero_superblock,
+        }),
+    );
     let config = assemble_device_pool_config(&devices, "destroy");
     ensure_device_pool_name(&pool_name, "destroy", &config);
     route_live_device_pool_owner("destroy", &pool_name, &config);
@@ -1388,6 +1416,7 @@ fn open_pool_property_filesystem_with_live_args(
         super::live_owner::route_with_args("pool", operation, pool, live_args);
     };
 
+    super::live_owner::route_if_owner_exists_with_args("pool", operation, pool, live_args.clone());
     let config = assemble_device_pool_config(devs, operation);
     ensure_device_pool_name(pool, operation, &config);
     super::live_owner::route_or_refuse_active_for_uuid_with_args(
