@@ -22,6 +22,14 @@
 //! | `cluster pool create` | cluster operator prototype; TFR-017 remains open |
 //! | `cluster placement exercise` | development diagnostic exercise |
 //! | `cluster heal exercise` | development diagnostic exercise |
+//!
+//! # Pool owner routing
+//!
+//! Imported-pool commands must talk to the runtime owner for live state:
+//! the declared kernel UAPI in kernel mode, or the FUSE/ublk owner in
+//! userspace mode. Explicit device or backing-directory arguments are for
+//! offline, discovery, import, or not-yet-imported work. Do not make pool-name
+//! usability by reopening runtime metadata behind the live owner.
 mod commands;
 
 use std::path::PathBuf;
@@ -36,9 +44,33 @@ use tidefs_posix_filesystem_adapter_daemon::{self, MountConfig};
 #[command(
     name = "tidefsctl",
     version = env!("CARGO_PKG_VERSION"),
-    about = "TideFS CLI for operator commands and development harnesses",
-    long_about = "TideFS command-line interface.\n\nOperator surfaces: pool, dataset, snapshot, device, block, diag.\nDevelopment harnesses: mount, pool mount, cluster placement exercise, cluster heal exercise.\n\nTideFS is pre-alpha; command help should describe the current command stage rather than imply production readiness.",
-    after_help = "Use `tidefsctl help <COMMAND>` for command details. The book source lives under docs/book/.",
+    about = "TideFS operator CLI and development harnesses",
+    long_about = r#"TideFS command-line interface.
+
+Primary operator groups:
+  pool      create, discover, import/export, inspect, and tune pools
+  dataset   manage the pool-wide dataset catalog and dataset properties
+  snapshot  create, list, destroy, roll back, send, and receive snapshots
+  device    remove or rebuild pool devices
+  block     attach, list, detach, send, and receive ublk block devices
+  diag      collect a redacted support bundle
+
+Development harnesses:
+  mount                         launch the current FUSE harness
+  pool mount                    import a pool and launch the FUSE harness
+  cluster placement exercise    run placement diagnostics
+  cluster heal exercise         run healing diagnostics
+
+Pool routing rule:
+  A pool name identifies an imported pool and should route to the live owner:
+  the kernel UAPI in kernel mode, or the userspace daemon owner in userspace
+  mode. Explicit --devices or --backing-dir inputs are for offline,
+  discovery, import, or not-yet-imported work.
+
+TideFS is pre-alpha. Help text should mark harnesses as such instead of
+treating them as the final kernel runtime."#,
+    after_help = "Start with `tidefsctl pool --help`, `tidefsctl dataset --help`, or `tidefsctl diag --help`. The book source lives under docs/book/.",
+    arg_required_else_help = true,
 )]
 struct Cli {
     #[command(subcommand)]
@@ -47,7 +79,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the development FUSE mount harness
+    /// Launch the FUSE development mount harness
     Mount {
         /// Backing directory for local object store
         backing_dir: PathBuf,
@@ -73,7 +105,7 @@ enum Command {
         encryption_envelope: Option<PathBuf>,
     },
 
-    /// Manage pools and pool-backed development mounts
+    /// Manage pools; includes the pool-backed FUSE harness
     Pool {
         #[command(subcommand)]
         cmd: commands::pool::PoolCommand,
@@ -106,7 +138,7 @@ enum Command {
         recursive: bool,
     },
 
-    /// Manage clustered pools and development diagnostics
+    /// Manage cluster prototypes and development diagnostics
     Cluster {
         #[command(subcommand)]
         cmd: commands::cluster::ClusterCommand,

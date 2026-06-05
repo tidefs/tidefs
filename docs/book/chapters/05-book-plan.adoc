@@ -1,0 +1,79 @@
+== Book Plan
+
+The finished TideFS Book should be an operator and contributor manual, not a
+dump of every historical design file. The source format is AsciiDoc; DocBook 5
+is a generated publishing output.
+
+=== Complete Outline Target
+
+The durable chapter map is:
+
+[cols="1,2,2",options="header"]
+|===
+| Part | Reader Job | Chapters
+
+| Preface and Authority
+| Understand maturity, claims, and source-of-truth rules.
+| Preface; Book Plan; Documentation Authority
+
+| Operator Guide
+| Use the command line without learning the whole codebase first.
+| `tidefsctl`; Pools; Datasets; Snapshots; Devices; Block Volumes; Diagnostics
+
+| Deployment Guide
+| Prepare hosts and choose a supported runtime path.
+| Installation; Kernel Path; Development FUSE Harness; CI Runner Environments
+
+| Storage Model
+| Understand the objects, extents, space accounting, and durability model.
+| Pools; Object Store; Space Accounting; Intent Log; Recovery; Scrub and Repair
+
+| POSIX and Kernel Interface
+| Understand mounted filesystem behavior and the transition from FUSE to kernel.
+| POSIX Semantics; Page Cache; Writeback; VFS Engine; Kernel Module Bridge
+
+| Distributed Operation
+| Understand cluster authority without mistaking prototypes for release gates.
+| Membership; Placement; Replication; Erasure Coding; Transport; Failure Domains
+
+| Development Guide
+| Build, test, review, and change TideFS without cargo-target or docs drift.
+| Workspace; Testing; xfstests; Crash Dumps; Review Register; Claim Gates
+
+| Reference
+| Look up exact interfaces and formats.
+| CLI Reference; On-Disk Formats; Properties; Environment Variables; Glossary
+|===
+
+=== First Milestone
+
+The first useful book milestone is the operator guide:
+
+* top-level `tidefsctl` taxonomy;
+* imported-pool owner routing: pool-name commands talk to the live kernel or
+  userspace owner, while `--devices`/`--backing-dir` spell offline or
+  not-yet-imported access;
+* pool lifecycle commands;
+* dataset lifecycle and properties;
+* snapshot lifecycle;
+* block-volume attach/detach/list;
+* diagnostics and support bundles;
+* explicit labels for FUSE and cluster development harnesses.
+
+This milestone should be kept in sync with `tidefsctl --help`, parser tests,
+and command source comments. When a command changes shape, update its book
+section in the same commit.
+
+=== Acceptance Rules
+
+A book chapter is acceptable when:
+
+* it names its audience and maturity boundary;
+* it cites current repo authority for behavior claims;
+* it avoids unclassified historical claims;
+* it includes command examples only when the command exists in live help;
+* it does not require generated files to be committed.
+
+Book work may be docs-only when the operator explicitly asks for book or
+documentation direction. It should still be reviewed like product surface,
+because it will become the public mental model for TideFS.

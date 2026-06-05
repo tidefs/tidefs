@@ -15,6 +15,7 @@ Book:
 
 - `docs/book/README.adoc`
 - `docs/book/tidefs-book.adoc`
+- `docs/book/chapters/05-book-plan.adoc`
 
 The remaining documents are imported design/reference material. They need
 ongoing audit against the review register before they can be treated as current

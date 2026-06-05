@@ -4,6 +4,47 @@
 operator path without pretending that every bring-up tool is final product
 surface.
 
+=== Starting Points
+
+Most operator sessions should start with one of these groups:
+
+* `tidefsctl pool --help` for pool creation, discovery, import/export, status,
+  and properties;
+* `tidefsctl dataset --help` for the pool-wide dataset catalog and dataset
+  properties;
+* `tidefsctl snapshot --help` for snapshot lifecycle and transfer commands;
+* `tidefsctl block --help` for ublk block-volume attachment and inspection;
+* `tidefsctl diag --help` for redacted support bundles.
+
+Development sessions may use `tidefsctl mount`, `tidefsctl pool mount`, and
+the `cluster * exercise` commands. Those are harnesses, not the final kernel
+runtime.
+
+=== Pool Identity And Routing
+
+The pool name should be the normal positional identity for operator commands,
+similar to established filesystem CLIs. The name is not a shorthand for
+opening some local directory behind the runtime.
+
+When a pool is imported or mounted, its live state belongs to the active
+runtime owner:
+
+* in final kernel mode, `tidefsctl` must talk to the declared kernel UAPI;
+* in userspace mode, `tidefsctl` must talk to the FUSE or ublk owner that
+  imported the pool and holds its caches, admission state, and runtime view.
+
+Offline inputs are explicit. Commands that operate on a pool that is not
+imported must say how to find it with arguments such as `--devices` or
+`--backing-dir`. Those arguments authorize import, repair, discovery, or
+offline inspection; they are not the ordinary path for mutating an already
+imported pool.
+
+Do not implement positional pool-name usability by reopening
+`/run/tidefs/pools/<name>`, by treating the pool name as a backing path, or by
+calling storage libraries behind the live owner. That would bypass cached
+state and split authority. Add the owner client first, then make the positional
+form call it.
+
 === Command Classes
 
 [cols="1,2",options="header"]
@@ -31,6 +72,16 @@ surface.
 
 The command classes are part of the CLI contract. Help text, parser tests, and
 book text should change together when a command moves between classes.
+
+=== Output Rules
+
+Operator commands should prefer plain text that is easy to scan and provide
+`--json` for automation when the command has stable structured output.
+
+Errors should name the command path first, for example
+`tidefsctl pool import: ...`, then describe the failed operation and the
+resource involved. Warnings must not hide pre-alpha limitations behind success
+language.
 
 === Help Text Rule
 

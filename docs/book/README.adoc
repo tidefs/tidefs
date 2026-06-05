@@ -13,6 +13,22 @@ same AsciiDoc sources; PDF can follow from the same pipeline.
 This keeps the project close to DocBook's long-form publishing model without
 forcing every normal edit through raw XML.
 
+== Rationale
+
+Raw DocBook is strong for publishing pipelines, but it is a poor everyday
+editing format for a fast-moving systems project. The TideFS source of truth
+needs normal code-review diffs, easy cross references, readable plain text, and
+the option to produce DocBook when the publishing path needs it.
+
+AsciiDoc gives the project one source tree for:
+
+* ordinary reviewable text edits;
+* HTML for local browsing and eventual website publication;
+* DocBook 5 XML for long-form publishing and downstream conversion;
+* PDF later, once the chapter set is stable enough to deserve typography work.
+
+DocBook remains a first-class output, not the handwritten source.
+
 == Source Rules
 
 The book is a curated product surface, not an import bucket.
@@ -26,8 +42,31 @@ The book is a curated product surface, not an import bucket.
   it is background, not current behavior.
 * CLI chapters must follow live `tidefsctl` help and source comments in the
   same commit that changes command shape.
+* CLI chapters must preserve the pool-owner route rule: an imported pool is
+  manipulated through the kernel UAPI or userspace daemon that owns its live
+  state; explicit devices or backing directories are for offline or
+  not-yet-imported work.
 * Capability wording must stay behind implementation reality and the project
   claims gate.
+* Generated HTML, DocBook XML, PDF, screenshots, and diagrams do not belong in
+  git unless a later policy explicitly makes them source artifacts.
+
+== Chapter Rules
+
+Each chapter should have a narrow reader job. Prefer one chapter that helps an
+operator finish a real task over ten loosely imported design notes.
+
+Every chapter should answer:
+
+* who the chapter is for;
+* what is current behavior, what is a development harness, and what is
+  historical background;
+* which command, crate, or register entry owns the underlying behavior;
+* what must change in the chapter when the code changes.
+
+Do not copy broad status claims from old design files into the book. If a
+claim is important and current, point at the active code, CLI help, review
+register, or authority document that makes it current.
 
 == Layout
 
@@ -37,6 +76,7 @@ docs/book/
   tidefs-book.adoc         assembled book root
   chapters/
     00-preface.adoc        maturity, audience, authority
+    05-book-plan.adoc      complete-book outline and acceptance rules
     10-tidefsctl.adoc      operator CLI map
 ----
 
