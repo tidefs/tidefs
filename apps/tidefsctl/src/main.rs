@@ -1015,23 +1015,35 @@ mod tests {
     #[test]
     fn cli_parse_pool_integrity_check_minimum() {
         use clap::Parser;
-        let args = Cli::try_parse_from(["tidefsctl", "pool", "integrity-check", "/tmp/pool"]);
+        let args = Cli::try_parse_from(["tidefsctl", "pool", "integrity-check", "mypool"]);
         assert!(
             args.is_ok(),
-            "pool integrity-check with backing dir should parse"
+            "pool integrity-check with pool name should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_pool_integrity_check_offline_backing_dir() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "integrity-check",
+            "mypool",
+            "--backing-dir",
+            "/tmp/pool",
+        ]);
+        assert!(
+            args.is_ok(),
+            "pool integrity-check with offline backing dir should parse"
         );
     }
 
     #[test]
     fn cli_parse_pool_integrity_check_json() {
         use clap::Parser;
-        let args = Cli::try_parse_from([
-            "tidefsctl",
-            "pool",
-            "integrity-check",
-            "/tmp/pool",
-            "--json",
-        ]);
+        let args =
+            Cli::try_parse_from(["tidefsctl", "pool", "integrity-check", "mypool", "--json"]);
         assert!(args.is_ok(), "pool integrity-check --json should parse");
     }
 
@@ -1042,7 +1054,7 @@ mod tests {
             "tidefsctl",
             "pool",
             "integrity-check",
-            "/tmp/pool",
+            "mypool",
             "--max-records",
             "100",
         ]);
@@ -1059,7 +1071,7 @@ mod tests {
             "tidefsctl",
             "pool",
             "integrity-check",
-            "/tmp/pool",
+            "mypool",
             "--max-bytes",
             "1048576",
         ]);
@@ -1076,7 +1088,11 @@ mod tests {
             "tidefsctl",
             "pool",
             "integrity-check",
+            "mypool",
+            "--backing-dir",
             "/tmp/pool",
+            "--devices",
+            "/dev/sdb",
             "--json",
             "--max-records",
             "1000",
@@ -1090,12 +1106,12 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_pool_integrity_check_rejects_no_dir() {
+    fn cli_parse_pool_integrity_check_rejects_no_pool() {
         use clap::Parser;
         let args = Cli::try_parse_from(["tidefsctl", "pool", "integrity-check"]);
         assert!(
             args.is_err(),
-            "pool integrity-check without backing dir should fail"
+            "pool integrity-check without pool should fail"
         );
     }
 }

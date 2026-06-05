@@ -370,10 +370,12 @@ closed; it does not evacuate through direct storage access.
 must not point into `/run/tidefs/pools` or any backing directory named by an
 imported-pool owner manifest.
 
-`tidefsctl pool integrity-check <path>` uses the same boundary. When `<path>`
-is runtime state or a backing directory named by an imported-pool owner
-manifest, the command routes to the owner interface or fails closed. Direct
-path scanning is only for exported/offline storage.
+`tidefsctl pool integrity-check mypool` uses the same boundary. Pool-name
+checks route to the kernel UAPI or userspace daemon owner for imported state.
+Direct storage scans are only for exported/offline or not-yet-imported storage
+named explicitly with `--devices` and/or `--backing-dir`; if those inputs name
+runtime state or an imported-pool owner manifest, the command routes to that
+owner interface or fails closed.
 
 ### 6.5 Pool export (deactivate)
 

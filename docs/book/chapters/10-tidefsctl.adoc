@@ -93,6 +93,7 @@ Common owner-aware forms put the pool first:
 ----
 tidefsctl pool status <pool>
 tidefsctl pool import <pool>
+tidefsctl pool integrity-check <pool>
 tidefsctl pool get <pool> <property>
 tidefsctl pool set <pool> <property>=<value>
 tidefsctl dataset create <pool> <dataset>
@@ -118,6 +119,7 @@ explicitly:
 tidefsctl device remove <pool> <device> --backing-dir <target-store> --surviving-dirs <stores>
 tidefsctl pool import <pool> --devices <devices>
 tidefsctl pool destroy <pool> --devices <devices>
+tidefsctl pool integrity-check <pool> --devices <devices> --backing-dir <object-store>
 tidefsctl block attach <pool> --backing-dir <object-store>
 tidefsctl block send <pool> --backing-dir <object-store> --target-addr <addr>
 tidefsctl block receive <pool> --backing-dir <object-store> --source-addr <addr>
@@ -138,9 +140,11 @@ owner.
 Device removal survivor directories and device rebuild source/replacement
 directories are offline object-store paths too, and must be refused when they
 point into `/run/tidefs/pools` or are named by an imported-pool owner manifest.
-`pool integrity-check <path>` follows the same rule: a path owned by an
-imported pool routes to that owner or fails closed, while direct scans are only
-for exported/offline storage.
+`pool integrity-check <pool>` follows the same rule as the other pool-name
+commands: it routes to the owner interface for imported state. Direct scans are
+only for exported/offline or not-yet-imported storage named explicitly with
+`--devices` and/or `--backing-dir`; if those inputs identify imported state,
+the command routes to the exact owner or fails closed.
 
 The old `--pool <pool>` spelling is not the operator form. It must not be
 kept as a parallel control path for imported state.

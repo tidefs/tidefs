@@ -187,10 +187,15 @@ pub enum PoolCommand {
         encryption_salt: Option<String>,
     },
 
-    /// Run an integrity check on a pool's backing directory
+    /// Run an integrity check through the live owner, or offline with explicit storage
     IntegrityCheck {
-        /// Backing directory or device path
-        path: PathBuf,
+        /// Pool name. Imported pools route to the live owner.
+        #[arg(value_parser = parse_pool_name)]
+        pool: String,
+
+        /// Backing directory for exported/offline object-store scans
+        #[arg(short = 'b', long = "backing-dir")]
+        backing_dir: Option<PathBuf>,
 
         /// Output as JSON
         #[arg(long = "json")]
@@ -347,13 +352,14 @@ pub fn handle_pool(cmd: PoolCommand) {
             });
         }
         PoolCommand::IntegrityCheck {
-            path,
+            pool,
+            backing_dir,
             json,
             max_records,
             max_bytes,
             devices,
         } => {
-            handle_pool_integrity_check(path, json, max_records, max_bytes, devices);
+            handle_pool_integrity_check(pool, backing_dir, json, max_records, max_bytes, devices);
         }
         PoolCommand::Get {
             property,
@@ -835,10 +841,7 @@ fn read_vcrl_committed_txg(device_path: &std::path::Path) -> Option<u64> {
 /// Opens each device as a block-device object store and verifies
 /// segment integrity. Returns a count of checksum errors found.
 /// Returns None if no device could be opened.
-fn scan_block_devices_for_integrity(
-    device_paths: &[std::path::PathBuf],
-    _store_root: &std::path::Path,
-) -> Option<PoolScanReport> {
+fn scan_block_devices_for_integrity(device_paths: &[std::path::PathBuf]) -> Option<PoolScanReport> {
     use std::time::Instant;
     use tidefs_local_object_store::LocalObjectStore;
     use tidefs_local_object_store::StoreOptions;
@@ -911,34 +914,75 @@ fn scan_block_devices_for_integrity(
 }
 
 fn handle_pool_integrity_check(
-    path: PathBuf,
+    pool: String,
+    backing_dir: Option<PathBuf>,
     json: bool,
     max_records: Option<u64>,
     max_bytes: Option<u64>,
     devices: Option<Vec<PathBuf>>,
 ) {
+    let device_paths = devices.filter(|devices| !devices.is_empty());
     let live_args = serde_json::json!({
-        "path": path.display().to_string(),
+        "backing_dir": backing_dir.as_ref().map(|path| path.display().to_string()),
+        "devices": device_paths.as_ref().map(|paths| {
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        }),
         "max_records": max_records,
         "max_bytes": max_bytes,
     });
-    super::live_owner::route_if_owner_exists_for_backing_dir_with_args(
-        "pool",
-        "integrity-check",
-        &path,
-        live_args.clone(),
-    );
-    super::offline_pool::refuse_runtime_pool_path("pool", "integrity-check", &path);
 
-    if let Some(ref device_paths) = devices {
+    if backing_dir.is_none() && device_paths.is_none() {
+        super::live_owner::route_if_owner_exists_with_format_and_args(
+            "pool",
+            "integrity-check",
+            &pool,
+            json,
+            live_args,
+        );
+        if json {
+            let out = serde_json::json!({
+                "ok": false,
+                "command": "pool integrity-check",
+                "pool_name": &pool,
+                "owner_required": true,
+                "offline_inputs_required": true,
+                "error": "no reachable live owner and no offline storage arguments were provided",
+                "recovery": "start or repair the kernel UAPI or userspace daemon owner, or provide --devices and/or --backing-dir for exported/offline storage",
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        } else {
+            eprintln!("tidefsctl pool integrity-check: pool '{pool}' has no reachable live owner");
+            eprintln!(
+                "tidefsctl pool integrity-check: use --devices and/or --backing-dir only for exported/offline or not-yet-imported storage"
+            );
+        }
+        process::exit(1);
+    }
+
+    if let Some(ref path) = backing_dir {
+        super::live_owner::route_if_owner_exists_for_pool_backing_dir_with_args(
+            "pool",
+            "integrity-check",
+            &pool,
+            path,
+            live_args.clone(),
+        );
+        super::offline_pool::refuse_runtime_pool_path("pool", "integrity-check", path);
+    }
+
+    if let Some(ref device_paths) = device_paths {
         let config = assemble_device_pool_config(device_paths, "integrity-check");
+        ensure_device_pool_name(&pool, "integrity-check", &config);
         super::live_owner::route_or_refuse_active_for_uuid_with_args(
             "pool",
             "integrity-check",
-            &config.pool_name,
+            &pool,
             config.pool_uuid,
             config.state == tidefs_types_pool_label_core::PoolState::Active,
-            live_args,
+            live_args.clone(),
         );
     }
 
@@ -949,7 +993,7 @@ fn handle_pool_integrity_check(
     let mut intent_log_pending_devices: Vec<String> = Vec::new();
     let mut vrbt_missing_devices: Vec<String> = Vec::new();
 
-    if let Some(ref device_paths) = devices {
+    if let Some(ref device_paths) = device_paths {
         // Validate pool labels via PoolScanner.
         let scan_config = tidefs_pool_scan::label::PoolScanConfig::new(device_paths.clone());
         match tidefs_pool_scan::result::PoolScanner::scan(&scan_config) {
@@ -1008,47 +1052,54 @@ fn handle_pool_integrity_check(
     }
 
     // ── Phase 2: segment-level integrity scan ──
-    // The SegmentScanner requires a directory-backed object store
-    // (segments/ subdirectory). For block-device pools the segment data
-    // lives on the raw device and directory scanning is not applicable.
-    // Try the scan and degrade gracefully when the store isn't a directory.
+    // Directory-backed stores use SegmentScanner. Block-device pools fall
+    // back to the block-device object-store scanner when --devices is present.
     let mut segment_scan_error: Option<String> = None;
+    let report_root = backing_dir
+        .clone()
+        .or_else(|| {
+            device_paths
+                .as_ref()
+                .and_then(|paths| paths.first().cloned())
+        })
+        .unwrap_or_else(|| PathBuf::from(&pool));
 
-    // Validate the store path exists.
-    if !path.exists() {
-        eprintln!(
-            "tidefsctl: integrity-check path does not exist: {}",
-            path.display()
-        );
-        process::exit(2);
-    }
+    let segment_report: Option<PoolScanReport> = if let Some(ref path) = backing_dir {
+        if !path.exists() {
+            eprintln!(
+                "tidefsctl: integrity-check backing directory does not exist: {}",
+                path.display()
+            );
+            process::exit(2);
+        }
 
-    // Build the scan plan.
-    let mut plan = ScanPlan::full(path.clone());
-    if let Some(n) = max_records {
-        plan = plan.with_max_records(n);
-    }
-    if let Some(b) = max_bytes {
-        plan = plan.with_max_bytes(b);
-    }
+        let mut plan = ScanPlan::full(path.clone());
+        if let Some(n) = max_records {
+            plan = plan.with_max_records(n);
+        }
+        if let Some(b) = max_bytes {
+            plan = plan.with_max_bytes(b);
+        }
 
-    // Run the segment-level integrity scan (best-effort).
-    // First try directory-backed store scan, then fall back to per-device
-    // block-device scanning when --devices is given.
-    let segment_report: Option<PoolScanReport> = match SegmentScanner::scan(&plan, None) {
-        Ok(r) => Some(r),
-        Err(err) => {
-            if let Some(ref device_paths) = devices {
-                scan_block_devices_for_integrity(device_paths, &path)
-            } else {
-                segment_scan_error = Some(err);
-                None
+        match SegmentScanner::scan(&plan, None) {
+            Ok(r) => Some(r),
+            Err(err) => {
+                if let Some(ref device_paths) = device_paths {
+                    scan_block_devices_for_integrity(device_paths)
+                } else {
+                    segment_scan_error = Some(err);
+                    None
+                }
             }
         }
+    } else if let Some(ref device_paths) = device_paths {
+        scan_block_devices_for_integrity(device_paths)
+    } else {
+        None
     };
 
     // Whether device-level checks were requested.
-    let device_checks_enabled = devices.is_some();
+    let device_checks_enabled = device_paths.is_some();
     let device_checks_skipped = !device_checks_enabled;
     let segment_scan_available = segment_report.is_some();
 
@@ -1095,9 +1146,10 @@ fn handle_pool_integrity_check(
 
     if json {
         print_combined_integrity_json(
+            &pool,
             device_checks_enabled,
             segment_report.as_ref(),
-            &path,
+            &report_root,
             overall_pass,
             &label_failures,
             committed_root_found,
@@ -1108,10 +1160,11 @@ fn handle_pool_integrity_check(
         );
     } else {
         print_combined_integrity_text(
+            &pool,
             device_checks_enabled,
             device_checks_skipped,
             segment_report.as_ref(),
-            &path,
+            &report_root,
             overall_pass,
             &label_failures,
             committed_root_found,
@@ -1132,6 +1185,7 @@ fn handle_pool_integrity_check(
 }
 
 fn print_combined_integrity_text(
+    pool: &str,
     device_checks_enabled: bool,
     device_checks_skipped: bool,
     report: Option<&PoolScanReport>,
@@ -1144,7 +1198,8 @@ fn print_combined_integrity_text(
     vrbt_missing_devices: &[String],
     segment_scan_error: Option<&str>,
 ) {
-    println!("pool integrity-check: {}", store_root.display());
+    println!("pool integrity-check: {pool}");
+    println!("  storage:       {}", store_root.display());
     println!(
         "  overall pass:  {}",
         if overall_pass {
@@ -1283,6 +1338,7 @@ fn print_combined_integrity_text(
 }
 
 fn print_combined_integrity_json(
+    pool: &str,
     device_checks_enabled: bool,
     report: Option<&PoolScanReport>,
     store_root: &Path,
@@ -1319,6 +1375,7 @@ fn print_combined_integrity_json(
     };
 
     let out = serde_json::json!({
+        "pool_name": pool,
         "pass": overall_pass,
         "device_checks_enabled": device_checks_enabled,
         "label_failures": label_failures,
@@ -1779,17 +1836,11 @@ mod tests {
     #[test]
     fn integrity_check_device_flag_parsed_single() {
         use clap::Parser;
-        let args = vec![
-            "pool",
-            "integrity-check",
-            "/data/pool",
-            "--devices",
-            "/dev/sdb",
-        ];
+        let args = vec!["pool", "integrity-check", "tank", "--devices", "/dev/sdb"];
         let cmd = PoolCommand::try_parse_from(args).expect("parse");
         match cmd {
-            PoolCommand::IntegrityCheck { path, devices, .. } => {
-                assert_eq!(path, PathBuf::from("/data/pool"));
+            PoolCommand::IntegrityCheck { pool, devices, .. } => {
+                assert_eq!(pool, "tank");
                 assert_eq!(devices, Some(vec![PathBuf::from("/dev/sdb")]));
             }
             _ => panic!("wrong command variant"),
@@ -1802,7 +1853,7 @@ mod tests {
         let args = vec![
             "pool",
             "integrity-check",
-            "/data/pool",
+            "tank",
             "--devices",
             "/dev/sdb",
             "/dev/sdc",
@@ -1827,10 +1878,43 @@ mod tests {
     #[test]
     fn integrity_check_without_devices_flag() {
         use clap::Parser;
-        let args = vec!["pool", "integrity-check", "/data/pool"];
+        let args = vec!["pool", "integrity-check", "tank"];
         let cmd = PoolCommand::try_parse_from(args).expect("parse");
         match cmd {
-            PoolCommand::IntegrityCheck { devices, .. } => {
+            PoolCommand::IntegrityCheck {
+                pool,
+                backing_dir,
+                devices,
+                ..
+            } => {
+                assert_eq!(pool, "tank");
+                assert_eq!(backing_dir, None);
+                assert_eq!(devices, None);
+            }
+            _ => panic!("wrong command variant"),
+        }
+    }
+
+    #[test]
+    fn integrity_check_offline_backing_dir_parsed() {
+        use clap::Parser;
+        let args = vec![
+            "pool",
+            "integrity-check",
+            "tank",
+            "--backing-dir",
+            "/data/pool",
+        ];
+        let cmd = PoolCommand::try_parse_from(args).expect("parse");
+        match cmd {
+            PoolCommand::IntegrityCheck {
+                pool,
+                backing_dir,
+                devices,
+                ..
+            } => {
+                assert_eq!(pool, "tank");
+                assert_eq!(backing_dir, Some(PathBuf::from("/data/pool")));
                 assert_eq!(devices, None);
             }
             _ => panic!("wrong command variant"),
