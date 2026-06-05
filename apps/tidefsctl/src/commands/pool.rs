@@ -88,14 +88,14 @@ pub enum PoolCommand {
         json: bool,
     },
 
-    /// Destroy a pool by zeroing its labels
+    /// Destroy a pool through its live owner, or offline with explicit devices
     Destroy {
-        /// Pool name
+        /// Pool name. Imported pools route to the live owner.
         pool_name: String,
 
-        /// Devices that belong to the pool
-        #[arg(short = 'd', long = "devices", required = true, num_args = 1..)]
-        devices: Vec<PathBuf>,
+        /// Devices that belong to an exported/offline pool
+        #[arg(short = 'd', long = "devices", num_args = 1..)]
+        devices: Option<Vec<PathBuf>>,
 
         /// Force destruction without confirmation
         #[arg(long = "force")]
@@ -106,11 +106,15 @@ pub enum PoolCommand {
         zero_superblock: bool,
     },
 
-    /// Import an existing pool through a live owner
+    /// Import an existing pool by name through a live owner
     Import {
-        /// One or more devices
-        #[arg(required = true, num_args = 1..)]
-        devices: Vec<PathBuf>,
+        /// Pool name. Imported pools route to the live owner.
+        #[arg(value_parser = parse_pool_name)]
+        pool_name: String,
+
+        /// Devices for exported/not-yet-imported owner creation
+        #[arg(short = 'd', long = "devices", num_args = 1..)]
+        devices: Option<Vec<PathBuf>>,
 
         /// Open devices read-only
         #[arg(long = "read-only")]
@@ -246,6 +250,19 @@ pub enum PoolCommand {
     },
 }
 
+fn parse_pool_name(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("pool name must not be empty".to_string());
+    }
+    if value.contains('/') {
+        return Err(
+            "pool name must be a pool identity, not a device path; pass devices with --devices"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Command handler
 // ---------------------------------------------------------------------------
@@ -272,12 +289,20 @@ pub fn handle_pool(cmd: PoolCommand) {
         ),
 
         PoolCommand::Import {
+            pool_name,
             devices,
             read_only,
             lock_dir,
             encryption_envelope,
             json,
-        } => handle_pool_import(devices, read_only, lock_dir, encryption_envelope, json),
+        } => handle_pool_import(
+            pool_name,
+            devices,
+            read_only,
+            lock_dir,
+            encryption_envelope,
+            json,
+        ),
         PoolCommand::Status {
             pool_name,
             devices,
@@ -511,28 +536,51 @@ fn hex_guid(bytes: &[u8; 16]) -> String {
 // ---------------------------------------------------------------------------
 
 fn handle_pool_import(
-    devices: Vec<PathBuf>,
-    _read_only: bool,
-    _lock_dir: Option<PathBuf>,
-    _encryption_envelope: Option<PathBuf>,
+    pool_name: String,
+    devices: Option<Vec<PathBuf>>,
+    read_only: bool,
+    lock_dir: Option<PathBuf>,
+    encryption_envelope: Option<PathBuf>,
     json: bool,
 ) {
+    let live_args = serde_json::json!({
+        "read_only": read_only,
+        "lock_dir": lock_dir.as_ref().map(|path| path.display().to_string()),
+        "encryption_envelope": encryption_envelope
+            .as_ref()
+            .map(|path| path.display().to_string()),
+    });
+    let Some(devices) = devices.filter(|devices| !devices.is_empty()) else {
+        super::live_owner::route_with_format_and_args(
+            "pool", "import", &pool_name, json, live_args,
+        );
+    };
+
+    let mut owner_args = live_args;
+    owner_args["devices"] = serde_json::Value::Array(
+        devices
+            .iter()
+            .map(|path| serde_json::Value::String(path.display().to_string()))
+            .collect(),
+    );
+
     let config = assemble_device_pool_config(&devices, "import");
+    ensure_device_pool_name(&pool_name, "import", &config);
     super::live_owner::route_or_refuse_active_for_uuid_with_format_and_args(
         "pool",
         "import",
-        &config.pool_name,
+        &pool_name,
         config.pool_uuid,
         config.state == tidefs_types_pool_label_core::PoolState::Active,
         json,
-        serde_json::Value::Null,
+        owner_args,
     );
 
     if json {
         let json_out = serde_json::json!({
             "ok": false,
             "command": "pool import",
-            "pool_name": config.pool_name,
+            "pool_name": pool_name,
             "pool_uuid": hex_guid(&config.pool_uuid),
             "state": config.state.to_string(),
             "error": "standalone import would activate a pool without a live owner",
@@ -542,14 +590,14 @@ fn handle_pool_import(
     } else {
         eprintln!(
             "tidefsctl pool import: refusing standalone import of pool '{}'",
-            config.pool_name
+            pool_name
         );
         eprintln!(
             "tidefsctl pool import: import creates live state, and live state must be owned by the kernel UAPI or a userspace daemon"
         );
         eprintln!(
             "tidefsctl pool import: use 'tidefsctl pool mount {} <mountpoint> --devices ...' for the current FUSE owner path",
-            config.pool_name
+            pool_name
         );
         eprintln!(
             "tidefsctl pool import: a future kernel import path must publish a live owner interface before this command can activate the pool"
@@ -1351,10 +1399,22 @@ fn handle_pool_export(pool_name: String, devices: Option<Vec<PathBuf>>, force: b
 
 fn handle_pool_destroy(
     pool_name: String,
-    devices: Vec<PathBuf>,
+    devices: Option<Vec<PathBuf>>,
     force: bool,
     zero_superblock: bool,
 ) {
+    let Some(devices) = devices.filter(|devices| !devices.is_empty()) else {
+        super::live_owner::route_with_args(
+            "pool",
+            "destroy",
+            &pool_name,
+            serde_json::json!({
+                "force": force,
+                "zero_superblock": zero_superblock,
+            }),
+        );
+    };
+
     let config = assemble_device_pool_config(&devices, "destroy");
     ensure_device_pool_name(&pool_name, "destroy", &config);
     super::live_owner::route_or_refuse_active_for_uuid_with_args(

@@ -454,6 +454,16 @@ mod tests {
     #[test]
     fn cli_parse_pool_destroy_default() {
         use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "pool", "destroy", "mypool"]);
+        assert!(
+            args.is_ok(),
+            "pool destroy with positional pool should route to live owner"
+        );
+    }
+
+    #[test]
+    fn cli_parse_pool_destroy_with_devices() {
+        use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
             "pool",
@@ -506,13 +516,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_pool_destroy_rejects_no_devices() {
-        use clap::Parser;
-        let args = Cli::try_parse_from(["tidefsctl", "pool", "destroy", "mypool"]);
-        assert!(args.is_err(), "pool destroy without --devices should fail");
-    }
-
-    #[test]
     fn cli_parse_unknown_command_rejected() {
         use clap::Parser;
         let args = Cli::try_parse_from(["tidefsctl", "nonexistent"]);
@@ -529,8 +532,11 @@ mod tests {
     #[test]
     fn cli_parse_pool_import_minimum() {
         use clap::Parser;
-        let args = Cli::try_parse_from(["tidefsctl", "pool", "import", "/dev/sda"]);
-        assert!(args.is_ok(), "pool import with one device should parse");
+        let args = Cli::try_parse_from(["tidefsctl", "pool", "import", "mypool"]);
+        assert!(
+            args.is_ok(),
+            "pool import with positional pool should parse"
+        );
     }
 
     #[test]
@@ -540,6 +546,8 @@ mod tests {
             "tidefsctl",
             "pool",
             "import",
+            "mypool",
+            "--devices",
             "/dev/sda",
             "/dev/sdb",
             "/dev/sdc",
@@ -553,7 +561,15 @@ mod tests {
     #[test]
     fn cli_parse_pool_import_read_only() {
         use clap::Parser;
-        let args = Cli::try_parse_from(["tidefsctl", "pool", "import", "--read-only", "/dev/sda"]);
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "pool",
+            "import",
+            "mypool",
+            "--read-only",
+            "--devices",
+            "/dev/sda",
+        ]);
         assert!(args.is_ok(), "pool import --read-only should parse");
     }
 
@@ -564,18 +580,30 @@ mod tests {
             "tidefsctl",
             "pool",
             "import",
+            "mypool",
             "--lock-dir",
             "/tmp/locks",
+            "--devices",
             "/dev/sda",
         ]);
         assert!(args.is_ok(), "pool import --lock-dir should parse");
     }
 
     #[test]
-    fn cli_parse_pool_import_rejects_no_devices() {
+    fn cli_parse_pool_import_rejects_no_name() {
         use clap::Parser;
         let args = Cli::try_parse_from(["tidefsctl", "pool", "import"]);
-        assert!(args.is_err(), "pool import without devices should fail");
+        assert!(args.is_err(), "pool import without pool name should fail");
+    }
+
+    #[test]
+    fn cli_parse_pool_import_rejects_device_only_positional() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "pool", "import", "/dev/sda"]);
+        assert!(
+            args.is_err(),
+            "pool import must not parse a device path as the pool identity"
+        );
     }
 
     // ── Pool export CLI parse tests ─────────────────────────────────

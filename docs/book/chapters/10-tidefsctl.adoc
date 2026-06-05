@@ -72,12 +72,14 @@ with `pool mount <pool> <mountpoint> --devices ...`, then operate through that
 owner.
 
 The current userspace path that both imports and creates a live owner is
-`pool mount <pool> <mountpoint> --devices ...`. `pool import --devices ...`
-does not activate a pool by itself in the current CLI because a one-shot
-device import would create live state and then leave no owner for cached
-state. A future kernel import path must publish a kernel owner interface
-before `pool import` can activate storage. After a pool is live, follow-up
-commands must use the owner interface or fail closed.
+`pool mount <pool> <mountpoint> --devices ...`. `pool import <pool>` is an
+owner-mediated request for an imported pool. `pool import <pool> --devices ...`
+does not activate an exported pool by itself in the current CLI because a
+one-shot device import would create live state and then leave no owner for
+cached state. A future kernel import path must publish a kernel owner
+interface before `pool import <pool> --devices ...` can activate storage.
+After a pool is live, follow-up commands must use the owner interface or fail
+closed.
 
 Do not implement positional pool-name usability by reopening
 `/run/tidefs/pools/<name>`, by treating the pool name as a backing path, or by
@@ -90,6 +92,7 @@ Common owner-aware forms put the pool first:
 [source,sh]
 ----
 tidefsctl pool status <pool>
+tidefsctl pool import <pool>
 tidefsctl pool get <pool> <property>
 tidefsctl pool set <pool> <property>=<value>
 tidefsctl dataset create <pool> <dataset>
@@ -100,6 +103,7 @@ tidefsctl dataset rotate-key <pool> --old-passphrase <phrase> --old-salt <hex> -
 tidefsctl snapshot create <pool> <snapshot>
 tidefsctl snapshot list <pool>
 tidefsctl pool export <pool>
+tidefsctl pool destroy <pool>
 tidefsctl device remove <pool> <device>
 tidefsctl block attach <pool>
 tidefsctl block send <pool> --target-addr <addr>
@@ -112,6 +116,8 @@ explicitly:
 [source,sh]
 ----
 tidefsctl device remove <pool> <device> --backing-dir <target-store> --surviving-dirs <stores>
+tidefsctl pool import <pool> --devices <devices>
+tidefsctl pool destroy <pool> --devices <devices>
 tidefsctl block attach <pool> --backing-dir <object-store>
 tidefsctl block send <pool> --backing-dir <object-store> --target-addr <addr>
 tidefsctl block receive <pool> --backing-dir <object-store> --source-addr <addr>

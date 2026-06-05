@@ -141,8 +141,9 @@ tidefsctl pool mount mypool /mnt/tidefs \
   --encryption-envelope ./mypool.key
 ```
 
-Plain `tidefsctl pool import ...` is not a live-state owner by itself. Do not
-use it as a substitute for the kernel UAPI or a userspace daemon endpoint.
+Plain `tidefsctl pool import mypool` is an owner-mediated request, not a
+live-state owner by itself. Do not use it as a substitute for the kernel UAPI
+or a userspace daemon endpoint.
 
 ### 3.4 Check pool status
 
@@ -507,6 +508,10 @@ tidefsctl pool export mypool --force
 # Destroy the pool (zeroes pool labels on each device)
 tidefsctl pool destroy mypool --devices /dev/sdb /dev/sdc --force --zero-superblock
 ```
+
+For an imported pool, `tidefsctl pool destroy mypool` asks the live owner. The
+current userspace owner fails that request closed; export or unmount first,
+then use the explicit `--devices` form on exported storage.
 
 Without `--zero-superblock`, only the label headers are removed. With it,
 the superblock regions on each device are also zeroed.

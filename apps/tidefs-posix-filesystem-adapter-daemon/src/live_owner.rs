@@ -274,6 +274,7 @@ fn dispatch_request(
         ("pool", "import") => already_owned("import", manifest, request.json),
         ("pool", "mount") => already_owned("mount", manifest, request.json),
         ("pool", "export") => pool_export(request.json, manifest, shutdown),
+        ("pool", "destroy") => pool_destroy_refused(request.json, manifest),
         ("pool", "get" | "set" | "list-props")
         | (
             "dataset",
@@ -460,6 +461,21 @@ fn pool_export(
             "pool export requested: {}\n  owner:      {} (pid {})\n  mountpoint: {}\n  action:     live owner shutdown requested",
             manifest.pool_name, manifest.owner_kind, manifest.pid, manifest.mountpoint
         ))
+    }
+}
+
+fn pool_destroy_refused(wants_json: bool, manifest: &LiveOwnerManifest) -> LiveOwnerResponse {
+    let message = "pool destroy is not implemented for the live userspace owner; export or unmount the pool, then destroy exported storage with --devices";
+    if wants_json {
+        LiveOwnerResponse::error(1, message)
+    } else {
+        LiveOwnerResponse::error(
+            1,
+            format!(
+                "{message} (pool '{}' owner={} pid={} mountpoint={})",
+                manifest.pool_name, manifest.owner_kind, manifest.pid, manifest.mountpoint
+            ),
+        )
     }
 }
 
