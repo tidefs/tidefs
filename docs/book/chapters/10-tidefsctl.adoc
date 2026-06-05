@@ -48,8 +48,12 @@ queries/mutations, dataset set-strategy/upgrade feature mutations, snapshot
 create/list/destroy/rollback, dataset key sealing/rotation, and
 owner-mediated `pool export` shutdown. Those operations run against the
 mounted engine that owns cached state. Snapshot send/receive, live destroy,
-live device removal execution, and live block attach/export/send/receive still
-fail closed where the owner-side implementation is missing.
+and live block attach/export/send/receive still fail closed where the
+owner-side implementation is missing. Live device removal is implemented for
+the current userspace FUSE owner by calling the mounted pool's evacuation path
+through that owner; it refuses forced removal and still needs follow-up
+active-label topology persistence before it can close the full device
+lifecycle debt.
 
 Offline inputs are explicit. Commands that operate on a pool that is not
 imported must say how to find it with arguments such as `--devices` or

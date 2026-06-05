@@ -338,8 +338,11 @@ tidefsctl device rebuild
 ```
 
 The pool name is the live-owner identity. If `mypool` is imported, device
-removal routes to that owner and fails closed until the owner implements the
-operation; the backing-directory form is only for exported/offline storage.
+removal routes to that owner. The current userspace FUSE owner executes
+mounted-pool evacuation through its live `Pool` state and refuses `--force`;
+kernel-owner removal and active-label topology persistence remain bounded
+follow-up work. The backing-directory form is only for exported/offline
+storage.
 The offline form probes existing labels without creating or opening the store
 writable. Those labels provide topology and recovery evidence. If they identify
 `ACTIVE` imported state, the request routes to the owner interface or fails

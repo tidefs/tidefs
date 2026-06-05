@@ -1182,10 +1182,7 @@ impl VfsLocalFileSystem {
             ("pool", "get") => self.live_pool_get(args),
             ("pool", "set") => self.live_pool_set(args),
             ("pool", "list-props") => self.live_pool_list_props(args),
-            ("device", "remove") => live_admin_error(
-                1,
-                "device remove: live owner interface is reached, but live evacuation/removal is not implemented yet",
-            ),
+            ("device", "remove") => self.live_device_remove(args, wants_json),
             _ => live_admin_error(
                 1,
                 format!("live engine does not implement tidefsctl {command} {operation}"),
@@ -2089,6 +2086,80 @@ impl VfsLocalFileSystem {
         let family = live_admin_optional_arg(args, "family");
         let fs = self.fs.borrow();
         live_property_table("pool list-props", fs.pool_properties(), family)
+    }
+
+    fn live_device_remove(&self, args: &Value, wants_json: bool) -> Vec<u8> {
+        let device_path = match live_admin_arg(args, "device_path") {
+            Ok(value) => std::path::PathBuf::from(value),
+            Err(err) => return live_admin_error(2, err),
+        };
+
+        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+        if force {
+            return live_admin_error(
+                1,
+                "device remove: --force is not supported through the live owner; live removal must evacuate every object cleanly",
+            );
+        }
+
+        let mut fs = self.fs.borrow_mut();
+        let result = match fs.store.safe_remove_device(&device_path) {
+            Ok(result) => result,
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "device remove: mounted pool owner could not remove '{}': {err}",
+                        device_path.display()
+                    ),
+                )
+            }
+        };
+
+        if !result.complete || result.objects_failed > 0 {
+            return live_admin_error(
+                1,
+                format!(
+                    "device remove: evacuation of '{}' did not complete (objects_evacuated={}, objects_failed={})",
+                    device_path.display(),
+                    result.objects_evacuated,
+                    result.objects_failed,
+                ),
+            );
+        }
+
+        if let Err(err) = fs.store.sync_all() {
+            return live_admin_error(
+                1,
+                format!(
+                    "device remove: '{}' was removed from mounted state, but surviving-device sync failed: {err}",
+                    device_path.display()
+                ),
+            );
+        }
+
+        let remaining_devices = fs.store.stats().device_count;
+        let response = json!({
+            "device_path": device_path.display().to_string(),
+            "objects_evacuated": result.objects_evacuated,
+            "objects_failed": result.objects_failed,
+            "bytes_evacuated": result.bytes_evacuated,
+            "remaining_devices": remaining_devices,
+            "active_label_persistence": "not yet wired in mounted-pool topology updates; tracked by TFR-011/TFR-012",
+        });
+
+        if wants_json {
+            live_admin_ok_json(response)
+        } else {
+            live_admin_ok_text(format!(
+                "device '{}' removed through live pool owner\n  objects evacuated: {}\n  bytes evacuated:   {}\n  objects failed:    {}\n  remaining devices: {}\n  active labels:     mounted-pool topology labels still need TFR-011/TFR-012 wiring",
+                device_path.display(),
+                result.objects_evacuated,
+                result.bytes_evacuated,
+                result.objects_failed,
+                remaining_devices,
+            ))
+        }
     }
 }
 
@@ -4091,6 +4162,49 @@ mod tests {
         serde_json::from_slice(&response).expect("decode live admin response")
     }
 
+    fn live_device_admin(
+        engine: &VfsLocalFileSystem,
+        operation: &str,
+        args: Value,
+        wants_json: bool,
+    ) -> Value {
+        let request = json!({
+            "command": "device",
+            "operation": operation,
+            "pool": "tank",
+            "json": wants_json,
+            "args": args,
+        });
+        let request = serde_json::to_vec(&request).expect("encode live admin request");
+        let response = engine
+            .handle_live_pool_admin_request(&request)
+            .expect("dispatch live admin request");
+        serde_json::from_slice(&response).expect("decode live admin response")
+    }
+
+    fn temp_fs_with_block_devices(
+        device_count: usize,
+    ) -> (VfsLocalFileSystem, tempfile::TempDir, Vec<PathBuf>) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let metadata = root.path().join("metadata");
+        std::fs::create_dir_all(&metadata).expect("create metadata dir");
+        let mut devices = Vec::with_capacity(device_count);
+        for idx in 0..device_count {
+            let path = root.path().join(format!("dev{idx}.img"));
+            let file = std::fs::File::create(&path).expect("create device image");
+            file.set_len(8 * 1024 * 1024).expect("size device image");
+            devices.push(path);
+        }
+        let fs = LocalFileSystem::open_with_block_devices(
+            metadata,
+            &devices,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open block-device filesystem");
+        (VfsLocalFileSystem::new(fs), root, devices)
+    }
+
     #[test]
     fn live_dataset_properties_use_pool_local_catalog_path() {
         let (engine, _td) = temp_fs();
@@ -4211,6 +4325,42 @@ mod tests {
                 "supported feature {feature} should be enabled",
             );
         }
+    }
+
+    #[test]
+    fn live_device_remove_evacuates_through_mounted_pool_owner() {
+        let (engine, _td, devices) = temp_fs_with_block_devices(2);
+        let payload = b"live owner device remove keeps mounted data reachable";
+        {
+            let mut fs = engine.fs.borrow_mut();
+            fs.create_file("/keep", 0o644).expect("create file");
+            fs.write_file("/keep", 0, payload).expect("write file");
+            fs.sync_all().expect("sync file before removal");
+            assert_eq!(fs.store.stats().device_count, 2);
+        }
+
+        let removed = live_device_admin(
+            &engine,
+            "remove",
+            json!({
+                "device_path": devices[0].display().to_string(),
+                "force": false,
+            }),
+            true,
+        );
+
+        assert_eq!(removed["ok"], true, "remove response: {removed}");
+        assert_eq!(removed["json"]["objects_failed"], 0);
+        assert_eq!(removed["json"]["remaining_devices"], 1);
+
+        let fs = engine.fs.borrow();
+        assert_eq!(fs.store.stats().device_count, 1);
+        assert_eq!(
+            fs.read_file("/keep").expect("read after live removal"),
+            payload
+        );
+        drop(fs);
+        drop(engine);
     }
 
     #[cfg(feature = "encryption")]
