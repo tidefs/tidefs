@@ -272,7 +272,7 @@ fn dispatch_request(
     match (request.command.as_str(), request.operation.as_str()) {
         ("pool", "status") => pool_status(request.json, manifest, engine),
         ("pool", "import") => already_owned("import", manifest, request.json),
-        ("pool", "mount") => already_owned("mount", manifest, request.json),
+        ("pool", "mount") => pool_mount_refused(&request, manifest),
         ("pool", "export") => pool_export(request.json, manifest, shutdown),
         ("pool", "destroy") => pool_destroy_refused(request.json, manifest),
         ("pool", "get" | "set" | "list-props" | "integrity-check")
@@ -442,6 +442,42 @@ fn already_owned(
     }
 }
 
+fn pool_mount_refused(
+    request: &LiveOwnerRequest,
+    manifest: &LiveOwnerManifest,
+) -> LiveOwnerResponse {
+    let mountpoint = request
+        .args
+        .get("mountpoint")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unspecified>");
+    let dataset = request
+        .args
+        .get("dataset")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("root");
+    let read_only = request
+        .args
+        .get("read_only")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let relatime = request
+        .args
+        .get("relatime")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let message = format!(
+        "pool mount for already-imported pool '{}' must be performed by the live owner; the current {} owner has no secondary mount implementation for mountpoint '{}' dataset '{}' (read_only={}, relatime={})",
+        manifest.pool_name,
+        manifest.owner_kind,
+        mountpoint,
+        dataset,
+        read_only,
+        relatime,
+    );
+    LiveOwnerResponse::error(1, message)
+}
+
 fn pool_export(
     wants_json: bool,
     manifest: &LiveOwnerManifest,
@@ -554,5 +590,33 @@ mod tests {
             payload.get("pool_uuid").and_then(serde_json::Value::as_str),
             Some("0123456789abcdeffedcba9876543210")
         );
+    }
+
+    #[test]
+    fn pool_mount_request_fails_until_owner_can_mount() {
+        let manifest = manifest();
+        let request = LiveOwnerRequest {
+            command: "pool".to_string(),
+            operation: "mount".to_string(),
+            pool: "tank".to_string(),
+            pool_uuid: None,
+            json: false,
+            args: json!({
+                "mountpoint": "/mnt/other",
+                "dataset": "root",
+                "read_only": true,
+                "relatime": false,
+            }),
+        };
+
+        let response = pool_mount_refused(&request, &manifest);
+
+        assert!(!response.ok);
+        assert_eq!(response.exit_code, 1);
+        let error = response.error.expect("mount refusal should explain why");
+        assert!(error.contains("already-imported pool 'tank'"));
+        assert!(error.contains("live owner"));
+        assert!(error.contains("/mnt/other"));
+        assert!(error.contains("no secondary mount implementation"));
     }
 }

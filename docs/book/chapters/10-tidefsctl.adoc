@@ -51,10 +51,14 @@ key sealing/rotation, and owner-mediated `pool export` shutdown. Those
 operations run against the mounted engine that owns cached state. Snapshot
 receive, live destroy, live network/incremental snapshot send, and live block
 attach/export/send/receive still fail closed where the owner-side
-implementation is missing. Live device removal is implemented for the current
-userspace FUSE owner by calling the mounted pool's evacuation path through
-that owner; it refuses forced removal and still needs follow-up active-label
-topology persistence before it can close the full device lifecycle debt.
+implementation is missing. A follow-up `pool mount <pool> <mountpoint>` for an
+already-imported userspace FUSE pool also fails closed until the owner can
+create an additional mount/session itself; returning success without mounting
+would be a false live-state operation. Live device removal is implemented for
+the current userspace FUSE owner by calling the mounted pool's evacuation path
+through that owner; it refuses forced removal and still needs follow-up
+active-label topology persistence before it can close the full device lifecycle
+debt.
 
 Offline inputs are explicit. Commands that operate on a pool that is not
 imported must say how to find it with arguments such as `--devices` or

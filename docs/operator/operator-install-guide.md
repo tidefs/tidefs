@@ -183,7 +183,9 @@ tidefsctl pool mount mypool /mnt/tidefs --devices /tmp/pool1.img /tmp/pool2.img
 
 The `--devices` form imports exported storage and starts the userspace FUSE
 owner. If the pool is already imported, omit `--devices`; the command talks to
-the runtime owner instead of reopening the devices.
+the runtime owner instead of reopening the devices. The current userspace FUSE
+owner fails closed for additional mount requests until owner-side secondary
+mount/session creation is implemented.
 
 For a specific dataset:
 
