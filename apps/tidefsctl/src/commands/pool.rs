@@ -145,7 +145,7 @@ pub enum PoolCommand {
         force: bool,
     },
 
-    /// Mount a pool's filesystem at a mountpoint
+    /// Run the development FUSE mount harness for an imported pool
     Mount {
         /// Pool name
         pool_name: String,

@@ -7,22 +7,19 @@
 //! | Command | Stage |
 //! |---|---|
 //! | `mount` | userspace harness (FUSE daemon launch) |
-//! | `pool create` | operator command |
-//! | `pool status` | operator command; device-label backed |
-//! | `pool destroy` | operator command |
-//! | `pool import` | operator command |
-//! | `pool export` | operator command |
+//! | `pool create/scan/status/import/export/destroy` | operator commands |
+//! | `pool get/set/list-props` | operator commands |
 //! | `pool mount` | userspace harness (pool import + FUSE daemon launch) |
-//! | `pool scan` | operator diagnostic; explicit device scan |
 //! | `pool integrity-check` | operator diagnostic |
-//! | `snapshot create/list/destroy` | operator command |
+//! | `snapshot create/list/destroy/rollback/send/receive` | operator commands |
 //! | `device remove` | operator command; TFR-012 remains open |
 //! | `device rebuild` | operator command; TFR-012 remains open |
 //! | `defrag` | operator command |
-//! | `block attach/detach/list` | operator command |
+//! | `block attach/detach/list/send/receive` | operator commands |
 //! | `dataset create/list/destroy/rename` | operator command (catalog-backed) |
-//! | `dataset set-strategy/seal-key/rotate-key/upgrade` | operator command |
-//! | `cluster pool create` | cluster operator command; TFR-017 remains open |
+//! | `dataset set-strategy/seal-key/rotate-key/upgrade/get/set/list-props` | operator commands |
+//! | `diag` | operator diagnostic/support bundle |
+//! | `cluster pool create` | cluster operator prototype; TFR-017 remains open |
 //! | `cluster placement exercise` | development diagnostic exercise |
 //! | `cluster heal exercise` | development diagnostic exercise |
 mod commands;
@@ -39,8 +36,9 @@ use tidefs_posix_filesystem_adapter_daemon::{self, MountConfig};
 #[command(
     name = "tidefsctl",
     version = env!("CARGO_PKG_VERSION"),
-    about = "TideFS operator CLI — pool lifecycle, snapshot management, device/block operations, and userspace harness",
-    long_about = None,
+    about = "TideFS CLI for operator commands and development harnesses",
+    long_about = "TideFS command-line interface.\n\nOperator surfaces: pool, dataset, snapshot, device, block, diag.\nDevelopment harnesses: mount, pool mount, cluster placement exercise, cluster heal exercise.\n\nTideFS is pre-alpha; command help should describe the current command stage rather than imply production readiness.",
+    after_help = "Use `tidefsctl help <COMMAND>` for command details. The book source lives under docs/book/.",
 )]
 struct Cli {
     #[command(subcommand)]
@@ -49,7 +47,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Mount a TideFS filesystem via FUSE
+    /// Run the development FUSE mount harness
     Mount {
         /// Backing directory for local object store
         backing_dir: PathBuf,
@@ -75,7 +73,7 @@ enum Command {
         encryption_envelope: Option<PathBuf>,
     },
 
-    /// Manage storage pools
+    /// Manage pools and pool-backed development mounts
     Pool {
         #[command(subcommand)]
         cmd: commands::pool::PoolCommand,
@@ -108,7 +106,7 @@ enum Command {
         recursive: bool,
     },
 
-    /// Manage multi-node cluster and clustered pools
+    /// Manage clustered pools and development diagnostics
     Cluster {
         #[command(subcommand)]
         cmd: commands::cluster::ClusterCommand,
@@ -120,7 +118,7 @@ enum Command {
         cmd: commands::block::BlockCommand,
     },
 
-    /// Collect a redacted support bundle for operator triage
+    /// Collect a redacted support bundle
     Diag {
         /// Output directory for the support bundle JSON file
         #[arg(long = "output", short = 'o', value_name = "DIR")]

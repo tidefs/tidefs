@@ -1,0 +1,40 @@
+== Preface
+
+TideFS is a pre-alpha Rust filesystem and storage stack. The project target is
+OpenZFS/Ceph-class reliability and scale, but the implementation is not there
+yet.
+
+This book is the curated reader-facing surface for TideFS. It should explain
+what a careful operator or contributor can actually do today, mark development
+harnesses plainly, and avoid carrying old imported design claims forward as
+current behavior.
+
+=== Authority
+
+When this book disagrees with active repo authority, fix the book. The current
+reading order starts with:
+
+* `README.md`
+* `AGENTS.md`
+* `docs/INDEX.md`
+* `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
+* `docs/REVIEW_TODO_POLICY.md`
+* `docs/REVIEW_TODO_REGISTER.md`
+* `docs/WHOLE_REPO_REVIEW.md`
+
+Historical design files may inform a chapter, but they are not product truth
+until classified by the documentation authority register.
+
+=== Maturity Language
+
+Use direct maturity labels:
+
+* `current operator surface` for commands that are live and intended to remain
+  part of the operator path;
+* `development harness` for FUSE, local, or exercise paths used to bring the
+  system up before the final kernel path is ready;
+* `historical background` for imported design text that is useful but not
+  current behavior.
+
+Do not write release-ready language until the corresponding repo authority says
+the behavior is real.

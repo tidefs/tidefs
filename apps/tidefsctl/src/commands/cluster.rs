@@ -35,13 +35,13 @@ pub enum ClusterCommand {
         cmd: ClusterPoolCommand,
     },
 
-    /// Run deterministic placement-map diagnostics
+    /// Run development placement-map diagnostics
     Placement {
         #[command(subcommand)]
         cmd: ClusterPlacementCommand,
     },
 
-    /// Run deterministic placement-heal diagnostics
+    /// Run development placement-heal diagnostics
     Heal {
         #[command(subcommand)]
         cmd: ClusterHealCommand,
@@ -89,7 +89,7 @@ pub enum ClusterPoolCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum ClusterPlacementCommand {
-    /// Run a deterministic PlacementMap diagnostic example
+    /// Run a development PlacementMap diagnostic example
     Exercise {
         /// Epoch for the placement map
         #[arg(long = "epoch", default_value = "1")]
@@ -103,7 +103,7 @@ pub enum ClusterPlacementCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum ClusterHealCommand {
-    /// Run a deterministic PlacementHealCoordinator diagnostic example:
+    /// Run a development PlacementHealCoordinator diagnostic example:
     /// populate placement, trigger loss, walk Idle->Assessing
     Exercise {
         /// Epoch for the heal coordinator

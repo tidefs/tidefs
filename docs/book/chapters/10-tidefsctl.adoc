@@ -1,0 +1,51 @@
+== tidefsctl
+
+`tidefsctl` is the TideFS command-line interface. Its job is to expose the
+operator path without pretending that every bring-up tool is final product
+surface.
+
+=== Command Classes
+
+[cols="1,2",options="header"]
+|===
+| Class | Commands
+
+| Current operator surface
+| `pool create`, `pool scan`, `pool status`, `pool import`, `pool export`,
+  `pool destroy`, `pool integrity-check`, `pool get`, `pool set`,
+  `pool list-props`; `dataset create`, `dataset list`, `dataset destroy`,
+  `dataset rename`, `dataset set-strategy`, `dataset seal-key`,
+  `dataset rotate-key`, `dataset upgrade`, `dataset get`, `dataset set`,
+  `dataset list-props`; `snapshot create`, `snapshot list`, `snapshot destroy`,
+  `snapshot rollback`, `snapshot send`, `snapshot receive`; `device remove`,
+  `device rebuild`; `block attach`, `block detach`, `block list`,
+  `block send`, `block receive`; `defrag`; `diag`
+
+| Development harness
+| `mount`, `pool mount`, hidden `pool create --file-devices`,
+  `cluster placement exercise`, `cluster heal exercise`
+
+| Cluster operator prototype
+| `cluster pool create`
+|===
+
+The command classes are part of the CLI contract. Help text, parser tests, and
+book text should change together when a command moves between classes.
+
+=== Help Text Rule
+
+Top-level help should answer two questions quickly:
+
+* Is this command an operator surface or a development harness?
+* Which subcommand should the operator inspect next?
+
+Keep command descriptions short, concrete, and honest. Avoid resurrecting
+removed control-plane stubs or hiding a development harness behind final
+operator wording.
+
+=== Final Kernel Path
+
+The final full-kernel direction leaves `tidefsctl` as an operator/query client.
+It may request configuration changes, inspect state, trigger runbook
+operations, and collect support bundles. It must not become a required
+userspace daemon for normal mounted filesystem operation.

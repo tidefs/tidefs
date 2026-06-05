@@ -6,7 +6,7 @@ publish.workspace = true
 license.workspace = true
 authors.workspace = true
 
-description = "TideFS operator CLI — pool lifecycle, snapshot management, device/block operations, and userspace harness"
+description = "TideFS CLI for operator commands and development harnesses"
 
 [dependencies]
 tidefs-posix-filesystem-adapter-daemon = { path = "../../apps/tidefs-posix-filesystem-adapter-daemon" }

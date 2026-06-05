@@ -1,0 +1,12 @@
+= TideFS Book
+:doctype: book
+:toc: left
+:toclevels: 3
+:sectanchors:
+:revdate: 2026-06-05
+
+include::chapters/00-preface.adoc[]
+
+= Operator Guide
+
+include::chapters/10-tidefsctl.adoc[]

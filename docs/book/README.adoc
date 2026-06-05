@@ -1,0 +1,71 @@
+= TideFS Book Authoring Decision
+:toc:
+
+== Decision
+
+Write the TideFS Book in AsciiDoc, using `docs/book/tidefs-book.adoc` as the
+root source file.
+
+AsciiDoc is the authoring format. DocBook is an output format. When the repo
+gets a book build target, it should emit at least HTML and DocBook XML from the
+same AsciiDoc sources; PDF can follow from the same pipeline.
+
+This keeps the project close to DocBook's long-form publishing model without
+forcing every normal edit through raw XML.
+
+== Source Rules
+
+The book is a curated product surface, not an import bucket.
+
+* Current authority starts at the repo root `README.md`, `AGENTS.md`,
+  `docs/INDEX.md`, `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, and the review
+  register.
+* Imported design notes stay historical until they are classified by the
+  documentation authority register.
+* Book chapters may summarize historical design only when the text clearly says
+  it is background, not current behavior.
+* CLI chapters must follow live `tidefsctl` help and source comments in the
+  same commit that changes command shape.
+* Capability wording must stay behind implementation reality and the project
+  claims gate.
+
+== Layout
+
+----
+docs/book/
+  README.adoc              authoring decision and house rules
+  tidefs-book.adoc         assembled book root
+  chapters/
+    00-preface.adoc        maturity, audience, authority
+    10-tidefsctl.adoc      operator CLI map
+----
+
+Future chapters should be added as numbered files so the book order stays
+stable under ordinary diffs.
+
+== Audience Map
+
+The finished book should serve four readers:
+
+* operators running pools, datasets, snapshots, devices, and block volumes;
+* developers hacking the Rust workspace and kernel-facing code;
+* reviewers checking whether claims match implementation;
+* future public users, once the private-release rule changes.
+
+The first real expansion should be the operator path: installing the tool,
+creating a pool, managing datasets, taking snapshots, attaching block volumes,
+and collecting support bundles. Development harnesses belong in their own
+clearly labeled sections.
+
+== Build Direction
+
+The intended build shape is:
+
+----
+asciidoctor -D target/book/html docs/book/tidefs-book.adoc
+asciidoctor -b docbook5 -D target/book/docbook docs/book/tidefs-book.adoc
+----
+
+Do not add generated HTML, DocBook XML, or PDF artifacts to the repository.
+The build target should write under `target/` or another ignored output
+directory.

@@ -11,6 +11,11 @@ Start here:
 7. `docs/WHOLE_REPO_REVIEW.md`
 8. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
 
+Book:
+
+- `docs/book/README.adoc`
+- `docs/book/tidefs-book.adoc`
+
 The remaining documents are imported design/reference material. They need
 ongoing audit against the review register before they can be treated as current
 status.

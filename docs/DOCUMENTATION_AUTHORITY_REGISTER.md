@@ -12,6 +12,11 @@ claim.
 The active entry points are `README.md`, `AGENTS.md`, `docs/LICENSING.md`,
 `docs/REVIEW_TODO_REGISTER.md`, `docs/WHOLE_REPO_REVIEW.md`, and this file.
 
+The active TideFS Book authoring decision is `docs/book/README.adoc`. The
+assembled book source starts at `docs/book/tidefs-book.adoc`; book chapters are
+current only for the narrow subject they state and must not promote imported
+historical design material without this register classifying it.
+
 All other imported documents are review inputs until classified here or in a
 small follow-up commit tied to TFR-019.
 
