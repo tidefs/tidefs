@@ -155,8 +155,9 @@ Use `--devices` only for exported/offline status or discovery. Once the pool is
 imported, `tidefsctl pool status mypool` routes to the live owner instead of
 opening the devices. A stale `/run/tidefs/pools/.../owner.json` file is not
 itself a live owner; the owner socket must be reachable. If labels still show an
-imported pool and no owner socket responds, recover or recreate the owner with
-`tidefsctl pool mount ... --devices ...` before running live-state commands.
+imported pool and no owner socket responds, repair or restart the kernel UAPI
+or userspace daemon owner before running live-state commands. Do not open the
+cached imported state directly.
 
 ---
 
@@ -306,8 +307,8 @@ or create `/run/tidefs/pools/<uuid>` runtime ownership as a side effect. If the
 live-owner registry already names that pool UUID, the CLI routes to that exact
 owner. An on-disk `ACTIVE` label is cached recovery evidence rather than the
 owner interface itself, but it is not ordinary exported storage. Without a
-reachable owner interface, live-state commands fail closed; recover or create
-the owner with `pool mount --devices`, then operate through that owner.
+reachable owner interface, live-state commands fail closed; repair or restart
+the kernel UAPI or userspace daemon owner, then operate through that owner.
 
 ### 6.3 Block device export
 

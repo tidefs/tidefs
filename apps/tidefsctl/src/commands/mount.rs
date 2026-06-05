@@ -243,15 +243,15 @@ pub fn handle_mount(args: PoolMountArgs) {
     // Determine the backing directory: explicit --devices import or live-owner route.
     let (backing_dir, owner_pool_uuid) = if let Some(ref devices) = args.devices {
         let existing_config = scan_device_pool_config(&args.pool_name, devices, "mount");
-        // Mount with explicit devices is the userspace owner-creating path.
-        // Route only when a live owner has already published its interface;
-        // an ACTIVE label without an owner can be stale crash state and must
-        // still flow through pool_import recovery before this process owns it.
-        super::live_owner::route_if_owner_exists_for_uuid_with_format_and_args(
+        // Mount with explicit devices creates a userspace owner only for a
+        // pool that is not already imported. ACTIVE labels are cached
+        // imported-pool state, so live work must go through the current owner.
+        super::live_owner::route_or_refuse_active_for_uuid_with_format_and_args(
             "pool",
             "mount",
             &args.pool_name,
             existing_config.pool_uuid,
+            existing_config.state == tidefs_types_pool_label_core::PoolState::Active,
             false,
             live_args.clone(),
         );

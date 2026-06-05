@@ -102,8 +102,11 @@ pub(crate) fn route_if_owner_exists_with_format_and_args(
     args: serde_json::Value,
 ) {
     let root = pool_runtime_root();
-    if owner_record_cached_by_pool_at(&root, pool) {
+    if owner_interface_reachable_by_pool_at(&root, pool) {
         route_with_format_and_args(command, operation, pool, json, args);
+    }
+    if owner_record_cached_by_pool_at(&root, pool) {
+        refuse_cached_without_owner(command, operation, pool, None, json);
     }
 }
 
@@ -114,10 +117,14 @@ pub(crate) fn route_if_owner_exists_for_pool_backing_dir_with_args(
     backing_dir: &Path,
     args: serde_json::Value,
 ) {
+    let root = pool_runtime_root();
     if let Some(pool_uuid) =
-        cached_owner_by_pool_backing_dir_at(&pool_runtime_root(), pool, backing_dir)
+        owner_interface_reachable_by_pool_backing_dir_at(&root, pool, backing_dir)
     {
         route_imported_with_format_and_args(command, operation, pool, pool_uuid, false, args);
+    }
+    if let Some(pool_uuid) = cached_owner_by_pool_backing_dir_at(&root, pool, backing_dir) {
+        refuse_cached_without_owner(command, operation, pool, Some(pool_uuid), false);
     }
 }
 
@@ -127,10 +134,13 @@ pub(crate) fn route_if_owner_exists_for_backing_dir_with_args(
     backing_dir: &Path,
     args: serde_json::Value,
 ) {
-    if let Some((pool, pool_uuid)) =
-        cached_owner_by_backing_dir_at(&pool_runtime_root(), backing_dir)
+    let root = pool_runtime_root();
+    if let Some((pool, pool_uuid)) = owner_interface_reachable_by_backing_dir_at(&root, backing_dir)
     {
         route_imported_with_format_and_args(command, operation, &pool, pool_uuid, false, args);
+    }
+    if let Some((pool, pool_uuid)) = cached_owner_by_backing_dir_at(&root, backing_dir) {
+        refuse_cached_without_owner(command, operation, &pool, Some(pool_uuid), false);
     }
 }
 
@@ -162,24 +172,11 @@ pub(crate) fn route_or_refuse_active_for_uuid_with_format_and_args(
     json: bool,
     args: serde_json::Value,
 ) {
-    if owner_record_cached_for_uuid_at(&pool_runtime_root(), pool, &pool_uuid) {
+    if owner_interface_reachable_for_uuid_at(&pool_runtime_root(), pool, &pool_uuid) {
         route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
     }
     if active_label {
         refuse_active_without_owner(command, operation, pool, pool_uuid, json);
-    }
-}
-
-pub(crate) fn route_if_owner_exists_for_uuid_with_format_and_args(
-    command: &str,
-    operation: &str,
-    pool: &str,
-    pool_uuid: [u8; 16],
-    json: bool,
-    args: serde_json::Value,
-) {
-    if owner_interface_reachable_for_uuid_at(&pool_runtime_root(), pool, &pool_uuid) {
-        route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
     }
 }
 
@@ -219,7 +216,7 @@ fn refuse_active_without_owner(
             "state": "ACTIVE",
             "owner_required": true,
             "error": "devices identify an imported pool but no live owner interface is reachable",
-            "recovery": "route through the kernel UAPI or userspace daemon owner; use pool mount --devices only to recover/create the userspace owner before operating on live state",
+            "recovery": "repair or restart the kernel UAPI or userspace daemon owner before operating on live state; do not open cached imported-pool state directly",
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
     } else {
@@ -230,7 +227,49 @@ fn refuse_active_without_owner(
             "tidefsctl {command} {operation}: imported pool state is cached and must be owned by the kernel UAPI or userspace daemon"
         );
         eprintln!(
-            "tidefsctl {command} {operation}: refusing direct device access; recover/create the owner with 'tidefsctl pool mount {pool} <mountpoint> --devices ...' before live-state operations"
+            "tidefsctl {command} {operation}: refusing direct device access; repair or restart the owner before live-state operations"
+        );
+    }
+    process::exit(1);
+}
+
+fn refuse_cached_without_owner(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    pool_uuid: Option<[u8; 16]>,
+    json: bool,
+) -> ! {
+    if json {
+        let mut out = serde_json::json!({
+            "ok": false,
+            "command": command,
+            "operation": operation,
+            "pool_name": pool,
+            "cached_import_state": true,
+            "owner_required": true,
+            "error": "cached imported-pool state exists but no live owner interface is reachable",
+            "recovery": "start or repair the kernel UAPI or userspace daemon that owns this imported pool; do not open the cached state directly",
+        });
+        if let Some(pool_uuid) = pool_uuid {
+            out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
+        }
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    } else {
+        eprintln!(
+            "tidefsctl {command} {operation}: cached imported-pool state exists for '{pool}', but no live owner interface is reachable"
+        );
+        if let Some(pool_uuid) = pool_uuid {
+            eprintln!(
+                "tidefsctl {command} {operation}: cached pool uuid {}",
+                hex_uuid(&pool_uuid)
+            );
+        }
+        eprintln!(
+            "tidefsctl {command} {operation}: live state must be handled by the kernel UAPI or userspace daemon that owns the import"
+        );
+        eprintln!(
+            "tidefsctl {command} {operation}: refusing direct access to cached imported-pool state"
         );
     }
     process::exit(1);
@@ -405,8 +444,8 @@ fn find_live_owner_manifest_at(
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(err) => {
-            if let Some(manifest) = cached_match {
-                return Ok(manifest);
+            if cached_match.is_some() {
+                return Err(cached_without_reachable_interface(route));
             }
             if let Some(message) = exact_mismatch {
                 return Err(LiveOwnerRequestError::Unavailable(message));
@@ -434,8 +473,8 @@ fn find_live_owner_manifest_at(
             }
         }
     }
-    if let Some(manifest) = cached_match {
-        return Ok(manifest);
+    if cached_match.is_some() {
+        return Err(cached_without_reachable_interface(route));
     }
     if let Some(message) = exact_mismatch {
         return Err(LiveOwnerRequestError::Unavailable(message));
@@ -444,6 +483,17 @@ fn find_live_owner_manifest_at(
         "no live owner manifest for pool '{pool}'",
         pool = route.pool
     )))
+}
+
+fn cached_without_reachable_interface(route: &LivePoolRoute<'_>) -> LiveOwnerRequestError {
+    let mut message = format!(
+        "cached imported-pool state exists for pool '{}', but no live owner interface is reachable",
+        route.pool
+    );
+    if let Some(pool_uuid) = route.pool_uuid {
+        message.push_str(&format!(" (uuid {})", hex_uuid(&pool_uuid)));
+    }
+    LiveOwnerRequestError::Unavailable(message)
 }
 
 fn manifest_matches_route(manifest: &serde_json::Value, route: &LivePoolRoute<'_>) -> bool {
@@ -515,17 +565,33 @@ fn owner_interface_reachable_for_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16
 }
 
 fn owner_record_cached_by_pool_at(root: &Path, pool: &str) -> bool {
-    let route = LivePoolRoute {
-        command: "pool",
-        operation: "status",
-        pool,
-        pool_uuid: None,
-        json: false,
-        args: serde_json::Value::Null,
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return false,
     };
-    find_live_owner_manifest_at(root, &route).is_ok()
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path().join("owner.json");
+        match path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(_) => continue,
+        }
+        let Ok(manifest) = read_manifest(&path) else {
+            continue;
+        };
+        if manifest_pool_name(&manifest).is_some_and(|name| name == pool) {
+            return true;
+        }
+    }
+    false
 }
 
+#[cfg(test)]
 fn owner_record_cached_for_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16]) -> bool {
     match owner_manifest_path(root, uuid).try_exists() {
         Ok(true) => return true,
@@ -533,18 +599,38 @@ fn owner_record_cached_for_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16]) -> 
         Err(_) => return true,
     }
 
-    let route = LivePoolRoute {
-        command: "pool",
-        operation: "status",
-        pool,
-        pool_uuid: Some(*uuid),
-        json: false,
-        args: serde_json::Value::Null,
+    let expected_uuid = hex_uuid(uuid);
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return false,
     };
-    find_live_owner_manifest_at(root, &route).is_ok()
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path().join("owner.json");
+        match path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(_) => continue,
+        }
+        let Ok(manifest) = read_manifest(&path) else {
+            continue;
+        };
+        let name_matches = manifest_pool_name(&manifest).is_some_and(|name| name == pool);
+        let uuid_matches = manifest
+            .get("pool_uuid")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|manifest_uuid| manifest_uuid.eq_ignore_ascii_case(&expected_uuid));
+        if name_matches && uuid_matches {
+            return true;
+        }
+    }
+    false
 }
 
-#[cfg(test)]
 fn owner_interface_reachable_by_pool_at(root: &Path, pool: &str) -> bool {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -577,7 +663,6 @@ fn owner_interface_reachable_by_pool_at(root: &Path, pool: &str) -> bool {
     false
 }
 
-#[cfg(test)]
 fn owner_interface_reachable_by_pool_backing_dir_at(
     root: &Path,
     pool: &str,
@@ -606,7 +691,6 @@ fn cached_owner_by_pool_backing_dir_at(
     })
 }
 
-#[cfg(test)]
 fn owner_interface_reachable_by_backing_dir_at(
     root: &Path,
     backing_dir: &Path,
@@ -1024,8 +1108,10 @@ mod tests {
     }
 
     #[test]
-    fn owner_lookup_with_uuid_falls_back_to_matching_pool_manifest() {
+    fn owner_lookup_with_uuid_falls_back_to_reachable_pool_manifest() {
         let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
         let manifest_path = dir.path().join("registry-entry").join("owner.json");
         std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -1033,7 +1119,7 @@ mod tests {
             serde_json::json!({
                 "pool_name": "tank",
                 "pool_uuid": "42424242424242424242424242424242",
-                "socket_path": "/run/tidefs/pools/tank/owner.sock",
+                "socket_path": socket_path,
             })
             .to_string(),
         )
@@ -1055,6 +1141,41 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("tank")
         );
+    }
+
+    #[test]
+    fn owner_lookup_refuses_cached_manifest_without_reachable_interface() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("registry-entry").join("owner.json");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "pool_name": "tank",
+                "pool_uuid": "42424242424242424242424242424242",
+                "socket_path": dir.path().join("missing-owner.sock"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: false,
+            args: serde_json::Value::Null,
+        };
+
+        let err = find_live_owner_manifest_at(dir.path(), &route).unwrap_err();
+
+        match err {
+            LiveOwnerRequestError::Unavailable(message) => {
+                assert!(message.contains("cached imported-pool state exists"));
+                assert!(message.contains("no live owner interface"));
+            }
+            LiveOwnerRequestError::Owner { .. } => panic!("cached state is not owner transport"),
+        }
     }
 
     #[test]
