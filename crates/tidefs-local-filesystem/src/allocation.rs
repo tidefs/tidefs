@@ -6,9 +6,10 @@ use tidefs_types_vfs_core::{InodeId, ROOT_INODE_ID};
 use crate::constants::*;
 use crate::content::{
     content_chunk_count, content_chunk_len, content_chunk_start, decode_content_layout,
-    find_chunk_in_manifest, overlay_chunk_index_bounds, overlay_chunk_writes_only_zeros,
-    range_intersects_overlay, read_content_layout_from_store, retained_content_chunk_ref,
-    validate_content_layout, ContentOverlayPatch,
+    find_chunk_in_manifest, overlay_chunk_covers_whole_chunk_with_zeros,
+    overlay_chunk_index_bounds, overlay_chunk_writes_only_zeros, range_intersects_overlay,
+    read_content_layout_from_store, retained_content_chunk_ref, validate_content_layout,
+    ContentOverlayPatch,
 };
 use crate::error::FileSystemError;
 use crate::object_keys::{content_chunk_object_key_for_version, content_object_key_for_version};
@@ -117,42 +118,34 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
 ) -> Result<BTreeMap<ObjectKey, u64>> {
     let old_layout = read_content_layout_from_store(store, old_record.inode_id, old_record, true)?;
     let mut entries = BTreeMap::new();
-    if allow_holes && overlay_bytes.is_empty() && new_record.size >= old_record.size {
+    if allow_holes && overlay_bytes.is_empty() {
         if let crate::records::ContentLayout::Chunked(ref manifest) = old_layout {
-            let mut retained = BTreeMap::new();
-            let mut can_retain_all_data = true;
+            let new_chunk_count = content_chunk_count(new_record.size)?;
             for old_ref in &manifest.chunks {
-                if old_ref.is_hole() {
+                if old_ref.is_hole() || old_ref.chunk_index >= new_chunk_count {
                     continue;
                 }
-                let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
-                let chunk_start = content_chunk_start(old_ref.chunk_index)?;
-                let chunk_end = chunk_start.checked_add(u64::from(new_len)).ok_or(
-                    FileSystemError::SizeOverflow {
-                        requested: u64::MAX,
-                    },
-                )?;
-                if old_ref.len != new_len || chunk_end > old_record.size {
-                    can_retain_all_data = false;
-                    break;
-                }
-                let grains = allocation_grains_for_len(u64::from(old_ref.len))?;
+                let expected_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
+                let data_version = if old_ref.len == expected_len {
+                    old_ref.data_version
+                } else {
+                    new_record.data_version
+                };
+                let grains = allocation_grains_for_len(u64::from(expected_len))?;
                 debug_assert!(
                     grains % content_chunk_size() as u64 == 0,
-                    "sparse truncate retained chunk allocation grains must be grain-aligned"
+                    "sparse size-change chunk allocation grains must be grain-aligned"
                 );
-                retained.insert(
+                entries.insert(
                     content_chunk_object_key_for_version(
                         new_record.inode_id,
-                        old_ref.data_version,
+                        data_version,
                         old_ref.chunk_index,
                     ),
                     grains,
                 );
             }
-            if can_retain_all_data {
-                return Ok(retained);
-            }
+            return Ok(entries);
         }
     }
     if allow_holes && old_record.size == new_record.size && !overlay_bytes.is_empty() {
@@ -194,6 +187,14 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
             {
                 for chunk_index in first_overlay_chunk..=last_overlay_chunk {
                     let len = content_chunk_len(new_record.size, chunk_index)?;
+                    if overlay_chunk_covers_whole_chunk_with_zeros(
+                        chunk_index,
+                        len,
+                        overlay_offset,
+                        overlay_bytes,
+                    )? {
+                        continue;
+                    }
                     let old_chunk_is_sparse_zero =
                         match find_chunk_in_manifest(manifest, chunk_index) {
                             Some(chunk_ref) => chunk_ref.is_hole(),

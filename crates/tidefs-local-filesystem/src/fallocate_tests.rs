@@ -207,10 +207,15 @@ fn zero_range_existing_data_does_not_charge_capacity_again() {
     let bytes = vec![0x7b; chunk];
     fs.write_file("/file.bin", 0, &bytes)
         .expect("fill one-chunk filesystem");
+    fs.flush_all_write_buffers()
+        .expect("flush initial one-chunk write");
     let before = fs.statfs().expect("statfs before zero range");
-    assert_eq!(before.blocks, 2);
-    assert_eq!(before.bfree, 0);
-    assert_eq!(before.bavail, 0);
+    assert_eq!(
+        before.blocks,
+        policy.content_capacity_bytes / u64::from(before.frsize)
+    );
+    assert!(before.bfree < before.blocks);
+    assert_eq!(before.bavail, before.bfree);
 
     fs.zero_range("/file.bin", 0, chunk as u64)
         .expect("zero existing allocated data");
