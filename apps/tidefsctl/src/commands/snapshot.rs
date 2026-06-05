@@ -571,15 +571,14 @@ fn import_devices_metadata_dir(
     live_args: serde_json::Value,
 ) -> PathBuf {
     let config = scan_device_pool_config(pool_name, devices, operation);
-    if config.state == PoolState::Active {
-        super::live_owner::route_imported_with_args(
-            "snapshot",
-            operation,
-            pool_name,
-            config.pool_uuid,
-            live_args,
-        );
-    }
+    super::live_owner::route_if_owned_with_args(
+        "snapshot",
+        operation,
+        pool_name,
+        config.pool_uuid,
+        config.state == PoolState::Active,
+        live_args,
+    );
 
     super::offline_pool::metadata_dir("snapshot", operation, &config.pool_uuid)
 }

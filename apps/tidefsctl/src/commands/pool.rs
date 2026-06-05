@@ -527,6 +527,16 @@ fn handle_pool_import(
         process::exit(1);
     }
 
+    let config = assemble_device_pool_config(&devices, "import");
+    super::live_owner::route_if_owned_with_format(
+        "pool",
+        "import",
+        &config.pool_name,
+        config.pool_uuid,
+        config.state == PoolState::Active,
+        json,
+    );
+
     // Resolve encryption key from sealed envelope for import validation.
     let (import_encryption_key, _enc_config) = if let Some(ref env_path) = encryption_envelope {
         let root_auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_environment()
@@ -562,7 +572,6 @@ fn handle_pool_import(
     ) {
         Ok(imp) => imp,
         Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
-            let config = assemble_device_pool_config(&devices, "import");
             super::live_owner::route_imported_with_format(
                 "pool",
                 "import",
@@ -798,15 +807,14 @@ fn route_active_device_pool_with_format(
     config: &tidefs_pool_scan::PoolConfig,
     json: bool,
 ) {
-    if config.state == PoolState::Active {
-        super::live_owner::route_imported_with_format(
-            "pool",
-            operation,
-            pool_name,
-            config.pool_uuid,
-            json,
-        );
-    }
+    super::live_owner::route_if_owned_with_format(
+        "pool",
+        operation,
+        pool_name,
+        config.pool_uuid,
+        config.state == PoolState::Active,
+        json,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,15 +1453,14 @@ fn open_pool_property_filesystem_with_live_args(
 
     let config = assemble_device_pool_config(devs, operation);
     ensure_device_pool_name(pool, operation, &config);
-    if config.state == PoolState::Active {
-        super::live_owner::route_imported_with_args(
-            "pool",
-            operation,
-            pool,
-            config.pool_uuid,
-            live_args,
-        );
-    }
+    super::live_owner::route_if_owned_with_args(
+        "pool",
+        operation,
+        pool,
+        config.pool_uuid,
+        config.state == PoolState::Active,
+        live_args,
+    );
 
     let metadata_dir = super::offline_pool::metadata_dir("pool", operation, &config.pool_uuid);
 

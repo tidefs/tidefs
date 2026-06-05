@@ -351,15 +351,14 @@ fn open_filesystem_with_live_args(
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
-        if config.state == PoolState::Active {
-            super::live_owner::route_imported_with_args(
-                "dataset",
-                operation,
-                pool,
-                config.pool_uuid,
-                live_args,
-            );
-        }
+        super::live_owner::route_if_owned_with_args(
+            "dataset",
+            operation,
+            pool,
+            config.pool_uuid,
+            config.state == PoolState::Active,
+            live_args,
+        );
 
         let metadata_dir =
             super::offline_pool::metadata_dir("dataset", operation, &config.pool_uuid);
@@ -1527,9 +1526,13 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
 fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -> PathBuf {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
-        if config.state == PoolState::Active {
-            super::live_owner::route_imported("dataset", operation, pool, config.pool_uuid);
-        }
+        super::live_owner::route_if_owned(
+            "dataset",
+            operation,
+            pool,
+            config.pool_uuid,
+            config.state == PoolState::Active,
+        );
 
         return super::offline_pool::metadata_dir("dataset", operation, &config.pool_uuid);
     }

@@ -54,9 +54,9 @@ imported must say how to find it with arguments such as `--devices` or
 repair, discovery, or explicit import when the command is `pool import` or an
 import-and-mount harness. Dataset, snapshot, and property commands must not
 turn an exported device set into an imported runtime as a side effect. If
-explicit devices assemble as an imported `ACTIVE` pool, the command still has
-to route through the owner of that live state instead of opening the devices
-directly.
+explicit devices assemble as an imported `ACTIVE` pool, or if the live-owner
+registry already names that pool UUID/name, the command still has to route
+through the owner of that live state instead of opening the devices directly.
 
 The current userspace path that both imports and creates a live owner is
 `pool mount <pool> <mountpoint> --devices ...`. A one-shot device import is

@@ -238,14 +238,13 @@ pub fn handle_mount(args: PoolMountArgs) {
     // Determine the backing directory: explicit --devices import or live-owner route.
     let (backing_dir, owner_pool_uuid) = if let Some(ref devices) = args.devices {
         let existing_config = scan_device_pool_config(&args.pool_name, devices, "mount");
-        if existing_config.state == PoolState::Active {
-            super::live_owner::route_imported(
-                "pool",
-                "mount",
-                &args.pool_name,
-                existing_config.pool_uuid,
-            );
-        }
+        super::live_owner::route_if_owned(
+            "pool",
+            "mount",
+            &args.pool_name,
+            existing_config.pool_uuid,
+            existing_config.state == PoolState::Active,
+        );
 
         // Block-device path: import from raw devices, then use a
         // runtime-managed backing directory keyed by pool UUID.
