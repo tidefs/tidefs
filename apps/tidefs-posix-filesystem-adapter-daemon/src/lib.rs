@@ -676,6 +676,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
             let owner_config = live_owner::LiveOwnerConfig {
                 pool_name: pool_name.clone(),
                 pool_uuid,
+                backing_dir: config.backing_dir.clone(),
                 mountpoint: config.mountpoint.clone(),
                 runtime_dir,
             };

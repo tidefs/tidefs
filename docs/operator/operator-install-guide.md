@@ -297,7 +297,7 @@ tidefsctl snapshot receive --backing-dir /tmp/received-pool --input /tmp/mypool.
 For exported/offline pools, the same dataset and snapshot commands may take
 `--devices`. That direct-device form stays offline; it does not import the pool
 or create `/run/tidefs/pools/<uuid>` runtime ownership as a side effect. If the
-live-owner registry already names that pool UUID/name, the CLI routes to that
+live-owner registry already names that pool UUID, the CLI routes to that exact
 owner. An on-disk `ACTIVE` label is cached recovery evidence rather than the
 owner interface itself, but it is not ordinary exported storage. Without a
 reachable owner interface, live-state commands fail closed; recover or create
@@ -322,10 +322,15 @@ tidefsctl block detach <dev-name>
 The pool-name form routes to the live owner. If the FUSE, ublk, or kernel
 owner does not implement block export yet, it fails closed instead of opening
 storage behind that owner. The `--backing-dir` form is only for exported or
-offline object-store development paths and checks for an existing owner before
-opening the backing directory. `tidefsctl block send` and
+offline object-store development paths. If a reachable owner manifest names
+both that pool and the same backing directory, the command routes to that exact
+owner; it must not route by pool name alone.
+`tidefsctl block send` and
 `tidefsctl block receive` follow the same split: pool-name form through the
 owner, explicit `--backing-dir` for exported/offline object-store work.
+Snapshot `--backing-dir` commands have no pool operand, so they route by the
+reachable owner manifest for that backing directory before opening or writing
+the object store directly.
 
 ### 6.4 Device management
 

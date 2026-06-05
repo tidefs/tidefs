@@ -242,12 +242,6 @@ pub fn handle_mount(args: PoolMountArgs) {
 
     // Determine the backing directory: explicit --devices import or live-owner route.
     let (backing_dir, owner_pool_uuid) = if let Some(ref devices) = args.devices {
-        super::live_owner::route_if_owner_exists_with_args(
-            "pool",
-            "mount",
-            &args.pool_name,
-            live_args.clone(),
-        );
         let existing_config = scan_device_pool_config(&args.pool_name, devices, "mount");
         // Mount with explicit devices is the userspace owner-creating path.
         // Route only when a live owner has already published its interface;

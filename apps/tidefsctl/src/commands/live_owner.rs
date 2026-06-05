@@ -107,6 +107,33 @@ pub(crate) fn route_if_owner_exists_with_format_and_args(
     }
 }
 
+pub(crate) fn route_if_owner_exists_for_pool_backing_dir_with_args(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    backing_dir: &Path,
+    args: serde_json::Value,
+) {
+    if let Some(pool_uuid) =
+        owner_interface_reachable_by_pool_backing_dir_at(&pool_runtime_root(), pool, backing_dir)
+    {
+        route_imported_with_format_and_args(command, operation, pool, pool_uuid, false, args);
+    }
+}
+
+pub(crate) fn route_if_owner_exists_for_backing_dir_with_args(
+    command: &str,
+    operation: &str,
+    backing_dir: &Path,
+    args: serde_json::Value,
+) {
+    if let Some((pool, pool_uuid)) =
+        owner_interface_reachable_by_backing_dir_at(&pool_runtime_root(), backing_dir)
+    {
+        route_imported_with_format_and_args(command, operation, &pool, pool_uuid, false, args);
+    }
+}
+
 pub(crate) fn route_or_refuse_active_for_uuid_with_args(
     command: &str,
     operation: &str,
@@ -489,6 +516,59 @@ fn owner_interface_reachable_by_pool_at(root: &Path, pool: &str) -> bool {
     false
 }
 
+fn owner_interface_reachable_by_pool_backing_dir_at(
+    root: &Path,
+    pool: &str,
+    backing_dir: &Path,
+) -> Option<[u8; 16]> {
+    owner_interface_reachable_by_backing_dir_at(root, backing_dir).and_then(|(owner_pool, uuid)| {
+        if owner_pool == pool {
+            Some(uuid)
+        } else {
+            None
+        }
+    })
+}
+
+fn owner_interface_reachable_by_backing_dir_at(
+    root: &Path,
+    backing_dir: &Path,
+) -> Option<(String, [u8; 16])> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return None,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path().join("owner.json");
+        match path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(_) => continue,
+        }
+        let Ok(manifest) = read_manifest(&path) else {
+            continue;
+        };
+        if !manifest_backing_dir_matches(&manifest, backing_dir) {
+            continue;
+        }
+        let Some(pool_name) = manifest_pool_name(&manifest) else {
+            continue;
+        };
+        let Some(pool_uuid) = manifest_pool_uuid_bytes(&manifest) else {
+            continue;
+        };
+        if manifest_has_reachable_socket(&manifest) {
+            return Some((pool_name.to_string(), pool_uuid));
+        }
+    }
+    None
+}
+
 fn owner_manifest_path(root: &Path, uuid: &[u8; 16]) -> PathBuf {
     root.join(hex_uuid(uuid)).join("owner.json")
 }
@@ -546,6 +626,49 @@ fn manifest_uuid_matches(manifest: &serde_json::Value, uuid: &[u8; 16]) -> bool 
         .get("pool_uuid")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|manifest_uuid| manifest_uuid.eq_ignore_ascii_case(&expected))
+}
+
+fn manifest_pool_uuid_bytes(manifest: &serde_json::Value) -> Option<[u8; 16]> {
+    manifest
+        .get("pool_uuid")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_hex_uuid)
+}
+
+fn manifest_pool_name(manifest: &serde_json::Value) -> Option<&str> {
+    manifest
+        .get("pool_name")
+        .and_then(serde_json::Value::as_str)
+}
+
+fn manifest_backing_dir_matches(manifest: &serde_json::Value, backing_dir: &Path) -> bool {
+    let Some(manifest_backing_dir) = manifest
+        .get("backing_dir")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    paths_refer_to_same_location(Path::new(manifest_backing_dir), backing_dir)
+}
+
+fn parse_hex_uuid(value: &str) -> Option<[u8; 16]> {
+    if value.len() != 32 {
+        return None;
+    }
+    let mut out = [0_u8; 16];
+    for (idx, byte) in out.iter_mut().enumerate() {
+        let start = idx * 2;
+        let end = start + 2;
+        *byte = u8::from_str_radix(&value[start..end], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
+    if let (Ok(left), Ok(right)) = (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        return left == right;
+    }
+    left == right
 }
 
 fn pool_runtime_root() -> PathBuf {
@@ -660,6 +783,60 @@ mod tests {
 
         assert!(!owner_interface_reachable_by_pool_at(&missing, "tank"));
         assert!(!owner_interface_reachable_by_uuid_at(&missing, &[0x11; 16]));
+        assert_eq!(
+            owner_interface_reachable_by_pool_backing_dir_at(
+                &missing,
+                "tank",
+                dir.path().join("backing").as_path()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn owner_interface_reachable_by_pool_backing_dir_requires_exact_storage_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing_dir = dir.path().join("backing");
+        let other_backing_dir = dir.path().join("other-backing");
+        std::fs::create_dir_all(&backing_dir).unwrap();
+        std::fs::create_dir_all(&other_backing_dir).unwrap();
+        let uuid = [0x55; 16];
+        let socket_path = dir.path().join("owner.sock");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let manifest_path = owner_manifest_path(dir.path(), &uuid);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "pool_name": "tank",
+                "pool_uuid": "55555555555555555555555555555555",
+                "backing_dir": backing_dir,
+                "socket_path": socket_path,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            owner_interface_reachable_by_pool_backing_dir_at(dir.path(), "tank", &backing_dir),
+            Some(uuid)
+        );
+        assert_eq!(
+            owner_interface_reachable_by_backing_dir_at(dir.path(), &backing_dir),
+            Some(("tank".to_string(), uuid))
+        );
+        assert_eq!(
+            owner_interface_reachable_by_pool_backing_dir_at(
+                dir.path(),
+                "tank",
+                &other_backing_dir
+            ),
+            None
+        );
+        assert_eq!(
+            owner_interface_reachable_by_pool_backing_dir_at(dir.path(), "other", &backing_dir),
+            None
+        );
     }
 
     #[test]

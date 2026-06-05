@@ -274,15 +274,7 @@ fn handle_remove(
     });
 
     let backing_dir = match backing_dir {
-        Some(backing_dir) => {
-            super::live_owner::route_if_owner_exists_with_args(
-                "device",
-                "remove",
-                pool_name,
-                live_args.clone(),
-            );
-            backing_dir
-        }
+        Some(backing_dir) => backing_dir,
         None => {
             super::live_owner::route_if_owner_exists_with_args(
                 "device", "remove", pool_name, live_args,

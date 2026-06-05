@@ -27,6 +27,7 @@ pub type LiveOwnerEngine = Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>;
 pub struct LiveOwnerConfig {
     pub pool_name: String,
     pub pool_uuid: [u8; 16],
+    pub backing_dir: PathBuf,
     pub mountpoint: PathBuf,
     pub runtime_dir: PathBuf,
 }
@@ -38,6 +39,7 @@ pub struct LiveOwnerManifest {
     pub pool_name: String,
     pub pool_uuid: String,
     pub pid: u32,
+    pub backing_dir: String,
     pub mountpoint: String,
     pub socket_path: String,
 }
@@ -98,6 +100,10 @@ pub fn start_fuse_owner(
         pool_name: config.pool_name.clone(),
         pool_uuid: hex_uuid(&config.pool_uuid),
         pid: std::process::id(),
+        backing_dir: fs::canonicalize(&config.backing_dir)
+            .unwrap_or_else(|_| config.backing_dir.clone())
+            .display()
+            .to_string(),
         mountpoint: config.mountpoint.display().to_string(),
         socket_path: socket_path.display().to_string(),
     };
@@ -367,6 +373,7 @@ fn pool_status(
         "state": "Active",
         "owner_kind": manifest.owner_kind,
         "pid": manifest.pid,
+        "backing_dir": manifest.backing_dir,
         "mountpoint": manifest.mountpoint,
         "socket_path": manifest.socket_path,
         "statfs": {
@@ -387,11 +394,12 @@ fn pool_status(
         LiveOwnerResponse::ok_json(value)
     } else {
         LiveOwnerResponse::ok_text(format!(
-            "pool: {}\n  pool uuid:   {}\n  state:       Active\n  owner:       {} (pid {})\n  mountpoint:  {}\n  blocks:      total={} free={} avail={}\n  files:       total={} free={}",
+            "pool: {}\n  pool uuid:   {}\n  state:       Active\n  owner:       {} (pid {})\n  backing dir: {}\n  mountpoint:  {}\n  blocks:      total={} free={} avail={}\n  files:       total={} free={}",
             manifest.pool_name,
             manifest.pool_uuid,
             manifest.owner_kind,
             manifest.pid,
+            manifest.backing_dir,
             manifest.mountpoint,
             statfs.total_blocks,
             statfs.free_blocks,
@@ -413,6 +421,7 @@ fn already_owned(
         "state": "Active",
         "owner_kind": manifest.owner_kind,
         "pid": manifest.pid,
+        "backing_dir": manifest.backing_dir,
         "mountpoint": manifest.mountpoint,
         "operation": operation,
         "already_owned": true,
@@ -439,6 +448,7 @@ fn pool_export(
         "state": "ExportRequested",
         "owner_kind": manifest.owner_kind,
         "pid": manifest.pid,
+        "backing_dir": manifest.backing_dir,
         "mountpoint": manifest.mountpoint,
         "operation": "export",
         "shutdown_requested": true,
@@ -471,6 +481,7 @@ mod tests {
             pool_name: "tank".to_string(),
             pool_uuid: "0123456789abcdeffedcba9876543210".to_string(),
             pid: 42,
+            backing_dir: "/var/lib/tidefs/tank".to_string(),
             mountpoint: "/mnt/tank".to_string(),
             socket_path: "/run/tidefs/pools/tank/owner.sock".to_string(),
         }

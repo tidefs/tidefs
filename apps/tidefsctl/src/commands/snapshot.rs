@@ -529,7 +529,12 @@ fn open_filesystem_with_live_args(
     }
 
     let path = match (backing_dir, pool) {
-        (Some(path), _) => path.clone(),
+        (Some(path), _) => {
+            super::live_owner::route_if_owner_exists_for_backing_dir_with_args(
+                "snapshot", operation, path, live_args,
+            );
+            path.clone()
+        }
         (None, Some(pool_name)) => {
             super::live_owner::route_with_args("snapshot", operation, pool_name, live_args)
         }
@@ -569,14 +574,6 @@ fn import_devices_metadata_dir(
     operation: &str,
     live_args: serde_json::Value,
 ) -> PathBuf {
-    if pool_name != "<unnamed>" {
-        super::live_owner::route_if_owner_exists_with_args(
-            "snapshot",
-            operation,
-            pool_name,
-            live_args.clone(),
-        );
-    }
     let config = scan_device_pool_config(pool_name, devices, operation);
     super::live_owner::route_or_refuse_active_for_uuid_with_args(
         "snapshot",
@@ -1059,6 +1056,18 @@ fn handle_send(args: SnapshotSendArgs) {
 }
 
 fn handle_receive(args: SnapshotReceiveArgs) {
+    super::live_owner::route_if_owner_exists_for_backing_dir_with_args(
+        "snapshot",
+        "receive",
+        &args.backing_dir,
+        serde_json::json!({
+            "input": args.input.as_ref().map(|path| path.display().to_string()),
+            "source_addr": args.source_addr.map(|addr| addr.to_string()),
+            "node_id": args.node_id,
+            "server_node_id": args.server_node_id,
+        }),
+    );
+
     // Network pull: fetch stream from a remote storage-node.
     if let Some(addr) = args.source_addr {
         let node_id = args.node_id.unwrap_or(1);

@@ -61,9 +61,10 @@ imported must say how to find it with arguments such as `--devices` or
 `--backing-dir`. Those arguments authorize offline work on exported storage,
 repair, discovery, or an owner-creating import-and-mount harness. Dataset,
 snapshot, and property commands must not turn an exported device set into an
-imported runtime as a side effect. If the live-owner registry already names
-that pool UUID/name, the command has to route through the owner of that live
-state instead of opening the devices directly. An `ACTIVE` label on disk is
+imported runtime as a side effect. Those commands first read the storage
+identity, and if the live-owner registry already names that pool UUID, the
+command has to route through the owner of that exact live state instead of
+opening the devices directly. An `ACTIVE` label on disk is
 cached recovery evidence rather than the live interface itself, but it still
 means the CLI must not treat the devices as ordinary exported storage. With no
 reachable owner, live-state commands fail closed; recover or create the owner
@@ -120,9 +121,11 @@ The device-removal offline form first probes existing labels without creating
 or opening the store writable. Those labels provide topology and recovery
 evidence. If the labels identify `ACTIVE` imported state, the request routes to
 the owner interface or fails closed; it does not continue into direct
-evacuation from cached live state. The block attach offline form is an
-explicit object-store development path and still checks for an existing live
-owner by pool name before opening the backing directory.
+evacuation from cached live state. Object-store `--backing-dir` forms are
+explicit development paths. If a reachable owner manifest names that backing
+directory, snapshot commands route to that owner; block commands route only
+when the manifest also names the requested pool. These forms must not route by
+pool name alone or make pool-name-only live state changes behind the owner.
 
 The old `--pool <pool>` spelling is not the operator form. It must not be
 kept as a parallel control path for imported state.

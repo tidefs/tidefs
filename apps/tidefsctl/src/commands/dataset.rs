@@ -349,12 +349,6 @@ fn open_filesystem_with_live_args(
     live_args: serde_json::Value,
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
-        super::live_owner::route_if_owner_exists_with_args(
-            "dataset",
-            operation,
-            pool,
-            live_args.clone(),
-        );
         let config = scan_device_pool_config(pool, devs, operation);
         super::live_owner::route_or_refuse_active_for_uuid_with_args(
             "dataset",
@@ -1589,12 +1583,6 @@ fn resolve_pool_path_with_live_args(
     live_args: serde_json::Value,
 ) -> PathBuf {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
-        super::live_owner::route_if_owner_exists_with_args(
-            "dataset",
-            operation,
-            pool,
-            live_args.clone(),
-        );
         let config = scan_device_pool_config(pool, devs, operation);
         super::live_owner::route_or_refuse_active_for_uuid_with_args(
             "dataset",

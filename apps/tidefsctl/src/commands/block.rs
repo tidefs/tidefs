@@ -196,7 +196,13 @@ fn handle_attach(
         super::live_owner::route_with_args("block", "attach", pool, live_args);
     };
 
-    super::live_owner::route_if_owner_exists_with_args("block", "attach", pool, live_args.clone());
+    super::live_owner::route_if_owner_exists_for_pool_backing_dir_with_args(
+        "block",
+        "attach",
+        pool,
+        pool_path,
+        live_args.clone(),
+    );
 
     if !pool_path.exists() {
         return Err(format!(
@@ -431,7 +437,13 @@ fn handle_block_send(
         super::live_owner::route_with_args("block", "send", pool, live_args);
     };
 
-    super::live_owner::route_if_owner_exists_with_args("block", "send", pool, live_args.clone());
+    super::live_owner::route_if_owner_exists_for_pool_backing_dir_with_args(
+        "block",
+        "send",
+        pool,
+        pool_path,
+        live_args.clone(),
+    );
 
     if !pool_path.exists() {
         return Err(format!(
@@ -486,7 +498,13 @@ fn handle_block_receive(
         super::live_owner::route_with_args("block", "receive", pool, live_args);
     };
 
-    super::live_owner::route_if_owner_exists_with_args("block", "receive", pool, live_args.clone());
+    super::live_owner::route_if_owner_exists_for_pool_backing_dir_with_args(
+        "block",
+        "receive",
+        pool,
+        pool_path,
+        live_args.clone(),
+    );
 
     if pool_path.exists() {
         return Err(format!(
