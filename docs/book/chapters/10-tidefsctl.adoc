@@ -44,13 +44,12 @@ The current userspace FUSE owner exposes an imported-pool JSON socket under
 registry entry; both are live-owner interfaces, not authorization to reopen
 devices directly. That socket currently handles live `pool status`, pool
 properties, dataset catalog create/list/rename/destroy and dataset property
-queries/mutations, snapshot create/list/destroy/rollback, owner-mediated
-`pool export` shutdown, and live `device remove` and `block attach` request
-boundaries. Those
+queries/mutations, dataset set-strategy/upgrade feature mutations, snapshot
+create/list/destroy/rollback, and owner-mediated `pool export` shutdown. Those
 operations run against the mounted engine that owns cached state. Snapshot
 send/receive, dataset key commands, live destroy, live device removal
-execution, and live block export/send/receive still fail closed where the
-owner-side implementation is missing.
+execution, and live block attach/export/send/receive still fail closed where
+the owner-side implementation is missing.
 
 Offline inputs are explicit. Commands that operate on a pool that is not
 imported must say how to find it with arguments such as `--devices` or

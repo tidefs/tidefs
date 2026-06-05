@@ -787,11 +787,18 @@ fn handle_rename(args: DatasetRenameArgs) {
 }
 fn handle_set_strategy(args: DatasetSetStrategyArgs) {
     let devices_ref = args.devices.as_deref();
-    let mut fs = open_filesystem(
+    let mut fs = open_filesystem_with_live_args(
         &args.pool,
         devices_ref,
         "set-strategy",
         RecoveryPolicy::default(),
+        serde_json::json!({
+            "name": &args.name,
+            "enable": &args.enable,
+            "disable": &args.disable,
+            "list": args.list,
+            "class": &args.class,
+        }),
     );
 
     // Verify dataset exists in catalog
@@ -954,11 +961,14 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
     use tidefs_types_dataset_feature_flags_core::get_feature_class;
 
     let devices_ref = args.devices.as_deref();
-    let mut fs = open_filesystem(
+    let mut fs = open_filesystem_with_live_args(
         &args.pool,
         devices_ref,
         "upgrade",
         RecoveryPolicy::default(),
+        serde_json::json!({
+            "name": &args.name,
+        }),
     );
 
     // Verify dataset exists in catalog
@@ -1000,31 +1010,66 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
         supported.len()
     );
 
-    for name in &to_enable {
-        let class = match get_feature_class(name) {
-            Some(c) => c,
-            None => {
-                // Unknown features are part of the supported set by definition;
-                // skip with a note (shouldn't happen for canonical features).
-                skipped_count += 1;
+    let mut pending = to_enable;
+    while !pending.is_empty() {
+        let mut deferred = Vec::new();
+        let mut made_progress = false;
+
+        for name in pending {
+            if fs.feature_flags().is_enabled(&name) {
                 continue;
             }
-        };
+            let class = match get_feature_class(&name) {
+                Some(c) => c,
+                None => {
+                    // Unknown features are part of the supported set by definition;
+                    // skip with a note (shouldn't happen for canonical features).
+                    skipped_count += 1;
+                    continue;
+                }
+            };
 
-        match fs
-            .feature_flags_mut()
-            .enable_feature_with_prereqs(name.clone(), class)
-        {
-            Ok(()) => {
-                println!("  enabled {name} ({class})");
-                enabled_count += 1;
-            }
-            Err(e) => {
-                let msg = format!("{e}");
-                eprintln!("  FAILED {name} ({class}) : {msg}");
-                failed.push((name.to_string(), msg));
+            match fs
+                .feature_flags_mut()
+                .enable_feature_with_prereqs(name.clone(), class)
+            {
+                Ok(()) => {
+                    println!("  enabled {name} ({class})");
+                    enabled_count += 1;
+                    made_progress = true;
+                }
+                Err(tidefs_dataset_feature_flags::FeatureFlagsError::MissingPrerequisite {
+                    ..
+                }) => deferred.push(name),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    eprintln!("  FAILED {name} ({class}) : {msg}");
+                    failed.push((name.to_string(), msg));
+                }
             }
         }
+
+        if deferred.is_empty() {
+            break;
+        }
+        if !made_progress {
+            for name in deferred {
+                let Some(class) = get_feature_class(&name) else {
+                    skipped_count += 1;
+                    continue;
+                };
+                if let Err(e) = fs
+                    .feature_flags_mut()
+                    .enable_feature_with_prereqs(name.clone(), class)
+                {
+                    let msg = format!("{e}");
+                    eprintln!("  FAILED {name} ({class}) : {msg}");
+                    failed.push((name.to_string(), msg));
+                }
+            }
+            break;
+        }
+        pending = deferred;
     }
 
     // Persist if any features were enabled

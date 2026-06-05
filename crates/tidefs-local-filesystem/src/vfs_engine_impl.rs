@@ -44,6 +44,7 @@ use tidefs_posix_semantics::sticky_dir_allows_unlink_or_rename;
 
 use crate::namespace::rename::RenameAt2Flags;
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType, SyncGuarantee};
+use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 
 // DirCursor-backed readdir with BLAKE3-verified entry iteration.
 use crate::{CopyFileRangeIntent, LocalFileSystem};
@@ -1163,6 +1164,8 @@ impl VfsLocalFileSystem {
             ("dataset", "list") => self.live_dataset_list(pool, wants_json),
             ("dataset", "rename") => self.live_dataset_rename(pool, args),
             ("dataset", "destroy") => self.live_dataset_destroy(args),
+            ("dataset", "set-strategy") => self.live_dataset_set_strategy(args),
+            ("dataset", "upgrade") => self.live_dataset_upgrade(args),
             ("dataset", "get") => self.live_dataset_get(pool, args),
             ("dataset", "set") => self.live_dataset_set(pool, args),
             ("dataset", "list-props") => self.live_dataset_list_props(pool, args),
@@ -1397,6 +1400,247 @@ impl VfsLocalFileSystem {
             );
         }
         live_admin_ok_text(format!("dataset '{name}' destroyed"))
+    }
+
+    fn live_dataset_set_strategy(&self, args: &Value) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let enable = match live_admin_string_vec(args, "enable") {
+            Ok(values) => values,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let disable = match live_admin_string_vec(args, "disable") {
+            Ok(values) => values,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let list = args.get("list").and_then(Value::as_bool).unwrap_or(false);
+        let class = live_admin_optional_arg(args, "class").unwrap_or("auto");
+
+        let mut fs = self.fs.borrow_mut();
+        if !fs.dataset_catalog().contains(name) {
+            return live_admin_error(
+                1,
+                format!("dataset set-strategy: dataset '{name}' does not exist in the catalog"),
+            );
+        }
+
+        if list {
+            let flags = fs.feature_flags();
+            if flags.is_empty() {
+                return live_admin_ok_text(format!(
+                    "dataset '{name}' has no feature flags enabled"
+                ));
+            }
+            let mut out = format!("dataset '{name}' feature flags:");
+            for (class, feature, value) in flags.all_features() {
+                let _ = write!(out, "\n  {class}  {feature}  ({})", value.to_u8());
+            }
+            return live_admin_ok_text(out);
+        }
+
+        let feature_class = match resolve_feature_class(class, &enable) {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(1, err),
+        };
+
+        let mut changed = false;
+        let mut out = Vec::new();
+
+        for feature_str in enable.iter().map(String::as_str).map(str::trim) {
+            if feature_str.is_empty() {
+                continue;
+            }
+            let Some(feature) = FeatureName::from_str(feature_str) else {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "dataset set-strategy: invalid feature name '{feature_str}'; expected format org.tidefs:<name>"
+                    ),
+                );
+            };
+            match fs
+                .feature_flags_mut()
+                .enable_feature_with_prereqs(feature, feature_class)
+            {
+                Ok(()) => {
+                    out.push(format!(
+                        "enabled feature '{feature_str}' (class: {feature_class})"
+                    ));
+                    changed = true;
+                }
+                Err(err) => {
+                    return live_admin_error(
+                        1,
+                        format!("dataset set-strategy: failed to enable '{feature_str}': {err}"),
+                    )
+                }
+            }
+        }
+
+        for feature_str in disable.iter().map(String::as_str).map(str::trim) {
+            if feature_str.is_empty() {
+                continue;
+            }
+            let Some(feature) = FeatureName::from_str(feature_str) else {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "dataset set-strategy: invalid feature name '{feature_str}'; expected format org.tidefs:<name>"
+                    ),
+                );
+            };
+            match fs.feature_flags_mut().disable_feature(&feature) {
+                Ok(()) => {
+                    out.push(format!("disabled feature '{feature_str}'"));
+                    changed = true;
+                }
+                Err(err) => {
+                    return live_admin_error(
+                        1,
+                        format!("dataset set-strategy: failed to disable '{feature_str}': {err}"),
+                    )
+                }
+            }
+        }
+
+        if changed {
+            if let Err(err) = fs.persist_feature_flags() {
+                return live_admin_error(
+                    1,
+                    format!("dataset set-strategy: failed to persist feature flags: {err}"),
+                );
+            }
+            fs.refresh_policies_from_features();
+            out.push(format!("feature flags persisted for dataset '{name}'"));
+        }
+
+        if out.is_empty() {
+            live_admin_ok_text(format!("dataset '{name}' feature flags unchanged"))
+        } else {
+            live_admin_ok_text(out.join("\n"))
+        }
+    }
+
+    fn live_dataset_upgrade(&self, args: &Value) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+
+        let mut fs = self.fs.borrow_mut();
+        if !fs.dataset_catalog().contains(name) {
+            return live_admin_error(
+                1,
+                format!("dataset upgrade: dataset '{name}' does not exist in the catalog"),
+            );
+        }
+
+        let supported = tidefs_dataset_feature_flags::SupportedFeaturesV1::current();
+        let to_enable: Vec<_> = supported
+            .as_slice()
+            .iter()
+            .filter(|feature| !fs.feature_flags().is_enabled(feature))
+            .cloned()
+            .collect();
+
+        if to_enable.is_empty() {
+            return live_admin_ok_text(format!(
+                "dataset '{name}': all {} supported features are already enabled",
+                supported.len()
+            ));
+        }
+
+        let before_count = fs.feature_flags().len();
+        let mut enabled_count = 0u32;
+        let mut skipped_count = 0u32;
+        let mut failed = Vec::new();
+        let mut out = vec![format!(
+            "dataset '{name}': upgrading from {before_count} enabled to {} supported features...",
+            supported.len()
+        )];
+
+        let mut pending = to_enable;
+        while !pending.is_empty() {
+            let mut deferred = Vec::new();
+            let mut made_progress = false;
+
+            for feature in pending {
+                if fs.feature_flags().is_enabled(&feature) {
+                    continue;
+                }
+                let Some(class) = get_feature_class(&feature) else {
+                    skipped_count += 1;
+                    continue;
+                };
+                match fs
+                    .feature_flags_mut()
+                    .enable_feature_with_prereqs(feature.clone(), class)
+                {
+                    Ok(()) => {
+                        out.push(format!("  enabled {feature} ({class})"));
+                        enabled_count += 1;
+                        made_progress = true;
+                    }
+                    Err(tidefs_dataset_feature_flags::FeatureFlagsError::MissingPrerequisite {
+                        ..
+                    }) => deferred.push(feature),
+                    Err(err) => {
+                        let msg = err.to_string();
+                        out.push(format!("  FAILED {feature} ({class}) : {msg}"));
+                        failed.push((feature.to_string(), msg));
+                    }
+                }
+            }
+
+            if deferred.is_empty() {
+                break;
+            }
+            if !made_progress {
+                for feature in deferred {
+                    let Some(class) = get_feature_class(&feature) else {
+                        skipped_count += 1;
+                        continue;
+                    };
+                    if let Err(err) = fs
+                        .feature_flags_mut()
+                        .enable_feature_with_prereqs(feature.clone(), class)
+                    {
+                        let msg = err.to_string();
+                        out.push(format!("  FAILED {feature} ({class}) : {msg}"));
+                        failed.push((feature.to_string(), msg));
+                    }
+                }
+                break;
+            }
+            pending = deferred;
+        }
+
+        if enabled_count > 0 {
+            if let Err(err) = fs.persist_feature_flags() {
+                return live_admin_error(
+                    1,
+                    format!("dataset upgrade: failed to persist feature flags: {err}"),
+                );
+            }
+            fs.refresh_policies_from_features();
+            out.push(format!("feature flags persisted for dataset '{name}'"));
+        }
+
+        out.push(format!(
+            "dataset '{name}' upgrade complete: {enabled_count} enabled, {skipped_count} skipped, {} failed",
+            failed.len()
+        ));
+
+        if failed.is_empty() {
+            live_admin_ok_text(out.join("\n"))
+        } else {
+            for (feature, reason) in &failed {
+                out.push(format!("  {feature}: {reason}"));
+            }
+            live_admin_error(1, out.join("\n"))
+        }
     }
 
     fn live_dataset_get(&self, _pool: &str, args: &Value) -> Vec<u8> {
@@ -1730,6 +1974,27 @@ fn live_admin_optional_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+fn live_admin_string_vec(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(Vec::new());
+    };
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| format!("live admin argument '{key}' must be a string array"))
+            })
+            .collect(),
+        Value::Null => Ok(Vec::new()),
+        _ => Err(format!(
+            "live admin argument '{key}' must be a string array"
+        )),
+    }
+}
+
 fn live_admin_ok_text(text: impl Into<String>) -> Vec<u8> {
     live_admin_encode(json!({
         "ok": true,
@@ -1767,6 +2032,42 @@ fn parse_sync_guarantee(value: &str) -> Option<SyncGuarantee> {
         "full-redundancy" => Some(SyncGuarantee::FullRedundancy),
         _ => None,
     }
+}
+
+fn resolve_feature_class(class: &str, enable: &[String]) -> Result<FeatureClass, String> {
+    let explicit = match class {
+        "compat" => Some(FeatureClass::Compat),
+        "ro_compat" | "ro-compat" => Some(FeatureClass::RoCompat),
+        "incompat" => Some(FeatureClass::Incompat),
+        "auto" => None,
+        other => {
+            return Err(format!(
+                "dataset set-strategy: unknown feature class '{other}'; expected auto, compat, ro_compat, or incompat"
+            ))
+        }
+    };
+    if let Some(class) = explicit {
+        return Ok(class);
+    }
+
+    let Some(first) = enable
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+    else {
+        return Ok(FeatureClass::Compat);
+    };
+    let Some(name) = FeatureName::from_str(first) else {
+        return Err(format!(
+            "dataset set-strategy: invalid feature name '{first}'"
+        ));
+    };
+    get_feature_class(&name).ok_or_else(|| {
+        format!(
+            "dataset set-strategy: cannot auto-resolve class for '{first}' (unknown feature); specify --class explicitly"
+        )
+    })
 }
 
 fn dataset_id_from_name(name: &str) -> DatasetId {
@@ -3680,6 +3981,73 @@ mod tests {
                 .is_some(),
             "property should be stored on pool-local dataset path",
         );
+    }
+
+    #[test]
+    fn live_dataset_set_strategy_updates_mounted_feature_flags() {
+        let (engine, _td) = temp_fs();
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "demo",
+                "parent": "root",
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true, "create response: {created}");
+
+        let set = live_dataset_admin(
+            &engine,
+            "set-strategy",
+            json!({
+                "name": "demo",
+                "enable": ["org.tidefs:compression_lz4"],
+                "disable": [],
+                "list": false,
+                "class": "auto",
+            }),
+        );
+
+        assert_eq!(set["ok"], true, "set-strategy response: {set}");
+        let feature = FeatureName::from_str("org.tidefs:compression_lz4").unwrap();
+        assert!(
+            engine.fs.borrow().feature_flags().is_enabled(&feature),
+            "feature should be enabled through live owner path",
+        );
+    }
+
+    #[test]
+    fn live_dataset_upgrade_uses_mounted_feature_flags() {
+        let (engine, _td) = temp_fs();
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "demo",
+                "parent": "root",
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true, "create response: {created}");
+
+        let upgraded = live_dataset_admin(
+            &engine,
+            "upgrade",
+            json!({
+                "name": "demo",
+            }),
+        );
+
+        assert_eq!(upgraded["ok"], true, "upgrade response: {upgraded}");
+        let supported = tidefs_dataset_feature_flags::SupportedFeaturesV1::current();
+        let fs = engine.fs.borrow();
+        for feature in supported.as_slice() {
+            assert!(
+                fs.feature_flags().is_enabled(feature),
+                "supported feature {feature} should be enabled",
+            );
+        }
     }
 
     fn temp_fs_with_content_capacity(

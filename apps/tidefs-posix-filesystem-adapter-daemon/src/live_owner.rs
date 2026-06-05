@@ -269,7 +269,11 @@ fn dispatch_request(
         ("pool", "mount") => already_owned("mount", manifest, request.json),
         ("pool", "export") => pool_export(request.json, manifest, shutdown),
         ("pool", "get" | "set" | "list-props")
-        | ("dataset", "create" | "list" | "rename" | "destroy" | "get" | "set" | "list-props")
+        | (
+            "dataset",
+            "create" | "list" | "rename" | "destroy" | "set-strategy" | "upgrade" | "get" | "set"
+            | "list-props",
+        )
         | ("snapshot", "create" | "list" | "destroy" | "rollback")
         | ("device", "remove") => delegate_admin_request(&request, engine),
         _ => LiveOwnerResponse::error(
