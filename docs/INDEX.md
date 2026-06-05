@@ -6,10 +6,11 @@ Start here:
 2. `AGENTS.md`
 3. `docs/LICENSING.md`
 4. `docs/GITHUB_CI.md`
-5. `docs/REVIEW_TODO_POLICY.md`
-6. `docs/REVIEW_TODO_REGISTER.md`
-7. `docs/WHOLE_REPO_REVIEW.md`
-8. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
+5. `docs/TEST_SIGNAL_POLICY.md`
+6. `docs/REVIEW_TODO_POLICY.md`
+7. `docs/REVIEW_TODO_REGISTER.md`
+8. `docs/WHOLE_REPO_REVIEW.md`
+9. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
 
 Book:
 
@@ -21,7 +22,7 @@ The remaining documents are imported design/reference material. They need
 ongoing audit against the review register before they can be treated as current
 status.
 
-Key design areas:
+Key current design and policy areas:
 
 - `docs/ARCHITECTURE.md`
 - `docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`
@@ -30,4 +31,5 @@ Key design areas:
 - `docs/MODULE_OWNERS_INVARIANTS_PC002.md`
 - `docs/ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md`
 - `docs/RDMA_TRANSPORT_POSITION.md`
+- `docs/TEST_SIGNAL_POLICY.md`
 - `docs/workspace-package-classification.md`
