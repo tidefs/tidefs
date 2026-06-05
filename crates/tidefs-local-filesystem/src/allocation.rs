@@ -306,10 +306,10 @@ pub(crate) fn planned_chunk_allocation_entries_for_patch_batch(
 ) -> Result<BTreeMap<ObjectKey, u64>> {
     let old_layout = read_content_layout_from_store(store, old_record.inode_id, old_record, true)?;
     let mut entries = BTreeMap::new();
-    if !allow_holes || old_record.size != new_record.size {
+    if !allow_holes || old_record.size > new_record.size {
         return Err(FileSystemError::Unsupported {
             operation: "patch batch allocation planning",
-            reason: "batch writeback optimization requires same-size sparse content",
+            reason: "batch writeback optimization requires non-shrinking sparse content",
         });
     }
     let crate::records::ContentLayout::Chunked(ref manifest) = old_layout else {
@@ -331,15 +331,21 @@ pub(crate) fn planned_chunk_allocation_entries_for_patch_batch(
         }
     }
 
+    let chunk_count = content_chunk_count(new_record.size)?;
     for old_ref in &manifest.chunks {
-        if old_ref.is_hole() || patched_chunks.contains_key(&old_ref.chunk_index) {
+        if old_ref.chunk_index >= chunk_count
+            || old_ref.is_hole()
+            || patched_chunks.contains_key(&old_ref.chunk_index)
+        {
             continue;
         }
         let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
-        if old_ref.len != new_len {
-            continue;
-        }
-        let grains = allocation_grains_for_len(u64::from(old_ref.len))?;
+        let (data_version, len) = if old_ref.len == new_len {
+            (old_ref.data_version, old_ref.len)
+        } else {
+            (new_record.data_version, new_len)
+        };
+        let grains = allocation_grains_for_len(u64::from(len))?;
         debug_assert!(
             grains % content_chunk_size() as u64 == 0,
             "retained patch-batch chunk allocation grains must be grain-aligned"
@@ -347,7 +353,7 @@ pub(crate) fn planned_chunk_allocation_entries_for_patch_batch(
         entries.insert(
             content_chunk_object_key_for_version(
                 new_record.inode_id,
-                old_ref.data_version,
+                data_version,
                 old_ref.chunk_index,
             ),
             grains,

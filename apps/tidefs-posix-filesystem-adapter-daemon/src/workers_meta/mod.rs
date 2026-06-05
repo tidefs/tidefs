@@ -1317,6 +1317,12 @@ pub enum MetaError {
     AttrStoreError,
     /// The reply sink failed.
     ReplyError,
+    /// Invalid metadata request input.
+    InvalidInput,
+    /// `XATTR_CREATE` found an existing xattr.
+    XattrAlreadyExists,
+    /// Requested xattr is absent.
+    XattrNoData,
     /// Internal I/O error.
     Io,
 }
@@ -1329,9 +1335,12 @@ impl MetaError {
             Self::InoNotFound => 2,     // ENOENT
             Self::NotDir => 20,         // ENOTDIR
             Self::AttrStoreError => 67, // ENOLINK
-            Self::ReplyError => 5,      // EIO
-            Self::Io => 5,              // EIO
-            Self::PermDenied => 1,      // EPERM
+            Self::InvalidInput => Errno::EINVAL.raw() as i32,
+            Self::XattrAlreadyExists => Errno::EEXIST.raw() as i32,
+            Self::XattrNoData => Errno::ENODATA.raw() as i32,
+            Self::ReplyError => 5, // EIO
+            Self::Io => 5,         // EIO
+            Self::PermDenied => 1, // EPERM
         }
     }
 }
@@ -1695,7 +1704,9 @@ pub trait InodeTable {
     /// Set (create or replace) an extended attribute on `ino`.
     ///
     /// `flags` is 0 (upsert), `XATTR_CREATE` (fail if exists),
-    /// or `XATTR_REPLACE` (fail if absent).
+    /// or `XATTR_REPLACE` (fail if absent). Backends should return
+    /// `XattrAlreadyExists`, `XattrNoData`, or `InvalidInput` for those
+    /// flag-shaped failures so the FUSE errno reaches callers unchanged.
     fn set_xattr(
         &self,
         _ino: u64,
@@ -1721,7 +1732,7 @@ pub trait InodeTable {
 
     /// Remove an extended attribute from `ino`.
     ///
-    /// Returns `Err(MetaError::Io)` when the attribute does not exist.
+    /// Returns `Err(MetaError::XattrNoData)` when the attribute does not exist.
     fn remove_xattr(&self, _ino: u64, _name: &[u8]) -> Result<(), MetaError> {
         Err(MetaError::Io)
     }
@@ -2233,8 +2244,8 @@ impl<'a, I: InodeTable, A: AttrStore, R: MetaReplySink> MetaWorker<'a, I, A, R> 
 
     /// Handle a FUSE `SETXATTR` request.
     ///
-    /// Validates the inode exists, plans the setxattr flags, applies
-    /// the mutation through the inode table, and emits the reply.
+    /// Validates the inode and flag shape, applies the mutation through the
+    /// inode table, and emits the backend errno directly.
     pub fn handle_setxattr(
         &mut self,
         ino: u64,
@@ -2258,22 +2269,19 @@ impl<'a, I: InodeTable, A: AttrStore, R: MetaReplySink> MetaWorker<'a, I, A, R> 
             }
         }
 
-        let exists = self.inode_table.get_xattr_size(ino, name).is_ok();
-        match plan_setxattr(flags, exists) {
-            Ok(_plan) => {
-                match self.inode_table.set_xattr(ino, name, value, flags) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        self.reply_sink.reply_error(unique, e.errno())?;
-                        return Err(e);
-                    }
-                }
+        if !matches!(flags, 0 | XATTR_CREATE | XATTR_REPLACE) {
+            self.reply_sink.reply_error(unique, POSIX_XATTR_EINVAL)?;
+            return Err(MetaError::InvalidInput);
+        }
+
+        match self.inode_table.set_xattr(ino, name, value, flags) {
+            Ok(()) => {
                 self.reply_sink.reply_error(unique, 0)?;
                 Ok(())
             }
-            Err(plan_err) => {
-                self.reply_sink.reply_error(unique, plan_err.errno())?;
-                Err(MetaError::Io)
+            Err(e) => {
+                self.reply_sink.reply_error(unique, e.errno())?;
+                Err(e)
             }
         }
     }
@@ -3804,13 +3812,22 @@ mod tests {
             ino: u64,
             name: &[u8],
             value: &[u8],
-            _flags: u32,
+            flags: u32,
         ) -> Result<(), MetaError> {
             if !self.entries.contains_key(&ino) {
                 return Err(MetaError::InoNotFound);
             }
             let mut xattrs = self.xattrs.borrow_mut();
             let per_inode = xattrs.entry(ino).or_default();
+            let exists = per_inode.contains_key(name);
+            match flags {
+                0 => {}
+                XATTR_CREATE if exists => return Err(MetaError::XattrAlreadyExists),
+                XATTR_CREATE => {}
+                XATTR_REPLACE if !exists => return Err(MetaError::XattrNoData),
+                XATTR_REPLACE => {}
+                _ => return Err(MetaError::InvalidInput),
+            }
             per_inode.insert(name.to_vec(), value.to_vec());
             Ok(())
         }
@@ -3852,9 +3869,9 @@ mod tests {
                 return Err(MetaError::InoNotFound);
             }
             let mut xattrs = self.xattrs.borrow_mut();
-            let per_inode = xattrs.get_mut(&ino).ok_or(MetaError::Io)?;
+            let per_inode = xattrs.get_mut(&ino).ok_or(MetaError::XattrNoData)?;
             if per_inode.remove(name).is_none() {
-                return Err(MetaError::Io);
+                return Err(MetaError::XattrNoData);
             }
             Ok(())
         }
@@ -6072,8 +6089,12 @@ mod tests {
     fn meta_error_errno_mapping() {
         assert_eq!(MetaError::InoNotFound.errno(), 2); // ENOENT
         assert_eq!(MetaError::AttrStoreError.errno(), 67); // ENOLINK
+        assert_eq!(MetaError::InvalidInput.errno(), POSIX_XATTR_EINVAL);
+        assert_eq!(MetaError::XattrAlreadyExists.errno(), POSIX_XATTR_EEXIST);
+        assert_eq!(MetaError::XattrNoData.errno(), POSIX_XATTR_ENODATA);
         assert_eq!(MetaError::ReplyError.errno(), 5); // EIO
         assert_eq!(MetaError::Io.errno(), 5); // EIO
+        assert_eq!(MetaError::PermDenied.errno(), 1); // EPERM
     }
 
     // ── FuseAttr layout ─────────────────────────────────────────────────

@@ -1005,6 +1005,47 @@ fn buffered_write_read_roundtrip_autoflush() {
 }
 
 #[test]
+fn threshold_autoflush_clears_flushed_writeback_range() {
+    let (mut fs, root) = wb_open_temp("threshold-autoflush-clears-writeback");
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: 8,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/flush.bin", 0o644).expect("create");
+    fs.write_file("/flush.bin", 0, b"abcdefgh")
+        .expect("threshold write");
+
+    assert!(!fs.write_buffers.contains_key(&record.inode_id));
+    assert!(!fs
+        .writeback_range_tracker
+        .lock()
+        .expect("locked")
+        .is_dirty(record.inode_id));
+    assert_eq!(&fs.read_file("/flush.bin").expect("read"), b"abcdefgh");
+
+    fs.write_file("/flush.bin", 16, b"xy")
+        .expect("below-threshold sparse write");
+    assert!(fs
+        .writeback_range_tracker
+        .lock()
+        .expect("locked")
+        .is_dirty(record.inode_id));
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush remaining buffer");
+    assert!(!fs
+        .writeback_range_tracker
+        .lock()
+        .expect("locked")
+        .is_dirty(record.inode_id));
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn sequential_small_writes_coalesce() {
     let (mut fs, root) = wb_open_temp("sequential-small");
     fs.set_write_buffer_config(WriteBufferConfig {
@@ -1186,6 +1227,76 @@ fn multi_chunk_writeback_batch_updates_touched_chunks_once() {
     assert_eq!(by_index[&2].data_version, patched_record.data_version);
     assert_eq!(by_index[&3].data_version, base_record.data_version);
     assert_eq!(fs.read_file("/batch.bin").expect("read final"), expected);
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
+fn extending_writeback_batch_preserves_sparse_manifest_once() {
+    let (mut fs, root) = wb_open_temp("extending-writeback-batch");
+    let chunk = content_chunk_size() as usize;
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: chunk * 8,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/extend.bin", 0o644).expect("create");
+    let prefix: Vec<u8> = (0..chunk / 2).map(|idx| (idx % 251) as u8).collect();
+    fs.write_file("/extend.bin", 0, &prefix)
+        .expect("write prefix");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush prefix");
+    let base_record = fs.stat("/extend.bin").expect("stat prefix");
+    let base_manifest = wd_current_content_manifest(&fs, "/extend.bin");
+    assert_eq!(base_manifest.chunks.len(), 1);
+    assert_eq!(base_manifest.chunks[0].len as usize, prefix.len());
+
+    let first_offset = chunk + 4096;
+    let second_offset = chunk * 3 + 123;
+    let first_patch = vec![0xa5_u8; 64];
+    let second_patch = vec![0x5a_u8; 128];
+    fs.write_file("/extend.bin", first_offset as u64, &first_patch)
+        .expect("write first extending patch");
+    fs.write_file("/extend.bin", second_offset as u64, &second_patch)
+        .expect("write second extending patch");
+
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush extending batch");
+    let patched_record = fs.stat("/extend.bin").expect("stat patched");
+    let patched_manifest = wd_current_content_manifest(&fs, "/extend.bin");
+    assert_eq!(
+        patched_record.data_version,
+        base_record.data_version + 1,
+        "extending writeback batch should publish one content version"
+    );
+
+    let by_index: BTreeMap<u64, _> = patched_manifest
+        .chunks
+        .iter()
+        .map(|chunk_ref| (chunk_ref.chunk_index, chunk_ref))
+        .collect();
+    assert_eq!(by_index.len(), 3);
+    assert_eq!(
+        by_index[&0].data_version, patched_record.data_version,
+        "old EOF chunk must be re-emitted with the extended manifest length"
+    );
+    assert_eq!(by_index[&0].len as usize, chunk);
+    assert_eq!(by_index[&1].data_version, patched_record.data_version);
+    assert!(
+        !by_index.contains_key(&2),
+        "untouched sparse chunk between extending writes must stay a hole"
+    );
+    assert_eq!(by_index[&3].data_version, patched_record.data_version);
+
+    let final_len = second_offset + second_patch.len();
+    let mut expected = vec![0_u8; final_len];
+    expected[..prefix.len()].copy_from_slice(&prefix);
+    expected[first_offset..first_offset + first_patch.len()].copy_from_slice(&first_patch);
+    expected[second_offset..second_offset + second_patch.len()].copy_from_slice(&second_patch);
+    assert_eq!(fs.read_file("/extend.bin").expect("read final"), expected);
 
     drop(fs);
     wd_cleanup(&root);

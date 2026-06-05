@@ -670,17 +670,16 @@ fn end_to_end_writeback_pipeline_crash_recovery() {
         fs.sync_all().expect("sync committed");
     }
 
-    // Phase 2: Drop an uncommitted handle and reopen.
-    {
-        let mut fs = open_fs(&dir);
-        fs.set_auto_commit(false);
-        fs.set_max_uncommitted_mutations(1_000_000);
+    // Phase 2: simulate an abrupt stop with an uncommitted handle. A normal
+    // Drop is best-effort and commits dirty write buffers.
+    let mut fs = open_fs(&dir);
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
 
-        // Write uncommitted data (will be lost on crash).
-        fs.write_file("/pipeline.dat", committed_payload.len() as u64, b"-lost")
-            .expect("write uncommitted");
-        // Drop without commit.
-    }
+    // Write uncommitted data (will be lost on crash).
+    fs.write_file("/pipeline.dat", committed_payload.len() as u64, b"-lost")
+        .expect("write uncommitted");
+    std::mem::forget(fs);
 
     // Phase 3: Recover and verify.
     {

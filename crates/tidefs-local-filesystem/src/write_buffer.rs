@@ -58,6 +58,34 @@ impl WriteBuffer {
         }
     }
 
+    fn first_segment_ending_at_or_after(&self, offset: u64) -> usize {
+        let mut left = 0;
+        let mut right = self.segments.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self.segments[mid].end() < offset {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        left
+    }
+
+    fn first_segment_ending_after(&self, offset: u64) -> usize {
+        let mut left = 0;
+        let mut right = self.segments.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self.segments[mid].end() <= offset {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        left
+    }
+
     /// Ingest a write at the given byte offset.
     ///
     /// Contiguous or overlapping writes are merged into sorted dirty segments.
@@ -70,14 +98,7 @@ impl WriteBuffer {
 
         let write_end = offset.saturating_add(buf.len() as u64);
 
-        let mut index = 0;
-        while index < self.segments.len() {
-            if self.segments[index].end() < offset {
-                index += 1;
-                continue;
-            }
-            break;
-        }
+        let index = self.first_segment_ending_at_or_after(offset);
 
         if index == self.segments.len() || self.segments[index].offset > write_end {
             self.segments.insert(
@@ -143,6 +164,11 @@ impl WriteBuffer {
     /// Total unique buffered dirty bytes.
     #[cfg(test)]
     pub fn len(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// Total unique buffered dirty bytes.
+    pub(crate) fn buffered_bytes(&self) -> usize {
         self.total_bytes
     }
 
@@ -214,7 +240,7 @@ impl WriteBuffer {
             if seg.offset >= size {
                 return false;
             }
-            let seg_end = seg.offset + seg.data.len() as u64;
+            let seg_end = seg.offset.saturating_add(seg.data.len() as u64);
             if seg_end > size {
                 let keep = (size - seg.offset) as usize;
                 seg.data.truncate(keep);
@@ -275,11 +301,15 @@ impl WriteBuffer {
     /// covered by any segment) are filled with zeros. Returns `None` when
     /// no segment covers any part of the requested range.
     pub fn read_overlap(&self, read_offset: u64, read_len: usize) -> Option<Vec<u8>> {
-        let read_end = read_offset + read_len as u64;
+        let read_end = read_offset.saturating_add(read_len as u64);
         let mut buf = vec![0u8; read_len];
         let mut any_hit = false;
 
-        for seg in &self.segments {
+        let start = self.first_segment_ending_after(read_offset);
+        for seg in &self.segments[start..] {
+            if seg.offset >= read_end {
+                break;
+            }
             let seg_end = seg.offset + seg.data.len() as u64;
             if seg.offset < read_end && seg_end > read_offset {
                 any_hit = true;
@@ -317,10 +347,17 @@ impl WriteBuffer {
             return false;
         }
         let read_end = read_offset.saturating_add(read_len);
-        self.segments.iter().any(|seg| {
+        let start = self.first_segment_ending_after(read_offset);
+        for seg in &self.segments[start..] {
+            if seg.offset >= read_end {
+                return false;
+            }
             let seg_end = seg.offset.saturating_add(seg.data.len() as u64);
-            seg.offset < read_end && seg_end > read_offset
-        })
+            if seg.offset < read_end && seg_end > read_offset {
+                return true;
+            }
+        }
+        false
     }
 
     /// Overlay dirty buffered bytes onto an existing read buffer.
@@ -335,7 +372,11 @@ impl WriteBuffer {
         let read_end = read_offset.saturating_add(buf.len() as u64);
         let mut any_hit = false;
 
-        for seg in &self.segments {
+        let start = self.first_segment_ending_after(read_offset);
+        for seg in &self.segments[start..] {
+            if seg.offset >= read_end {
+                break;
+            }
             let seg_end = seg.offset.saturating_add(seg.data.len() as u64);
             if seg.offset < read_end && seg_end > read_offset {
                 any_hit = true;

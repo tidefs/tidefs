@@ -5578,7 +5578,7 @@ impl LocalFileSystem {
                     })?;
             Ok::<u64, FileSystemError>(size.max(patch_end))
         })?;
-        if patches.len() > 1 && batch_new_size == base_record.size {
+        if patches.len() > 1 {
             match self.rewrite_content_with_patch_batch(
                 inode_id,
                 base_record.clone(),
@@ -6089,6 +6089,29 @@ impl LocalFileSystem {
         check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
 
         // Buffer the write — flush on threshold or explicit fsync.
+        let may_flush_after_ingest = self
+            .write_buffers
+            .get(&inode_id)
+            .map(|wb| wb.buffered_bytes().saturating_add(bytes.len()))
+            .unwrap_or(bytes.len())
+            >= self.write_buffer_config.flush_threshold_bytes;
+        let foreground_flush_rollback = if may_flush_after_ingest {
+            let old_write_buffer = self.write_buffers.get(&inode_id).cloned();
+            let old_dirty_ranges = self
+                .writeback_range_tracker
+                .lock()
+                .expect("locked")
+                .snapshot_ranges();
+            Some((old_write_buffer, old_dirty_ranges))
+        } else {
+            None
+        };
+        if bytes_len > 0 {
+            self.writeback_range_tracker
+                .lock()
+                .expect("locked")
+                .mark_dirty(inode_id, offset, bytes_len);
+        }
         self.snapshot_write_buffers_for_rollback();
         let should_flush = {
             let wb = self
@@ -6104,7 +6127,23 @@ impl LocalFileSystem {
                 .get(&inode_id)
                 .is_some_and(WriteBuffer::should_flush)
             {
-                self.flush_write_buffer_batch(inode_id)?;
+                if let Err(err) = self.flush_write_buffer_batch(inode_id) {
+                    if let Some((old_write_buffer, old_dirty_ranges)) = foreground_flush_rollback {
+                        match old_write_buffer {
+                            Some(wb) => {
+                                self.write_buffers.insert(inode_id, wb);
+                            }
+                            None => {
+                                self.write_buffers.remove(&inode_id);
+                            }
+                        }
+                        self.writeback_range_tracker
+                            .lock()
+                            .expect("locked")
+                            .restore_ranges(old_dirty_ranges);
+                    }
+                    return Err(err);
+                }
             }
         }
 
@@ -6128,12 +6167,6 @@ impl LocalFileSystem {
             .allocate_extent(inode_id.0, offset, bytes_len, None);
         // Capacity reservation was committed inline before the write.
         // On error paths the caller must rollback via capacity_authority.record_free.
-        if bytes_len > 0 {
-            self.writeback_range_tracker
-                .lock()
-                .expect("locked")
-                .mark_dirty(inode_id, offset, bytes_len);
-        }
         self.state.dirty_extent_maps.insert(inode_id);
         Ok(result)
     }
@@ -6162,6 +6195,8 @@ impl LocalFileSystem {
         if length == 0 {
             return Ok(record);
         }
+        self.flush_write_buffer(inode_id)?;
+        let record = self.committed_inode_record(inode_id)?;
         let end = offset
             .checked_add(length)
             .ok_or(FileSystemError::SizeOverflow {
@@ -6413,6 +6448,8 @@ impl LocalFileSystem {
         if length == 0 {
             return Ok(record);
         }
+        self.flush_write_buffer(inode_id)?;
+        let record = self.committed_inode_record(inode_id)?;
         let end = offset
             .checked_add(length)
             .ok_or(FileSystemError::SizeOverflow {
@@ -7794,8 +7831,77 @@ impl LocalFileSystem {
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        self.set_xattr_by_inode_with_target(inode_id, path, name, value, flags, None)
+    }
+
+    pub fn set_xattr_by_inode(
+        &mut self,
+        inode_id: InodeId,
+        name: &[u8],
+        value: &[u8],
+        flags: i32,
+    ) -> Result<()> {
+        let target = Self::xattr_inode_target(inode_id);
+        self.set_xattr_by_inode_with_target(inode_id, &target, name, value, flags, None)
+    }
+
+    pub(crate) fn set_xattr_by_inode_limited(
+        &mut self,
+        inode_id: InodeId,
+        name: &[u8],
+        value: &[u8],
+        flags: i32,
+        max_xattr_count: usize,
+    ) -> Result<()> {
+        let target = Self::xattr_inode_target(inode_id);
+        self.set_xattr_by_inode_with_target(
+            inode_id,
+            &target,
+            name,
+            value,
+            flags,
+            Some(max_xattr_count),
+        )
+    }
+
+    fn xattr_inode_target(inode_id: InodeId) -> String {
+        format!("<inode:{}>", inode_id.get())
+    }
+
+    fn ensure_xattr_inode_exists(&self, inode_id: InodeId) -> Result<()> {
+        if inode_id != ROOT_INODE_ID
+            && !self.state.known_inode_ids.contains(&inode_id)
+            && !self.state.inodes.contains_key(&inode_id)
+        {
+            return Err(FileSystemError::NotFound {
+                path: Self::xattr_inode_target(inode_id),
+            });
+        }
+        Ok(())
+    }
+
+    fn xattr_count_no_space_error(&self, max_xattr_count: usize) -> FileSystemError {
+        FileSystemError::NoSpace {
+            resource: LocalStorageResource::Inodes,
+            requested: (max_xattr_count as u64).saturating_add(1),
+            available: 0,
+            capacity: max_xattr_count as u64,
+            allocated: max_xattr_count as u64,
+        }
+    }
+
+    fn set_xattr_by_inode_with_target(
+        &mut self,
+        inode_id: InodeId,
+        target: &str,
+        name: &[u8],
+        value: &[u8],
+        flags: i32,
+        max_xattr_count: Option<usize>,
+    ) -> Result<()> {
+        self.ensure_xattr_inode_exists(inode_id)?;
         self.flush_write_buffer(inode_id)?;
-        let record = self.inode(inode_id)?.clone();
+        let record = self.inode(inode_id)?;
 
         if name.is_empty() || name.contains(&0) {
             return Err(FileSystemError::InvalidName {
@@ -7830,7 +7936,7 @@ impl LocalFileSystem {
 
             if name == ACL_DEFAULT && acl_entries.is_empty() {
                 if record.xattrs.contains_key(ACL_DEFAULT) {
-                    return self.remove_xattr(path, name);
+                    return self.remove_xattr_by_inode_with_target(inode_id, target, name);
                 }
                 return Ok(());
             }
@@ -7867,28 +7973,37 @@ impl LocalFileSystem {
         let tick = self.bump_generation();
         let mut updated = record;
         let n = name.to_vec();
+        let existed = updated.xattrs.contains_key(&n);
 
         const XATTR_CREATE: i32 = 1;
         const XATTR_REPLACE: i32 = 2;
 
         match flags {
             0 => {
+                if !existed && max_xattr_count.is_some_and(|limit| updated.xattrs.len() >= limit) {
+                    self.rollback_mutation_delta();
+                    return Err(self.xattr_count_no_space_error(max_xattr_count.unwrap()));
+                }
                 updated.xattrs.insert(n, value.to_vec());
             }
             XATTR_CREATE => {
-                if updated.xattrs.contains_key(&n) {
+                if existed {
                     self.rollback_mutation_delta();
                     return Err(FileSystemError::AlreadyExists {
-                        path: path.to_string(),
+                        path: target.to_string(),
                     });
+                }
+                if max_xattr_count.is_some_and(|limit| updated.xattrs.len() >= limit) {
+                    self.rollback_mutation_delta();
+                    return Err(self.xattr_count_no_space_error(max_xattr_count.unwrap()));
                 }
                 updated.xattrs.insert(n, value.to_vec());
             }
             XATTR_REPLACE => {
-                if !updated.xattrs.contains_key(&n) {
+                if !existed {
                     self.rollback_mutation_delta();
                     return Err(FileSystemError::NotFound {
-                        path: path.to_string(),
+                        path: format!("{target}:{}", String::from_utf8_lossy(name)),
                     });
                 }
                 updated.xattrs.insert(n, value.to_vec());
@@ -7920,6 +8035,11 @@ impl LocalFileSystem {
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        self.get_xattr_by_inode(inode_id, name)
+    }
+
+    pub fn get_xattr_by_inode(&self, inode_id: InodeId, name: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.ensure_xattr_inode_exists(inode_id)?;
         let record = self.inode(inode_id)?;
         // Re-encode ACL entries from decoded form back to canonical wire format.
         const ACL_ACCESS: &[u8] = b"system.posix_acl_access";
@@ -7934,10 +8054,37 @@ impl LocalFileSystem {
         Ok(record.xattrs.get(name).cloned())
     }
 
+    #[allow(dead_code)] // INTENT: path-dispatch support retained for crate tests; VFS hot path uses inode dispatch.
+    pub(crate) fn xattr_exists_and_count(
+        &self,
+        path: impl AsRef<str>,
+        name: &[u8],
+    ) -> Result<(bool, usize)> {
+        let path = path.as_ref();
+        let parts = parse_absolute_path(path)?;
+        let inode_id = self.resolve_parts(&parts, path)?;
+        self.xattr_exists_and_count_by_inode(inode_id, name)
+    }
+
+    pub(crate) fn xattr_exists_and_count_by_inode(
+        &self,
+        inode_id: InodeId,
+        name: &[u8],
+    ) -> Result<(bool, usize)> {
+        self.ensure_xattr_inode_exists(inode_id)?;
+        let record = self.inode(inode_id)?;
+        Ok((record.xattrs.contains_key(name), record.xattrs.len()))
+    }
+
     pub fn list_xattr(&self, path: impl AsRef<str>) -> Result<Vec<u8>> {
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        self.list_xattr_by_inode(inode_id)
+    }
+
+    pub fn list_xattr_by_inode(&self, inode_id: InodeId) -> Result<Vec<u8>> {
+        self.ensure_xattr_inode_exists(inode_id)?;
         let record = self.inode(inode_id)?;
         let mut out = Vec::new();
         for name in record.xattrs.keys() {
@@ -7951,12 +8098,27 @@ impl LocalFileSystem {
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
+        self.remove_xattr_by_inode_with_target(inode_id, path, name)
+    }
+
+    pub fn remove_xattr_by_inode(&mut self, inode_id: InodeId, name: &[u8]) -> Result<()> {
+        let target = Self::xattr_inode_target(inode_id);
+        self.remove_xattr_by_inode_with_target(inode_id, &target, name)
+    }
+
+    fn remove_xattr_by_inode_with_target(
+        &mut self,
+        inode_id: InodeId,
+        target: &str,
+        name: &[u8],
+    ) -> Result<()> {
+        self.ensure_xattr_inode_exists(inode_id)?;
         self.flush_write_buffer(inode_id)?;
-        let record = self.inode(inode_id)?.clone();
+        let record = self.inode(inode_id)?;
 
         if !record.xattrs.contains_key(name) {
             return Err(FileSystemError::NotFound {
-                path: format!("{path}:{}", String::from_utf8_lossy(name)),
+                path: format!("{target}:{}", String::from_utf8_lossy(name)),
             });
         }
 
@@ -8598,6 +8760,10 @@ impl LocalFileSystem {
             self.uncommitted_mutation_count = 0;
         }
         self.auto_commit = enabled;
+    }
+
+    pub fn set_commit_group_throughput_profile(&mut self) {
+        self.commit_group.config = CommitGroupConfig::throughput();
     }
 
     pub fn begin_transaction(&mut self) -> Result<()> {
@@ -9568,6 +9734,8 @@ impl LocalFileSystem {
                     })
             });
         }
+        self.dirty_set.record_metadata_op(inode_id);
+        let _accepted_by_commit_group = self.commit_group.record_write(0);
         self.state.dirty_inodes.insert(inode_id);
     }
 
@@ -9582,6 +9750,8 @@ impl LocalFileSystem {
                     .unwrap_or_default()
             });
         }
+        self.dirty_set.record_dir_op(inode_id);
+        let _accepted_by_commit_group = self.commit_group.record_write(0);
         self.state.dirty_dirs.insert(inode_id);
     }
     /// Bump parent directory nlink, mtime, and ctime when a subdirectory

@@ -296,8 +296,14 @@ pub fn dispatch_flush_with_tracker(
             .flush_dirty_range(ino, 0, u64::MAX, |offset, data| {
                 engine
                     .write(&efh, offset, data, ctx)
-                    .map(|_| ())
                     .map_err(engine_err_to_flush_err)
+                    .and_then(|written| {
+                        if usize::try_from(written).ok() == Some(data.len()) {
+                            Ok(())
+                        } else {
+                            Err(PageFlushError::IoError)
+                        }
+                    })
             })
             .map_err(|e| match e {
                 PageFlushError::IoError => FlushError::IoError,
@@ -377,8 +383,14 @@ pub fn dispatch_fsync_with_tracker(
             .flush_dirty_range(ino, 0, u64::MAX, |offset, data| {
                 engine
                     .write(&efh, offset, data, ctx)
-                    .map(|_| ())
                     .map_err(engine_err_to_flush_err)
+                    .and_then(|written| {
+                        if usize::try_from(written).ok() == Some(data.len()) {
+                            Ok(())
+                        } else {
+                            Err(PageFlushError::IoError)
+                        }
+                    })
             })
             .map_err(|e| match e {
                 PageFlushError::IoError => FsyncError::IoError,

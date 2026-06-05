@@ -1128,6 +1128,48 @@ impl DirtyPageTracker {
         before.saturating_sub(self.entries.len())
     }
 
+    /// Clear dirty bytes in `[offset, offset + length)` for `inode`.
+    ///
+    /// Authoritative byte-range mutations such as hole punch, truncate, and
+    /// direct I/O overwrite must be able to remove stale dirty work without
+    /// dropping unrelated dirty bytes on the same inode. Ranges that straddle
+    /// the cleared window are split and keep their original boundary token.
+    pub fn clear_range(&mut self, inode: u64, offset: u64, length: u64) -> usize {
+        if length == 0 {
+            return 0;
+        }
+        let clear_end = offset.saturating_add(length);
+        if clear_end <= offset {
+            return 0;
+        }
+
+        let mut cleared = 0usize;
+        let mut next = Vec::with_capacity(self.entries.len());
+        for entry in self.entries.drain(..) {
+            if entry.inode != inode || entry.offset_end <= offset || entry.offset_start >= clear_end
+            {
+                next.push(entry);
+                continue;
+            }
+
+            cleared = cleared.saturating_add(1);
+            if entry.offset_start < offset {
+                next.push(DirtyPageEntry {
+                    offset_end: offset,
+                    ..entry
+                });
+            }
+            if entry.offset_end > clear_end {
+                next.push(DirtyPageEntry {
+                    offset_start: clear_end,
+                    ..entry
+                });
+            }
+        }
+        self.entries = next;
+        cleared
+    }
+
     // ── internals ───────────────────────────────────────────────────────
 
     /// Insert a dirty-page entry and merge it with any adjacent or
@@ -4942,6 +4984,25 @@ mod tests {
         let removed = t.clear_all_until_boundary(tok);
         assert_eq!(removed, 3);
         assert_eq!(t.range_count(), 1); // only inode 4 remains
+    }
+
+    #[test]
+    fn clear_range_splits_dirty_range_without_touching_other_inodes() {
+        let mut t = DirtyPageTracker::new();
+        t.mark_dirty(7, 0, 16 * 1024).unwrap();
+        t.mark_dirty(8, 0, 4096).unwrap();
+
+        let cleared = t.clear_range(7, 4096, 4096);
+
+        assert_eq!(cleared, 1);
+        assert_eq!(
+            t.get_dirty_ranges(7),
+            vec![
+                DirtyRange::new(7, 0, 4096),
+                DirtyRange::new(7, 8192, 16 * 1024),
+            ]
+        );
+        assert_eq!(t.get_dirty_ranges(8), vec![DirtyRange::new(8, 0, 4096)]);
     }
 
     #[test]

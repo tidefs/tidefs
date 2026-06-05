@@ -351,6 +351,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
+const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 16 * 1024;
+
 /// Resolve an encryption configuration from a sealed pool key envelope file.
 ///
 /// Uses [`tidefs_local_object_store::encrypt::PoolEncryptionKey::unseal`] to
@@ -593,6 +596,13 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
         lfs.set_mounted_dataset_id(*ds_id.as_bytes());
     }
 
+    lfs.set_write_buffer_flush_threshold_bytes(MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES);
+    lfs.set_auto_commit(false);
+    lfs.set_commit_group_throughput_profile();
+    lfs.set_max_uncommitted_mutations(MOUNT_MAX_UNCOMMITTED_MUTATIONS);
+
+    let writeback_tracker = Arc::clone(lfs.writeback_range_tracker());
+
     // Build the base VfsLocalFileSystem, optionally scoped to a dataset root.
     let mut base_engine = VfsLocalFileSystem::new(lfs);
     // When mounting a non-root dataset, scope path resolution to the
@@ -642,7 +652,9 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     }
 
     if config.writeback_cache {
-        adapter = adapter.with_writeback_cache_enabled();
+        adapter = adapter
+            .with_writeback_cache_enabled()
+            .with_writeback_range_tracker(writeback_tracker);
     } else {
         adapter = adapter.with_writeback_cache_disabled();
     }

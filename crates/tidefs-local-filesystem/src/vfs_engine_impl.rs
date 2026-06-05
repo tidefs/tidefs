@@ -1,9 +1,10 @@
 //! VfsEngine trait implementation wrapping LocalFileSystem.
 //!
 //! Wraps `LocalFileSystem` in a `RefCell` to provide interior mutability,
-//! matching the VfsEngine `&self` contract. Maps all 30 canonical VFS
-//! operations to existing LocalFileSystem path-based methods using a
-//! lazy inode-to-path resolution layer.
+//! matching the VfsEngine `&self` contract. Most namespace operations map to
+//! existing LocalFileSystem path-based methods using a lazy inode-to-path
+//! resolution layer; hot inode-native operations such as xattrs avoid that
+//! path reconstruction.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -4255,8 +4256,7 @@ impl VfsEngine for VfsLocalFileSystem {
         if name.starts_with(b"trusted.") && ctx.uid != 0 {
             return Err(Errno::EPERM);
         }
-        let path = self.inode_path(inode)?;
-        xattr_dispatch::engine_getxattr(&self.fs.borrow(), &path, name)
+        xattr_dispatch::engine_getxattr_by_inode(&self.fs.borrow(), inode, name)
             .map_err(xattr_dispatch::errno_from_dispatch_error)?
             .ok_or(Errno::ENODATA)
     }
@@ -4272,13 +4272,17 @@ impl VfsEngine for VfsLocalFileSystem {
             return Err(Errno::EPERM);
         }
         Self::validate_posix_acl_xattr_value(name, value)?;
-        let path = self.inode_path(inode)?;
-        xattr_dispatch::engine_setxattr(&mut self.fs.borrow_mut(), &path, name, value, flags)
-            .map_err(xattr_dispatch::errno_from_dispatch_error)
+        xattr_dispatch::engine_setxattr_by_inode(
+            &mut self.fs.borrow_mut(),
+            inode,
+            name,
+            value,
+            flags,
+        )
+        .map_err(xattr_dispatch::errno_from_dispatch_error)
     }
     fn listxattr(&self, inode: InodeId, ctx: &RequestCtx) -> std::result::Result<Vec<u8>, Errno> {
-        let path = self.inode_path(inode)?;
-        let names = xattr_dispatch::engine_listxattr(&self.fs.borrow(), &path)
+        let names = xattr_dispatch::engine_listxattr_by_inode(&self.fs.borrow(), inode)
             .map_err(xattr_dispatch::errno_from_dispatch_error)?;
 
         if ctx.uid == 0 {
@@ -4307,8 +4311,7 @@ impl VfsEngine for VfsLocalFileSystem {
         if name.starts_with(b"trusted.") && ctx.uid != 0 {
             return Err(Errno::EPERM);
         }
-        let path = self.inode_path(inode)?;
-        xattr_dispatch::engine_removexattr(&mut self.fs.borrow_mut(), &path, name)
+        xattr_dispatch::engine_removexattr_by_inode(&mut self.fs.borrow_mut(), inode, name)
             .map_err(xattr_dispatch::errno_from_dispatch_error)
     }
 
@@ -10933,6 +10936,89 @@ mod tests {
             .getxattr(attr.inode_id, b"user.test", &ctx())
             .unwrap();
         assert_eq!(val, b"hello");
+    }
+
+    #[test]
+    fn xattr_ops_are_authoritative_by_inode_not_path_cache_alias() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (target, _target_fh) = engine
+            .create(root, b"xattr-target.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let (wrong, _wrong_fh) = engine
+            .create(root, b"xattr-wrong.txt", 0o644, 0, &ctx())
+            .unwrap();
+
+        engine
+            .path_cache
+            .borrow_mut()
+            .insert(target.inode_id, "/xattr-wrong.txt".to_string());
+
+        engine
+            .setxattr(target.inode_id, b"user.alias", b"target", 0, &ctx())
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .getxattr(target.inode_id, b"user.alias", &ctx())
+                .unwrap(),
+            b"target"
+        );
+        assert_eq!(
+            engine
+                .getxattr(wrong.inode_id, b"user.alias", &ctx())
+                .unwrap_err(),
+            Errno::ENODATA
+        );
+        assert_eq!(
+            engine.listxattr(target.inode_id, &ctx()).unwrap(),
+            b"user.alias\0"
+        );
+
+        engine
+            .removexattr(target.inode_id, b"user.alias", &ctx())
+            .unwrap();
+        assert_eq!(
+            engine
+                .getxattr(target.inode_id, b"user.alias", &ctx())
+                .unwrap_err(),
+            Errno::ENODATA
+        );
+    }
+
+    #[test]
+    fn xattr_burst_with_deferred_commit_stays_batched_below_threshold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut fs = LocalFileSystem::open(dir.path()).expect("open");
+        fs.set_auto_commit(false);
+        fs.set_max_uncommitted_mutations(16 * 1024);
+        fs.set_commit_group_throughput_profile();
+        let engine = VfsLocalFileSystem::new(fs);
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine
+            .create(root, b"xattr-burst.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let before_burst = engine.fs.borrow().uncommitted_mutation_count;
+
+        for i in 0..128 {
+            let name = format!("user.burst{i:03}");
+            engine
+                .setxattr(attr.inode_id, name.as_bytes(), b"value", 0, &ctx())
+                .unwrap();
+        }
+        for i in 0..128 {
+            let name = format!("user.burst{i:03}");
+            engine
+                .removexattr(attr.inode_id, name.as_bytes(), &ctx())
+                .unwrap();
+        }
+
+        assert!(engine.listxattr(attr.inode_id, &ctx()).unwrap().is_empty());
+        assert_eq!(
+            engine.fs.borrow().uncommitted_mutation_count,
+            before_burst + 256,
+            "xattr stress below the daemon threshold should remain commit-group batched"
+        );
     }
 
     #[test]

@@ -1978,7 +1978,10 @@ fn file_type_for_posix_mode(mode: u32) -> FileType {
 /// Map a VfsEngine `Errno` into the closest [`MetaError`].
 fn meta_err_from_errno(raw: u16) -> MetaError {
     match raw {
-        2 => MetaError::InoNotFound,     // ENOENT
+        2 => MetaError::InoNotFound, // ENOENT
+        17 => MetaError::XattrAlreadyExists,
+        22 => MetaError::InvalidInput,
+        61 => MetaError::XattrNoData,
         67 => MetaError::AttrStoreError, // ENOLINK
         _ => MetaError::Io,
     }
@@ -2157,6 +2160,9 @@ pub(crate) fn errno_from_meta_error(error: MetaError) -> Errno {
         MetaError::AttrStoreError => Errno::ENOLINK,
         MetaError::NotDir => Errno::ENOTDIR,
         MetaError::PermDenied => Errno::EPERM,
+        MetaError::InvalidInput => Errno::EINVAL,
+        MetaError::XattrAlreadyExists => Errno::EEXIST,
+        MetaError::XattrNoData => Errno::ENODATA,
         MetaError::ReplyError | MetaError::Io => Errno::EIO,
     }
 }
@@ -2285,6 +2291,44 @@ impl DirtyRanges {
             cov = cov.max(e);
         }
         cov >= qe
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AuthoritativeRangePayload<'a> {
+    Bytes(&'a [u8]),
+    Zeroes,
+    EngineRead {
+        engine: &'a (dyn VfsEngineStatFs + Send),
+        efh: &'a EngineFileHandle,
+        ctx: &'a RequestCtx,
+    },
+}
+
+impl AuthoritativeRangePayload<'_> {
+    fn fill(self, range_offset: u64, fill_offset: u64, dst: &mut [u8]) -> Result<(), Errno> {
+        match self {
+            Self::Bytes(bytes) => {
+                let relative = fill_offset.checked_sub(range_offset).ok_or(Errno::EIO)? as usize;
+                let end = relative.checked_add(dst.len()).ok_or(Errno::EIO)?;
+                let src = bytes.get(relative..end).ok_or(Errno::EIO)?;
+                dst.copy_from_slice(src);
+                Ok(())
+            }
+            Self::Zeroes => {
+                dst.fill(0);
+                Ok(())
+            }
+            Self::EngineRead { engine, efh, ctx } => {
+                let size = u32::try_from(dst.len()).map_err(|_| Errno::EFBIG)?;
+                let data = engine.read(efh, fill_offset, size, ctx)?;
+                if data.len() != dst.len() {
+                    return Err(Errno::EIO);
+                }
+                dst.copy_from_slice(&data);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -2579,6 +2623,7 @@ impl FuseVfsAdapter {
     #[must_use]
     pub fn with_writeback_cache_enabled(mut self) -> Self {
         self.writeback_cache_enabled = true;
+        self.writeback_page_cache = Some(Arc::clone(&self.write_page_cache));
         self
     }
     /// Disable FUSE writeback cache. Overrides the profile default.
@@ -2588,6 +2633,7 @@ impl FuseVfsAdapter {
     #[must_use]
     pub fn with_writeback_cache_disabled(mut self) -> Self {
         self.writeback_cache_enabled = false;
+        self.writeback_page_cache = None;
 
         self
     }
@@ -2870,10 +2916,14 @@ impl FuseVfsAdapter {
         if written == 0 {
             return false;
         }
-        if !is_writeback_cached || posix_direct_io || (write_flags & FUSE_WRITE_KILL_PRIV) != 0 {
-            return true;
-        }
-        offset.saturating_add(u64::from(written)) > old_size
+        let _ = (
+            is_writeback_cached,
+            posix_direct_io,
+            write_flags,
+            old_size,
+            offset,
+        );
+        true
     }
 
     fn writeback_sparse_zero_write_is_noop(
@@ -4413,6 +4463,7 @@ impl FuseVfsAdapter {
         }
         // Capacity admission and tracking for size changes are handled by the
         // engine's CapacityAuthority during truncate_extents dispatch.
+        let mut data_invalidation_range = None;
 
         // Perform extent mutation for size changes (shrink via punch-hole,
         // grow via zero-fill allocate). The engine lock is already held so
@@ -4436,7 +4487,8 @@ impl FuseVfsAdapter {
                 let new_sz = attr.size;
                 Self::truncate_extents(&**e, inode_id, efh, old_sz, new_sz, ctx)?;
                 if new_sz < old_sz {
-                    self.clear_dirty_for_deallocate_range(ino, new_sz, old_sz - new_sz);
+                    self.clear_dirty_for_deallocate_range(ino, new_sz, old_sz - new_sz)?;
+                    data_invalidation_range = Some((new_sz, old_sz - new_sz));
                 }
             } else {
                 // Path-based truncate (no open file handle): open, truncate, release.
@@ -4446,7 +4498,8 @@ impl FuseVfsAdapter {
                 let result =
                     Self::truncate_extents(&**e, inode_id, &efh, current_size, new_sz, ctx);
                 if result.is_ok() && new_sz < current_size {
-                    self.clear_dirty_for_deallocate_range(ino, new_sz, current_size - new_sz);
+                    self.clear_dirty_for_deallocate_range(ino, new_sz, current_size - new_sz)?;
+                    data_invalidation_range = Some((new_sz, current_size - new_sz));
                 }
                 let _ = e.release(&efh);
                 result?;
@@ -4482,7 +4535,12 @@ impl FuseVfsAdapter {
         // CapacityAuthority during truncate dispatch (check_enospc for growth,
         // record_free for shrinkage).
         self.sync_namespace_attrs_local(ino, &updated);
-        self.invalidate_inode_metadata_local(ino);
+        drop(e);
+        if let Some((offset, length)) = data_invalidation_range {
+            self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
+        } else {
+            self.invalidate_inode_metadata_local(ino);
+        }
 
         Ok(crate::workers_meta::fuse_attr_out(
             ino,
@@ -5007,7 +5065,6 @@ impl FuseVfsAdapter {
                 return Err(Errno::EINVAL);
             }
         }
-
         // ── fuse_read dispatch path (issue #3574) ────────────────────────
         //
         // When a FuseReadDispatch is configured, probe the PageCache
@@ -5472,6 +5529,9 @@ impl FuseVfsAdapter {
                                     self.invalidate_caches_after_direct_write(ino);
                                 } else if !sparse_zero_noop {
                                     self.mark_dirty_after_write(
+                                        &**e,
+                                        ctx,
+                                        write_efh,
                                         ino,
                                         effective_offset as u64,
                                         written,
@@ -5553,12 +5613,25 @@ impl FuseVfsAdapter {
                 // covered by this authoritative direct write, so later
                 // writeback cannot replay old page-cache bytes over it.
                 if posix_direct_io {
-                    let mut ds = self.dirty_state.lock().unwrap();
-                    if let Some(dr) = ds.get_mut(&ino) {
-                        dr.clear_overlap(effective_offset as u64, written as u64);
-                        if dr.is_empty() {
-                            ds.remove(&ino);
+                    let written_len = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                    let Some(written_data) = data.get(..written_len) else {
+                        if let Some(fallback) = fallback_to_release.take() {
+                            let e = self.engine.lock().unwrap();
+                            let _ = e.release(&fallback);
                         }
+                        return Err(Errno::EIO);
+                    };
+                    if let Err(errno) = self.reconcile_dirty_mirrors_for_authoritative_range(
+                        ino,
+                        effective_offset as u64,
+                        u64::from(written),
+                        AuthoritativeRangePayload::Bytes(written_data),
+                    ) {
+                        if let Some(fallback) = fallback_to_release.take() {
+                            let e = self.engine.lock().unwrap();
+                            let _ = e.release(&fallback);
+                        }
+                        return Err(errno);
                     }
                 }
             }
@@ -5620,6 +5693,9 @@ impl FuseVfsAdapter {
                                     self.invalidate_caches_after_direct_write(ino);
                                 } else {
                                     self.mark_dirty_after_write(
+                                        &**e,
+                                        ctx,
+                                        &efh,
                                         ino,
                                         effective_offset as u64,
                                         written,
@@ -5659,20 +5735,6 @@ impl FuseVfsAdapter {
                                         }
                                     }
                                 }
-                                // Direct I/O conflict guard: clear stale
-                                // cached dirty ranges covered by this
-                                // authoritative direct write, so later
-                                // writeback cannot replay old page-cache
-                                // bytes over it.
-                                if posix_direct_io {
-                                    let mut ds = self.dirty_state.lock().unwrap();
-                                    if let Some(dr) = ds.get_mut(&ino) {
-                                        dr.clear_overlap(effective_offset as u64, written as u64);
-                                        if dr.is_empty() {
-                                            ds.remove(&ino);
-                                        }
-                                    }
-                                }
                             }
                             (Ok(written), wrote_data)
                         }
@@ -5680,6 +5742,24 @@ impl FuseVfsAdapter {
                     }
                 }
             }; // engine lock dropped here
+
+            // Direct I/O conflict guard: reconcile stale cached dirty ranges
+            // covered by this authoritative direct write, so later writeback
+            // cannot replay old page-cache bytes over it.
+            if posix_direct_io {
+                if let Ok(written) = write_result {
+                    if written > 0 {
+                        let written_len = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                        let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
+                        self.reconcile_dirty_mirrors_for_authoritative_range(
+                            ino,
+                            effective_offset as u64,
+                            u64::from(written),
+                            AuthoritativeRangePayload::Bytes(written_data),
+                        )?;
+                    }
+                }
+            }
 
             // Relatime update locks the engine internally, so it must run after
             // the write dispatch lock is released.
@@ -5723,10 +5803,33 @@ impl FuseVfsAdapter {
         self.path_lookup_cache.lock().unwrap().remove_by_ino(ino);
     }
 
+    /// Invalidate daemon read-side caches after an engine mutation changes
+    /// visible file bytes without going through the kernel page cache.
+    fn invalidate_caches_after_engine_data_mutation(&self, ino: u64, offset: u64, length: u64) {
+        if length == 0 {
+            return;
+        }
+        let end = offset.saturating_add(length);
+        if let Some(ref wb_cache) = self.writeback_page_cache {
+            wb_cache.invalidate_range(ino, offset, end);
+        }
+        self.write_page_cache.invalidate_range(ino, offset, end);
+        if let Ok(mut cache) = self.page_cache.lock() {
+            cache.invalidate(ino);
+        }
+        if let Some(ref rd) = self.fuse_read_dispatch {
+            rd.page_cache().invalidate_range(ino, offset, end);
+        }
+        self.invalidate_inode_metadata_local(ino);
+    }
+
     /// Track dirty pages after a write: update writeback scheduler,
     /// dirty-state, page caches, and invalidate read/getattr caches.
     fn mark_dirty_after_write(
         &self,
+        engine: &(dyn VfsEngineStatFs + Send),
+        ctx: &RequestCtx,
+        efh: &EngineFileHandle,
         ino: u64,
         offset: u64,
         written: u32,
@@ -5753,6 +5856,7 @@ impl FuseVfsAdapter {
             .submit_dirty_extent(outcome);
         let mut ds = self.dirty_state.lock().unwrap();
         ds.entry(ino).or_default().mark_dirty(offset, written);
+        drop(ds);
         // Dirty the write-page-cache pages for writeback coordination.
         {
             let page_size = self.write_page_cache.page_size() as u64;
@@ -5790,10 +5894,27 @@ impl FuseVfsAdapter {
             let end_off = start_off.saturating_add(u64::from(written));
             let mut off = (start_off / page_size) * page_size;
             while off < end_off {
-                let _ = wb_cache.insert(ino, off);
+                let page_was_absent = wb_cache.lookup(ino, off).is_none();
+                let copy_start = start_off.max(off);
+                let copy_end = end_off.min(off.saturating_add(page_size));
+                let existing_page = if page_was_absent
+                    && (copy_start != off || copy_end != off.saturating_add(page_size))
+                {
+                    match u32::try_from(page_size) {
+                        Ok(read_size) => engine.read(efh, off, read_size, ctx).ok(),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                if page_was_absent {
+                    let _ = wb_cache.insert(ino, off);
+                }
                 if let Some(mut page) = wb_cache.lookup(ino, off) {
-                    let copy_start = start_off.max(off);
-                    let copy_end = end_off.min(off.saturating_add(page_size));
+                    if let Some(existing) = existing_page.as_deref() {
+                        let fill_len = existing.len().min(page.data_mut().len());
+                        page.data_mut()[..fill_len].copy_from_slice(&existing[..fill_len]);
+                    }
                     if copy_start < copy_end {
                         let src_start = (copy_start - start_off) as usize;
                         let dst_start = (copy_start - off) as usize;
@@ -5855,6 +5976,160 @@ impl FuseVfsAdapter {
                 ds.remove(&ino);
             }
         }
+    }
+
+    fn clear_worker_dirty_page_range(&self, ino: u64, offset: u64, length: u64) {
+        if length == 0 {
+            return;
+        }
+        let tracker = self.write_dispatch.lock().unwrap().dirty_page_tracker_arc();
+        tracker.lock().unwrap().clear_range(ino, offset, length);
+    }
+
+    fn dirty_trackers_overlap_range(&self, ino: u64, offset: u64, length: u64) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let end = offset.saturating_add(length);
+        if self
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_some_and(|dr| dr.overlaps(offset, length))
+        {
+            return true;
+        }
+        if let Some(ref tracker) = self.writeback_range_tracker {
+            if tracker
+                .lock()
+                .unwrap()
+                .dirty_ranges(InodeId::new(ino))
+                .is_some_and(|ranges| {
+                    ranges.iter().any(|range| {
+                        let range_end = range.offset.saturating_add(range.length);
+                        range.offset < end && offset < range_end
+                    })
+                })
+            {
+                return true;
+            }
+        }
+        let worker_tracker = self.write_dispatch.lock().unwrap().dirty_page_tracker_arc();
+        let worker_overlap = worker_tracker
+            .lock()
+            .unwrap()
+            .get_dirty_ranges(ino)
+            .into_iter()
+            .any(|range| range.offset_start < end && offset < range.offset_end);
+        worker_overlap
+    }
+
+    fn dirty_page_caches_overlap_range(&self, ino: u64, offset: u64, length: u64) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let end = offset.saturating_add(length);
+        if self
+            .writeback_page_cache
+            .as_ref()
+            .is_some_and(|cache| !cache.dirty_pages_in_range(ino, offset, end).is_empty())
+        {
+            return true;
+        }
+        !self
+            .write_page_cache
+            .dirty_pages_in_range(ino, offset, end)
+            .is_empty()
+    }
+
+    fn clear_dirty_trackers_for_authoritative_range(&self, ino: u64, offset: u64, length: u64) {
+        let mut ds = self.dirty_state.lock().unwrap();
+        if let Some(dr) = ds.get_mut(&ino) {
+            dr.clear_range(offset, length);
+            if dr.is_empty() {
+                ds.remove(&ino);
+            }
+        }
+        drop(ds);
+
+        self.clear_worker_dirty_page_range(ino, offset, length);
+        if let Some(ref tracker) = self.writeback_range_tracker {
+            tracker
+                .lock()
+                .unwrap()
+                .clear_range(InodeId::new(ino), offset, length);
+        }
+    }
+
+    fn reconcile_page_cache_after_authoritative_range(
+        &self,
+        cache: &PageCache,
+        ino: u64,
+        offset: u64,
+        length: u64,
+        payload: AuthoritativeRangePayload<'_>,
+    ) -> Result<(), Errno> {
+        if length == 0 {
+            return Ok(());
+        }
+        let page_size = cache.page_size() as u64;
+        let end = offset.saturating_add(length);
+        let mut poff = (offset / page_size) * page_size;
+        while poff < end {
+            let page_end = poff.saturating_add(page_size);
+            let copy_start = offset.max(poff);
+            let copy_end = end.min(page_end);
+            if copy_start < copy_end {
+                let page_present = cache.lookup(ino, poff).is_some();
+                if !page_present {
+                    poff = poff.saturating_add(page_size);
+                    continue;
+                }
+                let dst_start = (copy_start - poff) as usize;
+                let dst_end = (copy_end - poff) as usize;
+                let mut authoritative = vec![0_u8; dst_end.saturating_sub(dst_start)];
+                payload.fill(offset, copy_start, &mut authoritative)?;
+                let page_should_remain_dirty =
+                    self.dirty_trackers_overlap_range(ino, poff, page_size);
+                if let Some(mut page) = cache.lookup(ino, poff) {
+                    page.data_mut()[dst_start..dst_end].copy_from_slice(&authoritative);
+                    if page_should_remain_dirty {
+                        page.mark_dirty();
+                    } else {
+                        page.clear_dirty();
+                    }
+                }
+            }
+            poff = poff.saturating_add(page_size);
+        }
+        Ok(())
+    }
+
+    fn reconcile_dirty_mirrors_for_authoritative_range(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+        payload: AuthoritativeRangePayload<'_>,
+    ) -> Result<(), Errno> {
+        if length == 0 {
+            return Ok(());
+        }
+        self.clear_dirty_trackers_for_authoritative_range(ino, offset, length);
+        if let Some(ref wb_cache) = self.writeback_page_cache {
+            self.reconcile_page_cache_after_authoritative_range(
+                wb_cache, ino, offset, length, payload,
+            )?;
+        }
+        self.reconcile_page_cache_after_authoritative_range(
+            &self.write_page_cache,
+            ino,
+            offset,
+            length,
+            payload,
+        )?;
+        Ok(())
     }
 
     // ── Block-volume adapter extent resolution ───────────────────────────
@@ -6054,6 +6329,7 @@ impl FuseVfsAdapter {
         release_result?;
         self.sync_namespace_attrs_from_engine(ctx, ino, None);
         self.writeback_cache.lock().unwrap().mark_clean(ino);
+        self.write_page_cache.clear_dirty_for_inode(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
 
         // Drain the DirtyPageTracker for this inode after writeback so
@@ -6133,6 +6409,7 @@ impl FuseVfsAdapter {
             )?;
         }
         self.writeback_cache.lock().unwrap().mark_clean(ino);
+        self.write_page_cache.clear_dirty_for_inode(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
 
         // Drain the DirtyPageTracker for this inode after writeback so
@@ -6414,6 +6691,8 @@ impl FuseVfsAdapter {
             enforce_append_only_write_guard(raw_flags, false)?;
         }
         let engine_start = std::time::Instant::now();
+        let is_hole_or_zero =
+            (mode & FALLOC_FL_PUNCH_HOLE) != 0 || (mode & FALLOC_FL_ZERO_RANGE) != 0;
         if diagnostic {
             eprintln!(
                 "tidefs-diagnostic: fuse fallocate engine start ino={} fh={} engine_fh={} mode=0x{:x} offset={} length={}",
@@ -6437,23 +6716,12 @@ impl FuseVfsAdapter {
                 engine_start.elapsed().as_millis()
             );
         }
+        drop(e);
         if result.is_ok() {
-            // Clear dirty_state ranges for the affected extent.
-            let mut ds = self.dirty_state.lock().unwrap();
-            if let Some(dr) = ds.get_mut(&ino) {
-                dr.clear_range(offset, length);
-                if dr.is_empty() {
-                    ds.remove(&ino);
-                }
-            }
-            drop(ds);
-
             // When PUNCH_HOLE or ZERO_RANGE deallocates/zeros space,
             // clear all daemon-side dirty-page trackers for the affected
             // range so writeback flush does not later write phantom dirty
             // data into the hole (A11 sparse-tracker-drift / A16).
-            let is_hole_or_zero =
-                (mode & FALLOC_FL_PUNCH_HOLE) != 0 || (mode & FALLOC_FL_ZERO_RANGE) != 0;
             if is_hole_or_zero {
                 let clear_start = std::time::Instant::now();
                 if diagnostic {
@@ -6462,7 +6730,7 @@ impl FuseVfsAdapter {
                         ino, mode, offset, length
                     );
                 }
-                self.clear_dirty_for_deallocate_range(ino, offset, length);
+                self.clear_dirty_for_deallocate_range(ino, offset, length)?;
                 if diagnostic {
                     eprintln!(
                         "tidefs-diagnostic: fuse fallocate clear-dirty end ino={} mode=0x{:x} elapsed_ms={}",
@@ -6471,12 +6739,9 @@ impl FuseVfsAdapter {
                         clear_start.elapsed().as_millis()
                     );
                 }
-                // Note: the write_dispatch DirtyPageTracker (workers_writeback)
-                // tracks dirty byte ranges with boundary tokens and does not yet
-                // support range-level clearing.  The writeback_range_tracker above
-                // is the authoritative tracker for this inode; clearing it is
-                // sufficient to prevent phantom writes. Review debt TFR-008:
-                // add clear_range to the workers_writeback tracker for full coverage.
+                self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
+            } else {
+                self.invalidate_inode_metadata_after_engine_write(ino);
             }
         }
         result
@@ -6486,46 +6751,21 @@ impl FuseVfsAdapter {
     /// (truncate shrink, punch-hole, or zero-range).  Prevents stale
     /// dirty pages from being written back into deallocated space after
     /// the extent map has already freed the blocks (A11/A16 tracker drift).
-    fn clear_dirty_for_deallocate_range(&self, ino: u64, offset: u64, length: u64) {
-        // Clear dirty_state ranges for the affected extent.
-        let mut ds = self.dirty_state.lock().unwrap();
-        if let Some(dr) = ds.get_mut(&ino) {
-            dr.clear_range(offset, length);
-            if dr.is_empty() {
-                ds.remove(&ino);
-            }
-        }
-        drop(ds);
-
-        // Clear per-page dirty flags in the writeback PageCache.
-        if let Some(ref wb_cache) = self.writeback_page_cache {
-            let page_size = wb_cache.page_size() as u64;
-            let end = offset.saturating_add(length);
-            let mut poff = (offset / page_size) * page_size;
-            while poff < end {
-                wb_cache.clear_dirty(ino, poff);
-                poff = poff.saturating_add(page_size);
-            }
-        }
-        // Clear per-page dirty flags in the write-path PageCache.
-        {
-            let page_size = self.write_page_cache.page_size() as u64;
-            let end = offset.saturating_add(length);
-            let mut poff = (offset / page_size) * page_size;
-            while poff < end {
-                self.write_page_cache.clear_dirty(ino, poff);
-                poff = poff.saturating_add(page_size);
-            }
-        }
+    fn clear_dirty_for_deallocate_range(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), Errno> {
+        self.reconcile_dirty_mirrors_for_authoritative_range(
+            ino,
+            offset,
+            length,
+            AuthoritativeRangePayload::Zeroes,
+        )?;
         // Do not mark the whole inode clean here: this helper clears only the
         // deallocated byte range, and unrelated dirty ranges must survive.
-        // Clear dirty ranges from the shared DirtyPageTracker.
-        if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker
-                .lock()
-                .unwrap()
-                .clear_range(InodeId::new(ino), offset, length);
-        }
+        Ok(())
     }
 
     // ── shared truncate extent mutation (engine lock already held) ─────────
@@ -6577,8 +6817,12 @@ impl FuseVfsAdapter {
         }
         let old_size = current_attr.posix.size;
         let result = Self::truncate_extents(&**e, inode_id, &efh, old_size, size, ctx);
+        drop(e);
         if result.is_ok() && size < old_size {
-            self.clear_dirty_for_deallocate_range(ino, size, old_size - size);
+            self.clear_dirty_for_deallocate_range(ino, size, old_size - size)?;
+            self.invalidate_caches_after_engine_data_mutation(ino, size, old_size - size);
+        } else if result.is_ok() {
+            self.invalidate_inode_metadata_after_engine_write(ino);
         }
         result
     }
@@ -6608,11 +6852,15 @@ impl FuseVfsAdapter {
         }
         let current_size = current_attr.posix.size;
         let result = Self::truncate_extents(&**e, inode_id, &efh, current_size, size, ctx);
-        if result.is_ok() && size < current_size {
-            self.clear_dirty_for_deallocate_range(ino, size, current_size - size);
-        }
         // Release the temporary handle. Ignore release errors per POSIX close semantics.
         let _ = e.release(&efh);
+        drop(e);
+        if result.is_ok() && size < current_size {
+            self.clear_dirty_for_deallocate_range(ino, size, current_size - size)?;
+            self.invalidate_caches_after_engine_data_mutation(ino, size, current_size - size);
+        } else if result.is_ok() {
+            self.invalidate_inode_metadata_after_engine_write(ino);
+        }
         result
     }
 
@@ -9422,10 +9670,54 @@ impl Filesystem for FuseVfsAdapter {
                 self.copy_file_range_with_writeback_fallback(&**engine, &ctx, plan)
             }
         };
+        drop(engine);
         match result {
             Ok(written) => {
                 if written > 0 {
-                    self.invalidate_inode_metadata_after_engine_write(copy_dest.0);
+                    let reconcile_result = {
+                        let engine = self.engine.lock().unwrap();
+                        match engine.open(InodeId::new(copy_dest.0), libc::O_RDONLY as u32, &ctx) {
+                            Ok(read_fh) => {
+                                let result = self.reconcile_dirty_mirrors_for_authoritative_range(
+                                    copy_dest.0,
+                                    copy_dest.1,
+                                    u64::from(written),
+                                    AuthoritativeRangePayload::EngineRead {
+                                        engine: &**engine,
+                                        efh: &read_fh,
+                                        ctx: &ctx,
+                                    },
+                                );
+                                let _ = engine.release(&read_fh);
+                                result
+                            }
+                            Err(errno) => {
+                                let has_dirty_overlap = self.dirty_trackers_overlap_range(
+                                    copy_dest.0,
+                                    copy_dest.1,
+                                    u64::from(written),
+                                ) || self.dirty_page_caches_overlap_range(
+                                    copy_dest.0,
+                                    copy_dest.1,
+                                    u64::from(written),
+                                );
+                                if has_dirty_overlap {
+                                    Err(errno)
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        }
+                    };
+                    if let Err(errno) = reconcile_result {
+                        reply.reply_errno(errno);
+                        return;
+                    }
+                    self.invalidate_caches_after_engine_data_mutation(
+                        copy_dest.0,
+                        copy_dest.1,
+                        u64::from(written),
+                    );
                 }
                 if diagnostic {
                     eprintln!(
@@ -14555,6 +14847,138 @@ mod tests {
                 .expect("read punched data")
         };
         assert_eq!(data, vec![b'a', b'b', 0, 0, 0, b'f']);
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_fallocate_punch_hole_invalidates_read_cache() {
+        let mut fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"fallocate-punch-cache.txt",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        shared_tracker.lock().unwrap().mark_dirty(inode, 2, 3);
+        fixture.adapter.writeback_range_tracker = Some(Arc::clone(&shared_tracker));
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        worker_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, 2, 3)
+            .expect("seed stale worker dirty range");
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, b"abcdef", &ctx)
+                .expect("write initial data");
+        }
+        fixture
+            .adapter
+            .page_cache
+            .lock()
+            .unwrap()
+            .insert(ino, b"abcdef".to_vec());
+        assert_eq!(
+            fixture
+                .adapter
+                .page_cache
+                .lock()
+                .unwrap()
+                .get_range(ino, 0, 6),
+            Some(b"abcdef".to_vec())
+        );
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                2,
+                3,
+            )
+            .expect("punch hole");
+
+        assert_eq!(
+            fixture
+                .adapter
+                .page_cache
+                .lock()
+                .unwrap()
+                .get_range(ino, 0, 6),
+            None
+        );
+        assert!(
+            !shared_tracker.lock().unwrap().is_dirty(inode),
+            "punch-hole must clear shared writeback dirty range"
+        );
+        assert!(
+            worker_tracker
+                .lock()
+                .unwrap()
+                .get_dirty_ranges(ino)
+                .is_empty(),
+            "punch-hole must clear worker writeback dirty range"
+        );
+    }
+
+    #[test]
+    fn writeback_partial_page_preflush_preserves_unmodified_bytes() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        fixture.adapter.writeback_page_cache = Some(Arc::new(PageCache::new(64, 4096)));
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"partial-preflush-hole.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let mut expected = vec![b'A'; 4096];
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, &expected, &ctx)
+                .expect("seed initial page");
+        }
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 100, b"BBB", FUSE_WRITE_CACHE)
+            .expect("writeback-cache partial write");
+        expected[100..103].copy_from_slice(b"BBB");
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                200,
+                10,
+            )
+            .expect("punch hole after partial dirty page");
+        expected[200..210].fill(0);
+
+        let data = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .read(&engine_fh, 0, 4096, &ctx)
+                .expect("read after preflush and punch")
+        };
+        assert_eq!(data, expected);
     }
 
     #[test]
@@ -34845,7 +35269,7 @@ mod tests {
             handle: Option<&EngineFileHandle>,
             ctx: &RequestCtx,
         ) -> Result<InodeAttr, Errno> {
-            Err(Errno::ENOSYS)
+            Ok(test_attr(inode.get(), 1))
         }
         fn setattr(
             &self,
@@ -34854,7 +35278,11 @@ mod tests {
             handle: Option<&EngineFileHandle>,
             ctx: &RequestCtx,
         ) -> Result<InodeAttr, Errno> {
-            Err(Errno::ENOSYS)
+            let mut attr = test_attr(inode.get(), 1);
+            if set.valid & FATTR_MODE != 0 {
+                attr.posix.mode = (attr.posix.mode & S_IFMT) | (set.mode & !S_IFMT);
+            }
+            Ok(attr)
         }
         fn mkdir(
             &self,
@@ -35051,12 +35479,21 @@ mod tests {
             let key = (inode.get(), name.to_vec());
             let exists = map.contains_key(&key);
             match flags {
-                XATTR_CREATE if exists => Err(Errno::EEXIST),
-                XATTR_REPLACE if !exists => Err(Errno::ENODATA),
-                _ => {
+                0 => {
                     map.insert(key, value.to_vec());
                     Ok(())
                 }
+                XATTR_CREATE if exists => Err(Errno::EEXIST),
+                XATTR_CREATE => {
+                    map.insert(key, value.to_vec());
+                    Ok(())
+                }
+                XATTR_REPLACE if !exists => Err(Errno::ENODATA),
+                XATTR_REPLACE => {
+                    map.insert(key, value.to_vec());
+                    Ok(())
+                }
+                _ => Err(Errno::EINVAL),
             }
         }
 
@@ -36392,7 +36829,8 @@ mod tests {
 
         fixture
             .adapter
-            .clear_dirty_for_deallocate_range(ino, 0, 4096);
+            .clear_dirty_for_deallocate_range(ino, 0, 4096)
+            .expect("clear deallocated dirty range");
 
         assert_eq!(
             fixture
@@ -36606,6 +37044,171 @@ mod tests {
     }
 
     #[test]
+    fn direct_io_read_uses_engine_truth_not_dirty_mirror() {
+        let mut fixture = adapter_fixture();
+        fixture.adapter.writeback_page_cache = Some(Arc::new(PageCache::new(64, 4096)));
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"direct-read-drain.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, &[0x33_u8; 4096], &ctx)
+                .expect("seed engine file size");
+        }
+        let wb_cache = fixture
+            .adapter
+            .writeback_page_cache
+            .as_ref()
+            .expect("writeback page cache")
+            .clone();
+        wb_cache.insert(ino, 0).expect("insert dirty page");
+        {
+            let mut page = wb_cache.lookup(ino, 0).expect("lookup dirty page");
+            page.data_mut().fill(0x5c);
+            page.mark_dirty();
+        }
+
+        let open = fixture
+            .adapter
+            .dispatch_open_entry(&ctx, ino, libc::O_RDONLY as u32 | libc::O_DIRECT as u32)
+            .expect("open O_DIRECT read handle");
+        let result = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, open.adapter_fh, 0, 512, None)
+            .expect("direct read uses engine truth");
+
+        assert_eq!(result, vec![0x33; 512]);
+        assert_eq!(
+            wb_cache.dirty_pages_in_range(ino, 0, 4096).len(),
+            1,
+            "O_DIRECT read must not consume a non-authoritative page mirror"
+        );
+    }
+
+    #[test]
+    fn engine_read_reconcile_updates_copy_file_range_dirty_mirror() {
+        let mut fixture = adapter_fixture();
+        fixture.adapter.writeback_page_cache = Some(Arc::new(PageCache::new(64, 4096)));
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"engine-read-reconcile.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, &[0x11_u8; 4096], &ctx)
+                .expect("seed engine page");
+            engine
+                .write(&engine_fh, 1024, &[0xAB_u8; 512], &ctx)
+                .expect("seed copied engine range");
+        }
+
+        let wb_cache = fixture
+            .adapter
+            .writeback_page_cache
+            .as_ref()
+            .expect("writeback page cache")
+            .clone();
+        wb_cache.insert(ino, 0).expect("insert dirty mirror");
+        {
+            let mut page = wb_cache.lookup(ino, 0).expect("lookup dirty mirror");
+            page.data_mut().fill(0x55);
+            page.mark_dirty();
+        }
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, 4096);
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        shared_tracker.lock().unwrap().mark_dirty(inode, 0, 4096);
+        fixture.adapter.writeback_range_tracker = Some(Arc::clone(&shared_tracker));
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        worker_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, 0, 4096)
+            .expect("seed worker dirty range");
+
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .reconcile_dirty_mirrors_for_authoritative_range(
+                    ino,
+                    1024,
+                    512,
+                    AuthoritativeRangePayload::EngineRead {
+                        engine: &**engine,
+                        efh: &engine_fh,
+                        ctx: &ctx,
+                    },
+                )
+                .expect("reconcile copied range from engine");
+        }
+
+        {
+            let page = wb_cache.lookup(ino, 0).expect("lookup reconciled mirror");
+            assert_eq!(&page.data()[0..1024], &[0x55_u8; 1024]);
+            assert_eq!(&page.data()[1024..1536], &[0xAB_u8; 512]);
+            assert_eq!(&page.data()[1536..4096], &[0x55_u8; 2560]);
+            assert!(
+                page.is_dirty(),
+                "unrelated dirty bytes on the same page must keep the mirror dirty"
+            );
+        }
+        assert_eq!(
+            shared_tracker
+                .lock()
+                .unwrap()
+                .dirty_ranges(inode)
+                .expect("split shared ranges")
+                .iter()
+                .map(|range| (range.offset, range.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 1024), (1536, 2560)]
+        );
+        assert_eq!(
+            worker_tracker.lock().unwrap().get_dirty_ranges(ino),
+            vec![
+                crate::workers_writeback::DirtyRange::new(ino, 0, 1024),
+                crate::workers_writeback::DirtyRange::new(ino, 1536, 4096),
+            ]
+        );
+        assert!(
+            !fixture
+                .adapter
+                .dirty_state
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .expect("dirty_state survives unrelated ranges")
+                .contains(1024, 512),
+            "copied authoritative range must not remain dirty"
+        );
+    }
+
+    #[test]
     fn direct_io_read_unaligned_offset_rejected() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -36786,9 +37389,9 @@ mod tests {
 
     #[test]
     fn direct_io_write_bypasses_dirty_tracking() {
-        let fixture = adapter_fixture();
+        let mut fixture = adapter_fixture();
         let ctx = root_ctx();
-        let (inode, _adapter_fh, _efh) = create_adapter_file_handle(
+        let (inode, _adapter_fh, engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &ctx,
             b"direct-io-clean.txt",
@@ -36803,18 +37406,109 @@ mod tests {
                 libc::O_RDWR as u32 | libc::O_DIRECT as u32,
             )
             .expect("open with O_DIRECT|RDWR");
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, &[0x55_u8; 4096], &ctx)
+                .expect("seed engine with mirror-matching data");
+        }
+        let stale_page_cache = Arc::new(PageCache::new(64, 4096));
+        stale_page_cache
+            .insert(inode.get(), 0)
+            .expect("insert stale page");
+        {
+            let mut page = stale_page_cache
+                .lookup(inode.get(), 0)
+                .expect("lookup stale page");
+            page.data_mut().fill(0x55);
+            page.mark_dirty();
+        }
+        fixture.adapter.writeback_page_cache = Some(Arc::clone(&stale_page_cache));
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        shared_tracker.lock().unwrap().mark_dirty(inode, 0, 4096);
+        fixture.adapter.writeback_range_tracker = Some(Arc::clone(&shared_tracker));
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        worker_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(inode.get(), 0, 4096)
+            .expect("seed stale worker dirty range");
+        assert!(
+            !worker_tracker
+                .lock()
+                .unwrap()
+                .get_dirty_ranges(inode.get())
+                .is_empty(),
+            "test setup must seed stale dirty work"
+        );
         // Write aligned data via direct I/O.
         fixture
             .adapter
             .dispatch_write(&ctx, inode.get(), open.adapter_fh, 0, &[0xAAu8; 512], 0)
             .expect("direct-io write");
+        let data = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .read(&engine_fh, 0, 1024, &ctx)
+                .expect("read direct overwrite result")
+        };
+        assert_eq!(&data[..512], &[0xAAu8; 512]);
+        assert_eq!(&data[512..1024], &[0x55u8; 512]);
         // Verify dirty state is clean — direct I/O bypasses dirty tracking.
         let ds = fixture.adapter.dirty_state.lock().unwrap();
         let dirty = ds
             .get(&inode.get())
-            .map(|dr| dr.contains(0, 512))
+            .map(|dr| dr.contains(0, 4096))
             .unwrap_or(false);
         assert!(!dirty, "direct-io write must not mark pages dirty");
+        let dirty_pages = stale_page_cache.dirty_pages_in_range(inode.get(), 0, 4096);
+        assert_eq!(
+            dirty_pages.len(),
+            1,
+            "direct-io overwrite must keep the page dirty while tail bytes remain dirty"
+        );
+        assert_eq!(dirty_pages[0].offset, 0);
+        {
+            let page = stale_page_cache
+                .lookup(inode.get(), 0)
+                .expect("lookup reconciled page");
+            assert_eq!(
+                &page.data()[..512],
+                &[0xAAu8; 512],
+                "direct-io overwrite must patch cached mirror bytes"
+            );
+            assert_eq!(
+                &page.data()[512..1024],
+                &[0x55u8; 512],
+                "direct-io overwrite must preserve unrelated dirty tail bytes"
+            );
+        }
+        let shared_ranges = shared_tracker
+            .lock()
+            .unwrap()
+            .dirty_ranges(inode)
+            .unwrap()
+            .to_vec();
+        assert_eq!(shared_ranges.len(), 1);
+        assert_eq!(shared_ranges[0].offset, 512);
+        assert_eq!(shared_ranges[0].length, 4096 - 512);
+        let worker_ranges = worker_tracker.lock().unwrap().get_dirty_ranges(inode.get());
+        assert_eq!(
+            worker_ranges,
+            vec![crate::workers_writeback::DirtyRange::new(
+                inode.get(),
+                512,
+                4096
+            )],
+            "direct-io write must clear only the overwritten dirty bytes"
+        );
     }
 
     #[test]
@@ -37110,9 +37804,23 @@ mod tests {
     // ── WritebackCacheStats tests ────────────────────────────────────────
 
     fn adapter_fixture_with_writeback_cache() -> AdapterFixture {
-        let mut fixture = adapter_fixture();
-        fixture.adapter.writeback_cache_enabled = true;
-        fixture
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-vfs-adapter-wb-{}-{temp_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let local_fs = LocalFileSystem::open_with_root_authentication_key(
+            &root,
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open local filesystem");
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_writeback_cache_enabled();
+        AdapterFixture { adapter, root }
     }
 
     fn adapter_fixture_with_writeback_cache_deferred_commit() -> AdapterFixture {
@@ -37131,17 +37839,86 @@ mod tests {
         local_fs.set_auto_commit(false);
         local_fs.set_max_uncommitted_mutations(16 * 1024);
         let engine = VfsLocalFileSystem::new(local_fs);
-        let mut adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
-        adapter.writeback_cache_enabled = true;
+        let mut adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_writeback_cache_enabled();
         adapter.timestamp_policy = TimestampPolicy::StrictAtime;
         AdapterFixture { adapter, root }
     }
 
     #[test]
-    fn writeback_cached_overwrite_defers_namespace_attr_sync_until_flush() {
+    fn writeback_cache_enable_reuses_write_page_cache_mirror() {
+        let adapter = fresh_test_adapter().with_writeback_cache_enabled();
+        let wb_cache = adapter
+            .writeback_page_cache
+            .as_ref()
+            .expect("writeback page cache");
+
+        assert!(Arc::ptr_eq(wb_cache, &adapter.write_page_cache));
+    }
+
+    #[test]
+    fn writeback_cache_disable_drops_writeback_page_cache_mirror() {
+        let adapter = fresh_test_adapter()
+            .with_writeback_cache_enabled()
+            .with_writeback_cache_disabled();
+
+        assert!(!adapter.is_writeback_cache_enabled());
+        assert!(adapter.writeback_page_cache.is_none());
+    }
+
+    #[test]
+    fn writeback_cached_fsync_clears_write_page_cache_dirty_pages() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-fsync-clears-page-cache.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                ino,
+                adapter_fh,
+                128,
+                b"dirty mirror",
+                FUSE_WRITE_CACHE,
+            )
+            .expect("writeback-cache write");
         assert!(
-            !FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 512),
-            "writeback-cache overwrite within EOF can defer namespace mirror sync"
+            !fixture
+                .adapter
+                .write_page_cache
+                .dirty_pages_for_inode(ino)
+                .is_empty(),
+            "writeback-cache write should dirty the shared page mirror"
+        );
+
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, ino, adapter_fh)
+            .expect("fsync writeback-cache file");
+
+        assert!(
+            fixture
+                .adapter
+                .write_page_cache
+                .dirty_pages_for_inode(ino)
+                .is_empty(),
+            "fsync must clear the same page mirror dirtied by writeback-cache writes"
+        );
+    }
+
+    #[test]
+    fn writeback_cached_writes_refresh_namespace_attrs() {
+        assert!(
+            FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 512),
+            "writeback-cache overwrites refresh the namespace mirror for getattr coherence"
         );
         assert!(
             FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 3840, 512),

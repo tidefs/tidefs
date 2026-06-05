@@ -15,7 +15,7 @@ use tidefs_flow_commit_coordinator::{DurabilityError, DurabilitySequence};
 use tidefs_local_object_store::txg_manager::{CommitGroupManager, COMMITTED_ROOT_FILE};
 use tidefs_recovery_loop::compute_committed_root_digest;
 
-const COMMIT_GROUP_DIRTY_FLUSH_BYTES: usize = 64 * 1024 * 1024;
+const COMMIT_GROUP_DIRTY_FLUSH_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct CommitGroupCycle {
     mgr: Mutex<CommitGroupManager>,

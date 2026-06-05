@@ -57,10 +57,6 @@ impl DirtyRange {
         self.dirty_since.elapsed() >= threshold
     }
 
-    fn overlaps_or_adjacent(&self, other: &DirtyRange) -> bool {
-        self.offset <= other.end() && other.offset <= self.end()
-    }
-
     fn merge(&self, other: &DirtyRange) -> DirtyRange {
         let start = self.offset.min(other.offset);
         let end = self.end().max(other.end());
@@ -103,10 +99,12 @@ impl DirtyPageTracker {
     /// Overlapping and adjacent ranges are coalesced so that the flush
     /// path sees the minimum number of contiguous regions.
     pub fn mark_dirty(&mut self, inode: InodeId, offset: u64, length: u64) {
+        if length == 0 {
+            return;
+        }
         let range = DirtyRange::new(offset, length);
         let entry = self.ranges.entry(inode).or_default();
-        entry.push(range);
-        Self::coalesce(entry);
+        Self::insert_coalesced(entry, range);
     }
 
     #[allow(dead_code)] // INTENT: dirty page tracker types for planned writeback scheduling
@@ -127,10 +125,10 @@ impl DirtyPageTracker {
     pub(crate) fn restore_ranges(&mut self, ranges: BTreeMap<InodeId, Vec<DirtyRange>>) {
         self.ranges = ranges;
     }
-    /// Clear dirty tracking for bytes [offset, offset+length) within
-    /// .  Ranges that fall entirely outside the cleared span are
-    /// kept; ranges that overlap are split or removed so that no dirty
-    /// byte within [offset, offset+length) remains tracked.
+    /// Clear dirty tracking for bytes [offset, offset+length) within `inode`.
+    /// Ranges that fall entirely outside the cleared span are kept; ranges that
+    /// overlap are split or removed so that no dirty byte within
+    /// [offset, offset+length) remains tracked.
     /// Returns the number of ranges that were touched (split or removed).
     pub fn clear_range(&mut self, inode: InodeId, offset: u64, length: u64) -> usize {
         if length == 0 {
@@ -216,22 +214,24 @@ impl DirtyPageTracker {
 
     // ── private helpers ────────────────────────────────────────────
 
-    /// Sort by offset then merge overlapping/adjacent ranges in-place.
-    fn coalesce(ranges: &mut Vec<DirtyRange>) {
-        if ranges.len() <= 1 {
-            return;
+    /// Insert one range into the sorted non-overlapping set, merging only the
+    /// adjacent/overlapping window touched by the new range.
+    fn insert_coalesced(ranges: &mut Vec<DirtyRange>, mut range: DirtyRange) {
+        let mut start = 0;
+        while start < ranges.len() && ranges[start].end() < range.offset {
+            start += 1;
         }
-        ranges.sort_by_key(|r| r.offset);
-        let mut i = 0;
-        while i + 1 < ranges.len() {
-            if ranges[i].overlaps_or_adjacent(&ranges[i + 1]) {
-                let merged = ranges[i].merge(&ranges[i + 1]);
-                ranges[i] = merged;
-                ranges.remove(i + 1);
-                // Don't advance i — merged range may still overlap the next
-            } else {
-                i += 1;
-            }
+
+        let mut end = start;
+        while end < ranges.len() && ranges[end].offset <= range.end() {
+            range = range.merge(&ranges[end]);
+            end += 1;
+        }
+
+        if start == end {
+            ranges.insert(start, range);
+        } else {
+            ranges.splice(start..end, std::iter::once(range));
         }
     }
 }
@@ -404,12 +404,9 @@ mod tests {
         let ino = id(9);
 
         tracker.mark_dirty(ino, 4096, 0);
-        assert!(tracker.is_dirty(ino));
-        assert_eq!(tracker.total_dirty_ranges(), 1);
-        assert_eq!(
-            tracker.dirty_ranges(ino).unwrap(),
-            &[DirtyRange::new(4096, 0)]
-        );
+        assert!(!tracker.is_dirty(ino));
+        assert_eq!(tracker.total_dirty_ranges(), 0);
+        assert!(tracker.dirty_ranges(ino).is_none());
     }
 
     #[test]

@@ -507,14 +507,6 @@ fn write_same_size_sparse_overlay(
 
     for chunk_index in first_overlay_chunk..=last_overlay_chunk {
         let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
-        if overlay_chunk_covers_whole_chunk_with_zeros(
-            chunk_index,
-            chunk_len as u32,
-            overlay_offset,
-            overlay_bytes,
-        )? {
-            continue;
-        }
         let old_chunk_is_sparse_zero = match find_chunk_in_manifest(old_manifest, chunk_index) {
             Some(chunk_ref) => chunk_ref.is_hole(),
             None => true,
@@ -658,14 +650,104 @@ fn write_same_size_sparse_patch_batch(
         if old_ref.chunk_index >= chunk_count {
             continue;
         }
-        let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
-        if old_ref.len != new_len {
+        if old_ref.is_hole() {
+            let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
+            chunks_by_index.insert(
+                old_ref.chunk_index,
+                ContentChunkRef::hole(old_ref.chunk_index, new_len),
+            );
             continue;
         }
+
         if patches_by_chunk.contains_key(&old_ref.chunk_index) {
             continue;
         }
-        chunks_by_index.insert(old_ref.chunk_index, old_ref.clone());
+        let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
+        if old_ref.len == new_len {
+            chunks_by_index.insert(old_ref.chunk_index, old_ref.clone());
+            continue;
+        }
+
+        let mut chunk_bytes = vec![0_u8; new_len as usize];
+        copy_old_content_into_chunk(
+            store,
+            old_layout,
+            old_record.size,
+            old_ref.chunk_index,
+            &mut chunk_bytes,
+        )?;
+        let per_inode_key = content_chunk_object_key_for_version(
+            new_record.inode_id,
+            new_record.data_version,
+            old_ref.chunk_index,
+        );
+        let encoded = if dedup_enabled {
+            let fingerprint = crate::encoding::compute_content_fingerprint(&chunk_bytes);
+            if let Some(canonical_key) = dedup_index.lookup(&fingerprint) {
+                if store.contains_key(canonical_key) {
+                    dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    crate::encoding::encode_dedup_redirect(canonical_key)
+                } else {
+                    dedup_index.remove(&fingerprint);
+                    let canon_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+                    let enc = encode_content_chunk(
+                        new_record,
+                        old_ref.chunk_index,
+                        &chunk_bytes,
+                        compression_policy,
+                    );
+                    store.put(canon_key, &enc)?;
+                    dedup_index.insert(fingerprint, canon_key);
+                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::encoding::encode_dedup_redirect(canon_key)
+                }
+            } else {
+                let canon_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+                if store.contains_key(canon_key) {
+                    dedup_index.insert(fingerprint, canon_key);
+                    dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    crate::encoding::encode_dedup_redirect(canon_key)
+                } else {
+                    let enc = encode_content_chunk(
+                        new_record,
+                        old_ref.chunk_index,
+                        &chunk_bytes,
+                        compression_policy,
+                    );
+                    store.put(canon_key, &enc)?;
+                    if let Some(ref mut qs) = quorum_store {
+                        let _ = qs.quorum_put(canon_key, &enc);
+                    }
+                    dedup_index.insert(fingerprint, canon_key);
+                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::encoding::encode_dedup_redirect(canon_key)
+                }
+            }
+        } else {
+            encode_content_chunk(
+                new_record,
+                old_ref.chunk_index,
+                &chunk_bytes,
+                compression_policy,
+            )
+        };
+        dedup_index.record_chunk_written();
+        let checksum = checksum64(&encoded);
+        store.put(per_inode_key, &encoded)?;
+        if let Some(ref mut qs) = quorum_store {
+            let _ = qs.quorum_put(per_inode_key, &encoded);
+        }
+        chunks_by_index.insert(
+            old_ref.chunk_index,
+            ContentChunkRef {
+                chunk_index: old_ref.chunk_index,
+                data_version: new_record.data_version,
+                len: chunk_bytes.len() as u32,
+                checksum,
+            },
+        );
     }
 
     for (chunk_index, chunk_patches) in patches_by_chunk {
@@ -1120,7 +1202,7 @@ pub(crate) fn write_chunked_content_with_patch_batch(
         compression_policy,
     } = request;
     let old_layout = read_content_layout_from_store(store, inode_id, old_record, true)?;
-    if allow_holes && old_record.size == new_record.size {
+    if allow_holes && old_record.size <= new_record.size {
         if let ContentLayout::Chunked(ref old_manifest) = old_layout {
             return write_same_size_sparse_patch_batch(
                 dedup_enabled,
@@ -1138,7 +1220,7 @@ pub(crate) fn write_chunked_content_with_patch_batch(
     }
     Err(FileSystemError::Unsupported {
         operation: "chunked content patch batch",
-        reason: "batch writeback optimization requires same-size chunked content",
+        reason: "batch writeback optimization requires non-shrinking chunked content",
     })
 }
 
