@@ -224,6 +224,51 @@ impl WriteBuffer {
         self.total_bytes = self.segments.iter().map(|s| s.data.len()).sum();
     }
 
+    /// Clear dirty bytes in `[offset, offset + length)`, preserving dirty
+    /// prefix/suffix bytes that are outside the cleared range.
+    pub fn clear_range(&mut self, offset: u64, length: u64) -> usize {
+        if length == 0 || self.segments.is_empty() {
+            return 0;
+        }
+
+        let end = offset.checked_add(length).unwrap_or(u64::MAX);
+        let mut kept = Vec::with_capacity(self.segments.len());
+        let mut cleared = 0usize;
+
+        for segment in self.segments.drain(..) {
+            let segment_start = segment.offset;
+            let segment_end = segment.end();
+            if segment_end <= offset || segment_start >= end {
+                kept.push(segment);
+                continue;
+            }
+
+            let clear_start = segment_start.max(offset);
+            let clear_end = segment_end.min(end);
+            cleared = cleared.saturating_add((clear_end - clear_start) as usize);
+
+            if segment_start < clear_start {
+                let left_len = (clear_start - segment_start) as usize;
+                kept.push(Segment {
+                    offset: segment_start,
+                    data: segment.data[..left_len].to_vec(),
+                });
+            }
+
+            if clear_end < segment_end {
+                let right_start = (clear_end - segment_start) as usize;
+                kept.push(Segment {
+                    offset: clear_end,
+                    data: segment.data[right_start..].to_vec(),
+                });
+            }
+        }
+
+        self.segments = kept;
+        self.total_bytes = self.segments.iter().map(|segment| segment.data.len()).sum();
+        cleared
+    }
+
     /// Read buffered data overlapping `[read_offset, read_offset + read_len)`.
     ///
     /// Returns a byte vector covering the requested range. Gaps (ranges not
@@ -264,6 +309,18 @@ impl WriteBuffer {
         } else {
             None
         }
+    }
+
+    /// Return true when any buffered segment intersects the requested range.
+    pub fn overlaps_range(&self, read_offset: u64, read_len: u64) -> bool {
+        if read_len == 0 {
+            return false;
+        }
+        let read_end = read_offset.saturating_add(read_len);
+        self.segments.iter().any(|seg| {
+            let seg_end = seg.offset.saturating_add(seg.data.len() as u64);
+            seg.offset < read_end && seg_end > read_offset
+        })
     }
 
     /// Overlay dirty buffered bytes onto an existing read buffer.
@@ -405,6 +462,36 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].0, 0);
         assert_eq!(&drained[0].1, b"heXXo");
+    }
+
+    #[test]
+    fn clear_range_splits_overlapping_segment() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"abcdefghij", 10);
+
+        assert_eq!(wb.clear_range(13, 4), 4);
+
+        let drained = wb.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].0, 10);
+        assert_eq!(&drained[0].1, b"abc");
+        assert_eq!(drained[1].0, 17);
+        assert_eq!(&drained[1].1, b"hij");
+    }
+
+    #[test]
+    fn clear_range_removes_multiple_segments() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"aaaa", 0);
+        wb.ingest(b"bbbb", 10);
+        wb.ingest(b"cccc", 20);
+
+        assert_eq!(wb.clear_range(8, 20), 8);
+
+        let drained = wb.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, 0);
+        assert_eq!(&drained[0].1, b"aaaa");
     }
 
     #[test]
