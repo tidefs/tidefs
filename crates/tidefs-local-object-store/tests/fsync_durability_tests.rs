@@ -44,10 +44,11 @@ fn cleanup(root: &PathBuf) {
 }
 
 fn fast_opts() -> StoreOptions {
-    // sync_on_write is false by default in test_fast, so explicit sync_all
-    // calls are required for durability — this is exactly what we want to test.
+    // Keep sync_on_write false so explicit sync_all calls carry the durability
+    // claim, while preserving production-equivalent read checksum verification.
     StoreOptions {
         max_segment_bytes: 16384,
+        verify_read_checksums: true,
         ..StoreOptions::test_fast()
     }
 }
@@ -717,7 +718,7 @@ fn segment_rotation_with_sync_preserves_all_data() {
     // Force rotation with a tiny segment size.
     let small_opts = StoreOptions {
         max_segment_bytes: 1024,
-        ..StoreOptions::test_fast()
+        ..fast_opts()
     };
 
     {

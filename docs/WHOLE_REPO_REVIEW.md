@@ -1529,6 +1529,42 @@ narrow fast checks, but they must not support claims about production
 durability, checksum verification, recovery, or durable reads. Harness tests
 must be cited as harness signal, not product proof.
 
+2026-06-05 application pass:
+
+- Static inventory found 1,430 Rust files with `#[test]`, `#[cfg(test)]`,
+  `#[tokio::test]`, or `#[proptest]` markers. The largest inline test surfaces
+  remain `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs`
+  with 912 test attributes, `crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs`
+  with 318, `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` with 297,
+  `crates/tidefs-local-filesystem/src/tests.rs` with 264, and
+  `crates/tidefs-local-object-store/src/tests.rs` with 230.
+- Cargo metadata reports the largest integration-test target surfaces in
+  `tidefs-posix-filesystem-adapter-daemon` (48), `tidefs-validation` (27),
+  `tidefs-local-filesystem` (26), `tidefs-local-object-store` (25), and
+  `tidefs-transport` (16). These are the main review zones for future test
+  compression or relocation.
+- `#[ignore]` tests are limited and mostly legitimate opt-in harness/runtime
+  lanes: FUSE mount validation, trace-golden regeneration, two-node/RDMA
+  product-path validation, and timed transport budget measurement. The demo
+  mount ignored tests and the ignored adapter dirty-tracking/fsync dispatch
+  test still look like roadmap placeholders and should be removed or converted
+  to executable runtime signal when those surfaces are touched.
+- Source-marker xtask checks remain widespread. They are transitional
+  policy/tooling signal only; do not cite them as product proof. When touching
+  an owning surface, prefer replacing the marker check with cargo metadata,
+  structured parsing, a public API check, or a runtime/harness test.
+- The first fixture cleanup strengthened object-store and local-filesystem
+  durability/read-integrity tests so tests that claim reopen survival,
+  durable reads, or checksum-verified reads use `verify_read_checksums: true`
+  while retaining small segment sizes and explicit `sync_all`/fsync boundaries
+  where those boundaries are the behavior under test.
+- A broader `tidefs-local-object-store --test object_store_validation` run
+  still reproduces `compact_retaining_empty_protected_set_clears_store` with
+  live objects remaining after empty-retention compaction. That is separate
+  reclamation behavior, not test-signal cleanup; do not count the full
+  validation suite as green until the compaction retention rule is fixed in an
+  owning storage commit.
+
 ## Next Review Order
 
 1. Workspace authority: classify every manifest as product, harness, third

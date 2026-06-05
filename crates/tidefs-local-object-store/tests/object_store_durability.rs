@@ -11,7 +11,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions};
+use tidefs_local_object_store::{
+    constants::{INTEGRITY_TRAILER_V2_LEN_U64, RECORD_FOOTER_LEN_U64, RECORD_HEADER_LEN_U64},
+    LocalObjectStore, ObjectKey, StoreOptions,
+};
 
 // ── Fixture helpers ────────────────────────────────────────────────────────
 
@@ -31,7 +34,10 @@ fn cleanup(root: &PathBuf) {
 }
 
 fn fast_opts() -> StoreOptions {
-    StoreOptions::test_fast()
+    StoreOptions {
+        verify_read_checksums: true,
+        ..StoreOptions::test_fast()
+    }
 }
 
 fn open_store(root: &PathBuf) -> LocalObjectStore {
@@ -459,10 +465,7 @@ fn checksum_detected_corruption_payload_bit_flip() {
             // Store opened — verify corrupted object behaviour
             let read = store.get(key);
             match read {
-                Ok(Some(_data)) => {
-                    // Payload may have changed if the flip hit payload bytes
-                    // (the checksum is verified at open, not read)
-                }
+                Ok(Some(_data)) => panic!("corrupted payload must not be returned as valid data"),
                 Ok(None) => {} // Object discarded due to corruption
                 Err(e) => {
                     let msg = format!("{e:?}");
@@ -525,7 +528,7 @@ fn checksum_detected_corruption_magic_bit_flip() {
     cleanup(&root);
 }
 
-/// Flip a byte near the end of the segment (likely trailer region).
+/// Flip a byte inside the per-record production integrity trailer.
 /// Verifies that trailer corruption is also detected.
 #[test]
 fn checksum_detected_corruption_trailer_bit_flip() {
@@ -541,15 +544,33 @@ fn checksum_detected_corruption_trailer_bit_flip() {
 
     let seg_path = first_segment_path(&root);
     let file_len = fs::metadata(&seg_path).expect("metadata").len();
-    // Flip a byte near the end (footer/trailer region)
-    assert!(file_len > 16, "segment too short for trailer flip");
-    flip_bit(&seg_path, file_len - 8);
+    let trailer_offset = RECORD_HEADER_LEN_U64 + payload.len() as u64 + RECORD_FOOTER_LEN_U64;
+    assert!(
+        trailer_offset + INTEGRITY_TRAILER_V2_LEN_U64 <= file_len,
+        "segment too short for per-record trailer flip"
+    );
+    flip_bit(&seg_path, trailer_offset + 8);
 
     let result = LocalObjectStore::open_with_options(&root, fast_opts());
     match result {
         Ok(store) => {
-            // Store may have opened — if key missing, corruption was caught
-            let _ = store.get(key);
+            // Store may have opened, but the corrupted record must not be
+            // returned as valid data.
+            match store.get(key) {
+                Ok(Some(_data)) => {
+                    panic!("corrupted trailer must not be returned as valid data")
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let msg = format!("{e:?}");
+                    assert!(
+                        msg.contains("Corrupt")
+                            || msg.contains("Checksum")
+                            || msg.contains("Integrity"),
+                        "trailer corruption must be detected: {e:?}"
+                    );
+                }
+            }
         }
         Err(e) => {
             let msg = format!("{e:?}");

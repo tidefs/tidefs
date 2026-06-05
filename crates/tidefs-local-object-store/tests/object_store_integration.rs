@@ -50,6 +50,13 @@ fn fast_options() -> StoreOptions {
     }
 }
 
+fn verified_fast_options() -> StoreOptions {
+    StoreOptions {
+        verify_read_checksums: true,
+        ..fast_options()
+    }
+}
+
 fn cleanup(root: &std::path::Path) {
     let _ = fs::remove_dir_all(root);
 }
@@ -220,12 +227,13 @@ fn put_content_addressed_yields_key_from_payload_hash() {
 fn objects_survive_close_reopen() {
     let root = temp_root("reopen");
     {
-        let mut store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let mut store =
+            LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         put_bytes(&mut store, "survivor", b"persistent data");
         store.sync_all().expect("sync_all after writes");
     }
     {
-        let store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let store = LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         assert_eq!(
             get_bytes(&store, "survivor"),
             Some(b"persistent data".to_vec())
@@ -241,14 +249,15 @@ fn multiple_objects_survive_reopen() {
     let values: Vec<Vec<u8>> = keys.iter().map(|k| k.as_bytes().to_vec()).collect();
 
     {
-        let mut store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let mut store =
+            LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         for (k, v) in keys.iter().zip(values.iter()) {
             put_bytes(&mut store, k, v);
         }
         store.sync_all().expect("sync_all");
     }
     {
-        let store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let store = LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         let stats = store.stats();
         assert_eq!(stats.live_objects, 20);
         for (k, v) in keys.iter().zip(values.iter()) {
@@ -266,7 +275,8 @@ fn multiple_objects_survive_reopen() {
 fn deletes_survive_reopen() {
     let root = temp_root("delete-reopen");
     {
-        let mut store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let mut store =
+            LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         put_bytes(&mut store, "keep", b"still-here");
         put_bytes(&mut store, "tombstone", b"remove");
         store.sync_all().expect("sync_all after puts");
@@ -276,7 +286,7 @@ fn deletes_survive_reopen() {
         store.sync_all().expect("sync_all after delete");
     }
     {
-        let store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let store = LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         assert_eq!(get_bytes(&store, "keep"), Some(b"still-here".to_vec()));
         assert_eq!(get_bytes(&store, "tombstone"), None);
         let rep = store.replay_report();
@@ -289,14 +299,15 @@ fn deletes_survive_reopen() {
 fn overwrite_survives_reopen() {
     let root = temp_root("overwrite-reopen");
     {
-        let mut store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let mut store =
+            LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         put_bytes(&mut store, "doc", b"v1");
         put_bytes(&mut store, "doc", b"v2");
         put_bytes(&mut store, "doc", b"v3-final");
         store.sync_all().expect("sync_all after overwrites");
     }
     {
-        let store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let store = LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         assert_eq!(get_bytes(&store, "doc"), Some(b"v3-final".to_vec()));
         let rep = store.replay_report();
         assert_eq!(rep.puts_seen, 3, "all three puts should replay");
@@ -309,12 +320,13 @@ fn binary_payload_survives_reopen() {
     let root = temp_root("binary-reopen");
     let binary = (0u8..=255u8).collect::<Vec<u8>>();
     {
-        let mut store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let mut store =
+            LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         put_bytes(&mut store, "bin", &binary);
         store.sync_all().expect("sync_all");
     }
     {
-        let store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let store = LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         assert_eq!(get_bytes(&store, "bin"), Some(binary));
     }
     cleanup(&root);
@@ -324,13 +336,14 @@ fn binary_payload_survives_reopen() {
 fn replay_report_is_accurate_after_reopen() {
     let root = temp_root("replay-report");
     {
-        let mut store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let mut store =
+            LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         put_bytes(&mut store, "a", b"aa");
         put_bytes(&mut store, "b", b"bb");
         store.sync_all().expect("sync_all");
     }
     {
-        let store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let store = LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         let rep = store.replay_report();
         assert_eq!(rep.puts_seen, 2);
         assert!(rep.segment_count >= 1);
@@ -604,7 +617,7 @@ fn zero_length_object_round_trips() {
     store.sync_all().expect("sync_all");
     drop(store);
     {
-        let store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let store = LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         assert_eq!(get_bytes(&store, "empty"), Some(vec![]));
     }
     cleanup(&root);
@@ -631,7 +644,7 @@ fn many_small_objects_rapid_succession() {
     store.sync_all().expect("sync_all");
     drop(store);
     {
-        let store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let store = LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         assert_eq!(store.stats().live_objects, count as usize);
         assert_eq!(get_bytes(&store, "obj001f3"), Some(vec![0xf3u8; 4]));
     }
@@ -642,7 +655,7 @@ fn many_small_objects_rapid_succession() {
 fn large_payload_just_under_limit_succeeds() {
     let root = temp_root("large-near-limit");
     let opts = StoreOptions {
-        verify_read_checksums: false,
+        verify_read_checksums: true,
         max_segment_bytes: 2048,
         ..fast_options()
     };
@@ -660,7 +673,7 @@ fn large_payload_just_under_limit_succeeds() {
         let store = LocalObjectStore::open_with_options(
             &root,
             StoreOptions {
-                verify_read_checksums: false,
+                verify_read_checksums: true,
                 max_segment_bytes: 2048,
                 ..fast_options()
             },
@@ -674,7 +687,7 @@ fn large_payload_just_under_limit_succeeds() {
 #[test]
 fn get_range_returns_subset_of_payload() {
     let root = temp_root("get-range");
-    let mut store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+    let mut store = LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
     let payload = b"abcdefghijklmnopqrstuvwxyz";
     put_bytes(&mut store, "alpha", payload);
 
@@ -814,7 +827,7 @@ fn sync_on_write_durable_option_flushes_every_write() {
         let mut store = LocalObjectStore::open_with_options(
             &root,
             StoreOptions {
-                verify_read_checksums: false,
+                verify_read_checksums: true,
                 sync_on_write: true,
                 ..fast_options()
             },
@@ -824,7 +837,7 @@ fn sync_on_write_durable_option_flushes_every_write() {
         // No explicit sync_all — sync_on_write should handle it
     }
     {
-        let store = LocalObjectStore::open_with_options(&root, fast_options()).unwrap();
+        let store = LocalObjectStore::open_with_options(&root, verified_fast_options()).unwrap();
         assert_eq!(
             get_bytes(&store, "durable"),
             Some(b"immediately-synced".to_vec())
