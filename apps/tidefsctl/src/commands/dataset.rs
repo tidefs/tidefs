@@ -1071,7 +1071,7 @@ fn handle_get(args: DatasetGetArgs) {
         }),
     );
 
-    let path = format!("{}/{}", &args.pool, &args.name);
+    let path = args.name.as_str();
     // Resolve properties with full parent-chain inheritance.
     let effective = match fs.dataset_catalog().get_properties_with_inheritance(&path) {
         Ok(props) => props,
@@ -1163,7 +1163,7 @@ fn handle_set(args: DatasetSetArgs) {
     };
 
     // Validate the proposed value against the registry.
-    let path = format!("{}/{}", &args.pool, &args.name);
+    let path = args.name.as_str();
     let existing_props = fs
         .dataset_catalog()
         .get_properties(&path)
@@ -1219,7 +1219,7 @@ fn handle_list_props(args: DatasetListPropsArgs) {
         }),
     );
 
-    let path = format!("{}/{}", &args.pool, &args.name);
+    let path = args.name.as_str();
     let props = match fs.dataset_catalog().get_properties(&path) {
         Ok(props) => props,
         Err(e) => {

@@ -1321,7 +1321,7 @@ impl VfsLocalFileSystem {
         live_admin_ok_text(format!("dataset '{name}' destroyed"))
     }
 
-    fn live_dataset_get(&self, pool: &str, args: &Value) -> Vec<u8> {
+    fn live_dataset_get(&self, _pool: &str, args: &Value) -> Vec<u8> {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -1336,7 +1336,7 @@ impl VfsLocalFileSystem {
             return live_admin_error(1, format!("dataset get: unknown property '{property}'"));
         }
 
-        let path = format!("{pool}/{name}");
+        let path = name;
         let fs = self.fs.borrow();
         let effective = match fs.dataset_catalog().get_properties_with_inheritance(&path) {
             Ok(props) => props,
@@ -1359,7 +1359,7 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_dataset_set(&self, pool: &str, args: &Value) -> Vec<u8> {
+    fn live_dataset_set(&self, _pool: &str, args: &Value) -> Vec<u8> {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -1395,7 +1395,7 @@ impl VfsLocalFileSystem {
         } else {
             tidefs_dataset_properties::PropertySet::parse_value_from_str(prop_val_str)
         };
-        let path = format!("{pool}/{name}");
+        let path = name;
         let mut fs = self.fs.borrow_mut();
         let existing_props = fs
             .dataset_catalog()
@@ -1433,13 +1433,13 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_dataset_list_props(&self, pool: &str, args: &Value) -> Vec<u8> {
+    fn live_dataset_list_props(&self, _pool: &str, args: &Value) -> Vec<u8> {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
         };
         let family = live_admin_optional_arg(args, "family");
-        let path = format!("{pool}/{name}");
+        let path = name;
         let fs = self.fs.borrow();
         let props = match fs.dataset_catalog().get_properties(&path) {
             Ok(props) => props,
@@ -3389,6 +3389,76 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let fs = LocalFileSystem::open(dir.path()).expect("open");
         (VfsLocalFileSystem::new(fs), dir)
+    }
+
+    fn live_dataset_admin(engine: &VfsLocalFileSystem, operation: &str, args: Value) -> Value {
+        let request = json!({
+            "command": "dataset",
+            "operation": operation,
+            "pool": "tank",
+            "json": false,
+            "args": args,
+        });
+        let request = serde_json::to_vec(&request).expect("encode live admin request");
+        let response = engine
+            .handle_live_pool_admin_request(&request)
+            .expect("dispatch live admin request");
+        serde_json::from_slice(&response).expect("decode live admin response")
+    }
+
+    #[test]
+    fn live_dataset_properties_use_pool_local_catalog_path() {
+        let (engine, _td) = temp_fs();
+
+        let created = live_dataset_admin(
+            &engine,
+            "create",
+            json!({
+                "name": "demo",
+                "parent": "root",
+                "sync": "local",
+            }),
+        );
+        assert_eq!(created["ok"], true);
+
+        let set = live_dataset_admin(
+            &engine,
+            "set",
+            json!({
+                "name": "demo",
+                "assignment": "access.readonly=on",
+            }),
+        );
+        assert_eq!(set["ok"], true, "set response: {set}");
+
+        let get = live_dataset_admin(
+            &engine,
+            "get",
+            json!({
+                "name": "demo",
+                "property": "access.readonly",
+            }),
+        );
+        assert_eq!(get["ok"], true, "get response: {get}");
+        assert!(
+            get["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("source:    local")),
+            "expected local property source, got {get}",
+        );
+
+        let fs = engine.fs.borrow();
+        let key = tidefs_dataset_properties::PropertyKey::new("access.readonly");
+        assert!(fs.dataset_catalog().contains("demo"));
+        assert!(!fs.dataset_catalog().contains("tank/demo"));
+        assert!(
+            fs.dataset_catalog()
+                .get_properties("demo")
+                .expect("demo properties")
+                .get(&key)
+                .is_some(),
+            "property should be stored on pool-local dataset path",
+        );
     }
 
     fn temp_fs_with_content_capacity(
