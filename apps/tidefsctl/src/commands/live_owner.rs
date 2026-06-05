@@ -2,10 +2,11 @@
 //!
 //! A pool name is an identity for state already owned by a runtime, not a
 //! filesystem path. Explicit storage arguments are not override handles once
-//! a kernel, FUSE, or ublk runtime owns the imported pool. Cached label state
-//! is not the live interface, but an ACTIVE label is enough evidence to fail
-//! closed until an owner handles the request or the operator enters a recovery
-//! path that creates/cleans that owner state.
+//! a kernel, FUSE, or ublk runtime owns the imported pool. The live owner
+//! interface is the reachable kernel/daemon endpoint, not a stale runtime
+//! manifest file. Cached ACTIVE label state is not the live interface either,
+//! but it is enough evidence to fail closed until an owner handles the request
+//! or the operator enters a recovery path that creates/cleans that owner state.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -101,7 +102,7 @@ pub(crate) fn route_if_owner_exists_with_format_and_args(
     args: serde_json::Value,
 ) {
     let root = pool_runtime_root();
-    if owner_manifest_exists_by_pool_at(&root, pool) {
+    if owner_interface_reachable_by_pool_at(&root, pool) {
         route_with_format_and_args(command, operation, pool, json, args);
     }
 }
@@ -134,7 +135,7 @@ pub(crate) fn route_or_refuse_active_for_uuid_with_format_and_args(
     json: bool,
     args: serde_json::Value,
 ) {
-    if owner_manifest_exists_for_uuid_at(&pool_runtime_root(), pool, &pool_uuid) {
+    if owner_interface_reachable_for_uuid_at(&pool_runtime_root(), pool, &pool_uuid) {
         route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
     }
     if active_label {
@@ -150,7 +151,7 @@ pub(crate) fn route_if_owner_exists_for_uuid_with_format_and_args(
     json: bool,
     args: serde_json::Value,
 ) {
-    if owner_manifest_exists_for_uuid_at(&pool_runtime_root(), pool, &pool_uuid) {
+    if owner_interface_reachable_for_uuid_at(&pool_runtime_root(), pool, &pool_uuid) {
         route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
     }
 }
@@ -407,30 +408,31 @@ fn manifest_matches_route(manifest: &serde_json::Value, route: &LivePoolRoute<'_
         .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&expected))
 }
 
-fn owner_manifest_exists_by_uuid_at(root: &Path, uuid: &[u8; 16]) -> bool {
-    match owner_manifest_path(root, uuid).try_exists() {
-        Ok(exists) => exists,
-        Err(_) => true,
-    }
+fn owner_interface_reachable_by_uuid_at(root: &Path, uuid: &[u8; 16]) -> bool {
+    let manifest_path = owner_manifest_path(root, uuid);
+    let Ok(Some(manifest)) = read_manifest_if_exists(&manifest_path) else {
+        return false;
+    };
+    manifest_uuid_matches(&manifest, uuid) && manifest_has_reachable_socket(&manifest)
 }
 
-fn owner_manifest_exists_by_pool_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16]) -> bool {
+fn owner_interface_reachable_by_pool_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16]) -> bool {
     let expected_uuid = hex_uuid(uuid);
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
+        Err(_) => return false,
     };
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => return true,
+            Err(_) => continue,
         };
         let path = entry.path().join("owner.json");
         match path.try_exists() {
             Ok(true) => {}
             Ok(false) => continue,
-            Err(_) => return true,
+            Err(_) => continue,
         }
         let Ok(manifest) = read_manifest(&path) else {
             continue;
@@ -443,34 +445,34 @@ fn owner_manifest_exists_by_pool_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16
             .get("pool_uuid")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|manifest_uuid| manifest_uuid.eq_ignore_ascii_case(&expected_uuid));
-        if name_matches && uuid_matches {
+        if name_matches && uuid_matches && manifest_has_reachable_socket(&manifest) {
             return true;
         }
     }
     false
 }
 
-fn owner_manifest_exists_for_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16]) -> bool {
-    owner_manifest_exists_by_uuid_at(root, uuid)
-        || owner_manifest_exists_by_pool_uuid_at(root, pool, uuid)
+fn owner_interface_reachable_for_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16]) -> bool {
+    owner_interface_reachable_by_uuid_at(root, uuid)
+        || owner_interface_reachable_by_pool_uuid_at(root, pool, uuid)
 }
 
-fn owner_manifest_exists_by_pool_at(root: &Path, pool: &str) -> bool {
+fn owner_interface_reachable_by_pool_at(root: &Path, pool: &str) -> bool {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
+        Err(_) => return false,
     };
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => return true,
+            Err(_) => continue,
         };
         let path = entry.path().join("owner.json");
         match path.try_exists() {
             Ok(true) => {}
             Ok(false) => continue,
-            Err(_) => return true,
+            Err(_) => continue,
         }
         let Ok(manifest) = read_manifest(&path) else {
             continue;
@@ -479,6 +481,7 @@ fn owner_manifest_exists_by_pool_at(root: &Path, pool: &str) -> bool {
             .get("pool_name")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|name| name == pool)
+            && manifest_has_reachable_socket(&manifest)
         {
             return true;
         }
@@ -530,6 +533,21 @@ fn manifest_socket_path(manifest: &serde_json::Value) -> Result<PathBuf, LiveOwn
         })
 }
 
+fn manifest_has_reachable_socket(manifest: &serde_json::Value) -> bool {
+    let Ok(socket_path) = manifest_socket_path(manifest) else {
+        return false;
+    };
+    UnixStream::connect(socket_path).is_ok()
+}
+
+fn manifest_uuid_matches(manifest: &serde_json::Value, uuid: &[u8; 16]) -> bool {
+    let expected = hex_uuid(uuid);
+    manifest
+        .get("pool_uuid")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|manifest_uuid| manifest_uuid.eq_ignore_ascii_case(&expected))
+}
+
 fn pool_runtime_root() -> PathBuf {
     PathBuf::from("/run/tidefs/pools")
 }
@@ -544,22 +562,38 @@ fn hex_uuid(uuid: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener;
 
     #[test]
-    fn owner_manifest_exists_by_uuid_when_manifest_path_exists() {
+    fn owner_interface_requires_decodable_manifest_and_reachable_socket() {
         let dir = tempfile::tempdir().unwrap();
         let uuid = [0x42; 16];
         let manifest_path = owner_manifest_path(dir.path(), &uuid);
         std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
         std::fs::write(&manifest_path, b"not json").unwrap();
 
-        assert!(owner_manifest_exists_by_uuid_at(dir.path(), &uuid));
+        assert!(!owner_interface_reachable_by_uuid_at(dir.path(), &uuid));
+
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "pool_name": "tank",
+                "pool_uuid": "42424242424242424242424242424242",
+                "socket_path": dir.path().join("missing-owner.sock"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(!owner_interface_reachable_by_uuid_at(dir.path(), &uuid));
     }
 
     #[test]
-    fn owner_manifest_exists_by_pool_when_manifest_names_pool() {
+    fn owner_interface_reachable_by_pool_when_manifest_names_pool() {
         let dir = tempfile::tempdir().unwrap();
         let uuid = [0x24; 16];
+        let socket_path = dir.path().join("owner.sock");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
         let manifest_path = owner_manifest_path(dir.path(), &uuid);
         std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -567,20 +601,20 @@ mod tests {
             serde_json::json!({
                 "pool_name": "tank",
                 "pool_uuid": "24242424242424242424242424242424",
-                "socket_path": "/run/tidefs/pools/test/owner.sock",
+                "socket_path": socket_path,
             })
             .to_string(),
         )
         .unwrap();
 
-        assert!(owner_manifest_exists_by_pool_at(dir.path(), "tank"));
-        assert!(!owner_manifest_exists_by_pool_at(dir.path(), "other"));
-        assert!(owner_manifest_exists_by_pool_uuid_at(
+        assert!(owner_interface_reachable_by_pool_at(dir.path(), "tank"));
+        assert!(!owner_interface_reachable_by_pool_at(dir.path(), "other"));
+        assert!(owner_interface_reachable_by_pool_uuid_at(
             dir.path(),
             "tank",
             &[0x24; 16]
         ));
-        assert!(!owner_manifest_exists_by_pool_uuid_at(
+        assert!(!owner_interface_reachable_by_pool_uuid_at(
             dir.path(),
             "tank",
             &[0x42; 16]
@@ -588,10 +622,12 @@ mod tests {
     }
 
     #[test]
-    fn owner_manifest_exists_for_uuid_uses_uuid_not_pool_name_only() {
+    fn owner_interface_reachable_for_uuid_uses_uuid_not_pool_name_only() {
         let dir = tempfile::tempdir().unwrap();
         let matching_uuid = [0x42; 16];
         let other_uuid = [0x24; 16];
+        let socket_path = dir.path().join("owner.sock");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
         let manifest_path = dir.path().join("registry-entry").join("owner.json");
         std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -599,18 +635,18 @@ mod tests {
             serde_json::json!({
                 "pool_name": "tank",
                 "pool_uuid": "42424242424242424242424242424242",
-                "socket_path": "/run/tidefs/pools/tank/owner.sock",
+                "socket_path": socket_path,
             })
             .to_string(),
         )
         .unwrap();
 
-        assert!(owner_manifest_exists_for_uuid_at(
+        assert!(owner_interface_reachable_for_uuid_at(
             dir.path(),
             "tank",
             &matching_uuid
         ));
-        assert!(!owner_manifest_exists_for_uuid_at(
+        assert!(!owner_interface_reachable_for_uuid_at(
             dir.path(),
             "tank",
             &other_uuid
@@ -618,12 +654,12 @@ mod tests {
     }
 
     #[test]
-    fn owner_manifest_absent_when_runtime_root_is_missing() {
+    fn owner_interface_absent_when_runtime_root_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing");
 
-        assert!(!owner_manifest_exists_by_pool_at(&missing, "tank"));
-        assert!(!owner_manifest_exists_by_uuid_at(&missing, &[0x11; 16]));
+        assert!(!owner_interface_reachable_by_pool_at(&missing, "tank"));
+        assert!(!owner_interface_reachable_by_uuid_at(&missing, &[0x11; 16]));
     }
 
     #[test]

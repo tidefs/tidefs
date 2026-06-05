@@ -153,7 +153,10 @@ tidefsctl pool status mypool --json  # machine-readable
 
 Use `--devices` only for exported/offline status or discovery. Once the pool is
 imported, `tidefsctl pool status mypool` routes to the live owner instead of
-opening the devices.
+opening the devices. A stale `/run/tidefs/pools/.../owner.json` file is not
+itself a live owner; the owner socket must be reachable. If labels still show an
+imported pool and no owner socket responds, recover or recreate the owner with
+`tidefsctl pool mount ... --devices ...` before running live-state commands.
 
 ---
 
