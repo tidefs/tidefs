@@ -203,13 +203,10 @@ pub(crate) fn route_if_imported_with_format_and_args(
 ) {
     let root = pool_runtime_root();
     let uuid_manifest_exists = owner_manifest_exists_by_uuid_at(&root, &pool_uuid);
-    let pool_manifest_exists = owner_manifest_exists_by_pool_at(&root, pool);
+    let pool_manifest_exists = owner_manifest_exists_by_pool_uuid_at(&root, pool, &pool_uuid);
 
-    if uuid_manifest_exists {
+    if uuid_manifest_exists || pool_manifest_exists {
         route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
-    }
-    if pool_manifest_exists {
-        route_with_format_and_args(command, operation, pool, json, args);
     }
     if imported_label {
         route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
@@ -363,7 +360,15 @@ fn find_live_owner_manifest_at(
     if let Some(pool_uuid) = route.pool_uuid {
         let manifest_path = owner_manifest_path(root, &pool_uuid);
         if let Some(manifest) = read_manifest_if_exists(&manifest_path)? {
-            return Ok(manifest);
+            if manifest_matches_route(&manifest, route) {
+                return Ok(manifest);
+            }
+            return Err(LiveOwnerRequestError::Unavailable(format!(
+                "live owner manifest {} does not match pool '{}' uuid {}",
+                manifest_path.display(),
+                route.pool,
+                hex_uuid(&pool_uuid)
+            )));
         }
     }
 
@@ -378,11 +383,7 @@ fn find_live_owner_manifest_at(
         let Ok(manifest) = read_manifest(&path) else {
             continue;
         };
-        if manifest
-            .get("pool_name")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| name == route.pool)
-        {
+        if manifest_matches_route(&manifest, route) {
             return Ok(manifest);
         }
     }
@@ -392,11 +393,66 @@ fn find_live_owner_manifest_at(
     )))
 }
 
+fn manifest_matches_route(manifest: &serde_json::Value, route: &LivePoolRoute<'_>) -> bool {
+    let name_matches = manifest
+        .get("pool_name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| name == route.pool);
+    if !name_matches {
+        return false;
+    }
+
+    let Some(pool_uuid) = route.pool_uuid else {
+        return true;
+    };
+    let expected = hex_uuid(&pool_uuid);
+    manifest
+        .get("pool_uuid")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&expected))
+}
+
 fn owner_manifest_exists_by_uuid_at(root: &Path, uuid: &[u8; 16]) -> bool {
     match owner_manifest_path(root, uuid).try_exists() {
         Ok(exists) => exists,
         Err(_) => true,
     }
+}
+
+fn owner_manifest_exists_by_pool_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16]) -> bool {
+    let expected_uuid = hex_uuid(uuid);
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return true,
+        };
+        let path = entry.path().join("owner.json");
+        match path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(_) => return true,
+        }
+        let Ok(manifest) = read_manifest(&path) else {
+            continue;
+        };
+        let name_matches = manifest
+            .get("pool_name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| name == pool);
+        let uuid_matches = manifest
+            .get("pool_uuid")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|manifest_uuid| manifest_uuid.eq_ignore_ascii_case(&expected_uuid));
+        if name_matches && uuid_matches {
+            return true;
+        }
+    }
+    false
 }
 
 fn owner_manifest_exists_by_pool_at(root: &Path, pool: &str) -> bool {
@@ -510,6 +566,7 @@ mod tests {
             &manifest_path,
             serde_json::json!({
                 "pool_name": "tank",
+                "pool_uuid": "24242424242424242424242424242424",
                 "socket_path": "/run/tidefs/pools/test/owner.sock",
             })
             .to_string(),
@@ -518,6 +575,16 @@ mod tests {
 
         assert!(owner_manifest_exists_by_pool_at(dir.path(), "tank"));
         assert!(!owner_manifest_exists_by_pool_at(dir.path(), "other"));
+        assert!(owner_manifest_exists_by_pool_uuid_at(
+            dir.path(),
+            "tank",
+            &[0x24; 16]
+        ));
+        assert!(!owner_manifest_exists_by_pool_uuid_at(
+            dir.path(),
+            "tank",
+            &[0x42; 16]
+        ));
     }
 
     #[test]
@@ -530,15 +597,15 @@ mod tests {
     }
 
     #[test]
-    fn owner_lookup_with_uuid_falls_back_to_pool_manifest() {
+    fn owner_lookup_with_uuid_falls_back_to_matching_pool_manifest() {
         let dir = tempfile::tempdir().unwrap();
-        let uuid = [0x24; 16];
-        let manifest_path = owner_manifest_path(dir.path(), &uuid);
+        let manifest_path = dir.path().join("registry-entry").join("owner.json");
         std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
         std::fs::write(
             &manifest_path,
             serde_json::json!({
                 "pool_name": "tank",
+                "pool_uuid": "42424242424242424242424242424242",
                 "socket_path": "/run/tidefs/pools/tank/owner.sock",
             })
             .to_string(),
@@ -561,6 +628,35 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("tank")
         );
+    }
+
+    #[test]
+    fn owner_lookup_with_uuid_rejects_same_name_mismatched_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("registry-entry").join("owner.json");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "pool_name": "tank",
+                "pool_uuid": "24242424242424242424242424242424",
+                "socket_path": "/run/tidefs/pools/tank/owner.sock",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: false,
+            args: serde_json::Value::Null,
+        };
+
+        let err = find_live_owner_manifest_at(dir.path(), &route).unwrap_err();
+
+        assert!(matches!(err, LiveOwnerRequestError::Unavailable(_)));
     }
 
     #[test]
