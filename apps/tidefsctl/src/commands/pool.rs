@@ -1435,19 +1435,28 @@ fn handle_pool_destroy(
 // Pool property handlers
 // ---------------------------------------------------------------------------
 
-fn open_pool_property_filesystem(
+fn open_pool_property_filesystem_with_live_args(
     pool: &str,
     devices: Option<&[PathBuf]>,
     operation: &str,
     recovery_policy: RecoveryPolicy,
+    live_args: serde_json::Value,
 ) -> LocalFileSystem {
     let Some(devs) = devices.filter(|devs| !devs.is_empty()) else {
-        super::live_owner::route("pool", operation, pool);
+        super::live_owner::route_with_args("pool", operation, pool, live_args);
     };
 
     let config = assemble_device_pool_config(devs, operation);
     ensure_device_pool_name(pool, operation, &config);
-    route_active_device_pool(operation, pool, &config);
+    if config.state == PoolState::Active {
+        super::live_owner::route_imported_with_args(
+            "pool",
+            operation,
+            pool,
+            config.pool_uuid,
+            live_args,
+        );
+    }
 
     let metadata_dir = super::offline_pool::metadata_dir("pool", operation, &config.pool_uuid);
 
@@ -1472,7 +1481,15 @@ fn open_pool_property_filesystem(
 }
 
 fn handle_pool_get(pool: &str, devices: Option<&[PathBuf]>, property: &str) {
-    let fs = open_pool_property_filesystem(pool, devices, "get", RecoveryPolicy::ReadOnly);
+    let fs = open_pool_property_filesystem_with_live_args(
+        pool,
+        devices,
+        "get",
+        RecoveryPolicy::ReadOnly,
+        serde_json::json!({
+            "property": property,
+        }),
+    );
 
     let registry = tidefs_dataset_properties::build_registry();
     let key = tidefs_dataset_properties::PropertyKey::new(property);
@@ -1499,7 +1516,15 @@ fn handle_pool_get(pool: &str, devices: Option<&[PathBuf]>, property: &str) {
 }
 
 fn handle_pool_set(pool: &str, devices: Option<&[PathBuf]>, assignment: &str) {
-    let mut fs = open_pool_property_filesystem(pool, devices, "set", RecoveryPolicy::default());
+    let mut fs = open_pool_property_filesystem_with_live_args(
+        pool,
+        devices,
+        "set",
+        RecoveryPolicy::default(),
+        serde_json::json!({
+            "assignment": assignment,
+        }),
+    );
 
     let (prop_name, prop_val_str) = match assignment.split_once('=') {
         Some((k, v)) => (k.trim(), v.trim()),
@@ -1565,7 +1590,15 @@ fn handle_pool_set(pool: &str, devices: Option<&[PathBuf]>, assignment: &str) {
 }
 
 fn handle_pool_list_props(pool: &str, devices: Option<&[PathBuf]>, family: Option<&str>) {
-    let fs = open_pool_property_filesystem(pool, devices, "list-props", RecoveryPolicy::ReadOnly);
+    let fs = open_pool_property_filesystem_with_live_args(
+        pool,
+        devices,
+        "list-props",
+        RecoveryPolicy::ReadOnly,
+        serde_json::json!({
+            "family": family,
+        }),
+    );
 
     let registry = tidefs_dataset_properties::build_registry();
 

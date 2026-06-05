@@ -9,13 +9,14 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct LivePoolRoute<'a> {
     pub(crate) command: &'a str,
     pub(crate) operation: &'a str,
     pub(crate) pool: &'a str,
     pub(crate) pool_uuid: Option<[u8; 16]>,
     pub(crate) json: bool,
+    pub(crate) args: serde_json::Value,
 }
 
 pub(crate) trait LivePoolOwnerClient {
@@ -54,6 +55,7 @@ pub(crate) fn route_with_format(command: &str, operation: &str, pool: &str, json
         pool,
         pool_uuid: None,
         json,
+        args: serde_json::Value::Null,
     })
 }
 
@@ -74,6 +76,61 @@ pub(crate) fn route_imported_with_format(
         pool,
         pool_uuid: Some(pool_uuid),
         json,
+        args: serde_json::Value::Null,
+    })
+}
+
+pub(crate) fn route_with_args(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    args: serde_json::Value,
+) -> ! {
+    route_with_format_and_args(command, operation, pool, false, args)
+}
+
+pub(crate) fn route_with_format_and_args(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    json: bool,
+    args: serde_json::Value,
+) -> ! {
+    MissingLivePoolOwnerClient.route_live_pool(LivePoolRoute {
+        command,
+        operation,
+        pool,
+        pool_uuid: None,
+        json,
+        args,
+    })
+}
+
+pub(crate) fn route_imported_with_args(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    pool_uuid: [u8; 16],
+    args: serde_json::Value,
+) -> ! {
+    route_imported_with_format_and_args(command, operation, pool, pool_uuid, false, args)
+}
+
+pub(crate) fn route_imported_with_format_and_args(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    pool_uuid: [u8; 16],
+    json: bool,
+    args: serde_json::Value,
+) -> ! {
+    MissingLivePoolOwnerClient.route_live_pool(LivePoolRoute {
+        command,
+        operation,
+        pool,
+        pool_uuid: Some(pool_uuid),
+        json,
+        args,
     })
 }
 
@@ -126,6 +183,7 @@ fn send_live_owner_request(route: &LivePoolRoute<'_>) -> Result<(), LiveOwnerReq
         "operation": route.operation,
         "pool": route.pool,
         "json": route.json,
+        "args": &route.args,
     });
     stream
         .write_all(request.to_string().as_bytes())

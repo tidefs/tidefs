@@ -7,8 +7,10 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
+use serde_json::{json, Value};
 use tidefs_local_object_store::StoreError;
 use tidefs_types_extent_map_core::ExtentMapOps;
 use tidefs_types_vfs_core::{
@@ -41,7 +43,7 @@ use tidefs_posix_semantics::apply_setgid_inheritance_for_create;
 use tidefs_posix_semantics::sticky_dir_allows_unlink_or_rename;
 
 use crate::namespace::rename::RenameAt2Flags;
-use tidefs_dataset_lifecycle::SyncGuarantee;
+use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType, SyncGuarantee};
 
 // DirCursor-backed readdir with BLAKE3-verified entry iteration.
 use crate::{CopyFileRangeIntent, LocalFileSystem};
@@ -1063,6 +1065,715 @@ impl VfsLocalFileSystem {
             }
         }
     }
+
+    fn handle_live_pool_admin_request(
+        &self,
+        request_json: &[u8],
+    ) -> std::result::Result<Vec<u8>, Errno> {
+        let request: Value = serde_json::from_slice(request_json).map_err(|_| Errno::EINVAL)?;
+        let command = live_admin_str(&request, "command")?;
+        let operation = live_admin_str(&request, "operation")?;
+        let pool = live_admin_str(&request, "pool")?;
+        let wants_json = request
+            .get("json")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let args = request.get("args").unwrap_or(&Value::Null);
+
+        Ok(match (command, operation) {
+            ("dataset", "create") => self.live_dataset_create(pool, args),
+            ("dataset", "list") => self.live_dataset_list(pool, wants_json),
+            ("dataset", "rename") => self.live_dataset_rename(pool, args),
+            ("dataset", "destroy") => self.live_dataset_destroy(args),
+            ("dataset", "get") => self.live_dataset_get(pool, args),
+            ("dataset", "set") => self.live_dataset_set(pool, args),
+            ("dataset", "list-props") => self.live_dataset_list_props(pool, args),
+            ("snapshot", "create") => self.live_snapshot_create(args),
+            ("snapshot", "list") => self.live_snapshot_list(wants_json),
+            ("snapshot", "destroy") => self.live_snapshot_destroy(args),
+            ("snapshot", "rollback") => self.live_snapshot_rollback(args),
+            ("pool", "get") => self.live_pool_get(args),
+            ("pool", "set") => self.live_pool_set(args),
+            ("pool", "list-props") => self.live_pool_list_props(args),
+            _ => live_admin_error(
+                1,
+                format!("live engine does not implement tidefsctl {command} {operation}"),
+            ),
+        })
+    }
+
+    fn live_dataset_create(&self, pool: &str, args: &Value) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let parent = live_admin_arg(args, "parent").unwrap_or("root");
+        let sync = live_admin_arg(args, "sync").unwrap_or("local");
+
+        if name == "root" {
+            return live_admin_error(1, "dataset create: 'root' dataset cannot be re-created");
+        }
+
+        let sync_guarantee = match parse_sync_guarantee(sync) {
+            Some(value) => value,
+            None => {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "dataset create: invalid sync value {sync}; expected local, remote-copy, or full-redundancy"
+                    ),
+                )
+            }
+        };
+
+        let full_path = if parent == "root" {
+            name.to_string()
+        } else {
+            format!("{parent}/{name}")
+        };
+        let dataset_id = dataset_id_from_name(&full_path);
+
+        let mut fs = self.fs.borrow_mut();
+        if !fs.dataset_catalog().contains(parent) {
+            return live_admin_error(
+                1,
+                format!("dataset create: parent dataset '{parent}' does not exist in the catalog"),
+            );
+        }
+        if fs.dataset_catalog().contains(&full_path) {
+            return live_admin_error(
+                1,
+                format!("dataset create: dataset '{full_path}' already exists in the catalog"),
+            );
+        }
+
+        if let Err(err) = fs.dataset_catalog_mut().create(
+            &full_path,
+            dataset_id,
+            DatasetType::Filesystem,
+            1,
+            vec![],
+            DatasetFlags::default_create(),
+            sync_guarantee,
+        ) {
+            return live_admin_error(
+                1,
+                format!("dataset create: catalog error creating '{full_path}': {err}"),
+            );
+        }
+        if let Err(err) = fs.persist_dataset_catalog() {
+            return live_admin_error(
+                1,
+                format!("dataset create: failed to persist catalog: {err}"),
+            );
+        }
+
+        live_admin_ok_text(format!(
+            "dataset '{full_path}' created in imported pool '{pool}'\n  id={}  parent='{parent}'",
+            format_dataset_id(&dataset_id)
+        ))
+    }
+
+    fn live_dataset_list(&self, pool: &str, wants_json: bool) -> Vec<u8> {
+        let fs = self.fs.borrow();
+        let catalog = fs.dataset_catalog();
+        let mut entries: Vec<_> = catalog.entries().into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        if wants_json {
+            let values: Vec<_> = entries
+                .iter()
+                .map(|(path, id)| {
+                    json!({
+                        "path": path,
+                        "id": id.to_string(),
+                        "sync": catalog.sync_guarantee(path).ok().map(|value| value.to_string()),
+                        "state": catalog.lifecycle_state(path).ok().map(|value| format!("{value:?}")),
+                    })
+                })
+                .collect();
+            return live_admin_ok_json(json!({
+                "pool": pool,
+                "datasets": values,
+            }));
+        }
+
+        if entries.is_empty() {
+            return live_admin_ok_text(format!("pool '{pool}' has no datasets"));
+        }
+
+        let mut out = format!("pool '{pool}' datasets:");
+        for (path, id) in &entries {
+            let sg = catalog
+                .sync_guarantee(path)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|_| "---".to_string());
+            let lc = catalog
+                .lifecycle_state(path)
+                .map(|value| format!("{value:?}"))
+                .unwrap_or_else(|_| "---".to_string());
+            let _ = write!(
+                out,
+                "\n  dataset '{path}' id={} sync={sg} state={lc}",
+                format_dataset_id(id)
+            );
+        }
+        live_admin_ok_text(out)
+    }
+
+    fn live_dataset_rename(&self, pool: &str, args: &Value) -> Vec<u8> {
+        let old_name = match live_admin_arg(args, "old_name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let new_name = match live_admin_arg(args, "new_name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        if old_name == "root" || new_name == "root" {
+            return live_admin_error(1, "dataset rename: root dataset cannot be renamed");
+        }
+
+        let mut fs = self.fs.borrow_mut();
+        if !fs.dataset_catalog().contains(old_name) {
+            return live_admin_error(
+                1,
+                format!("dataset rename: dataset '{old_name}' does not exist in the catalog"),
+            );
+        }
+        if fs.dataset_catalog().contains(new_name) {
+            return live_admin_error(
+                1,
+                format!("dataset rename: dataset '{new_name}' already exists in the catalog"),
+            );
+        }
+        if let Err(err) = fs.dataset_catalog_mut().rename(old_name, new_name) {
+            return live_admin_error(
+                1,
+                format!(
+                    "dataset rename: catalog error renaming '{old_name}' -> '{new_name}': {err}"
+                ),
+            );
+        }
+        if let Err(err) = fs.persist_dataset_catalog() {
+            return live_admin_error(
+                1,
+                format!("dataset rename: failed to persist catalog: {err}"),
+            );
+        }
+
+        live_admin_ok_text(format!(
+            "dataset '{old_name}' renamed to '{new_name}' in imported pool '{pool}'"
+        ))
+    }
+
+    fn live_dataset_destroy(&self, args: &Value) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        if name == "root" {
+            return live_admin_error(1, "dataset destroy: 'root' dataset cannot be destroyed");
+        }
+
+        let mut fs = self.fs.borrow_mut();
+        if !fs.dataset_catalog().contains(name) {
+            return live_admin_error(
+                1,
+                format!("dataset destroy: dataset '{name}' does not exist in the catalog"),
+            );
+        }
+        match fs.dataset_catalog().list_children(name) {
+            Ok(children) if !children.is_empty() => {
+                return live_admin_error(
+                    1,
+                    format!(
+                    "dataset destroy: dataset '{name}' has {} child(ren) and cannot be destroyed",
+                    children.len()
+                ),
+                )
+            }
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("dataset destroy: catalog error listing children of '{name}': {err}"),
+                )
+            }
+            Ok(_) => {}
+        }
+
+        if let Err(err) = fs.dataset_catalog_mut().destroy(name) {
+            return live_admin_error(
+                1,
+                format!("dataset destroy: catalog error destroying '{name}': {err}"),
+            );
+        }
+        if let Err(err) = fs.persist_dataset_catalog() {
+            return live_admin_error(
+                1,
+                format!("dataset destroy: failed to persist catalog: {err}"),
+            );
+        }
+        live_admin_ok_text(format!("dataset '{name}' destroyed"))
+    }
+
+    fn live_dataset_get(&self, pool: &str, args: &Value) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let property = match live_admin_arg(args, "property") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let registry = tidefs_dataset_properties::build_registry();
+        let key = tidefs_dataset_properties::PropertyKey::new(property);
+        if tidefs_dataset_properties::lookup_property(&registry, &key).is_none() {
+            return live_admin_error(1, format!("dataset get: unknown property '{property}'"));
+        }
+
+        let path = format!("{pool}/{name}");
+        let fs = self.fs.borrow();
+        let effective = match fs.dataset_catalog().get_properties_with_inheritance(&path) {
+            Ok(props) => props,
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("dataset get: cannot read properties for '{name}': {err}"),
+                )
+            }
+        };
+        match effective.get(&key) {
+            Some(entry) => live_admin_ok_text(format!(
+                "property:  {property}\nvalue:     {}\nsource:    {}",
+                entry.value, entry.source
+            )),
+            None => live_admin_error(
+                1,
+                format!("dataset get: internal error resolving '{property}'"),
+            ),
+        }
+    }
+
+    fn live_dataset_set(&self, pool: &str, args: &Value) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let assignment = match live_admin_arg(args, "assignment") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let (prop_name, prop_val_str) = match assignment.split_once('=') {
+            Some((key, value)) => (key.trim(), value.trim()),
+            None => {
+                return live_admin_error(
+                    1,
+                    format!("dataset set: invalid assignment '{assignment}' (expected key=value)"),
+                )
+            }
+        };
+        if prop_name.is_empty() {
+            return live_admin_error(1, "dataset set: property name must not be empty");
+        }
+
+        let registry = tidefs_dataset_properties::build_registry();
+        let key = tidefs_dataset_properties::PropertyKey::new(prop_name);
+        let def = match tidefs_dataset_properties::lookup_property(&registry, &key) {
+            Some(def) => def,
+            None => {
+                return live_admin_error(1, format!("dataset set: unknown property '{prop_name}'"))
+            }
+        };
+        let is_clear = prop_val_str.is_empty() || prop_val_str == "-";
+        let value = if is_clear {
+            tidefs_dataset_properties::PropertyValue::None
+        } else {
+            tidefs_dataset_properties::PropertySet::parse_value_from_str(prop_val_str)
+        };
+        let path = format!("{pool}/{name}");
+        let mut fs = self.fs.borrow_mut();
+        let existing_props = fs
+            .dataset_catalog()
+            .get_properties(&path)
+            .unwrap_or_default();
+        if let Err(err) =
+            tidefs_dataset_properties::validate_set(&key, &value, def, &existing_props)
+        {
+            return live_admin_error(1, format!("dataset set: validation failed: {err}"));
+        }
+        let mut props = existing_props;
+        if is_clear {
+            props.remove_local_override(&key);
+        } else {
+            props.set_local(key.clone(), value.clone());
+        }
+        if let Err(err) = fs.dataset_catalog_mut().set_properties(&path, &props) {
+            return live_admin_error(
+                1,
+                format!("dataset set: cannot write properties for '{name}': {err}"),
+            );
+        }
+        if let Err(err) = fs.persist_dataset_catalog() {
+            return live_admin_error(
+                1,
+                format!("dataset set: property set but catalog persist failed: {err}"),
+            );
+        }
+        if is_clear {
+            live_admin_ok_text(format!(
+                "cleared '{prop_name}' (now using default/inherited value)"
+            ))
+        } else {
+            live_admin_ok_text(format!("{prop_name} = {value}"))
+        }
+    }
+
+    fn live_dataset_list_props(&self, pool: &str, args: &Value) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let family = live_admin_optional_arg(args, "family");
+        let path = format!("{pool}/{name}");
+        let fs = self.fs.borrow();
+        let props = match fs.dataset_catalog().get_properties(&path) {
+            Ok(props) => props,
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("dataset list-props: cannot read properties for '{name}': {err}"),
+                )
+            }
+        };
+        live_property_table("dataset list-props", &props, family)
+    }
+
+    fn live_snapshot_create(&self, args: &Value) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let mut fs = self.fs.borrow_mut();
+        match fs.create_snapshot(name) {
+            Ok(summary) => {
+                live_admin_ok_text(format!("{} created", snapshot_summary_line(&summary)))
+            }
+            Err(err) => live_admin_error(
+                1,
+                format!("snapshot create: failed to create snapshot '{name}': {err}"),
+            ),
+        }
+    }
+
+    fn live_snapshot_list(&self, wants_json: bool) -> Vec<u8> {
+        let fs = self.fs.borrow();
+        let mut snapshots = fs.list_snapshots();
+        snapshots.sort_by(|a, b| {
+            a.created_at_generation
+                .cmp(&b.created_at_generation)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        if wants_json {
+            let values: Vec<_> = snapshots
+                .iter()
+                .map(|summary| {
+                    json!({
+                        "name": summary.name,
+                        "source_transaction_id": summary.source_transaction_id,
+                        "source_generation": summary.source_generation,
+                        "created_at_generation": summary.created_at_generation,
+                    })
+                })
+                .collect();
+            return live_admin_ok_json(json!({ "snapshots": values }));
+        }
+        if snapshots.is_empty() {
+            return live_admin_ok_text("no snapshots");
+        }
+        let mut out = String::new();
+        for (idx, summary) in snapshots.iter().enumerate() {
+            if idx > 0 {
+                out.push('\n');
+            }
+            out.push_str(&snapshot_summary_line(summary));
+        }
+        live_admin_ok_text(out)
+    }
+
+    fn live_snapshot_destroy(&self, args: &Value) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let mut fs = self.fs.borrow_mut();
+        match fs.delete_snapshot(name) {
+            Ok(summary) => {
+                live_admin_ok_text(format!("{} destroyed", snapshot_summary_line(&summary)))
+            }
+            Err(err) => live_admin_error(
+                1,
+                format!("snapshot destroy: failed to destroy snapshot '{name}': {err}"),
+            ),
+        }
+    }
+
+    fn live_snapshot_rollback(&self, args: &Value) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let mut fs = self.fs.borrow_mut();
+        match fs.rollback_to_snapshot(name) {
+            Ok(report) => live_admin_ok_text(format!(
+                "rolled back to snapshot '{}' (generation {} -> {}, restored source gen {}, {} snapshot entries)",
+                report.snapshot.name,
+                report.generation_before,
+                report.published_generation,
+                report.restored_source_generation,
+                report.snapshot_catalog_entries,
+            )),
+            Err(err) => live_admin_error(
+                1,
+                format!("snapshot rollback: failed to rollback to snapshot '{name}': {err}"),
+            ),
+        }
+    }
+
+    fn live_pool_get(&self, args: &Value) -> Vec<u8> {
+        let property = match live_admin_arg(args, "property") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let registry = tidefs_dataset_properties::build_registry();
+        let key = tidefs_dataset_properties::PropertyKey::new(property);
+        let Some(def) = tidefs_dataset_properties::lookup_property(&registry, &key) else {
+            return live_admin_error(1, format!("pool get: unknown property '{property}'"));
+        };
+        let fs = self.fs.borrow();
+        match fs.pool_properties().get(&key) {
+            Some(entry) => live_admin_ok_text(format!(
+                "property:  {property}\nvalue:     {}\nsource:    {}",
+                entry.value, entry.source
+            )),
+            None => live_admin_ok_text(format!(
+                "property:  {property}\nvalue:     {}\nsource:    default",
+                def.default_value
+            )),
+        }
+    }
+
+    fn live_pool_set(&self, args: &Value) -> Vec<u8> {
+        let assignment = match live_admin_arg(args, "assignment") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let (prop_name, prop_val_str) = match assignment.split_once('=') {
+            Some((key, value)) => (key.trim(), value.trim()),
+            None => {
+                return live_admin_error(
+                    1,
+                    format!("pool set: invalid assignment '{assignment}' (expected key=value)"),
+                )
+            }
+        };
+        if prop_name.is_empty() {
+            return live_admin_error(1, "pool set: property name must not be empty");
+        }
+
+        let registry = tidefs_dataset_properties::build_registry();
+        let key = tidefs_dataset_properties::PropertyKey::new(prop_name);
+        let def = match tidefs_dataset_properties::lookup_property(&registry, &key) {
+            Some(def) => def,
+            None => {
+                return live_admin_error(1, format!("pool set: unknown property '{prop_name}'"))
+            }
+        };
+        let is_clear = prop_val_str.is_empty() || prop_val_str == "-";
+        let value = if is_clear {
+            tidefs_dataset_properties::PropertyValue::None
+        } else {
+            tidefs_dataset_properties::PropertySet::parse_value_from_str(prop_val_str)
+        };
+
+        let mut fs = self.fs.borrow_mut();
+        if let Err(err) =
+            tidefs_dataset_properties::validate_set(&key, &value, def, fs.pool_properties())
+        {
+            return live_admin_error(1, format!("pool set: validation failed: {err}"));
+        }
+        let mut props = fs.pool_properties().clone();
+        if is_clear {
+            props.remove_local_override(&key);
+        } else {
+            props.set_local(key.clone(), value.clone());
+        }
+        fs.pool_properties_mut().clone_from(&props);
+        if let Err(err) = fs.persist_pool_properties() {
+            return live_admin_error(
+                1,
+                format!("pool set: property set but persist failed: {err}"),
+            );
+        }
+        if is_clear {
+            live_admin_ok_text(format!(
+                "cleared '{prop_name}' (now using default/inherited value)"
+            ))
+        } else {
+            live_admin_ok_text(format!("{prop_name} = {value}"))
+        }
+    }
+
+    fn live_pool_list_props(&self, args: &Value) -> Vec<u8> {
+        let family = live_admin_optional_arg(args, "family");
+        let fs = self.fs.borrow();
+        live_property_table("pool list-props", fs.pool_properties(), family)
+    }
+}
+
+fn live_admin_str<'a>(value: &'a Value, key: &str) -> std::result::Result<&'a str, Errno> {
+    value.get(key).and_then(Value::as_str).ok_or(Errno::EINVAL)
+}
+
+fn live_admin_arg<'a>(args: &'a Value, key: &str) -> std::result::Result<&'a str, String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing live admin argument '{key}'"))
+}
+
+fn live_admin_optional_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn live_admin_ok_text(text: impl Into<String>) -> Vec<u8> {
+    live_admin_encode(json!({
+        "ok": true,
+        "exit_code": 0,
+        "text": text.into(),
+    }))
+}
+
+fn live_admin_ok_json(value: Value) -> Vec<u8> {
+    live_admin_encode(json!({
+        "ok": true,
+        "exit_code": 0,
+        "json": value,
+    }))
+}
+
+fn live_admin_error(exit_code: i32, message: impl Into<String>) -> Vec<u8> {
+    live_admin_encode(json!({
+        "ok": false,
+        "exit_code": exit_code,
+        "error": message.into(),
+    }))
+}
+
+fn live_admin_encode(value: Value) -> Vec<u8> {
+    serde_json::to_vec(&value).unwrap_or_else(|_| {
+        br#"{"ok":false,"exit_code":2,"error":"encode live admin response"}"#.to_vec()
+    })
+}
+
+fn parse_sync_guarantee(value: &str) -> Option<SyncGuarantee> {
+    match value {
+        "local" => Some(SyncGuarantee::Local),
+        "remote-copy" => Some(SyncGuarantee::RemoteCopy),
+        "full-redundancy" => Some(SyncGuarantee::FullRedundancy),
+        _ => None,
+    }
+}
+
+fn dataset_id_from_name(name: &str) -> DatasetId {
+    let mut id_bytes = [0u8; 16];
+    let hash = blake3::hash(name.as_bytes());
+    id_bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    DatasetId::from_bytes(id_bytes)
+}
+
+fn format_dataset_id(id: &DatasetId) -> String {
+    id.to_string().chars().take(8).collect()
+}
+
+fn snapshot_summary_line(summary: &crate::types::SnapshotSummary) -> String {
+    format!(
+        "snapshot '{}' (source tx={}, source gen={}, created gen={})",
+        summary.name,
+        summary.source_transaction_id,
+        summary.source_generation,
+        summary.created_at_generation
+    )
+}
+
+fn property_family_from_str(value: &str) -> Option<tidefs_dataset_properties::PropertyFamily> {
+    match value.to_lowercase().as_str() {
+        "compression" => Some(tidefs_dataset_properties::PropertyFamily::Compression),
+        "encryption" => Some(tidefs_dataset_properties::PropertyFamily::Encryption),
+        "space" => Some(tidefs_dataset_properties::PropertyFamily::Space),
+        "layout" => Some(tidefs_dataset_properties::PropertyFamily::Layout),
+        "integrity" => Some(tidefs_dataset_properties::PropertyFamily::Integrity),
+        "access" => Some(tidefs_dataset_properties::PropertyFamily::Access),
+        "performance" | "perf" => Some(tidefs_dataset_properties::PropertyFamily::Performance),
+        "snapshot" => Some(tidefs_dataset_properties::PropertyFamily::Snapshot),
+        _ => None,
+    }
+}
+
+fn live_property_table(
+    operation: &str,
+    props: &tidefs_dataset_properties::PropertySet,
+    family: Option<&str>,
+) -> Vec<u8> {
+    let registry = tidefs_dataset_properties::build_registry();
+    let defs: Vec<_> = if let Some(family_str) = family {
+        let Some(family) = property_family_from_str(family_str) else {
+            return live_admin_error(
+                1,
+                format!(
+                    "{operation}: unknown family '{family_str}' (valid: compression, encryption, space, layout, integrity, access, performance, snapshot)"
+                ),
+            );
+        };
+        tidefs_dataset_properties::filter_registry_by_family(&registry, family)
+    } else {
+        registry.iter().collect()
+    };
+
+    if defs.is_empty() {
+        return live_admin_ok_text("(no properties registered)");
+    }
+
+    let mut out = format!(
+        "{:<35} {:<20} {:<12} {}\n{:-<35} {:-<20} {:-<12} {:-<20}",
+        "PROPERTY", "VALUE", "TYPE", "SOURCE", "", "", "", ""
+    );
+    for def in &defs {
+        let local_entry = props.get(&def.name);
+        let (value, source) = match local_entry {
+            Some(entry) => (entry.value.clone(), entry.source.clone()),
+            None => (
+                def.default_value.clone(),
+                tidefs_dataset_properties::PropertySource::Default,
+            ),
+        };
+        let source_str = match &source {
+            tidefs_dataset_properties::PropertySource::Local => "local",
+            tidefs_dataset_properties::PropertySource::Inherited { .. } => "inherited",
+            tidefs_dataset_properties::PropertySource::Default => "default",
+        };
+        let _ = write!(
+            out,
+            "\n{:<35} {:<20} {:<12} {}",
+            def.name.as_str(),
+            value.to_string(),
+            def.value_type.label(),
+            source_str,
+        );
+    }
+    live_admin_ok_text(out)
 }
 
 // ── VfsEngine for VfsLocalFileSystem ──────────────────────────────────────
@@ -2590,6 +3301,10 @@ impl VfsEngineStatFs for VfsLocalFileSystem {
     fn statfs(&self, _ctx: &RequestCtx) -> std::result::Result<StatFs, Errno> {
         let mut fs = self.fs.borrow_mut();
         fuse_statfs::engine_statfs(&mut fs).map_err(|e| e.to_errno())
+    }
+
+    fn live_pool_admin_request(&self, request_json: &[u8]) -> std::result::Result<Vec<u8>, Errno> {
+        self.handle_live_pool_admin_request(request_json)
     }
 }
 

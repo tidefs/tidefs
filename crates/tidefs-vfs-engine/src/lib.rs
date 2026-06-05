@@ -1710,6 +1710,16 @@ pub trait VfsEngineStatFs: VfsEngine {
     /// Corresponds to §9 auxiliary operations in
     /// `docs/VFS_ENGINE_API_CONTRACT.md`.
     fn statfs(&self, ctx: &RequestCtx) -> Result<StatFs, Errno>;
+
+    /// Handle an imported-pool admin request owned by this live engine.
+    ///
+    /// The request and response are intentionally byte-oriented so the VFS
+    /// contract does not grow a second userspace-only schema. Engines that own
+    /// live pool state may decode their selected control UAPI here; engines
+    /// without such authority must leave the default unsupported response.
+    fn live_pool_admin_request(&self, _request_json: &[u8]) -> Result<Vec<u8>, Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
 }
 
 /// O_EXCL: fail if the file already exists (used with O_CREAT).

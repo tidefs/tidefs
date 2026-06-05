@@ -344,10 +344,32 @@ fn open_filesystem(
     operation: &str,
     recovery_policy: RecoveryPolicy,
 ) -> LocalFileSystem {
+    open_filesystem_with_live_args(
+        pool,
+        devices,
+        operation,
+        recovery_policy,
+        serde_json::Value::Null,
+    )
+}
+
+fn open_filesystem_with_live_args(
+    pool: &str,
+    devices: Option<&[PathBuf]>,
+    operation: &str,
+    recovery_policy: RecoveryPolicy,
+    live_args: serde_json::Value,
+) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
         if config.state == PoolState::Active {
-            super::live_owner::route_imported("dataset", operation, pool, config.pool_uuid);
+            super::live_owner::route_imported_with_args(
+                "dataset",
+                operation,
+                pool,
+                config.pool_uuid,
+                live_args,
+            );
         }
 
         let metadata_dir =
@@ -373,7 +395,7 @@ fn open_filesystem(
         };
     }
 
-    super::live_owner::route("dataset", operation, pool)
+    super::live_owner::route_with_args("dataset", operation, pool, live_args)
 }
 
 fn scan_device_pool_config(
@@ -540,7 +562,17 @@ fn handle_create(args: DatasetCreateArgs) {
         return;
     }
 
-    let mut fs = open_filesystem(&args.pool, devices_ref, "create", RecoveryPolicy::default());
+    let mut fs = open_filesystem_with_live_args(
+        &args.pool,
+        devices_ref,
+        "create",
+        RecoveryPolicy::default(),
+        serde_json::json!({
+            "name": &args.name,
+            "parent": &args.parent,
+            "sync": &args.sync,
+        }),
+    );
 
     // Check parent exists in the catalog
     if !fs.dataset_catalog().contains(parent) {
@@ -723,7 +755,16 @@ fn handle_rename(args: DatasetRenameArgs) {
     }
 
     let devices_ref = args.devices.as_deref();
-    let mut fs = open_filesystem(&args.pool, devices_ref, "rename", RecoveryPolicy::default());
+    let mut fs = open_filesystem_with_live_args(
+        &args.pool,
+        devices_ref,
+        "rename",
+        RecoveryPolicy::default(),
+        serde_json::json!({
+            "old_name": &args.old_name,
+            "new_name": &args.new_name,
+        }),
+    );
 
     // Verify the old name exists
     if !fs.dataset_catalog().contains(old_name) {
@@ -1031,11 +1072,15 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
 }
 
 fn handle_get(args: DatasetGetArgs) {
-    let fs = open_filesystem(
+    let fs = open_filesystem_with_live_args(
         &args.pool,
         args.devices.as_deref(),
         "get",
         RecoveryPolicy::ReadOnly,
+        serde_json::json!({
+            "name": &args.name,
+            "property": &args.property,
+        }),
     );
 
     let path = format!("{}/{}", &args.pool, &args.name);
@@ -1081,11 +1126,15 @@ fn handle_get(args: DatasetGetArgs) {
     }
 }
 fn handle_set(args: DatasetSetArgs) {
-    let mut fs = open_filesystem(
+    let mut fs = open_filesystem_with_live_args(
         &args.pool,
         args.devices.as_deref(),
         "set",
         RecoveryPolicy::RepairWriteback,
+        serde_json::json!({
+            "name": &args.name,
+            "assignment": &args.assignment,
+        }),
     );
 
     // Parse the assignment: key=value
@@ -1171,11 +1220,15 @@ fn handle_set(args: DatasetSetArgs) {
 }
 
 fn handle_list_props(args: DatasetListPropsArgs) {
-    let fs = open_filesystem(
+    let fs = open_filesystem_with_live_args(
         &args.pool,
         args.devices.as_deref(),
         "list-props",
         RecoveryPolicy::ReadOnly,
+        serde_json::json!({
+            "name": &args.name,
+            "family": args.family.as_deref(),
+        }),
     );
 
     let path = format!("{}/{}", &args.pool, &args.name);
@@ -1282,11 +1335,14 @@ fn handle_destroy(args: DatasetDestroyArgs) {
     }
 
     let devices_ref = args.devices.as_deref();
-    let mut fs = open_filesystem(
+    let mut fs = open_filesystem_with_live_args(
         &args.pool,
         devices_ref,
         "destroy",
         RecoveryPolicy::default(),
+        serde_json::json!({
+            "name": &args.name,
+        }),
     );
 
     // Check dataset exists

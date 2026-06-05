@@ -166,9 +166,11 @@ struct LiveOwnerRequest {
     operation: String,
     pool: String,
     json: bool,
+    #[serde(default)]
+    args: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct LiveOwnerResponse {
     ok: bool,
     exit_code: i32,
@@ -255,6 +257,11 @@ fn dispatch_request(
         ("pool", "status") => pool_status(request.json, manifest, engine),
         ("pool", "import") => already_owned("import", manifest, request.json),
         ("pool", "mount") => already_owned("mount", manifest, request.json),
+        ("pool", "get" | "set" | "list-props")
+        | ("dataset", "create" | "list" | "rename" | "destroy" | "get" | "set" | "list-props")
+        | ("snapshot", "create" | "list" | "destroy" | "rollback") => {
+            delegate_admin_request(&request, engine)
+        }
         _ => LiveOwnerResponse::error(
             1,
             format!(
@@ -263,6 +270,40 @@ fn dispatch_request(
             ),
         ),
     }
+}
+
+fn delegate_admin_request(
+    request: &LiveOwnerRequest,
+    engine: &LiveOwnerEngine,
+) -> LiveOwnerResponse {
+    let payload = json!({
+        "command": request.command.as_str(),
+        "operation": request.operation.as_str(),
+        "pool": request.pool.as_str(),
+        "json": request.json,
+        "args": &request.args,
+    });
+    let bytes = match serde_json::to_vec(&payload) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return LiveOwnerResponse::error(2, format!("encode live admin request: {err}"))
+        }
+    };
+    let response_bytes = match engine.lock() {
+        Ok(engine) => match engine.live_pool_admin_request(&bytes) {
+            Ok(bytes) => bytes,
+            Err(errno) => {
+                return LiveOwnerResponse::error(
+                    1,
+                    format!("live engine does not support this admin request: {errno:?}"),
+                )
+            }
+        },
+        Err(_) => return LiveOwnerResponse::error(1, "live owner engine lock poisoned"),
+    };
+    serde_json::from_slice::<LiveOwnerResponse>(&response_bytes).unwrap_or_else(|err| {
+        LiveOwnerResponse::error(2, format!("decode live admin response: {err}"))
+    })
 }
 
 fn pool_status(

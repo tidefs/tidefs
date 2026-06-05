@@ -525,6 +525,10 @@ impl VfsEngineStatFs for ClusterPlacementVfsEngine {
     fn statfs(&self, ctx: &RequestCtx) -> Result<StatFs, Errno> {
         self.inner.statfs(ctx)
     }
+
+    fn live_pool_admin_request(&self, request_json: &[u8]) -> Result<Vec<u8>, Errno> {
+        self.inner.live_pool_admin_request(request_json)
+    }
 }
 
 #[cfg(test)]

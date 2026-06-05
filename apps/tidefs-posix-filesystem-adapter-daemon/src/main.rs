@@ -15,6 +15,7 @@ mod fuse_vfs_adapter;
 mod fusewire;
 mod handler_prelude;
 mod ingress;
+mod live_owner;
 mod lock_dispatch;
 mod maintenance;
 mod materialized_cache;

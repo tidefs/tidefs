@@ -501,9 +501,27 @@ fn open_filesystem(
     operation: &str,
     recovery_policy: RecoveryPolicy,
 ) -> LocalFileSystem {
+    open_filesystem_with_live_args(
+        backing_dir,
+        pool,
+        devices,
+        operation,
+        recovery_policy,
+        serde_json::Value::Null,
+    )
+}
+
+fn open_filesystem_with_live_args(
+    backing_dir: Option<&PathBuf>,
+    pool: Option<&str>,
+    devices: Option<&[PathBuf]>,
+    operation: &str,
+    recovery_policy: RecoveryPolicy,
+    live_args: serde_json::Value,
+) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let pool_name = pool.unwrap_or("<unnamed>");
-        let metadata_dir = import_devices_metadata_dir(devs, pool_name, operation);
+        let metadata_dir = import_devices_metadata_dir(devs, pool_name, operation, live_args);
 
         let root_auth_key = RootAuthenticationKey::from_environment()
             .unwrap_or_else(|_| RootAuthenticationKey::demo_key());
@@ -527,7 +545,9 @@ fn open_filesystem(
 
     let path = match (backing_dir, pool) {
         (Some(path), _) => path.clone(),
-        (None, Some(pool_name)) => super::live_owner::route("snapshot", operation, pool_name),
+        (None, Some(pool_name)) => {
+            super::live_owner::route_with_args("snapshot", operation, pool_name, live_args)
+        }
         (None, None) => {
             eprintln!("tidefsctl snapshot {operation}: --backing-dir or --pool is required");
             process::exit(1);
@@ -558,10 +578,21 @@ fn open_filesystem(
     }
 }
 
-fn import_devices_metadata_dir(devices: &[PathBuf], pool_name: &str, operation: &str) -> PathBuf {
+fn import_devices_metadata_dir(
+    devices: &[PathBuf],
+    pool_name: &str,
+    operation: &str,
+    live_args: serde_json::Value,
+) -> PathBuf {
     let config = scan_device_pool_config(pool_name, devices, operation);
     if config.state == PoolState::Active {
-        super::live_owner::route_imported("snapshot", operation, pool_name, config.pool_uuid);
+        super::live_owner::route_imported_with_args(
+            "snapshot",
+            operation,
+            pool_name,
+            config.pool_uuid,
+            live_args,
+        );
     }
 
     super::offline_pool::metadata_dir("snapshot", operation, &config.pool_uuid)
@@ -674,10 +705,18 @@ fn snapshot_backing_path(
 ) -> PathBuf {
     match (backing_dir, pool, devices.filter(|devs| !devs.is_empty())) {
         (Some(p), _, _) => p.clone(),
-        (None, pool_name, Some(devs)) => {
-            import_devices_metadata_dir(devs, pool_name.unwrap_or("<unnamed>"), operation)
-        }
-        (None, Some(pool_name), None) => super::live_owner::route("snapshot", "send", pool_name),
+        (None, pool_name, Some(devs)) => import_devices_metadata_dir(
+            devs,
+            pool_name.unwrap_or("<unnamed>"),
+            operation,
+            serde_json::Value::Null,
+        ),
+        (None, Some(pool_name), None) => super::live_owner::route_with_args(
+            "snapshot",
+            "send",
+            pool_name,
+            serde_json::Value::Null,
+        ),
         (None, None, None) => {
             eprintln!("tidefsctl snapshot send: --backing-dir or --pool required");
             process::exit(1);
@@ -716,12 +755,15 @@ fn parse_incremental_from_root(
 
 fn handle_create(args: SnapshotCreateArgs) {
     let snapshot_name = &args.name;
-    let mut fs = open_filesystem(
+    let mut fs = open_filesystem_with_live_args(
         args.backing_dir.as_ref(),
         args.pool.as_deref(),
         args.devices.as_deref(),
         "create",
         RecoveryPolicy::default(),
+        serde_json::json!({
+            "name": &args.name,
+        }),
     );
 
     match fs.create_snapshot(snapshot_name) {
@@ -764,12 +806,15 @@ fn handle_list(args: SnapshotListArgs) {
 
 fn handle_destroy(args: SnapshotDestroyArgs) {
     let snapshot_name = &args.name;
-    let mut fs = open_filesystem(
+    let mut fs = open_filesystem_with_live_args(
         args.backing_dir.as_ref(),
         args.pool.as_deref(),
         args.devices.as_deref(),
         "destroy",
         RecoveryPolicy::default(),
+        serde_json::json!({
+            "name": &args.name,
+        }),
     );
 
     // delete_snapshot validates the entry is a Snapshot (not clone/bookmark),
@@ -790,12 +835,15 @@ fn handle_destroy(args: SnapshotDestroyArgs) {
 
 fn handle_rollback(args: SnapshotRollbackArgs) {
     let snapshot_name = &args.name;
-    let mut fs = open_filesystem(
+    let mut fs = open_filesystem_with_live_args(
         args.backing_dir.as_ref(),
         args.pool.as_deref(),
         args.devices.as_deref(),
         "rollback",
         RecoveryPolicy::default(),
+        serde_json::json!({
+            "name": &args.name,
+        }),
     );
 
     match fs.rollback_to_snapshot(snapshot_name) {
