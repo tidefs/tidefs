@@ -30,9 +30,14 @@ let
     QEMU_BIN="${pkgs.qemu}/bin/qemu-system-x86_64"
     BUSYBOX="${pkgs.busybox}/bin/busybox"
     GLIBC_LIB="${pkgs.glibc}/lib"
-    KERNEL_IMG="${linuxKernel_7_0}/bzImage"
+    DEFAULT_KERNEL_IMG="${linuxKernel_7_0}/bzImage"
+    DEFAULT_KERNEL_VMLINUX="${linuxKernel_7_0.dev}/vmlinux"
+    DEFAULT_MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
+    KERNEL_IMG="''${TIDEFS_FUSE_XFSTESTS_KERNEL_IMG:-$DEFAULT_KERNEL_IMG}"
+    KERNEL_VMLINUX="''${TIDEFS_FUSE_XFSTESTS_KERNEL_VMLINUX:-$DEFAULT_KERNEL_VMLINUX}"
     CPIO="${pkgs.cpio}/bin/cpio"
-    MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
+    SOCAT_BIN="${pkgs.socat}/bin/socat"
+    MODULE_DIR="''${TIDEFS_FUSE_XFSTESTS_MODULE_DIR:-$DEFAULT_MODULE_DIR}"
     FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
     XFSTESTS_BIN="${xfstests}/bin/xfstests-check"
     BASH_BIN="${pkgs.bash}/bin/bash"
@@ -69,6 +74,9 @@ let
     PER_TEST_TIMEOUT_SEC="''${TIDEFS_FUSE_XFSTESTS_PER_TEST_TIMEOUT:-180}"
     QEMU_MEMORY_MB="''${TIDEFS_FUSE_XFSTESTS_QEMU_MEMORY_MB:-2048}"
     STORE_IMAGE_MB="''${TIDEFS_FUSE_XFSTESTS_STORE_IMAGE_MB:-8192}"
+    CRASHDUMP_MODE="''${TIDEFS_FUSE_XFSTESTS_CRASHDUMP:-0}"
+    PANIC_ON_WARN_MODE="''${TIDEFS_FUSE_XFSTESTS_PANIC_ON_WARN:-0}"
+    CRASH_BIN="''${TIDEFS_FUSE_XFSTESTS_CRASH_BIN:-/usr/bin/crash}"
     DEFAULT_TESTS="generic/001 generic/002 generic/003 generic/004 generic/005 generic/006 generic/007 generic/008 generic/009 generic/010 generic/011 generic/012 generic/013"
 
     usage() {
@@ -92,6 +100,12 @@ Options:
 Environment:
   TIDEFS_FUSE_XFSTESTS_QEMU_MEMORY_MB  Guest RAM in MiB (default: $QEMU_MEMORY_MB)
   TIDEFS_FUSE_XFSTESTS_STORE_IMAGE_MB  Guest /store disk image in MiB (default: $STORE_IMAGE_MB)
+  TIDEFS_FUSE_XFSTESTS_PANIC_ON_WARN   Set guest panic-on-warning/lockup knobs (0/1)
+  TIDEFS_FUSE_XFSTESTS_CRASHDUMP       Dump guest memory through QMP on panic/timeout (0/1)
+  TIDEFS_FUSE_XFSTESTS_CRASH_BIN       crash(8) binary for vmcore analysis (default: $CRASH_BIN)
+  TIDEFS_FUSE_XFSTESTS_KERNEL_IMG      Override guest kernel bzImage
+  TIDEFS_FUSE_XFSTESTS_KERNEL_VMLINUX  Override vmlinux for crash(8)
+  TIDEFS_FUSE_XFSTESTS_MODULE_DIR      Override guest module directory
 
 Exit codes:
   0   All attempted tests passed or were classified non-fail
@@ -180,6 +194,9 @@ if false; then
     echo "  Timeout:   ''${TIMEOUT_SEC}s"
     echo "  Memory:    $QEMU_MEMORY_MB MiB"
     echo "  Store img: $STORE_IMAGE_MB MiB"
+    echo "  Panic warn:$PANIC_ON_WARN_MODE"
+    echo "  Crashdump: $CRASHDUMP_MODE"
+    echo "  vmlinux:   $KERNEL_VMLINUX"
     echo ""
 
     # ── Resolve fuse.ko ────────────────────────────────────────────────
@@ -277,7 +294,7 @@ if false; then
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff \
                   reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync \
                   expr head tail cut kill ps test seq du dirname basename \
-                  readlink tr cmp diff uname date mountpoint umount timeout sed mktemp chmod chown awk sort uniq xargs which tr ln tee hostname df pgrep pkill id killall logger; do
+                  readlink tr cmp diff od uname date mountpoint umount timeout sed mktemp chmod chown awk sort uniq xargs which tr ln tee hostname df pgrep pkill id killall logger; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
     cat > "$RUN_DIR/etc/passwd" << 'PASSWD'
@@ -813,6 +830,40 @@ echo "kernel_version=$(uname -r)"
 echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo ""
 
+PANIC_ON_WARN=__PANIC_ON_WARN_MODE__
+set_kernel_knob() {
+    knob_path="$1"
+    knob_value="$2"
+    knob_name=$(basename "$knob_path")
+    if [ -e "$knob_path" ]; then
+        if echo "$knob_value" > "$knob_path" 2>/dev/null; then
+            echo "kernel_knob $knob_name=$(cat "$knob_path" 2>/dev/null || echo "$knob_value")"
+        else
+            echo "kernel_knob $knob_name=unavailable"
+        fi
+    fi
+}
+if [ "$PANIC_ON_WARN" = "1" ]; then
+    echo "kernel_debug: enabling panic-on-warning and broad warning/panic knobs"
+    set_kernel_knob /proc/sys/kernel/panic_on_warn 1
+    set_kernel_knob /proc/sys/kernel/panic_on_oops 1
+    set_kernel_knob /proc/sys/kernel/hung_task_panic 1
+    set_kernel_knob /proc/sys/kernel/hung_task_timeout_secs 60
+    set_kernel_knob /proc/sys/kernel/hung_task_check_interval_secs 15
+    set_kernel_knob /proc/sys/kernel/hung_task_warnings -1
+    set_kernel_knob /proc/sys/kernel/hung_task_all_cpu_backtrace 1
+    set_kernel_knob /proc/sys/kernel/softlockup_panic 1
+    set_kernel_knob /proc/sys/kernel/hardlockup_panic 1
+    set_kernel_knob /proc/sys/kernel/softlockup_all_cpu_backtrace 1
+    set_kernel_knob /proc/sys/kernel/hardlockup_all_cpu_backtrace 1
+    set_kernel_knob /proc/sys/kernel/panic_on_rcu_stall 1
+    set_kernel_knob /proc/sys/kernel/max_rcu_stall_to_panic 1
+    set_kernel_knob /proc/sys/kernel/panic_print 63
+    set_kernel_knob /proc/sys/kernel/warn_limit 0
+    set_kernel_knob /proc/sys/kernel/traceoff_on_warning 0
+    echo ""
+fi
+
 PASSED=0
 FAILED=0
 BLOCKED=0
@@ -1031,6 +1082,58 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         dump_test="$1"
         dump_result_base="$2"
         dump_test_log="$3"
+        dump_xfstests_binary_cmp() {
+            cmp_test="$1"
+            cmp_result_base="$2"
+            cmp_suffix="$3"
+            for stem in "$cmp_result_base/$cmp_test" "$cmp_result_base/''${cmp_test#*/}"; do
+                good="$stem.$cmp_suffix.good"
+                bad="$stem.$cmp_suffix.bad"
+                [ -f "$good" ] && [ -f "$bad" ] || continue
+                echo "--- fsx binary compare $(basename "$good") vs $(basename "$bad") ---"
+                echo "good-bytes=$(wc -c <"$good" 2>/dev/null || true) bad-bytes=$(wc -c <"$bad" 2>/dev/null || true)"
+                first_line=$(cmp -l "$good" "$bad" 2>/dev/null | head -1 || true)
+                if [ -z "$first_line" ]; then
+                    echo "cmp: no byte differences reported"
+                    continue
+                fi
+                first_byte=$(printf '%s\n' "$first_line" | awk '{print $1}')
+                echo "first-difference: $first_line"
+                case "$first_byte" in
+                    ""|*[!0-9]*) continue ;;
+                esac
+                if [ "$first_byte" -gt 65 ]; then
+                    skip=$((first_byte - 65))
+                else
+                    skip=0
+                fi
+                echo "--- good context offset=$skip ---"
+                dd if="$good" bs=1 skip="$skip" count=256 2>/dev/null | od -Ax -tx1 -v || true
+                echo "--- bad context offset=$skip ---"
+                dd if="$bad" bs=1 skip="$skip" count=256 2>/dev/null | od -Ax -tx1 -v || true
+            done
+        }
+        dump_tidefs_helper_logs() {
+            helper_test="$1"
+            if find /tmp -maxdepth 1 -type f \( -name 'tidefs-preview-*.log' -o -name 'tidefs-daemon-*.log' -o -name 'daemon-helper.log' -o -name 'mount-helper.log' \) -print | sort | grep . >/tmp/tidefs-helper-log-files; then
+                while read -r f; do
+                    echo "helper-log: $f"
+                    echo "helper-log-bytes=$(wc -c <"$f" 2>/dev/null || true)"
+                    grep -a "tidefs-diagnostic" "$f" 2>/dev/null || true
+                    case "$f" in
+                        *tidefs-daemon-*)
+                            echo "--- full daemon log for $helper_test: $f ---"
+                            cat "$f" 2>/dev/null || true
+                            ;;
+                        *)
+                            tail -160 "$f" 2>/dev/null || true
+                            ;;
+                    esac
+                done </tmp/tidefs-helper-log-files
+            else
+                echo "(none)"
+            fi
+        }
         dump_process_threads() {
             inspect_pid="$1"
             inspect_label="$2"
@@ -1097,21 +1200,17 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             while read -r f; do
                 echo "result-file: $f"
                 head -80 "$f" 2>/dev/null || true
+                echo "--- result-file tail: $f ---"
+                tail -120 "$f" 2>/dev/null || true
             done </tmp/xfstests-result-files
         else
             echo "(none)"
         fi
+        dump_xfstests_binary_cmp "$dump_test" "$dump_result_base" "0"
         echo "--- test log tail for $dump_test ---"
         tail -160 "$dump_test_log" 2>/dev/null || true
         echo "--- TideFS mount helper logs for $dump_test ---"
-        if find /tmp -maxdepth 1 -type f \( -name 'tidefs-preview-*.log' -o -name 'tidefs-daemon-*.log' -o -name 'daemon-helper.log' -o -name 'mount-helper.log' \) -print | sort | grep . >/tmp/tidefs-helper-log-files; then
-            while read -r f; do
-                echo "helper-log: $f"
-                tail -160 "$f" 2>/dev/null || true
-            done </tmp/tidefs-helper-log-files
-        else
-            echo "(none)"
-        fi
+        dump_tidefs_helper_logs "$dump_test"
     }
 
     terminate_process_tree() {
@@ -1273,15 +1372,7 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
                 else
                     echo "(none)"
                 fi
-                echo "--- TideFS mount helper logs for $test ---"
-                if find /tmp -maxdepth 1 -type f \( -name 'tidefs-preview-*.log' -o -name 'tidefs-daemon-*.log' -o -name 'daemon-helper.log' -o -name 'mount-helper.log' \) -print | sort | grep . >/tmp/tidefs-helper-log-files; then
-                    while read -r f; do
-                        echo "helper-log: $f"
-                        tail -120 "$f" 2>/dev/null || true
-                    done </tmp/tidefs-helper-log-files
-                else
-                    echo "(none)"
-                fi
+                dump_xfstests_test_state "$test" "$RESULT_BASE" "$TEST_LOG"
                 fail "xfstests_$test" "$FAIL_DETAIL"
             fi
             TESTS_FAIL=$((TESTS_FAIL + 1))
@@ -1364,6 +1455,7 @@ INITSCRIPT
     sed -i "s|__ROOT_AUTH_KEY__|$ROOT_AUTH_KEY|g" "$RUN_DIR/init"
     sed -i "s|__XFSTESTS_TRACE__|$TRACE_XFSTESTS|g" "$RUN_DIR/init"
     sed -i "s|__XFSTESTS_PER_TEST_TIMEOUT__|$PER_TEST_TIMEOUT_SEC|g" "$RUN_DIR/init"
+    sed -i "s|__PANIC_ON_WARN_MODE__|$PANIC_ON_WARN_MODE|g" "$RUN_DIR/init"
 
     chmod +x "$RUN_DIR/init"
 
@@ -1381,21 +1473,124 @@ INITSCRIPT
     # ── Run QEMU ──────────────────────────────────────────────────────
 
     VAL_LOG="$RUN_DIR/qemu-boot.log"
+    QMP_SOCKET="/tmp/tidefs-fuse-xfstests-qmp-$$.sock"
+    CRASHDUMP_FILE="$RUN_DIR/qemu-guest-memory.elf"
+    CRASH_ANALYSIS="$RUN_DIR/crash-analysis.txt"
+    CRASH_CMDS="$RUN_DIR/crash.cmds"
+
+    KERNEL_APPEND="console=ttyS0 ignore_loglevel panic=30 oops=panic panic_on_oops=1"
+    if [ "$PANIC_ON_WARN_MODE" = "1" ]; then
+      KERNEL_APPEND="$KERNEL_APPEND panic_on_warn=1 hung_task_panic=1 hung_task_timeout_secs=60 softlockup_panic=1 hardlockup_panic=1 panic_on_rcu_stall=1 panic_print=0x3f"
+    fi
+    if [ "$CRASHDUMP_MODE" = "1" ]; then
+      KERNEL_APPEND="$KERNEL_APPEND nokaslr"
+    fi
+
+    CRASHDUMP_CREATED=0
+    capture_guest_crashdump() {
+      reason="$1"
+      [ "$CRASHDUMP_MODE" = "1" ] || return 0
+      if [ ! -S "$QMP_SOCKET" ]; then
+        echo "  Crashdump: QMP socket unavailable for $reason"
+        return 0
+      fi
+      rm -f "$CRASHDUMP_FILE"
+      echo "  Crashdump: dumping guest memory for $reason to $CRASHDUMP_FILE"
+      {
+        printf '{"execute":"qmp_capabilities"}\n'
+        printf '{"execute":"dump-guest-memory","arguments":{"paging":true,"protocol":"file:%s"}}\n' "$CRASHDUMP_FILE"
+      } | timeout 600 "$SOCAT_BIN" - UNIX-CONNECT:"$QMP_SOCKET" > "$RUN_DIR/qmp-dump-$reason.log" 2>&1 || true
+      if [ -s "$CRASHDUMP_FILE" ]; then
+        CRASHDUMP_CREATED=1
+        echo "  Crashdump: complete ($(wc -c < "$CRASHDUMP_FILE" 2>/dev/null || echo 0) bytes)"
+      else
+        echo "  Crashdump: no vmcore produced; see $RUN_DIR/qmp-dump-$reason.log"
+      fi
+    }
+
+    analyze_guest_crashdump() {
+      [ "$CRASHDUMP_CREATED" -eq 1 ] || return 0
+      if [ ! -f "$KERNEL_VMLINUX" ]; then
+        echo "  crash: vmlinux unavailable at $KERNEL_VMLINUX"
+        return 0
+      fi
+      if [ ! -x "$CRASH_BIN" ]; then
+        echo "  crash: binary unavailable at $CRASH_BIN"
+        return 0
+      fi
+      cat > "$CRASH_CMDS" << CRASHCMDS
+set scroll off
+sys
+log
+bt
+ps
+foreach bt
+kmem -i
+mount
+files
+quit
+CRASHCMDS
+      echo "  crash: analyzing vmcore with $CRASH_BIN"
+      timeout 300 "$CRASH_BIN" -i "$CRASH_CMDS" "$KERNEL_VMLINUX" "$CRASHDUMP_FILE" > "$CRASH_ANALYSIS" 2>&1 || true
+      if [ -s "$CRASH_ANALYSIS" ]; then
+        echo "  crash: analysis written to $CRASH_ANALYSIS"
+      else
+        echo "  crash: analysis produced no output"
+      fi
+    }
 
     echo "  Booting QEMU VM..."
     QEMU_ACCEL=""; if [ "$HAS_KVM" -eq 1 ]; then QEMU_ACCEL="-accel kvm -cpu host"; echo "  (KVM mode)"; else QEMU_ACCEL="-accel tcg"; echo "  (TCG mode)"; fi
-    timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
+    echo "  Kernel append: $KERNEL_APPEND"
+    "$QEMU_BIN" \
       -kernel "$KERNEL_IMG" \
       -initrd "$RUN_DIR/initrd.img" \
-      -append "console=ttyS0 ignore_loglevel panic=30 oops=panic" \
+      -append "$KERNEL_APPEND" \
       $QEMU_ACCEL \
       -m "''${QEMU_MEMORY_MB}M" \
       -smp 1 \
       -nographic \
+      -qmp "unix:$QMP_SOCKET,server,nowait" \
       -drive "file=$STORE_IMG,format=raw,if=virtio,cache=unsafe" \
       -no-reboot \
       < /dev/null \
-      > "$VAL_LOG" 2>&1 || true
+      > "$VAL_LOG" 2>&1 &
+    QEMU_PID=$!
+
+    QEMU_RC=0
+    DUMPED_FOR_PANIC=0
+    DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
+    while kill -0 "$QEMU_PID" 2>/dev/null; do
+      if [ "$CRASHDUMP_MODE" = "1" ] && [ "$DUMPED_FOR_PANIC" -eq 0 ] \
+         && grep -aE 'Kernel panic|Oops:|BUG:|WARNING:' "$VAL_LOG" >/dev/null 2>&1; then
+        DUMPED_FOR_PANIC=1
+        capture_guest_crashdump "panic"
+        analyze_guest_crashdump
+      fi
+      now=$(date +%s)
+      if [ "$now" -ge "$DEADLINE" ]; then
+        echo "  QEMU timeout after ''${TIMEOUT_SEC}s"
+        capture_guest_crashdump "timeout"
+        analyze_guest_crashdump
+        kill -TERM "$QEMU_PID" 2>/dev/null || true
+        sleep 5
+        kill -KILL "$QEMU_PID" 2>/dev/null || true
+        break
+      fi
+      sleep 2
+    done
+    if wait "$QEMU_PID" 2>/dev/null; then
+      QEMU_RC=0
+    else
+      QEMU_RC=$?
+    fi
+    echo "  QEMU exit code: $QEMU_RC"
+    if [ "$CRASHDUMP_MODE" = "1" ] && [ "$CRASHDUMP_CREATED" -eq 0 ] \
+       && grep -aE 'Kernel panic|Oops:|BUG:|WARNING:' "$VAL_LOG" >/dev/null 2>&1; then
+      capture_guest_crashdump "post-exit"
+      analyze_guest_crashdump
+    fi
+    rm -f "$QMP_SOCKET"
 
     echo "  QEMU boot completed"
     BOOT_LINES=$(wc -l < "$VAL_LOG" 2>/dev/null || echo 0)
@@ -1490,6 +1685,9 @@ INITSCRIPT
   "kernel_version": "$KERNEL_VER",
   "qemu_binary": "qemu-system-x86_64",
   "kernel_image": "$(basename "$KERNEL_IMG")",
+  "kernel_vmlinux": "$KERNEL_VMLINUX",
+  "panic_on_warn": "$PANIC_ON_WARN_MODE",
+  "crashdump": "$CRASHDUMP_MODE",
   "backend": "file",
   "validation_tier": "mounted-userspace",
   "accel_mode": "$ACCEL_MODE",
@@ -1555,6 +1753,12 @@ ROWEOF
       mkdir -p "$OUT_DIR"
       cp "$JSON_FILE" "$JSON_OUT"
       cp "$VAL_LOG" "$OUT_DIR/qemu-boot.log"
+      if [ "$CRASHDUMP_MODE" = "1" ]; then
+        for artifact in "$CRASHDUMP_FILE" "$CRASH_ANALYSIS" "$CRASH_CMDS" "$RUN_DIR"/qmp-dump-*.log; do
+          [ -f "$artifact" ] || continue
+          cp "$artifact" "$OUT_DIR/$(basename "$artifact")"
+        done
+      fi
       MANIFEST_VERDICT="go"
       MANIFEST_RESULT="passed"
       if [ "$FAILC" -gt 0 ]; then
@@ -1582,6 +1786,8 @@ a Linux 7.0 QEMU guest launched outside the Nix build sandbox.
 - Acceleration: \`$ACCEL_MODE\`
 - Guest memory: \`$QEMU_MEMORY_MB MiB\`
 - Guest /store image: \`$STORE_IMAGE_MB MiB\`
+- Panic-on-warning mode: \`$PANIC_ON_WARN_MODE\`
+- Crashdump mode: \`$CRASHDUMP_MODE\`
 - Requested tests: \`$TEST_LIST\`
 - Passed rows: $PASSC
 - Failed rows: $FAILC
@@ -1594,6 +1800,9 @@ Validation outputs:
 - \`$(basename "$JSON_OUT")\`
 - \`qemu-boot.log\`
 - \`validation-manifest.json\`
+
+Crash/debug outputs are copied when present: \`qemu-guest-memory.elf\`,
+\`crash-analysis.txt\`, \`crash.cmds\`, and \`qmp-dump-*.log\`.
 
 ## Release Meaning
 
