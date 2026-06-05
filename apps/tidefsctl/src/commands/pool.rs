@@ -1305,13 +1305,29 @@ fn handle_pool_export(pool_name: String, devices: Option<Vec<PathBuf>>, force: b
     let device_paths = match devices {
         Some(d) if !d.is_empty() => d,
         _ => {
-            super::live_owner::route("pool", "export", &pool_name);
+            super::live_owner::route_with_args(
+                "pool",
+                "export",
+                &pool_name,
+                serde_json::json!({
+                    "force": force,
+                }),
+            );
         }
     };
 
     let config = assemble_device_pool_config(&device_paths, "export");
     ensure_device_pool_name(&pool_name, "export", &config);
-    route_active_device_pool("export", &pool_name, &config);
+    super::live_owner::route_if_imported_with_args(
+        "pool",
+        "export",
+        &pool_name,
+        config.pool_uuid,
+        config.state == PoolState::Active,
+        serde_json::json!({
+            "force": force,
+        }),
+    );
 
     let lock_dir = PathBuf::from("/run/tidefs/import");
     match tidefs_pool_import::pool_export(&device_paths, &lock_dir, force) {

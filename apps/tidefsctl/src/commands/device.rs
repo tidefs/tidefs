@@ -29,6 +29,7 @@ use tidefs_pool_scan::{
     DeviceRemovalPlanner, DeviceRemovalResult, DeviceRemovalState, ObjectPlacement, PoolConfig,
 };
 use tidefs_replication_model::{FailureDomain, ReplicationIntent};
+use tidefs_types_pool_label_core::PoolState;
 
 /// Device management subcommands.
 #[derive(Subcommand, Debug)]
@@ -39,6 +40,9 @@ pub enum DeviceCommand {
     /// devices. Once evacuation completes, the pool membership is updated and
     /// the removal is anchored in a committed root for crash safety.
     Remove {
+        /// Pool name. If the pool is imported, the request is routed to its live owner.
+        pool_name: String,
+
         /// Path to the block device to remove.
         device_path: PathBuf,
 
@@ -85,6 +89,7 @@ pub enum DeviceCommand {
 pub fn handle_device(cmd: DeviceCommand) {
     match cmd {
         DeviceCommand::Remove {
+            pool_name,
             device_path,
             backing_dir,
             surviving_dirs,
@@ -93,6 +98,7 @@ pub fn handle_device(cmd: DeviceCommand) {
             force,
         } => {
             if let Err(e) = handle_remove(
+                &pool_name,
                 &device_path,
                 &backing_dir,
                 &surviving_dirs,
@@ -249,6 +255,7 @@ fn handle_rebuild(
 }
 
 fn handle_remove(
+    pool_name: &str,
     device_path: &PathBuf,
     backing_dir: &PathBuf,
     surviving_dirs: &[PathBuf],
@@ -256,6 +263,18 @@ fn handle_remove(
     failure_domain: &str,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    super::live_owner::route_if_owner_exists_with_args(
+        "device",
+        "remove",
+        pool_name,
+        serde_json::json!({
+            "device_path": device_path.to_string_lossy(),
+            "replication_factor": replication_factor,
+            "failure_domain": failure_domain,
+            "force": force,
+        }),
+    );
+
     let domain = match failure_domain {
         "device" => FailureDomain::Device,
         "node" => FailureDomain::Node,
@@ -305,6 +324,26 @@ fn handle_remove(
             .into());
         }
     };
+    if pre_config.pool_name != pool_name {
+        return Err(format!(
+            "target device belongs to pool '{}', not '{pool_name}'",
+            pre_config.pool_name
+        )
+        .into());
+    }
+    super::live_owner::route_if_imported_with_args(
+        "device",
+        "remove",
+        pool_name,
+        pre_config.pool_uuid,
+        pre_config.state == PoolState::Active,
+        serde_json::json!({
+            "device_path": device_path.to_string_lossy(),
+            "replication_factor": replication_factor,
+            "failure_domain": failure_domain,
+            "force": force,
+        }),
+    );
 
     // Derive target and surviving devices from the imported pool membership.
     // The target device path must match a leaf in the imported config.
@@ -606,7 +645,7 @@ mod tests {
     use super::*;
     use tidefs_pool_scan::DeviceRemovalPhase;
 
-    // Helper: create a 3-device pool config with labels in the target store.
+    // Helper: create a 3-device exported pool config with labels in the target store.
     fn setup_labeled_pool(
         target_dir: &std::path::Path,
         surv0_dir: &std::path::Path,
@@ -657,7 +696,7 @@ mod tests {
                 children: vec![leaf0, leaf1, leaf2],
             },
             health: DeviceHealth::Online,
-            state: PoolState::Active,
+            state: PoolState::Exported,
             total_capacity_bytes: 3 * 1024 * 1024 * 1024,
             allocated_bytes: 0,
             feature_flags: 0,
@@ -715,6 +754,7 @@ mod tests {
 
         let device_path = PathBuf::from("/dev/disk0");
         let result = handle_remove(
+            "testpool",
             &device_path,
             &target_dir,
             &[surv0_dir.clone(), surv1_dir.clone()],
@@ -827,7 +867,15 @@ mod tests {
         let surv_dir = dir.path().join("surv");
         std::fs::create_dir_all(&surv_dir).unwrap();
 
-        let result = handle_remove(&device_path, &target_dir, &[surv_dir], 2, "device", false);
+        let result = handle_remove(
+            "testpool",
+            &device_path,
+            &target_dir,
+            &[surv_dir],
+            2,
+            "device",
+            false,
+        );
         assert!(
             result.is_err(),
             "expected error when no pool labels present"
@@ -848,6 +896,7 @@ mod tests {
         setup_labeled_pool(&target_dir, &surv_dir, &dir.path().join("extra"));
 
         let result = handle_remove(
+            "testpool",
             &PathBuf::from("/dev/nonexistent"),
             &target_dir,
             &[surv_dir],
@@ -889,6 +938,7 @@ mod tests {
 
         let device_path = PathBuf::from("/dev/disk0");
         let result = handle_remove(
+            "testpool",
             &device_path,
             &target_dir,
             &[surv0_dir.clone(), surv1_dir.clone()],
@@ -948,7 +998,15 @@ mod tests {
         let bad_dir = dir.path().join("not-a-dir");
         std::fs::write(&bad_dir, b"not a directory").unwrap();
 
-        let result = handle_remove(&device_path, &target_dir, &[bad_dir], 2, "device", false);
+        let result = handle_remove(
+            "testpool",
+            &device_path,
+            &target_dir,
+            &[bad_dir],
+            2,
+            "device",
+            false,
+        );
         assert!(
             result.is_err(),
             "expected error opening non-directory as store"

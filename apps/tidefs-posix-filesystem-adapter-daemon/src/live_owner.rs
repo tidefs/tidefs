@@ -102,14 +102,12 @@ pub fn start_fuse_owner(
     write_manifest(&manifest_path, &manifest)?;
 
     let thread_manifest = manifest.clone();
-    let thread_socket_path = socket_path.clone();
-    let thread_manifest_path = manifest_path.clone();
     let thread_shutdown = Arc::clone(&shutdown);
     let join = thread::spawn(move || {
         while !thread_shutdown.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _addr)) => {
-                    handle_client(stream, &thread_manifest, &engine);
+                    handle_client(stream, &thread_manifest, &engine, &thread_shutdown);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
@@ -120,7 +118,6 @@ pub fn start_fuse_owner(
                 }
             }
         }
-        cleanup_endpoint(&thread_socket_path, &thread_manifest_path);
     });
 
     Ok(LiveOwnerHandle {
@@ -211,13 +208,18 @@ impl LiveOwnerResponse {
     }
 }
 
-fn handle_client(stream: UnixStream, manifest: &LiveOwnerManifest, engine: &LiveOwnerEngine) {
+fn handle_client(
+    stream: UnixStream,
+    manifest: &LiveOwnerManifest,
+    engine: &LiveOwnerEngine,
+    shutdown: &Arc<AtomicBool>,
+) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let response = match reader.read_line(&mut line) {
         Ok(0) => LiveOwnerResponse::error(2, "empty live-owner request"),
         Ok(_) => match serde_json::from_str::<LiveOwnerRequest>(&line) {
-            Ok(request) => dispatch_request(request, manifest, engine),
+            Ok(request) => dispatch_request(request, manifest, engine, shutdown),
             Err(err) => LiveOwnerResponse::error(2, format!("decode live-owner request: {err}")),
         },
         Err(err) => LiveOwnerResponse::error(2, format!("read live-owner request: {err}")),
@@ -242,6 +244,7 @@ fn dispatch_request(
     request: LiveOwnerRequest,
     manifest: &LiveOwnerManifest,
     engine: &LiveOwnerEngine,
+    shutdown: &Arc<AtomicBool>,
 ) -> LiveOwnerResponse {
     if request.pool != manifest.pool_name {
         return LiveOwnerResponse::error(
@@ -257,6 +260,7 @@ fn dispatch_request(
         ("pool", "status") => pool_status(request.json, manifest, engine),
         ("pool", "import") => already_owned("import", manifest, request.json),
         ("pool", "mount") => already_owned("mount", manifest, request.json),
+        ("pool", "export") => pool_export(request.json, manifest, shutdown),
         ("pool", "get" | "set" | "list-props")
         | ("dataset", "create" | "list" | "rename" | "destroy" | "get" | "set" | "list-props")
         | ("snapshot", "create" | "list" | "destroy" | "rollback") => {
@@ -392,6 +396,32 @@ fn already_owned(
     } else {
         LiveOwnerResponse::ok_text(format!(
             "pool already imported: {}\n  owner:      {} (pid {})\n  mountpoint: {}",
+            manifest.pool_name, manifest.owner_kind, manifest.pid, manifest.mountpoint
+        ))
+    }
+}
+
+fn pool_export(
+    wants_json: bool,
+    manifest: &LiveOwnerManifest,
+    shutdown: &Arc<AtomicBool>,
+) -> LiveOwnerResponse {
+    shutdown.store(true, Ordering::Release);
+    let value = json!({
+        "pool_name": manifest.pool_name,
+        "pool_uuid": manifest.pool_uuid,
+        "state": "ExportRequested",
+        "owner_kind": manifest.owner_kind,
+        "pid": manifest.pid,
+        "mountpoint": manifest.mountpoint,
+        "operation": "export",
+        "shutdown_requested": true,
+    });
+    if wants_json {
+        LiveOwnerResponse::ok_json(value)
+    } else {
+        LiveOwnerResponse::ok_text(format!(
+            "pool export requested: {}\n  owner:      {} (pid {})\n  mountpoint: {}\n  action:     live owner shutdown requested",
             manifest.pool_name, manifest.owner_kind, manifest.pid, manifest.mountpoint
         ))
     }

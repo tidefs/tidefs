@@ -106,6 +106,18 @@ pub(crate) fn route_with_format_and_args(
     })
 }
 
+pub(crate) fn route_if_owner_exists_with_args(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    args: serde_json::Value,
+) {
+    let root = pool_runtime_root();
+    if owner_manifest_exists_by_pool_at(&root, pool) {
+        route_with_format_and_args(command, operation, pool, false, args);
+    }
+}
+
 pub(crate) fn route_imported_with_format_and_args(
     command: &str,
     operation: &str,

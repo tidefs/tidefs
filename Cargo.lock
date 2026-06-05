@@ -2993,6 +2993,7 @@ dependencies = [
  "tidefs-namespace",
  "tidefs-orphan-index",
  "tidefs-permission",
+ "tidefs-pool-import",
  "tidefs-posix-acl",
  "tidefs-posix-filesystem-adapter-workers-io",
  "tidefs-posix-filesystem-adapter-workers-locks",

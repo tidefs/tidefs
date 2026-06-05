@@ -44,11 +44,11 @@ The current userspace FUSE owner exposes an imported-pool JSON socket under
 registry entry; both are live-owner interfaces, not authorization to reopen
 devices directly. That socket currently handles live `pool status`, pool
 properties, dataset catalog create/list/rename/destroy and dataset property
-queries/mutations, plus snapshot create/list/destroy/rollback. Those
-operations run against the mounted engine that owns cached state. Snapshot
-send/receive, dataset key commands, and live export/destroy still require
-their own owner request shapes and therefore fail closed when addressed to an
-imported pool.
+queries/mutations, snapshot create/list/destroy/rollback, and owner-mediated
+`pool export` shutdown. Those operations run against the mounted engine that
+owns cached state. Snapshot send/receive, dataset key commands, live destroy,
+and live device removal still require their own owner request shapes and
+therefore fail closed when addressed to an imported pool.
 
 Offline inputs are explicit. Commands that operate on a pool that is not
 imported must say how to find it with arguments such as `--devices` or
@@ -74,7 +74,7 @@ calling storage libraries behind the live owner. That would bypass cached
 state and split authority. Add the owner client first, then make the positional
 form call it.
 
-Common live-pool forms put the pool first:
+Common owner-aware forms put the pool first:
 
 [source,sh]
 ----
@@ -86,6 +86,8 @@ tidefsctl dataset list <pool>
 tidefsctl dataset set <pool> <dataset> <property>=<value>
 tidefsctl snapshot create <pool> <snapshot>
 tidefsctl snapshot list <pool>
+tidefsctl pool export <pool>
+tidefsctl device remove <pool> <device> --backing-dir <path> --surviving-dirs <paths>
 ----
 
 The old `--pool <pool>` spelling is not the operator form. It must not be

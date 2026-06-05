@@ -315,11 +315,15 @@ tidefsctl block detach <dev-name>
 
 ```sh
 # Remove a device from the pool
-tidefsctl device remove /dev/sdc --backing-dir /var/lib/tidefs/device-sdc --surviving-dirs /var/lib/tidefs/device-sdb
+tidefsctl device remove mypool /dev/sdc --backing-dir /var/lib/tidefs/device-sdc --surviving-dirs /var/lib/tidefs/device-sdb
 
 # Trigger rebuild after device replacement
 tidefsctl device rebuild
 ```
+
+The pool name is the live-owner identity. If `mypool` is imported, device
+removal routes to that owner and fails closed until the owner implements the
+operation; the backing-directory form is only for exported/offline storage.
 
 ### 6.5 Pool export (deactivate)
 

@@ -16,6 +16,7 @@ fuser = { version = "0.14.0", features = ["abi-7-30", "abi-7-32"] }
 libc = "0.2"
 rustix = { version = "0.38.44", features = ["fs"] }
 tidefs-local-filesystem = { path = "../../crates/tidefs-local-filesystem" }
+tidefs-pool-import = { path = "../../crates/tidefs-pool-import" }
 tidefs-dataset-lifecycle = { path = "../../crates/tidefs-dataset-lifecycle" }
 tidefs-dataset-catalog = { path = "../../crates/tidefs-dataset-catalog" }
 tidefs-inode-table = { path = "../../crates/tidefs-inode-table" }

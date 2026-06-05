@@ -698,6 +698,21 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
 
     crate::observability::emit_all_summaries();
     session.join();
+    if let Some(ref block_devices) = config.block_devices {
+        let lock_dir = PathBuf::from("/run/tidefs/import");
+        match tidefs_pool_import::pool_export(block_devices, &lock_dir, false) {
+            Ok(()) => {
+                if let Some(ref pool_name) = config.pool_name {
+                    eprintln!("tidefsctl: pool exported: {pool_name}");
+                } else {
+                    eprintln!("tidefsctl: block-device pool exported");
+                }
+            }
+            Err(err) => {
+                eprintln!("tidefsctl: warning: clean pool export failed during unmount: {err}");
+            }
+        }
+    }
     if let Some(live_owner) = live_owner {
         live_owner.stop();
     }
