@@ -645,9 +645,8 @@ impl LocalFileSystem {
             }
         }
 
-        let mut pruned_snapshots = Vec::new();
+        let mut prune_snapshot_names = Vec::new();
         let mut skipped_held_snapshots = Vec::new();
-        let mut remove_names = Vec::new();
 
         for name in prune_names {
             let Some(record) = self.state.snapshots.get(&name) else {
@@ -656,24 +655,23 @@ impl LocalFileSystem {
             if record.hold_count > 0 {
                 skipped_held_snapshots.push(record.summary());
             } else {
-                pruned_snapshots.push(record.summary());
-                remove_names.push(name);
+                prune_snapshot_names.push(String::from_utf8_lossy(&name).into_owned());
             }
         }
 
-        sort_snapshot_summaries(&mut pruned_snapshots);
         sort_snapshot_summaries(&mut skipped_held_snapshots);
 
-        let mut published_generation = evaluated_at_generation;
-        if !remove_names.is_empty() {
-            self.begin_mutation();
-            published_generation = self.bump_generation();
-            for name in remove_names {
-                self.state.snapshots.remove(&name);
-            }
-            self.mark_inode_metadata_dirty(ROOT_INODE_ID);
-            self.mark_dir_dirty(ROOT_INODE_ID);
+        let mut pruned_snapshots = Vec::new();
+        for name in prune_snapshot_names {
+            pruned_snapshots.push(self.delete_snapshot(&name)?);
         }
+        sort_snapshot_summaries(&mut pruned_snapshots);
+
+        let published_generation = if pruned_snapshots.is_empty() {
+            evaluated_at_generation
+        } else {
+            self.state.generation
+        };
 
         let mut retained_snapshots = self.regular_snapshot_summaries();
         sort_snapshot_summaries(&mut retained_snapshots);
@@ -688,11 +686,7 @@ impl LocalFileSystem {
             excluded_catalog_entries,
         };
 
-        if report.pruned_snapshots.is_empty() {
-            Ok(report)
-        } else {
-            self.commit_mutation(report)
-        }
+        Ok(report)
     }
 
     fn regular_snapshots_by_age(&self) -> Vec<(Vec<u8>, SnapshotRecord)> {
@@ -744,6 +738,7 @@ fn sort_snapshot_summaries(summaries: &mut [SnapshotSummary]) {
 mod tests {
     use super::*;
     use std::env;
+    use tidefs_types_dataset_lifecycle_core::TraversalRootType;
 
     fn setup_auth_env() {
         env::set_var("TIDEFS_ROOT_AUTHENTICATION_KEY_HEX", "A".repeat(64));
@@ -790,6 +785,10 @@ mod tests {
             .iter()
             .map(|summary| summary.name.clone())
             .collect()
+    }
+
+    fn snapshot_catalog_pin_count(fs: &LocalFileSystem) -> u32 {
+        fs.lifecycle().stats().per_root_pins[TraversalRootType::SnapshotCatalog.to_u8() as usize]
     }
 
     #[test]
@@ -1023,6 +1022,43 @@ mod tests {
         assert!(fs.snapshot_summary("old").is_err());
         assert!(fs.snapshot_summary("middle").is_ok());
         assert!(fs.snapshot_summary("new").is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_prune_removes_dataset_catalog_entry_and_snapshot_pin() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        fs.create_snapshot("old").expect("old snapshot");
+        fs.create_snapshot("middle").expect("middle snapshot");
+        fs.create_snapshot("new").expect("new snapshot");
+
+        assert!(fs.dataset_catalog().contains("root@old"));
+        assert!(fs.dataset_catalog().contains("root@middle"));
+        assert!(fs.dataset_catalog().contains("root@new"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 3);
+
+        let report = fs
+            .prune_snapshots(SnapshotRetentionPolicy::retain_latest(2))
+            .expect("prune snapshots");
+
+        assert_eq!(summary_names(&report.pruned_snapshots), vec!["old"]);
+        assert!(fs.snapshot_summary("old").is_err());
+        assert!(!fs.dataset_catalog().contains("root@old"));
+        assert!(fs.dataset_catalog().contains("root@middle"));
+        assert!(fs.dataset_catalog().contains("root@new"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 2);
+        fs.sync_all().expect("sync pruned snapshot state");
+        drop(fs);
+
+        let fs = reopen_fs(&dir);
+        assert!(fs.snapshot_summary("old").is_err());
+        assert!(!fs.dataset_catalog().contains("root@old"));
+        assert!(fs.dataset_catalog().contains("root@middle"));
+        assert!(fs.dataset_catalog().contains("root@new"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
