@@ -3985,39 +3985,95 @@ fn set_get_xattr_round_trip() {
 }
 
 #[test]
-fn set_xattr_flushes_pending_write_buffer_before_metadata_commit() {
-    let root = temp_root("xattr-pending-write-flush");
+fn xattr_mutations_do_not_force_deferred_write_buffer_flush() {
+    let root = temp_root("xattr-pending-write-buffer");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-    fs.create_file("/f", 0o644).expect("create file");
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+    let record = fs.create_file("/f", 0o644).expect("create file");
+    let inode_id = record.inode_id;
 
-    fs.write_file("/f", 0, b"content before xattr")
-        .expect("buffered write");
+    let data = b"content before xattr";
+    fs.write_file("/f", 0, data).expect("buffered write");
+    assert!(
+        fs.write_buffers.contains_key(&inode_id),
+        "small write should remain staged before xattr mutation"
+    );
+
     fs.set_xattr("/f", b"user.marker", b"present", 0)
         .expect("set xattr after buffered write");
 
-    assert_eq!(
-        fs.read_file("/f").expect("read file after xattr"),
-        b"content before xattr"
+    assert!(
+        fs.write_buffers.contains_key(&inode_id),
+        "setxattr must not drain pending file data"
     );
+    assert_eq!(
+        fs.stat("/f").expect("stat after setxattr").size,
+        data.len() as u64,
+        "stat should still include the pending write-buffer overlay"
+    );
+    assert_eq!(
+        fs.committed_inode_record(inode_id)
+            .expect("committed inode after setxattr")
+            .size,
+        0,
+        "xattr metadata commit must not persist the overlay size before data flush"
+    );
+    assert_eq!(fs.read_file("/f").expect("read file after xattr"), data);
     assert_eq!(
         fs.get_xattr("/f", b"user.marker")
             .expect("get xattr after buffered write"),
         Some(b"present".to_vec())
     );
 
-    fs.sync_all().expect("sync fs");
-    drop(fs);
-
-    let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-    assert_eq!(
-        fs.read_file("/f").expect("read file after reopen"),
-        b"content before xattr"
+    fs.remove_xattr("/f", b"user.marker")
+        .expect("remove xattr after buffered write");
+    assert!(
+        fs.write_buffers.contains_key(&inode_id),
+        "removexattr must not drain pending file data"
     );
     assert_eq!(
         fs.get_xattr("/f", b"user.marker")
-            .expect("get xattr after reopen"),
-        Some(b"present".to_vec())
+            .expect("get removed xattr"),
+        None
     );
+
+    fs.set_xattr("/f", b"user.a", b"1", 0).expect("set xattr a");
+    fs.set_xattr("/f", b"user.b", b"2", 0).expect("set xattr b");
+    fs.remove_all_xattrs("/f").expect("remove all xattrs");
+    assert!(
+        fs.write_buffers.contains_key(&inode_id),
+        "remove_all_xattrs must not drain pending file data"
+    );
+    assert!(
+        fs.list_xattr("/f")
+            .expect("list after remove_all")
+            .is_empty(),
+        "remove_all_xattrs should still clear metadata immediately"
+    );
+
+    fs.set_xattr("/f", b"user.final", b"durable", 0)
+        .expect("set final xattr");
+    assert!(
+        fs.write_buffers.contains_key(&inode_id),
+        "final setxattr must leave data staged until sync"
+    );
+
+    fs.sync_all().expect("sync fs");
+    assert!(
+        !fs.write_buffers.contains_key(&inode_id),
+        "sync_all must flush the pending data buffer"
+    );
+    drop(fs);
+
+    let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(fs.read_file("/f").expect("read file after reopen"), data);
+    assert_eq!(
+        fs.get_xattr("/f", b"user.final")
+            .expect("get xattr after reopen"),
+        Some(b"durable".to_vec())
+    );
+    drop(fs);
 
     cleanup(&root);
 }

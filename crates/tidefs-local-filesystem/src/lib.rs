@@ -7890,6 +7890,13 @@ impl LocalFileSystem {
         }
     }
 
+    fn xattr_metadata_record(&self, inode_id: InodeId) -> Result<InodeRecord> {
+        // Xattr mutations touch inode metadata only.  Do not force pending
+        // file-data buffers through the object store, and do not persist the
+        // stat overlay size before those bytes are flushed.
+        self.committed_inode_record(inode_id)
+    }
+
     fn set_xattr_by_inode_with_target(
         &mut self,
         inode_id: InodeId,
@@ -7900,8 +7907,7 @@ impl LocalFileSystem {
         max_xattr_count: Option<usize>,
     ) -> Result<()> {
         self.ensure_xattr_inode_exists(inode_id)?;
-        self.flush_write_buffer(inode_id)?;
-        let record = self.inode(inode_id)?;
+        let record = self.xattr_metadata_record(inode_id)?;
 
         if name.is_empty() || name.contains(&0) {
             return Err(FileSystemError::InvalidName {
@@ -8113,8 +8119,7 @@ impl LocalFileSystem {
         name: &[u8],
     ) -> Result<()> {
         self.ensure_xattr_inode_exists(inode_id)?;
-        self.flush_write_buffer(inode_id)?;
-        let record = self.inode(inode_id)?;
+        let record = self.xattr_metadata_record(inode_id)?;
 
         if !record.xattrs.contains_key(name) {
             return Err(FileSystemError::NotFound {
@@ -8161,8 +8166,7 @@ impl LocalFileSystem {
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
         let inode_id = self.resolve_parts(&parts, path)?;
-        self.flush_write_buffer(inode_id)?;
-        let record = self.inode(inode_id)?.clone();
+        let record = self.xattr_metadata_record(inode_id)?;
 
         if record.xattrs.is_empty() {
             return Ok(());
