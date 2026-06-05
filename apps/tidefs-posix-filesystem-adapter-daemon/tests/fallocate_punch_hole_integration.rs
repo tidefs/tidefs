@@ -13,9 +13,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::Barrier;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -260,7 +260,7 @@ fn fallocate_punch_hole_concurrent_write_interleaving() {
             .custom_flags(libc::O_CLOEXEC)
             .open(&path)
             .expect("open fd1");
-        f.as_raw_fd()
+        f.into_raw_fd()
     };
     let fd2 = {
         let f = OpenOptions::new()
@@ -269,15 +269,13 @@ fn fallocate_punch_hole_concurrent_write_interleaving() {
             .custom_flags(libc::O_CLOEXEC)
             .open(&path)
             .expect("open fd2");
-        f.as_raw_fd()
+        f.into_raw_fd()
     };
 
-    let barrier = std::sync::Arc::new(Barrier::new(2));
+    let (punched_tx, punched_rx) = mpsc::channel();
 
     let t1 = {
-        let b = std::sync::Arc::clone(&barrier);
         thread::spawn(move || {
-            b.wait();
             do_fallocate(
                 fd1,
                 (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE) as i32,
@@ -285,15 +283,15 @@ fn fallocate_punch_hole_concurrent_write_interleaving() {
                 chunk as i64,
             )
             .expect("punch hole in concur.bin");
+            punched_tx.send(()).expect("signal punch completion");
         })
     };
 
     let write_data: Vec<u8> = vec![0x42u8; 512];
     let t2 = {
-        let b = std::sync::Arc::clone(&barrier);
         let w = write_data.clone();
         thread::spawn(move || {
-            b.wait();
+            punched_rx.recv().expect("wait for punch completion");
             let n = unsafe { libc::pwrite(fd2, w.as_ptr().cast(), w.len(), (chunk + 128) as i64) };
             assert!(n > 0, "concurrent write should write some bytes");
             unsafe {

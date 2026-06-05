@@ -238,7 +238,7 @@ impl FuseCopyFileRangeRequest {
     }
 
     /// Validate signed offsets and flags before converting to a copy plan.
-    pub fn plan(self) -> Result<FuseCopyFileRangePlan, CopyFileRangePlanError> {
+    pub fn plan(&self) -> Result<FuseCopyFileRangePlan, CopyFileRangePlanError> {
         if self.offset_in < 0 || self.offset_out < 0 {
             return Err(CopyFileRangePlanError::NegativeOffset);
         }

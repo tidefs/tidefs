@@ -67,10 +67,10 @@ use tidefs_types_posix_filesystem_adapter_core::PosixFilesystemAdapterRequestCon
 use tidefs_types_posix_filesystem_adapter_core::PosixFilesystemAdapterWriteStagingOutcome;
 use tidefs_types_vfs_core::{
     compose_posix_time_ns, split_posix_time_ns, DirEntry, EngineDirHandle, EngineFileHandle, Errno,
-    FileHandleId, Generation, InodeAttr, InodeId, NodeKind, RequestCtx, SetAttr, StatFs,
-    FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
-    FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE,
-    FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, F_UNLCK, S_IFMT, S_ISGID, S_ISUID,
+    FileHandleId, Generation, InodeAttr, InodeId, NodeKind, PosixAttrs, RequestCtx, SetAttr,
+    StatFs, FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, FATTR_ATIME,
+    FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME,
+    FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, F_UNLCK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
 };
 use tidefs_vfs_engine::{LockSpec, LseekDataRange, VfsEngine, VfsEngineStatFs};
 
@@ -78,6 +78,13 @@ use crate::mount_options::TimestampPolicy;
 use tidefs_dir_index::DirCookie;
 use tidefs_intent_log::{IntentLogBuffer, IntentLogRecord as IlRecord};
 use tidefs_local_filesystem::PATH_MAX_BYTES;
+
+fn fuse_op_diagnostics_enabled() -> bool {
+    matches!(
+        std::env::var("TIDEFS_FUSE_OP_DIAGNOSTICS").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
 use tidefs_namespace::Namespace;
 
 /// Compile-time authority guard: filesystem intent recording and crash
@@ -809,6 +816,7 @@ struct AdapterFileHandle {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct InodeOpenState {
+    has_readable: bool,
     has_writable: bool,
     has_writable_append: bool,
     has_sync: bool,
@@ -824,6 +832,7 @@ struct WriteDispatchFlags {
 impl InodeOpenState {
     fn observe(&mut self, handle: AdapterFileHandle) {
         let flags = handle.engine_handle.open_flags;
+        self.has_readable |= open_flags_allow_read(flags).unwrap_or(false);
         let writable = open_flags_allow_write(flags).unwrap_or(false);
         self.has_writable |= writable;
         self.has_writable_append |= writable && (flags & libc::O_APPEND as u32) != 0;
@@ -1074,11 +1083,25 @@ fn copy_file_range_ranges_overlap(start_a: u64, start_b: u64, len: u64) -> Resul
     Ok(start_a < end_b && start_b < end_a)
 }
 
+fn validate_vfs_copy_file_range_plan(
+    request: &FuseCopyFileRangeRequest,
+) -> Result<FuseCopyFileRangePlan, Errno> {
+    let plan = request.plan().map_err(|_| Errno::EINVAL)?;
+
+    if plan.ino_in == plan.ino_out
+        && copy_file_range_ranges_overlap(plan.offset_in, plan.offset_out, plan.len)?
+    {
+        return Err(Errno::EINVAL);
+    }
+
+    Ok(plan)
+}
+
 fn plan_vfs_copy_file_range_dispatch(
     handles: &AdapterFileHandleTable,
-    request: FuseCopyFileRangeRequest,
+    request: &FuseCopyFileRangeRequest,
 ) -> Result<VfsCopyFileRangeDispatch, Errno> {
-    let plan = request.plan().map_err(|_| Errno::EINVAL)?;
+    let plan = validate_vfs_copy_file_range_plan(request)?;
     let source_fh = handles.resolve(plan.ino_in, plan.fh_in, 0)?;
     match open_flags_allow_read(source_fh.open_flags) {
         Ok(true) => {}
@@ -1090,17 +1113,26 @@ fn plan_vfs_copy_file_range_dispatch(
         Ok(false) | Err(_) => return Err(Errno::EBADF),
     }
 
-    if source_fh.inode_id == dest_fh.inode_id
-        && copy_file_range_ranges_overlap(plan.offset_in, plan.offset_out, plan.len)?
-    {
-        return Err(Errno::EINVAL);
-    }
-
     Ok(VfsCopyFileRangeDispatch {
         plan,
         source_fh,
         dest_fh,
     })
+}
+
+fn plan_vfs_copy_file_range_writeback_fallback(
+    handles: &AdapterFileHandleTable,
+    request: &FuseCopyFileRangeRequest,
+) -> Result<FuseCopyFileRangePlan, Errno> {
+    let plan = validate_vfs_copy_file_range_plan(request)?;
+    let source_state = handles.inode_open_state(plan.ino_in);
+    let dest_state = handles.inode_open_state(plan.ino_out);
+
+    if !source_state.has_readable || !dest_state.has_writable {
+        return Err(Errno::EBADF);
+    }
+
+    Ok(plan)
 }
 
 fn plan_vfs_bmap(file_size: u64, blocksize: u32, idx: u64) -> Result<u64, Errno> {
@@ -1729,6 +1761,49 @@ fn setattr_from_fuse(
     (sa, fh)
 }
 
+fn is_timestamp_only_setattr(attr: &SetAttr) -> bool {
+    let timestamp_bits =
+        FATTR_ATIME | FATTR_MTIME | FATTR_CTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW;
+    attr.valid & timestamp_bits != 0 && attr.valid & !timestamp_bits == 0
+}
+
+fn orphan_timestamp_attr_out(ino: u64, attr: &SetAttr, ctx: &RequestCtx) -> FuseAttrOut {
+    let now_ns = system_time_to_ns(SystemTime::now());
+    let atime_ns = if attr.valid & FATTR_ATIME != 0 {
+        attr.atime_ns
+    } else {
+        now_ns
+    };
+    let mtime_ns = if attr.valid & FATTR_MTIME != 0 {
+        attr.mtime_ns
+    } else {
+        now_ns
+    };
+    let ctime_ns = if attr.valid & FATTR_CTIME != 0 {
+        attr.ctime_ns
+    } else {
+        now_ns
+    };
+    let posix = PosixAttrs::new(
+        S_IFREG | 0o600,
+        ctx.uid,
+        ctx.gid,
+        0,
+        0,
+        atime_ns,
+        mtime_ns,
+        ctime_ns,
+        now_ns,
+        0,
+        0,
+        4096,
+    );
+    fuse_attr_out_with_ttl(
+        crate::workers_meta::fuse_attr_out(ino, &posix, NodeKind::File),
+        Duration::ZERO,
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FuseReadDispatchPlan {
     fh: EngineFileHandle,
@@ -2306,6 +2381,12 @@ pub struct FuseVfsAdapter {
     /// On last-close of an nlink==0 inode, an entry is inserted here
     /// so the cleanup engine can reclaim the inode's space.
     orphan_index: Mutex<OrphanIndex>,
+    /// Inodes whose lifetime has been exposed to the kernel while FUSE
+    /// writeback-cache is active. Linux can issue a late handle-less
+    /// timestamp-only setattr for these inodes after the backing engine has
+    /// already reclaimed them; such requests are safe to acknowledge with a
+    /// zero-TTL synthetic attr.
+    writeback_seen_inodes: Mutex<HashSet<u64>>,
 
     /// Stable DatasetId for the mounted dataset, resolved through the catalog.
     /// Used for lifecycle gating, cache invalidation scope, and metrics.
@@ -2380,6 +2461,7 @@ impl FuseVfsAdapter {
             notifier: notifier.clone(),
             mmap_coherency,
             orphan_index: Mutex::new(OrphanIndex::new()),
+            writeback_seen_inodes: Mutex::new(HashSet::new()),
             dataset_id: None,
             workload_observer: Arc::new(WorkloadObserver::new()),
             signature_cache: Arc::new(MaterializedSignatureCache::new()),
@@ -2412,6 +2494,16 @@ impl FuseVfsAdapter {
     pub fn with_orphan_index(self, oi: OrphanIndex) -> Self {
         *self.orphan_index.lock().unwrap() = oi;
         self
+    }
+
+    fn remember_writeback_inode(&self, ino: u64) {
+        if self.writeback_cache_enabled {
+            self.writeback_seen_inodes.lock().unwrap().insert(ino);
+        }
+    }
+
+    fn is_writeback_seen_inode(&self, ino: u64) -> bool {
+        self.writeback_seen_inodes.lock().unwrap().contains(&ino)
     }
 
     /// Attach a [`tidefs_namespace::Namespace`] for legacy namespace fallback.
@@ -2718,13 +2810,17 @@ impl FuseVfsAdapter {
         reply_flags
     }
 
-    fn invalidate_inode_metadata_after_engine_write(&self, ino: u64) {
+    fn invalidate_inode_metadata_local(&self, ino: u64) {
         self.getattr_cache.lock().unwrap().remove(&ino);
         self.path_lookup_cache.lock().unwrap().remove_by_ino(ino);
+    }
+
+    fn invalidate_inode_metadata_after_engine_write(&self, ino: u64) {
+        self.invalidate_inode_metadata_local(ino);
         self.try_inval_inode_attrs(ino);
     }
 
-    fn sync_namespace_attrs_after_engine_write(&self, ino: u64, attr: &InodeAttr) {
+    fn sync_namespace_attrs_local(&self, ino: u64, attr: &InodeAttr) {
         if let Some(ns) = self.namespace.as_ref() {
             if let Some(mut ns_attrs) = ns.get_attrs(ino) {
                 ns_attrs.mode = attr.posix.mode;
@@ -2739,7 +2835,10 @@ impl FuseVfsAdapter {
                 let _ = ns.update_attrs(ino, ns_attrs);
             }
         }
+    }
 
+    fn sync_namespace_attrs_after_engine_write(&self, ino: u64, attr: &InodeAttr) {
+        self.sync_namespace_attrs_local(ino, attr);
         self.invalidate_inode_metadata_after_engine_write(ino);
     }
 
@@ -3587,6 +3686,8 @@ impl FuseVfsAdapter {
             adapter_fh
         };
         let fuse_open_flags = self.fuse_open_flags_for_request(open_flags);
+        self.file_handles.lock().unwrap().inc_open_ref(ino);
+        self.remember_writeback_inode(ino);
         Ok(VfsCreateDispatch {
             attr,
             adapter_fh,
@@ -4269,6 +4370,15 @@ impl FuseVfsAdapter {
         let e = self.engine.lock().unwrap();
         let current_attr = match e.getattr(inode_id, engine_fh.as_ref(), ctx) {
             Ok(attr) => attr,
+            Err(Errno::ENOENT | Errno::ESTALE)
+                if self.writeback_cache_enabled
+                    && fh.is_none()
+                    && is_timestamp_only_setattr(attr)
+                    && (self.orphan_index.lock().unwrap().contains(ino)
+                        || self.is_writeback_seen_inode(ino)) =>
+            {
+                return Ok(orphan_timestamp_attr_out(ino, attr, ctx));
+            }
             Err(Errno::ENOENT | Errno::EIO) if self.namespace.is_some() => {
                 drop(e);
                 let ns = self.namespace.as_ref().expect("namespace checked");
@@ -4281,6 +4391,7 @@ impl FuseVfsAdapter {
                     ctx.groups.as_slice(),
                 );
             }
+            Err(Errno::ENOENT) => return Err(Errno::ESTALE),
             Err(errno) => return Err(errno),
         };
 
@@ -4300,7 +4411,6 @@ impl FuseVfsAdapter {
         {
             return Err(Errno::EPERM);
         }
-
         // Capacity admission and tracking for size changes are handled by the
         // engine's CapacityAuthority during truncate_extents dispatch.
 
@@ -4371,14 +4481,8 @@ impl FuseVfsAdapter {
         // Capacity tracking for all size changes is handled by the engine's
         // CapacityAuthority during truncate dispatch (check_enospc for growth,
         // record_free for shrinkage).
-        // Invalidate getattr cache entry on any setattr mutation.
-        {
-            let mut cache = self.getattr_cache.lock().unwrap();
-            cache.remove(&ino);
-        }
-        self.path_lookup_cache.lock().unwrap().remove_by_ino(ino);
-        self.sync_namespace_attrs_after_engine_write(ino, &updated);
-        self.try_inval_inode_attrs(ino);
+        self.sync_namespace_attrs_local(ino, &updated);
+        self.invalidate_inode_metadata_local(ino);
 
         Ok(crate::workers_meta::fuse_attr_out(
             ino,
@@ -4629,7 +4733,7 @@ impl FuseVfsAdapter {
         classify_setlk_request(unique, ino, fh, uid, gid, pid)
     }
 
-    /// P5-02 classification for an incoming FUSE FLOCK request.
+    /// P5-02 classification for a BSD flock carried by the FUSE lock path.
     #[must_use]
     fn classify_fuse_flock(
         unique: u64,
@@ -4834,6 +4938,11 @@ impl FuseVfsAdapter {
                     adapter_fh,
                     fh,
                 ));
+                self.file_handles
+                    .lock()
+                    .unwrap()
+                    .inc_open_ref(attr.inode_id.get());
+                self.remember_writeback_inode(attr.inode_id.get());
                 let fuse_open_flags = self.fuse_open_flags_for_request(engine_open_flags);
                 Ok(VfsCreateDispatch {
                     attr,
@@ -5165,6 +5274,7 @@ impl FuseVfsAdapter {
         let request_open_flags = flags.request_open;
         self.check_not_read_only()?;
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_WRITE);
+        self.remember_writeback_inode(ino);
         let resolved_efh = match self.resolve_file_handle(ino, fh, 0) {
             Ok(efh) => Some(efh),
             Err(Errno::EBADF) if self.writeback_cache_enabled => None,
@@ -5434,6 +5544,11 @@ impl FuseVfsAdapter {
                     .lock()
                     .unwrap()
                     .record_write_buf(written);
+                self.clear_write_through_dirty_range_without_block_volume(
+                    ino,
+                    effective_offset as u64,
+                    written,
+                );
                 // Direct I/O conflict guard: clear stale cached dirty ranges
                 // covered by this authoritative direct write, so later
                 // writeback cannot replay old page-cache bytes over it.
@@ -5722,6 +5837,24 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .accept_write(ino, offset, &data[..written as usize]);
+    }
+
+    fn clear_write_through_dirty_range_without_block_volume(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u32,
+    ) {
+        if length == 0 || self.block_volume.lock().unwrap().is_some() {
+            return;
+        }
+        let mut ds = self.dirty_state.lock().unwrap();
+        if let Some(dr) = ds.get_mut(&ino) {
+            dr.clear_range(offset, u64::from(length));
+            if dr.is_empty() {
+                ds.remove(&ino);
+            }
+        }
     }
 
     // ── Block-volume adapter extent resolution ───────────────────────────
@@ -6262,6 +6395,7 @@ impl FuseVfsAdapter {
         offset: u64,
         length: u64,
     ) -> Result<(), Errno> {
+        let diagnostic = fuse_op_diagnostics_enabled();
         self.check_not_read_only()?;
         let efh = self.resolve_file_handle(ino, fh, 0)?;
         // Reject read-only file handles: fallocate is a write operation per POSIX.
@@ -6279,7 +6413,30 @@ impl FuseVfsAdapter {
         if (mode & FALLOC_FL_PUNCH_HOLE) != 0 || (mode & FALLOC_FL_COLLAPSE_RANGE) != 0 {
             enforce_append_only_write_guard(raw_flags, false)?;
         }
+        let engine_start = std::time::Instant::now();
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse fallocate engine start ino={} fh={} engine_fh={} mode=0x{:x} offset={} length={}",
+                ino,
+                fh,
+                efh.fh_id.0,
+                mode,
+                offset,
+                length
+            );
+        }
         let result = e.fallocate(&efh, mode, offset, length, ctx);
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse fallocate engine end ino={} fh={} engine_fh={} status={} errno={:?} elapsed_ms={}",
+                ino,
+                fh,
+                efh.fh_id.0,
+                if result.is_ok() { "ok" } else { "err" },
+                result.as_ref().err(),
+                engine_start.elapsed().as_millis()
+            );
+        }
         if result.is_ok() {
             // Clear dirty_state ranges for the affected extent.
             let mut ds = self.dirty_state.lock().unwrap();
@@ -6298,7 +6455,22 @@ impl FuseVfsAdapter {
             let is_hole_or_zero =
                 (mode & FALLOC_FL_PUNCH_HOLE) != 0 || (mode & FALLOC_FL_ZERO_RANGE) != 0;
             if is_hole_or_zero {
+                let clear_start = std::time::Instant::now();
+                if diagnostic {
+                    eprintln!(
+                        "tidefs-diagnostic: fuse fallocate clear-dirty start ino={} mode=0x{:x} offset={} length={}",
+                        ino, mode, offset, length
+                    );
+                }
                 self.clear_dirty_for_deallocate_range(ino, offset, length);
+                if diagnostic {
+                    eprintln!(
+                        "tidefs-diagnostic: fuse fallocate clear-dirty end ino={} mode=0x{:x} elapsed_ms={}",
+                        ino,
+                        mode,
+                        clear_start.elapsed().as_millis()
+                    );
+                }
                 // Note: the write_dispatch DirtyPageTracker (workers_writeback)
                 // tracks dirty byte ranges with boundary tokens and does not yet
                 // support range-level clearing.  The writeback_range_tracker above
@@ -6365,28 +6537,15 @@ impl FuseVfsAdapter {
         e: &(dyn VfsEngineStatFs + Send),
         inode_id: InodeId,
         efh: &EngineFileHandle,
-        current_size: u64,
+        _current_size: u64,
         new_size: u64,
         ctx: &RequestCtx,
     ) -> Result<(), Errno> {
-        match new_size.cmp(&current_size) {
-            std::cmp::Ordering::Less => {
-                // Shrink: punch-hole deallocation from new size to old size.
-                e.fallocate(
-                    efh,
-                    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                    new_size,
-                    current_size - new_size,
-                    ctx,
-                )?;
-            }
-            std::cmp::Ordering::Greater => {
-                // Grow: truncate(2)/ftruncate(2) creates a sparse zero tail.
-                // Do not preallocate the range here; the setattr below records
-                // the new EOF and reads synthesize zeros for holes.
-            }
-            std::cmp::Ordering::Equal => {}
-        }
+        // Let the engine's FATTR_SIZE path own truncate semantics. Its
+        // truncate_file implementation has the buffered-write authority,
+        // effective EOF, extent deallocation, and sparse zero-tail handling in
+        // one place. Issuing a separate punch-hole here made writeback-cache
+        // fsx truncates perform the same shrink work twice.
         let mut set = SetAttr::new();
         set.valid = FATTR_SIZE;
         set.size = new_size;
@@ -7470,8 +7629,66 @@ impl FuseVfsAdapter {
             ctx,
         ) {
             Ok(written) => Ok(written),
-            Err(errno) => Err(errno),
+            Err(errno) => {
+                if fuse_op_diagnostics_enabled() {
+                    eprintln!(
+                        "tidefs-diagnostic: fuse copy_file_range engine error ino_in={} fh_in={} off_in={} ino_out={} fh_out={} off_out={} len={} errno={:?}",
+                        dispatch.plan.ino_in,
+                        dispatch.plan.fh_in,
+                        dispatch.plan.offset_in,
+                        dispatch.plan.ino_out,
+                        dispatch.plan.fh_out,
+                        dispatch.plan.offset_out,
+                        dispatch.plan.len,
+                        errno
+                    );
+                }
+                Err(errno)
+            }
         }
+    }
+
+    fn copy_file_range_with_writeback_fallback(
+        &self,
+        engine: &(dyn VfsEngineStatFs + Send),
+        ctx: &RequestCtx,
+        plan: FuseCopyFileRangePlan,
+    ) -> Result<u32, Errno> {
+        let source_fh = engine.open(InodeId::new(plan.ino_in), libc::O_RDONLY as u32, ctx)?;
+        let dest_fh = match engine.open(InodeId::new(plan.ino_out), libc::O_WRONLY as u32, ctx) {
+            Ok(dest_fh) => dest_fh,
+            Err(errno) => {
+                let _ = engine.release(&source_fh);
+                return Err(errno);
+            }
+        };
+
+        let result = engine.copy_file_range(
+            &source_fh,
+            plan.offset_in,
+            &dest_fh,
+            plan.offset_out,
+            plan.len,
+            ctx,
+        );
+        if let Err(errno) = result {
+            if fuse_op_diagnostics_enabled() {
+                eprintln!(
+                    "tidefs-diagnostic: fuse copy_file_range fallback error ino_in={} fh_in={} off_in={} ino_out={} fh_out={} off_out={} len={} errno={:?}",
+                    plan.ino_in,
+                    plan.fh_in,
+                    plan.offset_in,
+                    plan.ino_out,
+                    plan.fh_out,
+                    plan.offset_out,
+                    plan.len,
+                    errno
+                );
+            }
+        }
+        let _ = engine.release(&dest_fh);
+        let _ = engine.release(&source_fh);
+        result
     }
 
     fn validate_open_flags(open_flags: u32) -> Result<(), Errno> {
@@ -7544,6 +7761,7 @@ impl FuseVfsAdapter {
             ino, adapter_fh, engine_fh,
         ));
         self.file_handles.lock().unwrap().inc_open_ref(ino);
+        self.remember_writeback_inode(ino);
         // FUSE reply flags already computed and stored by AdapterFileHandle::new
         // during allocate(). Read them back for the reply.
         self.mmap_coherency.register(ino, 0);
@@ -7612,6 +7830,7 @@ impl FuseVfsAdapter {
             ino, adapter_fh, engine_fh,
         ));
         self.file_handles.lock().unwrap().inc_open_ref(ino);
+        self.remember_writeback_inode(ino);
         // FUSE reply flags already computed by AdapterFileHandle::new in allocate().
         let fuse_flags = {
             let fht = self.file_handles.lock().unwrap();
@@ -8169,7 +8388,30 @@ impl Filesystem for FuseVfsAdapter {
         let _p5_02 =
             Self::classify_fuse_setattr(req.unique(), ino, req.uid(), req.gid(), req.pid());
         let (sa, fh) = setattr_from_fuse(mode, uid, gid, size, atime, mtime, fh);
-        match self.dispatch_setattr(&ctx, req.unique(), ino, &sa, fh) {
+        let diagnostic = fuse_op_diagnostics_enabled();
+        let start = std::time::Instant::now();
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse setattr start unique={} ino={} fh={:?} size={:?} valid=0x{:x}",
+                req.unique(),
+                ino,
+                fh,
+                size,
+                sa.valid
+            );
+        }
+        let result = self.dispatch_setattr(&ctx, req.unique(), ino, &sa, fh);
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse setattr end unique={} ino={} status={} errno={:?} elapsed_ms={}",
+                req.unique(),
+                ino,
+                if result.is_ok() { "ok" } else { "err" },
+                result.as_ref().err(),
+                start.elapsed().as_millis()
+            );
+        }
+        match result {
             Ok(attr_out) => {
                 let attr = file_attr_from_fuse_attr(&attr_out.attr);
                 let ttl = Duration::ZERO; // attr_timeout=0: belt-and-suspenders with inval_inode below
@@ -8416,6 +8658,19 @@ impl Filesystem for FuseVfsAdapter {
         reply: ReplyWrite,
     ) {
         let _start = std::time::Instant::now();
+        let diagnostic = fuse_op_diagnostics_enabled();
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse write start unique={} ino={} fh={} offset={} len={} write_flags=0x{:x} open_flags=0x{:x}",
+                req.unique(),
+                ino,
+                fh,
+                offset,
+                data.len(),
+                _write_flags,
+                flags
+            );
+        }
         let ctx = Self::ctx_from_req(req);
         // P5-02 classification: classify the incoming write request
         // for the multi-pool dispatch seam observability path.
@@ -8460,7 +8715,7 @@ impl Filesystem for FuseVfsAdapter {
             }
         }
 
-        match self.dispatch_write_with_request_flags(
+        let result = self.dispatch_write_with_request_flags(
             &ctx,
             ino,
             fh,
@@ -8470,7 +8725,19 @@ impl Filesystem for FuseVfsAdapter {
                 write: _write_flags,
                 request_open: flags as u32,
             },
-        ) {
+        );
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse write end unique={} ino={} fh={} status={} errno={:?} elapsed_ms={}",
+                req.unique(),
+                ino,
+                fh,
+                if result.is_ok() { "ok" } else { "err" },
+                result.as_ref().err(),
+                _start.elapsed().as_millis()
+            );
+        }
+        match result {
             Ok(written) => {
                 crate::observability::HIST_WRITE.record(_start.elapsed());
                 reply.written(written);
@@ -8798,13 +9065,36 @@ impl Filesystem for FuseVfsAdapter {
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        let diagnostic = fuse_op_diagnostics_enabled();
+        let start = std::time::Instant::now();
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse fallocate start unique={} ino={} fh={} mode=0x{:x} offset={} length={}",
+                req.unique(),
+                ino,
+                fh,
+                mode,
+                offset,
+                length
+            );
+        }
         let _p5_02 =
             Self::classify_fuse_fallocate(req.unique(), ino, fh, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
-        reply_empty_ok_or_errno(
-            reply,
-            self.dispatch_fallocate_file(&ctx, ino, fh, mode as u32, offset as u64, length as u64),
-        );
+        let result =
+            self.dispatch_fallocate_file(&ctx, ino, fh, mode as u32, offset as u64, length as u64);
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse fallocate end unique={} ino={} fh={} status={} errno={:?} elapsed_ms={}",
+                req.unique(),
+                ino,
+                fh,
+                if result.is_ok() { "ok" } else { "err" },
+                result.as_ref().err(),
+                start.elapsed().as_millis()
+            );
+        }
+        reply_empty_ok_or_errno(reply, result);
     }
 
     fn lseek(
@@ -9058,6 +9348,22 @@ impl Filesystem for FuseVfsAdapter {
         flags: u32,
         reply: ReplyWrite,
     ) {
+        let diagnostic = fuse_op_diagnostics_enabled();
+        let start = std::time::Instant::now();
+        if diagnostic {
+            eprintln!(
+                "tidefs-diagnostic: fuse copy_file_range start unique={} ino_in={} fh_in={} off_in={} ino_out={} fh_out={} off_out={} len={} flags=0x{:x}",
+                req.unique(),
+                ino_in,
+                fh_in,
+                offset_in,
+                ino_out,
+                fh_out,
+                offset_out,
+                len,
+                flags
+            );
+        }
         let _p5_02 = Self::classify_fuse_copy_file_range(
             req.unique(),
             ino_in,
@@ -9077,10 +9383,24 @@ impl Filesystem for FuseVfsAdapter {
             len,
             flags,
         );
+        enum CopyDispatch {
+            Registered(VfsCopyFileRangeDispatch),
+            WritebackFallback(FuseCopyFileRangePlan),
+        }
+
         let dispatch = {
             let handles = self.file_handles.lock().unwrap();
-            match plan_vfs_copy_file_range_dispatch(&handles, request) {
-                Ok(dispatch) => dispatch,
+            match plan_vfs_copy_file_range_dispatch(&handles, &request) {
+                Ok(dispatch) => CopyDispatch::Registered(dispatch),
+                Err(Errno::EBADF) if self.writeback_cache_enabled => {
+                    match plan_vfs_copy_file_range_writeback_fallback(&handles, &request) {
+                        Ok(plan) => CopyDispatch::WritebackFallback(plan),
+                        Err(errno) => {
+                            reply.reply_errno(errno);
+                            return;
+                        }
+                    }
+                }
                 Err(errno) => {
                     reply.reply_errno(errno);
                     return;
@@ -9089,10 +9409,45 @@ impl Filesystem for FuseVfsAdapter {
         };
 
         let ctx = Self::ctx_from_req(req);
+        let copy_dest = match &dispatch {
+            CopyDispatch::Registered(dispatch) => (dispatch.plan.ino_out, dispatch.plan.offset_out),
+            CopyDispatch::WritebackFallback(plan) => (plan.ino_out, plan.offset_out),
+        };
         let engine = self.engine.lock().unwrap();
-        match self.copy_file_range_with_engine(&**engine, &ctx, dispatch) {
-            Ok(written) => reply.written(written),
-            Err(errno) => reply.reply_errno(errno),
+        let result = match dispatch {
+            CopyDispatch::Registered(dispatch) => {
+                self.copy_file_range_with_engine(&**engine, &ctx, dispatch)
+            }
+            CopyDispatch::WritebackFallback(plan) => {
+                self.copy_file_range_with_writeback_fallback(&**engine, &ctx, plan)
+            }
+        };
+        match result {
+            Ok(written) => {
+                if written > 0 {
+                    self.invalidate_inode_metadata_after_engine_write(copy_dest.0);
+                }
+                if diagnostic {
+                    eprintln!(
+                        "tidefs-diagnostic: fuse copy_file_range end unique={} status=ok written={} elapsed_ms={}",
+                        req.unique(),
+                        written,
+                        start.elapsed().as_millis()
+                    );
+                }
+                reply.written(written);
+            }
+            Err(errno) => {
+                if diagnostic {
+                    eprintln!(
+                        "tidefs-diagnostic: fuse copy_file_range end unique={} status=err errno={:?} elapsed_ms={}",
+                        req.unique(),
+                        errno,
+                        start.elapsed().as_millis()
+                    );
+                }
+                reply.reply_errno(errno);
+            }
         }
     }
 
@@ -16183,6 +16538,53 @@ mod tests {
     }
 
     #[test]
+    fn vfs_adapter_open_ref_count_tracks_dispatch_create_entry() {
+        let mut fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+
+        let created = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"create-refcount.txt",
+                0o644,
+                libc::O_RDWR as u32,
+            )
+            .expect("create dispatch");
+        let inode = created.attr.inode_id.get();
+
+        assert_eq!(
+            fixture
+                .adapter
+                .file_handles
+                .lock()
+                .unwrap()
+                .open_ref_count(inode),
+            1
+        );
+
+        fixture
+            .adapter
+            .dispatch_release(inode, created.adapter_fh, 0, None, false)
+            .expect("release created handle");
+
+        assert_eq!(
+            fixture
+                .adapter
+                .file_handles
+                .lock()
+                .unwrap()
+                .open_ref_count(inode),
+            0
+        );
+    }
+
+    #[test]
     fn vfs_adapter_open_ref_count_decrements_on_release() {
         let mut fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -17677,7 +18079,7 @@ mod tests {
 
         let dispatch = plan_vfs_copy_file_range_dispatch(
             &table,
-            copy_file_range_request(CopyFileRangeFixture {
+            &copy_file_range_request(CopyFileRangeFixture {
                 ino_in: 42,
                 fh_in: source,
                 offset_in: 128,
@@ -17716,7 +18118,7 @@ mod tests {
         assert_eq!(
             plan_vfs_copy_file_range_dispatch(
                 &table,
-                copy_file_range_request(CopyFileRangeFixture {
+                &copy_file_range_request(CopyFileRangeFixture {
                     ino_in: 42,
                     fh_in: read_only,
                     offset_in: -1,
@@ -17732,7 +18134,7 @@ mod tests {
         assert_eq!(
             plan_vfs_copy_file_range_dispatch(
                 &table,
-                copy_file_range_request(CopyFileRangeFixture {
+                &copy_file_range_request(CopyFileRangeFixture {
                     ino_in: 42,
                     fh_in: read_only,
                     offset_in: 0,
@@ -17748,7 +18150,7 @@ mod tests {
         assert_eq!(
             plan_vfs_copy_file_range_dispatch(
                 &table,
-                copy_file_range_request(CopyFileRangeFixture {
+                &copy_file_range_request(CopyFileRangeFixture {
                     ino_in: 42,
                     fh_in: 999,
                     offset_in: 0,
@@ -17764,7 +18166,7 @@ mod tests {
         assert_eq!(
             plan_vfs_copy_file_range_dispatch(
                 &table,
-                copy_file_range_request(CopyFileRangeFixture {
+                &copy_file_range_request(CopyFileRangeFixture {
                     ino_in: 43,
                     fh_in: write_only,
                     offset_in: 0,
@@ -17780,7 +18182,7 @@ mod tests {
         assert_eq!(
             plan_vfs_copy_file_range_dispatch(
                 &table,
-                copy_file_range_request(CopyFileRangeFixture {
+                &copy_file_range_request(CopyFileRangeFixture {
                     ino_in: 42,
                     fh_in: read_only,
                     offset_in: 0,
@@ -17812,7 +18214,7 @@ mod tests {
         assert_eq!(
             plan_vfs_copy_file_range_dispatch(
                 &table,
-                copy_file_range_request(CopyFileRangeFixture {
+                &copy_file_range_request(CopyFileRangeFixture {
                     ino_in: 42,
                     fh_in: source,
                     offset_in: 0,
@@ -17831,7 +18233,7 @@ mod tests {
         assert_eq!(
             plan_vfs_copy_file_range_dispatch(
                 &table,
-                copy_file_range_request(CopyFileRangeFixture {
+                &copy_file_range_request(CopyFileRangeFixture {
                     ino_in: 42,
                     fh_in: source,
                     offset_in: 0,
@@ -17893,6 +18295,69 @@ mod tests {
             engine.read(&engine_fh, 0x1351e, 0xb039, &ctx).unwrap(),
             vec![0; 0xb039]
         );
+    }
+
+    #[test]
+    fn writeback_copy_file_range_fallback_uses_live_open_authority() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-copy-fallback.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let source = b"copy me through the writeback fallback";
+        let dest_offset = 0x2000;
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0, source, FUSE_WRITE_CACHE)
+            .expect("write source bytes");
+
+        let request = FuseCopyFileRangeRequest::new(
+            82,
+            ino,
+            adapter_fh + 10_000,
+            0,
+            ino,
+            adapter_fh + 20_000,
+            dest_offset,
+            source.len() as u64,
+            0,
+        );
+        let fallback_plan = {
+            let handles = fixture.adapter.file_handles.lock().unwrap();
+            assert_eq!(
+                plan_vfs_copy_file_range_dispatch(&handles, &request),
+                Err(Errno::EBADF)
+            );
+            plan_vfs_copy_file_range_writeback_fallback(&handles, &request)
+                .expect("writeback fallback plan")
+        };
+
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .copy_file_range_with_writeback_fallback(&**engine, &ctx, fallback_plan)
+                .expect("copy through fallback handles")
+        };
+        assert_eq!(copied, source.len() as u32);
+
+        let read_back = fixture
+            .adapter
+            .dispatch_read(
+                &ctx,
+                ino,
+                adapter_fh,
+                dest_offset,
+                source.len() as u32,
+                None,
+            )
+            .expect("read copied bytes");
+        assert_eq!(read_back, source);
     }
 
     #[test]
@@ -31386,6 +31851,128 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_setattr_missing_timestamp_only_non_orphan_returns_estale() {
+        let (adapter, root) = attr_test_adapter();
+        let ctx = root_ctx();
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MTIME;
+        set.mtime_ns = 1_700_000_123_000_000_000;
+        let err = adapter
+            .dispatch_setattr(&ctx, 303, 99999, &set, None)
+            .expect_err("timestamp setattr on nonexistent non-orphan inode");
+        assert_eq!(
+            err,
+            Errno::ESTALE,
+            "missing non-orphan inode should still return ESTALE"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn writeback_unseen_missing_timestamp_only_setattr_returns_estale() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MTIME;
+        set.mtime_ns = 1_700_000_321_000_000_000;
+
+        let err = fixture
+            .adapter
+            .dispatch_setattr(&ctx, 304, 99999, &set, None)
+            .expect_err("unseen missing writeback inode");
+
+        assert_eq!(err, Errno::ESTALE);
+    }
+
+    #[test]
+    fn writeback_seen_removed_timestamp_only_setattr_succeeds() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let name = b"writeback-seen-removed-mtime.txt";
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let created = fixture
+            .adapter
+            .dispatch_create_entry(&ctx, root.get(), name, 0o644, libc::O_RDWR as u32)
+            .expect("create dispatch");
+        let ino = created.attr.inode_id.get();
+
+        fixture
+            .adapter
+            .dispatch_release(ino, created.adapter_fh, 0, None, false)
+            .expect("release before unlink");
+        fixture
+            .adapter
+            .dispatch_unlink(&ctx, root.get(), name)
+            .expect("unlink after close");
+        assert!(
+            !fixture.adapter.orphan_index.lock().unwrap().contains(ino),
+            "closed unlink should not create an orphan entry"
+        );
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MTIME;
+        set.mtime_ns = 1_700_000_654_000_000_000;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 305, ino, &set, None)
+            .expect("late timestamp-only setattr for writeback-seen inode");
+    }
+
+    #[test]
+    fn writeback_orphan_timestamp_only_setattr_after_release_succeeds() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let name = b"writeback-open-unlink-mtime.txt";
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let created = fixture
+            .adapter
+            .dispatch_create_entry(&ctx, root.get(), name, 0o644, libc::O_RDWR as u32)
+            .expect("create dispatch");
+        let ino = created.attr.inode_id.get();
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, created.adapter_fh, 0, b"before unlink", 0)
+            .expect("write before unlink");
+        fixture
+            .adapter
+            .dispatch_unlink(&ctx, root.get(), name)
+            .expect("unlink while open");
+        assert!(
+            fixture.adapter.orphan_index.lock().unwrap().contains(ino),
+            "unlink while open should register orphan before release"
+        );
+
+        fixture
+            .adapter
+            .dispatch_release(ino, created.adapter_fh, 0, None, false)
+            .expect("release open-unlinked handle");
+
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            assert_eq!(
+                engine.getattr(InodeId::new(ino), None, &ctx).unwrap_err(),
+                Errno::ENOENT,
+                "engine should have reclaimed the anonymous tmpfile"
+            );
+        }
+
+        let mut set = SetAttr::new();
+        set.valid = FATTR_MTIME;
+        set.mtime_ns = 1_700_000_456_000_000_000;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 304, ino, &set, None)
+            .expect("late orphan timestamp-only setattr");
+    }
+
+    #[test]
     fn dispatch_setattr_truncate_shrink_reflected_in_getattr() {
         let (adapter, root) = attr_test_adapter();
         let ctx = root_ctx();
@@ -36529,6 +37116,28 @@ mod tests {
         fixture
     }
 
+    fn adapter_fixture_with_writeback_cache_deferred_commit() -> AdapterFixture {
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-vfs-adapter-wb-deferred-{}-{temp_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let mut local_fs = LocalFileSystem::open_with_root_authentication_key(
+            &root,
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open local filesystem");
+        local_fs.set_auto_commit(false);
+        local_fs.set_max_uncommitted_mutations(16 * 1024);
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let mut adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
+        adapter.writeback_cache_enabled = true;
+        adapter.timestamp_policy = TimestampPolicy::StrictAtime;
+        AdapterFixture { adapter, root }
+    }
+
     #[test]
     fn writeback_cached_overwrite_defers_namespace_attr_sync_until_flush() {
         assert!(
@@ -36747,6 +37356,13 @@ mod tests {
             .dispatch_read(&ctx, ino, adapter_fh, 0, data.len() as u32, None)
             .expect("read after writeback-cached write");
         assert_eq!(read_back, data);
+        assert!(fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_none_or(|ranges| ranges.is_empty()));
     }
 
     #[test]
@@ -37124,6 +37740,1567 @@ mod tests {
             .dispatch_read(&ctx, inode.get(), read_fh, 0, data.len() as u32, None)
             .expect("read released data");
         assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn writeback_cached_open_unlink_syncfs_keeps_content_manifest_consistent() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let create = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"wb-open-unlink-syncfs.txt",
+                0o644,
+                libc::O_RDWR as u32,
+            )
+            .expect("create writeback-cache file");
+        let inode = create.attr.inode_id;
+        let adapter_fh = create.adapter_fh;
+        let data = b"hello\n";
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, data, FUSE_WRITE_CACHE)
+            .expect("writeback cached write");
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, data.len() as u32, None)
+            .expect("read after write");
+        assert_eq!(read_back, data);
+
+        fixture
+            .adapter
+            .dispatch_unlink_entry(&ctx, root.get(), b"wb-open-unlink-syncfs.txt")
+            .expect("unlink while open");
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_flush(&ctx, inode.get(), adapter_fh, 0),
+            Ok(())
+        );
+        fixture
+            .adapter
+            .dispatch_release(inode.get(), adapter_fh, 0, None, false)
+            .expect("release unlinked handle");
+
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs after writeback open-unlink");
+    }
+
+    #[test]
+    fn writeback_cached_closed_unlink_syncfs_keeps_content_manifest_consistent() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let create = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"wb-closed-unlink-syncfs.txt",
+                0o644,
+                libc::O_RDWR as u32,
+            )
+            .expect("create writeback-cache file");
+        let inode = create.attr.inode_id;
+        let adapter_fh = create.adapter_fh;
+        let data = b"hello\n";
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, data, FUSE_WRITE_CACHE)
+            .expect("writeback cached write");
+        fixture
+            .adapter
+            .dispatch_flush(&ctx, inode.get(), adapter_fh, 0)
+            .expect("flush writer");
+        fixture
+            .adapter
+            .dispatch_release(inode.get(), adapter_fh, 0, None, false)
+            .expect("release writer");
+
+        let read_open = fixture
+            .adapter
+            .dispatch_open(&ctx, inode.get(), libc::O_RDONLY as u32)
+            .expect("open reader");
+        let read_back = fixture
+            .adapter
+            .dispatch_read(
+                &ctx,
+                inode.get(),
+                read_open.adapter_fh,
+                0,
+                data.len() as u32,
+                None,
+            )
+            .expect("read after close");
+        assert_eq!(read_back, data);
+        fixture
+            .adapter
+            .dispatch_release(inode.get(), read_open.adapter_fh, 0, None, false)
+            .expect("release reader");
+
+        fixture
+            .adapter
+            .dispatch_unlink_entry(&ctx, root.get(), b"wb-closed-unlink-syncfs.txt")
+            .expect("unlink closed file");
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs after writeback closed-unlink");
+    }
+
+    #[test]
+    fn writeback_cached_fsx075_seed0_syncfs_keeps_content_manifest_consistent() {
+        fn pattern(len: usize, seed: u8) -> Vec<u8> {
+            (0..len)
+                .map(|idx| seed.wrapping_add((idx % 251) as u8))
+                .collect()
+        }
+
+        fn overlay(expected: &mut Vec<u8>, offset: usize, data: &[u8]) {
+            let end = offset.checked_add(data.len()).expect("overlay end");
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[offset..end].copy_from_slice(data);
+        }
+
+        fn zero(expected: &mut [u8], offset: usize, len: usize) {
+            let end = offset.saturating_add(len).min(expected.len());
+            if offset < end {
+                expected[offset..end].fill(0);
+            }
+        }
+
+        let fixture = adapter_fixture_with_writeback_cache_deferred_commit();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-fsx075-seed0.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let mut expected = Vec::new();
+
+        let first = pattern(0xb218, 0x11);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x267e2, &first, FUSE_WRITE_CACHE)
+            .expect("write first fsx extent");
+        overlay(&mut expected, 0x267e2, &first);
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            assert_eq!(
+                engine
+                    .read(&engine_fh, 0x2045a, 0xe1f6, &ctx)
+                    .expect("engine read first fsx copy source"),
+                expected[0x2045a..0x2045a + 0xe1f6]
+            );
+        }
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_read(&ctx, ino, adapter_fh, 0x2045a, 0xe1f6, None)
+                .expect("read first fsx copy source"),
+            expected[0x2045a..0x2045a + 0xe1f6]
+        );
+
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan: FuseCopyFileRangePlan {
+                unique: 75,
+                ino_in: ino,
+                fh_in: adapter_fh,
+                offset_in: 0x2045a,
+                ino_out: ino,
+                fh_out: adapter_fh,
+                offset_out: 0x5380,
+                len: 0xe1f6,
+            },
+            source_fh: engine_fh,
+            dest_fh: engine_fh,
+        };
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("copy first fsx range")
+        };
+        assert_eq!(copied, 0xe1f6);
+        let copied_bytes = expected[0x2045a..0x2045a + 0xe1f6].to_vec();
+        overlay(&mut expected, 0x5380, &copied_bytes);
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x1098c)
+            .expect("truncate after first copy");
+        expected.truncate(0x1098c);
+
+        let second = pattern(0x78c4, 0x42);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x15110, &second, FUSE_WRITE_CACHE)
+            .expect("write second fsx extent");
+        overlay(&mut expected, 0x15110, &second);
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x2b2c)
+            .expect("truncate before punch");
+        expected.truncate(0x2b2c);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                0x2612,
+                0x51a,
+            )
+            .expect("punch fsx hole");
+        zero(&mut expected, 0x2612, 0x51a);
+
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan: FuseCopyFileRangePlan {
+                unique: 76,
+                ino_in: ino,
+                fh_in: adapter_fh,
+                offset_in: 0x4a8,
+                ino_out: ino,
+                fh_out: adapter_fh,
+                offset_out: 0x67b1,
+                len: 0x2001,
+            },
+            source_fh: engine_fh,
+            dest_fh: engine_fh,
+        };
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("copy second fsx range")
+        };
+        assert_eq!(copied, 0x2001);
+        let copied_bytes = expected[0x4a8..0x4a8 + 0x2001].to_vec();
+        overlay(&mut expected, 0x67b1, &copied_bytes);
+
+        let third = pattern(0x782a, 0x93);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x6f15, &third, FUSE_WRITE_CACHE)
+            .expect("write final fsx extent");
+        overlay(&mut expected, 0x6f15, &third);
+
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0, expected.len() as u32, None)
+            .expect("read final fsx content");
+        assert_eq!(read_back, expected);
+
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs after fsx writeback-cache sequence");
+    }
+
+    #[test]
+    fn writeback_cached_fsx075_late_sparse_copy_after_zero_punch_truncate() {
+        fn pattern(len: usize, seed: u8) -> Vec<u8> {
+            (0..len)
+                .map(|idx| seed.wrapping_add((idx % 251) as u8))
+                .collect()
+        }
+
+        fn overlay(expected: &mut Vec<u8>, offset: usize, data: &[u8]) {
+            let end = offset.checked_add(data.len()).expect("overlay end");
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[offset..end].copy_from_slice(data);
+        }
+
+        fn zero(expected: &mut Vec<u8>, offset: usize, len: usize, keep_size: bool) {
+            let end = offset.checked_add(len).expect("zero end");
+            if !keep_size && expected.len() < end {
+                expected.resize(end, 0);
+            }
+            let end = end.min(expected.len());
+            if offset < end {
+                expected[offset..end].fill(0);
+            }
+        }
+
+        let fixture = adapter_fixture_with_writeback_cache_deferred_commit();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-fsx075-late-sparse-copy.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let mut expected = Vec::new();
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, FALLOC_FL_ZERO_RANGE, 0x7ba8, 0x3fb5)
+            .expect("initial zero range");
+        zero(&mut expected, 0x7ba8, 0x3fb5, false);
+
+        let first = pattern(0x2d4b, 0x21);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x16c18, &first, FUSE_WRITE_CACHE)
+            .expect("write first fsx extent");
+        overlay(&mut expected, 0x16c18, &first);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, 0, 0x33f5b, 0xb011)
+            .expect("extend fallocate");
+        expected.resize(0x3ef6c, 0);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE,
+                0xa402,
+                0xd8ec,
+            )
+            .expect("keep-size zero range");
+        zero(&mut expected, 0xa402, 0xd8ec, true);
+
+        let second = pattern(0x28e0, 0x42);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x2cd5, &second, FUSE_WRITE_CACHE)
+            .expect("write second fsx extent");
+        overlay(&mut expected, 0x2cd5, &second);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                0x30c58,
+                0x1c80,
+            )
+            .expect("punch first fsx hole");
+        zero(&mut expected, 0x30c58, 0x1c80, true);
+
+        let third = pattern(0x739b, 0x63);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x33335, &third, FUSE_WRITE_CACHE)
+            .expect("write third fsx extent");
+        overlay(&mut expected, 0x33335, &third);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, 0, 0x323aa, 0x5a10)
+            .expect("in-size fallocate");
+
+        let fourth = pattern(0x37ec, 0x84);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x3c814, &fourth, FUSE_WRITE_CACHE)
+            .expect("write fourth fsx extent");
+        overlay(&mut expected, 0x3c814, &fourth);
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x33952)
+            .expect("truncate after fourth write");
+        expected.truncate(0x33952);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                0x231c3,
+                0x517b,
+            )
+            .expect("punch second fsx hole");
+        zero(&mut expected, 0x231c3, 0x517b, true);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, FALLOC_FL_ZERO_RANGE, 0x2c381, 0xfaf3)
+            .expect("extending zero range");
+        zero(&mut expected, 0x2c381, 0xfaf3, false);
+
+        let fifth = pattern(0x360f, 0xa5);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x13b37, &fifth, FUSE_WRITE_CACHE)
+            .expect("write fifth fsx extent");
+        overlay(&mut expected, 0x13b37, &fifth);
+
+        let sixth = pattern(0x57c6, 0xc6);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0xe1a7, &sixth, FUSE_WRITE_CACHE)
+            .expect("write sixth fsx extent");
+        overlay(&mut expected, 0xe1a7, &sixth);
+
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan: FuseCopyFileRangePlan {
+                unique: 77,
+                ino_in: ino,
+                fh_in: adapter_fh,
+                offset_in: 0xde31,
+                ino_out: ino,
+                fh_out: adapter_fh,
+                offset_out: 0x1c07e,
+                len: 0xb6d2,
+            },
+            source_fh: engine_fh,
+            dest_fh: engine_fh,
+        };
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("copy late fsx range")
+        };
+        assert_eq!(copied, 0xb6d2);
+        let copied_bytes = expected[0xde31..0xde31 + 0xb6d2].to_vec();
+        overlay(&mut expected, 0x1c07e, &copied_bytes);
+
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x1c07e, 0xb6d2, None)
+            .expect("read copied late fsx range");
+        assert_eq!(read_back, copied_bytes);
+
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs after late fsx writeback-cache sequence");
+    }
+
+    #[test]
+    fn writeback_cached_fsx075_kernel_page_flush_before_late_copy() {
+        fn pattern(len: usize, seed: u8) -> Vec<u8> {
+            (0..len)
+                .map(|idx| seed.wrapping_add((idx % 251) as u8))
+                .collect()
+        }
+
+        fn overlay(expected: &mut Vec<u8>, offset: usize, data: &[u8]) {
+            let end = offset.checked_add(data.len()).expect("overlay end");
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[offset..end].copy_from_slice(data);
+        }
+
+        fn zero(expected: &mut Vec<u8>, offset: usize, len: usize, keep_size: bool) {
+            let end = offset.checked_add(len).expect("zero end");
+            if !keep_size && expected.len() < end {
+                expected.resize(end, 0);
+            }
+            let end = end.min(expected.len());
+            if offset < end {
+                expected[offset..end].fill(0);
+            }
+        }
+
+        let fixture = adapter_fixture_with_writeback_cache_deferred_commit();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-fsx075-kernel-page-flush.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let mut expected = Vec::new();
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, FALLOC_FL_ZERO_RANGE, 0x7ba8, 0x3fb5)
+            .expect("initial zero range");
+        zero(&mut expected, 0x7ba8, 0x3fb5, false);
+
+        let first = pattern(0x2d4b, 0x21);
+        overlay(&mut expected, 0x16c18, &first);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, 0, 0x33f5b, 0xb011)
+            .expect("extend fallocate");
+        expected.resize(0x3ef6c, 0);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE,
+                0xa402,
+                0xd8ec,
+            )
+            .expect("keep-size zero range");
+        zero(&mut expected, 0xa402, 0xd8ec, true);
+
+        let second = pattern(0x28e0, 0x42);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x2cd5, &second, FUSE_WRITE_CACHE)
+            .expect("flushed second fsx extent");
+        overlay(&mut expected, 0x2cd5, &second);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                0x30c58,
+                0x1c80,
+            )
+            .expect("punch first fsx hole");
+        zero(&mut expected, 0x30c58, 0x1c80, true);
+
+        let third = pattern(0x739b, 0x63);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x33335, &third, FUSE_WRITE_CACHE)
+            .expect("flushed third fsx extent");
+        overlay(&mut expected, 0x33335, &third);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, 0, 0x323aa, 0x5a10)
+            .expect("in-size fallocate");
+
+        let fourth = pattern(0x37ec, 0x84);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x3c814, &fourth, FUSE_WRITE_CACHE)
+            .expect("flushed fourth fsx extent");
+        overlay(&mut expected, 0x3c814, &fourth);
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x33952)
+            .expect("truncate after fourth write");
+        expected.truncate(0x33952);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                0x231c3,
+                0x517b,
+            )
+            .expect("punch second fsx hole");
+        zero(&mut expected, 0x231c3, 0x517b, true);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, FALLOC_FL_ZERO_RANGE, 0x2c381, 0xfaf3)
+            .expect("extending zero range");
+        zero(&mut expected, 0x2c381, 0xfaf3, false);
+
+        let fifth = pattern(0x360f, 0xa5);
+        overlay(&mut expected, 0x13b37, &fifth);
+        let sixth = pattern(0x57c6, 0xc6);
+        overlay(&mut expected, 0xe1a7, &sixth);
+
+        let page_flush = expected[0xd000..0x1a000].to_vec();
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0xd000, &page_flush, FUSE_WRITE_CACHE)
+            .expect("kernel page-aligned writeback before copy");
+
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan: FuseCopyFileRangePlan {
+                unique: 78,
+                ino_in: ino,
+                fh_in: adapter_fh,
+                offset_in: 0xde31,
+                ino_out: ino,
+                fh_out: adapter_fh,
+                offset_out: 0x1c07e,
+                len: 0xb6d2,
+            },
+            source_fh: engine_fh,
+            dest_fh: engine_fh,
+        };
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("copy after kernel page-aligned writeback")
+        };
+        assert_eq!(copied, 0xb6d2);
+        let copied_bytes = expected[0xde31..0xde31 + 0xb6d2].to_vec();
+        overlay(&mut expected, 0x1c07e, &copied_bytes);
+
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x1c07e, 0xb6d2, None)
+            .expect("read copied range after page-aligned writeback");
+        assert_eq!(read_back, copied_bytes);
+    }
+
+    #[test]
+    fn writeback_cached_fsx075_mapwrite_then_sparse_copy_range() {
+        fn pattern(len: usize) -> Vec<u8> {
+            (0..len)
+                .map(|idx| 0x05_u8.wrapping_add(((idx * 37) % 251) as u8))
+                .collect()
+        }
+
+        fn overlay(expected: &mut Vec<u8>, offset: usize, data: &[u8]) {
+            let end = offset.checked_add(data.len()).expect("overlay end");
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[offset..end].copy_from_slice(data);
+        }
+
+        let fixture = adapter_fixture_with_writeback_cache_deferred_commit();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-fsx075-mapwrite-copy.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let mut expected = vec![0; 0x31663];
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x31663)
+            .expect("truncate up");
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x252fd)
+            .expect("truncate down");
+        expected.truncate(0x252fd);
+
+        let mapread = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x10251, 0xaea0, None)
+            .expect("fsx mapread before mapwrite");
+        assert_eq!(mapread, vec![0; 0xaea0]);
+
+        let mapped = pattern(0x78c0);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x12db9, &mapped, FUSE_WRITE_CACHE)
+            .expect("fsx mapwrite writeback");
+        overlay(&mut expected, 0x12db9, &mapped);
+
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan: FuseCopyFileRangePlan {
+                unique: 79,
+                ino_in: ino,
+                fh_in: adapter_fh,
+                offset_in: 0x1d658,
+                ino_out: ino,
+                fh_out: adapter_fh,
+                offset_out: 0xbe71,
+                len: 0x7ca5,
+            },
+            source_fh: engine_fh,
+            dest_fh: engine_fh,
+        };
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("copy sparse source after fsx mapwrite")
+        };
+        assert_eq!(copied, 0x7ca5);
+        let copied_bytes = expected[0x1d658..0x1d658 + 0x7ca5].to_vec();
+        overlay(&mut expected, 0xbe71, &copied_bytes);
+
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0, expected.len() as u32, None)
+            .expect("read after sparse copy");
+        assert_eq!(read_back, expected);
+    }
+
+    #[test]
+    fn writeback_cached_fsx075_sparse_truncate_then_server_copy() {
+        fn pattern(len: usize) -> Vec<u8> {
+            (0..len)
+                .map(|idx| 0x0b_u8.wrapping_add(((idx * 29) % 251) as u8))
+                .collect()
+        }
+
+        fn overlay(expected: &mut Vec<u8>, offset: usize, data: &[u8]) {
+            let end = offset.checked_add(data.len()).expect("overlay end");
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[offset..end].copy_from_slice(data);
+        }
+
+        let fixture = adapter_fixture_with_writeback_cache_deferred_commit();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-fsx075-qemu3-server-copy.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let mut expected = Vec::new();
+
+        let mapped = pattern(0x17ff);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x219d2, &mapped, FUSE_WRITE_CACHE)
+            .expect("fsx mapwrite writeback");
+        overlay(&mut expected, 0x219d2, &mapped);
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x2bc0c)
+            .expect("truncate up after mapwrite");
+        expected.resize(0x2bc0c, 0);
+
+        let source = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x13903, 0x38b1, None)
+            .expect("kernel fallback copy source read");
+        assert_eq!(source, expected[0x13903..0x13903 + 0x38b1]);
+
+        for page in [0x28000_u64, 0x29000, 0x2a000, 0x2b000] {
+            let remaining = 0x2bc0c_u64.saturating_sub(page);
+            let size = remaining.min(0x1000) as u32;
+            let page_read = fixture
+                .adapter
+                .dispatch_read(&ctx, ino, adapter_fh, page as i64, size, None)
+                .expect("kernel write_begin destination page fill");
+            assert_eq!(
+                page_read,
+                expected[page as usize..page as usize + size as usize]
+            );
+        }
+
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan: FuseCopyFileRangePlan {
+                unique: 80,
+                ino_in: ino,
+                fh_in: adapter_fh,
+                offset_in: 0x13903,
+                ino_out: ino,
+                fh_out: adapter_fh,
+                offset_out: 0x280b7,
+                len: 0x38b1,
+            },
+            source_fh: {
+                let handles = fixture.adapter.file_handles.lock().unwrap();
+                handles
+                    .resolve(ino, adapter_fh, 0)
+                    .expect("resolve source handle")
+            },
+            dest_fh: {
+                let handles = fixture.adapter.file_handles.lock().unwrap();
+                handles
+                    .resolve(ino, adapter_fh, 0)
+                    .expect("resolve destination handle")
+            },
+        };
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("server copy after sparse truncate")
+        };
+        assert_eq!(copied, 0x38b1);
+        overlay(&mut expected, 0x280b7, &source);
+
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0, expected.len() as u32, None)
+            .expect("read after fallback copy");
+        assert_eq!(read_back, expected);
+    }
+
+    #[test]
+    fn writeback_cached_fsx075_dirty_source_then_server_copy() {
+        fn pattern(len: usize, seed: u8) -> Vec<u8> {
+            (0..len)
+                .map(|idx| seed.wrapping_add(((idx * 31) % 251) as u8))
+                .collect()
+        }
+
+        fn overlay(expected: &mut Vec<u8>, offset: usize, data: &[u8]) {
+            let end = offset.checked_add(data.len()).expect("overlay end");
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[offset..end].copy_from_slice(data);
+        }
+
+        fn zero(expected: &mut [u8], offset: usize, len: usize) {
+            let end = offset.saturating_add(len).min(expected.len());
+            if offset < end {
+                expected[offset..end].fill(0);
+            }
+        }
+
+        let fixture = adapter_fixture_with_writeback_cache_deferred_commit();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-fsx075-qemu4-dirty-source-copy.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let mut expected = Vec::new();
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x24127)
+            .expect("initial truncate up");
+        expected.resize(0x24127, 0);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, 0, 0x20a87, 0x9c4a)
+            .expect("extend fallocate");
+        expected.resize(0x2a6d1, 0);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                0x1eb2,
+                0xbf23,
+            )
+            .expect("punch hole");
+        zero(&mut expected, 0x1eb2, 0xbf23);
+
+        let mapped = pattern(0xb061, 0x17);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x11e59, &mapped, FUSE_WRITE_CACHE)
+            .expect("writeback source mapwrite");
+        overlay(&mut expected, 0x11e59, &mapped);
+
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x22e01, 0x78d0, None)
+            .expect("fsx read after mapwrite");
+        assert_eq!(read_back, expected[0x22e01..0x22e01 + 0x78d0]);
+
+        let high_write = pattern(0x62b1, 0x51);
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                ino,
+                adapter_fh,
+                0x32006,
+                &high_write,
+                FUSE_WRITE_CACHE,
+            )
+            .expect("writeback high sparse write");
+        overlay(&mut expected, 0x32006, &high_write);
+
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan: FuseCopyFileRangePlan {
+                unique: 81,
+                ino_in: ino,
+                fh_in: adapter_fh,
+                offset_in: 0xbe8c,
+                ino_out: ino,
+                fh_out: adapter_fh,
+                offset_out: 0x1a777,
+                len: 0xa6e2,
+            },
+            source_fh: engine_fh,
+            dest_fh: engine_fh,
+        };
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("server copy from dirty source range")
+        };
+        assert_eq!(copied, 0xa6e2);
+        let copied_bytes = expected[0xbe8c..0xbe8c + 0xa6e2].to_vec();
+        overlay(&mut expected, 0x1a777, &copied_bytes);
+
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x1a777, 0xa6e2, None)
+            .expect("read copied dirty-source range");
+        assert_eq!(read_back, copied_bytes);
+    }
+
+    #[test]
+    fn writeback_cached_fsx075_splice_fallback_sparse_copy_sequence() {
+        fn pattern(len: usize) -> Vec<u8> {
+            (0..len)
+                .map(|idx| 0x02_u8.wrapping_add(((idx * 53) % 251) as u8))
+                .collect()
+        }
+
+        fn overlay(expected: &mut Vec<u8>, offset: usize, data: &[u8]) {
+            let end = offset.checked_add(data.len()).expect("overlay end");
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[offset..end].copy_from_slice(data);
+        }
+
+        fn zero(expected: &mut Vec<u8>, offset: usize, len: usize, keep_size: bool) {
+            let end = offset.checked_add(len).expect("zero end");
+            if !keep_size && expected.len() < end {
+                expected.resize(end, 0);
+            }
+            let end = end.min(expected.len());
+            if offset < end {
+                expected[offset..end].fill(0);
+            }
+        }
+
+        let fixture = adapter_fixture_with_writeback_cache_deferred_commit();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-fsx075-qemu7-splice-copy.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let mut expected = Vec::new();
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE,
+                0x1f567,
+                0x4996,
+            )
+            .expect("initial keep-size zero range");
+        zero(&mut expected, 0x1f567, 0x4996, true);
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x1db14)
+            .expect("truncate up");
+        expected.resize(0x1db14, 0);
+
+        let high = pattern(0x6d24);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x392dc, &high, FUSE_WRITE_CACHE)
+            .expect("high sparse write");
+        overlay(&mut expected, 0x392dc, &high);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                0x334b1,
+                0x423d,
+            )
+            .expect("punch high hole");
+        zero(&mut expected, 0x334b1, 0x423d, true);
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x110ef)
+            .expect("truncate down after high write");
+        expected.truncate(0x110ef);
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x3e06c)
+            .expect("truncate up before zero range");
+        expected.resize(0x3e06c, 0);
+
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x2074)
+            .expect("truncate down before zero range");
+        expected.truncate(0x2074);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, FALLOC_FL_ZERO_RANGE, 0x316dd, 0xd3b3)
+            .expect("extending zero range before copy");
+        zero(&mut expected, 0x316dd, 0xd3b3, false);
+
+        let source = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x11a77, 0xb13c, None)
+            .expect("splice fallback source read");
+        assert_eq!(source, expected[0x11a77..0x11a77 + 0xb13c]);
+
+        for page in [0x24000_u64, 0x25000, 0x2f000] {
+            let page_read = fixture
+                .adapter
+                .dispatch_read(&ctx, ino, adapter_fh, page as i64, 0x1000, None)
+                .expect("splice fallback destination page fill");
+            assert_eq!(page_read, expected[page as usize..page as usize + 0x1000]);
+        }
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x24260, &source, FUSE_WRITE_CACHE)
+            .expect("splice fallback destination write");
+        overlay(&mut expected, 0x24260, &source);
+
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x24260, 0xb13c, None)
+            .expect("read splice-copied range");
+        assert_eq!(read_back, expected[0x24260..0x24260 + 0xb13c]);
+    }
+
+    #[test]
+    fn writeback_cached_fsx075_qemu_seed0_copy_after_punches() {
+        fn pattern(len: usize, seed: u8) -> Vec<u8> {
+            (0..len)
+                .map(|idx| seed.wrapping_add(((idx * 61) % 251) as u8))
+                .collect()
+        }
+
+        fn overlay(expected: &mut Vec<u8>, offset: usize, data: &[u8]) {
+            let end = offset.checked_add(data.len()).expect("overlay end");
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[offset..end].copy_from_slice(data);
+        }
+
+        fn zero(expected: &mut Vec<u8>, offset: usize, len: usize, keep_size: bool) {
+            let end = offset.checked_add(len).expect("zero end");
+            if !keep_size && expected.len() < end {
+                expected.resize(end, 0);
+            }
+            let end = end.min(expected.len());
+            if offset < end {
+                expected[offset..end].fill(0);
+            }
+        }
+
+        fn seed0_replay_prefix(
+            name: &[u8],
+        ) -> (
+            AdapterFixture,
+            RequestCtx,
+            u64,
+            u64,
+            EngineFileHandle,
+            Vec<u8>,
+        ) {
+            let fixture = adapter_fixture_with_writeback_cache_deferred_commit();
+            let ctx = root_ctx();
+            let (inode, adapter_fh, engine_fh) =
+                create_adapter_file_handle(&fixture.adapter, &ctx, name, libc::O_RDWR as u32);
+            let ino = inode.get();
+            let mut expected = Vec::new();
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(&ctx, ino, adapter_fh, 0, 0x25bce, 0x366)
+                .expect("op1 fallocate");
+            expected.resize(0x25f34, 0);
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    FALLOC_FL_ZERO_RANGE,
+                    0x463e,
+                    0xd8c0,
+                )
+                .expect("op2 zero range");
+            zero(&mut expected, 0x463e, 0xd8c0, false);
+
+            let mapread = fixture
+                .adapter
+                .dispatch_read(&ctx, ino, adapter_fh, 0xe861, 0x70a7, None)
+                .expect("op4 mapread");
+            assert_eq!(mapread, expected[0xe861..0xe861 + 0x70a7]);
+
+            let first_mapwrite = pattern(0x2d39, 0x11);
+            fixture
+                .adapter
+                .dispatch_write(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    0x35a37,
+                    &first_mapwrite,
+                    FUSE_WRITE_CACHE,
+                )
+                .expect("op5 mapwrite");
+            overlay(&mut expected, 0x35a37, &first_mapwrite);
+
+            let write = pattern(0x7b72, 0x31);
+            fixture
+                .adapter
+                .dispatch_write(&ctx, ino, adapter_fh, 0x3848e, &write, FUSE_WRITE_CACHE)
+                .expect("op6 write");
+            overlay(&mut expected, 0x3848e, &write);
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                    0x297d0,
+                    0x2be9,
+                )
+                .expect("op7 punch");
+            zero(&mut expected, 0x297d0, 0x2be9, true);
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                    0x19a95,
+                    0xeb32,
+                )
+                .expect("op8 punch");
+            zero(&mut expected, 0x19a95, 0xeb32, true);
+
+            let second_mapwrite = pattern(0x251d, 0x51);
+            fixture
+                .adapter
+                .dispatch_write(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    0x42ae,
+                    &second_mapwrite,
+                    FUSE_WRITE_CACHE,
+                )
+                .expect("op12 mapwrite");
+            overlay(&mut expected, 0x42ae, &second_mapwrite);
+
+            let read = fixture
+                .adapter
+                .dispatch_read(&ctx, ino, adapter_fh, 0x3780c, 0x6d4f, None)
+                .expect("op13 read");
+            assert_eq!(read, expected[0x3780c..0x3780c + 0x6d4f]);
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                    0x3ded9,
+                    0x2127,
+                )
+                .expect("op14 punch");
+            zero(&mut expected, 0x3ded9, 0x2127, true);
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                    0x2c802,
+                    0xc28c,
+                )
+                .expect("op15 punch");
+            zero(&mut expected, 0x2c802, 0xc28c, true);
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                    0x3e325,
+                    0x1cdb,
+                )
+                .expect("op16 punch");
+            zero(&mut expected, 0x3e325, 0x1cdb, true);
+
+            let third_mapwrite = pattern(0x402b, 0x71);
+            fixture
+                .adapter
+                .dispatch_write(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    0x7b28,
+                    &third_mapwrite,
+                    FUSE_WRITE_CACHE,
+                )
+                .expect("op17 mapwrite");
+            overlay(&mut expected, 0x7b28, &third_mapwrite);
+
+            (fixture, ctx, ino, adapter_fh, engine_fh, expected)
+        }
+
+        let (fixture, ctx, ino, adapter_fh, engine_fh, mut expected) =
+            seed0_replay_prefix(b"wb-fsx075-qemu-seed0-server-copy.bin");
+        let source = expected[0xc6e0..0xc6e0 + 0xfc8f].to_vec();
+        assert!(source.iter().all(|byte| *byte == 0));
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan: FuseCopyFileRangePlan {
+                unique: 82,
+                ino_in: ino,
+                fh_in: adapter_fh,
+                offset_in: 0xc6e0,
+                ino_out: ino,
+                fh_out: adapter_fh,
+                offset_out: 0x26d29,
+                len: 0xfc8f,
+            },
+            source_fh: engine_fh,
+            dest_fh: engine_fh,
+        };
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("op18 server copy after qemu seed0 punch sequence")
+        };
+        assert_eq!(copied, 0xfc8f);
+        overlay(&mut expected, 0x26d29, &source);
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x26d29, 0xfc8f, None)
+            .expect("read server-copied qemu seed0 range");
+        assert_eq!(read_back, source);
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs after qemu seed0 server copy");
+
+        let (fixture, ctx, ino, adapter_fh, _engine_fh, mut expected) =
+            seed0_replay_prefix(b"wb-fsx075-qemu-seed0-fallback-copy.bin");
+        let source = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0xc6e0, 0xfc8f, None)
+            .expect("op18 fallback source read");
+        assert_eq!(source, expected[0xc6e0..0xc6e0 + 0xfc8f]);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x26d29, &source, FUSE_WRITE_CACHE)
+            .expect("op18 fallback destination write");
+        overlay(&mut expected, 0x26d29, &source);
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x26d29, 0xfc8f, None)
+            .expect("read fallback-copied qemu seed0 range");
+        assert_eq!(read_back, source);
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs after qemu seed0 fallback copy");
+    }
+
+    #[test]
+    fn writeback_cached_fsx075_qemu_seed0_late_truncate_copy() {
+        fn pattern(len: usize, seed: u8) -> Vec<u8> {
+            (0..len)
+                .map(|idx| seed.wrapping_add(((idx * 43) % 251) as u8))
+                .collect()
+        }
+
+        fn overlay(expected: &mut Vec<u8>, offset: usize, data: &[u8]) {
+            let end = offset.checked_add(data.len()).expect("overlay end");
+            if expected.len() < end {
+                expected.resize(end, 0);
+            }
+            expected[offset..end].copy_from_slice(data);
+        }
+
+        fn zero(expected: &mut Vec<u8>, offset: usize, len: usize, keep_size: bool) {
+            let end = offset.checked_add(len).expect("zero end");
+            if !keep_size && expected.len() < end {
+                expected.resize(end, 0);
+            }
+            let end = end.min(expected.len());
+            if offset < end {
+                expected[offset..end].fill(0);
+            }
+        }
+
+        fn seed0_late_truncate_prefix(
+            name: &[u8],
+        ) -> (
+            AdapterFixture,
+            RequestCtx,
+            u64,
+            u64,
+            EngineFileHandle,
+            Vec<u8>,
+        ) {
+            let fixture = adapter_fixture_with_writeback_cache_deferred_commit();
+            let ctx = root_ctx();
+            let (inode, adapter_fh, engine_fh) =
+                create_adapter_file_handle(&fixture.adapter, &ctx, name, libc::O_RDWR as u32);
+            let ino = inode.get();
+            let mut expected = Vec::new();
+
+            let first = pattern(0xa75b, 0x13);
+            fixture
+                .adapter
+                .dispatch_write(&ctx, ino, adapter_fh, 0x2b0b5, &first, FUSE_WRITE_CACHE)
+                .expect("op2 write");
+            overlay(&mut expected, 0x2b0b5, &first);
+
+            fixture
+                .adapter
+                .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x2a832)
+                .expect("op3 truncate down");
+            expected.truncate(0x2a832);
+
+            let mapwrite_a = pattern(0x88dc, 0x35);
+            fixture
+                .adapter
+                .dispatch_write(&ctx, ino, adapter_fh, 0x2ac, &mapwrite_a, FUSE_WRITE_CACHE)
+                .expect("op4 mapwrite");
+            overlay(&mut expected, 0x2ac, &mapwrite_a);
+
+            fixture
+                .adapter
+                .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x2fe75)
+                .expect("op5 truncate up");
+            expected.resize(0x2fe75, 0);
+
+            let high_a = pattern(0x1d9d, 0x57);
+            fixture
+                .adapter
+                .dispatch_write(&ctx, ino, adapter_fh, 0x3e263, &high_a, FUSE_WRITE_CACHE)
+                .expect("op6 write");
+            overlay(&mut expected, 0x3e263, &high_a);
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    FALLOC_FL_KEEP_SIZE,
+                    0x2b831,
+                    0x55d2,
+                )
+                .expect("op7 keep-size fallocate");
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                    0x21108,
+                    0x6e8f,
+                )
+                .expect("op9 punch");
+            zero(&mut expected, 0x21108, 0x6e8f, true);
+
+            let mapread = fixture
+                .adapter
+                .dispatch_read(&ctx, ino, adapter_fh, 0x37755, 0x1f53, None)
+                .expect("op10 mapread");
+            assert_eq!(mapread, expected[0x37755..0x37755 + 0x1f53]);
+
+            let high_b = pattern(0x3f9b, 0x79);
+            fixture
+                .adapter
+                .dispatch_write(&ctx, ino, adapter_fh, 0x3c065, &high_b, FUSE_WRITE_CACHE)
+                .expect("op11 write");
+            overlay(&mut expected, 0x3c065, &high_b);
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(&ctx, ino, adapter_fh, 0, 0x2ccd9, 0x604c)
+                .expect("op12 fallocate");
+
+            let mid = pattern(0x42ce, 0x9b);
+            fixture
+                .adapter
+                .dispatch_write(&ctx, ino, adapter_fh, 0x1f3d4, &mid, FUSE_WRITE_CACHE)
+                .expect("op14 write");
+            overlay(&mut expected, 0x1f3d4, &mid);
+
+            let mapwrite_b = pattern(0xd9ab, 0xbd);
+            fixture
+                .adapter
+                .dispatch_write(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    0x17ef2,
+                    &mapwrite_b,
+                    FUSE_WRITE_CACHE,
+                )
+                .expect("op15 mapwrite");
+            overlay(&mut expected, 0x17ef2, &mapwrite_b);
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    FALLOC_FL_KEEP_SIZE,
+                    0x3635e,
+                    0x9ca2,
+                )
+                .expect("op18 keep-size fallocate");
+
+            fixture
+                .adapter
+                .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0xc04d)
+                .expect("op19 truncate down");
+            expected.truncate(0xc04d);
+
+            fixture
+                .adapter
+                .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0xfc8a)
+                .expect("op22 truncate up");
+            expected.resize(0xfc8a, 0);
+
+            fixture
+                .adapter
+                .dispatch_fallocate_file(
+                    &ctx,
+                    ino,
+                    adapter_fh,
+                    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                    0xd754,
+                    0x2536,
+                )
+                .expect("op26 punch");
+            zero(&mut expected, 0xd754, 0x2536, true);
+
+            fixture
+                .adapter
+                .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 0x10a1d)
+                .expect("op29 truncate up");
+            expected.resize(0x10a1d, 0);
+
+            (fixture, ctx, ino, adapter_fh, engine_fh, expected)
+        }
+
+        let (fixture, ctx, ino, adapter_fh, engine_fh, mut expected) =
+            seed0_late_truncate_prefix(b"wb-fsx075-qemu-seed0-late-server-copy.bin");
+        let source = expected[0x895e..0x895e + 0x5c8d].to_vec();
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan: FuseCopyFileRangePlan {
+                unique: 83,
+                ino_in: ino,
+                fh_in: adapter_fh,
+                offset_in: 0x895e,
+                ino_out: ino,
+                fh_out: adapter_fh,
+                offset_out: 0x1c9b5,
+                len: 0x5c8d,
+            },
+            source_fh: engine_fh,
+            dest_fh: engine_fh,
+        };
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("op30 server copy after qemu seed0 late truncate sequence")
+        };
+        assert_eq!(copied, 0x5c8d);
+        overlay(&mut expected, 0x1c9b5, &source);
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x1c9b5, 0x5c8d, None)
+            .expect("read server-copied qemu seed0 late range");
+        assert_eq!(read_back, source);
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs after qemu seed0 late server copy");
+
+        let (fixture, ctx, ino, adapter_fh, _engine_fh, mut expected) =
+            seed0_late_truncate_prefix(b"wb-fsx075-qemu-seed0-late-fallback-copy.bin");
+        let source = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x895e, 0x5c8d, None)
+            .expect("op30 fallback source read");
+        assert_eq!(source, expected[0x895e..0x895e + 0x5c8d]);
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0x1c9b5, &source, FUSE_WRITE_CACHE)
+            .expect("op30 fallback destination write");
+        overlay(&mut expected, 0x1c9b5, &source);
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0x1c9b5, 0x5c8d, None)
+            .expect("read fallback-copied qemu seed0 late range");
+        assert_eq!(read_back, source);
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs after qemu seed0 late fallback copy");
     }
 
     #[test]
