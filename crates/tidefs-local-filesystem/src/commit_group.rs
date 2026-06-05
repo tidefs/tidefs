@@ -624,10 +624,6 @@ impl<C: Clock> CommitGroupStateMachine<C> {
         self.current_commit_group
     }
 
-    pub fn generation(&self) -> u64 {
-        self.current_commit_group.0
-    }
-
     #[allow(dead_code)] // INTENT: COMMIT_GROUP state machine types for planned transaction-group commit pipeline
     pub fn phase_elapsed(&self) -> Duration {
         self.clock.now().duration_since(self.phase_start)

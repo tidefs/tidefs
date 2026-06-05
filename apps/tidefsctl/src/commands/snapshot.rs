@@ -899,12 +899,24 @@ fn handle_rollback(args: SnapshotRollbackArgs) {
 }
 
 fn handle_send(args: SnapshotSendArgs) {
-    let mut fs = open_filesystem(
+    let live_args = serde_json::json!({
+        "output": args.output.as_ref().map(|path| path.display().to_string()),
+        "target_addr": args.target_addr.map(|addr| addr.to_string()),
+        "node_id": args.node_id,
+        "server_node_id": args.server_node_id,
+        "format": &args.format,
+        "incremental": args.incremental,
+        "from_root": args.from_root.as_deref(),
+        "pool_id": args.pool_id.as_deref(),
+        "dataset_id": args.dataset_id.as_deref(),
+    });
+    let mut fs = open_filesystem_with_live_args(
         args.backing_dir.as_ref(),
         args.pool.as_deref(),
         args.devices.as_deref(),
         "send",
         RecoveryPolicy::default(),
+        live_args,
     );
 
     // Export: VFSSEND2 path or VFSSEND1 path, full or incremental.

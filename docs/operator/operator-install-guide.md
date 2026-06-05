@@ -294,6 +294,12 @@ tidefsctl snapshot send mypool --output /tmp/mypool.vfssend1
 tidefsctl snapshot receive --backing-dir /tmp/received-pool --input /tmp/mypool.vfssend1
 ```
 
+For an imported pool, the full `snapshot send --output` form asks the live
+owner to export from its mounted state and write the stream. Live network push
+and live incremental send are not owner-side paths yet, so those forms fail
+closed instead of opening storage behind the owner. Snapshot receive remains an
+explicit target-store operation.
+
 For exported/offline pools, the same dataset and snapshot commands may take
 `--devices`. That direct-device form stays offline; it does not import the pool
 or create `/run/tidefs/pools/<uuid>` runtime ownership as a side effect. If the

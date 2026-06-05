@@ -9426,16 +9426,13 @@ impl LocalFileSystem {
         // COMMIT_GROUP STATE MACHINE: complete SYNC only if we transitioned.
         // No-op commits do not advance generation.
         if self.commit_group.phase == CommitGroupPhase::Sync {
-            let _commit_log = self.commit_group.complete_sync();
+            let commit_log = self.commit_group.complete_sync();
             check_crash_hook(CrashInjectionPoint::CommitGroupAfterCheckpoint);
-            // Merge: never regress generation (bump_generation may have
-            // advanced it further during mutations).
-            self.state.generation = self.state.generation.max(self.commit_group.generation());
             // Notify the sync gate that this commit group has been committed.
             // Wakes fsync and syncfs waiters whose durability barrier
             // depends on this TXG.
             self.sync_gate
-                .notify_committed(CommitGroupId(self.commit_group.current_commit_group().0));
+                .notify_committed(CommitGroupId(commit_log.commit_group.0));
         }
         check_crash_hook(CrashInjectionPoint::CommitGroupAfterFlush);
         // Progress background services after each commit so that

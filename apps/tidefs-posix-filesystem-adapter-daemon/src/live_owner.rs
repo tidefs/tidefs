@@ -280,7 +280,7 @@ fn dispatch_request(
             "create" | "list" | "rename" | "destroy" | "set-strategy" | "upgrade" | "get" | "set"
             | "list-props" | "seal-key" | "rotate-key",
         )
-        | ("snapshot", "create" | "list" | "destroy" | "rollback")
+        | ("snapshot", "create" | "list" | "destroy" | "rollback" | "send")
         | ("device", "remove") => delegate_admin_request(&request, engine),
         _ => LiveOwnerResponse::error(
             1,

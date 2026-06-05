@@ -1179,6 +1179,7 @@ impl VfsLocalFileSystem {
             ("snapshot", "list") => self.live_snapshot_list(wants_json),
             ("snapshot", "destroy") => self.live_snapshot_destroy(args),
             ("snapshot", "rollback") => self.live_snapshot_rollback(args),
+            ("snapshot", "send") => self.live_snapshot_send(args, wants_json),
             ("pool", "get") => self.live_pool_get(args),
             ("pool", "set") => self.live_pool_set(args),
             ("pool", "list-props") => self.live_pool_list_props(args),
@@ -1998,6 +1999,110 @@ impl VfsLocalFileSystem {
         }
     }
 
+    fn live_snapshot_send(&self, args: &Value, wants_json: bool) -> Vec<u8> {
+        if live_admin_optional_arg(args, "target_addr").is_some() {
+            return live_admin_error(
+                1,
+                "snapshot send: live owner network push is not implemented; write an owner-mediated --output stream first",
+            );
+        }
+        if args
+            .get("incremental")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return live_admin_error(
+                1,
+                "snapshot send: live owner incremental export is not implemented",
+            );
+        }
+        let output = match live_admin_arg(args, "output") {
+            Ok(value) => std::path::PathBuf::from(value),
+            Err(_) => {
+                return live_admin_error(1, "snapshot send: --output is required for live pools")
+            }
+        };
+        let format = live_admin_optional_arg(args, "format").unwrap_or("vfssend1");
+        let pool_id = match live_admin_hex_16_or_default(args, "pool_id") {
+            Ok(value) => value,
+            Err(err) => {
+                return live_admin_error(1, format!("snapshot send: invalid pool-id: {err}"))
+            }
+        };
+        let dataset_id = match live_admin_hex_16_or_default(args, "dataset_id") {
+            Ok(value) => value,
+            Err(err) => {
+                return live_admin_error(1, format!("snapshot send: invalid dataset-id: {err}"))
+            }
+        };
+
+        let (encoded, total_records, payload_bytes, roots_len) = {
+            let mut fs = self.fs.borrow_mut();
+            let export = match fs.export_changed_records() {
+                Ok(export) => export,
+                Err(err) => {
+                    return live_admin_error(
+                        1,
+                        format!("snapshot send: failed to export changed records: {err}"),
+                    )
+                }
+            };
+            let encoded = match format {
+                "vfssend1" => export.encode(),
+                "vfssend2" => match crate::vfssend2_bridge::export_vfssend2_from_changed_records(
+                    &export, pool_id, dataset_id,
+                ) {
+                    Ok(encoded) => encoded,
+                    Err(err) => {
+                        return live_admin_error(
+                            1,
+                            format!("snapshot send: VFSSEND2 export failed: {err}"),
+                        )
+                    }
+                },
+                other => {
+                    return live_admin_error(
+                        1,
+                        format!("snapshot send: unknown stream format '{other}'"),
+                    )
+                }
+            };
+            (
+                encoded,
+                export.total_records,
+                export.payload_bytes,
+                export.roots.len(),
+            )
+        };
+
+        if let Err(err) = std::fs::write(&output, &encoded) {
+            return live_admin_error(
+                1,
+                format!(
+                    "snapshot send: failed to write stream to {}: {err}",
+                    output.display()
+                ),
+            );
+        }
+
+        if wants_json {
+            live_admin_ok_json(json!({
+                "output": output.display().to_string(),
+                "bytes": encoded.len(),
+                "format": format,
+                "roots": roots_len,
+                "records": total_records,
+                "payload_bytes": payload_bytes,
+            }))
+        } else {
+            live_admin_ok_text(format!(
+                "wrote stream to {} ({} bytes, format={format}, roots={roots_len}, records={total_records}, payload={payload_bytes} bytes)",
+                output.display(),
+                encoded.len(),
+            ))
+        }
+    }
+
     fn live_pool_get(&self, args: &Value) -> Vec<u8> {
         let property = match live_admin_arg(args, "property") {
             Ok(value) => value,
@@ -2199,6 +2304,33 @@ fn live_admin_string_vec(args: &Value, key: &str) -> Result<Vec<String>, String>
             "live admin argument '{key}' must be a string array"
         )),
     }
+}
+
+fn live_admin_hex_16_or_default(args: &Value, key: &str) -> Result<[u8; 16], String> {
+    match live_admin_optional_arg(args, key) {
+        Some(value) => live_admin_hex_to_16(value),
+        None => Ok([0; 16]),
+    }
+}
+
+fn live_admin_hex_to_16(value: &str) -> Result<[u8; 16], String> {
+    let hex = value.strip_prefix("0x").unwrap_or(value);
+    if hex.len() != 32 {
+        return Err(format!(
+            "expected 32 hex chars (16 bytes), got {}",
+            hex.len()
+        ));
+    }
+    let mut out = [0_u8; 16];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let byte = u8::from_str_radix(
+            std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in hex string".to_string())?,
+            16,
+        )
+        .map_err(|err| format!("invalid hex byte at position {}: {err}", i * 2))?;
+        out[i] = byte;
+    }
+    Ok(out)
 }
 
 fn live_admin_ok_text(text: impl Into<String>) -> Vec<u8> {
@@ -4162,6 +4294,26 @@ mod tests {
         serde_json::from_slice(&response).expect("decode live admin response")
     }
 
+    fn live_snapshot_admin(
+        engine: &VfsLocalFileSystem,
+        operation: &str,
+        args: Value,
+        wants_json: bool,
+    ) -> Value {
+        let request = json!({
+            "command": "snapshot",
+            "operation": operation,
+            "pool": "tank",
+            "json": wants_json,
+            "args": args,
+        });
+        let request = serde_json::to_vec(&request).expect("encode live admin request");
+        let response = engine
+            .handle_live_pool_admin_request(&request)
+            .expect("dispatch live admin request");
+        serde_json::from_slice(&response).expect("decode live admin response")
+    }
+
     fn live_device_admin(
         engine: &VfsLocalFileSystem,
         operation: &str,
@@ -4361,6 +4513,38 @@ mod tests {
         );
         drop(fs);
         drop(engine);
+    }
+
+    #[test]
+    fn live_snapshot_send_exports_from_mounted_pool_owner() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("live-send.vfs");
+
+        let sent = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "format": "vfssend1",
+                "incremental": false,
+            }),
+            true,
+        );
+
+        assert_eq!(sent["ok"], true, "send response: {sent}");
+        assert_eq!(sent["json"]["format"], "vfssend1");
+        assert!(sent["json"]["bytes"].as_u64().unwrap_or(0) > 0);
+        let encoded = std::fs::read(&output).expect("read live send output");
+        let decoded =
+            crate::ChangedRecordExport::decode(&encoded).expect("decode live send output");
+        assert!(decoded.total_records > 0);
+        assert!(decoded.payload_bytes > 0);
     }
 
     #[cfg(feature = "encryption")]
