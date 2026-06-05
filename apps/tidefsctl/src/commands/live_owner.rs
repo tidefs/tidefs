@@ -260,13 +260,7 @@ fn send_live_owner_request(route: &LivePoolRoute<'_>) -> Result<(), LiveOwnerReq
     let mut stream = UnixStream::connect(&socket_path).map_err(|err| {
         LiveOwnerRequestError::Unavailable(format!("connect {}: {err}", socket_path.display()))
     })?;
-    let request = serde_json::json!({
-        "command": route.command,
-        "operation": route.operation,
-        "pool": route.pool,
-        "json": route.json,
-        "args": &route.args,
-    });
+    let request = live_owner_request_json(route);
     stream
         .write_all(request.to_string().as_bytes())
         .map_err(|err| {
@@ -340,6 +334,20 @@ fn send_live_owner_request(route: &LivePoolRoute<'_>) -> Result<(), LiveOwnerReq
             message: message.to_string(),
         })
     }
+}
+
+fn live_owner_request_json(route: &LivePoolRoute<'_>) -> serde_json::Value {
+    let mut request = serde_json::json!({
+        "command": route.command,
+        "operation": route.operation,
+        "pool": route.pool,
+        "json": route.json,
+        "args": &route.args,
+    });
+    if let Some(pool_uuid) = route.pool_uuid {
+        request["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
+    }
+    request
 }
 
 fn find_live_owner_manifest(
@@ -553,5 +561,40 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("tank")
         );
+    }
+
+    #[test]
+    fn live_owner_request_carries_pool_uuid_when_known() {
+        let route = LivePoolRoute {
+            command: "device",
+            operation: "remove",
+            pool: "tank",
+            pool_uuid: Some([0xab; 16]),
+            json: false,
+            args: serde_json::json!({"device_path": "/dev/sdc"}),
+        };
+
+        let request = live_owner_request_json(&route);
+
+        assert_eq!(
+            request.get("pool_uuid").and_then(serde_json::Value::as_str),
+            Some("abababababababababababababababab")
+        );
+    }
+
+    #[test]
+    fn live_owner_request_omits_pool_uuid_when_unknown() {
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: None,
+            json: false,
+            args: serde_json::Value::Null,
+        };
+
+        let request = live_owner_request_json(&route);
+
+        assert!(request.get("pool_uuid").is_none());
     }
 }

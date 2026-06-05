@@ -266,23 +266,25 @@ fn handle_remove(
     failure_domain: &str,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    super::live_owner::route_if_owner_exists_with_args(
-        "device",
-        "remove",
-        pool_name,
-        serde_json::json!({
-            "device_path": device_path.to_string_lossy(),
-            "replication_factor": replication_factor,
-            "failure_domain": failure_domain,
-            "force": force,
-        }),
-    );
+    let live_args = serde_json::json!({
+        "device_path": device_path.to_string_lossy(),
+        "replication_factor": replication_factor,
+        "failure_domain": failure_domain,
+        "force": force,
+    });
 
-    let backing_dir = backing_dir.ok_or_else(|| {
-        format!(
-            "pool-name device removal for '{pool_name}' requires a reachable live owner; route through the kernel UAPI or userspace daemon owner. Use --backing-dir only for exported/offline device removal."
-        )
-    })?;
+    let backing_dir = match backing_dir {
+        Some(backing_dir) => backing_dir,
+        None => {
+            super::live_owner::route_if_owner_exists_with_args(
+                "device", "remove", pool_name, live_args,
+            );
+            return Err(format!(
+                "pool-name device removal for '{pool_name}' requires a reachable live owner; route through the kernel UAPI or userspace daemon owner. Use --backing-dir only for exported/offline device removal."
+            )
+            .into());
+        }
+    };
 
     // Read labels without creating or mutating the store. If labels say the
     // pool is active/imported, the owner boundary below must route or fail
@@ -295,12 +297,7 @@ fn handle_remove(
         pool_name,
         pre_config.pool_uuid,
         pre_config.state == PoolState::Active,
-        serde_json::json!({
-            "device_path": device_path.to_string_lossy(),
-            "replication_factor": replication_factor,
-            "failure_domain": failure_domain,
-            "force": force,
-        }),
+        live_args,
     );
 
     let domain = match failure_domain {

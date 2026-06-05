@@ -3,6 +3,8 @@
 //! This is the FUSE-session side of the imported-pool authority boundary:
 //! pool-name commands talk to the runtime that owns cached state instead of
 //! reopening devices or metadata directories behind it.
+//! When a client knows the pool UUID, the request carries it and this owner
+//! must prove the UUID matches before serving live cached state.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -162,6 +164,8 @@ struct LiveOwnerRequest {
     command: String,
     operation: String,
     pool: String,
+    #[serde(default)]
+    pool_uuid: Option<String>,
     json: bool,
     #[serde(default)]
     args: serde_json::Value,
@@ -255,6 +259,9 @@ fn dispatch_request(
             ),
         );
     }
+    if let Err(message) = validate_requested_pool_uuid(request.pool_uuid.as_deref(), manifest) {
+        return LiveOwnerResponse::error(2, message);
+    }
 
     match (request.command.as_str(), request.operation.as_str()) {
         ("pool", "status") => pool_status(request.json, manifest, engine),
@@ -273,6 +280,22 @@ fn dispatch_request(
             ),
         ),
     }
+}
+
+fn validate_requested_pool_uuid(
+    requested_uuid: Option<&str>,
+    manifest: &LiveOwnerManifest,
+) -> Result<(), String> {
+    let Some(requested_uuid) = requested_uuid else {
+        return Ok(());
+    };
+    if requested_uuid.eq_ignore_ascii_case(&manifest.pool_uuid) {
+        return Ok(());
+    }
+    Err(format!(
+        "live owner for pool '{}' owns uuid {}, not requested uuid {}",
+        manifest.pool_name, manifest.pool_uuid, requested_uuid
+    ))
 }
 
 fn delegate_admin_request(
@@ -431,4 +454,49 @@ fn hex_uuid(uuid: &[u8; 16]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> LiveOwnerManifest {
+        LiveOwnerManifest {
+            protocol: "tidefs-live-owner-json-v1".to_string(),
+            owner_kind: "fuse".to_string(),
+            pool_name: "tank".to_string(),
+            pool_uuid: "0123456789abcdeffedcba9876543210".to_string(),
+            pid: 42,
+            mountpoint: "/mnt/tank".to_string(),
+            socket_path: "/run/tidefs/pools/tank/owner.sock".to_string(),
+        }
+    }
+
+    #[test]
+    fn request_uuid_validation_accepts_matching_uuid() {
+        let manifest = manifest();
+
+        assert!(
+            validate_requested_pool_uuid(Some("0123456789ABCDEFFEDCBA9876543210"), &manifest)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn request_uuid_validation_accepts_name_only_requests() {
+        let manifest = manifest();
+
+        assert!(validate_requested_pool_uuid(None, &manifest).is_ok());
+    }
+
+    #[test]
+    fn request_uuid_validation_rejects_mismatched_uuid() {
+        let manifest = manifest();
+
+        let err = validate_requested_pool_uuid(Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), &manifest)
+            .unwrap_err();
+
+        assert!(err.contains("owns uuid 0123456789abcdeffedcba9876543210"));
+        assert!(err.contains("not requested uuid aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
 }
