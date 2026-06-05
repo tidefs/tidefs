@@ -28,6 +28,7 @@ use clap::Parser;
 use tidefs_dataset_properties;
 use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy, RootAuthenticationKey};
 use tidefs_local_object_store::StoreOptions;
+use tidefs_types_pool_label_core::PoolState;
 
 #[derive(Parser, Debug)]
 pub enum PoolCommand {
@@ -716,25 +717,13 @@ fn handle_pool_status(pool_name: String, devices: Option<Vec<PathBuf>>, json: bo
     let device_paths = match devices {
         Some(d) if !d.is_empty() => d,
         _ => {
-            super::live_owner::exit_missing_client("pool", "status", &pool_name);
+            super::live_owner::route("pool", "status", &pool_name);
         }
     };
 
-    let entries = match tidefs_pool_scan::scan_labels(&device_paths) {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("tidefsctl: label scan failed: {err}");
-            process::exit(1);
-        }
-    };
-
-    let config = match tidefs_pool_scan::PoolAssembler::assemble(&entries, None) {
-        Ok(c) => c,
-        Err(err) => {
-            eprintln!("tidefsctl: pool assembly failed: {err}");
-            process::exit(1);
-        }
-    };
+    let config = assemble_device_pool_config(&device_paths, "status");
+    ensure_device_pool_name(&pool_name, "status", &config);
+    route_active_device_pool("status", &pool_name, &config);
 
     if json {
         let json_out = serde_json::json!({
@@ -751,6 +740,50 @@ fn handle_pool_status(pool_name: String, devices: Option<Vec<PathBuf>>, json: bo
         println!("  state:       {}", config.state);
         println!("  devices:     {}", config.device_count);
         println!("  health:      {}", config.health);
+    }
+}
+
+fn assemble_device_pool_config(
+    device_paths: &[PathBuf],
+    operation: &str,
+) -> tidefs_pool_scan::PoolConfig {
+    let entries = match tidefs_pool_scan::scan_labels(device_paths) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("tidefsctl pool {operation}: label scan failed: {err}");
+            process::exit(1);
+        }
+    };
+    match tidefs_pool_scan::PoolAssembler::assemble(&entries, None) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("tidefsctl pool {operation}: pool assembly failed: {err}");
+            process::exit(1);
+        }
+    }
+}
+
+fn ensure_device_pool_name(
+    pool_name: &str,
+    operation: &str,
+    config: &tidefs_pool_scan::PoolConfig,
+) {
+    if config.pool_name != pool_name {
+        eprintln!(
+            "tidefsctl pool {operation}: devices belong to pool '{}', not '{pool_name}'",
+            config.pool_name
+        );
+        process::exit(1);
+    }
+}
+
+fn route_active_device_pool(
+    operation: &str,
+    pool_name: &str,
+    config: &tidefs_pool_scan::PoolConfig,
+) {
+    if config.state == PoolState::Active {
+        super::live_owner::route_imported("pool", operation, pool_name, config.pool_uuid);
     }
 }
 
@@ -893,6 +926,11 @@ fn handle_pool_integrity_check(
     max_bytes: Option<u64>,
     devices: Option<Vec<PathBuf>>,
 ) {
+    if let Some(ref device_paths) = devices {
+        let config = assemble_device_pool_config(device_paths, "integrity-check");
+        route_active_device_pool("integrity-check", &config.pool_name, &config);
+    }
+
     // ── Phase 1: device-level checks (labels, committed root, intent log) ──
     let mut label_failures: Vec<String> = Vec::new();
     let mut committed_root_found = false;
@@ -1317,9 +1355,13 @@ fn handle_pool_export(pool_name: String, devices: Option<Vec<PathBuf>>, force: b
     let device_paths = match devices {
         Some(d) if !d.is_empty() => d,
         _ => {
-            super::live_owner::exit_missing_client("pool", "export", &pool_name);
+            super::live_owner::route("pool", "export", &pool_name);
         }
     };
+
+    let config = assemble_device_pool_config(&device_paths, "export");
+    ensure_device_pool_name(&pool_name, "export", &config);
+    route_active_device_pool("export", &pool_name, &config);
 
     let lock_dir = PathBuf::from("/run/tidefs/import");
     match tidefs_pool_import::pool_export(&device_paths, &lock_dir, force) {
@@ -1346,6 +1388,10 @@ fn handle_pool_destroy(
     _force: bool,
     zero_superblock: bool,
 ) {
+    let config = assemble_device_pool_config(&devices, "destroy");
+    ensure_device_pool_name(&pool_name, "destroy", &config);
+    route_active_device_pool("destroy", &pool_name, &config);
+
     match tidefs_pool_import::pool_destroy(&devices, zero_superblock) {
         Ok(()) => {
             println!("pool destroyed: {pool_name}");
@@ -1371,8 +1417,12 @@ fn open_pool_property_filesystem(
     recovery_policy: RecoveryPolicy,
 ) -> LocalFileSystem {
     let Some(devs) = devices.filter(|devs| !devs.is_empty()) else {
-        super::live_owner::exit_missing_client("pool", operation, pool);
+        super::live_owner::route("pool", operation, pool);
     };
+
+    let config = assemble_device_pool_config(devs, operation);
+    ensure_device_pool_name(pool, operation, &config);
+    route_active_device_pool(operation, pool, &config);
 
     let lock_dir = std::env::temp_dir().join("tidefs-import-pool-properties");
     if let Err(err) = std::fs::create_dir_all(&lock_dir) {
@@ -1385,7 +1435,9 @@ fn open_pool_property_filesystem(
 
     let pool_uuid = match tidefs_pool_import::pool_import(devs, &lock_dir, false, None, None) {
         Ok(imported) => imported.config.pool_uuid,
-        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => pool_uuid,
+        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
+            super::live_owner::route_imported("pool", operation, pool, pool_uuid)
+        }
         Err(err) => {
             eprintln!("tidefsctl pool {operation}: pool import failed for '{pool}': {err}");
             process::exit(1);

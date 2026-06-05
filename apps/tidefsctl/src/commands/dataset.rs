@@ -2,7 +2,8 @@
 //!
 //! Pool-name-only dataset commands must route through the runtime owner that
 //! imported the pool. Explicit `--devices` are the offline/not-yet-imported
-//! escape hatch that opens storage directly for bring-up work.
+//! escape hatch; if those devices are already imported, the command must use
+//! the live owner instead of opening storage directly.
 
 use std::path::PathBuf;
 use std::process;
@@ -16,6 +17,7 @@ use tidefs_dataset_properties;
 use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy, RootAuthenticationKey};
 use tidefs_local_object_store::StoreOptions;
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
+use tidefs_types_pool_label_core::PoolState;
 
 use bincode;
 
@@ -343,6 +345,11 @@ fn open_filesystem(
     recovery_policy: RecoveryPolicy,
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
+        let config = scan_device_pool_config(pool, devs, operation);
+        if config.state == PoolState::Active {
+            super::live_owner::route_imported("dataset", operation, pool, config.pool_uuid);
+        }
+
         let lock_dir = std::env::temp_dir().join("tidefs-import");
         if let Err(err) = std::fs::create_dir_all(&lock_dir) {
             eprintln!(
@@ -362,7 +369,9 @@ fn open_filesystem(
                 );
                 imported.config.pool_uuid
             }
-            Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => pool_uuid,
+            Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
+                super::live_owner::route_imported("dataset", operation, pool, pool_uuid)
+            }
             Err(err) => {
                 eprintln!("tidefsctl dataset {operation}: pool import failed for '{pool}': {err}");
                 process::exit(1);
@@ -398,8 +407,38 @@ fn open_filesystem(
         };
     }
 
-    super::live_owner::exit_missing_client("dataset", operation, pool)
+    super::live_owner::route("dataset", operation, pool)
 }
+
+fn scan_device_pool_config(
+    pool: &str,
+    devices: &[PathBuf],
+    operation: &str,
+) -> tidefs_pool_scan::PoolConfig {
+    let entries = match tidefs_pool_scan::scan_labels(devices) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("tidefsctl dataset {operation}: pool label scan failed for '{pool}': {err}");
+            process::exit(1);
+        }
+    };
+    let config = match tidefs_pool_scan::PoolAssembler::assemble(&entries, None) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("tidefsctl dataset {operation}: pool assembly failed for '{pool}': {err}");
+            process::exit(1);
+        }
+    };
+    if config.pool_name != pool {
+        eprintln!(
+            "tidefsctl dataset {operation}: devices belong to pool '{}', not '{pool}'",
+            config.pool_name
+        );
+        process::exit(1);
+    }
+    config
+}
+
 fn hex_uuid(uuid: &[u8; 16]) -> String {
     uuid.iter()
         .map(|b| format!("{b:02x}"))
@@ -418,19 +457,17 @@ fn dataset_id_from_name(name: &str) -> DatasetId {
 
 /// Resolve the pool GUID from device labels. Exits on failure.
 fn resolve_cluster_pool_guid(devices: &[std::path::PathBuf], operation: &str) -> [u8; 16] {
-    let lock_dir = std::env::temp_dir().join("tidefs-import-cluster");
-    if let Err(err) = std::fs::create_dir_all(&lock_dir) {
-        eprintln!(
-            "tidefsctl dataset {operation}: cannot create import lock dir {}: {err}",
-            lock_dir.display()
-        );
-        process::exit(1);
-    }
-    match tidefs_pool_import::pool_import(devices, &lock_dir, false, None, None) {
-        Ok(imported) => imported.config.pool_uuid,
-        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => pool_uuid,
+    let entries = match tidefs_pool_scan::scan_labels(devices) {
+        Ok(entries) => entries,
         Err(err) => {
-            eprintln!("tidefsctl dataset {operation}: pool import failed: {err}");
+            eprintln!("tidefsctl dataset {operation}: pool label scan failed: {err}");
+            process::exit(1);
+        }
+    };
+    match tidefs_pool_scan::PoolAssembler::assemble(&entries, None) {
+        Ok(config) => config.pool_uuid,
+        Err(err) => {
+            eprintln!("tidefsctl dataset {operation}: pool assembly failed: {err}");
             process::exit(1);
         }
     }
@@ -1484,6 +1521,11 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
 /// reopen the path named by the pool identity.
 fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -> PathBuf {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
+        let config = scan_device_pool_config(pool, devs, operation);
+        if config.state == PoolState::Active {
+            super::live_owner::route_imported("dataset", operation, pool, config.pool_uuid);
+        }
+
         let lock_dir = std::env::temp_dir().join("tidefs-import-keys");
         if let Err(err) = std::fs::create_dir_all(&lock_dir) {
             eprintln!(
@@ -1495,7 +1537,9 @@ fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -
 
         let pool_uuid = match tidefs_pool_import::pool_import(devs, &lock_dir, false, None, None) {
             Ok(imported) => imported.config.pool_uuid,
-            Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => pool_uuid,
+            Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
+                super::live_owner::route_imported("dataset", operation, pool, pool_uuid)
+            }
             Err(err) => {
                 eprintln!("tidefsctl dataset {operation}: pool import failed for '{pool}': {err}");
                 process::exit(1);
@@ -1505,7 +1549,7 @@ fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -
         return PathBuf::from("/run/tidefs/pools").join(hex_uuid(&pool_uuid));
     }
 
-    super::live_owner::exit_missing_client("dataset", operation, pool)
+    super::live_owner::route("dataset", operation, pool)
 }
 /// Decode a hex-encoded 16-byte salt string into `[u8; SALT_LEN]`.
 fn hex_to_salt(hex: &str) -> Result<[u8; tidefs_encryption::key_hierarchy::SALT_LEN], String> {

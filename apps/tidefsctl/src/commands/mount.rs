@@ -16,6 +16,7 @@ use tidefs_encryption;
 use tidefs_local_filesystem::RootAuthenticationKey;
 use tidefs_transport::{NodeInfo, Transport, TransportAddr};
 use tidefs_types_pool_label_core::features;
+use tidefs_types_pool_label_core::PoolState;
 
 /// `pool mount <pool_name> <mount_point> [--devices <dev>...] [--read-only] [--relatime]`
 ///
@@ -141,6 +142,35 @@ fn try_import_pool(
         .map_err(|e| e.to_string())
 }
 
+fn scan_device_pool_config(
+    pool_name: &str,
+    devices: &[PathBuf],
+    operation: &str,
+) -> tidefs_pool_scan::PoolConfig {
+    let entries = match tidefs_pool_scan::scan_labels(devices) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("tidefsctl pool {operation}: label scan failed for '{pool_name}': {err}");
+            process::exit(1);
+        }
+    };
+    let config = match tidefs_pool_scan::PoolAssembler::assemble(&entries, None) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("tidefsctl pool {operation}: pool assembly failed for '{pool_name}': {err}");
+            process::exit(1);
+        }
+    };
+    if config.pool_name != pool_name {
+        eprintln!(
+            "tidefsctl pool {operation}: devices belong to pool '{}', not '{pool_name}'",
+            config.pool_name
+        );
+        process::exit(1);
+    }
+    config
+}
+
 /// Resolve encryption material from a sealed envelope file for pool import.
 ///
 /// Returns:
@@ -207,6 +237,16 @@ pub fn handle_mount(args: PoolMountArgs) {
 
     // Determine the backing directory: explicit --devices import or live-owner route.
     let backing_dir = if let Some(ref devices) = args.devices {
+        let existing_config = scan_device_pool_config(&args.pool_name, devices, "mount");
+        if existing_config.state == PoolState::Active {
+            super::live_owner::route_imported(
+                "pool",
+                "mount",
+                &args.pool_name,
+                existing_config.pool_uuid,
+            );
+        }
+
         // Block-device path: import from raw devices, then use a
         // runtime-managed backing directory keyed by pool UUID.
         // Resolve encryption key before import for label validation + fingerprint.
@@ -220,6 +260,9 @@ pub fn handle_mount(args: PoolMountArgs) {
             None,
         ) {
             Ok(imp) => imp,
+            Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
+                super::live_owner::route_imported("pool", "mount", &args.pool_name, pool_uuid)
+            }
             Err(err) => {
                 eprintln!("tidefsctl pool mount: pool import failed: {err}");
                 process::exit(1);
@@ -251,7 +294,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         });
         pool_dir
     } else {
-        super::live_owner::exit_missing_client("pool", "mount", &args.pool_name);
+        super::live_owner::route("pool", "mount", &args.pool_name);
     };
 
     // --- Encryption passphrase verification ---

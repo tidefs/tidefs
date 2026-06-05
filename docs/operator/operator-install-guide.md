@@ -145,6 +145,10 @@ tidefsctl pool status mypool --devices /dev/sdb /dev/sdc
 tidefsctl pool status mypool --json  # machine-readable
 ```
 
+Use `--devices` only for exported/offline status or discovery. Once the pool is
+imported, `tidefsctl pool status mypool` routes to the live owner instead of
+opening the devices.
+
 ---
 
 ## 4. Mounting the Filesystem
@@ -165,6 +169,10 @@ This starts the FUSE daemon in the foreground, mounting the pool at
 ```sh
 tidefsctl pool mount mypool /mnt/tidefs --devices /tmp/pool1.img /tmp/pool2.img
 ```
+
+The `--devices` form imports exported storage and starts the userspace FUSE
+owner. If the pool is already imported, omit `--devices`; the command must talk
+to the runtime owner instead of reopening the devices.
 
 For a specific dataset:
 
@@ -248,11 +256,10 @@ outside-sandbox runners.
 
 ```sh
 # Create a dataset
-tidefsctl dataset create mydataset --pool mypool --devices /dev/sdb /dev/sdc
+tidefsctl dataset create mydataset --pool mypool
 
 # List datasets
-tidefsctl dataset list --pool mypool --devices /dev/sdb /dev/sdc
-tidefsctl dataset list --pool mypool --devices /dev/sdb /dev/sdc --json
+tidefsctl dataset list --pool mypool
 
 # Rename
 tidefsctl dataset rename mydataset newname --pool mypool
@@ -265,18 +272,22 @@ tidefsctl dataset destroy mydataset --pool mypool
 
 ```sh
 # Create a snapshot
-tidefsctl snapshot create mysnap --pool mypool --devices /dev/sdb /dev/sdc
+tidefsctl snapshot create mysnap --pool mypool
 
 # List snapshots
-tidefsctl snapshot list --pool mypool --devices /dev/sdb /dev/sdc
+tidefsctl snapshot list --pool mypool
 
 # Destroy
 tidefsctl snapshot destroy mysnap --pool mypool
 
 # Export and receive a changed-record snapshot stream
-tidefsctl snapshot send --pool mypool --devices /dev/sdb /dev/sdc --output /tmp/mypool.vfssend1
+tidefsctl snapshot send --pool mypool --output /tmp/mypool.vfssend1
 tidefsctl snapshot receive --backing-dir /tmp/received-pool --input /tmp/mypool.vfssend1
 ```
+
+For exported/offline pools, the same dataset and snapshot commands may take
+`--devices`. If those devices already identify an imported `ACTIVE` pool, the
+CLI refuses direct storage access and routes to the owner.
 
 ### 6.3 Block device export
 
@@ -304,8 +315,8 @@ tidefsctl device rebuild
 ### 6.5 Pool export (deactivate)
 
 ```sh
-tidefsctl pool export mypool --devices /dev/sdb /dev/sdc
-tidefsctl pool export mypool --devices /dev/sdb /dev/sdc --force
+tidefsctl pool export mypool
+tidefsctl pool export mypool --force
 ```
 
 Export makes the pool inactive. Use it before system shutdown, device
@@ -335,13 +346,12 @@ nix profile install ./result
 
 ```sh
 fusermount3 -u /mnt/tidefs
-tidefsctl pool export mypool --devices /dev/sdb /dev/sdc
+tidefsctl pool export mypool
 ```
 
 ### 7.3 Import and mount with the new version
 
 ```sh
-tidefsctl pool import /dev/sdb /dev/sdc
 tidefsctl pool mount mypool /mnt/tidefs --devices /dev/sdb /dev/sdc
 ```
 
@@ -351,7 +361,7 @@ After the software is updated, upgrade on-disk datasets to enable new
 features supported by the new version:
 
 ```sh
-tidefsctl dataset upgrade mydataset --pool mypool --devices /dev/sdb /dev/sdc
+tidefsctl dataset upgrade mydataset --pool mypool
 ```
 
 This uses the upgrade table (`SupportedFeaturesV1`) to enumerate every
@@ -377,7 +387,7 @@ scripts/tidefs-operator-demo.sh \
 Check pool status and verify existing data is accessible:
 
 ```sh
-tidefsctl pool status mypool --devices /dev/sdb /dev/sdc --json
+tidefsctl pool status mypool --json
 ls -la /mnt/tidefs
 ```
 
@@ -391,7 +401,7 @@ If an upgrade causes problems, roll back to the previous version.
 
 ```sh
 fusermount3 -u /mnt/tidefs
-tidefsctl pool export mypool --devices /dev/sdb /dev/sdc
+tidefsctl pool export mypool
 ```
 
 ### 8.2 Roll back the software
@@ -417,7 +427,6 @@ nix build .#packages.x86_64-linux.default
 ### 8.3 Re-import and mount
 
 ```sh
-tidefsctl pool import /dev/sdb /dev/sdc
 tidefsctl pool mount mypool /mnt/tidefs --devices /dev/sdb /dev/sdc
 ```
 
@@ -442,7 +451,7 @@ To completely remove a pool and its data:
 
 ```sh
 # Ensure the pool is exported first
-tidefsctl pool export mypool --devices /dev/sdb /dev/sdc --force
+tidefsctl pool export mypool --force
 
 # Destroy the pool (zeroes pool labels on each device)
 tidefsctl pool destroy mypool --devices /dev/sdb /dev/sdc --force --zero-superblock
@@ -523,7 +532,7 @@ Ensure all mounts are unmounted and no process is using the pool:
 ```sh
 fusermount3 -u /mnt/tidefs
 lsof /dev/sdb  # check for open handles
-tidefsctl pool export mypool --devices /dev/sdb /dev/sdc --force
+tidefsctl pool export mypool --force
 ```
 
 ### Dataset upgrade failed

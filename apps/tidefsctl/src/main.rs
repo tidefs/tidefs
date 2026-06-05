@@ -28,8 +28,9 @@
 //! Imported-pool commands must talk to the runtime owner for live state:
 //! the declared kernel UAPI in kernel mode, or the FUSE/ublk owner in
 //! userspace mode. Explicit device or backing-directory arguments are for
-//! offline, discovery, import, or not-yet-imported work. Do not make pool-name
-//! usability by reopening runtime metadata behind the live owner.
+//! offline, discovery, import, or not-yet-imported work; they are not an
+//! override once the pool is imported. Do not make pool-name usability by
+//! reopening runtime metadata behind the live owner.
 mod commands;
 
 use std::path::PathBuf;
@@ -66,7 +67,7 @@ Pool routing rule:
   be queried or changed through the live owner: the kernel UAPI in kernel
   mode, or the userspace daemon owner in userspace mode. Explicit --devices
   or --backing-dir inputs are for offline, discovery, import, or
-  not-yet-imported work.
+  not-yet-imported work, not overrides for an imported pool.
 
 TideFS is pre-alpha. Help text should mark harnesses as such instead of
 treating them as the final kernel runtime."#,

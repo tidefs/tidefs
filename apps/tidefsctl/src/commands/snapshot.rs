@@ -15,6 +15,7 @@ use tidefs_local_filesystem::{
 };
 use tidefs_local_object_store::StoreOptions;
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
+use tidefs_types_pool_label_core::PoolState;
 
 // ---------------------------------------------------------------------------
 // Snapshot network transfer protocol (simple VFSSEND1 push/pull via VSNP)
@@ -526,9 +527,7 @@ fn open_filesystem(
 
     let path = match (backing_dir, pool) {
         (Some(path), _) => path.clone(),
-        (None, Some(pool_name)) => {
-            super::live_owner::exit_missing_client("snapshot", operation, pool_name)
-        }
+        (None, Some(pool_name)) => super::live_owner::route("snapshot", operation, pool_name),
         (None, None) => {
             eprintln!("tidefsctl snapshot {operation}: --backing-dir or --pool is required");
             process::exit(1);
@@ -560,6 +559,11 @@ fn open_filesystem(
 }
 
 fn import_devices_metadata_dir(devices: &[PathBuf], pool_name: &str, operation: &str) -> PathBuf {
+    let config = scan_device_pool_config(pool_name, devices, operation);
+    if config.state == PoolState::Active {
+        super::live_owner::route_imported("snapshot", operation, pool_name, config.pool_uuid);
+    }
+
     let lock_dir = std::env::temp_dir().join("tidefs-import");
     if let Err(err) = std::fs::create_dir_all(&lock_dir) {
         eprintln!(
@@ -579,7 +583,9 @@ fn import_devices_metadata_dir(devices: &[PathBuf], pool_name: &str, operation: 
             );
             imported.config.pool_uuid
         }
-        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => pool_uuid,
+        Err(tidefs_pool_import::ImportError::AlreadyImported { pool_uuid }) => {
+            super::live_owner::route_imported("snapshot", operation, pool_name, pool_uuid)
+        }
         Err(err) => {
             eprintln!(
                 "tidefsctl snapshot {operation}: pool import failed for '{pool_name}': {err}"
@@ -597,6 +603,39 @@ fn import_devices_metadata_dir(devices: &[PathBuf], pool_name: &str, operation: 
         process::exit(1);
     }
     metadata_dir
+}
+
+fn scan_device_pool_config(
+    pool_name: &str,
+    devices: &[PathBuf],
+    operation: &str,
+) -> tidefs_pool_scan::PoolConfig {
+    let entries = match tidefs_pool_scan::scan_labels(devices) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: pool label scan failed for '{pool_name}': {err}"
+            );
+            process::exit(1);
+        }
+    };
+    let config = match tidefs_pool_scan::PoolAssembler::assemble(&entries, None) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: pool assembly failed for '{pool_name}': {err}"
+            );
+            process::exit(1);
+        }
+    };
+    if pool_name != "<unnamed>" && config.pool_name != pool_name {
+        eprintln!(
+            "tidefsctl snapshot {operation}: devices belong to pool '{}', not '{pool_name}'",
+            config.pool_name
+        );
+        process::exit(1);
+    }
+    config
 }
 
 fn hex_uuid(uuid: &[u8; 16]) -> String {
@@ -683,9 +722,7 @@ fn snapshot_backing_path(
         (None, pool_name, Some(devs)) => {
             import_devices_metadata_dir(devs, pool_name.unwrap_or("<unnamed>"), operation)
         }
-        (None, Some(pool_name), None) => {
-            super::live_owner::exit_missing_client("snapshot", "send", pool_name)
-        }
+        (None, Some(pool_name), None) => super::live_owner::route("snapshot", "send", pool_name),
         (None, None, None) => {
             eprintln!("tidefsctl snapshot send: --backing-dir or --pool required");
             process::exit(1);
