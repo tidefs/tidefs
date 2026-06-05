@@ -518,12 +518,11 @@ fn handle_pool_import(
     json: bool,
 ) {
     let config = assemble_device_pool_config(&devices, "import");
-    super::live_owner::route_or_refuse_active_for_uuid_with_format_and_args(
+    super::live_owner::route_if_owner_exists_for_uuid_with_format_and_args(
         "pool",
         "import",
         &config.pool_name,
         config.pool_uuid,
-        config.state == tidefs_types_pool_label_core::PoolState::Active,
         json,
         serde_json::Value::Null,
     );
@@ -727,12 +726,11 @@ fn route_live_device_pool_owner_with_format(
     config: &tidefs_pool_scan::PoolConfig,
     json: bool,
 ) {
-    super::live_owner::route_or_refuse_active_for_uuid_with_format_and_args(
+    super::live_owner::route_if_owner_exists_for_uuid_with_format_and_args(
         "pool",
         operation,
         pool_name,
         config.pool_uuid,
-        config.state == tidefs_types_pool_label_core::PoolState::Active,
         json,
         serde_json::Value::Null,
     );
@@ -1319,12 +1317,11 @@ fn handle_pool_export(pool_name: String, devices: Option<Vec<PathBuf>>, force: b
 
     let config = assemble_device_pool_config(&device_paths, "export");
     ensure_device_pool_name(&pool_name, "export", &config);
-    super::live_owner::route_or_refuse_active_for_uuid_with_args(
+    super::live_owner::route_if_owner_exists_for_uuid_with_args(
         "pool",
         "export",
         &pool_name,
         config.pool_uuid,
-        config.state == tidefs_types_pool_label_core::PoolState::Active,
         serde_json::json!({
             "force": force,
         }),
@@ -1390,12 +1387,11 @@ fn open_pool_property_filesystem_with_live_args(
 
     let config = assemble_device_pool_config(devs, operation);
     ensure_device_pool_name(pool, operation, &config);
-    super::live_owner::route_or_refuse_active_for_uuid_with_args(
+    super::live_owner::route_if_owner_exists_for_uuid_with_args(
         "pool",
         operation,
         pool,
         config.pool_uuid,
-        config.state == tidefs_types_pool_label_core::PoolState::Active,
         live_args,
     );
 

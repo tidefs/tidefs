@@ -5,8 +5,8 @@
 //!
 //! For imported pools, the pool name is routed to the live owner before this
 //! module opens any store. The target-device backing directory and surviving
-//! directories are only for exported/offline device removal after no live
-//! owner exists for the pool.
+//! directories are only for exported/offline device removal when no live owner
+//! interface exists for the pool.
 //!
 //! Offline device removal requires at least one surviving device backing
 //! directory (--surviving-dirs). Evacuated objects are read from the target
@@ -287,16 +287,15 @@ fn handle_remove(
     };
 
     // Read labels without creating or mutating the store. Cached labels are
-    // recovery input; a matching live owner manifest is the live-state gate
-    // before any offline evacuation store is opened writable.
+    // recovery input; only a matching live owner manifest redirects this
+    // offline evacuation request to live state.
     let pre_config = import_offline_pool_config(pool_name, backing_dir)?;
 
-    super::live_owner::route_or_refuse_active_for_uuid_with_args(
+    super::live_owner::route_if_owner_exists_for_uuid_with_args(
         "device",
         "remove",
         pool_name,
         pre_config.pool_uuid,
-        pre_config.state == tidefs_types_pool_label_core::PoolState::Active,
         live_args,
     );
 

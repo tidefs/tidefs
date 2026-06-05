@@ -293,12 +293,12 @@ tidefsctl snapshot receive --backing-dir /tmp/received-pool --input /tmp/mypool.
 
 For exported/offline pools, the same dataset and snapshot commands may take
 `--devices`. That direct-device form stays offline; it does not import the pool
-or create `/run/tidefs/pools/<uuid>` runtime ownership as a side effect. If
-those devices already identify an imported `ACTIVE` pool, or if the live-owner
-registry already names that pool UUID/name, the CLI refuses direct storage
-access and routes to the owner. If an `ACTIVE` label is stale after a crash
-and no owner is reachable, recover or create the owner with `pool mount
---devices`, or export the pool cleanly before offline work.
+or create `/run/tidefs/pools/<uuid>` runtime ownership as a side effect. If the
+live-owner registry already names that pool UUID/name, the CLI routes to that
+owner. An on-disk `ACTIVE` label is cached recovery evidence, not proof that a
+live owner currently exists. Without a reachable owner interface, explicit
+device arguments remain the offline repair, inspection, or clean-export path;
+they are not a way to inspect current live state.
 
 ### 6.3 Block device export
 
@@ -341,8 +341,9 @@ The pool name is the live-owner identity. If `mypool` is imported, device
 removal routes to that owner and fails closed until the owner implements the
 operation; the backing-directory form is only for exported/offline storage.
 The offline form probes existing labels without creating or opening the store
-writable, and an `ACTIVE` imported label only selects the owner route or closed
-failure. It is not permission to evacuate through cached state.
+writable. Those labels provide topology and recovery evidence; only a live
+owner registry entry redirects the request to runtime state. An `ACTIVE` label
+without an owner is stale/offline input, not live-state authority.
 
 ### 6.5 Pool export (deactivate)
 
