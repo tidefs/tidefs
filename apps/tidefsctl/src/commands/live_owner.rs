@@ -118,6 +118,35 @@ pub(crate) fn route_if_owner_exists_with_args(
     }
 }
 
+pub(crate) fn route_if_owner_exists_for_uuid(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    pool_uuid: [u8; 16],
+) {
+    route_if_owner_exists_for_uuid_with_format_and_args(
+        command,
+        operation,
+        pool,
+        pool_uuid,
+        false,
+        serde_json::Value::Null,
+    );
+}
+
+pub(crate) fn route_if_owner_exists_for_uuid_with_format_and_args(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    pool_uuid: [u8; 16],
+    json: bool,
+    args: serde_json::Value,
+) {
+    if owner_manifest_exists_for_uuid_at(&pool_runtime_root(), pool, &pool_uuid) {
+        route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
+    }
+}
+
 pub(crate) fn route_imported_with_format_and_args(
     command: &str,
     operation: &str,
@@ -201,13 +230,14 @@ pub(crate) fn route_if_imported_with_format_and_args(
     json: bool,
     args: serde_json::Value,
 ) {
-    let root = pool_runtime_root();
-    let uuid_manifest_exists = owner_manifest_exists_by_uuid_at(&root, &pool_uuid);
-    let pool_manifest_exists = owner_manifest_exists_by_pool_uuid_at(&root, pool, &pool_uuid);
-
-    if uuid_manifest_exists || pool_manifest_exists {
-        route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
-    }
+    route_if_owner_exists_for_uuid_with_format_and_args(
+        command,
+        operation,
+        pool,
+        pool_uuid,
+        json,
+        args.clone(),
+    );
     if imported_label {
         route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
     }
@@ -455,6 +485,11 @@ fn owner_manifest_exists_by_pool_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16
     false
 }
 
+fn owner_manifest_exists_for_uuid_at(root: &Path, pool: &str, uuid: &[u8; 16]) -> bool {
+    owner_manifest_exists_by_uuid_at(root, uuid)
+        || owner_manifest_exists_by_pool_uuid_at(root, pool, uuid)
+}
+
 fn owner_manifest_exists_by_pool_at(root: &Path, pool: &str) -> bool {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -584,6 +619,36 @@ mod tests {
             dir.path(),
             "tank",
             &[0x42; 16]
+        ));
+    }
+
+    #[test]
+    fn owner_manifest_exists_for_uuid_uses_uuid_not_pool_name_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let matching_uuid = [0x42; 16];
+        let other_uuid = [0x24; 16];
+        let manifest_path = dir.path().join("registry-entry").join("owner.json");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "pool_name": "tank",
+                "pool_uuid": "42424242424242424242424242424242",
+                "socket_path": "/run/tidefs/pools/tank/owner.sock",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(owner_manifest_exists_for_uuid_at(
+            dir.path(),
+            "tank",
+            &matching_uuid
+        ));
+        assert!(!owner_manifest_exists_for_uuid_at(
+            dir.path(),
+            "tank",
+            &other_uuid
         ));
     }
 

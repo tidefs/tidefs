@@ -16,7 +16,6 @@ use tidefs_encryption;
 use tidefs_local_filesystem::RootAuthenticationKey;
 use tidefs_transport::{NodeInfo, Transport, TransportAddr};
 use tidefs_types_pool_label_core::features;
-use tidefs_types_pool_label_core::PoolState;
 
 /// `pool mount <pool_name> <mount_point> [--devices <dev>...] [--read-only] [--relatime]`
 ///
@@ -238,12 +237,15 @@ pub fn handle_mount(args: PoolMountArgs) {
     // Determine the backing directory: explicit --devices import or live-owner route.
     let (backing_dir, owner_pool_uuid) = if let Some(ref devices) = args.devices {
         let existing_config = scan_device_pool_config(&args.pool_name, devices, "mount");
-        super::live_owner::route_if_imported(
+        // Mount with explicit devices is the userspace owner-creating path.
+        // Route only when a live owner has already published its interface;
+        // an ACTIVE label without an owner can be stale crash state and must
+        // still flow through pool_import recovery before this process owns it.
+        super::live_owner::route_if_owner_exists_for_uuid(
             "pool",
             "mount",
             &args.pool_name,
             existing_config.pool_uuid,
-            existing_config.state == PoolState::Active,
         );
 
         // Block-device path: import from raw devices, then use a
