@@ -769,6 +769,35 @@ mod tests {
         );
     }
 
+    // -- Block CLI parse tests -------------------------------------------
+
+    #[test]
+    fn cli_parse_block_attach_live_pool_positional() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "block", "attach", "mypool"]);
+        assert!(
+            args.is_ok(),
+            "block attach with positional pool should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_block_attach_offline_backing_dir() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "block",
+            "attach",
+            "mypool",
+            "--backing-dir",
+            "/var/lib/tidefs/mypool",
+        ]);
+        assert!(
+            args.is_ok(),
+            "block attach offline backing dir should parse"
+        );
+    }
+
     // -- Dataset CLI parse tests ------------------------------------------
 
     #[test]

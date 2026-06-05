@@ -301,8 +301,11 @@ access and routes to the owner.
 ### 6.3 Block device export
 
 ```sh
-# Attach a ublk block device backed by the pool
-tidefsctl block attach /var/lib/tidefs/mypool
+# Request a ublk block export from the imported pool owner
+tidefsctl block attach mypool
+
+# Development/exported object-store attach path
+tidefsctl block attach mypool --backing-dir /var/lib/tidefs/mypool
 
 # List exported block devices
 tidefsctl block list
@@ -310,6 +313,12 @@ tidefsctl block list
 # Detach
 tidefsctl block detach <dev-name>
 ```
+
+The pool-name form routes to the live owner. If the FUSE, ublk, or kernel
+owner does not implement block export yet, it fails closed instead of opening
+storage behind that owner. The `--backing-dir` form is only for exported or
+offline object-store development paths and checks for an existing owner before
+opening the backing directory.
 
 ### 6.4 Device management
 

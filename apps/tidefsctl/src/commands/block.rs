@@ -3,12 +3,14 @@
 //!
 //! # Entrypoint Authority
 //!
-//! `tidefsctl block attach` is the **single supported production
-//! entrypoint** for ublk block device lifecycle. It owns attach,
-//! I/O serve (read/write/flush/FUA/discard/write-zeroes),
-//! graceful drain, and detach. The block-volume-adapter-daemon
-//! binary `ublk-serve` subcommand is a development/harness tool
-//! and must not be used as a production device lifecycle path.
+//! `tidefsctl block attach <pool>` is the operator entrypoint for ublk block
+//! device lifecycle. Imported pools route to the live owner. Exported/offline
+//! object-store attach requires an explicit `--backing-dir`; the pool name is
+//! not interpreted as a filesystem path behind the runtime owner.
+//!
+//! The block-volume-adapter-daemon binary `ublk-serve` subcommand is a
+//! development/harness tool and must not be used as a production device
+//! lifecycle path.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -24,8 +26,12 @@ use tidefs_local_filesystem::RootAuthenticationKey;
 pub enum BlockCommand {
     /// Attach a pool as a ublk block device and serve I/O
     Attach {
-        /// Path to the pool object store directory
-        pool_path: PathBuf,
+        /// Pool name. Imported pools route to the live owner.
+        pool: String,
+
+        /// Backing directory for exported/offline object-store attach.
+        #[arg(short = 'b', long = "backing-dir")]
+        backing_dir: Option<PathBuf>,
 
         /// Number of hardware queues (1..UBLK_MAX_NR_QUEUES)
         #[arg(long, default_value_t = 1)]
@@ -94,14 +100,16 @@ pub enum BlockCommand {
 pub fn handle_block(cmd: BlockCommand) {
     match cmd {
         BlockCommand::Attach {
-            pool_path,
+            pool,
+            backing_dir,
             nr_hw_queues,
             queue_depth,
             drain_deadline_secs,
             io_uring,
         } => {
             if let Err(err) = handle_attach(
-                &pool_path,
+                &pool,
+                backing_dir.as_deref(),
                 nr_hw_queues,
                 queue_depth,
                 drain_deadline_secs,
@@ -149,24 +157,41 @@ pub fn handle_block(cmd: BlockCommand) {
 // ── Attach ────────────────────────────────────────────────────────────
 
 fn handle_attach(
-    pool_path: &Path,
+    pool: &str,
+    backing_dir: Option<&Path>,
     nr_hw_queues: u16,
     queue_depth: u16,
     drain_deadline_secs: u64,
     io_uring: bool,
 ) -> Result<(), String> {
+    let live_args = serde_json::json!({
+        "nr_hw_queues": nr_hw_queues,
+        "queue_depth": queue_depth,
+        "drain_deadline_secs": drain_deadline_secs,
+        "io_uring": io_uring,
+    });
+
+    let Some(pool_path) = backing_dir else {
+        super::live_owner::route_with_args("block", "attach", pool, live_args);
+    };
+
+    super::live_owner::route_if_owner_exists_with_args("block", "attach", pool, live_args.clone());
+
     if !pool_path.exists() {
-        return Err(format!("pool path does not exist: {}", pool_path.display()));
+        return Err(format!(
+            "backing directory does not exist: {}",
+            pool_path.display()
+        ));
     }
     if !pool_path.is_dir() {
         return Err(format!(
-            "pool path is not a directory: {}",
+            "backing directory is not a directory: {}",
             pool_path.display()
         ));
     }
 
     eprintln!(
-        "tidefsctl block attach: opening pool at {}",
+        "tidefsctl block attach: opening exported/offline backing directory for pool '{pool}' at {}",
         pool_path.display()
     );
 
@@ -502,14 +527,17 @@ mod tests {
     #[test]
     fn block_attach_rejects_nonexistent_path() {
         let result = handle_attach(
-            Path::new("/tmp/tidefs-nonexistent-pool-xyz"),
+            "mypool",
+            Some(Path::new("/tmp/tidefs-nonexistent-pool-xyz")),
             4,
             64,
             30,
             false,
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("pool path does not exist"),);
+        assert!(result
+            .unwrap_err()
+            .contains("backing directory does not exist"),);
     }
 
     #[test]
