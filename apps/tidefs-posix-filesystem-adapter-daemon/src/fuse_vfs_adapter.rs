@@ -21191,9 +21191,8 @@ mod tests {
         );
     }
 
-    #[ignore = "activate when #3062 dirty-tracking and #3058 fsync dispatch land"]
     #[test]
-    fn vfs_adapter_dispatch_ftruncate_fsync_coordination_stub() {
+    fn vfs_adapter_dispatch_ftruncate_updates_adapter_handle_size() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
         let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(

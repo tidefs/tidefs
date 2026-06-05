@@ -29,6 +29,7 @@ fn fast_opts() -> StoreOptions {
     // segment only fits 3872 bytes after record overhead).
     StoreOptions {
         max_segment_bytes: 16384,
+        verify_read_checksums: true,
         ..StoreOptions::test_fast()
     }
 }

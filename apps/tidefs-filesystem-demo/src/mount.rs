@@ -158,12 +158,7 @@ mod smoke {
 
     /// write_read_roundtrip: write bytes, read back, compare.
     ///
-    /// NOTE: this test exercises FUSE write (#3581) and read (#3574)
-    /// dispatch batches that are currently owned by peer workers.
-    /// If the read or write path is incomplete, this test will fail.
-    /// When the batches land, remove the `#[ignore]` attribute.
     #[test]
-    #[ignore = "depends on FUSE read (#3574) and write (#3581) dispatch batches"]
     fn write_read_roundtrip() {
         let mount = TempMount::new();
         let file_path = mount.path("/data.bin");
@@ -216,10 +211,7 @@ mod smoke {
 
     /// Concurrent readers: spawn threads that open and read a shared file.
     ///
-    /// NOTE: depends on FUSE read dispatch (#3574) owned by peer workers.
-    /// When the batch lands, remove the `#[ignore]` attribute.
     #[test]
-    #[ignore = "depends on FUSE read dispatch (#3574)"]
     fn concurrent_readers() {
         let mount = TempMount::new();
         let file_path = mount.path("/shared.txt");

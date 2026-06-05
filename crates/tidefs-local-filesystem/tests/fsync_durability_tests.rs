@@ -67,7 +67,7 @@ fn opts() -> StoreOptions {
         fault_injection_config: None,
         background_scrub_interval_secs: 0,
         segment_count: 256,
-        verify_read_checksums: false,
+        verify_read_checksums: true,
         durability_layout: None,
     }
 }
