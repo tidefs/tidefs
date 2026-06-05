@@ -3,7 +3,7 @@
 Maturity: current policy guardrail.
 
 TideFS may describe ambition and future direction, but publishing-facing docs
-do not prove.
+must not present future capability as current product fact.
 
 ## Required command
 
@@ -19,21 +19,32 @@ The canonical Forgejo repository is `forgeadmin/tidefs`. Local
 overrides are for temporary forks or emergency diagnostics only; the primary
 `/root/tidefs` checkout should not need a tracked-source override.
 
-The full Nix gate also runs it through:
-
-```text
-```
-
 ## Claims rule
 
-exists. The same rule applies to these present-tense claim families:
+Current capability wording is blocked for these claim families unless the same
+line clearly frames the capability as absent today, future work, or a goal:
 
+- must not publish an OpenZFS/Ceph successor claim;
+- must not claim production-ready status;
+- must not claim POSIX-complete behavior;
+- must not claim distributed storage capability;
+- must not claim kernelspace-ready or full-kernel operation;
+- must not claim an RDMA data path.
 
 A line may mention one of those topics only when it is clearly framed as one of:
 
 - not true today;
 - future or aspirational work;
 - a goal or ambition rather than current product state.
+
+## Proof Before Stronger Claims
+
+Stronger wording requires all of the following:
+
+1. a tracked Forgejo issue naming the claim;
+2. recorded proof that covers the full claimed behavior;
+3. an updated current-status or review-register row;
+4. an updated claims gate rule that allows the specific stronger claim.
 
 ## Scanned surfaces
 
@@ -47,11 +58,3 @@ the whole-repo review. It also verifies that the source rule table in
 Forgejo `PC-*` issues track publication gates. No release note or handoff may
 upgrade the project from prototype wording to present-tense production
 intentionally.
-
-
-
-Stronger wording requires all of the following:
-
-1. a tracked Forgejo issue naming the claim;
-3. an updated current-status or review-register row;
-4. an updated claims gate rule that allows the specific stronger claim.

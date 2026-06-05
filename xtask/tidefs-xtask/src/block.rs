@@ -461,7 +461,7 @@ pub fn check_block_volume_host_preflight_current_workspace() -> Result<(), Block
         "apps/tidefs-block-volume-adapter-daemon/src/kernel_check.rs",
         "docs/BLOCK_VOLUME_ADAPTER_HOST_PREFLIGHT_OW301H.md",
         "docs/ARCHITECTURE.md",
-        "docs/VALIDATION.md",
+        "docs/GITHUB_CI.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -512,7 +512,7 @@ pub fn check_block_volume_host_preflight_current_workspace() -> Result<(), Block
             "daemon-local host/kernel classification",
             "/dev/ublk-control",
             "does not load modules",
-            "not attach/list/detach validation",
+            "not a ublk daemon",
         ],
         &mut missing,
     );
@@ -527,16 +527,13 @@ pub fn check_block_volume_host_preflight_current_workspace() -> Result<(), Block
     );
     check_source_markers(
         &root,
-        "docs/VALIDATION.md",
-        &[
-            "QEMU guest checks for FUSE, ublk, RDMA, and kernel behavior",
-            "Host-kernel shortcuts and Nix-sandbox device refusals",
-        ],
+        "docs/GITHUB_CI.md",
+        &["QEMU Smoke", "ublk", "self-hosted"],
         &mut missing,
     );
     if missing.is_empty() {
         println!(
-            "OW-301H block-volume host preflight ok: Linux host probe, ublk control-device readiness, explicit attach refusal, non-mutation, and validation hooks are implementation-tracked non-release"
+            "OW-301H block-volume host preflight ok: Linux host probe, ublk control-device readiness, explicit attach refusal, non-mutation, and proof hooks are implementation-tracked non-release"
         );
         Ok(())
     } else {

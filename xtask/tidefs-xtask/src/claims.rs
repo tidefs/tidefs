@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, or RDMA data-path capability before matching validation has passed";
+pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, or RDMA data-path capability before matching proof exists";
 pub const CLAIMS_GATE_REQUIRED_COMMAND: &str = "cargo run -p tidefs-xtask -- check-claims-gate";
 
 pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
@@ -16,7 +16,6 @@ pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "docs/PREVIEW_USER_MANUAL.md",
     "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
     "docs/REVIEW_TODO_REGISTER.md",
-    "docs/VALIDATION.md",
     "docs/WHOLE_REPO_REVIEW.md",
 ];
 
@@ -43,8 +42,8 @@ const CLAIMS_GATE_ALLOWED_FRAMES: &[&str] = &[
     "no ",
     "none",
     "without",
-    "until validation",
-    "before validation",
+    "until proof",
+    "before proof",
     "prohibited",
     "future",
     "eventually",
@@ -92,7 +91,7 @@ pub enum ClaimGateRuleTopic {
     ForbiddenCurrentCapabilityClaims,
     RequiredLimitationMarkers,
     ForgejoWorkState,
-    ValidationBeforeEscalation,
+    EvidenceBeforeEscalation,
 }
 
 impl ClaimGateRuleTopic {
@@ -104,7 +103,7 @@ impl ClaimGateRuleTopic {
             }
             Self::RequiredLimitationMarkers => "claims_gate.required_limitation_markers",
             Self::ForgejoWorkState => "claims_gate.forgejo_work_state",
-            Self::ValidationBeforeEscalation => "claims_gate.validation_before_escalation",
+            Self::EvidenceBeforeEscalation => "claims_gate.evidence_before_escalation",
         }
     }
 
@@ -114,7 +113,7 @@ impl ClaimGateRuleTopic {
             Self::ForbiddenCurrentCapabilityClaims => "forbidden current capability claims",
             Self::RequiredLimitationMarkers => "required limitation markers",
             Self::ForgejoWorkState => "Forgejo work-state authority",
-            Self::ValidationBeforeEscalation => "validation before stronger claims",
+            Self::EvidenceBeforeEscalation => "proof before stronger claims",
         }
     }
 }
@@ -136,15 +135,15 @@ pub const CLAIMS_GATE_RULES: &[ClaimGateRule] = &[
     },
     ClaimGateRule {
         topic: ClaimGateRuleTopic::RequiredLimitationMarkers,
-        rule: "README and current preview docs must preserve explicit limitation markers so readers see prototype status and missing validation before capability summaries.",
+        rule: "README and current preview docs must preserve explicit limitation markers so readers see prototype status and missing proof before capability summaries.",
     },
     ClaimGateRule {
         topic: ClaimGateRuleTopic::ForgejoWorkState,
         rule: "Forgejo project state, not repo-local task, checklist, roadmap, queue, or ledger files, is the live work-state authority.",
     },
     ClaimGateRule {
-        topic: ClaimGateRuleTopic::ValidationBeforeEscalation,
-        rule: "Any stronger claim requires a tracked Forgejo issue, validation, and an update to this gate before the wording can become present-tense product capability.",
+        topic: ClaimGateRuleTopic::EvidenceBeforeEscalation,
+        rule: "Any stronger claim requires a tracked Forgejo issue, recorded proof, and an update to this gate before the wording can become present-tense product capability.",
     },
 ];
 
@@ -217,7 +216,7 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "production-ready",
             "POSIX-complete",
             "check-claims-gate",
-            "validation before stronger claims",
+            "Proof Before Stronger Claims",
         ],
         &mut missing,
     );
@@ -255,7 +254,7 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
 
     scan_public_claim_surfaces(&root, &mut missing);
 
-    // Forgejo work/claim validation: ensure parallel instance safety
+    // Forgejo work/claim proof: ensure parallel instance safety
     if let Err(err) = forgejo_work::check_claim_gate_current_workspace() {
         missing.push(format!("forgejo claim gate: {err}"));
     }
@@ -278,8 +277,8 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
 }
 
 fn check_source_bound_claim_rules(missing: &mut Vec<String>) {
-    if !CLAIMS_GATE_POLICY_SPEC.contains("matching validation") {
-        missing.push("claims gate policy spec does not mention matching validation".to_string());
+    if !CLAIMS_GATE_POLICY_SPEC.contains("matching proof") {
+        missing.push("claims gate policy spec does not mention matching proof".to_string());
     }
     if !CLAIMS_GATE_REQUIRED_COMMAND.contains("check-claims-gate") {
         missing.push("claims gate required command does not name check-claims-gate".to_string());
@@ -291,7 +290,7 @@ fn check_source_bound_claim_rules(missing: &mut Vec<String>) {
         ClaimGateRuleTopic::ForbiddenCurrentCapabilityClaims,
         ClaimGateRuleTopic::RequiredLimitationMarkers,
         ClaimGateRuleTopic::ForgejoWorkState,
-        ClaimGateRuleTopic::ValidationBeforeEscalation,
+        ClaimGateRuleTopic::EvidenceBeforeEscalation,
     ] {
         if !rules.iter().any(|rule| rule.topic == topic) {
             missing.push(format!(
@@ -403,7 +402,7 @@ mod tests {
             ClaimGateRuleTopic::ForbiddenCurrentCapabilityClaims,
             ClaimGateRuleTopic::RequiredLimitationMarkers,
             ClaimGateRuleTopic::ForgejoWorkState,
-            ClaimGateRuleTopic::ValidationBeforeEscalation,
+            ClaimGateRuleTopic::EvidenceBeforeEscalation,
         ] {
             assert!(
                 rules.iter().any(|rule| rule.topic == topic),
@@ -418,7 +417,7 @@ mod tests {
             "production-ready",
             "POSIX-complete",
             "Forgejo project state",
-            "validation",
+            "proof",
         ] {
             assert!(
                 rules.iter().any(|rule| rule.rule.contains(marker))
@@ -427,7 +426,7 @@ mod tests {
             );
         }
 
-        assert!(CLAIMS_GATE_POLICY_SPEC.contains("matching validation"));
+        assert!(CLAIMS_GATE_POLICY_SPEC.contains("matching proof"));
         assert!(CLAIMS_GATE_REQUIRED_COMMAND.contains("check-claims-gate"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"README.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/REVIEW_TODO_REGISTER.md"));
@@ -454,7 +453,7 @@ mod tests {
             "TideFS is not production-ready."
         ));
         assert!(!line_has_present_tense_overclaim(
-            "The OpenZFS/Ceph successor claim is prohibited until validation exists."
+            "The OpenZFS/Ceph successor claim is prohibited until proof exists."
         ));
         assert!(!line_has_present_tense_overclaim(
             "RDMA data path work is future optional transport acceleration."

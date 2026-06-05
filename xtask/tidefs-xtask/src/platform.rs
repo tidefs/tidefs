@@ -28,8 +28,9 @@ pub fn check_current_workspace() -> Result<(), PlatformCheckError> {
         "nix/tidefs-validation.sh",
         "nix/tidefs-qemu-direct.sh",
         "nix/tidefs-rdma-probe.sh",
-        "docs/NIX_DEVELOPMENT_AND_VALIDATION.md",
-        "docs/VALIDATION.md",
+        "docs/DEBUGGING_WORKFLOWS.md",
+        "docs/GITHUB_CI.md",
+        "docs/xfstests-harness.md",
         "docs/RDMA_TRANSPORT_POSITION.md",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -61,29 +62,29 @@ pub fn check_current_workspace() -> Result<(), PlatformCheckError> {
     );
     check_source_markers(
         &root,
-        "docs/VALIDATION.md",
-        &["ephemeral", "/root/ai/tmp/tidefs-validation", "QEMU"],
+        "docs/DEBUGGING_WORKFLOWS.md",
+        &["nix develop", "POSIX scoreboard", "Output artifacts"],
         &mut missing,
     );
     check_source_markers(
         &root,
-        "docs/NIX_DEVELOPMENT_AND_VALIDATION.md",
+        "docs/GITHUB_CI.md",
+        &["TIDEFS_SELF_HOSTED_READY", "QEMU Smoke", "xfstests", "RDMA"],
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "docs/xfstests-harness.md",
         &[
-            "nix develop",
-            "nix run .#validate",
-            "CARGO_TARGET_DIR",
-            "/root/ai/tmp/tidefs-validation",
-            "nix run .#qemu-direct",
-            "TIDEFS_QEMU_KERNEL",
-            "nix run .#rdma-probe",
-            "TIDEFS_RDMA_ALLOW_MUTATION=1",
-            "environment.env",
+            "fuse-xfstests",
+            "outside the Nix build sandbox",
+            "scoreboard.md",
         ],
         &mut missing,
     );
 
     if missing.is_empty() {
-        println!("platform scaffolding ok: current Nix validation, outside-sandbox QEMU direct, and optional RDMA probe surfaces are present");
+        println!("platform scaffolding ok: current Nix proof, outside-sandbox QEMU direct, and optional RDMA probe surfaces are present");
         Ok(())
     } else {
         Err(PlatformCheckError { missing })

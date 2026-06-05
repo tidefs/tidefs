@@ -65,7 +65,7 @@ On the initial v0.399 probe host:
 - the Nix app supplies RDMA user tools through `rdma-core`; `ibv_devinfo`
   reports no IB devices on the current host.
 
-TideFS has an RDMA data path.
+TideFS does not have a product RDMA data path yet.
 
 The OW-308 harness classifies this state as `blocked_no_active_link` with
 `transport_session_0_fallback=tcp_required`.

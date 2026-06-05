@@ -972,18 +972,18 @@ Important 2026-06-01 findings:
   `unsupported=43`, and `skipped=3`; the xfstests rows specifically had zero
   PASS rows, 4 product FAIL rows (`generic/169`, `184`, `192`, `198`), 43
   unsupported rows, and 3 skipped rows. The infrastructure rows, including
-  `unmount` and `daemon_stop`, passed. A focused current-tree rerun at
-  `/root/ai/tmp/tidefs-validation/fuse-generic-184-20260603T183844Z.json`
+  `unmount` and `daemon_stop`, passed. A focused current-tree rerun recorded as
+  `fuse-generic-184-20260603T183844Z.json`
   now passes `generic/184` after FUSE special-node `mknod` preserves device
   node type, `rdev`, and `/dev/null` write-through behavior. A second focused
   current-head rerun at
-  `/root/ai/tmp/tidefs-validation/fuse-generic-192-20260603T190341Z.json`
+  `fuse-generic-192-20260603T190341Z.json`
   now passes `generic/192`. A focused patched-tree rerun at
-  `/root/ai/tmp/tidefs-validation/fuse-generic-169-20260603T192830Z-fsgetxattr.json`
+  `fuse-generic-169-20260603T192830Z-fsgetxattr.json`
   now passes `generic/169` after `FS_IOC_FSGETXATTR` reports a Linux-shaped
   empty `struct fsxattr` and the xfstests helper keeps a stable per-device
   backing store across remounts. A focused patched-tree rerun at
-  `/root/ai/tmp/tidefs-validation/fuse-generic-198-20260604T004023Z-final.json`
+  `fuse-generic-198-20260604T004023Z-final.json`
   now passes `generic/198` with `passed=12`, `failed=0`, `blocked=0`,
   `unsupported=0`, and `skipped=0` after sparse same-size direct-write
   overlays, open-unlink sparse anonymous data, deferred O_DIRECT flush

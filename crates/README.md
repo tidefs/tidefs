@@ -27,8 +27,8 @@ Current audit note as of 2026-06-01:
   `tidefs-types-truth-view-core` were deleted after reverse-reference review
   found no live code consumers and their current record surfaces were already
   represented by `tidefs-types-vfs-core` or product-local code.
-- This file is a source ownership index, not release validation. Capability
-  claims must follow `docs/REVIEW_TODO_REGISTER.md`, `docs/VALIDATION.md`, and
+- This file is a source ownership index, not release proof. Capability claims
+  must follow `docs/REVIEW_TODO_REGISTER.md`, `docs/CLAIMS_GATE_POLICY.md`, and
   `cargo run -p tidefs-xtask -- check-claims-gate`.
 
 Authoritative companion docs:
@@ -53,7 +53,7 @@ Authoritative companion docs:
 | `tidefs-block-volume-adapter-core` | Block adapter | Pure block-volume request and descriptor mapping core. |
 | `tidefs-block-volume-adapter-ublk-control-runtime` | Block adapter | Linux ublk control-device runtime and queue boundary. |
 | `tidefs-btree` | Storage core | Generic `no_std` B+tree used by indexes, queues, and maps. |
-| `tidefs-cache-core` | Storage core | Cache-lattice registry, eviction, invalidation, and coherency logic. |
+| `tidefs-cache-core` | Storage core | Cache-lattice registry, eviction, and coherency logic. |
 | `tidefs-checksum-tree` | Maintenance | Incremental Merkle checksum tree for integrity checking and scrub. |
 | `tidefs-chunk-shipper` | Distributed storage | Cross-node chunk staging, streaming, and receive orchestration. |
 | `tidefs-claim-ledger` | Control and policy | Runtime claim ledger for capacity and resource admission. |
@@ -70,7 +70,7 @@ Authoritative companion docs:
 | `tidefs-dataset-catalog` | Storage core | Dataset path-to-id catalog with stable IDs across renames. |
 | `tidefs-dataset-feature-flags` | Storage core | Runtime dataset feature compatibility and enablement gate. |
 | `tidefs-dataset-lifecycle` | Storage core | Dataset `ACTIVE`, `DESTROYING`, and `TOMBSTONE` runtime transitions. |
-| `tidefs-dataset-properties` | Storage core | Inherited dataset property framework and validation. |
+| `tidefs-dataset-properties` | Storage core | Inherited dataset property framework and typed property checks. |
 | `tidefs-dedup` | Maintenance | Post-process duplicate extent scanner and DDT planner. |
 | `tidefs-derived-catalog` | Storage core | Cached derived directory and catalog views over authoritative indexes. |
 | `tidefs-device-removal` | Storage core | Device decommission state machine and evacuation planner. |
@@ -88,7 +88,6 @@ Authoritative companion docs:
 | `tidefs-inode-attributes` | Storage core | Inode attributes, stat translation, xattrs, and link counts. |
 | `tidefs-inode-table` | Storage core | Inode-number registry, allocator, lookup, and lifecycle table. |
 | `tidefs-intent-log` | Storage core | Mutating filesystem intent records and framed append buffer. |
-| `tidefs-invalidation-feed` | Distributed storage | Cluster cache-invalidation event stream and resync protocol. |
 | `tidefs-kernel-cutover-runtime` | Kernel | Userspace cutover, fence, dry-run, and rollback executor for kernel transition. |
 | `tidefs-kernel-storage-io` | Kernel | Kernel-portable block I/O traits and `KernelPoolCore` primitives. |
 | `tidefs-kmod-posix-vfs` | Kernel | Linux POSIX VFS module delegating to the `VfsEngine` boundary. |
@@ -118,7 +117,7 @@ Authoritative companion docs:
 | `tidefs-posix-filesystem-adapter-reply` | POSIX/FUSE | FUSE reply construction and commit lanes. |
 | `tidefs-posix-filesystem-adapter-workers-io` | POSIX/FUSE | FUSE read/writeback worker-pool support. |
 | `tidefs-posix-filesystem-adapter-workers-locks` | POSIX/FUSE | FUSE lock-wait worker-pool support. |
-| `tidefs-posix-guarantee-verifier` | Validation | Checks whether a coordination strategy satisfies POSIX operation guarantees. |
+| `tidefs-posix-guarantee-verifier` | Proof harness | Checks whether a coordination strategy satisfies POSIX operation guarantees. |
 | `tidefs-posix-semantics` | POSIX/FUSE | Pure POSIX helpers for sticky, setgid, killpriv, and relatime behavior. |
 | `tidefs-quorum-write` | Distributed storage | Deterministic prepare, transfer, commit, and witness write protocol. |
 | `tidefs-quorum-write-runtime` | Distributed storage | Runtime quorum-write coordinator for `LocalFileSystem` writes. |
@@ -146,9 +145,9 @@ Authoritative companion docs:
 | `tidefs-space-accounting` | Storage core | Logical and physical counters, statfs, ENOSPC, and capacity gates. |
 | `tidefs-spacemap-allocator` | Storage core | Deterministic segment-level free-space allocator. |
 | `tidefs-tdma-scheduler` | Distributed storage | Per-object TDMA slot scheduler for contending nodes. |
-| `tidefs-trace-oracle` | Validation | Deterministic operation recording and replay oracle. |
+| `tidefs-trace-oracle` | Proof harness | Deterministic operation recording and replay oracle. |
 | `tidefs-transport` | Distributed storage | TCP/RDMA transport, sessions, lanes, envelopes, and reconnection. |
-| `tidefs-two-node-harness` | Validation | Deterministic two-node storage and transport scenario harness. |
+| `tidefs-two-node-harness` | Proof harness | Deterministic two-node storage and transport scenario harness. |
 | `tidefs-types-cache-lattice-core` | Types | Cache lattice value types. |
 | `tidefs-types-claim-ledger-core` | Types | Claim, reserve, and witness value types. |
 | `tidefs-types-control-plane-core` | Types | Control-plane scalar and newtype core. |
@@ -172,12 +171,11 @@ Authoritative companion docs:
 | `tidefs-types-vfs-core` | Types | Portable VFS scalar and fixed record types. |
 | `tidefs-types-vfs-owned` | Types | Alloc-backed owned mirrors for VFS boundary values. |
 | `tidefs-ublk-abi` | Block adapter | Typed Linux ublk userspace ABI constants. |
-| `tidefs-validation` | Validation | Validation harness and validation helpers. |
 | `tidefs-verification-engine` | Maintenance | Replicated chunk and segment verification engine. |
 | `tidefs-vfs-engine` | VFS boundary | `VfsEngine` trait and canonical operation boundary. |
 | `tidefs-vfs-rpc` | VFS boundary | `VfsEngine` RPC forwarding protocol over transport. |
 | `tidefs-witness-set` | Distributed storage | Quorum witness selection and receipt tracking. |
-| `tidefs-workload` | Validation | Workload signature and materialization classifier. |
+| `tidefs-workload` | Proof harness | Workload signature and materialization classifier. |
 | `tidefs-xattr-storage` | Storage core | Polymorphic xattr storage runtime. |
 
 ## Deletion / Archive Candidates
@@ -186,7 +184,7 @@ No deletion should happen from this README alone. Each candidate below needs an
 issue-backed cleanup decision because deleted or archived subjects must not keep
 living on the active authority path.
 
-| Candidate | Validation | Disposition |
+| Candidate | Basis | Disposition |
 | --- | --- | --- |
 | Remaining non-workspace crate-local fuzz harnesses | These have `Cargo.toml` files but are intentionally excluded from root workspace membership because cargo-fuzz targets are built separately. | Keep standalone-checkable while they cover parser or on-disk format inputs; delete when coverage is redundant. |
-| Zero-reverse workspace review set: `tidefs-invalidation-feed`, `tidefs-vfs-rpc`, `tidefs-workload`, `tidefs-secret-key-policy-runtime`, `tidefs-types-package-profile-catalog` | These are workspace members with zero in-workspace reverse dependencies. Some may be entrypoints, public surfaces, or issue-backed future work. | Review-only, not deletion by default. Require a concrete owner issue to classify each as live, planned, archived, or removable. The standalone `tidefs-posix-filesystem-adapter-runtime` crate was removed after review because the daemon owns the live runtime module. |
+| Zero-reverse workspace review set: `tidefs-vfs-rpc`, `tidefs-workload`, `tidefs-secret-key-policy-runtime`, `tidefs-types-package-profile-catalog` | These are workspace members with zero in-workspace reverse dependencies. Some may be entrypoints, public surfaces, or issue-backed future work. | Review-only, not deletion by default. Require a concrete owner issue to classify each as live, planned, archived, or removable. The standalone `tidefs-posix-filesystem-adapter-runtime` crate was removed after review because the daemon owns the live runtime module. |

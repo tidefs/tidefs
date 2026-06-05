@@ -1315,16 +1315,16 @@ Concrete current drift:
   through `generic/200`. That tranche had no xfstests pass rows:
   `generic/169`, `generic/184`, `generic/192`, and `generic/198` failed as
   product defects; 43 rows were unsupported; and 3 rows were skipped
-  preconditions. A focused current-tree rerun at
-  `/root/ai/tmp/tidefs-validation/fuse-generic-184-20260603T183844Z.json`
+  preconditions. A focused current-tree rerun recorded as
+  `fuse-generic-184-20260603T183844Z.json`
   now passes `generic/184`. A second focused current-head run at
-  `/root/ai/tmp/tidefs-validation/fuse-generic-192-20260603T190341Z.json`
+  `fuse-generic-192-20260603T190341Z.json`
   now passes `generic/192`. A focused patched-tree run at
-  `/root/ai/tmp/tidefs-validation/fuse-generic-169-20260603T192830Z-fsgetxattr.json`
+  `fuse-generic-169-20260603T192830Z-fsgetxattr.json`
   now passes `generic/169` after `FS_IOC_FSGETXATTR` reports a Linux-shaped
   empty `struct fsxattr` and the xfstests helper keeps a stable per-device
   backing store across remounts. A focused patched-tree rerun at
-  `/root/ai/tmp/tidefs-validation/fuse-generic-198-20260604T004023Z-final.json`
+  `fuse-generic-198-20260604T004023Z-final.json`
   now passes `generic/198` with `passed=12`, `failed=0`, `blocked=0`,
   `unsupported=0`, and `skipped=0` after sparse same-size direct-write
   overlays, open-unlink sparse anonymous data, deferred O_DIRECT flush

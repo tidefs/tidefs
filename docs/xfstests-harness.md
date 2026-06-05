@@ -178,16 +178,16 @@ product defects (`generic/169`, `184`, `192`, `198`); 43 rows are unsupported
 feature/precondition rows; and 3 rows are environment or feature skips. The
 `passed=10`, `failed=4`, `blocked=0`, `unsupported=43`, and `skipped=3`; all
 infrastructure rows, including `unmount` and `daemon_stop`, passed. A focused
-current-tree rerun at
-`/root/ai/tmp/tidefs-validation/fuse-generic-184-20260603T183844Z.json`
+current-tree rerun recorded as
+`fuse-generic-184-20260603T183844Z.json`
 passes `generic/184`. A second focused current-head run at
-`/root/ai/tmp/tidefs-validation/fuse-generic-192-20260603T190341Z.json`
+`fuse-generic-192-20260603T190341Z.json`
 passes `generic/192`. A focused patched-tree run at
-`/root/ai/tmp/tidefs-validation/fuse-generic-169-20260603T192830Z-fsgetxattr.json`
+`fuse-generic-169-20260603T192830Z-fsgetxattr.json`
 passes `generic/169` after `FS_IOC_FSGETXATTR` reports a Linux-shaped empty
 `struct fsxattr` and the xfstests helper keeps a stable per-device backing
 store across remounts. A focused patched-tree rerun at
-`/root/ai/tmp/tidefs-validation/fuse-generic-198-20260604T004023Z-final.json`
+`fuse-generic-198-20260604T004023Z-final.json`
 passes `generic/198` with `passed=12`, `failed=0`, `blocked=0`,
 `unsupported=0`, and `skipped=0` after sparse same-size direct-write overlays,
 open-unlink sparse anonymous data, deferred O_DIRECT flush behavior, and
