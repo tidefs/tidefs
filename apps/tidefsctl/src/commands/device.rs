@@ -33,7 +33,6 @@ use tidefs_pool_scan::{
     DeviceRemovalPlanner, DeviceRemovalResult, DeviceRemovalState, ObjectPlacement, PoolConfig,
 };
 use tidefs_replication_model::{FailureDomain, ReplicationIntent};
-use tidefs_types_pool_label_core::PoolState;
 
 /// Device management subcommands.
 #[derive(Subcommand, Debug)]
@@ -286,17 +285,16 @@ fn handle_remove(
         }
     };
 
-    // Read labels without creating or mutating the store. If labels say the
-    // pool is active/imported, the owner boundary below must route or fail
-    // closed before any offline evacuation store is opened writable.
+    // Read labels without creating or mutating the store. Cached labels are
+    // recovery input; a matching live owner manifest is the live-state gate
+    // before any offline evacuation store is opened writable.
     let pre_config = import_offline_pool_config(pool_name, backing_dir)?;
 
-    super::live_owner::route_if_imported_with_args(
+    super::live_owner::route_if_owner_exists_for_uuid_with_args(
         "device",
         "remove",
         pool_name,
         pre_config.pool_uuid,
-        pre_config.state == PoolState::Active,
         live_args,
     );
 

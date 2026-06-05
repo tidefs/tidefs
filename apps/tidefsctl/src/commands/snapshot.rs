@@ -15,7 +15,6 @@ use tidefs_local_filesystem::{
 };
 use tidefs_local_object_store::StoreOptions;
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
-use tidefs_types_pool_label_core::PoolState;
 
 // ---------------------------------------------------------------------------
 // Snapshot network transfer protocol (simple VFSSEND1 push/pull via VSNP)
@@ -571,12 +570,11 @@ fn import_devices_metadata_dir(
     live_args: serde_json::Value,
 ) -> PathBuf {
     let config = scan_device_pool_config(pool_name, devices, operation);
-    super::live_owner::route_if_imported_with_args(
+    super::live_owner::route_if_owner_exists_for_uuid_with_args(
         "snapshot",
         operation,
         pool_name,
         config.pool_uuid,
-        config.state == PoolState::Active,
         live_args,
     );
 

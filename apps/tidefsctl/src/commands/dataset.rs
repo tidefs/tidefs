@@ -17,7 +17,6 @@ use tidefs_dataset_properties;
 use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy, RootAuthenticationKey};
 use tidefs_local_object_store::StoreOptions;
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
-use tidefs_types_pool_label_core::PoolState;
 
 use bincode;
 
@@ -351,12 +350,11 @@ fn open_filesystem_with_live_args(
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
-        super::live_owner::route_if_imported_with_args(
+        super::live_owner::route_if_owner_exists_for_uuid_with_args(
             "dataset",
             operation,
             pool,
             config.pool_uuid,
-            config.state == PoolState::Active,
             live_args,
         );
 
@@ -1526,12 +1524,11 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
 fn resolve_pool_path(pool: &str, devices: Option<&[PathBuf]>, operation: &str) -> PathBuf {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
-        super::live_owner::route_if_imported(
+        super::live_owner::route_if_owner_exists_for_uuid(
             "dataset",
             operation,
             pool,
             config.pool_uuid,
-            config.state == PoolState::Active,
         );
 
         return super::offline_pool::metadata_dir("dataset", operation, &config.pool_uuid);

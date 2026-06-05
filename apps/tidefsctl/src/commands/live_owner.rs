@@ -2,7 +2,8 @@
 //!
 //! A pool name is an identity for state already owned by a runtime, not a
 //! filesystem path. Explicit storage arguments are not override handles once
-//! a kernel, FUSE, or ublk runtime owns the imported pool.
+//! a kernel, FUSE, or ublk runtime owns the imported pool. Cached label state
+//! is not that ownership signal; a live owner has to publish an interface.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -134,6 +135,18 @@ pub(crate) fn route_if_owner_exists_for_uuid(
     );
 }
 
+pub(crate) fn route_if_owner_exists_for_uuid_with_args(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    pool_uuid: [u8; 16],
+    args: serde_json::Value,
+) {
+    route_if_owner_exists_for_uuid_with_format_and_args(
+        command, operation, pool, pool_uuid, false, args,
+    );
+}
+
 pub(crate) fn route_if_owner_exists_for_uuid_with_format_and_args(
     command: &str,
     operation: &str,
@@ -163,84 +176,6 @@ pub(crate) fn route_imported_with_format_and_args(
         json,
         args,
     })
-}
-
-pub(crate) fn route_if_imported(
-    command: &str,
-    operation: &str,
-    pool: &str,
-    pool_uuid: [u8; 16],
-    imported_label: bool,
-) {
-    route_if_imported_with_format_and_args(
-        command,
-        operation,
-        pool,
-        pool_uuid,
-        imported_label,
-        false,
-        serde_json::Value::Null,
-    );
-}
-
-pub(crate) fn route_if_imported_with_format(
-    command: &str,
-    operation: &str,
-    pool: &str,
-    pool_uuid: [u8; 16],
-    imported_label: bool,
-    json: bool,
-) {
-    route_if_imported_with_format_and_args(
-        command,
-        operation,
-        pool,
-        pool_uuid,
-        imported_label,
-        json,
-        serde_json::Value::Null,
-    );
-}
-
-pub(crate) fn route_if_imported_with_args(
-    command: &str,
-    operation: &str,
-    pool: &str,
-    pool_uuid: [u8; 16],
-    imported_label: bool,
-    args: serde_json::Value,
-) {
-    route_if_imported_with_format_and_args(
-        command,
-        operation,
-        pool,
-        pool_uuid,
-        imported_label,
-        false,
-        args,
-    );
-}
-
-pub(crate) fn route_if_imported_with_format_and_args(
-    command: &str,
-    operation: &str,
-    pool: &str,
-    pool_uuid: [u8; 16],
-    imported_label: bool,
-    json: bool,
-    args: serde_json::Value,
-) {
-    route_if_owner_exists_for_uuid_with_format_and_args(
-        command,
-        operation,
-        pool,
-        pool_uuid,
-        json,
-        args.clone(),
-    );
-    if imported_label {
-        route_imported_with_format_and_args(command, operation, pool, pool_uuid, json, args);
-    }
 }
 
 fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {

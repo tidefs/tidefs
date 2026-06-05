@@ -28,7 +28,6 @@ use clap::Parser;
 use tidefs_dataset_properties;
 use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy, RootAuthenticationKey};
 use tidefs_local_object_store::StoreOptions;
-use tidefs_types_pool_label_core::PoolState;
 
 #[derive(Parser, Debug)]
 pub enum PoolCommand {
@@ -519,13 +518,13 @@ fn handle_pool_import(
     json: bool,
 ) {
     let config = assemble_device_pool_config(&devices, "import");
-    super::live_owner::route_if_imported_with_format(
+    super::live_owner::route_if_owner_exists_for_uuid_with_format_and_args(
         "pool",
         "import",
         &config.pool_name,
         config.pool_uuid,
-        config.state == PoolState::Active,
         json,
+        serde_json::Value::Null,
     );
 
     if json {
@@ -659,7 +658,7 @@ fn handle_pool_status(pool_name: String, devices: Option<Vec<PathBuf>>, json: bo
 
     let config = assemble_device_pool_config(&device_paths, "status");
     ensure_device_pool_name(&pool_name, "status", &config);
-    route_active_device_pool_with_format("status", &pool_name, &config, json);
+    route_live_device_pool_owner_with_format("status", &pool_name, &config, json);
 
     if json {
         let json_out = serde_json::json!({
@@ -713,27 +712,27 @@ fn ensure_device_pool_name(
     }
 }
 
-fn route_active_device_pool(
+fn route_live_device_pool_owner(
     operation: &str,
     pool_name: &str,
     config: &tidefs_pool_scan::PoolConfig,
 ) {
-    route_active_device_pool_with_format(operation, pool_name, config, false);
+    route_live_device_pool_owner_with_format(operation, pool_name, config, false);
 }
 
-fn route_active_device_pool_with_format(
+fn route_live_device_pool_owner_with_format(
     operation: &str,
     pool_name: &str,
     config: &tidefs_pool_scan::PoolConfig,
     json: bool,
 ) {
-    super::live_owner::route_if_imported_with_format(
+    super::live_owner::route_if_owner_exists_for_uuid_with_format_and_args(
         "pool",
         operation,
         pool_name,
         config.pool_uuid,
-        config.state == PoolState::Active,
         json,
+        serde_json::Value::Null,
     );
 }
 
@@ -878,7 +877,7 @@ fn handle_pool_integrity_check(
 ) {
     if let Some(ref device_paths) = devices {
         let config = assemble_device_pool_config(device_paths, "integrity-check");
-        route_active_device_pool("integrity-check", &config.pool_name, &config);
+        route_live_device_pool_owner("integrity-check", &config.pool_name, &config);
     }
 
     // ── Phase 1: device-level checks (labels, committed root, intent log) ──
@@ -1318,12 +1317,11 @@ fn handle_pool_export(pool_name: String, devices: Option<Vec<PathBuf>>, force: b
 
     let config = assemble_device_pool_config(&device_paths, "export");
     ensure_device_pool_name(&pool_name, "export", &config);
-    super::live_owner::route_if_imported_with_args(
+    super::live_owner::route_if_owner_exists_for_uuid_with_args(
         "pool",
         "export",
         &pool_name,
         config.pool_uuid,
-        config.state == PoolState::Active,
         serde_json::json!({
             "force": force,
         }),
@@ -1356,7 +1354,7 @@ fn handle_pool_destroy(
 ) {
     let config = assemble_device_pool_config(&devices, "destroy");
     ensure_device_pool_name(&pool_name, "destroy", &config);
-    route_active_device_pool("destroy", &pool_name, &config);
+    route_live_device_pool_owner("destroy", &pool_name, &config);
 
     match tidefs_pool_import::pool_destroy(&devices, zero_superblock) {
         Ok(()) => {
@@ -1389,12 +1387,11 @@ fn open_pool_property_filesystem_with_live_args(
 
     let config = assemble_device_pool_config(devs, operation);
     ensure_device_pool_name(pool, operation, &config);
-    super::live_owner::route_if_imported_with_args(
+    super::live_owner::route_if_owner_exists_for_uuid_with_args(
         "pool",
         operation,
         pool,
         config.pool_uuid,
-        config.state == PoolState::Active,
         live_args,
     );
 
