@@ -1203,20 +1203,38 @@ pub(crate) fn write_chunked_content_with_patch_batch(
     } = request;
     let old_layout = read_content_layout_from_store(store, inode_id, old_record, true)?;
     if allow_holes && old_record.size <= new_record.size {
-        if let ContentLayout::Chunked(ref old_manifest) = old_layout {
-            return write_same_size_sparse_patch_batch(
-                dedup_enabled,
-                store,
-                &old_layout,
-                old_manifest,
-                old_record,
-                new_record,
-                patches,
-                dedup_index,
-                quorum_store,
-                compression_policy,
-            );
-        }
+        let empty_manifest;
+        let old_manifest = match &old_layout {
+            ContentLayout::Chunked(old_manifest) => old_manifest,
+            ContentLayout::Inline(content) if old_record.size == 0 && content.bytes.is_empty() => {
+                empty_manifest = ContentManifestObject {
+                    inode_id: old_record.inode_id,
+                    data_version: old_record.data_version,
+                    file_size: 0,
+                    chunk_size: content_chunk_size(),
+                    chunks: Vec::new(),
+                };
+                &empty_manifest
+            }
+            _ => {
+                return Err(FileSystemError::Unsupported {
+                    operation: "chunked content patch batch",
+                    reason: "batch writeback optimization requires non-shrinking chunked content",
+                });
+            }
+        };
+        return write_same_size_sparse_patch_batch(
+            dedup_enabled,
+            store,
+            &old_layout,
+            old_manifest,
+            old_record,
+            new_record,
+            patches,
+            dedup_index,
+            quorum_store,
+            compression_policy,
+        );
     }
     Err(FileSystemError::Unsupported {
         operation: "chunked content patch batch",

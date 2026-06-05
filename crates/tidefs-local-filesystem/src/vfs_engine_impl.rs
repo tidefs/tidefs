@@ -3505,6 +3505,18 @@ impl VfsEngine for VfsLocalFileSystem {
     }
 
     fn release(&self, fh: &EngineFileHandle) -> std::result::Result<(), Errno> {
+        self.validate_file_handle(fh)?;
+        if !self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
+            if let Ok(path) = self.inode_path(fh.inode_id) {
+                let _ = self.fs.borrow_mut().flush_file(
+                    &path,
+                    fh.inode_id.0,
+                    fh.fh_id.0,
+                    fh.lock_owner,
+                );
+            }
+        }
+
         // Delegate handle release to the release dispatch module.
         let released = release_dispatch::engine_release(&self.file_handle_table, fh)?;
 
@@ -3793,8 +3805,21 @@ impl VfsEngine for VfsLocalFileSystem {
                     fs.truncate_file(&path, end).map_err(|e| map_errno(&e))?;
                 }
             }
-            fs.zero_range(&path, offset, length)
-                .map_err(|e| map_errno(&e))?;
+            fs.zero_range(&path, offset, length).map_err(|e| {
+                let errno = map_errno(&e);
+                if errno == Errno::EIO && vfs_op_diagnostics_enabled() {
+                    eprintln!(
+                        "tidefs-diagnostic: vfs fallocate zero_range error ino={} fh={} offset={} length={} errno={:?} err={:?}",
+                        fh.inode_id.get(),
+                        fh.fh_id.0,
+                        offset,
+                        length,
+                        errno,
+                        e
+                    );
+                }
+                errno
+            })?;
             let _ = fs.apply_timestamp_update(
                 fh.inode_id,
                 TimestampUpdate::Write,
@@ -7476,6 +7501,45 @@ mod tests {
                 .as_deref(),
             Some(&b"handle-sized"[..]),
             "ordinary VFS writes should remain buffered until flush/fsync"
+        );
+    }
+
+    #[test]
+    fn release_flushes_buffered_write_before_handle_invalidated() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"release-flushes-buffer.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let payload = b"release drains buffered bytes";
+
+        engine.write(&fh, 0, payload, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(attr.inode_id, 0, payload.len())
+                .as_deref(),
+            Some(&payload[..]),
+            "test setup should leave bytes in the local write buffer"
+        );
+
+        engine.release(&fh).unwrap();
+
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(attr.inode_id, 0, payload.len())
+                .is_none(),
+            "release must drain the non-durable write buffer before closing"
+        );
+        let reopened = engine.open(attr.inode_id, O_RDONLY, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .read(&reopened, 0, u32::try_from(payload.len()).unwrap(), &ctx())
+                .unwrap(),
+            payload
         );
     }
 

@@ -68,7 +68,7 @@ use crate::mount_options::MountOptions;
 use tidefs_dataset_lifecycle::SyncGuarantee;
 use tidefs_inode_attributes::timestamp::TimestampPolicy as EngineTimestampPolicy;
 
-const MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
+const MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 const MOUNT_VFS_TXG_COMMIT_INTERVAL_SECS: u64 = 30;
 
 /// RAII guard that removes a PID file on drop (clean shutdown).

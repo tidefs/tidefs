@@ -2422,8 +2422,8 @@ pub struct FuseVfsAdapter {
     /// FUSE kernel cache invalidation notifier, filled after mount.
     notifier: Arc<Mutex<Option<fuser::Notifier>>>,
     /// Orphan index for tracking inodes unlinked while still open.
-    /// On last-close of an nlink==0 inode, an entry is inserted here
-    /// so the cleanup engine can reclaim the inode's space.
+    /// Unlink and O_TMPFILE creation insert entries at the causal namespace
+    /// mutation; release only observes last-close and lets engine cleanup run.
     orphan_index: Mutex<OrphanIndex>,
     /// Inodes whose lifetime has been exposed to the kernel while FUSE
     /// writeback-cache is active. Linux can issue a late handle-less
@@ -2532,8 +2532,9 @@ impl FuseVfsAdapter {
 
     /// Attach an [`OrphanIndex`] for tracking unlinked-but-open inodes.
     ///
-    /// When set, `dispatch_release` will insert orphan entries on last-close
-    /// of nlink==0 inodes so the cleanup engine can reclaim their space.
+    /// The index records namespace mutations that already made an inode
+    /// orphaned. `dispatch_release` must not rediscover that by scanning engine
+    /// metadata on ordinary closes.
     #[must_use]
     pub fn with_orphan_index(self, oi: OrphanIndex) -> Self {
         *self.orphan_index.lock().unwrap() = oi;
@@ -2548,6 +2549,12 @@ impl FuseVfsAdapter {
 
     fn is_writeback_seen_inode(&self, ino: u64) -> bool {
         self.writeback_seen_inodes.lock().unwrap().contains(&ino)
+    }
+
+    fn may_accept_writeback_unknown_handle(&self, ino: u64) -> bool {
+        self.writeback_cache_enabled
+            && (self.is_writeback_seen_inode(ino)
+                || self.file_handles.lock().unwrap().open_ref_count(ino) > 0)
     }
 
     /// Attach a [`tidefs_namespace::Namespace`] for legacy namespace fallback.
@@ -2916,14 +2923,13 @@ impl FuseVfsAdapter {
         if written == 0 {
             return false;
         }
-        let _ = (
-            is_writeback_cached,
-            posix_direct_io,
-            write_flags,
-            old_size,
-            offset,
-        );
-        true
+        if !is_writeback_cached || posix_direct_io || (write_flags & FUSE_WRITE_KILL_PRIV) != 0 {
+            return true;
+        }
+        let Some(write_end) = offset.checked_add(u64::from(written)) else {
+            return true;
+        };
+        write_end > old_size
     }
 
     fn writeback_sparse_zero_write_is_noop(
@@ -5460,6 +5466,12 @@ impl FuseVfsAdapter {
         // still observe the dirty lifecycle, but the engine is authoritative
         // before this method replies to the kernel.
         if is_writeback_cached || !handle_allows_write {
+            let writeback_write_through_without_block_volume = is_writeback_cached
+                && self
+                    .block_volume
+                    .lock()
+                    .map(|block_volume| block_volume.is_none())
+                    .unwrap_or(true);
             let (
                 write_result,
                 should_update_write_atime,
@@ -5526,7 +5538,18 @@ impl FuseVfsAdapter {
                                     // read-after-write; flush/fsync/close publish
                                     // it instead of forcing every O_DIRECT write
                                     // through a committed-root cycle.
-                                    self.invalidate_caches_after_direct_write(ino);
+                                    // Cache reconciliation runs after the
+                                    // engine mutex is dropped.
+                                } else if writeback_write_through_without_block_volume
+                                    && !sparse_zero_noop
+                                {
+                                    // FUSE_WRITE_CACHE writes are already
+                                    // written through to the engine before
+                                    // acknowledgement. Do not synthesize a
+                                    // clean daemon page-cache mirror for every
+                                    // partial-page write; existing mirrors are
+                                    // reconciled below after the engine mutex
+                                    // is dropped.
                                 } else if !sparse_zero_noop {
                                     self.mark_dirty_after_write(
                                         &**e,
@@ -5580,6 +5603,14 @@ impl FuseVfsAdapter {
             if let Some(attr) = post_write_attr {
                 self.sync_namespace_attrs_after_engine_write(ino, &attr);
             }
+            if written > 0 && posix_direct_io {
+                self.invalidate_caches_after_direct_write(ino);
+            } else if written > 0
+                && writeback_write_through_without_block_volume
+                && !sparse_zero_noop
+            {
+                self.invalidate_caches_after_direct_write(ino);
+            }
             // Record write intent before acknowledging to kernel.
             if written > 0 && self.intent_log_write_enabled && !sparse_zero_noop {
                 if let Some(ref buf) = self.intent_log_buffer {
@@ -5612,6 +5643,10 @@ impl FuseVfsAdapter {
                     }
                     return Err(Errno::EIO);
                 };
+                if writeback_write_through_without_block_volume && !posix_direct_io {
+                    self.txg_cycle
+                        .queue_write(ino, effective_offset as u64, written_data);
+                }
                 // Direct I/O conflict guard: clear stale cached dirty ranges
                 // covered by this authoritative direct write, so later
                 // writeback cannot replay old page-cache bytes over it.
@@ -5982,10 +6017,17 @@ impl FuseVfsAdapter {
         if length == 0 || self.block_volume.lock().unwrap().is_some() {
             return Ok(());
         }
+        let length = u64::from(length);
+        if !self.dirty_trackers_overlap_range(ino, offset, length)
+            && !self.dirty_page_caches_overlap_range(ino, offset, length)
+            && !self.page_cache_mirrors_overlap_range(ino, offset, length)
+        {
+            return Ok(());
+        }
         self.reconcile_dirty_mirrors_for_authoritative_range(
             ino,
             offset,
-            u64::from(length),
+            length,
             AuthoritativeRangePayload::Bytes(payload),
         )
     }
@@ -6053,6 +6095,36 @@ impl FuseVfsAdapter {
             .write_page_cache
             .dirty_pages_in_range(ino, offset, end)
             .is_empty()
+    }
+
+    fn page_cache_mirrors_overlap_range(&self, ino: u64, offset: u64, length: u64) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let page_cache_has_mirror = |cache: &PageCache| {
+            let page_size = cache.page_size() as u64;
+            let end = offset.saturating_add(length);
+            let mut poff = (offset / page_size) * page_size;
+            while poff < end {
+                if cache.lookup(ino, poff).is_some() {
+                    return true;
+                }
+                let next = poff.saturating_add(page_size);
+                if next <= poff {
+                    break;
+                }
+                poff = next;
+            }
+            false
+        };
+        if self
+            .writeback_page_cache
+            .as_ref()
+            .is_some_and(|cache| page_cache_has_mirror(cache))
+        {
+            return true;
+        }
+        page_cache_has_mirror(&self.write_page_cache)
     }
 
     fn inode_has_dirty_trackers(&self, ino: u64) -> bool {
@@ -6354,54 +6426,7 @@ impl FuseVfsAdapter {
         lock_owner: u64,
     ) -> Result<(), Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_FLUSH);
-        let mut fallback_to_release = None;
-        let efh = match self.resolve_file_handle(ino, fh, lock_owner) {
-            Ok(efh) => efh,
-            Err(Errno::EBADF) if self.writeback_cache_enabled => {
-                let e = self.engine.lock().unwrap();
-                let efh = e.open(InodeId::new(ino), libc::O_RDWR as u32, ctx)?;
-                fallback_to_release = Some(efh);
-                efh
-            }
-            Err(errno) => return Err(errno),
-        };
-
-        // Delegate writeback and engine.flush() through the
-        // local-filesystem dispatch layer via PageCacheDirtyFlush
-        // (issue #3583).  This drains the PageCache dirty set and
-        // calls engine.flush().
-        let flush_result = {
-            let engine = self.engine.lock().unwrap();
-            let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-                self.writeback_page_cache.as_ref(),
-                &**engine,
-                &efh,
-                ctx,
-            );
-            tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
-                &bridge,
-                efh.inode_id,
-                false,
-            )
-        };
-        let release_result = if let Some(fallback) = fallback_to_release.take() {
-            let engine = self.engine.lock().unwrap();
-            engine.release(&fallback)
-        } else {
-            Ok(())
-        };
-        flush_result?;
-        release_result?;
-        self.sync_namespace_attrs_from_engine(ctx, ino, None);
-        self.writeback_cache.lock().unwrap().mark_clean(ino);
-        self.write_page_cache.clear_dirty_for_inode(ino);
-        self.writeback_cache_stats.lock().unwrap().record_flush();
-
-        // Drain the DirtyPageTracker for this inode after writeback so
-        // the background flush service (#4657) sees a clean inode.
-        if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker.lock().unwrap().flush_inode(InodeId::new(ino));
-        }
+        self.flush_file_handle_for_close(ctx, ino, fh, lock_owner)?;
 
         // Release POSIX locks owned by this lock_owner after flush
         // completes.  Per FUSE protocol, close() releases locks; flush()
@@ -6432,6 +6457,43 @@ impl FuseVfsAdapter {
         self.lock_dispatch
             .release_by_owner_and_inode(lock_owner, ino);
 
+        Ok(())
+    }
+
+    fn flush_file_handle_for_close(
+        &self,
+        ctx: &RequestCtx,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+    ) -> Result<(), Errno> {
+        let mut fallback_to_release = None;
+        let efh = match self.resolve_file_handle(ino, fh, lock_owner) {
+            Ok(efh) => efh,
+            Err(Errno::EBADF) if self.may_accept_writeback_unknown_handle(ino) => {
+                let e = self.engine.lock().unwrap();
+                let efh = e.open(InodeId::new(ino), libc::O_RDWR as u32, ctx)?;
+                fallback_to_release = Some(efh);
+                efh
+            }
+            Err(errno) => return Err(errno),
+        };
+        let flush_result = {
+            let e = self.engine.lock().unwrap();
+            e.flush(&efh, ctx)
+        };
+        if flush_result.is_ok() {
+            self.sync_namespace_attrs_from_engine(ctx, ino, Some(&efh));
+        }
+        let release_result = if let Some(fallback) = fallback_to_release.take() {
+            let e = self.engine.lock().unwrap();
+            e.release(&fallback)
+        } else {
+            Ok(())
+        };
+        flush_result?;
+        release_result?;
+        self.writeback_cache_stats.lock().unwrap().record_flush();
         Ok(())
     }
 
@@ -6472,15 +6534,6 @@ impl FuseVfsAdapter {
                 efh.inode_id,
                 datasync,
             )?;
-        }
-        self.writeback_cache.lock().unwrap().mark_clean(ino);
-        self.write_page_cache.clear_dirty_for_inode(ino);
-        self.writeback_cache_stats.lock().unwrap().record_flush();
-
-        // Drain the DirtyPageTracker for this inode after writeback so
-        // the background flush service (#4657) sees a clean inode.
-        if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker.lock().unwrap().flush_inode(InodeId::new(ino));
         }
 
         // Phase 2: Block-volume dirty-range writes (when configured).
@@ -6587,6 +6640,16 @@ impl FuseVfsAdapter {
         self.commit_current_txg_barrier("fsync")?;
         self.sync_namespace_attrs_from_engine(ctx, ino, Some(efh));
         self.fsync_handler.handle_fsync(ino, datasync)?;
+        self.writeback_cache.lock().unwrap().mark_clean(ino);
+        self.write_page_cache.clear_dirty_for_inode(ino);
+        self.writeback_cache_stats.lock().unwrap().record_flush();
+
+        // Drain the DirtyPageTracker only after every fsync barrier phase
+        // succeeds, so a later block-volume/engine/txg failure leaves the inode
+        // visibly dirty for retry.
+        if let Some(ref tracker) = self.writeback_range_tracker {
+            tracker.lock().unwrap().flush_inode(InodeId::new(ino));
+        }
         Ok(())
     }
 
@@ -7158,58 +7221,30 @@ impl FuseVfsAdapter {
         lock_owner: Option<u64>,
         flush: bool,
     ) -> Result<(), Errno> {
-        // If the kernel requested flush-on-close and the inode has
-        // dirty pages tracked by the adapter writeback layer,
-        // trigger writeback before releasing the handle.
-        // Clean inodes short-circuit without initiating engine writeback.
+        let ctx = RequestCtx {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            umask: 0,
+            groups: vec![0],
+        };
+        self.dispatch_release_with_ctx(&ctx, ino, fh, flags, lock_owner, flush)
+    }
+
+    pub fn dispatch_release_with_ctx(
+        &mut self,
+        ctx: &RequestCtx,
+        ino: u64,
+        fh: u64,
+        _flags: u32,
+        lock_owner: Option<u64>,
+        flush: bool,
+    ) -> Result<(), Errno> {
+        // FUSE flush-on-close is close bookkeeping, not a durability barrier.
+        // Drain the engine write buffer, but leave writeback dirty trackers for
+        // explicit fsync/syncfs/destroy durability barriers.
         if flush {
-            let mut fallback_to_release = None;
-            let efh = match self.resolve_file_handle(ino, fh, lock_owner.unwrap_or(0)) {
-                Ok(efh) => efh,
-                Err(Errno::EBADF) if self.writeback_cache_enabled => {
-                    let e = self.engine.lock().unwrap();
-                    let efh = e.open(
-                        InodeId::new(ino),
-                        libc::O_RDWR as u32,
-                        &RequestCtx {
-                            uid: 0,
-                            gid: 0,
-                            pid: 0,
-                            umask: 0,
-                            groups: vec![0],
-                        },
-                    )?;
-                    fallback_to_release = Some(efh);
-                    efh
-                }
-                Err(errno) => return Err(errno),
-            };
-            let is_dirty = {
-                let ds = self.dirty_state.lock().unwrap();
-                ds.get(&ino).map(|dr| !dr.is_empty()).unwrap_or(false)
-            };
-            let direct_flush = (efh.open_flags & libc::O_DIRECT as u32) != 0
-                || (flags & libc::O_DIRECT as u32) != 0;
-            if is_dirty || direct_flush {
-                let e = self.engine.lock().unwrap();
-                // Ignore flush errors during release; the kernel already
-                // decided to close the file. Engine-level errors are logged
-                // by the engine implementation.
-                let _ = e.flush(
-                    &efh,
-                    &RequestCtx {
-                        uid: 0,
-                        gid: 0,
-                        pid: 0,
-                        umask: 0,
-                        groups: vec![0],
-                    },
-                );
-            }
-            if let Some(fallback) = fallback_to_release.take() {
-                let e = self.engine.lock().unwrap();
-                let _ = e.release(&fallback);
-            }
+            self.flush_file_handle_for_close(ctx, ino, fh, lock_owner.unwrap_or(0))?;
         }
 
         // Check whether the kernel wants to preserve cached data.
@@ -7225,7 +7260,7 @@ impl FuseVfsAdapter {
 
         let efh = match self.remove_file_handle(ino, fh, lock_owner.unwrap_or(0)) {
             Ok(efh) => Some(efh),
-            Err(Errno::EBADF) if self.writeback_cache_enabled => None,
+            Err(Errno::EBADF) if self.may_accept_writeback_unknown_handle(ino) => None,
             Err(errno) => return Err(errno),
         };
         self.poll_registrations
@@ -7240,10 +7275,9 @@ impl FuseVfsAdapter {
             }
         }
 
-        // Decrement the open-reference count and detect last-close.
-        // When the last handle for this inode is closed and the inode
-        // has dirty pages, trigger writeback even if the kernel did
-        // not request flush-on-close (e.g. non-flushing release).
+        // Decrement the open-reference count and detect last-close.  Last
+        // close tears down handle/mmap/lock state; fsync/syncfs/destroy own
+        // data writeback and durability.
         let removed_registered_handle = efh.is_some();
         let is_last_close = if removed_registered_handle {
             let mut fht = self.file_handles.lock().unwrap();
@@ -7254,81 +7288,14 @@ impl FuseVfsAdapter {
         if is_last_close {
             self.mmap_coherency.deregister(ino);
         }
-        if is_last_close || (!removed_registered_handle && self.writeback_cache_enabled) {
-            let is_dirty = {
-                let ds = self.dirty_state.lock().unwrap();
-                ds.get(&ino).map(|dr| !dr.is_empty()).unwrap_or(false)
-            };
-            if is_dirty {
-                let e = self.engine.lock().unwrap();
-                let flush_ctx = RequestCtx {
-                    uid: 0,
-                    gid: 0,
-                    pid: 0,
-                    umask: 0,
-                    groups: vec![0],
-                };
-                let mut fallback_to_release = None;
-                let flush_handle = match efh {
-                    Some(efh) => Some(efh),
-                    None if self.writeback_cache_enabled => {
-                        match e.open(InodeId::new(ino), libc::O_RDWR as u32, &flush_ctx) {
-                            Ok(fallback) => {
-                                fallback_to_release = Some(fallback);
-                                Some(fallback)
-                            }
-                            Err(_) => None,
-                        }
-                    }
-                    None => None,
-                };
-                if let Some(flush_handle) = flush_handle.as_ref() {
-                    let _ = e.flush(flush_handle, &flush_ctx);
-                }
-                if let Some(fallback) = fallback_to_release.take() {
-                    let _ = e.release(&fallback);
-                }
-            }
-        }
 
-        // On last-close, if the inode was unlinked while still open
-        // (nlink == 0), insert it into the orphan index so the cleanup
-        // engine (#5527, #5549) can reclaim its space.
-        if is_last_close {
-            let e = self.engine.lock().unwrap();
-            if let Ok(attrs) = e.getattr(
-                InodeId::new(ino),
-                None,
-                &RequestCtx {
-                    uid: 0,
-                    gid: 0,
-                    pid: 0,
-                    umask: 0,
-                    groups: vec![0],
-                },
-            ) {
-                if attrs.posix.nlink == 0 {
-                    let entry =
-                        OrphanEntry::new(ino, attrs.generation.get(), 0, OrphanEntryFlags::NONE);
-                    self.orphan_index.lock().unwrap().insert(ino, entry);
-                }
-            }
-        }
-
-        // Finalize any pending extent operations on the engine handle.
-        // The engine.release() contract requires the caller to have
-        // completed or cancelled all pending operations before release,
-        // which is satisfied here by flushing above when requested.
+        // Finalize the engine handle.  The engine owns its final
+        // non-durable close flush; fsync/syncfs/destroy remain the durable
+        // writeback barriers and the adapter must not drain durability
+        // trackers here.
         if let Some(efh) = efh.as_ref() {
             let e = self.engine.lock().unwrap();
             e.release(efh)?;
-        }
-        self.writeback_cache.lock().unwrap().mark_clean(ino);
-
-        // Drain the DirtyPageTracker for this inode after writeback so
-        // the background flush service (#4657) sees a clean inode.
-        if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker.lock().unwrap().flush_inode(InodeId::new(ino));
         }
         self.writeback_cache.lock().unwrap().invalidate(ino);
 
@@ -7365,10 +7332,6 @@ impl FuseVfsAdapter {
         if let Some(efh) = efh {
             Self::emit_open_lifecycle_observation(OpenLifecycleObservation::released(ino, fh, efh));
         }
-
-        // flags are recorded for observability; the adapter does not
-        // alter release semantics based on open flags at this layer.
-        let _ = flags;
 
         Ok(())
     }
@@ -9093,7 +9056,8 @@ impl Filesystem for FuseVfsAdapter {
     ) {
         let _p5_02 =
             Self::classify_fuse_release(_req.unique(), ino, fh, _req.uid(), _req.gid(), _req.pid());
-        let result = self.dispatch_release(ino, fh, flags as u32, lock_owner, flush);
+        let ctx = Self::ctx_from_req(_req);
+        let result = self.dispatch_release_with_ctx(&ctx, ino, fh, flags as u32, lock_owner, flush);
         reply_empty_ok_or_errno(reply, result);
     }
 
@@ -15969,7 +15933,7 @@ mod tests {
     }
 
     #[test]
-    fn vfs_adapter_dispatch_flush_skips_engine_when_inode_clean() {
+    fn vfs_adapter_dispatch_flush_keeps_dirty_state_for_fsync() {
         let mut fixture = adapter_fixture();
         let ctx = root_ctx();
         let (inode, adapter_fh, _) = create_adapter_file_handle(
@@ -15979,7 +15943,7 @@ mod tests {
             libc::O_RDWR as u32,
         );
 
-        // Before any writes, dirty_state is empty. Flush must short-circuit.
+        // Before any writes, dirty_state is empty.
         {
             let ds = fixture.adapter.dirty_state.lock().unwrap();
             assert!(ds.get(&inode.get()).is_none_or(|dr| dr.is_empty()));
@@ -16007,7 +15971,6 @@ mod tests {
             assert!(!dr.is_empty());
         }
 
-        // Flush on a dirty file calls engine flush (no short-circuit).
         assert_eq!(
             fixture
                 .adapter
@@ -16150,7 +16113,7 @@ mod tests {
     }
 
     #[test]
-    fn vfs_adapter_dispatch_release_with_flush_true_on_dirty_triggers_writeback() {
+    fn vfs_adapter_dispatch_release_with_flush_true_closes_handle_without_losing_data() {
         let mut fixture = adapter_fixture();
         let ctx = root_ctx();
         let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
@@ -16169,13 +16132,14 @@ mod tests {
             );
         }
 
-        // Release with flush=true: must writeback dirty data before cleanup.
+        // Release with flush=true is close bookkeeping. The engine write above
+        // is already authoritative; release must not lose the handle's data.
         fixture
             .adapter
             .dispatch_release(inode.get(), adapter_fh, 0, None, true)
             .expect("release with flush=true");
 
-        // Data must persist after release with flush.
+        // Data remains engine-visible after release.
         let (_fresh_fh, fresh_engine_fh) =
             open_adapter_file_handle(&fixture.adapter, &ctx, inode, libc::O_RDONLY as u32);
         let data = {
@@ -17215,10 +17179,10 @@ mod tests {
         assert_eq!(fht.open_ref_count(99999), 0);
     }
 
-    // ── last-close writeback tests ─────────────────────────────────────
+    // ── last-close release tests ───────────────────────────────────────
 
     #[test]
-    fn vfs_adapter_last_close_writeback_triggers_on_dirty_inode() {
+    fn vfs_adapter_last_close_release_preserves_engine_visible_data() {
         let mut fixture = adapter_fixture();
         let ctx = root_ctx();
         let (inode, adapter_fh) = {
@@ -17231,8 +17195,8 @@ mod tests {
             {
                 let engine = fixture.adapter.engine.lock().unwrap();
                 engine
-                    .write(&efh, 0, b"dirty data for last-close writeback", &ctx)
-                    .expect("write dirty data");
+                    .write(&efh, 0, b"data visible before last-close release", &ctx)
+                    .expect("write engine-visible data");
             }
             {
                 let mut ds = fixture.adapter.dirty_state.lock().unwrap();
@@ -17247,7 +17211,7 @@ mod tests {
             let ds = fixture.adapter.dirty_state.lock().unwrap();
             assert!(
                 ds.contains_key(&inode.get()),
-                "inode should be dirty before last-close release"
+                "dirty bookkeeping is present before last-close release"
             );
         }
 
@@ -17271,10 +17235,10 @@ mod tests {
         let data = {
             let engine = fixture.adapter.engine.lock().unwrap();
             engine
-                .read(&new_efh, 0, 36, &ctx)
-                .expect("read back after last-close writeback")
+                .read(&new_efh, 0, 38, &ctx)
+                .expect("read back after last-close release")
         };
-        assert_eq!(data, b"dirty data for last-close writeback");
+        assert_eq!(data, b"data visible before last-close release");
     }
 
     #[test]
@@ -28447,6 +28411,18 @@ mod tests {
         }
     }
 
+    struct FailingBlockVolume;
+
+    impl BlockVolumeWriteTarget for FailingBlockVolume {
+        fn write_bytes(&mut self, _offset: u64, _data: &[u8]) -> Result<(), Errno> {
+            Err(Errno::EIO)
+        }
+
+        fn read_bytes(&self, _offset: u64, len: u64) -> Result<Vec<u8>, Errno> {
+            Ok(vec![0; len as usize])
+        }
+    }
+
     fn adapter_fixture_with_mock_block_volume() -> (
         AdapterFixture,
         std::sync::Arc<std::sync::Mutex<MockBlockVolume>>,
@@ -28461,6 +28437,57 @@ mod tests {
             }));
         }
         (fixture, bv)
+    }
+
+    #[test]
+    fn fsync_block_volume_failure_preserves_dirty_retry_state() {
+        let (fixture, tracker) = adapter_fixture_with_writeback_tracker();
+        let ctx = root_ctx();
+        {
+            let mut bv_guard = fixture.adapter.block_volume.lock().unwrap();
+            *bv_guard = Some(Box::new(FailingBlockVolume));
+        }
+
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"fsync-bv-fails.txt",
+            libc::O_RDWR as u32,
+        );
+        fixture
+            .adapter
+            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, b"retry me", 0)
+            .expect("write dispatch");
+
+        assert!(tracker.lock().unwrap().is_dirty(inode));
+        assert!(fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .contains_key(&inode.get()));
+
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_fsync(&ctx, inode.get(), adapter_fh),
+            Err(Errno::EIO)
+        );
+
+        assert!(
+            tracker.lock().unwrap().is_dirty(inode),
+            "failed fsync must leave writeback tracker dirty for retry"
+        );
+        assert!(
+            fixture
+                .adapter
+                .dirty_state
+                .lock()
+                .unwrap()
+                .get(&inode.get())
+                .is_some_and(|ranges| !ranges.is_empty()),
+            "failed block-volume fsync must not clear adapter dirty ranges"
+        );
     }
 
     #[test]
@@ -36704,7 +36731,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_flush_drains_writeback_range_tracker() {
+    fn dispatch_flush_keeps_writeback_range_dirty_until_fsync() {
         let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
         let ctx = root_ctx();
 
@@ -36728,16 +36755,24 @@ mod tests {
             "tracker should be dirty after write"
         );
 
-        // Flush the file handle.
         fixture
             .adapter
             .dispatch_flush(&ctx, ino, adapter_fh, 0)
             .expect("flush");
 
-        // Tracker should be drained for this inode.
+        assert!(
+            tracker.lock().unwrap().is_dirty(inode),
+            "FUSE flush is close bookkeeping and must not drain writeback"
+        );
+
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, ino, adapter_fh)
+            .expect("fsync");
+
         assert!(
             !tracker.lock().unwrap().is_dirty(inode),
-            "tracker should be clean after flush"
+            "fsync remains the per-file writeback drain"
         );
     }
 
@@ -36798,7 +36833,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_release_drains_writeback_range_tracker_on_last_close() {
+    fn dispatch_release_keeps_writeback_range_dirty_on_last_close() {
         let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
         let ctx = root_ctx();
 
@@ -36823,7 +36858,10 @@ mod tests {
             .dispatch_release(ino, adapter_fh, libc::O_RDWR as u32, Some(0), true)
             .expect("release");
 
-        assert!(!tracker.lock().unwrap().is_dirty(inode));
+        assert!(
+            tracker.lock().unwrap().is_dirty(inode),
+            "release is handle cleanup and must not report dirty writeback as drained"
+        );
     }
 
     #[test]
@@ -36924,7 +36962,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_flush_drains_only_target_inode() {
+    fn dispatch_flush_does_not_drain_tracked_inodes() {
         let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
         let ctx = root_ctx();
 
@@ -36947,13 +36985,12 @@ mod tests {
         assert!(tracker.lock().unwrap().is_dirty(ino_a));
         assert!(tracker.lock().unwrap().is_dirty(ino_b));
 
-        // Flush only file A.
         fixture
             .adapter
             .dispatch_flush(&ctx, ino_a.get(), fh_a, 0)
             .expect("flush A");
 
-        assert!(!tracker.lock().unwrap().is_dirty(ino_a));
+        assert!(tracker.lock().unwrap().is_dirty(ino_a));
         assert!(tracker.lock().unwrap().is_dirty(ino_b));
     }
 
@@ -37677,6 +37714,29 @@ mod tests {
         assert_eq!(flush_result, Err(Errno::EIO));
     }
 
+    #[test]
+    fn release_with_flush_true_surfaces_engine_flush_error() {
+        let ctx = root_ctx();
+        let engine = AclMockEngine::new()
+            .with_root(1)
+            .with_attr(0, 0, 0o666)
+            .with_no_acl()
+            .with_open_ok()
+            .with_flush_error(Errno::EIO);
+        let mut adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
+        let open = adapter
+            .dispatch_open_entry(&ctx, 1, libc::O_RDWR as u32)
+            .expect("open file");
+
+        let release_result =
+            adapter.dispatch_release_with_ctx(&ctx, 1, open.adapter_fh, 0, Some(0), true);
+        assert_eq!(release_result, Err(Errno::EIO));
+        assert!(
+            adapter.resolve_file_handle(1, open.adapter_fh, 0).is_ok(),
+            "failed close flush must leave the handle registered for retry"
+        );
+    }
+
     // ── Defrag ioctl tests ──────────────────────────────────────────────
 
     #[test]
@@ -37990,14 +38050,14 @@ mod tests {
             .unwrap()
             .get_dirty_ranges(ino)
             .is_empty());
-        assert_eq!(
+        assert!(
             fixture
                 .adapter
                 .writeback_cache
                 .lock()
                 .unwrap()
-                .is_dirty(ino),
-            Some(false),
+                .is_dirty(ino)
+                .is_none_or(|dirty| !dirty),
             "write-through cache writes must not leave the inode reclaim cache dirty"
         );
         assert!(
@@ -38008,18 +38068,26 @@ mod tests {
                 .is_empty(),
             "write-through cache writes must not leave dirty page mirrors"
         );
-        let page = fixture
+        assert!(
+            fixture.adapter.write_page_cache.lookup(ino, 0).is_none(),
+            "write-through cache writes should not synthesize clean page mirrors"
+        );
+        let read_back = fixture
             .adapter
-            .write_page_cache
-            .lookup(ino, 0)
-            .expect("write-through mirror remains resident");
-        let start = offset as usize;
-        assert_eq!(&page.data()[start..start + payload.len()], payload);
-        assert!(!page.is_dirty());
+            .dispatch_read(
+                &ctx,
+                ino,
+                adapter_fh,
+                offset as i64,
+                payload.len() as u32,
+                None,
+            )
+            .expect("read write-through payload");
+        assert_eq!(read_back, payload);
     }
 
     #[test]
-    fn writeback_cached_partial_page_preserves_authoritative_tails() {
+    fn writeback_cached_partial_page_reads_authoritative_tails_without_new_mirror() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
@@ -38049,11 +38117,72 @@ mod tests {
             .expect("writeback-cache partial overwrite");
         assert_eq!(written, payload.len() as u32);
 
+        assert!(
+            fixture.adapter.write_page_cache.lookup(ino, 0).is_none(),
+            "write-through partial writes should not synthesize clean page mirrors"
+        );
+        let read_back = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0, page_size as u32, None)
+            .expect("read authoritative page");
+        let start = offset as usize;
+        assert_eq!(&read_back[..start], &seed[..start]);
+        assert_eq!(&read_back[start..start + payload.len()], payload);
+        assert_eq!(
+            &read_back[start + payload.len()..page_size],
+            &seed[start + payload.len()..]
+        );
+    }
+
+    #[test]
+    fn writeback_cached_write_through_reconciles_existing_clean_mirror() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-existing-mirror.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let seed: Vec<u8> = (0..page_size).map(|index| (index % 251) as u8).collect();
+
+        fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .write(&engine_fh, 0, &seed, &ctx)
+            .expect("seed authoritative engine page");
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert existing clean mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("existing mirror");
+            page.data_mut().copy_from_slice(&seed);
+            assert!(!page.is_dirty());
+        }
+
+        let offset = 1234i64;
+        let payload = b"partial writeback payload";
+        let written = fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, offset, payload, FUSE_WRITE_CACHE)
+            .expect("writeback-cache partial overwrite");
+        assert_eq!(written, payload.len() as u32);
+
         let page = fixture
             .adapter
             .write_page_cache
             .lookup(ino, 0)
-            .expect("partial writeback mirror remains resident");
+            .expect("existing writeback mirror remains resident");
         let start = offset as usize;
         assert_eq!(&page.data()[..start], &seed[..start]);
         assert_eq!(&page.data()[start..start + payload.len()], payload);
@@ -38065,10 +38194,10 @@ mod tests {
     }
 
     #[test]
-    fn writeback_cached_writes_refresh_namespace_attrs() {
+    fn writeback_cached_overwrites_defer_namespace_attr_sync_until_flush_or_fsync() {
         assert!(
-            FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 512),
-            "writeback-cache overwrites refresh the namespace mirror for getattr coherence"
+            !FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 512),
+            "writeback-cache same-size overwrites defer namespace mirror sync to flush/fsync"
         );
         assert!(
             FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 3840, 512),

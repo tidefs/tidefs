@@ -4,9 +4,10 @@
 //! for checkpoint tracking, and a tokio interval timer that periodically
 //! commits the current transaction group.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,13 +17,17 @@ use tidefs_local_object_store::txg_manager::{CommitGroupManager, COMMITTED_ROOT_
 use tidefs_recovery_loop::compute_committed_root_digest;
 
 const COMMIT_GROUP_DIRTY_FLUSH_BYTES: usize = 256 * 1024 * 1024;
+const TXG_WRITE_DESCRIPTOR_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 
 pub struct CommitGroupCycle {
     mgr: Mutex<CommitGroupManager>,
+    queued_write_windows: Mutex<BTreeSet<(u64, u64)>>,
+    publish_lock: Mutex<()>,
     durability: Mutex<DurabilitySequence>,
     pub current_commit_group_id: AtomicU64,
     pub committed_count: AtomicU64,
     queued_dirty_bytes: AtomicUsize,
+    commit_requested: AtomicBool,
     store_root: Mutex<Option<PathBuf>>,
     barrier_active: AtomicU64,
 }
@@ -32,10 +37,13 @@ impl CommitGroupCycle {
     pub fn new() -> Self {
         Self {
             mgr: Mutex::new(CommitGroupManager::new(CommitGroupId::FIRST)),
+            queued_write_windows: Mutex::new(BTreeSet::new()),
+            publish_lock: Mutex::new(()),
             durability: Mutex::new(DurabilitySequence::new()),
             current_commit_group_id: AtomicU64::new(CommitGroupId::FIRST.0),
             committed_count: AtomicU64::new(0),
             queued_dirty_bytes: AtomicUsize::new(0),
+            commit_requested: AtomicBool::new(false),
             store_root: Mutex::new(None),
             barrier_active: AtomicU64::new(0),
         }
@@ -62,8 +70,11 @@ impl CommitGroupCycle {
             current_commit_group_id: AtomicU64::new(starting_id.0),
             committed_count: AtomicU64::new(0),
             queued_dirty_bytes: AtomicUsize::new(0),
+            commit_requested: AtomicBool::new(false),
             store_root: Mutex::new(Some(store_root)),
             mgr: Mutex::new(mgr),
+            queued_write_windows: Mutex::new(BTreeSet::new()),
+            publish_lock: Mutex::new(()),
             durability: Mutex::new(DurabilitySequence::new()),
             barrier_active: AtomicU64::new(0),
         }
@@ -119,6 +130,10 @@ impl CommitGroupCycle {
         descriptor
     }
 
+    fn descriptor_window_start(offset: u64) -> u64 {
+        (offset / TXG_WRITE_DESCRIPTOR_WINDOW_BYTES) * TXG_WRITE_DESCRIPTOR_WINDOW_BYTES
+    }
+
     fn add_queued_dirty_bytes(&self, dirty_bytes: usize) -> usize {
         let mut current = self.queued_dirty_bytes.load(Ordering::Relaxed);
         loop {
@@ -146,29 +161,38 @@ impl CommitGroupCycle {
             return;
         }
         if let Ok(mut mgr) = self.mgr.lock() {
-            let key = crate::dispatch_helpers::derive_commit_group_object_key(ino, offset);
-            let descriptor = Self::encode_write_descriptor(ino, offset, data.len() as u64);
-            match mgr.queue_put(key, &descriptor) {
-                Ok(_) => {
+            let mut windows = self.queued_write_windows.lock().unwrap();
+            let write_end = offset.saturating_add(data.len() as u64);
+            let mut window_start = Self::descriptor_window_start(offset);
+            let mut queue_result = Ok(());
+            while window_start < write_end {
+                let window_key = (ino, window_start);
+                if !windows.contains(&window_key) {
+                    let key =
+                        crate::dispatch_helpers::derive_commit_group_object_key(ino, window_start);
+                    let descriptor = Self::encode_write_descriptor(
+                        ino,
+                        window_start,
+                        TXG_WRITE_DESCRIPTOR_WINDOW_BYTES,
+                    );
+                    if let Err(e) = mgr.queue_put(key, &descriptor) {
+                        queue_result = Err(e);
+                        break;
+                    }
+                    windows.insert(window_key);
+                }
+                let next = window_start.saturating_add(TXG_WRITE_DESCRIPTOR_WINDOW_BYTES);
+                if next <= window_start {
+                    break;
+                }
+                window_start = next;
+            }
+            drop(windows);
+            match queue_result {
+                Ok(()) => {
                     let queued_dirty_bytes = self.add_queued_dirty_bytes(data.len());
                     if queued_dirty_bytes >= flush_bytes {
-                        match mgr.commit_current() {
-                            Ok(Some(root)) => {
-                                self.queued_dirty_bytes.store(0, Ordering::Relaxed);
-                                if let Err(e) = self.publish_committed_root(root) {
-                                    eprintln!("commit_group threshold commit publish error: {e}");
-                                } else {
-                                    eprintln!(
-                                        "commit_group committed: id={} handle={} count={}",
-                                        root.commit_group_id.0,
-                                        root.root_handle,
-                                        self.committed_count.load(Ordering::Relaxed)
-                                    );
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => eprintln!("commit_group threshold commit error: {e}"),
-                        }
+                        self.commit_requested.store(true, Ordering::Release);
                     }
                 }
                 Err(e) => eprintln!("commit_group queue write error: {e}"),
@@ -180,8 +204,9 @@ impl CommitGroupCycle {
         &self,
         root: RootPointer,
     ) -> Result<(), tidefs_commit_group::CommitGroupError> {
-        if let Some(ref store_root) = *self.store_root.lock().unwrap() {
-            Self::persist_committed_root(store_root, root)
+        let store_root = self.store_root.lock().unwrap().clone();
+        if let Some(store_root) = store_root {
+            Self::persist_committed_root(&store_root, root)
                 .map_err(|e| tidefs_commit_group::CommitGroupError::Io(e.kind()))?;
         }
         let durable_high_val = {
@@ -208,10 +233,16 @@ impl CommitGroupCycle {
     pub fn commit_current(
         &self,
     ) -> Result<Option<RootPointer>, tidefs_commit_group::CommitGroupError> {
-        let mut mgr = self.mgr.lock().unwrap();
-        let result = mgr.commit_current()?;
-        if let Some(root) = result {
+        let _publish_guard = self.publish_lock.lock().unwrap();
+        let result = {
+            let mut mgr = self.mgr.lock().unwrap();
+            let result = mgr.commit_current()?;
             self.queued_dirty_bytes.store(0, Ordering::Relaxed);
+            self.commit_requested.store(false, Ordering::Release);
+            self.queued_write_windows.lock().unwrap().clear();
+            result
+        };
+        if let Some(root) = result {
             self.publish_committed_root(root)?;
             Ok(Some(root))
         } else {
@@ -270,21 +301,23 @@ impl CommitGroupCycle {
         };
         rt.block_on(async move {
             let mut ticker = tokio::time::interval(interval);
+            let mut request_ticker = tokio::time::interval(Duration::from_millis(100));
             ticker.tick().await;
+            request_ticker.tick().await;
             loop {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
                 tokio::select! {
                     _ = ticker.tick() => {
-                        match cycle.commit_current() {
-                            Ok(Some(root)) => {
-                                eprintln!("commit_group committed: id={} handle={} count={}",
-                                    root.commit_group_id.0, root.root_handle,
-                                    cycle.committed_count.load(Ordering::Relaxed));
-                            }
-                            Ok(None) => {}
-                            Err(e) => { eprintln!("commit_group commit error: {e}"); }
+                        Self::commit_from_background(&cycle, "periodic");
+                    }
+                    _ = request_ticker.tick() => {
+                        if cycle.commit_requested.swap(false, Ordering::AcqRel)
+                            || cycle.queued_dirty_bytes.load(Ordering::Relaxed)
+                                >= COMMIT_GROUP_DIRTY_FLUSH_BYTES
+                        {
+                            Self::commit_from_background(&cycle, "requested");
                         }
                     }
                     _ = async {
@@ -310,6 +343,25 @@ impl CommitGroupCycle {
                 }
             }
         });
+    }
+
+    fn commit_from_background(cycle: &Arc<Self>, reason: &str) {
+        match cycle.commit_current() {
+            Ok(Some(root)) => {
+                eprintln!(
+                    "commit_group committed: reason={} id={} handle={} count={}",
+                    reason,
+                    root.commit_group_id.0,
+                    root.root_handle,
+                    cycle.committed_count.load(Ordering::Relaxed)
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                cycle.commit_requested.store(true, Ordering::Release);
+                eprintln!("commit_group {reason} commit error: {e}");
+            }
+        }
     }
 }
 
@@ -344,15 +396,49 @@ mod tests {
     }
 
     #[test]
-    fn queue_write_commits_when_dirty_bytes_cross_threshold() {
+    fn queue_write_requests_background_commit_when_dirty_bytes_cross_threshold() {
         let cycle = CommitGroupCycle::new();
         let payload = vec![0xA5; 1024];
 
         cycle.queue_write_with_flush_threshold(1, 0, &payload, 1024);
 
-        assert_eq!(cycle.committed_count.load(Ordering::Relaxed), 1);
+        assert_eq!(cycle.committed_count.load(Ordering::Relaxed), 0);
+        assert!(cycle.commit_requested.load(Ordering::Acquire));
+        assert_eq!(cycle.queued_dirty_bytes.load(Ordering::Relaxed), 1024);
         let result = cycle.commit_current().unwrap();
-        assert!(result.is_none());
+        assert!(result.is_some());
+        assert_eq!(cycle.committed_count.load(Ordering::Relaxed), 1);
+        assert!(!cycle.commit_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn queue_write_can_enter_next_group_while_publication_waits() {
+        let cycle = Arc::new(CommitGroupCycle::new());
+        cycle.queue_write(1, 0, b"first");
+
+        let publish_guard = cycle.publish_lock.lock().unwrap();
+        let worker_cycle = Arc::clone(&cycle);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            worker_cycle.commit_current().unwrap()
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        cycle.queue_write(2, 0, b"second");
+        {
+            let mgr = cycle.mgr.lock().unwrap();
+            assert_eq!(
+                mgr.current_write_count(),
+                2,
+                "commit_current must not hold the manager mutex while waiting to publish"
+            );
+        }
+
+        drop(publish_guard);
+        assert!(handle.join().unwrap().is_some());
+        assert_eq!(cycle.committed_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -372,6 +458,76 @@ mod tests {
         assert_eq!(
             cycle.queued_dirty_bytes.load(Ordering::Relaxed),
             payload.len()
+        );
+    }
+
+    #[test]
+    fn queue_write_coalesces_descriptors_by_window() {
+        let cycle = CommitGroupCycle::new();
+        let payload = vec![0xA5; 512];
+
+        cycle.queue_write_with_flush_threshold(7, 0, &payload, usize::MAX);
+        cycle.queue_write_with_flush_threshold(7, 4096, &payload, usize::MAX);
+        cycle.queue_write_with_flush_threshold(
+            7,
+            TXG_WRITE_DESCRIPTOR_WINDOW_BYTES - 512,
+            &payload,
+            usize::MAX,
+        );
+
+        let mgr = cycle.mgr.lock().unwrap();
+        assert_eq!(
+            mgr.current_write_count(),
+            1,
+            "many tiny writes in one txg window should stage one descriptor"
+        );
+        assert_eq!(mgr.current_bytes(), 32);
+        drop(mgr);
+        assert_eq!(
+            cycle.queued_dirty_bytes.load(Ordering::Relaxed),
+            payload.len() * 3,
+            "dirty byte accounting still counts every write"
+        );
+    }
+
+    #[test]
+    fn queue_write_stages_one_descriptor_per_touched_window() {
+        let cycle = CommitGroupCycle::new();
+        let payload = vec![0xA5; 1024];
+
+        cycle.queue_write_with_flush_threshold(
+            9,
+            TXG_WRITE_DESCRIPTOR_WINDOW_BYTES - 512,
+            &payload,
+            usize::MAX,
+        );
+
+        let mgr = cycle.mgr.lock().unwrap();
+        assert_eq!(
+            mgr.current_write_count(),
+            2,
+            "a write crossing a txg descriptor window stages both windows"
+        );
+        assert_eq!(mgr.current_bytes(), 64);
+    }
+
+    #[test]
+    fn commit_current_resets_descriptor_coalescing_for_next_group() {
+        let cycle = CommitGroupCycle::new();
+        let payload = vec![0xA5; 512];
+
+        cycle.queue_write_with_flush_threshold(11, 0, &payload, usize::MAX);
+        cycle.queue_write_with_flush_threshold(11, 4096, &payload, usize::MAX);
+        assert_eq!(cycle.mgr.lock().unwrap().current_write_count(), 1);
+
+        assert!(cycle.commit_current().unwrap().is_some());
+
+        cycle.queue_write_with_flush_threshold(11, 4096, &payload, usize::MAX);
+        let mgr = cycle.mgr.lock().unwrap();
+        assert_eq!(
+            mgr.current_write_count(),
+            1,
+            "the same descriptor window is eligible again in the next txg"
         );
     }
 

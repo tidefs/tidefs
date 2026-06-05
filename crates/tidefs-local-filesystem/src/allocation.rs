@@ -12,7 +12,7 @@ use crate::content::{
 };
 use crate::error::FileSystemError;
 use crate::object_keys::{content_chunk_object_key_for_version, content_object_key_for_version};
-use crate::records::ContentLayout;
+use crate::records::{ContentLayout, ContentManifestObject};
 use crate::types::*;
 use crate::{FileSystemState, Result};
 pub(crate) fn content_allocation_entries_for_state(
@@ -303,11 +303,27 @@ pub(crate) fn planned_chunk_allocation_entries_for_patch_batch(
             reason: "batch writeback optimization requires non-shrinking sparse content",
         });
     }
-    let crate::records::ContentLayout::Chunked(ref manifest) = old_layout else {
-        return Err(FileSystemError::Unsupported {
-            operation: "patch batch allocation planning",
-            reason: "batch writeback optimization requires chunked content",
-        });
+    let empty_manifest;
+    let manifest = match &old_layout {
+        crate::records::ContentLayout::Chunked(manifest) => manifest,
+        crate::records::ContentLayout::Inline(content)
+            if old_record.size == 0 && content.bytes.is_empty() =>
+        {
+            empty_manifest = ContentManifestObject {
+                inode_id: old_record.inode_id,
+                data_version: old_record.data_version,
+                file_size: 0,
+                chunk_size: content_chunk_size(),
+                chunks: Vec::new(),
+            };
+            &empty_manifest
+        }
+        _ => {
+            return Err(FileSystemError::Unsupported {
+                operation: "patch batch allocation planning",
+                reason: "batch writeback optimization requires chunked content",
+            });
+        }
     };
 
     let mut patched_chunks: BTreeMap<u64, Vec<ContentOverlayPatch<'_>>> = BTreeMap::new();

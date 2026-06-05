@@ -37,6 +37,7 @@ pub struct WriteBuffer {
     config: WriteBufferConfig,
     segments: BTreeMap<u64, Vec<u8>>,
     total_bytes: usize,
+    max_offset: Option<u64>,
 }
 
 impl WriteBuffer {
@@ -45,6 +46,7 @@ impl WriteBuffer {
             config,
             segments: BTreeMap::new(),
             total_bytes: 0,
+            max_offset: None,
         }
     }
 
@@ -66,6 +68,14 @@ impl WriteBuffer {
             .next_back()
             .and_then(|(&start, data)| (Self::segment_end(start, data) > offset).then_some(start))
             .unwrap_or(offset)
+    }
+
+    fn recompute_max_offset(&mut self) {
+        self.max_offset = self
+            .segments
+            .iter()
+            .map(|(&offset, data)| Self::segment_end(offset, data))
+            .max();
     }
 
     /// Ingest a write at the given byte offset.
@@ -107,6 +117,7 @@ impl WriteBuffer {
         if candidate_starts.is_empty() {
             self.segments.insert(offset, buf.to_vec());
             self.total_bytes = self.total_bytes.saturating_add(buf.len());
+            self.max_offset = Some(self.max_offset.unwrap_or(0).max(write_end));
             return;
         }
 
@@ -127,6 +138,7 @@ impl WriteBuffer {
         merged[write_dst..write_dst + buf.len()].copy_from_slice(buf);
         self.total_bytes = self.total_bytes.saturating_add(merged.len());
         self.segments.insert(merged_start, merged);
+        self.max_offset = Some(self.max_offset.unwrap_or(0).max(merged_end));
     }
 
     /// Returns `true` when the foreground byte-count threshold is crossed.
@@ -153,10 +165,7 @@ impl WriteBuffer {
     /// Return the highest byte offset covered by any buffered segment
     /// (offset + length). Returns `None` when the buffer is empty.
     pub fn max_offset(&self) -> Option<u64> {
-        self.segments
-            .iter()
-            .map(|(&offset, data)| Self::segment_end(offset, data))
-            .max()
+        self.max_offset
     }
 
     /// Drain all segments, returning `(offset, data)` pairs and resetting
@@ -164,6 +173,7 @@ impl WriteBuffer {
     pub fn drain(&mut self) -> Vec<(u64, Vec<u8>)> {
         let result: Vec<_> = std::mem::take(&mut self.segments).into_iter().collect();
         self.total_bytes = 0;
+        self.max_offset = None;
         result
     }
 
@@ -205,6 +215,7 @@ impl WriteBuffer {
             drained.push((offset, data));
             remaining = 0;
         }
+        self.recompute_max_offset();
         drained
     }
 
@@ -226,6 +237,7 @@ impl WriteBuffer {
             true
         });
         self.total_bytes = self.segments.values().map(Vec::len).sum();
+        self.recompute_max_offset();
     }
 
     /// Clear dirty bytes in `[offset, offset + length)`, preserving dirty
@@ -263,6 +275,7 @@ impl WriteBuffer {
 
         self.segments = kept;
         self.total_bytes = self.segments.values().map(Vec::len).sum();
+        self.recompute_max_offset();
         cleared
     }
 
@@ -479,6 +492,33 @@ mod tests {
                 index as u64
             );
         }
+    }
+
+    #[test]
+    fn max_offset_tracks_sparse_mutations_without_rescan() {
+        let mut wb = WriteBuffer::new(WriteBufferConfig {
+            flush_threshold_bytes: 10,
+            flush_threshold_age: Duration::from_millis(50),
+        });
+
+        assert_eq!(wb.max_offset(), None);
+        wb.ingest(b"tail", 100);
+        wb.ingest(b"head", 0);
+        assert_eq!(wb.max_offset(), Some(104));
+
+        let batch = wb.drain_flush_batch();
+        assert_eq!(batch, vec![(0, b"head".to_vec()), (100, b"tail".to_vec())]);
+        assert_eq!(wb.max_offset(), None);
+
+        wb.ingest(b"abcdefghij", 20);
+        wb.truncate(24);
+        assert_eq!(wb.max_offset(), Some(24));
+
+        wb.clear_range(22, 2);
+        assert_eq!(wb.max_offset(), Some(22));
+
+        wb.clear_range(20, 2);
+        assert_eq!(wb.max_offset(), None);
     }
 
     #[test]

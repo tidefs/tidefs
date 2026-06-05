@@ -2,13 +2,13 @@
 //!
 //! Exercises the writeback path end-to-end through the public
 //! [`tidefs_local_filesystem::LocalFileSystem`] API: write dirties
-//! pages in the tracker, the writeback daemon flushes them on
-//! shutdown, and the data survives a readback round-trip.
+//! pages in the tracker, the foreground/drop writeback path flushes
+//! them, and the data survives a readback round-trip.
 //!
 //! # Tests
 //!
 //! - `single_page_writeback_roundtrip` — write a full page, trigger
-//!   writeback via daemon shutdown, verify object-store contents.
+//!   writeback via filesystem drop, verify object-store contents.
 //! - `multi_page_ordering` — write multiple sequential pages, verify
 //!   all pages persist in order with no data loss or reordering.
 //! - `fsync_barrier_durability` — write pre-barrier data, fsync,
@@ -16,12 +16,12 @@
 //!   pre-barrier data survived.
 //! - `partial_page_read_modify_write` — write a sub-page range,
 //!   verify the write persists correctly.
-//! - `writeback_daemon_starts_on_mount` — verify daemon is active
-//!   after filesystem open.
+//! - `production_mount_keeps_sidecar_daemon_disabled` — verify the
+//!   production mount uses the inline writeback path, not the retired sidecar.
 //! - `repeated_remount_persistence` — write, commit, remount, verify
 //!   data survives multiple mount cycles.
 //! - `empty_file_no_writeback_panic` — verify empty writes and
-//!   zero-length files don't trigger daemon errors.
+//!   zero-length files don't trigger writeback errors.
 //! - `large_data_integrity` — write a multi-page payload, verify
 //!   byte-for-byte equality after remount.
 //! - `truncate_then_write_roundtrip` — truncate a file, write new
@@ -56,13 +56,13 @@ fn open_fs(dir: &std::path::Path) -> LocalFileSystem {
 // ── tests ─────────────────────────────────────────────────────────
 
 #[test]
-fn writeback_daemon_starts_on_mount() {
+fn production_mount_keeps_sidecar_daemon_disabled() {
     set_test_key();
-    let dir = temp_dir("daemon_starts");
+    let dir = temp_dir("sidecar_disabled");
     let fs = open_fs(&dir);
     assert!(
-        fs.has_writeback_daemon(),
-        "writeback daemon should be running after mount"
+        !fs.has_writeback_daemon(),
+        "production mount should use inline writeback, not the retired sidecar daemon"
     );
     drop(fs);
 }
@@ -81,7 +81,7 @@ fn single_page_writeback_roundtrip() {
         fs.create_file("/page", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
         fs.write_file("/page", 0, &payload).expect("write page");
-        // Drop triggers daemon shutdown + final tick flush.
+        // Drop triggers the filesystem's final writeback/sync path.
     }
 
     // Reopen and read back.
@@ -429,29 +429,29 @@ fn multiple_files_independent_persistence() {
     }
 }
 
-// ── writeback daemon survives metadata-only operations ────────────
+// ── inline writeback survives metadata-only operations ────────────
 
 #[test]
-fn daemon_survives_metadata_operations() {
+fn inline_writeback_survives_metadata_operations() {
     set_test_key();
     let dir = temp_dir("meta_ops");
 
     {
         let mut fs = open_fs(&dir);
-        assert!(fs.has_writeback_daemon());
+        assert!(!fs.has_writeback_daemon());
 
         // Create a file with data.
         fs.create_file("/file", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
         fs.write_file("/file", 0, b"test-data").expect("write");
 
-        // Metadata operations should not crash the daemon.
+        // Metadata operations should not disturb pending writeback state.
         let _stat = fs.stat("/file").expect("stat");
 
-        // Daemon should still be running.
-        assert!(fs.has_writeback_daemon());
+        assert_eq!(fs.read_file("/file").expect("read file"), b"test-data");
+        assert!(!fs.has_writeback_daemon());
     }
-    // Drop triggers daemon shutdown — should not panic.
+    // Drop triggers final writeback/sync and must not panic.
 }
 
 // ── concurrent write patterns ─────────────────────────────────────
@@ -593,32 +593,23 @@ fn page_cache_evict_inode_skips_dirty_pages() {
     }
 }
 
-// ── writeback daemon end-to-end gap documentation ─────────────────
+// ── inline writeback survives uncommitted inode state ─────────────
 
-/// Documents the current architectural gap: the writeback daemon's
-/// `FsPageDataProvider` opens the pool store independently and
-/// cannot find inodes that exist only in the filesystem's in-memory
-/// state (not yet committed). This means the daemon's async flush
-/// path currently logs errors for inodes that haven't been committed.
-///
-/// The commit path (auto-commit or explicit fsync/commit) provides
-/// the durability guarantee. The writeback daemon is an async
-/// optimization that will be made functional when the provider is
-/// wired to the filesystem's in-memory inode table.
-///
-/// This test verifies that the filesystem survives the daemon's
-/// error path without crashing or corrupting state.
+/// The production mount does not start the retired sidecar writeback daemon.
+/// Dirty bytes are owned by the filesystem write buffer and commit/drop paths,
+/// so an uncommitted inode must not depend on an external daemon to remain
+/// readable inside the live mount or safe to drop.
 #[test]
-fn writeback_daemon_survives_uncommitted_inode_read_error() {
+fn inline_writeback_survives_uncommitted_inode_state() {
     set_test_key();
-    let dir = temp_dir("daemon_gap");
+    let dir = temp_dir("inline_gap");
 
-    let payload: Vec<u8> = b"daemon-gap-test-data".to_vec();
+    let payload: Vec<u8> = b"inline-gap-test-data".to_vec();
     {
         let mut fs = open_fs(&dir);
         assert!(
-            fs.has_writeback_daemon(),
-            "daemon must be running to exercise the gap"
+            !fs.has_writeback_daemon(),
+            "production mount should keep the sidecar daemon disabled"
         );
 
         fs.create_file("/gap", DEFAULT_FILE_PERMISSIONS)
@@ -627,17 +618,9 @@ fn writeback_daemon_survives_uncommitted_inode_read_error() {
         // Disable auto-commit so the inode stays in memory only.
         fs.set_auto_commit(false);
         fs.write_file("/gap", 0, &payload).expect("write file");
-
-        // At this point the inode is not committed to the object store.
-        // When the daemon runs its final tick on drop, FsPageDataProvider
-        // will fail to find the inode and log an error. The filesystem
-        // must survive this without panic or corruption.
+        assert_eq!(fs.read_file("/gap").expect("read file"), payload);
     }
-    // Drop triggers daemon shutdown — must not panic.
-
-    // After drop, auto-commit is re-enabled on reopen, and the file
-    // was created but the data may or may not have been committed
-    // before drop. The key assertion: no crash occurred.
+    // Drop must not depend on a sidecar daemon to survive dirty in-memory state.
 }
 
 /// Verifies that the writeback validation suite tests are independent

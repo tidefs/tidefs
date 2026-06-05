@@ -5663,23 +5663,21 @@ impl LocalFileSystem {
                     })?;
             Ok::<u64, FileSystemError>(size.max(patch_end))
         })?;
-        if patches.len() > 1 {
-            match self.rewrite_content_with_patch_batch(
-                inode_id,
-                base_record.clone(),
-                &patches,
-                batch_new_size,
-                true,
-            ) {
-                Ok(_) => {
-                    self.finalize_drained_write_segments(inode_id, segments);
-                    return Ok(());
-                }
-                Err(FileSystemError::Unsupported { .. }) => {}
-                Err(err) => {
-                    self.restore_drained_write_segments(inode_id, &segments);
-                    return Err(err);
-                }
+        match self.rewrite_content_with_patch_batch(
+            inode_id,
+            base_record.clone(),
+            &patches,
+            batch_new_size,
+            true,
+        ) {
+            Ok(_) => {
+                self.finalize_drained_write_segments(inode_id, segments);
+                return Ok(());
+            }
+            Err(FileSystemError::Unsupported { .. }) => {}
+            Err(err) => {
+                self.restore_drained_write_segments(inode_id, &segments);
+                return Err(err);
             }
         }
         let batch_transaction = self.auto_commit && !self.in_transaction && patches.len() > 1;
@@ -6131,44 +6129,44 @@ impl LocalFileSystem {
             })?;
         let _end_len =
             usize::try_from(end).map_err(|_| FileSystemError::SizeOverflow { requested: end })?;
-        let new_size = record.size.max(end);
         if bytes.iter().all(|byte| *byte == 0)
             && self.sparse_zero_write_is_noop(inode_id, &record, offset, bytes.len())?
         {
             return Ok(record);
         }
-        // Quota: check byte grain delta for write
-        let old_grains = crate::quota::allocation_grains_for_len(record.size);
-        let new_grains = crate::quota::allocation_grains_for_len(new_size);
-        let delta_bytes = new_grains.saturating_sub(old_grains);
-        if delta_bytes > 0 {
+        let (existing_data_bytes, existing_reserved_bytes) =
+            self.accounted_extent_bytes(inode_id, offset, bytes_len);
+        let existing_accounted_bytes = existing_data_bytes
+            .saturating_add(existing_reserved_bytes)
+            .min(bytes_len);
+        let newly_allocated_write_bytes = bytes_len.saturating_sub(existing_accounted_bytes);
+
+        // Quota and capacity admission are based on extent-state transitions.
+        // Sparse file-size gaps stay HOLEs and must not consume capacity just
+        // because a later write extends EOF.
+        if newly_allocated_write_bytes > 0 {
             let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
             let pool_free = self.pool_free_bytes_for_quota();
-            let decision =
-                self.state
-                    .quota_table
-                    .check_delta(&inode_ancestors, delta_bytes, 0, pool_free);
+            let decision = self.state.quota_table.check_delta(
+                &inode_ancestors,
+                newly_allocated_write_bytes,
+                0,
+                pool_free,
+            );
             if decision.is_refusal() {
                 return Err(FileSystemError::from(decision));
             }
         }
-        // Capacity reservation: atomically reserve and commit bytes before
-        // the write, replacing the former check-then-record TOCTOU pattern.
-        // The reservation handle is immediately consumed so the mutable borrow
-        // on self is released before the write body.
-        let _admit_bytes = new_size.saturating_sub(record.size);
-        if _admit_bytes > 0 {
-            let handle = self.reserve_with_hierarchy(_admit_bytes).map_err(|_e| {
-                FileSystemError::NoSpace {
+        if newly_allocated_write_bytes > 0 {
+            let handle = self
+                .reserve_with_hierarchy(newly_allocated_write_bytes)
+                .map_err(|_e| FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
-                    requested: _admit_bytes,
+                    requested: newly_allocated_write_bytes,
                     available: self.capacity_authority.available_bytes(),
                     capacity: self.capacity_authority.total_bytes(),
                     allocated: self.capacity_authority.used_bytes(),
-                }
-            })?;
-            // Immediately commit: reserved bytes become used bytes.
-            // The handle is consumed here, releasing the immutable borrow on self.
+                })?;
             handle.commit();
         }
         check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
@@ -6207,44 +6205,52 @@ impl LocalFileSystem {
             wb.should_flush()
         };
         if should_flush {
-            while self
-                .write_buffers
-                .get(&inode_id)
-                .is_some_and(WriteBuffer::should_flush)
-            {
-                if let Err(err) = self.flush_write_buffer_batch(inode_id) {
-                    if let Some((old_write_buffer, old_dirty_ranges)) = foreground_flush_rollback {
-                        match old_write_buffer {
-                            Some(wb) => {
-                                self.write_buffers.insert(inode_id, wb);
-                            }
-                            None => {
-                                self.write_buffers.remove(&inode_id);
-                            }
+            if let Err(err) = self.flush_write_buffer_batch(inode_id) {
+                if let Some((old_write_buffer, old_dirty_ranges)) = foreground_flush_rollback {
+                    match old_write_buffer {
+                        Some(wb) => {
+                            self.write_buffers.insert(inode_id, wb);
                         }
-                        self.writeback_range_tracker
-                            .lock()
-                            .expect("locked")
-                            .restore_ranges(old_dirty_ranges);
+                        None => {
+                            self.write_buffers.remove(&inode_id);
+                        }
                     }
-                    return Err(err);
+                    self.writeback_range_tracker
+                        .lock()
+                        .expect("locked")
+                        .restore_ranges(old_dirty_ranges);
                 }
+                if newly_allocated_write_bytes > 0 {
+                    self.capacity_authority
+                        .record_free(newly_allocated_write_bytes);
+                }
+                return Err(err);
             }
         }
 
         let result = self.inode(inode_id)?.clone();
-        if delta_bytes > 0 {
+        if newly_allocated_write_bytes > 0 {
             let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
             self.state
                 .quota_table
-                .apply_delta(&inode_ancestors, delta_bytes, 0);
+                .apply_delta(&inode_ancestors, newly_allocated_write_bytes, 0);
         }
-        // Accumulate space delta for logical write
-        if bytes_len > 0 {
+        let mut space_delta = SpaceDelta::ZERO;
+        if newly_allocated_write_bytes > 0 {
+            space_delta.accumulate(SpaceDelta::new_write(newly_allocated_write_bytes));
+        }
+        if existing_reserved_bytes > 0 {
+            space_delta.accumulate(SpaceDelta::new_write_into_unwritten(
+                existing_reserved_bytes,
+            ));
+        }
+        if !space_delta.is_zero() {
+            self.state.space_accounting.accumulate_delta(space_delta);
+        }
+        if newly_allocated_write_bytes > 0 {
             self.state
                 .space_accounting
-                .accumulate_delta(SpaceDelta::new_write(bytes_len));
-            self.state.space_accounting.track_physical_write(bytes_len);
+                .track_physical_write(newly_allocated_write_bytes);
         }
         // Track extent allocation for the writeback layer.
         let _ = self
@@ -6755,12 +6761,13 @@ impl LocalFileSystem {
         if offset >= logical_size {
             return Ok(self.adjust_for_write_buffer(inode_id, record));
         }
-        let effective_length = logical_size.saturating_sub(offset).min(length);
-        if logical_size > record.size {
-            let _ =
-                self.rewrite_content_with_overlay(inode_id, record, 0, &[], logical_size, true)?;
-            record = self.committed_inode_record(inode_id)?;
+        self.flush_write_buffer(inode_id)?;
+        record = self.committed_inode_record(inode_id)?;
+        let logical_size = record.size;
+        if offset >= logical_size {
+            return Ok(record);
         }
+        let effective_length = logical_size.saturating_sub(offset).min(length);
 
         // Accumulate space delta only for extents that actually existed in the
         // punched range. Sparse holes must stay accounting-neutral.
@@ -6958,14 +6965,15 @@ impl LocalFileSystem {
         if offset >= logical_size {
             return Ok(self.adjust_for_write_buffer(inode_id, record));
         }
+        self.flush_write_buffer(inode_id)?;
+        record = self.committed_inode_record(inode_id)?;
+        let logical_size = record.size;
+        if offset >= logical_size {
+            return Ok(record);
+        }
         let effective_length = (logical_size.saturating_sub(offset)).min(length);
         if effective_length == 0 {
-            return Ok(self.adjust_for_write_buffer(inode_id, record));
-        }
-        if logical_size > record.size {
-            let _ =
-                self.rewrite_content_with_overlay(inode_id, record, 0, &[], logical_size, true)?;
-            record = self.committed_inode_record(inode_id)?;
+            return Ok(record);
         }
         let record_size = record.size;
         let (data_bytes, _reserved_bytes) =
@@ -7008,6 +7016,7 @@ impl LocalFileSystem {
         }
 
         if data_bytes == 0 && !materialized_data {
+            let mut updated_record = None;
             if newly_allocated_bytes > 0 {
                 let birth_txg = self.commit_group.current_commit_group().0;
                 for (range_offset, range_length) in &reservation_ranges {
@@ -7023,6 +7032,13 @@ impl LocalFileSystem {
                     .space_accounting
                     .accumulate_delta(SpaceDelta::new_reservation(newly_allocated_bytes));
                 self.state.dirty_extent_maps.insert(inode_id);
+                let tick = self.bump_generation();
+                let mut updated = record.clone();
+                updated.metadata_version = tick;
+                self.mark_inode_metadata_dirty(inode_id);
+                Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated.clone());
+                self.inode_cache.borrow_mut().invalidate(inode_id);
+                updated_record = Some(updated);
             }
             self.clear_write_buffer_range(inode_id, offset, effective_length);
             self.writeback_range_tracker
@@ -7040,14 +7056,16 @@ impl LocalFileSystem {
                     0,
                 );
             });
-            if newly_allocated_bytes > 0 {
-                return self.commit_mutation(record);
+            if let Some(updated) = updated_record {
+                return self.commit_mutation(updated);
             }
             return Ok(self.adjust_for_write_buffer(inode_id, record));
         }
 
-        let data_to_unwritten_bytes = data_bytes.saturating_add(materialized_bytes);
-        let reserved_delta = data_to_unwritten_bytes.saturating_add(newly_allocated_bytes);
+        let data_to_unwritten_bytes = data_bytes;
+        let reserved_delta = data_bytes
+            .saturating_add(materialized_bytes)
+            .saturating_add(newly_allocated_bytes);
         if data_to_unwritten_bytes > 0 || reserved_delta > 0 {
             self.state.space_accounting.accumulate_delta(SpaceDelta {
                 logical_used_delta: -(data_to_unwritten_bytes as i64),

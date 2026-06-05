@@ -1634,6 +1634,158 @@ fn write_buffer_flush_threshold_setter_changes_autoflush_batch_size() {
 }
 
 #[test]
+fn foreground_threshold_flush_publishes_one_batch_per_write() {
+    let (mut fs, root) = wb_open_temp("foreground-one-batch");
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: 4 * 1024,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/large-write.bin", 0o644).expect("create");
+    let data = vec![0x71; 10 * 1024];
+
+    fs.write_file("/large-write.bin", 0, &data)
+        .expect("large foreground write");
+
+    let after_write = fs.stat("/large-write.bin").expect("stat after write");
+    assert_eq!(
+        after_write.data_version,
+        record.data_version + 1,
+        "foreground threshold crossing should publish only one writeback batch"
+    );
+    assert_eq!(
+        after_write.size,
+        data.len() as u64,
+        "buffered tail must remain visible through stat"
+    );
+    let buffered = fs
+        .write_buffers
+        .get(&record.inode_id)
+        .expect("tail remains buffered after bounded foreground flush")
+        .buffered_bytes();
+    assert!(
+        buffered >= 4 * 1024,
+        "bounded foreground flush should leave later bytes for a fence or future batch"
+    );
+    assert_eq!(
+        fs.read_file("/large-write.bin").expect("read with overlay"),
+        data,
+        "buffered tail must remain visible before fsync"
+    );
+
+    fs.fsync_file("/large-write.bin").expect("fsync");
+    assert!(
+        !fs.write_buffers.contains_key(&record.inode_id),
+        "fsync must drain all remaining buffered bytes"
+    );
+    assert_eq!(fs.read_file("/large-write.bin").expect("read final"), data);
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
+fn sparse_512_byte_autoflush_preserves_holes_across_batches() {
+    let (mut fs, root) = wb_open_temp("sparse-512-autoflush");
+    let chunk = content_chunk_size() as usize;
+    let file_chunks = 64usize;
+    let file_len = chunk * file_chunks;
+    let write_len = 512usize;
+
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: 8 * 1024,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/fstest-sparse.bin", 0o644).expect("create");
+    fs.truncate_file("/fstest-sparse.bin", file_len as u64)
+        .expect("sparse truncate");
+    let base_record = fs.stat("/fstest-sparse.bin").expect("stat sparse");
+    assert!(
+        wd_current_content_manifest(&fs, "/fstest-sparse.bin")
+            .chunks
+            .is_empty(),
+        "sparse truncate should not materialize file chunks"
+    );
+
+    let mut expected_payloads = BTreeMap::new();
+    for chunk_index in (0..file_chunks).step_by(2) {
+        let mut payload = vec![0_u8; write_len];
+        payload[..8].copy_from_slice(&(chunk_index as u64).to_le_bytes());
+        payload[8..16].copy_from_slice(&(0xf57e_5700_u64).to_le_bytes());
+        let offset = chunk_index * chunk + 512;
+        fs.write_file("/fstest-sparse.bin", offset as u64, &payload)
+            .expect("sparse 512-byte write");
+        expected_payloads.insert(chunk_index as u64, (offset as u64, payload));
+    }
+
+    fs.fsync_file("/fstest-sparse.bin").expect("fsync sparse");
+    assert!(
+        !fs.write_buffers.contains_key(&record.inode_id),
+        "fsync must drain all foreground sparse writeback batches"
+    );
+
+    let final_record = fs.stat("/fstest-sparse.bin").expect("stat final");
+    assert_eq!(final_record.size, file_len as u64);
+    assert_eq!(
+        final_record.data_version,
+        base_record.data_version + 2,
+        "32 sparse 512-byte writes at the 8 KiB ceiling must publish as two writeback batches"
+    );
+
+    let manifest = wd_current_content_manifest(&fs, "/fstest-sparse.bin");
+    let by_index: BTreeMap<u64, _> = manifest
+        .chunks
+        .iter()
+        .map(|chunk_ref| (chunk_ref.chunk_index, chunk_ref))
+        .collect();
+
+    for chunk_index in 0..file_chunks as u64 {
+        if expected_payloads.contains_key(&chunk_index) {
+            assert!(
+                by_index
+                    .get(&chunk_index)
+                    .is_some_and(|chunk_ref| !chunk_ref.is_hole()),
+                "chunk {chunk_index} contains a sparse write and must be materialized"
+            );
+        } else {
+            assert!(
+                !by_index.contains_key(&chunk_index)
+                    || by_index
+                        .get(&chunk_index)
+                        .is_some_and(|chunk_ref| chunk_ref.is_hole()),
+                "untouched chunk {chunk_index} must remain sparse"
+            );
+        }
+    }
+
+    for (chunk_index, (offset, payload)) in expected_payloads {
+        assert_eq!(
+            fs.read_file_range("/fstest-sparse.bin", offset, payload.len())
+                .expect("read sparse payload"),
+            payload,
+            "512-byte sparse payload in chunk {chunk_index} must survive autoflush"
+        );
+        let hole_offset = (chunk_index + 1)
+            .saturating_mul(chunk as u64)
+            .min(file_len as u64 - write_len as u64);
+        assert_eq!(
+            fs.read_file_range("/fstest-sparse.bin", hole_offset, write_len)
+                .expect("read sparse hole"),
+            vec![0_u8; write_len],
+            "adjacent untouched chunk should still read as a hole"
+        );
+    }
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn read_sees_buffered_data_before_flush() {
     let (mut fs, root) = wb_open_temp("read-sees-buffered");
     fs.set_write_buffer_config(WriteBufferConfig {

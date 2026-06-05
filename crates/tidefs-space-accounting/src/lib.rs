@@ -261,11 +261,13 @@ impl SpaceAccounting {
         pool: PoolPhysicalCountersV1,
     ) -> Result<(), SpaceAccountingError> {
         self.update_pool_counters(pool);
-        let delta = core::mem::replace(&mut self.pending_delta, SpaceDelta::ZERO);
+        let delta = self.pending_delta;
         if delta.is_zero() {
             return Ok(());
         }
-        self.commit_delta(delta)
+        self.commit_delta(delta)?;
+        self.pending_delta = SpaceDelta::ZERO;
+        Ok(())
     }
 
     /// Whether there is a non-zero pending delta to commit.
@@ -3369,6 +3371,23 @@ mod tests {
         sa.commit_delta(SpaceDelta::new_write(50_000)).unwrap();
         assert_eq!(sa.counters().logical_used_bytes, 150_000);
         assert_eq!(sa.commit_group_commits(), 2);
+    }
+
+    #[test]
+    fn commit_pending_preserves_delta_on_failure() {
+        let mut counters = test_counters();
+        counters.quota_bytes = 100;
+        let mut sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
+        sa.accumulate_delta(SpaceDelta::new_write(200));
+
+        let err = sa.commit_pending(test_pool(1_000, 1_000)).unwrap_err();
+        assert!(matches!(err, SpaceAccountingError::QuotaExceeded { .. }));
+        assert!(sa.has_pending_delta());
+        assert_eq!(sa.counters().logical_used_bytes, 0);
+        assert_eq!(
+            sa.projected_counters_after_pending().logical_used_bytes,
+            200
+        );
     }
 
     #[test]
