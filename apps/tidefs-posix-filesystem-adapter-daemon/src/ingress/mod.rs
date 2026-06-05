@@ -410,9 +410,6 @@ pub const FUSE_SETLK_OPCODE: u32 = 32;
 /// FUSE setlkw operation opcode (kernel ABI).
 pub const FUSE_SETLKW_OPCODE: u32 = 33;
 
-/// FUSE flock operation opcode (kernel ABI).
-pub const FUSE_FLOCK_OPCODE: u32 = 53;
-
 /// FUSE access operation opcode (kernel ABI).
 pub const FUSE_ACCESS_OPCODE: u32 = 34;
 
@@ -1068,7 +1065,10 @@ pub fn classify_setlkw_request(
     )
 }
 
-/// Classify an incoming FUSE_FLOCK request.
+/// Classify an incoming BSD flock operation.
+///
+/// Linux FUSE carries flock through the lock request family using
+/// `FUSE_LK_FLOCK`; it does not define a standalone FLOCK request opcode.
 #[must_use]
 pub fn classify_flock_request(
     unique: u64,
@@ -1084,7 +1084,7 @@ pub fn classify_flock_request(
         uid,
         gid,
         pid,
-        FUSE_FLOCK_OPCODE,
+        FUSE_SETLK_OPCODE,
         PosixFilesystemAdapterRequestClass::LockWait,
         PosixFilesystemAdapterShardKeyPolicy::LockScope,
         fh,
@@ -2184,29 +2184,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_flock_sets_lock_wait_lock_scope_class() {
-        let ctx = classify_flock_request(42, 100, 0xfeed, 1000, 1000, 1234);
-        assert_eq!(ctx.unique, 42);
-        assert_eq!(ctx.nodeid, 100);
-        assert_eq!(ctx.uid, 1000);
-        assert_eq!(ctx.gid, 1000);
-        assert_eq!(ctx.pid, 1234);
-        assert_eq!(ctx.opcode, FUSE_FLOCK_OPCODE);
-        assert_eq!(
-            ctx.request_class,
-            PosixFilesystemAdapterRequestClass::LockWait.as_u32()
-        );
-        assert_eq!(
-            ctx.shard_key_policy,
-            PosixFilesystemAdapterShardKeyPolicy::LockScope.as_u32()
-        );
-        assert_eq!(ctx.shard_key, 0xfeed);
-    }
-
-    #[test]
     fn classify_flock_shards_by_file_handle_not_inode() {
         let ctx = classify_flock_request(7, 0x42, 0x99, 0, 0, 0);
         assert_eq!(ctx.nodeid, 0x42);
+        assert_eq!(ctx.opcode, FUSE_SETLK_OPCODE);
         assert_eq!(ctx.shard_key, 0x99);
         assert_ne!(ctx.shard_key, ctx.nodeid);
     }

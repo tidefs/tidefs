@@ -33,7 +33,7 @@ pub use libc::{EINTR, EIO, ENOSPC, EROFS};
 /// Validate and execute a FUSE `syncfs` operation.
 ///
 /// This is the preferred entry point for a FUSE daemon dispatching
-/// `FUSE_SYNCFS` (opcode 48).  It performs request-level validation
+/// `FUSE_SYNCFS` (opcode 50).  It performs request-level validation
 /// and returns `Ok(())` to signal that the daemon should proceed with
 /// the filesystem-wide flush and commit barrier.
 ///

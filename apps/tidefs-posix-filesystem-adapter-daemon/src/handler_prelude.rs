@@ -28,14 +28,13 @@
 //! | Dir      | `classify_rename_request` | 12 | `FUSE_RENAME` |
 //! | Dir      | `classify_rename2_request` | 12 | `FUSE_RENAME2` |
 //! | Dir      | `classify_unlink_request` | 10 | `FUSE_UNLINK` |
-//! | Lock     | `classify_flock_request` | 36 | `FUSE_FLOCK` (BSD) |
 //! | Lock     | `classify_getlk_request` | 31 | `FUSE_GETLK` |
 //! | Lock     | `classify_setlk_request` | 32 | `FUSE_SETLK` |
 //! | Attr     | `classify_setattr_request` | 4 | `FUSE_SETATTR` |
 //! | Attr     | `classify_access_request` | 34 | `FUSE_ACCESS` |
 //! | Attr     | `classify_statfs_request` | 17 | `FUSE_STATFS` |
 //! | Attr     | `classify_statx_request` | 52 | `FUSE_STATX` |
-//! | Attr     | `classify_syncfs_request` | 48 | `FUSE_SYNCFS` |
+//! | Attr     | `classify_syncfs_request` | 50 | `FUSE_SYNCFS` |
 //! | Xattr    | `classify_getxattr_request` | 22 | `FUSE_GETXATTR` |
 //! | Xattr    | `classify_setxattr_request` | 6 | `FUSE_SETXATTR` |
 //! | Xattr    | `classify_listxattr_request` | 23 | `FUSE_LISTXATTR` |

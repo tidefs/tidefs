@@ -358,11 +358,9 @@ pub enum fuse_opcode {
     #[cfg(feature = "abi-7-28")]
     FUSE_COPY_FILE_RANGE = 47,
     #[cfg(feature = "abi-7-31")]
-    FUSE_SYNCFS = 48,
+    FUSE_SYNCFS = 50,
     #[cfg(feature = "abi-7-30")]
     FUSE_STATX = 52,
-    #[cfg(feature = "abi-7-32")]
-    FUSE_FLOCK = 53,
 
     #[cfg(target_os = "macos")]
     FUSE_SETVOLNAME = 61,
@@ -429,11 +427,9 @@ impl TryFrom<u32> for fuse_opcode {
             #[cfg(feature = "abi-7-28")]
             47 => Ok(fuse_opcode::FUSE_COPY_FILE_RANGE),
             #[cfg(feature = "abi-7-31")]
-            48 => Ok(fuse_opcode::FUSE_SYNCFS),
+            50 => Ok(fuse_opcode::FUSE_SYNCFS),
             #[cfg(feature = "abi-7-30")]
             52 => Ok(fuse_opcode::FUSE_STATX),
-            #[cfg(feature = "abi-7-32")]
-            53 => Ok(fuse_opcode::FUSE_FLOCK),
 
             #[cfg(target_os = "macos")]
             61 => Ok(fuse_opcode::FUSE_SETVOLNAME),
@@ -1073,4 +1069,11 @@ pub struct fuse_copy_file_range_in {
     pub off_out: i64,
     pub len: u64,
     pub flags: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, FromBytes, FromZeroes)]
+#[cfg(feature = "abi-7-31")]
+pub struct fuse_syncfs_in {
+    pub padding: u64,
 }

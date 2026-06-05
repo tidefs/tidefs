@@ -1593,16 +1593,22 @@ mod op {
         }
     }
 
-    /// Filesystem-wide sync (syncfs).  Flushes all dirty data and metadata
-    /// to stable storage.  Added in Linux 6.8 (FUSE protocol 7.39).
-    /// Takes no additional arguments beyond the header.
+    /// Filesystem-wide sync (syncfs). Flushes all dirty data and metadata to
+    /// stable storage.
     #[cfg(feature = "abi-7-31")]
     #[derive(Debug)]
     pub struct SyncFs<'a> {
         header: &'a fuse_in_header,
+        _arg: &'a fuse_syncfs_in,
     }
     #[cfg(feature = "abi-7-31")]
     impl_request!(SyncFs<'_>);
+    #[cfg(all(feature = "abi-7-31", test))]
+    impl SyncFs<'_> {
+        pub fn padding(&self) -> u64 {
+            self._arg.padding
+        }
+    }
 
     /// BSD file lock (flock).  Operates on the open file description rather than
     /// byte ranges.  The kernel sends a whole-file lock with `FUSE_LK_FLOCK`
@@ -1916,11 +1922,9 @@ mod op {
                 arg: data.fetch()?,
             }),
             #[cfg(feature = "abi-7-31")]
-            fuse_opcode::FUSE_SYNCFS => Operation::SyncFs(SyncFs { header }),
-            #[cfg(feature = "abi-7-32")]
-            fuse_opcode::FUSE_FLOCK => Operation::Flock(Flock {
+            fuse_opcode::FUSE_SYNCFS => Operation::SyncFs(SyncFs {
                 header,
-                arg: data.fetch()?,
+                _arg: data.fetch()?,
             }),
 
             #[cfg(target_os = "macos")]
@@ -2855,14 +2859,15 @@ mod tests {
         0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
         0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
     ]);
-    // SYNCFS (opcode 48): header only, no extra args.  Added in FUSE 7.39.
+    // SYNCFS (opcode 50): header(40) + fuse_syncfs_in(8)
     #[cfg(feature = "abi-7-31")]
-    const SYNCFS_REQUEST: AlignedData<[u8; 40]> = AlignedData([
-        0x28, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, // len=40, opcode=48
+    const SYNCFS_REQUEST: AlignedData<[u8; 48]> = AlignedData([
+        0x30, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, // len=48, opcode=50
         0xde, 0xad, 0xbe, 0xef, 0xba, 0xad, 0xd0, 0x0d, // unique
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
         0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
         0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fuse_syncfs_in.padding
     ]);
 
     // ACCESS (opcode 34): header(40) + fuse_access_in(8)
@@ -2928,9 +2933,9 @@ mod tests {
     #[cfg(feature = "abi-7-31")]
     fn parse_syncfs() {
         let req = AnyRequest::try_from(&SYNCFS_REQUEST[..]).unwrap();
-        assert_eq!(req.header.opcode, 48);
+        assert_eq!(req.header.opcode, 50);
         match req.operation().unwrap() {
-            Operation::SyncFs(_) => {}
+            Operation::SyncFs(x) => assert_eq!(x.padding(), 0),
             other => panic!("Expected SyncFs, got {:?}", other),
         }
     }
@@ -3338,6 +3343,24 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mode=0, padding=0
     ]);
 
+    // COPY_FILE_RANGE request (opcode 47): header(40) + fuse_copy_file_range_in(56)
+    #[cfg(all(target_endian = "little", feature = "abi-7-28"))]
+    const COPY_FILE_RANGE_REQUEST: AlignedData<[u8; 96]> = AlignedData([
+        0x60, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, // len=96, opcode=47
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        // fuse_copy_file_range_in
+        0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fh_in=5
+        0x96, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // off_in=0x20c96
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid_out
+        0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fh_out=6
+        0x1e, 0x35, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // off_out=0x1351e
+        0x39, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // len=0xb039
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // flags=0
+    ]);
+
     #[test]
     fn parse_readdir() {
         let req = AnyRequest::try_from(&READDIR_REQUEST[..]).unwrap();
@@ -3377,6 +3400,46 @@ mod tests {
                 assert_eq!(x.mode(), 0);
             }
             other => panic!("Expected FAllocate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_endian = "little", feature = "abi-7-28"))]
+    fn parse_copy_file_range() {
+        let req = AnyRequest::try_from(&COPY_FILE_RANGE_REQUEST[..]).unwrap();
+        assert_eq!(req.header.opcode, 47);
+        match req.operation().unwrap() {
+            Operation::CopyFileRange(x) => {
+                let src = x.src();
+                let dst = x.dest();
+                assert_eq!(src.inode, INodeNo(0x1122334455667788));
+                assert_eq!(src.file_handle, FileHandle(5));
+                assert_eq!(src.offset, 0x20c96);
+                assert_eq!(dst.inode, INodeNo(0x1122334455667788));
+                assert_eq!(dst.file_handle, FileHandle(6));
+                assert_eq!(dst.offset, 0x1351e);
+                assert_eq!(x.len(), 0xb039);
+                assert_eq!(x.flags(), 0);
+            }
+            other => panic!("Expected CopyFileRange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_endian = "little", feature = "abi-7-32"))]
+    fn linux_opcode_53_is_unknown() {
+        let request = AlignedData([
+            0x28, 0x00, 0x00, 0x00, 0x35, 0x00, 0x00, 0x00, // len=40, opcode=53
+            0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+            0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+            0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        ]);
+        let req = AnyRequest::try_from(&request[..]).unwrap();
+        assert_eq!(req.header.opcode, 53);
+        match req.operation() {
+            Err(RequestError::UnknownOperation(53)) => {}
+            other => panic!("expected opcode 53 to be unknown, got {:?}", other),
         }
     }
 }

@@ -285,101 +285,10 @@ pub fn build_session_runtime_record(
 /// - `OPENDIR`, `READDIR`, `READDIRPLUS`, `RELEASEDIR`, `FSYNCDIR` → `DirStream`
 /// - `OPEN`, `READ`, `LSEEK`, small ioctls/poll → `FileRead`
 /// - `WRITE`, `SETATTR`, `FALLOCATE`, `COPY_FILE_RANGE`, `FLUSH`, `FSYNC`, `RELEASE` → `FileWriteback`
-/// - `GETLK`, `SETLK`, `SETLKW`, `FLOCK` → `LockWait`
+/// - `GETLK`, `SETLK`, `SETLKW` → `LockWait`
 /// - everything else (drain/release-finalize) → `Maintenance`
 pub fn classify_fuse_opcode(opcode: u32) -> PosixFilesystemAdapterRequestClass {
-    // FUSE wire opcodes — reference Linux 7.0 `include/uapi/linux/fuse.h`
-    // control-urgent lane
-
-    // FUSE opcode numbers from the Linux <linux/fuse.h> header:
-    // 1:LOOKUP 2:FORGET 3:GETATTR 4:SETATTR 5:READLINK 6:SYMLINK
-    // 7:MKNOD 8:MKDIR 9:UNLINK 10:RMDIR 11:RENAME 12:LINK
-    // 13:OPEN 14:READ 15:WRITE 16:STATFS 17:RELEASE
-    // 18:FSYNC 19:SETXATTR 20:GETXATTR 21:LISTXATTR 22:REMOVEXATTR
-    // 23:FLUSH 24:INIT 25:OPENDIR 26:READDIR 27:RELEASEDIR
-    // 28:FSYNCDIR 29:GETLK 30:SETLK 31:SETLKW 32:ACCESS
-    // 33:CREATE 34:INTERRUPT 35:BMAP 36:DESTROY
-    // 37:IOCTL 38:POLL 39:NOTIFY_REPLY 40:BATCH_FORGET
-    // 41:FALLOCATE 42:READDIRPLUS 43:RENAME2 44:LSEEK
-    // 45:COPY_FILE_RANGE 46:SETUPMAPPING 47:REMOVEMAPPING
-    // 48:? 49:? 50:SYNCFS 51:TMPFILE 52:STATX
-
-    match opcode {
-        // queue_class_0.control_urgent
-        24 |  // INIT
-        36 |  // DESTROY
-        34 |  // INTERRUPT
-        2  |  // FORGET
-        40    // BATCH_FORGET
-        => PosixFilesystemAdapterRequestClass::ControlUrgent,
-
-        // queue_class_1.meta_read
-        1  |  // LOOKUP
-        3  |  // GETATTR
-        32 |  // ACCESS
-        5  |  // READLINK
-        16 |  // STATFS
-        52    // STATX
-        => PosixFilesystemAdapterRequestClass::MetaRead,
-
-        // queue_class_2.namespace_mut
-        6  |  // SYMLINK
-        7  |  // MKNOD
-        8  |  // MKDIR
-        9  |  // UNLINK
-        10 |  // RMDIR
-        11 |  // RENAME
-        12 |  // LINK
-        19 |  // SETXATTR
-        20 |  // GETXATTR? (read xattr, but metadata)
-        21 |  // LISTXATTR
-        22 |  // REMOVEXATTR
-        33 |  // CREATE
-        43 |  // RENAME2
-        51    // TMPFILE
-        => PosixFilesystemAdapterRequestClass::NamespaceMut,
-
-        // queue_class_3.dir_stream
-        25 |  // OPENDIR
-        26 |  // READDIR
-        42 |  // READDIRPLUS
-        27 |  // RELEASEDIR
-        28    // FSYNCDIR
-        => PosixFilesystemAdapterRequestClass::DirStream,
-
-        // queue_class_4.file_read
-        13 |  // OPEN
-        14 |  // READ
-        44 |  // LSEEK
-        37 |  // IOCTL
-        38    // POLL
-        => PosixFilesystemAdapterRequestClass::FileRead,
-
-        // queue_class_5.file_writeback
-        15 |  // WRITE
-        4  |  // SETATTR
-        41 |  // FALLOCATE
-        45 |  // COPY_FILE_RANGE
-        23 |  // FLUSH
-        18 |  // FSYNC
-        50 |  // SYNCFS
-        17    // RELEASE
-        => PosixFilesystemAdapterRequestClass::FileWriteback,
-
-        // queue_class_6.lock_wait
-        29..=31   // SETLKW
-        // flock via IOCTL? FUSE doesn't have a direct FLOCK opcode in uapi >=7.12
-        => PosixFilesystemAdapterRequestClass::LockWait,
-
-        // queue_class_7.maintenance — explicit for known rare ops, catch-all for unknown
-        35 |  // BMAP
-        46 |  // SETUPMAPPING
-        47 |  // REMOVEMAPPING
-        39   // NOTIFY_REPLY
-        => PosixFilesystemAdapterRequestClass::Maintenance,
-
-        _ => PosixFilesystemAdapterRequestClass::Maintenance,
-    }
+    crate::fusewire::classify_fuse_request(opcode)
 }
 
 /// Derive the canonical shard-key policy for a given request class and opcode.
@@ -396,7 +305,9 @@ pub fn classify_fuse_request(opcode: u32, _nodeid: u64) -> PosixFilesystemAdapte
         PosixFilesystemAdapterRequestClass::NamespaceMut => {
             // namespace mutations shard by parent_dir; rename uses dual_parent_pair
             match opcode {
-                11 | 43 => PosixFilesystemAdapterShardKeyPolicy::DualParentPair,
+                crate::fusewire::opcode::FUSE_RENAME | crate::fusewire::opcode::FUSE_RENAME2 => {
+                    PosixFilesystemAdapterShardKeyPolicy::DualParentPair
+                }
                 _ => PosixFilesystemAdapterShardKeyPolicy::ParentDir,
             }
         }
@@ -465,6 +376,7 @@ pub fn admit_request_against_backpressure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fusewire::opcode;
     use tidefs_types_posix_filesystem_adapter_core::PosixFilesystemAdapterId128;
 
     const fn bundle_answer() -> PosixFilesystemAdapterDemoVisibleAnswerRecord {
@@ -802,23 +714,23 @@ mod tests {
     #[test]
     fn classify_fuse_opcode_control_urgent() {
         assert_eq!(
-            classify_fuse_opcode(24),
+            classify_fuse_opcode(opcode::FUSE_INIT),
             PosixFilesystemAdapterRequestClass::ControlUrgent
         ); // INIT
         assert_eq!(
-            classify_fuse_opcode(36),
+            classify_fuse_opcode(opcode::FUSE_DESTROY),
             PosixFilesystemAdapterRequestClass::ControlUrgent
         ); // DESTROY
         assert_eq!(
-            classify_fuse_opcode(34),
+            classify_fuse_opcode(opcode::FUSE_INTERRUPT),
             PosixFilesystemAdapterRequestClass::ControlUrgent
         ); // INTERRUPT
         assert_eq!(
-            classify_fuse_opcode(2),
+            classify_fuse_opcode(opcode::FUSE_FORGET),
             PosixFilesystemAdapterRequestClass::ControlUrgent
         ); // FORGET
         assert_eq!(
-            classify_fuse_opcode(40),
+            classify_fuse_opcode(opcode::FUSE_BATCH_FORGET),
             PosixFilesystemAdapterRequestClass::ControlUrgent
         ); // BATCH_FORGET
     }
@@ -826,27 +738,27 @@ mod tests {
     #[test]
     fn classify_fuse_opcode_meta_read() {
         assert_eq!(
-            classify_fuse_opcode(1),
+            classify_fuse_opcode(opcode::FUSE_LOOKUP),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // LOOKUP
         assert_eq!(
-            classify_fuse_opcode(3),
+            classify_fuse_opcode(opcode::FUSE_GETATTR),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // GETATTR
         assert_eq!(
-            classify_fuse_opcode(32),
+            classify_fuse_opcode(opcode::FUSE_ACCESS),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // ACCESS
         assert_eq!(
-            classify_fuse_opcode(5),
+            classify_fuse_opcode(opcode::FUSE_READLINK),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // READLINK
         assert_eq!(
-            classify_fuse_opcode(16),
+            classify_fuse_opcode(opcode::FUSE_STATFS),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // STATFS
         assert_eq!(
-            classify_fuse_opcode(52),
+            classify_fuse_opcode(opcode::FUSE_STATX),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // STATX
     }
@@ -854,59 +766,59 @@ mod tests {
     #[test]
     fn classify_fuse_opcode_namespace_mut() {
         assert_eq!(
-            classify_fuse_opcode(6),
+            classify_fuse_opcode(opcode::FUSE_SYMLINK),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // SYMLINK
         assert_eq!(
-            classify_fuse_opcode(7),
+            classify_fuse_opcode(opcode::FUSE_MKNOD),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // MKNOD
         assert_eq!(
-            classify_fuse_opcode(8),
+            classify_fuse_opcode(opcode::FUSE_MKDIR),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // MKDIR
         assert_eq!(
-            classify_fuse_opcode(9),
+            classify_fuse_opcode(opcode::FUSE_UNLINK),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // UNLINK
         assert_eq!(
-            classify_fuse_opcode(10),
+            classify_fuse_opcode(opcode::FUSE_RMDIR),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // RMDIR
         assert_eq!(
-            classify_fuse_opcode(11),
+            classify_fuse_opcode(opcode::FUSE_RENAME),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // RENAME
         assert_eq!(
-            classify_fuse_opcode(12),
+            classify_fuse_opcode(opcode::FUSE_LINK),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // LINK
         assert_eq!(
-            classify_fuse_opcode(33),
+            classify_fuse_opcode(opcode::FUSE_CREATE),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // CREATE
         assert_eq!(
-            classify_fuse_opcode(43),
+            classify_fuse_opcode(opcode::FUSE_RENAME2),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // RENAME2
         assert_eq!(
-            classify_fuse_opcode(51),
+            classify_fuse_opcode(opcode::FUSE_TMPFILE),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // TMPFILE
         assert_eq!(
-            classify_fuse_opcode(19),
+            classify_fuse_opcode(opcode::FUSE_SETXATTR),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // SETXATTR
         assert_eq!(
-            classify_fuse_opcode(20),
+            classify_fuse_opcode(opcode::FUSE_GETXATTR),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // GETXATTR
         assert_eq!(
-            classify_fuse_opcode(21),
+            classify_fuse_opcode(opcode::FUSE_LISTXATTR),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // LISTXATTR
         assert_eq!(
-            classify_fuse_opcode(22),
+            classify_fuse_opcode(opcode::FUSE_REMOVEXATTR),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // REMOVEXATTR
     }
@@ -914,23 +826,23 @@ mod tests {
     #[test]
     fn classify_fuse_opcode_dir_stream() {
         assert_eq!(
-            classify_fuse_opcode(25),
+            classify_fuse_opcode(opcode::FUSE_OPENDIR),
             PosixFilesystemAdapterRequestClass::DirStream
         ); // OPENDIR
         assert_eq!(
-            classify_fuse_opcode(26),
+            classify_fuse_opcode(opcode::FUSE_READDIR),
             PosixFilesystemAdapterRequestClass::DirStream
         ); // READDIR
         assert_eq!(
-            classify_fuse_opcode(42),
+            classify_fuse_opcode(opcode::FUSE_READDIRPLUS),
             PosixFilesystemAdapterRequestClass::DirStream
         ); // READDIRPLUS
         assert_eq!(
-            classify_fuse_opcode(27),
+            classify_fuse_opcode(opcode::FUSE_RELEASEDIR),
             PosixFilesystemAdapterRequestClass::DirStream
         ); // RELEASEDIR
         assert_eq!(
-            classify_fuse_opcode(28),
+            classify_fuse_opcode(opcode::FUSE_FSYNCDIR),
             PosixFilesystemAdapterRequestClass::DirStream
         ); // FSYNCDIR
     }
@@ -938,23 +850,23 @@ mod tests {
     #[test]
     fn classify_fuse_opcode_file_read() {
         assert_eq!(
-            classify_fuse_opcode(13),
+            classify_fuse_opcode(opcode::FUSE_OPEN),
             PosixFilesystemAdapterRequestClass::FileRead
         ); // OPEN
         assert_eq!(
-            classify_fuse_opcode(14),
+            classify_fuse_opcode(opcode::FUSE_READ),
             PosixFilesystemAdapterRequestClass::FileRead
         ); // READ
         assert_eq!(
-            classify_fuse_opcode(44),
+            classify_fuse_opcode(opcode::FUSE_LSEEK),
             PosixFilesystemAdapterRequestClass::FileRead
         ); // LSEEK
         assert_eq!(
-            classify_fuse_opcode(37),
+            classify_fuse_opcode(opcode::FUSE_IOCTL),
             PosixFilesystemAdapterRequestClass::FileRead
         ); // IOCTL
         assert_eq!(
-            classify_fuse_opcode(38),
+            classify_fuse_opcode(opcode::FUSE_POLL),
             PosixFilesystemAdapterRequestClass::FileRead
         ); // POLL
     }
@@ -962,35 +874,35 @@ mod tests {
     #[test]
     fn classify_fuse_opcode_file_writeback() {
         assert_eq!(
-            classify_fuse_opcode(15),
+            classify_fuse_opcode(opcode::FUSE_WRITE),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // WRITE
         assert_eq!(
-            classify_fuse_opcode(4),
+            classify_fuse_opcode(opcode::FUSE_SETATTR),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // SETATTR
         assert_eq!(
-            classify_fuse_opcode(41),
+            classify_fuse_opcode(opcode::FUSE_FALLOCATE),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // FALLOCATE
         assert_eq!(
-            classify_fuse_opcode(45),
+            classify_fuse_opcode(opcode::FUSE_COPY_FILE_RANGE),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // COPY_FILE_RANGE
         assert_eq!(
-            classify_fuse_opcode(23),
+            classify_fuse_opcode(opcode::FUSE_FLUSH),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // FLUSH
         assert_eq!(
-            classify_fuse_opcode(18),
+            classify_fuse_opcode(opcode::FUSE_FSYNC),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // FSYNC
         assert_eq!(
-            classify_fuse_opcode(50),
+            classify_fuse_opcode(opcode::FUSE_SYNCFS),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // SYNCFS
         assert_eq!(
-            classify_fuse_opcode(17),
+            classify_fuse_opcode(opcode::FUSE_RELEASE),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // RELEASE
     }
@@ -998,15 +910,15 @@ mod tests {
     #[test]
     fn classify_fuse_opcode_lock_wait() {
         assert_eq!(
-            classify_fuse_opcode(29),
+            classify_fuse_opcode(opcode::FUSE_GETLK),
             PosixFilesystemAdapterRequestClass::LockWait
         ); // GETLK
         assert_eq!(
-            classify_fuse_opcode(30),
+            classify_fuse_opcode(opcode::FUSE_SETLK),
             PosixFilesystemAdapterRequestClass::LockWait
         ); // SETLK
         assert_eq!(
-            classify_fuse_opcode(31),
+            classify_fuse_opcode(opcode::FUSE_SETLKW),
             PosixFilesystemAdapterRequestClass::LockWait
         ); // SETLKW
     }
@@ -1018,13 +930,17 @@ mod tests {
             PosixFilesystemAdapterRequestClass::Maintenance
         );
         assert_eq!(
-            classify_fuse_opcode(35),
+            classify_fuse_opcode(opcode::FUSE_BMAP),
             PosixFilesystemAdapterRequestClass::Maintenance
         ); // BMAP
         assert_eq!(
-            classify_fuse_opcode(46),
+            classify_fuse_opcode(opcode::FUSE_SETUPMAPPING),
             PosixFilesystemAdapterRequestClass::Maintenance
         ); // SETUPMAPPING
+        assert_eq!(
+            classify_fuse_opcode(opcode::FUSE_REMOVEMAPPING),
+            PosixFilesystemAdapterRequestClass::Maintenance
+        ); // REMOVEMAPPING
         assert_eq!(
             classify_fuse_opcode(255),
             PosixFilesystemAdapterRequestClass::Maintenance
@@ -1037,54 +953,194 @@ mod tests {
 
     #[test]
     fn classify_fuse_opcode_all_canonical_mapped() {
-        // Every opcode 1-52 except BMAP (35) and those explicitly mapped to Maintenance must map to a non-Maintenance class
+        // Every supported Linux opcode in the mounted POSIX set maps to a
+        // non-Maintenance class; explicit infrastructure/unsupported opcodes
+        // remain Maintenance.
         let non_maintenance: &[(u32, PosixFilesystemAdapterRequestClass)] = &[
-            (1, PosixFilesystemAdapterRequestClass::MetaRead),
-            (2, PosixFilesystemAdapterRequestClass::ControlUrgent),
-            (3, PosixFilesystemAdapterRequestClass::MetaRead),
-            (4, PosixFilesystemAdapterRequestClass::FileWriteback),
-            (5, PosixFilesystemAdapterRequestClass::MetaRead),
-            (6, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (7, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (8, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (9, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (10, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (11, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (12, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (13, PosixFilesystemAdapterRequestClass::FileRead),
-            (14, PosixFilesystemAdapterRequestClass::FileRead),
-            (15, PosixFilesystemAdapterRequestClass::FileWriteback),
-            (16, PosixFilesystemAdapterRequestClass::MetaRead),
-            (17, PosixFilesystemAdapterRequestClass::FileWriteback),
-            (18, PosixFilesystemAdapterRequestClass::FileWriteback),
-            (19, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (20, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (21, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (22, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (23, PosixFilesystemAdapterRequestClass::FileWriteback),
-            (24, PosixFilesystemAdapterRequestClass::ControlUrgent),
-            (25, PosixFilesystemAdapterRequestClass::DirStream),
-            (26, PosixFilesystemAdapterRequestClass::DirStream),
-            (27, PosixFilesystemAdapterRequestClass::DirStream),
-            (28, PosixFilesystemAdapterRequestClass::DirStream),
-            (29, PosixFilesystemAdapterRequestClass::LockWait),
-            (30, PosixFilesystemAdapterRequestClass::LockWait),
-            (31, PosixFilesystemAdapterRequestClass::LockWait),
-            (32, PosixFilesystemAdapterRequestClass::MetaRead),
-            (33, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (34, PosixFilesystemAdapterRequestClass::ControlUrgent),
-            (36, PosixFilesystemAdapterRequestClass::ControlUrgent),
-            (37, PosixFilesystemAdapterRequestClass::FileRead),
-            (38, PosixFilesystemAdapterRequestClass::FileRead),
-            (40, PosixFilesystemAdapterRequestClass::ControlUrgent),
-            (41, PosixFilesystemAdapterRequestClass::FileWriteback),
-            (42, PosixFilesystemAdapterRequestClass::DirStream),
-            (43, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (44, PosixFilesystemAdapterRequestClass::FileRead),
-            (45, PosixFilesystemAdapterRequestClass::FileWriteback),
-            (50, PosixFilesystemAdapterRequestClass::FileWriteback),
-            (51, PosixFilesystemAdapterRequestClass::NamespaceMut),
-            (52, PosixFilesystemAdapterRequestClass::MetaRead),
+            (
+                opcode::FUSE_LOOKUP,
+                PosixFilesystemAdapterRequestClass::MetaRead,
+            ),
+            (
+                opcode::FUSE_FORGET,
+                PosixFilesystemAdapterRequestClass::ControlUrgent,
+            ),
+            (
+                opcode::FUSE_GETATTR,
+                PosixFilesystemAdapterRequestClass::MetaRead,
+            ),
+            (
+                opcode::FUSE_SETATTR,
+                PosixFilesystemAdapterRequestClass::FileWriteback,
+            ),
+            (
+                opcode::FUSE_READLINK,
+                PosixFilesystemAdapterRequestClass::MetaRead,
+            ),
+            (
+                opcode::FUSE_SYMLINK,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_MKNOD,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_MKDIR,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_UNLINK,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_RMDIR,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_RENAME,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_LINK,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_OPEN,
+                PosixFilesystemAdapterRequestClass::FileRead,
+            ),
+            (
+                opcode::FUSE_READ,
+                PosixFilesystemAdapterRequestClass::FileRead,
+            ),
+            (
+                opcode::FUSE_WRITE,
+                PosixFilesystemAdapterRequestClass::FileWriteback,
+            ),
+            (
+                opcode::FUSE_STATFS,
+                PosixFilesystemAdapterRequestClass::MetaRead,
+            ),
+            (
+                opcode::FUSE_RELEASE,
+                PosixFilesystemAdapterRequestClass::FileWriteback,
+            ),
+            (
+                opcode::FUSE_FSYNC,
+                PosixFilesystemAdapterRequestClass::FileWriteback,
+            ),
+            (
+                opcode::FUSE_SETXATTR,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_GETXATTR,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_LISTXATTR,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_REMOVEXATTR,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_FLUSH,
+                PosixFilesystemAdapterRequestClass::FileWriteback,
+            ),
+            (
+                opcode::FUSE_INIT,
+                PosixFilesystemAdapterRequestClass::ControlUrgent,
+            ),
+            (
+                opcode::FUSE_OPENDIR,
+                PosixFilesystemAdapterRequestClass::DirStream,
+            ),
+            (
+                opcode::FUSE_READDIR,
+                PosixFilesystemAdapterRequestClass::DirStream,
+            ),
+            (
+                opcode::FUSE_RELEASEDIR,
+                PosixFilesystemAdapterRequestClass::DirStream,
+            ),
+            (
+                opcode::FUSE_FSYNCDIR,
+                PosixFilesystemAdapterRequestClass::DirStream,
+            ),
+            (
+                opcode::FUSE_GETLK,
+                PosixFilesystemAdapterRequestClass::LockWait,
+            ),
+            (
+                opcode::FUSE_SETLK,
+                PosixFilesystemAdapterRequestClass::LockWait,
+            ),
+            (
+                opcode::FUSE_SETLKW,
+                PosixFilesystemAdapterRequestClass::LockWait,
+            ),
+            (
+                opcode::FUSE_ACCESS,
+                PosixFilesystemAdapterRequestClass::MetaRead,
+            ),
+            (
+                opcode::FUSE_CREATE,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_INTERRUPT,
+                PosixFilesystemAdapterRequestClass::ControlUrgent,
+            ),
+            (
+                opcode::FUSE_DESTROY,
+                PosixFilesystemAdapterRequestClass::ControlUrgent,
+            ),
+            (
+                opcode::FUSE_IOCTL,
+                PosixFilesystemAdapterRequestClass::FileRead,
+            ),
+            (
+                opcode::FUSE_POLL,
+                PosixFilesystemAdapterRequestClass::FileRead,
+            ),
+            (
+                opcode::FUSE_BATCH_FORGET,
+                PosixFilesystemAdapterRequestClass::ControlUrgent,
+            ),
+            (
+                opcode::FUSE_FALLOCATE,
+                PosixFilesystemAdapterRequestClass::FileWriteback,
+            ),
+            (
+                opcode::FUSE_READDIRPLUS,
+                PosixFilesystemAdapterRequestClass::DirStream,
+            ),
+            (
+                opcode::FUSE_RENAME2,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_LSEEK,
+                PosixFilesystemAdapterRequestClass::FileRead,
+            ),
+            (
+                opcode::FUSE_COPY_FILE_RANGE,
+                PosixFilesystemAdapterRequestClass::FileWriteback,
+            ),
+            (
+                opcode::FUSE_SYNCFS,
+                PosixFilesystemAdapterRequestClass::FileWriteback,
+            ),
+            (
+                opcode::FUSE_TMPFILE,
+                PosixFilesystemAdapterRequestClass::NamespaceMut,
+            ),
+            (
+                opcode::FUSE_STATX,
+                PosixFilesystemAdapterRequestClass::MetaRead,
+            ),
         ];
         for &(opcode, expected) in non_maintenance {
             assert_eq!(
@@ -1100,11 +1156,11 @@ mod tests {
     #[test]
     fn classify_fuse_request_control_urgent_session_key() {
         assert_eq!(
-            classify_fuse_request(24, 1), // INIT
+            classify_fuse_request(opcode::FUSE_INIT, 1), // INIT
             PosixFilesystemAdapterShardKeyPolicy::Session
         );
         assert_eq!(
-            classify_fuse_request(36, 1), // DESTROY
+            classify_fuse_request(opcode::FUSE_DESTROY, 1), // DESTROY
             PosixFilesystemAdapterShardKeyPolicy::Session
         );
     }
@@ -1120,7 +1176,7 @@ mod tests {
     #[test]
     fn classify_fuse_request_meta_read_object_read_key() {
         assert_eq!(
-            classify_fuse_request(1, 100), // LOOKUP
+            classify_fuse_request(opcode::FUSE_LOOKUP, 100), // LOOKUP
             PosixFilesystemAdapterShardKeyPolicy::ObjectRead
         );
     }
@@ -1128,11 +1184,11 @@ mod tests {
     #[test]
     fn classify_fuse_request_namespace_mut_rename_dual_parent_pair() {
         assert_eq!(
-            classify_fuse_request(11, 0), // RENAME
+            classify_fuse_request(opcode::FUSE_RENAME, 0), // RENAME
             PosixFilesystemAdapterShardKeyPolicy::DualParentPair
         );
         assert_eq!(
-            classify_fuse_request(43, 0), // RENAME2
+            classify_fuse_request(opcode::FUSE_RENAME2, 0), // RENAME2
             PosixFilesystemAdapterShardKeyPolicy::DualParentPair
         );
     }
@@ -1140,11 +1196,11 @@ mod tests {
     #[test]
     fn classify_fuse_request_namespace_mut_other_parent_dir() {
         assert_eq!(
-            classify_fuse_request(9, 0), // UNLINK
+            classify_fuse_request(opcode::FUSE_UNLINK, 0), // UNLINK
             PosixFilesystemAdapterShardKeyPolicy::ParentDir
         );
         assert_eq!(
-            classify_fuse_request(33, 0), // CREATE
+            classify_fuse_request(opcode::FUSE_CREATE, 0), // CREATE
             PosixFilesystemAdapterShardKeyPolicy::ParentDir
         );
     }
@@ -1152,7 +1208,7 @@ mod tests {
     #[test]
     fn classify_fuse_request_dir_stream_dir_handle_key() {
         assert_eq!(
-            classify_fuse_request(26, 0), // READDIR
+            classify_fuse_request(opcode::FUSE_READDIR, 0), // READDIR
             PosixFilesystemAdapterShardKeyPolicy::DirHandle
         );
     }
@@ -1160,7 +1216,7 @@ mod tests {
     #[test]
     fn classify_fuse_request_file_read_object_read_key() {
         assert_eq!(
-            classify_fuse_request(14, 0), // READ
+            classify_fuse_request(opcode::FUSE_READ, 0), // READ
             PosixFilesystemAdapterShardKeyPolicy::ObjectRead
         );
     }
@@ -1168,7 +1224,7 @@ mod tests {
     #[test]
     fn classify_fuse_request_file_writeback_object_write_key() {
         assert_eq!(
-            classify_fuse_request(15, 0), // WRITE
+            classify_fuse_request(opcode::FUSE_WRITE, 0), // WRITE
             PosixFilesystemAdapterShardKeyPolicy::ObjectWrite
         );
     }
@@ -1176,7 +1232,7 @@ mod tests {
     #[test]
     fn classify_fuse_request_lock_wait_lock_scope_key() {
         assert_eq!(
-            classify_fuse_request(29, 0), // GETLK
+            classify_fuse_request(opcode::FUSE_GETLK, 0), // GETLK
             PosixFilesystemAdapterShardKeyPolicy::LockScope
         );
     }
@@ -1370,6 +1426,7 @@ mod tests {
 #[cfg(test)]
 mod p5_02_tests {
     use super::*;
+    use crate::fusewire::opcode;
     use tidefs_types_posix_filesystem_adapter_core::{
         PosixFilesystemAdapterBackpressureStateRecord, PosixFilesystemAdapterRequestClass,
         PosixFilesystemAdapterShardKeyPolicy,
@@ -1485,23 +1542,23 @@ mod p5_02_tests {
     #[test]
     fn classify_control_urgent_opcodes() {
         assert_eq!(
-            classify_fuse_opcode(24),
+            classify_fuse_opcode(opcode::FUSE_INIT),
             PosixFilesystemAdapterRequestClass::ControlUrgent
         ); // INIT
         assert_eq!(
-            classify_fuse_opcode(36),
+            classify_fuse_opcode(opcode::FUSE_DESTROY),
             PosixFilesystemAdapterRequestClass::ControlUrgent
         ); // DESTROY
         assert_eq!(
-            classify_fuse_opcode(34),
+            classify_fuse_opcode(opcode::FUSE_INTERRUPT),
             PosixFilesystemAdapterRequestClass::ControlUrgent
         ); // INTERRUPT
         assert_eq!(
-            classify_fuse_opcode(2),
+            classify_fuse_opcode(opcode::FUSE_FORGET),
             PosixFilesystemAdapterRequestClass::ControlUrgent
         ); // FORGET
         assert_eq!(
-            classify_fuse_opcode(40),
+            classify_fuse_opcode(opcode::FUSE_BATCH_FORGET),
             PosixFilesystemAdapterRequestClass::ControlUrgent
         ); // BATCH_FORGET
     }
@@ -1509,27 +1566,27 @@ mod p5_02_tests {
     #[test]
     fn classify_meta_read_opcodes() {
         assert_eq!(
-            classify_fuse_opcode(1),
+            classify_fuse_opcode(opcode::FUSE_LOOKUP),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // LOOKUP
         assert_eq!(
-            classify_fuse_opcode(3),
+            classify_fuse_opcode(opcode::FUSE_GETATTR),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // GETATTR
         assert_eq!(
-            classify_fuse_opcode(32),
+            classify_fuse_opcode(opcode::FUSE_ACCESS),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // ACCESS
         assert_eq!(
-            classify_fuse_opcode(5),
+            classify_fuse_opcode(opcode::FUSE_READLINK),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // READLINK
         assert_eq!(
-            classify_fuse_opcode(16),
+            classify_fuse_opcode(opcode::FUSE_STATFS),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // STATFS
         assert_eq!(
-            classify_fuse_opcode(52),
+            classify_fuse_opcode(opcode::FUSE_STATX),
             PosixFilesystemAdapterRequestClass::MetaRead
         ); // STATX
     }
@@ -1537,35 +1594,35 @@ mod p5_02_tests {
     #[test]
     fn classify_namespace_mut_opcodes() {
         assert_eq!(
-            classify_fuse_opcode(6),
+            classify_fuse_opcode(opcode::FUSE_SYMLINK),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // SYMLINK
         assert_eq!(
-            classify_fuse_opcode(9),
+            classify_fuse_opcode(opcode::FUSE_UNLINK),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // UNLINK
         assert_eq!(
-            classify_fuse_opcode(11),
+            classify_fuse_opcode(opcode::FUSE_RENAME),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // RENAME
         assert_eq!(
-            classify_fuse_opcode(33),
+            classify_fuse_opcode(opcode::FUSE_CREATE),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // CREATE
         assert_eq!(
-            classify_fuse_opcode(43),
+            classify_fuse_opcode(opcode::FUSE_RENAME2),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // RENAME2
         assert_eq!(
-            classify_fuse_opcode(51),
+            classify_fuse_opcode(opcode::FUSE_TMPFILE),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // TMPFILE
         assert_eq!(
-            classify_fuse_opcode(19),
+            classify_fuse_opcode(opcode::FUSE_SETXATTR),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // SETXATTR
         assert_eq!(
-            classify_fuse_opcode(22),
+            classify_fuse_opcode(opcode::FUSE_REMOVEXATTR),
             PosixFilesystemAdapterRequestClass::NamespaceMut
         ); // REMOVEXATTR
     }
@@ -1573,23 +1630,23 @@ mod p5_02_tests {
     #[test]
     fn classify_dir_stream_opcodes() {
         assert_eq!(
-            classify_fuse_opcode(25),
+            classify_fuse_opcode(opcode::FUSE_OPENDIR),
             PosixFilesystemAdapterRequestClass::DirStream
         ); // OPENDIR
         assert_eq!(
-            classify_fuse_opcode(26),
+            classify_fuse_opcode(opcode::FUSE_READDIR),
             PosixFilesystemAdapterRequestClass::DirStream
         ); // READDIR
         assert_eq!(
-            classify_fuse_opcode(42),
+            classify_fuse_opcode(opcode::FUSE_READDIRPLUS),
             PosixFilesystemAdapterRequestClass::DirStream
         ); // READDIRPLUS
         assert_eq!(
-            classify_fuse_opcode(27),
+            classify_fuse_opcode(opcode::FUSE_RELEASEDIR),
             PosixFilesystemAdapterRequestClass::DirStream
         ); // RELEASEDIR
         assert_eq!(
-            classify_fuse_opcode(28),
+            classify_fuse_opcode(opcode::FUSE_FSYNCDIR),
             PosixFilesystemAdapterRequestClass::DirStream
         ); // FSYNCDIR
     }
@@ -1597,23 +1654,23 @@ mod p5_02_tests {
     #[test]
     fn classify_file_read_opcodes() {
         assert_eq!(
-            classify_fuse_opcode(13),
+            classify_fuse_opcode(opcode::FUSE_OPEN),
             PosixFilesystemAdapterRequestClass::FileRead
         ); // OPEN
         assert_eq!(
-            classify_fuse_opcode(14),
+            classify_fuse_opcode(opcode::FUSE_READ),
             PosixFilesystemAdapterRequestClass::FileRead
         ); // READ
         assert_eq!(
-            classify_fuse_opcode(44),
+            classify_fuse_opcode(opcode::FUSE_LSEEK),
             PosixFilesystemAdapterRequestClass::FileRead
         ); // LSEEK
         assert_eq!(
-            classify_fuse_opcode(37),
+            classify_fuse_opcode(opcode::FUSE_IOCTL),
             PosixFilesystemAdapterRequestClass::FileRead
         ); // IOCTL
         assert_eq!(
-            classify_fuse_opcode(38),
+            classify_fuse_opcode(opcode::FUSE_POLL),
             PosixFilesystemAdapterRequestClass::FileRead
         ); // POLL
     }
@@ -1621,27 +1678,27 @@ mod p5_02_tests {
     #[test]
     fn classify_file_writeback_opcodes() {
         assert_eq!(
-            classify_fuse_opcode(15),
+            classify_fuse_opcode(opcode::FUSE_WRITE),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // WRITE
         assert_eq!(
-            classify_fuse_opcode(4),
+            classify_fuse_opcode(opcode::FUSE_SETATTR),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // SETATTR
         assert_eq!(
-            classify_fuse_opcode(41),
+            classify_fuse_opcode(opcode::FUSE_FALLOCATE),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // FALLOCATE
         assert_eq!(
-            classify_fuse_opcode(45),
+            classify_fuse_opcode(opcode::FUSE_COPY_FILE_RANGE),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // COPY_FILE_RANGE
         assert_eq!(
-            classify_fuse_opcode(18),
+            classify_fuse_opcode(opcode::FUSE_FSYNC),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // FSYNC
         assert_eq!(
-            classify_fuse_opcode(17),
+            classify_fuse_opcode(opcode::FUSE_RELEASE),
             PosixFilesystemAdapterRequestClass::FileWriteback
         ); // RELEASE
     }
@@ -1649,15 +1706,15 @@ mod p5_02_tests {
     #[test]
     fn classify_lock_wait_opcodes() {
         assert_eq!(
-            classify_fuse_opcode(29),
+            classify_fuse_opcode(opcode::FUSE_GETLK),
             PosixFilesystemAdapterRequestClass::LockWait
         ); // GETLK
         assert_eq!(
-            classify_fuse_opcode(30),
+            classify_fuse_opcode(opcode::FUSE_SETLK),
             PosixFilesystemAdapterRequestClass::LockWait
         ); // SETLK
         assert_eq!(
-            classify_fuse_opcode(31),
+            classify_fuse_opcode(opcode::FUSE_SETLKW),
             PosixFilesystemAdapterRequestClass::LockWait
         ); // SETLKW
     }
@@ -1669,11 +1726,11 @@ mod p5_02_tests {
             PosixFilesystemAdapterRequestClass::Maintenance
         );
         assert_eq!(
-            classify_fuse_opcode(46),
+            classify_fuse_opcode(opcode::FUSE_SETUPMAPPING),
             PosixFilesystemAdapterRequestClass::Maintenance
         );
         assert_eq!(
-            classify_fuse_opcode(47),
+            classify_fuse_opcode(opcode::FUSE_REMOVEMAPPING),
             PosixFilesystemAdapterRequestClass::Maintenance
         );
         assert_eq!(
@@ -1691,8 +1748,52 @@ mod p5_02_tests {
     #[test]
     fn classify_exhaustiveness_covers_known_range() {
         let known_not_maintenance: &[u32] = &[
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 36, 37, 38, 40, 41, 42, 43, 44, 45, 52,
+            opcode::FUSE_LOOKUP,
+            opcode::FUSE_FORGET,
+            opcode::FUSE_GETATTR,
+            opcode::FUSE_SETATTR,
+            opcode::FUSE_READLINK,
+            opcode::FUSE_SYMLINK,
+            opcode::FUSE_MKNOD,
+            opcode::FUSE_MKDIR,
+            opcode::FUSE_UNLINK,
+            opcode::FUSE_RMDIR,
+            opcode::FUSE_RENAME,
+            opcode::FUSE_LINK,
+            opcode::FUSE_OPEN,
+            opcode::FUSE_READ,
+            opcode::FUSE_WRITE,
+            opcode::FUSE_STATFS,
+            opcode::FUSE_RELEASE,
+            opcode::FUSE_FSYNC,
+            opcode::FUSE_SETXATTR,
+            opcode::FUSE_GETXATTR,
+            opcode::FUSE_LISTXATTR,
+            opcode::FUSE_REMOVEXATTR,
+            opcode::FUSE_FLUSH,
+            opcode::FUSE_INIT,
+            opcode::FUSE_OPENDIR,
+            opcode::FUSE_READDIR,
+            opcode::FUSE_RELEASEDIR,
+            opcode::FUSE_FSYNCDIR,
+            opcode::FUSE_GETLK,
+            opcode::FUSE_SETLK,
+            opcode::FUSE_SETLKW,
+            opcode::FUSE_ACCESS,
+            opcode::FUSE_CREATE,
+            opcode::FUSE_INTERRUPT,
+            opcode::FUSE_DESTROY,
+            opcode::FUSE_IOCTL,
+            opcode::FUSE_POLL,
+            opcode::FUSE_BATCH_FORGET,
+            opcode::FUSE_FALLOCATE,
+            opcode::FUSE_READDIRPLUS,
+            opcode::FUSE_RENAME2,
+            opcode::FUSE_LSEEK,
+            opcode::FUSE_COPY_FILE_RANGE,
+            opcode::FUSE_SYNCFS,
+            opcode::FUSE_TMPFILE,
+            opcode::FUSE_STATX,
         ];
         for &op in known_not_maintenance {
             assert_ne!(
@@ -1708,43 +1809,43 @@ mod p5_02_tests {
     #[test]
     fn classify_request_shard_key_policies() {
         assert_eq!(
-            classify_fuse_request(24, 0),
+            classify_fuse_request(opcode::FUSE_INIT, 0),
             PosixFilesystemAdapterShardKeyPolicy::Session
         ); // INIT → ControlUrgent → Session
         assert_eq!(
-            classify_fuse_request(34, 0),
+            classify_fuse_request(opcode::FUSE_INTERRUPT, 0),
             PosixFilesystemAdapterShardKeyPolicy::Session
         ); // INTERRUPT
         assert_eq!(
-            classify_fuse_request(1, 0),
+            classify_fuse_request(opcode::FUSE_LOOKUP, 0),
             PosixFilesystemAdapterShardKeyPolicy::ObjectRead
         ); // LOOKUP → MetaRead
         assert_eq!(
-            classify_fuse_request(3, 0),
+            classify_fuse_request(opcode::FUSE_GETATTR, 0),
             PosixFilesystemAdapterShardKeyPolicy::ObjectRead
         ); // GETATTR
         assert_eq!(
-            classify_fuse_request(9, 0),
+            classify_fuse_request(opcode::FUSE_UNLINK, 0),
             PosixFilesystemAdapterShardKeyPolicy::ParentDir
         ); // UNLINK → NamespaceMut
         assert_eq!(
-            classify_fuse_request(33, 0),
+            classify_fuse_request(opcode::FUSE_CREATE, 0),
             PosixFilesystemAdapterShardKeyPolicy::ParentDir
         ); // CREATE
         assert_eq!(
-            classify_fuse_request(25, 0),
+            classify_fuse_request(opcode::FUSE_OPENDIR, 0),
             PosixFilesystemAdapterShardKeyPolicy::DirHandle
         ); // OPENDIR → DirStream
         assert_eq!(
-            classify_fuse_request(13, 0),
+            classify_fuse_request(opcode::FUSE_OPEN, 0),
             PosixFilesystemAdapterShardKeyPolicy::ObjectRead
         ); // OPEN → FileRead
         assert_eq!(
-            classify_fuse_request(15, 0),
+            classify_fuse_request(opcode::FUSE_WRITE, 0),
             PosixFilesystemAdapterShardKeyPolicy::ObjectWrite
         ); // WRITE → FileWriteback
         assert_eq!(
-            classify_fuse_request(29, 0),
+            classify_fuse_request(opcode::FUSE_GETLK, 0),
             PosixFilesystemAdapterShardKeyPolicy::LockScope
         ); // GETLK → LockWait
     }
@@ -1752,11 +1853,11 @@ mod p5_02_tests {
     #[test]
     fn rename_uses_dual_parent_pair() {
         assert_eq!(
-            classify_fuse_request(11, 0),
+            classify_fuse_request(opcode::FUSE_RENAME, 0),
             PosixFilesystemAdapterShardKeyPolicy::DualParentPair
         );
         assert_eq!(
-            classify_fuse_request(43, 0),
+            classify_fuse_request(opcode::FUSE_RENAME2, 0),
             PosixFilesystemAdapterShardKeyPolicy::DualParentPair
         );
     }

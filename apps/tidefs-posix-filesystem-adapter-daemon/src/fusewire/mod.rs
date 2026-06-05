@@ -73,7 +73,6 @@ pub mod opcode {
     pub const FUSE_SYNCFS: u32 = 50;
     pub const FUSE_TMPFILE: u32 = 51;
     pub const FUSE_STATX: u32 = 52;
-    pub const FUSE_FLOCK: u32 = 53;
     pub const FUSE_SETVOLNAME: u32 = 61;
     pub const FUSE_GETXTIMES: u32 = 62;
     pub const FUSE_EXCHANGE: u32 = 63;
@@ -144,8 +143,8 @@ pub const fn classify_fuse_request(opcode: u32) -> PosixFilesystemAdapterRequest
         | opcode::FUSE_RELEASE
         | opcode::FUSE_SYNCFS => PosixFilesystemAdapterRequestClass::FileWriteback,
 
-        // queue_class_6.lock_wait — GETLK, SETLK, SETLKW, FLOCK
-        opcode::FUSE_GETLK | opcode::FUSE_SETLK | opcode::FUSE_SETLKW | opcode::FUSE_FLOCK => {
+        // queue_class_6.lock_wait — GETLK, SETLK, SETLKW.
+        opcode::FUSE_GETLK | opcode::FUSE_SETLK | opcode::FUSE_SETLKW => {
             PosixFilesystemAdapterRequestClass::LockWait
         }
 
@@ -224,8 +223,8 @@ pub const fn derive_shard_key_policy(opcode: u32) -> PosixFilesystemAdapterShard
         | opcode::FUSE_RELEASEDIR
         | opcode::FUSE_FSYNCDIR => PosixFilesystemAdapterShardKeyPolicy::DirHandle,
 
-        // Lock-scope: file/record/BSD lock scope
-        opcode::FUSE_GETLK | opcode::FUSE_SETLK | opcode::FUSE_SETLKW | opcode::FUSE_FLOCK => {
+        // Lock-scope: file/record lock scope. BSD flock is carried by lock flags.
+        opcode::FUSE_GETLK | opcode::FUSE_SETLK | opcode::FUSE_SETLKW => {
             PosixFilesystemAdapterShardKeyPolicy::LockScope
         }
 
@@ -394,7 +393,7 @@ pub const FUSE_STATFS_IN_WIRE_SIZE: usize = 0;
 pub const FUSE_DESTROY_IN_WIRE_SIZE: usize = 0;
 
 /// Wire size of FUSE_SYNCFS payload after `fuse_in_header`.
-pub const FUSE_SYNCFS_IN_WIRE_SIZE: usize = 0;
+pub const FUSE_SYNCFS_IN_WIRE_SIZE: usize = 8;
 
 /// Wire size of `struct fuse_setattr_in`.
 pub const FUSE_SETATTR_IN_WIRE_SIZE: usize = 88;
@@ -676,7 +675,7 @@ pub enum DestroyRequestParseError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncfsRequestParseError {
-    NonEmptyPayload { actual: usize },
+    UnexpectedPayloadSize { expected: usize, actual: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2142,7 +2141,8 @@ pub fn parse_fuse_syncfs_request(
     payload: &[u8],
 ) -> Result<FuseSyncfsRequest, SyncfsRequestParseError> {
     if payload.len() != FUSE_SYNCFS_IN_WIRE_SIZE {
-        return Err(SyncfsRequestParseError::NonEmptyPayload {
+        return Err(SyncfsRequestParseError::UnexpectedPayloadSize {
+            expected: FUSE_SYNCFS_IN_WIRE_SIZE,
             actual: payload.len(),
         });
     }
@@ -3668,7 +3668,6 @@ mod tests {
         assert_eq!(FUSE_TMPFILE_IN_WIRE_SIZE, 0);
         assert_eq!(FUSE_STATFS_IN_WIRE_SIZE, 0);
         assert_eq!(FUSE_DESTROY_IN_WIRE_SIZE, 0);
-        assert_eq!(FUSE_SYNCFS_IN_WIRE_SIZE, 0);
     }
 
     #[test]
@@ -4534,15 +4533,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_fuse_syncfs_request_parses_bodyless_request() {
-        assert_eq!(parse_fuse_syncfs_request(&[]), Ok(FuseSyncfsRequest));
+    fn parse_fuse_syncfs_request_parses_padding_payload() {
+        assert_eq!(
+            parse_fuse_syncfs_request(&[0_u8; FUSE_SYNCFS_IN_WIRE_SIZE]),
+            Ok(FuseSyncfsRequest)
+        );
     }
 
     #[test]
-    fn parse_fuse_syncfs_request_rejects_nonempty_payload() {
+    fn parse_fuse_syncfs_request_rejects_wrong_payload_size() {
         assert_eq!(
-            parse_fuse_syncfs_request(&[0_u8, 1]),
-            Err(SyncfsRequestParseError::NonEmptyPayload { actual: 2 })
+            parse_fuse_syncfs_request(&[0_u8; FUSE_SYNCFS_IN_WIRE_SIZE - 1]),
+            Err(SyncfsRequestParseError::UnexpectedPayloadSize {
+                expected: FUSE_SYNCFS_IN_WIRE_SIZE,
+                actual: FUSE_SYNCFS_IN_WIRE_SIZE - 1
+            })
+        );
+        assert_eq!(
+            parse_fuse_syncfs_request(&[0_u8; FUSE_SYNCFS_IN_WIRE_SIZE + 1]),
+            Err(SyncfsRequestParseError::UnexpectedPayloadSize {
+                expected: FUSE_SYNCFS_IN_WIRE_SIZE,
+                actual: FUSE_SYNCFS_IN_WIRE_SIZE + 1
+            })
         );
     }
 
