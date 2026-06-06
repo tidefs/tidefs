@@ -13,6 +13,12 @@ otherwise. Do not start or depend on parked Nexus/Factory automation.
 - On this host, publish Codex-authored branches through
   `/root/ai/bin/git-push-approve` plus `/root/ai/bin/git-push-guard`. Do not
   bypass a blocked guarded push.
+- PRs are autonomous integration gates, not human handoff points. The owning
+  Codex must review the PR against the issue acceptance criteria, repo docs,
+  product requirements, touched-code behavior, validation evidence, active
+  write sets, and CI. When the review is clean, mark the PR ready if needed,
+  merge with a linear method, sync affected worktrees, close/update the issue,
+  and delete the feature branch.
 - Keep build output outside the repository, normally with
   `CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target-codexN`.
 - Check disk headroom before work, before heavy validation, and after creating
