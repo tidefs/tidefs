@@ -3387,6 +3387,7 @@ name = "tidefs-storage-node"
 version = "0.421.0"
 dependencies = [
  "bincode",
+ "blake3",
  "clap 4.6.1",
  "hex",
  "libc",
@@ -3404,6 +3405,7 @@ dependencies = [
  "tidefs-pool-import",
  "tidefs-pool-scan",
  "tidefs-replicated-object-store",
+ "tidefs-replication-model",
  "tidefs-transport",
  "tidefs-types-pool-label-core",
  "tokio",
@@ -3478,6 +3480,7 @@ dependencies = [
  "tidefs-membership-epoch",
  "tidefs-membership-types",
  "tidefs-placement-planner",
+ "tidefs-replication-model",
  "tidefs-tdma-scheduler",
  "tidefs-types-transport-session",
  "tokio",

@@ -40,6 +40,7 @@ use tidefs_replicated_object_store::{
     ReplicatedObjectStore, ReplicatedStoreConfig, TransportReplicatedStore,
     TransportReplicatedStoreConfig,
 };
+use tidefs_replication_model::PlacementReceiptRef;
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
     send_replication_msg, send_segment_fetch_response, PlacementVersionTracker, ReplicationMessage,
@@ -90,6 +91,119 @@ fn sync_entries_from_store(store: &StoreBackend) -> Vec<([u8; 32], Vec<u8>)> {
                     .map(|payload| (key.as_bytes32(), payload))
             })
             .collect(),
+    }
+}
+
+fn validate_repair_receipt_for_name(
+    name: &[u8],
+    payload: &[u8],
+    placement_receipt_ref: PlacementReceiptRef,
+) -> Result<(), String> {
+    let expected_key = tidefs_local_object_store::ObjectKey::from_name(name).as_bytes32();
+    validate_repair_receipt(expected_key, payload, placement_receipt_ref)
+}
+
+fn validate_repair_receipt(
+    expected_key: [u8; 32],
+    payload: &[u8],
+    placement_receipt_ref: PlacementReceiptRef,
+) -> Result<(), String> {
+    if placement_receipt_ref.is_synthetic() {
+        return Err(format!(
+            "repair refused: placement receipt for object {} is synthetic",
+            placement_receipt_ref.object_id
+        ));
+    }
+    if !placement_receipt_ref.redundancy_policy.is_well_formed() {
+        return Err(format!(
+            "repair refused: placement receipt for object {} has malformed redundancy policy",
+            placement_receipt_ref.object_id
+        ));
+    }
+    let required_targets = placement_receipt_ref.redundancy_policy.target_width();
+    if placement_receipt_ref.target_count < required_targets {
+        return Err(format!(
+            "repair refused: placement receipt for object {} has {} targets, needs {}",
+            placement_receipt_ref.object_id, placement_receipt_ref.target_count, required_targets
+        ));
+    }
+    if placement_receipt_ref.object_key != expected_key {
+        return Err(format!(
+            "repair refused: placement receipt object key does not match repair key for object {}",
+            placement_receipt_ref.object_id
+        ));
+    }
+    if placement_receipt_ref.payload_len != payload.len() as u64 {
+        return Err(format!(
+            "repair refused: placement receipt payload length {} does not match repair payload length {} for object {}",
+            placement_receipt_ref.payload_len,
+            payload.len(),
+            placement_receipt_ref.object_id
+        ));
+    }
+    let digest: [u8; 32] = blake3::hash(payload).into();
+    if placement_receipt_ref.payload_digest != digest {
+        return Err(format!(
+            "repair refused: placement receipt payload digest does not match repair payload for object {}",
+            placement_receipt_ref.object_id
+        ));
+    }
+    Ok(())
+}
+
+fn apply_receipt_bound_repair(
+    store: &mut StoreBackend,
+    name: &[u8],
+    payload: &[u8],
+    placement_receipt_ref: PlacementReceiptRef,
+) -> Result<(), String> {
+    validate_repair_receipt_for_name(name, payload, placement_receipt_ref)?;
+    let repair_name = String::from_utf8_lossy(name).to_string();
+    match store {
+        StoreBackend::Local(rs) => rs.put_local(&repair_name, payload),
+        StoreBackend::TransportBacked(ts) => ts.put_local(&repair_name, payload),
+    }
+}
+
+fn placement_receipt_inventory_json() -> serde_json::Value {
+    serde_json::json!({
+        "available": false,
+        "count": 0,
+        "refs": [],
+        "reason": "storage-node object-store backend does not expose pool placement receipts; receipt-bound repair requests must carry PlacementReceiptRef explicitly",
+    })
+}
+
+fn local_scrub_report_json(config: &StorageNodeConfig) -> (String, u64) {
+    let store_dir = &config.store_paths[0];
+    let segments_dir = store_dir.join(tidefs_local_object_store::STORE_DIR_NAME);
+    let scrubber = tidefs_local_object_store::SegmentIntegrityScrubber::new(&segments_dir);
+    let mut suspect_log = tidefs_local_object_store::SuspectLog::new();
+    let placement_receipt_refs = placement_receipt_inventory_json();
+    let placement_receipt_ref_count = placement_receipt_refs["count"].as_u64().unwrap_or(0);
+    match scrubber.scrub_full(&mut suspect_log) {
+        Ok(report) => {
+            let findings = report.outcomes.len() as u64;
+            let json = serde_json::json!({
+                "segments_scanned": report.segments_scanned,
+                "records_verified": report.records_verified,
+                "bytes_scanned": report.bytes_scanned,
+                "chain_breaks_detected": report.chain_breaks_detected,
+                "completed": report.completed,
+                "findings_count": findings,
+                "placement_receipt_ref_count": placement_receipt_ref_count,
+                "placement_receipt_refs": placement_receipt_refs,
+            });
+            (json.to_string(), findings)
+        }
+        Err(e) => {
+            let json = serde_json::json!({
+                "error": format!("{e}"),
+                "placement_receipt_ref_count": placement_receipt_ref_count,
+                "placement_receipt_refs": placement_receipt_refs,
+            });
+            (json.to_string(), 0)
+        }
     }
 }
 
@@ -1364,31 +1478,7 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     ReplicationMessage::SyncResponse { entries }
                 }
                 ReplicationMessage::ScrubRequest => {
-                    // Run local segment integrity scrub and report findings.
-                    let store_dir = &ctx.config.store_paths[0];
-                    let segments_dir = store_dir.join(tidefs_local_object_store::STORE_DIR_NAME);
-                    let scrubber =
-                        tidefs_local_object_store::SegmentIntegrityScrubber::new(&segments_dir);
-                    let mut suspect_log = tidefs_local_object_store::SuspectLog::new();
-                    let (report_json, findings_count) = match scrubber.scrub_full(&mut suspect_log)
-                    {
-                        Ok(report) => {
-                            let findings = report.outcomes.len() as u64;
-                            let json = serde_json::json!({
-                                "segments_scanned": report.segments_scanned,
-                                "records_verified": report.records_verified,
-                                "bytes_scanned": report.bytes_scanned,
-                                "chain_breaks_detected": report.chain_breaks_detected,
-                                "completed": report.completed,
-                                "findings_count": findings,
-                            });
-                            (json.to_string(), findings)
-                        }
-                        Err(e) => {
-                            let json = serde_json::json!({"error": format!("{e}")});
-                            (json.to_string(), 0)
-                        }
-                    };
+                    let (report_json, findings_count) = local_scrub_report_json(&ctx.config);
                     ReplicationMessage::ScrubResponse {
                         report_json,
                         findings_count,
@@ -1396,16 +1486,18 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                 }
                 ReplicationMessage::RepairObject {
                     name,
+                    placement_receipt_ref,
                     authoritative_payload,
                 } => {
-                    let mut s = ctx.store.lock().unwrap();
-                    let success = match &mut *s {
-                        StoreBackend::Local(rs) => {
-                            rs.put_local(name, authoritative_payload).is_ok()
-                        }
-                        StoreBackend::TransportBacked(ts) => {
-                            ts.put_local(name, authoritative_payload).is_ok()
-                        }
+                    let success = {
+                        let mut s = ctx.store.lock().unwrap();
+                        apply_receipt_bound_repair(
+                            &mut *s,
+                            name.as_bytes(),
+                            authoritative_payload,
+                            *placement_receipt_ref,
+                        )
+                        .is_ok()
                     };
                     ReplicationMessage::RepairObjectAck {
                         name: name.clone(),
@@ -2568,28 +2660,7 @@ fn handle_frame_ctx(
         }
         // ── Multi-node scrub fanout ──
         Frame::ScrubRequest => {
-            let store_dir = &ctx.config.store_paths[0];
-            let segments_dir = store_dir.join(tidefs_local_object_store::STORE_DIR_NAME);
-            let scrubber = tidefs_local_object_store::SegmentIntegrityScrubber::new(&segments_dir);
-            let mut suspect_log = tidefs_local_object_store::SuspectLog::new();
-            let (report_json, findings_count) = match scrubber.scrub_full(&mut suspect_log) {
-                Ok(report) => {
-                    let findings = report.outcomes.len() as u64;
-                    let json = serde_json::json!({
-                        "segments_scanned": report.segments_scanned,
-                        "records_verified": report.records_verified,
-                        "bytes_scanned": report.bytes_scanned,
-                        "chain_breaks_detected": report.chain_breaks_detected,
-                        "completed": report.completed,
-                        "findings_count": findings,
-                    });
-                    (json.to_string(), findings)
-                }
-                Err(e) => {
-                    let json = serde_json::json!({"error": format!("{e}")});
-                    (json.to_string(), 0)
-                }
-            };
+            let (report_json, findings_count) = local_scrub_report_json(&ctx.config);
             eprintln!(
                 "[storage-node] session {session_id}: scrub request completed findings_count={findings_count}"
             );
@@ -2600,18 +2671,23 @@ fn handle_frame_ctx(
         }
         Frame::RepairObject {
             key,
+            placement_receipt_ref,
             authoritative_payload,
         } => {
             let mut s = store.lock().unwrap();
-            let name = String::from_utf8_lossy(key).to_string();
-            let success = match &mut *s {
-                StoreBackend::Local(rs) => rs.put_local(&name, authoritative_payload).is_ok(),
-                StoreBackend::TransportBacked(ts) => {
-                    ts.put_local(&name, authoritative_payload).is_ok()
-                }
-            };
+            let result = apply_receipt_bound_repair(
+                &mut *s,
+                key,
+                authoritative_payload,
+                *placement_receipt_ref,
+            );
+            if let Err(message) = result {
+                return Some(Frame::Error { message });
+            }
+            let success = true;
             eprintln!(
-                "[storage-node] session {session_id}: repair object key={name} success={success}"
+                "[storage-node] session {session_id}: repair object key={} success={success}",
+                String::from_utf8_lossy(key)
             );
             Some(Frame::RepairObjectAck {
                 key: key.clone(),
@@ -3240,6 +3316,7 @@ mod cluster_pool_handler_tests {
     use tidefs_cluster::pool_protocol::{ClusterPoolCreateResponse, ClusterPoolImportResponse};
     use tidefs_local_object_store::ObjectKey;
     use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
+    use tidefs_replication_model::ReceiptRedundancyPolicy;
 
     /// Minimum device size for pool creation: 2 * 256KB labels + 8KB offset + 256KB commit region.
     const DEVICE_BYTES: u64 = 2_000_000;
@@ -3250,6 +3327,19 @@ mod cluster_pool_handler_tests {
         f.set_len(DEVICE_BYTES).unwrap();
         f.flush().unwrap();
         path
+    }
+
+    fn receipt_ref(name: &[u8], payload: &[u8], generation: u64) -> PlacementReceiptRef {
+        PlacementReceiptRef::new(
+            88,
+            ObjectKey::from_name(name).as_bytes32(),
+            EpochId::new(11),
+            generation,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            payload.len() as u64,
+            blake3::hash(payload).into(),
+            2,
+        )
     }
 
     #[test]
@@ -3265,6 +3355,63 @@ mod cluster_pool_handler_tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, ObjectKey::from_name("alpha").as_bytes32());
         assert_eq!(entries[0].1, b"payload".to_vec());
+    }
+
+    #[test]
+    fn receipt_bound_repair_writes_matching_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().join("store")];
+        let store = ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
+        let mut backend = StoreBackend::Local(Box::new(store));
+        let name = b"repair-target";
+        let payload = b"authoritative";
+        let receipt = receipt_ref(name, payload, 3);
+
+        apply_receipt_bound_repair(&mut backend, name, payload, receipt).unwrap();
+
+        let entries = sync_entries_from_store(&backend);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, ObjectKey::from_name(name).as_bytes32());
+        assert_eq!(entries[0].1, payload.to_vec());
+    }
+
+    #[test]
+    fn receipt_bound_repair_rejects_synthetic_receipt() {
+        let name = b"repair-target";
+        let payload = b"authoritative";
+        let receipt = PlacementReceiptRef::synthetic_for_subject(
+            tidefs_replication_model::ReplicatedSubjectId::new(88),
+        );
+        let err = validate_repair_receipt_for_name(name, payload, receipt).unwrap_err();
+        assert!(err.contains("synthetic"));
+    }
+
+    #[test]
+    fn receipt_bound_repair_rejects_key_mismatch() {
+        let payload = b"authoritative";
+        let receipt = receipt_ref(b"other-key", payload, 4);
+        let err = validate_repair_receipt_for_name(b"repair-target", payload, receipt).unwrap_err();
+        assert!(err.contains("object key does not match"));
+    }
+
+    #[test]
+    fn receipt_bound_repair_rejects_payload_digest_mismatch() {
+        let name = b"repair-target";
+        let mut receipt = receipt_ref(name, b"authoritative", 5);
+        receipt.payload_digest = blake3::hash(b"different").into();
+        let err = validate_repair_receipt_for_name(name, b"authoritative", receipt).unwrap_err();
+        assert!(err.contains("payload digest"));
+    }
+
+    #[test]
+    fn receipt_inventory_discloses_storage_node_boundary() {
+        let inventory = placement_receipt_inventory_json();
+        assert_eq!(inventory["available"], false);
+        assert_eq!(inventory["count"], 0);
+        assert!(inventory["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not expose pool placement receipts"));
     }
 
     #[test]

@@ -21,11 +21,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tidefs-pool-import = { path = "../../crates/tidefs-pool-import" }
 tidefs-cluster = { path = "../../crates/tidefs-cluster" }
+tidefs-replication-model = { path = "../../crates/tidefs-replication-model" }
 tidefs-partition-runtime = { path = "../../crates/tidefs-partition-runtime" }
 bincode = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 hex = "0.4"
+blake3 = "1"
 tidefs-pool-scan = { path = "../../crates/tidefs-pool-scan" }
 tidefs-node-join = { path = "../../crates/tidefs-node-join" }
 

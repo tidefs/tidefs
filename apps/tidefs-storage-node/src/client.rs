@@ -189,41 +189,11 @@ pub fn run_client(
             }
         }
         "repair" => {
-            let (key, value) = if args.first().map(|s| s.as_str()) == Some("--file") {
-                let path = args.get(1).ok_or("usage: repair --file <path> <key>")?;
-                let key = args.get(2).ok_or("usage: repair --file <path> <key>")?;
-                let value = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-                (key.as_bytes().to_vec(), value)
-            } else {
-                let key = args
-                    .first()
-                    .ok_or("usage: repair <key> <authoritative-value>")?;
-                let value = args
-                    .get(1)
-                    .ok_or("usage: repair <key> <authoritative-value>")?;
-                (key.as_bytes().to_vec(), value.as_bytes().to_vec())
-            };
-            let resp = request(
-                node_id,
-                server_node_id,
-                server_addr,
-                Frame::RepairObject {
-                    key,
-                    authoritative_payload: value,
-                },
-                rdma,
-            )?;
-            match resp {
-                Frame::RepairObjectAck { key: _k, success } => {
-                    if success {
-                        println!("ok");
-                    } else {
-                        return Err("repair failed".into());
-                    }
-                }
-                Frame::Error { message } => return Err(format!("server error: {message}")),
-                other => return Err(format!("unexpected response: {other:?}")),
-            }
+            let _ = args;
+            return Err(
+                "repair requires placement-receipt-bound authority; key+payload repair is refused"
+                    .into(),
+            );
         }
         "send" => {
             let key = if args.first().map(|s| s.as_str()) == Some("--incremental") {
