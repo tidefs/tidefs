@@ -14,10 +14,10 @@ reader could treat as a capability statement:
 cargo run -p tidefs-xtask -- check-claims-gate
 ```
 
-The canonical Forgejo repository is `forgeadmin/tidefs`. Local
-`TIDEFS_FORGEJO_REPO` or `git config tidefs.forgejo-repo <owner/repo>`
-overrides are for temporary forks or emergency diagnostics only; the primary
-`/root/tidefs` checkout should not need a tracked-source override.
+This command checks publishing-facing capability wording. It does not validate
+active work ownership. Foreground Codex work is coordinated through GitHub
+issues and pull requests in `tidefs/tidefs`; use the separate worktree/claim
+diagnostic commands when checking local worker ownership.
 
 ## Claims rule
 
@@ -41,7 +41,7 @@ A line may mention one of those topics only when it is clearly framed as one of:
 
 Stronger wording requires all of the following:
 
-1. a tracked Forgejo issue naming the claim;
+1. a tracked GitHub issue naming the claim;
 2. recorded proof that covers the full claimed behavior;
 3. an updated current-status or review-register row;
 4. an updated claims gate rule that allows the specific stronger claim.
@@ -53,8 +53,10 @@ docs, preview handoff docs that remain in the tree, the review register, and
 the whole-repo review. It also verifies that the source rule table in
 `xtask/tidefs-xtask/src/claims.rs` and this policy document remain present.
 
-## Forgejo Publication State
+## Work-State Boundary
 
-Forgejo `PC-*` issues track publication gates. No release note or handoff may
-upgrade the project from prototype wording to present-tense production
-intentionally.
+GitHub issue and pull request state is the active work-state authority for
+foreground Codex development. Legacy Forgejo helper commands remain available
+for historical/local diagnostics, but stale Forgejo ownership assumptions must
+not block `check-claims-gate` from scanning publishing claims in a valid
+GitHub/Codex worktree.

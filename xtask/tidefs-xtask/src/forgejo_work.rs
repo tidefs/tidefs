@@ -1,10 +1,13 @@
-// Policy gates for Forgejo-based parallel instance safety.
+// Policy gates for parallel instance safety.
 //
 // Provides checks that validate:
 //   - Worktree ownership: the current directory is a valid tidefs worktree
-//     with a branch matching the expected codex/issue-N-* pattern.
-//   - Forgejo claim: the corresponding issue has codex:claimed label.
-//   - Stale claims: no codex:claimed issue has been untouched for > timeout.
+//     with a branch matching the current codexN/issue-N-* pattern or the
+//     legacy codex/issue-N-* pattern.
+//   - GitHub/Forgejo claim: the corresponding issue is live in the active
+//     tracker for the branch family.
+//   - Stale legacy Forgejo claims: no codex:claimed issue has been untouched
+//     for > timeout.
 //   - Abandoned worktrees: no stale worktree directories exist locally.
 //   - Auto-release: stale claims older than timeout can be automatically
 //     released (removes codex:claimed, adds codex:ready, posts comment).
@@ -25,9 +28,6 @@ const DEFAULT_STALE_TIMEOUT_HOURS: u64 = 24;
 
 // Expected worktree root directory, relative to $HOME.
 const WORKTREE_ROOT: &str = "tidefs-worktrees";
-
-// Expected branch prefix for codex worktrees.
-const CODEX_BRANCH_PREFIX: &str = "codex/issue-";
 
 // Forgejo configuration.
 const FORGEJO_BASE_URL: &str = "http://172.16.106.12/forgejo";
@@ -75,6 +75,11 @@ struct ForgejoIssue {
     created_at: Option<String>,
     #[serde(default)]
     closed_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubIssue {
+    state: String,
 }
 // ---------------------------------------------------------------------------
 // API client state
@@ -218,19 +223,33 @@ pub fn check_claim_gate_current_workspace() -> Result<(), ForgejoWorkError> {
     };
 
     // 3. Validate the worktree directory exists and has a valid git branch.
-    if let Err(err) = validate_worktree_branch(&wt_dir, issue_num) {
-        violations.push(err);
-    }
+    let branch_authority = match validate_worktree_branch(&wt_dir, issue_num) {
+        Ok(authority) => Some(authority),
+        Err(err) => {
+            violations.push(err);
+            None
+        }
+    };
 
-    // 4. Check Forgejo claim via API (serde-parsed).
-    match check_forgejo_claim(issue_num) {
-        Ok(true) => {}
-        Ok(false) => violations.push(format!(
-            "issue #{issue_num} has no codex:claimed label on Forgejo"
-        )),
-        Err(err) => violations.push(format!(
-            "could not verify Forgejo claim for issue #{issue_num}: {err}"
-        )),
+    // 4. Check the active issue authority for the branch family.
+    match branch_authority {
+        Some(WorktreeIssueAuthority::GitHub) => match check_github_issue_open(issue_num) {
+            Ok(true) => {}
+            Ok(false) => violations.push(format!("issue #{issue_num} is not open on GitHub")),
+            Err(err) => {
+                violations.push(format!("could not verify GitHub issue #{issue_num}: {err}"))
+            }
+        },
+        Some(WorktreeIssueAuthority::LegacyForgejo) => match check_forgejo_claim(issue_num) {
+            Ok(true) => {}
+            Ok(false) => violations.push(format!(
+                "issue #{issue_num} has no codex:claimed label on Forgejo"
+            )),
+            Err(err) => violations.push(format!(
+                "could not verify Forgejo claim for issue #{issue_num}: {err}"
+            )),
+        },
+        None => {}
     }
 
     if violations.is_empty() {
@@ -367,29 +386,22 @@ pub fn check_abandoned_worktrees_current_workspace() -> Result<(), ForgejoWorkEr
         return Ok(());
     }
 
-    let entries = match fs::read_dir(&worktree_root) {
-        Ok(entries) => entries,
+    let worktrees = match list_issue_worktree_dirs(&worktree_root) {
+        Ok(worktrees) => worktrees,
         Err(err) => {
-            violations.push(format!(
-                "could not read worktree root '{}': {err}",
-                worktree_root.display()
-            ));
+            violations.push(err);
             return Err(ForgejoWorkError { violations });
         }
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let issue_num = match dir_name
-            .strip_prefix("issue-")
-            .and_then(|s| s.split('-').next())
-            .and_then(|s| s.parse::<u64>().ok())
+    for path in worktrees {
+        let dir_name = worktree_display_name(&worktree_root, &path);
+        let issue_num = match path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(issue_number_from_worktree_name)
         {
-            Some(n) => n,
+            Some(issue_num) => issue_num,
             None => continue,
         };
 
@@ -403,31 +415,35 @@ pub fn check_abandoned_worktrees_current_workspace() -> Result<(), ForgejoWorkEr
             }
         };
 
-        if !branch.starts_with(CODEX_BRANCH_PREFIX) {
-            if branch == "HEAD" {
-                violations.push(format!(
-                    "abandoned worktree: '{dir_name}' has detached HEAD (stale or uninitialized worktree)"
-                ));
-            } else {
-                violations.push(format!(
-                    "worktree '{dir_name}' has unexpected branch '{branch}'"
-                ));
-            }
-            continue;
-        }
-
-        // Cross-reference with Forgejo: the corresponding issue should be claimed
-        match check_forgejo_claim(issue_num) {
-            Ok(true) => {}
-            Ok(false) => {
-                violations.push(format!(
+        match branch_issue_authority(&branch, issue_num) {
+            Some(WorktreeIssueAuthority::GitHub) => match check_github_issue_open(issue_num) {
+                Ok(true) => {}
+                Ok(false) => violations.push(format!(
+                    "worktree '{dir_name}' exists but issue #{issue_num} is not open on GitHub"
+                )),
+                Err(err) => violations.push(format!(
+                    "worktree '{dir_name}': could not verify GitHub issue #{issue_num}: {err}"
+                )),
+            },
+            Some(WorktreeIssueAuthority::LegacyForgejo) => match check_forgejo_claim(issue_num) {
+                Ok(true) => {}
+                Ok(false) => violations.push(format!(
                     "worktree '{dir_name}' exists but issue #{issue_num} is not claimed on Forgejo"
-                ));
-            }
-            Err(err) => {
-                violations.push(format!(
+                )),
+                Err(err) => violations.push(format!(
                     "worktree '{dir_name}': could not verify Forgejo claim for issue #{issue_num}: {err}"
-                ));
+                )),
+            },
+            None => {
+                if branch == "HEAD" {
+                    violations.push(format!(
+                        "abandoned worktree: '{dir_name}' has detached HEAD (stale or uninitialized worktree)"
+                    ));
+                } else {
+                    violations.push(format!(
+                        "worktree '{dir_name}' has unexpected branch '{branch}'"
+                    ));
+                }
             }
         }
     }
@@ -1019,17 +1035,11 @@ fn home_dir() -> Result<PathBuf, ForgejoWorkError> {
 }
 
 fn detect_issue_number_from_path(cwd: &Path, worktree_root: &Path) -> Option<u64> {
-    let cwd_str = cwd.to_string_lossy();
-    let root_str = worktree_root.to_string_lossy();
-    let after = cwd_str
-        .strip_prefix(root_str.as_ref())?
-        .trim_start_matches('/');
-    after
-        .strip_prefix("issue-")?
-        .split('-')
-        .next()?
-        .parse::<u64>()
-        .ok()
+    let relative = cwd.strip_prefix(worktree_root).ok()?;
+    relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .find_map(issue_number_from_worktree_name)
 }
 
 fn foreground_main_checkout_root(cwd: &Path, home: &Path) -> Option<PathBuf> {
@@ -1050,20 +1060,90 @@ fn active_claimed_issues(issues: &[ForgejoIssue]) -> Vec<&ForgejoIssue> {
         .collect()
 }
 
-fn find_worktree_dir(worktree_root: &Path, issue_num: u64) -> Option<PathBuf> {
-    let prefix = format!("issue-{issue_num}-");
-    for entry in fs::read_dir(worktree_root).ok()? {
-        let entry = entry.ok()?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with(&prefix) {
-            return Some(entry.path());
-        }
-    }
-    None
+fn issue_number_from_worktree_name(name: &str) -> Option<u64> {
+    name.strip_prefix("issue-")?
+        .split('-')
+        .next()?
+        .parse::<u64>()
+        .ok()
 }
 
-fn validate_worktree_branch(wt_dir: &Path, issue_num: u64) -> Result<(), String> {
+fn worktree_name_matches_issue(name: &str, issue_num: u64) -> bool {
+    issue_number_from_worktree_name(name) == Some(issue_num)
+}
+
+fn find_worktree_dir(worktree_root: &Path, issue_num: u64) -> Option<PathBuf> {
+    list_issue_worktree_dirs(worktree_root)
+        .ok()?
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| worktree_name_matches_issue(name, issue_num))
+        })
+}
+
+fn list_issue_worktree_dirs(worktree_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(worktree_root).map_err(|err| {
+        format!(
+            "could not read worktree root '{}': {err}",
+            worktree_root.display()
+        )
+    })?;
+    let mut worktrees = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if issue_number_from_worktree_name(&name_str).is_some() {
+            worktrees.push(path);
+            continue;
+        }
+        if is_codex_identity_dir(&name_str) {
+            let children = fs::read_dir(&path).map_err(|err| {
+                format!(
+                    "could not read worktree owner dir '{}': {err}",
+                    path.display()
+                )
+            })?;
+            for child in children.flatten() {
+                let child_path = child.path();
+                if !child_path.is_dir() {
+                    continue;
+                }
+                let child_name = child.file_name();
+                let child_name_str = child_name.to_string_lossy();
+                if issue_number_from_worktree_name(&child_name_str).is_some() {
+                    worktrees.push(child_path);
+                }
+            }
+        }
+    }
+
+    Ok(worktrees)
+}
+
+fn worktree_display_name(worktree_root: &Path, path: &Path) -> String {
+    path.strip_prefix(worktree_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorktreeIssueAuthority {
+    GitHub,
+    LegacyForgejo,
+}
+
+fn validate_worktree_branch(
+    wt_dir: &Path,
+    issue_num: u64,
+) -> Result<WorktreeIssueAuthority, String> {
     let branch = git_branch(wt_dir).map_err(|err| {
         format!(
             "could not determine branch in '{}': {err}",
@@ -1071,16 +1151,38 @@ fn validate_worktree_branch(wt_dir: &Path, issue_num: u64) -> Result<(), String>
         )
     })?;
 
-    let expected_prefix = format!("{CODEX_BRANCH_PREFIX}{issue_num}-");
-    if !branch.starts_with(&expected_prefix) {
-        return Err(format!(
-            "worktree branch '{}' does not match expected prefix '{}*' in '{}'",
-            branch,
-            expected_prefix,
-            wt_dir.display()
-        ));
+    if let Some(authority) = branch_issue_authority(&branch, issue_num) {
+        return Ok(authority);
     }
-    Ok(())
+
+    Err(format!(
+        "worktree branch '{}' does not match expected prefixes 'codex/issue-{}-*' or 'codexN/issue-{}-*' in '{}'",
+        branch,
+        issue_num,
+        issue_num,
+        wt_dir.display()
+    ))
+}
+
+fn branch_issue_authority(branch: &str, issue_num: u64) -> Option<WorktreeIssueAuthority> {
+    let legacy_prefix = format!("codex/issue-{issue_num}-");
+    if branch.starts_with(&legacy_prefix) {
+        return Some(WorktreeIssueAuthority::LegacyForgejo);
+    }
+
+    let (owner, rest) = branch.split_once('/')?;
+    if is_codex_identity_dir(owner) && rest.starts_with(&format!("issue-{issue_num}-")) {
+        return Some(WorktreeIssueAuthority::GitHub);
+    }
+
+    None
+}
+
+fn is_codex_identity_dir(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix("codex") else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn git_toplevel(dir: &Path) -> Result<PathBuf, String> {
@@ -1309,6 +1411,33 @@ fn check_forgejo_claim(issue_num: u64) -> Result<bool, String> {
     let issue: ForgejoIssue = serde_json::from_str(&body)
         .map_err(|err| format!("failed to parse issue #{issue_num} JSON: {err}"))?;
     Ok(issue_has_label(&issue, "codex:claimed"))
+}
+
+fn check_github_issue_open(issue_num: u64) -> Result<bool, String> {
+    let issue_arg = issue_num.to_string();
+    let output = Command::new("gh")
+        .args([
+            "-R",
+            "tidefs/tidefs",
+            "issue",
+            "view",
+            &issue_arg,
+            "--json",
+            "state",
+        ])
+        .output()
+        .map_err(|err| format!("gh issue view failed to start: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gh issue view failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let issue: GitHubIssue = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("failed to parse GitHub issue #{issue_num} JSON: {err}"))?;
+    Ok(issue.state == "OPEN")
 }
 
 /// Find all open Forgejo issues that have the codex:claimed label and have
@@ -1653,6 +1782,9 @@ mod tests {
             detect_issue_number_from_path(cwd2, worktree_root),
             Some(123)
         );
+
+        let cwd3 = Path::new("/root/tidefs-worktrees/codex0/issue-8-xtask-claim-gate");
+        assert_eq!(detect_issue_number_from_path(cwd3, worktree_root), Some(8));
     }
 
     #[test]
@@ -1663,6 +1795,44 @@ mod tests {
 
         let cwd2 = Path::new("/root/tidefs-worktrees/no-issue-here");
         assert_eq!(detect_issue_number_from_path(cwd2, worktree_root), None);
+
+        let cwd3 = Path::new("/root/tidefs-worktrees/codex0/no-issue-here");
+        assert_eq!(detect_issue_number_from_path(cwd3, worktree_root), None);
+    }
+
+    #[test]
+    fn branch_issue_authority_accepts_current_and_legacy_prefixes() {
+        assert_eq!(
+            branch_issue_authority("codex0/issue-8-xtask-claim-gate", 8),
+            Some(WorktreeIssueAuthority::GitHub)
+        );
+        assert_eq!(
+            branch_issue_authority("codex12/issue-123-storage", 123),
+            Some(WorktreeIssueAuthority::GitHub)
+        );
+        assert_eq!(
+            branch_issue_authority("codex/issue-730-claim-gates", 730),
+            Some(WorktreeIssueAuthority::LegacyForgejo)
+        );
+        assert_eq!(branch_issue_authority("codex0/issue-9-wrong", 8), None);
+        assert_eq!(branch_issue_authority("feature/issue-8-wrong", 8), None);
+    }
+
+    #[test]
+    fn list_issue_worktree_dirs_finds_direct_and_nested_layouts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let direct = root.join("issue-123-direct");
+        let nested = root.join("codex0").join("issue-8-xtask-claim-gate");
+        let ignored = root.join("codex0").join("scratch");
+        fs::create_dir_all(&direct).expect("direct worktree dir");
+        fs::create_dir_all(&nested).expect("nested worktree dir");
+        fs::create_dir_all(&ignored).expect("ignored dir");
+
+        let mut dirs = list_issue_worktree_dirs(root).expect("list worktrees");
+        dirs.sort();
+
+        assert_eq!(dirs, vec![nested, direct]);
     }
 
     #[test]
