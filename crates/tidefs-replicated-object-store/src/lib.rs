@@ -484,6 +484,14 @@ impl ReplicatedObjectStore {
             .map_err(|e| format!("primary put for replication receive: {e}"))
     }
 
+    /// Write an object to the local primary store by exact key, without fan-out.
+    pub fn put_key_local(&mut self, key: ObjectKey, payload: &[u8]) -> Result<(), String> {
+        self.primary
+            .put(key, payload)
+            .map(|_| ())
+            .map_err(|e| format!("primary key put for replication receive: {e}"))
+    }
+
     /// Delete an object from the local primary store only, without fan-out.
     ///
     /// Used by storage-node replication handlers to accept deletes from peers
@@ -1383,6 +1391,18 @@ impl TransportReplicatedStore {
             .put_named(&name, payload)
             .map(|_| ())
             .map_err(|e| format!("primary put for replication receive: {e}"))
+    }
+
+    /// Write an object to the local primary store by exact key, without fan-out.
+    pub fn put_key_local(
+        &mut self,
+        key: tidefs_local_object_store::ObjectKey,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        self.primary
+            .put(key, payload)
+            .map(|_| ())
+            .map_err(|e| format!("primary key put for replication receive: {e}"))
     }
 
     /// Delete an object from the local primary store without fan-out.
@@ -2615,6 +2635,21 @@ mod tests {
         assert_eq!(missing, None);
         cleanup_dirs(&paths);
     }
+
+    #[test]
+    fn put_key_local_stores_exact_object_key() {
+        let paths = make_paths(1, "put-key-local");
+        let mut store =
+            ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
+        let key = ObjectKey::from_bytes32([0xA5; 32]);
+
+        store.put_key_local(key, b"exact").unwrap();
+
+        assert_eq!(store.get_key_local(key).unwrap(), Some(b"exact".to_vec()));
+        assert_eq!(store.get_local(key.as_bytes32()).unwrap(), None);
+        cleanup_dirs(&paths);
+    }
+
     // --- Three-replica quorum write ---
 
     #[test]
@@ -3435,6 +3470,23 @@ mod tests {
 
             let missing = store.get_named("nope").unwrap();
             assert_eq!(missing, None);
+        }
+
+        #[test]
+        fn put_key_local_stores_exact_object_key() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = TransportReplicatedStore::open(
+                dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let key = tidefs_local_object_store::ObjectKey::from_bytes32([0xB6; 32]);
+
+            store.put_key_local(key, b"exact").unwrap();
+
+            assert_eq!(store.get_key_local(key).unwrap(), Some(b"exact".to_vec()));
+            assert_eq!(store.get_local(key.as_bytes32()).unwrap(), None);
         }
 
         #[test]

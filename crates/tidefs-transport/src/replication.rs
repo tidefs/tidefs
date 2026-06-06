@@ -84,12 +84,12 @@ pub enum ReplicationMessage {
     /// Repair an object on a replica under durable placement receipt
     /// authority. The receiver must validate the receipt before writing.
     RepairObject {
-        name: String,
+        key: Vec<u8>,
         placement_receipt_ref: PlacementReceiptRef,
         authoritative_payload: Vec<u8>,
     },
     /// Acknowledge a repair operation.
-    RepairObjectAck { name: String, success: bool },
+    RepairObjectAck { key: Vec<u8>, success: bool },
 }
 
 /// Send a structured replication message over a transport session.
@@ -186,8 +186,11 @@ mod tests {
     #[test]
     fn repair_object_bincode_roundtrip() {
         let payload = b"repaired-data".to_vec();
+        let key = tidefs_local_object_store::ObjectKey::from_name("corrupted-key-01")
+            .as_bytes32()
+            .to_vec();
         let msg = ReplicationMessage::RepairObject {
-            name: "corrupted-key-01".into(),
+            key,
             placement_receipt_ref: receipt_ref("corrupted-key-01", &payload, 11),
             authoritative_payload: payload,
         };
@@ -197,8 +200,11 @@ mod tests {
 
     #[test]
     fn repair_object_empty_payload_bincode_roundtrip() {
+        let key = tidefs_local_object_store::ObjectKey::from_name("")
+            .as_bytes32()
+            .to_vec();
         let msg = ReplicationMessage::RepairObject {
-            name: String::new(),
+            key,
             placement_receipt_ref: receipt_ref("", &[], 12),
             authoritative_payload: vec![],
         };
@@ -209,8 +215,11 @@ mod tests {
     #[test]
     fn repair_object_large_payload_bincode_roundtrip() {
         let payload = vec![0xABu8; 65536];
+        let key = tidefs_local_object_store::ObjectKey::from_name("large-key")
+            .as_bytes32()
+            .to_vec();
         let msg = ReplicationMessage::RepairObject {
-            name: "large-key".into(),
+            key,
             placement_receipt_ref: receipt_ref("large-key", &payload, 13),
             authoritative_payload: payload,
         };
@@ -223,7 +232,9 @@ mod tests {
     #[test]
     fn repair_object_ack_success_bincode_roundtrip() {
         let msg = ReplicationMessage::RepairObjectAck {
-            name: "fixed-key".into(),
+            key: tidefs_local_object_store::ObjectKey::from_name("fixed-key")
+                .as_bytes32()
+                .to_vec(),
             success: true,
         };
         let rt = bincode_roundtrip(&msg);
@@ -233,7 +244,9 @@ mod tests {
     #[test]
     fn repair_object_ack_failure_bincode_roundtrip() {
         let msg = ReplicationMessage::RepairObjectAck {
-            name: "still-bad".into(),
+            key: tidefs_local_object_store::ObjectKey::from_name("still-bad")
+                .as_bytes32()
+                .to_vec(),
             success: false,
         };
         let rt = bincode_roundtrip(&msg);
@@ -260,15 +273,15 @@ mod tests {
     #[test]
     fn repair_variants_are_distinct() {
         let payload = Vec::new();
+        let key = tidefs_local_object_store::ObjectKey::from_name("k")
+            .as_bytes32()
+            .to_vec();
         let repair_obj = ReplicationMessage::RepairObject {
-            name: "k".into(),
+            key: key.clone(),
             placement_receipt_ref: receipt_ref("k", &payload, 14),
             authoritative_payload: payload,
         };
-        let repair_ack = ReplicationMessage::RepairObjectAck {
-            name: "k".into(),
-            success: true,
-        };
+        let repair_ack = ReplicationMessage::RepairObjectAck { key, success: true };
         assert_ne!(repair_obj, repair_ack);
     }
 

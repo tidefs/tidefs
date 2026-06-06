@@ -103,7 +103,7 @@ deserialization for `tidefs_transport::ReplicationMessage`.
 | `Delete { name, generation }` | Deletes from local primary store; responds `DeleteAck` |
 | `SyncRequest` | Lists all keys with payloads; responds `SyncResponse` |
 | `ScrubRequest` | Runs local segment scrub and reports findings plus receipt-inventory disclosure |
-| `RepairObject { name, placement_receipt_ref, authoritative_payload }` | Validates the shared placement receipt against key, length, digest, policy, and target width before local repair write; responds `RepairObjectAck` |
+| `RepairObject { key, placement_receipt_ref, authoritative_payload }` | Validates the shared placement receipt against the exact 32-byte object key, length, digest, policy, and target width before local repair write; responds `RepairObjectAck` |
 
 ### Local-Only Operations (LOCAL-ONLY boundary)
 
