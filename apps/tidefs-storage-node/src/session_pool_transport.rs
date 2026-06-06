@@ -119,6 +119,7 @@ mod tests {
             target_node_id: 1,
             node_devices: vec![],
             placement: ClusterPlacementPolicy::Stripe,
+            allow_file_devices: false,
         });
 
         let wire = t.frame_message(&msg).unwrap();

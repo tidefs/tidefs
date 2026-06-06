@@ -239,6 +239,7 @@ impl ClusterPoolConfig {
             total_capacity_bytes: labels.iter().map(|l| l.device_capacity_bytes).sum(),
             topology_generation,
             redundancy,
+            allow_file_devices: false,
         })
     }
 

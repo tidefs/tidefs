@@ -84,6 +84,10 @@ pub enum ClusterPoolCommand {
         /// Output as JSON
         #[arg(long = "json")]
         json: bool,
+
+        /// Allow regular files as pool devices (development only)
+        #[arg(long = "file-devices", hide = true)]
+        file_devices: bool,
     },
 }
 
@@ -140,7 +144,15 @@ fn handle_cluster_pool(cmd: ClusterPoolCommand) {
             node_addrs,
             redundancy,
             json,
-        } => handle_cluster_pool_create(pool_name, node_devices, node_addrs, redundancy, json),
+            file_devices,
+        } => handle_cluster_pool_create(
+            pool_name,
+            node_devices,
+            node_addrs,
+            redundancy,
+            json,
+            file_devices,
+        ),
     }
 }
 
@@ -410,6 +422,7 @@ fn handle_cluster_pool_create(
     node_addrs: Vec<String>,
     redundancy: String,
     json: bool,
+    file_devices: bool,
 ) {
     // 1. Parse node-device pairs.
     let pairs = match parse_node_device_pairs(&node_devices) {
@@ -505,7 +518,8 @@ fn handle_cluster_pool_create(
         node_local_idx.insert(*node_id, local_idx + 1);
     }
 
-    let config = ClusterPoolConfig::new(pool_guid, pool_name.clone(), devices, placement);
+    let config = ClusterPoolConfig::new(pool_guid, pool_name.clone(), devices, placement)
+        .with_file_devices_for_development(file_devices);
 
     if !config.has_sufficient_nodes() {
         eprintln!(
@@ -876,6 +890,13 @@ fn hex_guid(bytes: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct TestClusterCli {
+        #[command(subcommand)]
+        cmd: ClusterCommand,
+    }
 
     // -- parse_node_device_pairs tests --
 
@@ -912,6 +933,35 @@ mod tests {
         assert_eq!(pairs[0].0, 1);
         assert_eq!(pairs[1].0, 1);
         assert_eq!(pairs[2].0, 2);
+    }
+
+    #[test]
+    fn parse_cluster_pool_create_file_devices_flag() {
+        let cli = TestClusterCli::try_parse_from([
+            "test",
+            "pool",
+            "create",
+            "tank",
+            "--node-devices",
+            "1:/tmp/dev.img",
+            "--node-addr",
+            "1=127.0.0.1:12001",
+            "--file-devices",
+        ])
+        .unwrap();
+
+        match cli.cmd {
+            ClusterCommand::Pool {
+                cmd:
+                    ClusterPoolCommand::Create {
+                        file_devices, json, ..
+                    },
+            } => {
+                assert!(file_devices);
+                assert!(!json);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
     }
 
     #[test]
@@ -1131,6 +1181,7 @@ mod tests {
             target_node_id: 1,
             node_devices: vec![],
             placement: ClusterPlacementPolicy::Stripe,
+            allow_file_devices: false,
         });
 
         let wire = TcpClusterTransport::frame_message(&msg).unwrap();

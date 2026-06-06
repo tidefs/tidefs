@@ -1099,6 +1099,27 @@ fn object_pool_device_backing(path: &Path) -> Result<DeviceBacking, String> {
     }
 }
 
+fn validate_cluster_create_device_media(
+    device_paths: &[PathBuf],
+    allow_file_devices: bool,
+) -> Result<(), String> {
+    for path in device_paths {
+        match tidefs_pool_scan::classify_pool_device_backing(path)
+            .map_err(|e| format!("cluster pool create device {}: {e}", path.display()))?
+        {
+            PoolDeviceBacking::BlockDevice => {}
+            PoolDeviceBacking::RegularFileDev if allow_file_devices => {}
+            PoolDeviceBacking::RegularFileDev => {
+                return Err(format!(
+                    "{} is a regular file; cluster pool create requires explicit --file-devices for development file media",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn object_pool_device_config(path: PathBuf) -> Result<ObjectDeviceConfig, String> {
     let backing = object_pool_device_backing(&path)?;
     Ok(ObjectDeviceConfig {
@@ -2120,6 +2141,21 @@ fn handle_cluster_pool_message(
                 .iter()
                 .map(|d| std::path::PathBuf::from(&d.device_path))
                 .collect();
+            if let Err(media_err) =
+                validate_cluster_create_device_media(&device_paths, req.allow_file_devices)
+            {
+                eprintln!("[storage-node] session {session_id}: create refused: {media_err}");
+                return Some(ClusterPoolMessage::CreateResponse(
+                    ClusterPoolCreateResponse {
+                        request_id: req.request_id,
+                        node_id: req.target_node_id,
+                        pool_guid: req.pool_guid,
+                        success: false,
+                        device_guids: vec![],
+                        error: Some(media_err),
+                    },
+                ));
+            }
             let redundancy = match req.placement {
                 ClusterPlacementPolicy::Stripe => RedundancyPolicy::replicated(1),
                 ClusterPlacementPolicy::MirrorAcrossNodes { copies } => {
@@ -4336,6 +4372,30 @@ mod cluster_pool_handler_tests {
         };
         let result = PoolCreator::create_pool(&device_paths, &config);
         assert!(result.is_err(), "expected error on nonexistent device");
+    }
+
+    #[test]
+    fn cluster_create_media_rejects_regular_files_without_dev_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = make_device(&dir, "dev0");
+        let err = validate_cluster_create_device_media(&[dev], false).unwrap_err();
+        assert!(err.contains("regular file"));
+        assert!(err.contains("--file-devices"));
+    }
+
+    #[test]
+    fn cluster_create_media_allows_regular_files_with_dev_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = make_device(&dir, "dev0");
+        validate_cluster_create_device_media(&[dev], true).unwrap();
+    }
+
+    #[test]
+    fn cluster_create_media_rejects_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            validate_cluster_create_device_media(&[dir.path().to_path_buf()], true).unwrap_err();
+        assert!(err.contains("cluster pool create device"));
     }
 
     #[test]
