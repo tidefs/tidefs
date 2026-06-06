@@ -1046,6 +1046,68 @@ fn threshold_autoflush_clears_flushed_writeback_range() {
 }
 
 #[test]
+fn flush_file_keeps_write_buffer_visible_until_fsync() {
+    let (mut fs, root) = wb_open_temp("flush-file-keeps-buffer-visible");
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: 1024 * 1024,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/close.bin", 0o644).expect("create");
+    fs.write_file("/close.bin", 4096, b"tail")
+        .expect("buffered sparse write");
+    assert!(
+        fs.write_buffers.contains_key(&record.inode_id),
+        "test setup should leave the sparse write buffered"
+    );
+
+    fs.flush_file("/close.bin", record.inode_id.0, 42, 0)
+        .expect("FUSE close-time flush");
+
+    assert!(
+        fs.write_buffers.contains_key(&record.inode_id),
+        "FUSE_FLUSH is close bookkeeping and must not publish write buffers"
+    );
+    assert!(
+        fs.writeback_range_tracker
+            .lock()
+            .expect("locked")
+            .is_dirty(record.inode_id),
+        "fsync must remain responsible for draining dirty writeback ranges"
+    );
+    assert_eq!(fs.stat("/close.bin").expect("stat after flush").size, 4100);
+    assert_eq!(
+        fs.read_file_range("/close.bin", 4096, 4)
+            .expect("read buffered tail"),
+        b"tail"
+    );
+
+    fs.fsync_file("/close.bin")
+        .expect("fsync publishes buffered data");
+    assert!(
+        !fs.write_buffers.contains_key(&record.inode_id),
+        "fsync drains the buffered write"
+    );
+    assert!(
+        !fs.writeback_range_tracker
+            .lock()
+            .expect("locked")
+            .is_dirty(record.inode_id),
+        "fsync clears the dirty range after publication"
+    );
+    assert_eq!(
+        fs.read_file_range("/close.bin", 4096, 4)
+            .expect("read published tail"),
+        b"tail"
+    );
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn threshold_autoflush_leaves_overflow_tail_buffered_with_auto_commit() {
     let (mut fs, root) = wb_open_temp("threshold-autoflush-keeps-tail");
     fs.set_write_buffer_config(WriteBufferConfig {

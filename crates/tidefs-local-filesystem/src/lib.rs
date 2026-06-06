@@ -9307,11 +9307,11 @@ impl LocalFileSystem {
 
     /// Flush a single file for the FUSE close path.
     ///
-    /// `FUSE_FLUSH` is close bookkeeping, not a durability barrier.  It
-    /// drains this file's in-memory write buffer so subsequent live reads
-    /// observe the latest bytes, but it deliberately does not publish a
-    /// committed root or sync the object store.  Callers that need durability
-    /// must use `fsync_file`, `fsync_directory`, or `sync_all`.
+    /// `FUSE_FLUSH` is close bookkeeping, not a durability barrier.  Buffered
+    /// writes are already visible to live readers through the write-buffer
+    /// overlay, so close-time flush must not force object-store publication.
+    /// Callers that need durability must use `fsync_file`, `fsync_directory`,
+    /// or `sync_all`.
     pub fn flush_file(
         &mut self,
         path: impl AsRef<str>,
@@ -9319,8 +9319,8 @@ impl LocalFileSystem {
         _fh: u64,
         _lock_owner: u64,
     ) -> Result<()> {
-        let attr = self.stat(path.as_ref())?;
-        self.flush_write_buffer(attr.inode_id)
+        let _attr = self.stat(path.as_ref())?;
+        Ok(())
     }
 
     pub fn fsync_all(&mut self) -> Result<()> {
