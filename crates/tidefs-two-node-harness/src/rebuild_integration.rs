@@ -14,13 +14,14 @@
 use crate::{StateObject, StateTransferResult, TwoNodeHarness};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use tidefs_membership_epoch::MemberId;
+use tidefs_membership_epoch::{EpochId, MemberId};
 use tidefs_rebuild_runtime::admission::{
     AdmissionOutcome, AffectedSubject, LossRecord, RebuildAdmission,
 };
 use tidefs_rebuild_runtime::completion::{RebuildCompleted, RebuildCompletion};
 use tidefs_rebuild_runtime::scheduler::BackfillScheduler;
-use tidefs_replication_model::{ObjectDigest, ReplicaMovementClass, ReplicatedSubjectId};
+use tidefs_rebuild_runtime::task::BackfillTask;
+use tidefs_replication_model::{PlacementReceiptRef, ReplicaMovementClass, ReplicatedSubjectId};
 
 /// A rebuild recovery scenario binding the rebuild-runtime admission and
 /// completion controllers to the deterministic two-node transport harness.
@@ -255,7 +256,44 @@ impl RebuildScenario {
         payload
     }
 
-    /// Record the completion of a rebuild task for a target member.
+    fn placement_receipt_ref(
+        &self,
+        subject_id: u64,
+        payload_len: u64,
+        receipt_generation: u64,
+    ) -> PlacementReceiptRef {
+        let payload = Self::build_task_payload(subject_id, payload_len);
+        let payload_digest = crate::blake3_hash(&payload);
+        let mut object_key = [0x54; 32];
+        object_key[..8].copy_from_slice(&subject_id.to_le_bytes());
+        object_key[8..16].copy_from_slice(&self.epoch.to_le_bytes());
+        object_key[16..24].copy_from_slice(&receipt_generation.to_le_bytes());
+
+        PlacementReceiptRef::replicated(
+            subject_id,
+            object_key,
+            EpochId::new(self.epoch),
+            receipt_generation,
+            2,
+            payload_len,
+            payload_digest,
+        )
+    }
+
+    fn affected_subject(
+        &self,
+        subject_id: u64,
+        payload_len: u64,
+        movement_class: ReplicaMovementClass,
+        lost_on: Vec<MemberId>,
+        receipt_generation: u64,
+    ) -> AffectedSubject {
+        let receipt_ref = self.placement_receipt_ref(subject_id, payload_len, receipt_generation);
+        AffectedSubject::from_placement_receipt_ref(receipt_ref, movement_class, lost_on)
+            .expect("harness receipt refs are well formed")
+    }
+
+    /// Record compatibility intent-only completion for a target member.
     pub fn record_task_completion(
         &mut self,
         target_member: u64,
@@ -268,6 +306,16 @@ impl RebuildScenario {
             success,
             &mut self.admission,
         )
+    }
+
+    /// Record receipt-aware completion for an actual scheduled backfill task.
+    pub fn record_scheduled_task_completion(
+        &mut self,
+        task: &BackfillTask,
+        success: bool,
+    ) -> Option<RebuildCompleted> {
+        self.completion
+            .record_task_completion(task, success, &mut self.admission)
     }
 
     /// Drain any pending completion events.
@@ -295,15 +343,17 @@ impl RebuildScenario {
         departed_member: u64,
         subjects: Vec<(u64, u64, u64)>, // (subject_id, source_member, payload_len)
     ) -> Result<Vec<RebuildCompleted>, String> {
-        // Build affected subject records
         let affected: Vec<AffectedSubject> = subjects
             .iter()
-            .map(|&(sid, _src, plen)| AffectedSubject {
-                subject_ref: ReplicatedSubjectId::new(sid),
-                payload_digest: ObjectDigest::new(sid * 100),
-                payload_len: plen,
-                movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
-                lost_on: vec![MemberId::new(departed_member)],
+            .enumerate()
+            .map(|(idx, &(sid, _src, plen))| {
+                self.affected_subject(
+                    sid,
+                    plen,
+                    ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                    vec![MemberId::new(departed_member)],
+                    idx as u64 + 1,
+                )
             })
             .collect();
 
@@ -313,21 +363,30 @@ impl RebuildScenario {
             return Ok(Vec::new());
         }
 
-        // 2. Register total subjects for the target member
+        // 2. Register the scheduled receipt-bound completion units.
         self.completion
-            .register(MemberId::new(departed_member), subjects.len() as u64);
+            .register(MemberId::new(departed_member), outcome.report_count as u64);
 
-        // 3. Execute each task via state transfer
-        for (sid, src_member, plen) in &subjects {
-            self.execute_task(*src_member, departed_member, *sid, *plen)?;
+        // 3. Execute and complete the scheduler's actual BackfillTask values.
+        loop {
+            let tasks = self.scheduler.drain_eligible();
+            if tasks.is_empty() {
+                break;
+            }
+
+            for task in tasks {
+                self.execute_task(
+                    task.source_member.0,
+                    task.target_member.0,
+                    task.subject_ref.0,
+                    task.payload_len,
+                )?;
+                self.scheduler.mark_completed(&task);
+                self.record_scheduled_task_completion(&task, true);
+            }
         }
 
-        // 4. Record completion for all subjects
-        for (sid, _, _) in &subjects {
-            self.record_task_completion(departed_member, *sid, true);
-        }
-
-        // 5. Drain events
+        // 4. Drain events.
         Ok(self.drain_completion_events())
     }
 
@@ -358,20 +417,20 @@ mod tests {
         let outcome = scenario.admit_rebuild(
             2,
             vec![
-                AffectedSubject {
-                    subject_ref: ReplicatedSubjectId::new(10),
-                    payload_digest: ObjectDigest::new(1000),
-                    payload_len: 1024,
-                    movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
-                    lost_on: vec![MemberId::new(2)],
-                },
-                AffectedSubject {
-                    subject_ref: ReplicatedSubjectId::new(20),
-                    payload_digest: ObjectDigest::new(2000),
-                    payload_len: 2048,
-                    movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
-                    lost_on: vec![MemberId::new(2)],
-                },
+                scenario.affected_subject(
+                    10,
+                    1024,
+                    ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                    vec![MemberId::new(2)],
+                    1,
+                ),
+                scenario.affected_subject(
+                    20,
+                    2048,
+                    ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                    vec![MemberId::new(2)],
+                    2,
+                ),
             ],
         );
 
@@ -391,13 +450,13 @@ mod tests {
 
         let outcome = scenario.admit_rebuild(
             1,
-            vec![AffectedSubject {
-                subject_ref: ReplicatedSubjectId::new(1),
-                payload_digest: ObjectDigest::new(100),
-                payload_len: 512,
-                movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
-                lost_on: vec![MemberId::new(1)],
-            }],
+            vec![scenario.affected_subject(
+                1,
+                512,
+                ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                vec![MemberId::new(1)],
+                1,
+            )],
         );
 
         assert!(outcome.admitted.is_empty());
@@ -413,13 +472,13 @@ mod tests {
 
         let _ = scenario.admit_rebuild(
             2,
-            vec![AffectedSubject {
-                subject_ref: ReplicatedSubjectId::new(100),
-                payload_digest: ObjectDigest::new(10000),
-                payload_len: 4096,
-                movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
-                lost_on: vec![MemberId::new(2)],
-            }],
+            vec![scenario.affected_subject(
+                100,
+                4096,
+                ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                vec![MemberId::new(2)],
+                1,
+            )],
         );
 
         scenario.completion.register(MemberId::new(2), 1);
@@ -443,13 +502,13 @@ mod tests {
 
         let _ = scenario.admit_rebuild(
             2,
-            vec![AffectedSubject {
-                subject_ref: ReplicatedSubjectId::new(1),
-                payload_digest: ObjectDigest::new(100),
-                payload_len: 512,
-                movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
-                lost_on: vec![MemberId::new(2)],
-            }],
+            vec![scenario.affected_subject(
+                1,
+                512,
+                ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                vec![MemberId::new(2)],
+                1,
+            )],
         );
 
         scenario.completion.register(MemberId::new(2), 1);
@@ -486,6 +545,65 @@ mod tests {
         assert_eq!(event.total, 2);
         assert!(scenario.is_member_complete(2));
         assert!(!scenario.has_active_rebuilds());
+        assert!(scenario.scheduler.is_idle());
+    }
+
+    #[test]
+    fn run_rebuild_cycle_counts_distinct_receipt_generations() {
+        let mut scenario = RebuildScenario::new(4242);
+        scenario.establish().expect("session establishment");
+        scenario.simulate_node_departure(2);
+        scenario.rejoin_member(2);
+        scenario.heal_links();
+
+        let events = scenario
+            .run_rebuild_cycle(2, vec![(42, 1, 1024), (42, 1, 1024)])
+            .expect("rebuild cycle with two receipt generations");
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.member, MemberId::new(2));
+        assert!(event.fully_successful);
+        assert_eq!(event.succeeded, 2);
+        assert_eq!(event.total, 2);
+        assert!(scenario.scheduler.is_idle());
+    }
+
+    #[test]
+    fn scheduled_task_completion_deduplicates_exact_receipt_task() {
+        let mut scenario = RebuildScenario::new(6262);
+        scenario.establish().expect("session establishment");
+        scenario.simulate_node_departure(2);
+        scenario.rejoin_member(2);
+        scenario.heal_links();
+
+        let outcome = scenario.admit_rebuild(
+            2,
+            vec![scenario.affected_subject(
+                42,
+                1024,
+                ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                vec![MemberId::new(2)],
+                1,
+            )],
+        );
+        assert_eq!(outcome.report_count, 1);
+
+        let tasks = scenario.scheduler.drain_eligible();
+        assert_eq!(tasks.len(), 1);
+        scenario.completion.register(MemberId::new(2), 1);
+
+        scenario.scheduler.mark_completed(&tasks[0]);
+        let first = scenario
+            .record_scheduled_task_completion(&tasks[0], true)
+            .expect("first scheduled task completion emits event");
+        let duplicate = scenario.record_scheduled_task_completion(&tasks[0], true);
+
+        assert_eq!(first.succeeded, 1);
+        assert!(first.fully_successful);
+        assert!(duplicate.is_none());
+        assert_eq!(scenario.completion.total_completed_subjects(), 1);
+        assert!(scenario.scheduler.is_idle());
     }
 
     #[test]
@@ -507,13 +625,13 @@ mod tests {
         // Should be able to re-admit
         let outcome = scenario.admit_rebuild(
             2,
-            vec![AffectedSubject {
-                subject_ref: ReplicatedSubjectId::new(2),
-                payload_digest: ObjectDigest::new(200),
-                payload_len: 512,
-                movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
-                lost_on: vec![MemberId::new(2)],
-            }],
+            vec![scenario.affected_subject(
+                2,
+                512,
+                ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                vec![MemberId::new(2)],
+                1,
+            )],
         );
         assert_eq!(outcome.admitted, vec![MemberId::new(2)]);
     }
@@ -775,13 +893,13 @@ mod tests {
 
         let _ = scenario.admit_rebuild(
             2,
-            vec![AffectedSubject {
-                subject_ref: ReplicatedSubjectId::new(1),
-                payload_digest: ObjectDigest::new(100),
-                payload_len: 512,
-                movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
-                lost_on: vec![MemberId::new(2)],
-            }],
+            vec![scenario.affected_subject(
+                1,
+                512,
+                ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                vec![MemberId::new(2)],
+                1,
+            )],
         );
         assert!(scenario.has_active_rebuilds());
 
