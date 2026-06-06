@@ -1065,7 +1065,7 @@ impl TidefsBlockDevice {
     /// Return total device capacity in bytes.
     #[must_use]
     pub fn capacity_bytes(&self) -> u64 {
-        self.dispatch_engine.backend().capacity_bytes()
+        self.limits.capacity_bytes()
     }
 
     /// Return the logical block (sector) size in bytes.
