@@ -67,6 +67,7 @@ use crate::tidefs_kmod_bridge::{
 #[cfg(not(CONFIG_RUST))]
 use tidefs_kmod_bridge::{BioQueue, BridgeError, BridgeResult, OpaqueBio, OpaqueRequestQueue};
 
+pub mod backend_mode;
 pub mod device;
 pub mod dispatch;
 pub mod ioctl;

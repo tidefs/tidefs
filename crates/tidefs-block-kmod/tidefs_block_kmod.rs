@@ -136,6 +136,14 @@ const EFAULT: i32 = -14;
 const EINVAL: i32 = -22;
 const EIO: i32 = -5;
 
+#[cfg(tidefs_block_kmod_bringup_backend)]
+const KBUILD_BACKEND_MODE: crate::backend_mode::BackendMode =
+    crate::backend_mode::BackendMode::BringUpBuffer;
+
+#[cfg(not(tidefs_block_kmod_bringup_backend))]
+const KBUILD_BACKEND_MODE: crate::backend_mode::BackendMode =
+    crate::backend_mode::BackendMode::PoolRequired;
+
 #[pin_data]
 struct BlockQueueData {
     #[pin]
@@ -300,6 +308,10 @@ impl kernel::Module for TidefsBlockModule {
             transport_carrier.is_some(),
         );
         pr_info!("tidefs_block: cluster_mode={}\n", cluster_active);
+        pr_info!(
+            "tidefs_block: backend_mode={}\n",
+            KBUILD_BACKEND_MODE.label(),
+        );
 
         pr_info!(
             "initializing: capacity={} sectors ({} MiB), hw_queues={} (cpu_ids={}), depth={}, num_maps={} (kernel default)\n",
@@ -322,8 +334,9 @@ impl kernel::Module for TidefsBlockModule {
         // through KernelStorageIoCompat -> KernelStoragePoolCoreAdapter
         // -> PoolCoreOps.  The well-known path /dev/tidefs_pool_member
         // is a symlink to the actual member device (e.g., /dev/vda).
-        // Falls back to kernel-block buffer if the member device is
-        // not present (bring-up/testing mode).
+        // The default policy refuses registration when the member device is
+        // absent. Kbuild smoke tests may opt into the in-memory bring-up
+        // buffer with --cfg tidefs_block_kmod_bringup_backend.
         let backing_path = b"/dev/tidefs_pool_member\0";
         let (device, pool_core): (crate::device::TidefsBlockDevice, Option<crate::tidefs_kmod_bridge::kernel_types::KernelPoolCore>) = match crate::raw_block_file::RawBlockFile::open(backing_path, 512) {
             Ok(rbf) => {
@@ -414,16 +427,31 @@ impl kernel::Module for TidefsBlockModule {
                 (dev, Some(pool_core))
             }
             Err(_) => {
-                pr_info!("no pool member device at /dev/tidefs_pool_member; using kernel-block buffer (bring-up mode, discard supported)\n");
-                let discard_limits = crate::BlockQueueLimits {
-                    discard_supported: true,
-                    write_zeroes_supported: true,
-                    zero_range_supported: true,
-                    ..crate::BlockQueueLimits::fixed_capacity(capacity)
-                };
-                let dev = crate::device::TidefsBlockDevice::with_limits("tidefs", discard_limits)
-                    .map_err(|_| code::ENOMEM)?;
-                (dev, None)
+                match crate::backend_mode::select_backend(KBUILD_BACKEND_MODE, false) {
+                    crate::backend_mode::BackendSelection::BringUpBuffer => {
+                        pr_info!("no pool member device at /dev/tidefs_pool_member; using explicit kernel-block buffer bring-up mode (discard supported)\n");
+                        let discard_limits = crate::BlockQueueLimits {
+                            discard_supported: true,
+                            write_zeroes_supported: true,
+                            zero_range_supported: true,
+                            ..crate::BlockQueueLimits::fixed_capacity(capacity)
+                        };
+                        let dev = crate::device::TidefsBlockDevice::with_limits("tidefs", discard_limits)
+                            .map_err(|_| code::ENOMEM)?;
+                        (dev, None)
+                    }
+                    crate::backend_mode::BackendSelection::RefuseNoPool { reason } => {
+                        pr_err!(
+                            "refusing /dev/tidefs registration: {}; provide /dev/tidefs_pool_member or build with --cfg tidefs_block_kmod_bringup_backend for smoke tests\n",
+                            reason
+                        );
+                        return Err(code::ENODEV);
+                    }
+                    crate::backend_mode::BackendSelection::PoolBacked => {
+                        pr_err!("internal backend-selection error: missing pool was classified as pool-backed\n");
+                        return Err(code::EINVAL);
+                    }
+                }
             }
         };
         let block_limits = device.limits().clone();

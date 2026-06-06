@@ -376,9 +376,12 @@ Important 2026-06-01 findings:
   current mounted operation slice uses a small fixed in-kernel namespace/data
   table and is not the final object/extent/intent-log engine, page-cache
   The block-kmod entrypoint opens a hard-coded `/dev/tidefs_pool_member`
-  backing path, falls back to an in-kernel buffer when the member is absent,
-  and wraps it in a local `PoolCoreOps` adapter that still says it should be
-  replaced by the canonical `KernelPoolCore` bridge. The common kmod
+  backing path and wraps it in a local `PoolCoreOps` adapter that still says
+  it should be replaced by the canonical `KernelPoolCore` bridge. The
+  entrypoint now refuses to register `/dev/tidefs` when that pool-backed
+  backend is absent unless a Kbuild smoke job explicitly enables the
+  `tidefs_block_kmod_bringup_backend` cfg, so the old silent in-kernel-buffer
+  fallback no longer presents as production-shaped block authority. The common kmod
   `VfsEngine` trait defaults still return `ENOSYS` for block read/write,
   flush, discard, write-zeroes, and zero-range operations, while the Kbuild
   `RawBlockFile` flush path is a no-op that relies on guest-side sync. That is

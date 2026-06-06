@@ -6,6 +6,11 @@
 # Build command (from repo root):
 #   make -j8 -C <linux-7.0-src> LLVM=1 O=<linux-7.0-build> M=crates/tidefs-block-kmod MO=<module-out> RUSTC=<rustc> RUSTC_BOOTSTRAP=1 modules
 #
+# The module defaults to pool-required backend selection and refuses to
+# register /dev/tidefs when /dev/tidefs_pool_member cannot be opened. Smoke
+# tests that intentionally need the in-memory backend must pass:
+#   RUSTFLAGS_MODULE=--cfg=tidefs_block_kmod_bringup_backend
+#
 # Prerequisites:
 #   - Linux 7.0 kernel build tree with CONFIG_RUST=y
 #   - modules_prepare completed (builds rust/kernel.o, rust/pin_init.o, etc.)

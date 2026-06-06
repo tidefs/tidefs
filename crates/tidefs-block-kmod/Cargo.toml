@@ -28,4 +28,4 @@ tempfile = "3"
 kernel-module = []
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(CONFIG_RUST)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(CONFIG_RUST)", "cfg(tidefs_block_kmod_bringup_backend)"] }
