@@ -3112,7 +3112,9 @@ version = "0.421.0"
 dependencies = [
  "blake3",
  "serde",
+ "tempfile",
  "tidefs-incremental-job-core",
+ "tidefs-local-object-store",
  "tidefs-membership-epoch",
  "tidefs-object-io",
  "tidefs-replication-model",

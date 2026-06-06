@@ -87,6 +87,109 @@ pub struct AffectedSubject {
     pub lost_on: Vec<MemberId>,
 }
 
+/// Error returned when rebuilding admission cannot derive authoritative loss
+/// subjects from placement receipt references.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiptIngestionError {
+    /// The caller supplied a compatibility placeholder instead of a durable
+    /// local placement receipt.
+    SyntheticReceiptRef { object_id: u64 },
+    /// The receipt carries a redundancy policy that cannot describe legal
+    /// placement.
+    MalformedReceiptPolicy { object_id: u64 },
+    /// The receipt records fewer physical targets than its redundancy policy
+    /// requires.
+    InsufficientReceiptTargets {
+        object_id: u64,
+        required: u16,
+        actual: u16,
+    },
+}
+
+fn receipt_digest_to_object_digest(payload_digest: [u8; 32]) -> ObjectDigest {
+    ObjectDigest::new(u64::from_le_bytes(
+        payload_digest[..8]
+            .try_into()
+            .expect("digest prefix has 8 bytes"),
+    ))
+}
+
+impl AffectedSubject {
+    /// Build an affected subject directly from local placement receipt
+    /// authority. This is the bridge used by callers that scan
+    /// `Pool::placement_receipt_refs(IoClass)` after a member/device loss.
+    pub fn from_placement_receipt_ref(
+        placement_receipt_ref: PlacementReceiptRef,
+        movement_class: ReplicaMovementClass,
+        lost_on: Vec<MemberId>,
+    ) -> Result<Self, ReceiptIngestionError> {
+        if placement_receipt_ref.is_synthetic() {
+            return Err(ReceiptIngestionError::SyntheticReceiptRef {
+                object_id: placement_receipt_ref.object_id,
+            });
+        }
+        if !placement_receipt_ref.redundancy_policy.is_well_formed() {
+            return Err(ReceiptIngestionError::MalformedReceiptPolicy {
+                object_id: placement_receipt_ref.object_id,
+            });
+        }
+        let required = placement_receipt_ref.redundancy_policy.target_width();
+        if placement_receipt_ref.target_count < required {
+            return Err(ReceiptIngestionError::InsufficientReceiptTargets {
+                object_id: placement_receipt_ref.object_id,
+                required,
+                actual: placement_receipt_ref.target_count,
+            });
+        }
+
+        Ok(Self {
+            subject_ref: ReplicatedSubjectId::new(placement_receipt_ref.object_id),
+            placement_receipt_ref,
+            payload_digest: receipt_digest_to_object_digest(placement_receipt_ref.payload_digest),
+            payload_len: placement_receipt_ref.payload_len,
+            movement_class,
+            lost_on,
+        })
+    }
+}
+
+impl LossRecord {
+    /// Construct a loss record from local placement receipt references.
+    ///
+    /// `placement_receipt_refs` is intentionally the same compact model
+    /// returned by `tidefs_local_object_store::Pool::placement_receipt_refs`.
+    /// Synthetic compatibility refs are rejected here so rebuild admission
+    /// cannot accidentally treat legacy placeholders as durable source
+    /// placement authority.
+    pub fn from_placement_receipt_refs(
+        lost_members: Vec<MemberId>,
+        healthy_sources: Vec<MemberId>,
+        placement_receipt_refs: impl IntoIterator<Item = PlacementReceiptRef>,
+        movement_class: ReplicaMovementClass,
+        detected_epoch: u64,
+        detected_at_ns: u64,
+    ) -> Result<Self, ReceiptIngestionError> {
+        let affected_subjects = placement_receipt_refs
+            .into_iter()
+            .map(|placement_receipt_ref| {
+                AffectedSubject::from_placement_receipt_ref(
+                    placement_receipt_ref,
+                    movement_class,
+                    lost_members.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            lost_members,
+            healthy_sources,
+            affected_subjects,
+            detected_epoch,
+            detected_at_ns,
+        })
+    }
+}
+
 // ─ AdmissionOutcome ───────────────────────────────────────────────
 
 /// Result of attempting to admit a rebuild for a set of lost members.
@@ -399,6 +502,116 @@ mod tests {
             detected_epoch: 1,
             detected_at_ns: 1000,
         }
+    }
+
+    fn receipt_ref(subject: u64, generation: u64, payload: &[u8]) -> PlacementReceiptRef {
+        let mut object_key = [0xA5; 32];
+        object_key[..8].copy_from_slice(&subject.to_le_bytes());
+        let payload_digest = *blake3::hash(payload).as_bytes();
+        PlacementReceiptRef::replicated(
+            subject,
+            object_key,
+            tidefs_membership_epoch::EpochId::new(7),
+            generation,
+            2,
+            payload.len() as u64,
+            payload_digest,
+        )
+    }
+
+    #[test]
+    fn loss_record_from_placement_refs_feeds_scheduler_reports() {
+        let payload = b"receipt-backed rebuild admission payload";
+        let receipt = receipt_ref(42, 9, payload);
+        let expected_digest = receipt_digest_to_object_digest(receipt.payload_digest);
+
+        let loss = LossRecord::from_placement_receipt_refs(
+            vec![MemberId::new(10)],
+            vec![MemberId::new(20)],
+            vec![receipt],
+            ReplicaMovementClass::RebuildLostOrSuspectCopy,
+            7,
+            1234,
+        )
+        .expect("receipt refs become loss record");
+
+        assert_eq!(loss.lost_members, vec![MemberId::new(10)]);
+        assert_eq!(loss.healthy_sources, vec![MemberId::new(20)]);
+        assert_eq!(loss.detected_epoch, 7);
+        assert_eq!(loss.affected_subjects.len(), 1);
+        assert_eq!(
+            loss.affected_subjects[0].subject_ref,
+            ReplicatedSubjectId::new(42)
+        );
+        assert_eq!(loss.affected_subjects[0].placement_receipt_ref, receipt);
+        assert_eq!(loss.affected_subjects[0].payload_digest, expected_digest);
+        assert_eq!(loss.affected_subjects[0].payload_len, payload.len() as u64);
+        assert!(!loss.affected_subjects[0]
+            .placement_receipt_ref
+            .is_synthetic());
+
+        let mut admission = RebuildAdmission::with_epoch(7);
+        let mut scheduler = BackfillScheduler::new();
+        let outcome = admission.admit(&loss, &mut scheduler);
+
+        assert_eq!(outcome.admitted, vec![MemberId::new(10)]);
+        assert!(outcome.refused.is_empty());
+        assert_eq!(outcome.report_count, 1);
+
+        let tasks = scheduler.drain_eligible();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].subject_ref, ReplicatedSubjectId::new(42));
+        assert_eq!(tasks[0].placement_receipt_ref, receipt);
+        assert_eq!(tasks[0].source_member, MemberId::new(20));
+        assert_eq!(tasks[0].target_member, MemberId::new(10));
+        assert_eq!(tasks[0].payload_digest, expected_digest);
+        assert_eq!(tasks[0].payload_len, payload.len() as u64);
+        assert!(!tasks[0].placement_receipt_ref.is_synthetic());
+    }
+
+    #[test]
+    fn placement_ref_ingestion_rejects_synthetic_authority() {
+        let synthetic = PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(77));
+
+        let err = LossRecord::from_placement_receipt_refs(
+            vec![MemberId::new(10)],
+            vec![MemberId::new(20)],
+            vec![synthetic],
+            ReplicaMovementClass::RebuildLostOrSuspectCopy,
+            1,
+            0,
+        )
+        .expect_err("synthetic refs are not durable receipt authority");
+
+        assert_eq!(
+            err,
+            ReceiptIngestionError::SyntheticReceiptRef { object_id: 77 }
+        );
+    }
+
+    #[test]
+    fn placement_ref_ingestion_rejects_under_width_receipts() {
+        let mut receipt = receipt_ref(81, 1, b"under width");
+        receipt.target_count = 1;
+
+        let err = LossRecord::from_placement_receipt_refs(
+            vec![MemberId::new(10)],
+            vec![MemberId::new(20)],
+            vec![receipt],
+            ReplicaMovementClass::RebuildLostOrSuspectCopy,
+            1,
+            0,
+        )
+        .expect_err("receipt target count must satisfy policy width");
+
+        assert_eq!(
+            err,
+            ReceiptIngestionError::InsufficientReceiptTargets {
+                object_id: 81,
+                required: 2,
+                actual: 1
+            }
+        );
     }
 
     #[test]
