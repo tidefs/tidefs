@@ -12,6 +12,7 @@
 
 pub use tidefs_types_pool_label_core::{
     decode_label, encode_label, features, seal_label, verify_label_checksum,
-    DeviceClass as LabelDeviceClass, LabelError, PoolLabelV1, PoolState as LabelPoolState,
-    POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE, POOL_NAME_MAX,
+    DeviceClass as LabelDeviceClass, LabelError, PoolLabelV1, PoolRedundancyPolicy,
+    PoolState as LabelPoolState, POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
+    POOL_NAME_MAX,
 };

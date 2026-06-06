@@ -98,9 +98,13 @@ The pool is left in **exported** state.
 
 | Flag | Behavior |
 |---|---|
-| `--redundancy none` | No redundancy (default) |
-| `--redundancy mirror` | Mirror copies across devices |
-| `--redundancy erasure` | Erasure-coded layout (not yet implemented) |
+| `--redundancy single` | One full copy on one eligible device (default) |
+| `--redundancy replicated=N` | `N` full copies on distinct eligible devices |
+| `--redundancy erasure=D+P` | Erasure placement with `D` data shards and `P` parity shards on distinct eligible devices |
+
+The selected policy is pool-wide and is persisted in every pool member label.
+It does not pre-create fixed RAIDZ-like or vdev-like groups; placement receipts
+record the exact devices selected for each allocation.
 
 **Encryption (optional):**
 
@@ -120,7 +124,8 @@ truncate -s 2G /tmp/pool2.img
 tidefsctl pool create mypool --devices /tmp/pool1.img /tmp/pool2.img --file-devices
 ```
 
-The `--file-devices` flag is hidden and intended for development.
+The `--file-devices` flag is hidden and intended for development. Directory
+object-store paths are compatibility/offline storage only, not pool members.
 
 ### 3.3 Import the pool into a live owner
 

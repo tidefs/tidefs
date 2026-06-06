@@ -14,7 +14,7 @@ use crate::intent_log::record::IntentLogRecord;
 use crate::intent_log::sync_write::IntentLog;
 use crate::pool_label::{
     decode_label, encode_label, seal_label, LabelDeviceClass, LabelPoolState, PoolLabelV1,
-    POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
+    PoolRedundancyPolicy, POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
 };
 use crate::txg_manager::CommitGroupManager;
 use tidefs_auth::local_only::LocalOnlyGuard;
@@ -220,6 +220,7 @@ impl PoolExporter {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             });
         }
@@ -679,6 +680,7 @@ mod tests {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
@@ -792,6 +794,7 @@ mod tests {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
@@ -873,6 +876,7 @@ mod tests {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
@@ -956,6 +960,7 @@ mod tests {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
@@ -1033,6 +1038,7 @@ mod tests {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();

@@ -40,12 +40,12 @@ use tidefs_kernel_storage_io::{
 use tidefs_kmod_bridge::kernel_types::{
     decode_label, read_pool_superblock, read_pool_superblock_at, DeviceClass, KernelPoolSuperblock,
     KernelStorageIo, LabelError, PoolLabelV1, PoolState, PoolSuperblockError, POOL_LABEL_SIZE,
-    POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_WIRE_SIZE,
+    POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_HEALTH_WIRE_SIZE, POOL_LABEL_V1_WIRE_SIZE,
 };
 #[cfg(not(CONFIG_RUST))]
 use tidefs_types_pool_label_core::{
     decode_label, DeviceClass, LabelError, PoolLabelV1, PoolState, POOL_LABEL_SIZE,
-    POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_WIRE_SIZE,
+    POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_HEALTH_WIRE_SIZE, POOL_LABEL_V1_WIRE_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -168,14 +168,16 @@ impl From<LabelError> for PoolImportError {
                     s
                 },
             },
-            LabelError::BadDeviceClass(_) => Self::LabelInvalid {
-                detail: {
-                    use core::fmt::Write;
-                    let mut s = String::new();
-                    let _ = write!(s, "{e}");
-                    s
-                },
-            },
+            LabelError::BadDeviceClass(_) | LabelError::BadRedundancyPolicy { .. } => {
+                Self::LabelInvalid {
+                    detail: {
+                        use core::fmt::Write;
+                        let mut s = String::new();
+                        let _ = write!(s, "{e}");
+                        s
+                    },
+                }
+            }
             LabelError::NameTooLong => Self::LabelInvalid {
                 detail: {
                     use core::fmt::Write;
@@ -241,9 +243,9 @@ impl PoolImportContext {
     /// Import a pool label from a raw device buffer.
     ///
     /// Attempts to decode `buf` as a [`PoolLabelV1`]. If the buffer is
-    /// large enough to contain an extended label (≥ `POOL_LABEL_V1_EXT_WIRE_SIZE`
-    /// bytes), the health extension fields are decoded. Otherwise, a
-    /// base (411-byte) label is decoded.
+    /// large enough to contain an extended label, the health and pool-wide
+    /// redundancy policy extension fields are decoded. Otherwise, a base
+    /// (411-byte) label is decoded.
     ///
     /// After successful decode, performs semantic validation:
     /// - Pool state must be importable (`Active` or `Exported`).
@@ -303,9 +305,9 @@ impl PoolImportContext {
 
     /// Import from a buffer that is known to be at least `POOL_LABEL_SIZE`
     /// bytes (the full 256 KiB label region). Attempts decoding at both
-    /// the base size (411 bytes) and extended size (436 bytes), preferring
-    /// the extended decode when the feature flags indicate health fields
-    /// are present.
+    /// the base size (411 bytes), health-only size (436 bytes), and current
+    /// policy-bearing size (440 bytes), preferring the widest decode required
+    /// by the feature flags.
     pub fn import_full(buf: &[u8], label_copy: u8) -> Result<Self, PoolImportError> {
         if buf.len() < POOL_LABEL_V1_WIRE_SIZE {
             return Err(PoolImportError::BufferTooSmall {
@@ -314,18 +316,29 @@ impl PoolImportContext {
             });
         }
 
-        // Determine whether to decode as extended by checking
-        // the features_compat field at offset 371 for DEVICE_HEALTH_STATE.
-        let has_health = buf.len() >= POOL_LABEL_V1_EXT_WIRE_SIZE
-            && (u64::from_le_bytes(buf[371..379].try_into().unwrap_or([0u8; 8]))
-                & tidefs_kmod_bridge::kernel_types::DEVICE_HEALTH_STATE
-                != 0);
+        let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap_or([0u8; 8]));
+        let has_policy =
+            features_compat & tidefs_kmod_bridge::kernel_types::POOL_REDUNDANCY_POLICY != 0;
+        let has_health =
+            features_compat & tidefs_kmod_bridge::kernel_types::DEVICE_HEALTH_STATE != 0;
 
-        let label = if has_health {
-            // Decode the extended slice (436 bytes).
+        let label = if has_policy {
+            if buf.len() < POOL_LABEL_V1_EXT_WIRE_SIZE {
+                return Err(PoolImportError::BufferTooSmall {
+                    provided: buf.len(),
+                    required: POOL_LABEL_V1_EXT_WIRE_SIZE,
+                });
+            }
             decode_label(&buf[..POOL_LABEL_V1_EXT_WIRE_SIZE])?
+        } else if has_health {
+            if buf.len() < POOL_LABEL_V1_HEALTH_WIRE_SIZE {
+                return Err(PoolImportError::BufferTooSmall {
+                    provided: buf.len(),
+                    required: POOL_LABEL_V1_HEALTH_WIRE_SIZE,
+                });
+            }
+            decode_label(&buf[..POOL_LABEL_V1_HEALTH_WIRE_SIZE])?
         } else {
-            // Decode the base slice (411 bytes).
             decode_label(&buf[..POOL_LABEL_V1_WIRE_SIZE])?
         };
 
@@ -567,6 +580,7 @@ impl PoolImportContext {
             device_read_errors: 0,
             device_write_errors: 0,
             device_checksum_errors: 0,
+            redundancy_policy: sb.redundancy_policy,
             checksum: sb.checksum,
         })
     }

@@ -419,7 +419,9 @@ pub fn import_pool_config_from_store(
     store: &tidefs_local_object_store::LocalObjectStore,
 ) -> Result<Option<PoolConfig>, DeviceRemovalAnchorError> {
     use tidefs_pool_scan::DeviceType;
-    use tidefs_types_pool_label_core::{decode_label, verify_label_checksum, PoolState};
+    use tidefs_types_pool_label_core::{
+        decode_label, verify_label_checksum, PoolRedundancyPolicy, PoolState,
+    };
 
     let mut leaves: Vec<DeviceType> = Vec::new();
     let mut ref_uuid: Option<[u8; 16]> = None;
@@ -428,6 +430,7 @@ pub fn import_pool_config_from_store(
     let mut pool_name = String::new();
     let mut pool_state = PoolState::Active;
     let mut feature_flags: u64 = 0;
+    let mut redundancy_policy = PoolRedundancyPolicy::default();
 
     for idx in 0u32..64u32 {
         let label_key = ObjectKey::from_name(format!("{POOL_LABEL_KEY_PREFIX}{idx}"));
@@ -465,6 +468,11 @@ pub fn import_pool_config_from_store(
             .into_owned();
             pool_state = decoded.pool_state;
             feature_flags = decoded.features_compat;
+            redundancy_policy = decoded.redundancy_policy;
+        } else if decoded.redundancy_policy != redundancy_policy {
+            return Err(DeviceRemovalAnchorError::Serialize(format!(
+                "label redundancy policy mismatch for device index {idx}"
+            )));
         }
 
         let health = tidefs_pool_scan::DeviceHealth::from_label_health(decoded.device_health);
@@ -509,6 +517,7 @@ pub fn import_pool_config_from_store(
         total_capacity_bytes: total_capacity,
         allocated_bytes: 0,
         feature_flags,
+        redundancy_policy,
         topology_generation: ref_gen,
         device_count: ref_count,
         missing_indices: vec![],

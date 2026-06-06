@@ -1024,6 +1024,7 @@ mod tests {
         tidefs_pool_scan::PoolConfig {
             pool_uuid: [0x42u8; 16],
             pool_name: "testpool".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror { children: leaves },
             health: DeviceHealth::Online,
             state: PoolState::Active,

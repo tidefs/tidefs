@@ -7,10 +7,11 @@
 //! # Label layout
 //!
 //! The pool label (PoolLabelV1) sits at sector 0 of the block device.
-//! It is 436 bytes (POOL_LABEL_V1_EXT_WIRE_SIZE) and carries a BLAKE3-256
+//! It is 440 bytes (POOL_LABEL_V1_EXT_WIRE_SIZE) and carries a BLAKE3-256
 //! checksum covering all preceding fields. The label identifies the pool
 //! GUID, device GUID, pool name, commit_group recovery point, and the
-//! system-area pointer where the committed-root ledger lives.
+//! pool-wide redundancy policy plus the system-area pointer where the
+//! committed-root ledger lives.
 //!
 //! # no_std
 //!
@@ -20,7 +21,8 @@
 use core::fmt;
 
 use tidefs_types_pool_label_core::{
-    decode_label, LabelError, PoolLabelV1, POOL_LABEL_MAGIC, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    decode_label, LabelError, PoolLabelV1, PoolRedundancyPolicy, POOL_LABEL_MAGIC,
+    POOL_LABEL_V1_EXT_WIRE_SIZE,
 };
 use tidefs_types_vfs_core::Errno;
 
@@ -70,6 +72,8 @@ pub struct KernelPoolSuperblock {
     pub features_ro_compat: u64,
     /// Feature bitmask: compatible features.
     pub features_compat: u64,
+    /// Pool-wide redundancy policy identity from the label.
+    pub redundancy_policy: PoolRedundancyPolicy,
     /// BLAKE3-256 checksum of all preceding fields (verified on read).
     pub checksum: [u8; 32],
 }
@@ -97,6 +101,7 @@ impl KernelPoolSuperblock {
             features_incompat: label.features_incompat,
             features_ro_compat: label.features_ro_compat,
             features_compat: label.features_compat,
+            redundancy_policy: label.redundancy_policy,
             checksum: label.checksum,
         }
     }
@@ -173,6 +178,7 @@ impl From<LabelError> for PoolSuperblockError {
             LabelError::ChecksumMismatch => Self::Corrupt,
             LabelError::BadPoolState(_)
             | LabelError::BadDeviceClass(_)
+            | LabelError::BadRedundancyPolicy { .. }
             | LabelError::NameTooLong
             | LabelError::LastDevice => Self::Corrupt,
         }

@@ -1373,6 +1373,7 @@ mod tests {
         let mut config = crate::PoolConfig {
             pool_uuid: [0xAAu8; 16],
             pool_name: "test".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: make_mirror(vec![leaf0, leaf1, leaf2]),
             health: crate::DeviceHealth::Online,
             state: tidefs_types_pool_label_core::PoolState::Active,
@@ -1404,6 +1405,7 @@ mod tests {
         let mut config = crate::PoolConfig {
             pool_uuid: [0xAAu8; 16],
             pool_name: "test".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: make_mirror(vec![leaf0, leaf1]),
             health: crate::DeviceHealth::Online,
             state: tidefs_types_pool_label_core::PoolState::Active,
@@ -1428,6 +1430,7 @@ mod tests {
         let mut config = crate::PoolConfig {
             pool_uuid: [0xAAu8; 16],
             pool_name: "test".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: leaf0,
             health: crate::DeviceHealth::Online,
             state: tidefs_types_pool_label_core::PoolState::Active,
@@ -2013,6 +2016,7 @@ mod tests {
         let mut config = crate::PoolConfig {
             pool_uuid: [0xAAu8; 16],
             pool_name: "test".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: tree,
             health: crate::DeviceHealth::Online,
             state: tidefs_types_pool_label_core::PoolState::Active,

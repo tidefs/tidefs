@@ -1543,11 +1543,13 @@ fn handle_cluster_pool_message(
                 .map(|d| std::path::PathBuf::from(&d.device_path))
                 .collect();
             let redundancy = match req.placement {
-                ClusterPlacementPolicy::Stripe => RedundancyPolicy::None,
-                ClusterPlacementPolicy::MirrorAcrossNodes { copies } => RedundancyPolicy::Mirror {
-                    copies: copies as u8,
-                },
-                ClusterPlacementPolicy::ErasureCoded { .. } => RedundancyPolicy::None,
+                ClusterPlacementPolicy::Stripe => RedundancyPolicy::replicated(1),
+                ClusterPlacementPolicy::MirrorAcrossNodes { copies } => {
+                    RedundancyPolicy::replicated(copies as u8)
+                }
+                ClusterPlacementPolicy::ErasureCoded { data, parity } => {
+                    RedundancyPolicy::erasure(data as u8, parity as u8)
+                }
             };
             let config = PoolCreateConfig {
                 pool_name: req.pool_name.clone(),
@@ -3274,7 +3276,7 @@ mod cluster_pool_handler_tests {
         let config = PoolCreateConfig {
             pool_name: "test-pool".into(),
             pool_guid: Some([0xA1; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -3291,7 +3293,7 @@ mod cluster_pool_handler_tests {
         let config = PoolCreateConfig {
             pool_name: "bad-pool".into(),
             pool_guid: Some([0xB2; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -3309,7 +3311,7 @@ mod cluster_pool_handler_tests {
         let create_config = PoolCreateConfig {
             pool_name: "roundtrip".into(),
             pool_guid: Some([0xC3; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };

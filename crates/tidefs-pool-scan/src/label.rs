@@ -140,7 +140,9 @@ impl From<&LabelError> for LabelErrorKind {
             LabelError::BadMagic => Self::Other,
             LabelError::BufferTooSmall => Self::Other,
             LabelError::UnsupportedVersion(_) => Self::UnsupportedVersion,
-            LabelError::BadPoolState(_) | LabelError::BadDeviceClass(_) => Self::BadField,
+            LabelError::BadPoolState(_)
+            | LabelError::BadDeviceClass(_)
+            | LabelError::BadRedundancyPolicy { .. } => Self::BadField,
             LabelError::NameTooLong => Self::BadField,
             LabelError::LastDevice => Self::Other,
         }
@@ -498,7 +500,9 @@ pub fn validate_pool_membership(reader: &LabelReader) -> Result<[u8; 16], Member
 mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
-    use tidefs_types_pool_label_core::{encode_label, seal_label, DeviceClass, PoolState};
+    use tidefs_types_pool_label_core::{
+        encode_label, seal_label, DeviceClass, PoolState, POOL_LABEL_V1_CHECKSUM_OFFSET,
+    };
 
     // -- Helpers --
 
@@ -769,8 +773,7 @@ mod tests {
         let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         encode_label(&label, &mut buf).unwrap();
 
-        // Offset 404 is the checksum field in EXT_WIRE_SIZE layout.
-        let checksum_offset = 404;
+        let checksum_offset = POOL_LABEL_V1_CHECKSUM_OFFSET;
         let checksum_end = POOL_LABEL_V1_EXT_WIRE_SIZE;
 
         assert!(LabelReader::verify_raw_checksum(

@@ -779,6 +779,7 @@ mod tests {
             total_capacity_bytes: 3 * 1024 * 1024 * 1024,
             allocated_bytes: 0,
             feature_flags: 0,
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             topology_generation: 1,
             device_count: 3,
             missing_indices: vec![],

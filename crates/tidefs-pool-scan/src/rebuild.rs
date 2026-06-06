@@ -367,6 +367,7 @@ mod tests {
         let config = PoolConfig {
             pool_uuid: [0xAAu8; 16],
             pool_name: "healthy".into(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![
                     make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online),
@@ -396,6 +397,7 @@ mod tests {
         let config = PoolConfig {
             pool_uuid: [0xBBu8; 16],
             pool_name: "missing-mirror".into(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![
                     make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online),
@@ -429,6 +431,7 @@ mod tests {
         let config = PoolConfig {
             pool_uuid: [0xCCu8; 16],
             pool_name: "degraded-device".into(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![
                     make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online),
@@ -463,6 +466,7 @@ mod tests {
         let config = PoolConfig {
             pool_uuid: [0xDDu8; 16],
             pool_name: "faulted-device".into(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![
                     make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online),
@@ -499,6 +503,7 @@ mod tests {
         let config = PoolConfig {
             pool_uuid: [0xEEu8; 16],
             pool_name: "raidz-missing".into(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::ParityRaid {
                 parity: 1,
                 children: vec![leaf0, leaf1],
