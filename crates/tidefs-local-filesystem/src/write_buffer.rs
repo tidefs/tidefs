@@ -3,6 +3,8 @@ use std::ops::Bound;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::time::Duration;
 
+const MAX_DIRTY_SEGMENT_BYTES: usize = 128 * 1024;
+
 /// Configuration for write-buffer coalescing thresholds.
 #[derive(Debug, Clone)]
 pub struct WriteBufferConfig {
@@ -54,14 +56,6 @@ impl WriteBuffer {
         offset.saturating_add(data.len() as u64)
     }
 
-    fn first_segment_start_ending_at_or_after(&self, offset: u64) -> u64 {
-        self.segments
-            .range(..=offset)
-            .next_back()
-            .and_then(|(&start, data)| (Self::segment_end(start, data) >= offset).then_some(start))
-            .unwrap_or(offset)
-    }
-
     fn first_segment_start_ending_after(&self, offset: u64) -> u64 {
         self.segments
             .range(..=offset)
@@ -89,11 +83,133 @@ impl WriteBuffer {
         if Self::segment_end(segment_start, segment_data) != offset {
             return false;
         }
+        if segment_data.len().saturating_add(buf.len()) > MAX_DIRTY_SEGMENT_BYTES {
+            return false;
+        }
 
         segment_data.extend_from_slice(buf);
         self.total_bytes = self.total_bytes.saturating_add(buf.len());
         self.max_offset = Some(write_end);
         true
+    }
+
+    fn insert_preserved_segment(&mut self, mut offset: u64, data: &[u8]) {
+        for chunk in data.chunks(MAX_DIRTY_SEGMENT_BYTES) {
+            if chunk.is_empty() {
+                continue;
+            }
+            self.segments.insert(offset, chunk.to_vec());
+            self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+            offset = offset.saturating_add(chunk.len() as u64);
+        }
+    }
+
+    fn coalesce_around(&mut self, mut offset: u64) {
+        loop {
+            let Some(current) = self.segments.get(&offset) else {
+                return;
+            };
+            let Some((&prev_offset, prev)) = self.segments.range(..offset).next_back() else {
+                break;
+            };
+            if Self::segment_end(prev_offset, prev) != offset
+                || prev.len().saturating_add(current.len()) > MAX_DIRTY_SEGMENT_BYTES
+            {
+                break;
+            }
+
+            let current = self
+                .segments
+                .remove(&offset)
+                .expect("current segment existed");
+            let mut prev = self
+                .segments
+                .remove(&prev_offset)
+                .expect("previous segment existed");
+            prev.extend_from_slice(&current);
+            self.segments.insert(prev_offset, prev);
+            offset = prev_offset;
+        }
+
+        loop {
+            let Some(current) = self.segments.get(&offset) else {
+                return;
+            };
+            let current_end = Self::segment_end(offset, current);
+            let Some((&next_offset, next)) =
+                self.segments.range((Excluded(offset), Unbounded)).next()
+            else {
+                break;
+            };
+            if next_offset != current_end
+                || current.len().saturating_add(next.len()) > MAX_DIRTY_SEGMENT_BYTES
+            {
+                break;
+            }
+
+            let mut current = self
+                .segments
+                .remove(&offset)
+                .expect("current segment existed");
+            let next = self
+                .segments
+                .remove(&next_offset)
+                .expect("next segment existed");
+            current.extend_from_slice(&next);
+            self.segments.insert(offset, current);
+        }
+    }
+
+    fn insert_chunk(&mut self, offset: u64, buf: &[u8]) {
+        debug_assert!(buf.len() <= MAX_DIRTY_SEGMENT_BYTES);
+        if buf.is_empty() {
+            return;
+        }
+
+        let write_end = offset.saturating_add(buf.len() as u64);
+        let scan_start = self.first_segment_start_ending_after(offset);
+        let mut overlapping = Vec::new();
+        let mut next_bound: Bound<u64> = Included(scan_start);
+
+        loop {
+            let next = self
+                .segments
+                .range((next_bound, Unbounded))
+                .next()
+                .map(|(&start, data)| (start, Self::segment_end(start, data)));
+            let Some((segment_start, segment_end)) = next else {
+                break;
+            };
+            if segment_start >= write_end {
+                break;
+            }
+            if segment_end > offset {
+                overlapping.push(segment_start);
+            }
+            next_bound = Excluded(segment_start);
+        }
+
+        for segment_start in overlapping {
+            let Some(data) = self.segments.remove(&segment_start) else {
+                continue;
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(data.len());
+            let segment_end = Self::segment_end(segment_start, &data);
+
+            if segment_start < offset {
+                let prefix_len = (offset - segment_start) as usize;
+                self.insert_preserved_segment(segment_start, &data[..prefix_len]);
+            }
+            if write_end < segment_end {
+                let suffix_start = (write_end - segment_start) as usize;
+                self.insert_preserved_segment(write_end, &data[suffix_start..]);
+            }
+        }
+
+        self.segments.insert(offset, buf.to_vec());
+        self.total_bytes = self.total_bytes.saturating_add(buf.len());
+        self.max_offset = Some(self.max_offset.unwrap_or(0).max(write_end));
+        self.coalesce_around(offset);
     }
 
     /// Ingest a write at the given byte offset.
@@ -110,56 +226,15 @@ impl WriteBuffer {
         if self.try_append_to_contiguous_tail(buf, offset, write_end) {
             return;
         }
-        let scan_start = self.first_segment_start_ending_at_or_after(offset);
-        let mut merged_start = offset;
-        let mut merged_end = write_end;
-        let mut candidate_starts = Vec::new();
-        let mut next_bound: Bound<u64> = Included(scan_start);
 
-        loop {
-            let next = self
-                .segments
-                .range((next_bound, Unbounded))
-                .next()
-                .map(|(&start, data)| (start, Self::segment_end(start, data)));
-            let Some((segment_start, segment_end)) = next else {
-                break;
-            };
-            if segment_start > merged_end {
-                break;
-            }
-
-            candidate_starts.push(segment_start);
-            merged_start = merged_start.min(segment_start);
-            merged_end = merged_end.max(segment_end);
-            next_bound = Excluded(segment_start);
+        let mut consumed = 0usize;
+        while consumed < buf.len() {
+            let remaining = buf.len() - consumed;
+            let chunk_len = remaining.min(MAX_DIRTY_SEGMENT_BYTES);
+            let chunk_offset = offset.saturating_add(consumed as u64);
+            self.insert_chunk(chunk_offset, &buf[consumed..consumed + chunk_len]);
+            consumed += chunk_len;
         }
-
-        if candidate_starts.is_empty() {
-            self.segments.insert(offset, buf.to_vec());
-            self.total_bytes = self.total_bytes.saturating_add(buf.len());
-            self.max_offset = Some(self.max_offset.unwrap_or(0).max(write_end));
-            return;
-        }
-
-        let merged_len = (merged_end - merged_start) as usize;
-        let mut merged = vec![0_u8; merged_len];
-
-        for segment_start in candidate_starts {
-            let Some(data) = self.segments.remove(&segment_start) else {
-                continue;
-            };
-            self.total_bytes = self.total_bytes.saturating_sub(data.len());
-            let dst = (segment_start - merged_start) as usize;
-            let dst_end = dst.saturating_add(data.len());
-            merged[dst..dst_end].copy_from_slice(&data);
-        }
-
-        let write_dst = (offset - merged_start) as usize;
-        merged[write_dst..write_dst + buf.len()].copy_from_slice(buf);
-        self.total_bytes = self.total_bytes.saturating_add(merged.len());
-        self.segments.insert(merged_start, merged);
-        self.max_offset = Some(self.max_offset.unwrap_or(0).max(merged_end));
     }
 
     /// Returns `true` when the foreground byte-count threshold is crossed.
@@ -474,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn long_sequential_512_byte_appends_stay_coalesced() {
+    fn long_sequential_512_byte_appends_stay_record_bounded() {
         let mut wb = WriteBuffer::new(WriteBufferConfig {
             flush_threshold_bytes: 8 * 1024 * 1024,
             flush_threshold_age: Duration::from_millis(50),
@@ -490,7 +565,16 @@ mod tests {
 
         assert_eq!(wb.len(), writes * write_len);
         assert_eq!(wb.max_offset(), Some((writes * write_len) as u64));
-        assert_eq!(wb.segments.len(), 1);
+        assert_eq!(
+            wb.segments.len(),
+            (writes * write_len).div_ceil(MAX_DIRTY_SEGMENT_BYTES)
+        );
+        assert!(
+            wb.segments
+                .values()
+                .all(|segment| segment.len() <= MAX_DIRTY_SEGMENT_BYTES),
+            "dirty segments must stay record-bounded"
+        );
 
         let boundary = ((writes / 2) * write_len - 8) as u64;
         let overlap = wb
@@ -504,18 +588,66 @@ mod tests {
         );
 
         let drained = wb.drain();
-        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained.len(),
+            (writes * write_len).div_ceil(MAX_DIRTY_SEGMENT_BYTES)
+        );
         assert_eq!(drained[0].0, 0);
-        assert_eq!(drained[0].1.len(), writes * write_len);
+        assert!(
+            drained
+                .iter()
+                .all(|(_, segment)| segment.len() <= MAX_DIRTY_SEGMENT_BYTES),
+            "drained segments must stay record-bounded"
+        );
         for index in [0usize, writes / 2, writes - 1] {
-            let base = index * write_len;
+            let absolute = index * write_len;
+            let (segment_offset, segment) = drained
+                .iter()
+                .find(|(offset, segment)| {
+                    let start = *offset as usize;
+                    let end = start + segment.len();
+                    start <= absolute && absolute + 8 <= end
+                })
+                .expect("marker should fit in one record-bounded segment");
+            let base = absolute - *segment_offset as usize;
             assert_eq!(
-                u64::from_le_bytes(
-                    drained[0].1[base..base + 8]
-                        .try_into()
-                        .expect("marker width")
-                ),
+                u64::from_le_bytes(segment[base..base + 8].try_into().expect("marker width")),
                 index as u64
+            );
+        }
+    }
+
+    #[test]
+    fn random_overwrites_do_not_rebuild_whole_dirty_file() {
+        let mut wb = WriteBuffer::new(WriteBufferConfig {
+            flush_threshold_bytes: 8 * 1024 * 1024,
+            flush_threshold_age: Duration::from_millis(50),
+        });
+        let file_len = 1024 * 1024usize;
+        wb.ingest(&vec![0x11_u8; file_len], 0);
+
+        let write_len = 1024usize;
+        let mut expected = vec![0x11_u8; file_len];
+        for index in 0..2048usize {
+            let offset = (index * 7919) % (file_len - write_len);
+            let byte = (index % 251) as u8;
+            let payload = vec![byte; write_len];
+            expected[offset..offset + write_len].copy_from_slice(&payload);
+            wb.ingest(&payload, offset as u64);
+        }
+
+        assert_eq!(wb.len(), file_len);
+        assert!(
+            wb.segments
+                .values()
+                .all(|segment| segment.len() <= MAX_DIRTY_SEGMENT_BYTES),
+            "overlap replacement must not rebuild a whole dirty file segment"
+        );
+        for offset in [0usize, 17_321, 131_072, 524_288, file_len - 4096] {
+            assert_eq!(
+                wb.read_overlap(offset as u64, 4096)
+                    .expect("dirty range should cover initialized file"),
+                expected[offset..offset + 4096]
             );
         }
     }
