@@ -8,7 +8,7 @@
 // # Pool create
 //
 // `tidefsctl pool create <pool-name> --devices <device>...` bootstraps a
-// TideFS pool on raw block devices by calling
+// TideFS pool on block devices, or regular files in hidden development mode, by calling
 // [`tidefs_pool_import::create::PoolCreator::create_pool`] with
 // `RedundancyPolicy::None` for the default initial command shape.  The
 // create path writes dual-copy pool labels and an initial committed root
@@ -416,25 +416,9 @@ fn handle_pool_create(
         }
     };
 
-    // --- guard: refuse regular files unless --file-devices is set ---
-    if !file_devices {
-        for dev in &devices {
-            match dev.metadata() {
-                Ok(meta) => {
-                    if !meta.file_type().is_block_device() {
-                        eprintln!(
-                            "tidefsctl: {} is not a block device; use --file-devices to allow regular files (development only)",
-                            dev.display()
-                        );
-                        process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("tidefsctl: cannot access {}: {e}", dev.display());
-                    process::exit(1);
-                }
-            }
-        }
+    if let Err(err) = validate_pool_create_device_paths(&devices, file_devices) {
+        eprintln!("tidefsctl: {err}");
+        process::exit(1);
     }
 
     // --- create the pool ---
@@ -523,6 +507,41 @@ fn handle_pool_create(
             outcome.committed_root.root.commit_group_id.0
         );
     }
+}
+
+fn validate_pool_create_device_paths(
+    devices: &[PathBuf],
+    file_devices: bool,
+) -> Result<(), String> {
+    for dev in devices {
+        let meta = dev
+            .metadata()
+            .map_err(|e| format!("cannot access {}: {e}", dev.display()))?;
+        let file_type = meta.file_type();
+        if meta.is_dir() {
+            return Err(format!(
+                "{} is a directory; pool devices must be block devices or regular files with --file-devices (development only)",
+                dev.display()
+            ));
+        }
+        if file_type.is_block_device() {
+            continue;
+        }
+        if meta.is_file() {
+            if file_devices {
+                continue;
+            }
+            return Err(format!(
+                "{} is a regular file; use --file-devices to allow regular files (development only)",
+                dev.display()
+            ));
+        }
+        return Err(format!(
+            "{} is not a block device or regular file",
+            dev.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Format a 16-byte GUID as a hex-encoded string with hyphens (UUID v4 style).
@@ -1290,7 +1309,7 @@ fn print_combined_integrity_text(
         println!("  suspect entries:       {}", r.suspect_entries);
         println!("  suspect unresolved:    {}", r.suspect_unresolved);
     } else {
-        println!("  segment scan:  unavailable (no directory-backed store found)");
+        println!("  segment scan:  unavailable (no object-store directory found)");
         if let Some(err) = segment_scan_error {
             println!("  scan error:    {err}");
         }
@@ -1829,6 +1848,24 @@ mod tests {
     fn redundancy_unknown_rejected() {
         let s = "raidz";
         assert!(!matches!(s, "none" | "mirror"));
+    }
+
+    #[test]
+    fn pool_create_validation_accepts_regular_file_only_with_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dev = dir.path().join("pool.img");
+        std::fs::File::create(&dev).expect("create temp file");
+
+        assert!(validate_pool_create_device_paths(std::slice::from_ref(&dev), false).is_err());
+        assert!(validate_pool_create_device_paths(&[dev], true).is_ok());
+    }
+
+    #[test]
+    fn pool_create_validation_rejects_directory_even_with_file_devices() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = validate_pool_create_device_paths(&[dir.path().to_path_buf()], true).unwrap_err();
+
+        assert!(err.contains("directory"));
     }
 
     // -- integrity-check --devices parser tests --

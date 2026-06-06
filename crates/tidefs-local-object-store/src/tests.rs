@@ -1722,7 +1722,7 @@ fn store_stats_default_is_all_zeroes() {
 
 #[test]
 fn pool_label_export_pool_import_roundtrip_preserves_metadata_and_topology() {
-    use crate::device::{DeviceClass, DeviceConfig, DeviceKind};
+    use crate::device::{DeviceBacking, DeviceClass, DeviceConfig, DeviceKind};
     use crate::pool_label::{
         encode_label, seal_label, LabelDeviceClass, LabelPoolState, PoolLabelV1,
         POOL_LABEL_V1_WIRE_SIZE,
@@ -1771,6 +1771,7 @@ fn pool_label_export_pool_import_roundtrip_preserves_metadata_and_topology() {
         .map(|device_root| DeviceConfig {
             media_class: Default::default(),
             path: device_root.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             class: DeviceClass::Data,
             kind: DeviceKind::Single {
                 path: device_root.clone(),

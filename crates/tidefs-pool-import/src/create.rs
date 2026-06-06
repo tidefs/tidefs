@@ -1,4 +1,4 @@
-//! Pool creation: initialize raw block devices with TideFS pool labels,
+//! Pool creation: initialize byte-addressable pool devices with TideFS labels,
 //! superblock data, and an initial committed root.
 //!
 //! This is the bootstrap path that writes the initial on-disk structures
@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use tidefs_commit_group::{seal_commit_hash, CommitGroupId, RootPointer};
 use tidefs_encryption::StoreKey;
+use tidefs_pool_scan::PoolDeviceBacking;
 use tidefs_types_pool_label_core::{
     decode_label, encode_label, encode_vcrl_ledger_into, pool_guid_to_uuid32, seal_label,
     vcrl_required_len, DeviceClass, LabelError, PoolLabelV1, PoolState, VcrlEntry, POOL_LABEL_SIZE,
@@ -89,6 +90,8 @@ pub struct PoolCreateOutcome {
     pub encrypted: bool,
     /// Per-device GUIDs assigned during label creation (one per device).
     pub device_guids: Vec<[u8; 16]>,
+    /// Explicit backing media accepted for each created device.
+    pub device_backings: Vec<PoolDeviceBacking>,
     /// Hex key fingerprint (first 8 bytes of BLAKE3 keyed hash of the
     /// encryption key) for operator verification.  `None` when unencrypted.
     pub encryption_key_fingerprint: Option<String>,
@@ -219,7 +222,10 @@ impl From<LabelError> for CreateError {
 // Internal: open-device handle
 // ---------------------------------------------------------------------------
 
-/// An open block device (or temp file) used during pool creation.
+/// An open byte-addressable device path used during pool creation.
+///
+/// Production callers pass block devices. Development callers may pass regular
+/// files. Directories and other special files are not pool devices.
 struct CreationDevice {
     /// Absolute path to the device.
     device_path: PathBuf,
@@ -227,14 +233,23 @@ struct CreationDevice {
     device_index: u32,
     /// Total capacity in bytes.
     capacity_bytes: u64,
+    /// Explicit backing media classification.
+    backing: PoolDeviceBacking,
     /// Opened read/write file handle.
     file: File,
 }
 
 impl CreationDevice {
-    /// Open a device for pool creation.  Fails if the path does not exist
-    /// or cannot be opened for read/write.
+    /// Open a pool device for creation. Fails if the path does not exist,
+    /// is not a block device or regular file, or cannot be opened read/write.
     fn open(path: &Path, device_index: u32) -> Result<Self, CreateError> {
+        let backing = tidefs_pool_scan::classify_pool_device_backing(path).map_err(|e| {
+            CreateError::DeviceOpen {
+                device_path: path.to_path_buf(),
+                msg: format!("{e}"),
+            }
+        })?;
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -263,6 +278,7 @@ impl CreationDevice {
             device_path: path.to_path_buf(),
             device_index,
             capacity_bytes,
+            backing,
             file,
         })
     }
@@ -413,7 +429,7 @@ impl CreationDevice {
 // PoolCreator
 // ---------------------------------------------------------------------------
 
-/// Creates TideFS pools on raw block devices.
+/// Creates TideFS pools on byte-addressable device paths.
 ///
 /// This is the bootstrap path: it writes dual-copy BLAKE3-verified pool
 /// labels to every device, initializes the superblock fields within the
@@ -436,7 +452,7 @@ impl CreationDevice {
 pub struct PoolCreator;
 
 impl PoolCreator {
-    /// Create a new TideFS pool on the given device paths.
+    /// Create a new TideFS pool on the given block-device or regular-file paths.
     ///
     /// Writes dual-copy BLAKE3-verified pool labels (at offset 0 and at
     /// `capacity - POOL_LABEL_SIZE` on each device) and an initial
@@ -588,12 +604,14 @@ impl PoolCreator {
         let committed_root = CommittedRoot::new(root_pointer, commitment_hash, INITIAL_TXG, 0);
 
         let device_guids: Vec<[u8; 16]> = labels.iter().map(|l| l.device_guid).collect();
+        let device_backings: Vec<PoolDeviceBacking> = handles.iter().map(|h| h.backing).collect();
 
         Ok(PoolCreateOutcome {
             pool_guid,
             pool_name: config.pool_name.clone(),
             device_count,
             device_guids,
+            device_backings,
             encrypted: config.encryption_key.is_some(),
             encryption_key_fingerprint: config.encryption_key.as_ref().map(|k| {
                 let fp = blake3::keyed_hash(k.as_bytes(), b"tidefs-enc-fp");
@@ -666,6 +684,10 @@ mod tests {
         assert_eq!(outcome.pool_name, "testpool");
         assert_eq!(outcome.pool_guid, [0xABu8; 16]);
         assert_eq!(outcome.device_count, 1);
+        assert_eq!(
+            outcome.device_backings,
+            vec![PoolDeviceBacking::RegularFileDev]
+        );
         assert_eq!(outcome.state, PoolState::Exported);
         assert!(outcome.committed_root.is_valid());
         assert_eq!(outcome.committed_root.epoch_number, 1);
@@ -980,6 +1002,23 @@ mod tests {
         let result =
             PoolCreator::create_pool(&[PathBuf::from("/nonexistent/device/ghost")], &config);
         assert!(matches!(result, Err(CreateError::DeviceOpen { .. })));
+    }
+
+    #[test]
+    fn directory_device_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolCreateConfig {
+            pool_name: "directory".into(),
+            pool_guid: None,
+            redundancy: RedundancyPolicy::None,
+            encryption_key: None,
+            clustered: false,
+        };
+        let result = PoolCreator::create_pool(&[dir.path().to_path_buf()], &config);
+        match result {
+            Err(CreateError::DeviceOpen { msg, .. }) => assert!(msg.contains("directory")),
+            other => panic!("expected directory DeviceOpen error, got {other:?}"),
+        }
     }
 
     #[test]

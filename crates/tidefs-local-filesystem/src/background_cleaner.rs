@@ -286,8 +286,8 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tidefs_local_object_store::{
-        DeviceConfig, DeviceIoClass, DeviceKind, ObjectKey, Pool, PoolConfig, PoolProperties,
-        StoreOptions,
+        DeviceBacking, DeviceConfig, DeviceIoClass, DeviceKind, ObjectKey, Pool, PoolConfig,
+        PoolProperties, StoreOptions,
     };
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
@@ -305,6 +305,7 @@ mod tests {
             root_path: root.to_path_buf(),
             devices: vec![DeviceConfig {
                 path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 media_class: Default::default(),
                 class: tidefs_local_object_store::DeviceClass::Data,
                 kind: DeviceKind::Single { path: data_dir },

@@ -406,21 +406,26 @@ Important 2026-06-01 findings:
   hard-codes `cluster_authorized: false`, `pool mount --cluster` has a separate
   lease path, and cluster diagnostic commands still sit beside live-ish
   transport dispatch. UAPI status must therefore be derived from real handler
-- `TFR-012`: Device lifecycle and media privacy remain incomplete. Device
-  capacity for directory-backed devices still uses a 1 TiB placeholder,
-  segment free still performs best-effort hole punching, and that is not
-  proven media erasure. `tidefsctl device remove` imports labels and has useful
-  survivor-label persistence, but it preloads all target objects, maps object
-  ids locally, depends on operator-supplied surviving store directories, maps
-  synthetic device paths to directories, syncs survivors, and anchors removal
-  on the target store. That is not yet a pool-authoritative
-  add/remove/replace/remanence lifecycle. Issue #14 closes the narrow
-  directory-backed discard capability bug:
-  `SingleDevice` no longer advertises discard, non-zero direct discard now
-  fails explicitly, and directory-only pool trim/free paths report zero bytes
-  discarded. TFR-012 remains open for real discard-capable backing devices,
-  segment-reclaim remanence, device capacity authority, and online lifecycle
-  work.
+- `TFR-012`: Device lifecycle and media privacy remain incomplete. Pool-member
+  backing must be one byte-addressable media model: block devices for
+  production and regular files for hidden development mode. Directory
+  `LocalObjectStore` compatibility is not a valid pool-member device mode.
+  Segment free still performs best-effort hole punching in that compatibility
+  path, and that is not proven media erasure. `tidefsctl device remove` imports
+  labels and has useful survivor-label persistence, but it preloads all target
+  objects, maps object ids locally, depends on operator-supplied surviving
+  store directories, maps synthetic device paths to directories, syncs
+  survivors, and anchors removal on the target store. That is not yet a
+  pool-authoritative add/remove/replace/remanence lifecycle. Issue #14 closes
+  the narrow invalid-media/discard capability bug, and issue #16 establishes
+  the explicit pool media contract: user pool-device admission rejects
+  directories, `DeviceConfig` carries the backing kind, byte-addressable file
+  and block devices share fixed-offset labels and single-segment object
+  storage, directory compatibility no longer advertises discard, non-zero
+  direct discard fails explicitly, and directory-only pool trim/free paths
+  report zero bytes discarded. TFR-012 remains open for real discard-capable
+  backing devices, segment-reclaim remanence, online replacement/removal
+  authority, and byte-device remanence policy.
 - `TFR-013`: stage words remain widespread; examples include CLI stubs,
   runners, old issue-era gate labels outside the first cleaned xtask gate set,
   and app/workspace classification docs that list deleted or quarantined

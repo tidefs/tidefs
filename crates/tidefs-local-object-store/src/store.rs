@@ -38,6 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 // already imported above
@@ -591,9 +592,9 @@ impl LocalObjectStore {
         }
     }
 
-    /// Open a block device as a single-segment store.
+    /// Open a block device or development regular file as a single-segment store.
     ///
-    /// The block device is treated as a single append-only segment.
+    /// The backing file/device is treated as a single append-only segment.
     /// Objects are written sequentially starting at offset 4096 (after
     /// the superblock region). On open, the data region is scanned to
     /// rebuild the in-memory index.
@@ -606,10 +607,15 @@ impl LocalObjectStore {
             path: device_path.clone(),
             source: e,
         })?;
-        // Accept the path if it exists and is not a directory.
         if metadata.is_dir() {
             return Err(StoreError::InvalidOptions {
-                reason: "block device path is a directory, not a block device or regular file",
+                reason: "pool backing path is a directory; use a block device or regular file",
+            });
+        }
+        let file_type = metadata.file_type();
+        if !metadata.is_file() && !file_type.is_block_device() {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool backing path must be a block device or regular file",
             });
         }
 
@@ -6137,6 +6143,40 @@ pub(crate) fn load_checksums(segments_dir: &Path) -> BTreeMap<ObjectKey, ObjectD
     }
 
     checksums
+}
+
+#[cfg(test)]
+mod block_device_open_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn open_block_device_accepts_regular_file_dev_backing() {
+        let dir = tempdir().expect("tempdir");
+        let image = dir.path().join("pool.img");
+        let file = File::create(&image).expect("create image");
+        file.set_len(2 * 1024 * 1024).expect("size image");
+
+        let store = LocalObjectStore::open_block_device(&image, StoreOptions::test_fast())
+            .expect("open regular file backing");
+
+        assert!(store.block_device_mode);
+    }
+
+    #[test]
+    fn open_block_device_rejects_directory_path() {
+        let dir = tempdir().expect("tempdir");
+
+        let err = match LocalObjectStore::open_block_device(dir.path(), StoreOptions::test_fast()) {
+            Ok(_) => panic!("directory must not open as a pool backing"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            StoreError::InvalidOptions { reason } if reason.contains("directory")
+        ));
+    }
 }
 
 #[cfg(test)]

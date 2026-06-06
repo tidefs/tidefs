@@ -743,6 +743,7 @@ fn owner_interface_reachable_by_pool_at(root: &Path, pool: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 fn owner_interface_reachable_by_pool_backing_dir_at(
     root: &Path,
     pool: &str,
@@ -757,6 +758,7 @@ fn owner_interface_reachable_by_pool_backing_dir_at(
     })
 }
 
+#[cfg(test)]
 fn cached_owner_by_pool_backing_dir_at(
     root: &Path,
     pool: &str,

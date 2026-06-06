@@ -1,14 +1,15 @@
 //! Block-device-backed object store.
 //!
-//! `BlockDeviceStore` stores objects directly on a raw block device using
-//! a sequential-write log structure.  On open, the full device is scanned
-//! to rebuild the in-memory index.  Objects are immutable once written;
-//! deletes are logical (index removal only).  Space reclamation happens
-//! through compaction/rewrite of live objects.
+//! `BlockDeviceStore` stores objects directly on a byte-addressable block
+//! device or development regular file using a sequential-write log structure.
+//! On open, the full backing is scanned to rebuild the in-memory index.
+//! Objects are immutable once written; deletes are logical (index removal
+//! only). Space reclamation happens through compaction/rewrite of live objects.
 //!
 //! This is the production block-device backend for TideFS pools.
 //! It provides the object-store/segment allocation backend consumed by
-//! `LocalFileSystem` and FUSE when the pool is backed by raw block devices.
+//! `LocalFileSystem` and FUSE when the pool is backed by block devices or
+//! hidden regular-file development devices.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
