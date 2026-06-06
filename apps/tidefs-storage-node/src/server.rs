@@ -99,6 +99,22 @@ fn pool_put_key(pool: &mut Pool, key: ObjectKey, payload: &[u8]) -> Result<(), S
         .map_err(|e| format!("pool key put: {e}"))
 }
 
+fn pool_placement_receipt_ref_for_key(
+    pool: &Pool,
+    key: ObjectKey,
+    object_id: u64,
+) -> Result<PlacementReceiptRef, String> {
+    let receipt = pool
+        .placement_receipt_for_key(ObjectIoClass::Data, key)
+        .map_err(|e| format!("pool key placement receipt lookup: {e}"))?
+        .ok_or_else(|| {
+            "pool key repair succeeded without a durable placement receipt".to_string()
+        })?;
+    receipt
+        .shared_receipt_ref_for_subject(object_id)
+        .map_err(|e| format!("pool key placement receipt projection: {e}"))
+}
+
 fn pool_get_named(pool: &Pool, name: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, String> {
     pool.get(ObjectIoClass::Data, pool_name_key(name))
         .map_err(|e| format!("pool get: {e}"))
@@ -256,12 +272,16 @@ fn apply_receipt_bound_key_repair(
     object_key: ObjectKey,
     payload: &[u8],
     placement_receipt_ref: PlacementReceiptRef,
-) -> Result<(), String> {
+) -> Result<Option<PlacementReceiptRef>, String> {
     validate_repair_receipt_for_object_key(object_key, payload, placement_receipt_ref)?;
+    let repaired_object_id = placement_receipt_ref.object_id;
     match store {
-        StoreBackend::Local(rs) => rs.put_key_local(object_key, payload),
-        StoreBackend::TransportBacked(ts) => ts.put_key_local(object_key, payload),
-        StoreBackend::PoolBacked(pool) => pool_put_key(pool, object_key, payload),
+        StoreBackend::Local(rs) => rs.put_key_local(object_key, payload).map(|_| None),
+        StoreBackend::TransportBacked(ts) => ts.put_key_local(object_key, payload).map(|_| None),
+        StoreBackend::PoolBacked(pool) => {
+            pool_put_key(pool, object_key, payload)?;
+            pool_placement_receipt_ref_for_key(pool, object_key, repaired_object_id).map(Some)
+        }
     }
 }
 
@@ -1990,27 +2010,37 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     placement_receipt_ref,
                     authoritative_payload,
                 } => {
-                    let success = {
+                    let (success, repaired_placement_receipt_ref) = {
                         let mut s = ctx.store.lock().unwrap();
                         match exact_repair_object_key(key) {
-                            Ok(object_key) => apply_receipt_bound_key_repair(
+                            Ok(object_key) => match apply_receipt_bound_key_repair(
                                 &mut *s,
                                 object_key,
                                 authoritative_payload,
                                 *placement_receipt_ref,
-                            )
-                            .is_ok(),
+                            ) {
+                                Ok(repaired_placement_receipt_ref) => {
+                                    (true, repaired_placement_receipt_ref)
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[storage-node] session {session_id}: repair object refused: {e}"
+                                    );
+                                    (false, None)
+                                }
+                            },
                             Err(e) => {
                                 eprintln!(
                                     "[storage-node] session {session_id}: repair object key invalid: {e}"
                                 );
-                                false
+                                (false, None)
                             }
                         }
                     };
                     ReplicationMessage::RepairObjectAck {
                         key: key.clone(),
                         success,
+                        repaired_placement_receipt_ref,
                     }
                 }
                 ReplicationMessage::ScrubResponse {
@@ -3237,9 +3267,10 @@ fn handle_frame_ctx(
                 authoritative_payload,
                 *placement_receipt_ref,
             );
-            if let Err(message) = result {
-                return Some(Frame::Error { message });
-            }
+            let repaired_placement_receipt_ref = match result {
+                Ok(repaired_placement_receipt_ref) => repaired_placement_receipt_ref,
+                Err(message) => return Some(Frame::Error { message }),
+            };
             let success = true;
             eprintln!(
                 "[storage-node] session {session_id}: repair object key={} success={success}",
@@ -3248,6 +3279,7 @@ fn handle_frame_ctx(
             Some(Frame::RepairObjectAck {
                 key: key.clone(),
                 success,
+                repaired_placement_receipt_ref,
             })
         }
         // ── Snapshot lifecycle operations (clustered dataset path) ──
@@ -4043,7 +4075,9 @@ mod cluster_pool_handler_tests {
         let payload = b"authoritative";
         let receipt = receipt_ref_for_key(object_key, payload, 6);
 
-        apply_receipt_bound_key_repair(&mut backend, object_key, payload, receipt).unwrap();
+        let repaired_receipt_ref =
+            apply_receipt_bound_key_repair(&mut backend, object_key, payload, receipt).unwrap();
+        assert_eq!(repaired_receipt_ref, None);
 
         let entries = sync_entries_from_store(&backend);
         assert_eq!(entries.len(), 1);
@@ -4231,7 +4265,19 @@ mod cluster_pool_handler_tests {
             open_imported_pool_backend(&imported, &lock_dir).unwrap(),
         ));
 
-        apply_receipt_bound_key_repair(&mut backend, object_key, payload, receipt).unwrap();
+        let stale_generation = if let StoreBackend::PoolBacked(pool) = &mut backend {
+            pool_put_key(pool, object_key, b"stale-local-payload").unwrap();
+            pool_placement_receipt_ref_for_key(pool, object_key, receipt.object_id)
+                .unwrap()
+                .receipt_generation
+        } else {
+            unreachable!()
+        };
+
+        let repaired_receipt_ref =
+            apply_receipt_bound_key_repair(&mut backend, object_key, payload, receipt)
+                .unwrap()
+                .unwrap();
 
         if let StoreBackend::PoolBacked(pool) = &mut backend {
             assert_eq!(
@@ -4242,6 +4288,14 @@ mod cluster_pool_handler_tests {
                 .unwrap()
                 .is_none());
         }
+        assert_eq!(repaired_receipt_ref.object_id, receipt.object_id);
+        assert_eq!(repaired_receipt_ref.object_key, object_key.as_bytes32());
+        assert_eq!(repaired_receipt_ref.payload_len, payload.len() as u64);
+        let expected_digest: [u8; 32] = blake3::hash(payload).into();
+        assert_eq!(repaired_receipt_ref.payload_digest, expected_digest);
+        assert_eq!(repaired_receipt_ref.target_count, 2);
+        assert!(repaired_receipt_ref.receipt_generation > stale_generation);
+        assert!(!repaired_receipt_ref.is_synthetic());
         let entries = sync_entries_from_store(&backend);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, object_key.as_bytes32());
