@@ -14,6 +14,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::thread;
 use std::time::Duration;
 use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions};
+use tidefs_membership_epoch::EpochId;
+use tidefs_replication_model::PlacementReceiptRef;
 use tidefs_transport::{
     recv_segment_fetch, recv_segment_fetch_response, send_segment_fetch,
     send_segment_fetch_response, NodeInfo, SegmentFetchRequest, SegmentFetchResponse,
@@ -29,6 +31,18 @@ fn temp_store() -> (tempfile::TempDir, LocalObjectStore) {
     let store = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
         .expect("open store");
     (dir, store)
+}
+
+fn receipt_ref(object_id: u64, object_key: [u8; 32]) -> PlacementReceiptRef {
+    PlacementReceiptRef::replicated(
+        object_id,
+        object_key,
+        EpochId::new(12),
+        5,
+        2,
+        32,
+        [0xC1; 32],
+    )
 }
 
 fn listening_transport(node_id: u64) -> (Transport, tidefs_transport::TransportAddr) {
@@ -152,6 +166,56 @@ fn segment_fetch_request_response_over_transport() {
         .close_session(sid, SessionCloseReason::LocalShutdown)
         .expect("close");
     server_handle.join().expect("server thread");
+}
+
+#[test]
+fn segment_fetch_preserves_receipt_ref_over_transport() {
+    let (mut node_a, addr_a) = listening_transport(13);
+    let mut node_b = Transport::new(14);
+
+    node_a.add_node(NodeInfo::new(14, vec![addr_a.clone()], 0));
+    node_b.add_node(NodeInfo::new(13, vec![addr_a], 0));
+
+    let receipt = receipt_ref(1234, [0xD3; 32]);
+
+    let server_handle = thread::spawn(move || {
+        let sid = blocking_accept(&mut node_a);
+        node_a.perform_handshake(sid).expect("server handshake");
+
+        let request = recv_segment_fetch(&mut node_a, sid).expect("server recv");
+        assert_eq!(request.object_id, receipt.object_id);
+        assert_eq!(request.placement_receipt_ref, Some(receipt));
+        assert_eq!(request.non_synthetic_receipt_ref(), Some(receipt));
+        assert_eq!(request.segment_offset, 3);
+        assert_eq!(request.segment_length, 4);
+
+        let response = SegmentFetchResponse::new(
+            request.object_id,
+            request.segment_offset,
+            4,
+            b"pong".to_vec(),
+        );
+        send_segment_fetch_response(&mut node_a, sid, &response).expect("send");
+        node_a
+            .close_session(sid, SessionCloseReason::LocalShutdown)
+            .ok();
+    });
+
+    thread::sleep(Duration::from_millis(50));
+
+    let sid = node_b.connect(13).expect("connect");
+    node_b.perform_handshake(sid).expect("client handshake");
+
+    let request = SegmentFetchRequest::with_placement_receipt_ref(receipt, 3, 4);
+    send_segment_fetch(&mut node_b, sid, &request).expect("client send");
+    let response = recv_segment_fetch_response(&mut node_b, sid).expect("client recv");
+    assert_eq!(response.object_id, receipt.object_id);
+    assert_eq!(response.payload, b"pong".to_vec());
+
+    node_b
+        .close_session(sid, SessionCloseReason::LocalShutdown)
+        .expect("close");
+    server_handle.join().expect("server");
 }
 
 /// Segment fetch with empty payload (zero-length segment).

@@ -491,6 +491,59 @@ fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> 
     }
 }
 
+fn build_segment_fetch_response(
+    store: &StoreBackend,
+    request: &SegmentFetchRequest,
+) -> Result<SegmentFetchResponse, String> {
+    let receipt_ref = request.non_synthetic_receipt_ref();
+    let obj_id = receipt_ref.map_or(request.object_id, |receipt| receipt.object_id);
+    let receipt_key = receipt_ref.map(|receipt| ObjectKey::from_bytes32(receipt.object_key));
+
+    let full_payload = match (store, receipt_key) {
+        (StoreBackend::Local(rs), Some(object_key)) => rs
+            .get_key_local(object_key)
+            .map_err(|e| format!("primary receipt-key get for object {obj_id}: {e}"))?
+            .unwrap_or_default(),
+        (StoreBackend::TransportBacked(ts), Some(object_key)) => ts
+            .get_key_local(object_key)
+            .map_err(|e| format!("primary receipt-key get for object {obj_id}: {e}"))?
+            .unwrap_or_default(),
+        (StoreBackend::PoolBacked(pool), Some(object_key)) => pool_get_key(pool, object_key)
+            .map_err(|e| format!("pool receipt-key get for object {obj_id}: {e}"))?
+            .unwrap_or_default(),
+        (StoreBackend::Local(rs), None) => rs
+            .get_local(request.object_id.to_le_bytes())
+            .map_err(|e| format!("primary get for object {}: {e}", request.object_id))?
+            .unwrap_or_default(),
+        (StoreBackend::TransportBacked(ts), None) => ts
+            .get_local(request.object_id.to_le_bytes())
+            .map_err(|e| format!("primary get for object {}: {e}", request.object_id))?
+            .unwrap_or_default(),
+        (StoreBackend::PoolBacked(pool), None) => {
+            pool_get_named(pool, request.object_id.to_le_bytes())
+                .map_err(|e| format!("pool get for object {}: {e}", request.object_id))?
+                .unwrap_or_default()
+        }
+    };
+
+    let start = request.segment_offset as usize;
+    let end = start.saturating_add(request.segment_length as usize);
+    let segment_payload = if start < full_payload.len() {
+        let slice_end = end.min(full_payload.len());
+        full_payload[start..slice_end].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let actual_length = segment_payload.len() as u64;
+    Ok(SegmentFetchResponse::new(
+        obj_id,
+        request.segment_offset,
+        actual_length,
+        segment_payload,
+    ))
+}
+
 /// Configuration for a storage node server.
 #[derive(Clone)]
 pub struct StorageNodeConfig {
@@ -3385,40 +3438,11 @@ fn handle_segment_fetch_ctx(
     request: SegmentFetchRequest,
     ctx: &SessionContext,
 ) -> Result<u64, String> {
-    let obj_id = request.object_id;
-    let full_payload = {
+    let response = {
         let store_guard = ctx.store.lock().map_err(|e| format!("lock: {e}"))?;
-        match &*store_guard {
-            StoreBackend::Local(rs) => rs
-                .get_local(obj_id.to_le_bytes())
-                .map_err(|e| format!("primary get for object {obj_id}: {e}"))?
-                .unwrap_or_default(),
-            StoreBackend::TransportBacked(ts) => ts
-                .get_local(obj_id.to_le_bytes())
-                .map_err(|e| format!("primary get for object {obj_id}: {e}"))?
-                .unwrap_or_default(),
-            StoreBackend::PoolBacked(pool) => pool_get_named(pool, obj_id.to_le_bytes())
-                .map_err(|e| format!("pool get for object {obj_id}: {e}"))?
-                .unwrap_or_default(),
-        }
+        build_segment_fetch_response(&store_guard, &request)?
     };
-
-    let start = request.segment_offset as usize;
-    let end = start.saturating_add(request.segment_length as usize);
-    let segment_payload = if start < full_payload.len() {
-        let slice_end = end.min(full_payload.len());
-        full_payload[start..slice_end].to_vec()
-    } else {
-        Vec::new()
-    };
-
-    let actual_length = segment_payload.len() as u64;
-    let response = SegmentFetchResponse::new(
-        obj_id,
-        request.segment_offset,
-        actual_length,
-        segment_payload,
-    );
+    let obj_id = response.object_id;
 
     let mut t = ctx.transport.lock().map_err(|e| format!("lock: {e}"))?;
     send_segment_fetch_response(&mut t, session_id, &response)
@@ -4093,6 +4117,44 @@ mod cluster_pool_handler_tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, object_key.as_bytes32());
         assert_eq!(entries[0].1, payload.to_vec());
+    }
+
+    #[test]
+    fn pool_backend_segment_fetch_uses_receipt_object_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let mut backend = StoreBackend::PoolBacked(Box::new(
+            open_imported_pool_backend(&imported, &lock_dir).unwrap(),
+        ));
+
+        let legacy_object_id: u64 = 44;
+        let receipt_key = ObjectKey::from_bytes32([0x5A; 32]);
+        let receipt_payload = b"receipt-authoritative-payload";
+        let legacy_payload = b"legacy-object-id-payload";
+        let receipt = receipt_ref_for_key(receipt_key, receipt_payload, 8);
+
+        if let StoreBackend::PoolBacked(pool) = &mut backend {
+            pool_put_named(pool, legacy_object_id.to_le_bytes(), legacy_payload).unwrap();
+            pool_put_key(pool, receipt_key, receipt_payload).unwrap();
+        }
+
+        let request = SegmentFetchRequest {
+            object_id: legacy_object_id,
+            placement_receipt_ref: Some(receipt),
+            segment_offset: 8,
+            segment_length: 13,
+        };
+
+        let response = build_segment_fetch_response(&backend, &request).unwrap();
+
+        assert_eq!(response.object_id, receipt.object_id);
+        assert_eq!(response.payload, b"authoritative".to_vec());
+        assert_eq!(response.segment_offset, 8);
+        assert_eq!(response.segment_length, 13);
     }
 
     #[test]
