@@ -189,10 +189,6 @@ pub(crate) fn route_if_owner_exists_for_backing_dir_with_args(
     }
 }
 
-pub(crate) fn imported_owner_by_backing_dir(backing_dir: &Path) -> Option<ImportedBackingDirOwner> {
-    imported_owner_by_backing_dir_at(&pool_runtime_root(), backing_dir)
-}
-
 pub(crate) fn route_or_refuse_active_for_uuid_with_args(
     command: &str,
     operation: &str,
