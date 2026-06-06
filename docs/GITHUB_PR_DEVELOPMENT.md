@@ -14,6 +14,9 @@ source changes. This policy supersedes direct implementation on the root
   `/root/tidefs-worktrees/codexN/issue-<number>-<short-slug>`.
 - Push the branch before source edits and open a draft PR after the first
   scoped commit.
+- On this host, publish Codex-authored branches through
+  `/root/ai/bin/git-push-approve` plus `/root/ai/bin/git-push-guard`. Do not
+  bypass a blocked guarded push.
 - Keep commits focused and bisectable. Do not make test-only commits or merge
   commits for normal work.
 - Push after each meaningful commit or checkpoint so other Codex sessions can

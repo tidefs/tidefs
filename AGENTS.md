@@ -10,6 +10,9 @@ otherwise. Do not start or depend on parked Nexus/Factory automation.
   issue branch from `origin/master`, a dedicated worktree under
   `/root/tidefs-worktrees/codexN/`, push the branch before edits, and open a
   draft PR after the first scoped commit.
+- On this host, publish Codex-authored branches through
+  `/root/ai/bin/git-push-approve` plus `/root/ai/bin/git-push-guard`. Do not
+  bypass a blocked guarded push.
 - Keep build output outside the repository, normally with
   `CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target-codexN`.
 - Check disk headroom before work, before heavy validation, and after creating
