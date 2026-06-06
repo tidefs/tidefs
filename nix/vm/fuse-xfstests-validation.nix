@@ -1225,6 +1225,16 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         kill "-$signal" "$tree_pid" 2>/dev/null || true
     }
 
+    LAST_XFSTESTS_TIMEOUT_EMITTED=""
+    emit_xfstests_timeout_fail() {
+        timeout_test="$1"
+        timeout_detail="$2"
+        if [ "''${LAST_XFSTESTS_TIMEOUT_EMITTED:-}" != "$timeout_test" ]; then
+            fail "xfstests_$timeout_test" "$timeout_detail"
+            LAST_XFSTESTS_TIMEOUT_EMITTED="$timeout_test"
+        fi
+    }
+
     wait_process_bounded() {
         wait_pid="$1"
         wait_label="$2"
@@ -1319,6 +1329,7 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         elapsed=0
         while kill -0 "$check_pid" 2>/dev/null; do
             if [ "$elapsed" -ge "$PER_TEST_TIMEOUT" ]; then
+                emit_xfstests_timeout_fail "$bounded_test" "test timed out after ''${PER_TEST_TIMEOUT}s"
                 run_diagnostics_bounded "timeout-$bounded_test" "$bounded_test" "$bounded_result_base" "$bounded_test_log"
                 terminate_process_tree "$check_pid" TERM
                 sleep 2
@@ -1387,7 +1398,7 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             RC=$?
             cat "$TEST_LOG" 2>/dev/null || true
             if [ "$RC" -eq 124 ]; then
-                fail "xfstests_$test" "test timed out after ''${PER_TEST_TIMEOUT}s"
+                emit_xfstests_timeout_fail "$test" "test timed out after ''${PER_TEST_TIMEOUT}s"
             elif [ "$RC" -eq 143 ]; then
                 run_diagnostics_bounded "terminated-$test" "$test" "$RESULT_BASE" "$TEST_LOG"
                 fail "xfstests_$test" "test terminated after ''${PER_TEST_TIMEOUT}s window"
@@ -1712,12 +1723,37 @@ CRASHCMDS
     if [ -f "$QEMU_TIMEOUT_SENTINEL" ]; then
       echo "BLOCKED: harness_qemu_timeout -- QEMU exceeded ''${TIMEOUT_SEC}s" >> "$VAL_LOG"
     fi
+
+    STOPPED_XFSTESTS_TEST=$(
+      grep -aE 'stopping guest after unrecoverable timeout: xfstests-' "$VAL_LOG" 2>/dev/null \
+        | tail -1 \
+        | sed 's/.*unrecoverable timeout: xfstests-//; s/[[:space:]].*$//' \
+        | tr -d '\r' || true
+    )
+    STOPPED_XFSTESTS_OP=""
+    if [ -n "$STOPPED_XFSTESTS_TEST" ]; then
+      STOPPED_XFSTESTS_OP="xfstests_$STOPPED_XFSTESTS_TEST"
+      if ! grep -aE "^(PASS|FAIL): $STOPPED_XFSTESTS_OP([[:space:]]|$)" "$VAL_LOG" >/dev/null 2>&1; then
+        echo "FAIL: $STOPPED_XFSTESTS_OP -- test timed out after ''${PER_TEST_TIMEOUT_SEC}s; guest stopped during timeout recovery" >> "$VAL_LOG"
+      fi
+    fi
+
     ALL_OPS=$(validation_ops)
 
+    STOPPED_XFSTESTS_SEEN=0
     for requested in $TEST_LIST; do
       requested_op="xfstests_$requested"
+      if [ -n "$STOPPED_XFSTESTS_OP" ] && [ "$requested_op" = "$STOPPED_XFSTESTS_OP" ]; then
+        STOPPED_XFSTESTS_SEEN=1
+      fi
       if ! printf '%s\n' "$ALL_OPS" | grep -Fx "$requested_op" >/dev/null 2>&1; then
-        echo "BLOCKED: $requested_op -- requested test produced no parsed validation row" >> "$VAL_LOG"
+        if [ -n "$STOPPED_XFSTESTS_OP" ] \
+           && [ "$STOPPED_XFSTESTS_SEEN" -eq 1 ] \
+           && [ "$requested_op" != "$STOPPED_XFSTESTS_OP" ]; then
+          echo "BLOCKED: $requested_op -- not attempted after unrecoverable timeout in $STOPPED_XFSTESTS_OP" >> "$VAL_LOG"
+        else
+          echo "BLOCKED: $requested_op -- requested test produced no parsed validation row" >> "$VAL_LOG"
+        fi
       fi
     done
     ALL_OPS=$(validation_ops)
