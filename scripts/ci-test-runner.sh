@@ -88,13 +88,13 @@ parse_test_summary() {
 # Determine if a test run produced a "test result:" line (had test targets).
 has_test_results() {
     local output="$1"
-    echo "$output" | grep -q '^test result:'
+    grep -q '^test result:' <<< "$output"
 }
 
 # Determine if output contains a compile error.
 has_compile_error() {
     local output="$1"
-    echo "$output" | grep -q '^error: could not compile'
+    grep -q '^error: could not compile' <<< "$output"
 }
 
 # ---- per-crate test execution ------------------------------------------
@@ -263,7 +263,7 @@ main() {
         IFS=',' read -ra filter_names <<< "$crate_filter"
         for name in "${filter_names[@]}"; do
             name="$(echo "$name" | xargs)" # trim whitespace
-            if echo "$all_crates" | grep -qxF "$name"; then
+            if grep -qxF "$name" <<< "$all_crates"; then
                 crates+=("$name")
             else
                 echo "ci-test-runner: warning: crate '$name' not found in workspace, skipping" >&2
