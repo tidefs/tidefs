@@ -31,6 +31,7 @@ blake3 = "1"
 tidefs-pool-scan = { path = "../../crates/tidefs-pool-scan" }
 tidefs-node-join = { path = "../../crates/tidefs-node-join" }
 tidefs-types-pool-label-core = { path = "../../crates/tidefs-types-pool-label-core" }
+tidefs-rebuild-runtime = { path = "../../crates/tidefs-rebuild-runtime" }
 
 [dev-dependencies]
 tempfile = "3"

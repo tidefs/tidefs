@@ -3404,6 +3404,7 @@ dependencies = [
  "tidefs-partition-runtime",
  "tidefs-pool-import",
  "tidefs-pool-scan",
+ "tidefs-rebuild-runtime",
  "tidefs-replicated-object-store",
  "tidefs-replication-model",
  "tidefs-transport",

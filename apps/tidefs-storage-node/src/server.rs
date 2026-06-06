@@ -2,6 +2,7 @@
 //! put/get/delete/list/stats operations backed by a ReplicatedObjectStore,
 //! plus send/receive backed by a LocalFileSystem at a configured fs_root.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,11 +46,13 @@ use tidefs_partition_runtime::types::PartitionFence;
 use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
 use tidefs_pool_import::{pool_import, ImportedPool};
 use tidefs_pool_scan::PoolDeviceBacking;
+use tidefs_rebuild_runtime::admission::{LossRecord, RebuildAdmission, ReceiptIngestionError};
+use tidefs_rebuild_runtime::scheduler::BackfillScheduler;
 use tidefs_replicated_object_store::{
     ReplicatedObjectStore, ReplicatedStoreConfig, TransportReplicatedStore,
     TransportReplicatedStoreConfig,
 };
-use tidefs_replication_model::PlacementReceiptRef;
+use tidefs_replication_model::{PlacementReceiptRef, ReplicaMovementClass};
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
     send_replication_msg, send_segment_fetch_response, PlacementVersionTracker, ReplicationMessage,
@@ -288,9 +291,158 @@ fn placement_receipt_inventory_json(store: &StoreBackend) -> serde_json::Value {
     }
 }
 
+fn configured_rebuild_target_members(config: &StorageNodeConfig) -> Vec<MemberId> {
+    let local = MemberId::new(config.node_id);
+    let mut targets = BTreeSet::new();
+    for peer in config
+        .replica_peers
+        .iter()
+        .chain(config.membership_peers.iter())
+    {
+        let member = MemberId::new(peer.node_id);
+        if member != local {
+            targets.insert(member);
+        }
+    }
+    targets.into_iter().collect()
+}
+
+fn receipt_ingestion_error_json(error: ReceiptIngestionError) -> serde_json::Value {
+    match error {
+        ReceiptIngestionError::SyntheticReceiptRef { object_id } => serde_json::json!({
+            "class": "synthetic-receipt-ref",
+            "object_id": object_id,
+        }),
+        ReceiptIngestionError::MalformedReceiptPolicy { object_id } => serde_json::json!({
+            "class": "malformed-receipt-policy",
+            "object_id": object_id,
+        }),
+        ReceiptIngestionError::InsufficientReceiptTargets {
+            object_id,
+            required,
+            actual,
+        } => serde_json::json!({
+            "class": "insufficient-receipt-targets",
+            "object_id": object_id,
+            "required": required,
+            "actual": actual,
+        }),
+    }
+}
+
+fn receipt_backed_rebuild_admission_json(
+    config: &StorageNodeConfig,
+    store: &StoreBackend,
+) -> serde_json::Value {
+    let StoreBackend::PoolBacked(pool) = store else {
+        return serde_json::json!({
+            "available": false,
+            "preview": false,
+            "receipt_ref_count": 0,
+            "scheduled_task_count": 0,
+            "reason": "compatibility object-store backend does not expose pool placement receipts; rebuild admission requires Pool::placement_receipt_refs authority",
+        });
+    };
+
+    let receipt_refs = match pool.placement_receipt_refs(ObjectIoClass::Data) {
+        Ok(refs) => refs,
+        Err(e) => {
+            return serde_json::json!({
+                "available": false,
+                "preview": true,
+                "receipt_ref_count": 0,
+                "scheduled_task_count": 0,
+                "reason": format!("pool placement receipt scan failed: {e}"),
+            });
+        }
+    };
+
+    receipt_backed_rebuild_admission_from_refs_json(config, receipt_refs)
+}
+
+fn receipt_backed_rebuild_admission_from_refs_json(
+    config: &StorageNodeConfig,
+    receipt_refs: Vec<PlacementReceiptRef>,
+) -> serde_json::Value {
+    let receipt_ref_count = receipt_refs.len();
+    let detected_epoch = receipt_refs
+        .iter()
+        .map(|receipt| receipt.receipt_epoch.0)
+        .max()
+        .unwrap_or(0);
+
+    let healthy_sources = vec![MemberId::new(config.node_id)];
+    let lost_members = configured_rebuild_target_members(config);
+    if lost_members.is_empty() {
+        return serde_json::json!({
+            "available": false,
+            "preview": true,
+            "receipt_ref_count": receipt_ref_count,
+            "scheduled_task_count": 0,
+            "detected_epoch": detected_epoch,
+            "healthy_sources": healthy_sources,
+            "lost_members": [],
+            "reason": "pool placement receipts are present but no remote membership or replica peer is configured as a rebuild target",
+        });
+    }
+
+    let loss = match LossRecord::from_placement_receipt_refs(
+        lost_members.clone(),
+        healthy_sources.clone(),
+        receipt_refs,
+        ReplicaMovementClass::RebuildLostOrSuspectCopy,
+        detected_epoch,
+        0,
+    ) {
+        Ok(loss) => loss,
+        Err(error) => {
+            return serde_json::json!({
+                "available": false,
+                "preview": true,
+                "receipt_ref_count": receipt_ref_count,
+                "scheduled_task_count": 0,
+                "detected_epoch": detected_epoch,
+                "healthy_sources": healthy_sources,
+                "lost_members": lost_members,
+                "receipt_ingestion_error": receipt_ingestion_error_json(error),
+            });
+        }
+    };
+
+    let mut admission = RebuildAdmission::with_epoch(detected_epoch);
+    let mut scheduler = BackfillScheduler::new();
+    let outcome = admission.admit(&loss, &mut scheduler);
+    let tasks = scheduler.drain_eligible();
+
+    serde_json::json!({
+        "available": true,
+        "preview": true,
+        "receipt_ref_count": receipt_ref_count,
+        "detected_epoch": detected_epoch,
+        "healthy_sources": healthy_sources,
+        "lost_members": lost_members,
+        "admitted_members": outcome.admitted,
+        "refused_members": outcome
+            .refused
+            .into_iter()
+            .map(|(member, reason)| {
+                serde_json::json!({
+                    "member": member,
+                    "reason": format!("{reason:?}"),
+                })
+            })
+            .collect::<Vec<_>>(),
+        "report_count": outcome.report_count,
+        "intent_count": outcome.intent_count,
+        "scheduled_task_count": tasks.len(),
+        "scheduled_tasks": tasks,
+    })
+}
+
 fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> (String, u64) {
     let placement_receipt_refs = placement_receipt_inventory_json(store);
     let placement_receipt_ref_count = placement_receipt_refs["count"].as_u64().unwrap_or(0);
+    let rebuild_admission = receipt_backed_rebuild_admission_json(config, store);
     if matches!(store, StoreBackend::PoolBacked(_)) {
         let json = serde_json::json!({
             "backend": "pool",
@@ -302,6 +454,7 @@ fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> 
             "findings_count": 0,
             "placement_receipt_ref_count": placement_receipt_ref_count,
             "placement_receipt_refs": placement_receipt_refs,
+            "rebuild_admission": rebuild_admission,
         });
         return (json.to_string(), 0);
     }
@@ -322,6 +475,7 @@ fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> 
                 "findings_count": findings,
                 "placement_receipt_ref_count": placement_receipt_ref_count,
                 "placement_receipt_refs": placement_receipt_refs,
+                "rebuild_admission": rebuild_admission,
             });
             (json.to_string(), findings)
         }
@@ -330,6 +484,7 @@ fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> 
                 "error": format!("{e}"),
                 "placement_receipt_ref_count": placement_receipt_ref_count,
                 "placement_receipt_refs": placement_receipt_refs,
+                "rebuild_admission": rebuild_admission,
             });
             (json.to_string(), 0)
         }
@@ -3638,6 +3793,17 @@ mod cluster_pool_handler_tests {
         }
     }
 
+    fn config_with_rebuild_peer() -> StorageNodeConfig {
+        let mut config = minimal_config();
+        config.replica_peers.push(MembershipPeerConfig {
+            node_id: 2,
+            addr: "127.0.0.1:12002".parse().unwrap(),
+            member_class: MemberClass::Voter,
+            failure_domain: 2,
+        });
+        config
+    }
+
     fn imported_regular_file_pool(
         dir: &tempfile::TempDir,
         names: &[&str],
@@ -3779,6 +3945,48 @@ mod cluster_pool_handler_tests {
             .as_str()
             .unwrap()
             .contains("compatibility object-store backend"));
+
+        let admission = receipt_backed_rebuild_admission_json(&minimal_config(), &backend);
+        assert_eq!(admission["available"], false);
+        assert_eq!(admission["scheduled_task_count"], 0);
+        assert!(admission["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not expose pool placement receipts"));
+    }
+
+    #[test]
+    fn rebuild_admission_rejects_invalid_receipt_refs() {
+        let payload = b"invalid-receipt-payload";
+        let object_key = ObjectKey::from_bytes32([0xE4; 32]);
+        let mut under_width = receipt_ref_for_key(object_key, payload, 1);
+        under_width.target_count = 1;
+
+        let admission = receipt_backed_rebuild_admission_from_refs_json(
+            &config_with_rebuild_peer(),
+            vec![under_width],
+        );
+        assert_eq!(admission["available"], false);
+        assert_eq!(admission["receipt_ref_count"], 1);
+        assert_eq!(
+            admission["receipt_ingestion_error"]["class"],
+            "insufficient-receipt-targets"
+        );
+        assert_eq!(admission["receipt_ingestion_error"]["required"], 2);
+        assert_eq!(admission["receipt_ingestion_error"]["actual"], 1);
+
+        let synthetic = PlacementReceiptRef::synthetic_for_subject(
+            tidefs_replication_model::ReplicatedSubjectId::new(99),
+        );
+        let admission = receipt_backed_rebuild_admission_from_refs_json(
+            &config_with_rebuild_peer(),
+            vec![synthetic],
+        );
+        assert_eq!(admission["available"], false);
+        assert_eq!(
+            admission["receipt_ingestion_error"]["class"],
+            "synthetic-receipt-ref"
+        );
     }
 
     #[test]
@@ -3902,12 +4110,43 @@ mod cluster_pool_handler_tests {
             pool_put_named(pool, b"scrubbed", b"payload").unwrap();
         }
 
-        let (report_json, findings_count) = local_scrub_report_json(&minimal_config(), &backend);
+        let (report_json, findings_count) =
+            local_scrub_report_json(&config_with_rebuild_peer(), &backend);
         let report: serde_json::Value = serde_json::from_str(&report_json).unwrap();
         assert_eq!(findings_count, 0);
         assert_eq!(report["backend"], "pool");
         assert_eq!(report["placement_receipt_refs"]["available"], true);
         assert_eq!(report["placement_receipt_ref_count"], 1);
+        assert_eq!(report["rebuild_admission"]["available"], true);
+        assert_eq!(report["rebuild_admission"]["preview"], true);
+        assert_eq!(report["rebuild_admission"]["receipt_ref_count"], 1);
+        assert_eq!(
+            report["rebuild_admission"]["healthy_sources"],
+            serde_json::json!([1])
+        );
+        assert_eq!(
+            report["rebuild_admission"]["lost_members"],
+            serde_json::json!([2])
+        );
+        assert_eq!(
+            report["rebuild_admission"]["admitted_members"],
+            serde_json::json!([2])
+        );
+        assert_eq!(report["rebuild_admission"]["report_count"], 1);
+        assert_eq!(report["rebuild_admission"]["intent_count"], 1);
+        assert_eq!(report["rebuild_admission"]["scheduled_task_count"], 1);
+
+        let receipt_ref = &report["placement_receipt_refs"]["refs"][0];
+        let task = &report["rebuild_admission"]["scheduled_tasks"][0];
+        assert_eq!(task["source_member"], 1);
+        assert_eq!(task["target_member"], 2);
+        assert_eq!(task["subject_ref"], receipt_ref["object_id"]);
+        assert_eq!(task["payload_len"], receipt_ref["payload_len"]);
+        assert_eq!(task["placement_receipt_ref"], *receipt_ref);
+        assert_eq!(
+            task["placement_receipt_ref"]["target_count"],
+            receipt_ref["target_count"]
+        );
     }
 
     #[test]
