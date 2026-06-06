@@ -1071,8 +1071,9 @@ fn handle_pool_integrity_check(
     }
 
     // ── Phase 2: segment-level integrity scan ──
-    // Directory-backed stores use SegmentScanner. Block-device pools fall
-    // back to the block-device object-store scanner when --devices is present.
+    // Compatibility directory stores use SegmentScanner. Byte-addressable
+    // pool members use the block-device object-store scanner when --devices is
+    // present.
     let mut segment_scan_error: Option<String> = None;
     let report_root = backing_dir
         .clone()

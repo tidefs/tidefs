@@ -126,10 +126,10 @@ explicitly:
 tidefsctl device remove <pool> <device> --backing-dir <target-store> --surviving-dirs <stores>
 tidefsctl pool import <pool> --devices <devices>
 tidefsctl pool destroy <pool> --devices <devices>
-tidefsctl pool integrity-check <pool> --devices <devices> --backing-dir <object-store>
-tidefsctl block attach <pool> --backing-dir <object-store>
-tidefsctl block send <pool> --backing-dir <object-store> --target-addr <addr>
-tidefsctl block receive <pool> --backing-dir <object-store> --source-addr <addr>
+tidefsctl pool integrity-check <pool> --devices <devices> --backing-dir <offline-store-dir>
+tidefsctl block attach <pool> --backing-dir <offline-store-dir>
+tidefsctl block send <pool> --backing-dir <offline-store-dir> --target-addr <addr>
+tidefsctl block receive <pool> --backing-dir <offline-store-dir> --source-addr <addr>
 ----
 
 The device-removal offline form first probes existing labels without creating
@@ -137,11 +137,13 @@ or opening the store writable. Those labels provide topology and recovery
 evidence. If the labels identify `ACTIVE` imported state, the request routes to
 the owner interface or fails closed; it does not continue into direct
 evacuation from cached live state. Object-store `--backing-dir` forms are
-explicit development paths. If a reachable owner manifest names that backing
-directory, snapshot commands route to that owner; block commands route only
-when the manifest also names the requested pool. If an owner manifest names
-the backing directory for a different pool, the command refuses instead of
-opening the cached imported state as exported storage. These forms must not
+explicit exported/offline compatibility paths, not pool-member media. Pool
+members are named with `--devices` and must be block devices, or regular files
+only in hidden development mode. If a reachable owner manifest names that
+backing directory, snapshot commands route to that owner; block commands route
+only when the manifest also names the requested pool. If an owner manifest
+names the backing directory for a different pool, the command refuses instead
+of opening the cached imported state as exported storage. These forms must not
 route by pool name alone or make pool-name-only live state changes behind the
 owner.
 Device removal survivor directories and device rebuild source/replacement
