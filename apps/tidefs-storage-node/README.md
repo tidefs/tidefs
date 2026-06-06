@@ -105,6 +105,15 @@ deserialization for `tidefs_transport::ReplicationMessage`.
 | `ScrubRequest` | Runs local segment scrub and reports findings plus receipt-inventory disclosure |
 | `RepairObject { key, placement_receipt_ref, authoritative_payload }` | Validates the shared placement receipt against the exact 32-byte object key, length, digest, policy, and target width before local repair write; responds `RepairObjectAck` |
 
+Pool-backed scrub reports include both `placement_receipt_refs` and a
+`rebuild_admission` preview. The preview is built from the same real
+`PlacementReceiptRef` values through `tidefs-rebuild-runtime` admission and
+scheduler types, so later distributed rebuild orchestration can consume
+receipt-addressed tasks instead of deriving placement from current topology or
+compatibility store listings. Local path-backed and transport-backed
+compatibility stores report rebuild admission as unavailable because they do
+not expose pool placement receipt inventory.
+
 ### Local-Only Operations (LOCAL-ONLY boundary)
 
 Inbound replication messages from peer storage nodes MUST use local-only
