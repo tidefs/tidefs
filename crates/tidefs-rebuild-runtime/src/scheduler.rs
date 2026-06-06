@@ -6,8 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::task::{BackfillTask, BackfillTaskInit};
 use tidefs_membership_epoch::MemberId;
-use tidefs_replication_model::ReplicaMovementClass;
-use tidefs_replication_model::ReplicatedSubjectId;
+use tidefs_replication_model::{PlacementReceiptRef, ReplicaMovementClass, ReplicatedSubjectId};
 
 /// Maximum concurrent transfers a single target node can accept.
 pub const DEFAULT_NODE_CAPACITY: usize = 4;
@@ -17,6 +16,8 @@ pub const DEFAULT_NODE_CAPACITY: usize = 4;
 pub struct DegradedReplicaReport {
     /// Affected subject.
     pub subject_ref: ReplicatedSubjectId,
+    /// Placement receipt that authorizes the healthy source bytes.
+    pub placement_receipt_ref: PlacementReceiptRef,
     /// Healthy source members with a valid copy.
     pub healthy_sources: Vec<MemberId>,
     /// Node(s) missing a healthy replica.
@@ -41,8 +42,8 @@ pub struct BackfillScheduler {
     node_capacity: BTreeMap<MemberId, usize>,
     /// Default capacity for nodes not explicitly configured.
     default_capacity: usize,
-    /// Active (subject, target) pairs already scheduled.
-    active_dedup: BTreeSet<(ReplicatedSubjectId, MemberId)>,
+    /// Active (subject, target, placement receipt) triples already scheduled.
+    active_dedup: BTreeSet<(ReplicatedSubjectId, MemberId, PlacementReceiptRef)>,
     /// Pending tasks in priority order.
     pending: VecDeque<BackfillTask>,
 }
@@ -84,13 +85,14 @@ impl BackfillScheduler {
             };
 
             for &target in &report.missing_targets {
-                let dedup = (report.subject_ref, target);
+                let dedup = (report.subject_ref, target, report.placement_receipt_ref);
                 if self.active_dedup.contains(&dedup) {
                     continue;
                 }
 
                 let task = BackfillTask::new(BackfillTaskInit {
                     subject_ref: report.subject_ref,
+                    placement_receipt_ref: report.placement_receipt_ref,
                     source_member: source,
                     target_member: target,
                     movement_class: report.movement_class,
@@ -180,6 +182,23 @@ mod tests {
     use super::*;
     use tidefs_replication_model::ObjectDigest;
 
+    fn receipt_ref(subject: u64, generation: u64) -> PlacementReceiptRef {
+        let mut object_key = [0xA5; 32];
+        object_key[..8].copy_from_slice(&subject.to_le_bytes());
+        let mut digest = [0x5A; 32];
+        digest[..8].copy_from_slice(&subject.to_le_bytes());
+        digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        PlacementReceiptRef::replicated(
+            subject,
+            object_key,
+            tidefs_membership_epoch::EpochId::new(1),
+            generation,
+            2,
+            4096,
+            digest,
+        )
+    }
+
     fn report(
         subject: u64,
         source: u64,
@@ -187,8 +206,27 @@ mod tests {
         class: ReplicaMovementClass,
         now: u64,
     ) -> DegradedReplicaReport {
+        report_with_receipt(
+            subject,
+            source,
+            missing,
+            class,
+            now,
+            receipt_ref(subject, 1),
+        )
+    }
+
+    fn report_with_receipt(
+        subject: u64,
+        source: u64,
+        missing: &[u64],
+        class: ReplicaMovementClass,
+        now: u64,
+        placement_receipt_ref: PlacementReceiptRef,
+    ) -> DegradedReplicaReport {
         DegradedReplicaReport {
             subject_ref: ReplicatedSubjectId::new(subject),
+            placement_receipt_ref,
             healthy_sources: vec![MemberId::new(source)],
             missing_targets: missing.iter().map(|&m| MemberId::new(m)).collect(),
             movement_class: class,
@@ -247,6 +285,40 @@ mod tests {
 
         assert_eq!(s.pending_count(), 1);
         assert_eq!(s.dedup_count(), 1);
+    }
+
+    #[test]
+    fn distinct_receipt_refs_do_not_deduplicate_subject_target() {
+        let mut s = BackfillScheduler::new();
+        s.ingest(&[
+            report_with_receipt(
+                42,
+                10,
+                &[20],
+                ReplicaMovementClass::BackfillLaggedCopy,
+                1000,
+                receipt_ref(42, 1),
+            ),
+            report_with_receipt(
+                42,
+                99,
+                &[20],
+                ReplicaMovementClass::BackfillLaggedCopy,
+                1000,
+                receipt_ref(42, 2),
+            ),
+        ]);
+
+        assert_eq!(s.pending_count(), 2);
+        assert_eq!(s.dedup_count(), 2);
+
+        let mut generations: Vec<u64> = s
+            .drain_eligible()
+            .iter()
+            .map(|task| task.placement_receipt_ref.receipt_generation)
+            .collect();
+        generations.sort_unstable();
+        assert_eq!(generations, vec![1, 2]);
     }
 
     #[test]
@@ -388,6 +460,7 @@ mod tests {
         let mut s = BackfillScheduler::new();
         let report = DegradedReplicaReport {
             subject_ref: ReplicatedSubjectId::new(1),
+            placement_receipt_ref: receipt_ref(1, 1),
             healthy_sources: vec![],
             missing_targets: vec![MemberId::new(20)],
             movement_class: ReplicaMovementClass::BackfillLaggedCopy,

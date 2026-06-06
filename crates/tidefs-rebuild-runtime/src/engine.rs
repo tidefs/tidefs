@@ -74,11 +74,17 @@ impl Error for EngineError {
 
 /// Compute the deterministic ObjectKey for a backfill task.
 ///
-/// The key is the BLAKE3 hash of (subject_ref.0 || payload_digest.0)
-/// as little-endian bytes, producing a 32-byte content-addressed
-/// identifier that is identical across all replicas for the same
-/// logical object.
+/// Real placement receipt refs carry the source object key that the local pool
+/// made durable. Synthetic compatibility refs fall back to the older
+/// subject+digest derivation used by existing tests and scaffolding callers.
+///
+/// For synthetic refs, the fallback key is the BLAKE3 hash of
+/// (subject_ref.0 || payload_digest.0) as little-endian bytes.
 pub fn task_object_key(task: &BackfillTask) -> ObjectKey {
+    if !task.placement_receipt_ref.is_synthetic() {
+        return ObjectKey::from_bytes32(task.placement_receipt_ref.object_key);
+    }
+
     let mut hasher = blake3::Hasher::new();
     hasher.update(&task.subject_ref.0.to_le_bytes());
     hasher.update(&task.payload_digest.0.to_le_bytes());
@@ -238,7 +244,9 @@ mod tests {
     use crate::task::BackfillTaskInit;
     use std::collections::HashMap;
     use tidefs_membership_epoch::MemberId;
-    use tidefs_replication_model::{ObjectDigest, ReplicaMovementClass, ReplicatedSubjectId};
+    use tidefs_replication_model::{
+        ObjectDigest, PlacementReceiptRef, ReplicaMovementClass, ReplicatedSubjectId,
+    };
 
     /// In-memory object store for testing.
     #[derive(Clone, Debug, Default)]
@@ -273,6 +281,9 @@ mod tests {
     fn test_task(payload_len: u64) -> BackfillTask {
         BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(1),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(1),
+            ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(20),
             movement_class: ReplicaMovementClass::BackfillLaggedCopy,
@@ -383,6 +394,9 @@ mod tests {
     fn task_object_key_is_deterministic() {
         let t1 = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(42),
+            ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(20),
             movement_class: ReplicaMovementClass::BackfillLaggedCopy,
@@ -393,6 +407,9 @@ mod tests {
         });
         let t2 = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(42),
+            ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(99),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
@@ -405,6 +422,9 @@ mod tests {
 
         let t3 = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(42),
+            ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(20),
             movement_class: ReplicaMovementClass::BackfillLaggedCopy,
@@ -414,6 +434,36 @@ mod tests {
             deadline_ns: 5000,
         });
         assert_ne!(task_object_key(&t1), task_object_key(&t3));
+    }
+
+    #[test]
+    fn task_object_key_uses_real_placement_receipt_key() {
+        let mut object_key = [0xA5; 32];
+        object_key[..8].copy_from_slice(&42u64.to_le_bytes());
+        let mut digest = [0x5A; 32];
+        digest[..8].copy_from_slice(&42u64.to_le_bytes());
+
+        let task = BackfillTask::new(BackfillTaskInit {
+            subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref: PlacementReceiptRef::replicated(
+                42,
+                object_key,
+                tidefs_membership_epoch::EpochId::new(7),
+                1,
+                2,
+                4096,
+                digest,
+            ),
+            source_member: MemberId::new(10),
+            target_member: MemberId::new(20),
+            movement_class: ReplicaMovementClass::BackfillLaggedCopy,
+            payload_digest: ObjectDigest::new(0xCAFE),
+            payload_len: 4096,
+            created_at_ns: 1000,
+            deadline_ns: 5000,
+        });
+
+        assert_eq!(task_object_key(&task), ObjectKey::from_bytes32(object_key));
     }
 
     #[test]

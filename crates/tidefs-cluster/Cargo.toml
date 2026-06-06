@@ -17,6 +17,7 @@ tidefs-dataset-catalog = { path = "../tidefs-dataset-catalog" }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"
 tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-replication-model = { path = "../tidefs-replication-model" }
 
 [dev-dependencies]
 serde_json = "1"
