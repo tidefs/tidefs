@@ -68,9 +68,10 @@ use tidefs_types_posix_filesystem_adapter_core::PosixFilesystemAdapterWriteStagi
 use tidefs_types_vfs_core::{
     compose_posix_time_ns, split_posix_time_ns, DirEntry, EngineDirHandle, EngineFileHandle, Errno,
     FileHandleId, Generation, InodeAttr, InodeId, NodeKind, PosixAttrs, RequestCtx, SetAttr,
-    StatFs, FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, FATTR_ATIME,
-    FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME,
-    FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, F_UNLCK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
+    StatFs, FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE,
+    FALLOC_FL_ZERO_RANGE, FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID,
+    FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, F_UNLCK,
+    S_IFMT, S_IFREG, S_ISGID, S_ISUID,
 };
 use tidefs_vfs_engine::{LockSpec, LseekDataRange, VfsEngine, VfsEngineStatFs};
 
@@ -6803,6 +6804,8 @@ impl FuseVfsAdapter {
         let attr = e.getattr(InodeId::new(ino), Some(&efh), ctx)?;
         let raw_flags = attr.flags.to_raw_flags();
         enforce_immutable_guard(raw_flags)?;
+        let old_size = attr.posix.size;
+        let fallocate_end = offset.checked_add(length);
         // Append-only files reject shrinking operations: PUNCH_HOLE and COLLAPSE_RANGE.
         if (mode & FALLOC_FL_PUNCH_HOLE) != 0 || (mode & FALLOC_FL_COLLAPSE_RANGE) != 0 {
             enforce_append_only_write_guard(raw_flags, false)?;
@@ -6857,6 +6860,19 @@ impl FuseVfsAdapter {
                     );
                 }
                 self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
+            } else if (mode & FALLOC_FL_KEEP_SIZE) == 0
+                && fallocate_end.is_some_and(|end| end > old_size)
+            {
+                let end = fallocate_end.expect("successful fallocate checked size");
+                let extension_length = end - old_size;
+                self.reconcile_dirty_mirrors_for_authoritative_range(
+                    ino,
+                    old_size,
+                    extension_length,
+                    AuthoritativeRangePayload::Zeroes,
+                )?;
+                self.invalidate_caches_after_engine_data_mutation(ino, old_size, extension_length);
+                self.invalidate_inode_metadata_after_engine_write(ino);
             } else {
                 self.invalidate_inode_metadata_after_engine_write(ino);
             }
@@ -15046,6 +15062,68 @@ mod tests {
                 .expect("getattr after fallocate")
         };
         assert_eq!(attr.posix.size, 12);
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_fallocate_extension_zeroes_dirty_eof_page_tail() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"fallocate-eof-tail.txt",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let old_size = 1024_usize;
+        let extension_end = 2048_usize;
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, &vec![0x11; old_size], &ctx)
+                .expect("seed old eof");
+        }
+        let wb_cache = Arc::clone(
+            fixture
+                .adapter
+                .writeback_page_cache
+                .as_ref()
+                .expect("writeback page cache"),
+        );
+        wb_cache.insert(ino, 0).expect("seed dirty eof page");
+        {
+            let mut page = wb_cache.lookup(ino, 0).expect("dirty eof page");
+            page.data_mut()[..old_size].fill(0x22);
+            page.data_mut()[old_size..extension_end].fill(0xee);
+            page.mark_dirty();
+        }
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, old_size as u32);
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, 0, 512, 1536)
+            .expect("extend fallocate across eof page");
+
+        let page = wb_cache
+            .lookup(ino, 0)
+            .expect("dirty eof page must remain resident");
+        assert_eq!(&page.data()[..old_size], vec![0x22; old_size].as_slice());
+        assert_eq!(
+            &page.data()[old_size..extension_end],
+            vec![0; extension_end - old_size].as_slice()
+        );
+        assert!(page.is_dirty(), "pre-eof dirty bytes must remain dirty");
+        drop(page);
+        let dirty_state = fixture.adapter.dirty_state.lock().unwrap();
+        let ranges = dirty_state.get(&ino).expect("pre-eof dirty state").ranges();
+        assert_eq!(ranges, &[(0, old_size as u64)]);
     }
 
     #[test]
