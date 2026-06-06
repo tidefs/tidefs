@@ -333,23 +333,19 @@ fn stress_allocate_1000_extents_across_inodes_then_free_all() {
 }
 
 #[test]
-fn stress_many_extents_per_inode_up_to_map_limit() {
-    // Test all 6 slots per inode for several inodes.
+fn stress_many_extents_per_inode_scales_past_inline_limit() {
     let mut alloc = ExtentAllocator::new();
 
     for inode in 1..=10u64 {
-        for j in 0..6u64 {
+        for j in 0..12u64 {
             alloc.allocate_extent(inode, j * 8192, 4096, None).unwrap();
         }
     }
-    assert_eq!(alloc.total_extents(), 60);
+    assert_eq!(alloc.total_extents(), 120);
 
-    // The 7th entry for any inode fails with MapFull.
-    let err = alloc.allocate_extent(1, 6 * 8192, 4096, None).unwrap_err();
-    assert_eq!(
-        err,
-        ExtentAllocError::MapError(tidefs_types_extent_map_core::ExtentMapError::MapFull)
-    );
+    let entries = alloc.lookup_extents(1, 0, 12 * 8192);
+    assert_eq!(entries.len(), 12);
+    assert_eq!(entries[6].logical_offset, 6 * 8192);
 }
 
 // =====================================================================
@@ -442,44 +438,36 @@ fn extent_id_continues_across_inodes() {
 }
 
 // =====================================================================
-// 10. MapFull boundary
+// 10. Sparse scaling beyond inline boundary
 // =====================================================================
 
 #[test]
-fn inline_map_full_at_seventh_entry() {
-    // The allocator uses per-inode InlineExtentMap (V1, <=6 entries).
+fn allocator_accepts_seventh_sparse_extent() {
     let mut alloc = ExtentAllocator::new();
 
-    for i in 0..6u64 {
+    for i in 0..7u64 {
         alloc.allocate_extent(1, i * 8192, 4096, None).unwrap();
     }
-    assert_eq!(alloc.total_extents(), 6);
+    assert_eq!(alloc.total_extents(), 7);
 
-    let err = alloc.allocate_extent(1, 6 * 8192, 4096, None).unwrap_err();
-    assert_eq!(
-        err,
-        ExtentAllocError::MapError(tidefs_types_extent_map_core::ExtentMapError::MapFull)
-    );
+    let entries = alloc.lookup_extents(1, 0, 7 * 8192);
+    assert_eq!(entries.len(), 7);
+    assert_eq!(entries[6].logical_offset, 6 * 8192);
 }
 
 #[test]
-fn map_full_does_not_corrupt_previous_extents() {
+fn scaling_past_inline_limit_preserves_previous_extents() {
     let mut alloc = ExtentAllocator::new();
 
     for i in 0..6u64 {
         alloc.allocate_extent(1, i * 8192, 4096, None).unwrap();
     }
 
-    let err = alloc.allocate_extent(1, 6 * 8192, 4096, None).unwrap_err();
-    assert_eq!(
-        err,
-        ExtentAllocError::MapError(tidefs_types_extent_map_core::ExtentMapError::MapFull)
-    );
+    alloc.allocate_extent(1, 6 * 8192, 4096, None).unwrap();
 
-    // The 6 existing extents should still be intact.
-    assert_eq!(alloc.total_extents(), 6);
-    for i in 0..6u64 {
+    assert_eq!(alloc.total_extents(), 7);
+    for i in 0..7u64 {
         let entries = alloc.lookup_extents(1, i * 8192, 4096);
-        assert_eq!(entries.len(), 1, "extent {i} lost after MapFull");
+        assert_eq!(entries.len(), 1, "extent {i} lost after promotion");
     }
 }

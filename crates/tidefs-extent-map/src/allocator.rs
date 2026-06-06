@@ -3,7 +3,7 @@
 //! `ExtentAllocator` manages physical extent allocation for the local
 //! filesystem write path. Each `allocate_extent` call picks a physical
 //! range, records the logical-to-physical mapping in a per-inode
-//! [`InlineExtentMap`], and returns an [`ExtentId`].
+//! [`PolymorphicExtentMap`], and returns an [`ExtentId`].
 //!
 //! The block allocator reference is a simplified counter-based model for
 //! Phase 1; it will be replaced by `tidefs_spacemap_allocator` integration
@@ -19,7 +19,7 @@ use tidefs_types_extent_map_core::{
 
 use tidefs_shard_group::{ExtentScan, IngestExtent, ReplicaLifecycle};
 
-use crate::{split_into_recordsize_chunks, InlineExtentMap, RecordsizePolicy};
+use crate::{split_into_recordsize_chunks, PolymorphicExtentMap, RecordsizePolicy};
 
 /// Errors returned by the extent allocator.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,7 +59,7 @@ impl From<ExtentMapError> for ExtentAllocError {
 
 /// Phase-1 extent allocator with a simple counter-based block allocator.
 ///
-/// Manages per-inode [`InlineExtentMap`] instances, assigning monotonically
+/// Manages per-inode [`PolymorphicExtentMap`] instances, assigning monotonically
 /// increasing [`LocatorId`] and [`ExtentId`] values to each allocated extent.
 ///
 /// When the spacemap allocator integration lands, the `next_locator` counter
@@ -67,7 +67,7 @@ impl From<ExtentMapError> for ExtentAllocError {
 #[derive(Clone, Debug, Default)]
 pub struct ExtentAllocator {
     /// Per-inode (keyed by inode number) extent maps.
-    maps: BTreeMap<u64, InlineExtentMap>,
+    maps: BTreeMap<u64, PolymorphicExtentMap>,
     /// Monotonically increasing extent id counter.
     next_extent_id: u64,
     /// Monotonically increasing locator id counter (physical address).
@@ -226,8 +226,8 @@ impl ExtentAllocator {
             .get_mut(&inode)
             .ok_or(ExtentAllocError::ExtentNotFound)?;
 
-        let candidates: Vec<usize> = map
-            .entries
+        let mut entries = map.entries_snapshot();
+        let candidates: Vec<usize> = entries
             .iter()
             .enumerate()
             .filter(|(_, e)| {
@@ -244,8 +244,9 @@ impl ExtentAllocator {
 
         let count = candidates.len();
         for idx in candidates {
-            map.entries[idx].finalize_data(checksum, birth_commit_group);
+            entries[idx].finalize_data(checksum, birth_commit_group);
         }
+        map.replace_entries_preserving_totals(&entries)?;
 
         Ok(count)
     }
@@ -270,7 +271,7 @@ impl ExtentAllocator {
 
     /// Find the next data byte offset at or after `offset` for `inode`.
     ///
-    /// Delegates to the underlying [`InlineExtentMap::seek_data`].
+    /// Delegates to the underlying [`PolymorphicExtentMap::seek_data`].
     /// Returns `Some((start, remaining))` if a DATA or UNWRITTEN extent
     /// exists at or after `offset`, or `None` if no data region is found.
     #[must_use]
@@ -280,7 +281,7 @@ impl ExtentAllocator {
 
     /// Find the next hole byte offset at or after `offset` for `inode`.
     ///
-    /// Delegates to the underlying [`InlineExtentMap::seek_hole`].
+    /// Delegates to the underlying [`PolymorphicExtentMap::seek_hole`].
     /// Returns `Some((start, remaining))` if a hole is found at or after
     /// `offset`, or `None` if no hole exists before EOF or `offset` is
     /// past EOF.
@@ -331,13 +332,13 @@ impl ExtentAllocator {
     /// Return total number of extents across all inodes.
     #[must_use]
     pub fn total_extents(&self) -> usize {
-        self.maps.values().map(|m| m.entries.len()).sum()
+        self.maps.values().map(|m| m.entry_count() as usize).sum()
     }
 
     /// Check whether a given inode has any extents.
     #[must_use]
     pub fn has_extents(&self, inode: u64) -> bool {
-        self.maps.get(&inode).is_some_and(|m| !m.entries.is_empty())
+        self.maps.get(&inode).is_some_and(|m| m.entry_count() > 0)
     }
 
     /// Remove all extent state for an inode that has left the live namespace.
@@ -356,11 +357,11 @@ impl ExtentAllocator {
     pub fn ingest_candidates(&self) -> Vec<(u64, ExtentMapEntryV2)> {
         let mut candidates = Vec::new();
         for (&inode, map) in self.maps.iter() {
-            for entry in map.entries.iter() {
+            for entry in map.entries_snapshot() {
                 if (entry.is_data() || entry.is_pending_data())
                     && entry.lifecycle_state() == ExtentLifecycleState::Ingest
                 {
-                    candidates.push((inode, entry.clone()));
+                    candidates.push((inode, entry));
                 }
             }
         }
@@ -379,7 +380,8 @@ impl ExtentAllocator {
             None => return 0,
         };
         let mut count = 0;
-        for entry in map.entries.iter_mut() {
+        let mut entries = map.entries_snapshot();
+        for entry in entries.iter_mut() {
             if (entry.is_data() || entry.is_pending_data())
                 && entry.lifecycle_state() == ExtentLifecycleState::Ingest
                 && entry.intersects(offset, length)
@@ -387,6 +389,9 @@ impl ExtentAllocator {
                 entry.set_base_complete();
                 count += 1;
             }
+        }
+        if count > 0 {
+            let _ = map.replace_entries_preserving_totals(&entries);
         }
         count
     }
@@ -397,7 +402,7 @@ impl ExtentAllocator {
     pub fn ingest_summary(&self) -> IngestSummary {
         let mut s = IngestSummary::default();
         for map in self.maps.values() {
-            for entry in map.entries.iter() {
+            for entry in map.entries_snapshot() {
                 s.total_extents = s.total_extents.saturating_add(1);
                 s.total_bytes = s.total_bytes.saturating_add(entry.length);
                 match entry.lifecycle_state() {
@@ -521,6 +526,37 @@ mod tests {
         // Full scan across all three.
         let entries = allocator.lookup_extents(1, 0, 40960);
         assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn sparse_file_extents_scale_past_inline_limit() {
+        let mut allocator = ExtentAllocator::new();
+        let inode = 1;
+
+        for i in 0..64 {
+            allocator
+                .allocate_extent(inode, i * 8192, 512, None)
+                .expect("sparse allocation should scale past inline map size");
+        }
+
+        assert_eq!(allocator.total_extents(), 64);
+        for i in 0..64 {
+            let offset = i * 8192;
+            let entries = allocator.lookup_extents(inode, offset, 512);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].logical_offset, offset);
+            assert_eq!(entries[0].length, 512);
+            assert!(entries[0].is_pending_data());
+        }
+        assert_eq!(allocator.seek_data(inode, 4096), Some((8192, 512)));
+        assert_eq!(allocator.seek_hole(inode, 0), Some((512, 7680)));
+
+        allocator
+            .finalize_data_extent(inode, 0, 64 * 8192, [0xA5; 32], 42)
+            .expect("finalize sparse extents");
+        let entries = allocator.lookup_extents(inode, 0, 64 * 8192);
+        assert_eq!(entries.len(), 64);
+        assert!(entries.iter().all(|entry| entry.is_data()));
     }
 
     #[test]

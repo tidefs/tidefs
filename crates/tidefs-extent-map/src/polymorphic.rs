@@ -115,6 +115,31 @@ impl PolymorphicExtentMap {
         }
     }
 
+    fn alloc_bytes(&self) -> u64 {
+        match self.active {
+            ExtentMapRepr::Inline => self.inline.header.alloc_bytes,
+            ExtentMapRepr::BTree => self.btree.header.alloc_bytes,
+            ExtentMapRepr::MultiLevel => self.multi_level.header.alloc_bytes,
+        }
+    }
+
+    fn set_header_totals(&mut self, file_size: u64, alloc_bytes: u64) {
+        match self.active {
+            ExtentMapRepr::Inline => {
+                self.inline.header.file_size = file_size;
+                self.inline.header.alloc_bytes = alloc_bytes;
+            }
+            ExtentMapRepr::BTree => {
+                self.btree.header.file_size = file_size;
+                self.btree.header.alloc_bytes = alloc_bytes;
+            }
+            ExtentMapRepr::MultiLevel => {
+                self.multi_level.header.file_size = file_size;
+                self.multi_level.header.alloc_bytes = alloc_bytes;
+            }
+        }
+    }
+
     /// Collect all entries from the active representation.
     fn collect_entries(&self) -> Vec<ExtentMapEntryV2> {
         match self.active {
@@ -353,6 +378,27 @@ impl PolymorphicExtentMap {
                 self.multi_level.header.entry_count = entries.len() as u64;
             }
         }
+    }
+
+    /// Return a sorted snapshot of the active extent entries.
+    pub(crate) fn entries_snapshot(&self) -> Vec<ExtentMapEntryV2> {
+        self.collect_entries()
+    }
+
+    /// Replace entries after representation-neutral metadata updates.
+    pub(crate) fn replace_entries_preserving_totals(
+        &mut self,
+        entries: &[ExtentMapEntryV2],
+    ) -> Result<(), ExtentMapError> {
+        let file_size = self.file_size();
+        let alloc_bytes = self.alloc_bytes();
+        let mut replacement = Self::new();
+        if !entries.is_empty() {
+            replacement.insert_extent(entries)?;
+        }
+        replacement.set_header_totals(file_size, alloc_bytes);
+        *self = replacement;
+        Ok(())
     }
 }
 
