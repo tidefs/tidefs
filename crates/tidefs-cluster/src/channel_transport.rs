@@ -142,7 +142,7 @@ impl PoolTransport for ChannelPoolTransport {
 mod tests {
     use super::*;
     use crate::pool_config::{
-        ClusterPlacementPolicy, ClusterPoolConfig, FailureDomain, NodeDevice,
+        ClusterPlacementPolicy, ClusterPoolConfig, ClusterRedundancy, FailureDomain, NodeDevice,
     };
     use crate::pool_orchestrator::ClusterPoolOrchestrator;
     use crate::pool_protocol::{ClusterPoolCreateRequest, ClusterPoolCreateResponse};
@@ -185,6 +185,7 @@ mod tests {
             pool_name: "test".into(),
             target_node_id: 5,
             node_devices: vec![],
+            redundancy: ClusterRedundancy::None,
             placement: ClusterPlacementPolicy::Stripe,
             allow_file_devices: false,
         });
@@ -205,6 +206,7 @@ mod tests {
             pool_name: "a".into(),
             target_node_id: 1,
             node_devices: vec![],
+            redundancy: ClusterRedundancy::None,
             placement: ClusterPlacementPolicy::Stripe,
             allow_file_devices: false,
         });
@@ -214,6 +216,7 @@ mod tests {
             pool_name: "a".into(),
             target_node_id: 2,
             node_devices: vec![],
+            redundancy: ClusterRedundancy::None,
             placement: ClusterPlacementPolicy::Stripe,
             allow_file_devices: false,
         });

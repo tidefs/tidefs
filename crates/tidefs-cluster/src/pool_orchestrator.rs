@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::pool_config::ClusterPoolConfig;
+use crate::pool_config::{ClusterPlacementPolicy, ClusterPoolConfig};
 use crate::pool_protocol::{
     ClusterPoolCreateRequest, ClusterPoolCreateResponse, ClusterPoolImportRequest,
     ClusterPoolImportResponse, ClusterPoolMessage, NodeDeviceSpec,
@@ -180,7 +180,8 @@ impl ClusterPoolOrchestrator {
                     pool_name: config.pool_name.clone(),
                     target_node_id: node_id,
                     node_devices,
-                    placement: config.placement,
+                    redundancy: config.redundancy,
+                    placement: ClusterPlacementPolicy::from_redundancy(config.redundancy),
                     allow_file_devices: config.allow_file_devices,
                 },
             );
@@ -422,7 +423,9 @@ impl ClusterPoolOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pool_config::{ClusterPlacementPolicy, FailureDomain, NodeDevice};
+    use crate::pool_config::{
+        ClusterPlacementPolicy, ClusterRedundancy, FailureDomain, NodeDevice,
+    };
     use std::path::PathBuf;
 
     fn make_test_device(node_id: u64, local_idx: u32, global_idx: u32) -> NodeDevice {
@@ -469,6 +472,8 @@ mod tests {
             assert_eq!(req.pool_name, "clustertest");
             assert_eq!(req.target_node_id, *node_id);
             assert_eq!(req.node_devices.len(), 1);
+            assert_eq!(req.redundancy, ClusterRedundancy::None);
+            assert_eq!(req.placement, ClusterPlacementPolicy::Stripe);
         }
     }
 
@@ -493,6 +498,41 @@ mod tests {
         assert_eq!(requests[&20].node_devices.len(), 2);
         assert_eq!(requests[&10].target_node_id, 10);
         assert_eq!(requests[&20].target_node_id, 20);
+        assert_eq!(
+            requests[&10].redundancy,
+            ClusterRedundancy::MirrorAcrossNodes { copies: 2 }
+        );
+        assert_eq!(
+            requests[&20].redundancy,
+            ClusterRedundancy::MirrorAcrossNodes { copies: 2 }
+        );
+    }
+
+    #[test]
+    fn build_create_requests_derive_placement_from_redundancy() {
+        let mut config = make_three_node_config();
+        config.redundancy = ClusterRedundancy::ErasureCoded {
+            data_shards: 2,
+            parity_shards: 1,
+        };
+        config.placement = ClusterPlacementPolicy::Stripe;
+
+        let requests = ClusterPoolOrchestrator::build_create_requests(&config, 5);
+
+        assert_eq!(requests.len(), 3);
+        for req in requests.values() {
+            assert_eq!(
+                req.redundancy,
+                ClusterRedundancy::ErasureCoded {
+                    data_shards: 2,
+                    parity_shards: 1,
+                }
+            );
+            assert_eq!(
+                req.placement,
+                ClusterPlacementPolicy::ErasureCoded { data: 2, parity: 1 }
+            );
+        }
     }
 
     #[test]

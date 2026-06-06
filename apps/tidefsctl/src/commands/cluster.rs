@@ -21,8 +21,8 @@ use clap::Subcommand;
 
 use tidefs_cluster::{
     ClusterPlacementPolicy, ClusterPoolConfig, ClusterPoolMessage, ClusterPoolOrchestrator,
-    FailureDomain, HealState, LossEvent, NodeDevice, PlacementHealCoordinator, PlacementMap,
-    PoolTransport,
+    ClusterRedundancy, FailureDomain, HealState, LossEvent, NodeDevice, PlacementHealCoordinator,
+    PlacementMap, PoolTransport,
 };
 use tidefs_membership_epoch::HealthClass;
 use tidefs_transport::{NodeInfo, SessionId, Transport, TransportAddr};
@@ -1180,6 +1180,7 @@ mod tests {
             pool_name: "test".into(),
             target_node_id: 1,
             node_devices: vec![],
+            redundancy: ClusterRedundancy::None,
             placement: ClusterPlacementPolicy::Stripe,
             allow_file_devices: false,
         });

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use tidefs_cluster::pool_config::{ClusterPlacementPolicy, FailureDomain};
+use tidefs_cluster::pool_config::{ClusterPlacementPolicy, ClusterRedundancy, FailureDomain};
 use tidefs_cluster::pool_protocol::{
     ClusterPoolCreateRequest, ClusterPoolCreateResponse, ClusterPoolImportRequest,
     ClusterPoolImportResponse, ClusterPoolMessage, NodeDeviceSpec,
@@ -220,6 +220,7 @@ fn cluster_pool_create_two_nodes_both_succeed() {
                 region: 0,
             },
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -242,6 +243,7 @@ fn cluster_pool_create_two_nodes_both_succeed() {
                 region: 0,
             },
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -338,6 +340,7 @@ fn cluster_pool_create_duplicate_device_rejected() {
                 region: 0,
             },
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -368,6 +371,7 @@ fn cluster_pool_create_duplicate_device_rejected() {
                 region: 0,
             },
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -421,6 +425,7 @@ fn cluster_pool_create_partial_success_one_node_rejects() {
                     region: 0,
                 },
             }],
+            redundancy: ClusterRedundancy::None,
             placement: ClusterPlacementPolicy::Stripe,
             allow_file_devices: true,
         };
@@ -452,6 +457,7 @@ fn cluster_pool_create_partial_success_one_node_rejects() {
                 region: 0,
             },
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -474,6 +480,7 @@ fn cluster_pool_create_partial_success_one_node_rejects() {
                 region: 0,
             },
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -588,6 +595,7 @@ fn cluster_pool_create_import_and_restart_reimport() {
                 region: 0,
             },
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -698,6 +706,7 @@ fn cluster_pool_import_fails_on_unlabeled_device_after_restart() {
                 region: 0,
             },
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -785,6 +794,7 @@ fn cluster_pool_import_refuses_mismatched_guid_after_restart() {
                     region: 0,
                 },
             }],
+            redundancy: ClusterRedundancy::None,
             placement: ClusterPlacementPolicy::Stripe,
             allow_file_devices: true,
         },
@@ -814,6 +824,7 @@ fn cluster_pool_import_refuses_mismatched_guid_after_restart() {
                     region: 0,
                 },
             }],
+            redundancy: ClusterRedundancy::None,
             placement: ClusterPlacementPolicy::Stripe,
             allow_file_devices: true,
         },
@@ -880,6 +891,7 @@ fn cluster_pool_restart_varied_order_nodes_reimport() {
                 region: 0,
             },
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
