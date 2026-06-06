@@ -64,7 +64,7 @@ use tidefs_ublk_abi::{
 };
 
 use crate::block_device_validation::run_block_device_appearance_validation;
-use crate::storage_backend::{BlockVolumeObjectStoreBackend, BlockVolumeStorageBackend};
+use crate::storage_backend::BlockVolumeStorageBackend;
 use crate::ublk_control_open::{
     run_ublk_acceptance_harness, run_ublk_control_add_del_dev_boundary,
     run_ublk_control_add_dev_boundary, run_ublk_control_open_preflight,
@@ -76,7 +76,6 @@ use crate::ublk_control_open::{
     run_ublk_data_queue_open_boundary, run_ublk_live_device,
     BLOCK_VOLUME_UBLK_CONTROL_OPEN_GATE_OW_301O,
 };
-use tidefs_recovery_loop::{CrashRecoveryLoop, CrashRecoveryState, MountState};
 
 pub const BLOCK_VOLUME_ADAPTER_APP_GATE_OW_301G: &str =
     "OW-301G block-volume adapter app smoke surface: boundary probes plus live block-device I/O serving (ublk-serve subcommand)";
@@ -468,7 +467,7 @@ fn print_help() {
         "  ublk-reconnect  probe START_USER_RECOVERY + END_USER_RECOVERY on existing ublk devices"
     );
     println!("  ublk-enumerate-devices  enumerate ublk devices and query capacity");
-    println!("  ublk-serve  serve a live block device backed by a file (SIGINT to stop)");
+    println!("  ublk-serve  serve a live block device backed by a regular file or block device (SIGINT to stop)");
     println!("  ublk-live  alias for ublk-serve");
     println!("  ublk-serve-device  alias for ublk-serve");
     println!("  ublk-acceptance-harness  run the full ublk acceptance harness (ADD_DEV→IO→fio→DEL_DEV→durability re-verify)");
@@ -1229,6 +1228,313 @@ const fn validate_nr_hw_queues(n: u16) -> u16 {
     }
 }
 
+const UBLK_SERVE_USAGE: &str = "usage: ublk-serve (--backing-file <PATH> | --backing-block-device <PATH>) [--create] [--read-only] [--block-size <N>] [--block-count <N>] [--discard-granularity <N>] [--nr-hw-queues <N>] [--drain-deadline <SECONDS>]";
+const UBLK_SERVE_OBJECT_STORE_REFUSAL: &str = "--object-store is not a valid ublk-serve backing; use --backing-file <PATH> for a regular-file dev image or --backing-block-device <PATH> for a real block device";
+const UBLK_SERVE_SNAPSHOT_REFUSAL: &str = "--snapshot is not a valid ublk-serve backing mode; object-store snapshot export is no longer a live backing device";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UblkServeBacking {
+    RegularFile(PathBuf),
+    BlockDevice(PathBuf),
+}
+
+impl UblkServeBacking {
+    fn path(&self) -> &Path {
+        match self {
+            Self::RegularFile(path) | Self::BlockDevice(path) => path,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::RegularFile(_) => "regular-file",
+            Self::BlockDevice(_) => "block-device",
+        }
+    }
+
+    fn resize_supported(&self) -> bool {
+        matches!(self, Self::RegularFile(_))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UblkServeConfig {
+    backing: UblkServeBacking,
+    create: bool,
+    read_only: bool,
+    block_size: usize,
+    block_count: usize,
+    discard_granularity: usize,
+    nr_hw_queues: u16,
+    drain_deadline_secs: u64,
+}
+
+fn parse_ublk_serve_args(
+    args: &[String],
+    cli_nr_hw_queues: u16,
+) -> Result<UblkServeConfig, AppError> {
+    let mut backing_file: Option<PathBuf> = None;
+    let mut backing_block_device: Option<PathBuf> = None;
+    let mut object_store_path: Option<PathBuf> = None;
+    let mut snapshot_name: Option<String> = None;
+    let mut create = false;
+    let mut read_only = false;
+    let mut block_size: usize = 4096;
+    let mut block_count: usize = 262144;
+    let mut discard_granularity: usize = 1;
+    let mut nr_hw_queues: u16 = validate_nr_hw_queues(cli_nr_hw_queues);
+    let mut drain_deadline_secs: u64 = 30;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--backing-file" => {
+                backing_file = Some(PathBuf::from(next_ublk_serve_value(
+                    args,
+                    &mut i,
+                    "--backing-file",
+                )?));
+            }
+            "--backing-block-device" => {
+                backing_block_device = Some(PathBuf::from(next_ublk_serve_value(
+                    args,
+                    &mut i,
+                    "--backing-block-device",
+                )?));
+            }
+            "--object-store" => {
+                object_store_path = Some(PathBuf::from(next_ublk_serve_value(
+                    args,
+                    &mut i,
+                    "--object-store",
+                )?));
+            }
+            "--snapshot" => {
+                snapshot_name =
+                    Some(next_ublk_serve_value(args, &mut i, "--snapshot")?.to_string());
+            }
+            "--create" => create = true,
+            "--read-only" => read_only = true,
+            "--block-size" => {
+                block_size = parse_ublk_serve_usize(
+                    next_ublk_serve_value(args, &mut i, "--block-size")?,
+                    "--block-size",
+                )?;
+            }
+            "--block-count" => {
+                block_count = parse_ublk_serve_usize(
+                    next_ublk_serve_value(args, &mut i, "--block-count")?,
+                    "--block-count",
+                )?;
+            }
+            "--discard-granularity" => {
+                discard_granularity = parse_ublk_serve_usize(
+                    next_ublk_serve_value(args, &mut i, "--discard-granularity")?,
+                    "--discard-granularity",
+                )?;
+            }
+            "--nr-hw-queues" => {
+                nr_hw_queues = validate_nr_hw_queues(parse_ublk_serve_u16(
+                    next_ublk_serve_value(args, &mut i, "--nr-hw-queues")?,
+                    "--nr-hw-queues",
+                )?);
+            }
+            "--drain-deadline" => {
+                drain_deadline_secs = parse_ublk_serve_u64(
+                    next_ublk_serve_value(args, &mut i, "--drain-deadline")?,
+                    "--drain-deadline",
+                )?;
+            }
+            other => {
+                return Err(AppError::new(format!(
+                    "unknown ublk-serve option `{other}`; {UBLK_SERVE_USAGE}"
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    if object_store_path.is_some() {
+        return Err(AppError::new(UBLK_SERVE_OBJECT_STORE_REFUSAL));
+    }
+    if snapshot_name.is_some() {
+        return Err(AppError::new(UBLK_SERVE_SNAPSHOT_REFUSAL));
+    }
+    if backing_file.is_some() && backing_block_device.is_some() {
+        return Err(AppError::new(
+            "choose exactly one of --backing-file or --backing-block-device",
+        ));
+    }
+    if block_size == 0 || block_size % LINUX_SECTOR_SIZE_BYTES != 0 {
+        return Err(AppError::new(format!(
+            "block-size must be a positive multiple of 512, got {block_size}"
+        )));
+    }
+    if block_count == 0 {
+        return Err(AppError::new("block-count must be positive"));
+    }
+
+    let backing = if let Some(path) = backing_file {
+        if create && read_only {
+            return Err(AppError::new(
+                "--create is incompatible with --read-only for regular-file backing",
+            ));
+        }
+        validate_regular_file_ublk_backing(&path, create)?;
+        UblkServeBacking::RegularFile(path)
+    } else if let Some(path) = backing_block_device {
+        if create {
+            return Err(AppError::new(
+                "--create is incompatible with --backing-block-device",
+            ));
+        }
+        validate_block_device_ublk_backing(&path)?;
+        UblkServeBacking::BlockDevice(path)
+    } else {
+        return Err(AppError::new(format!(
+            "missing ublk-serve backing; {UBLK_SERVE_USAGE}"
+        )));
+    };
+
+    Ok(UblkServeConfig {
+        backing,
+        create,
+        read_only,
+        block_size,
+        block_count,
+        discard_granularity,
+        nr_hw_queues,
+        drain_deadline_secs,
+    })
+}
+
+fn next_ublk_serve_value<'a>(
+    args: &'a [String],
+    index: &mut usize,
+    flag: &str,
+) -> Result<&'a str, AppError> {
+    *index += 1;
+    args.get(*index)
+        .map(String::as_str)
+        .ok_or_else(|| AppError::new(format!("{flag} requires a value")))
+}
+
+fn parse_ublk_serve_usize(value: &str, flag: &str) -> Result<usize, AppError> {
+    value
+        .parse::<usize>()
+        .map_err(|err| AppError::new(format!("parse {flag} value `{value}`: {err}")))
+}
+
+fn parse_ublk_serve_u16(value: &str, flag: &str) -> Result<u16, AppError> {
+    value
+        .parse::<u16>()
+        .map_err(|err| AppError::new(format!("parse {flag} value `{value}`: {err}")))
+}
+
+fn parse_ublk_serve_u64(value: &str, flag: &str) -> Result<u64, AppError> {
+    value
+        .parse::<u64>()
+        .map_err(|err| AppError::new(format!("parse {flag} value `{value}`: {err}")))
+}
+
+fn validate_regular_file_ublk_backing(path: &Path, create: bool) -> Result<(), AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_file() {
+                Ok(())
+            } else if file_type.is_dir() {
+                Err(AppError::new(format!(
+                    "regular-file ublk backing `{}` is a directory; directory-backed ublk devices are not supported",
+                    path.display()
+                )))
+            } else if file_type.is_block_device() {
+                Err(AppError::new(format!(
+                    "regular-file ublk backing `{}` is a block device; use --backing-block-device",
+                    path.display()
+                )))
+            } else {
+                Err(AppError::new(format!(
+                    "regular-file ublk backing `{}` is not a regular file",
+                    path.display()
+                )))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && create => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(AppError::new(format!(
+            "regular-file ublk backing `{}` does not exist; pass --create to create a dev image",
+            path.display()
+        ))),
+        Err(err) => Err(AppError::new(format!(
+            "inspect regular-file ublk backing `{}`: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn validate_block_device_ublk_backing(path: &Path) -> Result<(), AppError> {
+    let metadata = fs::metadata(path).map_err(|err| {
+        AppError::new(format!(
+            "inspect block-device ublk backing `{}`: {err}",
+            path.display()
+        ))
+    })?;
+    let file_type = metadata.file_type();
+    if file_type.is_block_device() {
+        Ok(())
+    } else if file_type.is_dir() {
+        Err(AppError::new(format!(
+            "block-device ublk backing `{}` is a directory; directory-backed ublk devices are not supported",
+            path.display()
+        )))
+    } else if file_type.is_file() {
+        Err(AppError::new(format!(
+            "block-device ublk backing `{}` is a regular file; use --backing-file for dev images",
+            path.display()
+        )))
+    } else {
+        Err(AppError::new(format!(
+            "block-device ublk backing `{}` is not a block device",
+            path.display()
+        )))
+    }
+}
+
+fn open_ublk_serve_backing(
+    backing: &UblkServeBacking,
+    create: bool,
+    read_only: bool,
+    geometry: BlockVolumeGeometryRecord,
+) -> Result<BlockVolumeFileImage, AppError> {
+    match backing {
+        UblkServeBacking::RegularFile(path) if read_only => {
+            eprintln!("tidefs ublk-serve: opening regular-file backing read-only");
+            BlockVolumeFileImage::reopen_read_only(path, geometry)
+                .map_err(|err| file_image_error("ublk-serve reopen regular-file read-only", err))
+        }
+        UblkServeBacking::RegularFile(path) if create => {
+            eprintln!("tidefs ublk-serve: creating zeroed regular-file backing");
+            BlockVolumeFileImage::create_zeroed(path, geometry)
+                .map_err(|err| file_image_error("ublk-serve create regular-file backing", err))
+        }
+        UblkServeBacking::RegularFile(path) => {
+            eprintln!("tidefs ublk-serve: reopening existing regular-file backing");
+            BlockVolumeFileImage::reopen_existing(path, geometry)
+                .map_err(|err| file_image_error("ublk-serve reopen regular-file backing", err))
+        }
+        UblkServeBacking::BlockDevice(path) if read_only => {
+            eprintln!("tidefs ublk-serve: opening block-device backing read-only");
+            BlockVolumeFileImage::reopen_read_only(path, geometry)
+                .map_err(|err| file_image_error("ublk-serve reopen block-device read-only", err))
+        }
+        UblkServeBacking::BlockDevice(path) => {
+            eprintln!("tidefs ublk-serve: opening block-device backing read-write");
+            BlockVolumeFileImage::reopen_existing(path, geometry)
+                .map_err(|err| file_image_error("ublk-serve reopen block-device backing", err))
+        }
+    }
+}
+
 fn run_ublk_enumerate_devices() -> Result<(), AppError> {
     let capacities = enumerate_device_capacities()
         .map_err(|e| AppError::new(format!("enumerate ublk devices: {e}")))?;
@@ -1342,106 +1648,17 @@ fn run_ublk_reconnect() -> Result<(), AppError> {
 #[allow(unsafe_code)]
 fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().collect();
-    let mut backing_path: Option<String> = None;
-    let mut create = false;
-    let mut block_size: usize = 4096;
-    let mut block_count: usize = 262144; // 1 GiB default at 4 KiB blocks
-    let mut discard_granularity: usize = 1;
-    let mut nr_hw_queues: u16 = validate_nr_hw_queues(cli_nr_hw_queues);
-    let mut drain_deadline_secs: u64 = 30;
-
-    let mut object_store_path: Option<String> = None;
-    let mut read_only_flag = false;
-    let mut snapshot_name: Option<String> = None;
-
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--object-store" => {
-                i += 1;
-                if i < args.len() {
-                    object_store_path = Some(args[i].clone());
-                }
-            }
-            "--backing-file" => {
-                i += 1;
-                if i < args.len() {
-                    backing_path = Some(args[i].clone());
-                }
-            }
-            "--create" => create = true,
-            "--block-size" => {
-                i += 1;
-                if i < args.len() {
-                    block_size = args[i].parse().unwrap_or(4096);
-                }
-            }
-            "--block-count" => {
-                i += 1;
-                if i < args.len() {
-                    block_count = args[i].parse().unwrap_or(262144);
-                }
-            }
-            "--discard-granularity" => {
-                i += 1;
-                if i < args.len() {
-                    discard_granularity = args[i].parse().unwrap_or(1);
-                }
-            }
-            "--nr-hw-queues" => {
-                i += 1;
-                if i < args.len() {
-                    nr_hw_queues =
-                        validate_nr_hw_queues(args[i].parse().unwrap_or(cli_nr_hw_queues));
-                }
-            }
-            "--read-only" => read_only_flag = true,
-            "--snapshot" => {
-                i += 1;
-                if i < args.len() {
-                    snapshot_name = Some(args[i].clone());
-                }
-            }
-            "--drain-deadline" => {
-                i += 1;
-                if i < args.len() {
-                    drain_deadline_secs = args[i].parse().unwrap_or(30);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    // A snapshot-backed export is always read-only.
-    if snapshot_name.is_some() {
-        read_only_flag = true;
-    }
-
-    let backing = match (&backing_path, &object_store_path) {
-        (Some(ref p), _) => std::path::PathBuf::from(p),
-        (None, Some(ref p)) => std::path::PathBuf::from(p),
-        (None, None) => {
-            eprintln!("tidefs ublk-serve: --backing-file or --object-store is required");
-            eprintln!("usage: ublk-serve --backing-file <PATH> | --object-store <PATH> [--create] [--read-only] [--snapshot <NAME>] [--block-size <N>] [--block-count <N>] [--discard-granularity <N>] [--nr-hw-queues <N>] [--drain-deadline <N>]");
-            return Err(AppError::new("missing --backing-file or --object-store"));
-        }
-    };
-
-    if block_size == 0 || block_size % 512 != 0 {
-        return Err(AppError::new(format!(
-            "block-size must be a positive multiple of 512, got {block_size}"
-        )));
-    }
-    if block_count == 0 {
-        return Err(AppError::new("block-count must be positive"));
-    }
+    let config = parse_ublk_serve_args(&args[2..], cli_nr_hw_queues).map_err(|err| {
+        eprintln!("tidefs ublk-serve: {}", err.message);
+        eprintln!("{UBLK_SERVE_USAGE}");
+        err
+    })?;
 
     let geometry = BlockVolumeGeometryRecord::new(
         BlockVolumeId::new(301_200),
-        block_size,
-        block_count,
-        discard_granularity,
+        config.block_size,
+        config.block_count,
+        config.discard_granularity,
     );
 
     let capacity_mb = geometry
@@ -1449,21 +1666,20 @@ fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), A
         .map(|b| b / (1024 * 1024))
         .unwrap_or(0);
     eprintln!(
-        "tidefs ublk-serve: backing={} geometry={}B x {} blocks discard_gran={} capacity~={}MiB",
-        backing.display(),
-        block_size,
-        block_count,
-        discard_granularity,
+        "tidefs ublk-serve: {} backing={} geometry={}B x {} blocks discard_gran={} capacity~={}MiB",
+        config.backing.kind(),
+        config.backing.path().display(),
+        config.block_size,
+        config.block_count,
+        config.discard_granularity,
         capacity_mb
     );
-    if read_only_flag {
+    if config.read_only {
         eprintln!("tidefs ublk-serve: read-only mode enabled");
     }
-    if let Some(ref snap) = snapshot_name {
-        eprintln!("tidefs ublk-serve: snapshot-backed mode snapshot={snap}");
-    }
 
-    let resize_policy = resolve_resize_policy(true);
+    let resize_policy =
+        resolve_resize_policy(config.backing.resize_supported() && !config.read_only);
     if let Some(reason) = resize_policy.reason {
         eprintln!(
             "tidefs ublk-serve: resize refused -- {} (guest errno: {})",
@@ -1472,121 +1688,10 @@ fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), A
         );
     }
 
-    let mut file_image: Option<BlockVolumeFileImage> = None;
-    let mut obj_backend: Option<BlockVolumeObjectStoreBackend> = None;
-
-    // ── Crash recovery detection ──────────────────────────────────
-    // If using an object store, detect whether the previous shutdown
-    // was unclean and replay intent-log segments before opening.
-    let mount_state_path = object_store_path.as_ref().map(|p| {
-        let mut p = std::path::PathBuf::from(p);
-        p.push(".tidefs_mount_state_ublk");
-        p
-    });
-    if let Some(ref msp) = mount_state_path {
-        let mut recovery = CrashRecoveryLoop::detect(msp)
-            .map_err(|e| AppError::new(format!("crash recovery detection: {e}")))?;
-        recovery.advance();
-        if recovery.state == CrashRecoveryState::Replay {
-            eprintln!("Unclean shutdown detected — replaying intent log...");
-            let store = tidefs_local_object_store::LocalObjectStore::open(
-                object_store_path.as_ref().unwrap(),
-            )
-            .map_err(|e| AppError::new(format!("open store for crash recovery: {e}")))?;
-            recovery
-                .run_replay(&store)
-                .map_err(|e| AppError::new(format!("intent log replay failed: {e}")))?;
-            recovery.reconcile_and_finish();
-            eprintln!("Crash recovery complete — pool is ready.");
-        }
-        // Mark dirty for this session (skip when read-only)
-        if !read_only_flag {
-            MountState::Dirty
-                .write_to_path(msp)
-                .map_err(|e| AppError::new(format!("write mount-state: {e}")))?;
-        }
-    }
-
-    if let Some(ref store_path) = object_store_path {
-        if read_only_flag {
-            eprintln!("tidefs ublk-serve: opening object store read-only at {store_path}");
-        } else {
-            eprintln!("tidefs ublk-serve: opening object store at {store_path}");
-        }
-        let backend = if let Some(ref snap) = snapshot_name {
-            BlockVolumeObjectStoreBackend::open_snapshot_read_only(store_path, geometry, snap)
-                .map_err(|err| {
-                    AppError::new(format!(
-                        "open object store backend snapshot '{snap}': {err}"
-                    ))
-                })?
-        } else if read_only_flag {
-            BlockVolumeObjectStoreBackend::open_read_only(store_path, geometry).map_err(|err| {
-                AppError::new(format!("open object store backend read-only: {err}"))
-            })?
-        } else {
-            BlockVolumeObjectStoreBackend::open(store_path, geometry)
-                .map_err(|err| AppError::new(format!("open object store backend: {err}")))?
-        };
-
-        if let Some(ref snap) = snapshot_name {
-            if let Some(root) = backend.snapshot_committed_root {
-                eprintln!(
-                    "tidefs ublk-serve: snapshot '{}' anchored at commit_group={} root_handle={}",
-                    snap, root.commit_group_id.0, root.root_handle,
-                );
-            }
-        }
-
-        // ── Committed-root validation ──────────────────────────────────
-        // Validate the committed root discovered during pool import via
-        // BLAKE3 domain-separated chain verification.
-        let root_file = std::path::Path::new(store_path).join("tidefs-committed-root");
-        if let Ok(payload) = std::fs::read(&root_file) {
-            if let Some((root, digest)) =
-                tidefs_local_object_store::txg_manager::CommitGroupManager::decode_root_with_digest(
-                    &payload,
-                )
-            {
-                match tidefs_recovery_loop::recovery_loop::validate_committed_root(root, digest) {
-                    Ok(()) => {
-                        eprintln!(
-                            "Committed root validated: commit_group={} handle={}",
-                            root.commit_group_id.0, root.root_handle,
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "warning: committed root validation failed: {e};                              continuing with unvalidated root"
-                        );
-                    }
-                }
-            }
-        }
-
-        obj_backend = Some(backend);
-    } else if read_only_flag {
-        if create {
-            return Err(AppError::new(
-                "--create is incompatible with --read-only for file-backed devices",
-            ));
-        }
-        eprintln!("tidefs ublk-serve: opening backing file read-only");
-        let image = BlockVolumeFileImage::reopen_read_only(&backing, geometry)
-            .map_err(|err| file_image_error("ublk-serve reopen backing read-only", err))?;
-        file_image = Some(image);
-    } else {
-        let image = if create || !backing.exists() {
-            eprintln!("tidefs ublk-serve: creating zeroed backing file");
-            BlockVolumeFileImage::create_zeroed(&backing, geometry)
-                .map_err(|err| file_image_error("ublk-serve create backing", err))?
-        } else {
-            eprintln!("tidefs ublk-serve: reopening existing backing file");
-            BlockVolumeFileImage::reopen_existing(&backing, geometry)
-                .map_err(|err| file_image_error("ublk-serve reopen backing", err))?
-        };
-        file_image = Some(image);
-    }
+    let mut file_image =
+        open_ublk_serve_backing(&config.backing, config.create, config.read_only, geometry)?;
+    let nr_hw_queues = config.nr_hw_queues;
+    let drain_deadline_secs = config.drain_deadline_secs;
 
     // Block SIGTERM, SIGINT, and SIGUSR1 in the main thread (and all threads
     // spawned from it, since the signal mask is inherited). SIGTERM/SIGINT
@@ -1661,13 +1766,7 @@ fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), A
         std::process::id()
     );
 
-    let backend: &mut dyn BlockVolumeStorageBackend = if let Some(ref mut be) = obj_backend {
-        be
-    } else if let Some(ref mut img) = file_image {
-        img
-    } else {
-        return Err(AppError::new("no backend available"));
-    };
+    let backend: &mut dyn BlockVolumeStorageBackend = &mut file_image;
 
     // ── Reconnect detection: enumerate existing ublk devices and pass
     // the first found dev_id to the I/O loop for reconnect. The I/O loop
@@ -1795,13 +1894,6 @@ fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), A
 
     if report.ublk_device_pair_deleted {
         eprintln!("tidefs ublk-serve: device pair cleaned up");
-    }
-
-    // Mark mount state clean on successful shutdown
-    if let Some(ref msp) = mount_state_path {
-        MountState::Clean
-            .write_to_path(msp)
-            .map_err(|e| AppError::new(format!("write clean mount-state: {e}")))?;
     }
 
     // Unblock the sigwait thread: SIGUSR1 is blocked in the main thread mask
@@ -2050,6 +2142,160 @@ impl ResizeFenceFileSmokeReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ublk_serve_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    fn parse_ublk_serve_for_test(args: &[&str]) -> Result<UblkServeConfig, AppError> {
+        parse_ublk_serve_args(&ublk_serve_args(args), 4)
+    }
+
+    fn ublk_serve_parse_error(args: &[&str]) -> String {
+        parse_ublk_serve_for_test(args)
+            .expect_err("ublk-serve parse should fail")
+            .message
+    }
+
+    fn unique_ublk_serve_test_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "tidefs-ublk-serve-{label}-{}-{nonce}",
+            process::id()
+        ))
+    }
+
+    #[test]
+    fn ublk_serve_rejects_object_store_backing() {
+        let message = ublk_serve_parse_error(&["--object-store", "/tmp/tidefs-store"]);
+        assert!(message.contains("--object-store is not a valid ublk-serve backing"));
+        assert!(message.contains("--backing-file"));
+        assert!(message.contains("--backing-block-device"));
+    }
+
+    #[test]
+    fn ublk_serve_rejects_snapshot_backing_mode() {
+        let message = ublk_serve_parse_error(&["--snapshot", "snap0"]);
+        assert!(message.contains("--snapshot is not a valid ublk-serve backing mode"));
+        assert!(message.contains("object-store snapshot export is no longer a live backing"));
+    }
+
+    #[test]
+    fn ublk_serve_rejects_missing_backing() {
+        let message = ublk_serve_parse_error(&["--block-size", "4096"]);
+        assert!(message.contains("missing ublk-serve backing"));
+        assert!(message.contains("--backing-block-device"));
+    }
+
+    #[test]
+    fn ublk_serve_rejects_ambiguous_file_and_block_backing() {
+        let message = ublk_serve_parse_error(&[
+            "--backing-file",
+            "/tmp/a.img",
+            "--backing-block-device",
+            "/dev/sda",
+        ]);
+        assert!(message.contains("choose exactly one"));
+    }
+
+    #[test]
+    fn ublk_serve_rejects_directory_as_regular_file_backing() {
+        let dir = unique_ublk_serve_test_path("file-dir");
+        fs::create_dir(&dir).expect("create temp dir");
+        let message = ublk_serve_parse_error(&["--backing-file", dir.to_str().expect("utf8")]);
+        assert!(message.contains("is a directory"));
+        assert!(message.contains("directory-backed ublk devices are not supported"));
+        fs::remove_dir(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn ublk_serve_rejects_directory_as_block_device_backing() {
+        let dir = unique_ublk_serve_test_path("block-dir");
+        fs::create_dir(&dir).expect("create temp dir");
+        let message =
+            ublk_serve_parse_error(&["--backing-block-device", dir.to_str().expect("utf8")]);
+        assert!(message.contains("is a directory"));
+        assert!(message.contains("directory-backed ublk devices are not supported"));
+        fs::remove_dir(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn ublk_serve_rejects_regular_file_as_block_device_backing() {
+        let backing = TempBackingFile::new().expect("temp backing");
+        fs::write(backing.path(), [0_u8; 4096]).expect("seed file");
+        let message = ublk_serve_parse_error(&[
+            "--backing-block-device",
+            backing.path().to_str().expect("utf8"),
+        ]);
+        assert!(message.contains("is a regular file"));
+        assert!(message.contains("use --backing-file"));
+        assert!(backing.remove().expect("remove"));
+    }
+
+    #[test]
+    fn ublk_serve_rejects_block_device_create_mode() {
+        let message = ublk_serve_parse_error(&[
+            "--backing-block-device",
+            "/dev/tidefs-test-device",
+            "--create",
+        ]);
+        assert!(message.contains("--create is incompatible with --backing-block-device"));
+    }
+
+    #[test]
+    fn ublk_serve_accepts_existing_regular_file_backing() {
+        let backing = TempBackingFile::new().expect("temp backing");
+        fs::write(backing.path(), vec![0_u8; 4096 * 8]).expect("seed file");
+        let config = parse_ublk_serve_for_test(&[
+            "--backing-file",
+            backing.path().to_str().expect("utf8"),
+            "--block-size",
+            "4096",
+            "--block-count",
+            "8",
+            "--nr-hw-queues",
+            "2",
+        ])
+        .expect("parse regular file backing");
+
+        match &config.backing {
+            UblkServeBacking::RegularFile(path) => assert_eq!(path.as_path(), backing.path()),
+            UblkServeBacking::BlockDevice(_) => panic!("expected regular-file backing"),
+        }
+        assert!(!config.create);
+        assert!(!config.read_only);
+        assert_eq!(config.block_size, 4096);
+        assert_eq!(config.block_count, 8);
+        assert_eq!(config.nr_hw_queues, 2);
+        assert!(config.backing.resize_supported());
+        assert!(backing.remove().expect("remove"));
+    }
+
+    #[test]
+    fn ublk_serve_accepts_regular_file_create_mode_without_preexisting_path() {
+        let path = unique_ublk_serve_test_path("create-file");
+        let config = parse_ublk_serve_for_test(&[
+            "--backing-file",
+            path.to_str().expect("utf8"),
+            "--create",
+            "--block-size",
+            "4096",
+            "--block-count",
+            "8",
+        ])
+        .expect("parse create mode");
+        match &config.backing {
+            UblkServeBacking::RegularFile(backing_path) => {
+                assert_eq!(backing_path.as_path(), path.as_path());
+            }
+            UblkServeBacking::BlockDevice(_) => panic!("expected regular-file backing"),
+        }
+        assert!(config.create);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn backing_file_smoke_uses_real_backing_file_without_live_ublk() {
