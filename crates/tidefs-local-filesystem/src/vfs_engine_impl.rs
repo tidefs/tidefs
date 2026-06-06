@@ -25,9 +25,6 @@ use tidefs_types_vfs_core::{
 use tidefs_types_vfs_core::{LockRange, LockType};
 use tidefs_vfs_engine::{LseekDataRange, VfsEngine, VfsEngineStatFs};
 
-use crate::content::{
-    content_chunk_start, read_content_chunk_from_store, read_content_layout_from_store,
-};
 use crate::error::FileSystemError;
 use crate::fuse_getattr;
 use crate::fuse_setattr;
@@ -38,7 +35,6 @@ use crate::readahead::ReadaheadTracker;
 use crate::release_dispatch;
 use crate::types::{InodeRecord, NamespaceEntry};
 use crate::xattr_dispatch;
-use crate::ContentLayout;
 use tidefs_inode_attributes::timestamp::{TimestampPolicy, TimestampUpdate};
 use tidefs_posix_semantics::apply_setgid_inheritance_for_create;
 use tidefs_posix_semantics::sticky_dir_allows_unlink_or_rename;
@@ -185,39 +181,29 @@ impl SparseAnonymousData {
         }
     }
 
-    fn from_vec(bytes: Vec<u8>) -> Self {
-        let mut data = Self::new();
-        data.insert_if_data(0, bytes);
-        data
-    }
+    fn from_open_local_file(
+        fs: &LocalFileSystem,
+        path: &str,
+        record: &InodeRecord,
+    ) -> crate::Result<(Self, u64)> {
+        const SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
 
-    fn from_local_file(fs: &LocalFileSystem, record: &InodeRecord) -> crate::Result<Self> {
-        let layout = read_content_layout_from_store(
-            fs.store.raw_primary_store(),
-            record.inode_id,
-            record,
-            true,
-        )?;
-        match layout {
-            ContentLayout::Inline(content) => Ok(Self::from_vec(content.bytes)),
-            ContentLayout::Chunked(manifest) => {
-                let mut data = Self::new();
-                for chunk_ref in manifest
-                    .chunks
-                    .iter()
-                    .filter(|chunk_ref| !chunk_ref.is_hole())
-                {
-                    let chunk = read_content_chunk_from_store(
-                        fs.store.raw_primary_store(),
-                        record.inode_id,
-                        chunk_ref,
-                    )?;
-                    let offset = content_chunk_start(chunk_ref.chunk_index)?;
-                    data.insert_if_data(offset, chunk.bytes);
-                }
-                Ok(data)
-            }
+        let file_size = fs.effective_file_size(record.inode_id);
+        let mut data = Self::new();
+        let mut offset = 0_u64;
+        while offset < file_size {
+            let remaining = file_size - offset;
+            let len =
+                usize::try_from(remaining.min(SNAPSHOT_CHUNK_BYTES as u64)).map_err(|_| {
+                    crate::FileSystemError::SizeOverflow {
+                        requested: remaining,
+                    }
+                })?;
+            let bytes = fs.read_file_range(path, offset, len)?;
+            data.insert_if_data(offset, bytes);
+            offset = offset.saturating_add(len as u64);
         }
+        Ok((data, file_size))
     }
 
     fn insert_if_data(&mut self, offset: u64, bytes: Vec<u8>) {
@@ -3127,30 +3113,19 @@ impl VfsEngine for VfsLocalFileSystem {
             .borrow()
             .contains_inode(record.inode_id);
         if has_open_handles {
-            self.fs
-                .borrow_mut()
-                .flush_write_buffer(record.inode_id)
-                .map_err(|e| map_errno(&e))?;
-            let record = self
-                .fs
-                .borrow()
-                .stat(&child_path)
-                .map_err(|e| map_errno(&e))?;
-            let mut attr = self
-                .fs
-                .borrow()
-                .stat_attr(&child_path)
-                .map_err(|e| map_errno(&e))?;
-            if attr.posix.nlink <= 1 {
-                attr.posix.nlink = 0;
-                attr.posix.ctime_ns = crate::types::current_posix_time_ns();
-                let data = {
+            if record.nlink <= 1 {
+                let (data, file_size) = {
                     let fs = self.fs.borrow();
-                    SparseAnonymousData::from_local_file(&fs, &record).map_err(|e| map_errno(&e))?
+                    SparseAnonymousData::from_open_local_file(&fs, &child_path, &record)
+                        .map_err(|e| map_errno(&e))?
                 };
+                let mut attr = record.to_inode_attr();
+                attr.posix.nlink = 0;
+                attr.posix.size = file_size;
+                attr.posix.ctime_ns = crate::types::current_posix_time_ns();
                 self.fs
                     .borrow_mut()
-                    .unlink(&child_path)
+                    .unlink_without_write_buffer_flush(&child_path)
                     .map_err(|e| map_errno(&e))?;
                 self.anonymous_tmpfiles
                     .borrow_mut()
@@ -3158,7 +3133,7 @@ impl VfsEngine for VfsLocalFileSystem {
             } else {
                 self.fs
                     .borrow_mut()
-                    .unlink(&child_path)
+                    .unlink_without_write_buffer_flush(&child_path)
                     .map_err(|e| map_errno(&e))?;
             }
         } else {
@@ -6347,6 +6322,61 @@ mod tests {
             Errno::ENOENT
         );
         assert_eq!(engine.release(&fh).unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn unlink_open_file_snapshots_unflushed_write_buffer_without_flush() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"buffered-open-gone.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let payload = b"buffered bytes survive open unlink";
+
+        engine.write(&fh, 0, payload, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(attr.inode_id, 0, payload.len())
+                .as_deref(),
+            Some(&payload[..]),
+            "test setup should leave data in the write buffer"
+        );
+
+        engine
+            .unlink(root, b"buffered-open-gone.txt", &ctx())
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .lookup(root, b"buffered-open-gone.txt", &ctx())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(attr.inode_id, 0, payload.len())
+                .is_none(),
+            "unlink should clear removed inode write-buffer state"
+        );
+        let anonymous = engine.anonymous_tmpfiles.borrow();
+        let file = anonymous
+            .get(&attr.inode_id)
+            .expect("open-unlinked inode should be anonymous");
+        assert_eq!(file.attr.posix.size, payload.len() as u64);
+        assert_eq!(file.attr.posix.nlink, 0);
+        assert_eq!(file.data.extents.len(), 1);
+        drop(anonymous);
+        assert_eq!(
+            engine
+                .read(&fh, 0, u32::try_from(payload.len()).unwrap(), &ctx())
+                .unwrap(),
+            payload
+        );
+        engine.release(&fh).unwrap();
     }
 
     #[test]

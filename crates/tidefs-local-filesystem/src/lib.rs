@@ -7344,6 +7344,17 @@ impl LocalFileSystem {
     }
 
     pub fn unlink(&mut self, path: impl AsRef<str>) -> Result<()> {
+        self.unlink_internal(path.as_ref(), true)
+    }
+
+    pub(crate) fn unlink_without_write_buffer_flush(
+        &mut self,
+        path: impl AsRef<str>,
+    ) -> Result<()> {
+        self.unlink_internal(path.as_ref(), false)
+    }
+
+    fn unlink_internal(&mut self, path: &str, flush_write_buffer: bool) -> Result<()> {
         let path = path.as_ref();
 
         // ── Namespace-level pre-check (reuse namespace module) ──────
@@ -7360,10 +7371,17 @@ impl LocalFileSystem {
             .ok_or_else(|| FileSystemError::NotFound {
                 path: path.to_string(),
             })?;
-        self.flush_file_write_buffer_for_entry(&entry)?;
+        if flush_write_buffer {
+            self.flush_file_write_buffer_for_entry(&entry)?;
+        }
         let record = self.inode(entry.inode_id)?.clone();
         // pre_check already ensures target is not a directory.
         debug_assert!(record.kind() != NodeKind::Dir);
+        let effective_size = if record.kind() == NodeKind::File {
+            self.effective_file_size(entry.inode_id)
+        } else {
+            record.size
+        };
 
         let was_multilinked = record.nlink > 1;
 
@@ -7371,9 +7389,9 @@ impl LocalFileSystem {
                                // Accumulate space delta for unlink only when this removes the last link.
                                // File size can include sparse holes; only data extents release logical
                                // bytes, while unwritten extents release reservation bytes.
-        if !was_multilinked && record.size > 0 {
+        if !was_multilinked && effective_size > 0 {
             let (data_bytes, reserved_bytes) =
-                self.accounted_extent_bytes(entry.inode_id, 0, record.size);
+                self.accounted_extent_bytes(entry.inode_id, 0, effective_size);
             let projected = self
                 .state
                 .space_accounting
@@ -9837,6 +9855,8 @@ impl LocalFileSystem {
         self.state.last_dir_write_tx.remove(&inode_id);
         self.state.last_extent_map_write_tx.remove(&inode_id);
         self.state.extent_maps.remove(&inode_id);
+        self.extent_allocator.remove_inode(inode_id.0);
+        self.obligation_ledger.release_claims_for_inode(inode_id);
         self.state.known_inode_ids.remove(&inode_id);
         self.dirty_set.forget_inode(inode_id);
         self.inode_cache.borrow_mut().invalidate(inode_id);

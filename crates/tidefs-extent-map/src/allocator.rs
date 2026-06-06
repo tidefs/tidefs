@@ -340,6 +340,11 @@ impl ExtentAllocator {
         self.maps.get(&inode).is_some_and(|m| !m.entries.is_empty())
     }
 
+    /// Remove all extent state for an inode that has left the live namespace.
+    pub fn remove_inode(&mut self, inode: u64) -> bool {
+        self.maps.remove(&inode).is_some()
+    }
+
     /// Return all extents currently in the INGEST lifecycle state
     /// (awaiting rebake to base placement). Each entry is paired with
     /// its owning inode number.
@@ -581,6 +586,20 @@ mod tests {
         // Inode 1 should not see inode 2's extents.
         let entries_inode1_full = allocator.lookup_extents(1, 0, 16384);
         assert_eq!(entries_inode1_full.len(), 1);
+    }
+
+    #[test]
+    fn remove_inode_drops_all_extent_state_for_inode() {
+        let mut allocator = ExtentAllocator::new();
+
+        allocator.allocate_extent(1, 0, 4096, None).unwrap();
+        allocator.allocate_extent(1, 8192, 4096, None).unwrap();
+        allocator.allocate_extent(2, 0, 4096, None).unwrap();
+
+        assert!(allocator.remove_inode(1));
+        assert!(!allocator.has_extents(1));
+        assert!(allocator.has_extents(2));
+        assert!(!allocator.remove_inode(1));
     }
 
     #[test]
