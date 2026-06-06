@@ -125,9 +125,9 @@ impl LayoutValidator {
             }
             DurabilityPolicy::ErasureStyle {
                 data_shards,
-                parity_shards: _,
+                parity_shards,
             } => {
-                self.validate_erasure(*data_shards, topology, &mut result);
+                self.validate_erasure(*data_shards, *parity_shards, topology, &mut result);
             }
             DurabilityPolicy::Hybrid {
                 mirror_copies,
@@ -183,10 +183,10 @@ impl LayoutValidator {
             DurabilityPolicy::Mirror { copies } => (*copies as usize, 1),
             DurabilityPolicy::ErasureStyle {
                 data_shards,
-                parity_shards: _,
+                parity_shards,
             } => {
-                let total = *data_shards as usize;
-                (total, total)
+                let total = (*data_shards + *parity_shards) as usize;
+                (total, *data_shards as usize)
             }
             DurabilityPolicy::Hybrid {
                 mirror_copies: _,
@@ -253,6 +253,7 @@ impl LayoutValidator {
     fn validate_erasure(
         &self,
         data_shards: u8,
+        parity_shards: u8,
         topology: &FailureDomainTopology,
         result: &mut ValidationResult,
     ) {
@@ -263,12 +264,13 @@ impl LayoutValidator {
         }
 
         let device_count = topology.device_count();
-        if device_count < data_shards as usize {
+        let total_shards = (data_shards + parity_shards) as usize;
+        if device_count < total_shards {
             result.valid = false;
             result
                 .errors
                 .push(LayoutValidationError::InsufficientDevices {
-                    required: data_shards as usize,
+                    required: total_shards,
                     available: device_count,
                 });
         }
@@ -460,16 +462,34 @@ mod tests {
     }
 
     #[test]
-    fn erasure_4_insufficient_devices_rejected() {
+    fn erasure_4_2_four_devices_requires_six_targets() {
         let mut topo = FailureDomainTopology::new();
         topo.add_node(1, 10, 100);
-        topo.add_device(101, 1);
-        topo.add_device(102, 1);
-        topo.add_device(103, 1);
+        topo.add_node(2, 10, 100);
+        for device_id in 0..4 {
+            let node_id = if device_id % 2 == 0 { 1 } else { 2 };
+            topo.add_device(100 + device_id, node_id);
+        }
         let layout = DurabilityLayoutV1::erasure(4, 2).unwrap();
         let validator = LayoutValidator::new(layout);
         let result = validator.validate(&topo);
         assert!(!result.valid);
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            LayoutValidationError::InsufficientDevices {
+                required: 6,
+                available: 4
+            }
+        )));
+    }
+
+    #[test]
+    fn erasure_4_2_failure_scenario_uses_full_width() {
+        let layout = DurabilityLayoutV1::erasure(4, 2).unwrap();
+        let validator = LayoutValidator::new(layout);
+        assert!(validator
+            .validate_failure_scenario(&three_node_two_rack_topology(), &[1])
+            .is_ok());
     }
 
     #[test]
