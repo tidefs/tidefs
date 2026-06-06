@@ -14,7 +14,9 @@ use std::convert::TryFrom;
 #[cfg(feature = "abi-7-28")]
 use std::convert::TryInto;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
+use crate::abort::AbortRegistry;
 use crate::channel::ChannelSender;
 use crate::ll::Request as _;
 #[cfg(feature = "abi-7-21")]
@@ -23,6 +25,13 @@ use crate::reply::{Reply, ReplyDirectory, ReplySender};
 use crate::session::{Session, SessionACL};
 use crate::Filesystem;
 use crate::{ll, KernelConfig};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DispatchLane {
+    Inline,
+    FileWriteback,
+    Maintenance,
+}
 
 /// Request data structure
 pub struct Request<'a> {
@@ -106,6 +115,252 @@ impl<'a> Request<'a> {
 
         if let Err(err) = res {
             warn!("Request {unique:?}: Failed to send reply: {err}")
+        }
+    }
+
+    pub(crate) fn dispatch_lane(&self, initialized: bool) -> DispatchLane {
+        if !initialized {
+            return DispatchLane::Inline;
+        }
+        let Ok(op) = self.request.operation() else {
+            return DispatchLane::Inline;
+        };
+        match op {
+            ll::Operation::SetAttr(_)
+            | ll::Operation::Write(_)
+            | ll::Operation::Flush(_)
+            | ll::Operation::Release(_)
+            | ll::Operation::FSync(_) => DispatchLane::FileWriteback,
+            #[cfg(feature = "abi-7-19")]
+            ll::Operation::FAllocate(_) => DispatchLane::FileWriteback,
+            #[cfg(feature = "abi-7-28")]
+            ll::Operation::CopyFileRange(_) => DispatchLane::FileWriteback,
+            ll::Operation::Forget(_) => DispatchLane::Maintenance,
+            #[cfg(feature = "abi-7-16")]
+            ll::Operation::BatchForget(_) => DispatchLane::Maintenance,
+            _ => DispatchLane::Inline,
+        }
+    }
+
+    pub(crate) fn reply_io_error(&self) {
+        let unique = self.request.unique();
+        let res = self
+            .request
+            .reply_err(Errno::EIO)
+            .with_iovec(unique, |iov| self.ch.send(iov));
+        if let Err(err) = res {
+            warn!("Request {unique:?}: Failed to send EIO reply: {err}")
+        }
+    }
+
+    pub(crate) fn dispatch_file_writeback_worker<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        abort_registry: &AbortRegistry,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) {
+        debug!("{}", self.request);
+        let unique = self.request.unique();
+        let opcode = self.request.opcode();
+        let inode: u64 = self.request.nodeid().into();
+        let res = match self.dispatch_file_writeback_req(
+            filesystem,
+            abort_registry,
+            allowed,
+            session_owner,
+        ) {
+            Ok(Some(resp)) => resp,
+            Ok(None) => return,
+            Err(errno) => {
+                ERROR_COUNTERS.increment(opcode);
+                warn!(
+                    "FUSE {} error: ino={:#x?} errno={} ({})",
+                    opcode_name(opcode),
+                    inode,
+                    i32::from(errno.0),
+                    errno_name(i32::from(errno.0)),
+                );
+                self.request.reply_err(errno)
+            }
+        }
+        .with_iovec(unique, |iov| self.ch.send(iov));
+
+        if let Err(err) = res {
+            warn!("Request {unique:?}: Failed to send reply: {err}")
+        }
+    }
+
+    pub(crate) fn dispatch_maintenance_worker<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) {
+        debug!("{}", self.request);
+        if self.acl_denied(allowed, session_owner) {
+            return;
+        }
+        let Ok(op) = self.request.operation() else {
+            return;
+        };
+        let mut fs = filesystem.lock().expect("filesystem mutex poisoned");
+        match op {
+            ll::Operation::Forget(x) => {
+                fs.forget(self, self.request.nodeid().into(), x.nlookup());
+            }
+            #[cfg(feature = "abi-7-16")]
+            ll::Operation::BatchForget(x) => {
+                fs.batch_forget(self, x.nodes());
+            }
+            _ => {}
+        }
+    }
+
+    fn dispatch_file_writeback_req<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        abort_registry: &AbortRegistry,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) -> Result<Option<Response<'_>>, Errno> {
+        if self.acl_denied(allowed, session_owner) {
+            return Err(Errno::EACCES);
+        }
+        let op = self.request.operation().map_err(|_| Errno::ENOSYS)?;
+        let mut fs = filesystem.lock().expect("filesystem mutex poisoned");
+        match op {
+            ll::Operation::SetAttr(x) => {
+                fs.setattr(
+                    self,
+                    self.request.nodeid().into(),
+                    x.mode(),
+                    x.uid(),
+                    x.gid(),
+                    x.size(),
+                    x.atime(),
+                    x.mtime(),
+                    x.ctime(),
+                    x.file_handle().map(|fh| fh.into()),
+                    x.crtime(),
+                    x.chgtime(),
+                    x.bkuptime(),
+                    x.flags(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::Write(x) => {
+                fs.write(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.offset(),
+                    x.data(),
+                    x.write_flags(),
+                    x.flags(),
+                    x.lock_owner().map(|l| l.into()),
+                    self.reply(),
+                );
+            }
+            ll::Operation::Flush(x) => {
+                fs.flush(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.lock_owner().into(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::Release(x) => {
+                fs.release(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.flags(),
+                    x.lock_owner().map(|x| x.into()),
+                    x.flush(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::FSync(x) => {
+                let unique = self.request.unique().into();
+                let handle = abort_registry.register(unique);
+                self.attach_abort(handle);
+                fs.fsync(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.fdatasync(),
+                    self.reply(),
+                );
+                abort_registry.remove(unique);
+            }
+            #[cfg(feature = "abi-7-19")]
+            ll::Operation::FAllocate(x) => {
+                fs.fallocate(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.offset(),
+                    x.len(),
+                    x.mode(),
+                    self.reply(),
+                );
+            }
+            #[cfg(feature = "abi-7-28")]
+            ll::Operation::CopyFileRange(x) => {
+                let flags: u32 = match x.flags().try_into() {
+                    Ok(f) => f,
+                    Err(_) => return Err(Errno::EINVAL),
+                };
+                let (i, o) = (x.src(), x.dest());
+                fs.copy_file_range(
+                    self,
+                    i.inode.into(),
+                    i.file_handle.into(),
+                    i.offset,
+                    o.inode.into(),
+                    o.file_handle.into(),
+                    o.offset,
+                    x.len(),
+                    flags,
+                    self.reply(),
+                );
+            }
+            _ => return Err(Errno::ENOSYS),
+        }
+        Ok(None)
+    }
+
+    fn acl_denied(&self, allowed: SessionACL, session_owner: u32) -> bool {
+        if !((allowed == SessionACL::RootAndOwner
+            && self.request.uid() != session_owner
+            && self.request.uid() != 0)
+            || (allowed == SessionACL::Owner && self.request.uid() != session_owner))
+        {
+            return false;
+        }
+
+        let Ok(op) = self.request.operation() else {
+            return true;
+        };
+        match op {
+            ll::Operation::Init(_)
+            | ll::Operation::Destroy(_)
+            | ll::Operation::Read(_)
+            | ll::Operation::ReadDir(_)
+            | ll::Operation::Forget(_)
+            | ll::Operation::Write(_)
+            | ll::Operation::FSync(_)
+            | ll::Operation::FSyncDir(_)
+            | ll::Operation::Release(_)
+            | ll::Operation::ReleaseDir(_)
+            | ll::Operation::Flush(_) => false,
+            #[cfg(feature = "abi-7-16")]
+            ll::Operation::BatchForget(_) => false,
+            #[cfg(feature = "abi-7-21")]
+            ll::Operation::ReadDirPlus(_) => false,
+            _ => true,
         }
     }
 
@@ -202,6 +457,8 @@ impl<'a> Request<'a> {
                 }
                 // Call filesystem init method and give it a chance to return an error
                 se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
                     .init(self, &mut config)
                     .map_err(Errno::from_i32)?;
 
@@ -226,7 +483,10 @@ impl<'a> Request<'a> {
             }
             // Filesystem destroyed
             ll::Operation::Destroy(x) => {
-                se.filesystem.destroy();
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .destroy();
                 se.destroyed = true;
                 return Ok(Some(x.reply()));
             }
@@ -247,285 +507,368 @@ impl<'a> Request<'a> {
             }
 
             ll::Operation::Lookup(x) => {
-                se.filesystem.lookup(
-                    self,
-                    self.request.nodeid().into(),
-                    x.name().as_ref(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .lookup(
+                        self,
+                        self.request.nodeid().into(),
+                        x.name().as_ref(),
+                        self.reply(),
+                    );
             }
             ll::Operation::Forget(x) => {
                 se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
                     .forget(self, self.request.nodeid().into(), x.nlookup()); // no reply
             }
             ll::Operation::GetAttr(_) => {
                 se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
                     .getattr(self, self.request.nodeid().into(), self.reply());
             }
             ll::Operation::SetAttr(x) => {
-                se.filesystem.setattr(
-                    self,
-                    self.request.nodeid().into(),
-                    x.mode(),
-                    x.uid(),
-                    x.gid(),
-                    x.size(),
-                    x.atime(),
-                    x.mtime(),
-                    x.ctime(),
-                    x.file_handle().map(|fh| fh.into()),
-                    x.crtime(),
-                    x.chgtime(),
-                    x.bkuptime(),
-                    x.flags(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .setattr(
+                        self,
+                        self.request.nodeid().into(),
+                        x.mode(),
+                        x.uid(),
+                        x.gid(),
+                        x.size(),
+                        x.atime(),
+                        x.mtime(),
+                        x.ctime(),
+                        x.file_handle().map(|fh| fh.into()),
+                        x.crtime(),
+                        x.chgtime(),
+                        x.bkuptime(),
+                        x.flags(),
+                        self.reply(),
+                    );
             }
             ll::Operation::ReadLink(_) => {
                 se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
                     .readlink(self, self.request.nodeid().into(), self.reply());
             }
             ll::Operation::MkNod(x) => {
-                se.filesystem.mknod(
-                    self,
-                    self.request.nodeid().into(),
-                    x.name().as_ref(),
-                    x.mode(),
-                    x.umask(),
-                    x.rdev(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .mknod(
+                        self,
+                        self.request.nodeid().into(),
+                        x.name().as_ref(),
+                        x.mode(),
+                        x.umask(),
+                        x.rdev(),
+                        self.reply(),
+                    );
             }
             ll::Operation::MkDir(x) => {
-                se.filesystem.mkdir(
-                    self,
-                    self.request.nodeid().into(),
-                    x.name().as_ref(),
-                    x.mode(),
-                    x.umask(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .mkdir(
+                        self,
+                        self.request.nodeid().into(),
+                        x.name().as_ref(),
+                        x.mode(),
+                        x.umask(),
+                        self.reply(),
+                    );
             }
             ll::Operation::Unlink(x) => {
-                se.filesystem.unlink(
-                    self,
-                    self.request.nodeid().into(),
-                    x.name().as_ref(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .unlink(
+                        self,
+                        self.request.nodeid().into(),
+                        x.name().as_ref(),
+                        self.reply(),
+                    );
             }
             ll::Operation::RmDir(x) => {
-                se.filesystem.rmdir(
-                    self,
-                    self.request.nodeid().into(),
-                    x.name().as_ref(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .rmdir(
+                        self,
+                        self.request.nodeid().into(),
+                        x.name().as_ref(),
+                        self.reply(),
+                    );
             }
             ll::Operation::SymLink(x) => {
-                se.filesystem.symlink(
-                    self,
-                    self.request.nodeid().into(),
-                    x.link_name().as_ref(),
-                    Path::new(x.target()),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .symlink(
+                        self,
+                        self.request.nodeid().into(),
+                        x.link_name().as_ref(),
+                        Path::new(x.target()),
+                        self.reply(),
+                    );
             }
             ll::Operation::Rename(x) => {
-                se.filesystem.rename(
-                    self,
-                    self.request.nodeid().into(),
-                    x.src().name.as_ref(),
-                    x.dest().dir.into(),
-                    x.dest().name.as_ref(),
-                    0,
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .rename(
+                        self,
+                        self.request.nodeid().into(),
+                        x.src().name.as_ref(),
+                        x.dest().dir.into(),
+                        x.dest().name.as_ref(),
+                        0,
+                        self.reply(),
+                    );
             }
             ll::Operation::Link(x) => {
-                se.filesystem.link(
-                    self,
-                    x.inode_no().into(),
-                    self.request.nodeid().into(),
-                    x.dest().name.as_ref(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .link(
+                        self,
+                        x.inode_no().into(),
+                        self.request.nodeid().into(),
+                        x.dest().name.as_ref(),
+                        self.reply(),
+                    );
             }
             ll::Operation::Open(x) => {
                 se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
                     .open(self, self.request.nodeid().into(), x.flags(), self.reply());
             }
             ll::Operation::Read(x) => {
-                se.filesystem.read(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.offset(),
-                    x.size(),
-                    x.flags(),
-                    x.lock_owner().map(|l| l.into()),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .read(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.offset(),
+                        x.size(),
+                        x.flags(),
+                        x.lock_owner().map(|l| l.into()),
+                        self.reply(),
+                    );
             }
             ll::Operation::Write(x) => {
-                se.filesystem.write(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.offset(),
-                    x.data(),
-                    x.write_flags(),
-                    x.flags(),
-                    x.lock_owner().map(|l| l.into()),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .write(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.offset(),
+                        x.data(),
+                        x.write_flags(),
+                        x.flags(),
+                        x.lock_owner().map(|l| l.into()),
+                        self.reply(),
+                    );
             }
             ll::Operation::Flush(x) => {
-                se.filesystem.flush(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.lock_owner().into(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .flush(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.lock_owner().into(),
+                        self.reply(),
+                    );
             }
             ll::Operation::Release(x) => {
-                se.filesystem.release(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.flags(),
-                    x.lock_owner().map(|x| x.into()),
-                    x.flush(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .release(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.flags(),
+                        x.lock_owner().map(|x| x.into()),
+                        x.flush(),
+                        self.reply(),
+                    );
             }
             ll::Operation::FSync(x) => {
-                se.filesystem.fsync(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.fdatasync(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .fsync(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.fdatasync(),
+                        self.reply(),
+                    );
             }
             ll::Operation::OpenDir(x) => {
                 se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
                     .opendir(self, self.request.nodeid().into(), x.flags(), self.reply());
             }
             ll::Operation::ReadDir(x) => {
-                se.filesystem.readdir(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.offset(),
-                    ReplyDirectory::new(
-                        self.request.unique().into(),
-                        self.ch.clone(),
-                        x.size() as usize,
-                    ),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .readdir(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.offset(),
+                        ReplyDirectory::new(
+                            self.request.unique().into(),
+                            self.ch.clone(),
+                            x.size() as usize,
+                        ),
+                    );
             }
             ll::Operation::ReleaseDir(x) => {
-                se.filesystem.releasedir(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.flags(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .releasedir(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.flags(),
+                        self.reply(),
+                    );
             }
             ll::Operation::FSyncDir(x) => {
-                se.filesystem.fsyncdir(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.fdatasync(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .fsyncdir(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.fdatasync(),
+                        self.reply(),
+                    );
             }
             ll::Operation::StatFs(_) => {
                 se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
                     .statfs(self, self.request.nodeid().into(), self.reply());
             }
             #[cfg(feature = "abi-7-31")]
             ll::Operation::SyncFs(_) => {
-                se.filesystem.syncfs(self, self.reply());
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .syncfs(self, self.reply());
             }
             ll::Operation::SetXAttr(x) => {
-                se.filesystem.setxattr(
-                    self,
-                    self.request.nodeid().into(),
-                    x.name(),
-                    x.value(),
-                    x.flags(),
-                    x.position(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .setxattr(
+                        self,
+                        self.request.nodeid().into(),
+                        x.name(),
+                        x.value(),
+                        x.flags(),
+                        x.position(),
+                        self.reply(),
+                    );
             }
             ll::Operation::GetXAttr(x) => {
-                se.filesystem.getxattr(
-                    self,
-                    self.request.nodeid().into(),
-                    x.name(),
-                    x.size_u32(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .getxattr(
+                        self,
+                        self.request.nodeid().into(),
+                        x.name(),
+                        x.size_u32(),
+                        self.reply(),
+                    );
             }
             ll::Operation::ListXAttr(x) => {
                 se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
                     .listxattr(self, self.request.nodeid().into(), x.size(), self.reply());
             }
             ll::Operation::RemoveXAttr(x) => {
-                se.filesystem.removexattr(
-                    self,
-                    self.request.nodeid().into(),
-                    x.name(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .removexattr(self, self.request.nodeid().into(), x.name(), self.reply());
             }
             ll::Operation::Access(x) => {
                 se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
                     .access(self, self.request.nodeid().into(), x.mask(), self.reply());
             }
             ll::Operation::Create(x) => {
-                se.filesystem.create(
-                    self,
-                    self.request.nodeid().into(),
-                    x.name().as_ref(),
-                    x.mode(),
-                    x.umask(),
-                    x.flags(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .create(
+                        self,
+                        self.request.nodeid().into(),
+                        x.name().as_ref(),
+                        x.mode(),
+                        x.umask(),
+                        x.flags(),
+                        self.reply(),
+                    );
             }
             ll::Operation::GetLk(x) => {
-                se.filesystem.getlk(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.lock_owner().into(),
-                    x.lock().range.0,
-                    x.lock().range.1,
-                    x.lock().typ,
-                    x.lock().pid,
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .getlk(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.lock_owner().into(),
+                        x.lock().range.0,
+                        x.lock().range.1,
+                        x.lock().typ,
+                        x.lock().pid,
+                        self.reply(),
+                    );
             }
             ll::Operation::SetLk(x) => {
-                se.filesystem.setlk(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.lock_owner().into(),
-                    x.lock().range.0,
-                    x.lock().range.1,
-                    x.lock().typ,
-                    x.lk_flags(),
-                    x.lock().pid,
-                    false,
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .setlk(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.lock_owner().into(),
+                        x.lock().range.0,
+                        x.lock().range.1,
+                        x.lock().typ,
+                        x.lk_flags(),
+                        x.lock().pid,
+                        false,
+                        self.reply(),
+                    );
             }
             ll::Operation::SetLkW(x) => {
                 // Register an abort handle so the kernel can interrupt
@@ -533,29 +876,35 @@ impl<'a> Request<'a> {
                 let unique = self.request.unique().into();
                 let handle = se.register_abort(unique);
                 self.attach_abort(handle);
-                se.filesystem.setlk(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.lock_owner().into(),
-                    x.lock().range.0,
-                    x.lock().range.1,
-                    x.lock().typ,
-                    x.lk_flags(),
-                    x.lock().pid,
-                    true,
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .setlk(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.lock_owner().into(),
+                        x.lock().range.0,
+                        x.lock().range.1,
+                        x.lock().typ,
+                        x.lk_flags(),
+                        x.lock().pid,
+                        true,
+                        self.reply(),
+                    );
                 se.clear_abort(unique);
             }
             ll::Operation::BMap(x) => {
-                se.filesystem.bmap(
-                    self,
-                    self.request.nodeid().into(),
-                    x.block_size(),
-                    x.block(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .bmap(
+                        self,
+                        self.request.nodeid().into(),
+                        x.block_size(),
+                        x.block(),
+                        self.reply(),
+                    );
             }
 
             #[cfg(feature = "abi-7-11")]
@@ -563,82 +912,103 @@ impl<'a> Request<'a> {
                 if x.unrestricted() {
                     return Err(Errno::ENOSYS);
                 } else {
-                    se.filesystem.ioctl(
-                        self,
-                        self.request.nodeid().into(),
-                        x.file_handle().into(),
-                        x.flags(),
-                        x.command(),
-                        x.in_data(),
-                        x.out_size(),
-                        self.reply(),
-                    );
+                    se.filesystem
+                        .lock()
+                        .expect("filesystem mutex poisoned")
+                        .ioctl(
+                            self,
+                            self.request.nodeid().into(),
+                            x.file_handle().into(),
+                            x.flags(),
+                            x.command(),
+                            x.in_data(),
+                            x.out_size(),
+                            self.reply(),
+                        );
                 }
             }
             #[cfg(feature = "abi-7-11")]
             ll::Operation::Poll(x) => {
-                se.filesystem.poll(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.kernel_handle(),
-                    x.events(),
-                    x.flags(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .poll(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.kernel_handle(),
+                        x.events(),
+                        x.flags(),
+                        self.reply(),
+                    );
             }
             #[cfg(feature = "abi-7-16")]
             ll::Operation::BatchForget(x) => {
-                se.filesystem.batch_forget(self, x.nodes()); // no reply
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .batch_forget(self, x.nodes()); // no reply
             }
             #[cfg(feature = "abi-7-19")]
             ll::Operation::FAllocate(x) => {
-                se.filesystem.fallocate(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.offset(),
-                    x.len(),
-                    x.mode(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .fallocate(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.offset(),
+                        x.len(),
+                        x.mode(),
+                        self.reply(),
+                    );
             }
             #[cfg(feature = "abi-7-21")]
             ll::Operation::ReadDirPlus(x) => {
-                se.filesystem.readdirplus(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.offset(),
-                    ReplyDirectoryPlus::new(
-                        self.request.unique().into(),
-                        self.ch.clone(),
-                        x.size() as usize,
-                    ),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .readdirplus(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.offset(),
+                        ReplyDirectoryPlus::new(
+                            self.request.unique().into(),
+                            self.ch.clone(),
+                            x.size() as usize,
+                        ),
+                    );
             }
             #[cfg(feature = "abi-7-23")]
             ll::Operation::Rename2(x) => {
-                se.filesystem.rename(
-                    self,
-                    x.from().dir.into(),
-                    x.from().name.as_ref(),
-                    x.to().dir.into(),
-                    x.to().name.as_ref(),
-                    x.flags(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .rename(
+                        self,
+                        x.from().dir.into(),
+                        x.from().name.as_ref(),
+                        x.to().dir.into(),
+                        x.to().name.as_ref(),
+                        x.flags(),
+                        self.reply(),
+                    );
             }
             #[cfg(feature = "abi-7-24")]
             ll::Operation::Lseek(x) => {
-                se.filesystem.lseek(
-                    self,
-                    self.request.nodeid().into(),
-                    x.file_handle().into(),
-                    x.offset(),
-                    x.whence(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .lseek(
+                        self,
+                        self.request.nodeid().into(),
+                        x.file_handle().into(),
+                        x.offset(),
+                        x.whence(),
+                        self.reply(),
+                    );
             }
             #[cfg(feature = "abi-7-28")]
             ll::Operation::CopyFileRange(x) => {
@@ -647,60 +1017,77 @@ impl<'a> Request<'a> {
                     Err(_) => return Err(Errno::EINVAL),
                 };
                 let (i, o) = (x.src(), x.dest());
-                se.filesystem.copy_file_range(
-                    self,
-                    i.inode.into(),
-                    i.file_handle.into(),
-                    i.offset,
-                    o.inode.into(),
-                    o.file_handle.into(),
-                    o.offset,
-                    x.len(),
-                    flags,
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .copy_file_range(
+                        self,
+                        i.inode.into(),
+                        i.file_handle.into(),
+                        i.offset,
+                        o.inode.into(),
+                        o.file_handle.into(),
+                        o.offset,
+                        x.len(),
+                        flags,
+                        self.reply(),
+                    );
             }
             #[cfg(feature = "abi-7-30")]
             ll::Operation::Statx(x) => {
-                se.filesystem.statx(
-                    self,
-                    self.request.nodeid().into(),
-                    x.sx_flags(),
-                    x.sx_mask(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .statx(
+                        self,
+                        self.request.nodeid().into(),
+                        x.sx_flags(),
+                        x.sx_mask(),
+                        self.reply(),
+                    );
             }
             #[cfg(feature = "abi-7-32")]
             ll::Operation::Flock(x) => {
-                se.filesystem.flock(
-                    self,
-                    self.request.nodeid().into(),
-                    x.fh(),
-                    x.owner(),
-                    x.typ() as u32,
-                    x.lk_flags(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .flock(
+                        self,
+                        self.request.nodeid().into(),
+                        x.fh(),
+                        x.owner(),
+                        x.typ() as u32,
+                        x.lk_flags(),
+                        self.reply(),
+                    );
             }
             #[cfg(target_os = "macos")]
             ll::Operation::SetVolName(x) => {
-                se.filesystem.setvolname(self, x.name(), self.reply());
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .setvolname(self, x.name(), self.reply());
             }
             #[cfg(target_os = "macos")]
             ll::Operation::GetXTimes(_) => {
                 se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
                     .getxtimes(self, self.request.nodeid().into(), self.reply());
             }
             ll::Operation::Exchange(x) => {
-                se.filesystem.exchange(
-                    self,
-                    x.from().dir.into(),
-                    x.from().name.as_ref(),
-                    x.to().dir.into(),
-                    x.to().name.as_ref(),
-                    x.options(),
-                    self.reply(),
-                );
+                se.filesystem
+                    .lock()
+                    .expect("filesystem mutex poisoned")
+                    .exchange(
+                        self,
+                        x.from().dir.into(),
+                        x.from().name.as_ref(),
+                        x.to().dir.into(),
+                        x.to().name.as_ref(),
+                        x.options(),
+                        self.reply(),
+                    );
             }
         }
         Ok(None)
@@ -758,7 +1145,7 @@ mod tests {
     use crate::channel::Channel;
     use crate::ll::test::AlignedData;
     use std::fs::File;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn dummy_channel() -> crate::channel::ChannelSender {
         Channel::new(Arc::new(File::open("/dev/null").unwrap())).sender()
@@ -774,6 +1161,44 @@ mod tests {
         0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
         0x07, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, // major, minor
         0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // max_readahead, flags
+    ]);
+
+    #[cfg(all(target_endian = "little", feature = "abi-7-9"))]
+    const WRITE_REQUEST: AlignedData<[u8; 84]> = AlignedData([
+        0x54, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, // len=84, opcode=16
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fh=2
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset=0
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // size=4, write_flags=0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // lock_owner=0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // flags=0, padding=0
+        0xde, 0xad, 0xbe, 0xef,
+    ]);
+
+    #[cfg(all(target_endian = "little", not(feature = "abi-7-9")))]
+    const WRITE_REQUEST: AlignedData<[u8; 68]> = AlignedData([
+        0x44, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, // len=68, opcode=16
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fh=2
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset=0
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // size=4, write_flags=0
+        0xde, 0xad, 0xbe, 0xef,
+    ]);
+
+    #[cfg(target_endian = "little")]
+    const FORGET_REQUEST: AlignedData<[u8; 48]> = AlignedData([
+        0x30, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, // len=48, opcode=2
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // nlookup=3
     ]);
 
     #[test]
@@ -843,6 +1268,63 @@ mod tests {
         assert_eq!(req.uid(), 0xc001_d00d);
         assert_eq!(req.gid(), 0xc001_cafe);
         assert_eq!(req.pid(), 0xc0de_ba5e);
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn dispatch_lane_keeps_bootstrap_inline_and_defers_steady_state_work() {
+        let ch = dummy_channel();
+        let init = Request::new(ch.clone(), &INIT_REQUEST[..]).unwrap();
+        let write = Request::new(ch.clone(), &WRITE_REQUEST[..]).unwrap();
+        let forget = Request::new(ch, &FORGET_REQUEST[..]).unwrap();
+
+        assert_eq!(write.dispatch_lane(false), DispatchLane::Inline);
+        assert_eq!(init.dispatch_lane(true), DispatchLane::Inline);
+        assert_eq!(write.dispatch_lane(true), DispatchLane::FileWriteback);
+        assert_eq!(forget.dispatch_lane(true), DispatchLane::Maintenance);
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn file_writeback_worker_dispatches_owned_write_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct WriteSeenFS {
+            seen: Arc<AtomicBool>,
+        }
+
+        impl Filesystem for WriteSeenFS {
+            fn write(
+                &mut self,
+                _req: &Request<'_>,
+                _ino: u64,
+                _fh: u64,
+                _offset: i64,
+                data: &[u8],
+                _write_flags: u32,
+                _flags: i32,
+                _lock_owner: Option<u64>,
+                reply: crate::ReplyWrite,
+            ) {
+                assert_eq!(data, &[0xde, 0xad, 0xbe, 0xef]);
+                self.seen.store(true, Ordering::Release);
+                reply.written(data.len() as u32);
+            }
+        }
+
+        let seen = Arc::new(AtomicBool::new(false));
+        let filesystem = Arc::new(Mutex::new(WriteSeenFS {
+            seen: Arc::clone(&seen),
+        }));
+        let req = Request::new(dummy_channel(), &WRITE_REQUEST[..]).unwrap();
+        req.dispatch_file_writeback_worker(
+            &filesystem,
+            &AbortRegistry::default(),
+            SessionACL::All,
+            0,
+        );
+
+        assert!(seen.load(Ordering::Acquire));
     }
 
     // --- Filesystem trait dispatch smoke tests ---

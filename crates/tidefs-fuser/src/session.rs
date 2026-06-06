@@ -9,18 +9,21 @@ use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{info, warn};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    mpsc::{self, SyncSender},
+    Arc, Mutex,
+};
 use std::thread::{self, JoinHandle};
 use std::{io, ops::DerefMut};
 
 use crate::abort::{AbortHandle, AbortRegistry};
 use crate::ll::fuse_abi as abi;
-use crate::request::Request;
+#[cfg(feature = "abi-7-11")]
+use crate::notify::Notifier;
+use crate::request::{DispatchLane, Request};
 use crate::Filesystem;
 use crate::MountOption;
-use crate::{channel::Channel, mnt::Mount};
-#[cfg(feature = "abi-7-11")]
-use crate::{channel::ChannelSender, notify::Notifier};
+use crate::{channel::Channel, channel::ChannelSender, mnt::Mount};
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
@@ -31,7 +34,7 @@ pub const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
 /// up to MAX_WRITE_SIZE bytes in a write request, we use that value plus some extra space.
 const BUFFER_SIZE: usize = MAX_WRITE_SIZE + 4096;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SessionACL {
     All,
     RootAndOwner,
@@ -42,7 +45,7 @@ pub(crate) enum SessionACL {
 #[derive(Debug)]
 pub struct Session<FS: Filesystem> {
     /// Filesystem operation implementations
-    pub(crate) filesystem: FS,
+    pub(crate) filesystem: Arc<Mutex<FS>>,
     /// Communication channel to the kernel driver
     ch: Channel,
     /// Handle to the mount.  Dropping this unmounts.
@@ -66,7 +69,13 @@ pub struct Session<FS: Filesystem> {
     #[cfg(feature = "abi-7-23")]
     pub(crate) wants_writeback_cache: bool,
     /// Registry of in-flight abort handles keyed by request unique
-    abort_registry: AbortRegistry,
+    abort_registry: Arc<AbortRegistry>,
+    /// Bounded worker lane for file data/writeback operations that may block.
+    file_writeback_tx: Option<SyncSender<WorkerJob>>,
+    /// Bounded maintenance lane for no-reply forget traffic.
+    maintenance_tx: Option<SyncSender<WorkerJob>>,
+    /// Worker thread guards joined before filesystem destroy.
+    worker_guards: Vec<JoinHandle<()>>,
 }
 
 impl<FS: Filesystem> Session<FS> {
@@ -105,18 +114,22 @@ impl<FS: Filesystem> Session<FS> {
         #[cfg(not(feature = "abi-7-23"))]
         let _ = options; // suppress unused warning
 
+        let session_owner = unsafe { libc::geteuid() };
         Ok(Session {
-            filesystem,
+            filesystem: Arc::new(Mutex::new(filesystem)),
             ch,
             mount: Arc::new(Mutex::new(Some(mount))),
             mountpoint: mountpoint.to_owned(),
             allowed,
             // SAFETY: geteuid() is always safe to call; it returns the effective UID of
             // the calling process with no side effects and no preconditions.
-            session_owner: unsafe { libc::geteuid() },
+            session_owner,
             #[cfg(feature = "abi-7-23")]
             wants_writeback_cache,
-            abort_registry: AbortRegistry::default(),
+            abort_registry: Arc::new(AbortRegistry::default()),
+            file_writeback_tx: None,
+            maintenance_tx: None,
+            worker_guards: Vec::new(),
             proto_major: 0,
             proto_minor: 0,
             initialized: false,
@@ -147,7 +160,28 @@ impl<FS: Filesystem> Session<FS> {
             match self.ch.receive(buf) {
                 Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
-                    Some(req) => req.dispatch(self),
+                    Some(req) => match req.dispatch_lane(self.initialized) {
+                        DispatchLane::Inline => req.dispatch(self),
+                        DispatchLane::FileWriteback if self.file_writeback_tx.is_some() => {
+                            let job = WorkerJob::new(self.ch.sender(), buf[..size].to_vec());
+                            if let Some(tx) = &self.file_writeback_tx {
+                                if tx.send(job).is_err() {
+                                    req.reply_io_error();
+                                }
+                            } else {
+                                req.reply_io_error();
+                            }
+                        }
+                        DispatchLane::Maintenance if self.maintenance_tx.is_some() => {
+                            let job = WorkerJob::new(self.ch.sender(), buf[..size].to_vec());
+                            if let Some(tx) = &self.maintenance_tx {
+                                let _ = tx.send(job);
+                            }
+                        }
+                        DispatchLane::FileWriteback | DispatchLane::Maintenance => {
+                            req.dispatch(self)
+                        }
+                    },
                     // Quit loop on illegal request
                     None => break,
                 },
@@ -189,6 +223,36 @@ impl<FS: Filesystem> Session<FS> {
         self.abort_registry.remove(unique);
     }
 
+    fn start_worker_lanes(&mut self) -> io::Result<()>
+    where
+        FS: Send + 'static,
+    {
+        if self.file_writeback_tx.is_some() || self.maintenance_tx.is_some() {
+            return Ok(());
+        }
+        let (file_writeback_tx, file_writeback_guard) = spawn_worker_lane(
+            "fuse-file-writeback",
+            DispatchLane::FileWriteback,
+            Arc::clone(&self.filesystem),
+            Arc::clone(&self.abort_registry),
+            self.allowed.clone(),
+            self.session_owner,
+        )?;
+        let (maintenance_tx, maintenance_guard) = spawn_worker_lane(
+            "fuse-maintenance",
+            DispatchLane::Maintenance,
+            Arc::clone(&self.filesystem),
+            Arc::clone(&self.abort_registry),
+            self.allowed.clone(),
+            self.session_owner,
+        )?;
+        self.file_writeback_tx = Some(file_writeback_tx);
+        self.maintenance_tx = Some(maintenance_tx);
+        self.worker_guards.push(file_writeback_guard);
+        self.worker_guards.push(maintenance_guard);
+        Ok(())
+    }
+
     /// Unmount the filesystem
     /// Safety: Mutex lock on mount handle. Since this is called
     /// from the owning Session, no other thread can poison this lock.
@@ -222,12 +286,68 @@ impl<FS: 'static + Filesystem + Send> Session<FS> {
 
 impl<FS: Filesystem> Drop for Session<FS> {
     fn drop(&mut self) {
+        self.file_writeback_tx.take();
+        self.maintenance_tx.take();
+        for guard in self.worker_guards.drain(..) {
+            if guard.join().is_err() {
+                warn!("FUSE worker thread panicked");
+            }
+        }
         if !self.destroyed {
-            self.filesystem.destroy();
+            self.filesystem
+                .lock()
+                .expect("filesystem mutex poisoned")
+                .destroy();
             self.destroyed = true;
         }
         info!("Unmounted {}", self.mountpoint().display());
     }
+}
+
+struct WorkerJob {
+    ch: ChannelSender,
+    data: Vec<u8>,
+}
+
+impl WorkerJob {
+    fn new(ch: ChannelSender, data: Vec<u8>) -> Self {
+        Self { ch, data }
+    }
+}
+
+fn spawn_worker_lane<FS: Filesystem + Send + 'static>(
+    name: &'static str,
+    lane: DispatchLane,
+    filesystem: Arc<Mutex<FS>>,
+    abort_registry: Arc<AbortRegistry>,
+    allowed: SessionACL,
+    session_owner: u32,
+) -> io::Result<(SyncSender<WorkerJob>, JoinHandle<()>)> {
+    const WORKER_QUEUE_DEPTH: usize = 1024;
+    let (tx, rx) = mpsc::sync_channel::<WorkerJob>(WORKER_QUEUE_DEPTH);
+    let guard = thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            while let Ok(job) = rx.recv() {
+                if let Some(req) = Request::new(job.ch, &job.data) {
+                    match lane {
+                        DispatchLane::FileWriteback => req.dispatch_file_writeback_worker(
+                            &filesystem,
+                            &abort_registry,
+                            allowed.clone(),
+                            session_owner,
+                        ),
+                        DispatchLane::Maintenance => req.dispatch_maintenance_worker(
+                            &filesystem,
+                            allowed.clone(),
+                            session_owner,
+                        ),
+                        DispatchLane::Inline => {}
+                    }
+                }
+            }
+        })?;
+    Ok((tx, guard))
 }
 
 /// The background session data structure
@@ -247,7 +367,10 @@ impl BackgroundSession {
     /// Create a new background session for the given session by running its
     /// session loop in a background thread. If the returned handle is dropped,
     /// the filesystem is unmounted and the given session ends.
-    pub fn new<FS: Filesystem + Send + 'static>(se: Session<FS>) -> io::Result<BackgroundSession> {
+    pub fn new<FS: Filesystem + Send + 'static>(
+        mut se: Session<FS>,
+    ) -> io::Result<BackgroundSession> {
+        se.start_worker_lanes()?;
         let mountpoint = se.mountpoint().to_path_buf();
         #[cfg(feature = "abi-7-11")]
         let sender = se.ch.sender();
