@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{DeviceHealth, DeviceType, PoolConfig};
+use tidefs_types_pool_label_core::PoolRedundancyPolicy;
 
 // ---------------------------------------------------------------------------
 // RebuildAction
@@ -38,11 +39,15 @@ pub struct RebuildAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RebuildKind {
-    /// Mirror member missing: the missing device's copies must be
-    /// recreated from surviving mirror members.
+    /// Replicated placement rebuild. The Rust variant name is retained for
+    /// compatibility with older callers; new serde/display output uses
+    /// pool-wide policy wording.
+    #[serde(rename = "replicated-placement-rebuild", alias = "mirror-rebuild")]
     MirrorRebuild,
-    /// Parity RAID member missing: parity reconstruction is required
-    /// to rebuild the missing data onto a replacement device.
+    /// Erasure placement rebuild. The Rust variant name is retained for
+    /// compatibility with older callers; new serde/display output uses
+    /// pool-wide policy wording.
+    #[serde(rename = "erasure-placement-rebuild", alias = "parity-rebuild")]
     ParityRebuild,
     /// Device is degraded but still present; resilience-restore
     /// operation to bring it back to full health.
@@ -56,8 +61,8 @@ pub enum RebuildKind {
 impl std::fmt::Display for RebuildKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MirrorRebuild => f.write_str("mirror-rebuild"),
-            Self::ParityRebuild => f.write_str("parity-rebuild"),
+            Self::MirrorRebuild => f.write_str("replicated-placement-rebuild"),
+            Self::ParityRebuild => f.write_str("erasure-placement-rebuild"),
             Self::ResilienceRestore => f.write_str("resilience-restore"),
             Self::DeviceReplace => f.write_str("device-replace"),
             Self::NoAction => f.write_str("no-action"),
@@ -230,64 +235,37 @@ impl RebuildScheduler {
 
     /// Determine the rebuild action for a missing device.
     fn action_for_missing(config: &PoolConfig, device_index: u32) -> (RebuildKind, String) {
-        match &config.device_tree {
-            DeviceType::Mirror { children } => {
-                if !children.is_empty() {
-                    (
-                        RebuildKind::MirrorRebuild,
-                        format!(
-                            "mirror member at index {device_index} is missing; \
-                             rebuild from surviving mirror members"
-                        ),
-                    )
-                } else {
-                    (
-                        RebuildKind::NoAction,
-                        format!(
-                            "all mirror members missing at index {device_index}; \
-                             pool is empty"
-                        ),
-                    )
-                }
-            }
-            DeviceType::ParityRaid { parity, children } => {
-                if children.len() >= *parity as usize {
-                    (
-                        RebuildKind::ParityRebuild,
-                        format!(
-                            "raidz member at index {device_index} is missing; \
-                             reconstruct from parity and surviving data"
-                        ),
-                    )
-                } else {
-                    (
-                        RebuildKind::NoAction,
-                        format!(
-                            "insufficient raidz members for index {device_index}; \
-                             pool is faulted"
-                        ),
-                    )
-                }
-            }
-            DeviceType::Leaf { .. } => {
-                if config.device_count <= 1 {
-                    (
-                        RebuildKind::NoAction,
-                        format!(
-                            "sole device at index {device_index} is missing; \
-                             pool is destroyed"
-                        ),
-                    )
-                } else {
-                    (
-                        RebuildKind::DeviceReplace,
-                        format!(
-                            "device at index {device_index} is missing; \
-                             replacement required"
-                        ),
-                    )
-                }
-            }
+        let operational = operational_leaf_count(config);
+        match config.redundancy_policy {
+            PoolRedundancyPolicy::Replicated { copies } if copies > 1 && operational > 0 => (
+                RebuildKind::MirrorRebuild,
+                format!(
+                    "device at index {device_index} is missing; pool-wide policy {} has \
+                     {operational} operational source device(s); rebuild affected placement \
+                     receipts from surviving replicas",
+                    config.redundancy_policy
+                ),
+            ),
+            PoolRedundancyPolicy::Erasure {
+                data_shards,
+                parity_shards: _,
+            } if data_shards > 0 && operational >= data_shards as u16 => (
+                RebuildKind::ParityRebuild,
+                format!(
+                    "device at index {device_index} is missing; pool-wide policy {} has \
+                     {operational} operational source device(s); reconstruct affected placement \
+                     receipts from surviving shards",
+                    config.redundancy_policy
+                ),
+            ),
+            policy => (
+                RebuildKind::DeviceReplace,
+                format!(
+                    "device at index {device_index} is missing; pool-wide policy {policy} has \
+                     {operational} operational source device(s), so affected placements require \
+                     device replacement or external recovery"
+                ),
+            ),
         }
     }
 }
@@ -336,6 +314,15 @@ fn find_leaf_health(tree: &DeviceType, path: &std::path::Path) -> Option<DeviceH
     }
 }
 
+fn operational_leaf_count(config: &PoolConfig) -> u16 {
+    config
+        .device_tree
+        .collect_leaves()
+        .into_iter()
+        .filter(|leaf| leaf.health.is_operational())
+        .count() as u16
+}
+
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Tests
@@ -346,7 +333,7 @@ mod tests {
     use super::*;
     use crate::{DeviceHealth, DeviceType, PoolConfig};
     use std::path::PathBuf;
-    use tidefs_types_pool_label_core::{DeviceClass, PoolState};
+    use tidefs_types_pool_label_core::{DeviceClass, PoolRedundancyPolicy, PoolState};
 
     fn make_leaf(path: &str, index: u32, guid: u8, health: DeviceHealth) -> DeviceType {
         DeviceType::Leaf {
@@ -362,12 +349,47 @@ mod tests {
         }
     }
 
+    fn make_config(
+        name: &str,
+        policy: PoolRedundancyPolicy,
+        device_tree: DeviceType,
+        device_count: u32,
+        missing_indices: Vec<u32>,
+    ) -> PoolConfig {
+        PoolConfig {
+            pool_uuid: [0xABu8; 16],
+            pool_name: name.into(),
+            redundancy_policy: policy,
+            device_tree,
+            health: if missing_indices.is_empty() {
+                DeviceHealth::Online
+            } else {
+                DeviceHealth::Degraded
+            },
+            state: PoolState::Active,
+            total_capacity_bytes: device_count as u64 * 1024 * 1024 * 1024,
+            allocated_bytes: 0,
+            feature_flags: 0,
+            topology_generation: 1,
+            device_count,
+            missing_indices,
+            removing_device_indices: vec![],
+        }
+    }
+
+    fn assert_no_fixed_group_language(reason: &str) {
+        let lower = reason.to_ascii_lowercase();
+        assert!(!lower.contains("mirror"), "{reason}");
+        assert!(!lower.contains("raidz"), "{reason}");
+        assert!(!lower.contains("parity group"), "{reason}");
+    }
+
     #[test]
     fn healthy_pool_has_no_actions() {
         let config = PoolConfig {
             pool_uuid: [0xAAu8; 16],
             pool_name: "healthy".into(),
-            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![
                     make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online),
@@ -393,27 +415,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_device_in_mirror_triggers_rebuild() {
-        let config = PoolConfig {
-            pool_uuid: [0xBBu8; 16],
-            pool_name: "missing-mirror".into(),
-            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
-            device_tree: DeviceType::Mirror {
+    fn missing_device_in_replicated_policy_triggers_policy_rebuild() {
+        let config = make_config(
+            "missing-replicated",
+            PoolRedundancyPolicy::replicated(2),
+            DeviceType::ParityRaid {
+                parity: 1,
                 children: vec![
                     make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online),
                     make_leaf("/dev/disk1", 1, 0x02, DeviceHealth::Online),
                 ],
             },
-            health: DeviceHealth::Degraded,
-            state: PoolState::Active,
-            total_capacity_bytes: 2 * 1024 * 1024 * 1024,
-            allocated_bytes: 0,
-            feature_flags: 0,
-            topology_generation: 1,
-            device_count: 3,
-            missing_indices: vec![2],
-            removing_device_indices: vec![],
-        };
+            3,
+            vec![2],
+        );
 
         let plan = RebuildScheduler::schedule(&config);
         assert_eq!(plan.missing_count, 1);
@@ -422,6 +437,9 @@ mod tests {
 
         let action = &plan.actions[0];
         assert_eq!(action.kind, RebuildKind::MirrorRebuild);
+        assert_eq!(action.kind.to_string(), "replicated-placement-rebuild");
+        assert!(action.reason.contains("replicated=2"));
+        assert_no_fixed_group_language(&action.reason);
         assert!(action.urgent);
         assert_eq!(action.affected_device_indices, vec![2]);
     }
@@ -431,7 +449,7 @@ mod tests {
         let config = PoolConfig {
             pool_uuid: [0xCCu8; 16],
             pool_name: "degraded-device".into(),
-            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![
                     make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online),
@@ -466,7 +484,7 @@ mod tests {
         let config = PoolConfig {
             pool_uuid: [0xDDu8; 16],
             pool_name: "faulted-device".into(),
-            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![
                     make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online),
@@ -497,33 +515,69 @@ mod tests {
     }
 
     #[test]
-    fn missing_device_in_raidz_triggers_parity_rebuild() {
+    fn missing_device_in_erasure_policy_triggers_erasure_rebuild() {
         let leaf0 = make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online);
         let leaf1 = make_leaf("/dev/disk1", 1, 0x02, DeviceHealth::Online);
-        let config = PoolConfig {
-            pool_uuid: [0xEEu8; 16],
-            pool_name: "raidz-missing".into(),
-            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
-            device_tree: DeviceType::ParityRaid {
-                parity: 1,
+        let config = make_config(
+            "erasure-missing",
+            PoolRedundancyPolicy::erasure(2, 1),
+            DeviceType::Mirror {
                 children: vec![leaf0, leaf1],
             },
-            health: DeviceHealth::Degraded,
-            state: PoolState::Active,
-            total_capacity_bytes: 2 * 1024 * 1024 * 1024,
-            allocated_bytes: 0,
-            feature_flags: 0,
-            topology_generation: 1,
-            device_count: 3,
-            missing_indices: vec![2],
-            removing_device_indices: vec![],
-        };
+            3,
+            vec![2],
+        );
 
         let plan = RebuildScheduler::schedule(&config);
         assert!(plan.any_urgent);
 
         let action = &plan.actions[0];
         assert_eq!(action.kind, RebuildKind::ParityRebuild);
+        assert_eq!(action.kind.to_string(), "erasure-placement-rebuild");
+        assert!(action.reason.contains("erasure=2+1"));
+        assert_no_fixed_group_language(&action.reason);
+    }
+
+    #[test]
+    fn missing_device_in_single_policy_requires_replacement() {
+        let config = make_config(
+            "single-missing",
+            PoolRedundancyPolicy::replicated(1),
+            DeviceType::Mirror {
+                children: vec![make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online)],
+            },
+            2,
+            vec![1],
+        );
+
+        let plan = RebuildScheduler::schedule(&config);
+        assert!(plan.any_urgent);
+        let action = &plan.actions[0];
+        assert_eq!(action.kind, RebuildKind::DeviceReplace);
+        assert!(action.reason.contains("single"));
+        assert_no_fixed_group_language(&action.reason);
+    }
+
+    #[test]
+    fn erasure_policy_with_too_few_sources_requires_replacement() {
+        let config = make_config(
+            "erasure-too-few-sources",
+            PoolRedundancyPolicy::erasure(2, 1),
+            DeviceType::Mirror {
+                children: vec![make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online)],
+            },
+            3,
+            vec![1, 2],
+        );
+
+        let plan = RebuildScheduler::schedule(&config);
+        assert_eq!(plan.actions.len(), 2);
+        assert!(plan.any_urgent);
+        for action in &plan.actions {
+            assert_eq!(action.kind, RebuildKind::DeviceReplace);
+            assert!(action.reason.contains("erasure=2+1"));
+            assert_no_fixed_group_language(&action.reason);
+        }
     }
 
     #[test]
@@ -537,7 +591,7 @@ mod tests {
             degraded_count: 0,
             actions: vec![RebuildAction {
                 kind: RebuildKind::MirrorRebuild,
-                reason: "missing mirror member".into(),
+                reason: "missing policy placement".into(),
                 affected_device_indices: vec![1],
                 target_device_index: None,
                 urgent: true,
@@ -547,8 +601,30 @@ mod tests {
         };
 
         let json = serde_json::to_string(&plan).unwrap();
+        assert!(json.contains("replicated-placement-rebuild"));
+        assert!(!json.contains("mirror-rebuild"));
         let round: RebuildPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(plan, round);
+    }
+
+    #[test]
+    fn legacy_rebuild_kind_names_deserialize_as_policy_kinds() {
+        assert_eq!(
+            serde_json::from_str::<RebuildKind>("\"mirror-rebuild\"").unwrap(),
+            RebuildKind::MirrorRebuild
+        );
+        assert_eq!(
+            serde_json::from_str::<RebuildKind>("\"parity-rebuild\"").unwrap(),
+            RebuildKind::ParityRebuild
+        );
+        assert_eq!(
+            serde_json::to_string(&RebuildKind::MirrorRebuild).unwrap(),
+            "\"replicated-placement-rebuild\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RebuildKind::ParityRebuild).unwrap(),
+            "\"erasure-placement-rebuild\""
+        );
     }
 
     #[test]
