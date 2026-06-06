@@ -6,6 +6,9 @@
 //! Every frame starts with a 4-byte ASCII tag followed by
 //! tag-specific payload encoded as little-endian.
 
+use tidefs_membership_epoch::EpochId;
+use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
+
 /// Protocol frame tags (4 bytes, ASCII).
 pub mod tag {
     /// Put object: key_len(u32) + key + value_len(u32) + value
@@ -41,7 +44,8 @@ pub mod tag {
     /// Scrub request: no payload.
     /// Response: report_json_len(u32 LE) + report_json + findings_count(u64 LE)
     pub const SCRB: &[u8; 4] = b"SCRB";
-    /// Repair object: key_len(u32 LE) + key + payload_len(u32 LE) + authoritative_payload
+    /// Repair object:
+    /// key_len(u32 LE) + key + placement_receipt_ref + payload_len(u32 LE) + authoritative_payload
     /// Response: ok(u8) + success(u8) + key_len(u32 LE) + key
     pub const RPRR: &[u8; 4] = b"RPRR";
 
@@ -67,6 +71,85 @@ pub mod tag {
     /// Request: cursor_len(u8) + cursor
     /// Response: same shape as SendChunk response
     pub const SNDR: &[u8; 4] = b"SNDR";
+}
+
+const RECEIPT_POLICY_REPLICATED: u8 = 0;
+const RECEIPT_POLICY_ERASURE: u8 = 1;
+const PLACEMENT_RECEIPT_REF_WIRE_LEN: usize = 8 + 32 + 8 + 8 + 4 + 8 + 32 + 2;
+
+fn encode_placement_receipt_ref(buf: &mut Vec<u8>, receipt: &PlacementReceiptRef) {
+    buf.extend_from_slice(&receipt.object_id.to_le_bytes());
+    buf.extend_from_slice(&receipt.object_key);
+    buf.extend_from_slice(&receipt.receipt_epoch.0.to_le_bytes());
+    buf.extend_from_slice(&receipt.receipt_generation.to_le_bytes());
+    match receipt.redundancy_policy {
+        ReceiptRedundancyPolicy::Replicated { copies } => {
+            buf.push(RECEIPT_POLICY_REPLICATED);
+            buf.push(copies);
+            buf.push(0);
+            buf.push(0);
+        }
+        ReceiptRedundancyPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        } => {
+            buf.push(RECEIPT_POLICY_ERASURE);
+            buf.push(data_shards);
+            buf.push(parity_shards);
+            buf.push(0);
+        }
+    }
+    buf.extend_from_slice(&receipt.payload_len.to_le_bytes());
+    buf.extend_from_slice(&receipt.payload_digest);
+    buf.extend_from_slice(&receipt.target_count.to_le_bytes());
+}
+
+fn decode_placement_receipt_ref(payload: &[u8]) -> Option<(PlacementReceiptRef, usize)> {
+    if payload.len() < PLACEMENT_RECEIPT_REF_WIRE_LEN {
+        return None;
+    }
+    let object_id = u64::from_le_bytes(payload[0..8].try_into().ok()?);
+    let mut object_key = [0u8; 32];
+    object_key.copy_from_slice(&payload[8..40]);
+    let receipt_epoch = EpochId::new(u64::from_le_bytes(payload[40..48].try_into().ok()?));
+    let receipt_generation = u64::from_le_bytes(payload[48..56].try_into().ok()?);
+    let redundancy_policy = match payload[56] {
+        RECEIPT_POLICY_REPLICATED => {
+            if payload[58] != 0 || payload[59] != 0 {
+                return None;
+            }
+            ReceiptRedundancyPolicy::Replicated {
+                copies: payload[57],
+            }
+        }
+        RECEIPT_POLICY_ERASURE => {
+            if payload[59] != 0 {
+                return None;
+            }
+            ReceiptRedundancyPolicy::Erasure {
+                data_shards: payload[57],
+                parity_shards: payload[58],
+            }
+        }
+        _ => return None,
+    };
+    let payload_len = u64::from_le_bytes(payload[60..68].try_into().ok()?);
+    let mut payload_digest = [0u8; 32];
+    payload_digest.copy_from_slice(&payload[68..100]);
+    let target_count = u16::from_le_bytes(payload[100..102].try_into().ok()?);
+    Some((
+        PlacementReceiptRef::new(
+            object_id,
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            target_count,
+        ),
+        PLACEMENT_RECEIPT_REF_WIRE_LEN,
+    ))
 }
 
 /// An owned protocol frame.
@@ -160,9 +243,10 @@ pub enum Frame {
         /// Number of findings (non-clean outcomes).
         findings_count: u64,
     },
-    /// Repair a named object with an authoritative payload.
+    /// Repair a named object with placement-receipt-bound authoritative payload.
     RepairObject {
         key: Vec<u8>,
+        placement_receipt_ref: PlacementReceiptRef,
         authoritative_payload: Vec<u8>,
     },
     /// Acknowledge a repair operation.
@@ -383,11 +467,13 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
         }
         Frame::RepairObject {
             key,
+            placement_receipt_ref,
             authoritative_payload,
         } => {
             buf.extend_from_slice(tag::RPRR);
             buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
             buf.extend_from_slice(key);
+            encode_placement_receipt_ref(&mut buf, placement_receipt_ref);
             buf.extend_from_slice(&(authoritative_payload.len() as u32).to_le_bytes());
             buf.extend_from_slice(authoritative_payload);
         }
@@ -838,13 +924,18 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
                 }
             }
             if payload.len() >= 4 {
-                // Request: key_len(u32 LE) + key + payload_len(u32 LE) + authoritative_payload
+                // Request: key_len(u32 LE) + key + placement_receipt_ref
+                // + payload_len(u32 LE) + authoritative_payload. Legacy
+                // key+payload repair frames no longer decode as repair
+                // requests because repair must be placement-receipt-bound.
                 let key_len = u32::from_le_bytes(payload[0..4].try_into().ok()?) as usize;
-                if payload.len() < 4 + key_len + 4 {
+                if payload.len() < 4 + key_len + PLACEMENT_RECEIPT_REF_WIRE_LEN + 4 {
                     return None;
                 }
                 let key = payload[4..4 + key_len].to_vec();
-                let pl_start = 4 + key_len;
+                let (placement_receipt_ref, receipt_len) =
+                    decode_placement_receipt_ref(&payload[4 + key_len..])?;
+                let pl_start = 4 + key_len + receipt_len;
                 let pl_len =
                     u32::from_le_bytes(payload[pl_start..pl_start + 4].try_into().ok()?) as usize;
                 if payload.len() < pl_start + 4 + pl_len {
@@ -853,6 +944,7 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
                 let authoritative_payload = payload[pl_start + 4..pl_start + 4 + pl_len].to_vec();
                 Some(Frame::RepairObject {
                     key,
+                    placement_receipt_ref,
                     authoritative_payload,
                 })
             } else {
@@ -1057,6 +1149,20 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
 mod tests {
     use super::*;
 
+    fn receipt_ref(key: &[u8], payload: &[u8], generation: u64) -> PlacementReceiptRef {
+        let object_key = tidefs_local_object_store::ObjectKey::from_name(key).as_bytes32();
+        PlacementReceiptRef::new(
+            77,
+            object_key,
+            EpochId::new(9),
+            generation,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            payload.len() as u64,
+            blake3::hash(payload).into(),
+            2,
+        )
+    }
+
     #[test]
     fn roundtrip_put() {
         let f = Frame::Put {
@@ -1234,20 +1340,39 @@ mod tests {
 
     #[test]
     fn roundtrip_repair_object() {
+        let key = b"corrupted-obj".to_vec();
+        let payload = b"fixed-data".to_vec();
         let f = Frame::RepairObject {
-            key: b"corrupted-obj".to_vec(),
-            authoritative_payload: b"fixed-data".to_vec(),
+            placement_receipt_ref: receipt_ref(&key, &payload, 17),
+            key,
+            authoritative_payload: payload,
         };
         assert_eq!(decode(&encode(&f)), Some(f));
     }
 
     #[test]
     fn roundtrip_repair_object_one_byte_key() {
+        let key = b"k".to_vec();
+        let payload = b"fixed-data".to_vec();
         let f = Frame::RepairObject {
-            key: b"k".to_vec(),
-            authoritative_payload: b"fixed-data".to_vec(),
+            placement_receipt_ref: receipt_ref(&key, &payload, 18),
+            key,
+            authoritative_payload: payload,
         };
         assert_eq!(decode(&encode(&f)), Some(f));
+    }
+
+    #[test]
+    fn legacy_repair_without_receipt_does_not_decode() {
+        let key = b"legacy-key";
+        let payload = b"fixed-data";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(tag::RPRR);
+        raw.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        raw.extend_from_slice(key);
+        raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        raw.extend_from_slice(payload);
+        assert_eq!(decode(&raw), None);
     }
 
     #[test]

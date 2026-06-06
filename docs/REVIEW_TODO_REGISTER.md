@@ -696,11 +696,16 @@ Important 2026-06-01 findings:
   sync identity bug: `SyncResponse` now carries 32-byte `ObjectKey` values and
   the storage-node server reads local payloads by exact object key instead of
   converting key bytes through lossy UTF-8 and re-hashing them as names. This
-  makes the existing sync response keyed by real local inventory entries, but
-  it is still not a full cross-replica inventory authority with digest
+  makes the existing sync response keyed by real local inventory entries.
+  This receipt-authority slice makes `RepairObject` require a real shared
+  `PlacementReceiptRef` and validates key, length, digest, policy shape, and
+  target width before local repair writes, while scrub reports disclose that
+  the storage-node object-store backend does not itself expose pool placement
+  receipts. This is still not a full cross-replica inventory authority with digest
   comparison, epochs, membership/fencing, or repair selection.
-  Multi-node scrub responses are logged but not compared, repair is local put,
-  harness that says live TCP or RDMA runtime closure is still required. Cluster
+  Multi-node scrub responses are still logged but not compared. Repair source
+  selection, recovery closure, and live TCP/RDMA runtime proof remain
+  incomplete. Cluster
   pool docs and CLI also disagree: the orchestrator source still says live
   dispatch is not wired into the orchestrator, while `tidefsctl cluster pool
   create` has a TCP transport adapter and the placement/heal exercise commands

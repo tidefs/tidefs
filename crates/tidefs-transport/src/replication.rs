@@ -7,6 +7,7 @@
 use crate::error::TransportError;
 use crate::transport::Transport;
 use crate::types::SessionId;
+use tidefs_replication_model::PlacementReceiptRef;
 
 /// Wire message types for distributed object replication.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -80,10 +81,11 @@ pub enum ReplicationMessage {
         /// Number of findings (non-clean outcomes).
         findings_count: u64,
     },
-    /// Repair an object on a replica: the authoritative peer sends the
-    /// correct payload and the replica overwrites its local copy.
+    /// Repair an object on a replica under durable placement receipt
+    /// authority. The receiver must validate the receipt before writing.
     RepairObject {
         name: String,
+        placement_receipt_ref: PlacementReceiptRef,
         authoritative_payload: Vec<u8>,
     },
     /// Acknowledge a repair operation.
@@ -114,12 +116,28 @@ pub fn recv_replication_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_membership_epoch::EpochId;
+    use tidefs_replication_model::ReceiptRedundancyPolicy;
 
     // ── Helper: round-trip a message through bincode ──
 
     fn bincode_roundtrip(msg: &ReplicationMessage) -> ReplicationMessage {
         let payload = bincode::serialize(msg).expect("serialize");
         bincode::deserialize::<ReplicationMessage>(&payload).expect("deserialize")
+    }
+
+    fn receipt_ref(name: &str, payload: &[u8], generation: u64) -> PlacementReceiptRef {
+        let object_key = tidefs_local_object_store::ObjectKey::from_name(name).as_bytes32();
+        PlacementReceiptRef::new(
+            42,
+            object_key,
+            EpochId::new(7),
+            generation,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            payload.len() as u64,
+            blake3::hash(payload).into(),
+            2,
+        )
     }
 
     // ── ScrubRequest round-trip ──
@@ -167,9 +185,11 @@ mod tests {
 
     #[test]
     fn repair_object_bincode_roundtrip() {
+        let payload = b"repaired-data".to_vec();
         let msg = ReplicationMessage::RepairObject {
             name: "corrupted-key-01".into(),
-            authoritative_payload: b"repaired-data".to_vec(),
+            placement_receipt_ref: receipt_ref("corrupted-key-01", &payload, 11),
+            authoritative_payload: payload,
         };
         let rt = bincode_roundtrip(&msg);
         assert_eq!(rt, msg);
@@ -179,6 +199,7 @@ mod tests {
     fn repair_object_empty_payload_bincode_roundtrip() {
         let msg = ReplicationMessage::RepairObject {
             name: String::new(),
+            placement_receipt_ref: receipt_ref("", &[], 12),
             authoritative_payload: vec![],
         };
         let rt = bincode_roundtrip(&msg);
@@ -187,9 +208,11 @@ mod tests {
 
     #[test]
     fn repair_object_large_payload_bincode_roundtrip() {
+        let payload = vec![0xABu8; 65536];
         let msg = ReplicationMessage::RepairObject {
             name: "large-key".into(),
-            authoritative_payload: vec![0xABu8; 65536],
+            placement_receipt_ref: receipt_ref("large-key", &payload, 13),
+            authoritative_payload: payload,
         };
         let rt = bincode_roundtrip(&msg);
         assert_eq!(rt, msg);
@@ -236,9 +259,11 @@ mod tests {
 
     #[test]
     fn repair_variants_are_distinct() {
+        let payload = Vec::new();
         let repair_obj = ReplicationMessage::RepairObject {
             name: "k".into(),
-            authoritative_payload: vec![],
+            placement_receipt_ref: receipt_ref("k", &payload, 14),
+            authoritative_payload: payload,
         };
         let repair_ack = ReplicationMessage::RepairObjectAck {
             name: "k".into(),
