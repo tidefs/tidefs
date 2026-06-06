@@ -1907,25 +1907,17 @@ impl Pool {
         Ok(total)
     }
 
-    /// Discard (TRIM/UNMAP) all unused blocks on devices that support it.
+    /// Discard (TRIM/UNMAP) allocator free ranges on devices that support it.
     ///
-    /// Iterates over every device in the pool and calls []
-    /// on those that report []. This is a placeholder;
-    /// the actual free-block tracking and auto-TRIM scheduling will be
-    /// added under Review debt TFR-012 (historical issue #4375).
-    ///
-    /// # Errors
-    ///
-    /// Returns the first error encountered from any device.
-    /// Discard (TRIM/UNMAP) all unused blocks on devices that support it.
-    ///
-    /// Reads the allocator's [] and feeds
-    /// every contiguous free range to [] in batches of
-    /// 64, sleeping 10 ms between batches to avoid I/O storms.
+    /// Reads the allocator's free ranges and feeds every contiguous range to
+    /// [`discard_ranges`] in batches of 64, sleeping 10 ms between batches to
+    /// avoid I/O storms.
     ///
     /// When no allocator is registered, this is a no-op.
     ///
-    /// Returns the total number of bytes for which discard was requested.
+    /// Returns the total number of bytes accepted by discard-capable devices.
+    /// Directory-backed devices currently report no proven discard capability,
+    /// so directory-only pools return 0.
     pub fn discard_unused(&mut self) -> u64 {
         if let Some(ref allocator) = self.allocator {
             let free_ranges = allocator.free_ranges();
@@ -1944,7 +1936,7 @@ impl Pool {
     /// skipped so that one unhealthy device does not block the entire trim
     /// pass.
     ///
-    /// Returns the total number of bytes for which discard was requested.
+    /// Returns the total number of bytes accepted by discard-capable devices.
     /// A return value of 0 can mean no discard-capable devices exist.
     pub fn discard_ranges(&mut self, ranges: &[(u64, u64)]) -> u64 {
         let mut total = 0u64;
@@ -4137,7 +4129,7 @@ mod tests {
     }
 
     #[test]
-    fn free_blocks_with_trim_on_delete_invokes_discard() {
+    fn free_blocks_with_trim_on_delete_reports_zero_for_directory_device() {
         let root = temp_dir("free-trim");
         let _ = std::fs::remove_dir_all(&root);
         let config = single_device_config(&root);
@@ -4158,19 +4150,27 @@ mod tests {
         let blocks = ba.alloc_contiguous(10).unwrap();
         pool.set_allocator(ba);
 
-        // free_blocks should call discard_ranges (which iterates devices
-        // and returns bytes trimmed). SingleDevice reports
-        // supports_discard=true but discard_range is a no-op placeholder,
-        // so the return value is 0 but the method does not panic.
         let trimmed = pool.free_blocks(&blocks);
-        // With a real device the result would be > 0; currently a no-op.
-        let _ = trimmed;
+        assert_eq!(trimmed, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn trim_free_space_with_batching() {
+    fn discard_ranges_returns_zero_for_directory_device() {
+        let root = temp_dir("discard-ranges-dir");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let options = test_options();
+        let mut pool = Pool::create(config, PoolProperties::default(), &options).unwrap();
+
+        assert_eq!(pool.discard_ranges(&[(0, 4096), (4096, 0)]), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trim_free_space_with_batching_reports_zero_for_directory_device() {
         use tidefs_block_allocator::TrimRequest;
         let root = temp_dir("trim-batch");
         let _ = std::fs::remove_dir_all(&root);
@@ -4183,17 +4183,17 @@ mod tests {
 
         // batch_size=0 → all at once
         let t0 = pool.trim_free_space(&ranges, 0, std::time::Duration::from_millis(0));
-        assert_eq!(t0, 10 * 4096);
+        assert_eq!(t0, 0);
 
         // batch_size=3 → 4 batches (3+3+3+1)
         let t3 = pool.trim_free_space(&ranges, 3, std::time::Duration::from_millis(0));
-        assert_eq!(t3, 10 * 4096);
+        assert_eq!(t3, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn discard_unused_with_allocator_calls_free_ranges() {
+    fn discard_unused_with_allocator_reports_zero_without_discard_device() {
         let root = temp_dir("discard-alloc");
         let _ = std::fs::remove_dir_all(&root);
         let config = single_device_config(&root);
@@ -4210,14 +4210,8 @@ mod tests {
         let _used = ba.alloc_contiguous(10).unwrap();
         pool.set_allocator(ba);
 
-        // discard_unused should call allocator.free_ranges() and issue
-        // discard for every free range. SingleDevice discard_range is a
-        // no-op placeholder, so the return value reflects the allocator's
-        // view of free space.
         let trimmed = pool.discard_unused();
-        // With single device, all free ranges are reported as trimmed.
-        // 54 blocks * 4096 = 221184 bytes free (64 total - 10 used)
-        assert_eq!(trimmed, 54 * 4096);
+        assert_eq!(trimmed, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -743,56 +743,19 @@ impl DeviceImpl for SingleDevice {
             .force_error_for_test(kind, count)
     }
 
-    fn discard_range(&mut self, offset: u64, len: u64) -> Result<()> {
+    fn discard_range(&mut self, _offset: u64, len: u64) -> Result<()> {
         // No-op for zero-length discard requests.
         if len == 0 {
             return Ok(());
         }
 
-        let max_segment = self.store.max_segment_bytes();
-        if max_segment == 0 {
-            return Ok(());
-        }
-
-        let segments_dir = self.store.segments_dir().to_path_buf();
-        let mut remaining = len;
-        let mut current_offset = offset;
-
-        while remaining > 0 {
-            let segment_id = current_offset / max_segment;
-            let offset_in_segment = current_offset % max_segment;
-
-            // Bytes to punch from this segment (may span multiple
-            // segments if the range crosses a segment boundary).
-            let bytes_this_segment = remaining.min(max_segment - offset_in_segment);
-
-            let seg_path = crate::store::segment_path(&segments_dir, segment_id);
-            if seg_path.exists() {
-                // Best-effort hole-punch via fallocate(1). If the
-                // utility is unavailable or the filesystem does not
-                // support hole-punch, skip silently rather than
-                // failing the entire discard operation.
-                let _ = std::process::Command::new("fallocate")
-                    .args([
-                        "-p",
-                        "-o",
-                        &offset_in_segment.to_string(),
-                        "-l",
-                        &bytes_this_segment.to_string(),
-                    ])
-                    .arg(&seg_path)
-                    .status();
-            }
-
-            remaining = remaining.saturating_sub(bytes_this_segment);
-            current_offset = current_offset.saturating_add(bytes_this_segment);
-        }
-
-        Ok(())
+        Err(StoreError::InvalidOptions {
+            reason: "directory-backed device discard is not a proven storage capability",
+        })
     }
 
     fn supports_discard(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -4071,7 +4034,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     #[test]
-    fn parity_raid1_discard_fans_out_to_all_children() {
+    fn parity_raid1_directory_children_do_not_advertise_discard() {
         let paths: Vec<_> = (0..3)
             .map(|i| temp_path(&format!("parity_raid-discard-{i}")))
             .collect();
@@ -4079,10 +4042,12 @@ mod tests {
             let _ = std::fs::remove_dir_all(p);
         }
         let mut device = Device::open_parity_raid1(&paths, &test_options()).unwrap();
-        // PARITY_RAID1 with SingleDevice children should support discard.
-        assert!(device.supports_discard());
-        // Discard a range -- should fan out to all 3 children without error.
-        device.discard_range(0, 4096).unwrap();
+        // PARITY_RAID1 inherits the directory-backed child capability boundary.
+        assert!(!device.supports_discard());
+        assert!(matches!(
+            device.discard_range(0, 4096),
+            Err(StoreError::InvalidOptions { .. })
+        ));
         // After discard, the device should still be operational.
         let key = ObjectKey::from_name(b"after-discard");
         device.put(key, b"still-works").unwrap();
@@ -4774,74 +4739,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// discard_range succeeds when the segment file does not exist
-    /// (pool has not yet written data that far).
+    /// Non-zero discard is unsupported for directory-backed devices.
     #[test]
-    fn single_device_discard_range_nonexistent_segment() {
+    fn single_device_discard_range_nonzero_is_unsupported() {
         let dir = temp_path("discard-no-seg");
         let _ = std::fs::remove_dir_all(&dir);
         let mut dev = SingleDevice::open(&dir, test_options()).unwrap();
-        // max_segment_bytes defaults to 256 MiB; requesting offset
-        // 0 in a fresh store hits segment 0 which exists (empty).
-        // Requesting a range far beyond any allocated segment should
-        // not panic.
         let far_offset = 1024u64 * 1024 * 1024 * 1024; // 1 TiB
-        assert!(dev.discard_range(far_offset, 4096).is_ok());
+        assert!(matches!(
+            dev.discard_range(far_offset, 4096),
+            Err(StoreError::InvalidOptions { .. })
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// discard_range across multiple segment boundaries completes
-    /// without panicking.
+    /// Discard remains unsupported even when segment files exist.
     #[test]
-    fn single_device_discard_range_crosses_segment_boundary() {
+    fn single_device_discard_range_existing_segment_is_unsupported() {
         let dir = temp_path("discard-cross-seg");
         let _ = std::fs::remove_dir_all(&dir);
         let mut opts = test_options();
-        // Use a small segment size so we can test multi-segment crossing.
-        // Record header/footer overhead is ~224 bytes, so a 4096-byte
-        // segment fits payloads up to ~3872 bytes.
         opts.max_segment_bytes = 4096;
         let mut dev = SingleDevice::open(&dir, opts).unwrap();
 
-        // Write two small records to ensure segment 0 exists (rotates
-        // only after exceeding max_segment_bytes). The discard path
-        // doesn't require actual data in the segments.
         let key1 = ObjectKey::from_name(b"test-cross-1");
         dev.put(key1, b"hello").unwrap();
 
-        // Discard a range that starts in segment 0 and ends in segment 1
-        // (e.g. offset 2048, length 4096 → spans [2048, 6144) across two
-        // 4096-byte segments). Segment 1 may not exist yet; the discard
-        // path tolerates missing segment files.
-        assert!(dev.discard_range(2048, 4096).is_ok());
+        assert!(matches!(
+            dev.discard_range(2048, 4096),
+            Err(StoreError::InvalidOptions { .. })
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// discard_range handles the case where max_segment_bytes is set
-    /// to a non-zero value and a range fits entirely within one segment.
+    /// Directory-backed SingleDevice does not prove discard capability.
     #[test]
-    fn single_device_discard_range_single_segment() {
-        let dir = temp_path("discard-single-seg");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut opts = test_options();
-        opts.max_segment_bytes = 4096;
-        let mut dev = SingleDevice::open(&dir, opts).unwrap();
-
-        let key = ObjectKey::from_name(b"test-single-seg");
-        dev.put(key, b"hello world").unwrap();
-
-        assert!(dev.discard_range(0, 512).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// supports_discard returns true for SingleDevice after
-    /// discard_range is implemented.
-    #[test]
-    fn single_device_supports_discard_is_true() {
+    fn single_device_supports_discard_is_false() {
         let dir = temp_path("discard-supports");
         let _ = std::fs::remove_dir_all(&dir);
         let dev = SingleDevice::open(&dir, test_options()).unwrap();
-        assert!(dev.supports_discard());
+        assert!(!dev.supports_discard());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
