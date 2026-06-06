@@ -306,7 +306,9 @@ impl PoolLabelWriter {
             } => {
                 out.insert(*device_index, device_path.clone());
             }
-            DeviceType::Mirror { children } | DeviceType::ParityRaid { children, .. } => {
+            DeviceType::PoolWideData { children }
+            | DeviceType::Mirror { children }
+            | DeviceType::ParityRaid { children, .. } => {
                 for child in children {
                     Self::collect_leaf_index_map(child, out);
                 }

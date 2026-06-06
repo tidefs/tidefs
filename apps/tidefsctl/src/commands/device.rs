@@ -773,7 +773,7 @@ mod tests {
         let config = PoolConfig {
             pool_uuid: [0xAAu8; 16],
             pool_name: "testpool".to_string(),
-            device_tree: DeviceType::Mirror {
+            device_tree: DeviceType::PoolWideData {
                 children: vec![leaf0, leaf1, leaf2],
             },
             health: DeviceHealth::Online,

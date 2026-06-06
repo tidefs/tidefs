@@ -40,9 +40,7 @@ pub enum DeviceRemovalError {
     WouldEmptyPool,
 
     /// Removing this device would leave the pool with insufficient
-    /// redundancy to survive another failure (e.g. removing a parity
-    /// member from a ParityRaid group, or removing the last healthy
-    /// mirror member).
+    /// redundancy to survive another failure under the configured policy.
     InsufficientRedundancy {
         /// Human-readable details about the redundancy shortfall.
         details: String,
@@ -330,7 +328,9 @@ impl DeviceRemovalPlanner {
                     capacity_bytes: *capacity_bytes,
                 });
             }
-            DeviceType::Mirror { children } | DeviceType::ParityRaid { children, .. } => {
+            DeviceType::PoolWideData { children }
+            | DeviceType::Mirror { children }
+            | DeviceType::ParityRaid { children, .. } => {
                 for child in children {
                     Self::collect_leaves(child, out);
                 }
@@ -504,16 +504,15 @@ impl VdevRemoveStats {
 // check_removal_redundancy — validate that removing a device is safe
 // ---------------------------------------------------------------------------
 
-/// Check whether removing  from  would leave
-/// the pool with insufficient redundancy.
+/// Check whether removing a device would leave the topology empty.
 ///
 /// # Safety rules
 ///
-/// * Mirror: removal is allowed as long as at least one child remains
-///   (the mirror will become degraded but still operational).
-/// * ParityRaid: removal is refused — losing a parity member would
-///   compromise data integrity.
-/// * Standalone leaf: refused (would empty the pool).
+/// * Pool-wide data set: removal is allowed as long as at least one member
+///   remains. The caller's evacuation/placement validation owns policy
+///   sufficiency.
+/// * Legacy group nodes follow the same member-set rule for compatibility.
+/// * Standalone leaf: refused because it would empty the pool.
 ///
 /// # Errors
 ///
@@ -533,8 +532,9 @@ pub fn check_removal_redundancy(
                 path: target_path.to_path_buf(),
             })
         }
-        crate::DeviceType::Mirror { children } => {
-            // Find if the target is a direct child leaf
+        crate::DeviceType::PoolWideData { children }
+        | crate::DeviceType::Mirror { children }
+        | crate::DeviceType::ParityRaid { children, .. } => {
             let child_count = children.len();
             for child in children {
                 match child {
@@ -543,62 +543,13 @@ pub fn check_removal_redundancy(
                             if child_count <= 1 {
                                 return Err(DeviceRemovalError::WouldEmptyPool);
                             }
-                            // Mirror with 2+ children: safe to remove one
                             return Ok(());
-                        }
-                    }
-                    _ => {
-                        // Recurse into nested groups
-                        if let Ok(()) = check_removal_redundancy(child, target_path) {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            Err(DeviceRemovalError::TargetDeviceNotFound {
-                path: target_path.to_path_buf(),
-            })
-        }
-        crate::DeviceType::ParityRaid {
-            parity: _parity,
-            children,
-        } => {
-            for child in children {
-                match child {
-                    crate::DeviceType::Leaf { device_path, .. } => {
-                        if device_path == target_path {
-                            return Err(DeviceRemovalError::InsufficientRedundancy {
-                                details: format!(
-                                    "cannot remove {}: ParityRaid groups cannot lose a member without data loss",
-                                    target_path.display()
-                                ),
-                            });
                         }
                     }
                     _ => {
                         if let Ok(()) = check_removal_redundancy(child, target_path) {
                             return Ok(());
                         }
-                        // If the child is itself a group (nested ParityRaid or Mirror),
-                        // we also refuse - nested groups aren't supported for removal
-                        if let crate::DeviceType::Mirror { .. }
-                        | crate::DeviceType::ParityRaid { .. } = child
-                        {
-                            if std::path::Path::new("") == target_path {
-                                // dummy path check won't match
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-            // Check nested groups properly
-            for child in children {
-                if let crate::DeviceType::Mirror { .. } | crate::DeviceType::ParityRaid { .. } =
-                    child
-                {
-                    if let Ok(()) = check_removal_redundancy(child, target_path) {
-                        return Ok(());
                     }
                 }
             }
@@ -871,8 +822,8 @@ mod tests {
         }
     }
 
-    fn make_mirror(children: Vec<DeviceType>) -> DeviceType {
-        DeviceType::Mirror { children }
+    fn make_pool_data(children: Vec<DeviceType>) -> DeviceType {
+        DeviceType::PoolWideData { children }
     }
 
     fn make_object(id: u64, device: &str, size: u64) -> ObjectPlacement {
@@ -882,8 +833,8 @@ mod tests {
     // ---------- Planner: basic plan computation ----------
 
     #[test]
-    fn plan_removal_three_device_mirror() {
-        let tree = make_mirror(vec![
+    fn plan_removal_three_device_pool_data_set() {
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
             make_leaf("/dev/disk2", 3, 2, 1024 * 1024 * 1024),
@@ -917,7 +868,7 @@ mod tests {
 
     #[test]
     fn plan_removal_no_objects_on_target() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
@@ -960,7 +911,7 @@ mod tests {
 
     #[test]
     fn target_device_not_found() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
@@ -983,7 +934,7 @@ mod tests {
 
     #[test]
     fn device_level_separation_single_object() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
@@ -1003,7 +954,7 @@ mod tests {
 
     #[test]
     fn full_stripe_validated() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
             make_leaf("/dev/disk2", 3, 2, 1024 * 1024 * 1024),
@@ -1026,7 +977,7 @@ mod tests {
 
     #[test]
     fn validated_when_enough_surviving_devices() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
             make_leaf("/dev/disk2", 3, 2, 1024 * 1024 * 1024),
@@ -1053,7 +1004,7 @@ mod tests {
 
     #[test]
     fn round_robin_distribution_across_surviving() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
             make_leaf("/dev/disk2", 3, 2, 1024 * 1024 * 1024),
@@ -1374,7 +1325,7 @@ mod tests {
             pool_uuid: [0xAAu8; 16],
             pool_name: "test".to_string(),
             redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
-            device_tree: make_mirror(vec![leaf0, leaf1, leaf2]),
+            device_tree: make_pool_data(vec![leaf0, leaf1, leaf2]),
             health: crate::DeviceHealth::Online,
             state: tidefs_types_pool_label_core::PoolState::Active,
             total_capacity_bytes: 3 * 1024 * 1024 * 1024,
@@ -1406,7 +1357,7 @@ mod tests {
             pool_uuid: [0xAAu8; 16],
             pool_name: "test".to_string(),
             redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
-            device_tree: make_mirror(vec![leaf0, leaf1]),
+            device_tree: make_pool_data(vec![leaf0, leaf1]),
             health: crate::DeviceHealth::Online,
             state: tidefs_types_pool_label_core::PoolState::Active,
             total_capacity_bytes: 2 * 1024 * 1024 * 1024,
@@ -1548,7 +1499,7 @@ mod tests {
 
     #[test]
     fn full_removal_pipeline_succeeds() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
@@ -1595,7 +1546,7 @@ mod tests {
 
     #[test]
     fn removal_pipeline_quiesce_fails() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
@@ -1636,7 +1587,7 @@ mod tests {
 
     #[test]
     fn removal_pipeline_verify_fails() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
@@ -1685,7 +1636,7 @@ mod tests {
 
     #[test]
     fn removal_pipeline_commit_fails() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
@@ -1735,7 +1686,7 @@ mod tests {
 
     #[test]
     fn removal_pipeline_no_objects_on_device_is_error() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
@@ -1766,7 +1717,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "run_device_removal called on terminal phase")]
     fn run_from_terminal_phase_panics() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
@@ -1839,31 +1790,24 @@ mod tests {
     }
 
     #[test]
-    fn remove_mirror_member_two_to_one_way_degraded() {
-        // 2-way mirror: removing one member leaves 1-way (degraded but allowed).
-        let tree = make_mirror(vec![
+    fn remove_pool_data_member_two_to_one_allowed() {
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
         let result = check_removal_redundancy(&tree, Path::new("/dev/disk0"));
-        assert!(result.is_ok(), "mirror 2→1 should be allowed");
+        assert!(result.is_ok(), "2-member pool data set can lose one member");
     }
 
     #[test]
-    fn remove_raidz_member_refused() {
-        // 3-device ParityRaid(1): removing one member would lose parity.
+    fn remove_legacy_parity_member_uses_pool_wide_rule() {
         let tree = make_parity_raid(&["/dev/disk0", "/dev/disk1", "/dev/disk2"], 1);
         let result = check_removal_redundancy(&tree, Path::new("/dev/disk0"));
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            DeviceRemovalError::InsufficientRedundancy { .. }
-        ));
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn remove_raidz_member_with_2_parity_refused() {
-        // 5-device ParityRaid(2): still cannot lose any member.
+    fn remove_legacy_two_parity_member_uses_pool_wide_rule() {
         let tree = make_parity_raid(
             &[
                 "/dev/disk0",
@@ -1875,17 +1819,12 @@ mod tests {
             2,
         );
         let result = check_removal_redundancy(&tree, Path::new("/dev/disk2"));
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            DeviceRemovalError::InsufficientRedundancy { .. }
-        ));
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn remove_with_insufficient_redundancy_last_mirror_member() {
-        // 1-way mirror: removing would empty the parent.
-        let tree = make_mirror(vec![make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024)]);
+    fn remove_with_insufficient_redundancy_last_pool_data_member() {
+        let tree = make_pool_data(vec![make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024)]);
         let result = check_removal_redundancy(&tree, Path::new("/dev/disk0"));
         assert!(result.is_err());
         assert!(matches!(
@@ -1896,7 +1835,7 @@ mod tests {
 
     #[test]
     fn remove_device_not_in_tree_by_redundancy_check() {
-        let tree = make_mirror(vec![
+        let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
@@ -1986,11 +1925,11 @@ mod tests {
     #[test]
     fn insufficient_redundancy_error_display() {
         let err = DeviceRemovalError::InsufficientRedundancy {
-            details: "ParityRaid groups cannot lose a member".into(),
+            details: "pool-wide policy would not have enough surviving receipts".into(),
         };
         let displayed = format!("{err}");
         assert!(displayed.contains("insufficient redundancy"));
-        assert!(displayed.contains("ParityRaid"));
+        assert!(displayed.contains("pool-wide policy"));
     }
 
     #[test]
@@ -2011,7 +1950,7 @@ mod tests {
     // ── PoolConfig::remove_device integration with redundancy ──────
 
     #[test]
-    fn poolconfig_remove_device_rejects_raidz_member() {
+    fn poolconfig_remove_device_updates_legacy_parity_tree_by_member_rule() {
         let tree = make_parity_raid(&["/dev/disk0", "/dev/disk1", "/dev/disk2"], 1);
         let mut config = crate::PoolConfig {
             pool_uuid: [0xAAu8; 16],
@@ -2029,10 +1968,9 @@ mod tests {
             removing_device_indices: vec![],
         };
         let result = config.remove_device(Path::new("/dev/disk0"));
-        assert!(matches!(
-            result,
-            Err(DeviceRemovalError::InsufficientRedundancy { .. })
-        ));
+        assert!(result.is_ok());
+        assert_eq!(config.device_count, 2);
+        assert_eq!(config.topology_generation, 2);
     }
 }
 

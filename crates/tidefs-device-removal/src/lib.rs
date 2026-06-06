@@ -909,7 +909,8 @@ fn find_device_health(
                 None
             }
         }
-        tidefs_pool_scan::DeviceType::Mirror { children }
+        tidefs_pool_scan::DeviceType::PoolWideData { children }
+        | tidefs_pool_scan::DeviceType::Mirror { children }
         | tidefs_pool_scan::DeviceType::ParityRaid { children, .. } => {
             for child in children {
                 if let Some(h) = find_device_health(child, target_path) {
@@ -1025,7 +1026,7 @@ mod tests {
             pool_uuid: [0x42u8; 16],
             pool_name: "testpool".to_string(),
             redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
-            device_tree: DeviceType::Mirror { children: leaves },
+            device_tree: DeviceType::PoolWideData { children: leaves },
             health: DeviceHealth::Online,
             state: PoolState::Active,
             total_capacity_bytes: 1024 * 1024 * 1024 * u64::from(count),

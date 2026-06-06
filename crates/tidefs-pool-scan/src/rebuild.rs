@@ -286,7 +286,9 @@ fn collect_indices(node: &DeviceType, out: &mut Vec<u32>) {
         DeviceType::Leaf { device_index, .. } => {
             out.push(*device_index);
         }
-        DeviceType::Mirror { children } | DeviceType::ParityRaid { children, .. } => {
+        DeviceType::PoolWideData { children }
+        | DeviceType::Mirror { children }
+        | DeviceType::ParityRaid { children, .. } => {
             for child in children {
                 collect_indices(child, out);
             }
@@ -308,7 +310,9 @@ fn find_leaf_health(tree: &DeviceType, path: &std::path::Path) -> Option<DeviceH
                 None
             }
         }
-        DeviceType::Mirror { children } | DeviceType::ParityRaid { children, .. } => {
+        DeviceType::PoolWideData { children }
+        | DeviceType::Mirror { children }
+        | DeviceType::ParityRaid { children, .. } => {
             children.iter().find_map(|c| find_leaf_health(c, path))
         }
     }

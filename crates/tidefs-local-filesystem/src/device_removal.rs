@@ -15,7 +15,7 @@
 //! | Stage | Function | Authority Source | Pool-Authoritative | Synthetic |
 //! |-------|----------|-----------------|--------------------|-----------|
 //! | 1. Config Import | [`import_pool_config_from_store`] | Sealed labels in `LocalObjectStore` at `tidefs-pool-label-{idx}` keys | pool UUID, pool name, device GUIDs, device indices, device count, topology generation, feature flags, pool state, device health | Device paths: labels carry `device_index` but not real block-device paths; the importer synthesises `/dev/disk{idx}` |
-//! | 2. Target & Survivor Derivation | `PoolConfig::find_leaf` / `all_leaf_paths` | Imported `PoolConfig` | Which devices exist, their GUIDs, their indices, the tree topology (Mirror/ParityRaid/Leaf), health, and capacity | Device paths in the tree are the synthetic paths from stage 1, not real block devices |
+//! | 2. Target & Survivor Derivation | `PoolConfig::find_leaf` / `all_leaf_paths` | Imported `PoolConfig` | Which devices exist, their GUIDs, their indices, the pool-wide or legacy compatibility topology, health, and capacity | Device paths in the tree are the synthetic paths from stage 1, not real block devices |
 //! | 3. Object Enumeration | CLI: target-store key listing → `ObjectPlacement` rows | `LocalObjectStore::list_keys` (all data keys filtered from label/record keys) | None (see nonclaim boundaries) | Every data key in the target store is marked resident on the target device; no canonical locator/placement/refcount authority is consulted |
 //! | 4. Evacuation Plan | `DeviceRemovalPlanner::plan_removal` | Imported topology + synthetic placements + replication intent | topology generation, device GUIDs, device count | Round-robin target assignment per object; failure-domain validation uses synthetic PlacementEntry device/node/rack IDs |
 //! | 5. Post-Removal Config | `build_post_removal_pool_config` → `PoolConfig::remove_device` | Imported pre-config, mutated in place | pool UUID, pool name, feature flags, device GUIDs, topology generation (bumped), device count (decremented), remaining device tree | Device paths remain synthetic |
@@ -503,7 +503,7 @@ pub fn import_pool_config_from_store(
     let device_tree = if leaves.len() == 1 {
         leaves.into_iter().next().unwrap()
     } else {
-        DeviceType::Mirror { children: leaves }
+        DeviceType::PoolWideData { children: leaves }
     };
 
     let total_capacity = device_tree.total_capacity_bytes();
@@ -710,9 +710,10 @@ mod tests {
         let mut config = PoolConfig {
             pool_uuid: [0x42u8; 16],
             pool_name: "testpool".to_string(),
-            device_tree: DeviceType::Mirror {
+            device_tree: DeviceType::PoolWideData {
                 children: vec![leaf0, leaf1.clone(), leaf2],
             },
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             health: DeviceHealth::Online,
             state: PoolState::Active,
             total_capacity_bytes: 3 * 1024 * 1024 * 1024,
@@ -1174,6 +1175,7 @@ fn imported_config_preserves_authoritative_fields_through_remove_device() {
         device_tree: DeviceType::Mirror {
             children: vec![leaf0.clone(), leaf1.clone(), leaf2.clone()],
         },
+        redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
         health: DeviceHealth::Online,
         state: PoolState::Active,
         total_capacity_bytes: 3 * 1024 * 1024 * 1024,

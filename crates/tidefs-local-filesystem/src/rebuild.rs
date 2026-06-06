@@ -266,7 +266,9 @@ pub fn mark_device_rebuilt(config: &mut tidefs_pool_scan::PoolConfig, device_ind
                     *health = tidefs_pool_scan::DeviceHealth::Online;
                 }
             }
-            DeviceType::Mirror { children } | DeviceType::ParityRaid { children, .. } => {
+            DeviceType::PoolWideData { children }
+            | DeviceType::Mirror { children }
+            | DeviceType::ParityRaid { children, .. } => {
                 for child in children {
                     set_leaf_health(child, target_index);
                 }
@@ -384,6 +386,7 @@ mod tests {
                     make_leaf("/dev/disk1", 1, 0x02, DeviceHealth::Online),
                 ],
             },
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             health: DeviceHealth::Online,
             state: PoolState::Active,
             total_capacity_bytes: 2 * 1024 * 1024 * 1024,
@@ -424,6 +427,7 @@ mod tests {
                     make_leaf("/dev/disk1", 1, 0x02, DeviceHealth::Online),
                 ],
             },
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             health: DeviceHealth::Degraded,
             state: PoolState::Active,
             total_capacity_bytes: 2 * 1024 * 1024 * 1024,
@@ -479,6 +483,7 @@ mod tests {
                     make_leaf("/dev/disk1", 1, 0x02, DeviceHealth::Degraded),
                 ],
             },
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             health: DeviceHealth::Degraded,
             state: PoolState::Active,
             total_capacity_bytes: 2 * 1024 * 1024 * 1024,
@@ -515,7 +520,9 @@ mod tests {
                         None
                     }
                 }
-                DeviceType::Mirror { children } | DeviceType::ParityRaid { children, .. } => {
+                DeviceType::PoolWideData { children }
+                | DeviceType::Mirror { children }
+                | DeviceType::ParityRaid { children, .. } => {
                     children.iter().find_map(|c| find_health(c, idx))
                 }
             }
@@ -589,6 +596,7 @@ mod tests {
             device_tree: DeviceType::Mirror {
                 children: vec![make_leaf("/dev/disk0", 0, 0x01, DeviceHealth::Online)],
             },
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             health: DeviceHealth::Online,
             state: PoolState::Active,
             total_capacity_bytes: 1024 * 1024 * 1024,
