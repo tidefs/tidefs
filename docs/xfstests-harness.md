@@ -110,6 +110,9 @@ Results land in `<out_dir>/scoreboard.md` and `<out_dir>/scoreboard.tsv`.
 
 - **Passed**: test exited 0 and xfstests `.out.bad` was empty or matched `.out`
 - **Failed**: test exited non-zero or output mismatch
+- **Failed timeout**: a row exceeded the per-test timeout. The harness records
+  this as a failed product row, attempts bounded per-row cleanup, and may still
+  attempt later requested rows for visibility.
 - **Skipped**: test was excluded or xfstests could not run it (e.g. missing helper binary)
 
 

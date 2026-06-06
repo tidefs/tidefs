@@ -1268,6 +1268,42 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         exit 124
     }
 
+    abort_nested_xfstests_mounts() {
+        abort_label="$1"
+        echo "timeout recovery: abort nested xfstests mounts for $abort_label"
+        for nested_mnt in "$SCRATCH_MNT" "$TEST_DIR" "$MNT"/xfstests-*; do
+            [ -e "$nested_mnt" ] || continue
+            if mountpoint -q "$nested_mnt" 2>/dev/null; then
+                timeout 5 umount "$nested_mnt" 2>/dev/null \
+                    || timeout 5 umount -l "$nested_mnt" 2>/dev/null \
+                    || true
+            fi
+        done
+        pkill -TERM -f "tidefs-posix-filesystem-adapter-daemon.*--mount $TEST_DIR" 2>/dev/null || true
+        pkill -TERM -f "tidefs-posix-filesystem-adapter-daemon.*--mount $SCRATCH_MNT" 2>/dev/null || true
+        sleep 1
+        pkill -KILL -f "tidefs-posix-filesystem-adapter-daemon.*--mount $TEST_DIR" 2>/dev/null || true
+        pkill -KILL -f "tidefs-posix-filesystem-adapter-daemon.*--mount $SCRATCH_MNT" 2>/dev/null || true
+        for nested_mnt in "$SCRATCH_MNT" "$TEST_DIR" "$MNT"/xfstests-*; do
+            [ -e "$nested_mnt" ] || continue
+            if mountpoint -q "$nested_mnt" 2>/dev/null; then
+                timeout 5 umount -l "$nested_mnt" 2>/dev/null || true
+            fi
+        done
+    }
+
+    recover_timed_out_xfstests_check() {
+        recovery_test="$1"
+        recovery_pid="$2"
+        echo "timeout recovery: terminate xfstests process tree for $recovery_test"
+        terminate_process_tree "$recovery_pid" TERM
+        sleep 2
+        abort_nested_xfstests_mounts "$recovery_test"
+        terminate_process_tree "$recovery_pid" KILL
+        sleep 1
+        abort_nested_xfstests_mounts "$recovery_test"
+    }
+
     run_diagnostics_bounded() {
         diag_label="$1"
         shift
@@ -1331,9 +1367,7 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             if [ "$elapsed" -ge "$PER_TEST_TIMEOUT" ]; then
                 emit_xfstests_timeout_fail "$bounded_test" "test timed out after ''${PER_TEST_TIMEOUT}s"
                 run_diagnostics_bounded "timeout-$bounded_test" "$bounded_test" "$bounded_result_base" "$bounded_test_log"
-                terminate_process_tree "$check_pid" TERM
-                sleep 2
-                terminate_process_tree "$check_pid" KILL
+                recover_timed_out_xfstests_check "$bounded_test" "$check_pid"
                 if ! wait_process_bounded "$check_pid" "xfstests-$bounded_test" 5; then
                     stop_guest_after_stuck_timeout "xfstests-$bounded_test"
                 fi
