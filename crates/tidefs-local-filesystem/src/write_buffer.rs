@@ -189,6 +189,12 @@ impl WriteBuffer {
         self.max_offset
     }
 
+    pub(crate) fn segments(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.segments
+            .iter()
+            .map(|(&offset, data)| (offset, data.as_slice()))
+    }
+
     /// Drain all segments, returning `(offset, data)` pairs and resetting
     /// internal state.
     pub fn drain(&mut self) -> Vec<(u64, Vec<u8>)> {

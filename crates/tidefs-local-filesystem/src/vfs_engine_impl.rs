@@ -183,27 +183,16 @@ impl SparseAnonymousData {
 
     fn from_open_local_file(
         fs: &LocalFileSystem,
-        path: &str,
+        _path: &str,
         record: &InodeRecord,
     ) -> crate::Result<(Self, u64)> {
-        const SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
-
-        let file_size = fs.effective_file_size(record.inode_id);
-        let mut data = Self::new();
-        let mut offset = 0_u64;
-        while offset < file_size {
-            let remaining = file_size - offset;
-            let len =
-                usize::try_from(remaining.min(SNAPSHOT_CHUNK_BYTES as u64)).map_err(|_| {
-                    crate::FileSystemError::SizeOverflow {
-                        requested: remaining,
-                    }
-                })?;
-            let bytes = fs.read_file_range(path, offset, len)?;
-            data.insert_if_data(offset, bytes);
-            offset = offset.saturating_add(len as u64);
-        }
-        Ok((data, file_size))
+        let (extents, file_size) = fs.sparse_file_snapshot_extents(record.inode_id, record)?;
+        Ok((
+            Self {
+                extents: extents.into_iter().collect(),
+            },
+            file_size,
+        ))
     }
 
     fn insert_if_data(&mut self, offset: u64, bytes: Vec<u8>) {
@@ -6521,6 +6510,46 @@ mod tests {
             engine.getattr(attr.inode_id, None, &ctx()).unwrap_err(),
             Errno::ENOENT
         );
+    }
+
+    #[test]
+    fn unlink_open_file_snapshot_overlays_buffered_zero_writes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, fh) = engine
+            .create(root, b"zero-overlay-open-gone.dat", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let mut base = vec![0x5a; 8192];
+        base[..8].copy_from_slice(b"basehead");
+
+        engine.write(&fh, 0, &base, &ctx()).unwrap();
+        engine.flush(&fh, &ctx()).unwrap();
+
+        let zeroes = vec![0_u8; 1024];
+        engine.write(&fh, 2048, &zeroes, &ctx()).unwrap();
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(attr.inode_id, 2048, zeroes.len())
+                .is_some(),
+            "test setup should leave the zero overlay buffered"
+        );
+
+        engine
+            .unlink(root, b"zero-overlay-open-gone.dat", &ctx())
+            .unwrap();
+
+        let mut expected = base;
+        expected[2048..2048 + zeroes.len()].fill(0);
+        assert_eq!(
+            engine
+                .read(&fh, 0, u32::try_from(expected.len()).unwrap(), &ctx())
+                .unwrap(),
+            expected
+        );
+        engine.release(&fh).unwrap();
+        drop(engine);
     }
 
     #[test]

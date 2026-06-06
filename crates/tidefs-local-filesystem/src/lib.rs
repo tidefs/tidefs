@@ -664,6 +664,85 @@ struct CoalescedBufferedWritePatch {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Default)]
+struct SparseFileSnapshotBuilder {
+    extents: BTreeMap<u64, Vec<u8>>,
+}
+
+impl SparseFileSnapshotBuilder {
+    fn insert_if_data(&mut self, offset: u64, bytes: &[u8]) {
+        if !bytes.is_empty() && bytes.iter().any(|byte| *byte != 0) {
+            self.extents.insert(offset, bytes.to_vec());
+        }
+    }
+
+    fn clear_range(&mut self, start: u64, end: u64) -> Result<()> {
+        if start >= end {
+            return Ok(());
+        }
+
+        let keys = self
+            .extents
+            .range(..end)
+            .filter_map(|(&extent_start, bytes)| {
+                let extent_len = u64::try_from(bytes.len()).ok()?;
+                let extent_end = extent_start.checked_add(extent_len)?;
+                (extent_end > start).then_some(extent_start)
+            })
+            .collect::<Vec<_>>();
+        for extent_start in keys {
+            let Some(bytes) = self.extents.remove(&extent_start) else {
+                continue;
+            };
+            let extent_len =
+                u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            let extent_end =
+                extent_start
+                    .checked_add(extent_len)
+                    .ok_or(FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    })?;
+            if extent_start < start {
+                let prefix_len = usize::try_from(start - extent_start).map_err(|_| {
+                    FileSystemError::SizeOverflow {
+                        requested: start - extent_start,
+                    }
+                })?;
+                self.insert_if_data(extent_start, &bytes[..prefix_len]);
+            }
+            if extent_end > end {
+                let suffix_start = usize::try_from(end - extent_start).map_err(|_| {
+                    FileSystemError::SizeOverflow {
+                        requested: end - extent_start,
+                    }
+                })?;
+                self.insert_if_data(end, &bytes[suffix_start..]);
+            }
+        }
+        Ok(())
+    }
+
+    fn overlay(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        let len = u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+        let end = offset
+            .checked_add(len)
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+        self.clear_range(offset, end)?;
+        self.insert_if_data(offset, bytes);
+        Ok(())
+    }
+
+    fn into_extents(self) -> Vec<(u64, Vec<u8>)> {
+        self.extents.into_iter().collect()
+    }
+}
+
 /// Captures old values of inodes, directories, and snapshots
 /// modified during a mutation.  On commit failure the delta is
 /// used to roll back each modified object to its pre-mutation
@@ -6122,6 +6201,92 @@ impl LocalFileSystem {
             return Ok(None);
         }
         Ok(Some(bytes))
+    }
+
+    pub(crate) fn sparse_file_snapshot_extents(
+        &self,
+        inode_id: InodeId,
+        adjusted_record: &InodeRecord,
+    ) -> Result<(Vec<(u64, Vec<u8>)>, u64)> {
+        if adjusted_record.kind() != NodeKind::File {
+            return Err(FileSystemError::NotFile {
+                path: format!("inode:{}", inode_id.get()),
+                kind: adjusted_record.kind(),
+            });
+        }
+
+        let file_size = self.effective_file_size(inode_id);
+        let mut snapshot = SparseFileSnapshotBuilder::default();
+        let base_record = self.committed_record_for_buffered_read(inode_id, adjusted_record);
+
+        if file_size > 0 && base_record.size > 0 {
+            let layout = read_content_layout_from_store(
+                self.store.raw_primary_store(),
+                inode_id,
+                &base_record,
+                true,
+            )?;
+            match layout {
+                ContentLayout::Inline(content) => {
+                    let len_u64 =
+                        file_size.min(u64::try_from(content.bytes.len()).map_err(|_| {
+                            FileSystemError::SizeOverflow {
+                                requested: u64::MAX,
+                            }
+                        })?);
+                    let len = usize::try_from(len_u64)
+                        .map_err(|_| FileSystemError::SizeOverflow { requested: len_u64 })?;
+                    snapshot.insert_if_data(0, &content.bytes[..len]);
+                }
+                ContentLayout::Chunked(manifest) => {
+                    for chunk_ref in &manifest.chunks {
+                        if chunk_ref.is_hole() {
+                            continue;
+                        }
+                        let chunk_start = content_chunk_start(chunk_ref.chunk_index)?;
+                        if chunk_start >= file_size {
+                            break;
+                        }
+                        let chunk = read_content_chunk_from_store(
+                            self.store.raw_primary_store(),
+                            inode_id,
+                            chunk_ref,
+                        )?;
+                        let available = file_size.saturating_sub(chunk_start);
+                        let len_u64 =
+                            available.min(u64::try_from(chunk.bytes.len()).map_err(|_| {
+                                FileSystemError::SizeOverflow {
+                                    requested: u64::MAX,
+                                }
+                            })?);
+                        let len = usize::try_from(len_u64)
+                            .map_err(|_| FileSystemError::SizeOverflow { requested: len_u64 })?;
+                        snapshot.insert_if_data(chunk_start, &chunk.bytes[..len]);
+                    }
+                }
+            }
+        }
+
+        if let Some(wb) = self.write_buffers.get(&inode_id) {
+            for (offset, bytes) in wb.segments() {
+                if offset >= file_size {
+                    continue;
+                }
+                let len_u64 =
+                    file_size
+                        .saturating_sub(offset)
+                        .min(u64::try_from(bytes.len()).map_err(|_| {
+                            FileSystemError::SizeOverflow {
+                                requested: u64::MAX,
+                            }
+                        })?);
+                let len = usize::try_from(len_u64)
+                    .map_err(|_| FileSystemError::SizeOverflow { requested: len_u64 })?;
+                snapshot.overlay(offset, &bytes[..len])?;
+            }
+        }
+
+        Ok((snapshot.into_extents(), file_size))
     }
 
     pub fn write_file(
