@@ -2927,8 +2927,8 @@ impl Pool {
     /// When no allocator is registered, this is a no-op.
     ///
     /// Returns the total number of bytes accepted by discard-capable devices.
-    /// Directory-backed devices currently report no proven discard capability,
-    /// so directory-only pools return 0.
+    /// Compatibility directory stores report no proven discard capability, so
+    /// compatibility-only pools return 0.
     pub fn discard_unused(&mut self) -> u64 {
         if let Some(ref allocator) = self.allocator {
             let free_ranges = allocator.free_ranges();

@@ -829,7 +829,7 @@ fn write_during_eviction() {
 
     let payload: Vec<u8> = b"dirty-page-survives-reclaim".to_vec();
 
-    // Write data through the filesystem (object-store backing).
+    // Write data through the filesystem's compatibility object-store path.
     fs.create_file("/dirty_write", DEFAULT_FILE_PERMISSIONS)
         .expect("create file");
     fs.write_file("/dirty_write", 0, &payload)
