@@ -71,6 +71,22 @@ use tidefs_inode_attributes::timestamp::TimestampPolicy as EngineTimestampPolicy
 const MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 const MOUNT_VFS_TXG_COMMIT_INTERVAL_SECS: u64 = 30;
 
+fn mount_vfs_store_options(config: &MountVfsConfig) -> tidefs_local_object_store::StoreOptions {
+    tidefs_local_object_store::StoreOptions {
+        // Mounted buffered writes become durable at explicit fsync/syncfs or clean shutdown.
+        sync_on_write: false,
+        background_scrub_interval_secs: config.background_scrub_interval_secs,
+        reclaim_enabled: config.enable_reclaim,
+        fault_injection_config: config.fault_inject_corruption.map(|p| {
+            tidefs_local_object_store::FaultInjectionConfig {
+                byte_corruption_probability: p,
+                ..tidefs_local_object_store::FaultInjectionConfig::off()
+            }
+        }),
+        ..tidefs_local_object_store::StoreOptions::default()
+    }
+}
+
 /// RAII guard that removes a PID file on drop (clean shutdown).
 /// On SIGKILL the guard never runs, leaving the PID file as validation.
 struct PidFileGuard(Option<PathBuf>);
@@ -266,17 +282,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         .write_to_path(&mount_state_path)
         .map_err(|e| format!("write mount-state: {e}"))?;
 
-    let store_options = StoreOptions {
-        background_scrub_interval_secs: config.background_scrub_interval_secs,
-        reclaim_enabled: config.enable_reclaim,
-        fault_injection_config: config.fault_inject_corruption.map(|p| {
-            tidefs_local_object_store::FaultInjectionConfig {
-                byte_corruption_probability: p,
-                ..tidefs_local_object_store::FaultInjectionConfig::off()
-            }
-        }),
-        ..StoreOptions::default()
-    };
+    let store_options = mount_vfs_store_options(&config);
     let scrub_interval = config.background_scrub_interval_secs;
     let scrub_store_root = config.store_root.clone();
 
@@ -3868,6 +3874,35 @@ mod tests {
             "writeback_cache must remain opt-in for the default qemu-smoke mount"
         );
         assert_eq!(config.fs_name, "tidefs-vfs");
+    }
+
+    #[test]
+    fn mount_vfs_store_options_defer_per_object_sync_without_relaxing_integrity() {
+        let mut args = required_mount_args();
+        args.push("--background-scrub-interval".to_string());
+        args.push("17".to_string());
+        args.push("--enable-reclaim".to_string());
+        args.push("--fault-inject-corruption".to_string());
+        args.push("0.25".to_string());
+        let config = parse_mount_vfs_config(args).expect("parse mount config");
+
+        let options = mount_vfs_store_options(&config);
+        let durable = tidefs_local_object_store::StoreOptions::default();
+
+        assert!(!options.sync_on_write);
+        assert!(options.verify_read_checksums);
+        assert!(options.repair_torn_tail);
+        assert_eq!(options.max_segment_bytes, durable.max_segment_bytes);
+        assert_eq!(options.background_scrub_interval_secs, 17);
+        assert!(options.reclaim_enabled);
+        assert_eq!(
+            options
+                .fault_injection_config
+                .as_ref()
+                .expect("fault injection config")
+                .byte_corruption_probability,
+            0.25
+        );
     }
 
     #[test]

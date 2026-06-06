@@ -354,6 +354,14 @@ use std::sync::Arc;
 const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 16 * 1024;
 
+fn mounted_store_options() -> tidefs_local_object_store::StoreOptions {
+    tidefs_local_object_store::StoreOptions {
+        // Mounted buffered writes become durable at explicit fsync/syncfs or clean shutdown.
+        sync_on_write: false,
+        ..tidefs_local_object_store::StoreOptions::default()
+    }
+}
+
 /// Resolve an encryption configuration from a sealed pool key envelope file.
 ///
 /// Uses [`tidefs_local_object_store::encrypt::PoolEncryptionKey::unseal`] to
@@ -463,7 +471,6 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     use std::fs;
 
     use tidefs_dataset_lifecycle::DatasetId;
-    use tidefs_local_filesystem::human::local_filesystem::StoreOptions;
     use tidefs_local_filesystem::vfs_engine_impl::VfsLocalFileSystem;
     use tidefs_local_filesystem::LocalFileSystem;
 
@@ -534,7 +541,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
             LocalFileSystem::open_with_block_devices_and_encryption(
                 &config.backing_dir,
                 devices,
-                StoreOptions::default(),
+                mounted_store_options(),
                 root_auth_key,
                 enc.clone(),
             )
@@ -542,7 +549,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
             LocalFileSystem::open_with_block_devices(
                 &config.backing_dir,
                 devices,
-                StoreOptions::default(),
+                mounted_store_options(),
                 root_auth_key,
             )
         }
@@ -550,14 +557,14 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
         eprintln!("tidefsctl: encryption enabled (key fingerprint not logged)");
         LocalFileSystem::open_with_root_authentication_key_and_encryption(
             &config.backing_dir,
-            StoreOptions::default(),
+            mounted_store_options(),
             root_auth_key,
             enc.clone(),
         )
     } else {
         LocalFileSystem::open_with_root_authentication_key(
             &config.backing_dir,
-            StoreOptions::default(),
+            mounted_store_options(),
             root_auth_key,
         )
     }
@@ -949,6 +956,26 @@ pub fn check_idmapped_mount(mountpoint: &std::path::Path) -> Result<(), String> 
     match check_idmapped_mount_from_text(&mountinfo, mountpoint) {
         Ok(()) => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod mounted_store_options_tests {
+    use super::*;
+
+    #[test]
+    fn mounted_store_options_defer_per_object_sync_without_relaxing_integrity() {
+        let options = mounted_store_options();
+        let durable = tidefs_local_object_store::StoreOptions::default();
+
+        assert!(!options.sync_on_write);
+        assert!(options.verify_read_checksums);
+        assert!(options.repair_torn_tail);
+        assert_eq!(options.max_segment_bytes, durable.max_segment_bytes);
+        assert_eq!(
+            options.segment_rotation_interval_secs,
+            durable.segment_rotation_interval_secs
+        );
     }
 }
 
