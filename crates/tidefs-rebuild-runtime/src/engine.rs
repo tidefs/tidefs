@@ -8,7 +8,9 @@ use crate::progress::BackfillProgress;
 use crate::task::BackfillTask;
 use std::error::Error;
 use std::fmt;
+use tidefs_membership_epoch::MemberId;
 use tidefs_object_io::{ObjectKey, ObjectStore};
+use tidefs_replication_model::PlacementReceiptRef;
 
 /// Maximum bytes to report in a single progress tick.
 pub const DEFAULT_CHUNK_SIZE: usize = 65536;
@@ -30,6 +32,34 @@ pub enum EngineError {
     },
     /// An error from the underlying object store.
     StoreError(Box<dyn Error + Send + Sync>),
+    /// Receipt-bound execution was asked to use a compatibility placeholder.
+    SyntheticReceiptRef { object_id: u64 },
+    /// The receipt source could not fetch bytes from the selected member.
+    ReceiptSourceError {
+        source_member: MemberId,
+        object_id: u64,
+        message: String,
+    },
+    /// The task and receipt disagree about the payload length.
+    ReceiptTaskLengthMismatch {
+        object_id: u64,
+        task_len: u64,
+        receipt_len: u64,
+    },
+    /// The receipt-bound source returned fewer or more bytes than the receipt
+    /// authorizes.
+    ReceiptPayloadLengthMismatch {
+        object_id: u64,
+        expected_len: u64,
+        actual_len: u64,
+    },
+    /// The receipt-bound source returned bytes that do not match the durable
+    /// placement receipt digest.
+    ReceiptPayloadDigestMismatch {
+        object_id: u64,
+        expected_hex: String,
+        actual_hex: String,
+    },
     /// The task has no payload (zero-length object).
     EmptyPayload,
     /// Invalid state transition during progress tracking.
@@ -55,10 +85,62 @@ impl fmt::Display for EngineError {
                 "destination checksum mismatch: source {source_hex}, destination {destination_hex}"
             ),
             Self::StoreError(err) => write!(f, "object store error: {err}"),
+            Self::SyntheticReceiptRef { object_id } => write!(
+                f,
+                "receipt-bound rebuild fetch for object {object_id} requires non-synthetic placement receipt"
+            ),
+            Self::ReceiptSourceError {
+                source_member,
+                object_id,
+                message,
+            } => write!(
+                f,
+                "receipt-bound source fetch from member {} for object {object_id} failed: {message}",
+                source_member.0
+            ),
+            Self::ReceiptTaskLengthMismatch {
+                object_id,
+                task_len,
+                receipt_len,
+            } => write!(
+                f,
+                "receipt-bound task length mismatch for object {object_id}: task {task_len}, receipt {receipt_len}"
+            ),
+            Self::ReceiptPayloadLengthMismatch {
+                object_id,
+                expected_len,
+                actual_len,
+            } => write!(
+                f,
+                "receipt-bound payload length mismatch for object {object_id}: expected {expected_len}, got {actual_len}"
+            ),
+            Self::ReceiptPayloadDigestMismatch {
+                object_id,
+                expected_hex,
+                actual_hex,
+            } => write!(
+                f,
+                "receipt-bound payload digest mismatch for object {object_id}: expected {expected_hex}, got {actual_hex}"
+            ),
             Self::EmptyPayload => f.write_str("empty payload, nothing to transfer"),
             Self::ProgressError(msg) => write!(f, "progress tracking error: {msg}"),
         }
     }
+}
+
+/// Source that can fetch rebuild/backfill bytes by durable placement receipt.
+pub trait ReceiptSegmentSource {
+    /// Backend error type.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Fetch bytes from `source_member` using the exact placement receipt.
+    fn fetch_segment_by_receipt(
+        &mut self,
+        source_member: MemberId,
+        placement_receipt_ref: PlacementReceiptRef,
+        segment_offset: u64,
+        segment_length: u64,
+    ) -> Result<Vec<u8>, Self::Error>;
 }
 
 impl Error for EngineError {
@@ -182,6 +264,95 @@ impl<S: ObjectStore> DataMovementEngine<S> {
                 actual_hex,
             });
         }
+
+        self.write_target_and_complete(key, object_data, target_store, progress)
+    }
+
+    /// Execute a backfill task using receipt-bound source bytes.
+    ///
+    /// This is the distributed rebuild/backfill execution path. Unlike the
+    /// compatibility local-store executor, it refuses synthetic receipt refs and
+    /// asks the source to fetch by the exact `PlacementReceiptRef` carried by
+    /// the admitted task.
+    pub fn execute_from_receipt_source<R>(
+        &self,
+        task: &BackfillTask,
+        source: &mut R,
+        target_store: &mut S,
+        progress: &mut BackfillProgress,
+    ) -> Result<(), EngineError>
+    where
+        R: ReceiptSegmentSource,
+    {
+        if task.payload_len == 0 {
+            return Err(EngineError::EmptyPayload);
+        }
+        if task.placement_receipt_ref.is_synthetic() {
+            return Err(EngineError::SyntheticReceiptRef {
+                object_id: task.placement_receipt_ref.object_id,
+            });
+        }
+        if task.payload_len != task.placement_receipt_ref.payload_len {
+            return Err(EngineError::ReceiptTaskLengthMismatch {
+                object_id: task.placement_receipt_ref.object_id,
+                task_len: task.payload_len,
+                receipt_len: task.placement_receipt_ref.payload_len,
+            });
+        }
+
+        let object_data = source
+            .fetch_segment_by_receipt(
+                task.source_member,
+                task.placement_receipt_ref,
+                0,
+                task.placement_receipt_ref.payload_len,
+            )
+            .map_err(|err| EngineError::ReceiptSourceError {
+                source_member: task.source_member,
+                object_id: task.placement_receipt_ref.object_id,
+                message: err.to_string(),
+            })?;
+
+        self.verify_receipt_payload(task.placement_receipt_ref, &object_data)?;
+
+        let key = task_object_key(task);
+        self.write_target_and_complete(key, object_data, target_store, progress)
+    }
+
+    fn verify_receipt_payload(
+        &self,
+        placement_receipt_ref: PlacementReceiptRef,
+        object_data: &[u8],
+    ) -> Result<(), EngineError> {
+        let actual_len = object_data.len() as u64;
+        if actual_len != placement_receipt_ref.payload_len {
+            return Err(EngineError::ReceiptPayloadLengthMismatch {
+                object_id: placement_receipt_ref.object_id,
+                expected_len: placement_receipt_ref.payload_len,
+                actual_len,
+            });
+        }
+
+        let actual_digest = blake3::hash(object_data);
+        if actual_digest.as_bytes() != &placement_receipt_ref.payload_digest {
+            return Err(EngineError::ReceiptPayloadDigestMismatch {
+                object_id: placement_receipt_ref.object_id,
+                expected_hex: bytes_to_hex(&placement_receipt_ref.payload_digest),
+                actual_hex: bytes_to_hex(actual_digest.as_bytes()),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn write_target_and_complete(
+        &self,
+        key: ObjectKey,
+        object_data: Vec<u8>,
+        target_store: &mut S,
+        progress: &mut BackfillProgress,
+    ) -> Result<(), EngineError> {
+        let expected_hex = blake3_hex(&object_data);
 
         progress
             .start_transfer()

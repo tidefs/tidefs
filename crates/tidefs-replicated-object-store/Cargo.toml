@@ -14,6 +14,7 @@ tidefs-quorum-write = { path = "../tidefs-quorum-write" }
 tidefs-quorum-write-runtime = { path = "../tidefs-quorum-write-runtime" }
 tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
 tidefs-replica-health = { path = "../tidefs-replica-health" }
+tidefs-rebuild-runtime = { path = "../tidefs-rebuild-runtime" }
 tidefs-transport = { path = "../tidefs-transport" }
 tidefs-replication = { path = "../tidefs-replication" }
 tidefs-replication-model = { path = "../tidefs-replication-model" }

@@ -3216,6 +3216,7 @@ dependencies = [
  "tidefs-membership-epoch",
  "tidefs-quorum-write",
  "tidefs-quorum-write-runtime",
+ "tidefs-rebuild-runtime",
  "tidefs-replica-health",
  "tidefs-replication",
  "tidefs-replication-model",

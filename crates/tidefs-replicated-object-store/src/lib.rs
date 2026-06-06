@@ -35,14 +35,14 @@ use tidefs_replica_health::ReplicaDegradationTracker;
 use tidefs_replication::{
     QuorumWriteTransport, ReplicatedWrite, ReplicationWriteError, ReplicationWritePath,
 };
-#[cfg(test)]
-use tidefs_replication_model::VerificationStatus;
 use tidefs_replication_model::{
     commit_replicated_object_root_write, plan_replicated_object_root_read, ObjectDigest,
     PlacementReceiptRef, ReplicaCopyRecord, ReplicaTransferReceipt, ReplicaVerificationReceipt,
     ReplicatedObjectRootRecord, ReplicatedReadPlan, ReplicatedReceiptId, ReplicatedSubjectClass,
     ReplicatedSubjectId, ReplicatedWriteClass, ReplicatedWritePlan,
 };
+#[cfg(test)]
+use tidefs_replication_model::{ReplicaMovementClass, VerificationStatus};
 use tidefs_types_transport_session::EndpointFamily;
 use tidefs_verification_engine::{verify_transfer_and_emit_receipt, VerificationContext};
 use tidefs_witness_set::{WitnessAnchor, WitnessLifecycle, WitnessQuorumClass, WitnessSet};
@@ -1015,6 +1015,7 @@ impl ReplicatedObjectStore {
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::net::SocketAddr;
+use tidefs_rebuild_runtime::engine::ReceiptSegmentSource;
 use tidefs_transport::{
     build_read_responses, recv_replication_msg, recv_segment_fetch, recv_segment_fetch_response,
     recv_write_request, send_replication_msg, send_segment_fetch, send_segment_fetch_response,
@@ -2531,6 +2532,36 @@ impl TransportReplicatedStore {
                 .close_session(replica.shadow_session_id, SessionCloseReason::LocalShutdown);
         }
         self.replicas.clear();
+    }
+}
+
+impl ReceiptSegmentSource for TransportReplicatedStore {
+    type Error = String;
+
+    fn fetch_segment_by_receipt(
+        &mut self,
+        source_member: MemberId,
+        placement_receipt_ref: PlacementReceiptRef,
+        segment_offset: u64,
+        segment_length: u64,
+    ) -> Result<Vec<u8>, Self::Error> {
+        let replica_idx = self
+            .replicas
+            .iter()
+            .position(|replica| replica.node_id == source_member.0)
+            .ok_or_else(|| {
+                format!(
+                    "source member {} is not connected for receipt-bound fetch of object {}",
+                    source_member.0, placement_receipt_ref.object_id
+                )
+            })?;
+
+        self.fetch_remote_segment_by_receipt(
+            replica_idx,
+            placement_receipt_ref,
+            segment_offset,
+            segment_length,
+        )
     }
 }
 
@@ -4388,6 +4419,85 @@ mod tests {
             assert_eq!(fetched, receipt_payload[8..16].to_vec());
             assert_ne!(fetched, legacy_payload[8..16].to_vec());
             assert_eq!(server.join().unwrap(), object_id);
+        }
+
+        #[test]
+        fn receipt_segment_source_executes_backfill_by_receipt_key() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let replica_dir = tempfile::tempdir().unwrap();
+            let target_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut replica = TransportReplicatedStore::open(
+                replica_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut target = tidefs_local_object_store::LocalObjectStore::open_with_options(
+                target_dir.path(),
+                tidefs_local_object_store::StoreOptions::test_fast(),
+            )
+            .unwrap();
+
+            let object_id = 5600u64;
+            let receipt_payload = b"receipt-source engine payload".to_vec();
+            let legacy_payload = b"legacy path must not feed rebuild".to_vec();
+            let receipt_key =
+                tidefs_local_object_store::ObjectKey::from_name(b"issue-56-receipt-key");
+            let legacy_key =
+                tidefs_local_object_store::ObjectKey::from_name(object_id.to_le_bytes());
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &receipt_payload, 56);
+            let payload_digest_prefix =
+                u64::from_le_bytes(receipt.payload_digest[..8].try_into().unwrap());
+            let task = tidefs_rebuild_runtime::task::BackfillTask::new(
+                tidefs_rebuild_runtime::task::BackfillTaskInit {
+                    subject_ref: ReplicatedSubjectId::new(object_id),
+                    placement_receipt_ref: receipt,
+                    source_member: MemberId::new(2),
+                    target_member: MemberId::new(3),
+                    movement_class: ReplicaMovementClass::BackfillLaggedCopy,
+                    payload_digest: ObjectDigest::new(payload_digest_prefix),
+                    payload_len: receipt_payload.len() as u64,
+                    created_at_ns: 1000,
+                    deadline_ns: 5000,
+                },
+            );
+
+            replica.primary.put(receipt_key, &receipt_payload).unwrap();
+            replica.primary.put(legacy_key, &legacy_payload).unwrap();
+            target.put(legacy_key, b"existing legacy target").unwrap();
+
+            let (_client_session_id, server_session_id) =
+                connect_replica_pair(&mut primary, &mut replica, 2);
+            let server = std::thread::spawn(move || {
+                replica
+                    .handle_segment_fetch_request(server_session_id)
+                    .expect("receipt segment fetch served")
+            });
+            let engine = tidefs_rebuild_runtime::engine::DataMovementEngine::new();
+            let mut progress =
+                tidefs_rebuild_runtime::progress::BackfillProgress::new(task.payload_len, 3);
+            progress.schedule().unwrap();
+
+            engine
+                .execute_from_receipt_source(&task, &mut primary, &mut target, &mut progress)
+                .expect("receipt-source backfill execution");
+
+            assert_eq!(server.join().unwrap(), object_id);
+            assert_eq!(target.get(receipt_key).unwrap(), Some(receipt_payload));
+            assert_eq!(
+                target.get(legacy_key).unwrap(),
+                Some(b"existing legacy target".to_vec())
+            );
+            assert_eq!(
+                progress.state,
+                tidefs_rebuild_runtime::progress::TaskState::Complete
+            );
         }
 
         #[test]
