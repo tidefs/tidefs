@@ -585,6 +585,28 @@ impl StoreOptions {
         }
     }
 
+    /// Whether these options denote the local object-store fast harness.
+    ///
+    /// Directory/fixed-layout pool device shims are admitted only for this
+    /// exact compatibility fixture, not for durable product pool admission.
+    #[must_use]
+    pub fn is_test_fast_harness_fixture(&self) -> bool {
+        self.max_segment_bytes == 4096
+            && !self.sync_on_write
+            && self.repair_torn_tail
+            && self.segment_rotation_interval_secs == u64::MAX
+            && self.segment_rotation_write_limit == 0
+            && self.background_scrub_interval_secs == 0
+            && self.segment_count == DEFAULT_SEGMENT_COUNT
+            && self.mirror_path.is_none()
+            && self.replica_paths.is_empty()
+            && self.durability_layout.is_none()
+            && self.fault_injection_config.is_none()
+            && !self.reclaim_enabled
+            && !self.write_throttle_enabled
+            && !self.verify_read_checksums
+    }
+
     #[must_use]
     pub const fn max_object_bytes(&self) -> u64 {
         self.max_segment_bytes

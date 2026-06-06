@@ -784,7 +784,7 @@ impl Pool {
         let classes: Vec<DeviceClass> = config.devices.iter().map(|vc| vc.class).collect();
         let class_map = build_class_map(&classes);
 
-        let devices = open_devices(&config.devices, options)?;
+        let devices = open_devices(&config, options)?;
         let next_placement_receipt_generation =
             next_placement_receipt_generation_for_devices(&devices);
 
@@ -1001,7 +1001,7 @@ impl Pool {
 
         let classes: Vec<DeviceClass> = config.devices.iter().map(|vc| vc.class).collect();
         let class_map = build_class_map(&classes);
-        let mut devices = open_devices(&config.devices, options)?;
+        let mut devices = open_devices(&config, options)?;
         let next_placement_receipt_generation =
             next_placement_receipt_generation_for_devices(&devices);
 
@@ -2137,7 +2137,8 @@ impl Pool {
         let config_for_record = config.clone();
         let mut dev_opts = options.clone();
         dev_opts.max_segment_bytes = config.media_class.default_segment_size();
-        let device = open_single_device(&config, &dev_opts)?;
+        let device =
+            open_single_device(&config, &dev_opts, options.is_test_fast_harness_fixture())?;
         self.classes.push(config.class);
         self.media_classes.push(config.media_class);
         self.devices.push(device);
@@ -2249,7 +2250,11 @@ impl Pool {
         // Update in-memory device at the faulted index.
         let mut dev_opts = options.clone();
         dev_opts.max_segment_bytes = spare_config.media_class.default_segment_size();
-        let new_device = open_single_device(&spare_config, &dev_opts)?;
+        let new_device = open_single_device(
+            &spare_config,
+            &dev_opts,
+            options.is_test_fast_harness_fixture(),
+        )?;
         self.devices[faulted_index] = new_device;
         self.device_guids[faulted_index] = spare_device_guid;
 
@@ -2585,7 +2590,8 @@ impl Pool {
             });
 
         // Open the replacement device.
-        let new_device = open_single_device(&new_config, options)?;
+        let new_device =
+            open_single_device(&new_config, options, options.is_test_fast_harness_fixture())?;
 
         // Swap the device in the pool list (old out, new in).
         let _old_device = std::mem::replace(&mut self.devices[idx], new_device);
@@ -2650,7 +2656,11 @@ impl Pool {
 
         // If the old device can still be opened, swap it back using the exact
         // media configuration captured before replacement.
-        if let Ok(old_device) = open_single_device(&replacement.old_config, options) {
+        if let Ok(old_device) = open_single_device(
+            &replacement.old_config,
+            options,
+            options.is_test_fast_harness_fixture(),
+        ) {
             self.devices[replacement.device_index] = old_device;
             if replacement.device_index < self.config.devices.len() {
                 self.config.devices[replacement.device_index] = replacement.old_config.clone();
@@ -3335,59 +3345,70 @@ impl<'a> PoolStoreMut<'a> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn open_devices(configs: &[DeviceConfig], options: &StoreOptions) -> Result<Vec<Device>> {
-    configs
+fn open_devices(config: &PoolConfig, options: &StoreOptions) -> Result<Vec<Device>> {
+    let allow_legacy_directory_shims =
+        options.is_test_fast_harness_fixture() || is_legacy_single_directory_store_bridge(config);
+    config
+        .devices
         .iter()
         .map(|vc| {
             let mut dev_opts = options.clone();
             dev_opts.max_segment_bytes = vc.media_class.default_segment_size();
-            open_single_device(vc, &dev_opts)
+            open_single_device(vc, &dev_opts, allow_legacy_directory_shims)
         })
         .collect()
 }
 
-fn open_single_device(config: &DeviceConfig, options: &StoreOptions) -> Result<Device> {
+fn open_single_device(
+    config: &DeviceConfig,
+    options: &StoreOptions,
+    allow_legacy_directory_shims: bool,
+) -> Result<Device> {
     let device = match &config.kind {
         DeviceKind::Single { path } => {
-            if config.backing != DeviceBacking::DirectoryObjectStoreCompat {
-                return Err(StoreError::InvalidOptions {
-                    reason:
-                        "DeviceKind::Single requires directory object-store compatibility backing",
-                });
-            }
+            require_legacy_directory_pool_shim(
+                config.backing,
+                allow_legacy_directory_shims,
+                "DeviceKind::Single requires directory object-store compatibility backing",
+            )?;
             Device::open_single(path, options.clone())
         }
         DeviceKind::Mirror { paths } => {
-            require_directory_compat_backing(
+            require_legacy_directory_pool_shim(
                 config.backing,
+                allow_legacy_directory_shims,
                 "DeviceKind::Mirror requires directory object-store compatibility backing",
             )?;
             Device::open_mirror(paths, options)
         }
         DeviceKind::LogDevice { path } => {
-            require_directory_compat_backing(
+            require_legacy_directory_pool_shim(
                 config.backing,
+                allow_legacy_directory_shims,
                 "DeviceKind::LogDevice requires directory object-store compatibility backing",
             )?;
             Device::open_log_device(path, options.clone())
         }
         DeviceKind::ParityRaid1 { paths } => {
-            require_directory_compat_backing(
+            require_legacy_directory_pool_shim(
                 config.backing,
+                allow_legacy_directory_shims,
                 "DeviceKind::ParityRaid1 requires directory object-store compatibility backing",
             )?;
             Device::open_parity_raid1(paths, options)
         }
         DeviceKind::ParityRaid2 { paths } => {
-            require_directory_compat_backing(
+            require_legacy_directory_pool_shim(
                 config.backing,
+                allow_legacy_directory_shims,
                 "DeviceKind::ParityRaid2 requires directory object-store compatibility backing",
             )?;
             Device::open_parity_raid2(paths, options)
         }
         DeviceKind::ParityRaid3 { paths } => {
-            require_directory_compat_backing(
+            require_legacy_directory_pool_shim(
                 config.backing,
+                allow_legacy_directory_shims,
                 "DeviceKind::ParityRaid3 requires directory object-store compatibility backing",
             )?;
             Device::open_parity_raid3(paths, options)
@@ -3415,11 +3436,35 @@ fn open_single_device(config: &DeviceConfig, options: &StoreOptions) -> Result<D
     }
 }
 
-fn require_directory_compat_backing(backing: DeviceBacking, reason: &'static str) -> Result<()> {
+fn require_legacy_directory_pool_shim(
+    backing: DeviceBacking,
+    allow_legacy_directory_shims: bool,
+    reason: &'static str,
+) -> Result<()> {
+    if !allow_legacy_directory_shims {
+        return Err(StoreError::InvalidOptions {
+            reason: "pool device admission requires DeviceKind::Block with block-device or regular-file backing; directory object-store device shims are harness-only",
+        });
+    }
     if backing == DeviceBacking::DirectoryObjectStoreCompat {
         Ok(())
     } else {
         Err(StoreError::InvalidOptions { reason })
+    }
+}
+
+fn is_legacy_single_directory_store_bridge(config: &PoolConfig) -> bool {
+    let [device] = config.devices.as_slice() else {
+        return false;
+    };
+    if device.backing != DeviceBacking::DirectoryObjectStoreCompat
+        || device.class != DeviceClass::Data
+    {
+        return false;
+    }
+    match &device.kind {
+        DeviceKind::Single { path } => device.path == *path && device.path == config.root_path,
+        _ => false,
     }
 }
 
@@ -3619,6 +3664,40 @@ mod tests {
         }
     }
 
+    fn create_regular_file_device(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(2 * 1024 * 1024).unwrap();
+    }
+
+    fn regular_file_device_config(path: PathBuf) -> DeviceConfig {
+        create_regular_file_device(&path);
+        DeviceConfig {
+            media_class: Default::default(),
+            path: path.clone(),
+            backing: DeviceBacking::RegularFileDev,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Block { path },
+            encryption: None,
+            compression: None,
+        }
+    }
+
+    fn assert_invalid_options_reason_contains<T>(result: Result<T>, needle: &str) {
+        match result {
+            Err(StoreError::InvalidOptions { reason }) => {
+                assert!(
+                    reason.contains(needle),
+                    "expected InvalidOptions reason containing {needle:?}, got {reason:?}"
+                );
+            }
+            Ok(_) => panic!("expected InvalidOptions containing {needle:?}, got success"),
+            Err(other) => panic!("expected InvalidOptions containing {needle:?}, got {other:?}"),
+        }
+    }
+
     fn deterministic_device_guid(idx: usize) -> [u8; 16] {
         let mut guid = [0x42; 16];
         guid[..8].copy_from_slice(&(0xA11C_E000_0000_0000u64 + idx as u64).to_le_bytes());
@@ -3650,8 +3729,115 @@ mod tests {
             compression: None,
         };
 
-        let err = open_single_device(&config, &test_options()).unwrap_err();
+        let err = open_single_device(&config, &test_options(), false).unwrap_err();
         assert!(matches!(err, StoreError::InvalidOptions { reason } if reason.contains("Block")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn product_pool_refuses_directory_object_store_member() {
+        let root = temp_dir("directory-member-refused");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+
+        assert_invalid_options_reason_contains(
+            Pool::create(config, PoolProperties::default(), &StoreOptions::default()),
+            "directory object-store device shims are harness-only",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn harness_options_allow_legacy_directory_object_store_member() {
+        let root = temp_dir("directory-member-harness");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let key = ObjectKey::from_name(b"harness-directory-shim");
+        pool.put(IoClass::Data, key, b"compat").unwrap();
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(b"compat".to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn product_pool_accepts_regular_file_dev_block_member() {
+        let root = temp_dir("regular-file-dev-product");
+        let _ = std::fs::remove_dir_all(&root);
+        let image = root.join("pool0.img");
+        let config = PoolConfig {
+            name: "testpool-file-dev".into(),
+            root_path: root.join("metadata"),
+            devices: vec![regular_file_device_config(image)],
+        };
+
+        let mut pool =
+            Pool::create(config, PoolProperties::default(), &StoreOptions::default()).unwrap();
+        let key = ObjectKey::from_name(b"regular-file-dev-pool-member");
+        pool.put(IoClass::Data, key, b"file-dev").unwrap();
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(b"file-dev".to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn product_pool_refuses_fixed_directory_layout_kinds() {
+        let root = temp_dir("fixed-layout-refused");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mirror_paths = vec![root.join("mirror-a"), root.join("mirror-b")];
+        let parity_paths = vec![
+            root.join("parity-a"),
+            root.join("parity-b"),
+            root.join("parity-c"),
+            root.join("parity-d"),
+            root.join("parity-e"),
+        ];
+        let log_path = root.join("log");
+        let cases = vec![
+            DeviceKind::Mirror {
+                paths: mirror_paths,
+            },
+            DeviceKind::ParityRaid1 {
+                paths: parity_paths[..3].to_vec(),
+            },
+            DeviceKind::ParityRaid2 {
+                paths: parity_paths[..4].to_vec(),
+            },
+            DeviceKind::ParityRaid3 {
+                paths: parity_paths,
+            },
+            DeviceKind::LogDevice { path: log_path },
+        ];
+
+        for (idx, kind) in cases.into_iter().enumerate() {
+            let config = PoolConfig {
+                name: format!("testpool-fixed-layout-{idx}"),
+                root_path: root.join(format!("metadata-{idx}")),
+                devices: vec![DeviceConfig {
+                    media_class: Default::default(),
+                    path: root.join(format!("dev-{idx}")),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind,
+                    encryption: None,
+                    compression: None,
+                }],
+            };
+            assert_invalid_options_reason_contains(
+                Pool::create(config, PoolProperties::default(), &StoreOptions::default()),
+                "directory object-store device shims are harness-only",
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
