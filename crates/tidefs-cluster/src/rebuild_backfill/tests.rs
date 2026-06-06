@@ -5,6 +5,7 @@ use crate::rebuild_backfill::{
 use crate::types::{DataPathCarrier, LeaseState};
 use std::collections::BTreeMap;
 use tidefs_membership_epoch::EpochId;
+use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 
 // ── Helpers ───────────────────────────────────────────────────
 
@@ -19,6 +20,21 @@ fn make_task(
     priority: u8,
 ) -> ReconstructionTask {
     ReconstructionTask::new_full(object_id, sources, targets, priority)
+}
+
+fn receipt_ref(object_id: u64, generation: u64) -> PlacementReceiptRef {
+    let mut object_key = [0u8; 32];
+    object_key[..8].copy_from_slice(&object_id.to_le_bytes());
+    let mut digest = [0u8; 32];
+    digest[..8].copy_from_slice(&(object_id ^ generation).to_le_bytes());
+    PlacementReceiptRef::new(
+        object_key,
+        11,
+        generation,
+        ReceiptRedundancyPolicy::Replicated { copies: 2 },
+        digest,
+        4096,
+    )
 }
 
 fn make_plan(plan_id: u64, tasks: Vec<ReconstructionTask>) -> RebuildPlan {
@@ -84,8 +100,17 @@ fn command_with_objects() {
     let cmd = BackfillCommand::new(10, 20, vec![100, 200, 300], 65536);
     assert!(!cmd.is_empty());
     assert_eq!(cmd.object_count(), 3);
+    assert_eq!(cmd.placement_receipt_refs.len(), 3);
     assert_eq!(cmd.source_node, 10);
     assert_eq!(cmd.target_node, 20);
+}
+
+#[test]
+fn command_preserves_object_receipt_alignment() {
+    let refs = vec![receipt_ref(100, 1), receipt_ref(100, 2)];
+    let cmd = BackfillCommand::new_with_receipts(10, 20, vec![100, 100], refs.clone(), 65536);
+    assert_eq!(cmd.object_ids, vec![100, 100]);
+    assert_eq!(cmd.placement_receipt_refs, refs);
 }
 
 // ── BackfillBatch ─────────────────────────────────────────────
@@ -106,6 +131,29 @@ fn batch_add_commands() {
     assert!(!batch.is_empty());
     assert_eq!(batch.command_count(), 2);
     assert_eq!(batch.total_objects(), 3);
+}
+
+#[test]
+fn partition_keeps_distinct_receipt_generations_separate() {
+    let mut init = RebuildBackfillInitiator::new(eid(1));
+    let plan = make_plan(
+        100,
+        vec![
+            ReconstructionTask::new_full_with_receipt(7, receipt_ref(7, 1), vec![10], vec![20], 0),
+            ReconstructionTask::new_full_with_receipt(7, receipt_ref(7, 2), vec![10], vec![20], 0),
+        ],
+    );
+    let id = init.open_backfill(plan, eid(1)).unwrap();
+    let session = init.session(id).unwrap();
+    assert_eq!(session.batches.len(), 1);
+    assert_eq!(session.batches[0].commands.len(), 2);
+    let mut generations: Vec<u64> = session.batches[0]
+        .commands
+        .iter()
+        .map(|cmd| cmd.placement_receipt_refs[0].generation)
+        .collect();
+    generations.sort_unstable();
+    assert_eq!(generations, vec![1, 2]);
 }
 
 // ── BackfillState ─────────────────────────────────────────────

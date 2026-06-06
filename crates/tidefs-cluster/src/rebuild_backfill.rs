@@ -48,6 +48,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use tidefs_membership_epoch::EpochId;
+use tidefs_replication_model::PlacementReceiptRef;
 
 use crate::types::{DataPathCarrier, LeaseState};
 
@@ -62,6 +63,8 @@ use crate::types::{DataPathCarrier, LeaseState};
 pub struct ReconstructionTask {
     /// Object identifier.
     pub object_id: u64,
+    /// Placement receipt that currently authorizes viable source copies.
+    pub placement_receipt_ref: PlacementReceiptRef,
     /// Nodes that currently hold viable copies of this object.
     pub source_nodes: Vec<u64>,
     /// Nodes that need a copy of this object.
@@ -80,8 +83,28 @@ impl ReconstructionTask {
         target_nodes: Vec<u64>,
         priority: u8,
     ) -> Self {
+        Self::new_full_with_receipt(
+            object_id,
+            PlacementReceiptRef::synthetic_for_subject(
+                tidefs_replication_model::ReplicatedSubjectId::new(object_id),
+            ),
+            source_nodes,
+            target_nodes,
+            priority,
+        )
+    }
+
+    /// Create a task for full-object reconstruction with receipt authority.
+    pub fn new_full_with_receipt(
+        object_id: u64,
+        placement_receipt_ref: PlacementReceiptRef,
+        source_nodes: Vec<u64>,
+        target_nodes: Vec<u64>,
+        priority: u8,
+    ) -> Self {
         Self {
             object_id,
+            placement_receipt_ref,
             source_nodes,
             target_nodes,
             data_range: None,
@@ -98,8 +121,32 @@ impl ReconstructionTask {
         end: u64,
         priority: u8,
     ) -> Self {
+        Self::new_range_with_receipt(
+            object_id,
+            PlacementReceiptRef::synthetic_for_subject(
+                tidefs_replication_model::ReplicatedSubjectId::new(object_id),
+            ),
+            source_nodes,
+            target_nodes,
+            start,
+            end,
+            priority,
+        )
+    }
+
+    /// Create a task for partial-range reconstruction with receipt authority.
+    pub fn new_range_with_receipt(
+        object_id: u64,
+        placement_receipt_ref: PlacementReceiptRef,
+        source_nodes: Vec<u64>,
+        target_nodes: Vec<u64>,
+        start: u64,
+        end: u64,
+        priority: u8,
+    ) -> Self {
         Self {
             object_id,
+            placement_receipt_ref,
             source_nodes,
             target_nodes,
             data_range: Some((start, end)),
@@ -173,6 +220,8 @@ pub struct BackfillCommand {
     pub target_node: u64,
     /// Object IDs to transfer.
     pub object_ids: Vec<u64>,
+    /// Placement receipts corresponding one-for-one with `object_ids`.
+    pub placement_receipt_refs: Vec<PlacementReceiptRef>,
     /// Maximum chunk size in bytes for this transfer.
     pub max_chunk_bytes: u64,
 }
@@ -180,10 +229,42 @@ pub struct BackfillCommand {
 impl BackfillCommand {
     /// Create a new backfill command.
     pub fn new(source: u64, target: u64, object_ids: Vec<u64>, max_chunk_bytes: u64) -> Self {
+        let placement_receipt_refs = object_ids
+            .iter()
+            .copied()
+            .map(|object_id| {
+                PlacementReceiptRef::synthetic_for_subject(
+                    tidefs_replication_model::ReplicatedSubjectId::new(object_id),
+                )
+            })
+            .collect();
+        Self::new_with_receipts(
+            source,
+            target,
+            object_ids,
+            placement_receipt_refs,
+            max_chunk_bytes,
+        )
+    }
+
+    /// Create a new backfill command from receipt-authoritative object refs.
+    pub fn new_with_receipts(
+        source: u64,
+        target: u64,
+        object_ids: Vec<u64>,
+        placement_receipt_refs: Vec<PlacementReceiptRef>,
+        max_chunk_bytes: u64,
+    ) -> Self {
+        assert_eq!(
+            object_ids.len(),
+            placement_receipt_refs.len(),
+            "backfill object IDs and placement receipt refs must align"
+        );
         Self {
             source_node: source,
             target_node: target,
             object_ids,
+            placement_receipt_refs,
             max_chunk_bytes,
         }
     }
@@ -563,8 +644,9 @@ impl RebuildBackfillInitiator {
         max_chunk_bytes: u64,
         carrier: DataPathCarrier,
     ) -> Vec<BackfillBatch> {
-        // Build: target_node -> { source_node -> [object_ids] }
-        let mut target_map: BTreeMap<u64, BTreeMap<u64, Vec<u64>>> = BTreeMap::new();
+        // Build: target_node -> { (source_node, receipt_ref) -> [object_ids] }
+        let mut target_map: BTreeMap<u64, BTreeMap<(u64, PlacementReceiptRef), Vec<u64>>> =
+            BTreeMap::new();
 
         for task in &plan.tasks {
             if task.source_nodes.is_empty() {
@@ -576,7 +658,7 @@ impl RebuildBackfillInitiator {
                 // by any viable source
                 let source = task.source_nodes[0];
                 source_buckets
-                    .entry(source)
+                    .entry((source, task.placement_receipt_ref))
                     .or_default()
                     .push(task.object_id);
             }
@@ -586,11 +668,12 @@ impl RebuildBackfillInitiator {
 
         for (target_node, source_buckets) in &target_map {
             let mut batch = BackfillBatch::new(*target_node, epoch, carrier);
-            for (&source_node, object_ids) in source_buckets {
-                batch.add_command(BackfillCommand::new(
+            for (&(source_node, receipt_ref), object_ids) in source_buckets {
+                batch.add_command(BackfillCommand::new_with_receipts(
                     source_node,
                     *target_node,
                     object_ids.clone(),
+                    vec![receipt_ref; object_ids.len()],
                     max_chunk_bytes,
                 ));
             }

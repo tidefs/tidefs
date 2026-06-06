@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 use tidefs_membership_epoch::MemberId;
-use tidefs_replication_model::{ObjectDigest, ReplicaMovementClass, ReplicatedSubjectId};
+use tidefs_replication_model::{
+    ObjectDigest, PlacementReceiptRef, ReplicaMovementClass, ReplicatedSubjectId,
+};
 
 /// Maximum retry attempts before a task is permanently failed.
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
@@ -15,6 +17,8 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 pub struct BackfillTask {
     /// Object to replicate.
     pub subject_ref: ReplicatedSubjectId,
+    /// Source placement receipt that authorizes the bytes being moved.
+    pub placement_receipt_ref: PlacementReceiptRef,
     /// Source member that holds a healthy copy.
     pub source_member: MemberId,
     /// Target member to receive the replica.
@@ -39,6 +43,7 @@ pub struct BackfillTask {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackfillTaskInit {
     pub subject_ref: ReplicatedSubjectId,
+    pub placement_receipt_ref: PlacementReceiptRef,
     pub source_member: MemberId,
     pub target_member: MemberId,
     pub movement_class: ReplicaMovementClass,
@@ -54,6 +59,7 @@ impl BackfillTask {
     pub fn new(init: BackfillTaskInit) -> Self {
         Self {
             subject_ref: init.subject_ref,
+            placement_receipt_ref: init.placement_receipt_ref,
             source_member: init.source_member,
             target_member: init.target_member,
             movement_class: init.movement_class,
@@ -109,6 +115,9 @@ mod tests {
     fn task() -> BackfillTask {
         BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(1),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(1),
+            ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(20),
             movement_class: ReplicaMovementClass::BackfillLaggedCopy,
@@ -144,6 +153,9 @@ mod tests {
     fn dedup_key_uniqueness() {
         let a = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(42),
+            ),
             source_member: MemberId::new(1),
             target_member: MemberId::new(2),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
@@ -154,6 +166,9 @@ mod tests {
         });
         let b = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(42),
+            ),
             source_member: MemberId::new(99),
             target_member: MemberId::new(2),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
@@ -167,6 +182,9 @@ mod tests {
 
         let c = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(42),
+            ),
             source_member: MemberId::new(1),
             target_member: MemberId::new(3),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,

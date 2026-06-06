@@ -6,8 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::task::{BackfillTask, BackfillTaskInit};
 use tidefs_membership_epoch::MemberId;
-use tidefs_replication_model::ReplicaMovementClass;
-use tidefs_replication_model::ReplicatedSubjectId;
+use tidefs_replication_model::{PlacementReceiptRef, ReplicaMovementClass, ReplicatedSubjectId};
 
 /// Maximum concurrent transfers a single target node can accept.
 pub const DEFAULT_NODE_CAPACITY: usize = 4;
@@ -91,6 +90,9 @@ impl BackfillScheduler {
 
                 let task = BackfillTask::new(BackfillTaskInit {
                     subject_ref: report.subject_ref,
+                    placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                        report.subject_ref,
+                    ),
                     source_member: source,
                     target_member: target,
                     movement_class: report.movement_class,

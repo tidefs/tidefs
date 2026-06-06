@@ -115,6 +115,61 @@ impl ObjectDigest {
     }
 }
 
+/// Redundancy policy identity copied from a placement receipt.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ReceiptRedundancyPolicy {
+    Replicated { copies: u8 },
+    Erasure { data_shards: u8, parity_shards: u8 },
+}
+
+impl Default for ReceiptRedundancyPolicy {
+    fn default() -> Self {
+        Self::Replicated { copies: 1 }
+    }
+}
+
+/// Minimal distributed reference to a committed placement receipt.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PlacementReceiptRef {
+    pub object_key: [u8; 32],
+    pub topology_epoch: u64,
+    pub generation: u64,
+    pub redundancy_policy: ReceiptRedundancyPolicy,
+    pub payload_digest: [u8; 32],
+    pub payload_len: u64,
+}
+
+impl PlacementReceiptRef {
+    #[must_use]
+    pub const fn new(
+        object_key: [u8; 32],
+        topology_epoch: u64,
+        generation: u64,
+        redundancy_policy: ReceiptRedundancyPolicy,
+        payload_digest: [u8; 32],
+        payload_len: u64,
+    ) -> Self {
+        Self {
+            object_key,
+            topology_epoch,
+            generation,
+            redundancy_policy,
+            payload_digest,
+            payload_len,
+        }
+    }
+
+    #[must_use]
+    pub fn synthetic_for_subject(subject: ReplicatedSubjectId) -> Self {
+        let mut object_key = [0u8; 32];
+        object_key[..8].copy_from_slice(&subject.0.to_le_bytes());
+        Self {
+            object_key,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplicatedSubjectClass {
     ImmutableObject,

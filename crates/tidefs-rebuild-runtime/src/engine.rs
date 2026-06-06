@@ -273,6 +273,10 @@ mod tests {
     fn test_task(payload_len: u64) -> BackfillTask {
         BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(1),
+            placement_receipt_ref:
+                tidefs_replication_model::PlacementReceiptRef::synthetic_for_subject(
+                    ReplicatedSubjectId::new(1),
+                ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(20),
             movement_class: ReplicaMovementClass::BackfillLaggedCopy,
@@ -383,6 +387,10 @@ mod tests {
     fn task_object_key_is_deterministic() {
         let t1 = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref:
+                tidefs_replication_model::PlacementReceiptRef::synthetic_for_subject(
+                    ReplicatedSubjectId::new(42),
+                ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(20),
             movement_class: ReplicaMovementClass::BackfillLaggedCopy,
@@ -393,6 +401,10 @@ mod tests {
         });
         let t2 = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref:
+                tidefs_replication_model::PlacementReceiptRef::synthetic_for_subject(
+                    ReplicatedSubjectId::new(42),
+                ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(99),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
@@ -405,6 +417,10 @@ mod tests {
 
         let t3 = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref:
+                tidefs_replication_model::PlacementReceiptRef::synthetic_for_subject(
+                    ReplicatedSubjectId::new(42),
+                ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(20),
             movement_class: ReplicaMovementClass::BackfillLaggedCopy,

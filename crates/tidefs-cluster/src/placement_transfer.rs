@@ -38,6 +38,7 @@
 
 use std::collections::BTreeMap;
 use tidefs_membership_epoch::EpochId;
+use tidefs_replication_model::PlacementReceiptRef;
 
 use crate::types::{DataPathCarrier, LeaseState};
 
@@ -71,10 +72,30 @@ pub struct PlanEntry {
 pub struct ObjectRange {
     /// Object identifier.
     pub object_id: u64,
+    /// Committed placement receipt that authorizes the source extent.
+    pub placement_receipt_ref: PlacementReceiptRef,
     /// Start offset in bytes.
     pub start_offset: u64,
     /// Number of bytes.
     pub length_bytes: u64,
+}
+
+impl ObjectRange {
+    /// Create an object range backed by a committed placement receipt.
+    #[must_use]
+    pub const fn new(
+        object_id: u64,
+        placement_receipt_ref: PlacementReceiptRef,
+        start_offset: u64,
+        length_bytes: u64,
+    ) -> Self {
+        Self {
+            object_id,
+            placement_receipt_ref,
+            start_offset,
+            length_bytes,
+        }
+    }
 }
 
 impl TransferPlan {
@@ -592,11 +613,22 @@ mod tests {
     }
 
     fn obj_range(id: u64, start: u64, len: u64) -> ObjectRange {
-        ObjectRange {
-            object_id: id,
-            start_offset: start,
-            length_bytes: len,
-        }
+        ObjectRange::new(id, receipt_ref(id, 1), start, len)
+    }
+
+    fn receipt_ref(id: u64, generation: u64) -> PlacementReceiptRef {
+        let mut object_key = [0u8; 32];
+        object_key[..8].copy_from_slice(&id.to_le_bytes());
+        let mut digest = [0u8; 32];
+        digest[..8].copy_from_slice(&(id ^ generation).to_le_bytes());
+        PlacementReceiptRef::new(
+            object_key,
+            7,
+            generation,
+            tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            digest,
+            4096,
+        )
     }
 
     // ── TransferPlan tests ─────────────────────────────────────────
@@ -617,6 +649,14 @@ mod tests {
         assert!(!plan.is_empty());
         assert_eq!(plan.total_ranges(), 3);
         assert_eq!(plan.total_bytes(), 1700);
+    }
+
+    #[test]
+    fn object_ranges_preserve_receipt_generation() {
+        let receipt = receipt_ref(10, 42);
+        let range = ObjectRange::new(10, receipt, 0, 512);
+        assert_eq!(range.placement_receipt_ref, receipt);
+        assert_eq!(range.placement_receipt_ref.generation, 42);
     }
 
     #[test]

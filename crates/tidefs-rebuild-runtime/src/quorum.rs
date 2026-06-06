@@ -180,11 +180,14 @@ impl QuorumCoordinator {
 mod tests {
     use super::*;
     use crate::task::BackfillTaskInit;
-    use tidefs_replication_model::{ObjectDigest, ReplicaMovementClass};
+    use tidefs_replication_model::{ObjectDigest, PlacementReceiptRef, ReplicaMovementClass};
 
     fn task(id: u64) -> BackfillTask {
         BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(id),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(id),
+            ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(20),
             movement_class: ReplicaMovementClass::BackfillLaggedCopy,

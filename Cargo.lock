@@ -2223,6 +2223,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tidefs-dataset-catalog",
  "tidefs-membership-epoch",
+ "tidefs-replication-model",
  "tidefs-types-pool-label-core",
  "tokio",
  "tracing",
