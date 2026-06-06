@@ -1101,6 +1101,8 @@ pub struct RelocationBatchRecord {
     pub pointer_move_ready: bool,
     pub source_retire_ready: bool,
     pub verification_refs: Vec<ReplicatedReceiptId>,
+    #[serde(default)]
+    pub placement_receipt_refs: Vec<PlacementReceiptRef>,
 }
 
 /// Authoritative lag / degraded visibility state (P8-03 §5: `ReplicaLagStateRecord`).
@@ -4011,10 +4013,33 @@ mod tests {
             pointer_move_ready: false,
             source_retire_ready: false,
             verification_refs: vec![ReplicatedReceiptId(800)],
+            placement_receipt_refs: vec![PlacementReceiptRef::replicated(
+                99,
+                receipt_key(99),
+                EpochId::new(12),
+                3,
+                2,
+                8192,
+                receipt_digest(99, 3),
+            )],
         };
         let json = serde_json::to_string(&rec).expect("serialize");
         let round: RelocationBatchRecord = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(rec, round);
+    }
+
+    #[test]
+    fn serde_relocation_batch_record_defaults_legacy_receipts() {
+        let json = r#"{
+            "batch_id": 2,
+            "relocation_flow_ref": 5,
+            "chunk_refs": [200, 201],
+            "pointer_move_ready": false,
+            "source_retire_ready": false,
+            "verification_refs": [800]
+        }"#;
+        let round: RelocationBatchRecord = serde_json::from_str(json).expect("deserialize");
+        assert!(round.placement_receipt_refs.is_empty());
     }
 
     #[test]
