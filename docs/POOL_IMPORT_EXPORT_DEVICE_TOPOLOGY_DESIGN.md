@@ -43,6 +43,38 @@ ZFS limitations this design addresses:
 
 ## 3. Pool Label Format
 
+### 3.0 Pool media and allocation authority
+
+Product pool members are byte-addressable media handles: block devices for
+production and explicit regular-file device images for development. A directory
+object-store root may exist as legacy compatibility or harness storage, but it
+is not a user-facing pool-device medium and must not be modeled as a real pool
+member.
+
+The pool topology labels identify the eligible device set. They do not encode
+fixed RAIDZ-like or vdev-like disk groups as the allocation authority. For
+ordinary data, metadata, and read-cache objects, allocation is decided per
+logical object or stripe by the pool-wide redundancy policy:
+
+- replicated placement stores the requested number of full copies on distinct
+  eligible devices;
+- erasure placement stores `data_shards + parity_shards` shard records across
+  distinct eligible devices;
+- the placement planner consumes current health, capacity, the placement epoch,
+  and the requested failure-domain level when choosing targets.
+
+Every successful non-log allocation persists a placement receipt. The receipt
+records the logical object key, epoch, redundancy policy, failure-domain level,
+payload digest, shard length for erasure objects, and the exact device GUIDs
+and shard roles selected for the write. Reads, scrub, evacuation, rebuild, and
+distributed replay consume this receipt authority. They must not recompute
+locations from the latest topology and assume the old bytes moved.
+
+Topology changes increment the placement epoch. Old receipts remain readable
+against their recorded device GUIDs while new allocations use the new epoch and
+the current eligible device set. Rebalance, rebuild, and reclaim are explicit
+receipt-rewrite operations, not side effects of importing a newer topology map.
+
 ### 3.1 PoolLabelV1 record
 
 Each device in a pool carries a self-describing label that identifies the pool,
@@ -206,10 +238,11 @@ Admin: `tidefsctl pool add <pool> <device>`
 3. Write both label copies to new device.
 4. **Within the same commit_group commit**: update labels on ALL existing devices to
    reflect new `device_count` and `topology_generation`.
-5. Commit the commit_group. The new device participates in future allocations
-   immediately.
-6. Existing data is NOT rebalanced. Rebalancing is a separate BACKGROUND
-   operation (#1241, #1265).
+5. Commit the commit_group. The new device participates in future pool-wide
+   placement decisions immediately after the placement epoch advances.
+6. Existing data is NOT rebalanced by the add operation. Existing placement
+   receipts remain authoritative until an explicit relocation/rewrite operation
+   publishes replacement receipts.
 7. Device addition does not block IO. Label updates are piggybacked on the
    regular commit_group commit cycle.
 
@@ -221,9 +254,14 @@ Admin: `tidefsctl pool remove <pool> <device>`
 
 2. Mark device state as REMOVING in the pool's in-memory topology.
 3. **Data evacuation** (BACKGROUND lane, #1241):
-   - Iterate all extent locators on the target device.
-   - For each locator: allocate new space on remaining devices, copy data,
-     update ExtentLocatorTable (#1285), decrement old locator refcount.
+   - Iterate placement receipts and legacy locators that reference the target
+     device.
+   - For each receipt-backed logical object: read through the receipt, allocate
+     a replacement receipt over the surviving eligible devices, verify the
+     payload digest, and then retire the old target records.
+   - For legacy locator-backed extents: allocate new space on remaining
+     devices, copy data, update ExtentLocatorTable (#1285), decrement old
+     locator refcount.
    - Cursor-driven for restart-after-interrupt (#1239).
    - Budgeted per-tick via resource governor (#1237).
 4. Once evacuated (refcount of all locators on device reaches 0):
@@ -240,11 +278,11 @@ Admin: `tidefsctl pool replace <pool> <old-device> <new-device>`
 **Algorithm**: `DeviceManager::replace_device(pool, old_idx, new_path)`
 
 1. Add new device (as in 6.1), initially as REPLACING.
-2. **Direct copy evacuation**: copy all data from old device to new device
-   directly (faster than general evacuation: sequential read of old device,
-   sequential write to new device).
-3. Update ExtentLocatorTable entries: redirect `device_id` and `physical_offset`
-   to new device.
+2. **Receipt-aware evacuation**: healthy old devices may copy data directly,
+   but the committed authority is still the rewritten receipt or locator. A
+   direct byte copy without receipt/locator update is not legal placement.
+3. Update placement receipts and legacy ExtentLocatorTable entries to name the
+   new device GUID or new physical locator.
 4. Once copy is complete:
    - Remove old device (as in 6.2, skip evacuation since data already moved).
    - Promote new device from REPLACING to ACTIVE.
@@ -322,6 +360,10 @@ SparePolicy {
 - The proposal is committed as a replicated commit_group: all nodes apply the change.
 - Label updates are written by the pool owning node; other nodes read labels on
   next pool open or label refresh.
+- Distributed data placement uses the same receipt contract as the standalone
+  pool. A cluster map or object-store service may help choose and transport
+  targets, but the durable read/rebuild authority remains the persisted
+  placement receipt bound to a membership/topology epoch.
 
 ## 8. Protocol and Compatibility
 
@@ -360,6 +402,7 @@ flags are used for pool-level capability changes within a label version.
 | Device addition | `zpool add`; immediate participation; no rebalancing | `ceph osd create`; CRUSH map update | `tidefsctl pool add`; immediate participation; rebalancing is separate BACKGROUND op |
 | Device removal | Post-0.8.0, limited (mirror only); PARITY_RAID removal requires device remap indirection | `ceph osd out`; data migrates via backfill | Full support: evacuation → refcount zero → label update; cursor-driven, restartable |
 | Device replacement | `zpool replace`; resilver to new device; manual trigger | `ceph osd destroy` + `create`; backfill | `tidefsctl pool replace`; direct copy for healthy old device, rebuild for failed |
+| Data placement | Fixed vdev/RAIDZ groups chosen before allocation | CRUSH chooses OSD sets from map/rules | Per-object/stripe pool-wide planner over all eligible devices; receipts are read/rebuild authority |
 | Hot-spare | `zed` daemon (external scripting); not built into ZFS core | N/A (CRUSH handles failure via replication) | Built-in `SparePolicy` with auto-replace; no external daemon required |
 | Cross-system import | `zpool import -a` finds all pools; portable | N/A (monitor model) | Label-driven import; portable; cluster membership cleared on import |
 | Cluster integration | N/A (single-node) | Native (monitor cluster) | Hybrid: standalone or cluster mode; pool ownership orthogonal to membership |
@@ -429,8 +472,10 @@ flags are used for pool-level capability changes within a label version.
 
 - **Cluster pool import (Phase 10)**: depends on cluster membership (#1283),
   distributed lock service (#1248), and ADMIN service (#1243).
-- **Online pool geometry conversion** (mirror ↔ erasure coding): tracked in
-  #1275; label format supports it but algorithm is deferred.
+- **Online redundancy-policy conversion** (for example replicated to erasure):
+  tracked separately from import/export. It must be implemented as a receipt
+  rewrite/rebuild operation over the pool-wide eligible device set, not as a
+  fixed vdev geometry conversion.
 - **Pool migration between cluster and standalone mode**: requires coordinated
   export + re-import with cluster state teardown.
 - **Device firmware/health SMART integration**: useful for predictive failure
@@ -447,6 +492,8 @@ flags are used for pool-level capability changes within a label version.
   tracked in #1249.
 - This design does not specify the ADMIN service protocol or replicated commit_group
   commit — tracked in #1243 and cluster design suite.
-- This design does not change the local filesystem's single-device I/O path;
-  multi-device allocation and IO scheduling are deferred to their respective
-  issues.
+- This design document is broader than the current implementation. The current
+  local object-store path implements receipt-backed pool-wide replicated and
+  erasure object placement; full mounted-filesystem locator integration,
+  distributed transport execution, scrub/repair orchestration, and complete
+  TFR-007 capacity semantics remain governed by their own tracked work.

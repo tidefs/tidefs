@@ -372,21 +372,31 @@ fn init_txg_coordinator(root: &Path) -> tidefs_commit_group::CommitGroupCoordina
 }
 
 /// Returns `true` if the key is internal metadata rather than user data.
-fn is_internal_key(key: ObjectKey) -> bool {
+fn committed_root_key() -> ObjectKey {
     static COMMITTED_ROOT_KEY: OnceLock<ObjectKey> = OnceLock::new();
-    let root_key = COMMITTED_ROOT_KEY
-        .get_or_init(|| ObjectKey::from_name(crate::txg_manager::COMMITTED_ROOT_FILE.as_bytes()));
-    key == *root_key
+    *COMMITTED_ROOT_KEY
+        .get_or_init(|| ObjectKey::from_name(crate::txg_manager::COMMITTED_ROOT_FILE.as_bytes()))
 }
 
-fn user_visible_index_len(index: &BTreeMap<ObjectKey, ObjectLocation>) -> usize {
-    index.keys().filter(|key| !is_internal_key(**key)).count()
+fn is_stats_internal_key(key: ObjectKey) -> bool {
+    key == committed_root_key() || crate::is_pool_placement_receipt_key(key)
 }
 
-fn user_visible_index_bytes(index: &BTreeMap<ObjectKey, ObjectLocation>) -> u64 {
+fn is_public_scan_internal_key(key: ObjectKey) -> bool {
+    key == committed_root_key() || crate::is_pool_placement_scan_internal_key(key)
+}
+
+fn stats_counted_index_len(index: &BTreeMap<ObjectKey, ObjectLocation>) -> usize {
+    index
+        .keys()
+        .filter(|key| !is_stats_internal_key(**key))
+        .count()
+}
+
+fn stats_counted_index_bytes(index: &BTreeMap<ObjectKey, ObjectLocation>) -> u64 {
     index
         .iter()
-        .filter(|(key, _)| !is_internal_key(**key))
+        .filter(|(key, _)| !is_stats_internal_key(**key))
         .map(|(_, loc)| loc.payload_len)
         .sum()
 }
@@ -1445,19 +1455,19 @@ impl LocalObjectStore {
     #[must_use]
     pub fn stats(&self) -> StoreStats {
         let mirror_live_objects = if !self.replicas.is_empty() {
-            user_visible_index_len(&self.replicas[0].index)
+            stats_counted_index_len(&self.replicas[0].index)
         } else {
             0
         };
         let mirror_live_bytes = if !self.replicas.is_empty() {
-            user_visible_index_bytes(&self.replicas[0].index)
+            stats_counted_index_bytes(&self.replicas[0].index)
         } else {
             0
         };
         let replica_live_objects: Vec<usize> = self
             .replicas
             .iter()
-            .map(|r| user_visible_index_len(&r.index))
+            .map(|r| stats_counted_index_len(&r.index))
             .collect();
         let last_scrub_secs = self.last_scrub.elapsed().as_secs();
         let free_segments = self.free_map.free_count();
@@ -1465,8 +1475,8 @@ impl LocalObjectStore {
         let committed_root_txg = committed_root.commit_group_id.0;
         let committed_root_generation = self.txg_manager().commit_count();
         StoreStats {
-            live_objects: user_visible_index_len(&self.index),
-            live_bytes: user_visible_index_bytes(&self.index),
+            live_objects: stats_counted_index_len(&self.index),
+            live_bytes: stats_counted_index_bytes(&self.index),
             segment_count: self.replay.segment_count,
             free_segments,
             free_bytes: free_segments * self.options.max_segment_bytes,
@@ -2137,19 +2147,25 @@ impl LocalObjectStore {
     }
 
     #[must_use]
-    pub fn list_keys(&self) -> Vec<ObjectKey> {
+    pub fn list_keys_including_internal(&self) -> Vec<ObjectKey> {
         let mut keys: BTreeSet<ObjectKey> = self.index.keys().copied().collect();
         for replica in &self.replicas {
-            keys.extend(replica.list_keys());
+            keys.extend(replica.list_keys_including_internal());
         }
-        keys.into_iter()
-            .filter(|key| !is_internal_key(*key))
+        keys.into_iter().collect()
+    }
+
+    #[must_use]
+    pub fn list_keys(&self) -> Vec<ObjectKey> {
+        self.list_keys_including_internal()
+            .into_iter()
+            .filter(|key| !is_public_scan_internal_key(*key))
             .collect()
     }
 
     #[must_use]
     pub fn contains_key(&self, key: ObjectKey) -> bool {
-        !is_internal_key(key)
+        !is_public_scan_internal_key(key)
             && (self.index.contains_key(&key) || self.replicas.iter().any(|r| r.contains_key(key)))
     }
     // -- Corruption localization: reverse segment-position to object-key lookup --
@@ -4400,7 +4416,7 @@ fn replay_segment(request: ReplaySegmentRequest<'_>, state: ReplaySegmentState<'
         }
 
         physical_records_seen = true;
-        let internal_record = is_internal_key(record.key);
+        let internal_record = is_public_scan_internal_key(record.key);
         replay.highest_sequence = replay.highest_sequence.max(record.sequence);
         if !internal_record {
             replay.records_seen += 1;

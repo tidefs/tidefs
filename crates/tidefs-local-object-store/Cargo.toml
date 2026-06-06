@@ -33,6 +33,7 @@ tidefs-reserve-ledger = { path = "../tidefs-reserve-ledger" }
 chacha20poly1305 = "0.10"
 tidefs-erasure-coding = { path = "../tidefs-erasure-coding" }
 tidefs-durability-layout = { path = "../tidefs-durability-layout" }
+tidefs-placement-planner = { path = "../tidefs-placement-planner" }
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 zstd = { version = "0.13", default-features = false }
