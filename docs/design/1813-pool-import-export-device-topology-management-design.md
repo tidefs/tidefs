@@ -325,7 +325,8 @@ pub struct DeviceManager {
 
 2. FLUSH — drain all pending state to devices:
    - Flush all committed commit_groups (call commit_group_state.flush_all())
-   - Sync filesystem (fsync) on every device backing directory
+   - Flush/sync every byte-addressable member through its backing media handle
+     (block device in production, regular-file image in development mode)
 
 3. WRITE_LABELS atomically:
    - Set pool_state = Exported on every device
@@ -343,7 +344,7 @@ Online export is deferred to a future design.
 
 ```
 1. OPEN commit_group — acquire a new commit_group number
-2. INIT — create backing directory for new device
+2. INIT — open and validate the new byte-addressable device path
 3. WRITE_LABELS — write PoolLabelV1 with:
     - device_index = current device_count
     - device_count = old + 1
@@ -380,7 +381,9 @@ All label updates occur within a single commit_group commit to eliminate transie
     - Commit commit_group
 
 4. DEREGISTER — remove device's SegmentFreeMap from PoolAllocator
-5. CLOSE — close the source device, optionally delete backing directory
+5. CLOSE — close the source device; regular-file development images may be
+   removed by explicit operator/test cleanup, but pool members are not
+   directory-backed devices
 ```
 
 ### 3.5 Online device replacement (mirror case)
