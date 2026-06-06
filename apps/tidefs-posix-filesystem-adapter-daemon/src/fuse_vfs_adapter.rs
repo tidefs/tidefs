@@ -5603,13 +5603,15 @@ impl FuseVfsAdapter {
             if let Some(attr) = post_write_attr {
                 self.sync_namespace_attrs_after_engine_write(ino, &attr);
             }
-            if written > 0 && posix_direct_io {
-                self.invalidate_caches_after_direct_write(ino);
-            } else if written > 0
-                && writeback_write_through_without_block_volume
-                && !sparse_zero_noop
+            if written > 0
+                && (posix_direct_io
+                    || (writeback_write_through_without_block_volume && !sparse_zero_noop))
             {
-                self.invalidate_caches_after_direct_write(ino);
+                self.invalidate_caches_after_engine_data_mutation(
+                    ino,
+                    effective_offset as u64,
+                    u64::from(written),
+                );
             }
             // Record write intent before acknowledging to kernel.
             if written > 0 && self.intent_log_write_enabled && !sparse_zero_noop {
@@ -5733,7 +5735,8 @@ impl FuseVfsAdapter {
                                     // read-after-write; flush/fsync/close publish
                                     // it instead of forcing every O_DIRECT write
                                     // through a committed-root cycle.
-                                    self.invalidate_caches_after_direct_write(ino);
+                                    // Range-local cache reconciliation runs
+                                    // after the engine mutex is dropped.
                                 } else {
                                     self.mark_dirty_after_write(
                                         &**e,
@@ -5792,6 +5795,11 @@ impl FuseVfsAdapter {
             if posix_direct_io {
                 if let Ok(written) = write_result {
                     if written > 0 {
+                        self.invalidate_caches_after_engine_data_mutation(
+                            ino,
+                            effective_offset as u64,
+                            u64::from(written),
+                        );
                         let written_len = usize::try_from(written).map_err(|_| Errno::EIO)?;
                         let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
                         self.reconcile_dirty_mirrors_for_authoritative_range(
@@ -5825,25 +5833,6 @@ impl FuseVfsAdapter {
             }
             write_result
         }
-    }
-
-    /// Invalidate adapter-side caches after a direct engine write.
-    ///
-    /// O_DIRECT bypasses page-cache/writeback staging but still changes
-    /// engine-visible file bytes and possibly size. Readers through another
-    /// handle must not observe stale cached data.
-    fn invalidate_caches_after_direct_write(&self, ino: u64) {
-        if let Ok(mut cache) = self.page_cache.lock() {
-            cache.invalidate(ino);
-        }
-        if let Some(ref rd) = self.fuse_read_dispatch {
-            rd.page_cache().remove_pages_for_inode(ino);
-        }
-        {
-            let mut cache = self.getattr_cache.lock().unwrap();
-            cache.remove(&ino);
-        }
-        self.path_lookup_cache.lock().unwrap().remove_by_ino(ino);
     }
 
     /// Invalidate daemon read-side caches after an engine mutation changes
@@ -37995,6 +37984,56 @@ mod tests {
             .expect("writeback page cache");
 
         assert!(Arc::ptr_eq(wb_cache, &adapter.write_page_cache));
+    }
+
+    #[test]
+    fn writeback_write_through_invalidates_only_touched_cache_range() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-range-inval.txt",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let page_size = fixture.adapter.write_page_cache.page_size() as u64;
+
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("seed first clean page");
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, page_size)
+            .expect("seed second clean page");
+
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                ino,
+                adapter_fh,
+                page_size as i64,
+                &[0x5A; 512],
+                FUSE_WRITE_CACHE,
+            )
+            .expect("writeback cached write-through");
+
+        assert!(
+            fixture.adapter.write_page_cache.lookup(ino, 0).is_some(),
+            "clean page outside the authoritative write range must remain cached"
+        );
+        assert!(
+            fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, page_size)
+                .is_none(),
+            "clean page overlapping the authoritative write range must be invalidated"
+        );
     }
 
     #[test]
