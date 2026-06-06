@@ -411,11 +411,12 @@ Important 2026-06-01 findings:
   production and regular files for hidden development mode. Directory
   `LocalObjectStore` compatibility is not a valid pool-member device mode.
   Segment free still performs best-effort hole punching in that compatibility
-  path, and that is not proven media erasure. `tidefsctl device remove` imports
-  labels and has useful survivor-label persistence, but it preloads all target
-  objects, maps object ids locally, depends on operator-supplied surviving
-  store directories, maps synthetic device paths to directories, syncs
-  survivors, and anchors removal on the target store. That is not yet a
+  path, and that is not proven media erasure. The public `tidefsctl` parser now
+  rejects directory object-store handles for device removal/rebuild, but the
+  internal compatibility helper still imports labels, preloads all target
+  objects, maps object ids locally, depends on supplied surviving store
+  directories, maps synthetic device paths to directories, syncs survivors,
+  and anchors removal on the target store. That is not yet a
   pool-authoritative add/remove/replace/remanence lifecycle. Issue #14 closes
   the narrow invalid-media/discard capability bug, and issue #16 establishes
   the explicit pool media contract: user pool-device admission rejects

@@ -376,7 +376,7 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
         "tidefsctl {command} {operation}: live state must be requested through the kernel UAPI client in kernel mode, or the FUSE/ublk daemon owner in userspace mode"
     );
     eprintln!(
-        "tidefsctl {command} {operation}: use --devices or --backing-dir only for offline, discovery, owner-creating import-and-mount, or not-yet-imported work"
+        "tidefsctl {command} {operation}: use explicit --devices only for offline, discovery, owner-creating import-and-mount, or not-yet-imported pool media"
     );
     process::exit(1);
 }

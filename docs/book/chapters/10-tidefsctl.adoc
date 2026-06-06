@@ -64,19 +64,19 @@ active-label topology persistence before it can close the full device lifecycle
 debt.
 
 Offline inputs are explicit. Commands that operate on a pool that is not
-imported must say how to find it with arguments such as `--devices` or
-`--backing-dir`. Those arguments authorize offline work on exported storage,
-repair, discovery, or an owner-creating import-and-mount harness. Dataset,
-snapshot, and property commands must not turn an exported device set into an
-imported runtime as a side effect. Those commands first read the storage
-identity, and if the live-owner registry already names that pool UUID, the
-command has to route through the owner of that exact live state instead of
-opening the devices directly. An `ACTIVE` label on disk is
-cached recovery evidence rather than the live interface itself, but it still
-means the CLI must not treat the devices as ordinary exported storage. With no
-reachable owner, live-state commands fail closed; recover or create the owner
-with `pool mount <pool> <mountpoint> --devices ...`, then operate through that
-owner.
+imported must say how to find it with byte-addressable `--devices` arguments
+where the command supports offline access. Those arguments authorize offline
+work on exported storage, repair, discovery, or an owner-creating
+import-and-mount harness. Dataset, snapshot, and property commands must not
+turn an exported device set into an imported runtime as a side effect. Those
+commands first read the storage identity, and if the live-owner registry
+already names that pool UUID, the command has to route through the owner of
+that exact live state instead of opening the devices directly. An `ACTIVE`
+label on disk is cached recovery evidence rather than the live interface
+itself, but it still means the CLI must not treat the devices as ordinary
+exported storage. With no reachable owner, live-state commands fail closed;
+recover or create the owner with `pool mount <pool> <mountpoint> --devices
+...`, then operate through that owner.
 
 The current userspace path that both imports and creates a live owner is
 `pool mount <pool> <mountpoint> --devices ...`. `pool import <pool>` is an
@@ -118,42 +118,27 @@ tidefsctl block send <pool> --target-addr <addr>
 tidefsctl block receive <pool> --source-addr <addr>
 ----
 
-The exported/offline device-removal form spells its storage handles
-explicitly:
+Exported/offline byte-addressable forms spell their devices explicitly:
 
 [source,sh]
 ----
-tidefsctl device remove <pool> <device> --backing-dir <target-store> --surviving-dirs <stores>
 tidefsctl pool import <pool> --devices <devices>
 tidefsctl pool destroy <pool> --devices <devices>
-tidefsctl pool integrity-check <pool> --devices <devices> --backing-dir <offline-store-dir>
-tidefsctl block attach <pool> --backing-dir <offline-store-dir>
-tidefsctl block send <pool> --backing-dir <offline-store-dir> --target-addr <addr>
-tidefsctl block receive <pool> --backing-dir <offline-store-dir> --source-addr <addr>
+tidefsctl pool integrity-check <pool> --devices <devices>
 ----
 
-The device-removal offline form first probes existing labels without creating
-or opening the store writable. Those labels provide topology and recovery
-evidence. If the labels identify `ACTIVE` imported state, the request routes to
-the owner interface or fails closed; it does not continue into direct
-evacuation from cached live state. Object-store `--backing-dir` forms are
-explicit exported/offline compatibility paths, not pool-member media. Pool
-members are named with `--devices` and must be block devices, or regular files
-only in hidden development mode. If a reachable owner manifest names that
-backing directory, snapshot commands route to that owner; block commands route
-only when the manifest also names the requested pool. If an owner manifest
-names the backing directory for a different pool, the command refuses instead
-of opening the cached imported state as exported storage. These forms must not
-route by pool name alone or make pool-name-only live state changes behind the
-owner.
-Device removal survivor directories and device rebuild source/replacement
-directories are offline object-store paths too, and must be refused when they
-point into `/run/tidefs/pools` or are named by an imported-pool owner manifest.
+Pool members are named with `--devices` and must be block devices, or regular
+files only in hidden development mode. Directory object-store roots may remain
+internal compatibility and harness storage, but they are not operator pool
+media, block-volume backing, snapshot storage, or device lifecycle handles.
+Device removal, rebuild, repair, and block-volume operations must consume pool
+labels, byte-addressable media, placement receipts, and the live owner instead
+of receiving directory survivor/replacement paths from the operator.
 `pool integrity-check <pool>` follows the same rule as the other pool-name
 commands: it routes to the owner interface for imported state. Direct scans are
 only for exported/offline or not-yet-imported storage named explicitly with
-`--devices` and/or `--backing-dir`; if those inputs identify imported state,
-the command routes to the exact owner or fails closed.
+`--devices`; if those inputs identify imported state, the command routes to the
+exact owner or fails closed.
 
 The old `--pool <pool>` spelling is not the operator form. It must not be
 kept as a parallel control path for imported state.

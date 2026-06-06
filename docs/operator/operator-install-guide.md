@@ -307,18 +307,19 @@ tidefsctl snapshot destroy mypool mysnap
 
 # Export and receive a changed-record snapshot stream
 tidefsctl snapshot send mypool --output /tmp/mypool.vfssend1
-tidefsctl snapshot receive --backing-dir /tmp/received-pool --input /tmp/mypool.vfssend1
+tidefsctl snapshot receive mypool --input /tmp/mypool.vfssend1
 ```
 
-For an imported pool, the full `snapshot send --output` form asks the live
-owner to export from its mounted state and write the stream. Live network push
-and live incremental send are not owner-side paths yet, so those forms fail
-closed instead of opening storage behind the owner. Snapshot receive remains an
-explicit target-store operation.
+For an imported pool, snapshot commands ask the live owner to operate on its
+mounted state. Owner-side receive, live network push, and live incremental
+send remain bounded follow-up paths; missing owner implementations fail closed
+instead of opening storage behind the owner. Directory object-store receive is
+not a pool media mode.
 
 For exported/offline pools, the same dataset and snapshot commands may take
-`--devices`. That direct-device form stays offline; it does not import the pool
-or create `/run/tidefs/pools/<uuid>` runtime ownership as a side effect. If the
+`--devices` where the command supports direct byte-addressable access. That
+direct-device form stays offline; it does not import the pool or create
+`/run/tidefs/pools/<uuid>` runtime ownership as a side effect. If the
 live-owner registry already names that pool UUID, the CLI routes to that exact
 owner. An on-disk `ACTIVE` label is cached recovery evidence rather than the
 owner interface itself, but it is not ordinary exported storage. Without a
@@ -331,9 +332,6 @@ the kernel UAPI or userspace daemon owner, then operate through that owner.
 # Request a ublk block export from the imported pool owner
 tidefsctl block attach mypool
 
-# Development/exported object-store attach path
-tidefsctl block attach mypool --backing-dir /var/lib/tidefs/mypool
-
 # List exported block devices
 tidefsctl block list
 
@@ -343,53 +341,34 @@ tidefsctl block detach <dev-name>
 
 The pool-name form routes to the live owner. If the FUSE, ublk, or kernel
 owner does not implement block export yet, it fails closed instead of opening
-storage behind that owner. The `--backing-dir` form is only for exported or
-offline object-store development paths. If a reachable owner manifest names
-both that pool and the same backing directory, the command routes to that exact
-owner; it must not route by pool name alone. If any imported-pool owner
-manifest names the backing directory for a different pool, the command refuses
-instead of opening that cached imported state as offline storage.
+storage behind that owner. Directory object-store backing is not an operator
+block-volume media mode.
 `tidefsctl block send` and
 `tidefsctl block receive` follow the same split: pool-name form through the
-owner, explicit `--backing-dir` for exported/offline object-store work.
-Snapshot `--backing-dir` commands have no pool operand, so they route by the
-reachable owner manifest for that backing directory before opening or writing
-the object store directly.
+owner, and no fallback to directory object-store storage.
 
 ### 6.4 Device management
 
 ```sh
 # Request live owner-mediated removal from an imported pool
 tidefsctl device remove mypool /dev/sdc
-
-# Exported/offline removal spells its storage handles explicitly
-tidefsctl device remove mypool /dev/sdc --backing-dir /var/lib/tidefs/device-sdc --surviving-dirs /var/lib/tidefs/device-sdb
-
-# Trigger rebuild after device replacement
-tidefsctl device rebuild
 ```
 
 The pool name is the live-owner identity. If `mypool` is imported, device
 removal routes to that owner. The current userspace FUSE owner executes
 mounted-pool evacuation through its live `Pool` state and refuses `--force`;
 kernel-owner removal and active-label topology persistence remain bounded
-follow-up work. The backing-directory form is only for exported/offline
-storage.
-The offline form probes existing labels without creating or opening the store
-writable. Those labels provide topology and recovery evidence. If they identify
-`ACTIVE` imported state, the request routes to the owner interface or fails
-closed; it does not evacuate through direct storage access.
-`--surviving-dirs`, `device rebuild --surviving-dir`, and
-`device rebuild --replacement-dir` are offline object-store paths as well. They
-must not point into `/run/tidefs/pools` or any backing directory named by an
-imported-pool owner manifest.
+follow-up work. Directory-backed offline evacuation and rebuild forms are
+retired operator UAPI. Internal compatibility tests may still exercise local
+directory stores, but product device lifecycle must work from pool labels,
+byte-addressable devices, placement receipts, and the live owner.
 
 `tidefsctl pool integrity-check mypool` uses the same boundary. Pool-name
 checks route to the kernel UAPI or userspace daemon owner for imported state.
 Direct storage scans are only for exported/offline or not-yet-imported storage
-named explicitly with `--devices` and/or `--backing-dir`; if those inputs name
-runtime state or an imported-pool owner manifest, the command routes to that
-owner interface or fails closed.
+named explicitly with `--devices`; if those inputs name runtime state or an
+imported-pool owner manifest, the command routes to that owner interface or
+fails closed.
 
 ### 6.5 Pool export (deactivate)
 

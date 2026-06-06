@@ -28,10 +28,10 @@
 //!
 //! Imported-pool commands must talk to the runtime owner for live state:
 //! the declared kernel UAPI in kernel mode, or the FUSE/ublk owner in
-//! userspace mode. Explicit device or backing-directory arguments are for
-//! offline, discovery, import, or not-yet-imported work; they are not an
-//! override once the pool is imported. Do not make pool-name usability by
-//! reopening runtime metadata behind the live owner.
+//! userspace mode. Explicit device arguments are for offline, discovery,
+//! import, or not-yet-imported work; they are not an override once the pool is
+//! imported. Do not make pool-name usability by reopening runtime metadata
+//! behind the live owner.
 mod commands;
 
 use std::path::PathBuf;
@@ -68,8 +68,9 @@ Pool routing rule:
   A pool name identifies an imported pool. Imported state is cached and must
   be queried or changed through the live owner: the kernel UAPI in kernel
   mode, or the userspace daemon owner in userspace mode. Explicit --devices
-  or --backing-dir inputs are for offline, discovery, import, or
-  not-yet-imported work, not overrides for an imported pool.
+  inputs are for offline, discovery, import, or not-yet-imported work, not
+  overrides for an imported pool. Directory object-store backing is not pool
+  media.
 
 TideFS is pre-alpha. Help text should mark harnesses as such instead of
 treating them as the final kernel runtime."#,
@@ -656,7 +657,7 @@ mod tests {
     // -- Snapshot CLI parse tests -----------------------------------------
 
     #[test]
-    fn cli_parse_snapshot_create_minimum() {
+    fn cli_parse_snapshot_create_rejects_backing_dir() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
@@ -667,8 +668,8 @@ mod tests {
             "/tmp/pool",
         ]);
         assert!(
-            args.is_ok(),
-            "snapshot create with name and backing-dir should parse"
+            args.is_err(),
+            "snapshot create with backing-dir must be retired"
         );
     }
 
@@ -683,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_snapshot_list_minimum() {
+    fn cli_parse_snapshot_list_rejects_backing_dir() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
@@ -692,7 +693,10 @@ mod tests {
             "--backing-dir",
             "/tmp/pool",
         ]);
-        assert!(args.is_ok(), "snapshot list with backing-dir should parse");
+        assert!(
+            args.is_err(),
+            "snapshot list with backing-dir must be retired"
+        );
     }
 
     #[test]
@@ -713,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_snapshot_destroy_minimum() {
+    fn cli_parse_snapshot_destroy_rejects_backing_dir() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
@@ -724,8 +728,8 @@ mod tests {
             "/tmp/pool",
         ]);
         assert!(
-            args.is_ok(),
-            "snapshot destroy with name and backing-dir should parse"
+            args.is_err(),
+            "snapshot destroy with backing-dir must be retired"
         );
     }
 
@@ -740,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_snapshot_destroy_short_flag() {
+    fn cli_parse_snapshot_destroy_rejects_short_backing_dir() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
@@ -750,7 +754,7 @@ mod tests {
             "-b",
             "/tmp/pool",
         ]);
-        assert!(args.is_ok(), "snapshot destroy with -b flag should parse");
+        assert!(args.is_err(), "snapshot destroy -b must be retired");
     }
 
     #[test]
@@ -776,6 +780,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cli_parse_snapshot_receive_live_pool_positional() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "snapshot",
+            "receive",
+            "mypool",
+            "--input",
+            "/tmp/mypool.vfssend1",
+        ]);
+        assert!(
+            args.is_ok(),
+            "snapshot receive with positional pool should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_snapshot_receive_rejects_backing_dir() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "snapshot",
+            "receive",
+            "--backing-dir",
+            "/tmp/pool",
+            "--input",
+            "/tmp/mypool.vfssend1",
+        ]);
+        assert!(
+            args.is_err(),
+            "snapshot receive backing-dir must be retired"
+        );
+    }
+
     // -- Device CLI parse tests -------------------------------------------
 
     #[test]
@@ -789,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_device_remove_positional_pool() {
+    fn cli_parse_device_remove_rejects_offline_backing_dirs() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
@@ -803,8 +842,8 @@ mod tests {
             "/var/lib/tidefs/device-sdb",
         ]);
         assert!(
-            args.is_ok(),
-            "device remove with positional pool and device should parse"
+            args.is_err(),
+            "device remove backing-dir/surviving-dirs must be retired"
         );
     }
 
@@ -821,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_block_attach_offline_backing_dir() {
+    fn cli_parse_block_attach_rejects_backing_dir() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
@@ -831,10 +870,7 @@ mod tests {
             "--backing-dir",
             "/var/lib/tidefs/mypool",
         ]);
-        assert!(
-            args.is_ok(),
-            "block attach offline backing dir should parse"
-        );
+        assert!(args.is_err(), "block attach backing-dir must be retired");
     }
 
     #[test]
@@ -852,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_block_send_offline_backing_dir() {
+    fn cli_parse_block_send_rejects_backing_dir() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
@@ -864,7 +900,7 @@ mod tests {
             "--target-addr",
             "127.0.0.1:9000",
         ]);
-        assert!(args.is_ok(), "block send offline backing dir should parse");
+        assert!(args.is_err(), "block send backing-dir must be retired");
     }
 
     #[test]
@@ -885,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_block_receive_offline_backing_dir() {
+    fn cli_parse_block_receive_rejects_backing_dir() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
@@ -897,10 +933,7 @@ mod tests {
             "--source-addr",
             "127.0.0.1:9000",
         ]);
-        assert!(
-            args.is_ok(),
-            "block receive offline backing dir should parse"
-        );
+        assert!(args.is_err(), "block receive backing-dir must be retired");
     }
 
     // -- Kernel CLI parse tests ------------------------------------------
@@ -1065,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_pool_integrity_check_offline_backing_dir() {
+    fn cli_parse_pool_integrity_check_rejects_backing_dir() {
         use clap::Parser;
         let args = Cli::try_parse_from([
             "tidefsctl",
@@ -1076,8 +1109,8 @@ mod tests {
             "/tmp/pool",
         ]);
         assert!(
-            args.is_ok(),
-            "pool integrity-check with offline backing dir should parse"
+            args.is_err(),
+            "pool integrity-check backing-dir must be retired"
         );
     }
 
@@ -1142,8 +1175,8 @@ mod tests {
             "1048576",
         ]);
         assert!(
-            args.is_ok(),
-            "pool integrity-check with all flags should parse"
+            args.is_err(),
+            "pool integrity-check must reject retired backing-dir even with devices"
         );
     }
 

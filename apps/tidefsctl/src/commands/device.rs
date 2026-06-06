@@ -1,23 +1,12 @@
 //! `tidefsctl device` subcommands: operator-triggered device removal from a
 //! TideFS pool with data evacuation and committed-root anchoring.
 //!
-//! ## Offline evacuation contract
+//! ## Media authority
 //!
-//! For imported pools, the pool name is routed to the live owner before this
-//! module opens any store. The target-device backing directory and surviving
-//! directories are only for exported/offline device removal when no live owner
-//! interface exists for the pool.
-//!
-//! Offline device removal requires at least one surviving device backing
-//! directory (--surviving-dirs). Evacuated objects are read from the target
-//! device's store and persisted to the surviving device stores via round-robin
-//! assignment consistent with the evacuation plan. The committed removal
-//! record is only marked complete when all objects have been durably relocated,
-//! pool labels have been updated, and the commit-group sync has succeeded.
-//!
-//! If no surviving directories are provided, the command refuses evacuation
-//! and reports the planning failure (NoObjectsOnDevice when empty, or
-//! WouldEmptyPool when objects exist but no survivors are available).
+//! Imported pools route to the live owner before this module opens any store.
+//! Product-facing device lifecycle commands operate on byte-addressable pool
+//! devices. Directory object-store evacuation/rebuild helpers remain internal
+//! compatibility coverage, not supported operator pool media.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -39,8 +28,7 @@ use tidefs_replication_model::{FailureDomain, ReplicationIntent};
 pub enum DeviceCommand {
     /// Remove a device from a pool.
     ///
-    /// Imported pools route to the live owner. Exported/offline pools use
-    /// --backing-dir and --surviving-dirs to run the local evacuation path.
+    /// Imported pools route to the live owner.
     Remove {
         /// Pool name. If the pool is imported, the request is routed to its live owner.
         pool_name: String,
@@ -48,15 +36,23 @@ pub enum DeviceCommand {
         /// Path to the block device to remove.
         device_path: PathBuf,
 
-        /// Backing directory for exported/offline removal of the target device's store.
-        #[arg(short = 'b', long = "backing-dir")]
+        /// Retired directory object-store backing mode.
+        #[arg(
+            short = 'b',
+            long = "backing-dir",
+            hide = true,
+            value_parser = crate::commands::reject_directory_pool_media_value
+        )]
         backing_dir: Option<PathBuf>,
 
-        /// Comma-separated paths to surviving exported/offline backing directories.
-        /// Each path must point to a distinct LocalObjectStore directory.
-        /// At least one surviving dir is required for evacuation of
-        /// populated target devices.
-        #[arg(short = 'S', long = "surviving-dirs", value_delimiter = ',')]
+        /// Retired directory object-store survivor mode.
+        #[arg(
+            short = 'S',
+            long = "surviving-dirs",
+            hide = true,
+            value_delimiter = ',',
+            value_parser = crate::commands::reject_directory_pool_media_value
+        )]
         surviving_dirs: Vec<PathBuf>,
 
         /// Replication factor for failure-domain separation (default: 2).
@@ -73,16 +69,23 @@ pub enum DeviceCommand {
     },
 
     /// Rebuild a lost device from a surviving replica.
-    ///
-    /// Copies all objects from the surviving store into a fresh
-    /// replacement store, restoring pool redundancy after device loss.
     Rebuild {
-        /// Backing directory for the surviving mirror/replica store.
-        #[arg(short = 'S', long = "surviving-dir")]
+        /// Retired directory object-store survivor mode.
+        #[arg(
+            short = 'S',
+            long = "surviving-dir",
+            hide = true,
+            value_parser = crate::commands::reject_directory_pool_media_value
+        )]
         surviving_dir: std::path::PathBuf,
 
-        /// Path where the replacement store will be created.
-        #[arg(short = 'r', long = "replacement-dir")]
+        /// Retired directory object-store replacement mode.
+        #[arg(
+            short = 'r',
+            long = "replacement-dir",
+            hide = true,
+            value_parser = crate::commands::reject_directory_pool_media_value
+        )]
         replacement_dir: std::path::PathBuf,
     },
 }
@@ -283,7 +286,7 @@ fn handle_remove(
                 "device", "remove", pool_name, live_args,
             );
             return Err(format!(
-                "pool-name device removal for '{pool_name}' requires a reachable live owner; route through the kernel UAPI or userspace daemon owner. Use --backing-dir only for exported/offline device removal."
+                "pool-name device removal for '{pool_name}' requires a reachable live owner; route through the kernel UAPI or userspace daemon owner. Directory-backed offline device removal is retired."
             )
             .into());
         }
@@ -367,16 +370,15 @@ fn handle_remove(
         .filter(|p| p != device_path)
         .collect();
 
-    // Require --surviving-dirs for multi-device pools. The pool config
-    // provides device topology authority but not filesystem store paths;
-    // the operator must provide actual LocalObjectStore directories.
+    // Internal compatibility path: the pool config provides device topology
+    // authority but not filesystem store paths.
     if surviving_dirs.is_empty() {
         if surviving_from_config.is_empty() {
             return Err("refusing to remove the only device in the pool;                         device removal requires at least one surviving device"
                 .into());
         }
         return Err(
-            "device removal requires --surviving-dirs for pools with              more than one device; provide paths to surviving device              backing directories"
+            "compatibility directory device removal requires surviving store paths for pools with more than one device"
                 .into(),
         );
     }
