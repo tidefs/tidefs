@@ -5863,12 +5863,9 @@ impl FuseVfsAdapter {
         if let Some(ref rd) = self.fuse_read_dispatch {
             rd.page_cache().invalidate_range(ino, offset, end);
         }
-        if !self
+        let _ = self
             .mmap_coherency
-            .invalidate_local_range(ino, offset, length)
-        {
-            self.try_inval_inode_range(ino, offset, length);
-        }
+            .invalidate_local_range(ino, offset, length);
         self.invalidate_inode_metadata_local(ino);
     }
 
