@@ -132,15 +132,28 @@ impl<'a> Request<'a> {
             ll::Operation::Poll(_) => DispatchLane::FileRead,
             #[cfg(feature = "abi-7-24")]
             ll::Operation::Lseek(_) => DispatchLane::FileRead,
-            ll::Operation::SetAttr(_)
+            ll::Operation::MkNod(_)
+            | ll::Operation::MkDir(_)
+            | ll::Operation::Unlink(_)
+            | ll::Operation::RmDir(_)
+            | ll::Operation::SymLink(_)
+            | ll::Operation::Rename(_)
+            | ll::Operation::Link(_)
+            | ll::Operation::SetAttr(_)
             | ll::Operation::Write(_)
             | ll::Operation::Flush(_)
             | ll::Operation::Release(_)
-            | ll::Operation::FSync(_) => DispatchLane::FileWriteback,
+            | ll::Operation::FSync(_)
+            | ll::Operation::SetXAttr(_)
+            | ll::Operation::RemoveXAttr(_)
+            | ll::Operation::Create(_) => DispatchLane::FileWriteback,
             #[cfg(feature = "abi-7-19")]
             ll::Operation::FAllocate(_) => DispatchLane::FileWriteback,
+            #[cfg(feature = "abi-7-23")]
+            ll::Operation::Rename2(_) => DispatchLane::FileWriteback,
             #[cfg(feature = "abi-7-28")]
             ll::Operation::CopyFileRange(_) => DispatchLane::FileWriteback,
+            ll::Operation::Exchange(_) => DispatchLane::FileWriteback,
             ll::Operation::Forget(_) => DispatchLane::Maintenance,
             #[cfg(feature = "abi-7-16")]
             ll::Operation::BatchForget(_) => DispatchLane::Maintenance,
@@ -323,6 +336,72 @@ impl<'a> Request<'a> {
         let op = self.request.operation().map_err(|_| Errno::ENOSYS)?;
         let mut fs = filesystem.lock().expect("filesystem mutex poisoned");
         match op {
+            ll::Operation::MkNod(x) => {
+                fs.mknod(
+                    self,
+                    self.request.nodeid().into(),
+                    x.name().as_ref(),
+                    x.mode(),
+                    x.umask(),
+                    x.rdev(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::MkDir(x) => {
+                fs.mkdir(
+                    self,
+                    self.request.nodeid().into(),
+                    x.name().as_ref(),
+                    x.mode(),
+                    x.umask(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::Unlink(x) => {
+                fs.unlink(
+                    self,
+                    self.request.nodeid().into(),
+                    x.name().as_ref(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::RmDir(x) => {
+                fs.rmdir(
+                    self,
+                    self.request.nodeid().into(),
+                    x.name().as_ref(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::SymLink(x) => {
+                fs.symlink(
+                    self,
+                    self.request.nodeid().into(),
+                    x.link_name().as_ref(),
+                    Path::new(x.target()),
+                    self.reply(),
+                );
+            }
+            ll::Operation::Rename(x) => {
+                fs.rename(
+                    self,
+                    self.request.nodeid().into(),
+                    x.src().name.as_ref(),
+                    x.dest().dir.into(),
+                    x.dest().name.as_ref(),
+                    0,
+                    self.reply(),
+                );
+            }
+            ll::Operation::Link(x) => {
+                fs.link(
+                    self,
+                    x.inode_no().into(),
+                    self.request.nodeid().into(),
+                    x.dest().name.as_ref(),
+                    self.reply(),
+                );
+            }
             ll::Operation::SetAttr(x) => {
                 fs.setattr(
                     self,
@@ -388,6 +467,31 @@ impl<'a> Request<'a> {
                 );
                 abort_registry.remove(unique);
             }
+            ll::Operation::SetXAttr(x) => {
+                fs.setxattr(
+                    self,
+                    self.request.nodeid().into(),
+                    x.name(),
+                    x.value(),
+                    x.flags(),
+                    x.position(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::RemoveXAttr(x) => {
+                fs.removexattr(self, self.request.nodeid().into(), x.name(), self.reply());
+            }
+            ll::Operation::Create(x) => {
+                fs.create(
+                    self,
+                    self.request.nodeid().into(),
+                    x.name().as_ref(),
+                    x.mode(),
+                    x.umask(),
+                    x.flags(),
+                    self.reply(),
+                );
+            }
             #[cfg(feature = "abi-7-19")]
             ll::Operation::FAllocate(x) => {
                 fs.fallocate(
@@ -397,6 +501,18 @@ impl<'a> Request<'a> {
                     x.offset(),
                     x.len(),
                     x.mode(),
+                    self.reply(),
+                );
+            }
+            #[cfg(feature = "abi-7-23")]
+            ll::Operation::Rename2(x) => {
+                fs.rename(
+                    self,
+                    x.from().dir.into(),
+                    x.from().name.as_ref(),
+                    x.to().dir.into(),
+                    x.to().name.as_ref(),
+                    x.flags(),
                     self.reply(),
                 );
             }
@@ -417,6 +533,17 @@ impl<'a> Request<'a> {
                     o.offset,
                     x.len(),
                     flags,
+                    self.reply(),
+                );
+            }
+            ll::Operation::Exchange(x) => {
+                fs.exchange(
+                    self,
+                    x.from().dir.into(),
+                    x.from().name.as_ref(),
+                    x.to().dir.into(),
+                    x.to().name.as_ref(),
+                    x.options(),
                     self.reply(),
                 );
             }
@@ -1342,6 +1469,17 @@ mod tests {
         0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // nlookup=3
     ]);
 
+    #[cfg(target_endian = "little")]
+    const RENAME_REQUEST: AlignedData<[u8; 56]> = AlignedData([
+        0x38, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, // len=56, opcode=12
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x99, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // newdir
+        0x6f, 0x6c, 0x64, 0x00, 0x6e, 0x65, 0x77, 0x00, // "old\0new\0"
+    ]);
+
     #[test]
     fn request_new_valid_init() {
         let ch = dummy_channel();
@@ -1420,6 +1558,7 @@ mod tests {
         let read = Request::new(ch.clone(), &READ_REQUEST[..]).unwrap();
         let write = Request::new(ch.clone(), &WRITE_REQUEST[..]).unwrap();
         let forget = Request::new(ch.clone(), &FORGET_REQUEST[..]).unwrap();
+        let rename = Request::new(ch.clone(), &RENAME_REQUEST[..]).unwrap();
         #[cfg(feature = "abi-7-11")]
         let poll = Request::new(ch.clone(), &POLL_REQUEST[..]).unwrap();
         #[cfg(feature = "abi-7-24")]
@@ -1436,6 +1575,10 @@ mod tests {
         assert_eq!(lseek.dispatch_lane(true, false), DispatchLane::FileRead);
         assert_eq!(
             write.dispatch_lane(true, false),
+            DispatchLane::FileWriteback
+        );
+        assert_eq!(
+            rename.dispatch_lane(true, false),
             DispatchLane::FileWriteback
         );
         assert_eq!(forget.dispatch_lane(true, false), DispatchLane::Maintenance);
@@ -1519,6 +1662,51 @@ mod tests {
         }));
         let req = Request::new(dummy_channel(), &READ_REQUEST[..]).unwrap();
         req.dispatch_file_read_worker(&filesystem, SessionACL::All, 0);
+
+        assert!(seen.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn file_writeback_worker_dispatches_owned_metadata_mutation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RenameSeenFS {
+            seen: Arc<AtomicBool>,
+        }
+
+        impl Filesystem for RenameSeenFS {
+            fn rename(
+                &mut self,
+                _req: &Request<'_>,
+                parent: u64,
+                name: &std::ffi::OsStr,
+                newparent: u64,
+                newname: &std::ffi::OsStr,
+                flags: u32,
+                reply: crate::ReplyEmpty,
+            ) {
+                assert_eq!(parent, 0x1122_3344_5566_7788);
+                assert_eq!(name, std::ffi::OsStr::new("old"));
+                assert_eq!(newparent, 0x1122_3344_5566_7799);
+                assert_eq!(newname, std::ffi::OsStr::new("new"));
+                assert_eq!(flags, 0);
+                self.seen.store(true, Ordering::Release);
+                reply.ok();
+            }
+        }
+
+        let seen = Arc::new(AtomicBool::new(false));
+        let filesystem = Arc::new(Mutex::new(RenameSeenFS {
+            seen: Arc::clone(&seen),
+        }));
+        let req = Request::new(dummy_channel(), &RENAME_REQUEST[..]).unwrap();
+        req.dispatch_file_writeback_worker(
+            &filesystem,
+            &AbortRegistry::default(),
+            SessionACL::All,
+            0,
+        );
 
         assert!(seen.load(Ordering::Acquire));
     }
