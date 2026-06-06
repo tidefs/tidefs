@@ -405,7 +405,7 @@ pub use reconnect::{
 pub use reconnect_state_push::{
     ReconnectStatePushDispatcher, ReconnectStatePushHandler, ReconnectStatePushMessage,
 };
-pub use replication::{recv_replication_msg, send_replication_msg, ReplicationMessage};
+pub use replication::{recv_replication_msg, send_replication_msg, ReplicationMessage, SyncEntry};
 pub use secure_transport::{SecureTransport, SecureTransportStats};
 pub use session::{
     handshake, MessageSequenceNumber, PeerSessionInfo, SeqReceiveOutcome, Session,

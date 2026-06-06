@@ -101,7 +101,7 @@ deserialization for `tidefs_transport::ReplicationMessage`.
 | `Put { name, payload }` | Writes to local primary store (no fan-out); responds `Ack` |
 | `Get { name }` | Reads from local primary store; responds `GetResponse` |
 | `Delete { name, generation }` | Deletes from local primary store; responds `DeleteAck` |
-| `SyncRequest` | Lists all keys with payloads; responds `SyncResponse` |
+| `SyncRequest` | Lists exact object payloads; responds `SyncResponse` entries with `PlacementReceiptRef` authority when the backend exposes pool receipts |
 | `ScrubRequest` | Runs local segment scrub and reports findings plus receipt-inventory disclosure |
 | `RepairObject { key, placement_receipt_ref, authoritative_payload }` | Validates the shared placement receipt against the exact 32-byte object key, length, digest, policy, and target width before local repair write; responds `RepairObjectAck` |
 
@@ -113,6 +113,11 @@ receipt-addressed tasks instead of deriving placement from current topology or
 compatibility store listings. Local path-backed and transport-backed
 compatibility stores report rebuild admission as unavailable because they do
 not expose pool placement receipt inventory.
+
+Pool-backed `SyncResponse` entries likewise carry the real non-synthetic
+`PlacementReceiptRef` for the payload being transferred. Local path-backed and
+transport-backed compatibility stores keep sync entries receipt-less rather
+than synthesizing placement authority.
 
 ### Local-Only Operations (LOCAL-ONLY boundary)
 
