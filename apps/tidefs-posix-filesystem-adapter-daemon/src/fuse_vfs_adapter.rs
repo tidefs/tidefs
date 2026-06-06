@@ -6544,49 +6544,65 @@ impl FuseVfsAdapter {
 
         // Phase 2: Block-volume dirty-range writes (when configured).
         {
-            let mut bv_guard = self.block_volume.lock().unwrap();
-            if let Some(bv) = bv_guard.as_mut() {
+            let block_volume_configured = self.block_volume.lock().unwrap().is_some();
+            if block_volume_configured {
                 let snapshot = {
                     let ds = self.dirty_state.lock().unwrap();
                     ds.get(&ino).map(|dr| dr.ranges().to_vec())
                 };
                 if let Some(ranges) = snapshot {
-                    let e = self.engine.lock().unwrap();
-                    for &(start, end) in &ranges {
-                        let len = u32::try_from(end - start).map_err(|_| Errno::EFBIG)?;
-                        let data = e.read(efh, start, len, ctx)?;
-                        // Resolve extent map for this range and write each
-                        // data chunk to the block volume at its physical offset.
-                        let entries = e.lookup_extents(efh.inode_id, start, len as u64);
-                        if entries.is_empty() {
-                            // No extent allocation yet — fall back to logical
-                            // offset write (the extent will be allocated later).
-                            bv.write_bytes(start, &data)?;
-                        } else {
-                            for entry in entries {
-                                if entry.is_data() {
-                                    let clip_start = entry.logical_offset.max(start);
-                                    let clip_end = entry.end_offset().min(end);
-                                    let clip_len = (clip_end - clip_start) as usize;
-                                    if clip_len == 0 {
-                                        continue;
+                    let block_writes = {
+                        let e = self.engine.lock().unwrap();
+                        let mut block_writes = Vec::new();
+                        for &(start, end) in &ranges {
+                            let len = u32::try_from(end - start).map_err(|_| Errno::EFBIG)?;
+                            let data = e.read(efh, start, len, ctx)?;
+                            // Resolve extent map for this range and write each
+                            // data chunk to the block volume at its physical offset.
+                            let entries = e.lookup_extents(efh.inode_id, start, len as u64);
+                            if entries.is_empty() {
+                                // No extent allocation yet — fall back to logical
+                                // offset write (the extent will be allocated later).
+                                block_writes.push((start, data));
+                            } else {
+                                for entry in entries {
+                                    if entry.is_data() {
+                                        let clip_start = entry.logical_offset.max(start);
+                                        let clip_end = entry.end_offset().min(end);
+                                        let clip_len = (clip_end - clip_start) as usize;
+                                        if clip_len == 0 {
+                                            continue;
+                                        }
+                                        let data_offset = (clip_start - start) as usize;
+                                        let chunk =
+                                            data[data_offset..data_offset + clip_len].to_vec();
+                                        let phys_off =
+                                            clip_start - entry.logical_offset + entry.locator_id.0;
+                                        block_writes.push((phys_off, chunk));
                                     }
-                                    let data_offset = (clip_start - start) as usize;
-                                    let chunk = &data[data_offset..data_offset + clip_len];
-                                    let phys_off =
-                                        clip_start - entry.logical_offset + entry.locator_id.0;
-                                    bv.write_bytes(phys_off, chunk)?;
+                                    // Holes and UNWRITTEN extents are not written
+                                    // to the block volume; they stay as engine-resident.
                                 }
-                                // Holes and UNWRITTEN extents are not written
-                                // to the block volume; they stay as engine-resident.
                             }
                         }
+                        block_writes
+                    };
+                    let mut wrote_to_block_volume = false;
+                    {
+                        let mut bv_guard = self.block_volume.lock().unwrap();
+                        if let Some(bv) = bv_guard.as_mut() {
+                            for (offset, data) in block_writes {
+                                bv.write_bytes(offset, &data)?;
+                            }
+                            wrote_to_block_volume = true;
+                        }
                     }
-                    drop(e);
-                    let mut ds = self.dirty_state.lock().unwrap();
-                    if let Some(dr) = ds.get_mut(&ino) {
-                        dr.clear_all();
-                        ds.remove(&ino);
+                    if wrote_to_block_volume {
+                        let mut ds = self.dirty_state.lock().unwrap();
+                        if let Some(dr) = ds.get_mut(&ino) {
+                            dr.clear_all();
+                            ds.remove(&ino);
+                        }
                     }
                 }
             }
