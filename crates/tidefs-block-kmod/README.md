@@ -28,10 +28,14 @@ Kbuild gendisk owner         (tidefs_block_kmod.rs under CONFIG_RUST)
   ↓
 TidefsBlockDevice            (device.rs, always available)
   ↓
+PoolCoreBackend → KernelPoolCore logical-volume I/O
+  ↓ explicit bring-up cfg only
 BlockExport → BlockExportQueue → backing buffer
 ```
 
-All I/O arrives through the blk-mq `queue_rq` callback.  Bio data (pages,
+All I/O arrives through the blk-mq `queue_rq` callback. The production-shaped
+entrypoint requires a pool-backed backend before registering `/dev/tidefs`.
+Bio data (pages,
 
 ### Linux 7.0 Rust-for-Linux API Gaps
 
@@ -189,26 +193,37 @@ cat /sys/block/tidefs/queue/rotational  # 0
 
 ## Backend Classification
 
-### In-Memory Backend (Bring-Up / Test)
+### In-Memory Backend (Explicit Bring-Up / Test)
 
-The default `BlockExport` + `BlockExportQueue` backend is a **fixed-capacity
-in-memory buffer**.  It is the bring-up and test backend for the typed
-userspace model and the initial kernel module registration path, not the
-production storage backend.
+The `BlockExport` + `BlockExportQueue` backend is a **fixed-capacity in-memory
+buffer**. It is the bring-up and test backend for the typed userspace model and
+kernel module smoke tests, not the production storage backend. The Kbuild module
+entrypoint no longer falls back to this backend implicitly: by default,
+`tidefs_block` refuses to register `/dev/tidefs` when `/dev/tidefs_pool_member`
+cannot be opened.
 
-- **Production backend**: In kernel mode, the production backend will be
-  `VfsEngine`, translating sector-relative offsets into VfsEngine file
-  offsets on the backing block file through the kernel-UAPI surface.
+Bring-up jobs that intentionally need the in-memory backend must build the
+module with `RUSTFLAGS_MODULE=--cfg=tidefs_block_kmod_bringup_backend`. Linux
+7.0's Rust `module!` macro in the current baseline does not expose module
+parameters, so this cfg is the current explicit kernel-facing switch. A runtime
+module parameter can replace it once the supported Rust-for-Linux parameter
+shape is wired.
+
+- **Production backend**: In kernel mode, the production backend is the shared
+  kernel pool authority exposed as `PoolCoreBackend`/`KernelPoolCore`
+  logical-volume I/O. The current hard-coded `/dev/tidefs_pool_member` open
+  remains a bring-up bridge toward that authority, not final pool import.
 - **Data movement guarantee**: The in-memory backend does move data
   (read/write/flush/discard against the flat byte buffer), so the dispatch
   path is exercised for correctness.  However, it does **not** exercise
   real block-device persistence (no physical media, no power-fail atomicity,
   no crash-consistency across host reboots).
-- **Kernel callback**: The `submit_bio` callback in the kernel module
-  registration path dispatches through this in-memory backend, moving data
-  between kernel bio pages and the backing buffer.  This is kernel-resident
-  data movement suitable for module-load and basic I/O smoke testing, but
-  it is **not** production kernel block I/O validation.
+- **Kernel callback**: The `queue_rq` callback in the kernel module
+  registration path can dispatch through this in-memory backend only in
+  explicit bring-up mode, moving data between kernel request pages and the
+  backing buffer. This is kernel-resident data movement suitable for module-load
+  and basic I/O smoke testing, but it is **not** production kernel block I/O
+  validation.
 
 ## Relationship To Physical Pool Devices
 
@@ -714,7 +729,7 @@ BlockKmodQueueRq::dispatch() or TidefsBlockDevice::submit_kernel_bio()
 DispatchEngine::dispatch(bio)
   ├─ classify: BioOp::Read/Write/Flush/Discard
   ├─ validate: sector range, device state (active/fenced)
-  ├─ execute: BlockBackend trait → BlockExport (in-memory) or VfsEngine (kernel)
+  ├─ execute: BlockBackend trait → PoolCoreBackend or explicit BlockExport bring-up buffer
   └─ record: BLAKE3-256 dispatch digest (domain: tidefs-block-kmod-dispatch-v1)
 ```
 
@@ -729,9 +744,11 @@ are accessed through `unsafe` C-bindgen dereference.
 
 The `BlockBackend` trait decouples dispatch logic from storage implementation.
 In the in-memory model, `BlockExport` implements `BlockBackend` with a flat
-byte buffer. In kernel mode, the backend bridges to VfsEngine through the
-kernel-UAPI surface, translating sector-relative offsets into VfsEngine file
-offsets on the backing block file.
+byte buffer. In kernel mode, `PoolCoreBackend` implements `BlockBackend` by
+routing sector-relative logical-volume operations through the pool-core
+adapter. The current `RawBlockFile` bridge is still a bring-up path toward the
+shared `KernelPoolCore` authority described above, not a separate production
+store.
 
 ### BioOp Classification
 
