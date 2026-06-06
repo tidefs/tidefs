@@ -6,8 +6,8 @@
 //! flows through the same pool-label/import/export authority used by
 //! local pools.  It defines:
 //!
-//! - A feature flag bit [`CLUSTER_POOL`] stored in `features_incompat` of
-//!   the label to mark pools managed by cluster authority.
+//! - Cluster feature flags stored in the label to mark pools managed by
+//!   cluster authority.
 //! - [`ClusterPoolConfig::from_pool_labels`] for constructing cluster
 //!   topology from decoded device labels plus node assignments.
 //! - [`ClusterPoolConfig::to_pool_labels`] for producing per-device label
@@ -23,9 +23,9 @@
 //! - **Failure domain is resolved at import time** through the membership
 //!   service and is provided as a parameter when constructing
 //!   `ClusterPoolConfig` from labels.
-//! - **Placement policy is stored as a feature flag** (`CLUSTER_POOL`)
-//!   rather than as per-device policy fields.  The pool-level policy is
-//!   carried in the orchestrator config, not in individual device labels.
+//! - **Redundancy policy identity is stored in the label.** Concrete
+//!   per-object placement remains runtime/receipt authority, but every pool
+//!   member label carries the same pool-wide replicated or erasure policy.
 //! - **Device GUIDs are real UUIDs.**  The bridge converts between the
 //!   `[u8; 16]` representation in both types.
 //! - **Capacity is carried verbatim** from the label's

@@ -2004,6 +2004,13 @@ mod kbuild_impl {
         if has_policy && buf.len() < POOL_LABEL_V1_EXT_WIRE_SIZE {
             return Err(LabelError::BufferTooSmall);
         }
+        if has_policy && buf[407] != 0 {
+            return Err(LabelError::BadRedundancyPolicy {
+                kind: buf[404],
+                first: buf[405],
+                second: buf[406],
+            });
+        }
 
         let (device_health, device_read_errors, device_write_errors, device_checksum_errors) =
             if has_health {
