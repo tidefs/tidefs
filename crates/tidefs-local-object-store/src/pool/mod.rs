@@ -49,10 +49,12 @@ use tidefs_erasure_coding::{
     encode as encode_erasure_stripe, reconstruct as reconstruct_erasure_stripe, ErasureShard,
     ShardKind, StripeConfig,
 };
+use tidefs_membership_epoch::EpochId;
 use tidefs_placement_planner::{
     AllocationRequest, DeviceHealthCapacity, HashRingPlacementPlanner, PlacementDecision,
     PlacementPlanner,
 };
+use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 use tidefs_space_accounting::{PoolCounters, StatfsResult};
 
 // ---------------------------------------------------------------------------
@@ -149,6 +151,21 @@ impl PoolRedundancyPolicy {
                 data_shards,
                 parity_shards,
             } => pool_label::PoolRedundancyPolicy::erasure(data_shards, parity_shards),
+        }
+    }
+
+    /// Project this local pool policy into the shared receipt-ref model.
+    #[must_use]
+    pub const fn to_receipt_redundancy_policy(self) -> ReceiptRedundancyPolicy {
+        match self {
+            Self::Replicated { copies } => ReceiptRedundancyPolicy::Replicated { copies },
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => ReceiptRedundancyPolicy::Erasure {
+                data_shards,
+                parity_shards,
+            },
         }
     }
 }
@@ -396,6 +413,25 @@ const PLACEMENT_RECEIPT_CONTEXT: &str = "TideFS pool placement receipt object ke
 const PLACEMENT_HASH_RING_VNODES_PER_GB: u64 = 16;
 
 impl PlacementReceipt {
+    /// Project this local receipt into the shared distributed/rebuild anchor.
+    pub fn to_receipt_ref(&self) -> Result<PlacementReceiptRef> {
+        let target_count =
+            u16::try_from(self.targets.len()).map_err(|_| StoreError::InvalidOptions {
+                reason: "placement receipt target count exceeds shared receipt-ref format",
+            })?;
+
+        Ok(PlacementReceiptRef::new(
+            placement_receipt_object_id(self.object_key),
+            self.object_key.as_bytes32(),
+            EpochId::new(self.epoch),
+            self.generation,
+            self.policy.to_receipt_redundancy_policy(),
+            self.payload_len,
+            self.payload_digest,
+            target_count,
+        ))
+    }
+
     fn encode(&self) -> Result<Vec<u8>> {
         if self.targets.len() > u16::MAX as usize {
             return Err(StoreError::InvalidOptions {
@@ -1533,6 +1569,19 @@ impl Pool {
         }
 
         Ok(receipts.into_values().collect())
+    }
+
+    /// Return shared placement receipt references for every logical object in
+    /// an I/O class.
+    ///
+    /// Distributed transfer, rebuild, and backfill planners use this
+    /// reference-sized view so they stay anchored to local placement authority
+    /// without depending on the private receipt object-key namespace.
+    pub fn placement_receipt_refs(&self, class: IoClass) -> Result<Vec<PlacementReceiptRef>> {
+        self.placement_receipts(class)?
+            .iter()
+            .map(PlacementReceipt::to_receipt_ref)
+            .collect()
     }
 
     fn load_placement_receipt(
@@ -3535,6 +3584,11 @@ fn placement_key_pair(key: ObjectKey) -> (u64, u64) {
     )
 }
 
+fn placement_receipt_object_id(key: ObjectKey) -> u64 {
+    let bytes = key.as_bytes32();
+    u64::from_le_bytes(bytes[..8].try_into().unwrap())
+}
+
 fn digest32(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }
@@ -3933,6 +3987,45 @@ mod tests {
     }
 
     #[test]
+    fn replicated_receipt_projects_to_shared_receipt_ref() {
+        let root = temp_dir("receipt-ref-replicated");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-ref-replicated-object");
+        let payload = b"replicated receipt ref payload";
+        pool.put(IoClass::Data, key, payload).unwrap();
+
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("placement receipt");
+        let receipt_ref = receipt.to_receipt_ref().unwrap();
+        assert_eq!(receipt_ref.object_id, placement_receipt_object_id(key));
+        assert_eq!(receipt_ref.object_key, key.as_bytes32());
+        assert_eq!(receipt_ref.receipt_epoch, EpochId::new(receipt.epoch));
+        assert_eq!(receipt_ref.receipt_generation, receipt.generation);
+        assert_eq!(
+            receipt_ref.redundancy_policy,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 }
+        );
+        assert_eq!(receipt_ref.payload_len, payload.len() as u64);
+        assert_eq!(receipt_ref.payload_digest, digest32(payload));
+        assert_eq!(receipt_ref.target_count, 2);
+
+        let refs = pool.placement_receipt_refs(IoClass::Data).unwrap();
+        assert_eq!(refs, vec![receipt_ref]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn receipt_generation_recovers_after_pool_reopen() {
         let root = temp_dir("receipt-generation-reopen");
         let _ = std::fs::remove_dir_all(&root);
@@ -3962,7 +4055,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_receipts_scan_exposes_erasure_receipts_not_internal_keys() {
+    fn erasure_receipt_ref_scan_exposes_receipts_not_internal_keys() {
         let root = temp_dir("receipt-snapshot-erasure");
         let _ = std::fs::remove_dir_all(&root);
         let config = multi_data_device_config(&root, 4);
@@ -4014,6 +4107,25 @@ mod tests {
                 "receipt snapshot must not make internal shard keys public"
             );
         }
+
+        let receipt_ref = receipt.to_receipt_ref().unwrap();
+        assert_eq!(receipt_ref.object_id, placement_receipt_object_id(key));
+        assert_eq!(receipt_ref.object_key, key.as_bytes32());
+        assert_eq!(receipt_ref.receipt_epoch, EpochId::new(receipt.epoch));
+        assert_eq!(receipt_ref.receipt_generation, receipt.generation);
+        assert_eq!(
+            receipt_ref.redundancy_policy,
+            ReceiptRedundancyPolicy::Erasure {
+                data_shards: 2,
+                parity_shards: 1
+            }
+        );
+        assert_eq!(receipt_ref.payload_len, receipt.payload_len);
+        assert_eq!(receipt_ref.payload_digest, receipt.payload_digest);
+        assert_eq!(receipt_ref.target_count, 3);
+
+        let refs = pool.placement_receipt_refs(IoClass::Data).unwrap();
+        assert_eq!(refs, vec![receipt_ref]);
 
         let _ = std::fs::remove_dir_all(&root);
     }

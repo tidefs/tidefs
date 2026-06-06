@@ -11,6 +11,8 @@ description = "Append-only durable local object-store prototype for TideFS"
 [dependencies]
 tidefs-auth = { path = "../tidefs-auth" }
 tidefs-cluster = { path = "../tidefs-cluster" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-replication-model = { path = "../tidefs-replication-model" }
 tidefs-block-allocator = { path = "../tidefs-block-allocator" }
 tidefs-spacemap-allocator = { path = "../tidefs-spacemap-allocator" }
 tidefs-pool-allocator = { path = "../tidefs-pool-allocator" }
