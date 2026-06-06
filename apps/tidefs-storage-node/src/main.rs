@@ -115,7 +115,7 @@ struct ServerArgs {
     root_auth_key_hex: Option<String>,
 
     #[arg(long = "pool-device")]
-    pool_device: Option<PathBuf>,
+    pool_devices: Vec<PathBuf>,
 
     #[arg(long = "rdma", default_value_t = false)]
     rdma: bool,
@@ -262,7 +262,7 @@ fn run_server(args: ServerArgs) -> ! {
         store_paths,
         fs_root,
         root_auth_key_hex,
-        pool_device,
+        pool_devices,
         rdma,
         carrier_policy,
         node_identity,
@@ -337,7 +337,7 @@ fn run_server(args: ServerArgs) -> ! {
             store_paths,
             fs_root,
             root_auth_key,
-            pool_device_path: pool_device,
+            pool_device_paths: pool_devices,
             pool_lock_dir: None,
             node_identity,
             rdma,
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(args.node_id, 1);
         assert_eq!(args.bind, "127.0.0.1:9000".parse().unwrap());
         assert!(args.store_paths.is_empty());
-        assert!(args.pool_device.is_none());
+        assert!(args.pool_devices.is_empty());
         assert!(args.node_identity.is_none());
         assert_eq!(args.replication_factor, 1);
     }
@@ -524,6 +524,8 @@ mod tests {
             "0101010101010101010101010101010101010101010101010101010101010101",
             "--pool-device",
             "/dev/tidefs/pool0",
+            "--pool-device",
+            "/dev/tidefs/pool1",
             "--node-identity",
             "node-7.rack-3",
             "--replication-factor",
@@ -561,7 +563,13 @@ mod tests {
             args.root_auth_key_hex,
             Some("0101010101010101010101010101010101010101010101010101010101010101".into())
         );
-        assert_eq!(args.pool_device, Some(PathBuf::from("/dev/tidefs/pool0")));
+        assert_eq!(
+            args.pool_devices,
+            vec![
+                PathBuf::from("/dev/tidefs/pool0"),
+                PathBuf::from("/dev/tidefs/pool1")
+            ]
+        );
         assert_eq!(args.node_identity, Some("node-7.rack-3".into()));
         assert_eq!(args.replication_factor, 3);
     }
@@ -880,7 +888,7 @@ mod tests {
             },
             fs_root: args.fs_root,
             root_auth_key: None,
-            pool_device_path: args.pool_device,
+            pool_device_paths: args.pool_devices,
             pool_lock_dir: None,
             node_identity: args.node_identity,
             ready_file: None,
@@ -894,7 +902,7 @@ mod tests {
         assert_eq!(config.node_id, 1);
         assert_eq!(config.bind_addr, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(config.store_paths, vec![PathBuf::from("/tmp/tidefs-store")]);
-        assert!(config.pool_device_path.is_none());
+        assert!(config.pool_device_paths.is_empty());
         assert!(config.node_identity.is_none());
     }
 
@@ -925,7 +933,7 @@ mod tests {
             },
             fs_root: args.fs_root,
             root_auth_key: None,
-            pool_device_path: args.pool_device,
+            pool_device_paths: args.pool_devices,
             pool_lock_dir: None,
             node_identity: args.node_identity,
             ready_file: None,
@@ -938,8 +946,8 @@ mod tests {
         };
         assert_eq!(config.node_id, 7);
         assert_eq!(
-            config.pool_device_path,
-            Some(PathBuf::from("/dev/tidefs/pool0"))
+            config.pool_device_paths,
+            vec![PathBuf::from("/dev/tidefs/pool0")]
         );
         assert_eq!(config.node_identity, Some("storage-north-3".into()));
     }

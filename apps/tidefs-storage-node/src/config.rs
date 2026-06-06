@@ -22,6 +22,8 @@ pub struct JsonStorageNodeConfig {
     pub store_paths: Vec<PathBuf>,
 
     pub pool_device: Option<PathBuf>,
+    #[serde(default)]
+    pub pool_devices: Vec<PathBuf>,
     pub pool_lock_dir: Option<PathBuf>,
     pub node_identity: Option<String>,
 
@@ -157,6 +159,12 @@ impl TryFrom<JsonStorageNodeConfig> for StorageNodeConfig {
             j.replication_factor,
         )?;
 
+        let mut pool_device_paths = Vec::new();
+        if let Some(path) = j.pool_device {
+            pool_device_paths.push(path);
+        }
+        pool_device_paths.extend(j.pool_devices);
+
         Ok(StorageNodeConfig {
             bind_addr: j.bind,
             node_id: j.node_id,
@@ -166,7 +174,7 @@ impl TryFrom<JsonStorageNodeConfig> for StorageNodeConfig {
             } else {
                 j.store_paths
             },
-            pool_device_path: j.pool_device,
+            pool_device_paths,
             pool_lock_dir: j.pool_lock_dir,
             node_identity: j.node_identity,
             fs_root: j.fs_root,
@@ -219,6 +227,7 @@ mod tests {
         assert_eq!(cfg.bind, "127.0.0.1:9000".parse().unwrap());
         assert!(cfg.store_paths.is_empty());
         assert!(cfg.pool_device.is_none());
+        assert!(cfg.pool_devices.is_empty());
         assert!(cfg.node_identity.is_none());
         assert!(!cfg.rdma);
         assert_eq!(cfg.replication_factor, 1);
@@ -231,6 +240,7 @@ mod tests {
   "bind": "0.0.0.0:9999",
   "store_paths": ["/data/tidefs/store1", "/data/tidefs/store2"],
   "pool_device": "/dev/tidefs/pool0",
+  "pool_devices": ["/dev/tidefs/pool1", "/dev/tidefs/pool2"],
   "pool_lock_dir": "/dev/tidefs/import",
   "node_identity": "node-7.rack-3",
   "fs_root": "/data/tidefs/fs",
@@ -254,6 +264,13 @@ mod tests {
         assert_eq!(cfg.bind, "0.0.0.0:9999".parse().unwrap());
         assert_eq!(cfg.store_paths.len(), 2);
         assert_eq!(cfg.pool_device, Some(PathBuf::from("/dev/tidefs/pool0")));
+        assert_eq!(
+            cfg.pool_devices,
+            vec![
+                PathBuf::from("/dev/tidefs/pool1"),
+                PathBuf::from("/dev/tidefs/pool2")
+            ]
+        );
         assert_eq!(cfg.node_identity, Some("node-7.rack-3".into()));
         assert_eq!(cfg.member_class, Some("learner".into()));
         assert_eq!(cfg.failure_domain, Some(3));
@@ -288,6 +305,28 @@ mod tests {
         let jcfg = serde_json::from_str::<JsonStorageNodeConfig>(json).expect("json parse ok");
         let cfg = StorageNodeConfig::try_from(jcfg).expect("config convert");
         assert!(cfg.member_class.is_none());
+    }
+
+    #[test]
+    fn json_pool_devices_merge_single_and_list() {
+        let json = r#"{
+  "node_id": 1,
+  "bind": "127.0.0.1:9000",
+  "pool_device": "/dev/tidefs/pool0",
+  "pool_devices": ["/dev/tidefs/pool1", "/dev/tidefs/pool2"]
+}"#;
+        let cfg = StorageNodeConfig::try_from(
+            serde_json::from_str::<JsonStorageNodeConfig>(json).expect("json"),
+        )
+        .expect("convert");
+        assert_eq!(
+            cfg.pool_device_paths,
+            vec![
+                PathBuf::from("/dev/tidefs/pool0"),
+                PathBuf::from("/dev/tidefs/pool1"),
+                PathBuf::from("/dev/tidefs/pool2")
+            ]
+        );
     }
 
     #[test]

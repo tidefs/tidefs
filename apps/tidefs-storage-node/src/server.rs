@@ -3,7 +3,7 @@
 //! plus send/receive backed by a LocalFileSystem at a configured fs_root.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,7 +17,15 @@ use tidefs_cluster::pool_protocol::{
 use tidefs_cluster::ClusterPlacementPolicy;
 use tidefs_cluster::{ClusterLeaseConfig, ClusterLeaseRuntime, FenceAuthority, FenceValidator};
 use tidefs_local_filesystem::{self as vfs, ChangedRecordExport, RootAuthenticationKey};
-use tidefs_local_object_store::StoreOptions;
+use tidefs_local_object_store::device_layout::DeviceMediaClass;
+use tidefs_local_object_store::pool::{
+    Pool, PoolConfig as ObjectPoolConfig, PoolProperties,
+    PoolRedundancyPolicy as ObjectPoolRedundancyPolicy,
+};
+use tidefs_local_object_store::{
+    DeviceBacking, DeviceClass as ObjectDeviceClass, DeviceConfig as ObjectDeviceConfig,
+    DeviceIoClass as ObjectIoClass, DeviceKind as ObjectDeviceKind, ObjectKey, StoreOptions,
+};
 use tidefs_membership_epoch::session_binding::{RosterSessionRegistry, SessionAcceptor};
 use tidefs_membership_epoch::EpochId;
 use tidefs_membership_epoch::{MemberClass, MemberId};
@@ -36,6 +44,7 @@ use tidefs_partition_runtime::split_brain_guard::SplitBrainGuard;
 use tidefs_partition_runtime::types::PartitionFence;
 use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
 use tidefs_pool_import::{pool_import, ImportedPool};
+use tidefs_pool_scan::PoolDeviceBacking;
 use tidefs_replicated_object_store::{
     ReplicatedObjectStore, ReplicatedStoreConfig, TransportReplicatedStore,
     TransportReplicatedStoreConfig,
@@ -47,6 +56,7 @@ use tidefs_transport::{
     SegmentFetchRequest, SegmentFetchResponse, SessionCloseReason, Transport, TransportError,
     SEGMENT_FETCH_REQUEST_MAGIC,
 };
+use tidefs_types_pool_label_core::PoolRedundancyPolicy as LabelPoolRedundancyPolicy;
 
 use crate::authority_spine::RuntimeAuthority;
 use crate::protocol::{self, Frame};
@@ -66,6 +76,43 @@ enum StoreBackend {
     Local(Box<ReplicatedObjectStore>),
     /// Transport-backed replicated store (live multi-node path).
     TransportBacked(Box<TransportReplicatedStore>),
+    /// Imported pool-backed byte-addressable media path.
+    PoolBacked(Box<Pool>),
+}
+
+fn pool_name_key(name: impl AsRef<[u8]>) -> ObjectKey {
+    ObjectKey::from_name(name)
+}
+
+fn pool_put_named(pool: &mut Pool, name: impl AsRef<[u8]>, payload: &[u8]) -> Result<(), String> {
+    pool.put(ObjectIoClass::Data, pool_name_key(name), payload)
+        .map(|_| ())
+        .map_err(|e| format!("pool put: {e}"))
+}
+
+fn pool_get_named(pool: &Pool, name: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, String> {
+    pool.get(ObjectIoClass::Data, pool_name_key(name))
+        .map_err(|e| format!("pool get: {e}"))
+}
+
+fn pool_get_key(pool: &Pool, key: ObjectKey) -> Result<Option<Vec<u8>>, String> {
+    pool.get(ObjectIoClass::Data, key)
+        .map_err(|e| format!("pool key get: {e}"))
+}
+
+fn pool_delete_named(pool: &mut Pool, name: impl AsRef<[u8]>) -> Result<bool, String> {
+    pool.delete(ObjectIoClass::Data, pool_name_key(name))
+        .map_err(|e| format!("pool delete: {e}"))
+}
+
+fn pool_list_logical_keys(pool: &Pool) -> Result<Vec<ObjectKey>, String> {
+    pool.placement_receipt_refs(ObjectIoClass::Data)
+        .map(|refs| {
+            refs.into_iter()
+                .map(|receipt| ObjectKey::from_bytes32(receipt.object_key))
+                .collect()
+        })
+        .map_err(|e| format!("pool receipt inventory: {e}"))
 }
 
 fn sync_entries_from_store(store: &StoreBackend) -> Vec<([u8; 32], Vec<u8>)> {
@@ -86,6 +133,16 @@ fn sync_entries_from_store(store: &StoreBackend) -> Vec<([u8; 32], Vec<u8>)> {
             .into_iter()
             .filter_map(|key| {
                 ts.get_key_local(key)
+                    .ok()
+                    .flatten()
+                    .map(|payload| (key.as_bytes32(), payload))
+            })
+            .collect(),
+        StoreBackend::PoolBacked(pool) => pool_list_logical_keys(pool)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|key| {
+                pool_get_key(pool, key)
                     .ok()
                     .flatten()
                     .map(|payload| (key.as_bytes32(), payload))
@@ -162,25 +219,58 @@ fn apply_receipt_bound_repair(
     match store {
         StoreBackend::Local(rs) => rs.put_local(&repair_name, payload),
         StoreBackend::TransportBacked(ts) => ts.put_local(&repair_name, payload),
+        StoreBackend::PoolBacked(pool) => pool_put_named(pool, name, payload),
     }
 }
 
-fn placement_receipt_inventory_json() -> serde_json::Value {
-    serde_json::json!({
-        "available": false,
-        "count": 0,
-        "refs": [],
-        "reason": "storage-node object-store backend does not expose pool placement receipts; receipt-bound repair requests must carry PlacementReceiptRef explicitly",
-    })
+fn placement_receipt_inventory_json(store: &StoreBackend) -> serde_json::Value {
+    match store {
+        StoreBackend::PoolBacked(pool) => match pool.placement_receipt_refs(ObjectIoClass::Data) {
+            Ok(refs) => serde_json::json!({
+                "available": true,
+                "count": refs.len(),
+                "refs": refs,
+            }),
+            Err(e) => serde_json::json!({
+                "available": false,
+                "count": 0,
+                "refs": [],
+                "reason": format!("pool placement receipt scan failed: {e}"),
+            }),
+        },
+        StoreBackend::Local(_) | StoreBackend::TransportBacked(_) => {
+            serde_json::json!({
+                "available": false,
+                "count": 0,
+                "refs": [],
+                "reason": "compatibility object-store backend does not expose pool placement receipts; receipt-bound repair requests must carry PlacementReceiptRef explicitly",
+            })
+        }
+    }
 }
 
-fn local_scrub_report_json(config: &StorageNodeConfig) -> (String, u64) {
+fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> (String, u64) {
+    let placement_receipt_refs = placement_receipt_inventory_json(store);
+    let placement_receipt_ref_count = placement_receipt_refs["count"].as_u64().unwrap_or(0);
+    if matches!(store, StoreBackend::PoolBacked(_)) {
+        let json = serde_json::json!({
+            "backend": "pool",
+            "segments_scanned": 0,
+            "records_verified": 0,
+            "bytes_scanned": 0,
+            "chain_breaks_detected": 0,
+            "completed": true,
+            "findings_count": 0,
+            "placement_receipt_ref_count": placement_receipt_ref_count,
+            "placement_receipt_refs": placement_receipt_refs,
+        });
+        return (json.to_string(), 0);
+    }
+
     let store_dir = &config.store_paths[0];
     let segments_dir = store_dir.join(tidefs_local_object_store::STORE_DIR_NAME);
     let scrubber = tidefs_local_object_store::SegmentIntegrityScrubber::new(&segments_dir);
     let mut suspect_log = tidefs_local_object_store::SuspectLog::new();
-    let placement_receipt_refs = placement_receipt_inventory_json();
-    let placement_receipt_ref_count = placement_receipt_refs["count"].as_u64().unwrap_or(0);
     match scrubber.scrub_full(&mut suspect_log) {
         Ok(report) => {
             let findings = report.outcomes.len() as u64;
@@ -216,9 +306,10 @@ pub struct StorageNodeConfig {
     pub node_id: u64,
     /// Paths for the replicated object store.
     pub store_paths: Vec<PathBuf>,
-    /// Pool device path for pool import at startup.
-    /// When set, the daemon imports the pool before opening the store.
-    pub pool_device_path: Option<PathBuf>,
+    /// Pool device paths for pool import at startup.
+    /// When set, the daemon imports these byte-addressable pool members
+    /// before opening the store and uses them as the live backend.
+    pub pool_device_paths: Vec<PathBuf>,
     /// Directory for pool import lock files. Defaults to /dev/tidefs/import.
     pub pool_lock_dir: Option<PathBuf>,
     /// Human-readable node identity string (e.g. "node-7.rack-3").
@@ -346,7 +437,7 @@ pub struct StorageNode {
     config: StorageNodeConfig,
     /// Runtime authority spine constructed at startup.
     authority: Option<RuntimeAuthority>,
-    /// Result of pool import at startup, if pool_device_path was set.
+    /// Result of pool import at startup, if pool_device_paths was set.
     imported_pool: Option<ImportedPool>,
     /// Daemon start time for uptime calculation.
     /// Cluster lease runtime for clustered pool import ownership.
@@ -687,13 +778,141 @@ fn transport_store_config_from_authority(
     }
 }
 
+fn import_lock_dir(config: &StorageNodeConfig) -> PathBuf {
+    config
+        .pool_lock_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/dev/tidefs/import"))
+}
+
+fn import_epoch_anchor_path(lock_dir: &Path) -> PathBuf {
+    lock_dir.join("epoch_anchor")
+}
+
+fn pool_guid_hex(guid: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(32);
+    for byte in guid {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn object_pool_redundancy_policy(policy: LabelPoolRedundancyPolicy) -> ObjectPoolRedundancyPolicy {
+    match policy {
+        LabelPoolRedundancyPolicy::Replicated { copies } => {
+            ObjectPoolRedundancyPolicy::replicated(copies)
+        }
+        LabelPoolRedundancyPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        } => ObjectPoolRedundancyPolicy::erasure(data_shards, parity_shards),
+    }
+}
+
+fn object_pool_device_backing(path: &Path) -> Result<DeviceBacking, String> {
+    match tidefs_pool_scan::classify_pool_device_backing(path)
+        .map_err(|e| format!("pool device backing {}: {e}", path.display()))?
+    {
+        PoolDeviceBacking::BlockDevice => Ok(DeviceBacking::BlockDevice),
+        PoolDeviceBacking::RegularFileDev => Ok(DeviceBacking::RegularFileDev),
+    }
+}
+
+fn object_pool_device_config(path: PathBuf) -> Result<ObjectDeviceConfig, String> {
+    let backing = object_pool_device_backing(&path)?;
+    Ok(ObjectDeviceConfig {
+        media_class: DeviceMediaClass::default(),
+        path: path.clone(),
+        backing,
+        class: ObjectDeviceClass::Data,
+        kind: ObjectDeviceKind::Block { path },
+        compression: None,
+        encryption: None,
+    })
+}
+
+fn object_pool_config_from_import(
+    imported: &ImportedPool,
+    lock_dir: &Path,
+) -> Result<ObjectPoolConfig, String> {
+    let device_paths = imported.config.device_tree.all_leaf_paths();
+    if device_paths.is_empty() {
+        return Err("pool import produced no leaf devices".into());
+    }
+    let devices = device_paths
+        .into_iter()
+        .map(object_pool_device_config)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ObjectPoolConfig {
+        name: imported.config.pool_name.clone(),
+        root_path: lock_dir.join(format!(
+            "storage-node-pool-{}",
+            pool_guid_hex(&imported.config.pool_uuid)
+        )),
+        devices,
+    })
+}
+
+fn object_pool_properties_from_import(imported: &ImportedPool) -> PoolProperties {
+    PoolProperties {
+        redundancy_policy: object_pool_redundancy_policy(imported.config.redundancy_policy),
+        ..PoolProperties::default()
+    }
+}
+
+fn open_imported_pool_backend(imported: &ImportedPool, lock_dir: &Path) -> Result<Pool, String> {
+    let config = object_pool_config_from_import(imported, lock_dir)?;
+    std::fs::create_dir_all(&config.root_path).map_err(|e| {
+        format!(
+            "create storage-node pool metadata root {}: {e}",
+            config.root_path.display()
+        )
+    })?;
+    let properties = object_pool_properties_from_import(imported);
+    Pool::open(config, properties, &StoreOptions::default())
+        .map_err(|e| format!("open pool-backed storage-node backend: {e}"))
+}
+
 impl StorageNode {
     /// Create and start a storage node.
     pub fn start(config: StorageNodeConfig) -> Result<Self, String> {
         // ── Extract the runtime authority spine ──────────────────────
         let authority = config.authority.clone();
 
-        let store_backend = if let Some(ref a) = authority {
+        // Pool import: if pool device paths are configured, import the pool
+        // to verify label consistency and activate the byte-addressable media.
+        //
+        // Split-brain prevention: read the persisted epoch anchor to
+        // reject stale committed roots from partitioned writers.
+        let lock_dir = import_lock_dir(&config);
+        let imported_pool = if !config.pool_device_paths.is_empty() {
+            let epoch_anchor_path = import_epoch_anchor_path(&lock_dir);
+            let min_epoch = read_epoch_anchor(&epoch_anchor_path);
+            let imported =
+                pool_import(&config.pool_device_paths, &lock_dir, false, None, min_epoch).map_err(
+                    |e| {
+                        let paths = config
+                            .pool_device_paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("pool import failed for [{paths}]: {e}")
+                    },
+                )?;
+            // Persist the committed-root epoch for the next import.
+            if let Some(epoch) = imported.stats.committed_root_epoch {
+                write_epoch_anchor(&epoch_anchor_path, epoch);
+            }
+            Some(imported)
+        } else {
+            None
+        };
+
+        let store_backend = if let Some(ref imported) = imported_pool {
+            StoreBackend::PoolBacked(Box::new(open_imported_pool_backend(imported, &lock_dir)?))
+        } else if let Some(ref a) = authority {
             if a.is_live() {
                 // Transport-backed live path: use TransportReplicatedStore
                 let primary_path = config
@@ -736,29 +955,6 @@ impl StorageNode {
             let store = ReplicatedObjectStore::open(&config.store_paths, store_cfg)
                 .map_err(|e| format!("failed to open replicated store: {e}"))?;
             StoreBackend::Local(Box::new(store))
-        };
-
-        // Pool import: if a pool device path is configured, import the pool
-        // to verify superblock consistency and activate the pool.
-        //
-        // Split-brain prevention: read the persisted epoch anchor to
-        // reject stale committed roots from partitioned writers.
-        let imported_pool = if let Some(ref pool_path) = config.pool_device_path {
-            let lock_dir = config
-                .pool_lock_dir
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from("/dev/tidefs/import"));
-            let epoch_anchor_path = lock_dir.join("epoch_anchor");
-            let min_epoch = read_epoch_anchor(&epoch_anchor_path);
-            let imported = pool_import(&[pool_path.clone()], &lock_dir, false, None, min_epoch)
-                .map_err(|e| format!("pool import failed for {}: {e}", pool_path.display()))?;
-            // Persist the committed-root epoch for the next import.
-            if let Some(epoch) = imported.stats.committed_root_epoch {
-                write_epoch_anchor(&epoch_anchor_path, epoch);
-            }
-            Some(imported)
-        } else {
-            None
         };
 
         let mut transport = if config.rdma {
@@ -1422,6 +1618,7 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                             rs.put_local(name, payload).map_err(|e| e.to_string())
                         }
                         StoreBackend::TransportBacked(ts) => ts.put_local(name, payload),
+                        StoreBackend::PoolBacked(pool) => pool_put_named(pool, name, payload),
                     };
                     match result {
                         Ok(()) => ReplicationMessage::Ack {
@@ -1439,6 +1636,7 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     let result = match &mut *s {
                         StoreBackend::Local(rs) => rs.get_local(name),
                         StoreBackend::TransportBacked(ts) => ts.get_local(name),
+                        StoreBackend::PoolBacked(pool) => pool_get_named(pool, name),
                     };
                     match result {
                         Ok(Some(payload)) => ReplicationMessage::GetResponse {
@@ -1460,6 +1658,7 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     let result = match &mut *s {
                         StoreBackend::Local(rs) => rs.delete_local(name),
                         StoreBackend::TransportBacked(ts) => ts.delete_local(name),
+                        StoreBackend::PoolBacked(pool) => pool_delete_named(pool, name),
                     };
                     match result {
                         Ok(deleted) => ReplicationMessage::DeleteAck {
@@ -1478,7 +1677,8 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     ReplicationMessage::SyncResponse { entries }
                 }
                 ReplicationMessage::ScrubRequest => {
-                    let (report_json, findings_count) = local_scrub_report_json(&ctx.config);
+                    let s = ctx.store.lock().unwrap();
+                    let (report_json, findings_count) = local_scrub_report_json(&ctx.config, &s);
                     ReplicationMessage::ScrubResponse {
                         report_json,
                         findings_count,
@@ -2222,6 +2422,7 @@ fn handle_frame_ctx(
                         ))
                     }
                 }),
+                StoreBackend::PoolBacked(pool) => pool_put_named(pool, key, value),
             };
             match result {
                 Ok(()) => Some(Frame::Ok),
@@ -2233,6 +2434,7 @@ fn handle_frame_ctx(
             let result = match &mut *s {
                 StoreBackend::Local(rs) => rs.get_named(key).map_err(|e| e.to_string()),
                 StoreBackend::TransportBacked(ts) => ts.get_named(key),
+                StoreBackend::PoolBacked(pool) => pool_get_named(pool, key),
             };
             match result {
                 Ok(Some(value)) => Some(Frame::GetResponse { value }),
@@ -2247,6 +2449,7 @@ fn handle_frame_ctx(
             let result = match &mut *s {
                 StoreBackend::Local(rs) => rs.delete_named(key).map_err(|e| e.to_string()),
                 StoreBackend::TransportBacked(ts) => ts.delete_named(key),
+                StoreBackend::PoolBacked(pool) => pool_delete_named(pool, key),
             };
             match result {
                 Ok(existed) => Some(Frame::DeleteResponse { existed }),
@@ -2265,6 +2468,10 @@ fn handle_frame_ctx(
                     .into_iter()
                     .map(|k| k.as_bytes32().to_vec())
                     .collect(),
+                StoreBackend::PoolBacked(pool) => match pool_list_logical_keys(pool) {
+                    Ok(keys) => keys.into_iter().map(|k| k.as_bytes32().to_vec()).collect(),
+                    Err(e) => return Some(Frame::Error { message: e }),
+                },
             };
             Some(Frame::ListResponse { keys })
         }
@@ -2298,6 +2505,23 @@ fn handle_frame_ctx(
                         "failed_writes": stats.failed_writes,
                         "degraded_reads": stats.degraded_reads,
                         "bytes_written": stats.bytes_written,
+                    })
+                }
+                StoreBackend::PoolBacked(pool) => {
+                    let stats = pool.pool_stats();
+                    let op_stats = pool.stats();
+                    let placement_receipt_ref_count = pool
+                        .placement_receipt_refs(ObjectIoClass::Data)
+                        .map(|refs| refs.len())
+                        .unwrap_or(0);
+                    serde_json::json!({
+                        "backend": "pool",
+                        "object_count": stats.object_count,
+                        "total_capacity_bytes": stats.total_capacity_bytes,
+                        "used_bytes": stats.used_bytes,
+                        "available_bytes": stats.available_bytes,
+                        "bytes_written": op_stats.total_bytes,
+                        "placement_receipt_ref_count": placement_receipt_ref_count,
                     })
                 }
             };
@@ -2650,6 +2874,11 @@ fn handle_frame_ctx(
                     let count = ts.stats().object_count;
                     (txg, gen, count)
                 }
+                StoreBackend::PoolBacked(pool) => {
+                    let _ = pool.sync_all();
+                    let count = pool.pool_stats().object_count;
+                    (0, 0, count)
+                }
             };
             Some(Frame::SnapshotBarrierResponse {
                 barrier_id: *barrier_id,
@@ -2660,7 +2889,8 @@ fn handle_frame_ctx(
         }
         // ── Multi-node scrub fanout ──
         Frame::ScrubRequest => {
-            let (report_json, findings_count) = local_scrub_report_json(&ctx.config);
+            let s = store.lock().unwrap();
+            let (report_json, findings_count) = local_scrub_report_json(&ctx.config, &s);
             eprintln!(
                 "[storage-node] session {session_id}: scrub request completed findings_count={findings_count}"
             );
@@ -2960,6 +3190,9 @@ fn handle_segment_fetch_ctx(
             StoreBackend::TransportBacked(ts) => ts
                 .get_local(obj_id.to_le_bytes())
                 .map_err(|e| format!("primary get for object {obj_id}: {e}"))?
+                .unwrap_or_default(),
+            StoreBackend::PoolBacked(pool) => pool_get_named(pool, obj_id.to_le_bytes())
+                .map_err(|e| format!("pool get for object {obj_id}: {e}"))?
                 .unwrap_or_default(),
         }
     };
@@ -3329,6 +3562,53 @@ mod cluster_pool_handler_tests {
         path
     }
 
+    fn minimal_config() -> StorageNodeConfig {
+        StorageNodeConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            node_id: 1,
+            store_paths: vec![PathBuf::from("/tmp/tidefs-store-test")],
+            pool_device_paths: Vec::new(),
+            pool_lock_dir: None,
+            node_identity: None,
+            authority: None,
+            fs_root: None,
+            root_auth_key: None,
+            member_class: None,
+            failure_domain: None,
+            membership_bind_addr: None,
+            membership_peers: Vec::new(),
+            replica_peers: Vec::new(),
+            rdma: false,
+            carrier_policy: None,
+            ready_file: None,
+            drain_timeout_secs: 30,
+            membership_checkpoint_dir: None,
+            cluster_lease_config: None,
+        }
+    }
+
+    fn imported_regular_file_pool(
+        dir: &tempfile::TempDir,
+        names: &[&str],
+        redundancy: RedundancyPolicy,
+    ) -> (ImportedPool, PathBuf, Vec<PathBuf>) {
+        let devices = names
+            .iter()
+            .map(|name| make_device(dir, name))
+            .collect::<Vec<_>>();
+        let create_config = PoolCreateConfig {
+            pool_name: "storage-node-pool".into(),
+            pool_guid: Some([0xC4; 16]),
+            redundancy,
+            encryption_key: None,
+            clustered: false,
+        };
+        PoolCreator::create_pool(&devices, &create_config).unwrap();
+        let lock_dir = dir.path().join("locks");
+        let imported = pool_import(&devices, &lock_dir, false, None, None).unwrap();
+        (imported, lock_dir, devices)
+    }
+
     fn receipt_ref(name: &[u8], payload: &[u8], generation: u64) -> PlacementReceiptRef {
         PlacementReceiptRef::new(
             88,
@@ -3405,13 +3685,114 @@ mod cluster_pool_handler_tests {
 
     #[test]
     fn receipt_inventory_discloses_storage_node_boundary() {
-        let inventory = placement_receipt_inventory_json();
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().join("store")];
+        let store = ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
+        let backend = StoreBackend::Local(Box::new(store));
+        let inventory = placement_receipt_inventory_json(&backend);
         assert_eq!(inventory["available"], false);
         assert_eq!(inventory["count"], 0);
         assert!(inventory["reason"]
             .as_str()
             .unwrap()
-            .contains("does not expose pool placement receipts"));
+            .contains("compatibility object-store backend"));
+    }
+
+    #[test]
+    fn pool_backend_rejects_directory_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = object_pool_device_config(dir.path().to_path_buf()).unwrap_err();
+        assert!(err.contains("pool device path is a directory"));
+    }
+
+    #[test]
+    fn pool_backend_maps_regular_file_pool_policy_and_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let config = object_pool_config_from_import(&imported, &lock_dir).unwrap();
+        assert_eq!(config.devices.len(), 2);
+        assert_eq!(
+            config
+                .devices
+                .iter()
+                .map(|device| device.path.clone())
+                .collect::<Vec<_>>(),
+            devices
+        );
+        assert!(config
+            .devices
+            .iter()
+            .all(|device| device.backing == DeviceBacking::RegularFileDev));
+        let properties = object_pool_properties_from_import(&imported);
+        assert_eq!(
+            properties.redundancy_policy,
+            ObjectPoolRedundancyPolicy::replicated(2)
+        );
+    }
+
+    #[test]
+    fn pool_backend_put_get_delete_list_uses_receipt_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let mut backend = StoreBackend::PoolBacked(Box::new(
+            open_imported_pool_backend(&imported, &lock_dir).unwrap(),
+        ));
+
+        let name = b"pool-backed-object";
+        if let StoreBackend::PoolBacked(pool) = &mut backend {
+            pool_put_named(pool, name, b"payload").unwrap();
+            assert_eq!(
+                pool_get_named(pool, name).unwrap(),
+                Some(b"payload".to_vec())
+            );
+        }
+
+        let entries = sync_entries_from_store(&backend);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, ObjectKey::from_name(name).as_bytes32());
+        assert_eq!(entries[0].1, b"payload".to_vec());
+
+        let inventory = placement_receipt_inventory_json(&backend);
+        assert_eq!(inventory["available"], true);
+        assert_eq!(inventory["count"], 1);
+        assert_eq!(inventory["refs"][0]["target_count"], 2);
+
+        if let StoreBackend::PoolBacked(pool) = &mut backend {
+            assert!(pool_delete_named(pool, name).unwrap());
+            assert!(pool_get_named(pool, name).unwrap().is_none());
+            assert!(pool_list_logical_keys(pool).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn pool_backend_scrub_reports_real_receipt_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let mut backend = StoreBackend::PoolBacked(Box::new(
+            open_imported_pool_backend(&imported, &lock_dir).unwrap(),
+        ));
+        if let StoreBackend::PoolBacked(pool) = &mut backend {
+            pool_put_named(pool, b"scrubbed", b"payload").unwrap();
+        }
+
+        let (report_json, findings_count) = local_scrub_report_json(&minimal_config(), &backend);
+        let report: serde_json::Value = serde_json::from_str(&report_json).unwrap();
+        assert_eq!(findings_count, 0);
+        assert_eq!(report["backend"], "pool");
+        assert_eq!(report["placement_receipt_refs"]["available"], true);
+        assert_eq!(report["placement_receipt_ref_count"], 1);
     }
 
     #[test]

@@ -77,7 +77,7 @@ impl TestServer {
             membership_bind_addr: None,
             membership_peers: vec![],
             replica_peers: vec![],
-            pool_device_path: None,
+            pool_device_paths: Vec::new(),
             pool_lock_dir: None,
             node_identity: None,
             authority: None,
