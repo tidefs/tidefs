@@ -56,8 +56,8 @@ use tidefs_replication_model::{PlacementReceiptRef, ReplicaMovementClass};
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
     send_replication_msg, send_segment_fetch_response, PlacementVersionTracker, ReplicationMessage,
-    SegmentFetchRequest, SegmentFetchResponse, SessionCloseReason, Transport, TransportError,
-    SEGMENT_FETCH_REQUEST_MAGIC,
+    SegmentFetchRequest, SegmentFetchResponse, SessionCloseReason, SyncEntry, Transport,
+    TransportError, SEGMENT_FETCH_REQUEST_MAGIC,
 };
 use tidefs_types_pool_label_core::PoolRedundancyPolicy as LabelPoolRedundancyPolicy;
 
@@ -140,7 +140,7 @@ fn pool_list_logical_keys(pool: &Pool) -> Result<Vec<ObjectKey>, String> {
         .map_err(|e| format!("pool receipt inventory: {e}"))
 }
 
-fn sync_entries_from_store(store: &StoreBackend) -> Vec<([u8; 32], Vec<u8>)> {
+fn sync_entries_from_store(store: &StoreBackend) -> Vec<SyncEntry> {
     match store {
         StoreBackend::Local(rs) => rs
             .list_keys_local()
@@ -150,7 +150,7 @@ fn sync_entries_from_store(store: &StoreBackend) -> Vec<([u8; 32], Vec<u8>)> {
                 rs.get_key_local(key)
                     .ok()
                     .flatten()
-                    .map(|payload| (key.as_bytes32(), payload))
+                    .map(|payload| SyncEntry::receiptless(key.as_bytes32(), payload))
             })
             .collect(),
         StoreBackend::TransportBacked(ts) => ts
@@ -160,17 +160,19 @@ fn sync_entries_from_store(store: &StoreBackend) -> Vec<([u8; 32], Vec<u8>)> {
                 ts.get_key_local(key)
                     .ok()
                     .flatten()
-                    .map(|payload| (key.as_bytes32(), payload))
+                    .map(|payload| SyncEntry::receiptless(key.as_bytes32(), payload))
             })
             .collect(),
-        StoreBackend::PoolBacked(pool) => pool_list_logical_keys(pool)
+        StoreBackend::PoolBacked(pool) => pool
+            .placement_receipt_refs(ObjectIoClass::Data)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|key| {
+            .filter_map(|receipt| {
+                let key = ObjectKey::from_bytes32(receipt.object_key);
                 pool_get_key(pool, key)
                     .ok()
                     .flatten()
-                    .map(|payload| (key.as_bytes32(), payload))
+                    .map(|payload| SyncEntry::with_receipt(key.as_bytes32(), payload, receipt))
             })
             .collect(),
     }
@@ -4048,8 +4050,12 @@ mod cluster_pool_handler_tests {
 
         let entries = sync_entries_from_store(&backend);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, ObjectKey::from_name("alpha").as_bytes32());
-        assert_eq!(entries[0].1, b"payload".to_vec());
+        assert_eq!(
+            entries[0].object_key,
+            ObjectKey::from_name("alpha").as_bytes32()
+        );
+        assert_eq!(entries[0].payload, b"payload".to_vec());
+        assert_eq!(entries[0].placement_receipt_ref, None);
     }
 
     fn assert_scrub_ack(report_json: String, findings_count: u64, expected_success: bool) {
@@ -4128,8 +4134,12 @@ mod cluster_pool_handler_tests {
 
         let entries = sync_entries_from_store(&backend);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, ObjectKey::from_name(name).as_bytes32());
-        assert_eq!(entries[0].1, payload.to_vec());
+        assert_eq!(
+            entries[0].object_key,
+            ObjectKey::from_name(name).as_bytes32()
+        );
+        assert_eq!(entries[0].payload, payload.to_vec());
+        assert_eq!(entries[0].placement_receipt_ref, None);
     }
 
     #[test]
@@ -4148,8 +4158,9 @@ mod cluster_pool_handler_tests {
 
         let entries = sync_entries_from_store(&backend);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, object_key.as_bytes32());
-        assert_eq!(entries[0].1, payload.to_vec());
+        assert_eq!(entries[0].object_key, object_key.as_bytes32());
+        assert_eq!(entries[0].payload, payload.to_vec());
+        assert_eq!(entries[0].placement_receipt_ref, None);
     }
 
     #[test]
@@ -4302,8 +4313,24 @@ mod cluster_pool_handler_tests {
 
         let entries = sync_entries_from_store(&backend);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, ObjectKey::from_name(name).as_bytes32());
-        assert_eq!(entries[0].1, b"payload".to_vec());
+        assert_eq!(
+            entries[0].object_key,
+            ObjectKey::from_name(name).as_bytes32()
+        );
+        assert_eq!(entries[0].payload, b"payload".to_vec());
+        let sync_receipt = entries[0]
+            .placement_receipt_ref
+            .expect("pool-backed sync entry carries receipt authority");
+        assert!(!sync_receipt.is_synthetic());
+        assert_eq!(sync_receipt.object_key, entries[0].object_key);
+        assert_eq!(sync_receipt.payload_len, entries[0].payload.len() as u64);
+        let expected_digest: [u8; 32] = blake3::hash(&entries[0].payload).into();
+        assert_eq!(sync_receipt.payload_digest, expected_digest);
+        assert_eq!(sync_receipt.target_count, 2);
+        assert_eq!(
+            sync_receipt.redundancy_policy,
+            tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies: 2 }
+        );
 
         let inventory = placement_receipt_inventory_json(&backend);
         assert_eq!(inventory["available"], true);
@@ -4365,8 +4392,20 @@ mod cluster_pool_handler_tests {
         assert!(!repaired_receipt_ref.is_synthetic());
         let entries = sync_entries_from_store(&backend);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, object_key.as_bytes32());
-        assert_eq!(entries[0].1, payload.to_vec());
+        assert_eq!(entries[0].object_key, object_key.as_bytes32());
+        assert_eq!(entries[0].payload, payload.to_vec());
+        let sync_receipt = entries[0]
+            .placement_receipt_ref
+            .expect("pool-backed repaired key carries receipt authority");
+        assert_eq!(sync_receipt.object_key, object_key.as_bytes32());
+        assert_eq!(sync_receipt.payload_len, payload.len() as u64);
+        assert_eq!(sync_receipt.payload_digest, expected_digest);
+        assert_eq!(sync_receipt.target_count, 2);
+        assert_eq!(
+            sync_receipt.redundancy_policy,
+            tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies: 2 }
+        );
+        assert!(!sync_receipt.is_synthetic());
     }
 
     #[test]

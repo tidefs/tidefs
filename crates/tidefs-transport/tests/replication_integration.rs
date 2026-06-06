@@ -11,6 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::thread;
 use std::time::Duration;
 use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions};
+use tidefs_replication_model::PlacementReceiptRef;
 use tidefs_transport::{NodeInfo, SessionCloseReason, SessionId, Transport, TransportError};
 
 // ---------------------------------------------------------------------------
@@ -78,8 +79,25 @@ enum ReplicationMessage {
     GetResponse { found: bool, payload: Vec<u8> },
     /// Request to sync all keys from peer.
     SyncRequest,
-    /// Sync response: list of (object key, payload) pairs.
-    SyncResponse { entries: Vec<([u8; 32], Vec<u8>)> },
+    /// Sync response: exact object payloads, with receipt authority when known.
+    SyncResponse { entries: Vec<SyncEntry> },
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+struct SyncEntry {
+    object_key: [u8; 32],
+    payload: Vec<u8>,
+    placement_receipt_ref: Option<PlacementReceiptRef>,
+}
+
+impl SyncEntry {
+    fn receiptless(object_key: [u8; 32], payload: Vec<u8>) -> Self {
+        Self {
+            object_key,
+            payload,
+            placement_receipt_ref: None,
+        }
+    }
 }
 
 /// Send a structured replication message over a transport session.
@@ -167,7 +185,7 @@ fn two_node_replication_put_and_verify() {
                     for k in keys {
                         if let Some(loc) = store_a.location_of(k) {
                             if let Ok(payload) = store_a.get_at_location(loc) {
-                                entries.push((k.as_bytes32(), payload));
+                                entries.push(SyncEntry::receiptless(k.as_bytes32(), payload));
                             }
                         }
                     }
@@ -496,12 +514,15 @@ fn replica_repair_after_recovery() {
     let (dir_a, mut store_a) = temp_store();
 
     // Pre-populate node A with data. Track the original (name, payload) pairs.
-    let mut pre_populated: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut pre_populated: Vec<SyncEntry> = Vec::new();
     for i in 0..5 {
         let name = format!("pre-{i}");
         let payload = format!("pre-data-{i}").into_bytes();
         store_a.put_named(&name, &payload).expect("put");
-        pre_populated.push((ObjectKey::from_name(&name).as_bytes32(), payload));
+        pre_populated.push(SyncEntry::receiptless(
+            ObjectKey::from_name(&name).as_bytes32(),
+            payload,
+        ));
     }
 
     // Node B: fresh empty store, needs sync
@@ -547,9 +568,10 @@ fn replica_repair_after_recovery() {
     match response {
         ReplicationMessage::SyncResponse { entries } => {
             assert_eq!(entries.len(), 5, "Should sync 5 pre-existing objects");
-            for (key_bytes, payload) in &entries {
+            for entry in &entries {
+                assert_eq!(entry.placement_receipt_ref, None);
                 store_b
-                    .put(ObjectKey::from_bytes32(*key_bytes), payload)
+                    .put(ObjectKey::from_bytes32(entry.object_key), &entry.payload)
                     .expect("store synced data");
             }
         }

@@ -9,6 +9,47 @@ use crate::transport::Transport;
 use crate::types::SessionId;
 use tidefs_replication_model::PlacementReceiptRef;
 
+/// One object transferred by a peer sync response.
+///
+/// Compatibility stores may omit `placement_receipt_ref`. Pool-backed sync
+/// entries carry the exact placement receipt that authorized the object key and
+/// payload bytes being transferred.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct SyncEntry {
+    /// Object key bytes used for exact-key sync into the receiver.
+    pub object_key: [u8; 32],
+    /// Payload bytes for the object.
+    pub payload: Vec<u8>,
+    /// Optional durable placement receipt authority for this payload.
+    pub placement_receipt_ref: Option<PlacementReceiptRef>,
+}
+
+impl SyncEntry {
+    /// Build a sync entry for compatibility stores without receipt authority.
+    #[must_use]
+    pub fn receiptless(object_key: [u8; 32], payload: Vec<u8>) -> Self {
+        Self {
+            object_key,
+            payload,
+            placement_receipt_ref: None,
+        }
+    }
+
+    /// Build a sync entry with durable placement receipt authority.
+    #[must_use]
+    pub fn with_receipt(
+        object_key: [u8; 32],
+        payload: Vec<u8>,
+        placement_receipt_ref: PlacementReceiptRef,
+    ) -> Self {
+        Self {
+            object_key,
+            payload,
+            placement_receipt_ref: Some(placement_receipt_ref),
+        }
+    }
+}
+
 /// Wire message types for distributed object replication.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub enum ReplicationMessage {
@@ -22,8 +63,8 @@ pub enum ReplicationMessage {
     GetResponse { found: bool, payload: Vec<u8> },
     /// Request to sync all keys from peer.
     SyncRequest,
-    /// Sync response: list of (object key, payload) pairs.
-    SyncResponse { entries: Vec<([u8; 32], Vec<u8>)> },
+    /// Sync response: exact object payloads, with receipt authority when known.
+    SyncResponse { entries: Vec<SyncEntry> },
     /// Delete an object by name with generation counter for race prevention.
     Delete {
         name: String,
@@ -338,7 +379,19 @@ mod tests {
     fn sync_response_preserves_object_key_bytes() {
         let key = [0xA5; 32];
         let msg = ReplicationMessage::SyncResponse {
-            entries: vec![(key, b"payload".to_vec())],
+            entries: vec![SyncEntry::receiptless(key, b"payload".to_vec())],
+        };
+        let rt = bincode_roundtrip(&msg);
+        assert_eq!(rt, msg);
+    }
+
+    #[test]
+    fn sync_response_preserves_placement_receipt_refs() {
+        let payload = b"receipt-bound-payload".to_vec();
+        let key = tidefs_local_object_store::ObjectKey::from_name("receipt-sync").as_bytes32();
+        let receipt = receipt_ref("receipt-sync", &payload, 22);
+        let msg = ReplicationMessage::SyncResponse {
+            entries: vec![SyncEntry::with_receipt(key, payload, receipt)],
         };
         let rt = bincode_roundtrip(&msg);
         assert_eq!(rt, msg);
