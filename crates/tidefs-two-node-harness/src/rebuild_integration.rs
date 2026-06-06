@@ -18,7 +18,9 @@ use tidefs_membership_epoch::{EpochId, MemberId};
 use tidefs_rebuild_runtime::admission::{
     AdmissionOutcome, AffectedSubject, LossRecord, RebuildAdmission,
 };
-use tidefs_rebuild_runtime::completion::{RebuildCompleted, RebuildCompletion};
+use tidefs_rebuild_runtime::completion::{
+    RebuildCompleted, RebuildCompletion, ReceiptCompletionError,
+};
 use tidefs_rebuild_runtime::scheduler::BackfillScheduler;
 use tidefs_rebuild_runtime::task::BackfillTask;
 use tidefs_replication_model::{PlacementReceiptRef, ReplicaMovementClass, ReplicatedSubjectId};
@@ -280,6 +282,16 @@ impl RebuildScenario {
         )
     }
 
+    fn repaired_receipt_ref_for_task(&self, task: &BackfillTask) -> PlacementReceiptRef {
+        let mut repaired = task.placement_receipt_ref;
+        repaired.receipt_epoch = EpochId::new(self.epoch);
+        repaired.receipt_generation = task
+            .placement_receipt_ref
+            .receipt_generation
+            .saturating_add(1_000_000);
+        repaired
+    }
+
     fn affected_subject(
         &self,
         subject_id: u64,
@@ -316,6 +328,20 @@ impl RebuildScenario {
     ) -> Option<RebuildCompleted> {
         self.completion
             .record_task_completion(task, success, &mut self.admission)
+    }
+
+    /// Record receipt-verified completion for an actual scheduled backfill
+    /// task after a repaired target receipt has been published.
+    pub fn record_verified_scheduled_task_completion(
+        &mut self,
+        task: &BackfillTask,
+        repaired_receipt_ref: PlacementReceiptRef,
+    ) -> Result<Option<RebuildCompleted>, ReceiptCompletionError> {
+        self.completion.record_receipt_verified_task_completion(
+            task,
+            repaired_receipt_ref,
+            &mut self.admission,
+        )
     }
 
     /// Drain any pending completion events.
@@ -381,8 +407,15 @@ impl RebuildScenario {
                     task.subject_ref.0,
                     task.payload_len,
                 )?;
+                let repaired_receipt_ref = self.repaired_receipt_ref_for_task(&task);
+                self.record_verified_scheduled_task_completion(&task, repaired_receipt_ref)
+                    .map_err(|err| {
+                        format!(
+                            "verified receipt completion failed for subject {}: {err:?}",
+                            task.subject_ref.0
+                        )
+                    })?;
                 self.scheduler.mark_completed(&task);
-                self.record_scheduled_task_completion(&task, true);
             }
         }
 
@@ -570,7 +603,44 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_task_completion_deduplicates_exact_receipt_task() {
+    fn scheduled_task_completion_compatibility_path_remains_available() {
+        let mut scenario = RebuildScenario::new(6161);
+        scenario.establish().expect("session establishment");
+        scenario.simulate_node_departure(2);
+        scenario.rejoin_member(2);
+        scenario.heal_links();
+
+        let outcome = scenario.admit_rebuild(
+            2,
+            vec![scenario.affected_subject(
+                42,
+                1024,
+                ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                vec![MemberId::new(2)],
+                1,
+            )],
+        );
+        assert_eq!(outcome.report_count, 1);
+
+        let tasks = scenario.scheduler.drain_eligible();
+        assert_eq!(tasks.len(), 1);
+        scenario.completion.register(MemberId::new(2), 1);
+
+        let first = scenario
+            .record_scheduled_task_completion(&tasks[0], true)
+            .expect("compatibility receipt completion emits event");
+        scenario.scheduler.mark_completed(&tasks[0]);
+        let duplicate = scenario.record_scheduled_task_completion(&tasks[0], true);
+
+        assert_eq!(first.succeeded, 1);
+        assert!(first.fully_successful);
+        assert!(duplicate.is_none());
+        assert_eq!(scenario.completion.total_completed_subjects(), 1);
+        assert!(scenario.scheduler.is_idle());
+    }
+
+    #[test]
+    fn verified_scheduled_task_completion_deduplicates_exact_repair_receipt() {
         let mut scenario = RebuildScenario::new(6262);
         scenario.establish().expect("session establishment");
         scenario.simulate_node_departure(2);
@@ -593,17 +663,65 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         scenario.completion.register(MemberId::new(2), 1);
 
-        scenario.scheduler.mark_completed(&tasks[0]);
+        let repaired_receipt = scenario.repaired_receipt_ref_for_task(&tasks[0]);
         let first = scenario
-            .record_scheduled_task_completion(&tasks[0], true)
-            .expect("first scheduled task completion emits event");
-        let duplicate = scenario.record_scheduled_task_completion(&tasks[0], true);
+            .record_verified_scheduled_task_completion(&tasks[0], repaired_receipt)
+            .expect("valid repaired receipt")
+            .expect("first verified scheduled task completion emits event");
+        scenario.scheduler.mark_completed(&tasks[0]);
+        let duplicate = scenario
+            .record_verified_scheduled_task_completion(&tasks[0], repaired_receipt)
+            .expect("duplicate repaired receipt remains valid");
 
         assert_eq!(first.succeeded, 1);
         assert!(first.fully_successful);
         assert!(duplicate.is_none());
         assert_eq!(scenario.completion.total_completed_subjects(), 1);
         assert!(scenario.scheduler.is_idle());
+    }
+
+    #[test]
+    fn verified_scheduled_task_completion_refuses_mismatched_repair_receipt() {
+        let mut scenario = RebuildScenario::new(7979);
+        scenario.establish().expect("session establishment");
+        scenario.simulate_node_departure(2);
+        scenario.rejoin_member(2);
+        scenario.heal_links();
+
+        let outcome = scenario.admit_rebuild(
+            2,
+            vec![scenario.affected_subject(
+                42,
+                1024,
+                ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                vec![MemberId::new(2)],
+                1,
+            )],
+        );
+        assert_eq!(outcome.report_count, 1);
+
+        let tasks = scenario.scheduler.drain_eligible();
+        assert_eq!(tasks.len(), 1);
+        scenario.completion.register(MemberId::new(2), 1);
+
+        let mut repaired_receipt = scenario.repaired_receipt_ref_for_task(&tasks[0]);
+        repaired_receipt.payload_len += 1;
+        let err = scenario
+            .record_verified_scheduled_task_completion(&tasks[0], repaired_receipt)
+            .expect_err("mismatched repaired receipt must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::PayloadLengthMismatch {
+                object_id: tasks[0].placement_receipt_ref.object_id,
+                task_len: tasks[0].payload_len,
+                repaired_len: tasks[0].payload_len + 1,
+            }
+        );
+        assert_eq!(scenario.completion.total_completed_subjects(), 0);
+        assert!(!scenario.is_member_complete(2));
+        assert!(scenario.has_active_rebuilds());
+        assert!(!scenario.scheduler.is_idle());
     }
 
     #[test]
