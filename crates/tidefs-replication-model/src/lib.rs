@@ -115,6 +115,179 @@ impl ObjectDigest {
     }
 }
 
+/// Redundancy policy identity recorded by a placement receipt reference.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ReceiptRedundancyPolicy {
+    /// Full replicas on distinct placement targets.
+    Replicated { copies: u8 },
+    /// One erasure stripe with data plus parity shard targets.
+    Erasure { data_shards: u8, parity_shards: u8 },
+}
+
+impl Default for ReceiptRedundancyPolicy {
+    fn default() -> Self {
+        Self::Replicated { copies: 1 }
+    }
+}
+
+impl ReceiptRedundancyPolicy {
+    /// Number of physical targets required by this policy.
+    #[must_use]
+    pub const fn target_width(self) -> u16 {
+        match self {
+            Self::Replicated { copies } => copies as u16,
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => data_shards as u16 + parity_shards as u16,
+        }
+    }
+
+    /// True when the policy can describe a usable receipt placement.
+    #[must_use]
+    pub const fn is_well_formed(self) -> bool {
+        match self {
+            Self::Replicated { copies } => copies > 0,
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => data_shards > 0 && parity_shards > 0,
+        }
+    }
+}
+
+/// Shared reference to durable source placement authority.
+///
+/// This is intentionally a reference-sized projection of the local placement
+/// receipt, not a second placement planner. Distributed rebuild/backfill code
+/// carries it so byte movement stays bound to the receipt that made the source
+/// bytes legal.
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd,
+)]
+pub struct PlacementReceiptRef {
+    /// Logical object id used by model/runtime planners.
+    pub object_id: u64,
+    /// Full 32-byte object key recorded by the local placement receipt.
+    pub object_key: [u8; 32],
+    /// Topology or membership epoch when this receipt was issued.
+    pub receipt_epoch: EpochId,
+    /// Monotonic receipt write generation.
+    pub receipt_generation: u64,
+    /// Redundancy policy identity in force for this placement.
+    pub redundancy_policy: ReceiptRedundancyPolicy,
+    /// Logical payload length before erasure padding.
+    pub payload_len: u64,
+    /// BLAKE3 digest of the logical payload.
+    pub payload_digest: [u8; 32],
+    /// Number of physical targets recorded by the placement receipt.
+    pub target_count: u16,
+}
+
+impl PlacementReceiptRef {
+    /// Construct a placement receipt reference from explicit receipt fields.
+    #[must_use]
+    pub const fn new(
+        object_id: u64,
+        object_key: [u8; 32],
+        receipt_epoch: EpochId,
+        receipt_generation: u64,
+        redundancy_policy: ReceiptRedundancyPolicy,
+        payload_len: u64,
+        payload_digest: [u8; 32],
+        target_count: u16,
+    ) -> Self {
+        Self {
+            object_id,
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            target_count,
+        }
+    }
+
+    /// Construct a replicated placement receipt reference.
+    #[must_use]
+    pub const fn replicated(
+        object_id: u64,
+        object_key: [u8; 32],
+        receipt_epoch: EpochId,
+        receipt_generation: u64,
+        copies: u8,
+        payload_len: u64,
+        payload_digest: [u8; 32],
+    ) -> Self {
+        let redundancy_policy = ReceiptRedundancyPolicy::Replicated { copies };
+        Self::new(
+            object_id,
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            redundancy_policy.target_width(),
+        )
+    }
+
+    /// Construct an erasure-coded placement receipt reference.
+    #[must_use]
+    pub const fn erasure(
+        object_id: u64,
+        object_key: [u8; 32],
+        receipt_epoch: EpochId,
+        receipt_generation: u64,
+        data_shards: u8,
+        parity_shards: u8,
+        payload_len: u64,
+        payload_digest: [u8; 32],
+    ) -> Self {
+        let redundancy_policy = ReceiptRedundancyPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        };
+        Self::new(
+            object_id,
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            redundancy_policy.target_width(),
+        )
+    }
+
+    /// Compatibility fallback for legacy callers that do not yet pass a real
+    /// local placement receipt. Generation zero deliberately keeps this from
+    /// validating as durable placement authority.
+    #[must_use]
+    pub fn synthetic_for_subject(subject: ReplicatedSubjectId) -> Self {
+        let mut object_key = [0u8; 32];
+        object_key[..8].copy_from_slice(&subject.0.to_le_bytes());
+        Self {
+            object_id: subject.0,
+            object_key,
+            receipt_epoch: EpochId::ZERO,
+            receipt_generation: 0,
+            redundancy_policy: ReceiptRedundancyPolicy::default(),
+            payload_len: 0,
+            payload_digest: [0; 32],
+            target_count: 1,
+        }
+    }
+
+    /// True when this is the legacy compatibility fallback rather than a
+    /// receipt emitted by the placement authority.
+    #[must_use]
+    pub const fn is_synthetic(self) -> bool {
+        self.receipt_generation == 0
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplicatedSubjectClass {
     ImmutableObject,
@@ -2594,6 +2767,66 @@ mod tests {
     };
 
     use super::*;
+
+    fn receipt_key(object_id: u64) -> [u8; 32] {
+        let mut key = [0xA5; 32];
+        key[..8].copy_from_slice(&object_id.to_le_bytes());
+        key
+    }
+
+    fn receipt_digest(object_id: u64, generation: u64) -> [u8; 32] {
+        let mut digest = [0x5A; 32];
+        digest[..8].copy_from_slice(&object_id.to_le_bytes());
+        digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        digest
+    }
+
+    #[test]
+    fn placement_receipt_ref_records_policy_width() {
+        let replicated = PlacementReceiptRef::replicated(
+            42,
+            receipt_key(42),
+            EpochId::new(7),
+            9,
+            3,
+            4096,
+            receipt_digest(42, 9),
+        );
+        assert_eq!(replicated.target_count, 3);
+        assert_eq!(
+            replicated.redundancy_policy,
+            ReceiptRedundancyPolicy::Replicated { copies: 3 }
+        );
+        assert!(replicated.redundancy_policy.is_well_formed());
+        assert!(!replicated.is_synthetic());
+
+        let erasure = PlacementReceiptRef::erasure(
+            42,
+            receipt_key(42),
+            EpochId::new(7),
+            10,
+            4,
+            2,
+            8192,
+            receipt_digest(42, 10),
+        );
+        assert_eq!(erasure.target_count, 6);
+        assert_eq!(
+            erasure.redundancy_policy,
+            ReceiptRedundancyPolicy::Erasure {
+                data_shards: 4,
+                parity_shards: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn synthetic_receipt_ref_is_compatibility_only() {
+        let receipt = PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(77));
+        assert_eq!(receipt.object_id, 77);
+        assert_eq!(receipt.receipt_generation, 0);
+        assert!(receipt.is_synthetic());
+    }
 
     const fn domain(seed: u64, rack: u64) -> FailureDomainVector {
         FailureDomainVector::new(

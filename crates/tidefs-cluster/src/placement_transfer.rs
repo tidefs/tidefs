@@ -44,6 +44,9 @@
 
 use std::collections::BTreeMap;
 use tidefs_membership_epoch::EpochId;
+pub use tidefs_replication_model::{
+    PlacementReceiptRef as PlacementReceiptAnchor, ReceiptRedundancyPolicy,
+};
 
 use crate::types::{DataPathCarrier, LeaseState};
 
@@ -70,116 +73,6 @@ pub struct PlanEntry {
     pub destination_node: u64,
     /// Object IDs and byte ranges to transfer.
     pub object_ranges: Vec<ObjectRange>,
-}
-
-/// Redundancy policy identity recorded by a placement receipt anchor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReceiptRedundancyPolicy {
-    /// Full replicas on distinct placement targets.
-    Replicated { copies: u8 },
-    /// One erasure stripe with data plus parity shard targets.
-    Erasure { data_shards: u8, parity_shards: u8 },
-}
-
-impl ReceiptRedundancyPolicy {
-    /// Number of physical targets required by this policy.
-    #[must_use]
-    pub const fn target_width(self) -> u16 {
-        match self {
-            Self::Replicated { copies } => copies as u16,
-            Self::Erasure {
-                data_shards,
-                parity_shards,
-            } => data_shards as u16 + parity_shards as u16,
-        }
-    }
-
-    /// True when the policy can describe a usable receipt placement.
-    #[must_use]
-    pub const fn is_well_formed(self) -> bool {
-        match self {
-            Self::Replicated { copies } => copies > 0,
-            Self::Erasure {
-                data_shards,
-                parity_shards,
-            } => data_shards > 0 && parity_shards > 0,
-        }
-    }
-}
-
-/// Durable receipt authority for one object placement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PlacementReceiptAnchor {
-    /// Logical object id used by the transfer planner.
-    pub object_id: u64,
-    /// Full 32-byte object key recorded by the local placement receipt.
-    pub object_key: [u8; 32],
-    /// Topology or membership epoch when this receipt was issued.
-    pub receipt_epoch: EpochId,
-    /// Monotonic receipt write generation.
-    pub receipt_generation: u64,
-    /// Redundancy policy identity in force for this placement.
-    pub redundancy_policy: ReceiptRedundancyPolicy,
-    /// Logical payload length before erasure padding.
-    pub payload_len: u64,
-    /// BLAKE3 digest of the logical payload.
-    pub payload_digest: [u8; 32],
-    /// Number of physical targets recorded by the placement receipt.
-    pub target_count: u16,
-}
-
-impl PlacementReceiptAnchor {
-    /// Construct a replicated placement receipt anchor.
-    #[must_use]
-    pub const fn replicated(
-        object_id: u64,
-        object_key: [u8; 32],
-        receipt_epoch: EpochId,
-        receipt_generation: u64,
-        copies: u8,
-        payload_len: u64,
-        payload_digest: [u8; 32],
-    ) -> Self {
-        let redundancy_policy = ReceiptRedundancyPolicy::Replicated { copies };
-        Self {
-            object_id,
-            object_key,
-            receipt_epoch,
-            receipt_generation,
-            redundancy_policy,
-            payload_len,
-            payload_digest,
-            target_count: redundancy_policy.target_width(),
-        }
-    }
-
-    /// Construct an erasure-coded placement receipt anchor.
-    #[must_use]
-    pub const fn erasure(
-        object_id: u64,
-        object_key: [u8; 32],
-        receipt_epoch: EpochId,
-        receipt_generation: u64,
-        data_shards: u8,
-        parity_shards: u8,
-        payload_len: u64,
-        payload_digest: [u8; 32],
-    ) -> Self {
-        let redundancy_policy = ReceiptRedundancyPolicy::Erasure {
-            data_shards,
-            parity_shards,
-        };
-        Self {
-            object_id,
-            object_key,
-            receipt_epoch,
-            receipt_generation,
-            redundancy_policy,
-            payload_len,
-            payload_digest,
-            target_count: redundancy_policy.target_width(),
-        }
-    }
 }
 
 /// A byte range within a specific object.

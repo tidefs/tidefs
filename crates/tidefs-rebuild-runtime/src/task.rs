@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 use tidefs_membership_epoch::MemberId;
-use tidefs_replication_model::{ObjectDigest, ReplicaMovementClass, ReplicatedSubjectId};
+use tidefs_replication_model::{
+    ObjectDigest, PlacementReceiptRef, ReplicaMovementClass, ReplicatedSubjectId,
+};
 
 /// Maximum retry attempts before a task is permanently failed.
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
@@ -15,6 +17,8 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 pub struct BackfillTask {
     /// Object to replicate.
     pub subject_ref: ReplicatedSubjectId,
+    /// Source placement receipt that authorizes the bytes being moved.
+    pub placement_receipt_ref: PlacementReceiptRef,
     /// Source member that holds a healthy copy.
     pub source_member: MemberId,
     /// Target member to receive the replica.
@@ -39,6 +43,7 @@ pub struct BackfillTask {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackfillTaskInit {
     pub subject_ref: ReplicatedSubjectId,
+    pub placement_receipt_ref: PlacementReceiptRef,
     pub source_member: MemberId,
     pub target_member: MemberId,
     pub movement_class: ReplicaMovementClass,
@@ -54,6 +59,7 @@ impl BackfillTask {
     pub fn new(init: BackfillTaskInit) -> Self {
         Self {
             subject_ref: init.subject_ref,
+            placement_receipt_ref: init.placement_receipt_ref,
             source_member: init.source_member,
             target_member: init.target_member,
             movement_class: init.movement_class,
@@ -95,10 +101,14 @@ impl BackfillTask {
         now_ns >= self.deadline_ns
     }
 
-    /// Canonical deduplication key: (subject, target_member).
+    /// Canonical deduplication key: (subject, target_member, placement receipt).
     #[must_use]
-    pub fn dedup_key(&self) -> (ReplicatedSubjectId, MemberId) {
-        (self.subject_ref, self.target_member)
+    pub fn dedup_key(&self) -> (ReplicatedSubjectId, MemberId, PlacementReceiptRef) {
+        (
+            self.subject_ref,
+            self.target_member,
+            self.placement_receipt_ref,
+        )
     }
 }
 
@@ -109,6 +119,9 @@ mod tests {
     fn task() -> BackfillTask {
         BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(1),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(1),
+            ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(20),
             movement_class: ReplicaMovementClass::BackfillLaggedCopy,
@@ -144,6 +157,9 @@ mod tests {
     fn dedup_key_uniqueness() {
         let a = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(42),
+            ),
             source_member: MemberId::new(1),
             target_member: MemberId::new(2),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
@@ -154,6 +170,9 @@ mod tests {
         });
         let b = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(42),
+            ),
             source_member: MemberId::new(99),
             target_member: MemberId::new(2),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
@@ -167,6 +186,9 @@ mod tests {
 
         let c = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(42),
+            ),
             source_member: MemberId::new(1),
             target_member: MemberId::new(3),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
@@ -176,6 +198,56 @@ mod tests {
             deadline_ns: 100,
         });
         assert_ne!(a.dedup_key(), c.dedup_key());
+    }
+
+    #[test]
+    fn dedup_key_keeps_receipt_generations_distinct() {
+        let subject = ReplicatedSubjectId::new(42);
+        let mut object_key = [0u8; 32];
+        object_key[..8].copy_from_slice(&42u64.to_le_bytes());
+        let mut digest = [0u8; 32];
+        digest[..8].copy_from_slice(&42u64.to_le_bytes());
+
+        let a = BackfillTask::new(BackfillTaskInit {
+            subject_ref: subject,
+            placement_receipt_ref: PlacementReceiptRef::replicated(
+                42,
+                object_key,
+                tidefs_membership_epoch::EpochId::new(7),
+                1,
+                2,
+                4096,
+                digest,
+            ),
+            source_member: MemberId::new(1),
+            target_member: MemberId::new(2),
+            movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
+            payload_digest: ObjectDigest::new(0x99),
+            payload_len: 1024,
+            created_at_ns: 0,
+            deadline_ns: 100,
+        });
+        let b = BackfillTask::new(BackfillTaskInit {
+            subject_ref: subject,
+            placement_receipt_ref: PlacementReceiptRef::replicated(
+                42,
+                object_key,
+                tidefs_membership_epoch::EpochId::new(7),
+                2,
+                2,
+                4096,
+                digest,
+            ),
+            source_member: MemberId::new(99),
+            target_member: MemberId::new(2),
+            movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
+            payload_digest: ObjectDigest::new(0x99),
+            payload_len: 1024,
+            created_at_ns: 0,
+            deadline_ns: 100,
+        });
+
+        assert_ne!(a.dedup_key(), b.dedup_key());
     }
 
     #[test]

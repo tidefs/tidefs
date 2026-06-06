@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use tidefs_membership_epoch::MemberId;
 use tidefs_replication_model::{
-    ObjectDigest, ReplicaMovementClass, ReplicaMovementIntentRecord, ReplicatedReceiptId,
-    ReplicatedSubjectId,
+    ObjectDigest, PlacementReceiptRef, ReplicaMovementClass, ReplicaMovementIntentRecord,
+    ReplicatedReceiptId, ReplicatedSubjectId,
 };
 
 use crate::scheduler::{BackfillScheduler, DegradedReplicaReport};
@@ -75,6 +75,8 @@ pub struct LossRecord {
 pub struct AffectedSubject {
     /// The subject that lost replica(s).
     pub subject_ref: ReplicatedSubjectId,
+    /// Placement receipt that authorizes surviving source bytes for rebuild.
+    pub placement_receipt_ref: PlacementReceiptRef,
     /// Expected payload digest.
     pub payload_digest: ObjectDigest,
     /// Expected payload length.
@@ -219,6 +221,7 @@ impl RebuildAdmission {
             for subject in &member_subjects {
                 let report = DegradedReplicaReport {
                     subject_ref: subject.subject_ref,
+                    placement_receipt_ref: subject.placement_receipt_ref,
                     healthy_sources: loss.healthy_sources.clone(),
                     missing_targets: vec![lost_member],
                     movement_class: subject.movement_class,
@@ -378,6 +381,9 @@ mod tests {
     fn make_subject(id: u64, class: ReplicaMovementClass, lost_on: Vec<u64>) -> AffectedSubject {
         AffectedSubject {
             subject_ref: ReplicatedSubjectId::new(id),
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(id),
+            ),
             payload_digest: ObjectDigest::new(id * 100),
             payload_len: 4096,
             movement_class: class,

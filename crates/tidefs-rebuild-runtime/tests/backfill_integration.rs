@@ -11,7 +11,9 @@ use tidefs_rebuild_runtime::progress::{BackfillProgress, TaskState};
 use tidefs_rebuild_runtime::quorum::{BackfillLeaseToken, QuorumAdmission, QuorumCoordinator};
 use tidefs_rebuild_runtime::scheduler::{BackfillScheduler, DegradedReplicaReport};
 use tidefs_rebuild_runtime::task::{BackfillTask, BackfillTaskInit};
-use tidefs_replication_model::{ObjectDigest, ReplicaMovementClass, ReplicatedSubjectId};
+use tidefs_replication_model::{
+    ObjectDigest, PlacementReceiptRef, ReplicaMovementClass, ReplicatedSubjectId,
+};
 
 /// In-memory object store shared across integration tests.
 #[derive(Clone, Debug, Default)]
@@ -58,6 +60,9 @@ fn make_report(
 
     DegradedReplicaReport {
         subject_ref: ReplicatedSubjectId::new(subject),
+        placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+            ReplicatedSubjectId::new(subject),
+        ),
         healthy_sources: vec![MemberId::new(source)],
         missing_targets: missing.iter().map(|&m| MemberId::new(m)).collect(),
         movement_class: class,
@@ -76,6 +81,9 @@ fn populate_source(
 ) -> ObjectKey {
     let key = task_object_key(&BackfillTask::new(BackfillTaskInit {
         subject_ref: ReplicatedSubjectId::new(subject),
+        placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+            ReplicatedSubjectId::new(subject),
+        ),
         source_member: MemberId::new(10),
         target_member: MemberId::new(20),
         movement_class: ReplicaMovementClass::BackfillLaggedCopy,
@@ -294,6 +302,9 @@ fn retry_exhaustion_pipeline() {
     // Create a task with retry budget of 1
     let task = BackfillTask::new(BackfillTaskInit {
         subject_ref: ReplicatedSubjectId::new(55),
+        placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+            ReplicatedSubjectId::new(55),
+        ),
         source_member: MemberId::new(10),
         target_member: MemberId::new(20),
         movement_class: ReplicaMovementClass::BackfillLaggedCopy,
@@ -384,6 +395,9 @@ fn engine_verifies_source_and_destination_checksums() {
 
     let task = BackfillTask::new(BackfillTaskInit {
         subject_ref: ReplicatedSubjectId::new(99),
+        placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+            ReplicatedSubjectId::new(99),
+        ),
         source_member: MemberId::new(10),
         target_member: MemberId::new(20),
         movement_class: ReplicaMovementClass::BackfillLaggedCopy,
