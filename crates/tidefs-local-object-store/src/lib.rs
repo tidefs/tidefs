@@ -181,6 +181,19 @@ impl ObjectKey {
     }
 }
 
+pub(crate) const POOL_PLACEMENT_RECEIPT_KEY_PREFIX: [u8; 8] = *b"TFSPRCPT";
+pub(crate) const POOL_PLACEMENT_SHARD_KEY_PREFIX: [u8; 8] = *b"TFSPSHRD";
+
+pub(crate) fn is_pool_placement_receipt_key(key: ObjectKey) -> bool {
+    let bytes = key.as_bytes();
+    bytes[..8] == POOL_PLACEMENT_RECEIPT_KEY_PREFIX
+}
+
+pub(crate) fn is_pool_placement_scan_internal_key(key: ObjectKey) -> bool {
+    let bytes = key.as_bytes();
+    bytes[..8] == POOL_PLACEMENT_RECEIPT_KEY_PREFIX || bytes[..8] == POOL_PLACEMENT_SHARD_KEY_PREFIX
+}
+
 impl fmt::Debug for ObjectKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ObjectKey({self})")
@@ -872,7 +885,10 @@ pub mod segment_builder;
 
 pub mod pool_importer;
 pub use io_scheduler::IoClass;
-pub use pool::{Pool, PoolConfig, PoolProperties};
+pub use pool::{
+    PlacementReceipt, PlacementReceiptTarget, PlacementTargetRole, Pool, PoolConfig,
+    PoolProperties, PoolRedundancyPolicy,
+};
 pub mod device;
 pub mod device_health;
 pub mod parity_raid;

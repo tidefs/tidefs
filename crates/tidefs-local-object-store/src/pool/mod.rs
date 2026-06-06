@@ -6,13 +6,15 @@
 //!
 //! # I/O routing
 //!
-//! - `IoClass::Data` → devices with `DeviceClass::Data` (deterministic hash)
+//! - `IoClass::Data` → pool-wide redundancy placement over eligible Data devices
 //! - `IoClass::Metadata` → preferred media tier from `DeviceClass::Metadata`
-//!   or `Special`, fallback `Data`, then deterministic key hash within tier
+//!   or `Special`, fallback `Data`, then pool-wide redundancy placement
 //! - `IoClass::IntentLog` → `DeviceClass::IntentLog` (write-all), fallback `Data`
-//! - `IoClass::ReadCache` → `DeviceClass::ReadCache`, fallback `Data`
+//! - `IoClass::ReadCache` → `DeviceClass::ReadCache`, fallback `Data`, then
+//!   pool-wide redundancy placement
 
 pub mod commit_group;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -40,6 +42,17 @@ use crate::{
     StoreRetentionCompactionReport, StoreStats, StoredObject,
 };
 use tidefs_block_allocator::{BlockAllocator, BlockId, TrimRequest};
+use tidefs_durability_layout::{
+    DurabilityLayoutV1, DurabilityPolicy, FailureDomainLevel, FailureDomainV1,
+};
+use tidefs_erasure_coding::{
+    encode as encode_erasure_stripe, reconstruct as reconstruct_erasure_stripe, ErasureShard,
+    ShardKind, StripeConfig,
+};
+use tidefs_placement_planner::{
+    AllocationRequest, DeviceHealthCapacity, HashRingPlacementPlanner, PlacementDecision,
+    PlacementPlanner,
+};
 use tidefs_space_accounting::{PoolCounters, StatfsResult};
 
 // ---------------------------------------------------------------------------
@@ -55,6 +68,79 @@ pub struct PoolConfig {
     pub root_path: PathBuf,
     /// Devices that make up this pool.
     pub devices: Vec<DeviceConfig>,
+}
+
+/// Pool-wide redundancy policy applied at object/stripe allocation time.
+///
+/// This replaces user-visible fixed mirror/parity device groups as the active
+/// pool allocation model: every allocation plans against the current eligible
+/// device set and persists the selected targets in a placement receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoolRedundancyPolicy {
+    /// Store `copies` full replicas on distinct eligible pool devices.
+    Replicated { copies: u8 },
+    /// Store one erasure-coded stripe with `data_shards + parity_shards`
+    /// physical shard targets.
+    Erasure { data_shards: u8, parity_shards: u8 },
+}
+
+impl Default for PoolRedundancyPolicy {
+    fn default() -> Self {
+        Self::Replicated { copies: 1 }
+    }
+}
+
+impl PoolRedundancyPolicy {
+    /// Convenience constructor for replicated placement.
+    #[must_use]
+    pub const fn replicated(copies: u8) -> Self {
+        Self::Replicated { copies }
+    }
+
+    /// Convenience constructor for erasure `(k,m)` placement.
+    #[must_use]
+    pub const fn erasure(data_shards: u8, parity_shards: u8) -> Self {
+        Self::Erasure {
+            data_shards,
+            parity_shards,
+        }
+    }
+
+    fn total_targets(self) -> Result<usize> {
+        let required = match self {
+            Self::Replicated { copies } => copies as usize,
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => (data_shards as usize).saturating_add(parity_shards as usize),
+        };
+        if required == 0 {
+            Err(StoreError::InvalidOptions {
+                reason: "pool redundancy policy requires at least one target",
+            })
+        } else {
+            Ok(required)
+        }
+    }
+
+    fn layout(self) -> Result<DurabilityLayoutV1> {
+        let policy = match self {
+            Self::Replicated { copies } => {
+                DurabilityPolicy::mirror(copies).map_err(|_| StoreError::InvalidOptions {
+                    reason: "replicated pool redundancy copies must be in 1..=32",
+                })?
+            }
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => DurabilityPolicy::erasure_style(data_shards, parity_shards).map_err(|_| {
+                StoreError::InvalidOptions {
+                    reason: "erasure pool redundancy shards must be nonzero and <=32",
+                }
+            })?,
+        };
+        Ok(DurabilityLayoutV1 { policy })
+    }
 }
 
 /// Pool-level tunable properties (ZFS-heritage).
@@ -77,6 +163,10 @@ pub struct PoolProperties {
     /// and allocator metadata remains possible.  Default 0 means the
     /// watermark is disabled, preserving existing behaviour.
     pub low_watermark_bytes: u64,
+    /// Pool-wide redundancy policy used when allocating non-log objects.
+    pub redundancy_policy: PoolRedundancyPolicy,
+    /// Failure-domain level enforced by the placement planner.
+    pub failure_domain_level: FailureDomainLevel,
 }
 
 impl Default for PoolProperties {
@@ -87,6 +177,8 @@ impl Default for PoolProperties {
             failmode: FailMode::Wait,
             trim_on_delete: true,
             low_watermark_bytes: 0,
+            redundancy_policy: PoolRedundancyPolicy::default(),
+            failure_domain_level: FailureDomainLevel::Device,
         }
     }
 }
@@ -224,6 +316,197 @@ pub struct PoolCapacityStats {
     pub object_count: u64,
 }
 
+/// Role of a physical placement target within a receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlacementTargetRole {
+    /// Full replica or erasure data shard.
+    Data,
+    /// Erasure parity shard.
+    Parity,
+}
+
+impl PlacementTargetRole {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::Data => 0,
+            Self::Parity => 1,
+        }
+    }
+
+    const fn from_u8(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Data),
+            1 => Some(Self::Parity),
+            _ => None,
+        }
+    }
+}
+
+/// A single physical target recorded in a placement receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementReceiptTarget {
+    /// Device index when the receipt was issued.
+    pub device_index: u32,
+    /// Persistent device GUID from the pool label/device table.
+    pub device_guid: [u8; 16],
+    /// Replica or shard index within this logical object/stripe.
+    pub shard_index: u16,
+    /// Target role.
+    pub role: PlacementTargetRole,
+    /// BLAKE3 digest of the bytes stored on this target.
+    pub stored_digest: [u8; 32],
+}
+
+/// Persisted object/stripe locator authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementReceipt {
+    /// Logical object key being located.
+    pub object_key: ObjectKey,
+    /// Topology epoch used for new allocation.
+    pub epoch: u64,
+    /// Redundancy policy in force for this write.
+    pub policy: PoolRedundancyPolicy,
+    /// Failure-domain level requested by the pool.
+    pub failure_domain_level: FailureDomainLevel,
+    /// Logical payload length before replication/erasure padding.
+    pub payload_len: u64,
+    /// Erasure shard length, or 0 for replicated placement.
+    pub shard_len: u32,
+    /// BLAKE3 digest of the logical payload.
+    pub payload_digest: [u8; 32],
+    /// Physical targets selected by the placement planner.
+    pub targets: Vec<PlacementReceiptTarget>,
+}
+
+const PLACEMENT_RECEIPT_MAGIC: &[u8; 8] = b"TFSPRC1\0";
+const PLACEMENT_RECEIPT_CONTEXT: &str = "TideFS pool placement receipt object key v1";
+const PLACEMENT_HASH_RING_VNODES_PER_GB: u64 = 16;
+
+impl PlacementReceipt {
+    fn encode(&self) -> Result<Vec<u8>> {
+        if self.targets.len() > u16::MAX as usize {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt target count exceeds wire format",
+            });
+        }
+        let mut out = Vec::with_capacity(96 + self.targets.len() * 55);
+        out.extend_from_slice(PLACEMENT_RECEIPT_MAGIC);
+        out.extend_from_slice(&self.object_key.as_bytes32());
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.push(self.failure_domain_level.discriminant());
+        match self.policy {
+            PoolRedundancyPolicy::Replicated { copies } => {
+                out.push(0);
+                out.push(copies);
+                out.push(0);
+            }
+            PoolRedundancyPolicy::Erasure {
+                data_shards,
+                parity_shards,
+            } => {
+                out.push(1);
+                out.push(data_shards);
+                out.push(parity_shards);
+            }
+        }
+        out.extend_from_slice(&self.payload_len.to_le_bytes());
+        out.extend_from_slice(&self.shard_len.to_le_bytes());
+        out.extend_from_slice(&self.payload_digest);
+        out.extend_from_slice(&(self.targets.len() as u16).to_le_bytes());
+        for target in &self.targets {
+            out.extend_from_slice(&target.device_index.to_le_bytes());
+            out.extend_from_slice(&target.device_guid);
+            out.extend_from_slice(&target.shard_index.to_le_bytes());
+            out.push(target.role.as_u8());
+            out.extend_from_slice(&target.stored_digest);
+        }
+        Ok(out)
+    }
+
+    fn decode(raw: &[u8]) -> Option<Self> {
+        let mut cursor = ReceiptCursor::new(raw);
+        if cursor.take(PLACEMENT_RECEIPT_MAGIC.len())? != PLACEMENT_RECEIPT_MAGIC {
+            return None;
+        }
+        let object_key = ObjectKey::from_bytes32(cursor.array()?);
+        let epoch = u64::from_le_bytes(cursor.array()?);
+        let failure_domain_level = FailureDomainLevel::from_u8(cursor.u8()?)?;
+        let policy_tag = cursor.u8()?;
+        let first = cursor.u8()?;
+        let second = cursor.u8()?;
+        let policy = match policy_tag {
+            0 => PoolRedundancyPolicy::Replicated { copies: first },
+            1 => PoolRedundancyPolicy::Erasure {
+                data_shards: first,
+                parity_shards: second,
+            },
+            _ => return None,
+        };
+        let payload_len = u64::from_le_bytes(cursor.array()?);
+        let shard_len = u32::from_le_bytes(cursor.array()?);
+        let payload_digest = cursor.array()?;
+        let target_count = u16::from_le_bytes(cursor.array()?) as usize;
+        let mut targets = Vec::with_capacity(target_count);
+        for _ in 0..target_count {
+            let device_index = u32::from_le_bytes(cursor.array()?);
+            let device_guid = cursor.array()?;
+            let shard_index = u16::from_le_bytes(cursor.array()?);
+            let role = PlacementTargetRole::from_u8(cursor.u8()?)?;
+            let stored_digest = cursor.array()?;
+            targets.push(PlacementReceiptTarget {
+                device_index,
+                device_guid,
+                shard_index,
+                role,
+                stored_digest,
+            });
+        }
+        if !cursor.is_finished() {
+            return None;
+        }
+        Some(Self {
+            object_key,
+            epoch,
+            policy,
+            failure_domain_level,
+            payload_len,
+            shard_len,
+            payload_digest,
+            targets,
+        })
+    }
+}
+
+struct ReceiptCursor<'a> {
+    raw: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ReceiptCursor<'a> {
+    const fn new(raw: &'a [u8]) -> Self {
+        Self { raw, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.offset.checked_add(len)?;
+        let bytes = self.raw.get(self.offset..end)?;
+        self.offset = end;
+        Some(bytes)
+    }
+
+    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.take(N)?.try_into().ok()
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(*self.take(1)?.first()?)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.offset == self.raw.len()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // IoClass → device index mapping
 // ---------------------------------------------------------------------------
@@ -304,9 +587,9 @@ pub struct Pool {
     /// Per-device physical media classes (NVMe, SSD, HDD, DM device).
     media_classes: Vec<DeviceMediaClass>,
     /// Device-class-aware write allocator retained for layout policy accounting
-    /// and future locator-backed placement. Pool writes currently use
-    /// deterministic key placement so reads and overwrites have a stable
-    /// authority without a separate object-location catalog.
+    /// and per-device scoring. Pool writes now persist placement receipts so
+    /// reads and overwrites use recorded locator authority instead of
+    /// recomputing against the current topology.
     write_allocator: WriteAllocator,
     /// Device class policy for I/O class preferences.
     device_class_policy: DeviceClassPolicy,
@@ -318,6 +601,10 @@ pub struct Pool {
     pool_guid: [u8; 16],
     /// Per-device GUIDs matching device order for label-based topology updates.
     device_guids: Vec<[u8; 16]>,
+    /// Monotonic local placement epoch. Receipts bind reads to the epoch that
+    /// selected their targets while later topology changes can steer new
+    /// allocations elsewhere.
+    placement_epoch: u64,
     /// Hot-spare activation policy.  Defaults to [`SparePolicy::Manual`].
     spare_policy: SparePolicy,
     /// Log of device health transitions for observability.
@@ -428,6 +715,7 @@ impl Pool {
             log_device,
             pool_guid,
             device_guids,
+            placement_epoch: 1,
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
             replacement: None,
@@ -461,6 +749,7 @@ impl Pool {
         let mut saved_features_ro_compat: u64 = 0;
         let mut saved_features_valid = false;
         let mut label_is_encrypted = false;
+        let mut topology_generation: Option<u64> = None;
 
         // Attempt to read a label from each configured device path.
         for vc in &config.devices {
@@ -498,6 +787,11 @@ impl Pool {
                 reason: "pool label corrupt or unreadable",
             })?;
             device_guids.push(label.device_guid);
+            topology_generation = Some(
+                topology_generation
+                    .unwrap_or(label.topology_generation)
+                    .max(label.topology_generation),
+            );
             if label.is_encrypted() {
                 label_is_encrypted = true;
             }
@@ -642,6 +936,7 @@ impl Pool {
             log_device,
             pool_guid: pg,
             device_guids,
+            placement_epoch: topology_generation.unwrap_or(1).max(1),
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
             replacement: None,
@@ -811,7 +1106,7 @@ impl Pool {
             pool_name_len: self.config.name.len().min(255) as u16,
             pool_state: PoolState::Exported,
             device_index: device_index as u32,
-            topology_generation: 1,
+            topology_generation: self.placement_epoch,
             device_count,
             device_class: runtime_class_to_label(self.classes.get(device_index).copied()),
             features_compat: features::DEVICE_HEALTH_STATE,
@@ -874,6 +1169,15 @@ impl Pool {
     }
 
     fn placement_candidates(&self, class: IoClass, indices: &[usize]) -> Vec<usize> {
+        self.placement_candidates_for_targets(class, indices, 1)
+    }
+
+    fn placement_candidates_for_targets(
+        &self,
+        class: IoClass,
+        indices: &[usize],
+        min_targets: usize,
+    ) -> Vec<usize> {
         let usable = self.usable_candidates(indices);
         if class != IoClass::Metadata {
             return usable;
@@ -896,7 +1200,7 @@ impl Pool {
                 .copied()
                 .filter(|idx| self.media_classes[*idx] == preferred)
                 .collect();
-            if !preferred_tier.is_empty() {
+            if preferred_tier.len() >= min_targets {
                 return preferred_tier;
             }
         }
@@ -945,44 +1249,438 @@ impl Pool {
         }
     }
 
-    fn put_canonical(
+    /// Current placement epoch used for new allocation receipts.
+    #[must_use]
+    pub fn placement_epoch(&self) -> u64 {
+        self.placement_epoch
+    }
+
+    /// Pool-wide redundancy policy used for new non-log object allocation.
+    #[must_use]
+    pub fn redundancy_policy(&self) -> PoolRedundancyPolicy {
+        self.properties.redundancy_policy
+    }
+
+    fn bump_placement_epoch(&mut self) {
+        self.placement_epoch = self.placement_epoch.saturating_add(1).max(1);
+    }
+
+    fn placement_failure_domain(&self, candidate_count: usize) -> Result<FailureDomainV1> {
+        let target_count =
+            u8::try_from(candidate_count.clamp(1, 64)).map_err(|_| StoreError::InvalidOptions {
+                reason: "candidate count exceeds placement failure-domain wire limit",
+            })?;
+        FailureDomainV1::new(self.properties.failure_domain_level, target_count).map_err(|_| {
+            StoreError::InvalidOptions {
+                reason: "invalid pool placement failure-domain policy",
+            }
+        })
+    }
+
+    fn device_guid_for_index(&self, idx: usize) -> [u8; 16] {
+        self.device_guids.get(idx).copied().unwrap_or_else(|| {
+            let mut fallback = [0u8; 16];
+            fallback[..8].copy_from_slice(&(idx as u64).to_le_bytes());
+            fallback
+        })
+    }
+
+    fn device_id_for_index(&self, idx: usize) -> u64 {
+        u64::from_le_bytes(self.device_guid_for_index(idx)[..8].try_into().unwrap())
+    }
+
+    fn device_index_for_device_id(&self, device_id: u64) -> Option<usize> {
+        self.device_guids
+            .iter()
+            .position(|guid| u64::from_le_bytes(guid[..8].try_into().unwrap()) == device_id)
+    }
+
+    fn resolve_receipt_target(&self, target: &PlacementReceiptTarget) -> Option<usize> {
+        if let Some(idx) = self
+            .device_guids
+            .iter()
+            .position(|guid| *guid == target.device_guid)
+        {
+            return Some(idx);
+        }
+
+        let idx = target.device_index as usize;
+        (idx < self.devices.len()).then_some(idx)
+    }
+
+    fn device_health_capacity_for_index(&self, idx: usize) -> DeviceHealthCapacity {
+        let store = self.devices[idx].store();
+        let total_bytes = store.capacity_bytes();
+        let used_bytes = self.devices[idx].stats().live_bytes;
+        let mut device = DeviceHealthCapacity::new(
+            self.device_id_for_index(idx),
+            self.device_id_for_index(idx),
+            self.device_id_for_index(idx),
+            total_bytes,
+        );
+        device.used_bytes = used_bytes;
+        device.healthy = !matches!(
+            self.devices[idx].status().state,
+            DeviceState::Faulted | DeviceState::Removed
+        );
+        device
+    }
+
+    fn plan_pool_wide_placement(
+        &self,
+        class: IoClass,
+        key: ObjectKey,
+        payload_len: usize,
+        indices: &[usize],
+    ) -> Result<PlacementReceipt> {
+        let required = self.properties.redundancy_policy.total_targets()?;
+        let candidates = self.placement_candidates_for_targets(class, indices, required);
+        if candidates.len() < required {
+            return Err(StoreError::InvalidOptions {
+                reason: "not enough eligible pool devices for redundancy policy",
+            });
+        }
+
+        let layout = self.properties.redundancy_policy.layout()?;
+        let failure_domain = self.placement_failure_domain(candidates.len())?;
+        let devices: Vec<DeviceHealthCapacity> = candidates
+            .iter()
+            .copied()
+            .map(|idx| self.device_health_capacity_for_index(idx))
+            .collect();
+        let (object_id, placement_key) = placement_key_pair(key);
+        let request = AllocationRequest::new(object_id, payload_len as u64, placement_key);
+        let planner =
+            HashRingPlacementPlanner::new(PLACEMENT_HASH_RING_VNODES_PER_GB, self.placement_epoch);
+        let decision = planner
+            .plan_placement(&layout, &failure_domain, &devices, &request)
+            .map_err(|_| StoreError::InvalidOptions {
+                reason: "pool-wide placement planner could not satisfy redundancy policy",
+            })?;
+
+        self.receipt_from_decision(key, payload_len, decision, &candidates)
+    }
+
+    fn receipt_from_decision(
+        &self,
+        key: ObjectKey,
+        payload_len: usize,
+        decision: PlacementDecision,
+        candidates: &[usize],
+    ) -> Result<PlacementReceipt> {
+        let device_to_index: BTreeMap<u64, usize> = candidates
+            .iter()
+            .copied()
+            .map(|idx| (self.device_id_for_index(idx), idx))
+            .collect();
+        let (data_shards, _parity_shards) = match self.properties.redundancy_policy {
+            PoolRedundancyPolicy::Replicated { copies } => (copies, 0),
+            PoolRedundancyPolicy::Erasure {
+                data_shards,
+                parity_shards,
+            } => (data_shards, parity_shards),
+        };
+        let mut targets = Vec::with_capacity(decision.device_targets.len());
+        for (slot, device_id) in decision.device_targets.iter().copied().enumerate() {
+            let idx = device_to_index
+                .get(&device_id)
+                .copied()
+                .or_else(|| self.device_index_for_device_id(device_id))
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement planner selected unknown device",
+                })?;
+            let role = match self.properties.redundancy_policy {
+                PoolRedundancyPolicy::Replicated { .. } => PlacementTargetRole::Data,
+                PoolRedundancyPolicy::Erasure { .. } if slot < data_shards as usize => {
+                    PlacementTargetRole::Data
+                }
+                PoolRedundancyPolicy::Erasure { .. } => PlacementTargetRole::Parity,
+            };
+            targets.push(PlacementReceiptTarget {
+                device_index: idx as u32,
+                device_guid: self.device_guid_for_index(idx),
+                shard_index: slot as u16,
+                role,
+                stored_digest: [0u8; 32],
+            });
+        }
+
+        Ok(PlacementReceipt {
+            object_key: key,
+            epoch: self.placement_epoch,
+            policy: self.properties.redundancy_policy,
+            failure_domain_level: self.properties.failure_domain_level,
+            payload_len: payload_len as u64,
+            shard_len: 0,
+            payload_digest: [0u8; 32],
+            targets,
+        })
+    }
+
+    /// Return the persisted placement receipt for a key, if one exists.
+    pub fn placement_receipt_for_key(
+        &self,
+        class: IoClass,
+        key: ObjectKey,
+    ) -> Result<Option<PlacementReceipt>> {
+        let indices: Vec<usize> = self.class_map.get(class).to_vec();
+        if indices.is_empty() {
+            return Ok(None);
+        }
+        self.load_placement_receipt(&indices, key)
+    }
+
+    fn load_placement_receipt(
+        &self,
+        indices: &[usize],
+        key: ObjectKey,
+    ) -> Result<Option<PlacementReceipt>> {
+        let receipt_key = placement_receipt_object_key(key);
+        let mut best: Option<PlacementReceipt> = None;
+        for idx in self.usable_candidates(indices) {
+            let raw = match self.devices[idx].get(receipt_key) {
+                Ok(Some(raw)) => raw,
+                Ok(None) | Err(_) => continue,
+            };
+            let Some(receipt) = PlacementReceipt::decode(&raw) else {
+                continue;
+            };
+            if receipt.object_key != key {
+                continue;
+            }
+            let replace = match best.as_ref() {
+                Some(current) => receipt.epoch >= current.epoch,
+                None => true,
+            };
+            if replace {
+                best = Some(receipt);
+            }
+        }
+        Ok(best)
+    }
+
+    fn write_placement_receipt(
+        &mut self,
+        indices: &[usize],
+        receipt: &PlacementReceipt,
+    ) -> Result<()> {
+        let receipt_key = placement_receipt_object_key(receipt.object_key);
+        let encoded = receipt.encode()?;
+        let mut wrote = false;
+        let mut last_err = None;
+        for idx in self.usable_candidates(indices) {
+            match self.devices[idx].put(receipt_key, &encoded) {
+                Ok(_) => wrote = true,
+                Err(err) => last_err = Some(err),
+            }
+        }
+        if wrote {
+            Ok(())
+        } else {
+            Err(last_err.unwrap_or(StoreError::InvalidOptions {
+                reason: "placement receipt could not be persisted",
+            }))
+        }
+    }
+
+    fn put_pool_wide(
         &mut self,
         class: IoClass,
         key: ObjectKey,
         payload: &[u8],
         indices: &[usize],
-        no_device_reason: &'static str,
     ) -> Result<StoredObject> {
-        let Some(idx) = self.canonical_device_for_key(class, key, indices) else {
-            self.health = compute_health(&self.devices);
-            self.record_health_transitions();
-            return Err(StoreError::InvalidOptions {
-                reason: no_device_reason,
-            });
-        };
+        let mut receipt = self.plan_pool_wide_placement(class, key, payload.len(), indices)?;
+        receipt.payload_digest = digest32(payload);
 
-        let result = self.devices[idx].put(key, payload);
-        self.record_device_write_result(idx, payload.len(), &result);
-        if result.is_ok() {
-            for stale_idx in self.usable_candidates(indices) {
-                if stale_idx != idx {
-                    let _ = self.devices[stale_idx].delete(key);
+        match receipt.policy {
+            PoolRedundancyPolicy::Replicated { .. } => {
+                self.put_replicated_with_receipt(key, payload, indices, &mut receipt)
+            }
+            PoolRedundancyPolicy::Erasure { .. } => {
+                self.put_erasure_with_receipt(key, payload, indices, &mut receipt)
+            }
+        }
+    }
+
+    fn put_replicated_with_receipt(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+        indices: &[usize],
+        receipt: &mut PlacementReceipt,
+    ) -> Result<StoredObject> {
+        let target_indices: Vec<(usize, usize)> = receipt
+            .targets
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, target)| self.resolve_receipt_target(target).map(|idx| (pos, idx)))
+            .collect();
+        if target_indices.len() != receipt.targets.len() {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt references unavailable device",
+            });
+        }
+
+        let mut written_indices = Vec::with_capacity(target_indices.len());
+        let mut last_object = None;
+        for (target_pos, idx) in target_indices {
+            let result = self.devices[idx].put(key, payload);
+            self.record_device_write_result(idx, payload.len(), &result);
+            match result {
+                Ok(object) => {
+                    receipt.targets[target_pos].stored_digest = receipt.payload_digest;
+                    written_indices.push(idx);
+                    last_object = Some(object);
+                }
+                Err(err) => {
+                    for rollback_idx in written_indices {
+                        let _ = self.devices[rollback_idx].delete(key);
+                    }
+                    self.health = compute_health(&self.devices);
+                    self.record_health_transitions();
+                    return Err(err);
                 }
             }
         }
+
+        self.write_placement_receipt(indices, receipt)?;
+        self.cleanup_stale_replicated_copies(key, indices, receipt);
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
-        result
+        Ok(last_object.unwrap_or(StoredObject {
+            key,
+            sequence: 0,
+            len: payload.len() as u64,
+            checksum: crate::store::checksum64(payload),
+        }))
+    }
+
+    fn put_erasure_with_receipt(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+        indices: &[usize],
+        receipt: &mut PlacementReceipt,
+    ) -> Result<StoredObject> {
+        let PoolRedundancyPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        } = receipt.policy
+        else {
+            return Err(StoreError::InvalidOptions {
+                reason: "erasure write requested for non-erasure receipt",
+            });
+        };
+        let shard_len = payload.len().div_ceil(data_shards as usize).max(1);
+        let stripe_config = StripeConfig {
+            data_shards: data_shards as usize,
+            parity_shards: parity_shards as usize,
+            shard_len,
+        };
+        let encoded =
+            encode_erasure_stripe(&stripe_config, payload).ok_or(StoreError::InvalidOptions {
+                reason: "erasure encoder rejected pool placement payload",
+            })?;
+        receipt.shard_len = shard_len as u32;
+
+        let mut written = Vec::with_capacity(receipt.targets.len());
+        for target_pos in 0..receipt.targets.len() {
+            let shard_index = receipt.targets[target_pos].shard_index as usize;
+            let Some(shard) = encoded
+                .shards
+                .iter()
+                .find(|shard| shard.index == shard_index)
+            else {
+                return Err(StoreError::InvalidOptions {
+                    reason: "erasure placement receipt missing encoded shard",
+                });
+            };
+            let Some(idx) = self.resolve_receipt_target(&receipt.targets[target_pos]) else {
+                return Err(StoreError::InvalidOptions {
+                    reason: "erasure placement receipt references unavailable device",
+                });
+            };
+            let shard_key = placement_shard_object_key(key, shard_index as u16);
+            let result = self.devices[idx].put(shard_key, &shard.bytes);
+            self.record_device_write_result(idx, shard.bytes.len(), &result);
+            match result {
+                Ok(_) => {
+                    receipt.targets[target_pos].stored_digest = digest32(&shard.bytes);
+                    written.push((idx, shard_key));
+                }
+                Err(err) => {
+                    for (rollback_idx, rollback_key) in written {
+                        let _ = self.devices[rollback_idx].delete(rollback_key);
+                    }
+                    self.health = compute_health(&self.devices);
+                    self.record_health_transitions();
+                    return Err(err);
+                }
+            }
+        }
+
+        self.write_placement_receipt(indices, receipt)?;
+        self.cleanup_stale_erasure_shards(key, indices, receipt);
+        self.health = compute_health(&self.devices);
+        self.record_health_transitions();
+        Ok(StoredObject {
+            key,
+            sequence: 0,
+            len: payload.len() as u64,
+            checksum: crate::store::checksum64(payload),
+        })
+    }
+
+    fn cleanup_stale_replicated_copies(
+        &mut self,
+        key: ObjectKey,
+        indices: &[usize],
+        receipt: &PlacementReceipt,
+    ) {
+        let target_indices: BTreeSet<usize> = receipt
+            .targets
+            .iter()
+            .filter_map(|target| self.resolve_receipt_target(target))
+            .collect();
+        for idx in self.usable_candidates(indices) {
+            if !target_indices.contains(&idx) {
+                let _ = self.devices[idx].delete(key);
+            }
+        }
+    }
+
+    fn cleanup_stale_erasure_shards(
+        &mut self,
+        key: ObjectKey,
+        indices: &[usize],
+        receipt: &PlacementReceipt,
+    ) {
+        let target_by_index: BTreeMap<usize, u16> = receipt
+            .targets
+            .iter()
+            .filter_map(|target| {
+                self.resolve_receipt_target(target)
+                    .map(|idx| (idx, target.shard_index))
+            })
+            .collect();
+        for idx in self.usable_candidates(indices) {
+            let keep_shard = target_by_index.get(&idx).copied();
+            for shard_index in 0..receipt.targets.len() {
+                let shard_key = placement_shard_object_key(key, shard_index as u16);
+                if keep_shard != Some(shard_index as u16) {
+                    let _ = self.devices[idx].delete(shard_key);
+                }
+            }
+            let _ = self.devices[idx].delete(key);
+        }
     }
 
     /// Store an object, routing by `class`.
     ///
-    /// For `IntentLog`, the write is fanned out to all devices in the class.
-    /// For all other classes, the write is routed to a canonical device chosen
-    /// deterministically from the key hash within the class policy. Reads use
-    /// the same canonical target first and only scan the remaining devices as a
-    /// legacy/repair fallback, so mutable named objects cannot be shadowed by
-    /// stale copies left on another device.
+    /// `IntentLog` retains write-all log semantics. All other classes allocate
+    /// through the pool-wide redundancy policy and persist a placement receipt
+    /// that becomes the read locator authority for this key.
     pub fn put(&mut self, class: IoClass, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         if self.locked {
             return Err(StoreError::InvalidOptions {
@@ -1030,34 +1728,16 @@ impl Pool {
                     })),
                 }
             }
-            IoClass::Metadata => self.put_canonical(
-                class,
-                key,
-                payload,
-                &indices,
-                "metadata: no healthy devices available",
-            ),
+            IoClass::Metadata => self.put_pool_wide(class, key, payload, &indices),
             IoClass::Data => {
                 self.check_write_admission(class, payload.len() as u64)?;
-                self.put_canonical(
-                    class,
-                    key,
-                    payload,
-                    &indices,
-                    "data: no healthy devices available",
-                )
+                self.put_pool_wide(class, key, payload, &indices)
             }
-            IoClass::ReadCache => self.put_canonical(
-                class,
-                key,
-                payload,
-                &indices,
-                "read-cache: no healthy devices available",
-            ),
+            IoClass::ReadCache => self.put_pool_wide(class, key, payload, &indices),
         }
     }
 
-    /// Retrieve an object, trying the canonical device first.
+    /// Retrieve an object from its persisted placement receipt when present.
     pub fn get(&self, class: IoClass, key: ObjectKey) -> Result<Option<Vec<u8>>> {
         if self.locked {
             return Err(StoreError::InvalidOptions {
@@ -1069,6 +1749,10 @@ impl Pool {
             return Err(StoreError::InvalidOptions {
                 reason: "pool has no devices for this I/O class",
             });
+        }
+
+        if let Some(receipt) = self.load_placement_receipt(&indices, key)? {
+            return self.get_with_receipt(&receipt);
         }
 
         for idx in self.read_order_for_key(class, key, &indices) {
@@ -1086,6 +1770,91 @@ impl Pool {
         Ok(None)
     }
 
+    fn get_with_receipt(&self, receipt: &PlacementReceipt) -> Result<Option<Vec<u8>>> {
+        match receipt.policy {
+            PoolRedundancyPolicy::Replicated { .. } => self.get_replicated_with_receipt(receipt),
+            PoolRedundancyPolicy::Erasure { .. } => self.get_erasure_with_receipt(receipt),
+        }
+    }
+
+    fn get_replicated_with_receipt(&self, receipt: &PlacementReceipt) -> Result<Option<Vec<u8>>> {
+        for target in &receipt.targets {
+            let Some(idx) = self.resolve_receipt_target(target) else {
+                continue;
+            };
+            match self.devices[idx].get(receipt.object_key) {
+                Ok(Some(payload)) if digest32(&payload) == receipt.payload_digest => {
+                    return Ok(Some(payload));
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => continue,
+                Err(_) => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    fn get_erasure_with_receipt(&self, receipt: &PlacementReceipt) -> Result<Option<Vec<u8>>> {
+        let PoolRedundancyPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        } = receipt.policy
+        else {
+            return Ok(None);
+        };
+        let shard_len =
+            usize::try_from(receipt.shard_len).map_err(|_| StoreError::InvalidOptions {
+                reason: "placement receipt shard length exceeds platform usize",
+            })?;
+        if shard_len == 0 {
+            return Err(StoreError::InvalidOptions {
+                reason: "erasure placement receipt has zero shard length",
+            });
+        }
+        let config = StripeConfig {
+            data_shards: data_shards as usize,
+            parity_shards: parity_shards as usize,
+            shard_len,
+        };
+        let width = config.stripe_width();
+        let mut available = vec![None; width];
+
+        for target in &receipt.targets {
+            let shard_index = target.shard_index as usize;
+            if shard_index >= width {
+                continue;
+            }
+            let Some(idx) = self.resolve_receipt_target(target) else {
+                continue;
+            };
+            let shard_key = placement_shard_object_key(receipt.object_key, target.shard_index);
+            let Some(bytes) = self.devices[idx].get(shard_key)? else {
+                continue;
+            };
+            if digest32(&bytes) != target.stored_digest {
+                continue;
+            }
+            let kind = match target.role {
+                PlacementTargetRole::Data => ShardKind::Data,
+                PlacementTargetRole::Parity => ShardKind::Parity,
+            };
+            available[shard_index] = Some(ErasureShard {
+                index: shard_index,
+                kind,
+                bytes,
+            });
+        }
+
+        let Some(mut reconstructed) = reconstruct_erasure_stripe(&config, &available, None) else {
+            return Ok(None);
+        };
+        reconstructed.payload.truncate(receipt.payload_len as usize);
+        if digest32(&reconstructed.payload) != receipt.payload_digest {
+            return Ok(None);
+        }
+        Ok(Some(reconstructed.payload))
+    }
+
     /// Delete an object from every device that can hold this I/O class.
     pub fn delete(&mut self, class: IoClass, key: ObjectKey) -> Result<bool> {
         let indices: Vec<usize> = self.class_map.get(class).to_vec();
@@ -1093,6 +1862,13 @@ impl Pool {
             return Err(StoreError::InvalidOptions {
                 reason: "pool has no devices for this I/O class",
             });
+        }
+
+        if let Some(receipt) = self.load_placement_receipt(&indices, key)? {
+            let deleted = self.delete_with_receipt(&receipt, &indices)?;
+            self.health = compute_health(&self.devices);
+            self.record_health_transitions();
+            return Ok(deleted);
         }
 
         let mut deleted = false;
@@ -1123,6 +1899,79 @@ impl Pool {
                 reason: "delete: no healthy devices available",
             })
         }
+    }
+
+    fn delete_with_receipt(
+        &mut self,
+        receipt: &PlacementReceipt,
+        indices: &[usize],
+    ) -> Result<bool> {
+        let mut deleted = false;
+        match receipt.policy {
+            PoolRedundancyPolicy::Replicated { .. } => {
+                for idx in self.usable_candidates(indices) {
+                    deleted |= self.devices[idx]
+                        .delete(receipt.object_key)
+                        .unwrap_or(false);
+                }
+            }
+            PoolRedundancyPolicy::Erasure { .. } => {
+                for idx in self.usable_candidates(indices) {
+                    for target in &receipt.targets {
+                        let shard_key =
+                            placement_shard_object_key(receipt.object_key, target.shard_index);
+                        deleted |= self.devices[idx].delete(shard_key).unwrap_or(false);
+                    }
+                    deleted |= self.devices[idx]
+                        .delete(receipt.object_key)
+                        .unwrap_or(false);
+                }
+            }
+        }
+
+        let receipt_key = placement_receipt_object_key(receipt.object_key);
+        for idx in self.usable_candidates(indices) {
+            deleted |= self.devices[idx].delete(receipt_key).unwrap_or(false);
+        }
+        Ok(deleted)
+    }
+
+    fn retarget_replicated_receipt_after_evacuate(
+        &mut self,
+        key: ObjectKey,
+        old_idx: usize,
+        new_idx: usize,
+        payload: &[u8],
+    ) -> Result<()> {
+        let indices: Vec<usize> = self.class_map.get(IoClass::Data).to_vec();
+        let Some(mut receipt) = self.load_placement_receipt(&indices, key)? else {
+            return Ok(());
+        };
+        if !matches!(receipt.policy, PoolRedundancyPolicy::Replicated { .. }) {
+            return Ok(());
+        }
+
+        let new_guid = self.device_guid_for_index(new_idx);
+        let digest = digest32(payload);
+        let mut changed = false;
+        for target in &mut receipt.targets {
+            let target_idx = self
+                .device_guids
+                .iter()
+                .position(|guid| *guid == target.device_guid)
+                .unwrap_or(target.device_index as usize);
+            if target_idx == old_idx {
+                target.device_index = new_idx as u32;
+                target.device_guid = new_guid;
+                target.stored_digest = digest;
+                changed = true;
+            }
+        }
+        if changed {
+            receipt.epoch = self.placement_epoch.saturating_add(1).max(1);
+            self.write_placement_receipt(&indices, &receipt)?;
+        }
+        Ok(())
     }
 
     /// Flush all devices.
@@ -1172,6 +2021,7 @@ impl Pool {
         self.write_allocator = WriteAllocator::new(self.media_classes.clone(), total_bytes);
         self.health = compute_health(&self.devices);
         self.config.devices.push(config_for_record);
+        self.bump_placement_epoch();
         self.record_health_transitions();
         Ok(())
     }
@@ -1286,6 +2136,7 @@ impl Pool {
         self.write_allocator = WriteAllocator::new(self.media_classes.clone(), total_bytes);
 
         self.health = compute_health(&self.devices);
+        self.bump_placement_epoch();
         self.record_health_transitions();
 
         Ok(())
@@ -1369,6 +2220,7 @@ impl Pool {
             .map(|d| d.store().capacity_bytes())
             .collect();
         self.write_allocator = WriteAllocator::new(self.media_classes.clone(), total_bytes);
+        self.bump_placement_epoch();
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
         Ok(())
@@ -1424,7 +2276,9 @@ impl Pool {
             .collect();
 
         // Enumerate objects on the target device.
-        let keys = self.devices[target_idx].store().list_keys();
+        let keys = self.devices[target_idx]
+            .store()
+            .list_keys_including_internal();
         let mut result = EvacuationResult::default();
 
         if keys.is_empty() {
@@ -1434,11 +2288,71 @@ impl Pool {
             return Ok(result);
         }
 
-        // For each object on the target device: read, route to survivor,
-        // write, verify, delete source.
+        let mut internal_placement_keys = BTreeSet::new();
+        let mut rewritten_logical_keys = BTreeSet::new();
+        let mut placement_receipts = Vec::new();
+
         for key in &keys {
+            let Ok(Some(raw)) = self.devices[target_idx].get(*key) else {
+                continue;
+            };
+            let Some(receipt) = PlacementReceipt::decode(&raw) else {
+                continue;
+            };
+            if placement_receipt_object_key(receipt.object_key) != *key {
+                continue;
+            }
+
+            internal_placement_keys.insert(*key);
+            if matches!(receipt.policy, PoolRedundancyPolicy::Erasure { .. }) {
+                for target in &receipt.targets {
+                    internal_placement_keys.insert(placement_shard_object_key(
+                        receipt.object_key,
+                        target.shard_index,
+                    ));
+                }
+            }
+            placement_receipts.push(receipt);
+        }
+
+        for receipt in placement_receipts {
+            let data = match self.get_with_receipt(&receipt)? {
+                Some(data) => data,
+                None => {
+                    result.objects_failed += 1;
+                    result.failed_keys.push(receipt.object_key);
+                    continue;
+                }
+            };
+            let digest: [u8; 32] = blake3::hash(&data).into();
+            let len = data.len() as u64;
+
+            if self
+                .put_pool_wide(IoClass::Data, receipt.object_key, &data, &surviving_indices)
+                .is_err()
+            {
+                result.objects_failed += 1;
+                result.failed_keys.push(receipt.object_key);
+                continue;
+            }
+
+            rewritten_logical_keys.insert(receipt.object_key);
+            result.objects_evacuated += 1;
+            result.bytes_evacuated += len;
+            result.content_digests.insert(receipt.object_key, digest);
+        }
+
+        // For each legacy object on the target device: read, route to
+        // survivor, write, verify, delete source. Receipt-backed logical
+        // objects were rewritten above; receipt and shard records are internal
+        // placement metadata and are intentionally skipped here.
+        for key in &keys {
+            if internal_placement_keys.contains(key) || rewritten_logical_keys.contains(key) {
+                continue;
+            }
+
             // Read from the target device.
-            let data = match self.devices[target_idx].store().get(*key) {
+            let data = match self.devices[target_idx].get(*key) {
                 Ok(Some(d)) => d,
                 Ok(None) => {
                     result.objects_failed += 1;
@@ -1459,18 +2373,14 @@ impl Pool {
             let survivor_idx = pick_device(*key, &surviving_indices);
 
             // Write to the surviving device.
-            if self.devices[survivor_idx]
-                .store_mut()
-                .put(*key, &data)
-                .is_err()
-            {
+            if self.devices[survivor_idx].put(*key, &data).is_err() {
                 result.objects_failed += 1;
                 result.failed_keys.push(*key);
                 continue;
             }
 
             // Verify the write is readable with correct content.
-            match self.devices[survivor_idx].store().get(*key) {
+            match self.devices[survivor_idx].get(*key) {
                 Ok(Some(readback)) => {
                     let readback_digest: [u8; 32] = blake3::hash(&readback).into();
                     if readback_digest != digest {
@@ -1486,8 +2396,10 @@ impl Pool {
                 }
             }
 
+            self.retarget_replicated_receipt_after_evacuate(*key, target_idx, survivor_idx, &data)?;
+
             // Delete from the target device.
-            let _ = self.devices[target_idx].store_mut().delete(*key);
+            let _ = self.devices[target_idx].delete(*key);
 
             result.objects_evacuated += 1;
             result.bytes_evacuated += len;
@@ -1606,6 +2518,7 @@ impl Pool {
 
         // Recompute pool health: the new device starts Online, so health
         // should improve if the old device was degraded/faulted.
+        self.bump_placement_epoch();
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
 
@@ -1664,6 +2577,7 @@ impl Pool {
             state: ReplacementState::Cancelled,
             ..replacement
         });
+        self.bump_placement_epoch();
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
         Ok(())
@@ -1730,12 +2644,17 @@ impl Pool {
 
     /// Pool capacity statistics for statfs integration.
     ///
-    /// Computes total capacity from the primary Data device's configured
-    /// segment count and max segment bytes, live (used) bytes from the
-    /// aggregate pool stats, and derives available bytes.
+    /// Computes total capacity from all data-class devices, live (used) bytes
+    /// from the aggregate pool stats, and derives available bytes.
     #[must_use]
     pub fn pool_stats(&self) -> PoolCapacityStats {
-        let total_capacity_bytes = self.raw_primary_store().capacity_bytes();
+        let total_capacity_bytes: u64 = self
+            .class_map
+            .get(IoClass::Data)
+            .iter()
+            .filter_map(|idx| self.devices.get(*idx))
+            .map(|device| device.store().capacity_bytes())
+            .sum();
         let op_stats = self.stats();
         let used_bytes = op_stats.total_bytes;
         let available_bytes = total_capacity_bytes.saturating_sub(used_bytes);
@@ -2498,6 +3417,38 @@ fn pick_device(key: ObjectKey, candidates: &[usize]) -> usize {
     candidates[(h as usize) % candidates.len()]
 }
 
+fn placement_key_pair(key: ObjectKey) -> (u64, u64) {
+    let digest = blake3::hash(&key.as_bytes32());
+    let bytes = digest.as_bytes();
+    (
+        u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+    )
+}
+
+fn digest32(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
+
+fn placement_receipt_object_key(key: ObjectKey) -> ObjectKey {
+    let mut hasher = blake3::Hasher::new_derive_key(PLACEMENT_RECEIPT_CONTEXT);
+    hasher.update(b"receipt");
+    hasher.update(&key.as_bytes32());
+    let mut bytes = *hasher.finalize().as_bytes();
+    bytes[..8].copy_from_slice(&crate::POOL_PLACEMENT_RECEIPT_KEY_PREFIX);
+    ObjectKey::from_bytes32(bytes)
+}
+
+fn placement_shard_object_key(key: ObjectKey, shard_index: u16) -> ObjectKey {
+    let mut hasher = blake3::Hasher::new_derive_key(PLACEMENT_RECEIPT_CONTEXT);
+    hasher.update(b"shard");
+    hasher.update(&key.as_bytes32());
+    hasher.update(&shard_index.to_le_bytes());
+    let mut bytes = *hasher.finalize().as_bytes();
+    bytes[..8].copy_from_slice(&crate::POOL_PLACEMENT_SHARD_KEY_PREFIX);
+    ObjectKey::from_bytes32(bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2535,6 +3486,41 @@ mod tests {
                 encryption: None,
                 compression: None,
             }],
+        }
+    }
+
+    fn multi_data_device_config(root: &Path, count: usize) -> PoolConfig {
+        let devices = (0..count)
+            .map(|idx| {
+                let path = root.join(format!("data-{idx}"));
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: path.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path },
+                    encryption: None,
+                    compression: None,
+                }
+            })
+            .collect();
+        PoolConfig {
+            name: "testpool".into(),
+            root_path: root.to_path_buf(),
+            devices,
+        }
+    }
+
+    fn deterministic_device_guid(idx: usize) -> [u8; 16] {
+        let mut guid = [0x42; 16];
+        guid[..8].copy_from_slice(&(0xA11C_E000_0000_0000u64 + idx as u64).to_le_bytes());
+        guid[8..].copy_from_slice(&(0x51A7_0000_0000_0000u64 + idx as u64).to_le_bytes());
+        guid
+    }
+
+    fn set_deterministic_device_guids(pool: &mut Pool) {
+        for idx in 0..pool.device_guids.len() {
+            pool.device_guids[idx] = deterministic_device_guid(idx);
         }
     }
 
@@ -2700,141 +3686,240 @@ mod tests {
     }
 
     #[test]
-    fn multi_device_data_writes_use_stable_key_placement() {
-        let root = temp_dir("multi-device");
+    fn replicated_pool_wide_receipts_use_all_eligible_devices() {
+        let root = temp_dir("pool-wide-replicated");
         let _ = std::fs::remove_dir_all(&root);
-        let d0 = root.join("data0");
-        let d1 = root.join("data1");
-        let d2 = root.join("data2");
-        let config = PoolConfig {
-            name: "multi".into(),
-            root_path: root.to_path_buf(),
-            devices: vec![
-                DeviceConfig {
-                    media_class: Default::default(),
-                    path: d0.clone(),
-                    backing: DeviceBacking::DirectoryObjectStoreCompat,
-                    class: DeviceClass::Data,
-                    kind: DeviceKind::Single { path: d0 },
-                    encryption: None,
-                    compression: None,
-                },
-                DeviceConfig {
-                    media_class: Default::default(),
-                    path: d1.clone(),
-                    backing: DeviceBacking::DirectoryObjectStoreCompat,
-                    class: DeviceClass::Data,
-                    kind: DeviceKind::Single { path: d1 },
-                    encryption: None,
-                    compression: None,
-                },
-                DeviceConfig {
-                    media_class: Default::default(),
-                    path: d2.clone(),
-                    backing: DeviceBacking::DirectoryObjectStoreCompat,
-                    class: DeviceClass::Data,
-                    kind: DeviceKind::Single { path: d2 },
-                    encryption: None,
-                    compression: None,
-                },
-            ],
+        let config = multi_data_device_config(&root, 5);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
         };
-        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
 
-        let key_a = ObjectKey::from_name(b"first-write");
-        let key_b = ObjectKey::from_name(b"second-write");
-        let _s1 = pool.put(IoClass::Data, key_a, b"payload-a").unwrap();
-        let _s2 = pool.put(IoClass::Data, key_b, b"payload-b").unwrap();
+        let mut seen = BTreeSet::new();
+        for i in 0..128 {
+            let name = format!("pool-wide-object-{i}");
+            let key = ObjectKey::from_name(name.as_bytes());
+            let payload = format!("payload-{i}");
+            pool.put(IoClass::Data, key, payload.as_bytes()).unwrap();
+            let receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("placement receipt must persist");
+            assert_eq!(receipt.policy, PoolRedundancyPolicy::replicated(2));
+            assert_eq!(receipt.targets.len(), 2);
+            for target in receipt.targets {
+                seen.insert(target.device_index);
+            }
+            assert_eq!(
+                pool.get(IoClass::Data, key).unwrap(),
+                Some(payload.into_bytes())
+            );
+        }
 
-        let candidates = [0usize, 1, 2];
-        let target_a = pick_device(key_a, &candidates);
-        let target_b = pick_device(key_b, &candidates);
         assert_eq!(
-            pool.device_layout_stats[target_a].write_allocations,
-            if target_a == target_b { 2 } else { 1 },
-            "first Data write should go to its key-selected device"
-        );
-        assert_eq!(
-            pool.device_layout_stats[target_b].write_allocations,
-            if target_a == target_b { 2 } else { 1 },
-            "second Data write should use its own stable key-selected device"
-        );
-
-        // Verify both writes were persisted.
-        assert_eq!(
-            pool.get(IoClass::Data, key_a).unwrap(),
-            Some(b"payload-a".to_vec()),
-        );
-        assert_eq!(
-            pool.get(IoClass::Data, key_b).unwrap(),
-            Some(b"payload-b".to_vec()),
+            seen.len(),
+            5,
+            "pool-wide placement should eventually use every eligible data device"
         );
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn multi_device_same_key_overwrite_reads_latest_and_prunes_stale_copies() {
-        let root = temp_dir("same-key-overwrite");
+    fn placement_epoch_add_device_leaves_old_receipt_readable_and_new_allocations_expand() {
+        let root = temp_dir("epoch-add-device");
         let _ = std::fs::remove_dir_all(&root);
-        let d0 = root.join("data0");
-        let d1 = root.join("data1");
-        let d2 = root.join("data2");
-        let config = PoolConfig {
-            name: "multi".into(),
-            root_path: root.to_path_buf(),
-            devices: vec![
-                DeviceConfig {
-                    media_class: Default::default(),
-                    path: d0.clone(),
-                    backing: DeviceBacking::DirectoryObjectStoreCompat,
-                    class: DeviceClass::Data,
-                    kind: DeviceKind::Single { path: d0 },
-                    encryption: None,
-                    compression: None,
-                },
-                DeviceConfig {
-                    media_class: Default::default(),
-                    path: d1.clone(),
-                    backing: DeviceBacking::DirectoryObjectStoreCompat,
-                    class: DeviceClass::Data,
-                    kind: DeviceKind::Single { path: d1 },
-                    encryption: None,
-                    compression: None,
-                },
-                DeviceConfig {
-                    media_class: Default::default(),
-                    path: d2.clone(),
-                    backing: DeviceBacking::DirectoryObjectStoreCompat,
-                    class: DeviceClass::Data,
-                    kind: DeviceKind::Single { path: d2 },
-                    encryption: None,
-                    compression: None,
-                },
-            ],
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
         };
-        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
 
-        let key = ObjectKey::from_name(b"mutable-named-object");
-        let candidates = [0usize, 1, 2];
-        let canonical = pick_device(key, &candidates);
-        let stale = candidates
-            .iter()
-            .copied()
-            .find(|idx| *idx != canonical)
-            .expect("non-canonical device exists");
+        let old_key = ObjectKey::from_name(b"old-before-add");
+        pool.put(IoClass::Data, old_key, b"old-payload").unwrap();
+        let old_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, old_key)
+            .unwrap()
+            .expect("old receipt");
+        assert_eq!(old_receipt.epoch, 1);
 
-        pool.devices[stale].put(key, b"stale").unwrap();
-        pool.put(IoClass::Data, key, b"fresh").unwrap();
+        let new_path = root.join("data-3");
+        let new_config = DeviceConfig {
+            media_class: Default::default(),
+            path: new_path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: new_path },
+            encryption: None,
+            compression: None,
+        };
+        pool.add_device(new_config, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        assert_eq!(pool.placement_epoch(), 2);
+
+        assert_eq!(
+            pool.get(IoClass::Data, old_key).unwrap(),
+            Some(b"old-payload".to_vec()),
+            "old receipt must remain readable after topology epoch changes"
+        );
+
+        let mut new_device_seen = false;
+        for i in 0..256 {
+            let key = ObjectKey::from_name(format!("after-add-{i}").as_bytes());
+            pool.put(IoClass::Data, key, b"new-payload").unwrap();
+            let receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("new receipt");
+            assert_eq!(receipt.epoch, 2);
+            new_device_seen |= receipt
+                .targets
+                .iter()
+                .any(|target| target.device_index == 3);
+            if new_device_seen {
+                break;
+            }
+        }
+        assert!(
+            new_device_seen,
+            "new placement epoch should allow allocations to use the added device"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn erasure_policy_receipt_width_and_reconstructs_missing_shard() {
+        let root = temp_dir("erasure-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"erasure-object");
+        let payload = b"payload large enough to span both data shards";
+        pool.put(IoClass::Data, key, payload).unwrap();
+
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("erasure receipt must persist");
+        assert_eq!(receipt.policy, PoolRedundancyPolicy::erasure(2, 1));
+        assert_eq!(receipt.targets.len(), 3);
+        let receipt_key = placement_receipt_object_key(key);
+        assert!(
+            pool.devices.iter().any(|device| device
+                .store()
+                .list_keys_including_internal()
+                .contains(&receipt_key)),
+            "receipt key should be visible to internal scans"
+        );
+        for device in &pool.devices {
+            assert!(
+                !device.store().list_keys().contains(&receipt_key),
+                "receipt key must stay hidden from public object scans"
+            );
+        }
+        assert_eq!(
+            receipt
+                .targets
+                .iter()
+                .filter(|target| target.role == PlacementTargetRole::Data)
+                .count(),
+            2
+        );
+        assert_eq!(
+            receipt
+                .targets
+                .iter()
+                .filter(|target| target.role == PlacementTargetRole::Parity)
+                .count(),
+            1
+        );
+        for target in &receipt.targets {
+            let idx = pool.resolve_receipt_target(target).unwrap();
+            let shard_key = placement_shard_object_key(key, target.shard_index);
+            assert!(
+                pool.devices[idx]
+                    .store()
+                    .list_keys_including_internal()
+                    .contains(&shard_key),
+                "shard key should be visible to internal scans"
+            );
+            assert!(
+                !pool.devices[idx].store().list_keys().contains(&shard_key),
+                "shard key must stay hidden from public object scans"
+            );
+        }
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+
+        let victim = receipt.targets[0].clone();
+        let victim_idx = pool.resolve_receipt_target(&victim).unwrap();
+        let victim_key = placement_shard_object_key(key, victim.shard_index);
+        assert!(pool.devices[victim_idx].delete(victim_key).unwrap());
 
         assert_eq!(
             pool.get(IoClass::Data, key).unwrap(),
-            Some(b"fresh".to_vec())
+            Some(payload.to_vec()),
+            "receipt-backed erasure read should reconstruct from surviving shards"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_rewrites_receipt_backed_erasure_object_to_survivors() {
+        let root = temp_dir("safe-remove-erasure-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"erasure-before-remove");
+        let payload = b"receipt-backed erasure payload before device removal";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let before = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt before removal");
+        let victim_idx = pool.resolve_receipt_target(&before.targets[0]).unwrap();
+        let victim_guid = pool.device_guid_for_index(victim_idx);
+        let victim_path = pool.devices[victim_idx].root().to_path_buf();
+
+        let removal = pool.safe_remove_device(&victim_path).unwrap();
+        assert!(removal.complete);
+        assert_eq!(removal.objects_failed, 0);
         assert_eq!(
-            pool.devices[stale].get(key).unwrap(),
-            None,
-            "successful canonical write should remove stale fallback copies"
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+
+        let after = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt after removal");
+        assert_eq!(after.targets.len(), 3);
+        assert!(
+            after
+                .targets
+                .iter()
+                .all(|target| target.device_guid != victim_guid),
+            "rewritten receipt must not target the removed device"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -4607,6 +5692,77 @@ mod tests {
         assert_eq!(
             pool.device_layout_stats[0].write_allocations, 1,
             "HDD should receive metadata write via fallback when no NVMe/SSD available"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn metadata_redundancy_expands_beyond_short_preferred_tier() {
+        let root = temp_dir("md-redundancy-fallback");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let metadata_path = root.join("metadata-nvme");
+        let data0_path = root.join("data-ssd-0");
+        let data1_path = root.join("data-ssd-1");
+        let config = PoolConfig {
+            name: "metadata-redundancy".into(),
+            root_path: root.clone(),
+            devices: vec![
+                DeviceConfig {
+                    path: metadata_path.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    media_class: DeviceMediaClass::Nvme,
+                    class: DeviceClass::Metadata,
+                    kind: DeviceKind::Single {
+                        path: metadata_path,
+                    },
+                    encryption: None,
+                    compression: None,
+                },
+                DeviceConfig {
+                    path: data0_path.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    media_class: DeviceMediaClass::Ssd,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: data0_path },
+                    encryption: None,
+                    compression: None,
+                },
+                DeviceConfig {
+                    path: data1_path.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    media_class: DeviceMediaClass::Ssd,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: data1_path },
+                    encryption: None,
+                    compression: None,
+                },
+            ],
+        };
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"metadata-replicated-entry");
+        pool.put(IoClass::Metadata, key, b"metadata-payload")
+            .unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Metadata, key)
+            .unwrap()
+            .expect("metadata receipt");
+
+        assert_eq!(receipt.targets.len(), 2);
+        assert!(
+            receipt.targets.iter().any(|target| target.device_index != 0),
+            "metadata redundancy should expand to fallback data devices when the preferred tier is too short"
+        );
+        assert_eq!(
+            pool.get(IoClass::Metadata, key).unwrap(),
+            Some(b"metadata-payload".to_vec())
         );
 
         let _ = std::fs::remove_dir_all(&root);
