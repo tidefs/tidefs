@@ -64,16 +64,24 @@ impl<'a> std::fmt::Debug for Request<'a> {
 
 impl<'a> Request<'a> {
     /// Create a new request from the given data
+    #[cfg(test)]
     pub(crate) fn new(ch: ChannelSender, data: &'a [u8]) -> Option<Request<'a>> {
-        let request = match ll::AnyRequest::try_from(data) {
-            Ok(request) => request,
+        match Self::try_new(ch, data) {
+            Ok(request) => Some(request),
             Err(err) => {
                 error!("{err}");
-                return None;
+                None
             }
-        };
+        }
+    }
 
-        Some(Self {
+    pub(crate) fn try_new(
+        ch: ChannelSender,
+        data: &'a [u8],
+    ) -> Result<Request<'a>, ll::RequestError> {
+        let request = ll::AnyRequest::try_from(data)?;
+
+        Ok(Self {
             ch,
             data,
             request,
@@ -187,6 +195,19 @@ impl<'a> Request<'a> {
             #[cfg(feature = "abi-7-16")]
             ll::Operation::BatchForget(_) => DispatchLane::Maintenance,
             _ => DispatchLane::Inline,
+        }
+    }
+
+    pub(crate) fn expects_reply(&self) -> bool {
+        let Ok(op) = self.request.operation() else {
+            return true;
+        };
+
+        match op {
+            ll::Operation::Forget(_) => false,
+            #[cfg(feature = "abi-7-16")]
+            ll::Operation::BatchForget(_) => false,
+            _ => true,
         }
     }
 

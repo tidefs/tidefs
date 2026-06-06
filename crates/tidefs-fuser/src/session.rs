@@ -7,7 +7,9 @@
 
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{info, warn};
+use std::convert::TryInto;
 use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{
     mpsc::{self, SyncSender, TrySendError},
@@ -17,9 +19,10 @@ use std::thread::{self, JoinHandle};
 use std::{io, ops::DerefMut};
 
 use crate::abort::{AbortHandle, AbortRegistry};
-use crate::ll::{fuse_abi as abi, Errno};
+use crate::ll::{fuse_abi as abi, Errno, RequestError, Response};
 #[cfg(feature = "abi-7-11")]
 use crate::notify::Notifier;
+use crate::reply::ReplySender;
 use crate::request::{DispatchLane, Request};
 use crate::Filesystem;
 use crate::MountOption;
@@ -173,14 +176,19 @@ impl<FS: Filesystem> Session<FS> {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
             match self.ch.receive(buf) {
-                Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
+                Ok(size) => match Request::try_new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
-                    Some(req) => {
+                    Ok(req) => {
                         let lane = req.dispatch_lane(self.initialized, self.destroyed);
                         match lane {
                             DispatchLane::Inline => req.dispatch(self),
                             _ => {
-                                let job = WorkerJob::new(self.ch.sender(), buf[..size].to_vec());
+                                let job = WorkerJob::new(
+                                    self.ch.sender(),
+                                    buf[..size].to_vec(),
+                                    req.unique(),
+                                    req.expects_reply(),
+                                );
                                 match self.enqueue_worker_job(lane, job) {
                                     Ok(()) => {}
                                     Err(WorkerEnqueueError::Missing) => req.dispatch(self),
@@ -204,8 +212,16 @@ impl<FS: Filesystem> Session<FS> {
                             }
                         }
                     }
-                    // Quit loop on illegal request
-                    None => break,
+                    Err(err) => {
+                        warn!("Invalid FUSE request: {err}");
+                        if let Some(errno) = decode_error_errno(&err) {
+                            if let Some(unique) = raw_request_unique(&buf[..size]) {
+                                reply_request_error(&self.ch.sender(), unique, errno);
+                                continue;
+                            }
+                        }
+                        break;
+                    }
                 },
                 Err(err) => match err.raw_os_error() {
                     // Operation interrupted. Accordingly to FUSE, this is safe to retry
@@ -415,11 +431,30 @@ impl<FS: Filesystem> Drop for Session<FS> {
 struct WorkerJob {
     ch: ChannelSender,
     data: Vec<u8>,
+    unique: u64,
+    reply_expected: bool,
 }
 
 impl WorkerJob {
-    fn new(ch: ChannelSender, data: Vec<u8>) -> Self {
-        Self { ch, data }
+    fn new(ch: ChannelSender, data: Vec<u8>, unique: u64, reply_expected: bool) -> Self {
+        Self {
+            ch,
+            data,
+            unique,
+            reply_expected,
+        }
+    }
+
+    fn reply_error(&self, errno: Errno) {
+        if self.reply_expected {
+            reply_request_error(&self.ch, self.unique, errno);
+        }
+    }
+
+    fn reply_decode_error(&self, err: &RequestError) {
+        if let Some(errno) = decode_error_errno(err) {
+            self.reply_error(errno);
+        }
     }
 }
 
@@ -444,51 +479,98 @@ fn spawn_worker_lane<FS: Filesystem + Send + 'static>(
         .name(name.to_string())
         .spawn(move || {
             while let Ok(job) = rx.recv() {
-                if let Some(req) = Request::new(job.ch, &job.data) {
-                    match lane {
-                        DispatchLane::MetaRead => req.dispatch_meta_read_worker(
-                            &filesystem,
-                            allowed.clone(),
-                            session_owner,
-                        ),
-                        DispatchLane::NamespaceMutation => req.dispatch_namespace_mutation_worker(
-                            &filesystem,
-                            allowed.clone(),
-                            session_owner,
-                        ),
-                        DispatchLane::DirStream => req.dispatch_dir_stream_worker(
-                            &filesystem,
-                            allowed.clone(),
-                            session_owner,
-                        ),
-                        DispatchLane::FileRead => req.dispatch_file_read_worker(
-                            &filesystem,
-                            allowed.clone(),
-                            session_owner,
-                        ),
-                        DispatchLane::FileWriteback => req.dispatch_file_writeback_worker(
-                            &filesystem,
-                            &abort_registry,
-                            allowed.clone(),
-                            session_owner,
-                        ),
-                        DispatchLane::LockWait => req.dispatch_lock_wait_worker(
-                            &filesystem,
-                            &abort_registry,
-                            allowed.clone(),
-                            session_owner,
-                        ),
-                        DispatchLane::Maintenance => req.dispatch_maintenance_worker(
-                            &filesystem,
-                            allowed.clone(),
-                            session_owner,
-                        ),
-                        DispatchLane::Inline => {}
-                    }
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    dispatch_worker_job(
+                        &job,
+                        lane,
+                        &filesystem,
+                        &abort_registry,
+                        allowed.clone(),
+                        session_owner,
+                    );
+                }));
+                if result.is_err() {
+                    warn!(
+                        "FUSE {lane:?} worker panicked while handling request {}",
+                        job.unique
+                    );
+                    job.reply_error(Errno::EIO);
                 }
             }
         })?;
     Ok((tx, guard))
+}
+
+fn dispatch_worker_job<FS: Filesystem>(
+    job: &WorkerJob,
+    lane: DispatchLane,
+    filesystem: &Arc<Mutex<FS>>,
+    abort_registry: &AbortRegistry,
+    allowed: SessionACL,
+    session_owner: u32,
+) {
+    match Request::try_new(job.ch.clone(), &job.data) {
+        Ok(req) => match lane {
+            DispatchLane::MetaRead => {
+                req.dispatch_meta_read_worker(filesystem, allowed, session_owner)
+            }
+            DispatchLane::NamespaceMutation => {
+                req.dispatch_namespace_mutation_worker(filesystem, allowed, session_owner)
+            }
+            DispatchLane::DirStream => {
+                req.dispatch_dir_stream_worker(filesystem, allowed, session_owner)
+            }
+            DispatchLane::FileRead => {
+                req.dispatch_file_read_worker(filesystem, allowed, session_owner)
+            }
+            DispatchLane::FileWriteback => req.dispatch_file_writeback_worker(
+                filesystem,
+                abort_registry,
+                allowed,
+                session_owner,
+            ),
+            DispatchLane::LockWait => {
+                req.dispatch_lock_wait_worker(filesystem, abort_registry, allowed, session_owner)
+            }
+            DispatchLane::Maintenance => {
+                req.dispatch_maintenance_worker(filesystem, allowed, session_owner)
+            }
+            DispatchLane::Inline => {}
+        },
+        Err(err) => {
+            warn!("Invalid queued FUSE request {}: {err}", job.unique);
+            job.reply_decode_error(&err);
+        }
+    }
+}
+
+fn decode_error_errno(err: &RequestError) -> Option<Errno> {
+    match err {
+        RequestError::ShortReadHeader(_) => None,
+        RequestError::UnknownOperation(_) => Some(Errno::ENOSYS),
+        RequestError::ShortRead(_, _) | RequestError::InsufficientData => Some(Errno::EIO),
+    }
+}
+
+fn raw_request_unique(data: &[u8]) -> Option<u64> {
+    let header_len = std::mem::size_of::<abi::fuse_in_header>();
+    if data.len() < header_len {
+        return None;
+    }
+
+    let packet_len = u32::from_ne_bytes(data[0..4].try_into().ok()?) as usize;
+    if packet_len < header_len {
+        return None;
+    }
+
+    Some(u64::from_ne_bytes(data[8..16].try_into().ok()?))
+}
+
+fn reply_request_error(ch: &ChannelSender, unique: u64, errno: Errno) {
+    let response = Response::new_error(errno);
+    if let Err(err) = response.with_iovec(crate::ll::RequestId(unique), |iov| ch.send(iov)) {
+        warn!("Request {unique:?}: Failed to send terminal error reply: {err}");
+    }
 }
 
 /// The background session data structure
@@ -567,5 +649,114 @@ impl fmt::Debug for BackgroundSession {
             "BackgroundSession {{ mountpoint: {:?}, guard: JoinGuard<()> }}",
             self.mountpoint
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
+
+    struct NullFS;
+    impl Filesystem for NullFS {}
+
+    fn channel_pair() -> (ChannelSender, File) {
+        let mut fds = [0; 2];
+        // SAFETY: pipe(2) writes two valid fds into the provided two-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe(2) returned ownership of this read fd to the test.
+        let reader = unsafe { File::from_raw_fd(fds[0]) };
+        // SAFETY: pipe(2) returned ownership of this write fd to the test.
+        let writer = unsafe { File::from_raw_fd(fds[1]) };
+        (Channel::new(Arc::new(writer)).sender(), reader)
+    }
+
+    fn request_header(len: u32, opcode: u32, unique: u64) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&len.to_ne_bytes());
+        data.extend_from_slice(&opcode.to_ne_bytes());
+        data.extend_from_slice(&unique.to_ne_bytes());
+        data.extend_from_slice(&0x1122_3344_5566_7788u64.to_ne_bytes());
+        data.extend_from_slice(&1000u32.to_ne_bytes());
+        data.extend_from_slice(&1000u32.to_ne_bytes());
+        data.extend_from_slice(&42u32.to_ne_bytes());
+        data.extend_from_slice(&0u32.to_ne_bytes());
+        data
+    }
+
+    fn read_reply_header(mut reader: File) -> (u32, i32, u64) {
+        let mut header = [0; 16];
+        reader.read_exact(&mut header).unwrap();
+        (
+            u32::from_ne_bytes(header[0..4].try_into().unwrap()),
+            i32::from_ne_bytes(header[4..8].try_into().unwrap()),
+            u64::from_ne_bytes(header[8..16].try_into().unwrap()),
+        )
+    }
+
+    #[test]
+    fn raw_request_unique_requires_a_complete_header() {
+        assert_eq!(raw_request_unique(&[]), None);
+        assert_eq!(raw_request_unique(&request_header(16, 16, 7)), None);
+        assert_eq!(raw_request_unique(&request_header(40, 16, 7)), Some(7));
+    }
+
+    #[test]
+    fn queued_decode_error_replies_to_reply_expected_request() {
+        let unique = 0xfeed_face_cafe_beefu64;
+        let (sender, reader) = channel_pair();
+        let job = WorkerJob::new(
+            sender,
+            request_header(80, abi::fuse_opcode::FUSE_WRITE as u32, unique),
+            unique,
+            true,
+        );
+        let filesystem = Arc::new(Mutex::new(NullFS));
+
+        dispatch_worker_job(
+            &job,
+            DispatchLane::FileWriteback,
+            &filesystem,
+            &AbortRegistry::default(),
+            SessionACL::All,
+            0,
+        );
+
+        let (len, error, got_unique) = read_reply_header(reader);
+        assert_eq!(len, 16);
+        assert_eq!(error, -libc::EIO);
+        assert_eq!(got_unique, unique);
+    }
+
+    #[test]
+    fn no_reply_worker_job_does_not_emit_decode_error_reply() {
+        let unique = 0xabba_cafe_0102_0304u64;
+        let (sender, mut reader) = channel_pair();
+        let job = WorkerJob::new(
+            sender,
+            request_header(80, abi::fuse_opcode::FUSE_WRITE as u32, unique),
+            unique,
+            false,
+        );
+
+        job.reply_error(Errno::EIO);
+        drop(job);
+        let mut byte = [0u8; 1];
+        assert_eq!(reader.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn reply_request_error_writes_terminal_errno() {
+        let unique = 0x1234_5678_9abc_def0u64;
+        let (sender, reader) = channel_pair();
+
+        reply_request_error(&sender, unique, Errno::ENOSYS);
+
+        let (len, error, got_unique) = read_reply_header(reader);
+        assert_eq!(len, 16);
+        assert_eq!(error, -libc::ENOSYS);
+        assert_eq!(got_unique, unique);
     }
 }

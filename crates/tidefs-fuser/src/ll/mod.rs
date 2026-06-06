@@ -11,7 +11,7 @@ use std::{convert::TryInto, num::NonZeroI32, time::SystemTime};
 
 pub use reply::Response;
 pub(crate) use request::{
-    AnyRequest, FileHandle, INodeNo, Lock, Operation, Request, RequestId, Version,
+    AnyRequest, FileHandle, INodeNo, Lock, Operation, Request, RequestError, RequestId, Version,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
