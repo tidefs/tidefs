@@ -78,6 +78,24 @@ impl WriteBuffer {
             .max();
     }
 
+    fn try_append_to_contiguous_tail(&mut self, buf: &[u8], offset: u64, write_end: u64) -> bool {
+        if self.max_offset != Some(offset) {
+            return false;
+        }
+
+        let Some((&segment_start, segment_data)) = self.segments.iter_mut().next_back() else {
+            return false;
+        };
+        if Self::segment_end(segment_start, segment_data) != offset {
+            return false;
+        }
+
+        segment_data.extend_from_slice(buf);
+        self.total_bytes = self.total_bytes.saturating_add(buf.len());
+        self.max_offset = Some(write_end);
+        true
+    }
+
     /// Ingest a write at the given byte offset.
     ///
     /// Contiguous or overlapping writes are merged into sorted dirty segments.
@@ -89,6 +107,9 @@ impl WriteBuffer {
         }
 
         let write_end = offset.saturating_add(buf.len() as u64);
+        if self.try_append_to_contiguous_tail(buf, offset, write_end) {
+            return;
+        }
         let scan_start = self.first_segment_start_ending_at_or_after(offset);
         let mut merged_start = offset;
         let mut merged_end = write_end;
@@ -421,6 +442,76 @@ mod tests {
         assert_eq!(&drained[0].1, b"hello world");
         assert!(wb.is_empty());
         assert_eq!(wb.len(), 0);
+    }
+
+    #[test]
+    fn contiguous_tail_append_preserves_earlier_hole() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"abcdefgh", 0);
+        assert_eq!(wb.clear_range(4, 2), 2);
+        wb.ingest(b"ij", 8);
+
+        assert_eq!(wb.len(), 8);
+        assert_eq!(wb.max_offset(), Some(10));
+        assert_eq!(wb.segments.len(), 2);
+        assert_eq!(
+            wb.read_overlap(0, 10).expect("buffer overlap"),
+            b"abcd\0\0ghij"
+        );
+
+        let drained = wb.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].0, 0);
+        assert_eq!(&drained[0].1, b"abcd");
+        assert_eq!(drained[1].0, 6);
+        assert_eq!(&drained[1].1, b"ghij");
+    }
+
+    #[test]
+    fn long_sequential_512_byte_appends_stay_coalesced() {
+        let mut wb = WriteBuffer::new(WriteBufferConfig {
+            flush_threshold_bytes: 8 * 1024 * 1024,
+            flush_threshold_age: Duration::from_millis(50),
+        });
+        let writes = 4096usize;
+        let write_len = 512usize;
+
+        for index in 0..writes {
+            let mut data = vec![(index % 251) as u8; write_len];
+            data[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            wb.ingest(&data, (index * write_len) as u64);
+        }
+
+        assert_eq!(wb.len(), writes * write_len);
+        assert_eq!(wb.max_offset(), Some((writes * write_len) as u64));
+        assert_eq!(wb.segments.len(), 1);
+
+        let boundary = ((writes / 2) * write_len - 8) as u64;
+        let overlap = wb
+            .read_overlap(boundary, 24)
+            .expect("sequential stream stays readable before drain");
+        let previous_fill = ((writes / 2 - 1) % 251) as u8;
+        assert_eq!(&overlap[..8], &[previous_fill; 8]);
+        assert_eq!(
+            u64::from_le_bytes(overlap[8..16].try_into().expect("marker width")),
+            writes as u64 / 2
+        );
+
+        let drained = wb.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, 0);
+        assert_eq!(drained[0].1.len(), writes * write_len);
+        for index in [0usize, writes / 2, writes - 1] {
+            let base = index * write_len;
+            assert_eq!(
+                u64::from_le_bytes(
+                    drained[0].1[base..base + 8]
+                        .try_into()
+                        .expect("marker width")
+                ),
+                index as u64
+            );
+        }
     }
 
     #[test]
