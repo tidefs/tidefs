@@ -1030,6 +1030,65 @@ const REPLICA_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLICA_ACK_TIMEOUT: Duration = Duration::from_millis(200);
 const REPLICA_ACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+fn validate_read_plan_response_receipt(
+    plan: &ReplicatedReadPlan,
+    payload: &[u8],
+    receipt: PlacementReceiptRef,
+) -> Result<(), String> {
+    if receipt.is_synthetic() {
+        return Err(format!(
+            "read plan for subject {} returned synthetic placement receipt",
+            plan.subject_ref.0
+        ));
+    }
+    if !receipt.redundancy_policy.is_well_formed() {
+        return Err(format!(
+            "read plan for subject {} returned malformed receipt policy",
+            plan.subject_ref.0
+        ));
+    }
+    let required_targets = receipt.redundancy_policy.target_width();
+    if receipt.target_count < required_targets {
+        return Err(format!(
+            "read plan for subject {} returned under-width receipt: targets={} required={}",
+            plan.subject_ref.0, receipt.target_count, required_targets
+        ));
+    }
+    if receipt.object_id != plan.subject_ref.0 {
+        return Err(format!(
+            "read plan subject mismatch: plan={} receipt={}",
+            plan.subject_ref.0, receipt.object_id
+        ));
+    }
+    if receipt.payload_len != payload.len() as u64 {
+        return Err(format!(
+            "read plan receipt length mismatch for subject {}: receipt={} actual={}",
+            plan.subject_ref.0,
+            receipt.payload_len,
+            payload.len()
+        ));
+    }
+    let actual_digest: [u8; 32] = blake3::hash(payload).into();
+    if receipt.payload_digest != actual_digest {
+        return Err(format!(
+            "read plan receipt digest mismatch for subject {}",
+            plan.subject_ref.0
+        ));
+    }
+    Ok(())
+}
+
+fn validate_read_plan_response_payload(
+    plan: &ReplicatedReadPlan,
+    payload: &[u8],
+    placement_receipt_ref: Option<PlacementReceiptRef>,
+) -> Result<(), String> {
+    if let Some(receipt) = placement_receipt_ref {
+        validate_read_plan_response_receipt(plan, payload, receipt)?;
+    }
+    Ok(())
+}
+
 /// Configuration for a transport-backed replicated object store.
 #[derive(Clone, Debug)]
 pub struct TransportReplicatedStoreConfig {
@@ -2029,24 +2088,19 @@ impl TransportReplicatedStore {
 
         // Try the plan's preferred source member via Shadow (e3)
         if let Some(source_ref) = plan.source_member_ref {
-            if let Some(replica) = self.replicas.iter().find(|r| r.node_id == source_ref.0) {
-                let msg = ReplicationMessage::ReadPlan {
-                    plan_bytes: plan_bytes.clone(),
-                };
-
-                if send_replication_msg(&mut self.transport, replica.shadow_session_id, &msg)
-                    .is_ok()
-                {
-                    if let Ok(ReplicationMessage::ReadPlanResponse {
-                        found: true,
-                        payload,
-                        ..
-                    }) = recv_replication_msg(&mut self.transport, replica.shadow_session_id)
-                    {
+            if let Some((node_id, shadow_session_id)) = self
+                .replicas
+                .iter()
+                .find(|r| r.node_id == source_ref.0)
+                .map(|r| (r.node_id, r.shadow_session_id))
+            {
+                match self.request_planned_read(node_id, shadow_session_id, &plan_bytes, plan)? {
+                    Some(payload) => {
                         self.stats.planned_reads += 1;
                         self.stats.degraded_reads += 1;
                         return Ok(Some(payload));
                     }
+                    None => {}
                 }
             }
         }
@@ -2057,30 +2111,71 @@ impl TransportReplicatedStore {
                 continue; // already tried
             }
 
-            if let Some(replica) = self.replicas.iter().find(|r| r.node_id == member_ref.0) {
-                let msg = ReplicationMessage::ReadPlan {
-                    plan_bytes: plan_bytes.clone(),
-                };
-
-                if send_replication_msg(&mut self.transport, replica.shadow_session_id, &msg)
-                    .is_ok()
-                {
-                    if let Ok(ReplicationMessage::ReadPlanResponse {
-                        found: true,
-                        payload,
-                        ..
-                    }) = recv_replication_msg(&mut self.transport, replica.shadow_session_id)
-                    {
+            if let Some((node_id, shadow_session_id)) = self
+                .replicas
+                .iter()
+                .find(|r| r.node_id == member_ref.0)
+                .map(|r| (r.node_id, r.shadow_session_id))
+            {
+                match self.request_planned_read(node_id, shadow_session_id, &plan_bytes, plan)? {
+                    Some(payload) => {
                         self.stats.planned_reads += 1;
                         self.stats.degraded_reads += 1;
                         return Ok(Some(payload));
                     }
+                    None => {}
                 }
             }
         }
 
         self.stats.planned_reads += 1;
         Ok(None)
+    }
+
+    fn request_planned_read(
+        &mut self,
+        node_id: u64,
+        shadow_session_id: SessionId,
+        plan_bytes: &[u8],
+        plan: &ReplicatedReadPlan,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let msg = ReplicationMessage::ReadPlan {
+            plan_bytes: plan_bytes.to_vec(),
+        };
+
+        if let Err(e) = send_replication_msg(&mut self.transport, shadow_session_id, &msg) {
+            eprintln!("send read plan to node {node_id} failed: {e}");
+            return Ok(None);
+        }
+
+        let response = match recv_replication_msg(&mut self.transport, shadow_session_id) {
+            Ok(response) => response,
+            Err(e) => {
+                eprintln!("recv read plan response from node {node_id} failed: {e}");
+                return Ok(None);
+            }
+        };
+
+        let ReplicationMessage::ReadPlanResponse {
+            found,
+            payload,
+            source_member_id,
+            placement_receipt_ref,
+        } = response
+        else {
+            return Ok(None);
+        };
+
+        if !found {
+            return Ok(None);
+        }
+        if source_member_id != node_id {
+            return Err(format!(
+                "read plan response source mismatch: expected node {node_id}, got {source_member_id}"
+            ));
+        }
+        validate_read_plan_response_payload(plan, &payload, placement_receipt_ref)?;
+        Ok(Some(payload))
     }
 
     /// Full write path: generates a write plan from the membership model and
@@ -3549,6 +3644,52 @@ mod tests {
                 payload.len() as u64,
                 *blake3::hash(payload).as_bytes(),
             )
+        }
+
+        fn read_plan_for_subject(object_id: u64) -> ReplicatedReadPlan {
+            ReplicatedReadPlan {
+                subject_ref: ReplicatedSubjectId::new(object_id),
+                source_member_ref: Some(MemberId::new(2)),
+                verified_member_refs: vec![MemberId::new(2)],
+                unavailable_member_refs: Vec::new(),
+                missing_replica_count: 0,
+                read_class: tidefs_replication_model::ReplicatedReadClass::Exact,
+                rebuild_required: false,
+                read_receipt_ref: ReplicatedReceiptId(17),
+            }
+        }
+
+        #[test]
+        fn read_plan_response_receipt_validates_payload_authority() {
+            let payload = b"planned-read-authority";
+            let object_key = tidefs_local_object_store::ObjectKey::from_name(b"planned-read");
+            let receipt = placement_receipt_ref(88, &object_key, payload, 9);
+            let plan = read_plan_for_subject(88);
+
+            validate_read_plan_response_payload(&plan, payload, Some(receipt)).unwrap();
+        }
+
+        #[test]
+        fn read_plan_response_receipt_rejects_digest_mismatch() {
+            let payload = b"planned-read-authority";
+            let object_key = tidefs_local_object_store::ObjectKey::from_name(b"planned-read");
+            let mut receipt = placement_receipt_ref(88, &object_key, payload, 9);
+            receipt.payload_digest = blake3::hash(b"different").into();
+            let plan = read_plan_for_subject(88);
+
+            let err =
+                validate_read_plan_response_payload(&plan, payload, Some(receipt)).unwrap_err();
+            assert!(err.contains("digest mismatch"));
+        }
+
+        #[test]
+        fn read_plan_response_receipt_rejects_synthetic_ref() {
+            let plan = read_plan_for_subject(88);
+            let receipt = PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(88));
+
+            let err =
+                validate_read_plan_response_payload(&plan, b"payload", Some(receipt)).unwrap_err();
+            assert!(err.contains("synthetic"));
         }
 
         #[test]

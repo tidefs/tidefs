@@ -52,7 +52,9 @@ use tidefs_replicated_object_store::{
     ReplicatedObjectStore, ReplicatedStoreConfig, TransportReplicatedStore,
     TransportReplicatedStoreConfig,
 };
-use tidefs_replication_model::{PlacementReceiptRef, ReplicaMovementClass};
+use tidefs_replication_model::{
+    PlacementReceiptRef, ReplicaMovementClass, ReplicatedReadClass, ReplicatedReadPlan,
+};
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
     send_replication_msg, send_segment_fetch_response, PlacementVersionTracker, ReplicationMessage,
@@ -175,6 +177,125 @@ fn sync_entries_from_store(store: &StoreBackend) -> Vec<SyncEntry> {
                     .map(|payload| SyncEntry::with_receipt(key.as_bytes32(), payload, receipt))
             })
             .collect(),
+    }
+}
+
+fn read_plan_object_name(plan: &ReplicatedReadPlan) -> String {
+    format!("obj-{:016x}", plan.subject_ref.0)
+}
+
+fn validate_read_plan_response_receipt(
+    plan: &ReplicatedReadPlan,
+    payload: &[u8],
+    receipt: PlacementReceiptRef,
+) -> Result<(), String> {
+    if receipt.is_synthetic() {
+        return Err(format!(
+            "read plan for subject {} would return synthetic placement receipt",
+            plan.subject_ref.0
+        ));
+    }
+    if !receipt.redundancy_policy.is_well_formed() {
+        return Err(format!(
+            "read plan for subject {} would return malformed receipt policy",
+            plan.subject_ref.0
+        ));
+    }
+    let required_targets = receipt.redundancy_policy.target_width();
+    if receipt.target_count < required_targets {
+        return Err(format!(
+            "read plan for subject {} would return under-width receipt: targets={} required={}",
+            plan.subject_ref.0, receipt.target_count, required_targets
+        ));
+    }
+    if receipt.object_id != plan.subject_ref.0 {
+        return Err(format!(
+            "read plan subject mismatch: plan={} receipt={}",
+            plan.subject_ref.0, receipt.object_id
+        ));
+    }
+    if receipt.payload_len != payload.len() as u64 {
+        return Err(format!(
+            "read plan receipt length mismatch for subject {}: receipt={} actual={}",
+            plan.subject_ref.0,
+            receipt.payload_len,
+            payload.len()
+        ));
+    }
+    let actual_digest: [u8; 32] = blake3::hash(payload).into();
+    if receipt.payload_digest != actual_digest {
+        return Err(format!(
+            "read plan receipt digest mismatch for subject {}",
+            plan.subject_ref.0
+        ));
+    }
+    Ok(())
+}
+
+fn read_plan_payload_from_store(
+    store: &StoreBackend,
+    plan: &ReplicatedReadPlan,
+) -> Result<Option<(Vec<u8>, Option<PlacementReceiptRef>)>, String> {
+    if plan.read_class == ReplicatedReadClass::Unavailable {
+        return Ok(None);
+    }
+
+    let name = read_plan_object_name(plan);
+    match store {
+        StoreBackend::Local(rs) => rs
+            .get_local(&name)
+            .map(|payload| payload.map(|payload| (payload, None))),
+        StoreBackend::TransportBacked(ts) => ts
+            .get_local(&name)
+            .map(|payload| payload.map(|payload| (payload, None))),
+        StoreBackend::PoolBacked(pool) => {
+            let key = pool_name_key(name.as_bytes());
+            let Some(payload) = pool_get_key(pool, key)? else {
+                return Ok(None);
+            };
+            let receipt = pool_placement_receipt_ref_for_key(pool, key, plan.subject_ref.0)?;
+            validate_read_plan_response_receipt(plan, &payload, receipt)?;
+            Ok(Some((payload, Some(receipt))))
+        }
+    }
+}
+
+fn read_plan_response_from_store(
+    store: &StoreBackend,
+    plan_bytes: &[u8],
+    source_member_id: u64,
+) -> ReplicationMessage {
+    let plan = match bincode::deserialize::<ReplicatedReadPlan>(plan_bytes) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return ReplicationMessage::ReadPlanResponse {
+                found: false,
+                payload: format!("read plan decode: {e}").into_bytes(),
+                source_member_id,
+                placement_receipt_ref: None,
+            };
+        }
+    };
+
+    match read_plan_payload_from_store(store, &plan) {
+        Ok(Some((payload, placement_receipt_ref))) => ReplicationMessage::ReadPlanResponse {
+            found: true,
+            payload,
+            source_member_id,
+            placement_receipt_ref,
+        },
+        Ok(None) => ReplicationMessage::ReadPlanResponse {
+            found: false,
+            payload: Vec::new(),
+            source_member_id,
+            placement_receipt_ref: None,
+        },
+        Err(e) => ReplicationMessage::ReadPlanResponse {
+            found: false,
+            payload: e.into_bytes(),
+            source_member_id,
+            placement_receipt_ref: None,
+        },
     }
 }
 
@@ -2055,6 +2176,10 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     let s = ctx.store.lock().unwrap();
                     let entries = sync_entries_from_store(&s);
                     ReplicationMessage::SyncResponse { entries }
+                }
+                ReplicationMessage::ReadPlan { plan_bytes } => {
+                    let s = ctx.store.lock().unwrap();
+                    read_plan_response_from_store(&s, plan_bytes, ctx.config.node_id)
                 }
                 ReplicationMessage::ScrubRequest => {
                     let s = ctx.store.lock().unwrap();
@@ -4039,6 +4164,23 @@ mod cluster_pool_handler_tests {
         receipt_ref_for_key(ObjectKey::from_name(name), payload, generation)
     }
 
+    fn read_plan(subject_id: u64) -> ReplicatedReadPlan {
+        ReplicatedReadPlan {
+            subject_ref: tidefs_replication_model::ReplicatedSubjectId::new(subject_id),
+            source_member_ref: Some(MemberId::new(1)),
+            verified_member_refs: vec![MemberId::new(1)],
+            unavailable_member_refs: Vec::new(),
+            missing_replica_count: 0,
+            read_class: ReplicatedReadClass::Exact,
+            rebuild_required: false,
+            read_receipt_ref: tidefs_replication_model::ReplicatedReceiptId(1),
+        }
+    }
+
+    fn encode_read_plan(plan: &ReplicatedReadPlan) -> Vec<u8> {
+        bincode::serialize(plan).unwrap()
+    }
+
     #[test]
     fn sync_entries_preserve_object_key_identity() {
         let dir = tempfile::tempdir().unwrap();
@@ -4056,6 +4198,79 @@ mod cluster_pool_handler_tests {
         );
         assert_eq!(entries[0].payload, b"payload".to_vec());
         assert_eq!(entries[0].placement_receipt_ref, None);
+    }
+
+    #[test]
+    fn local_backend_read_plan_response_is_receiptless() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().join("store")];
+        let mut store =
+            ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
+        let plan = read_plan(88);
+        let object_name = read_plan_object_name(&plan);
+        store.put_named(&object_name, b"planned-payload").unwrap();
+        let backend = StoreBackend::Local(Box::new(store));
+
+        let response = read_plan_response_from_store(&backend, &encode_read_plan(&plan), 1);
+
+        match response {
+            ReplicationMessage::ReadPlanResponse {
+                found,
+                payload,
+                source_member_id,
+                placement_receipt_ref,
+            } => {
+                assert!(found);
+                assert_eq!(payload, b"planned-payload".to_vec());
+                assert_eq!(source_member_id, 1);
+                assert_eq!(placement_receipt_ref, None);
+            }
+            other => panic!("expected ReadPlanResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pool_backend_read_plan_response_carries_receipt_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let mut backend = StoreBackend::PoolBacked(Box::new(
+            open_imported_pool_backend(&imported, &lock_dir).unwrap(),
+        ));
+        let plan = read_plan(88);
+        let object_name = read_plan_object_name(&plan);
+        let object_key = ObjectKey::from_name(object_name.as_bytes());
+
+        if let StoreBackend::PoolBacked(pool) = &mut backend {
+            pool_put_named(pool, object_name.as_bytes(), b"pool-planned-payload").unwrap();
+        }
+
+        let response = read_plan_response_from_store(&backend, &encode_read_plan(&plan), 1);
+
+        match response {
+            ReplicationMessage::ReadPlanResponse {
+                found,
+                payload,
+                source_member_id,
+                placement_receipt_ref,
+            } => {
+                assert!(found);
+                assert_eq!(payload, b"pool-planned-payload".to_vec());
+                assert_eq!(source_member_id, 1);
+                let receipt = placement_receipt_ref.expect("pool read plan carries receipt");
+                assert!(!receipt.is_synthetic());
+                assert_eq!(receipt.object_id, plan.subject_ref.0);
+                assert_eq!(receipt.object_key, object_key.as_bytes32());
+                assert_eq!(receipt.payload_len, payload.len() as u64);
+                let expected_digest: [u8; 32] = blake3::hash(&payload).into();
+                assert_eq!(receipt.payload_digest, expected_digest);
+                assert_eq!(receipt.target_count, 2);
+            }
+            other => panic!("expected ReadPlanResponse, got {other:?}"),
+        }
     }
 
     fn assert_scrub_ack(report_json: String, findings_count: u64, expected_success: bool) {

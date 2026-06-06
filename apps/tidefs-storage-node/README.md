@@ -102,6 +102,7 @@ deserialization for `tidefs_transport::ReplicationMessage`.
 | `Get { name }` | Reads from local primary store; responds `GetResponse` |
 | `Delete { name, generation }` | Deletes from local primary store; responds `DeleteAck` |
 | `SyncRequest` | Lists exact object payloads; responds `SyncResponse` entries with `PlacementReceiptRef` authority when the backend exposes pool receipts |
+| `ReadPlan { plan_bytes }` | Serves the planned subject locally; pool-backed responses carry a validated `PlacementReceiptRef`, while compatibility backends stay receipt-less |
 | `ScrubRequest` | Runs local segment scrub and reports findings plus receipt-inventory disclosure |
 | `RepairObject { key, placement_receipt_ref, authoritative_payload }` | Validates the shared placement receipt against the exact 32-byte object key, length, digest, policy, and target width before local repair write; responds `RepairObjectAck` |
 
