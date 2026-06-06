@@ -37,8 +37,8 @@ use std::collections::BTreeMap;
 use tidefs_locator_table::{ExtentId, LocatorError, LocatorTable};
 use tidefs_membership_epoch::{MemberId, StorageTier, StorageTierPolicy};
 use tidefs_replication_model::{
-    FlowScopeSelector, RelocationBatchRecord, RelocationFlowRecord, RelocationFlowState,
-    RelocationReasonClass, ReplicaPlacementIntentRecord, ReplicatedReceiptId,
+    FlowScopeSelector, PlacementReceiptRef, RelocationBatchRecord, RelocationFlowRecord,
+    RelocationFlowState, RelocationReasonClass, ReplicaPlacementIntentRecord, ReplicatedReceiptId,
 };
 
 // ── Relocation trigger ───────────────────────────────────────────────
@@ -126,6 +126,11 @@ pub enum RelocationGate {
         relocated_subject_count: u64,
         total_subject_count: u64,
     },
+    /// Replacement placement has durable receipt authority.
+    ReplacementPlacementReceipts {
+        durable_receipts: usize,
+        required: usize,
+    },
     /// Freshness fence hasn't expired during relocation.
     FreshnessFenceCurrent { fence_ns: u64, now_ns: u64 },
 }
@@ -173,6 +178,18 @@ impl RelocationGate {
                 } else {
                     GateResult::Blocked(format!(
                         "source retire unsafe: {relocated_subject_count}/{total_subject_count} relocated"
+                    ))
+                }
+            }
+            Self::ReplacementPlacementReceipts {
+                durable_receipts,
+                required,
+            } => {
+                if durable_receipts >= required {
+                    GateResult::Passed
+                } else {
+                    GateResult::Blocked(format!(
+                        "source retire unsafe: {durable_receipts}/{required} durable replacement placement receipts"
                     ))
                 }
             }
@@ -404,6 +421,7 @@ impl RelocationPlanner {
             pointer_move_ready: false,
             source_retire_ready: false,
             verification_refs: Vec::new(),
+            placement_receipt_refs: Vec::new(),
         };
         self.batches.insert(batch_id, batch);
 
@@ -424,16 +442,39 @@ impl RelocationPlanner {
         now_ns: u64,
         fence_ns: u64,
     ) -> FlowAdvanceResult {
+        self.mark_pointer_move_ready_with_receipts(
+            flow_id,
+            batch_id,
+            verification_refs,
+            &[],
+            now_ns,
+            fence_ns,
+        )
+    }
+
+    /// Mark transfer complete with replacement placement receipt evidence.
+    ///
+    /// Verification-only callers may still use [`Self::mark_pointer_move_ready`]
+    /// to diagnose copy/verification progress, but source retirement requires
+    /// the durable placement receipts carried here.
+    pub fn mark_pointer_move_ready_with_receipts(
+        &mut self,
+        flow_id: u64,
+        batch_id: u64,
+        verification_refs: &[ReplicatedReceiptId],
+        placement_receipt_refs: &[PlacementReceiptRef],
+        now_ns: u64,
+        fence_ns: u64,
+    ) -> FlowAdvanceResult {
         let flow = match self.flows.get(&flow_id) {
             Some(f) if f.state == RelocationFlowState::Transferring => f.clone(),
             Some(f) => return FlowAdvanceResult::InvalidState(f.state),
             None => return FlowAdvanceResult::NotFound,
         };
 
-        // Update batch with verification refs
-        if let Some(batch) = self.batches.get_mut(&batch_id) {
-            batch.verification_refs = verification_refs.to_vec();
-            batch.pointer_move_ready = true;
+        match self.batches.get(&batch_id) {
+            Some(batch) if batch.relocation_flow_ref == flow_id => {}
+            Some(_) | None => return FlowAdvanceResult::NotFound,
         }
 
         // Evaluate gates
@@ -450,8 +491,11 @@ impl RelocationPlanner {
         self.evaluated_gates
             .push((pointer_gate, pointer_result.clone()));
 
-        if !fence_result.is_passed() || !pointer_result.is_passed() {
-            let reasons: Vec<String> = [
+        let (_, receipt_reasons) =
+            Self::classify_placement_receipts(batch_id, placement_receipt_refs, false);
+
+        if !fence_result.is_passed() || !pointer_result.is_passed() || !receipt_reasons.is_empty() {
+            let mut reasons: Vec<String> = [
                 fence_result.blocked_reason(),
                 pointer_result.blocked_reason(),
             ]
@@ -459,11 +503,18 @@ impl RelocationPlanner {
             .flatten()
             .map(|s| s.to_string())
             .collect();
+            reasons.extend(receipt_reasons);
 
             let mut blocked = flow;
             blocked.state = RelocationFlowState::Blocked;
             self.flows.insert(flow_id, blocked);
             return FlowAdvanceResult::Blocked(reasons);
+        }
+
+        if let Some(batch) = self.batches.get_mut(&batch_id) {
+            batch.verification_refs = verification_refs.to_vec();
+            batch.placement_receipt_refs = placement_receipt_refs.to_vec();
+            batch.pointer_move_ready = true;
         }
 
         let mut ready = flow;
@@ -482,6 +533,63 @@ impl RelocationPlanner {
             Some(f) => return FlowAdvanceResult::InvalidState(f.state),
             None => return FlowAdvanceResult::NotFound,
         };
+
+        let batch_ids: Vec<u64> = self
+            .batches
+            .iter()
+            .filter_map(|(batch_id, batch)| {
+                (batch.relocation_flow_ref == flow_id).then_some(*batch_id)
+            })
+            .collect();
+
+        let mut reasons = Vec::new();
+        if batch_ids.is_empty() {
+            reasons.push(format!(
+                "source retire unsafe: relocation flow {flow_id} has no batches"
+            ));
+        }
+
+        for batch_id in &batch_ids {
+            let batch = &self.batches[batch_id];
+            if !batch.pointer_move_ready {
+                reasons.push(format!(
+                    "source retire unsafe: relocation batch {batch_id} is not pointer-move ready"
+                ));
+            }
+
+            let (durable_receipts, receipt_reasons) =
+                Self::classify_placement_receipts(*batch_id, &batch.placement_receipt_refs, true);
+            let receipt_gate = RelocationGate::ReplacementPlacementReceipts {
+                durable_receipts,
+                required: 1,
+            };
+            let receipt_result = receipt_gate.evaluate();
+            self.evaluated_gates
+                .push((receipt_gate, receipt_result.clone()));
+            if !receipt_result.is_passed() {
+                reasons.push(
+                    receipt_result
+                        .blocked_reason()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                );
+            }
+
+            reasons.extend(receipt_reasons);
+        }
+
+        if !reasons.is_empty() {
+            let mut blocked = flow;
+            blocked.state = RelocationFlowState::Blocked;
+            self.flows.insert(flow_id, blocked);
+            return FlowAdvanceResult::Blocked(reasons);
+        }
+
+        for batch_id in batch_ids {
+            if let Some(batch) = self.batches.get_mut(&batch_id) {
+                batch.source_retire_ready = true;
+            }
+        }
 
         let mut committed = flow;
         committed.state = RelocationFlowState::SourceRetireReady;
@@ -620,6 +728,48 @@ impl RelocationPlanner {
     #[must_use]
     pub fn drain_gates(&mut self) -> Vec<(RelocationGate, GateResult)> {
         std::mem::take(&mut self.evaluated_gates)
+    }
+
+    fn classify_placement_receipts(
+        batch_id: u64,
+        placement_receipt_refs: &[PlacementReceiptRef],
+        require_non_empty: bool,
+    ) -> (usize, Vec<String>) {
+        let mut durable_receipts = 0;
+        let mut reasons = Vec::new();
+        if require_non_empty && placement_receipt_refs.is_empty() {
+            reasons.push(format!(
+                "source retire unsafe: relocation batch {batch_id} has no replacement placement receipts"
+            ));
+        }
+
+        for receipt in placement_receipt_refs {
+            if receipt.is_synthetic() {
+                reasons.push(format!(
+                    "source retire unsafe: relocation batch {batch_id} placement receipt for object {} is synthetic",
+                    receipt.object_id
+                ));
+                continue;
+            }
+            if !receipt.redundancy_policy.is_well_formed() {
+                reasons.push(format!(
+                    "source retire unsafe: relocation batch {batch_id} placement receipt for object {} has malformed redundancy policy",
+                    receipt.object_id
+                ));
+                continue;
+            }
+            let required = receipt.redundancy_policy.target_width();
+            if receipt.target_count < required {
+                reasons.push(format!(
+                    "source retire unsafe: relocation batch {batch_id} placement receipt for object {} has {} targets, needs {}",
+                    receipt.object_id, receipt.target_count, required
+                ));
+                continue;
+            }
+            durable_receipts += 1;
+        }
+
+        (durable_receipts, reasons)
     }
 
     // ── Tiering awareness ──────────────────────────────────────────
@@ -2157,6 +2307,40 @@ mod tests {
         }
     }
 
+    fn receipt_key(object_id: u64) -> [u8; 32] {
+        let mut key = [0xA5; 32];
+        key[..8].copy_from_slice(&object_id.to_le_bytes());
+        key
+    }
+
+    fn receipt_digest(object_id: u64, generation: u64) -> [u8; 32] {
+        let mut digest = [0x5A; 32];
+        digest[..8].copy_from_slice(&object_id.to_le_bytes());
+        digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        digest
+    }
+
+    fn placement_receipt(object_id: u64, generation: u64) -> PlacementReceiptRef {
+        PlacementReceiptRef::replicated(
+            object_id,
+            receipt_key(object_id),
+            tidefs_membership_epoch::EpochId::new(1),
+            generation,
+            2,
+            4096,
+            receipt_digest(object_id, generation),
+        )
+    }
+
+    fn planner_in_transferring() -> (RelocationPlanner, u64) {
+        let mut planner = RelocationPlanner::new(1);
+        let trigger = make_trigger(RelocationReasonClass::Administrative);
+        let flow_id = planner.open_relocation_flow(&trigger).unwrap();
+        planner.begin_planning(flow_id, 2000);
+        planner.begin_transfer(flow_id, &[1, 2, 3], 3000);
+        (planner, flow_id)
+    }
+
     #[test]
     fn full_lifecycle_reclaim_flow() {
         let mut planner = RelocationPlanner::new(1);
@@ -2188,10 +2372,12 @@ mod tests {
         );
 
         // Pointer move ready
-        let result = planner.mark_pointer_move_ready(
+        let receipt = placement_receipt(1, 20);
+        let result = planner.mark_pointer_move_ready_with_receipts(
             flow_id,
             1,
             &[ReplicatedReceiptId(10)],
+            &[receipt],
             4000,
             5000, // fence valid until 5000 > now 4000
         );
@@ -2208,6 +2394,7 @@ mod tests {
             planner.get_flow(flow_id).unwrap().state,
             RelocationFlowState::SourceRetireReady
         );
+        assert!(planner.get_batch(1).unwrap().source_retire_ready);
 
         // Retire source — all 100 subjects relocated
         let result = planner.retire_source(flow_id, 100, 100, 6000);
@@ -2361,13 +2548,89 @@ mod tests {
     }
 
     #[test]
+    fn verification_only_pointer_move_cannot_reach_source_retire_ready() {
+        let (mut planner, flow_id) = planner_in_transferring();
+
+        let result =
+            planner.mark_pointer_move_ready(flow_id, 1, &[ReplicatedReceiptId(10)], 4000, 5000);
+        assert!(result.is_advanced());
+        assert!(planner
+            .get_batch(1)
+            .unwrap()
+            .placement_receipt_refs
+            .is_empty());
+
+        let result = planner.commit_pointer_move(flow_id, 5000);
+        match result {
+            FlowAdvanceResult::Blocked(reasons) => assert!(reasons
+                .iter()
+                .any(|reason| reason.contains("replacement placement receipts"))),
+            other => panic!("expected receipt gate block, got {other:?}"),
+        }
+        assert_eq!(
+            planner.get_flow(flow_id).unwrap().state,
+            RelocationFlowState::Blocked
+        );
+        assert!(!planner.get_batch(1).unwrap().source_retire_ready);
+    }
+
+    #[test]
+    fn pointer_move_receipt_gate_rejects_bad_receipt_refs() {
+        let synthetic = PlacementReceiptRef::synthetic_for_subject(
+            tidefs_replication_model::ReplicatedSubjectId::new(1),
+        );
+        let malformed = PlacementReceiptRef::new(
+            1,
+            receipt_key(1),
+            tidefs_membership_epoch::EpochId::new(1),
+            1,
+            tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies: 0 },
+            4096,
+            receipt_digest(1, 1),
+            0,
+        );
+        let mut under_width = placement_receipt(1, 2);
+        under_width.target_count = 1;
+
+        for (receipt, needle) in [
+            (synthetic, "synthetic"),
+            (malformed, "malformed redundancy policy"),
+            (under_width, "needs 2"),
+        ] {
+            let (mut planner, flow_id) = planner_in_transferring();
+            let result = planner.mark_pointer_move_ready_with_receipts(
+                flow_id,
+                1,
+                &[ReplicatedReceiptId(10)],
+                &[receipt],
+                4000,
+                5000,
+            );
+            match result {
+                FlowAdvanceResult::Blocked(reasons) => {
+                    assert!(reasons.iter().any(|reason| reason.contains(needle)));
+                }
+                other => panic!("expected bad receipt gate block, got {other:?}"),
+            }
+            assert_eq!(
+                planner.get_flow(flow_id).unwrap().state,
+                RelocationFlowState::Blocked
+            );
+        }
+    }
+
+    #[test]
     fn source_retire_safe_gate_blocks_partial_relocation() {
-        let mut planner = RelocationPlanner::new(1);
-        let trigger = make_trigger(RelocationReasonClass::Administrative);
-        let flow_id = planner.open_relocation_flow(&trigger).unwrap();
-        planner.begin_planning(flow_id, 2000);
-        planner.begin_transfer(flow_id, &[1, 2, 3], 3000);
-        planner.mark_pointer_move_ready(flow_id, 1, &[ReplicatedReceiptId(10)], 4000, 5000);
+        let (mut planner, flow_id) = planner_in_transferring();
+        let receipt = placement_receipt(1, 30);
+        planner.mark_pointer_move_ready_with_receipts(
+            flow_id,
+            1,
+            &[ReplicatedReceiptId(10)],
+            &[receipt],
+            4000,
+            5000,
+        );
         planner.commit_pointer_move(flow_id, 5000);
 
         // Only 50 of 100 subjects relocated
