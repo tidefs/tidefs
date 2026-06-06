@@ -3839,6 +3839,8 @@ fn hot_read_cache_hits_repeated_reads_and_invalidates_on_write() {
     fs.create_file("/hot.txt", 0o644).expect("create file");
     fs.write_file("/hot.txt", 0, b"hot read bytes")
         .expect("write hot bytes");
+    fs.flush_all_write_buffers()
+        .expect("publish baseline hot bytes");
 
     assert_eq!(
         fs.read_file("/hot.txt").expect("first read"),

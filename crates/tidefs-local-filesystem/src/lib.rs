@@ -5422,6 +5422,7 @@ impl LocalFileSystem {
         }
 
         let mut patches = Vec::with_capacity(chunks.len());
+        let mut base_layout = None;
         for chunk in chunks.into_values() {
             let overlay_len_u64 =
                 chunk
@@ -5446,13 +5447,21 @@ impl LocalFileSystem {
                         requested: base_len_u64,
                     })?;
                 if base_len > 0 {
-                    let base = read_content_range_from_store(
+                    if base_layout.is_none() {
+                        base_layout = Some(read_content_layout_from_store(
+                            self.store.raw_primary_store(),
+                            inode_id,
+                            base_record,
+                            true,
+                        )?);
+                    }
+                    let base = read_content_range_from_layout(
                         self.store.raw_primary_store(),
-                        inode_id,
-                        base_record,
+                        base_layout
+                            .as_ref()
+                            .expect("base layout loaded before buffered overlay read"),
                         chunk.start,
                         base_len,
-                        true,
                     )?;
                     overlay[..base.len()].copy_from_slice(&base);
                 }
@@ -5625,8 +5634,6 @@ impl LocalFileSystem {
             expiration_deadline: None,
         });
 
-        self.invalidate_hot_read_cache_for_inode(inode_id);
-        self.inode_cache.borrow_mut().invalidate(inode_id);
         self.mark_inode_metadata_dirty(inode_id);
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, record.clone());
         self.inode_cache.borrow_mut().invalidate(inode_id);
@@ -6095,13 +6102,11 @@ impl LocalFileSystem {
                     requested: base_len_u64,
                 })?;
             if base_len > 0 {
-                let base = read_content_range_from_store(
-                    self.store.raw_primary_store(),
+                let base = self.read_content_range_with_layout_cache(
                     inode_id,
                     &base_record,
                     offset,
                     base_len,
-                    true,
                 )?;
                 if base.len() > base_len {
                     return Err(FileSystemError::CorruptState {
@@ -8591,8 +8596,6 @@ impl LocalFileSystem {
             expiration_deadline: None,
         });
 
-        self.invalidate_hot_read_cache_for_inode(inode_id);
-        self.inode_cache.borrow_mut().invalidate(inode_id);
         // Capture old record in mutation delta BEFORE replacing it
         self.mark_inode_metadata_dirty(inode_id);
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, record.clone());
@@ -8704,8 +8707,6 @@ impl LocalFileSystem {
             expiration_deadline: None,
         });
 
-        self.invalidate_hot_read_cache_for_inode(inode_id);
-        self.inode_cache.borrow_mut().invalidate(inode_id);
         // Capture old record in mutation delta BEFORE replacing it
         self.mark_inode_metadata_dirty(inode_id);
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, record.clone());
@@ -10228,6 +10229,42 @@ impl LocalFileSystem {
             return Ok(bytes[start..end].to_vec());
         }
 
+        self.read_content_range_with_layout_cache(inode_id, record, offset, clipped_len)
+    }
+
+    fn read_content_range_with_layout_cache(
+        &self,
+        inode_id: InodeId,
+        record: &InodeRecord,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        if length == 0 || offset >= record.size {
+            return Ok(Vec::new());
+        }
+
+        let length_u64 = u64::try_from(length).map_err(|_| FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+        let available = record.size - offset;
+        let clipped_len_u64 = available.min(length_u64);
+        let clipped_len =
+            usize::try_from(clipped_len_u64).map_err(|_| FileSystemError::SizeOverflow {
+                requested: clipped_len_u64,
+            })?;
+
+        let role = HotReadCacheObjectRole::from_node_kind(record.kind()).ok_or(
+            FileSystemError::NotFile {
+                path: format!("inode:{}", inode_id.get()),
+                kind: record.kind(),
+            },
+        )?;
+        let key = HotReadCacheKey {
+            role,
+            inode_id: inode_id.get(),
+            data_version: record.data_version,
+            size: record.size,
+        };
         if let Some(layout) = self.content_layout_cache.borrow().get(&key).cloned() {
             return read_content_range_from_layout(
                 self.store.raw_primary_store(),

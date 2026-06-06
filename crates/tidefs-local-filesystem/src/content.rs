@@ -1524,30 +1524,6 @@ pub(crate) fn read_chunked_content(
     Ok(out)
 }
 
-pub(crate) fn read_content_range_from_store(
-    store: &LocalObjectStore,
-    inode_id: InodeId,
-    record: &InodeRecord,
-    offset: u64,
-    len: usize,
-    allow_v0390_fixed_content: bool,
-) -> Result<Vec<u8>> {
-    if len == 0 || offset >= record.size {
-        return Ok(Vec::new());
-    }
-    let len_u64 = u64::try_from(len).map_err(|_| FileSystemError::SizeOverflow {
-        requested: u64::MAX,
-    })?;
-    let available = record.size - offset;
-    let clipped_len =
-        usize::try_from(available.min(len_u64)).map_err(|_| FileSystemError::SizeOverflow {
-            requested: available,
-        })?;
-    let layout =
-        read_content_layout_from_store(store, inode_id, record, allow_v0390_fixed_content)?;
-    read_content_range_from_layout(store, &layout, offset, clipped_len)
-}
-
 pub(crate) fn read_content_range_from_layout(
     store: &LocalObjectStore,
     layout: &ContentLayout,

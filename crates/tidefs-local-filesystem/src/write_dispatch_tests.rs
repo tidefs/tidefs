@@ -1724,6 +1724,54 @@ fn foreground_threshold_flush_publishes_one_batch_per_write() {
 }
 
 #[test]
+fn buffered_sparse_range_reads_populate_layout_cache_without_whole_file_admission() {
+    let (mut fs, root) = wb_open_temp("buffered-sparse-range-layout-cache");
+    let chunk = content_chunk_size() as usize;
+    let file_len = 256 * 1024 * 1024usize;
+    assert!(file_len % chunk == 0);
+
+    fs.create_file("/sparse.bin", 0o644).expect("create");
+    fs.truncate_file("/sparse.bin", file_len as u64)
+        .expect("sparse truncate");
+    assert_eq!(
+        fs.content_layout_cache_len_for_test(),
+        0,
+        "sparse truncate should not prefill the layout cache"
+    );
+
+    let offset = (file_len / 2 + 512) as u64;
+    let payload = vec![0x5a_u8; 512];
+    fs.write_file("/sparse.bin", offset, &payload)
+        .expect("stage sparse write");
+    assert_eq!(
+        fs.content_layout_cache_len_for_test(),
+        0,
+        "buffered write ingestion should not decode the committed layout"
+    );
+
+    let read = fs
+        .read_file_range("/sparse.bin", offset - 128, payload.len() + 256)
+        .expect("read dirty sparse range");
+    let mut expected = vec![0_u8; payload.len() + 256];
+    expected[128..128 + payload.len()].copy_from_slice(&payload);
+    assert_eq!(read, expected);
+    assert_eq!(
+        fs.content_layout_cache_len_for_test(),
+        1,
+        "dirty overlay reads should cache the decoded committed layout"
+    );
+    let report = fs.hot_read_cache_report();
+    assert_eq!(
+        report.insertions, 0,
+        "range overlay reads must not admit a 256 MiB whole-file cache entry"
+    );
+    assert_eq!(report.resident_bytes, 0);
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn sparse_512_byte_autoflush_preserves_holes_across_batches() {
     let (mut fs, root) = wb_open_temp("sparse-512-autoflush");
     let chunk = content_chunk_size() as usize;
