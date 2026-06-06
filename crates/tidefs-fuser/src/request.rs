@@ -29,8 +29,12 @@ use crate::{ll, KernelConfig};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DispatchLane {
     Inline,
+    MetaRead,
+    NamespaceMutation,
+    DirStream,
     FileRead,
     FileWriteback,
+    LockWait,
     Maintenance,
 }
 
@@ -127,7 +131,25 @@ impl<'a> Request<'a> {
             return DispatchLane::Inline;
         };
         match op {
+            ll::Operation::Lookup(_)
+            | ll::Operation::GetAttr(_)
+            | ll::Operation::ReadLink(_)
+            | ll::Operation::StatFs(_)
+            | ll::Operation::GetXAttr(_)
+            | ll::Operation::ListXAttr(_)
+            | ll::Operation::Access(_)
+            | ll::Operation::BMap(_) => DispatchLane::MetaRead,
+            #[cfg(feature = "abi-7-30")]
+            ll::Operation::Statx(_) => DispatchLane::MetaRead,
+            ll::Operation::OpenDir(_)
+            | ll::Operation::ReadDir(_)
+            | ll::Operation::ReleaseDir(_)
+            | ll::Operation::FSyncDir(_) => DispatchLane::DirStream,
+            #[cfg(feature = "abi-7-21")]
+            ll::Operation::ReadDirPlus(_) => DispatchLane::DirStream,
             ll::Operation::Open(_) | ll::Operation::Read(_) => DispatchLane::FileRead,
+            #[cfg(feature = "abi-7-11")]
+            ll::Operation::IoCtl(_) => DispatchLane::FileRead,
             #[cfg(feature = "abi-7-11")]
             ll::Operation::Poll(_) => DispatchLane::FileRead,
             #[cfg(feature = "abi-7-24")]
@@ -139,21 +161,28 @@ impl<'a> Request<'a> {
             | ll::Operation::SymLink(_)
             | ll::Operation::Rename(_)
             | ll::Operation::Link(_)
-            | ll::Operation::SetAttr(_)
+            | ll::Operation::SetXAttr(_)
+            | ll::Operation::RemoveXAttr(_)
+            | ll::Operation::Create(_)
+            | ll::Operation::Exchange(_) => DispatchLane::NamespaceMutation,
+            #[cfg(feature = "abi-7-23")]
+            ll::Operation::Rename2(_) => DispatchLane::NamespaceMutation,
+            ll::Operation::SetAttr(_)
             | ll::Operation::Write(_)
             | ll::Operation::Flush(_)
             | ll::Operation::Release(_)
-            | ll::Operation::FSync(_)
-            | ll::Operation::SetXAttr(_)
-            | ll::Operation::RemoveXAttr(_)
-            | ll::Operation::Create(_) => DispatchLane::FileWriteback,
+            | ll::Operation::FSync(_) => DispatchLane::FileWriteback,
             #[cfg(feature = "abi-7-19")]
             ll::Operation::FAllocate(_) => DispatchLane::FileWriteback,
-            #[cfg(feature = "abi-7-23")]
-            ll::Operation::Rename2(_) => DispatchLane::FileWriteback,
             #[cfg(feature = "abi-7-28")]
             ll::Operation::CopyFileRange(_) => DispatchLane::FileWriteback,
-            ll::Operation::Exchange(_) => DispatchLane::FileWriteback,
+            #[cfg(feature = "abi-7-31")]
+            ll::Operation::SyncFs(_) => DispatchLane::FileWriteback,
+            ll::Operation::GetLk(_) | ll::Operation::SetLk(_) | ll::Operation::SetLkW(_) => {
+                DispatchLane::LockWait
+            }
+            #[cfg(feature = "abi-7-32")]
+            ll::Operation::Flock(_) => DispatchLane::LockWait,
             ll::Operation::Forget(_) => DispatchLane::Maintenance,
             #[cfg(feature = "abi-7-16")]
             ll::Operation::BatchForget(_) => DispatchLane::Maintenance,
@@ -161,14 +190,148 @@ impl<'a> Request<'a> {
         }
     }
 
-    pub(crate) fn reply_io_error(&self) {
+    pub(crate) fn reply_error(&self, errno: Errno) {
         let unique = self.request.unique();
         let res = self
             .request
-            .reply_err(Errno::EIO)
+            .reply_err(errno)
             .with_iovec(unique, |iov| self.ch.send(iov));
         if let Err(err) = res {
-            warn!("Request {unique:?}: Failed to send EIO reply: {err}")
+            warn!("Request {unique:?}: Failed to send error reply: {err}")
+        }
+    }
+
+    pub(crate) fn reply_io_error(&self) {
+        self.reply_error(Errno::EIO);
+    }
+
+    pub(crate) fn dispatch_meta_read_worker<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) {
+        debug!("{}", self.request);
+        let unique = self.request.unique();
+        let opcode = self.request.opcode();
+        let inode: u64 = self.request.nodeid().into();
+        let res = match self.dispatch_meta_read_req(filesystem, allowed, session_owner) {
+            Ok(Some(resp)) => resp,
+            Ok(None) => return,
+            Err(errno) => {
+                ERROR_COUNTERS.increment(opcode);
+                warn!(
+                    "FUSE {} error: ino={:#x?} errno={} ({})",
+                    opcode_name(opcode),
+                    inode,
+                    i32::from(errno.0),
+                    errno_name(i32::from(errno.0)),
+                );
+                self.request.reply_err(errno)
+            }
+        }
+        .with_iovec(unique, |iov| self.ch.send(iov));
+
+        if let Err(err) = res {
+            warn!("Request {unique:?}: Failed to send reply: {err}")
+        }
+    }
+
+    pub(crate) fn dispatch_namespace_mutation_worker<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) {
+        debug!("{}", self.request);
+        let unique = self.request.unique();
+        let opcode = self.request.opcode();
+        let inode: u64 = self.request.nodeid().into();
+        let res = match self.dispatch_namespace_mutation_req(filesystem, allowed, session_owner) {
+            Ok(Some(resp)) => resp,
+            Ok(None) => return,
+            Err(errno) => {
+                ERROR_COUNTERS.increment(opcode);
+                warn!(
+                    "FUSE {} error: ino={:#x?} errno={} ({})",
+                    opcode_name(opcode),
+                    inode,
+                    i32::from(errno.0),
+                    errno_name(i32::from(errno.0)),
+                );
+                self.request.reply_err(errno)
+            }
+        }
+        .with_iovec(unique, |iov| self.ch.send(iov));
+
+        if let Err(err) = res {
+            warn!("Request {unique:?}: Failed to send reply: {err}")
+        }
+    }
+
+    pub(crate) fn dispatch_dir_stream_worker<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) {
+        debug!("{}", self.request);
+        let unique = self.request.unique();
+        let opcode = self.request.opcode();
+        let inode: u64 = self.request.nodeid().into();
+        let res = match self.dispatch_dir_stream_req(filesystem, allowed, session_owner) {
+            Ok(Some(resp)) => resp,
+            Ok(None) => return,
+            Err(errno) => {
+                ERROR_COUNTERS.increment(opcode);
+                warn!(
+                    "FUSE {} error: ino={:#x?} errno={} ({})",
+                    opcode_name(opcode),
+                    inode,
+                    i32::from(errno.0),
+                    errno_name(i32::from(errno.0)),
+                );
+                self.request.reply_err(errno)
+            }
+        }
+        .with_iovec(unique, |iov| self.ch.send(iov));
+
+        if let Err(err) = res {
+            warn!("Request {unique:?}: Failed to send reply: {err}")
+        }
+    }
+
+    pub(crate) fn dispatch_lock_wait_worker<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        abort_registry: &AbortRegistry,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) {
+        debug!("{}", self.request);
+        let unique = self.request.unique();
+        let opcode = self.request.opcode();
+        let inode: u64 = self.request.nodeid().into();
+        let res =
+            match self.dispatch_lock_wait_req(filesystem, abort_registry, allowed, session_owner) {
+                Ok(Some(resp)) => resp,
+                Ok(None) => return,
+                Err(errno) => {
+                    ERROR_COUNTERS.increment(opcode);
+                    warn!(
+                        "FUSE {} error: ino={:#x?} errno={} ({})",
+                        opcode_name(opcode),
+                        inode,
+                        i32::from(errno.0),
+                        errno_name(i32::from(errno.0)),
+                    );
+                    self.request.reply_err(errno)
+                }
+            }
+            .with_iovec(unique, |iov| self.ch.send(iov));
+
+        if let Err(err) = res {
+            warn!("Request {unique:?}: Failed to send reply: {err}")
         }
     }
 
@@ -268,6 +431,74 @@ impl<'a> Request<'a> {
         }
     }
 
+    fn dispatch_meta_read_req<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) -> Result<Option<Response<'_>>, Errno> {
+        if self.acl_denied(allowed, session_owner) {
+            return Err(Errno::EACCES);
+        }
+        let op = self.request.operation().map_err(|_| Errno::ENOSYS)?;
+        let mut fs = filesystem.lock().expect("filesystem mutex poisoned");
+        match op {
+            ll::Operation::Lookup(x) => {
+                fs.lookup(
+                    self,
+                    self.request.nodeid().into(),
+                    x.name().as_ref(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::GetAttr(_) => {
+                fs.getattr(self, self.request.nodeid().into(), self.reply());
+            }
+            ll::Operation::ReadLink(_) => {
+                fs.readlink(self, self.request.nodeid().into(), self.reply());
+            }
+            ll::Operation::StatFs(_) => {
+                fs.statfs(self, self.request.nodeid().into(), self.reply());
+            }
+            ll::Operation::GetXAttr(x) => {
+                fs.getxattr(
+                    self,
+                    self.request.nodeid().into(),
+                    x.name(),
+                    x.size_u32(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::ListXAttr(x) => {
+                fs.listxattr(self, self.request.nodeid().into(), x.size(), self.reply());
+            }
+            ll::Operation::Access(x) => {
+                fs.access(self, self.request.nodeid().into(), x.mask(), self.reply());
+            }
+            ll::Operation::BMap(x) => {
+                fs.bmap(
+                    self,
+                    self.request.nodeid().into(),
+                    x.block_size(),
+                    x.block(),
+                    self.reply(),
+                );
+            }
+            #[cfg(feature = "abi-7-30")]
+            ll::Operation::Statx(x) => {
+                fs.statx(
+                    self,
+                    self.request.nodeid().into(),
+                    x.sx_flags(),
+                    x.sx_mask(),
+                    self.reply(),
+                );
+            }
+            _ => return Err(Errno::ENOSYS),
+        }
+        Ok(None)
+    }
+
     fn dispatch_file_read_req<FS: Filesystem>(
         &self,
         filesystem: &Arc<Mutex<FS>>,
@@ -292,6 +523,22 @@ impl<'a> Request<'a> {
                     x.size(),
                     x.flags(),
                     x.lock_owner().map(|l| l.into()),
+                    self.reply(),
+                );
+            }
+            #[cfg(feature = "abi-7-11")]
+            ll::Operation::IoCtl(x) => {
+                if x.unrestricted() {
+                    return Err(Errno::ENOSYS);
+                }
+                fs.ioctl(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.flags(),
+                    x.command(),
+                    x.in_data(),
+                    x.out_size(),
                     self.reply(),
                 );
             }
@@ -323,10 +570,9 @@ impl<'a> Request<'a> {
         Ok(None)
     }
 
-    fn dispatch_file_writeback_req<FS: Filesystem>(
+    fn dispatch_namespace_mutation_req<FS: Filesystem>(
         &self,
         filesystem: &Arc<Mutex<FS>>,
-        abort_registry: &AbortRegistry,
         allowed: SessionACL,
         session_owner: u32,
     ) -> Result<Option<Response<'_>>, Errno> {
@@ -402,6 +648,72 @@ impl<'a> Request<'a> {
                     self.reply(),
                 );
             }
+            ll::Operation::SetXAttr(x) => {
+                fs.setxattr(
+                    self,
+                    self.request.nodeid().into(),
+                    x.name(),
+                    x.value(),
+                    x.flags(),
+                    x.position(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::RemoveXAttr(x) => {
+                fs.removexattr(self, self.request.nodeid().into(), x.name(), self.reply());
+            }
+            ll::Operation::Create(x) => {
+                fs.create(
+                    self,
+                    self.request.nodeid().into(),
+                    x.name().as_ref(),
+                    x.mode(),
+                    x.umask(),
+                    x.flags(),
+                    self.reply(),
+                );
+            }
+            #[cfg(feature = "abi-7-23")]
+            ll::Operation::Rename2(x) => {
+                fs.rename(
+                    self,
+                    x.from().dir.into(),
+                    x.from().name.as_ref(),
+                    x.to().dir.into(),
+                    x.to().name.as_ref(),
+                    x.flags(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::Exchange(x) => {
+                fs.exchange(
+                    self,
+                    x.from().dir.into(),
+                    x.from().name.as_ref(),
+                    x.to().dir.into(),
+                    x.to().name.as_ref(),
+                    x.options(),
+                    self.reply(),
+                );
+            }
+            _ => return Err(Errno::ENOSYS),
+        }
+        Ok(None)
+    }
+
+    fn dispatch_file_writeback_req<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        abort_registry: &AbortRegistry,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) -> Result<Option<Response<'_>>, Errno> {
+        if self.acl_denied(allowed, session_owner) {
+            return Err(Errno::EACCES);
+        }
+        let op = self.request.operation().map_err(|_| Errno::ENOSYS)?;
+        let mut fs = filesystem.lock().expect("filesystem mutex poisoned");
+        match op {
             ll::Operation::SetAttr(x) => {
                 fs.setattr(
                     self,
@@ -467,31 +779,6 @@ impl<'a> Request<'a> {
                 );
                 abort_registry.remove(unique);
             }
-            ll::Operation::SetXAttr(x) => {
-                fs.setxattr(
-                    self,
-                    self.request.nodeid().into(),
-                    x.name(),
-                    x.value(),
-                    x.flags(),
-                    x.position(),
-                    self.reply(),
-                );
-            }
-            ll::Operation::RemoveXAttr(x) => {
-                fs.removexattr(self, self.request.nodeid().into(), x.name(), self.reply());
-            }
-            ll::Operation::Create(x) => {
-                fs.create(
-                    self,
-                    self.request.nodeid().into(),
-                    x.name().as_ref(),
-                    x.mode(),
-                    x.umask(),
-                    x.flags(),
-                    self.reply(),
-                );
-            }
             #[cfg(feature = "abi-7-19")]
             ll::Operation::FAllocate(x) => {
                 fs.fallocate(
@@ -501,18 +788,6 @@ impl<'a> Request<'a> {
                     x.offset(),
                     x.len(),
                     x.mode(),
-                    self.reply(),
-                );
-            }
-            #[cfg(feature = "abi-7-23")]
-            ll::Operation::Rename2(x) => {
-                fs.rename(
-                    self,
-                    x.from().dir.into(),
-                    x.from().name.as_ref(),
-                    x.to().dir.into(),
-                    x.to().name.as_ref(),
-                    x.flags(),
                     self.reply(),
                 );
             }
@@ -536,14 +811,149 @@ impl<'a> Request<'a> {
                     self.reply(),
                 );
             }
-            ll::Operation::Exchange(x) => {
-                fs.exchange(
+            #[cfg(feature = "abi-7-31")]
+            ll::Operation::SyncFs(_) => {
+                fs.syncfs(self, self.reply());
+            }
+            _ => return Err(Errno::ENOSYS),
+        }
+        Ok(None)
+    }
+
+    fn dispatch_dir_stream_req<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) -> Result<Option<Response<'_>>, Errno> {
+        if self.acl_denied(allowed, session_owner) {
+            return Err(Errno::EACCES);
+        }
+        let op = self.request.operation().map_err(|_| Errno::ENOSYS)?;
+        let mut fs = filesystem.lock().expect("filesystem mutex poisoned");
+        match op {
+            ll::Operation::OpenDir(x) => {
+                fs.opendir(self, self.request.nodeid().into(), x.flags(), self.reply());
+            }
+            ll::Operation::ReadDir(x) => {
+                fs.readdir(
                     self,
-                    x.from().dir.into(),
-                    x.from().name.as_ref(),
-                    x.to().dir.into(),
-                    x.to().name.as_ref(),
-                    x.options(),
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.offset(),
+                    ReplyDirectory::new(
+                        self.request.unique().into(),
+                        self.ch.clone(),
+                        x.size() as usize,
+                    ),
+                );
+            }
+            ll::Operation::ReleaseDir(x) => {
+                fs.releasedir(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.flags(),
+                    self.reply(),
+                );
+            }
+            ll::Operation::FSyncDir(x) => {
+                fs.fsyncdir(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.fdatasync(),
+                    self.reply(),
+                );
+            }
+            #[cfg(feature = "abi-7-21")]
+            ll::Operation::ReadDirPlus(x) => {
+                fs.readdirplus(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.offset(),
+                    ReplyDirectoryPlus::new(
+                        self.request.unique().into(),
+                        self.ch.clone(),
+                        x.size() as usize,
+                    ),
+                );
+            }
+            _ => return Err(Errno::ENOSYS),
+        }
+        Ok(None)
+    }
+
+    fn dispatch_lock_wait_req<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        abort_registry: &AbortRegistry,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) -> Result<Option<Response<'_>>, Errno> {
+        if self.acl_denied(allowed, session_owner) {
+            return Err(Errno::EACCES);
+        }
+        let op = self.request.operation().map_err(|_| Errno::ENOSYS)?;
+        let mut fs = filesystem.lock().expect("filesystem mutex poisoned");
+        match op {
+            ll::Operation::GetLk(x) => {
+                fs.getlk(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.lock_owner().into(),
+                    x.lock().range.0,
+                    x.lock().range.1,
+                    x.lock().typ,
+                    x.lock().pid,
+                    self.reply(),
+                );
+            }
+            ll::Operation::SetLk(x) => {
+                fs.setlk(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.lock_owner().into(),
+                    x.lock().range.0,
+                    x.lock().range.1,
+                    x.lock().typ,
+                    x.lk_flags(),
+                    x.lock().pid,
+                    false,
+                    self.reply(),
+                );
+            }
+            ll::Operation::SetLkW(x) => {
+                let unique = self.request.unique().into();
+                let handle = abort_registry.register(unique);
+                self.attach_abort(handle);
+                fs.setlk(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.lock_owner().into(),
+                    x.lock().range.0,
+                    x.lock().range.1,
+                    x.lock().typ,
+                    x.lk_flags(),
+                    x.lock().pid,
+                    true,
+                    self.reply(),
+                );
+                abort_registry.remove(unique);
+            }
+            #[cfg(feature = "abi-7-32")]
+            ll::Operation::Flock(x) => {
+                fs.flock(
+                    self,
+                    self.request.nodeid().into(),
+                    x.fh(),
+                    x.owner(),
+                    x.typ() as u32,
+                    x.lk_flags(),
                     self.reply(),
                 );
             }
@@ -1480,6 +1890,44 @@ mod tests {
         0x6f, 0x6c, 0x64, 0x00, 0x6e, 0x65, 0x77, 0x00, // "old\0new\0"
     ]);
 
+    #[cfg(target_endian = "little")]
+    const GETATTR_REQUEST: AlignedData<[u8; 40]> = AlignedData([
+        0x28, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, // len=40, opcode=3
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+    ]);
+
+    #[cfg(target_endian = "little")]
+    const READDIR_REQUEST: AlignedData<[u8; 80]> = AlignedData([
+        0x50, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, // len=80, opcode=28
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fh=3
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset=0
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // size=4096
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // lock_owner=0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // flags=0, padding=0
+    ]);
+
+    #[cfg(all(target_endian = "little", feature = "abi-7-9"))]
+    const GETLK_REQUEST: AlignedData<[u8; 88]> = AlignedData([
+        0x58, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, // len=88, opcode=31
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fh=2
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // owner=3
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // lk.start=0
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, // lk.end=i64::MAX
+        0x00, 0x00, 0x00, 0x00, 0xad, 0xde, 0x00, 0x00, // lk.typ=0, lk.pid=0xdead
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // lk_flags=0, padding=0
+    ]);
+
     #[test]
     fn request_new_valid_init() {
         let ch = dummy_channel();
@@ -1559,6 +2007,10 @@ mod tests {
         let write = Request::new(ch.clone(), &WRITE_REQUEST[..]).unwrap();
         let forget = Request::new(ch.clone(), &FORGET_REQUEST[..]).unwrap();
         let rename = Request::new(ch.clone(), &RENAME_REQUEST[..]).unwrap();
+        let getattr = Request::new(ch.clone(), &GETATTR_REQUEST[..]).unwrap();
+        let readdir = Request::new(ch.clone(), &READDIR_REQUEST[..]).unwrap();
+        #[cfg(feature = "abi-7-9")]
+        let getlk = Request::new(ch.clone(), &GETLK_REQUEST[..]).unwrap();
         #[cfg(feature = "abi-7-11")]
         let poll = Request::new(ch.clone(), &POLL_REQUEST[..]).unwrap();
         #[cfg(feature = "abi-7-24")]
@@ -1566,6 +2018,8 @@ mod tests {
 
         assert_eq!(write.dispatch_lane(false, false), DispatchLane::Inline);
         assert_eq!(init.dispatch_lane(true, false), DispatchLane::Inline);
+        assert_eq!(getattr.dispatch_lane(true, false), DispatchLane::MetaRead);
+        assert_eq!(readdir.dispatch_lane(true, false), DispatchLane::DirStream);
         assert_eq!(open.dispatch_lane(true, false), DispatchLane::FileRead);
         assert_eq!(read.dispatch_lane(true, false), DispatchLane::FileRead);
         assert_eq!(read.dispatch_lane(true, true), DispatchLane::Inline);
@@ -1579,8 +2033,10 @@ mod tests {
         );
         assert_eq!(
             rename.dispatch_lane(true, false),
-            DispatchLane::FileWriteback
+            DispatchLane::NamespaceMutation
         );
+        #[cfg(feature = "abi-7-9")]
+        assert_eq!(getlk.dispatch_lane(true, false), DispatchLane::LockWait);
         assert_eq!(forget.dispatch_lane(true, false), DispatchLane::Maintenance);
     }
 
@@ -1668,7 +2124,96 @@ mod tests {
 
     #[test]
     #[cfg(target_endian = "little")]
-    fn file_writeback_worker_dispatches_owned_metadata_mutation() {
+    fn meta_read_worker_dispatches_owned_getattr_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, SystemTime};
+
+        struct GetAttrSeenFS {
+            seen: Arc<AtomicBool>,
+        }
+
+        impl Filesystem for GetAttrSeenFS {
+            fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: crate::ReplyAttr) {
+                assert_eq!(ino, 0x1122_3344_5566_7788);
+                self.seen.store(true, Ordering::Release);
+                let attr = crate::FileAttr {
+                    ino,
+                    size: 0,
+                    blocks: 0,
+                    atime: SystemTime::UNIX_EPOCH,
+                    mtime: SystemTime::UNIX_EPOCH,
+                    ctime: SystemTime::UNIX_EPOCH,
+                    crtime: SystemTime::UNIX_EPOCH,
+                    kind: crate::FileType::RegularFile,
+                    perm: 0o644,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    blksize: 4096,
+                    flags: 0,
+                };
+                reply.attr(&Duration::ZERO, &attr);
+            }
+        }
+
+        let seen = Arc::new(AtomicBool::new(false));
+        let filesystem = Arc::new(Mutex::new(GetAttrSeenFS {
+            seen: Arc::clone(&seen),
+        }));
+        let req = Request::new(dummy_channel(), &GETATTR_REQUEST[..]).unwrap();
+        req.dispatch_meta_read_worker(&filesystem, SessionACL::All, 0);
+
+        assert!(seen.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[cfg(all(target_endian = "little", feature = "abi-7-9"))]
+    fn lock_wait_worker_dispatches_owned_getlk_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct GetLkSeenFS {
+            seen: Arc<AtomicBool>,
+        }
+
+        impl Filesystem for GetLkSeenFS {
+            fn getlk(
+                &mut self,
+                _req: &Request<'_>,
+                ino: u64,
+                fh: u64,
+                lock_owner: u64,
+                start: u64,
+                end: u64,
+                typ: i32,
+                pid: u32,
+                reply: crate::ReplyLock,
+            ) {
+                assert_eq!(ino, 0x1122_3344_5566_7788);
+                assert_eq!(fh, 2);
+                assert_eq!(lock_owner, 3);
+                assert_eq!(start, 0);
+                assert_eq!(end, i64::MAX as u64);
+                assert_eq!(typ, 0);
+                assert_eq!(pid, 0xdead);
+                self.seen.store(true, Ordering::Release);
+                reply.locked(start, end, typ, pid);
+            }
+        }
+
+        let seen = Arc::new(AtomicBool::new(false));
+        let filesystem = Arc::new(Mutex::new(GetLkSeenFS {
+            seen: Arc::clone(&seen),
+        }));
+        let req = Request::new(dummy_channel(), &GETLK_REQUEST[..]).unwrap();
+        req.dispatch_lock_wait_worker(&filesystem, &AbortRegistry::default(), SessionACL::All, 0);
+
+        assert!(seen.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn namespace_mutation_worker_dispatches_owned_metadata_mutation() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         struct RenameSeenFS {
@@ -1701,12 +2246,7 @@ mod tests {
             seen: Arc::clone(&seen),
         }));
         let req = Request::new(dummy_channel(), &RENAME_REQUEST[..]).unwrap();
-        req.dispatch_file_writeback_worker(
-            &filesystem,
-            &AbortRegistry::default(),
-            SessionACL::All,
-            0,
-        );
+        req.dispatch_namespace_mutation_worker(&filesystem, SessionACL::All, 0);
 
         assert!(seen.load(Ordering::Acquire));
     }

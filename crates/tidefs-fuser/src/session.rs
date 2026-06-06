@@ -10,14 +10,14 @@ use log::{info, warn};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    mpsc::{self, SyncSender},
+    mpsc::{self, SyncSender, TrySendError},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::{io, ops::DerefMut};
 
 use crate::abort::{AbortHandle, AbortRegistry};
-use crate::ll::fuse_abi as abi;
+use crate::ll::{fuse_abi as abi, Errno};
 #[cfg(feature = "abi-7-11")]
 use crate::notify::Notifier;
 use crate::request::{DispatchLane, Request};
@@ -70,10 +70,18 @@ pub struct Session<FS: Filesystem> {
     pub(crate) wants_writeback_cache: bool,
     /// Registry of in-flight abort handles keyed by request unique
     abort_registry: Arc<AbortRegistry>,
+    /// Bounded worker lane for small metadata reads.
+    meta_read_tx: Option<SyncSender<WorkerJob>>,
+    /// Bounded worker lane for namespace mutations.
+    namespace_mutation_tx: Option<SyncSender<WorkerJob>>,
+    /// Bounded worker lane for directory streams.
+    dir_stream_tx: Option<SyncSender<WorkerJob>>,
     /// Bounded worker lane for file reads that may copy bulk data replies.
     file_read_tx: Option<SyncSender<WorkerJob>>,
     /// Bounded worker lane for file data/writeback operations that may block.
     file_writeback_tx: Option<SyncSender<WorkerJob>>,
+    /// Bounded worker lane for blocking lock waits.
+    lock_wait_tx: Option<SyncSender<WorkerJob>>,
     /// Bounded maintenance lane for no-reply forget traffic.
     maintenance_tx: Option<SyncSender<WorkerJob>>,
     /// Worker thread guards joined before filesystem destroy.
@@ -129,8 +137,12 @@ impl<FS: Filesystem> Session<FS> {
             #[cfg(feature = "abi-7-23")]
             wants_writeback_cache,
             abort_registry: Arc::new(AbortRegistry::default()),
+            meta_read_tx: None,
+            namespace_mutation_tx: None,
+            dir_stream_tx: None,
             file_read_tx: None,
             file_writeback_tx: None,
+            lock_wait_tx: None,
             maintenance_tx: None,
             worker_guards: Vec::new(),
             proto_major: 0,
@@ -163,38 +175,35 @@ impl<FS: Filesystem> Session<FS> {
             match self.ch.receive(buf) {
                 Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
-                    Some(req) => match req.dispatch_lane(self.initialized, self.destroyed) {
-                        DispatchLane::Inline => req.dispatch(self),
-                        DispatchLane::FileRead if self.file_read_tx.is_some() => {
-                            let job = WorkerJob::new(self.ch.sender(), buf[..size].to_vec());
-                            if let Some(tx) = &self.file_read_tx {
-                                if tx.send(job).is_err() {
-                                    req.reply_io_error();
+                    Some(req) => {
+                        let lane = req.dispatch_lane(self.initialized, self.destroyed);
+                        match lane {
+                            DispatchLane::Inline => req.dispatch(self),
+                            _ => {
+                                let job = WorkerJob::new(self.ch.sender(), buf[..size].to_vec());
+                                match self.enqueue_worker_job(lane, job) {
+                                    Ok(()) => {}
+                                    Err(WorkerEnqueueError::Missing) => req.dispatch(self),
+                                    Err(WorkerEnqueueError::Full)
+                                        if lane == DispatchLane::Maintenance =>
+                                    {
+                                        req.dispatch(self);
+                                    }
+                                    Err(WorkerEnqueueError::Disconnected)
+                                        if lane == DispatchLane::Maintenance =>
+                                    {
+                                        req.dispatch(self);
+                                    }
+                                    Err(WorkerEnqueueError::Full) => {
+                                        req.reply_error(Errno::EAGAIN);
+                                    }
+                                    Err(WorkerEnqueueError::Disconnected) => {
+                                        req.reply_io_error();
+                                    }
                                 }
-                            } else {
-                                req.reply_io_error();
                             }
                         }
-                        DispatchLane::FileWriteback if self.file_writeback_tx.is_some() => {
-                            let job = WorkerJob::new(self.ch.sender(), buf[..size].to_vec());
-                            if let Some(tx) = &self.file_writeback_tx {
-                                if tx.send(job).is_err() {
-                                    req.reply_io_error();
-                                }
-                            } else {
-                                req.reply_io_error();
-                            }
-                        }
-                        DispatchLane::Maintenance if self.maintenance_tx.is_some() => {
-                            let job = WorkerJob::new(self.ch.sender(), buf[..size].to_vec());
-                            if let Some(tx) = &self.maintenance_tx {
-                                let _ = tx.send(job);
-                            }
-                        }
-                        DispatchLane::FileRead
-                        | DispatchLane::FileWriteback
-                        | DispatchLane::Maintenance => req.dispatch(self),
-                    },
+                    }
                     // Quit loop on illegal request
                     None => break,
                 },
@@ -236,16 +245,68 @@ impl<FS: Filesystem> Session<FS> {
         self.abort_registry.remove(unique);
     }
 
+    fn enqueue_worker_job(
+        &self,
+        lane: DispatchLane,
+        job: WorkerJob,
+    ) -> Result<(), WorkerEnqueueError> {
+        let Some(tx) = (match lane {
+            DispatchLane::MetaRead => self.meta_read_tx.as_ref(),
+            DispatchLane::NamespaceMutation => self.namespace_mutation_tx.as_ref(),
+            DispatchLane::DirStream => self.dir_stream_tx.as_ref(),
+            DispatchLane::FileRead => self.file_read_tx.as_ref(),
+            DispatchLane::FileWriteback => self.file_writeback_tx.as_ref(),
+            DispatchLane::LockWait => self.lock_wait_tx.as_ref(),
+            DispatchLane::Maintenance => self.maintenance_tx.as_ref(),
+            DispatchLane::Inline => None,
+        }) else {
+            return Err(WorkerEnqueueError::Missing);
+        };
+
+        tx.try_send(job).map_err(|err| match err {
+            TrySendError::Full(_) => WorkerEnqueueError::Full,
+            TrySendError::Disconnected(_) => WorkerEnqueueError::Disconnected,
+        })
+    }
+
     fn start_worker_lanes(&mut self) -> io::Result<()>
     where
         FS: Send + 'static,
     {
-        if self.file_read_tx.is_some()
+        if self.meta_read_tx.is_some()
+            || self.namespace_mutation_tx.is_some()
+            || self.dir_stream_tx.is_some()
+            || self.file_read_tx.is_some()
             || self.file_writeback_tx.is_some()
+            || self.lock_wait_tx.is_some()
             || self.maintenance_tx.is_some()
         {
             return Ok(());
         }
+        let (meta_read_tx, meta_read_guard) = spawn_worker_lane(
+            "fuse-meta-read",
+            DispatchLane::MetaRead,
+            Arc::clone(&self.filesystem),
+            Arc::clone(&self.abort_registry),
+            self.allowed.clone(),
+            self.session_owner,
+        )?;
+        let (namespace_mutation_tx, namespace_mutation_guard) = spawn_worker_lane(
+            "fuse-namespace-mut",
+            DispatchLane::NamespaceMutation,
+            Arc::clone(&self.filesystem),
+            Arc::clone(&self.abort_registry),
+            self.allowed.clone(),
+            self.session_owner,
+        )?;
+        let (dir_stream_tx, dir_stream_guard) = spawn_worker_lane(
+            "fuse-dir-stream",
+            DispatchLane::DirStream,
+            Arc::clone(&self.filesystem),
+            Arc::clone(&self.abort_registry),
+            self.allowed.clone(),
+            self.session_owner,
+        )?;
         let (file_read_tx, file_read_guard) = spawn_worker_lane(
             "fuse-file-read",
             DispatchLane::FileRead,
@@ -262,6 +323,14 @@ impl<FS: Filesystem> Session<FS> {
             self.allowed.clone(),
             self.session_owner,
         )?;
+        let (lock_wait_tx, lock_wait_guard) = spawn_worker_lane(
+            "fuse-lock-wait",
+            DispatchLane::LockWait,
+            Arc::clone(&self.filesystem),
+            Arc::clone(&self.abort_registry),
+            self.allowed.clone(),
+            self.session_owner,
+        )?;
         let (maintenance_tx, maintenance_guard) = spawn_worker_lane(
             "fuse-maintenance",
             DispatchLane::Maintenance,
@@ -270,11 +339,19 @@ impl<FS: Filesystem> Session<FS> {
             self.allowed.clone(),
             self.session_owner,
         )?;
+        self.meta_read_tx = Some(meta_read_tx);
+        self.namespace_mutation_tx = Some(namespace_mutation_tx);
+        self.dir_stream_tx = Some(dir_stream_tx);
         self.file_read_tx = Some(file_read_tx);
         self.file_writeback_tx = Some(file_writeback_tx);
+        self.lock_wait_tx = Some(lock_wait_tx);
         self.maintenance_tx = Some(maintenance_tx);
+        self.worker_guards.push(meta_read_guard);
+        self.worker_guards.push(namespace_mutation_guard);
+        self.worker_guards.push(dir_stream_guard);
         self.worker_guards.push(file_read_guard);
         self.worker_guards.push(file_writeback_guard);
+        self.worker_guards.push(lock_wait_guard);
         self.worker_guards.push(maintenance_guard);
         Ok(())
     }
@@ -312,8 +389,12 @@ impl<FS: 'static + Filesystem + Send> Session<FS> {
 
 impl<FS: Filesystem> Drop for Session<FS> {
     fn drop(&mut self) {
+        self.meta_read_tx.take();
+        self.namespace_mutation_tx.take();
+        self.dir_stream_tx.take();
         self.file_read_tx.take();
         self.file_writeback_tx.take();
+        self.lock_wait_tx.take();
         self.maintenance_tx.take();
         for guard in self.worker_guards.drain(..) {
             if guard.join().is_err() {
@@ -342,6 +423,13 @@ impl WorkerJob {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerEnqueueError {
+    Missing,
+    Full,
+    Disconnected,
+}
+
 fn spawn_worker_lane<FS: Filesystem + Send + 'static>(
     name: &'static str,
     lane: DispatchLane,
@@ -358,12 +446,33 @@ fn spawn_worker_lane<FS: Filesystem + Send + 'static>(
             while let Ok(job) = rx.recv() {
                 if let Some(req) = Request::new(job.ch, &job.data) {
                     match lane {
+                        DispatchLane::MetaRead => req.dispatch_meta_read_worker(
+                            &filesystem,
+                            allowed.clone(),
+                            session_owner,
+                        ),
+                        DispatchLane::NamespaceMutation => req.dispatch_namespace_mutation_worker(
+                            &filesystem,
+                            allowed.clone(),
+                            session_owner,
+                        ),
+                        DispatchLane::DirStream => req.dispatch_dir_stream_worker(
+                            &filesystem,
+                            allowed.clone(),
+                            session_owner,
+                        ),
                         DispatchLane::FileRead => req.dispatch_file_read_worker(
                             &filesystem,
                             allowed.clone(),
                             session_owner,
                         ),
                         DispatchLane::FileWriteback => req.dispatch_file_writeback_worker(
+                            &filesystem,
+                            &abort_registry,
+                            allowed.clone(),
+                            session_owner,
+                        ),
+                        DispatchLane::LockWait => req.dispatch_lock_wait_worker(
                             &filesystem,
                             &abort_registry,
                             allowed.clone(),
