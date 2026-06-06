@@ -6,9 +6,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use tidefs_membership_epoch::MemberId;
-use tidefs_replication_model::{ReplicaMovementIntentRecord, ReplicatedSubjectId};
+use tidefs_replication_model::{
+    PlacementReceiptRef, ReplicaMovementIntentRecord, ReplicatedSubjectId,
+};
 
 use crate::admission::RebuildAdmission;
+use crate::task::BackfillTask;
+
+type IntentCompletionKey = (MemberId, ReplicatedSubjectId);
+type ReceiptCompletionKey = (MemberId, ReplicatedSubjectId, PlacementReceiptRef);
 
 /// Per-member rebuild completion tracking.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -76,7 +82,8 @@ pub struct RebuildCompleted {
 #[derive(Clone, Debug, Default)]
 pub struct RebuildCompletion {
     members: BTreeMap<MemberId, CompletionStatus>,
-    completed_subjects: BTreeSet<(MemberId, ReplicatedSubjectId)>,
+    completed_intent_subjects: BTreeSet<IntentCompletionKey>,
+    completed_receipt_tasks: BTreeSet<ReceiptCompletionKey>,
     pending_events: Vec<RebuildCompleted>,
 }
 
@@ -85,7 +92,8 @@ impl RebuildCompletion {
     pub fn new() -> Self {
         Self {
             members: BTreeMap::new(),
-            completed_subjects: BTreeSet::new(),
+            completed_intent_subjects: BTreeSet::new(),
+            completed_receipt_tasks: BTreeSet::new(),
             pending_events: Vec::new(),
         }
     }
@@ -104,22 +112,51 @@ impl RebuildCompletion {
         admission: &mut RebuildAdmission,
     ) -> Option<RebuildCompleted> {
         let dedup_key = (member, subject);
-        if self.completed_subjects.contains(&dedup_key) {
+        if self.completed_intent_subjects.contains(&dedup_key) {
             return None;
         }
-        self.completed_subjects.insert(dedup_key);
+        self.completed_intent_subjects.insert(dedup_key);
 
+        self.record_completion_unit(member, success, admission)
+    }
+
+    pub fn record_task_completion(
+        &mut self,
+        task: &BackfillTask,
+        success: bool,
+        admission: &mut RebuildAdmission,
+    ) -> Option<RebuildCompleted> {
+        let dedup_key = (
+            task.target_member,
+            task.subject_ref,
+            task.placement_receipt_ref,
+        );
+        if self.completed_receipt_tasks.contains(&dedup_key) {
+            return None;
+        }
+        self.completed_receipt_tasks.insert(dedup_key);
+
+        self.record_completion_unit(task.target_member, success, admission)
+    }
+
+    fn record_completion_unit(
+        &mut self,
+        member: MemberId,
+        success: bool,
+        admission: &mut RebuildAdmission,
+    ) -> Option<RebuildCompleted> {
         let status = self
             .members
             .entry(member)
             .or_insert_with(|| CompletionStatus::new(member, 0));
+        let was_complete = status.is_complete;
         if success {
             status.record_completed();
         } else {
             status.record_failed();
         }
 
-        if status.is_complete {
+        if !was_complete && status.is_complete {
             let event = RebuildCompleted {
                 member,
                 total: status.total_subjects,
@@ -157,6 +194,20 @@ impl RebuildCompletion {
         events
     }
 
+    pub fn record_task_batch_completion(
+        &mut self,
+        completed_tasks: &[BackfillTask],
+        admission: &mut RebuildAdmission,
+    ) -> Vec<RebuildCompleted> {
+        let mut events = Vec::new();
+        for task in completed_tasks {
+            if let Some(event) = self.record_task_completion(task, true, admission) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
     #[must_use]
     pub fn drain_events(&mut self) -> Vec<RebuildCompleted> {
         std::mem::take(&mut self.pending_events)
@@ -187,12 +238,13 @@ impl RebuildCompletion {
 
     #[must_use]
     pub fn total_completed_subjects(&self) -> u64 {
-        self.completed_subjects.len() as u64
+        (self.completed_intent_subjects.len() + self.completed_receipt_tasks.len()) as u64
     }
 
     pub fn reset(&mut self) {
         self.members.clear();
-        self.completed_subjects.clear();
+        self.completed_intent_subjects.clear();
+        self.completed_receipt_tasks.clear();
         self.pending_events.clear();
     }
 }
@@ -200,9 +252,11 @@ impl RebuildCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task::{BackfillTask, BackfillTaskInit};
     use tidefs_membership_epoch::MemberId;
     use tidefs_replication_model::{
-        ObjectDigest, ReplicaMovementClass, ReplicatedReceiptId, ReplicatedSubjectId,
+        ObjectDigest, PlacementReceiptRef, ReplicaMovementClass, ReplicatedReceiptId,
+        ReplicatedSubjectId,
     };
 
     fn make_intent(id: u64, member: u64, subject: u64) -> ReplicaMovementIntentRecord {
@@ -216,6 +270,37 @@ mod tests {
             payload_len: 4096,
             verification_required: false,
         }
+    }
+
+    fn receipt_ref(subject: u64, generation: u64) -> PlacementReceiptRef {
+        let mut object_key = [0xA5; 32];
+        object_key[..8].copy_from_slice(&subject.to_le_bytes());
+        let mut digest = [0x5A; 32];
+        digest[..8].copy_from_slice(&subject.to_le_bytes());
+        digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        PlacementReceiptRef::replicated(
+            subject,
+            object_key,
+            tidefs_membership_epoch::EpochId::new(7),
+            generation,
+            2,
+            4096,
+            digest,
+        )
+    }
+
+    fn make_task(subject: u64, member: u64, generation: u64) -> BackfillTask {
+        BackfillTask::new(BackfillTaskInit {
+            subject_ref: ReplicatedSubjectId::new(subject),
+            placement_receipt_ref: receipt_ref(subject, generation),
+            source_member: MemberId::new(1),
+            target_member: MemberId::new(member),
+            movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
+            payload_digest: ObjectDigest::new(subject * 100),
+            payload_len: 4096,
+            created_at_ns: 0,
+            deadline_ns: 10_000,
+        })
     }
 
     #[test]
@@ -310,6 +395,60 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].fully_successful);
         assert!(completion.is_member_complete(member));
+    }
+
+    #[test]
+    fn task_completion_keeps_receipt_generations_distinct() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        completion.register(member, 2);
+        admission
+            .member_status
+            .insert(member, crate::admission::RebuildAdmissionStatus::Rebuilding);
+
+        let first = make_task(42, 10, 1);
+        let second = make_task(42, 10, 2);
+
+        assert!(completion
+            .record_task_completion(&first, true, &mut admission)
+            .is_none());
+        let event = completion
+            .record_task_completion(&second, true, &mut admission)
+            .expect("second receipt generation completes the member");
+
+        assert_eq!(event.succeeded, 2);
+        assert!(event.fully_successful);
+        assert_eq!(completion.total_completed_subjects(), 2);
+        assert_eq!(completion.status(member).unwrap().subjects_completed, 2);
+        assert_eq!(
+            admission.status(member),
+            crate::admission::RebuildAdmissionStatus::Completed
+        );
+    }
+
+    #[test]
+    fn task_completion_deduplicates_exact_receipt_task() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        completion.register(member, 1);
+        admission
+            .member_status
+            .insert(member, crate::admission::RebuildAdmissionStatus::Rebuilding);
+
+        let task = make_task(42, 10, 1);
+
+        assert!(completion
+            .record_task_completion(&task, true, &mut admission)
+            .is_some());
+        assert!(completion
+            .record_task_completion(&task, true, &mut admission)
+            .is_none());
+        assert_eq!(completion.total_completed_subjects(), 1);
+        assert_eq!(completion.status(member).unwrap().subjects_completed, 1);
+        assert_eq!(completion.drain_events().len(), 1);
+        assert_eq!(completion.drain_events().len(), 0);
     }
 
     #[test]
