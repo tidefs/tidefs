@@ -147,6 +147,8 @@ pub enum ReplacementState {
 pub struct DeviceReplacement {
     /// Path of the old device being replaced.
     pub old_path: PathBuf,
+    /// Original configured media for the old device.
+    pub old_config: DeviceConfig,
     /// Path of the new replacement device.
     pub new_path: PathBuf,
     /// Current replacement state.
@@ -157,9 +159,11 @@ pub struct DeviceReplacement {
 
 impl DeviceReplacement {
     /// Create a new replacement tracker.
-    pub fn new(old_path: PathBuf, new_path: PathBuf, device_index: usize) -> Self {
+    pub fn new(old_config: DeviceConfig, new_path: PathBuf, device_index: usize) -> Self {
+        let old_path = old_config.path.clone();
         Self {
             old_path,
+            old_config,
             new_path,
             state: ReplacementState::InProgress {
                 bytes_copied: 0,
@@ -1548,6 +1552,22 @@ impl Pool {
             .ok_or(StoreError::InvalidOptions {
                 reason: "device to replace not found in pool",
             })?;
+        let old_config = self
+            .config
+            .devices
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| DeviceConfig {
+                path: old_path.to_path_buf(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                media_class: self.media_classes.get(idx).copied().unwrap_or_default(),
+                class: self.classes[idx],
+                kind: DeviceKind::Single {
+                    path: old_path.to_path_buf(),
+                },
+                encryption: None,
+                compression: None,
+            });
 
         // Open the replacement device.
         let new_device = open_single_device(&new_config, options)?;
@@ -1579,7 +1599,7 @@ impl Pool {
 
         // Review debt TFR-012: track the replacement for evacuate + detach.
         self.replacement = Some(DeviceReplacement::new(
-            old_path.to_path_buf(),
+            old_config,
             new_config.path.clone(),
             idx,
         ));
@@ -1612,22 +1632,32 @@ impl Pool {
 
         let replacement = self.replacement.take().unwrap(); // safe: we checked
 
-        // Re-open the old device if possible.
-        let old_config = DeviceConfig {
-            path: replacement.old_path.clone(),
-            backing: DeviceBacking::DirectoryObjectStoreCompat,
-            media_class: Default::default(),
-            class: self.classes[replacement.device_index],
-            kind: DeviceKind::Single {
-                path: replacement.old_path.clone(),
-            },
-            encryption: None,
-            compression: None,
-        };
-
-        // If the old device can still be opened, swap it back.
-        if let Ok(old_device) = open_single_device(&old_config, options) {
+        // If the old device can still be opened, swap it back using the exact
+        // media configuration captured before replacement.
+        if let Ok(old_device) = open_single_device(&replacement.old_config, options) {
             self.devices[replacement.device_index] = old_device;
+            if replacement.device_index < self.config.devices.len() {
+                self.config.devices[replacement.device_index] = replacement.old_config.clone();
+            }
+            if replacement.device_index < self.classes.len() {
+                self.classes[replacement.device_index] = replacement.old_config.class;
+                self.class_map = build_class_map(&self.classes);
+            }
+            if replacement.device_index < self.media_classes.len() {
+                self.media_classes[replacement.device_index] = replacement.old_config.media_class;
+            }
+            if replacement.device_index < self.device_layout_stats.len() {
+                self.device_layout_stats[replacement.device_index] =
+                    DeviceLayoutStats::with_segment_size(
+                        replacement.old_config.media_class.default_segment_size(),
+                    );
+            }
+            let total_bytes: Vec<u64> = self
+                .devices
+                .iter()
+                .map(|d| d.store().capacity_bytes())
+                .collect();
+            self.write_allocator = WriteAllocator::new(self.media_classes.clone(), total_bytes);
         }
 
         self.replacement = Some(DeviceReplacement {
@@ -3407,6 +3437,69 @@ mod tests {
         assert!(matches!(r.state, ReplacementState::Cancelled));
 
         // Old device should be back and data still accessible.
+        let val = pool.get(IoClass::Data, key).unwrap();
+        assert_eq!(val, Some(b"before".to_vec()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancel_replacement_restores_regular_file_dev_backing() {
+        let root = temp_dir("replace-cancel-file-dev");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let d1 = root.join("pool0.img");
+        let d2 = root.join("pool1.img");
+        for path in [&d1, &d2] {
+            let file = std::fs::File::create(path).unwrap();
+            file.set_len(2 * 1024 * 1024).unwrap();
+        }
+        let config = PoolConfig {
+            name: "testpool".into(),
+            root_path: root.join("metadata"),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: d1.clone(),
+                backing: DeviceBacking::RegularFileDev,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Block { path: d1.clone() },
+                encryption: None,
+                compression: None,
+            }],
+        };
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+
+        let key = ObjectKey::from_name(b"pre-file-dev-replace");
+        pool.put(IoClass::Data, key, b"before").unwrap();
+
+        pool.replace_device(
+            &d1,
+            DeviceConfig {
+                media_class: Default::default(),
+                path: d2.clone(),
+                backing: DeviceBacking::RegularFileDev,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Block { path: d2 },
+                encryption: None,
+                compression: None,
+            },
+            &test_options(),
+        )
+        .unwrap();
+        assert_eq!(
+            pool.replacement_status().unwrap().old_config.backing,
+            DeviceBacking::RegularFileDev
+        );
+
+        pool.cancel_replacement(&test_options()).unwrap();
+        assert_eq!(
+            pool.config.devices[0].backing,
+            DeviceBacking::RegularFileDev
+        );
+        assert!(matches!(
+            pool.config.devices[0].kind,
+            DeviceKind::Block { .. }
+        ));
         let val = pool.get(IoClass::Data, key).unwrap();
         assert_eq!(val, Some(b"before".to_vec()));
 
