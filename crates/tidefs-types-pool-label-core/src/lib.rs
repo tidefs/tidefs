@@ -668,6 +668,13 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
     if has_policy && buf.len() < POOL_LABEL_V1_EXT_WIRE_SIZE {
         return Err(LabelError::BufferTooSmall);
     }
+    if has_policy && buf[407] != 0 {
+        return Err(LabelError::BadRedundancyPolicy {
+            kind: buf[404],
+            first: buf[405],
+            second: buf[406],
+        });
+    }
     let (device_health, device_read_errors, device_write_errors, device_checksum_errors) =
         if has_health {
             (
@@ -1662,6 +1669,21 @@ mod tests {
             Err(LabelError::BadRedundancyPolicy {
                 kind: 1,
                 first: 2,
+                second: 0
+            })
+        );
+    }
+
+    #[test]
+    fn decode_rejects_nonzero_redundancy_policy_reserved_byte() {
+        let (mut buf, cksum_off, _) = encode_valid_ext_label("badpolicyreserved");
+        buf[407] = 1;
+        rechecksum_buf(&mut buf, cksum_off);
+        assert_eq!(
+            decode_label(&buf),
+            Err(LabelError::BadRedundancyPolicy {
+                kind: 0,
+                first: 1,
                 second: 0
             })
         );
