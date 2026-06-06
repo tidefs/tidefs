@@ -1180,7 +1180,7 @@ impl BackgroundService for BackgroundScrubber {
                 match crate::recovery::load_latest_committed_state(
                     &mut store,
                     self.root_authentication_key,
-                    RecoveryPolicy::default(),
+                    RecoveryPolicy::ReadOnly,
                 ) {
                     Ok(Some(state)) => {
                         match crate::scrub::scrub_inodes_content(&store, &state.inodes) {
@@ -12668,6 +12668,71 @@ mod recovery_integration_tests {
         assert!(result.is_ok(), "ReadOnly should load state without error");
         let loaded = result.unwrap();
         assert!(loaded.is_some(), "should find committed state");
+    }
+
+    #[test]
+    fn background_scrub_loads_committed_state_without_replay() {
+        use crate::intent_log::{
+            IntentLog, IntentLogConfig, IntentLogEntryKind, IntentLogRootAnchor,
+        };
+        use crate::persistence::persist_state;
+        use crate::recovery::initial_state;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tidefs_background_scheduler::{BackgroundService, ServiceBudget};
+
+        let root = temp_root("background-scrub-readonly-intent-preserve");
+        let auth_key = default_root_authentication_key().expect("auth key");
+
+        {
+            let mut store = tidefs_local_object_store::LocalObjectStore::open_with_options(
+                &root,
+                test_options(),
+            )
+            .expect("open store");
+
+            let mut state = initial_state();
+            state.generation = 2;
+            persist_state(&mut store, &state, auth_key).expect("persist state");
+
+            let anchor = IntentLogRootAnchor {
+                transaction_id: state.generation,
+                generation: state.generation,
+                manifest_digest: tidefs_local_object_store::IntegrityDigest64(0),
+            };
+            let mut log = IntentLog::with_config(IntentLogConfig {
+                max_batch_entries: 1,
+                ..IntentLogConfig::default()
+            });
+            log.append(&mut store, IntentLogEntryKind::PressureFallback, anchor, 1)
+                .expect("append intent");
+            assert!(!log.is_empty(), "intent log should have entries");
+        }
+
+        let corruption_detected = Arc::new(AtomicBool::new(false));
+        let mut scrubber = BackgroundScrubber::new(
+            root.clone(),
+            test_options(),
+            auth_key,
+            Duration::ZERO,
+            Arc::clone(&corruption_detected),
+        );
+        let report = scrubber
+            .tick(&ServiceBudget::default())
+            .expect("background scrub tick");
+        assert_eq!(report.errors, 0);
+
+        let store =
+            tidefs_local_object_store::LocalObjectStore::open_with_options(&root, test_options())
+                .expect("reopen store for verification");
+        let intent_log = IntentLog::load(&store).expect("load intent log");
+        assert!(
+            !intent_log.is_empty(),
+            "background scrub must not replay or consume pending intent-log entries"
+        );
+
+        cleanup(&root);
     }
 
     /// Verify that RecoveryPolicy::ReplayOnly (default) allows intent-log
