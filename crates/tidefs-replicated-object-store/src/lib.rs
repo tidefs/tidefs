@@ -39,7 +39,7 @@ use tidefs_replication::{
 use tidefs_replication_model::VerificationStatus;
 use tidefs_replication_model::{
     commit_replicated_object_root_write, plan_replicated_object_root_read, ObjectDigest,
-    ReplicaCopyRecord, ReplicaTransferReceipt, ReplicaVerificationReceipt,
+    PlacementReceiptRef, ReplicaCopyRecord, ReplicaTransferReceipt, ReplicaVerificationReceipt,
     ReplicatedObjectRootRecord, ReplicatedReadPlan, ReplicatedReceiptId, ReplicatedSubjectClass,
     ReplicatedSubjectId, ReplicatedWriteClass, ReplicatedWritePlan,
 };
@@ -2228,20 +2228,57 @@ impl TransportReplicatedStore {
         segment_offset: u64,
         segment_length: u64,
     ) -> Result<Vec<u8>, String> {
+        let request = SegmentFetchRequest::new(object_id, segment_offset, segment_length);
+        self.fetch_remote_segment_request(replica_idx, request)
+    }
+
+    /// Fetch a segment from a remote replica using placement receipt authority.
+    ///
+    /// This is the rebuild/backfill movement path. The request carries the
+    /// durable placement receipt ref so the remote handler can read the exact
+    /// object key that the pool receipt made legal instead of recomputing a
+    /// name-derived key from the logical object id.
+    pub fn fetch_remote_segment_by_receipt(
+        &mut self,
+        replica_idx: usize,
+        placement_receipt_ref: PlacementReceiptRef,
+        segment_offset: u64,
+        segment_length: u64,
+    ) -> Result<Vec<u8>, String> {
+        if placement_receipt_ref.is_synthetic() {
+            return Err(format!(
+                "receipt-bound segment fetch for object {} requires non-synthetic placement receipt",
+                placement_receipt_ref.object_id
+            ));
+        }
+
+        let request = SegmentFetchRequest::with_placement_receipt_ref(
+            placement_receipt_ref,
+            segment_offset,
+            segment_length,
+        );
+        self.fetch_remote_segment_request(replica_idx, request)
+    }
+
+    fn fetch_remote_segment_request(
+        &mut self,
+        replica_idx: usize,
+        request: SegmentFetchRequest,
+    ) -> Result<Vec<u8>, String> {
         let replica = self.replicas.get(replica_idx).ok_or_else(|| {
             format!(
                 "replica index {replica_idx} out of bounds (have {} replicas)",
                 self.replicas.len()
             )
         })?;
+        let node_id = replica.node_id;
+        let data_session_id = replica.data_session_id;
 
-        let request = SegmentFetchRequest::new(object_id, segment_offset, segment_length);
+        send_segment_fetch(&mut self.transport, data_session_id, &request)
+            .map_err(|e| format!("send segment fetch to node {node_id}: {e}"))?;
 
-        send_segment_fetch(&mut self.transport, replica.data_session_id, &request)
-            .map_err(|e| format!("send segment fetch to node {}: {e}", replica.node_id))?;
-
-        let response = recv_segment_fetch_response(&mut self.transport, replica.data_session_id)
-            .map_err(|e| format!("recv segment fetch from node {}: {e}", replica.node_id))?;
+        let response = recv_segment_fetch_response(&mut self.transport, data_session_id)
+            .map_err(|e| format!("recv segment fetch from node {node_id}: {e}"))?;
 
         Ok(response.payload)
     }
@@ -2275,14 +2312,26 @@ impl TransportReplicatedStore {
             ));
         }
 
-        // Retrieve the full object from the local primary store
         let obj_id = request.object_id;
-        let key = tidefs_local_object_store::ObjectKey::from_name(obj_id.to_le_bytes());
-        let full_payload = self
+        let receipt_ref = request.non_synthetic_receipt_ref();
+        let key = receipt_ref.map_or_else(
+            || tidefs_local_object_store::ObjectKey::from_name(obj_id.to_le_bytes()),
+            |receipt| tidefs_local_object_store::ObjectKey::from_bytes32(receipt.object_key),
+        );
+
+        let payload = self
             .primary
             .get(key)
             .map_err(|e| format!("primary get for object {obj_id}: {e}"))?
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                format!("primary receipt-key get for object {obj_id}: object not found")
+            });
+        let full_payload = match (receipt_ref, payload) {
+            (Some(_), Ok(payload)) => payload,
+            (Some(_), Err(message)) => return Err(message),
+            (None, Ok(payload)) => payload,
+            (None, Err(_)) => Vec::new(),
+        };
 
         // Slice the requested segment range (cast to usize after overflow check above)
         let start = request.segment_offset as usize;
@@ -3434,6 +3483,43 @@ mod tests {
             panic!("timeout waiting for incoming connection");
         }
 
+        fn connect_replica_pair(
+            primary: &mut TransportReplicatedStore,
+            replica: &mut TransportReplicatedStore,
+            replica_node_id: u64,
+        ) -> (SessionId, SessionId) {
+            let replica_addr = replica.local_addr().unwrap();
+            primary
+                .transport
+                .add_node(NodeInfo::new(replica_node_id, vec![replica_addr], 0));
+            let client_session_id = primary.transport.connect(replica_node_id).unwrap();
+            let server_session_id = blocking_accept(&mut replica.transport);
+            primary.replicas.push(TransportReplica {
+                node_id: replica_node_id,
+                control_session_id: client_session_id,
+                data_session_id: client_session_id,
+                shadow_session_id: client_session_id,
+            });
+            (client_session_id, server_session_id)
+        }
+
+        fn placement_receipt_ref(
+            object_id: u64,
+            object_key: &tidefs_local_object_store::ObjectKey,
+            payload: &[u8],
+            generation: u64,
+        ) -> PlacementReceiptRef {
+            PlacementReceiptRef::replicated(
+                object_id,
+                *object_key.as_bytes(),
+                EpochId::new(7),
+                generation,
+                2,
+                payload.len() as u64,
+                *blake3::hash(payload).as_bytes(),
+            )
+        }
+
         #[test]
         fn open_and_close() {
             let dir = tempfile::tempdir().unwrap();
@@ -4257,6 +4343,168 @@ mod tests {
                 result.unwrap_err().contains("out of bounds"),
                 "expected out-of-bounds error"
             );
+        }
+
+        #[test]
+        fn fetch_remote_segment_by_receipt_uses_receipt_object_key() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let replica_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut replica = TransportReplicatedStore::open(
+                replica_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 52u64;
+            let receipt_payload = b"receipt-bound movement payload".to_vec();
+            let legacy_payload = b"legacy object-id bytes".to_vec();
+            let receipt_key =
+                tidefs_local_object_store::ObjectKey::from_name(b"issue-52-receipt-key");
+            let legacy_key =
+                tidefs_local_object_store::ObjectKey::from_name(object_id.to_le_bytes());
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &receipt_payload, 11);
+            replica.primary.put(receipt_key, &receipt_payload).unwrap();
+            replica.primary.put(legacy_key, &legacy_payload).unwrap();
+
+            let (_client_session_id, server_session_id) =
+                connect_replica_pair(&mut primary, &mut replica, 2);
+            let server = std::thread::spawn(move || {
+                replica
+                    .handle_segment_fetch_request(server_session_id)
+                    .expect("receipt segment fetch served")
+            });
+
+            let fetched = primary
+                .fetch_remote_segment_by_receipt(0, receipt, 8, 8)
+                .expect("receipt-bound segment fetch");
+
+            assert_eq!(fetched, receipt_payload[8..16].to_vec());
+            assert_ne!(fetched, legacy_payload[8..16].to_vec());
+            assert_eq!(server.join().unwrap(), object_id);
+        }
+
+        #[test]
+        fn fetch_remote_segment_legacy_uses_object_id_key() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let replica_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut replica = TransportReplicatedStore::open(
+                replica_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 5200u64;
+            let legacy_payload = b"legacy object-id segment payload".to_vec();
+            let receipt_payload = b"receipt payload must not be used".to_vec();
+            let legacy_key =
+                tidefs_local_object_store::ObjectKey::from_name(object_id.to_le_bytes());
+            let receipt_key =
+                tidefs_local_object_store::ObjectKey::from_name(b"issue-52-unused-receipt-key");
+            replica.primary.put(legacy_key, &legacy_payload).unwrap();
+            replica.primary.put(receipt_key, &receipt_payload).unwrap();
+
+            let (_client_session_id, server_session_id) =
+                connect_replica_pair(&mut primary, &mut replica, 2);
+            let server = std::thread::spawn(move || {
+                replica
+                    .handle_segment_fetch_request(server_session_id)
+                    .expect("legacy segment fetch served")
+            });
+
+            let fetched = primary
+                .fetch_remote_segment(0, object_id, 7, 9)
+                .expect("legacy segment fetch");
+
+            assert_eq!(fetched, legacy_payload[7..16].to_vec());
+            assert_ne!(fetched, receipt_payload[7..16].to_vec());
+            assert_eq!(server.join().unwrap(), object_id);
+        }
+
+        #[test]
+        fn handle_segment_fetch_request_synthetic_receipt_uses_legacy_object_id() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let replica_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut replica = TransportReplicatedStore::open(
+                replica_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 5201;
+            let legacy_payload = b"synthetic receipt fallback payload".to_vec();
+            let synthetic_payload = b"synthetic object-key payload".to_vec();
+            let synthetic_receipt =
+                PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(object_id));
+            let legacy_key =
+                tidefs_local_object_store::ObjectKey::from_name(object_id.to_le_bytes());
+            let synthetic_key =
+                tidefs_local_object_store::ObjectKey::from_bytes32(synthetic_receipt.object_key);
+            replica.primary.put(legacy_key, &legacy_payload).unwrap();
+            replica
+                .primary
+                .put(synthetic_key, &synthetic_payload)
+                .unwrap();
+
+            let (client_session_id, server_session_id) =
+                connect_replica_pair(&mut primary, &mut replica, 2);
+            let server = std::thread::spawn(move || {
+                replica
+                    .handle_segment_fetch_request(server_session_id)
+                    .expect("synthetic receipt segment fetch served")
+            });
+            let request = SegmentFetchRequest {
+                object_id,
+                placement_receipt_ref: Some(synthetic_receipt),
+                segment_offset: 10,
+                segment_length: 8,
+            };
+
+            send_segment_fetch(&mut primary.transport, client_session_id, &request).unwrap();
+            let response =
+                recv_segment_fetch_response(&mut primary.transport, client_session_id).unwrap();
+
+            assert_eq!(response.payload, legacy_payload[10..18].to_vec());
+            assert_ne!(response.payload, synthetic_payload[10..18].to_vec());
+            assert_eq!(server.join().unwrap(), object_id);
+        }
+
+        #[test]
+        fn fetch_remote_segment_by_receipt_rejects_synthetic_receipt() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = TransportReplicatedStore::open(
+                dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let receipt = PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(9));
+
+            let err = store
+                .fetch_remote_segment_by_receipt(0, receipt, 0, 8)
+                .unwrap_err();
+
+            assert!(err.contains("requires non-synthetic placement receipt"));
         }
 
         #[test]
