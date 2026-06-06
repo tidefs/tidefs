@@ -21,8 +21,16 @@ source changes. This policy supersedes direct implementation on the root
   commits for normal work.
 - Push after each meaningful commit or checkpoint so other Codex sessions can
   see current ownership and progress.
-- Merge only after rebasing onto `origin/master`, checking active PR write
-  sets, and attaching validation evidence to the PR.
+- PRs are autonomous integration gates, not human handoff points. The owning
+  Codex reviews each PR against the issue acceptance criteria, repo docs,
+  product requirements, touched-code behavior, validation evidence, active
+  write sets, and CI status.
+- Merge only after the branch is rebased onto `origin/master`, active PR write
+  sets do not conflict, validation evidence matches the issue scope, and the
+  review finds no unresolved requirement or product-claim gap.
+- Use a linear merge method, never a merge commit. After merge, sync affected
+  worktrees, update or close the issue, and delete the local and remote feature
+  branch unless a documented follow-up needs it preserved.
 
 ## Multi-Codex Rules
 
