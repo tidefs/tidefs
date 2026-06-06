@@ -6,7 +6,9 @@ use std::error::Error;
 use std::fmt;
 use tidefs_membership_epoch::{EpochId, MemberId};
 use tidefs_object_io::{ObjectKey, ObjectStore};
-use tidefs_rebuild_runtime::engine::{task_object_key, DataMovementEngine};
+use tidefs_rebuild_runtime::engine::{
+    task_object_key, DataMovementEngine, EngineError, ReceiptSegmentSource,
+};
 use tidefs_rebuild_runtime::progress::{BackfillProgress, TaskState};
 use tidefs_rebuild_runtime::quorum::{BackfillLeaseToken, QuorumAdmission, QuorumCoordinator};
 use tidefs_rebuild_runtime::scheduler::{BackfillScheduler, DegradedReplicaReport};
@@ -42,6 +44,69 @@ impl ObjectStore for MemStore {
 
     fn get(&self, key: &ObjectKey) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
         Ok(self.objects.get(key).cloned())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReceiptFetchCall {
+    source_member: MemberId,
+    object_id: u64,
+    segment_offset: u64,
+    segment_length: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MockReceiptSource {
+    payloads: HashMap<[u8; 32], Vec<u8>>,
+    calls: Vec<ReceiptFetchCall>,
+}
+
+impl MockReceiptSource {
+    fn insert(&mut self, key: ObjectKey, payload: &[u8]) {
+        self.payloads.insert(key.as_bytes32(), payload.to_vec());
+    }
+}
+
+impl ReceiptSegmentSource for MockReceiptSource {
+    type Error = String;
+
+    fn fetch_segment_by_receipt(
+        &mut self,
+        source_member: MemberId,
+        placement_receipt_ref: PlacementReceiptRef,
+        segment_offset: u64,
+        segment_length: u64,
+    ) -> Result<Vec<u8>, Self::Error> {
+        self.calls.push(ReceiptFetchCall {
+            source_member,
+            object_id: placement_receipt_ref.object_id,
+            segment_offset,
+            segment_length,
+        });
+
+        let payload = self
+            .payloads
+            .get(&placement_receipt_ref.object_key)
+            .ok_or_else(|| {
+                format!(
+                    "missing receipt key for object {}",
+                    placement_receipt_ref.object_id
+                )
+            })?;
+        let start = usize::try_from(segment_offset).map_err(|_| "offset too large".to_string())?;
+        let len = usize::try_from(segment_length).map_err(|_| "length too large".to_string())?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| "range overflow".to_string())?;
+        payload
+            .get(start..end)
+            .map(|slice| slice.to_vec())
+            .ok_or_else(|| {
+                format!(
+                    "receipt segment out of range for object {}",
+                    placement_receipt_ref.object_id
+                )
+            })
     }
 }
 
@@ -94,6 +159,38 @@ fn populate_source(
     }));
     store.put(key, data).unwrap();
     key
+}
+
+fn receipt_ref_for_payload(
+    object_id: u64,
+    object_key: ObjectKey,
+    payload: &[u8],
+    generation: u64,
+) -> PlacementReceiptRef {
+    PlacementReceiptRef::replicated(
+        object_id,
+        object_key.as_bytes32(),
+        EpochId::new(7),
+        generation,
+        2,
+        payload.len() as u64,
+        *blake3::hash(payload).as_bytes(),
+    )
+}
+
+fn task_from_receipt(receipt: PlacementReceiptRef, source: u64, target: u64) -> BackfillTask {
+    let payload_digest_prefix = u64::from_le_bytes(receipt.payload_digest[..8].try_into().unwrap());
+    BackfillTask::new(BackfillTaskInit {
+        subject_ref: ReplicatedSubjectId::new(receipt.object_id),
+        placement_receipt_ref: receipt,
+        source_member: MemberId::new(source),
+        target_member: MemberId::new(target),
+        movement_class: ReplicaMovementClass::BackfillLaggedCopy,
+        payload_digest: ObjectDigest::new(payload_digest_prefix),
+        payload_len: receipt.payload_len,
+        created_at_ns: 1000,
+        deadline_ns: 5000,
+    })
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -428,4 +525,77 @@ fn engine_verifies_source_and_destination_checksums() {
     let source_hash = blake3::hash(&source_data);
     let target_hash = blake3::hash(&target_data);
     assert_eq!(source_hash.as_bytes(), target_hash.as_bytes());
+}
+
+#[test]
+fn receipt_source_execution_uses_receipt_key_not_logical_object_id() {
+    let data = b"receipt source execution payload";
+    let object_id = 7001u64;
+    let receipt_key = ObjectKey::from_bytes32([0xA7; 32]);
+    let legacy_key = ObjectKey::from_name(object_id.to_le_bytes());
+    let receipt = receipt_ref_for_payload(object_id, receipt_key, data, 3);
+    let task = task_from_receipt(receipt, 10, 20);
+    let mut source = MockReceiptSource::default();
+    let mut target = MemStore::default();
+    let engine = DataMovementEngine::new();
+    let mut progress = BackfillProgress::new(task.payload_len, task.max_retries);
+
+    source.insert(receipt_key, data);
+    target.put(legacy_key, b"legacy target bytes").unwrap();
+    progress.schedule().unwrap();
+
+    engine
+        .execute_from_receipt_source(&task, &mut source, &mut target, &mut progress)
+        .unwrap();
+
+    assert_eq!(source.calls.len(), 1);
+    assert_eq!(
+        source.calls[0],
+        ReceiptFetchCall {
+            source_member: MemberId::new(10),
+            object_id,
+            segment_offset: 0,
+            segment_length: data.len() as u64,
+        }
+    );
+    assert_eq!(target.get(&receipt_key).unwrap(), Some(data.to_vec()));
+    assert_eq!(
+        target.get(&legacy_key).unwrap(),
+        Some(b"legacy target bytes".to_vec())
+    );
+    assert_eq!(progress.state, TaskState::Complete);
+}
+
+#[test]
+fn receipt_source_execution_rejects_synthetic_receipt_before_fetch() {
+    let data = b"synthetic receipt must not fetch";
+    let mut source = MockReceiptSource::default();
+    let mut target = MemStore::default();
+    let task = BackfillTask::new(BackfillTaskInit {
+        subject_ref: ReplicatedSubjectId::new(7002),
+        placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+            ReplicatedSubjectId::new(7002),
+        ),
+        source_member: MemberId::new(10),
+        target_member: MemberId::new(20),
+        movement_class: ReplicaMovementClass::BackfillLaggedCopy,
+        payload_digest: ObjectDigest::new(0x55),
+        payload_len: data.len() as u64,
+        created_at_ns: 1000,
+        deadline_ns: 5000,
+    });
+    let engine = DataMovementEngine::new();
+    let mut progress = BackfillProgress::new(task.payload_len, task.max_retries);
+
+    progress.schedule().unwrap();
+    let err = engine
+        .execute_from_receipt_source(&task, &mut source, &mut target, &mut progress)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        EngineError::SyntheticReceiptRef { object_id: 7002 }
+    ));
+    assert!(source.calls.is_empty());
+    assert!(target.objects.is_empty());
 }
