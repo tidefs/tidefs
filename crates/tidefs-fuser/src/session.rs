@@ -70,6 +70,8 @@ pub struct Session<FS: Filesystem> {
     pub(crate) wants_writeback_cache: bool,
     /// Registry of in-flight abort handles keyed by request unique
     abort_registry: Arc<AbortRegistry>,
+    /// Bounded worker lane for file reads that may copy bulk data replies.
+    file_read_tx: Option<SyncSender<WorkerJob>>,
     /// Bounded worker lane for file data/writeback operations that may block.
     file_writeback_tx: Option<SyncSender<WorkerJob>>,
     /// Bounded maintenance lane for no-reply forget traffic.
@@ -127,6 +129,7 @@ impl<FS: Filesystem> Session<FS> {
             #[cfg(feature = "abi-7-23")]
             wants_writeback_cache,
             abort_registry: Arc::new(AbortRegistry::default()),
+            file_read_tx: None,
             file_writeback_tx: None,
             maintenance_tx: None,
             worker_guards: Vec::new(),
@@ -160,8 +163,18 @@ impl<FS: Filesystem> Session<FS> {
             match self.ch.receive(buf) {
                 Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
-                    Some(req) => match req.dispatch_lane(self.initialized) {
+                    Some(req) => match req.dispatch_lane(self.initialized, self.destroyed) {
                         DispatchLane::Inline => req.dispatch(self),
+                        DispatchLane::FileRead if self.file_read_tx.is_some() => {
+                            let job = WorkerJob::new(self.ch.sender(), buf[..size].to_vec());
+                            if let Some(tx) = &self.file_read_tx {
+                                if tx.send(job).is_err() {
+                                    req.reply_io_error();
+                                }
+                            } else {
+                                req.reply_io_error();
+                            }
+                        }
                         DispatchLane::FileWriteback if self.file_writeback_tx.is_some() => {
                             let job = WorkerJob::new(self.ch.sender(), buf[..size].to_vec());
                             if let Some(tx) = &self.file_writeback_tx {
@@ -178,9 +191,9 @@ impl<FS: Filesystem> Session<FS> {
                                 let _ = tx.send(job);
                             }
                         }
-                        DispatchLane::FileWriteback | DispatchLane::Maintenance => {
-                            req.dispatch(self)
-                        }
+                        DispatchLane::FileRead
+                        | DispatchLane::FileWriteback
+                        | DispatchLane::Maintenance => req.dispatch(self),
                     },
                     // Quit loop on illegal request
                     None => break,
@@ -227,9 +240,20 @@ impl<FS: Filesystem> Session<FS> {
     where
         FS: Send + 'static,
     {
-        if self.file_writeback_tx.is_some() || self.maintenance_tx.is_some() {
+        if self.file_read_tx.is_some()
+            || self.file_writeback_tx.is_some()
+            || self.maintenance_tx.is_some()
+        {
             return Ok(());
         }
+        let (file_read_tx, file_read_guard) = spawn_worker_lane(
+            "fuse-file-read",
+            DispatchLane::FileRead,
+            Arc::clone(&self.filesystem),
+            Arc::clone(&self.abort_registry),
+            self.allowed.clone(),
+            self.session_owner,
+        )?;
         let (file_writeback_tx, file_writeback_guard) = spawn_worker_lane(
             "fuse-file-writeback",
             DispatchLane::FileWriteback,
@@ -246,8 +270,10 @@ impl<FS: Filesystem> Session<FS> {
             self.allowed.clone(),
             self.session_owner,
         )?;
+        self.file_read_tx = Some(file_read_tx);
         self.file_writeback_tx = Some(file_writeback_tx);
         self.maintenance_tx = Some(maintenance_tx);
+        self.worker_guards.push(file_read_guard);
         self.worker_guards.push(file_writeback_guard);
         self.worker_guards.push(maintenance_guard);
         Ok(())
@@ -286,6 +312,7 @@ impl<FS: 'static + Filesystem + Send> Session<FS> {
 
 impl<FS: Filesystem> Drop for Session<FS> {
     fn drop(&mut self) {
+        self.file_read_tx.take();
         self.file_writeback_tx.take();
         self.maintenance_tx.take();
         for guard in self.worker_guards.drain(..) {
@@ -331,6 +358,11 @@ fn spawn_worker_lane<FS: Filesystem + Send + 'static>(
             while let Ok(job) = rx.recv() {
                 if let Some(req) = Request::new(job.ch, &job.data) {
                     match lane {
+                        DispatchLane::FileRead => req.dispatch_file_read_worker(
+                            &filesystem,
+                            allowed.clone(),
+                            session_owner,
+                        ),
                         DispatchLane::FileWriteback => req.dispatch_file_writeback_worker(
                             &filesystem,
                             &abort_registry,

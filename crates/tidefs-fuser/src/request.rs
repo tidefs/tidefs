@@ -29,6 +29,7 @@ use crate::{ll, KernelConfig};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DispatchLane {
     Inline,
+    FileRead,
     FileWriteback,
     Maintenance,
 }
@@ -118,14 +119,19 @@ impl<'a> Request<'a> {
         }
     }
 
-    pub(crate) fn dispatch_lane(&self, initialized: bool) -> DispatchLane {
-        if !initialized {
+    pub(crate) fn dispatch_lane(&self, initialized: bool, destroyed: bool) -> DispatchLane {
+        if !initialized || destroyed {
             return DispatchLane::Inline;
         }
         let Ok(op) = self.request.operation() else {
             return DispatchLane::Inline;
         };
         match op {
+            ll::Operation::Open(_) | ll::Operation::Read(_) => DispatchLane::FileRead,
+            #[cfg(feature = "abi-7-11")]
+            ll::Operation::Poll(_) => DispatchLane::FileRead,
+            #[cfg(feature = "abi-7-24")]
+            ll::Operation::Lseek(_) => DispatchLane::FileRead,
             ll::Operation::SetAttr(_)
             | ll::Operation::Write(_)
             | ll::Operation::Flush(_)
@@ -150,6 +156,38 @@ impl<'a> Request<'a> {
             .with_iovec(unique, |iov| self.ch.send(iov));
         if let Err(err) = res {
             warn!("Request {unique:?}: Failed to send EIO reply: {err}")
+        }
+    }
+
+    pub(crate) fn dispatch_file_read_worker<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) {
+        debug!("{}", self.request);
+        let unique = self.request.unique();
+        let opcode = self.request.opcode();
+        let inode: u64 = self.request.nodeid().into();
+        let res = match self.dispatch_file_read_req(filesystem, allowed, session_owner) {
+            Ok(Some(resp)) => resp,
+            Ok(None) => return,
+            Err(errno) => {
+                ERROR_COUNTERS.increment(opcode);
+                warn!(
+                    "FUSE {} error: ino={:#x?} errno={} ({})",
+                    opcode_name(opcode),
+                    inode,
+                    i32::from(errno.0),
+                    errno_name(i32::from(errno.0)),
+                );
+                self.request.reply_err(errno)
+            }
+        }
+        .with_iovec(unique, |iov| self.ch.send(iov));
+
+        if let Err(err) = res {
+            warn!("Request {unique:?}: Failed to send reply: {err}")
         }
     }
 
@@ -215,6 +253,61 @@ impl<'a> Request<'a> {
             }
             _ => {}
         }
+    }
+
+    fn dispatch_file_read_req<FS: Filesystem>(
+        &self,
+        filesystem: &Arc<Mutex<FS>>,
+        allowed: SessionACL,
+        session_owner: u32,
+    ) -> Result<Option<Response<'_>>, Errno> {
+        if self.acl_denied(allowed, session_owner) {
+            return Err(Errno::EACCES);
+        }
+        let op = self.request.operation().map_err(|_| Errno::ENOSYS)?;
+        let mut fs = filesystem.lock().expect("filesystem mutex poisoned");
+        match op {
+            ll::Operation::Open(x) => {
+                fs.open(self, self.request.nodeid().into(), x.flags(), self.reply());
+            }
+            ll::Operation::Read(x) => {
+                fs.read(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.offset(),
+                    x.size(),
+                    x.flags(),
+                    x.lock_owner().map(|l| l.into()),
+                    self.reply(),
+                );
+            }
+            #[cfg(feature = "abi-7-11")]
+            ll::Operation::Poll(x) => {
+                fs.poll(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.kernel_handle(),
+                    x.events(),
+                    x.flags(),
+                    self.reply(),
+                );
+            }
+            #[cfg(feature = "abi-7-24")]
+            ll::Operation::Lseek(x) => {
+                fs.lseek(
+                    self,
+                    self.request.nodeid().into(),
+                    x.file_handle().into(),
+                    x.offset(),
+                    x.whence(),
+                    self.reply(),
+                );
+            }
+            _ => return Err(Errno::ENOSYS),
+        }
+        Ok(None)
     }
 
     fn dispatch_file_writeback_req<FS: Filesystem>(
@@ -1163,6 +1256,20 @@ mod tests {
         0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // max_readahead, flags
     ]);
 
+    #[cfg(target_endian = "little")]
+    const READ_REQUEST: AlignedData<[u8; 80]> = AlignedData([
+        0x50, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, // len=80, opcode=15
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fh=2
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset=4096
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // size=4096, read_flags=0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // lock_owner=0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // flags=0, padding=0
+    ]);
+
     #[cfg(all(target_endian = "little", feature = "abi-7-9"))]
     const WRITE_REQUEST: AlignedData<[u8; 84]> = AlignedData([
         0x54, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, // len=84, opcode=16
@@ -1189,6 +1296,40 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset=0
         0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // size=4, write_flags=0
         0xde, 0xad, 0xbe, 0xef,
+    ]);
+
+    #[cfg(target_endian = "little")]
+    const OPEN_REQUEST: AlignedData<[u8; 48]> = AlignedData([
+        0x30, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, // len=48, opcode=14
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // flags=O_RDONLY, unused=0
+    ]);
+
+    #[cfg(all(target_endian = "little", feature = "abi-7-11"))]
+    const POLL_REQUEST: AlignedData<[u8; 64]> = AlignedData([
+        0x40, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, // len=64, opcode=40
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fh=2
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // kh=3
+        0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, // flags=0, events/padding=5
+    ]);
+
+    #[cfg(all(target_endian = "little", feature = "abi-7-24"))]
+    const LSEEK_REQUEST: AlignedData<[u8; 64]> = AlignedData([
+        0x40, 0x00, 0x00, 0x00, 0x2e, 0x00, 0x00, 0x00, // len=64, opcode=46
+        0x0d, 0xf0, 0xad, 0xba, 0xef, 0xbe, 0xad, 0xde, // unique
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nodeid
+        0x0d, 0xd0, 0x01, 0xc0, 0xfe, 0xca, 0x01, 0xc0, // uid, gid
+        0x5e, 0xba, 0xde, 0xc0, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fh=2
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset=4096
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // whence=SEEK_HOLE, padding=0
     ]);
 
     #[cfg(target_endian = "little")]
@@ -1275,13 +1416,29 @@ mod tests {
     fn dispatch_lane_keeps_bootstrap_inline_and_defers_steady_state_work() {
         let ch = dummy_channel();
         let init = Request::new(ch.clone(), &INIT_REQUEST[..]).unwrap();
+        let open = Request::new(ch.clone(), &OPEN_REQUEST[..]).unwrap();
+        let read = Request::new(ch.clone(), &READ_REQUEST[..]).unwrap();
         let write = Request::new(ch.clone(), &WRITE_REQUEST[..]).unwrap();
-        let forget = Request::new(ch, &FORGET_REQUEST[..]).unwrap();
+        let forget = Request::new(ch.clone(), &FORGET_REQUEST[..]).unwrap();
+        #[cfg(feature = "abi-7-11")]
+        let poll = Request::new(ch.clone(), &POLL_REQUEST[..]).unwrap();
+        #[cfg(feature = "abi-7-24")]
+        let lseek = Request::new(ch, &LSEEK_REQUEST[..]).unwrap();
 
-        assert_eq!(write.dispatch_lane(false), DispatchLane::Inline);
-        assert_eq!(init.dispatch_lane(true), DispatchLane::Inline);
-        assert_eq!(write.dispatch_lane(true), DispatchLane::FileWriteback);
-        assert_eq!(forget.dispatch_lane(true), DispatchLane::Maintenance);
+        assert_eq!(write.dispatch_lane(false, false), DispatchLane::Inline);
+        assert_eq!(init.dispatch_lane(true, false), DispatchLane::Inline);
+        assert_eq!(open.dispatch_lane(true, false), DispatchLane::FileRead);
+        assert_eq!(read.dispatch_lane(true, false), DispatchLane::FileRead);
+        assert_eq!(read.dispatch_lane(true, true), DispatchLane::Inline);
+        #[cfg(feature = "abi-7-11")]
+        assert_eq!(poll.dispatch_lane(true, false), DispatchLane::FileRead);
+        #[cfg(feature = "abi-7-24")]
+        assert_eq!(lseek.dispatch_lane(true, false), DispatchLane::FileRead);
+        assert_eq!(
+            write.dispatch_lane(true, false),
+            DispatchLane::FileWriteback
+        );
+        assert_eq!(forget.dispatch_lane(true, false), DispatchLane::Maintenance);
     }
 
     #[test]
@@ -1323,6 +1480,45 @@ mod tests {
             SessionACL::All,
             0,
         );
+
+        assert!(seen.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn file_read_worker_dispatches_owned_read_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ReadSeenFS {
+            seen: Arc<AtomicBool>,
+        }
+
+        impl Filesystem for ReadSeenFS {
+            fn read(
+                &mut self,
+                _req: &Request<'_>,
+                _ino: u64,
+                fh: u64,
+                offset: i64,
+                size: u32,
+                _flags: i32,
+                _lock_owner: Option<u64>,
+                reply: crate::ReplyData,
+            ) {
+                assert_eq!(fh, 2);
+                assert_eq!(offset, 4096);
+                assert_eq!(size, 4096);
+                self.seen.store(true, Ordering::Release);
+                reply.data(b"read-data");
+            }
+        }
+
+        let seen = Arc::new(AtomicBool::new(false));
+        let filesystem = Arc::new(Mutex::new(ReadSeenFS {
+            seen: Arc::clone(&seen),
+        }));
+        let req = Request::new(dummy_channel(), &READ_REQUEST[..]).unwrap();
+        req.dispatch_file_read_worker(&filesystem, SessionACL::All, 0);
 
         assert!(seen.load(Ordering::Acquire));
     }
