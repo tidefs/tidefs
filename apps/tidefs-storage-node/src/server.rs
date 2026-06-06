@@ -90,6 +90,12 @@ fn pool_put_named(pool: &mut Pool, name: impl AsRef<[u8]>, payload: &[u8]) -> Re
         .map_err(|e| format!("pool put: {e}"))
 }
 
+fn pool_put_key(pool: &mut Pool, key: ObjectKey, payload: &[u8]) -> Result<(), String> {
+    pool.put(ObjectIoClass::Data, key, payload)
+        .map(|_| ())
+        .map_err(|e| format!("pool key put: {e}"))
+}
+
 fn pool_get_named(pool: &Pool, name: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, String> {
     pool.get(ObjectIoClass::Data, pool_name_key(name))
         .map_err(|e| format!("pool get: {e}"))
@@ -151,6 +157,7 @@ fn sync_entries_from_store(store: &StoreBackend) -> Vec<([u8; 32], Vec<u8>)> {
     }
 }
 
+#[cfg(test)]
 fn validate_repair_receipt_for_name(
     name: &[u8],
     payload: &[u8],
@@ -158,6 +165,24 @@ fn validate_repair_receipt_for_name(
 ) -> Result<(), String> {
     let expected_key = tidefs_local_object_store::ObjectKey::from_name(name).as_bytes32();
     validate_repair_receipt(expected_key, payload, placement_receipt_ref)
+}
+
+fn validate_repair_receipt_for_object_key(
+    object_key: ObjectKey,
+    payload: &[u8],
+    placement_receipt_ref: PlacementReceiptRef,
+) -> Result<(), String> {
+    validate_repair_receipt(object_key.as_bytes32(), payload, placement_receipt_ref)
+}
+
+fn exact_repair_object_key(key: &[u8]) -> Result<ObjectKey, String> {
+    let bytes: [u8; 32] = key.try_into().map_err(|_| {
+        format!(
+            "repair object key must be exactly 32 bytes for exact-key repair, got {}",
+            key.len()
+        )
+    })?;
+    Ok(ObjectKey::from_bytes32(bytes))
 }
 
 fn validate_repair_receipt(
@@ -208,18 +233,32 @@ fn validate_repair_receipt(
     Ok(())
 }
 
-fn apply_receipt_bound_repair(
+#[cfg(test)]
+fn apply_receipt_bound_name_repair(
     store: &mut StoreBackend,
     name: &[u8],
     payload: &[u8],
     placement_receipt_ref: PlacementReceiptRef,
 ) -> Result<(), String> {
     validate_repair_receipt_for_name(name, payload, placement_receipt_ref)?;
-    let repair_name = String::from_utf8_lossy(name).to_string();
     match store {
-        StoreBackend::Local(rs) => rs.put_local(&repair_name, payload),
-        StoreBackend::TransportBacked(ts) => ts.put_local(&repair_name, payload),
+        StoreBackend::Local(rs) => rs.put_local(name, payload),
+        StoreBackend::TransportBacked(ts) => ts.put_local(name, payload),
         StoreBackend::PoolBacked(pool) => pool_put_named(pool, name, payload),
+    }
+}
+
+fn apply_receipt_bound_key_repair(
+    store: &mut StoreBackend,
+    object_key: ObjectKey,
+    payload: &[u8],
+    placement_receipt_ref: PlacementReceiptRef,
+) -> Result<(), String> {
+    validate_repair_receipt_for_object_key(object_key, payload, placement_receipt_ref)?;
+    match store {
+        StoreBackend::Local(rs) => rs.put_key_local(object_key, payload),
+        StoreBackend::TransportBacked(ts) => ts.put_key_local(object_key, payload),
+        StoreBackend::PoolBacked(pool) => pool_put_key(pool, object_key, payload),
     }
 }
 
@@ -1685,22 +1724,30 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     }
                 }
                 ReplicationMessage::RepairObject {
-                    name,
+                    key,
                     placement_receipt_ref,
                     authoritative_payload,
                 } => {
                     let success = {
                         let mut s = ctx.store.lock().unwrap();
-                        apply_receipt_bound_repair(
-                            &mut *s,
-                            name.as_bytes(),
-                            authoritative_payload,
-                            *placement_receipt_ref,
-                        )
-                        .is_ok()
+                        match exact_repair_object_key(key) {
+                            Ok(object_key) => apply_receipt_bound_key_repair(
+                                &mut *s,
+                                object_key,
+                                authoritative_payload,
+                                *placement_receipt_ref,
+                            )
+                            .is_ok(),
+                            Err(e) => {
+                                eprintln!(
+                                    "[storage-node] session {session_id}: repair object key invalid: {e}"
+                                );
+                                false
+                            }
+                        }
                     };
                     ReplicationMessage::RepairObjectAck {
-                        name: name.clone(),
+                        key: key.clone(),
                         success,
                     }
                 }
@@ -2905,9 +2952,13 @@ fn handle_frame_ctx(
             authoritative_payload,
         } => {
             let mut s = store.lock().unwrap();
-            let result = apply_receipt_bound_repair(
+            let object_key = match exact_repair_object_key(key) {
+                Ok(object_key) => object_key,
+                Err(message) => return Some(Frame::Error { message }),
+            };
+            let result = apply_receipt_bound_key_repair(
                 &mut *s,
-                key,
+                object_key,
                 authoritative_payload,
                 *placement_receipt_ref,
             );
@@ -3609,10 +3660,14 @@ mod cluster_pool_handler_tests {
         (imported, lock_dir, devices)
     }
 
-    fn receipt_ref(name: &[u8], payload: &[u8], generation: u64) -> PlacementReceiptRef {
+    fn receipt_ref_for_key(
+        object_key: ObjectKey,
+        payload: &[u8],
+        generation: u64,
+    ) -> PlacementReceiptRef {
         PlacementReceiptRef::new(
             88,
-            ObjectKey::from_name(name).as_bytes32(),
+            object_key.as_bytes32(),
             EpochId::new(11),
             generation,
             ReceiptRedundancyPolicy::Replicated { copies: 2 },
@@ -3620,6 +3675,10 @@ mod cluster_pool_handler_tests {
             blake3::hash(payload).into(),
             2,
         )
+    }
+
+    fn receipt_ref(name: &[u8], payload: &[u8], generation: u64) -> PlacementReceiptRef {
+        receipt_ref_for_key(ObjectKey::from_name(name), payload, generation)
     }
 
     #[test]
@@ -3638,7 +3697,7 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
-    fn receipt_bound_repair_writes_matching_payload() {
+    fn receipt_bound_name_repair_writes_matching_payload() {
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![dir.path().join("store")];
         let store = ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
@@ -3647,12 +3706,36 @@ mod cluster_pool_handler_tests {
         let payload = b"authoritative";
         let receipt = receipt_ref(name, payload, 3);
 
-        apply_receipt_bound_repair(&mut backend, name, payload, receipt).unwrap();
+        apply_receipt_bound_name_repair(&mut backend, name, payload, receipt).unwrap();
 
         let entries = sync_entries_from_store(&backend);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, ObjectKey::from_name(name).as_bytes32());
         assert_eq!(entries[0].1, payload.to_vec());
+    }
+
+    #[test]
+    fn receipt_bound_exact_key_repair_writes_matching_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().join("store")];
+        let store = ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
+        let mut backend = StoreBackend::Local(Box::new(store));
+        let object_key = ObjectKey::from_bytes32([0xAB; 32]);
+        let payload = b"authoritative";
+        let receipt = receipt_ref_for_key(object_key, payload, 6);
+
+        apply_receipt_bound_key_repair(&mut backend, object_key, payload, receipt).unwrap();
+
+        let entries = sync_entries_from_store(&backend);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, object_key.as_bytes32());
+        assert_eq!(entries[0].1, payload.to_vec());
+    }
+
+    #[test]
+    fn exact_key_repair_rejects_non_32_byte_operand() {
+        let err = exact_repair_object_key(b"not-a-32-byte-object-key").unwrap_err();
+        assert!(err.contains("exactly 32 bytes"));
     }
 
     #[test]
@@ -3770,6 +3853,38 @@ mod cluster_pool_handler_tests {
             assert!(pool_get_named(pool, name).unwrap().is_none());
             assert!(pool_list_logical_keys(pool).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn pool_backend_exact_key_repair_uses_receipt_object_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let object_key = ObjectKey::from_bytes32([0xC7; 32]);
+        let payload = b"pool-authoritative";
+        let receipt = receipt_ref_for_key(object_key, payload, 7);
+        let mut backend = StoreBackend::PoolBacked(Box::new(
+            open_imported_pool_backend(&imported, &lock_dir).unwrap(),
+        ));
+
+        apply_receipt_bound_key_repair(&mut backend, object_key, payload, receipt).unwrap();
+
+        if let StoreBackend::PoolBacked(pool) = &mut backend {
+            assert_eq!(
+                pool_get_key(pool, object_key).unwrap(),
+                Some(payload.to_vec())
+            );
+            assert!(pool_get_named(pool, object_key.as_bytes32())
+                .unwrap()
+                .is_none());
+        }
+        let entries = sync_entries_from_store(&backend);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, object_key.as_bytes32());
+        assert_eq!(entries[0].1, payload.to_vec());
     }
 
     #[test]
