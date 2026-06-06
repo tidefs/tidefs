@@ -21,6 +21,7 @@
   linuxKernel_7_0,
   tidefsPackage,
   xfstests,
+  sourceRev ? "unknown",
 }:
 
 let
@@ -68,6 +69,7 @@ let
     FINDMNT_BIN="${pkgs.util-linux}/bin/findmnt"
     GMP_LIB="${pkgs.gmp}/lib"
     XFSTESTS_LIB="${xfstests}/lib/xfstests"
+    SOURCE_REV_DEFAULT=${pkgs.lib.escapeShellArg (toString sourceRev)}
 
     TMPDIR="''${TIDEFS_FUSE_XFSTESTS_TMPDIR:-/tmp/tidefs-fuse-xfstests-validation}"
     TIMEOUT_SEC="''${TIDEFS_FUSE_XFSTESTS_TIMEOUT:-1200}"
@@ -1669,8 +1671,17 @@ CRASHCMDS
 
     # ── Produce JSON validation report ───────────────────────────────────
 
-    TIDEFS_WT=""; for d in /root/tidefs-worktrees/agent-* /root/tidefs; do if [ -d "$d/.git" ]; then TIDEFS_WT="$d"; break; fi; done
-    COMMIT="$(git -C "$TIDEFS_WT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    COMMIT="''${TIDEFS_VALIDATION_COMMIT:-$SOURCE_REV_DEFAULT}"
+    if [ -z "$COMMIT" ] || [ "$COMMIT" = "unknown" ]; then
+      TIDEFS_WT=""
+      for d in /root/tidefs-worktrees/codex*/* /root/tidefs-worktrees/agent-* /root/tidefs; do
+        if git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          TIDEFS_WT="$d"
+          break
+        fi
+      done
+      COMMIT="$(git -C "$TIDEFS_WT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    fi
     RUN_ID="fuse-xfstests-$(date -u +%Y%m%dT%H%M%SZ)"
     KERNEL_VER="$(grep 'kernel_version=' "$VAL_LOG" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '\r' || echo unknown)"
     TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

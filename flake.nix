@@ -3032,6 +3032,7 @@ EOF
             linuxKernel_7_0 = linuxKernel_7_0;
             tidefsPackage = default;
             xfstests = xfstests;
+            sourceRev = self.rev or self.dirtyRev or "unknown";
           };
 
           fuseFsxValidation = import ./nix/vm/fuse-fsx-validation.nix {
