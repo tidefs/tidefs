@@ -3116,9 +3116,19 @@ impl FuseVfsAdapter {
     /// (A11 direct-I/O cache reconciliation / A16 page-cache authority).
     /// Advisory: errors are silently discarded.
     fn try_inval_inode_range(&self, ino: u64, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let Ok(offset) = i64::try_from(offset) else {
+            return;
+        };
+        let Ok(len) = i64::try_from(len) else {
+            self.try_inval_inode(ino);
+            return;
+        };
         if let Ok(guard) = self.notifier.lock() {
             if let Some(ref n) = *guard {
-                let _ = n.inval_inode(ino, offset as i64, len as i64);
+                let _ = n.inval_inode(ino, offset, len);
             }
         }
     }
@@ -5852,6 +5862,12 @@ impl FuseVfsAdapter {
         }
         if let Some(ref rd) = self.fuse_read_dispatch {
             rd.page_cache().invalidate_range(ino, offset, end);
+        }
+        if !self
+            .mmap_coherency
+            .invalidate_local_range(ino, offset, length)
+        {
+            self.try_inval_inode_range(ino, offset, length);
         }
         self.invalidate_inode_metadata_local(ino);
     }

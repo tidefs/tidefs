@@ -143,6 +143,46 @@ impl MmapCoherency {
     pub fn pending_event_count(&self) -> usize {
         self.processor.lock().unwrap().pending_event_count()
     }
+
+    pub fn invalidate_local_range(&self, ino: u64, offset: u64, length: u64) -> bool {
+        if length == 0 || !self.is_registered(ino) {
+            return false;
+        }
+        self.stats
+            .coherency_conflicts
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats.pages_invalidated.fetch_add(1, Ordering::Relaxed);
+        notify_inode_range(&self.notifier, ino, offset, length);
+        true
+    }
+}
+
+fn notify_inode_range(
+    notifier: &Arc<Mutex<Option<fuser::Notifier>>>,
+    ino: u64,
+    offset: u64,
+    length: u64,
+) {
+    let Some((offset, length)) = fuse_inval_range(offset, length) else {
+        return;
+    };
+    if let Ok(guard) = notifier.lock() {
+        if let Some(ref n) = *guard {
+            let _ = n.inval_inode(ino, offset, length);
+        }
+    }
+}
+
+fn fuse_inval_range(offset: u64, length: u64) -> Option<(i64, i64)> {
+    if offset == 0 && length == 0 {
+        return Some((0, -1));
+    }
+    if length == 0 {
+        return None;
+    }
+    let offset = i64::try_from(offset).ok()?;
+    let length = i64::try_from(length).ok()?;
+    Some((offset, length))
 }
 
 struct MmapInvalidationSink<'a> {
@@ -172,18 +212,32 @@ impl InvalidationSink for MmapInvalidationSink<'_> {
                 .coherency_conflicts
                 .fetch_add(1, Ordering::Relaxed);
             self.stats.pages_invalidated.fetch_add(1, Ordering::Relaxed);
-            if let Ok(guard) = self.notifier.lock() {
-                if let Some(ref n) = *guard {
-                    let _ = n.inval_inode(ino_u64, 0, -1);
-                }
-            }
+            notify_inode_range(self.notifier, ino_u64, 0, 0);
         }
     }
 
     fn invalidate_entry(&mut self, _parent: InodeId, _name: &[u8]) {}
     fn invalidate_directory(&mut self, _ino: InodeId) {}
     fn invalidate_dataset(&mut self, _dataset: DatasetId) {}
-    fn invalidate_range(&mut self, _ino: InodeId, _offset: u64, _length: u64) {}
+    fn invalidate_range(&mut self, ino: InodeId, offset: u64, length: u64) {
+        self.stats
+            .invalidations_received
+            .fetch_add(1, Ordering::Relaxed);
+        let ino_u64 = ino.0;
+        let should_invalidate = self
+            .registrations
+            .lock()
+            .unwrap()
+            .get(&ino_u64)
+            .is_some_and(|entry| entry.active);
+        if should_invalidate && fuse_inval_range(offset, length).is_some() {
+            self.stats
+                .coherency_conflicts
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats.pages_invalidated.fetch_add(1, Ordering::Relaxed);
+            notify_inode_range(self.notifier, ino_u64, offset, length);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +258,18 @@ mod tests {
 
     fn new_coherency() -> MmapCoherency {
         MmapCoherency::new(Arc::new(Mutex::new(None)))
+    }
+
+    fn range_batch(ino: u64, offset: u64, length: u64) -> InvalidationBatch {
+        InvalidationBatch::new(
+            DatasetId::new(1),
+            CommitGroupId::new(1),
+            vec![InvalidationEvent::Range {
+                ino: InodeId::new(ino),
+                offset,
+                length,
+            }],
+        )
     }
 
     #[test]
@@ -252,6 +318,38 @@ mod tests {
         c.process_tick(10);
         let s = c.stats.snapshot();
         assert_eq!(s.coherency_conflicts, 0);
+    }
+
+    #[test]
+    fn range_invalidation_triggers_for_registered_inode() {
+        let c = new_coherency();
+        c.register(42, 1);
+        c.enqueue_batch(range_batch(42, 4096, 8192));
+        let n = c.process_tick(10);
+        assert_eq!(n, 1);
+        let s = c.stats.snapshot();
+        assert_eq!(s.invalidations_received, 1);
+        assert_eq!(s.coherency_conflicts, 1);
+        assert_eq!(s.pages_invalidated, 1);
+    }
+
+    #[test]
+    fn local_range_invalidation_tracks_registered_inode() {
+        let c = new_coherency();
+        c.register(42, 1);
+        assert!(c.invalidate_local_range(42, 4096, 8192));
+        let s = c.stats.snapshot();
+        assert_eq!(s.coherency_conflicts, 1);
+        assert_eq!(s.pages_invalidated, 1);
+    }
+
+    #[test]
+    fn local_range_invalidation_ignores_unregistered_inode() {
+        let c = new_coherency();
+        assert!(!c.invalidate_local_range(42, 4096, 8192));
+        let s = c.stats.snapshot();
+        assert_eq!(s.coherency_conflicts, 0);
+        assert_eq!(s.pages_invalidated, 0);
     }
 
     #[test]
