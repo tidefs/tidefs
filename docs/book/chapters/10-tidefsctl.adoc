@@ -14,6 +14,7 @@ Most operator sessions should start with one of these groups:
   properties;
 * `tidefsctl snapshot --help` for snapshot lifecycle and transfer commands;
 * `tidefsctl block --help` for ublk block-volume attachment and inspection;
+* `tidefsctl kernel --help` for the declared kernel control endpoint probe;
 * `tidefsctl diag --help` for redacted support bundles.
 
 Development sessions may use `tidefsctl mount`, `tidefsctl pool mount`, and
@@ -155,6 +156,27 @@ the command routes to the exact owner or fails closed.
 The old `--pool <pool>` spelling is not the operator form. It must not be
 kept as a parallel control path for imported state.
 
+=== Kernel Control Probe
+
+`tidefsctl kernel status` reports the declared kernel control endpoint without
+opening it or issuing ioctls. The default control endpoint is
+`/dev/tidefs-control`, and `--control-dev <path>` may point the probe at a
+different path for tests or operator diagnostics.
+
+The current command is an honesty boundary, not proof of full-kernel control.
+It reports whether the path is missing, present as a character device, or
+present with the wrong file type. It always reports that production kernel UAPI
+wiring is not implemented until a later kernel-control issue wires a real
+client. It must not treat `/run/tidefs/pools/.../owner.json` manifests as
+kernel authority.
+
+[source,sh]
+----
+tidefsctl kernel status
+tidefsctl kernel status --json
+tidefsctl kernel status --control-dev /dev/null --json
+----
+
 === Command Classes
 
 [cols="1,2",options="header"]
@@ -170,7 +192,7 @@ kept as a parallel control path for imported state.
   `dataset list-props`; `snapshot create`, `snapshot list`, `snapshot destroy`,
   `snapshot rollback`, `snapshot send`, `snapshot receive`; `device remove`,
   `device rebuild`; `block attach`, `block detach`, `block list`,
-  `block send`, `block receive`; `defrag`; `diag`
+  `block send`, `block receive`; `kernel status`; `defrag`; `diag`
 
 | Development harness
 | `mount`, `pool mount`, hidden `pool create --file-devices`,

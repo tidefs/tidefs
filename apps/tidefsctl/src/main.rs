@@ -18,6 +18,7 @@
 //! | `block attach/detach/list/send/receive` | operator commands |
 //! | `dataset create/list/destroy/rename` | operator command (catalog-backed) |
 //! | `dataset set-strategy/seal-key/rotate-key/upgrade/get/set/list-props` | operator commands |
+//! | `kernel status` | operator diagnostic; production kernel UAPI not wired |
 //! | `diag` | operator diagnostic/support bundle |
 //! | `cluster pool create` | cluster operator prototype; TFR-017 remains open |
 //! | `cluster placement exercise` | development diagnostic exercise |
@@ -54,6 +55,7 @@ Primary operator groups:
   snapshot  create, list, destroy, roll back, send, and receive snapshots
   device    remove or rebuild pool devices
   block     attach, list, detach, send, and receive ublk block devices
+  kernel    inspect the declared kernel control endpoint
   diag      collect a redacted support bundle
 
 Development harnesses:
@@ -71,7 +73,7 @@ Pool routing rule:
 
 TideFS is pre-alpha. Help text should mark harnesses as such instead of
 treating them as the final kernel runtime."#,
-    after_help = "Start with `tidefsctl pool --help`, `tidefsctl dataset --help`, or `tidefsctl diag --help`. The book source lives under docs/book/.",
+    after_help = "Start with `tidefsctl pool --help`, `tidefsctl dataset --help`, `tidefsctl kernel --help`, or `tidefsctl diag --help`. The book source lives under docs/book/.",
     arg_required_else_help = true,
 )]
 struct Cli {
@@ -152,6 +154,12 @@ enum Command {
         cmd: commands::block::BlockCommand,
     },
 
+    /// Inspect kernel-resident TideFS control surfaces
+    Kernel {
+        #[command(subcommand)]
+        cmd: commands::kernel::KernelCommand,
+    },
+
     /// Collect a redacted support bundle
     Diag {
         /// Output directory for the support bundle JSON file
@@ -197,6 +205,7 @@ fn main() {
             devices,
         } => commands::diag::handle_diag(output_dir, &devices),
         Command::Cluster { cmd } => commands::cluster::handle_cluster(cmd),
+        Command::Kernel { cmd } => commands::kernel::handle_kernel(cmd),
     }
 }
 
@@ -892,6 +901,39 @@ mod tests {
             args.is_ok(),
             "block receive offline backing dir should parse"
         );
+    }
+
+    // -- Kernel CLI parse tests ------------------------------------------
+
+    #[test]
+    fn cli_parse_kernel_status_default() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "kernel", "status"]);
+        assert!(args.is_ok(), "kernel status should parse");
+    }
+
+    #[test]
+    fn cli_parse_kernel_status_json_and_control_dev() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "kernel",
+            "status",
+            "--json",
+            "--control-dev",
+            "/dev/null",
+        ]);
+        assert!(
+            args.is_ok(),
+            "kernel status --json --control-dev should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_kernel_rejects_missing_subcommand() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "kernel"]);
+        assert!(args.is_err(), "kernel requires a subcommand");
     }
 
     // -- Dataset CLI parse tests ------------------------------------------
