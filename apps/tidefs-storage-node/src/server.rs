@@ -553,17 +553,27 @@ fn build_segment_fetch_response(
     let receipt_key = receipt_ref.map(|receipt| ObjectKey::from_bytes32(receipt.object_key));
 
     let full_payload = match (store, receipt_key) {
-        (StoreBackend::Local(rs), Some(object_key)) => rs
-            .get_key_local(object_key)
-            .map_err(|e| format!("primary receipt-key get for object {obj_id}: {e}"))?
-            .unwrap_or_default(),
-        (StoreBackend::TransportBacked(ts), Some(object_key)) => ts
-            .get_key_local(object_key)
-            .map_err(|e| format!("primary receipt-key get for object {obj_id}: {e}"))?
-            .unwrap_or_default(),
-        (StoreBackend::PoolBacked(pool), Some(object_key)) => pool_get_key(pool, object_key)
-            .map_err(|e| format!("pool receipt-key get for object {obj_id}: {e}"))?
-            .unwrap_or_default(),
+        (StoreBackend::Local(rs), Some(object_key)) => require_receipt_key_payload(
+            "local",
+            obj_id,
+            object_key,
+            rs.get_key_local(object_key)
+                .map_err(|e| format!("local receipt-key get for object {obj_id}: {e}"))?,
+        )?,
+        (StoreBackend::TransportBacked(ts), Some(object_key)) => require_receipt_key_payload(
+            "transport",
+            obj_id,
+            object_key,
+            ts.get_key_local(object_key)
+                .map_err(|e| format!("transport receipt-key get for object {obj_id}: {e}"))?,
+        )?,
+        (StoreBackend::PoolBacked(pool), Some(object_key)) => require_receipt_key_payload(
+            "pool",
+            obj_id,
+            object_key,
+            pool_get_key(pool, object_key)
+                .map_err(|e| format!("pool receipt-key get for object {obj_id}: {e}"))?,
+        )?,
         (StoreBackend::Local(rs), None) => rs
             .get_local(request.object_id.to_le_bytes())
             .map_err(|e| format!("primary get for object {}: {e}", request.object_id))?
@@ -595,6 +605,29 @@ fn build_segment_fetch_response(
         actual_length,
         segment_payload,
     ))
+}
+
+fn require_receipt_key_payload(
+    backend: &str,
+    object_id: u64,
+    object_key: ObjectKey,
+    payload: Option<Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    payload.ok_or_else(|| {
+        format!(
+            "{backend} receipt-key get for object {object_id}: exact placement receipt key {} not found",
+            object_key_hex(object_key),
+        )
+    })
+}
+
+fn object_key_hex(object_key: ObjectKey) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in object_key.as_bytes32() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 /// Configuration for a storage node server.
@@ -4338,6 +4371,99 @@ mod cluster_pool_handler_tests {
         assert_eq!(response.payload, b"authoritative".to_vec());
         assert_eq!(response.segment_offset, 8);
         assert_eq!(response.segment_length, 13);
+    }
+
+    #[test]
+    fn pool_backend_segment_fetch_refuses_missing_receipt_object_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let mut backend = StoreBackend::PoolBacked(Box::new(
+            open_imported_pool_backend(&imported, &lock_dir).unwrap(),
+        ));
+
+        let legacy_object_id: u64 = 45;
+        let receipt_key = ObjectKey::from_bytes32([0x6A; 32]);
+        let receipt_payload = b"missing-receipt-authoritative-payload";
+        let receipt = receipt_ref_for_key(receipt_key, receipt_payload, 9);
+
+        if let StoreBackend::PoolBacked(pool) = &mut backend {
+            pool_put_named(pool, legacy_object_id.to_le_bytes(), b"legacy payload").unwrap();
+        }
+
+        let request = SegmentFetchRequest {
+            object_id: legacy_object_id,
+            placement_receipt_ref: Some(receipt),
+            segment_offset: 0,
+            segment_length: receipt.payload_len,
+        };
+
+        let err = build_segment_fetch_response(&backend, &request).unwrap_err();
+
+        assert!(err.contains("pool receipt-key get for object 88"));
+        assert!(err.contains("exact placement receipt key"));
+        assert!(err.contains("6a6a6a6a"));
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn pool_backend_segment_fetch_keeps_legacy_missing_fetch_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let backend = StoreBackend::PoolBacked(Box::new(
+            open_imported_pool_backend(&imported, &lock_dir).unwrap(),
+        ));
+
+        let request = SegmentFetchRequest {
+            object_id: 46,
+            placement_receipt_ref: None,
+            segment_offset: 0,
+            segment_length: 32,
+        };
+
+        let response = build_segment_fetch_response(&backend, &request).unwrap();
+
+        assert_eq!(response.object_id, 46);
+        assert_eq!(response.segment_offset, 0);
+        assert_eq!(response.segment_length, 0);
+        assert!(response.payload.is_empty());
+    }
+
+    #[test]
+    fn pool_backend_segment_fetch_keeps_synthetic_missing_fetch_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let backend = StoreBackend::PoolBacked(Box::new(
+            open_imported_pool_backend(&imported, &lock_dir).unwrap(),
+        ));
+        let synthetic = PlacementReceiptRef::synthetic_for_subject(
+            tidefs_replication_model::ReplicatedSubjectId::new(47),
+        );
+
+        let request = SegmentFetchRequest {
+            object_id: 47,
+            placement_receipt_ref: Some(synthetic),
+            segment_offset: 0,
+            segment_length: 32,
+        };
+
+        let response = build_segment_fetch_response(&backend, &request).unwrap();
+
+        assert_eq!(response.object_id, 47);
+        assert_eq!(response.segment_offset, 0);
+        assert_eq!(response.segment_length, 0);
+        assert!(response.payload.is_empty());
     }
 
     #[test]
