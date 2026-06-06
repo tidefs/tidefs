@@ -408,16 +408,19 @@ Important 2026-06-01 findings:
   transport dispatch. UAPI status must therefore be derived from real handler
 - `TFR-012`: Device lifecycle and media privacy remain incomplete. Device
   capacity for directory-backed devices still uses a 1 TiB placeholder,
-  `SingleDevice::supports_discard()` returns true while `discard_range()`
-  shells out to `fallocate -p` and silently ignores unsupported filesystems or
-  missing utilities, and segment free also performs best-effort hole punching.
-  Pool TRIM functions count requested bytes after successful best-effort calls,
-  not proven media erasure. `tidefsctl device remove` imports labels and has
-  useful survivor-label persistence, but it preloads all target objects,
-  maps object ids locally, depends on operator-supplied surviving store
-  directories, maps synthetic device paths to directories, syncs survivors,
-  and anchors removal on the target store. That is not yet a
-  pool-authoritative add/remove/replace/remanence lifecycle.
+  segment free still performs best-effort hole punching, and that is not
+  proven media erasure. `tidefsctl device remove` imports labels and has useful
+  survivor-label persistence, but it preloads all target objects, maps object
+  ids locally, depends on operator-supplied surviving store directories, maps
+  synthetic device paths to directories, syncs survivors, and anchors removal
+  on the target store. That is not yet a pool-authoritative
+  add/remove/replace/remanence lifecycle. Issue #14 closes the narrow
+  directory-backed discard capability bug:
+  `SingleDevice` no longer advertises discard, non-zero direct discard now
+  fails explicitly, and directory-only pool trim/free paths report zero bytes
+  discarded. TFR-012 remains open for real discard-capable backing devices,
+  segment-reclaim remanence, device capacity authority, and online lifecycle
+  work.
 - `TFR-013`: stage words remain widespread; examples include CLI stubs,
   runners, old issue-era gate labels outside the first cleaned xtask gate set,
   and app/workspace classification docs that list deleted or quarantined
