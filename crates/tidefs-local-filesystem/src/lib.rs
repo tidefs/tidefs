@@ -1343,6 +1343,7 @@ pub struct LocalFileSystem {
     uncommitted_mutation_count: u64,
     max_uncommitted_mutations: u64,
     in_transaction: bool,
+    suppress_commit_write_buffer_flush: bool,
     #[allow(dead_code)]
     // INTENT: kept for planned architecture; callers in test modules or pending wiring into FUSE dispatch
     state_before_transaction: Option<FileSystemState>,
@@ -2793,6 +2794,7 @@ impl LocalFileSystem {
             uncommitted_mutation_count: 0,
             max_uncommitted_mutations: DEFAULT_MAX_UNCOMMITTED_MUTATIONS,
             in_transaction: false,
+            suppress_commit_write_buffer_flush: false,
             mutation_delta: None,
             domain_registry: SpaceDomainRegistry::new(),
             state_before_transaction: None,
@@ -5633,7 +5635,32 @@ impl LocalFileSystem {
         self.commit_mutation(record)
     }
 
+    fn with_commit_write_buffer_flush_suppressed<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let previous = self.suppress_commit_write_buffer_flush;
+        self.suppress_commit_write_buffer_flush = true;
+        let result = f(self);
+        self.suppress_commit_write_buffer_flush = previous;
+        result
+    }
+
     fn flush_drained_write_segments(
+        &mut self,
+        inode_id: InodeId,
+        segments: Vec<(u64, Vec<u8>)>,
+        flush_remaining_write_buffers_on_commit: bool,
+    ) -> Result<()> {
+        if !flush_remaining_write_buffers_on_commit {
+            return self.with_commit_write_buffer_flush_suppressed(|fs| {
+                fs.flush_drained_write_segments_inner(inode_id, segments)
+            });
+        }
+        self.flush_drained_write_segments_inner(inode_id, segments)
+    }
+
+    fn flush_drained_write_segments_inner(
         &mut self,
         inode_id: InodeId,
         segments: Vec<(u64, Vec<u8>)>,
@@ -5744,7 +5771,7 @@ impl LocalFileSystem {
             None => return Ok(()),
         };
         self.write_buffers.remove(&inode_id);
-        self.flush_drained_write_segments(inode_id, segments)
+        self.flush_drained_write_segments(inode_id, segments, true)
     }
 
     fn flush_write_buffer_batch(&mut self, inode_id: InodeId) -> Result<()> {
@@ -5764,7 +5791,7 @@ impl LocalFileSystem {
         if drained_empty {
             self.write_buffers.remove(&inode_id);
         }
-        self.flush_drained_write_segments(inode_id, segments)
+        self.flush_drained_write_segments(inode_id, segments, false)
     }
 
     /// Flush all write buffers to the object store.
@@ -9481,8 +9508,12 @@ impl LocalFileSystem {
 
     pub(crate) fn do_commit(&mut self) -> Result<()> {
         let write_buffers_before = self.write_buffers.len();
-        self.flush_all_write_buffers()?;
-        let flushed_write_buffers = self.write_buffers.len() < write_buffers_before;
+        let flushed_write_buffers = if self.suppress_commit_write_buffer_flush {
+            false
+        } else {
+            self.flush_all_write_buffers()?;
+            self.write_buffers.len() < write_buffers_before
+        };
         // Per #863: clearing the intent log without a state commit is
         // silent data loss — acknowledged intents are dropped without
         // ever being persisted.

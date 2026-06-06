@@ -1046,6 +1046,43 @@ fn threshold_autoflush_clears_flushed_writeback_range() {
 }
 
 #[test]
+fn threshold_autoflush_leaves_overflow_tail_buffered_with_auto_commit() {
+    let (mut fs, root) = wb_open_temp("threshold-autoflush-keeps-tail");
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: 8,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+
+    let record = fs.create_file("/flush.bin", 0o644).expect("create");
+    fs.write_file("/flush.bin", 0, b"abcdefghijkl")
+        .expect("threshold write");
+
+    assert_eq!(
+        fs.read_from_write_buffer(record.inode_id, 8, 4).as_deref(),
+        Some(&b"ijkl"[..]),
+        "byte-threshold writeback should publish only the sealed batch"
+    );
+    assert!(fs
+        .writeback_range_tracker
+        .lock()
+        .expect("locked")
+        .is_dirty(record.inode_id));
+    assert_eq!(&fs.read_file("/flush.bin").expect("read"), b"abcdefghijkl");
+
+    fs.flush_write_buffer(record.inode_id)
+        .expect("explicit flush drains tail");
+    assert!(!fs.write_buffers.contains_key(&record.inode_id));
+    assert!(!fs
+        .writeback_range_tracker
+        .lock()
+        .expect("locked")
+        .is_dirty(record.inode_id));
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn sequential_small_writes_coalesce() {
     let (mut fs, root) = wb_open_temp("sequential-small");
     fs.set_write_buffer_config(WriteBufferConfig {
