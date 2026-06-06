@@ -1,9 +1,9 @@
 //! Segment fetch message types for cross-node object reads.
 //!
-//! These types carry object segment identifiers and payload data.
-//! Per-message integrity is provided by the transport session security
-//! boundary; segment fetch messages carry object identifiers for routing,
-//! not content or integrity verification.
+//! These types carry receipt-bound object segment identifiers and payload
+//! data. Per-message integrity is provided by the transport session security
+//! boundary; segment fetch messages carry placement receipt authority for real
+//! movement and keep bare object identifiers only as a compatibility fallback.
 //!
 //! ## Wire format
 //!
@@ -13,6 +13,7 @@
 //! from other wire protocols without ambiguous fallback decoding.
 
 use serde::{Deserialize, Serialize};
+use tidefs_replication_model::PlacementReceiptRef;
 
 // ---------------------------------------------------------------------------
 // Wire magic — self-describing 4-byte ASCII prefix
@@ -49,14 +50,19 @@ impl std::fmt::Display for SegmentFetchMagicError {
 /// Request from one node to fetch a segment of an object from a remote node.
 ///
 /// Sent over an established transport session to request a specific byte
-/// range of an object identified by `object_id`. The receiver should respond
-/// with a [`SegmentFetchResponse`] containing the segment payload.
+/// range of an object identified by `placement_receipt_ref` when real
+/// placement authority is available. `object_id` remains for model logging and
+/// compatibility callers that do not yet pass receipt refs.
 ///
 /// Wire format: 4-byte ASCII magic `SF01` followed by bincode-encoded struct.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentFetchRequest {
-    /// The object to read from.
+    /// The object to read from. Real movement should pair this with a
+    /// non-synthetic placement receipt ref; absent/synthetic refs are legacy
+    /// fallback only.
     pub object_id: u64,
+    /// Placement receipt authority for the object key to fetch.
+    pub placement_receipt_ref: Option<PlacementReceiptRef>,
     /// Byte offset within the object.
     pub segment_offset: u64,
     /// Number of bytes to read, starting at `segment_offset`.
@@ -68,9 +74,32 @@ impl SegmentFetchRequest {
     pub fn new(object_id: u64, segment_offset: u64, segment_length: u64) -> Self {
         Self {
             object_id,
+            placement_receipt_ref: None,
             segment_offset,
             segment_length,
         }
+    }
+
+    /// Create a segment fetch request bound to durable placement receipt
+    /// authority.
+    pub fn with_placement_receipt_ref(
+        placement_receipt_ref: PlacementReceiptRef,
+        segment_offset: u64,
+        segment_length: u64,
+    ) -> Self {
+        Self {
+            object_id: placement_receipt_ref.object_id,
+            placement_receipt_ref: Some(placement_receipt_ref),
+            segment_offset,
+            segment_length,
+        }
+    }
+
+    /// Return real receipt authority for object-key lookup, if this request
+    /// carries one.
+    pub fn non_synthetic_receipt_ref(&self) -> Option<PlacementReceiptRef> {
+        self.placement_receipt_ref
+            .filter(|receipt| !receipt.is_synthetic())
     }
 
     /// Encode to wire format: 4-byte SF01 magic + bincode payload.
@@ -209,6 +238,44 @@ mod tests {
         let encoded = req.encode().unwrap();
         let decoded = SegmentFetchRequest::decode(&encoded).unwrap();
         assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn request_roundtrip_preserves_receipt_ref() {
+        let receipt = PlacementReceiptRef::replicated(
+            42,
+            [0xA5; 32],
+            tidefs_membership_epoch::EpochId::new(7),
+            3,
+            2,
+            123,
+            [0xBC; 32],
+        );
+        let req = SegmentFetchRequest::with_placement_receipt_ref(receipt, 12, 34);
+
+        let encoded = req.encode().unwrap();
+        let decoded = SegmentFetchRequest::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.object_id, receipt.object_id);
+        assert_eq!(decoded.placement_receipt_ref, Some(receipt));
+        assert_eq!(decoded.non_synthetic_receipt_ref(), Some(receipt));
+        assert_eq!(decoded.segment_offset, 12);
+        assert_eq!(decoded.segment_length, 34);
+    }
+
+    #[test]
+    fn request_synthetic_receipt_is_not_lookup_authority() {
+        let receipt = PlacementReceiptRef::synthetic_for_subject(
+            tidefs_replication_model::ReplicatedSubjectId::new(42),
+        );
+        let req = SegmentFetchRequest {
+            object_id: 42,
+            placement_receipt_ref: Some(receipt),
+            segment_offset: 0,
+            segment_length: 1,
+        };
+
+        assert_eq!(req.non_synthetic_receipt_ref(), None);
     }
 
     #[test]
