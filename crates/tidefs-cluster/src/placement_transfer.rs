@@ -27,6 +27,12 @@
 //! the epoch it was opened under. Epoch transitions abort in-flight
 //! transfers via [`on_epoch_transition`].
 //!
+//! Transfer plans are receipt-bounded: every object range must carry the
+//! durable placement receipt authority that made the source placement legal.
+//! The coordinator rejects stale or malformed receipt anchors before creating
+//! a transfer session, so byte movement cannot become an alternate placement
+//! truth.
+//!
 //! ## Integration
 //!
 //! - **Lease state machine**: transfer phases are gated by lease state.
@@ -66,6 +72,116 @@ pub struct PlanEntry {
     pub object_ranges: Vec<ObjectRange>,
 }
 
+/// Redundancy policy identity recorded by a placement receipt anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptRedundancyPolicy {
+    /// Full replicas on distinct placement targets.
+    Replicated { copies: u8 },
+    /// One erasure stripe with data plus parity shard targets.
+    Erasure { data_shards: u8, parity_shards: u8 },
+}
+
+impl ReceiptRedundancyPolicy {
+    /// Number of physical targets required by this policy.
+    #[must_use]
+    pub const fn target_width(self) -> u16 {
+        match self {
+            Self::Replicated { copies } => copies as u16,
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => data_shards as u16 + parity_shards as u16,
+        }
+    }
+
+    /// True when the policy can describe a usable receipt placement.
+    #[must_use]
+    pub const fn is_well_formed(self) -> bool {
+        match self {
+            Self::Replicated { copies } => copies > 0,
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => data_shards > 0 && parity_shards > 0,
+        }
+    }
+}
+
+/// Durable receipt authority for one object placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacementReceiptAnchor {
+    /// Logical object id used by the transfer planner.
+    pub object_id: u64,
+    /// Full 32-byte object key recorded by the local placement receipt.
+    pub object_key: [u8; 32],
+    /// Topology or membership epoch when this receipt was issued.
+    pub receipt_epoch: EpochId,
+    /// Monotonic receipt write generation.
+    pub receipt_generation: u64,
+    /// Redundancy policy identity in force for this placement.
+    pub redundancy_policy: ReceiptRedundancyPolicy,
+    /// Logical payload length before erasure padding.
+    pub payload_len: u64,
+    /// BLAKE3 digest of the logical payload.
+    pub payload_digest: [u8; 32],
+    /// Number of physical targets recorded by the placement receipt.
+    pub target_count: u16,
+}
+
+impl PlacementReceiptAnchor {
+    /// Construct a replicated placement receipt anchor.
+    #[must_use]
+    pub const fn replicated(
+        object_id: u64,
+        object_key: [u8; 32],
+        receipt_epoch: EpochId,
+        receipt_generation: u64,
+        copies: u8,
+        payload_len: u64,
+        payload_digest: [u8; 32],
+    ) -> Self {
+        let redundancy_policy = ReceiptRedundancyPolicy::Replicated { copies };
+        Self {
+            object_id,
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            target_count: redundancy_policy.target_width(),
+        }
+    }
+
+    /// Construct an erasure-coded placement receipt anchor.
+    #[must_use]
+    pub const fn erasure(
+        object_id: u64,
+        object_key: [u8; 32],
+        receipt_epoch: EpochId,
+        receipt_generation: u64,
+        data_shards: u8,
+        parity_shards: u8,
+        payload_len: u64,
+        payload_digest: [u8; 32],
+    ) -> Self {
+        let redundancy_policy = ReceiptRedundancyPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        };
+        Self {
+            object_id,
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            target_count: redundancy_policy.target_width(),
+        }
+    }
+}
+
 /// A byte range within a specific object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObjectRange {
@@ -75,6 +191,26 @@ pub struct ObjectRange {
     pub start_offset: u64,
     /// Number of bytes.
     pub length_bytes: u64,
+    /// Receipt anchor proving the source placement for this range.
+    pub receipt: PlacementReceiptAnchor,
+}
+
+impl ObjectRange {
+    /// Create a receipt-bound object range.
+    #[must_use]
+    pub const fn receipt_bound(
+        object_id: u64,
+        start_offset: u64,
+        length_bytes: u64,
+        receipt: PlacementReceiptAnchor,
+    ) -> Self {
+        Self {
+            object_id,
+            start_offset,
+            length_bytes,
+            receipt,
+        }
+    }
 }
 
 impl TransferPlan {
@@ -113,6 +249,72 @@ impl TransferPlan {
     /// True if the plan has no transfers.
     pub fn is_empty(&self) -> bool {
         self.transfers.is_empty()
+    }
+
+    /// Validate that every range carries usable receipt authority for this plan.
+    pub fn validate_receipt_authority(&self) -> Result<(), TransferError> {
+        for entry in &self.transfers {
+            for range in &entry.object_ranges {
+                let receipt = range.receipt;
+                if receipt.object_id != range.object_id {
+                    return Err(TransferError::ReceiptAuthority {
+                        plan_id: self.plan_id,
+                        object_id: range.object_id,
+                        reason: "receipt object id does not match range",
+                    });
+                }
+                if receipt.receipt_epoch != self.epoch {
+                    return Err(TransferError::ReceiptAuthority {
+                        plan_id: self.plan_id,
+                        object_id: range.object_id,
+                        reason: "receipt epoch does not match transfer plan epoch",
+                    });
+                }
+                if receipt.receipt_generation == 0 {
+                    return Err(TransferError::ReceiptAuthority {
+                        plan_id: self.plan_id,
+                        object_id: range.object_id,
+                        reason: "placement receipt generation is zero",
+                    });
+                }
+                if !receipt.redundancy_policy.is_well_formed() {
+                    return Err(TransferError::ReceiptAuthority {
+                        plan_id: self.plan_id,
+                        object_id: range.object_id,
+                        reason: "placement receipt redundancy policy is malformed",
+                    });
+                }
+                if receipt.target_count == 0 {
+                    return Err(TransferError::ReceiptAuthority {
+                        plan_id: self.plan_id,
+                        object_id: range.object_id,
+                        reason: "placement receipt has no physical targets",
+                    });
+                }
+                if receipt.target_count != receipt.redundancy_policy.target_width() {
+                    return Err(TransferError::ReceiptAuthority {
+                        plan_id: self.plan_id,
+                        object_id: range.object_id,
+                        reason: "placement receipt target count does not match redundancy policy",
+                    });
+                }
+                let Some(range_end) = range.start_offset.checked_add(range.length_bytes) else {
+                    return Err(TransferError::ReceiptAuthority {
+                        plan_id: self.plan_id,
+                        object_id: range.object_id,
+                        reason: "object range end overflows",
+                    });
+                };
+                if range_end > receipt.payload_len {
+                    return Err(TransferError::ReceiptAuthority {
+                        plan_id: self.plan_id,
+                        object_id: range.object_id,
+                        reason: "object range exceeds placement receipt payload length",
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Build a plan from a list of (source, dest, ranges) entries.
@@ -284,6 +486,12 @@ pub enum TransferError {
     RetriesExceeded(u32, u64),
     #[error("plan is empty -- nothing to transfer")]
     EmptyPlan,
+    #[error("plan {plan_id} object {object_id} has invalid placement receipt authority: {reason}")]
+    ReceiptAuthority {
+        plan_id: u64,
+        object_id: u64,
+        reason: &'static str,
+    },
 }
 
 // ── Coordinator ─────────────────────────────────────────────────────
@@ -376,6 +584,7 @@ impl PlacementTransferCoordinator {
                 current_epoch: self.current_epoch,
             });
         }
+        plan.validate_receipt_authority()?;
         let id = self.next_transfer_id;
         self.next_transfer_id += 1;
 
@@ -591,12 +800,37 @@ mod tests {
         EpochId(v)
     }
 
+    fn object_key(id: u64) -> [u8; 32] {
+        let mut key = [0xA5; 32];
+        key[..8].copy_from_slice(&id.to_le_bytes());
+        key
+    }
+
+    fn payload_digest(id: u64, len: u64) -> [u8; 32] {
+        let mut digest = [0x5A; 32];
+        digest[..8].copy_from_slice(&id.to_le_bytes());
+        digest[8..16].copy_from_slice(&len.to_le_bytes());
+        digest
+    }
+
+    fn receipt_anchor_at(epoch: EpochId, id: u64, payload_len: u64) -> PlacementReceiptAnchor {
+        PlacementReceiptAnchor::replicated(
+            id,
+            object_key(id),
+            epoch,
+            1,
+            2,
+            payload_len,
+            payload_digest(id, payload_len),
+        )
+    }
+
+    fn obj_range_at(epoch: EpochId, id: u64, start: u64, len: u64) -> ObjectRange {
+        ObjectRange::receipt_bound(id, start, len, receipt_anchor_at(epoch, id, start + len))
+    }
+
     fn obj_range(id: u64, start: u64, len: u64) -> ObjectRange {
-        ObjectRange {
-            object_id: id,
-            start_offset: start,
-            length_bytes: len,
-        }
+        obj_range_at(eid(1), id, start, len)
     }
 
     // ── TransferPlan tests ─────────────────────────────────────────
@@ -648,6 +882,135 @@ mod tests {
         assert!(plan.is_empty());
         assert_eq!(plan.total_ranges(), 0);
         assert_eq!(plan.total_bytes(), 0);
+    }
+
+    #[test]
+    fn plan_receipt_authority_accepts_bound_ranges() {
+        let mut plan = TransferPlan::new(eid(7), 700);
+        plan.add_transfer(1, 2, vec![obj_range_at(eid(7), 11, 64, 1024)]);
+
+        assert!(plan.validate_receipt_authority().is_ok());
+    }
+
+    #[test]
+    fn plan_receipt_authority_rejects_epoch_mismatch() {
+        let mut plan = TransferPlan::new(eid(7), 701);
+        plan.add_transfer(1, 2, vec![obj_range_at(eid(6), 11, 64, 1024)]);
+
+        assert!(matches!(
+            plan.validate_receipt_authority().unwrap_err(),
+            TransferError::ReceiptAuthority {
+                plan_id: 701,
+                object_id: 11,
+                reason: "receipt epoch does not match transfer plan epoch",
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_receipt_authority_rejects_zero_generation() {
+        let mut range = obj_range_at(eid(1), 12, 0, 1024);
+        range.receipt.receipt_generation = 0;
+        let mut plan = TransferPlan::new(eid(1), 702);
+        plan.add_transfer(1, 2, vec![range]);
+
+        assert!(matches!(
+            plan.validate_receipt_authority().unwrap_err(),
+            TransferError::ReceiptAuthority {
+                plan_id: 702,
+                object_id: 12,
+                reason: "placement receipt generation is zero",
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_receipt_authority_rejects_targetless_receipt() {
+        let mut range = obj_range_at(eid(1), 13, 0, 1024);
+        range.receipt.target_count = 0;
+        let mut plan = TransferPlan::new(eid(1), 703);
+        plan.add_transfer(1, 2, vec![range]);
+
+        assert!(matches!(
+            plan.validate_receipt_authority().unwrap_err(),
+            TransferError::ReceiptAuthority {
+                plan_id: 703,
+                object_id: 13,
+                reason: "placement receipt has no physical targets",
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_receipt_authority_rejects_policy_width_mismatch() {
+        let mut range = obj_range_at(eid(1), 14, 0, 1024);
+        range.receipt.target_count = 3;
+        let mut plan = TransferPlan::new(eid(1), 704);
+        plan.add_transfer(1, 2, vec![range]);
+
+        assert!(matches!(
+            plan.validate_receipt_authority().unwrap_err(),
+            TransferError::ReceiptAuthority {
+                plan_id: 704,
+                object_id: 14,
+                reason: "placement receipt target count does not match redundancy policy",
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_receipt_authority_rejects_malformed_redundancy_policy() {
+        let mut range = obj_range_at(eid(1), 17, 0, 1024);
+        range.receipt.redundancy_policy = ReceiptRedundancyPolicy::Erasure {
+            data_shards: 0,
+            parity_shards: 1,
+        };
+        range.receipt.target_count = range.receipt.redundancy_policy.target_width();
+        let mut plan = TransferPlan::new(eid(1), 707);
+        plan.add_transfer(1, 2, vec![range]);
+
+        assert!(matches!(
+            plan.validate_receipt_authority().unwrap_err(),
+            TransferError::ReceiptAuthority {
+                plan_id: 707,
+                object_id: 17,
+                reason: "placement receipt redundancy policy is malformed",
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_receipt_authority_rejects_range_outside_payload() {
+        let mut range = obj_range_at(eid(1), 15, 800, 400);
+        range.receipt.payload_len = 1024;
+        let mut plan = TransferPlan::new(eid(1), 705);
+        plan.add_transfer(1, 2, vec![range]);
+
+        assert!(matches!(
+            plan.validate_receipt_authority().unwrap_err(),
+            TransferError::ReceiptAuthority {
+                plan_id: 705,
+                object_id: 15,
+                reason: "object range exceeds placement receipt payload length",
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_receipt_authority_rejects_object_id_mismatch() {
+        let mut range = obj_range_at(eid(1), 16, 0, 1024);
+        range.receipt.object_id = 99;
+        let mut plan = TransferPlan::new(eid(1), 706);
+        plan.add_transfer(1, 2, vec![range]);
+
+        assert!(matches!(
+            plan.validate_receipt_authority().unwrap_err(),
+            TransferError::ReceiptAuthority {
+                plan_id: 706,
+                object_id: 16,
+                reason: "receipt object id does not match range",
+            }
+        ));
     }
 
     #[test]
@@ -766,6 +1129,26 @@ mod tests {
             coord.open_transfer(plan, 1).unwrap_err(),
             TransferError::EpochMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn open_transfer_rejects_malformed_receipt_before_session() {
+        let mut coord = PlacementTransferCoordinator::new(eid(1));
+        let mut range = obj_range(1, 0, 100);
+        range.receipt.receipt_generation = 0;
+        let mut plan = TransferPlan::new(eid(1), 101);
+        plan.add_transfer(1, 2, vec![range]);
+
+        assert!(matches!(
+            coord.open_transfer(plan, 1).unwrap_err(),
+            TransferError::ReceiptAuthority {
+                plan_id: 101,
+                object_id: 1,
+                reason: "placement receipt generation is zero",
+            }
+        ));
+        assert_eq!(coord.active_count(), 0);
+        assert!(coord.session(1).is_none());
     }
 
     #[test]
@@ -940,7 +1323,7 @@ mod tests {
 
         coord.on_epoch_transition(eid(3));
         let mut plan2 = TransferPlan::new(eid(3), 200);
-        plan2.add_transfer(3, 4, vec![obj_range(2, 0, 200)]);
+        plan2.add_transfer(3, 4, vec![obj_range_at(eid(3), 2, 0, 200)]);
         coord.open_transfer(plan2, 1).unwrap();
         coord.initiate_transfer(2).unwrap();
         coord.start_transferring(2).unwrap();
