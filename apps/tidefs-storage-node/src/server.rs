@@ -265,6 +265,39 @@ fn apply_receipt_bound_key_repair(
     }
 }
 
+fn classify_peer_scrub_response(report_json: &str, findings_count: u64) -> Result<(), String> {
+    if findings_count > 0 {
+        return Err(format!("peer scrub reported {findings_count} finding(s)"));
+    }
+
+    let report: serde_json::Value = serde_json::from_str(report_json)
+        .map_err(|e| format!("peer scrub report JSON is malformed: {e}"))?;
+
+    if let Some(error) = report.get("error") {
+        return Err(format!("peer scrub reported error: {error}"));
+    }
+
+    match report.get("completed").and_then(serde_json::Value::as_bool) {
+        Some(true) => Ok(()),
+        Some(false) => Err("peer scrub did not complete".into()),
+        None => Err("peer scrub report missing completed=true".into()),
+    }
+}
+
+fn scrub_response_ack(report_json: &str, findings_count: u64) -> ReplicationMessage {
+    let success = match classify_peer_scrub_response(report_json, findings_count) {
+        Ok(()) => true,
+        Err(reason) => {
+            eprintln!("[storage-node] peer scrub response classified failed: {reason}");
+            false
+        }
+    };
+    ReplicationMessage::Ack {
+        key_hash: "scrub-ack".into(),
+        success,
+    }
+}
+
 fn placement_receipt_inventory_json(store: &StoreBackend) -> serde_json::Value {
     match store {
         StoreBackend::PoolBacked(pool) => match pool.placement_receipt_refs(ObjectIoClass::Data) {
@@ -1959,16 +1992,14 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                         success,
                     }
                 }
-                ReplicationMessage::ScrubResponse { .. } => {
-                    // Multi-node scrub: initiator receives peer scrub report.
-                    // Review debt TFR-017: add cross-replica comparison.
+                ReplicationMessage::ScrubResponse {
+                    report_json,
+                    findings_count,
+                } => {
                     eprintln!(
-                        "[storage-node] session {session_id}: received scrub response from peer"
+                        "[storage-node] session {session_id}: received scrub response from peer findings_count={findings_count}"
                     );
-                    ReplicationMessage::Ack {
-                        key_hash: "scrub-ack".into(),
-                        success: true,
-                    }
+                    scrub_response_ack(report_json, *findings_count)
                 }
                 ReplicationMessage::RepairObjectAck { .. } => {
                     eprintln!("[storage-node] session {session_id}: received repair ack from peer");
@@ -3884,6 +3915,68 @@ mod cluster_pool_handler_tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, ObjectKey::from_name("alpha").as_bytes32());
         assert_eq!(entries[0].1, b"payload".to_vec());
+    }
+
+    fn assert_scrub_ack(report_json: String, findings_count: u64, expected_success: bool) {
+        assert_eq!(
+            scrub_response_ack(&report_json, findings_count),
+            ReplicationMessage::Ack {
+                key_hash: "scrub-ack".into(),
+                success: expected_success,
+            }
+        );
+    }
+
+    #[test]
+    fn peer_scrub_ack_succeeds_for_clean_completed_report() {
+        let report_json = serde_json::json!({
+            "segments_scanned": 1,
+            "records_verified": 2,
+            "bytes_scanned": 3,
+            "chain_breaks_detected": 0,
+            "completed": true,
+            "findings_count": 0,
+        })
+        .to_string();
+
+        assert_scrub_ack(report_json, 0, true);
+    }
+
+    #[test]
+    fn peer_scrub_ack_fails_when_findings_are_reported() {
+        let report_json = serde_json::json!({
+            "completed": true,
+            "findings_count": 1,
+        })
+        .to_string();
+
+        assert_scrub_ack(report_json, 1, false);
+    }
+
+    #[test]
+    fn peer_scrub_ack_fails_when_peer_reports_error() {
+        let report_json = serde_json::json!({
+            "error": "segment digest mismatch",
+        })
+        .to_string();
+
+        assert_scrub_ack(report_json, 0, false);
+    }
+
+    #[test]
+    fn peer_scrub_ack_fails_when_scrub_did_not_complete() {
+        let report_json = serde_json::json!({
+            "completed": false,
+            "findings_count": 0,
+        })
+        .to_string();
+
+        assert_scrub_ack(report_json, 0, false);
+    }
+
+    #[test]
+    fn peer_scrub_ack_fails_on_malformed_report_json() {
+        assert_scrub_ack("{not-json".into(), 0, false);
     }
 
     #[test]
