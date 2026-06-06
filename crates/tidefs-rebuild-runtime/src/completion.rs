@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use tidefs_membership_epoch::MemberId;
 use tidefs_replication_model::{
-    PlacementReceiptRef, ReplicaMovementIntentRecord, ReplicatedSubjectId,
+    ObjectDigest, PlacementReceiptRef, ReplicaMovementIntentRecord, ReplicatedSubjectId,
 };
 
 use crate::admission::RebuildAdmission;
@@ -15,6 +15,20 @@ use crate::task::BackfillTask;
 
 type IntentCompletionKey = (MemberId, ReplicatedSubjectId);
 type ReceiptCompletionKey = (MemberId, ReplicatedSubjectId, PlacementReceiptRef);
+type VerifiedReceiptCompletionKey = (
+    MemberId,
+    ReplicatedSubjectId,
+    PlacementReceiptRef,
+    PlacementReceiptRef,
+);
+
+fn receipt_digest_to_object_digest(payload_digest: [u8; 32]) -> ObjectDigest {
+    ObjectDigest::new(u64::from_le_bytes(
+        payload_digest[..8]
+            .try_into()
+            .expect("digest prefix has 8 bytes"),
+    ))
+}
 
 /// Per-member rebuild completion tracking.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -78,12 +92,46 @@ pub struct RebuildCompleted {
     pub fully_successful: bool,
 }
 
+/// Error returned when a repaired target receipt cannot prove task completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiptCompletionError {
+    /// The caller supplied a compatibility placeholder instead of a durable
+    /// repaired target placement receipt.
+    SyntheticReceiptRef { object_id: u64 },
+    /// The repaired receipt carries a redundancy policy that cannot describe
+    /// legal placement.
+    MalformedReceiptPolicy { object_id: u64 },
+    /// The repaired receipt records fewer physical targets than its redundancy
+    /// policy requires.
+    InsufficientReceiptTargets {
+        object_id: u64,
+        required: u16,
+        actual: u16,
+    },
+    /// The repaired receipt is for a different logical subject.
+    ObjectIdMismatch {
+        task_object_id: u64,
+        repaired_object_id: u64,
+    },
+    /// The repaired receipt is for a different object key.
+    ObjectKeyMismatch { object_id: u64 },
+    /// The repaired receipt is for a different payload length.
+    PayloadLengthMismatch {
+        object_id: u64,
+        task_len: u64,
+        repaired_len: u64,
+    },
+    /// The repaired receipt is for a different payload digest.
+    PayloadDigestMismatch { object_id: u64 },
+}
+
 /// Tracks rebuild completion across multiple members.
 #[derive(Clone, Debug, Default)]
 pub struct RebuildCompletion {
     members: BTreeMap<MemberId, CompletionStatus>,
     completed_intent_subjects: BTreeSet<IntentCompletionKey>,
     completed_receipt_tasks: BTreeSet<ReceiptCompletionKey>,
+    completed_verified_receipt_tasks: BTreeSet<VerifiedReceiptCompletionKey>,
     pending_events: Vec<RebuildCompleted>,
 }
 
@@ -94,6 +142,7 @@ impl RebuildCompletion {
             members: BTreeMap::new(),
             completed_intent_subjects: BTreeSet::new(),
             completed_receipt_tasks: BTreeSet::new(),
+            completed_verified_receipt_tasks: BTreeSet::new(),
             pending_events: Vec::new(),
         }
     }
@@ -137,6 +186,84 @@ impl RebuildCompletion {
         self.completed_receipt_tasks.insert(dedup_key);
 
         self.record_completion_unit(task.target_member, success, admission)
+    }
+
+    /// Complete a receipt-bound task only after the repaired target receipt
+    /// proves the same logical object, object key, payload size, digest, and
+    /// redundancy width as the scheduled movement.
+    pub fn record_receipt_verified_task_completion(
+        &mut self,
+        task: &BackfillTask,
+        repaired_receipt_ref: PlacementReceiptRef,
+        admission: &mut RebuildAdmission,
+    ) -> Result<Option<RebuildCompleted>, ReceiptCompletionError> {
+        Self::validate_repaired_receipt_ref(task, repaired_receipt_ref)?;
+
+        let dedup_key = (
+            task.target_member,
+            task.subject_ref,
+            task.placement_receipt_ref,
+            repaired_receipt_ref,
+        );
+        if !self.completed_verified_receipt_tasks.insert(dedup_key) {
+            return Ok(None);
+        }
+
+        Ok(self.record_completion_unit(task.target_member, true, admission))
+    }
+
+    fn validate_repaired_receipt_ref(
+        task: &BackfillTask,
+        repaired_receipt_ref: PlacementReceiptRef,
+    ) -> Result<(), ReceiptCompletionError> {
+        if repaired_receipt_ref.is_synthetic() {
+            return Err(ReceiptCompletionError::SyntheticReceiptRef {
+                object_id: repaired_receipt_ref.object_id,
+            });
+        }
+        if !repaired_receipt_ref.redundancy_policy.is_well_formed() {
+            return Err(ReceiptCompletionError::MalformedReceiptPolicy {
+                object_id: repaired_receipt_ref.object_id,
+            });
+        }
+        let required = repaired_receipt_ref.redundancy_policy.target_width();
+        if repaired_receipt_ref.target_count < required {
+            return Err(ReceiptCompletionError::InsufficientReceiptTargets {
+                object_id: repaired_receipt_ref.object_id,
+                required,
+                actual: repaired_receipt_ref.target_count,
+            });
+        }
+
+        let task_object_id = task.subject_ref.0;
+        if repaired_receipt_ref.object_id != task_object_id {
+            return Err(ReceiptCompletionError::ObjectIdMismatch {
+                task_object_id,
+                repaired_object_id: repaired_receipt_ref.object_id,
+            });
+        }
+        if repaired_receipt_ref.object_key != task.placement_receipt_ref.object_key {
+            return Err(ReceiptCompletionError::ObjectKeyMismatch {
+                object_id: repaired_receipt_ref.object_id,
+            });
+        }
+        if repaired_receipt_ref.payload_len != task.payload_len {
+            return Err(ReceiptCompletionError::PayloadLengthMismatch {
+                object_id: repaired_receipt_ref.object_id,
+                task_len: task.payload_len,
+                repaired_len: repaired_receipt_ref.payload_len,
+            });
+        }
+        if repaired_receipt_ref.payload_digest != task.placement_receipt_ref.payload_digest
+            || receipt_digest_to_object_digest(repaired_receipt_ref.payload_digest)
+                != task.payload_digest
+        {
+            return Err(ReceiptCompletionError::PayloadDigestMismatch {
+                object_id: repaired_receipt_ref.object_id,
+            });
+        }
+
+        Ok(())
     }
 
     fn record_completion_unit(
@@ -238,13 +365,16 @@ impl RebuildCompletion {
 
     #[must_use]
     pub fn total_completed_subjects(&self) -> u64 {
-        (self.completed_intent_subjects.len() + self.completed_receipt_tasks.len()) as u64
+        (self.completed_intent_subjects.len()
+            + self.completed_receipt_tasks.len()
+            + self.completed_verified_receipt_tasks.len()) as u64
     }
 
     pub fn reset(&mut self) {
         self.members.clear();
         self.completed_intent_subjects.clear();
         self.completed_receipt_tasks.clear();
+        self.completed_verified_receipt_tasks.clear();
         self.pending_events.clear();
     }
 }
@@ -255,8 +385,8 @@ mod tests {
     use crate::task::{BackfillTask, BackfillTaskInit};
     use tidefs_membership_epoch::MemberId;
     use tidefs_replication_model::{
-        ObjectDigest, PlacementReceiptRef, ReplicaMovementClass, ReplicatedReceiptId,
-        ReplicatedSubjectId,
+        ObjectDigest, PlacementReceiptRef, ReceiptRedundancyPolicy, ReplicaMovementClass,
+        ReplicatedReceiptId, ReplicatedSubjectId,
     };
 
     fn make_intent(id: u64, member: u64, subject: u64) -> ReplicaMovementIntentRecord {
@@ -290,17 +420,50 @@ mod tests {
     }
 
     fn make_task(subject: u64, member: u64, generation: u64) -> BackfillTask {
+        let placement_receipt_ref = receipt_ref(subject, generation);
         BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(subject),
-            placement_receipt_ref: receipt_ref(subject, generation),
+            placement_receipt_ref,
             source_member: MemberId::new(1),
             target_member: MemberId::new(member),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
-            payload_digest: ObjectDigest::new(subject * 100),
-            payload_len: 4096,
+            payload_digest: receipt_digest_to_object_digest(placement_receipt_ref.payload_digest),
+            payload_len: placement_receipt_ref.payload_len,
             created_at_ns: 0,
             deadline_ns: 10_000,
         })
+    }
+
+    fn repaired_receipt_for_task(task: &BackfillTask, generation: u64) -> PlacementReceiptRef {
+        let mut repaired = task.placement_receipt_ref;
+        repaired.receipt_generation = generation;
+        repaired
+    }
+
+    fn rebuilding_member(
+        completion: &mut RebuildCompletion,
+        admission: &mut RebuildAdmission,
+        member: MemberId,
+        total_subjects: u64,
+    ) {
+        completion.register(member, total_subjects);
+        admission
+            .member_status
+            .insert(member, crate::admission::RebuildAdmissionStatus::Rebuilding);
+    }
+
+    fn assert_refusal_preserves_rebuild_state(
+        completion: &mut RebuildCompletion,
+        admission: &RebuildAdmission,
+        member: MemberId,
+    ) {
+        assert_eq!(
+            admission.status(member),
+            crate::admission::RebuildAdmissionStatus::Rebuilding
+        );
+        assert_eq!(completion.status(member).unwrap().subjects_completed, 0);
+        assert_eq!(completion.total_completed_subjects(), 0);
+        assert_eq!(completion.drain_events().len(), 0);
     }
 
     #[test]
@@ -449,6 +612,215 @@ mod tests {
         assert_eq!(completion.status(member).unwrap().subjects_completed, 1);
         assert_eq!(completion.drain_events().len(), 1);
         assert_eq!(completion.drain_events().len(), 0);
+    }
+
+    #[test]
+    fn receipt_verified_task_completion_requires_repaired_receipt() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_task(42, 10, 1);
+        let repaired = repaired_receipt_for_task(&task, 2);
+
+        let event = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect("receipt should verify")
+            .expect("first verified receipt completes the member");
+
+        assert_eq!(event.succeeded, 1);
+        assert!(event.fully_successful);
+        assert_eq!(completion.total_completed_subjects(), 1);
+        assert_eq!(completion.status(member).unwrap().subjects_completed, 1);
+        assert_eq!(
+            admission.status(member),
+            crate::admission::RebuildAdmissionStatus::Completed
+        );
+    }
+
+    #[test]
+    fn receipt_verified_task_completion_deduplicates_exact_repaired_receipt() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_task(42, 10, 1);
+        let repaired = repaired_receipt_for_task(&task, 2);
+
+        assert!(completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect("receipt should verify")
+            .is_some());
+        assert!(completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect("duplicate receipt should still verify")
+            .is_none());
+
+        assert_eq!(completion.total_completed_subjects(), 1);
+        assert_eq!(completion.status(member).unwrap().subjects_completed, 1);
+        assert_eq!(completion.drain_events().len(), 1);
+        assert_eq!(completion.drain_events().len(), 0);
+    }
+
+    #[test]
+    fn receipt_verified_task_completion_rejects_synthetic_repaired_receipt() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_task(42, 10, 1);
+        let repaired = PlacementReceiptRef::synthetic_for_subject(task.subject_ref);
+
+        let err = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect_err("synthetic receipt must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::SyntheticReceiptRef { object_id: 42 }
+        );
+        assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
+    }
+
+    #[test]
+    fn receipt_verified_task_completion_rejects_malformed_repaired_policy() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_task(42, 10, 1);
+        let mut repaired = repaired_receipt_for_task(&task, 2);
+        repaired.redundancy_policy = ReceiptRedundancyPolicy::Replicated { copies: 0 };
+
+        let err = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect_err("malformed policy must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::MalformedReceiptPolicy { object_id: 42 }
+        );
+        assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
+    }
+
+    #[test]
+    fn receipt_verified_task_completion_rejects_under_width_repaired_receipt() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_task(42, 10, 1);
+        let mut repaired = repaired_receipt_for_task(&task, 2);
+        repaired.redundancy_policy = ReceiptRedundancyPolicy::Erasure {
+            data_shards: 2,
+            parity_shards: 1,
+        };
+        repaired.target_count = 2;
+
+        let err = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect_err("under-width receipt must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::InsufficientReceiptTargets {
+                object_id: 42,
+                required: 3,
+                actual: 2,
+            }
+        );
+        assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
+    }
+
+    #[test]
+    fn receipt_verified_task_completion_rejects_object_id_mismatch() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_task(42, 10, 1);
+        let mut repaired = repaired_receipt_for_task(&task, 2);
+        repaired.object_id = 43;
+
+        let err = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect_err("object id mismatch must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::ObjectIdMismatch {
+                task_object_id: 42,
+                repaired_object_id: 43,
+            }
+        );
+        assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
+    }
+
+    #[test]
+    fn receipt_verified_task_completion_rejects_object_key_mismatch() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_task(42, 10, 1);
+        let mut repaired = repaired_receipt_for_task(&task, 2);
+        repaired.object_key[31] ^= 0xFF;
+
+        let err = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect_err("object key mismatch must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::ObjectKeyMismatch { object_id: 42 }
+        );
+        assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
+    }
+
+    #[test]
+    fn receipt_verified_task_completion_rejects_payload_len_mismatch() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_task(42, 10, 1);
+        let mut repaired = repaired_receipt_for_task(&task, 2);
+        repaired.payload_len += 1;
+
+        let err = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect_err("payload length mismatch must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::PayloadLengthMismatch {
+                object_id: 42,
+                task_len: 4096,
+                repaired_len: 4097,
+            }
+        );
+        assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
+    }
+
+    #[test]
+    fn receipt_verified_task_completion_rejects_payload_digest_mismatch() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_task(42, 10, 1);
+        let mut repaired = repaired_receipt_for_task(&task, 2);
+        repaired.payload_digest[0] ^= 0xFF;
+
+        let err = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect_err("payload digest mismatch must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::PayloadDigestMismatch { object_id: 42 }
+        );
+        assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
     }
 
     #[test]
