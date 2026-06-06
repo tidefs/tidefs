@@ -2108,45 +2108,6 @@ impl Pool {
         Ok(deleted)
     }
 
-    fn retarget_replicated_receipt_after_evacuate(
-        &mut self,
-        key: ObjectKey,
-        old_idx: usize,
-        new_idx: usize,
-        payload: &[u8],
-    ) -> Result<()> {
-        let indices: Vec<usize> = self.class_map.get(IoClass::Data).to_vec();
-        let Some(mut receipt) = self.load_placement_receipt(&indices, key)? else {
-            return Ok(());
-        };
-        if !matches!(receipt.policy, PoolRedundancyPolicy::Replicated { .. }) {
-            return Ok(());
-        }
-
-        let new_guid = self.device_guid_for_index(new_idx);
-        let digest = digest32(payload);
-        let mut changed = false;
-        for target in &mut receipt.targets {
-            let target_idx = self
-                .device_guids
-                .iter()
-                .position(|guid| *guid == target.device_guid)
-                .unwrap_or(target.device_index as usize);
-            if target_idx == old_idx {
-                target.device_index = new_idx as u32;
-                target.device_guid = new_guid;
-                target.stored_digest = digest;
-                changed = true;
-            }
-        }
-        if changed {
-            receipt.epoch = self.placement_epoch.saturating_add(1).max(1);
-            receipt.generation = self.allocate_placement_receipt_generation();
-            self.write_placement_receipt(&indices, &receipt)?;
-        }
-        Ok(())
-    }
-
     /// Flush all devices.
     pub fn sync_all(&mut self) -> Result<()> {
         for device in &mut self.devices {
@@ -2402,10 +2363,11 @@ impl Pool {
     /// Safely remove a device by path, evacuating all objects to surviving
     /// devices before decommission.
     ///
-    /// This is the preferred removal path. It enumerates objects resident on
-    /// the target device, copies each to a surviving device (deterministic
-    /// routing via key hash), verifies the target copy is readable, deletes
-    /// the source copy, and finally removes the device from the pool.
+    /// This is the preferred removal path. It enumerates current placement
+    /// receipts, rewrites each receipt-backed logical object through the
+    /// pool-wide redundancy policy on surviving devices, and finally removes
+    /// the device only after no unreceipted logical objects remain on the
+    /// target.
     ///
     /// # Errors
     ///
@@ -2448,22 +2410,25 @@ impl Pool {
             .filter(|&i| i != target_idx)
             .collect();
 
-        // Enumerate objects on the target device.
+        // Enumerate objects on the target device so internal metadata can be
+        // ignored and unreceipted logical keys can fail closed.
         let keys = self.devices[target_idx]
             .store()
             .list_keys_including_internal();
         let mut result = EvacuationResult::default();
 
-        if keys.is_empty() {
-            // Nothing to evacuate -- remove immediately.
-            self.remove_device(path)?;
-            result.complete = true;
-            return Ok(result);
-        }
-
         let mut internal_placement_keys = BTreeSet::new();
+        let mut current_logical_keys = BTreeSet::new();
         let mut rewritten_logical_keys = BTreeSet::new();
         let mut placement_receipts = Vec::new();
+        let mut failed_logical_keys = BTreeSet::new();
+
+        let mut mark_failed = |result: &mut EvacuationResult, key: ObjectKey| {
+            if failed_logical_keys.insert(key) {
+                result.objects_failed += 1;
+                result.failed_keys.push(key);
+            }
+        };
 
         for key in &keys {
             let Ok(Some(raw)) = self.devices[target_idx].get(*key) else {
@@ -2485,6 +2450,20 @@ impl Pool {
                     ));
                 }
             }
+        }
+
+        for receipt in self.placement_receipts(IoClass::Data)? {
+            current_logical_keys.insert(receipt.object_key);
+            internal_placement_keys.insert(placement_receipt_object_key(receipt.object_key));
+            if matches!(receipt.policy, PoolRedundancyPolicy::Erasure { .. }) {
+                for target in &receipt.targets {
+                    internal_placement_keys.insert(placement_shard_object_key(
+                        receipt.object_key,
+                        target.shard_index,
+                    ));
+                }
+            }
+
             placement_receipts.push(receipt);
         }
 
@@ -2492,8 +2471,7 @@ impl Pool {
             let data = match self.get_with_receipt(&receipt)? {
                 Some(data) => data,
                 None => {
-                    result.objects_failed += 1;
-                    result.failed_keys.push(receipt.object_key);
+                    mark_failed(&mut result, receipt.object_key);
                     continue;
                 }
             };
@@ -2504,8 +2482,7 @@ impl Pool {
                 .put_pool_wide(IoClass::Data, receipt.object_key, &data, &surviving_indices)
                 .is_err()
             {
-                result.objects_failed += 1;
-                result.failed_keys.push(receipt.object_key);
+                mark_failed(&mut result, receipt.object_key);
                 continue;
             }
 
@@ -2515,68 +2492,21 @@ impl Pool {
             result.content_digests.insert(receipt.object_key, digest);
         }
 
-        // For each legacy object on the target device: read, route to
-        // survivor, write, verify, delete source. Receipt-backed logical
-        // objects were rewritten above; receipt and shard records are internal
-        // placement metadata and are intentionally skipped here.
+        // Receipt-backed logical objects were rewritten above; receipt and
+        // shard records are internal placement metadata and are intentionally
+        // skipped here. Any remaining logical key on the target without a
+        // current placement receipt is a removal blocker, not a legacy
+        // hash-routed evacuation candidate.
         for key in &keys {
-            if internal_placement_keys.contains(key) || rewritten_logical_keys.contains(key) {
+            if crate::is_pool_placement_scan_internal_key(*key)
+                || internal_placement_keys.contains(key)
+                || rewritten_logical_keys.contains(key)
+                || current_logical_keys.contains(key)
+            {
                 continue;
             }
 
-            // Read from the target device.
-            let data = match self.devices[target_idx].get(*key) {
-                Ok(Some(d)) => d,
-                Ok(None) => {
-                    result.objects_failed += 1;
-                    result.failed_keys.push(*key);
-                    continue;
-                }
-                Err(_) => {
-                    result.objects_failed += 1;
-                    result.failed_keys.push(*key);
-                    continue;
-                }
-            };
-
-            let digest: [u8; 32] = blake3::hash(&data).into();
-            let len = data.len() as u64;
-
-            // Pick a surviving device by key hash.
-            let survivor_idx = pick_device(*key, &surviving_indices);
-
-            // Write to the surviving device.
-            if self.devices[survivor_idx].put(*key, &data).is_err() {
-                result.objects_failed += 1;
-                result.failed_keys.push(*key);
-                continue;
-            }
-
-            // Verify the write is readable with correct content.
-            match self.devices[survivor_idx].get(*key) {
-                Ok(Some(readback)) => {
-                    let readback_digest: [u8; 32] = blake3::hash(&readback).into();
-                    if readback_digest != digest {
-                        result.objects_failed += 1;
-                        result.failed_keys.push(*key);
-                        continue;
-                    }
-                }
-                _ => {
-                    result.objects_failed += 1;
-                    result.failed_keys.push(*key);
-                    continue;
-                }
-            }
-
-            self.retarget_replicated_receipt_after_evacuate(*key, target_idx, survivor_idx, &data)?;
-
-            // Delete from the target device.
-            let _ = self.devices[target_idx].delete(*key);
-
-            result.objects_evacuated += 1;
-            result.bytes_evacuated += len;
-            result.content_digests.insert(*key, digest);
+            mark_failed(&mut result, *key);
         }
 
         // If any objects failed, do not remove the device.
@@ -4536,6 +4466,7 @@ mod tests {
         assert!(pool.get(IoClass::Data, key3).unwrap().is_some());
 
         // Remove device 1. Objects on it are evacuated to device 2.
+        let victim_guid = pool.device_guid_for_index(0);
         let result = pool.safe_remove_device(&d1).unwrap();
         assert!(result.complete);
         assert_eq!(result.objects_failed, 0);
@@ -4547,6 +4478,72 @@ mod tests {
         assert!(pool.get(IoClass::Data, key1).unwrap().is_some());
         assert!(pool.get(IoClass::Data, key2).unwrap().is_some());
         assert!(pool.get(IoClass::Data, key3).unwrap().is_some());
+        for key in [key1, key2, key3] {
+            let receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("receipt after device removal");
+            assert!(
+                receipt
+                    .targets
+                    .iter()
+                    .all(|target| target.device_guid != victim_guid),
+                "receipt for {key:?} must not target the removed device"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_unreceipted_target_logical_data() {
+        let root = temp_dir("safe-remove-unreceipted");
+        let _ = std::fs::remove_dir_all(&root);
+        let d1 = root.join("data1");
+        let d2 = root.join("data2");
+        let config = PoolConfig {
+            name: "testpool".into(),
+            root_path: root.to_path_buf(),
+            devices: vec![
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: d1.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: d1.clone() },
+                    encryption: None,
+                    compression: None,
+                },
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: d2.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: d2.clone() },
+                    encryption: None,
+                    compression: None,
+                },
+            ],
+        };
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let rogue_key = ObjectKey::from_name(b"rogue-unreceipted-object");
+        let rogue_payload = b"this object has no placement receipt";
+        pool.devices[0].put(rogue_key, rogue_payload).unwrap();
+
+        let result = pool.safe_remove_device(&d1).unwrap();
+        assert!(!result.complete);
+        assert_eq!(result.objects_failed, 1);
+        assert_eq!(result.failed_keys, vec![rogue_key]);
+        assert_eq!(pool.stats().device_count, 2);
+        assert_eq!(
+            pool.devices[0].get(rogue_key).unwrap(),
+            Some(rogue_payload.to_vec())
+        );
+        assert_eq!(
+            pool.devices[1].get(rogue_key).unwrap(),
+            None,
+            "unreceipted data must not be copied to a survivor by key hash"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
