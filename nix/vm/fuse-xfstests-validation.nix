@@ -1152,7 +1152,8 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
                 echo "thread: pid=$inspect_pid tid=$tid comm=$comm state=$state wchan=$wchan schedstat=$schedstat stat=$stat"
                 if [ -r "$task_dir/stack" ]; then
                     echo "thread-stack: pid=$inspect_pid tid=$tid"
-                    cat "$task_dir/stack" 2>/dev/null || true
+                    timeout 2 cat "$task_dir/stack" 2>/dev/null \
+                        || echo "thread-stack: pid=$inspect_pid tid=$tid timed out or unavailable"
                 else
                     echo "thread-stack: pid=$inspect_pid tid=$tid unavailable"
                 fi
@@ -1224,6 +1225,62 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         kill "-$signal" "$tree_pid" 2>/dev/null || true
     }
 
+    wait_process_bounded() {
+        wait_pid="$1"
+        wait_label="$2"
+        wait_timeout="$3"
+        elapsed=0
+        while kill -0 "$wait_pid" 2>/dev/null; do
+            wait_state=$(sed -n 's/^State:[[:space:]]*//p' "/proc/$wait_pid/status" 2>/dev/null || true)
+            case "$wait_state" in
+                Z*)
+                    wait "$wait_pid" 2>/dev/null || true
+                    return 0
+                    ;;
+            esac
+            if [ "$elapsed" -ge "$wait_timeout" ]; then
+                echo "wait timeout: $wait_label pid=$wait_pid after ''${wait_timeout}s"
+                return 124
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        wait "$wait_pid" 2>/dev/null
+        return "$?"
+    }
+
+    stop_guest_after_stuck_timeout() {
+        stop_reason="$1"
+        echo "stopping guest after unrecoverable timeout: $stop_reason"
+        sync 2>/dev/null || true
+        poweroff -f
+        sleep 5
+        exit 124
+    }
+
+    run_diagnostics_bounded() {
+        diag_label="$1"
+        shift
+        diag_timeout=30
+        dump_xfstests_test_state "$@" &
+        diag_pid=$!
+        elapsed=0
+        while kill -0 "$diag_pid" 2>/dev/null; do
+            if [ "$elapsed" -ge "$diag_timeout" ]; then
+                echo "diagnostic timeout: $diag_label after ''${diag_timeout}s"
+                terminate_process_tree "$diag_pid" TERM
+                sleep 1
+                terminate_process_tree "$diag_pid" KILL
+                wait_process_bounded "$diag_pid" "diagnostics-$diag_label" 5 || true
+                return 124
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        wait "$diag_pid"
+        return "$?"
+    }
+
     run_cleanup_xfstests_test_bounded() {
         cleanup_label="$1"
         cleanup_test="$2"
@@ -1237,11 +1294,13 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         while kill -0 "$cleanup_pid" 2>/dev/null; do
             if [ "$elapsed" -ge "$cleanup_timeout" ]; then
                 echo "cleanup timeout: $cleanup_label after ''${cleanup_timeout}s"
-                dump_xfstests_test_state "$cleanup_test" "$cleanup_result_base" "$cleanup_test_log"
+                run_diagnostics_bounded "$cleanup_label" "$cleanup_test" "$cleanup_result_base" "$cleanup_test_log"
                 terminate_process_tree "$cleanup_pid" TERM
                 sleep 2
                 terminate_process_tree "$cleanup_pid" KILL
-                wait "$cleanup_pid" 2>/dev/null || true
+                if ! wait_process_bounded "$cleanup_pid" "cleanup-$cleanup_label" 5; then
+                    stop_guest_after_stuck_timeout "cleanup-$cleanup_label"
+                fi
                 return 124
             fi
             sleep 1
@@ -1260,11 +1319,13 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         elapsed=0
         while kill -0 "$check_pid" 2>/dev/null; do
             if [ "$elapsed" -ge "$PER_TEST_TIMEOUT" ]; then
-                dump_xfstests_test_state "$bounded_test" "$bounded_result_base" "$bounded_test_log"
+                run_diagnostics_bounded "timeout-$bounded_test" "$bounded_test" "$bounded_result_base" "$bounded_test_log"
                 terminate_process_tree "$check_pid" TERM
                 sleep 2
                 terminate_process_tree "$check_pid" KILL
-                wait "$check_pid" 2>/dev/null || true
+                if ! wait_process_bounded "$check_pid" "xfstests-$bounded_test" 5; then
+                    stop_guest_after_stuck_timeout "xfstests-$bounded_test"
+                fi
                 return 124
             fi
             sleep 1
@@ -1328,7 +1389,7 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             if [ "$RC" -eq 124 ]; then
                 fail "xfstests_$test" "test timed out after ''${PER_TEST_TIMEOUT}s"
             elif [ "$RC" -eq 143 ]; then
-                dump_xfstests_test_state "$test" "$RESULT_BASE" "$TEST_LOG"
+                run_diagnostics_bounded "terminated-$test" "$test" "$RESULT_BASE" "$TEST_LOG"
                 fail "xfstests_$test" "test terminated after ''${PER_TEST_TIMEOUT}s window"
             else
                 NOTRUN_DETAIL=""
@@ -1374,7 +1435,7 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
                 else
                     echo "(none)"
                 fi
-                dump_xfstests_test_state "$test" "$RESULT_BASE" "$TEST_LOG"
+                run_diagnostics_bounded "failure-$test" "$test" "$RESULT_BASE" "$TEST_LOG"
                 fail "xfstests_$test" "$FAIL_DETAIL"
             fi
             TESTS_FAIL=$((TESTS_FAIL + 1))
@@ -1558,6 +1619,19 @@ CRASHCMDS
       < /dev/null \
       > "$VAL_LOG" 2>&1 &
     QEMU_PID=$!
+    QEMU_TIMEOUT_SENTINEL="$RUN_DIR/qemu-timeout"
+    rm -f "$QEMU_TIMEOUT_SENTINEL"
+    (
+      sleep "$TIMEOUT_SEC"
+      if kill -0 "$QEMU_PID" 2>/dev/null; then
+        echo "  QEMU watchdog timeout after ''${TIMEOUT_SEC}s" >> "$VAL_LOG"
+        : > "$QEMU_TIMEOUT_SENTINEL"
+        kill -TERM "$QEMU_PID" 2>/dev/null || true
+        sleep 5
+        kill -KILL "$QEMU_PID" 2>/dev/null || true
+      fi
+    ) &
+    QEMU_WATCHDOG_PID=$!
 
     QEMU_RC=0
     DUMPED_FOR_PANIC=0
@@ -1572,6 +1646,7 @@ CRASHCMDS
       now=$(date +%s)
       if [ "$now" -ge "$DEADLINE" ]; then
         echo "  QEMU timeout after ''${TIMEOUT_SEC}s"
+        : > "$QEMU_TIMEOUT_SENTINEL"
         capture_guest_crashdump "timeout"
         analyze_guest_crashdump
         kill -TERM "$QEMU_PID" 2>/dev/null || true
@@ -1585,6 +1660,10 @@ CRASHCMDS
       QEMU_RC=0
     else
       QEMU_RC=$?
+    fi
+    if [ -n "''${QEMU_WATCHDOG_PID:-}" ]; then
+      kill "$QEMU_WATCHDOG_PID" 2>/dev/null || true
+      wait "$QEMU_WATCHDOG_PID" 2>/dev/null || true
     fi
     echo "  QEMU exit code: $QEMU_RC"
     if [ "$CRASHDUMP_MODE" = "1" ] && [ "$CRASHDUMP_CREATED" -eq 0 ] \
@@ -1629,6 +1708,9 @@ CRASHCMDS
 
     if ! grep -aE '(PASS|FAIL|BLOCKED|UNSUPPORTED|SKIP): [^[:space:]]+' "$VAL_LOG" >/dev/null 2>&1; then
       echo "BLOCKED: harness_no_validation_rows -- no validation rows parsed from QEMU boot log" >> "$VAL_LOG"
+    fi
+    if [ -f "$QEMU_TIMEOUT_SENTINEL" ]; then
+      echo "BLOCKED: harness_qemu_timeout -- QEMU exceeded ''${TIMEOUT_SEC}s" >> "$VAL_LOG"
     fi
     ALL_OPS=$(validation_ops)
 
