@@ -830,6 +830,12 @@ struct WriteDispatchFlags {
     request_open: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelCacheInvalidation {
+    NotifyMappedRanges,
+    SkipLocalWritebackSource,
+}
+
 impl InodeOpenState {
     fn observe(&mut self, handle: AdapterFileHandle) {
         let flags = handle.engine_handle.open_flags;
@@ -4554,7 +4560,12 @@ impl FuseVfsAdapter {
         self.sync_namespace_attrs_local(ino, &updated);
         drop(e);
         if let Some((offset, length)) = data_invalidation_range {
-            self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
+            self.invalidate_caches_after_engine_data_mutation(
+                ino,
+                offset,
+                length,
+                KernelCacheInvalidation::NotifyMappedRanges,
+            );
         } else {
             self.invalidate_inode_metadata_local(ino);
         }
@@ -5618,10 +5629,16 @@ impl FuseVfsAdapter {
                 && (posix_direct_io
                     || (writeback_write_through_without_block_volume && !sparse_zero_noop))
             {
+                let kernel_invalidation = if posix_direct_io {
+                    KernelCacheInvalidation::NotifyMappedRanges
+                } else {
+                    KernelCacheInvalidation::SkipLocalWritebackSource
+                };
                 self.invalidate_caches_after_engine_data_mutation(
                     ino,
                     effective_offset as u64,
                     u64::from(written),
+                    kernel_invalidation,
                 );
             }
             // Record write intent before acknowledging to kernel.
@@ -5810,6 +5827,7 @@ impl FuseVfsAdapter {
                             ino,
                             effective_offset as u64,
                             u64::from(written),
+                            KernelCacheInvalidation::NotifyMappedRanges,
                         );
                         let written_len = usize::try_from(written).map_err(|_| Errno::EIO)?;
                         let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
@@ -5848,7 +5866,13 @@ impl FuseVfsAdapter {
 
     /// Invalidate daemon read-side caches after an engine mutation changes
     /// visible file bytes without going through the kernel page cache.
-    fn invalidate_caches_after_engine_data_mutation(&self, ino: u64, offset: u64, length: u64) {
+    fn invalidate_caches_after_engine_data_mutation(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+        kernel_invalidation: KernelCacheInvalidation,
+    ) {
         if length == 0 {
             return;
         }
@@ -5863,9 +5887,11 @@ impl FuseVfsAdapter {
         if let Some(ref rd) = self.fuse_read_dispatch {
             rd.page_cache().invalidate_range(ino, offset, end);
         }
-        let _ = self
-            .mmap_coherency
-            .invalidate_local_range(ino, offset, length);
+        if kernel_invalidation == KernelCacheInvalidation::NotifyMappedRanges {
+            let _ = self
+                .mmap_coherency
+                .invalidate_local_range(ino, offset, length);
+        }
         self.invalidate_inode_metadata_local(ino);
     }
 
@@ -6888,7 +6914,12 @@ impl FuseVfsAdapter {
                         clear_start.elapsed().as_millis()
                     );
                 }
-                self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
+                self.invalidate_caches_after_engine_data_mutation(
+                    ino,
+                    offset,
+                    length,
+                    KernelCacheInvalidation::NotifyMappedRanges,
+                );
             } else if (mode & FALLOC_FL_KEEP_SIZE) == 0
                 && fallocate_end.is_some_and(|end| end > old_size)
             {
@@ -6900,7 +6931,12 @@ impl FuseVfsAdapter {
                     extension_length,
                     AuthoritativeRangePayload::Zeroes,
                 )?;
-                self.invalidate_caches_after_engine_data_mutation(ino, old_size, extension_length);
+                self.invalidate_caches_after_engine_data_mutation(
+                    ino,
+                    old_size,
+                    extension_length,
+                    KernelCacheInvalidation::NotifyMappedRanges,
+                );
                 self.invalidate_inode_metadata_after_engine_write(ino);
             } else {
                 self.invalidate_inode_metadata_after_engine_write(ino);
@@ -6982,7 +7018,12 @@ impl FuseVfsAdapter {
         drop(e);
         if result.is_ok() && size < old_size {
             self.clear_dirty_for_deallocate_range(ino, size, old_size - size)?;
-            self.invalidate_caches_after_engine_data_mutation(ino, size, old_size - size);
+            self.invalidate_caches_after_engine_data_mutation(
+                ino,
+                size,
+                old_size - size,
+                KernelCacheInvalidation::NotifyMappedRanges,
+            );
         } else if result.is_ok() {
             self.invalidate_inode_metadata_after_engine_write(ino);
         }
@@ -7019,7 +7060,12 @@ impl FuseVfsAdapter {
         drop(e);
         if result.is_ok() && size < current_size {
             self.clear_dirty_for_deallocate_range(ino, size, current_size - size)?;
-            self.invalidate_caches_after_engine_data_mutation(ino, size, current_size - size);
+            self.invalidate_caches_after_engine_data_mutation(
+                ino,
+                size,
+                current_size - size,
+                KernelCacheInvalidation::NotifyMappedRanges,
+            );
         } else if result.is_ok() {
             self.invalidate_inode_metadata_after_engine_write(ino);
         }
@@ -9780,6 +9826,7 @@ impl Filesystem for FuseVfsAdapter {
                         copy_dest.0,
                         copy_dest.1,
                         u64::from(written),
+                        KernelCacheInvalidation::NotifyMappedRanges,
                     );
                 }
                 if diagnostic {
@@ -38141,6 +38188,60 @@ mod tests {
                 .is_none(),
             "clean page overlapping the authoritative write range must be invalidated"
         );
+    }
+
+    #[test]
+    fn writeback_cached_self_write_skips_kernel_page_invalidation() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-self-inval.txt",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let coherency = fixture.adapter.mmap_coherency_cell();
+        coherency.register(ino, 0);
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 128, &[0x5A; 512], FUSE_WRITE_CACHE)
+            .expect("writeback cached write-through");
+
+        let stats = coherency.stats.snapshot();
+        assert_eq!(
+            stats.coherency_conflicts, 0,
+            "local FUSE_WRITE_CACHE writeback is already sourced from the kernel page cache"
+        );
+        assert_eq!(
+            stats.pages_invalidated, 0,
+            "local FUSE_WRITE_CACHE writeback must not invalidate the page being written back"
+        );
+    }
+
+    #[test]
+    fn direct_io_write_invalidates_registered_mapped_range() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"direct-io-inval.txt",
+            libc::O_RDWR as u32 | libc::O_DIRECT as u32,
+        );
+        let ino = inode.get();
+        let coherency = fixture.adapter.mmap_coherency_cell();
+        coherency.register(ino, 0);
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0, &[0xA5; 4096], 0)
+            .expect("direct I/O write");
+
+        let stats = coherency.stats.snapshot();
+        assert_eq!(stats.coherency_conflicts, 1);
+        assert_eq!(stats.pages_invalidated, 1);
     }
 
     #[test]
