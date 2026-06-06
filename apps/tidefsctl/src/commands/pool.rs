@@ -517,9 +517,14 @@ fn parse_pool_redundancy_policy(
 
     let value = raw.trim().to_ascii_lowercase();
     match value.as_str() {
-        "single" | "none" => return Ok(RedundancyPolicy::replicated(1)),
-        "mirror" => return Ok(RedundancyPolicy::replicated(2)),
+        "single" => return Ok(RedundancyPolicy::replicated(1)),
+        "none" => return Err(legacy_pool_redundancy_error(raw, "single")),
+        "mirror" => return Err(legacy_pool_redundancy_error(raw, "replicated=N")),
         _ => {}
+    }
+
+    if value.starts_with("mirror=") {
+        return Err(legacy_pool_redundancy_error(raw, "replicated=N"));
     }
 
     if let Some(rest) = value.strip_prefix("replicated=") {
@@ -535,6 +540,12 @@ fn parse_pool_redundancy_policy(
     Err(format!(
         "unknown redundancy policy \"{raw}\"; expected single, replicated=N, or erasure=D+P"
     ))
+}
+
+fn legacy_pool_redundancy_error(raw: &str, replacement: &str) -> String {
+    format!(
+        "legacy redundancy policy \"{raw}\" is no longer accepted; use {replacement} (expected single, replicated=N, or erasure=D+P)"
+    )
 }
 
 fn parse_nonzero_u8(value: &str, raw: &str, field: &str, expected: &str) -> Result<u8, String> {
@@ -1910,15 +1921,18 @@ mod tests {
     }
 
     #[test]
-    fn redundancy_legacy_aliases_remain_accepted() {
-        assert_eq!(
-            parse_pool_redundancy_policy("none").unwrap(),
-            tidefs_pool_import::create::RedundancyPolicy::replicated(1)
-        );
-        assert_eq!(
-            parse_pool_redundancy_policy("mirror").unwrap(),
-            tidefs_pool_import::create::RedundancyPolicy::replicated(2)
-        );
+    fn redundancy_legacy_aliases_are_rejected() {
+        let none = parse_pool_redundancy_policy("none").unwrap_err();
+        assert!(none.contains("legacy redundancy policy"));
+        assert!(none.contains("single"));
+
+        let mirror = parse_pool_redundancy_policy("mirror").unwrap_err();
+        assert!(mirror.contains("legacy redundancy policy"));
+        assert!(mirror.contains("replicated=N"));
+
+        let mirror_eq = parse_pool_redundancy_policy("mirror=2").unwrap_err();
+        assert!(mirror_eq.contains("legacy redundancy policy"));
+        assert!(mirror_eq.contains("replicated=N"));
     }
 
     #[test]
