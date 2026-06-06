@@ -1,5 +1,3 @@
-use crate::forgejo_work;
-
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -90,7 +88,7 @@ pub enum ClaimGateRuleTopic {
     ScannedPublishingSurfaces,
     ForbiddenCurrentCapabilityClaims,
     RequiredLimitationMarkers,
-    ForgejoWorkState,
+    WorkStateAuthority,
     EvidenceBeforeEscalation,
 }
 
@@ -102,7 +100,7 @@ impl ClaimGateRuleTopic {
                 "claims_gate.forbidden_current_capability_claims"
             }
             Self::RequiredLimitationMarkers => "claims_gate.required_limitation_markers",
-            Self::ForgejoWorkState => "claims_gate.forgejo_work_state",
+            Self::WorkStateAuthority => "claims_gate.work_state_authority",
             Self::EvidenceBeforeEscalation => "claims_gate.evidence_before_escalation",
         }
     }
@@ -112,7 +110,7 @@ impl ClaimGateRuleTopic {
             Self::ScannedPublishingSurfaces => "scanned publishing surfaces",
             Self::ForbiddenCurrentCapabilityClaims => "forbidden current capability claims",
             Self::RequiredLimitationMarkers => "required limitation markers",
-            Self::ForgejoWorkState => "Forgejo work-state authority",
+            Self::WorkStateAuthority => "GitHub work-state authority",
             Self::EvidenceBeforeEscalation => "proof before stronger claims",
         }
     }
@@ -138,12 +136,12 @@ pub const CLAIMS_GATE_RULES: &[ClaimGateRule] = &[
         rule: "README and current preview docs must preserve explicit limitation markers so readers see prototype status and missing proof before capability summaries.",
     },
     ClaimGateRule {
-        topic: ClaimGateRuleTopic::ForgejoWorkState,
-        rule: "Forgejo project state, not repo-local task, checklist, roadmap, queue, or ledger files, is the live work-state authority.",
+        topic: ClaimGateRuleTopic::WorkStateAuthority,
+        rule: "GitHub issue and pull request state, not repo-local task, checklist, roadmap, queue, or ledger files, is the foreground Codex work-state authority.",
     },
     ClaimGateRule {
         topic: ClaimGateRuleTopic::EvidenceBeforeEscalation,
-        rule: "Any stronger claim requires a tracked Forgejo issue, recorded proof, and an update to this gate before the wording can become present-tense product capability.",
+        rule: "Any stronger claim requires a tracked GitHub issue, recorded proof, and an update to this gate before the wording can become present-tense product capability.",
     },
 ];
 
@@ -203,6 +201,7 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "ClaimGateRuleTopic",
             "ClaimGateRule",
             "CLAIMS_GATE_RULES",
+            "GitHub issue and pull request state",
             "claims_gate_policy_covers_current_claim_boundaries",
         ],
         &mut missing,
@@ -211,7 +210,7 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
         &root,
         "docs/CLAIMS_GATE_POLICY.md",
         &[
-            "tracked Forgejo issue",
+            "tracked GitHub issue",
             "OpenZFS/Ceph successor claim",
             "production-ready",
             "POSIX-complete",
@@ -254,17 +253,6 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
 
     scan_public_claim_surfaces(&root, &mut missing);
 
-    // Forgejo work/claim proof: ensure parallel instance safety
-    if let Err(err) = forgejo_work::check_claim_gate_current_workspace() {
-        missing.push(format!("forgejo claim gate: {err}"));
-    }
-    if let Err(err) = forgejo_work::check_stale_claims_current_workspace() {
-        missing.push(format!("forgejo stale claims: {err}"));
-    }
-    if let Err(err) = forgejo_work::check_abandoned_worktrees_current_workspace() {
-        missing.push(format!("forgejo abandoned worktrees: {err}"));
-    }
-
     if missing.is_empty() {
         println!(
             "claims gate ok: {} publishing docs scanned and overclaims rejected",
@@ -289,7 +277,7 @@ fn check_source_bound_claim_rules(missing: &mut Vec<String>) {
         ClaimGateRuleTopic::ScannedPublishingSurfaces,
         ClaimGateRuleTopic::ForbiddenCurrentCapabilityClaims,
         ClaimGateRuleTopic::RequiredLimitationMarkers,
-        ClaimGateRuleTopic::ForgejoWorkState,
+        ClaimGateRuleTopic::WorkStateAuthority,
         ClaimGateRuleTopic::EvidenceBeforeEscalation,
     ] {
         if !rules.iter().any(|rule| rule.topic == topic) {
@@ -401,7 +389,7 @@ mod tests {
             ClaimGateRuleTopic::ScannedPublishingSurfaces,
             ClaimGateRuleTopic::ForbiddenCurrentCapabilityClaims,
             ClaimGateRuleTopic::RequiredLimitationMarkers,
-            ClaimGateRuleTopic::ForgejoWorkState,
+            ClaimGateRuleTopic::WorkStateAuthority,
             ClaimGateRuleTopic::EvidenceBeforeEscalation,
         ] {
             assert!(
@@ -416,7 +404,7 @@ mod tests {
             "OpenZFS/Ceph",
             "production-ready",
             "POSIX-complete",
-            "Forgejo project state",
+            "GitHub issue and pull request state",
             "proof",
         ] {
             assert!(

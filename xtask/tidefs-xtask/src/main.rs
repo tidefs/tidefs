@@ -1702,7 +1702,7 @@ fn print_help() {
     println!("  check-group cluster       run all cluster checks (7 checks)");
     println!("  check-group block         run all block-volume checks (26 checks)");
     println!("  check-group storage       run all storage checks (36 checks)");
-    println!("  check-group claims        run claims gate + forgejo work + kernel closure checks (6 checks)");
+    println!("  check-group claims        run claims gate + work ownership + kernel closure checks (6 checks)");
     println!("  check-group all           run all 80 checks, report all failures");
     println!();
     println!("  --- Individual check commands ---");
@@ -1903,7 +1903,7 @@ fn print_help() {
     println!("  check-module-invariants alias for check-module-owners");
     println!("  check-claims-gate       validate publish-facing capability claims");
     println!("  check-overclaims        alias for check-claims-gate");
-    println!("  check-claim-gate        validate current worktree has a valid Forgejo claim");
+    println!("  check-claim-gate        validate current worktree has a valid issue owner");
     println!("  check-worktree-claim    alias for check-claim-gate");
     println!("  check-stale-claims      scan Forgejo for stale codex:claimed issues");
     println!("  check-stale-forgejo-claims alias for check-stale-claims");
