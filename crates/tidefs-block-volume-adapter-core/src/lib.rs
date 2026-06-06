@@ -14,7 +14,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::ops::Range;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt};
 use std::path::Path;
 
 // Linux fallocate(2) mode flags for hole-punching discard.
@@ -4366,9 +4366,9 @@ impl fmt::Display for BlockVolumeFileImageError {
                 actual_bytes,
             } => write!(
                 f,
-                "backing file length mismatch: expected {expected_bytes} bytes, found {actual_bytes} bytes"
+                "backing media length mismatch: expected {expected_bytes} bytes, found {actual_bytes} bytes"
             ),
-            Self::Io(err) => write!(f, "backing file I/O failed: {err}"),
+            Self::Io(err) => write!(f, "backing media I/O failed: {err}"),
         }
     }
 }
@@ -4441,8 +4441,9 @@ impl BlockVolumeFileImage {
         geometry: BlockVolumeGeometryRecord,
     ) -> Result<Self, BlockVolumeFileImageError> {
         let expected_bytes = file_image_capacity_bytes(geometry)?;
+        let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let actual_bytes = file.metadata()?.len();
+        let actual_bytes = existing_backing_capacity_bytes(path, &file)?;
         if actual_bytes != expected_bytes {
             return Err(BlockVolumeFileImageError::BackingLengthMismatch {
                 expected_bytes,
@@ -4462,11 +4463,9 @@ impl BlockVolumeFileImage {
         geometry: BlockVolumeGeometryRecord,
     ) -> Result<Self, BlockVolumeFileImageError> {
         let expected_bytes = file_image_capacity_bytes(geometry)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(path.as_ref())?;
-        let actual_bytes = file.metadata()?.len();
+        let path = path.as_ref();
+        let file = OpenOptions::new().read(true).write(false).open(path)?;
+        let actual_bytes = existing_backing_capacity_bytes(path, &file)?;
         if actual_bytes != expected_bytes {
             return Err(BlockVolumeFileImageError::BackingLengthMismatch {
                 expected_bytes,
@@ -5328,6 +5327,68 @@ fn file_image_capacity_bytes(
         .capacity_bytes()
         .ok_or(BlockVolumeFileImageError::CapacityTooLarge)?;
     u64::try_from(capacity).map_err(|_| BlockVolumeFileImageError::CapacityTooLarge)
+}
+
+fn existing_backing_capacity_bytes(
+    path: &Path,
+    file: &File,
+) -> Result<u64, BlockVolumeFileImageError> {
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_block_device() {
+        return block_device_capacity_bytes(path, &metadata).map_err(BlockVolumeFileImageError::Io);
+    }
+    Ok(metadata.len())
+}
+
+#[cfg(target_os = "linux")]
+fn block_device_capacity_bytes(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<u64, io::Error> {
+    let major = linux_dev_major(metadata.rdev());
+    let minor = linux_dev_minor(metadata.rdev());
+    let size_path = Path::new("/sys/dev/block")
+        .join(format!("{major}:{minor}"))
+        .join("size");
+    let sectors = std::fs::read_to_string(&size_path)
+        .and_then(|raw| {
+            raw.trim().parse::<u64>().map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("parse {}: {err}", size_path.display()),
+                )
+            })
+        })
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("read block device capacity for {}: {err}", path.display()),
+            )
+        })?;
+    sectors.checked_mul(512).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("block device capacity overflows u64 for {}", path.display()),
+        )
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn block_device_capacity_bytes(
+    _path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<u64, io::Error> {
+    Ok(metadata.len())
+}
+
+#[cfg(target_os = "linux")]
+const fn linux_dev_major(dev: u64) -> u64 {
+    ((dev >> 8) & 0x0fff) | ((dev >> 32) & !0x0fff)
+}
+
+#[cfg(target_os = "linux")]
+const fn linux_dev_minor(dev: u64) -> u64 {
+    (dev & 0x00ff) | ((dev >> 12) & !0x00ff)
 }
 
 fn offset_u64(offset: usize) -> Result<u64, BlockVolumeFileImageError> {
