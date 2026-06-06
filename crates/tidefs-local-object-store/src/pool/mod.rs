@@ -364,6 +364,8 @@ pub struct PlacementReceipt {
     pub object_key: ObjectKey,
     /// Topology epoch used for new allocation.
     pub epoch: u64,
+    /// Monotonic per-pool receipt write generation.
+    pub generation: u64,
     /// Redundancy policy in force for this write.
     pub policy: PoolRedundancyPolicy,
     /// Failure-domain level requested by the pool.
@@ -378,7 +380,8 @@ pub struct PlacementReceipt {
     pub targets: Vec<PlacementReceiptTarget>,
 }
 
-const PLACEMENT_RECEIPT_MAGIC: &[u8; 8] = b"TFSPRC1\0";
+const PLACEMENT_RECEIPT_MAGIC_V1: &[u8; 8] = b"TFSPRC1\0";
+const PLACEMENT_RECEIPT_MAGIC_V2: &[u8; 8] = b"TFSPRC2\0";
 const PLACEMENT_RECEIPT_CONTEXT: &str = "TideFS pool placement receipt object key v1";
 const PLACEMENT_HASH_RING_VNODES_PER_GB: u64 = 16;
 
@@ -389,10 +392,11 @@ impl PlacementReceipt {
                 reason: "placement receipt target count exceeds wire format",
             });
         }
-        let mut out = Vec::with_capacity(96 + self.targets.len() * 55);
-        out.extend_from_slice(PLACEMENT_RECEIPT_MAGIC);
+        let mut out = Vec::with_capacity(104 + self.targets.len() * 55);
+        out.extend_from_slice(PLACEMENT_RECEIPT_MAGIC_V2);
         out.extend_from_slice(&self.object_key.as_bytes32());
         out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&self.generation.to_le_bytes());
         out.push(self.failure_domain_level.discriminant());
         match self.policy {
             PoolRedundancyPolicy::Replicated { copies } => {
@@ -425,11 +429,19 @@ impl PlacementReceipt {
 
     fn decode(raw: &[u8]) -> Option<Self> {
         let mut cursor = ReceiptCursor::new(raw);
-        if cursor.take(PLACEMENT_RECEIPT_MAGIC.len())? != PLACEMENT_RECEIPT_MAGIC {
-            return None;
-        }
+        let magic = cursor.take(PLACEMENT_RECEIPT_MAGIC_V2.len())?;
+        let has_generation = match magic {
+            m if m == PLACEMENT_RECEIPT_MAGIC_V2 => true,
+            m if m == PLACEMENT_RECEIPT_MAGIC_V1 => false,
+            _ => return None,
+        };
         let object_key = ObjectKey::from_bytes32(cursor.array()?);
         let epoch = u64::from_le_bytes(cursor.array()?);
+        let generation = if has_generation {
+            u64::from_le_bytes(cursor.array()?)
+        } else {
+            0
+        };
         let failure_domain_level = FailureDomainLevel::from_u8(cursor.u8()?)?;
         let policy_tag = cursor.u8()?;
         let first = cursor.u8()?;
@@ -467,6 +479,7 @@ impl PlacementReceipt {
         Some(Self {
             object_key,
             epoch,
+            generation,
             policy,
             failure_domain_level,
             payload_len,
@@ -605,6 +618,9 @@ pub struct Pool {
     /// selected their targets while later topology changes can steer new
     /// allocations elsewhere.
     placement_epoch: u64,
+    /// Next monotonic receipt generation for distinguishing same-topology
+    /// rewrites of the same logical object.
+    next_placement_receipt_generation: u64,
     /// Hot-spare activation policy.  Defaults to [`SparePolicy::Manual`].
     spare_policy: SparePolicy,
     /// Log of device health transitions for observability.
@@ -642,6 +658,24 @@ fn resume_device_removal_if_pending(pool: &mut Pool) {
             let _ = std::fs::remove_file(&marker_path);
         }
     }
+}
+
+fn next_placement_receipt_generation_for_devices(devices: &[Device]) -> u64 {
+    let max_generation = devices
+        .iter()
+        .flat_map(|device| {
+            device
+                .store()
+                .list_keys_including_internal()
+                .into_iter()
+                .filter(|key| crate::is_pool_placement_receipt_key(*key))
+                .filter_map(|key| device.get(key).ok().flatten())
+                .filter_map(|raw| PlacementReceipt::decode(&raw))
+                .map(|receipt| receipt.generation)
+        })
+        .max()
+        .unwrap_or(0);
+    max_generation.saturating_add(1).max(1)
 }
 
 impl Pool {
@@ -686,6 +720,8 @@ impl Pool {
         let class_map = build_class_map(&classes);
 
         let devices = open_devices(&config.devices, options)?;
+        let next_placement_receipt_generation =
+            next_placement_receipt_generation_for_devices(&devices);
 
         // Build device-class-aware layout state.
         let media_classes: Vec<DeviceMediaClass> =
@@ -716,6 +752,7 @@ impl Pool {
             pool_guid,
             device_guids,
             placement_epoch: 1,
+            next_placement_receipt_generation,
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
             replacement: None,
@@ -900,6 +937,8 @@ impl Pool {
         let classes: Vec<DeviceClass> = config.devices.iter().map(|vc| vc.class).collect();
         let class_map = build_class_map(&classes);
         let mut devices = open_devices(&config.devices, options)?;
+        let next_placement_receipt_generation =
+            next_placement_receipt_generation_for_devices(&devices);
 
         // Build device-class-aware layout state.
         let media_classes: Vec<DeviceMediaClass> =
@@ -937,6 +976,7 @@ impl Pool {
             pool_guid: pg,
             device_guids,
             placement_epoch: topology_generation.unwrap_or(1).max(1),
+            next_placement_receipt_generation,
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
             replacement: None,
@@ -1265,6 +1305,15 @@ impl Pool {
         self.placement_epoch = self.placement_epoch.saturating_add(1).max(1);
     }
 
+    fn allocate_placement_receipt_generation(&mut self) -> u64 {
+        let generation = self.next_placement_receipt_generation.max(1);
+        self.next_placement_receipt_generation = self
+            .next_placement_receipt_generation
+            .saturating_add(1)
+            .max(1);
+        generation
+    }
+
     fn placement_failure_domain(&self, candidate_count: usize) -> Result<FailureDomainV1> {
         let target_count =
             u8::try_from(candidate_count.clamp(1, 64)).map_err(|_| StoreError::InvalidOptions {
@@ -1408,6 +1457,7 @@ impl Pool {
         Ok(PlacementReceipt {
             object_key: key,
             epoch: self.placement_epoch,
+            generation: 0,
             policy: self.properties.redundancy_policy,
             failure_domain_level: self.properties.failure_domain_level,
             payload_len: payload_len as u64,
@@ -1449,7 +1499,9 @@ impl Pool {
                 continue;
             }
             let replace = match best.as_ref() {
-                Some(current) => receipt.epoch >= current.epoch,
+                Some(current) => {
+                    (receipt.generation, receipt.epoch) >= (current.generation, current.epoch)
+                }
                 None => true,
             };
             if replace {
@@ -1491,6 +1543,7 @@ impl Pool {
         indices: &[usize],
     ) -> Result<StoredObject> {
         let mut receipt = self.plan_pool_wide_placement(class, key, payload.len(), indices)?;
+        receipt.generation = self.allocate_placement_receipt_generation();
         receipt.payload_digest = digest32(payload);
 
         match receipt.policy {
@@ -1969,6 +2022,7 @@ impl Pool {
         }
         if changed {
             receipt.epoch = self.placement_epoch.saturating_add(1).max(1);
+            receipt.generation = self.allocate_placement_receipt_generation();
             self.write_placement_receipt(&indices, &receipt)?;
         }
         Ok(())
@@ -3708,6 +3762,7 @@ mod tests {
                 .unwrap()
                 .expect("placement receipt must persist");
             assert_eq!(receipt.policy, PoolRedundancyPolicy::replicated(2));
+            assert!(receipt.generation > 0);
             assert_eq!(receipt.targets.len(), 2);
             for target in receipt.targets {
                 seen.insert(target.device_index);
@@ -3723,6 +3778,83 @@ mod tests {
             5,
             "pool-wide placement should eventually use every eligible data device"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn receipt_generation_prefers_newer_same_epoch_rewrite() {
+        let root = temp_dir("receipt-generation-rewrite");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"same-key-rewrite");
+        pool.put(IoClass::Data, key, b"old-payload").unwrap();
+        let stale_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("old receipt");
+        assert_eq!(stale_receipt.generation, 1);
+
+        pool.put(IoClass::Data, key, b"new-payload").unwrap();
+        let fresh_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("fresh receipt");
+        assert_eq!(fresh_receipt.epoch, stale_receipt.epoch);
+        assert!(fresh_receipt.generation > stale_receipt.generation);
+
+        let stale_key = placement_receipt_object_key(key);
+        let stale_encoded = stale_receipt.encode().unwrap();
+        let last_idx = pool.devices.len() - 1;
+        pool.devices[last_idx]
+            .put(stale_key, &stale_encoded)
+            .expect("inject stale receipt");
+
+        let selected = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("selected receipt");
+        assert_eq!(selected.generation, fresh_receipt.generation);
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(b"new-payload".to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn receipt_generation_recovers_after_pool_reopen() {
+        let root = temp_dir("receipt-generation-reopen");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let properties = PoolProperties::default();
+
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+        let first_key = ObjectKey::from_name(b"first-before-reopen");
+        pool.put(IoClass::Data, first_key, b"first").unwrap();
+        let first_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, first_key)
+            .unwrap()
+            .expect("first receipt");
+        assert_eq!(first_receipt.generation, 1);
+        drop(pool);
+
+        let mut reopened = Pool::create(config, properties, &test_options()).unwrap();
+        let second_key = ObjectKey::from_name(b"second-after-reopen");
+        reopened.put(IoClass::Data, second_key, b"second").unwrap();
+        let second_receipt = reopened
+            .placement_receipt_for_key(IoClass::Data, second_key)
+            .unwrap()
+            .expect("second receipt");
+        assert!(second_receipt.generation > first_receipt.generation);
 
         let _ = std::fs::remove_dir_all(&root);
     }
