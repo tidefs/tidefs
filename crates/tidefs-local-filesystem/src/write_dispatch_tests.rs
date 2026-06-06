@@ -1939,8 +1939,8 @@ fn final_unlink_forgets_transient_writeback_state() {
 }
 
 #[test]
-fn keep_size_prealloc_flushes_buffered_growth_first() {
-    let (mut fs, root) = wb_open_temp("keep-size-prealloc-flushes-buffered-growth");
+fn keep_size_prealloc_preserves_buffered_growth_without_flush() {
+    let (mut fs, root) = wb_open_temp("keep-size-prealloc-preserves-buffer");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1024 * 1024,
         flush_threshold_age: Duration::from_millis(60_000),
@@ -1958,11 +1958,69 @@ fn keep_size_prealloc_flushes_buffered_growth_first() {
         .expect("keep-size prealloc");
 
     let record = fs.stat("/prealloc.bin").expect("stat");
-    let manifest = wd_current_content_manifest(&fs, "/prealloc.bin");
     assert_eq!(record.size, data.len() as u64);
-    assert_eq!(manifest.file_size, record.size);
-    assert!(!fs.write_buffers.contains_key(&record.inode_id));
+    assert!(
+        fs.write_buffers.contains_key(&record.inode_id),
+        "KEEP_SIZE preallocation must not publish unrelated buffered data"
+    );
     assert_eq!(fs.read_file("/prealloc.bin").expect("read"), data);
+
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush preserved buffered data");
+    let flushed = fs.stat("/prealloc.bin").expect("stat flushed");
+    let manifest = wd_current_content_manifest(&fs, "/prealloc.bin");
+    assert_eq!(flushed.size, data.len() as u64);
+    assert_eq!(manifest.file_size, flushed.size);
+    assert!(!fs.write_buffers.contains_key(&record.inode_id));
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
+fn extending_prealloc_preserves_buffered_data_without_flush() {
+    let (mut fs, root) = wb_open_temp("extending-prealloc-preserves-buffer");
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: 1024 * 1024,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/prealloc.bin", 0o644).expect("create");
+    let data = vec![0x9b; 8192];
+    fs.write_file("/prealloc.bin", 0, &data)
+        .expect("buffered write");
+    assert!(fs.write_buffers.contains_key(&record.inode_id));
+
+    let prealloc_offset = 16 * 1024;
+    let prealloc_len = 4096;
+    fs.fallocate_file("/prealloc.bin", prealloc_offset, prealloc_len)
+        .expect("extend prealloc");
+
+    let expected_len = prealloc_offset + prealloc_len;
+    let stat = fs.stat("/prealloc.bin").expect("stat after prealloc");
+    assert_eq!(stat.size, expected_len);
+    assert!(
+        fs.write_buffers.contains_key(&record.inode_id),
+        "mode-0 fallocate should not publish unrelated buffered writes"
+    );
+
+    let mut expected = vec![0_u8; expected_len as usize];
+    expected[..data.len()].copy_from_slice(&data);
+    assert_eq!(
+        fs.read_file("/prealloc.bin").expect("read overlay"),
+        expected
+    );
+
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush preserved buffered data");
+    assert_eq!(
+        fs.read_file("/prealloc.bin").expect("read flushed"),
+        expected
+    );
+    let manifest = wd_current_content_manifest(&fs, "/prealloc.bin");
+    assert_eq!(manifest.file_size, expected_len);
 
     drop(fs);
     wd_cleanup(&root);

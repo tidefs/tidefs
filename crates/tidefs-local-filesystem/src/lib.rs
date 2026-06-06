@@ -6286,7 +6286,6 @@ impl LocalFileSystem {
         if length == 0 {
             return Ok(record);
         }
-        self.flush_write_buffer(inode_id)?;
         let record = self.committed_inode_record(inode_id)?;
         let end = offset
             .checked_add(length)
@@ -6303,7 +6302,7 @@ impl LocalFileSystem {
             })
         })?;
         if end <= logical_size && reserve_bytes == 0 {
-            return Ok(record);
+            return Ok(self.adjust_for_write_buffer(inode_id, record));
         }
 
         // Quota/admission covers only hole bytes that become new UNWRITTEN
@@ -6386,7 +6385,7 @@ impl LocalFileSystem {
                 0, // txg_id assigned by TxgCoordinator at drain time
             );
         });
-        Ok(result)
+        Ok(self.adjust_for_write_buffer(inode_id, result))
     }
 
     pub fn fallocate_keep_size(
@@ -6431,7 +6430,6 @@ impl LocalFileSystem {
         if length == 0 {
             return Ok(record);
         }
-        self.flush_write_buffer(inode_id)?;
         let record = self.committed_inode_record(inode_id)?;
         let end = offset
             .checked_add(length)
@@ -6540,7 +6538,7 @@ impl LocalFileSystem {
                 0, // txg_id assigned by TxgCoordinator at drain time
             );
         });
-        Ok(result)
+        Ok(self.adjust_for_write_buffer(inode_id, result))
     }
 
     pub fn truncate_file(&mut self, path: impl AsRef<str>, size: u64) -> Result<InodeRecord> {
