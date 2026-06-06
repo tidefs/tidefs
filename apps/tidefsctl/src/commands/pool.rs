@@ -10,7 +10,7 @@
 // `tidefsctl pool create <pool-name> --devices <device>...` bootstraps a
 // TideFS pool on block devices, or regular files in hidden development mode, by calling
 // [`tidefs_pool_import::create::PoolCreator::create_pool`] with
-// `RedundancyPolicy::None` for the default initial command shape.  The
+// `RedundancyPolicy::replicated(1)` for the default initial command shape.  The
 // create path writes dual-copy pool labels and an initial committed root
 // (epoch 1), leaving the pool in `Exported` state ready for import.
 //
@@ -40,8 +40,8 @@ pub enum PoolCommand {
         #[arg(short = 'd', long = "devices", required = true, num_args = 1..)]
         devices: Vec<PathBuf>,
 
-        /// Redundancy policy: none (default) or mirror
-        #[arg(short = 'r', long = "redundancy", default_value = "none")]
+        /// Redundancy policy: single (default), replicated=N, or erasure=D+P
+        #[arg(short = 'r', long = "redundancy", default_value = "single")]
         redundancy: String,
 
         /// Comma-separated feature flags (e.g. "encryption,compression")
@@ -404,14 +404,13 @@ fn handle_pool_create(
         );
         process::exit(1);
     }
-    use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
+    use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator};
 
     // --- validate redundancy policy ---
-    let policy = match redundancy.as_str() {
-        "none" => RedundancyPolicy::None,
-        "mirror" => RedundancyPolicy::Mirror { copies: 2 },
-        other => {
-            eprintln!("tidefsctl: unknown redundancy policy \"{other}\"; expected none or mirror");
+    let policy = match parse_pool_redundancy_policy(&redundancy) {
+        Ok(policy) => policy,
+        Err(err) => {
+            eprintln!("tidefsctl: {err}");
             process::exit(1);
         }
     };
@@ -491,6 +490,7 @@ fn handle_pool_create(
             "pool_name": outcome.pool_name,
             "pool_guid": hex_guid(&outcome.pool_guid),
             "device_count": outcome.device_count,
+            "redundancy_policy": outcome.redundancy.to_string(),
             "state": outcome.state.to_string(),
             "committed_root_epoch": outcome.committed_root.epoch_number,
             "commit_group_id": outcome.committed_root.root.commit_group_id.0,
@@ -500,6 +500,7 @@ fn handle_pool_create(
         println!("pool created: {}", outcome.pool_name);
         println!("  pool GUID:       {}", hex_guid(&outcome.pool_guid));
         println!("  device count:    {}", outcome.device_count);
+        println!("  redundancy:      {}", outcome.redundancy);
         println!("  state:           {}", outcome.state);
         println!("  epoch:           {}", outcome.committed_root.epoch_number);
         println!(
@@ -507,6 +508,52 @@ fn handle_pool_create(
             outcome.committed_root.root.commit_group_id.0
         );
     }
+}
+
+fn parse_pool_redundancy_policy(
+    raw: &str,
+) -> Result<tidefs_pool_import::create::RedundancyPolicy, String> {
+    use tidefs_pool_import::create::RedundancyPolicy;
+
+    let value = raw.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "single" | "none" => return Ok(RedundancyPolicy::replicated(1)),
+        "mirror" => return Ok(RedundancyPolicy::replicated(2)),
+        _ => {}
+    }
+
+    if let Some(rest) = value.strip_prefix("replicated=") {
+        let copies = parse_nonzero_u8(rest, raw, "replicated copies", "replicated=N")?;
+        return Ok(RedundancyPolicy::replicated(copies));
+    }
+
+    if let Some(rest) = value.strip_prefix("erasure=") {
+        let (data, parity) = parse_erasure_shards(rest, raw)?;
+        return Ok(RedundancyPolicy::erasure(data, parity));
+    }
+
+    Err(format!(
+        "unknown redundancy policy \"{raw}\"; expected single, replicated=N, or erasure=D+P"
+    ))
+}
+
+fn parse_nonzero_u8(value: &str, raw: &str, field: &str, expected: &str) -> Result<u8, String> {
+    let parsed = value
+        .parse::<u8>()
+        .map_err(|_| format!("invalid {field} in \"{raw}\": expected {expected}"))?;
+    if parsed == 0 {
+        return Err(format!("{field} must be at least 1 in \"{raw}\""));
+    }
+    Ok(parsed)
+}
+
+fn parse_erasure_shards(raw_spec: &str, raw: &str) -> Result<(u8, u8), String> {
+    let (data, parity) = raw_spec
+        .split_once('+')
+        .ok_or_else(|| format!("invalid erasure policy \"{raw}\": expected erasure=D+P"))?;
+    let data = parse_nonzero_u8(data, raw, "erasure data shards", "erasure=D+P")?;
+    let parity = parse_nonzero_u8(parity, raw, "erasure parity shards", "erasure=D+P")?;
+    Ok((data, parity))
 }
 
 fn validate_pool_create_device_paths(
@@ -658,6 +705,7 @@ fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
                     "device_guid": e.device_guid.map(|g| hex_guid(&g)),
                     "device_index": e.device_index,
                     "device_count": e.device_count,
+                    "redundancy_policy": e.redundancy_policy.map(|policy| policy.to_string()),
                     "label_valid": e.label_valid,
                     "label_status": e.label_status,
                     "topology_generation": e.topology_generation,
@@ -704,6 +752,12 @@ fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
                         .device_count
                         .map_or_else(|| "-".into(), |c| c.to_string())
                 );
+                println!(
+                    "  redundancy_policy={}",
+                    entry
+                        .redundancy_policy
+                        .map_or_else(|| "-".into(), |policy| policy.to_string())
+                );
                 println!("  label_valid={}", entry.label_valid);
             } else {
                 println!("  label: none ({})", entry.label_status);
@@ -740,6 +794,7 @@ fn handle_pool_status(pool_name: String, devices: Option<Vec<PathBuf>>, json: bo
             "pool_uuid": hex_guid(&config.pool_uuid),
             "state": config.state.to_string(),
             "device_count": config.device_count,
+            "redundancy_policy": config.redundancy_policy.to_string(),
             "health": config.health.to_string(),
         });
         println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
@@ -748,6 +803,7 @@ fn handle_pool_status(pool_name: String, devices: Option<Vec<PathBuf>>, json: bo
         println!("  pool uuid:   {}", hex_guid(&config.pool_uuid));
         println!("  state:       {}", config.state);
         println!("  devices:     {}", config.device_count);
+        println!("  redundancy:  {}", config.redundancy_policy);
         println!("  health:      {}", config.health);
     }
 }
@@ -1827,28 +1883,60 @@ mod tests {
     // -- redundancy policy parsing tests (not requiring live devices) --
 
     #[test]
-    fn redundancy_none_is_valid() {
-        let s = "none";
-        assert!(matches!(s, "none" | "mirror"));
+    fn redundancy_single_is_valid() {
+        let policy = parse_pool_redundancy_policy("single").unwrap();
+        assert_eq!(
+            policy,
+            tidefs_pool_import::create::RedundancyPolicy::replicated(1)
+        );
     }
 
     #[test]
-    fn redundancy_mirror_is_valid() {
-        let s = "mirror";
-        assert!(matches!(s, "none" | "mirror"));
+    fn redundancy_replicated_is_valid() {
+        let policy = parse_pool_redundancy_policy("replicated=3").unwrap();
+        assert_eq!(
+            policy,
+            tidefs_pool_import::create::RedundancyPolicy::replicated(3)
+        );
     }
 
     #[test]
-    fn redundancy_erasure_rejected() {
-        // erasure is not yet implemented; the CLI must refuse it
-        let s = "erasure";
-        assert!(!matches!(s, "none" | "mirror"));
+    fn redundancy_erasure_is_valid() {
+        let policy = parse_pool_redundancy_policy("erasure=4+2").unwrap();
+        assert_eq!(
+            policy,
+            tidefs_pool_import::create::RedundancyPolicy::erasure(4, 2)
+        );
+    }
+
+    #[test]
+    fn redundancy_legacy_aliases_remain_accepted() {
+        assert_eq!(
+            parse_pool_redundancy_policy("none").unwrap(),
+            tidefs_pool_import::create::RedundancyPolicy::replicated(1)
+        );
+        assert_eq!(
+            parse_pool_redundancy_policy("mirror").unwrap(),
+            tidefs_pool_import::create::RedundancyPolicy::replicated(2)
+        );
     }
 
     #[test]
     fn redundancy_unknown_rejected() {
-        let s = "raidz";
-        assert!(!matches!(s, "none" | "mirror"));
+        let err = parse_pool_redundancy_policy("raidz").unwrap_err();
+        assert!(err.contains("single, replicated=N, or erasure=D+P"));
+    }
+
+    #[test]
+    fn redundancy_rejects_zero_width() {
+        assert!(parse_pool_redundancy_policy("replicated=0").is_err());
+        assert!(parse_pool_redundancy_policy("erasure=2+0").is_err());
+    }
+
+    #[test]
+    fn redundancy_rejects_bad_erasure_shape() {
+        let err = parse_pool_redundancy_policy("erasure=2").unwrap_err();
+        assert!(err.contains("erasure=D+P"));
     }
 
     #[test]

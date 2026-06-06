@@ -316,7 +316,7 @@ mod tests {
             "/dev/sdb",
             "/dev/sdc",
             "--redundancy",
-            "mirror",
+            "replicated=2",
         ]);
         assert!(
             args.is_ok(),
@@ -336,7 +336,7 @@ mod tests {
             "/dev/sda",
             "/dev/sdb",
             "--redundancy",
-            "mirror",
+            "replicated=2",
             "--feature-flags",
             "encryption,compression",
         ]);

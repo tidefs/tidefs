@@ -159,6 +159,109 @@ impl fmt::Display for DeviceClass {
 }
 
 // ---------------------------------------------------------------------------
+// PoolRedundancyPolicy
+// ---------------------------------------------------------------------------
+
+/// Pool-wide allocation policy recorded in every pool member label.
+///
+/// Labels carry the policy identity, not a fixed device-group layout. The
+/// placement planner still chooses concrete targets per object/stripe and
+/// persists those choices in placement receipts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PoolRedundancyPolicy {
+    /// Store `copies` full replicas on distinct eligible devices.
+    Replicated { copies: u8 },
+    /// Store one erasure stripe over `data_shards + parity_shards` targets.
+    Erasure { data_shards: u8, parity_shards: u8 },
+}
+
+impl Default for PoolRedundancyPolicy {
+    fn default() -> Self {
+        Self::Replicated { copies: 1 }
+    }
+}
+
+impl PoolRedundancyPolicy {
+    /// Convenience constructor for replicated placement.
+    #[must_use]
+    pub const fn replicated(copies: u8) -> Self {
+        Self::Replicated { copies }
+    }
+
+    /// Convenience constructor for erasure `(data,parity)` placement.
+    #[must_use]
+    pub const fn erasure(data_shards: u8, parity_shards: u8) -> Self {
+        Self::Erasure {
+            data_shards,
+            parity_shards,
+        }
+    }
+
+    /// Number of distinct physical targets required for one placement.
+    #[must_use]
+    pub const fn target_width(self) -> u16 {
+        match self {
+            Self::Replicated { copies } => copies as u16,
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => data_shards as u16 + parity_shards as u16,
+        }
+    }
+
+    /// Returns true when the policy can describe a usable allocation.
+    #[must_use]
+    pub const fn is_well_formed(self) -> bool {
+        match self {
+            Self::Replicated { copies } => copies > 0,
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => data_shards > 0 && parity_shards > 0,
+        }
+    }
+
+    /// Encode to the compact on-label policy extension fields.
+    #[must_use]
+    pub const fn to_wire(self) -> (u8, u8, u8, u8) {
+        match self {
+            Self::Replicated { copies } => (0, copies, 0, 0),
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => (1, data_shards, parity_shards, 0),
+        }
+    }
+
+    /// Decode from the compact on-label policy extension fields.
+    #[must_use]
+    pub const fn from_wire(kind: u8, first: u8, second: u8) -> Option<Self> {
+        match kind {
+            0 if first > 0 && second == 0 => Some(Self::Replicated { copies: first }),
+            1 if first > 0 && second > 0 => Some(Self::Erasure {
+                data_shards: first,
+                parity_shards: second,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for PoolRedundancyPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Replicated { copies: 1 } => f.write_str("single"),
+            Self::Replicated { copies } => write!(f, "replicated={copies}"),
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => write!(f, "erasure={data_shards}+{parity_shards}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Feature flag bit masks
 // ---------------------------------------------------------------------------
 
@@ -191,6 +294,10 @@ pub mod features {
     /// the pool but will not participate in cluster operations.
     /// Compat bit 8.
     pub const CLUSTER_POOL_COMPAT: u64 = 1 << 8;
+
+    /// Pool-wide redundancy policy extension fields are present in the label.
+    /// Compat bit 9.
+    pub const POOL_REDUNDANCY_POLICY: u64 = 1 << 9;
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +357,8 @@ pub struct PoolLabelV1 {
     pub device_write_errors: u64,
     /// Accumulated checksum errors on this device.
     pub device_checksum_errors: u64,
+    /// Pool-wide allocation policy identity.
+    pub redundancy_policy: PoolRedundancyPolicy,
     /// BLAKE3-256 checksum of all preceding fields (zeroed for computation).
     pub checksum: [u8; 32],
 }
@@ -282,19 +391,28 @@ pub struct PoolLabelV1 {
 // 380    8   device_read_errors
 // 388    8   device_write_errors
 // 396    8   device_checksum_errors
-// 404   32   checksum (BLAKE3-256)
-// 436  end   (total: 436 bytes)
+// 404    1   redundancy_policy_kind (0=replicated, 1=erasure)
+// 405    1   redundancy_policy_first (copies or data_shards)
+// 406    1   redundancy_policy_second (0 or parity_shards)
+// 407    1   redundancy_policy_reserved
+// 408   32   checksum (BLAKE3-256)
+// 440  end   (total: 440 bytes)
 
 /// Total wire size of a PoolLabelV1 in bytes.
 pub const POOL_LABEL_V1_WIRE_SIZE: usize = 411;
 
-/// Extended wire size including device health fields.
-pub const POOL_LABEL_V1_EXT_WIRE_SIZE: usize = 436;
+/// Extended wire size including device health fields, before pool-wide
+/// redundancy policy was added.
+pub const POOL_LABEL_V1_HEALTH_WIRE_SIZE: usize = 436;
+
+/// Extended wire size including device health and pool-wide redundancy policy.
+pub const POOL_LABEL_V1_EXT_WIRE_SIZE: usize = 440;
 
 /// Offset of the checksum field in the wire format.
 /// Original checksum offset for labels without health extension.
 pub const POOL_LABEL_V1_CHECKSUM_BASE_OFFSET: usize = 379;
-pub const POOL_LABEL_V1_CHECKSUM_OFFSET: usize = 404;
+pub const POOL_LABEL_V1_CHECKSUM_HEALTH_OFFSET: usize = 404;
+pub const POOL_LABEL_V1_CHECKSUM_OFFSET: usize = 408;
 
 // ---------------------------------------------------------------------------
 // Label errors
@@ -313,6 +431,8 @@ pub enum LabelError {
     BadPoolState(u8),
     /// `DeviceClass` value out of range.
     BadDeviceClass(u8),
+    /// Pool-wide redundancy policy extension fields are invalid.
+    BadRedundancyPolicy { kind: u8, first: u8, second: u8 },
     /// `pool_name_len` exceeds [`POOL_NAME_MAX`].
     NameTooLong,
     /// BLAKE3-256 checksum mismatch (label is corrupt).
@@ -329,6 +449,14 @@ impl fmt::Display for LabelError {
             Self::UnsupportedVersion(v) => write!(f, "unsupported label version {v}"),
             Self::BadPoolState(v) => write!(f, "bad pool state {v}"),
             Self::BadDeviceClass(v) => write!(f, "bad device class {v}"),
+            Self::BadRedundancyPolicy {
+                kind,
+                first,
+                second,
+            } => write!(
+                f,
+                "bad redundancy policy kind={kind} first={first} second={second}"
+            ),
             Self::NameTooLong => f.write_str("pool name too long"),
             Self::ChecksumMismatch => f.write_str("checksum mismatch"),
             Self::LastDevice => f.write_str("cannot remove last device from pool"),
@@ -408,7 +536,8 @@ pub fn encode_label(label: &PoolLabelV1, buf: &mut [u8]) -> Result<(), LabelErro
     if buf.len() < POOL_LABEL_V1_WIRE_SIZE {
         return Err(LabelError::BufferTooSmall);
     }
-    let ext = buf.len() >= POOL_LABEL_V1_EXT_WIRE_SIZE;
+    let health_ext = buf.len() >= POOL_LABEL_V1_HEALTH_WIRE_SIZE;
+    let policy_ext = buf.len() >= POOL_LABEL_V1_EXT_WIRE_SIZE;
 
     // Write fixed fields (little-endian).
     buf[0..4].copy_from_slice(&label.magic);
@@ -429,22 +558,37 @@ pub fn encode_label(label: &PoolLabelV1, buf: &mut [u8]) -> Result<(), LabelErro
     buf[347..355].copy_from_slice(&label.system_area_size.to_le_bytes());
     buf[355..363].copy_from_slice(&label.features_incompat.to_le_bytes());
     buf[363..371].copy_from_slice(&label.features_ro_compat.to_le_bytes());
-    let features_compat_wire = if ext {
-        label.features_compat | features::DEVICE_HEALTH_STATE
-    } else {
-        label.features_compat
-    };
+    let mut features_compat_wire =
+        label.features_compat & !(features::DEVICE_HEALTH_STATE | features::POOL_REDUNDANCY_POLICY);
+    if health_ext {
+        features_compat_wire |= features::DEVICE_HEALTH_STATE;
+    }
+    if policy_ext {
+        features_compat_wire |= features::POOL_REDUNDANCY_POLICY;
+    }
     buf[371..379].copy_from_slice(&features_compat_wire.to_le_bytes());
 
     let cksum_off: usize;
     let cksum_end: usize;
-    if ext {
+    if policy_ext {
         buf[379] = label.device_health;
         buf[380..388].copy_from_slice(&label.device_read_errors.to_le_bytes());
         buf[388..396].copy_from_slice(&label.device_write_errors.to_le_bytes());
         buf[396..404].copy_from_slice(&label.device_checksum_errors.to_le_bytes());
-        cksum_off = 404;
+        let (kind, first, second, reserved) = label.redundancy_policy.to_wire();
+        buf[404] = kind;
+        buf[405] = first;
+        buf[406] = second;
+        buf[407] = reserved;
+        cksum_off = POOL_LABEL_V1_CHECKSUM_OFFSET;
         cksum_end = POOL_LABEL_V1_EXT_WIRE_SIZE;
+    } else if health_ext {
+        buf[379] = label.device_health;
+        buf[380..388].copy_from_slice(&label.device_read_errors.to_le_bytes());
+        buf[388..396].copy_from_slice(&label.device_write_errors.to_le_bytes());
+        buf[396..404].copy_from_slice(&label.device_checksum_errors.to_le_bytes());
+        cksum_off = POOL_LABEL_V1_CHECKSUM_HEALTH_OFFSET;
+        cksum_end = POOL_LABEL_V1_HEALTH_WIRE_SIZE;
     } else {
         cksum_off = POOL_LABEL_V1_CHECKSUM_BASE_OFFSET;
         cksum_end = POOL_LABEL_V1_WIRE_SIZE;
@@ -508,9 +652,20 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
     let features_ro_compat = u64::from_le_bytes(buf[363..371].try_into().unwrap());
     let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
     let has_health = features_compat & features::DEVICE_HEALTH_STATE != 0;
+    let has_policy = features_compat & features::POOL_REDUNDANCY_POLICY != 0;
     // If health extension bit is set but the buffer is too short for the
     // extended label, reject early before slicing past the buffer.
-    if has_health && buf.len() < POOL_LABEL_V1_EXT_WIRE_SIZE {
+    if has_health && buf.len() < POOL_LABEL_V1_HEALTH_WIRE_SIZE {
+        return Err(LabelError::BufferTooSmall);
+    }
+    if has_policy && !has_health {
+        return Err(LabelError::BadRedundancyPolicy {
+            kind: buf.get(404).copied().unwrap_or(0),
+            first: buf.get(405).copied().unwrap_or(0),
+            second: buf.get(406).copied().unwrap_or(0),
+        });
+    }
+    if has_policy && buf.len() < POOL_LABEL_V1_EXT_WIRE_SIZE {
         return Err(LabelError::BufferTooSmall);
     }
     let (device_health, device_read_errors, device_write_errors, device_checksum_errors) =
@@ -524,13 +679,28 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
         } else {
             (0, 0, 0, 0)
         };
-    let checksum_offset = if has_health {
+    let redundancy_policy = if has_policy {
+        PoolRedundancyPolicy::from_wire(buf[404], buf[405], buf[406]).ok_or(
+            LabelError::BadRedundancyPolicy {
+                kind: buf[404],
+                first: buf[405],
+                second: buf[406],
+            },
+        )?
+    } else {
+        PoolRedundancyPolicy::default()
+    };
+    let checksum_offset = if has_policy {
         POOL_LABEL_V1_CHECKSUM_OFFSET
+    } else if has_health {
+        POOL_LABEL_V1_CHECKSUM_HEALTH_OFFSET
     } else {
         POOL_LABEL_V1_CHECKSUM_BASE_OFFSET
     };
-    let checksum_end = if has_health {
+    let checksum_end = if has_policy {
         POOL_LABEL_V1_EXT_WIRE_SIZE
+    } else if has_health {
+        POOL_LABEL_V1_HEALTH_WIRE_SIZE
     } else {
         POOL_LABEL_V1_WIRE_SIZE
     };
@@ -568,6 +738,7 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
         device_read_errors,
         device_write_errors,
         device_checksum_errors,
+        redundancy_policy,
         checksum,
     })
 }
@@ -584,7 +755,7 @@ pub fn seal_label(mut label: PoolLabelV1) -> Result<PoolLabelV1, LabelError> {
     encode_label(&label, &mut buf)?;
     label
         .checksum
-        .copy_from_slice(&buf[404..POOL_LABEL_V1_EXT_WIRE_SIZE]);
+        .copy_from_slice(&buf[POOL_LABEL_V1_CHECKSUM_OFFSET..POOL_LABEL_V1_EXT_WIRE_SIZE]);
     Ok(label)
 }
 
@@ -594,7 +765,7 @@ pub fn verify_label_checksum(label: &PoolLabelV1) -> bool {
     if encode_label(label, &mut buf).is_err() {
         return false;
     }
-    buf[404..POOL_LABEL_V1_EXT_WIRE_SIZE] == label.checksum
+    buf[POOL_LABEL_V1_CHECKSUM_OFFSET..POOL_LABEL_V1_EXT_WIRE_SIZE] == label.checksum
 }
 
 impl PoolLabelV1 {
@@ -631,6 +802,7 @@ impl PoolLabelV1 {
             device_read_errors: 0,
             device_write_errors: 0,
             device_checksum_errors: 0,
+            redundancy_policy: PoolRedundancyPolicy::default(),
             checksum: [0u8; 32],
         }
     }
@@ -906,6 +1078,48 @@ mod tests {
         }
         assert!(DeviceClass::from_u8(7).is_none());
         assert!(DeviceClass::from_u8(255).is_none());
+    }
+
+    #[test]
+    fn pool_redundancy_policy_roundtrip() {
+        let policies = [
+            PoolRedundancyPolicy::replicated(1),
+            PoolRedundancyPolicy::replicated(3),
+            PoolRedundancyPolicy::erasure(4, 2),
+        ];
+
+        for policy in policies {
+            let (kind, first, second, reserved) = policy.to_wire();
+            assert_eq!(reserved, 0);
+            assert_eq!(
+                PoolRedundancyPolicy::from_wire(kind, first, second),
+                Some(policy)
+            );
+            assert!(policy.is_well_formed());
+        }
+
+        assert_eq!(PoolRedundancyPolicy::replicated(1).target_width(), 1);
+        assert_eq!(PoolRedundancyPolicy::erasure(4, 2).target_width(), 6);
+        assert_eq!(format!("{}", PoolRedundancyPolicy::replicated(1)), "single");
+        assert_eq!(
+            format!("{}", PoolRedundancyPolicy::replicated(3)),
+            "replicated=3"
+        );
+        assert_eq!(
+            format!("{}", PoolRedundancyPolicy::erasure(4, 2)),
+            "erasure=4+2"
+        );
+    }
+
+    #[test]
+    fn pool_redundancy_policy_rejects_invalid_wire_values() {
+        assert_eq!(PoolRedundancyPolicy::from_wire(0, 0, 0), None);
+        assert_eq!(PoolRedundancyPolicy::from_wire(0, 2, 1), None);
+        assert_eq!(PoolRedundancyPolicy::from_wire(1, 2, 0), None);
+        assert_eq!(PoolRedundancyPolicy::from_wire(99, 1, 1), None);
+        assert!(!PoolRedundancyPolicy::replicated(0).is_well_formed());
+        assert!(!PoolRedundancyPolicy::erasure(0, 1).is_well_formed());
+        assert!(!PoolRedundancyPolicy::erasure(1, 0).is_well_formed());
     }
 
     #[test]
@@ -1226,12 +1440,14 @@ mod tests {
     // ── Wire format constant assertions ─────────────────────────────
 
     #[test]
-    fn format_constants_match_411_436_layout() {
+    fn format_constants_match_411_436_440_layout() {
         assert_eq!(POOL_LABEL_MAGIC, *b"VBFS");
         assert_eq!(POOL_LABEL_V1_WIRE_SIZE, 411);
-        assert_eq!(POOL_LABEL_V1_EXT_WIRE_SIZE, 436);
+        assert_eq!(POOL_LABEL_V1_HEALTH_WIRE_SIZE, 436);
+        assert_eq!(POOL_LABEL_V1_EXT_WIRE_SIZE, 440);
         assert_eq!(POOL_LABEL_V1_CHECKSUM_BASE_OFFSET, 379);
-        assert_eq!(POOL_LABEL_V1_CHECKSUM_OFFSET, 404);
+        assert_eq!(POOL_LABEL_V1_CHECKSUM_HEALTH_OFFSET, 404);
+        assert_eq!(POOL_LABEL_V1_CHECKSUM_OFFSET, 408);
         assert_eq!(POOL_LABEL_SIZE, 262_144);
         assert_eq!(POOL_NAME_MAX, 255);
 
@@ -1243,31 +1459,45 @@ mod tests {
         assert_eq!(VCRL_FOOTER_SIZE, 32);
         assert_eq!(VCRL_MIN_SIZE, 44);
 
-        // Internal consistency: extended = base + health fields (25 bytes).
-        assert_eq!(POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_WIRE_SIZE + 25);
+        // Internal consistency: extended = base + health fields + policy fields.
+        assert_eq!(POOL_LABEL_V1_HEALTH_WIRE_SIZE, POOL_LABEL_V1_WIRE_SIZE + 25);
+        assert_eq!(
+            POOL_LABEL_V1_EXT_WIRE_SIZE,
+            POOL_LABEL_V1_HEALTH_WIRE_SIZE + 4
+        );
+        assert_eq!(
+            POOL_LABEL_V1_CHECKSUM_HEALTH_OFFSET,
+            POOL_LABEL_V1_CHECKSUM_BASE_OFFSET + 25
+        );
         assert_eq!(
             POOL_LABEL_V1_CHECKSUM_OFFSET,
-            POOL_LABEL_V1_CHECKSUM_BASE_OFFSET + 25
+            POOL_LABEL_V1_CHECKSUM_HEALTH_OFFSET + 4
         );
     }
 
     // ── Helpers for decode-rejection tests ──────────────────────────
 
-    /// Encode a label into a fresh 436-byte buffer and return
+    /// Encode a label into a fresh current extended buffer and return
     /// (buffer, checksum_offset, has_health).
     fn encode_valid_ext_label(name: &str) -> ([u8; POOL_LABEL_V1_EXT_WIRE_SIZE], usize, bool) {
         let label = make_label(name);
         let sealed = seal_label(label).unwrap();
         let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         encode_label(&sealed, &mut buf).unwrap();
-        // The 436-byte buffer triggers the ext path in encode_label
-        // which sets DEVICE_HEALTH_STATE in features_compat_wire.
+        // The current extended buffer triggers both health and policy
+        // extensions in encode_label.
         let has_health = u64::from_le_bytes(buf[371..379].try_into().unwrap())
             & features::DEVICE_HEALTH_STATE
             != 0;
         assert!(
             has_health,
             "EXT_WIRE_SIZE buffer should set DEVICE_HEALTH_STATE"
+        );
+        assert!(
+            u64::from_le_bytes(buf[371..379].try_into().unwrap())
+                & features::POOL_REDUNDANCY_POLICY
+                != 0,
+            "EXT_WIRE_SIZE buffer should set POOL_REDUNDANCY_POLICY"
         );
         (buf, POOL_LABEL_V1_CHECKSUM_OFFSET, has_health)
     }
@@ -1375,21 +1605,66 @@ mod tests {
 
     #[test]
     fn decode_exact_436_byte_buffer_with_health_succeeds() {
-        let (buf, _, _) = encode_valid_ext_label("exact436");
+        let label = make_label("exact436");
+        let sealed = seal_label(label).unwrap();
+        let mut buf = [0u8; POOL_LABEL_V1_HEALTH_WIRE_SIZE];
+        encode_label(&sealed, &mut buf).unwrap();
         let decoded = decode_label(&buf).unwrap();
         assert_eq!(decoded.magic, POOL_LABEL_MAGIC);
+        assert_eq!(
+            decoded.redundancy_policy,
+            PoolRedundancyPolicy::replicated(1)
+        );
     }
 
     #[test]
     fn decode_435_byte_with_health_flag_rejected() {
-        // encode_valid_ext_label returns a 436-byte buffer with health extension.
+        let label = make_label("healthext435");
+        let sealed = seal_label(label).unwrap();
+        let mut full_buf = [0u8; POOL_LABEL_V1_HEALTH_WIRE_SIZE];
+        encode_label(&sealed, &mut full_buf).unwrap();
         // Truncating to 435 bytes with the health flag still set in
         // features_compat should trigger BufferTooSmall before the checksum
         // read, so no re-checksum is needed.
-        let (full_buf, _, _) = encode_valid_ext_label("healthext435");
         let mut short = [0u8; 435];
         short.copy_from_slice(&full_buf[..435]);
         assert_eq!(decode_label(&short), Err(LabelError::BufferTooSmall));
+    }
+
+    #[test]
+    fn decode_exact_440_byte_buffer_with_policy_succeeds() {
+        let (buf, _, _) = encode_valid_ext_label("exact440");
+        let decoded = decode_label(&buf).unwrap();
+        assert_eq!(decoded.magic, POOL_LABEL_MAGIC);
+        assert_eq!(
+            decoded.redundancy_policy,
+            PoolRedundancyPolicy::replicated(1)
+        );
+    }
+
+    #[test]
+    fn decode_439_byte_with_policy_flag_rejected() {
+        let (full_buf, _, _) = encode_valid_ext_label("policyext439");
+        let mut short = [0u8; 439];
+        short.copy_from_slice(&full_buf[..439]);
+        assert_eq!(decode_label(&short), Err(LabelError::BufferTooSmall));
+    }
+
+    #[test]
+    fn decode_rejects_bad_redundancy_policy() {
+        let (mut buf, cksum_off, _) = encode_valid_ext_label("badpolicy");
+        buf[404] = 1;
+        buf[405] = 2;
+        buf[406] = 0;
+        rechecksum_buf(&mut buf, cksum_off);
+        assert_eq!(
+            decode_label(&buf),
+            Err(LabelError::BadRedundancyPolicy {
+                kind: 1,
+                first: 2,
+                second: 0
+            })
+        );
     }
 
     // ── Zero-hash / committed-root rejection ────────────────────────

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::device::{DeviceBacking, DeviceClass as DeviceDeviceClass, DeviceConfig};
 use crate::pool_label::{
     decode_label, encode_label, features, seal_label, LabelDeviceClass, PoolLabelV1,
-    POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
+    PoolRedundancyPolicy, POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
 };
 use crate::{Result, StoreError};
 
@@ -381,6 +381,7 @@ impl DeviceManager {
             device_read_errors: 0,
             device_write_errors: 0,
             device_checksum_errors: 0,
+            redundancy_policy: PoolRedundancyPolicy::default(),
             checksum: [0u8; 32],
         };
 
@@ -458,6 +459,7 @@ impl DeviceManager {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: existing.redundancy_policy,
                 checksum: [0u8; 32],
             };
 
@@ -535,6 +537,7 @@ impl DeviceManager {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: existing.redundancy_policy,
                 checksum: [0u8; 32],
             };
 
@@ -604,6 +607,7 @@ impl DeviceManager {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             });
         }
@@ -650,6 +654,7 @@ impl DeviceManager {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             }),
         }
@@ -824,6 +829,7 @@ mod tests {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
@@ -908,6 +914,7 @@ mod tests {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
@@ -980,6 +987,7 @@ mod tests {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
@@ -1062,6 +1070,7 @@ mod tests {
             device_read_errors: 0,
             device_write_errors: 0,
             device_checksum_errors: 0,
+            redundancy_policy: PoolRedundancyPolicy::default(),
             checksum: [0u8; 32],
         };
         let sealed = seal_label(label).unwrap();

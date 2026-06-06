@@ -589,7 +589,7 @@ impl PoolImporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pool_label::{LabelDeviceClass, POOL_LABEL_MAGIC};
+    use crate::pool_label::{LabelDeviceClass, PoolRedundancyPolicy, POOL_LABEL_MAGIC};
 
     #[test]
     fn import_error_display() {
@@ -630,6 +630,7 @@ mod tests {
                     device_read_errors: 0,
                     device_write_errors: 0,
                     device_checksum_errors: 0,
+                    redundancy_policy: PoolRedundancyPolicy::default(),
                     checksum: [0u8; 32],
                 },
                 label_copy: 0,
@@ -661,6 +662,7 @@ mod tests {
                     device_read_errors: 0,
                     device_write_errors: 0,
                     device_checksum_errors: 0,
+                    redundancy_policy: PoolRedundancyPolicy::default(),
                     checksum: [0u8; 32],
                 },
                 label_copy: 0,
@@ -732,6 +734,7 @@ mod tests {
                     device_read_errors: 0,
                     device_write_errors: 0,
                     device_checksum_errors: 0,
+                    redundancy_policy: PoolRedundancyPolicy::default(),
                     checksum: [0u8; 32],
                 },
                 label_copy: 0,
@@ -763,6 +766,7 @@ mod tests {
                     device_read_errors: 0,
                     device_write_errors: 0,
                     device_checksum_errors: 0,
+                    redundancy_policy: PoolRedundancyPolicy::default(),
                     checksum: [0u8; 32],
                 },
                 label_copy: 0,
@@ -817,6 +821,7 @@ mod tests {
             device_read_errors: 0,
             device_write_errors: 0,
             device_checksum_errors: 0,
+            redundancy_policy: PoolRedundancyPolicy::default(),
             checksum: [0u8; 32],
         };
         // Verify the flag is properly set before using in test
@@ -885,6 +890,7 @@ mod tests {
             device_read_errors: 0,
             device_write_errors: 0,
             device_checksum_errors: 0,
+            redundancy_policy: PoolRedundancyPolicy::default(),
             checksum: [0u8; 32],
         };
         assert!(label.is_clustered());

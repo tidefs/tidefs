@@ -40,9 +40,11 @@
 //! - Cluster lease ownership, fencing, and failover (Phase 7 in the
 //!   design) are not yet integrated with the pool import/export path.
 
-use tidefs_types_pool_label_core::{features, PoolLabelV1};
+use tidefs_types_pool_label_core::{features, PoolLabelV1, PoolRedundancyPolicy};
 
-use crate::pool_config::{ClusterPlacementPolicy, ClusterPoolConfig, FailureDomain, NodeDevice};
+use crate::pool_config::{
+    ClusterPlacementPolicy, ClusterPoolConfig, ClusterRedundancy, FailureDomain, NodeDevice,
+};
 
 // ---------------------------------------------------------------------------
 // Cluster pool feature flag
@@ -122,6 +124,17 @@ impl NodeDevice {
 // ---------------------------------------------------------------------------
 // ClusterPoolConfig <-> PoolLabelV1 bridge
 // ---------------------------------------------------------------------------
+
+fn label_policy_from_cluster_redundancy(redundancy: ClusterRedundancy) -> PoolRedundancyPolicy {
+    match redundancy {
+        ClusterRedundancy::None => PoolRedundancyPolicy::replicated(1),
+        ClusterRedundancy::MirrorAcrossNodes { copies } => PoolRedundancyPolicy::replicated(copies),
+        ClusterRedundancy::ErasureCoded {
+            data_shards,
+            parity_shards,
+        } => PoolRedundancyPolicy::erasure(data_shards, parity_shards),
+    }
+}
 
 impl ClusterPoolConfig {
     /// Build a [`ClusterPoolConfig`] from a set of decoded
@@ -206,12 +219,12 @@ impl ClusterPoolConfig {
         node_ids.dedup();
 
         let redundancy = match placement {
-            ClusterPlacementPolicy::Stripe => crate::pool_config::ClusterRedundancy::None,
+            ClusterPlacementPolicy::Stripe => ClusterRedundancy::None,
             ClusterPlacementPolicy::MirrorAcrossNodes { copies } => {
-                crate::pool_config::ClusterRedundancy::MirrorAcrossNodes { copies }
+                ClusterRedundancy::MirrorAcrossNodes { copies }
             }
             ClusterPlacementPolicy::ErasureCoded { data, parity } => {
-                crate::pool_config::ClusterRedundancy::ErasureCoded {
+                ClusterRedundancy::ErasureCoded {
                     data_shards: data,
                     parity_shards: parity,
                 }
@@ -269,6 +282,7 @@ impl ClusterPoolConfig {
                     device_read_errors: 0,
                     device_write_errors: 0,
                     device_checksum_errors: 0,
+                    redundancy_policy: label_policy_from_cluster_redundancy(self.redundancy),
                     checksum: [0u8; 32],
                 }
             })
@@ -323,6 +337,7 @@ mod tests {
             device_read_errors: 0,
             device_write_errors: 0,
             device_checksum_errors: 0,
+            redundancy_policy: PoolRedundancyPolicy::default(),
             checksum: [0u8; 32],
         };
         label = seal_label(label).expect("seal_label");

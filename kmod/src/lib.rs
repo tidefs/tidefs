@@ -74,7 +74,9 @@ pub mod kernel_types {
     pub use tidefs_types_vfs_core::*;
     pub use tidefs_vfs_engine::*;
     /// Feature flag: DEVICE_HEALTH_STATE bit in features_compat.
-    pub const DEVICE_HEALTH_STATE: u64 = 1 << 0;
+    pub const DEVICE_HEALTH_STATE: u64 = 1 << 7;
+    /// Feature flag: POOL_REDUNDANCY_POLICY bit in features_compat.
+    pub const POOL_REDUNDANCY_POLICY: u64 = 1 << 9;
 
     /// Kernel-compatible Vec: under cargo this is `alloc::vec::Vec`;
     /// under Kbuild it wraps `kernel::alloc::KVec`.

@@ -396,6 +396,7 @@ mod tests {
         PoolConfig {
             pool_uuid: [0xABu8; 16],
             pool_name: "label-writer-test".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![leaf0, leaf1],
             },
@@ -504,6 +505,7 @@ mod tests {
         let config = PoolConfig {
             pool_uuid: [0xCDu8; 16],
             pool_name: "roundtrip-pool".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![leaf0, leaf1],
             },
@@ -600,6 +602,7 @@ mod tests {
         let mut config = PoolConfig {
             pool_uuid: [0xEFu8; 16],
             pool_name: "removal-test".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![leaf0, leaf1, leaf2],
             },
@@ -750,6 +753,7 @@ mod tests {
         let config = PoolConfig {
             pool_uuid: [0x99u8; 16],
             pool_name: "mismatch".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: leaf0,
             health: DeviceHealth::Online,
             state: PoolState::Active,

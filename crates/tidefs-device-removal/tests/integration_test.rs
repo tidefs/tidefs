@@ -39,6 +39,7 @@ fn make_3_device_config() -> tidefs_pool_scan::PoolConfig {
     tidefs_pool_scan::PoolConfig {
         pool_uuid: [0x42u8; 16],
         pool_name: "testpool".to_string(),
+        redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
         device_tree: DeviceType::Mirror {
             children: vec![leaf0, leaf1, leaf2],
         },
@@ -198,6 +199,7 @@ fn full_3_device_removal_lifecycle() {
     let updated_config = tidefs_pool_scan::PoolConfig {
         pool_uuid: [0x42u8; 16],
         pool_name: "testpool".to_string(),
+        redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
         device_tree: DeviceType::Mirror {
             children: vec![leaf0, leaf2],
         },
@@ -373,6 +375,7 @@ fn removal_with_zero_objects_completes_cleanly() {
     let updated_config = tidefs_pool_scan::PoolConfig {
         pool_uuid: [0x42u8; 16],
         pool_name: "testpool".to_string(),
+        redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
         device_tree: DeviceType::Mirror {
             children: vec![leaf0, leaf2],
         },

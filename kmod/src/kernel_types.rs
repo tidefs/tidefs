@@ -1572,7 +1572,7 @@ mod kbuild_impl {
     // ── Pool label types (kernel-compatible types, product-format) ──
     // Under cargo these come from tidefs_types_pool_label_core.
     // Under Kbuild we provide self-contained no_std equivalents that
-    // mirror the canonical crate exactly: wire sizes 411/436, enum
+    // mirror the canonical crate exactly: wire sizes 411/436/440, enum
     // variants, feature bits, checksum offsets, and fail-closed
     // decode_label.
 
@@ -1592,10 +1592,47 @@ mod kbuild_impl {
         /// Per-device health state (ONLINE/DEGRADED/FAULTED) and error
         /// counters are persisted in the label extension area.
         pub const DEVICE_HEALTH_STATE: u64 = 1 << 7;
+        /// Pool-wide redundancy policy extension fields are persisted in
+        /// the label extension area.
+        pub const POOL_REDUNDANCY_POLICY: u64 = 1 << 9;
     }
 
-    // Re-export DEVICE_HEALTH_STATE at module level for compatibility.
-    pub use features::DEVICE_HEALTH_STATE;
+    // Re-export feature bits at module level for compatibility.
+    pub use features::{DEVICE_HEALTH_STATE, POOL_REDUNDANCY_POLICY};
+
+    // ------------------------------------------------------------------
+    // PoolRedundancyPolicy
+    // ------------------------------------------------------------------
+
+    /// Pool-wide allocation policy recorded in every pool member label.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+    pub enum PoolRedundancyPolicy {
+        /// Store `copies` full replicas on distinct eligible devices.
+        Replicated { copies: u8 },
+        /// Store one erasure stripe over `data_shards + parity_shards` targets.
+        Erasure { data_shards: u8, parity_shards: u8 },
+    }
+
+    impl Default for PoolRedundancyPolicy {
+        fn default() -> Self {
+            Self::Replicated { copies: 1 }
+        }
+    }
+
+    impl PoolRedundancyPolicy {
+        /// Decode from the compact on-label policy extension fields.
+        #[must_use]
+        pub const fn from_wire(kind: u8, first: u8, second: u8) -> Option<Self> {
+            match kind {
+                0 if first > 0 && second == 0 => Some(Self::Replicated { copies: first }),
+                1 if first > 0 && second > 0 => Some(Self::Erasure {
+                    data_shards: first,
+                    parity_shards: second,
+                }),
+                _ => None,
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // DeviceClass
@@ -1731,14 +1768,21 @@ mod kbuild_impl {
     /// Total wire size of a PoolLabelV1 base label in bytes.
     pub const POOL_LABEL_V1_WIRE_SIZE: usize = 411;
 
-    /// Extended wire size including device health fields.
-    pub const POOL_LABEL_V1_EXT_WIRE_SIZE: usize = 436;
+    /// Extended wire size including device health fields, before pool-wide
+    /// redundancy policy was added.
+    pub const POOL_LABEL_V1_HEALTH_WIRE_SIZE: usize = 436;
+
+    /// Extended wire size including device health and pool-wide redundancy policy.
+    pub const POOL_LABEL_V1_EXT_WIRE_SIZE: usize = 440;
 
     /// Offset of the checksum field for base labels (no health extension).
     pub const POOL_LABEL_V1_CHECKSUM_BASE_OFFSET: usize = 379;
 
-    /// Offset of the checksum field for extended labels (with health extension).
-    pub const POOL_LABEL_V1_CHECKSUM_OFFSET: usize = 404;
+    /// Offset of the checksum field for health-only extended labels.
+    pub const POOL_LABEL_V1_CHECKSUM_HEALTH_OFFSET: usize = 404;
+
+    /// Offset of the checksum field for current extended labels.
+    pub const POOL_LABEL_V1_CHECKSUM_OFFSET: usize = 408;
 
     // ------------------------------------------------------------------
     // PoolLabelV1
@@ -1773,6 +1817,7 @@ mod kbuild_impl {
         pub device_read_errors: u64,
         pub device_write_errors: u64,
         pub device_checksum_errors: u64,
+        pub redundancy_policy: PoolRedundancyPolicy,
         pub checksum: [u8; 32],
     }
 
@@ -1810,6 +1855,7 @@ mod kbuild_impl {
                 device_read_errors: 0,
                 device_write_errors: 0,
                 device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
                 checksum: [0u8; 32],
             }
         }
@@ -1842,6 +1888,8 @@ mod kbuild_impl {
         BadPoolState(u8),
         /// `DeviceClass` value out of range.
         BadDeviceClass(u8),
+        /// Pool-wide redundancy policy extension fields are invalid.
+        BadRedundancyPolicy { kind: u8, first: u8, second: u8 },
         /// `pool_name_len` exceeds `POOL_NAME_MAX`.
         NameTooLong,
         /// BLAKE3-256 checksum mismatch (label is corrupt).
@@ -1860,6 +1908,14 @@ mod kbuild_impl {
                 Self::UnsupportedVersion(v) => write!(f, "unsupported label version {v}"),
                 Self::BadPoolState(v) => write!(f, "bad pool state {v}"),
                 Self::BadDeviceClass(v) => write!(f, "bad device class {v}"),
+                Self::BadRedundancyPolicy {
+                    kind,
+                    first,
+                    second,
+                } => write!(
+                    f,
+                    "bad redundancy policy kind={kind} first={first} second={second}"
+                ),
                 Self::NameTooLong => f.write_str("pool name too long"),
                 Self::ChecksumMismatch => f.write_str("checksum mismatch"),
                 Self::LastDevice => f.write_str("cannot remove last device from pool"),
@@ -1934,7 +1990,18 @@ mod kbuild_impl {
         let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
 
         let has_health = features_compat & features::DEVICE_HEALTH_STATE != 0;
-        if has_health && buf.len() < POOL_LABEL_V1_EXT_WIRE_SIZE {
+        let has_policy = features_compat & features::POOL_REDUNDANCY_POLICY != 0;
+        if has_health && buf.len() < POOL_LABEL_V1_HEALTH_WIRE_SIZE {
+            return Err(LabelError::BufferTooSmall);
+        }
+        if has_policy && !has_health {
+            return Err(LabelError::BadRedundancyPolicy {
+                kind: buf.get(404).copied().unwrap_or(0),
+                first: buf.get(405).copied().unwrap_or(0),
+                second: buf.get(406).copied().unwrap_or(0),
+            });
+        }
+        if has_policy && buf.len() < POOL_LABEL_V1_EXT_WIRE_SIZE {
             return Err(LabelError::BufferTooSmall);
         }
 
@@ -1950,13 +2017,29 @@ mod kbuild_impl {
                 (0, 0, 0, 0)
             };
 
-        let checksum_offset = if has_health {
+        let redundancy_policy = if has_policy {
+            PoolRedundancyPolicy::from_wire(buf[404], buf[405], buf[406]).ok_or(
+                LabelError::BadRedundancyPolicy {
+                    kind: buf[404],
+                    first: buf[405],
+                    second: buf[406],
+                },
+            )?
+        } else {
+            PoolRedundancyPolicy::default()
+        };
+
+        let checksum_offset = if has_policy {
             POOL_LABEL_V1_CHECKSUM_OFFSET
+        } else if has_health {
+            POOL_LABEL_V1_CHECKSUM_HEALTH_OFFSET
         } else {
             POOL_LABEL_V1_CHECKSUM_BASE_OFFSET
         };
-        let checksum_end = if has_health {
+        let checksum_end = if has_policy {
             POOL_LABEL_V1_EXT_WIRE_SIZE
+        } else if has_health {
+            POOL_LABEL_V1_HEALTH_WIRE_SIZE
         } else {
             POOL_LABEL_V1_WIRE_SIZE
         };
@@ -2003,6 +2086,7 @@ mod kbuild_impl {
             device_read_errors,
             device_write_errors,
             device_checksum_errors,
+            redundancy_policy,
             checksum,
         })
     }
@@ -2141,6 +2225,7 @@ mod kbuild_impl {
         pub features_incompat: u64,
         pub features_ro_compat: u64,
         pub features_compat: u64,
+        pub redundancy_policy: PoolRedundancyPolicy,
         pub checksum: [u8; 32],
     }
 
@@ -2165,6 +2250,7 @@ mod kbuild_impl {
                 features_incompat: label.features_incompat,
                 features_ro_compat: label.features_ro_compat,
                 features_compat: label.features_compat,
+                redundancy_policy: label.redundancy_policy,
                 checksum: label.checksum,
             }
         }
@@ -2227,6 +2313,7 @@ mod kbuild_impl {
                 LabelError::ChecksumMismatch | LabelError::ChecksumUnavailable => Self::Corrupt,
                 LabelError::BadPoolState(_)
                 | LabelError::BadDeviceClass(_)
+                | LabelError::BadRedundancyPolicy { .. }
                 | LabelError::NameTooLong
                 | LabelError::LastDevice => Self::Corrupt,
             }

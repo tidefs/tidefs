@@ -289,8 +289,8 @@ Admin: `tidefsctl pool replace <pool> <old-device> <new-device>`
 4. Once copy is complete:
    - Remove old device (as in 6.2, skip evacuation since data already moved).
    - Promote new device from REPLACING to ACTIVE.
-5. If old device is already FAILED: skip the copy phase; instead use redundancy
-   (erasure coding #1249 or mirror) to rebuild data onto new device.
+5. If old device is already FAILED: skip the copy phase; instead use the
+   pool-wide replicated or erasure policy to rebuild data onto the new device.
 
 ### 6.4 Failed device handling
 

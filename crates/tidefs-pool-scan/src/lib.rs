@@ -50,7 +50,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use tidefs_types_pool_label_core::{
-    decode_label, DeviceClass, LabelError, PoolLabelV1, PoolState, POOL_LABEL_MAGIC,
+    decode_label, DeviceClass, LabelError, PoolLabelV1, PoolRedundancyPolicy, PoolState,
+    POOL_LABEL_MAGIC,
 };
 
 pub mod device_removal;
@@ -297,6 +298,8 @@ pub struct DeviceScanEntry {
     pub device_write_errors: Option<u64>,
     /// Accumulated checksum errors from the label.
     pub device_checksum_errors: Option<u64>,
+    /// Pool-wide redundancy policy from the label.
+    pub redundancy_policy: Option<PoolRedundancyPolicy>,
 }
 
 // ---------------------------------------------------------------------------
@@ -691,6 +694,7 @@ impl PoolLabelReader {
             device_read_errors: None,
             device_write_errors: None,
             device_checksum_errors: None,
+            redundancy_policy: None,
         };
 
         match Self::read_label(&info.device_path) {
@@ -710,6 +714,7 @@ impl PoolLabelReader {
                 entry.device_read_errors = Some(label.device_read_errors);
                 entry.device_write_errors = Some(label.device_write_errors);
                 entry.device_checksum_errors = Some(label.device_checksum_errors);
+                entry.redundancy_policy = Some(label.redundancy_policy);
                 entry.label_status =
                     format!("pool={} state={}", label.pool_name_str(), label.pool_state);
             }
@@ -1228,6 +1233,8 @@ pub struct PoolConfig {
     pub pool_name: String,
     /// Assembled device tree (root → internal → leaf).
     pub device_tree: DeviceType,
+    /// Pool-wide allocation policy used by the placement planner.
+    pub redundancy_policy: PoolRedundancyPolicy,
     /// Aggregate health of the pool.
     pub health: DeviceHealth,
     /// Operational state from the label.
@@ -1325,6 +1332,7 @@ impl PoolConfig {
                 label.device_read_errors = *read_errors;
                 label.device_write_errors = *write_errors;
                 label.device_checksum_errors = *checksum_errors;
+                label.redundancy_policy = self.redundancy_policy;
                 label.features_compat = self.feature_flags;
                 out.push(label);
             }
@@ -1923,6 +1931,15 @@ pub enum AssemblyError {
         /// Actual count.
         found: u32,
     },
+    /// Devices in the same pool have mismatched pool-wide redundancy policy.
+    RedundancyPolicyMismatch {
+        /// The device path.
+        device_path: PathBuf,
+        /// Expected policy.
+        expected: PoolRedundancyPolicy,
+        /// Actual policy.
+        found: PoolRedundancyPolicy,
+    },
     /// One or more expected devices are missing.
     MissingDevices {
         /// Total devices expected.
@@ -1972,6 +1989,17 @@ impl std::fmt::Display for AssemblyError {
                 write!(
                     f,
                     "member count mismatch on {}: expected {expected}, found {found}",
+                    device_path.display()
+                )
+            }
+            Self::RedundancyPolicyMismatch {
+                device_path,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "redundancy policy mismatch on {}: expected {expected}, found {found}",
                     device_path.display()
                 )
             }
@@ -2056,6 +2084,7 @@ impl PoolAssembler {
         let ref_uuid = first.pool_guid.ok_or(AssemblyError::NoLabeledDevices)?;
         let ref_gen = first.topology_generation.unwrap_or(0);
         let ref_count = first.device_count.unwrap_or(candidates.len() as u32);
+        let ref_policy = first.redundancy_policy.unwrap_or_default();
 
         // Check pool state.
         if first.pool_state == Some(PoolState::Destroyed) {
@@ -2082,6 +2111,14 @@ impl PoolAssembler {
                     device_path: entry.device_path.clone(),
                     expected: ref_count,
                     found: entry.device_count.unwrap_or(ref_count),
+                });
+            }
+            let found_policy = entry.redundancy_policy.unwrap_or_default();
+            if found_policy != ref_policy {
+                return Err(AssemblyError::RedundancyPolicyMismatch {
+                    device_path: entry.device_path.clone(),
+                    expected: ref_policy,
+                    found: found_policy,
                 });
             }
 
@@ -2146,6 +2183,7 @@ impl PoolAssembler {
             pool_uuid: ref_uuid,
             pool_name: first.pool_name.clone().unwrap_or_default(),
             device_tree,
+            redundancy_policy: ref_policy,
             health,
             state: first.pool_state.unwrap_or(PoolState::Active),
             total_capacity_bytes: total_capacity,
@@ -2532,6 +2570,7 @@ mod tests {
             device_read_errors: Some(0),
             device_write_errors: Some(0),
             device_checksum_errors: Some(0),
+            redundancy_policy: Some(PoolRedundancyPolicy::replicated(1)),
         }
     }
 
@@ -2556,6 +2595,10 @@ mod tests {
         assert!(config.is_complete());
         assert!(config.is_importable());
         assert_eq!(config.health, DeviceHealth::Online);
+        assert_eq!(
+            config.redundancy_policy,
+            PoolRedundancyPolicy::replicated(1)
+        );
         // Single device should be a Leaf, not wrapped in Mirror.
         assert!(matches!(config.device_tree, DeviceType::Leaf { .. }));
     }
@@ -2771,6 +2814,45 @@ mod tests {
     }
 
     #[test]
+    fn assemble_rejects_redundancy_policy_mismatch() {
+        let pool_uuid = [0x67u8; 16];
+        let mut entries = vec![
+            make_labeled_entry(
+                pool_uuid,
+                [0x01u8; 16],
+                0,
+                2,
+                1,
+                "policy-split",
+                PoolState::Active,
+            ),
+            make_labeled_entry(
+                pool_uuid,
+                [0x02u8; 16],
+                1,
+                2,
+                1,
+                "policy-split",
+                PoolState::Active,
+            ),
+        ];
+        entries[0].redundancy_policy = Some(PoolRedundancyPolicy::replicated(2));
+        entries[1].redundancy_policy = Some(PoolRedundancyPolicy::erasure(1, 1));
+
+        let result = PoolAssembler::assemble(&entries, None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AssemblyError::RedundancyPolicyMismatch {
+                expected, found, ..
+            } => {
+                assert_eq!(expected, PoolRedundancyPolicy::replicated(2));
+                assert_eq!(found, PoolRedundancyPolicy::erasure(1, 1));
+            }
+            e => panic!("expected RedundancyPolicyMismatch, got {e:?}"),
+        }
+    }
+
+    #[test]
     fn assemble_rejects_destroyed_pool() {
         let pool_uuid = [0x77u8; 16];
         let entries = vec![make_labeled_entry(
@@ -2815,6 +2897,7 @@ mod tests {
             device_read_errors: None,
             device_write_errors: None,
             device_checksum_errors: None,
+            redundancy_policy: None,
         }];
 
         let result = PoolAssembler::assemble(&entries, None);
@@ -2931,6 +3014,7 @@ mod tests {
         PoolConfig {
             pool_uuid: [0x11u8; 16],
             pool_name: "testpool".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Leaf {
                 device_path: PathBuf::from("/dev/test/disk0"),
                 device_guid: [0x01u8; 16],
@@ -2984,6 +3068,7 @@ mod tests {
         PoolConfig {
             pool_uuid: [0x33u8; 16],
             pool_name: "raidpool".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: tree,
             health: DeviceHealth::Online,
             state: PoolState::Active,
@@ -3077,6 +3162,7 @@ mod tests {
         let mut config = PoolConfig {
             pool_uuid: [0x11u8; 16],
             pool_name: "mirrorpool".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![leaf1, leaf2],
             },
@@ -3169,6 +3255,7 @@ mod tests {
         let mut config = PoolConfig {
             pool_uuid: [0xFFu8; 16],
             pool_name: "fullpool".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror { children: leaves },
             health: DeviceHealth::Online,
             state: PoolState::Active,
@@ -3269,6 +3356,7 @@ mod tests {
         let original = PoolConfig {
             pool_uuid: [0xABu8; 16],
             pool_name: "roundtrip".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: tree,
             health: DeviceHealth::Online,
             state: PoolState::Exported,
@@ -3366,6 +3454,7 @@ mod tests {
         let original = PoolConfig {
             pool_uuid: [0xCDu8; 16],
             pool_name: "mirrorpool".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: tree,
             health: DeviceHealth::Degraded,
             state: PoolState::Active,

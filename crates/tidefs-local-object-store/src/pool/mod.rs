@@ -141,6 +141,16 @@ impl PoolRedundancyPolicy {
         };
         Ok(DurabilityLayoutV1 { policy })
     }
+
+    fn to_label_policy(self) -> pool_label::PoolRedundancyPolicy {
+        match self {
+            Self::Replicated { copies } => pool_label::PoolRedundancyPolicy::replicated(copies),
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => pool_label::PoolRedundancyPolicy::erasure(data_shards, parity_shards),
+        }
+    }
 }
 
 /// Pool-level tunable properties (ZFS-heritage).
@@ -1163,6 +1173,7 @@ impl Pool {
             device_checksum_errors: device
                 .health_state()
                 .map_or(0, |hs| hs.total_checksum_errors),
+            redundancy_policy: self.properties.redundancy_policy.to_label_policy(),
             ..PoolLabelV1::new(self.pool_guid, device_guid, &self.config.name)
         }
     }

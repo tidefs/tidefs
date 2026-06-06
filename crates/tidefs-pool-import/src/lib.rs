@@ -1567,6 +1567,7 @@ mod tests {
         PoolConfig {
             pool_uuid: [0xAAu8; 16],
             pool_name: "testpool".to_string(),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: tree,
             health: DeviceHealth::Online,
             state: PoolState::Active,
@@ -2038,7 +2039,7 @@ mod tests {
         let config = crate::create::PoolCreateConfig {
             pool_name: "preserve_root".into(),
             pool_guid: Some([0xBCu8; 16]),
-            redundancy: crate::create::RedundancyPolicy::None,
+            redundancy: crate::create::RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -2078,7 +2079,7 @@ mod tests {
         let config = crate::create::PoolCreateConfig {
             pool_name: "encrypted_pool".into(),
             pool_guid: Some([0xECu8; 16]),
-            redundancy: crate::create::RedundancyPolicy::None,
+            redundancy: crate::create::RedundancyPolicy::replicated(1),
             encryption_key: Some(pool_key.clone()),
             clustered: false,
         };
@@ -2145,7 +2146,7 @@ mod tests {
         let config = crate::create::PoolCreateConfig {
             pool_name: "enc_nokey".into(),
             pool_guid: Some([0xEDu8; 16]),
-            redundancy: crate::create::RedundancyPolicy::None,
+            redundancy: crate::create::RedundancyPolicy::replicated(1),
             encryption_key: Some(StoreKey::generate()),
             clustered: false,
         };

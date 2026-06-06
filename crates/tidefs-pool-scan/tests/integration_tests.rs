@@ -760,6 +760,7 @@ fn device_scan_entry_construction() {
         device_count: Some(4),
         topology_generation: Some(1),
         device_class: Some(tidefs_types_pool_label_core::DeviceClass::Ssd),
+        redundancy_policy: Some(tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1)),
         device_capacity_bytes: Some(1024 * 1024 * 1024),
         device_health: Some(tidefs_pool_scan::DeviceHealth::Online),
         device_read_errors: Some(0),

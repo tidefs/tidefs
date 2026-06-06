@@ -25,6 +25,9 @@ use crate::committed_root::{
 };
 use tidefs_auth::local_only::LocalOnlyGuard;
 
+/// Pool-wide redundancy policy accepted by pool creation.
+pub use tidefs_types_pool_label_core::PoolRedundancyPolicy as RedundancyPolicy;
+
 const MIN_DEVICE_BYTES: u64 =
     (2 * POOL_LABEL_SIZE as u64) + COMMIT_RECORD_REGION_OFFSET + COMMIT_RECORD_REGION_MAX;
 const INITIAL_ROOT_INO: u64 = 1;
@@ -62,15 +65,6 @@ pub struct PoolCreateConfig {
     pub clustered: bool,
 }
 
-/// Redundancy policy for pool creation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RedundancyPolicy {
-    /// No redundancy -- single copy of all data.
-    None,
-    /// N-way mirroring (1 = single device, 2+ = mirrored copies).
-    Mirror { copies: u8 },
-}
-
 // ---------------------------------------------------------------------------
 // PoolCreateOutcome
 // ---------------------------------------------------------------------------
@@ -84,6 +78,8 @@ pub struct PoolCreateOutcome {
     pub pool_name: String,
     /// Number of devices in the pool.
     pub device_count: u32,
+    /// Pool-wide redundancy policy persisted in every pool label.
+    pub redundancy: RedundancyPolicy,
     /// Pool operational state after creation.
     pub state: PoolState,
     /// Whether the pool was created with per-object encryption enabled.
@@ -142,6 +138,15 @@ pub enum CreateError {
     Label(LabelError),
     /// No devices were specified.
     NoDevices,
+    /// The requested redundancy policy cannot be satisfied by the device set.
+    InvalidRedundancyPolicy {
+        /// Requested policy.
+        policy: RedundancyPolicy,
+        /// Number of byte-addressable devices supplied.
+        device_count: u32,
+        /// Human-readable reason.
+        reason: String,
+    },
     /// Caller is not in a local process context -- privileged operation refused.
     NotLocal {
         operation: &'static str,
@@ -184,6 +189,14 @@ impl std::fmt::Display for CreateError {
                 }
             }
             Self::Label(e) => write!(f, "label error: {e}"),
+            Self::InvalidRedundancyPolicy {
+                policy,
+                device_count,
+                reason,
+            } => write!(
+                f,
+                "invalid redundancy policy {policy} for {device_count} device(s): {reason}"
+            ),
             Self::NotLocal { operation, reason } => {
                 write!(
                     f,
@@ -444,7 +457,7 @@ impl CreationDevice {
 /// let config = PoolCreateConfig {
 ///     pool_name: "mypool".into(),
 ///     pool_guid: None,
-///     redundancy: RedundancyPolicy::None,
+///     redundancy: RedundancyPolicy::replicated(1),
 ///     encryption_key: None,
 /// };
 /// let outcome = PoolCreator::create_pool(&["/dev/sda".into()], &config)?;
@@ -485,6 +498,7 @@ impl PoolCreator {
         };
 
         let device_count = devices.len() as u32;
+        validate_redundancy_policy(config.redundancy, device_count)?;
 
         // Phase 1: open and validate every device.
         let mut handles: Vec<CreationDevice> = Vec::with_capacity(device_count as usize);
@@ -533,6 +547,7 @@ impl PoolCreator {
             label.system_area_size = INITIAL_SYSTEM_AREA_SIZE;
             label.device_class = DeviceClass::Hdd;
             label.device_health = 0; // Online
+            label.redundancy_policy = config.redundancy;
             label.features_incompat = tidefs_types_pool_label_core::features::POOL_LABEL_V1;
             label.features_compat = tidefs_types_pool_label_core::features::DEVICE_CLASS_AWARE;
 
@@ -610,6 +625,7 @@ impl PoolCreator {
             pool_guid,
             pool_name: config.pool_name.clone(),
             device_count,
+            redundancy: config.redundancy,
             device_guids,
             device_backings,
             encrypted: config.encryption_key.is_some(),
@@ -631,6 +647,42 @@ impl PoolCreator {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn validate_redundancy_policy(
+    policy: RedundancyPolicy,
+    device_count: u32,
+) -> Result<(), CreateError> {
+    if !policy.is_well_formed() {
+        let reason = match policy {
+            RedundancyPolicy::Replicated { copies } if copies == 0 => {
+                "replicated copies must be at least 1".to_string()
+            }
+            RedundancyPolicy::Erasure {
+                data_shards,
+                parity_shards,
+            } if data_shards == 0 || parity_shards == 0 => {
+                "erasure data and parity shards must both be at least 1".to_string()
+            }
+            _ => "policy is not well formed".to_string(),
+        };
+        return Err(CreateError::InvalidRedundancyPolicy {
+            policy,
+            device_count,
+            reason,
+        });
+    }
+
+    let required = policy.target_width() as u32;
+    if required > device_count {
+        return Err(CreateError::InvalidRedundancyPolicy {
+            policy,
+            device_count,
+            reason: format!("requires at least {required} distinct device(s)"),
+        });
+    }
+
+    Ok(())
+}
 
 /// Read 16 random bytes from `/dev/urandom`.
 fn filesystem_uuid() -> Result<[u8; 16], std::io::Error> {
@@ -675,7 +727,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "testpool".into(),
             pool_guid: Some([0xABu8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -702,7 +754,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "twodev".into(),
             pool_guid: Some([0xCDu8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -717,7 +769,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "autoguid".into(),
             pool_guid: None,
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -735,7 +787,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "roundtrip".into(),
             pool_guid: Some([0xEFu8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -763,7 +815,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "kmodroot".into(),
             pool_guid: Some(pool_guid),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -819,7 +871,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "dualcopy".into(),
             pool_guid: Some([0x11u8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -855,7 +907,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "recoverable".into(),
             pool_guid: Some([0x22u8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -895,7 +947,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "withroot".into(),
             pool_guid: Some([0x33u8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -913,7 +965,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "recoverroot".into(),
             pool_guid: Some([0x44u8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -939,7 +991,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "empty".into(),
             pool_guid: None,
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -955,7 +1007,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "tiny".into(),
             pool_guid: None,
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -969,7 +1021,7 @@ mod tests {
         let config_a = PoolCreateConfig {
             pool_name: "pool_a".into(),
             pool_guid: Some([0xAAu8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -979,7 +1031,7 @@ mod tests {
         let config_b = PoolCreateConfig {
             pool_name: "pool_b".into(),
             pool_guid: Some([0xBBu8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -995,7 +1047,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "ghost".into(),
             pool_guid: None,
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -1010,7 +1062,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "directory".into(),
             pool_guid: None,
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -1027,7 +1079,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "exact".into(),
             pool_guid: None,
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -1044,7 +1096,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "capacity".into(),
             pool_guid: Some([0xCCu8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -1064,7 +1116,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "indexed".into(),
             pool_guid: Some([0xDDu8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -1082,12 +1134,102 @@ mod tests {
     }
 
     #[test]
+    fn replicated_policy_is_persisted_in_labels_and_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = temp_device(&dir, "dev0", MIN_DEVICE_BYTES);
+        let dev1 = temp_device(&dir, "dev1", MIN_DEVICE_BYTES);
+
+        let config = PoolCreateConfig {
+            pool_name: "replicated".into(),
+            pool_guid: Some([0xD0u8; 16]),
+            redundancy: RedundancyPolicy::replicated(2),
+            encryption_key: None,
+            clustered: false,
+        };
+        let outcome = PoolCreator::create_pool(&[dev0.clone(), dev1.clone()], &config).unwrap();
+        assert_eq!(outcome.redundancy, RedundancyPolicy::replicated(2));
+
+        let mut h0 = CreationDevice::open(&dev0, 0).unwrap();
+        let l0 = h0.read_label_at(0).unwrap();
+        assert_eq!(l0.redundancy_policy, RedundancyPolicy::replicated(2));
+
+        let mut h1 = CreationDevice::open(&dev1, 0).unwrap();
+        let l1 = h1.read_label_at(0).unwrap();
+        assert_eq!(l1.redundancy_policy, RedundancyPolicy::replicated(2));
+    }
+
+    #[test]
+    fn erasure_policy_is_persisted_in_labels_and_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = temp_device(&dir, "dev0", MIN_DEVICE_BYTES);
+        let dev1 = temp_device(&dir, "dev1", MIN_DEVICE_BYTES);
+        let dev2 = temp_device(&dir, "dev2", MIN_DEVICE_BYTES);
+
+        let config = PoolCreateConfig {
+            pool_name: "erasure".into(),
+            pool_guid: Some([0xD1u8; 16]),
+            redundancy: RedundancyPolicy::erasure(2, 1),
+            encryption_key: None,
+            clustered: false,
+        };
+        let outcome =
+            PoolCreator::create_pool(&[dev0.clone(), dev1.clone(), dev2.clone()], &config).unwrap();
+        assert_eq!(outcome.redundancy, RedundancyPolicy::erasure(2, 1));
+
+        for dev in [&dev0, &dev1, &dev2] {
+            let mut handle = CreationDevice::open(dev, 0).unwrap();
+            let label = handle.read_label_at(0).unwrap();
+            assert_eq!(label.redundancy_policy, RedundancyPolicy::erasure(2, 1));
+        }
+    }
+
+    #[test]
+    fn replicated_policy_width_larger_than_device_count_is_rejected() {
+        let (_dir, dev) = setup_single_device(MIN_DEVICE_BYTES);
+        let config = PoolCreateConfig {
+            pool_name: "too-wide".into(),
+            pool_guid: None,
+            redundancy: RedundancyPolicy::replicated(2),
+            encryption_key: None,
+            clustered: false,
+        };
+        let result = PoolCreator::create_pool(&[dev], &config);
+        match result {
+            Err(CreateError::InvalidRedundancyPolicy { reason, .. }) => {
+                assert!(reason.contains("requires at least 2"));
+            }
+            other => panic!("expected InvalidRedundancyPolicy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erasure_policy_width_larger_than_device_count_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = temp_device(&dir, "dev0", MIN_DEVICE_BYTES);
+        let dev1 = temp_device(&dir, "dev1", MIN_DEVICE_BYTES);
+        let config = PoolCreateConfig {
+            pool_name: "too-wide-erasure".into(),
+            pool_guid: None,
+            redundancy: RedundancyPolicy::erasure(2, 1),
+            encryption_key: None,
+            clustered: false,
+        };
+        let result = PoolCreator::create_pool(&[dev0, dev1], &config);
+        match result {
+            Err(CreateError::InvalidRedundancyPolicy { reason, .. }) => {
+                assert!(reason.contains("requires at least 3"));
+            }
+            other => panic!("expected InvalidRedundancyPolicy, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn labels_have_proper_feature_flags() {
         let (_dir, dev) = setup_single_device(MIN_DEVICE_BYTES);
         let config = PoolCreateConfig {
             pool_name: "features".into(),
             pool_guid: Some([0xEEu8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -1114,7 +1256,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "exported".into(),
             pool_guid: None,
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -1135,7 +1277,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "recreate".into(),
             pool_guid: Some(guid),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -1189,7 +1331,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "clustered".into(),
             pool_guid: Some([0x77u8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: true,
         };
@@ -1208,7 +1350,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "nonclustered".into(),
             pool_guid: Some([0x88u8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
@@ -1228,7 +1370,7 @@ mod tests {
         let config = PoolCreateConfig {
             pool_name: "guids".into(),
             pool_guid: Some([0x99u8; 16]),
-            redundancy: RedundancyPolicy::None,
+            redundancy: RedundancyPolicy::replicated(1),
             encryption_key: None,
             clustered: false,
         };
