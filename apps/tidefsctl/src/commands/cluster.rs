@@ -77,8 +77,8 @@ pub enum ClusterPoolCommand {
         )]
         node_addrs: Vec<String>,
 
-        /// Redundancy/placement policy: stripe (default), mirror=N, ec=D+P
-        #[arg(short = 'r', long = "redundancy", default_value = "stripe")]
+        /// Redundancy policy: single (default), replicated=N, or erasure=D+P
+        #[arg(short = 'r', long = "redundancy", default_value = "single")]
         redundancy: String,
 
         /// Output as JSON
@@ -223,37 +223,85 @@ fn parse_node_addresses(raw: &[String]) -> Result<BTreeMap<u64, SocketAddr>, Str
 
 fn parse_placement(raw: &str) -> Result<ClusterPlacementPolicy, String> {
     match raw {
-        "stripe" => Ok(ClusterPlacementPolicy::Stripe),
-        s if s.starts_with("mirror=") => {
-            let copies: u8 = s[7..]
-                .parse()
-                .map_err(|_| format!("invalid mirror copies in \"{raw}\": expected mirror=N"))?;
-            if copies < 2 {
-                return Err(format!("mirror copies must be at least 2, got {copies}"));
-            }
+        "single" => return Ok(ClusterPlacementPolicy::Stripe),
+        "stripe" => return Err(legacy_redundancy_error(raw, "single")),
+        _ => {}
+    }
+
+    if let Some(rest) = raw.strip_prefix("replicated=") {
+        let copies = parse_nonzero_u8(rest, raw, "replicated copies", "replicated=N")?;
+        return if copies == 1 {
+            Ok(ClusterPlacementPolicy::Stripe)
+        } else {
             Ok(ClusterPlacementPolicy::MirrorAcrossNodes { copies })
+        };
+    }
+
+    if raw.starts_with("mirror=") {
+        return Err(legacy_redundancy_error(raw, "replicated=N"));
+    }
+
+    if let Some(rest) = raw.strip_prefix("erasure=") {
+        let (data, parity) = parse_erasure_shards(rest, raw)?;
+        return Ok(ClusterPlacementPolicy::ErasureCoded { data, parity });
+    }
+
+    if raw.starts_with("ec=") {
+        return Err(legacy_redundancy_error(raw, "erasure=D+P"));
+    }
+
+    Err(format!(
+        "unknown redundancy policy \"{raw}\"; expected single, replicated=N, or erasure=D+P"
+    ))
+}
+
+fn parse_nonzero_u8(
+    raw_value: &str,
+    raw_policy: &str,
+    field: &str,
+    shape: &str,
+) -> Result<u8, String> {
+    let value: u8 = raw_value
+        .parse()
+        .map_err(|_| format!("invalid {field} in \"{raw_policy}\": expected {shape}"))?;
+    if value == 0 {
+        return Err(format!("{field} must be >= 1 in \"{raw_policy}\""));
+    }
+    Ok(value)
+}
+
+fn parse_erasure_shards(raw_spec: &str, raw_policy: &str) -> Result<(u8, u8), String> {
+    let plus_pos = raw_spec
+        .find('+')
+        .ok_or_else(|| format!("invalid erasure policy \"{raw_policy}\": expected erasure=D+P"))?;
+    let data = parse_nonzero_u8(
+        &raw_spec[..plus_pos],
+        raw_policy,
+        "erasure data shards",
+        "erasure=D+P",
+    )?;
+    let parity = parse_nonzero_u8(
+        &raw_spec[plus_pos + 1..],
+        raw_policy,
+        "erasure parity shards",
+        "erasure=D+P",
+    )?;
+    Ok((data, parity))
+}
+
+fn legacy_redundancy_error(raw: &str, replacement: &str) -> String {
+    format!(
+        "legacy redundancy policy \"{raw}\" is no longer accepted; use {replacement} (expected single, replicated=N, or erasure=D+P)"
+    )
+}
+
+fn format_cluster_redundancy(policy: ClusterPlacementPolicy) -> String {
+    match policy {
+        ClusterPlacementPolicy::Stripe => "single".to_string(),
+        ClusterPlacementPolicy::MirrorAcrossNodes { copies } => format!("replicated={copies}"),
+        ClusterPlacementPolicy::ErasureCoded { data, parity } => {
+            format!("erasure={data}+{parity}")
         }
-        s if s.starts_with("ec=") => {
-            let spec = &s[3..];
-            let plus_pos = spec
-                .find('+')
-                .ok_or_else(|| format!("invalid erasure coding spec \"{raw}\": expected ec=D+P"))?;
-            let data: u8 = spec[..plus_pos]
-                .parse()
-                .map_err(|_| format!("invalid data shards in \"{raw}\""))?;
-            let parity: u8 = spec[plus_pos + 1..]
-                .parse()
-                .map_err(|_| format!("invalid parity shards in \"{raw}\""))?;
-            if data == 0 || parity == 0 {
-                return Err(format!(
-                    "erasure coding data and parity must be >= 1, got D={data} P={parity}"
-                ));
-            }
-            Ok(ClusterPlacementPolicy::ErasureCoded { data, parity })
-        }
-        other => Err(format!(
-            "unknown redundancy policy \"{other}\"; expected stripe, mirror=N, or ec=D+P"
-        )),
     }
 }
 
@@ -391,7 +439,7 @@ fn handle_cluster_pool_create(
         }
     }
 
-    // 4. Parse placement policy.
+    // 4. Parse public redundancy policy into the current transport placement enum.
     let placement = match parse_placement(&redundancy) {
         Ok(p) => p,
         Err(e) => {
@@ -399,6 +447,7 @@ fn handle_cluster_pool_create(
             process::exit(1);
         }
     };
+    let canonical_redundancy = format_cluster_redundancy(placement);
 
     // 5. Build NodeDevice entries and ClusterPoolConfig.
     let pool_guid: [u8; 16] = generate_pool_guid();
@@ -530,7 +579,7 @@ fn handle_cluster_pool_create(
                     "total_nodes": outcome.total_nodes,
                     "succeeded": outcome.succeeded,
                     "node_results": node_results_json,
-                    "placement": format!("{:?}", config.placement),
+                    "redundancy": &canonical_redundancy,
                     "topology_generation": config.topology_generation,
                 });
                 println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
@@ -541,7 +590,7 @@ fn handle_cluster_pool_create(
                     "  nodes:          {}/{} succeeded",
                     outcome.succeeded, outcome.total_nodes
                 );
-                println!("  placement:      {:?}", config.placement);
+                println!("  redundancy:     {canonical_redundancy}");
                 println!("  topology gen:   {}", config.topology_generation);
 
                 for (&node_id, result) in &outcome.node_results {
@@ -947,76 +996,115 @@ mod tests {
     // -- parse_placement tests --
 
     #[test]
-    fn parse_stripe() {
+    fn parse_single() {
         assert_eq!(
-            parse_placement("stripe").unwrap(),
+            parse_placement("single").unwrap(),
             ClusterPlacementPolicy::Stripe
         );
     }
 
     #[test]
-    fn parse_mirror_2() {
+    fn parse_replicated_1_as_single() {
         assert_eq!(
-            parse_placement("mirror=2").unwrap(),
+            parse_placement("replicated=1").unwrap(),
+            ClusterPlacementPolicy::Stripe
+        );
+    }
+
+    #[test]
+    fn parse_replicated_2() {
+        assert_eq!(
+            parse_placement("replicated=2").unwrap(),
             ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 }
         );
     }
 
     #[test]
-    fn parse_mirror_3() {
+    fn parse_replicated_3() {
         assert_eq!(
-            parse_placement("mirror=3").unwrap(),
+            parse_placement("replicated=3").unwrap(),
             ClusterPlacementPolicy::MirrorAcrossNodes { copies: 3 }
         );
     }
 
     #[test]
-    fn parse_mirror_invalid_copies_rejected() {
-        assert!(parse_placement("mirror=abc").is_err());
+    fn parse_replicated_invalid_copies_rejected() {
+        assert!(parse_placement("replicated=abc").is_err());
     }
 
     #[test]
-    fn parse_mirror_too_few_copies_rejected() {
-        assert!(parse_placement("mirror=1").is_err());
+    fn parse_replicated_zero_rejected() {
+        assert!(parse_placement("replicated=0").is_err());
     }
 
     #[test]
-    fn parse_ec_4_2() {
+    fn parse_erasure_4_2() {
         assert_eq!(
-            parse_placement("ec=4+2").unwrap(),
+            parse_placement("erasure=4+2").unwrap(),
             ClusterPlacementPolicy::ErasureCoded { data: 4, parity: 2 }
         );
     }
 
     #[test]
-    fn parse_ec_8_3() {
+    fn parse_erasure_8_3() {
         assert_eq!(
-            parse_placement("ec=8+3").unwrap(),
+            parse_placement("erasure=8+3").unwrap(),
             ClusterPlacementPolicy::ErasureCoded { data: 8, parity: 3 }
         );
     }
 
     #[test]
-    fn parse_ec_invalid_format_rejected() {
-        assert!(parse_placement("ec=4-2").is_err());
-        assert!(parse_placement("ec=4*2").is_err());
-        assert!(parse_placement("ec=abc").is_err());
+    fn parse_erasure_invalid_format_rejected() {
+        assert!(parse_placement("erasure=4-2").is_err());
+        assert!(parse_placement("erasure=4*2").is_err());
+        assert!(parse_placement("erasure=abc").is_err());
     }
 
     #[test]
-    fn parse_ec_zero_data_rejected() {
-        assert!(parse_placement("ec=0+2").is_err());
+    fn parse_erasure_zero_data_rejected() {
+        assert!(parse_placement("erasure=0+2").is_err());
     }
 
     #[test]
-    fn parse_ec_zero_parity_rejected() {
-        assert!(parse_placement("ec=4+0").is_err());
+    fn parse_erasure_zero_parity_rejected() {
+        assert!(parse_placement("erasure=4+0").is_err());
+    }
+
+    #[test]
+    fn parse_legacy_redundancy_forms_rejected() {
+        let stripe = parse_placement("stripe").unwrap_err();
+        assert!(stripe.contains("legacy redundancy policy"));
+        assert!(stripe.contains("single"));
+
+        let mirror = parse_placement("mirror=2").unwrap_err();
+        assert!(mirror.contains("legacy redundancy policy"));
+        assert!(mirror.contains("replicated=N"));
+
+        let ec = parse_placement("ec=4+2").unwrap_err();
+        assert!(ec.contains("legacy redundancy policy"));
+        assert!(ec.contains("erasure=D+P"));
     }
 
     #[test]
     fn parse_unknown_rejected() {
         assert!(parse_placement("raidz").is_err());
         assert!(parse_placement("raid5").is_err());
+    }
+
+    #[test]
+    fn format_cluster_redundancy_uses_canonical_policy_language() {
+        assert_eq!(
+            format_cluster_redundancy(ClusterPlacementPolicy::Stripe),
+            "single"
+        );
+        assert_eq!(
+            format_cluster_redundancy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 3 }),
+            "replicated=3"
+        );
+        assert_eq!(
+            format_cluster_redundancy(ClusterPlacementPolicy::ErasureCoded { data: 4, parity: 2 }),
+            "erasure=4+2"
+        );
     }
 
     // -- hex_guid tests --
