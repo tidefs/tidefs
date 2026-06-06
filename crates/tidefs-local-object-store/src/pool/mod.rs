@@ -1480,6 +1480,50 @@ impl Pool {
         self.load_placement_receipt(&indices, key)
     }
 
+    /// Return the latest persisted placement receipt for every logical object
+    /// in an I/O class.
+    ///
+    /// This is the public receipt-authority scan for rebuild, repair,
+    /// relocation, and distributed state-transfer consumers. It hides the
+    /// internal receipt object-key namespace and returns decoded logical
+    /// receipts keyed by `object_key`.
+    pub fn placement_receipts(&self, class: IoClass) -> Result<Vec<PlacementReceipt>> {
+        let indices: Vec<usize> = self.class_map.get(class).to_vec();
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut receipts: BTreeMap<ObjectKey, PlacementReceipt> = BTreeMap::new();
+        for idx in self.usable_candidates(&indices) {
+            for key in self.devices[idx].store().list_keys_including_internal() {
+                if !crate::is_pool_placement_receipt_key(key) {
+                    continue;
+                }
+                let Ok(Some(raw)) = self.devices[idx].get(key) else {
+                    continue;
+                };
+                let Some(receipt) = PlacementReceipt::decode(&raw) else {
+                    continue;
+                };
+                if placement_receipt_object_key(receipt.object_key) != key {
+                    continue;
+                }
+
+                let replace = match receipts.get(&receipt.object_key) {
+                    Some(current) => {
+                        (receipt.generation, receipt.epoch) >= (current.generation, current.epoch)
+                    }
+                    None => true,
+                };
+                if replace {
+                    receipts.insert(receipt.object_key, receipt);
+                }
+            }
+        }
+
+        Ok(receipts.into_values().collect())
+    }
+
     fn load_placement_receipt(
         &self,
         indices: &[usize],
@@ -3831,6 +3875,53 @@ mod tests {
     }
 
     #[test]
+    fn placement_receipts_scan_returns_latest_logical_receipts() {
+        let root = temp_dir("receipt-snapshot-latest");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let first_key = ObjectKey::from_name(b"snapshot-first");
+        let second_key = ObjectKey::from_name(b"snapshot-second");
+        pool.put(IoClass::Data, first_key, b"old-first").unwrap();
+        let stale_first = pool
+            .placement_receipt_for_key(IoClass::Data, first_key)
+            .unwrap()
+            .expect("stale first receipt");
+        pool.put(IoClass::Data, first_key, b"fresh-first").unwrap();
+        pool.put(IoClass::Data, second_key, b"second").unwrap();
+
+        let stale_receipt_key = placement_receipt_object_key(first_key);
+        let stale_encoded = stale_first.encode().unwrap();
+        let last_idx = pool.devices.len() - 1;
+        pool.devices[last_idx]
+            .put(stale_receipt_key, &stale_encoded)
+            .expect("inject stale receipt");
+
+        let receipts = pool.placement_receipts(IoClass::Data).unwrap();
+        assert_eq!(receipts.len(), 2);
+        let first = receipts
+            .iter()
+            .find(|receipt| receipt.object_key == first_key)
+            .expect("first receipt");
+        assert!(first.generation > stale_first.generation);
+        assert_eq!(
+            pool.get(IoClass::Data, first_key).unwrap(),
+            Some(b"fresh-first".to_vec())
+        );
+        assert!(receipts
+            .iter()
+            .any(|receipt| receipt.object_key == second_key));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn receipt_generation_recovers_after_pool_reopen() {
         let root = temp_dir("receipt-generation-reopen");
         let _ = std::fs::remove_dir_all(&root);
@@ -3855,6 +3946,63 @@ mod tests {
             .unwrap()
             .expect("second receipt");
         assert!(second_receipt.generation > first_receipt.generation);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipts_scan_exposes_erasure_receipts_not_internal_keys() {
+        let root = temp_dir("receipt-snapshot-erasure");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"snapshot-erasure-object");
+        pool.put(IoClass::Data, key, b"receipt snapshot erasure payload")
+            .unwrap();
+
+        let receipts = pool.placement_receipts(IoClass::Data).unwrap();
+        assert_eq!(receipts.len(), 1);
+        let receipt = &receipts[0];
+        assert_eq!(receipt.object_key, key);
+        assert_eq!(receipt.policy, PoolRedundancyPolicy::erasure(2, 1));
+        assert_eq!(receipt.targets.len(), 3);
+        assert_eq!(
+            receipt
+                .targets
+                .iter()
+                .filter(|target| target.role == PlacementTargetRole::Data)
+                .count(),
+            2
+        );
+        assert_eq!(
+            receipt
+                .targets
+                .iter()
+                .filter(|target| target.role == PlacementTargetRole::Parity)
+                .count(),
+            1
+        );
+        let public_keys: BTreeSet<ObjectKey> = pool
+            .devices
+            .iter()
+            .flat_map(|device| device.store().list_keys())
+            .collect();
+        assert!(
+            !public_keys.contains(&placement_receipt_object_key(key)),
+            "receipt snapshot must not make internal receipt keys public"
+        );
+        for target in &receipt.targets {
+            assert!(
+                !public_keys.contains(&placement_shard_object_key(key, target.shard_index)),
+                "receipt snapshot must not make internal shard keys public"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
