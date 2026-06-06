@@ -41,15 +41,6 @@ pub(crate) fn build_push_message(export: &[u8], auth_key: &[u8; 32]) -> Vec<u8> 
     msg
 }
 
-pub(crate) fn build_pull_request(auth_key: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(4 + 1 + 4 + 32);
-    msg.extend_from_slice(SNAP_NET_MAGIC);
-    msg.push(SNAP_KIND_PULL_REQUEST);
-    msg.extend_from_slice(&32u32.to_le_bytes());
-    msg.extend_from_slice(auth_key);
-    msg
-}
-
 #[allow(dead_code)]
 pub(crate) fn build_ack(message: &str) -> Vec<u8> {
     let b = message.as_bytes();
@@ -271,21 +262,26 @@ pub enum SnapshotCommand {
     Destroy(SnapshotDestroyArgs),
     /// Export a changed-record snapshot stream from the current filesystem root
     Send(SnapshotSendArgs),
-    /// Receive a changed-record snapshot stream into an empty backing directory
+    /// Receive a changed-record snapshot stream through the live pool owner
     Receive(SnapshotReceiveArgs),
     /// Rollback the dataset to a named snapshot state
     Rollback(SnapshotRollbackArgs),
 }
 
-/// `snapshot create (<pool> <name> [--devices <dev>...] | <name> --backing-dir <path>)`
+/// `snapshot create <pool> <name> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct SnapshotCreateArgs {
-    /// Pool and snapshot name for live pool mode, or snapshot name for --backing-dir mode
+    /// Pool and snapshot name
     #[arg(value_name = "POOL_AND_SNAPSHOT", num_args = 1..=2, required = true)]
     pub operands: Vec<String>,
 
-    /// Offline/development backing directory for the local object store
-    #[arg(long = "backing-dir", short = 'b')]
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
     pub backing_dir: Option<PathBuf>,
 
     /// Block devices for offline/not-yet-imported snapshot access
@@ -298,13 +294,15 @@ pub struct SnapshotCreateArgs {
     pub devices: Option<Vec<PathBuf>>,
 }
 
-/// `snapshot list (<pool> [--devices <dev>...] | --backing-dir <path>)`
+/// `snapshot list <pool> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct SnapshotListArgs {
-    /// Offline/development backing directory for the local object store
+    /// Retired directory object-store backing mode.
     #[arg(
         long = "backing-dir",
         short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value,
         conflicts_with = "pool",
         required_unless_present = "pool"
     )]
@@ -329,15 +327,20 @@ pub struct SnapshotListArgs {
     pub devices: Option<Vec<PathBuf>>,
 }
 
-/// `snapshot destroy (<pool> <name> [--devices <dev>...] | <name> --backing-dir <path>)`
+/// `snapshot destroy <pool> <name> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct SnapshotDestroyArgs {
-    /// Pool and snapshot name for live pool mode, or snapshot name for --backing-dir mode
+    /// Pool and snapshot name
     #[arg(value_name = "POOL_AND_SNAPSHOT", num_args = 1..=2, required = true)]
     pub operands: Vec<String>,
 
-    /// Offline/development backing directory for the local object store
-    #[arg(long = "backing-dir", short = 'b')]
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
     pub backing_dir: Option<PathBuf>,
 
     /// Block devices for offline/not-yet-imported snapshot access
@@ -350,13 +353,15 @@ pub struct SnapshotDestroyArgs {
     pub devices: Option<Vec<PathBuf>>,
 }
 
-/// `snapshot send (<pool> [--devices <dev>...] | --backing-dir <path>) --output <path>`
+/// `snapshot send <pool> [--devices <dev>...] --output <path>`
 #[derive(Args, Debug)]
 pub struct SnapshotSendArgs {
-    /// Offline/development backing directory for the local object store
+    /// Retired directory object-store backing mode.
     #[arg(
         long = "backing-dir",
         short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value,
         conflicts_with = "pool",
         required_unless_present = "pool"
     )]
@@ -420,12 +425,29 @@ pub struct SnapshotSendArgs {
     pub dataset_id: Option<String>,
 }
 
-/// `snapshot receive --backing-dir <path> --input <path>`
+/// `snapshot receive <pool> --input <path>`
 #[derive(Args, Debug)]
 pub struct SnapshotReceiveArgs {
-    /// Empty target backing directory to publish the received filesystem into
-    #[arg(long = "backing-dir", short = 'b')]
-    pub backing_dir: PathBuf,
+    /// Pool name for imported-pool snapshots routed through the live owner
+    pub pool: String,
+
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
+    pub backing_dir: Option<PathBuf>,
+
+    /// Block devices for offline/not-yet-imported snapshot receive routing
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
+    pub devices: Option<Vec<PathBuf>>,
 
     /// Input path containing a changed-record stream from `snapshot send`
     #[arg(long = "input", short = 'i')]
@@ -439,22 +461,27 @@ pub struct SnapshotReceiveArgs {
     )]
     pub source_addr: Option<SocketAddr>,
 
-    #[arg(long = "node-id", requires = "source-addr")]
+    #[arg(long = "node-id", requires = "source_addr")]
     pub node_id: Option<u64>,
 
-    #[arg(long = "server-node-id", requires = "source-addr")]
+    #[arg(long = "server-node-id", requires = "source_addr")]
     pub server_node_id: Option<u64>,
 }
 
-/// `snapshot rollback (<pool> <name> [--devices <dev>...] | <name> --backing-dir <path>)`
+/// `snapshot rollback <pool> <name> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct SnapshotRollbackArgs {
-    /// Pool and snapshot name for live pool mode, or snapshot name for --backing-dir mode
+    /// Pool and snapshot name
     #[arg(value_name = "POOL_AND_SNAPSHOT", num_args = 1..=2, required = true)]
     pub operands: Vec<String>,
 
-    /// Offline/development backing directory for the local object store
-    #[arg(long = "backing-dir", short = 'b')]
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
     pub backing_dir: Option<PathBuf>,
 
     /// Block devices for offline/not-yet-imported rollback
@@ -540,7 +567,7 @@ fn open_filesystem_with_live_args(
             super::live_owner::route_with_args("snapshot", operation, pool_name, live_args)
         }
         (None, None) => {
-            eprintln!("tidefsctl snapshot {operation}: POOL or --backing-dir is required");
+            eprintln!("tidefsctl snapshot {operation}: POOL is required");
             process::exit(1);
         }
     };
@@ -638,14 +665,14 @@ fn parse_named_snapshot_operands(
         }
         (true, _) => {
             eprintln!(
-                "tidefsctl snapshot {operation}: --backing-dir mode expects one snapshot name"
+                "tidefsctl snapshot {operation}: directory-backed object-store mode is retired"
             );
             process::exit(1);
         }
         (false, [pool, name]) => (Some(pool.clone()), name.clone()),
         (false, [single]) => {
             eprintln!(
-                "tidefsctl snapshot {operation}: '{single}' is ambiguous; use '<pool> <snapshot>' for live pools or '<snapshot> --backing-dir <path>' for offline storage"
+                "tidefsctl snapshot {operation}: '{single}' is ambiguous; use '<pool> <snapshot>'"
             );
             process::exit(1);
         }
@@ -752,7 +779,7 @@ fn snapshot_backing_path(
             serde_json::Value::Null,
         ),
         (None, None, None) => {
-            eprintln!("tidefsctl snapshot send: POOL or --backing-dir required");
+            eprintln!("tidefsctl snapshot send: POOL required");
             process::exit(1);
         }
     }
@@ -1078,154 +1105,49 @@ fn handle_send(args: SnapshotSendArgs) {
 }
 
 fn handle_receive(args: SnapshotReceiveArgs) {
-    super::live_owner::route_if_owner_exists_for_backing_dir_with_args(
-        "snapshot",
-        "receive",
-        &args.backing_dir,
-        serde_json::json!({
-            "input": args.input.as_ref().map(|path| path.display().to_string()),
-            "source_addr": args.source_addr.map(|addr| addr.to_string()),
-            "node_id": args.node_id,
-            "server_node_id": args.server_node_id,
-        }),
-    );
-    super::offline_pool::refuse_runtime_pool_path("snapshot", "receive", &args.backing_dir);
-
-    // Network pull: fetch stream from a remote storage-node.
-    if let Some(addr) = args.source_addr {
-        let node_id = args.node_id.unwrap_or(1);
-        let server_node_id = args.server_node_id.unwrap_or(2);
-        let auth_key = root_authentication_key();
-        let req = build_pull_request(&auth_key.as_bytes32());
-
-        let response = match transport_request(node_id, server_node_id, addr, req) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("tidefsctl snapshot receive: transport from {addr}: {e}");
-                process::exit(1);
-            }
-        };
-
-        let export_bytes = match parse_snap_net_message(&response) {
-            Ok(SnapNetMessage::PullResponse { export }) => export,
-            Ok(SnapNetMessage::Error { message }) => {
-                eprintln!("tidefsctl snapshot receive: remote error: {message}");
-                process::exit(1);
-            }
-            _ => {
-                eprintln!("tidefsctl snapshot receive: bad response from {addr}");
-                process::exit(1);
-            }
-        };
-
-        let export =
-            match tidefs_local_filesystem::vfssend2_bridge::decode_any_stream_to_changed_records(
-                &export_bytes,
-            ) {
-                Ok(e) => e,
-                Err(err) => {
-                    eprintln!("tidefsctl snapshot receive: decode from {addr}: {err}");
-                    process::exit(1);
-                }
-            };
-
-        let report =
-            match LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
-                &args.backing_dir,
-                StoreOptions::default(),
-                &export,
-                auth_key,
-            ) {
-                Ok(r) => r,
-                Err(err) => {
-                    eprintln!(
-                        "tidefsctl snapshot receive: receive into {}: {err}",
-                        args.backing_dir.display()
-                    );
-                    process::exit(1);
-                }
-            };
-
-        println!(
-            "pulled stream v{} from {addr} into {} (roots={}, records={}, payload={} bytes, snapshots={}, generation={}, tx={})",
-            report.stream_version,
-            args.backing_dir.display(),
-            report.imported_roots,
-            report.imported_records,
-            report.imported_payload_bytes,
-            report.snapshot_catalog_entries,
-            report.selected_generation,
-            report.selected_transaction_id,
+    if let Some(path) = args.backing_dir.as_ref() {
+        eprintln!(
+            "tidefsctl snapshot receive: {}",
+            crate::commands::retired_directory_pool_media_message(&path.display().to_string())
         );
-
-        // Also save to local file if --input was given.
-        if let Some(input) = &args.input {
-            if let Err(err) = fs::write(input, &export_bytes) {
-                eprintln!(
-                    "tidefsctl snapshot receive: also saved to {}: {err}",
-                    input.display()
-                );
-            }
-        }
-        return;
+        process::exit(1);
     }
 
-    // Local file input.
-    let input = match &args.input {
-        Some(p) => p.clone(),
-        None => {
-            eprintln!("tidefsctl snapshot receive: --input or --source-addr required");
-            process::exit(1);
-        }
-    };
+    let live_args = serde_json::json!({
+        "input": args.input.as_ref().map(|path| path.display().to_string()),
+        "source_addr": args.source_addr.map(|addr| addr.to_string()),
+        "node_id": args.node_id,
+        "server_node_id": args.server_node_id,
+        "devices": args.devices.as_ref().map(|paths| {
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        }),
+    });
 
-    let bytes = match fs::read(&input) {
-        Ok(b) => b,
-        Err(err) => {
-            eprintln!(
-                "tidefsctl snapshot receive: failed to read {}: {err}",
-                input.display()
-            );
-            process::exit(1);
-        }
-    };
-    let export =
-        match tidefs_local_filesystem::vfssend2_bridge::decode_any_stream_to_changed_records(&bytes)
-        {
-            Ok(e) => e,
-            Err(err) => {
-                eprintln!("tidefsctl snapshot receive: decode: {err}");
-                process::exit(1);
-            }
-        };
-    let report =
-        match LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
-            &args.backing_dir,
-            StoreOptions::default(),
-            &export,
-            root_authentication_key(),
-        ) {
-            Ok(r) => r,
-            Err(err) => {
-                eprintln!(
-                    "tidefsctl snapshot receive: receive into {}: {err}",
-                    args.backing_dir.display()
-                );
-                process::exit(1);
-            }
-        };
+    if let Some(devices) = args
+        .devices
+        .as_deref()
+        .filter(|devices| !devices.is_empty())
+    {
+        let config = scan_device_pool_config(&args.pool, devices, "receive");
+        super::live_owner::route_or_refuse_active_for_uuid_with_args(
+            "snapshot",
+            "receive",
+            &args.pool,
+            config.pool_uuid,
+            config.state == tidefs_types_pool_label_core::PoolState::Active,
+            live_args,
+        );
+        eprintln!(
+            "tidefsctl snapshot receive: offline device-backed receive for exported pools is not implemented; use a live owner for pool '{}'",
+            args.pool
+        );
+        process::exit(1);
+    }
 
-    println!(
-        "received stream v{} into {} (roots={}, records={}, payload={} bytes, snapshots={}, generation={}, tx={})",
-        report.stream_version,
-        args.backing_dir.display(),
-        report.imported_roots,
-        report.imported_records,
-        report.imported_payload_bytes,
-        report.snapshot_catalog_entries,
-        report.selected_generation,
-        report.selected_transaction_id,
-    );
+    super::live_owner::route_with_args("snapshot", "receive", &args.pool, live_args);
 }
 
 #[cfg(test)]
@@ -1324,13 +1246,16 @@ mod tests {
     #[test]
     fn snapshot_receive_args_bindings() {
         let args = SnapshotReceiveArgs {
-            backing_dir: PathBuf::from("/tmp/target"),
+            pool: "mypool".into(),
+            backing_dir: None,
+            devices: None,
             input: Some(PathBuf::from("/tmp/stream.vfssend1")),
             source_addr: None,
             node_id: None,
             server_node_id: None,
         };
-        assert_eq!(args.backing_dir, PathBuf::from("/tmp/target"));
+        assert_eq!(args.pool, "mypool");
+        assert_eq!(args.backing_dir, None);
         assert_eq!(args.input, Some(PathBuf::from("/tmp/stream.vfssend1")));
         assert!(args.source_addr.is_none());
     }

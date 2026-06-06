@@ -187,14 +187,19 @@ pub enum PoolCommand {
         encryption_salt: Option<String>,
     },
 
-    /// Run an integrity check through the live owner, or offline with explicit storage
+    /// Run an integrity check through the live owner, or offline with explicit devices
     IntegrityCheck {
         /// Pool name. Imported pools route to the live owner.
         #[arg(value_parser = parse_pool_name)]
         pool: String,
 
-        /// Backing directory for exported/offline object-store scans
-        #[arg(short = 'b', long = "backing-dir")]
+        /// Retired directory object-store scan mode.
+        #[arg(
+            short = 'b',
+            long = "backing-dir",
+            hide = true,
+            value_parser = crate::commands::reject_directory_pool_media_value
+        )]
         backing_dir: Option<PathBuf>,
 
         /// Output as JSON
@@ -1036,13 +1041,13 @@ fn handle_pool_integrity_check(
                 "owner_required": true,
                 "offline_inputs_required": true,
                 "error": "no reachable live owner and no offline storage arguments were provided",
-                "recovery": "start or repair the kernel UAPI or userspace daemon owner, or provide --devices and/or --backing-dir for exported/offline storage",
+                "recovery": "start or repair the kernel UAPI or userspace daemon owner, or provide --devices for exported/offline byte-addressable storage",
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
         } else {
             eprintln!("tidefsctl pool integrity-check: pool '{pool}' has no reachable live owner");
             eprintln!(
-                "tidefsctl pool integrity-check: use --devices and/or --backing-dir only for exported/offline or not-yet-imported storage"
+                "tidefsctl pool integrity-check: use --devices for exported/offline or not-yet-imported byte-addressable storage"
             );
         }
         process::exit(1);
@@ -1154,7 +1159,7 @@ fn handle_pool_integrity_check(
     let segment_report: Option<PoolScanReport> = if let Some(ref path) = backing_dir {
         if !path.exists() {
             eprintln!(
-                "tidefsctl: integrity-check backing directory does not exist: {}",
+                "tidefsctl: integrity-check compatibility directory object store does not exist: {}",
                 path.display()
             );
             process::exit(2);
@@ -2036,7 +2041,7 @@ mod tests {
     }
 
     #[test]
-    fn integrity_check_offline_backing_dir_parsed() {
+    fn integrity_check_rejects_backing_dir() {
         use clap::Parser;
         let args = vec![
             "pool",
@@ -2045,19 +2050,9 @@ mod tests {
             "--backing-dir",
             "/data/pool",
         ];
-        let cmd = PoolCommand::try_parse_from(args).expect("parse");
-        match cmd {
-            PoolCommand::IntegrityCheck {
-                pool,
-                backing_dir,
-                devices,
-                ..
-            } => {
-                assert_eq!(pool, "tank");
-                assert_eq!(backing_dir, Some(PathBuf::from("/data/pool")));
-                assert_eq!(devices, None);
-            }
-            _ => panic!("wrong command variant"),
-        }
+        assert!(
+            PoolCommand::try_parse_from(args).is_err(),
+            "pool integrity-check backing-dir must be retired"
+        );
     }
 }
