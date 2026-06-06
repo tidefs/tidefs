@@ -102,6 +102,10 @@ pub enum ReplicationMessage {
         found: bool,
         payload: Vec<u8>,
         source_member_id: u64,
+        /// Optional durable placement receipt authority for the returned
+        /// payload. Compatibility peers may omit this; receipt-aware callers
+        /// must validate non-synthetic refs before accepting peer bytes.
+        placement_receipt_ref: Option<PlacementReceiptRef>,
     },
     /// Request witness verification of a digest (Shadow lane, e3).
     WitnessVerify { digest: Vec<u8>, payload_len: u64 },
@@ -441,6 +445,31 @@ mod tests {
         let msg = ReplicationMessage::WitnessVerify {
             digest: vec![0xBB; 32],
             payload_len: 2048,
+        };
+        let rt = bincode_roundtrip(&msg);
+        assert_eq!(rt, msg);
+    }
+
+    #[test]
+    fn read_plan_response_preserves_receipt_ref() {
+        let payload = b"planned-read-payload".to_vec();
+        let msg = ReplicationMessage::ReadPlanResponse {
+            found: true,
+            payload: payload.clone(),
+            source_member_id: 7,
+            placement_receipt_ref: Some(receipt_ref("planned-read", &payload, 23)),
+        };
+        let rt = bincode_roundtrip(&msg);
+        assert_eq!(rt, msg);
+    }
+
+    #[test]
+    fn read_plan_response_allows_receiptless_compatibility() {
+        let msg = ReplicationMessage::ReadPlanResponse {
+            found: true,
+            payload: b"legacy-planned-read".to_vec(),
+            source_member_id: 8,
+            placement_receipt_ref: None,
         };
         let rt = bincode_roundtrip(&msg);
         assert_eq!(rt, msg);
