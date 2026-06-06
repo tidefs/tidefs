@@ -349,7 +349,7 @@ mod tests {
     use super::*;
     use std::fs;
     use tidefs_pool_scan::{DeviceHealth, DeviceType, PoolConfig};
-    use tidefs_types_pool_label_core::PoolState;
+    use tidefs_types_pool_label_core::{PoolRedundancyPolicy, PoolState};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -389,6 +389,7 @@ mod tests {
             total_capacity_bytes: 2 * 1024 * 1024 * 1024,
             allocated_bytes: 0,
             feature_flags: 0,
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
             topology_generation: 1,
             device_count: 2,
             missing_indices: vec![],
@@ -429,6 +430,7 @@ mod tests {
             total_capacity_bytes: 2 * 1024 * 1024 * 1024,
             allocated_bytes: 0,
             feature_flags: 0,
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
             topology_generation: 1,
             device_count: 3,          // three configured
             missing_indices: vec![2], // device 2 missing
@@ -484,6 +486,7 @@ mod tests {
             total_capacity_bytes: 2 * 1024 * 1024 * 1024,
             allocated_bytes: 0,
             feature_flags: 0,
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
             topology_generation: 3,
             device_count: 2,
             missing_indices: vec![1],
@@ -594,6 +597,7 @@ mod tests {
             total_capacity_bytes: 1024 * 1024 * 1024,
             allocated_bytes: 0,
             feature_flags: 0,
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
             topology_generation: 1,
             device_count: 1,
             missing_indices: vec![],

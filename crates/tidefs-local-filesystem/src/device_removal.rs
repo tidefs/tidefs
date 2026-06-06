@@ -666,7 +666,7 @@ pub enum DeviceRemovalAnchorError {
 mod tests {
     use super::*;
     use tidefs_pool_scan::{DeviceHealth, DeviceType};
-    use tidefs_types_pool_label_core::{DeviceClass, PoolState};
+    use tidefs_types_pool_label_core::{DeviceClass, PoolRedundancyPolicy, PoolState};
 
     #[test]
     fn anchor_persists_labels_for_surviving_devices() {
@@ -718,6 +718,7 @@ mod tests {
             total_capacity_bytes: 3 * 1024 * 1024 * 1024,
             allocated_bytes: 0,
             feature_flags: 0,
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
             topology_generation: 1,
             device_count: 3,
             missing_indices: vec![],
@@ -1127,7 +1128,7 @@ mod tests {
 #[test]
 fn imported_config_preserves_authoritative_fields_through_remove_device() {
     use tidefs_pool_scan::{DeviceHealth, DeviceType, PoolConfig};
-    use tidefs_types_pool_label_core::{DeviceClass, PoolState};
+    use tidefs_types_pool_label_core::{DeviceClass, PoolRedundancyPolicy, PoolState};
 
     let dir = tempfile::tempdir().unwrap();
     let mut store = tidefs_local_object_store::LocalObjectStore::open(dir.path()).unwrap();
@@ -1179,6 +1180,7 @@ fn imported_config_preserves_authoritative_fields_through_remove_device() {
         total_capacity_bytes: 3 * 1024 * 1024 * 1024,
         allocated_bytes: 0,
         feature_flags: 0xFEED,
+        redundancy_policy: PoolRedundancyPolicy::replicated(1),
         topology_generation: 5,
         device_count: 3,
         missing_indices: vec![],

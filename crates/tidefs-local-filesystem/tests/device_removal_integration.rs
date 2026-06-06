@@ -17,7 +17,7 @@ use tidefs_pool_scan::{
     DeviceRemovalResult, DeviceType, ObjectPlacement, PoolConfig,
 };
 use tidefs_replication_model::{FailureDomain, ReplicationIntent};
-use tidefs_types_pool_label_core::{decode_label, DeviceClass, PoolState};
+use tidefs_types_pool_label_core::{decode_label, DeviceClass, PoolRedundancyPolicy, PoolState};
 
 /// Build a single leaf device for a pool tree.
 fn make_leaf_device(path: PathBuf, index: u32, guid: u8) -> DeviceType {
@@ -102,6 +102,7 @@ fn three_device_mirror_remove_middle_device_with_blake3_verification() {
         total_capacity_bytes: 3 * 1024 * 1024 * 1024,
         allocated_bytes: 0,
         feature_flags: 0,
+        redundancy_policy: PoolRedundancyPolicy::replicated(1),
         topology_generation: 1,
         device_count: 3,
         missing_indices: vec![],
@@ -350,6 +351,7 @@ fn removal_with_zero_objects_on_target_device() {
         total_capacity_bytes: 2 * 1024 * 1024 * 1024,
         allocated_bytes: 0,
         feature_flags: 0,
+        redundancy_policy: PoolRedundancyPolicy::replicated(1),
         topology_generation: 1,
         device_count: 2,
         missing_indices: vec![],
@@ -386,6 +388,7 @@ fn last_device_removal_refused() {
         total_capacity_bytes: 1024 * 1024 * 1024,
         allocated_bytes: 0,
         feature_flags: 0,
+        redundancy_policy: PoolRedundancyPolicy::replicated(1),
         topology_generation: 1,
         device_count: 1,
         missing_indices: vec![],
@@ -456,6 +459,7 @@ fn pool_label_writer_raw_device_roundtrip_after_removal() {
         total_capacity_bytes: 3 * 1024 * 1024 * 1024,
         allocated_bytes: 0,
         feature_flags: 0,
+        redundancy_policy: PoolRedundancyPolicy::replicated(1),
         topology_generation: 3,
         device_count: 3,
         missing_indices: vec![],
