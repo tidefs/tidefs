@@ -161,6 +161,12 @@ If labels still show an imported pool and no supported owner interface responds,
 repair or restart the kernel UAPI or userspace daemon owner before running
 live-state commands. Do not open the cached imported state directly.
 
+`tidefsctl kernel status` is the passive kernel-runtime inventory for the
+current pre-alpha kernel surface. It checks the declared control endpoint path
+and reports source-visible runtime surfaces such as TideFS-owned kthreads and
+workqueues, but it does not open `/dev/tidefs-control`, issue ioctls, or make a
+kernel owner manifest authoritative.
+
 ---
 
 ## 4. Mounting the Filesystem

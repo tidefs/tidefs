@@ -18,7 +18,7 @@
 //! | `block attach/detach/list/send/receive` | operator commands |
 //! | `dataset create/list/destroy/rename` | operator command (catalog-backed) |
 //! | `dataset set-strategy/seal-key/rotate-key/upgrade/get/set/list-props` | operator commands |
-//! | `kernel status` | operator diagnostic; production kernel UAPI not wired |
+//! | `kernel status` | operator diagnostic/runtime inventory; production kernel UAPI not wired |
 //! | `diag` | operator diagnostic/support bundle |
 //! | `cluster pool create` | cluster operator prototype; TFR-017 remains open |
 //! | `cluster placement exercise` | development diagnostic exercise |
@@ -55,7 +55,7 @@ Primary operator groups:
   snapshot  create, list, destroy, roll back, send, and receive snapshots
   device    remove or rebuild pool devices
   block     attach, list, detach, send, and receive ublk block devices
-  kernel    inspect the declared kernel control endpoint
+  kernel    inspect the declared kernel control endpoint and runtime inventory
   diag      collect a redacted support bundle
 
 Development harnesses:
