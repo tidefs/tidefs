@@ -15,8 +15,8 @@ use tidefs_cluster::pool_protocol::{
     ClusterPoolCreateResponse, ClusterPoolImportResponse, ClusterPoolLeaseResponse,
     ClusterPoolMessage,
 };
-use tidefs_cluster::ClusterPlacementPolicy;
 use tidefs_cluster::{ClusterLeaseConfig, ClusterLeaseRuntime, FenceAuthority, FenceValidator};
+use tidefs_cluster::{ClusterPlacementPolicy, ClusterRedundancy};
 use tidefs_local_filesystem::{self as vfs, ChangedRecordExport, RootAuthenticationKey};
 use tidefs_local_object_store::device_layout::DeviceMediaClass;
 use tidefs_local_object_store::pool::{
@@ -1173,6 +1173,30 @@ fn validate_cluster_create_device_media(
     Ok(())
 }
 
+fn pool_create_redundancy_from_cluster(policy: ClusterRedundancy) -> RedundancyPolicy {
+    match policy {
+        ClusterRedundancy::None => RedundancyPolicy::replicated(1),
+        ClusterRedundancy::MirrorAcrossNodes { copies } => RedundancyPolicy::replicated(copies),
+        ClusterRedundancy::ErasureCoded {
+            data_shards,
+            parity_shards,
+        } => RedundancyPolicy::erasure(data_shards, parity_shards),
+    }
+}
+
+fn cluster_create_redundancy_authority(
+    redundancy: ClusterRedundancy,
+    placement: ClusterPlacementPolicy,
+) -> Result<RedundancyPolicy, String> {
+    let expected = ClusterPlacementPolicy::from_redundancy(redundancy);
+    if placement != expected {
+        return Err(format!(
+            "cluster pool create redundancy/placement mismatch: canonical redundancy {redundancy:?} derives {expected:?}, request carried {placement:?}"
+        ));
+    }
+    Ok(pool_create_redundancy_from_cluster(redundancy))
+}
+
 fn object_pool_device_config(path: PathBuf) -> Result<ObjectDeviceConfig, String> {
     let backing = object_pool_device_backing(&path)?;
     Ok(ObjectDeviceConfig {
@@ -2219,15 +2243,25 @@ fn handle_cluster_pool_message(
                     },
                 ));
             }
-            let redundancy = match req.placement {
-                ClusterPlacementPolicy::Stripe => RedundancyPolicy::replicated(1),
-                ClusterPlacementPolicy::MirrorAcrossNodes { copies } => {
-                    RedundancyPolicy::replicated(copies as u8)
-                }
-                ClusterPlacementPolicy::ErasureCoded { data, parity } => {
-                    RedundancyPolicy::erasure(data as u8, parity as u8)
-                }
-            };
+            let redundancy =
+                match cluster_create_redundancy_authority(req.redundancy, req.placement) {
+                    Ok(redundancy) => redundancy,
+                    Err(redundancy_err) => {
+                        eprintln!(
+                            "[storage-node] session {session_id}: create refused: {redundancy_err}"
+                        );
+                        return Some(ClusterPoolMessage::CreateResponse(
+                            ClusterPoolCreateResponse {
+                                request_id: req.request_id,
+                                node_id: req.target_node_id,
+                                pool_guid: req.pool_guid,
+                                success: false,
+                                device_guids: vec![],
+                                error: Some(redundancy_err),
+                            },
+                        ));
+                    }
+                };
             let config = PoolCreateConfig {
                 pool_name: req.pool_name.clone(),
                 pool_guid: Some(req.pool_guid),
@@ -4576,6 +4610,44 @@ mod cluster_pool_handler_tests {
         let err =
             validate_cluster_create_device_media(&[dir.path().to_path_buf()], true).unwrap_err();
         assert!(err.contains("cluster pool create device"));
+    }
+
+    #[test]
+    fn cluster_create_redundancy_authority_maps_replicated() {
+        let redundancy = cluster_create_redundancy_authority(
+            ClusterRedundancy::MirrorAcrossNodes { copies: 2 },
+            ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 },
+        )
+        .unwrap();
+
+        assert_eq!(redundancy, RedundancyPolicy::replicated(2));
+    }
+
+    #[test]
+    fn cluster_create_redundancy_authority_maps_erasure() {
+        let redundancy = cluster_create_redundancy_authority(
+            ClusterRedundancy::ErasureCoded {
+                data_shards: 4,
+                parity_shards: 2,
+            },
+            ClusterPlacementPolicy::ErasureCoded { data: 4, parity: 2 },
+        )
+        .unwrap();
+
+        assert_eq!(redundancy, RedundancyPolicy::erasure(4, 2));
+    }
+
+    #[test]
+    fn cluster_create_redundancy_authority_rejects_placement_mismatch() {
+        let err = cluster_create_redundancy_authority(
+            ClusterRedundancy::MirrorAcrossNodes { copies: 2 },
+            ClusterPlacementPolicy::Stripe,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("redundancy/placement mismatch"));
+        assert!(err.contains("MirrorAcrossNodes"));
+        assert!(err.contains("Stripe"));
     }
 
     #[test]

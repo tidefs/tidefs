@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use tidefs_cluster::pool_config::{ClusterPlacementPolicy, FailureDomain};
+use tidefs_cluster::pool_config::{ClusterPlacementPolicy, ClusterRedundancy, FailureDomain};
 use tidefs_cluster::pool_lease_client::ClusterLeaseClient;
 use tidefs_cluster::pool_lease_token::PoolLeaseToken;
 use tidefs_cluster::pool_protocol::ClusterPoolLeaseRequest;
@@ -232,6 +232,7 @@ fn cluster_full_flow_create_lease_catalog_heal() {
             capacity_bytes: TEST_DEVICE_BYTES,
             failure_domain: FailureDomain::for_node(1),
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -247,6 +248,7 @@ fn cluster_full_flow_create_lease_catalog_heal() {
             capacity_bytes: TEST_DEVICE_BYTES,
             failure_domain: FailureDomain::for_node(2),
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -480,6 +482,7 @@ fn cluster_no_lease_config_lifecycle() {
             capacity_bytes: TEST_DEVICE_BYTES,
             failure_domain: FailureDomain::for_node(1),
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -545,6 +548,7 @@ fn cluster_full_flow_mirror_create_and_verify() {
                 capacity_bytes: TEST_DEVICE_BYTES,
                 failure_domain: FailureDomain::for_node(node_id),
             }],
+            redundancy: ClusterRedundancy::MirrorAcrossNodes { copies: 2 },
             placement: ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 },
             allow_file_devices: true,
         };
@@ -660,6 +664,7 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
             capacity_bytes: TEST_DEVICE_BYTES,
             failure_domain: FailureDomain::for_node(1),
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -725,6 +730,7 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
             capacity_bytes: TEST_DEVICE_BYTES,
             failure_domain: FailureDomain::for_node(1),
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };
@@ -786,6 +792,7 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
             capacity_bytes: TEST_DEVICE_BYTES,
             failure_domain: FailureDomain::for_node(1),
         }],
+        redundancy: ClusterRedundancy::None,
         placement: ClusterPlacementPolicy::Stripe,
         allow_file_devices: true,
     };

@@ -134,6 +134,20 @@ pub enum ClusterRedundancy {
 }
 
 impl ClusterRedundancy {
+    /// Derive the canonical redundancy policy from the legacy placement view.
+    pub fn from_placement(placement: ClusterPlacementPolicy) -> Self {
+        match placement {
+            ClusterPlacementPolicy::Stripe => Self::None,
+            ClusterPlacementPolicy::MirrorAcrossNodes { copies } => {
+                Self::MirrorAcrossNodes { copies }
+            }
+            ClusterPlacementPolicy::ErasureCoded { data, parity } => Self::ErasureCoded {
+                data_shards: data,
+                parity_shards: parity,
+            },
+        }
+    }
+
     /// Minimum number of nodes required for this redundancy policy.
     pub fn min_nodes(&self) -> usize {
         match self {
@@ -225,6 +239,12 @@ impl ClusterPlacementPolicy {
     pub fn min_distinct_failure_domains(&self) -> usize {
         self.desired_node_count()
     }
+
+    /// Return true when this compatibility placement view matches the
+    /// canonical redundancy authority exactly.
+    pub fn matches_redundancy(&self, redundancy: ClusterRedundancy) -> bool {
+        *self == Self::from_redundancy(redundancy)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -276,18 +296,7 @@ impl ClusterPoolConfig {
         devices: Vec<NodeDevice>,
         placement: ClusterPlacementPolicy,
     ) -> Self {
-        let redundancy = match placement {
-            ClusterPlacementPolicy::Stripe => ClusterRedundancy::None,
-            ClusterPlacementPolicy::MirrorAcrossNodes { copies } => {
-                ClusterRedundancy::MirrorAcrossNodes { copies }
-            }
-            ClusterPlacementPolicy::ErasureCoded { data, parity } => {
-                ClusterRedundancy::ErasureCoded {
-                    data_shards: data,
-                    parity_shards: parity,
-                }
-            }
-        };
+        let redundancy = ClusterRedundancy::from_placement(placement);
         let mut node_ids: Vec<u64> = devices.iter().map(|d| d.node_id).collect();
         node_ids.sort();
         node_ids.dedup();
@@ -303,6 +312,22 @@ impl ClusterPoolConfig {
             redundancy,
             allow_file_devices: false,
         }
+    }
+
+    /// Create a cluster pool configuration from the canonical redundancy
+    /// authority, deriving the compatibility placement view from it.
+    pub fn from_redundancy(
+        pool_guid: [u8; 16],
+        pool_name: String,
+        devices: Vec<NodeDevice>,
+        redundancy: ClusterRedundancy,
+    ) -> Self {
+        Self::new(
+            pool_guid,
+            pool_name,
+            devices,
+            ClusterPlacementPolicy::from_redundancy(redundancy),
+        )
     }
 
     /// Return this config with explicit regular-file development media
@@ -454,6 +479,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn redundancy_from_placement_mirror() {
+        let r = ClusterRedundancy::from_placement(ClusterPlacementPolicy::MirrorAcrossNodes {
+            copies: 2,
+        });
+        assert_eq!(r, ClusterRedundancy::MirrorAcrossNodes { copies: 2 });
+    }
+
+    #[test]
+    fn placement_matches_redundancy_exactly() {
+        let redundancy = ClusterRedundancy::ErasureCoded {
+            data_shards: 4,
+            parity_shards: 2,
+        };
+        assert!(ClusterPlacementPolicy::ErasureCoded { data: 4, parity: 2 }
+            .matches_redundancy(redundancy));
+        assert!(!ClusterPlacementPolicy::Stripe.matches_redundancy(redundancy));
+    }
+
     // -- ClusterPoolConfig tests --
 
     #[test]
@@ -584,6 +628,36 @@ mod tests {
         );
         assert_eq!(config.redundancy.min_nodes(), 6);
         assert_eq!(config.redundancy.fault_tolerance(), 2);
+    }
+
+    #[test]
+    fn cluster_pool_config_from_redundancy_derives_placement() {
+        let devices = vec![
+            make_test_device(1, 0, 0),
+            make_test_device(2, 0, 1),
+            make_test_device(3, 0, 2),
+        ];
+        let config = ClusterPoolConfig::from_redundancy(
+            [0xEF; 16],
+            "canonical".into(),
+            devices,
+            ClusterRedundancy::ErasureCoded {
+                data_shards: 2,
+                parity_shards: 1,
+            },
+        );
+
+        assert_eq!(
+            config.redundancy,
+            ClusterRedundancy::ErasureCoded {
+                data_shards: 2,
+                parity_shards: 1,
+            }
+        );
+        assert_eq!(
+            config.placement,
+            ClusterPlacementPolicy::ErasureCoded { data: 2, parity: 1 }
+        );
     }
 
     #[test]

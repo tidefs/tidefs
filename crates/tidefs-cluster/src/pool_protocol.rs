@@ -8,7 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::pool_config::{ClusterPlacementPolicy, ClusterPoolConfig, FailureDomain, NodeDevice};
+use crate::pool_config::{
+    ClusterPlacementPolicy, ClusterPoolConfig, ClusterRedundancy, FailureDomain, NodeDevice,
+};
 
 // ---------------------------------------------------------------------------
 // ProtocolError
@@ -86,7 +88,12 @@ pub struct ClusterPoolCreateRequest {
     pub target_node_id: u64,
     /// Devices on the target node to initialize for this pool.
     pub node_devices: Vec<NodeDeviceSpec>,
-    /// Redundancy/placement policy for the pool.
+    /// Canonical pool-wide redundancy policy for the pool.
+    pub redundancy: ClusterRedundancy,
+    /// Compatibility placement view derived from `redundancy`.
+    ///
+    /// Receivers must reject requests where this value does not match
+    /// `ClusterPlacementPolicy::from_redundancy(redundancy)`.
     pub placement: ClusterPlacementPolicy,
     /// Permit regular files as explicit development media on the target node.
     ///
@@ -541,7 +548,8 @@ impl ClusterPoolMessage {
                 pool_name: config.pool_name.clone(),
                 target_node_id: node_id,
                 node_devices,
-                placement: config.placement,
+                redundancy: config.redundancy,
+                placement: ClusterPlacementPolicy::from_redundancy(config.redundancy),
                 allow_file_devices: config.allow_file_devices,
             });
         }
@@ -582,7 +590,7 @@ impl ClusterPoolMessage {
 mod tests {
     use super::*;
     use crate::pool_config::{
-        ClusterPlacementPolicy, ClusterPoolConfig, FailureDomain, NodeDevice,
+        ClusterPlacementPolicy, ClusterPoolConfig, ClusterRedundancy, FailureDomain, NodeDevice,
     };
     use std::path::PathBuf;
 
@@ -628,6 +636,7 @@ mod tests {
                 capacity_bytes: 1024 * 1024 * 1024,
                 failure_domain: FailureDomain::for_node(7),
             }],
+            redundancy: ClusterRedundancy::None,
             placement: ClusterPlacementPolicy::Stripe,
             allow_file_devices: false,
         });
@@ -761,6 +770,7 @@ mod tests {
             pool_name: "det".into(),
             target_node_id: 1,
             node_devices: vec![],
+            redundancy: ClusterRedundancy::None,
             placement: ClusterPlacementPolicy::Stripe,
             allow_file_devices: false,
         });
@@ -833,10 +843,43 @@ mod tests {
         assert!(requests.iter().all(|r| r.request_id == 100));
         assert!(requests.iter().all(|r| r.pool_guid == [0xAB; 16]));
         assert!(requests.iter().all(|r| r.pool_name == "testpool"));
+        assert!(requests
+            .iter()
+            .all(|r| r.redundancy == ClusterRedundancy::None));
+        assert!(requests
+            .iter()
+            .all(|r| r.placement == ClusterPlacementPolicy::Stripe));
 
         // Each node should have exactly 1 device.
         for req in &requests {
             assert_eq!(req.node_devices.len(), 1);
+        }
+    }
+
+    #[test]
+    fn build_create_requests_uses_redundancy_as_authority() {
+        let mut config = make_three_node_config();
+        config.redundancy = ClusterRedundancy::ErasureCoded {
+            data_shards: 2,
+            parity_shards: 1,
+        };
+        config.placement = ClusterPlacementPolicy::Stripe;
+
+        let requests = ClusterPoolMessage::build_create_requests(&config, 102);
+
+        assert_eq!(requests.len(), 3);
+        for req in &requests {
+            assert_eq!(
+                req.redundancy,
+                ClusterRedundancy::ErasureCoded {
+                    data_shards: 2,
+                    parity_shards: 1,
+                }
+            );
+            assert_eq!(
+                req.placement,
+                ClusterPlacementPolicy::ErasureCoded { data: 2, parity: 1 }
+            );
         }
     }
 

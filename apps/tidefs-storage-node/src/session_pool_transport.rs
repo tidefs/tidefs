@@ -104,7 +104,7 @@ impl PoolTransport for SessionPoolTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_cluster::pool_config::ClusterPlacementPolicy;
+    use tidefs_cluster::pool_config::{ClusterPlacementPolicy, ClusterRedundancy};
     use tidefs_cluster::pool_protocol::{
         ClusterPoolCreateRequest, ClusterPoolCreateResponse, ClusterPoolImportResponse,
     };
@@ -118,6 +118,7 @@ mod tests {
             pool_name: "test".into(),
             target_node_id: 1,
             node_devices: vec![],
+            redundancy: ClusterRedundancy::None,
             placement: ClusterPlacementPolicy::Stripe,
             allow_file_devices: false,
         });
