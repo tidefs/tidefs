@@ -351,7 +351,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
+pub const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 16 * 1024;
 
 fn mounted_store_options() -> tidefs_local_object_store::StoreOptions {

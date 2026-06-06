@@ -1871,6 +1871,127 @@ fn sparse_512_byte_autoflush_preserves_holes_across_batches() {
 }
 
 #[test]
+fn mount_sized_sparse_stream_defers_foreground_flush_until_fsync() {
+    let (mut fs, root) = wb_open_temp("mount-sized-sparse-stream");
+    let chunk = content_chunk_size() as usize;
+    let stride = (1024 * 1024usize).max(chunk.saturating_mul(2));
+    let write_len = 512 * 1024usize;
+    let write_count = 17usize;
+    let file_len = (write_count - 1) * stride + 512 + write_len + 512;
+    let mount_threshold = 64 * 1024 * 1024usize;
+
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: mount_threshold,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs
+        .create_file("/mount-sparse-stream.bin", 0o644)
+        .expect("create sparse stream");
+    fs.truncate_file("/mount-sparse-stream.bin", file_len as u64)
+        .expect("sparse truncate");
+    let base_record = fs
+        .stat("/mount-sparse-stream.bin")
+        .expect("stat sparse base");
+    assert!(
+        wd_current_content_manifest(&fs, "/mount-sparse-stream.bin")
+            .chunks
+            .is_empty(),
+        "sparse truncate should not materialize chunks"
+    );
+
+    let mut expected_payloads = BTreeMap::new();
+    let mut expected_materialized_chunks = 0usize;
+    for chunk_index in 0..write_count {
+        let mut payload = vec![0x40_u8 + chunk_index as u8; write_len];
+        payload[..8].copy_from_slice(&(chunk_index as u64).to_le_bytes());
+        payload[8..16].copy_from_slice(&(0x6465_6665_7272_6564_u64).to_le_bytes());
+        let offset = chunk_index * stride + 512;
+        fs.write_file("/mount-sparse-stream.bin", offset as u64, &payload)
+            .expect("buffer sparse stream write");
+        let first_chunk = offset / chunk;
+        let last_chunk = (offset + payload.len() - 1) / chunk;
+        expected_materialized_chunks += last_chunk - first_chunk + 1;
+        expected_payloads.insert(chunk_index as u64, (offset as u64, payload));
+    }
+
+    let buffered_bytes = fs
+        .write_buffers
+        .get(&record.inode_id)
+        .expect("mount-sized stream remains buffered")
+        .buffered_bytes();
+    assert!(
+        buffered_bytes > 8 * 1024 * 1024,
+        "test stream must exceed the old mounted 8 MiB foreground threshold"
+    );
+    assert!(
+        buffered_bytes < mount_threshold,
+        "test stream must stay below the mounted foreground threshold"
+    );
+    let after_stream = fs
+        .stat("/mount-sparse-stream.bin")
+        .expect("stat buffered sparse stream");
+    assert_eq!(
+        after_stream.data_version, base_record.data_version,
+        "mounted sparse streams below the foreground threshold must not publish before fsync"
+    );
+    assert!(
+        wd_current_content_manifest(&fs, "/mount-sparse-stream.bin")
+            .chunks
+            .is_empty(),
+        "buffered sparse stream must not materialize object chunks before fsync"
+    );
+
+    for (chunk_index, (offset, payload)) in &expected_payloads {
+        assert_eq!(
+            fs.read_file_range("/mount-sparse-stream.bin", *offset, payload.len())
+                .expect("read buffered sparse payload"),
+            *payload,
+            "read-your-writes must survive deferral for sparse chunk {chunk_index}"
+        );
+        let hole_prefix = offset.saturating_sub(512);
+        assert_eq!(
+            fs.read_file_range("/mount-sparse-stream.bin", hole_prefix, 512)
+                .expect("read buffered sparse prefix hole"),
+            vec![0_u8; 512],
+            "prefix hole before sparse chunk {chunk_index} must remain zero"
+        );
+    }
+
+    fs.fsync_file("/mount-sparse-stream.bin")
+        .expect("fsync sparse stream");
+    assert!(
+        !fs.write_buffers.contains_key(&record.inode_id),
+        "fsync must drain the mounted sparse stream"
+    );
+    let final_record = fs
+        .stat("/mount-sparse-stream.bin")
+        .expect("stat fsynced sparse stream");
+    assert_eq!(final_record.size, file_len as u64);
+    assert_eq!(
+        final_record.data_version,
+        base_record.data_version + 1,
+        "fsync should publish the deferred sparse stream in one content generation"
+    );
+
+    let manifest = wd_current_content_manifest(&fs, "/mount-sparse-stream.bin");
+    let materialized_chunks = manifest
+        .chunks
+        .iter()
+        .filter(|chunk_ref| !chunk_ref.is_hole())
+        .count();
+    assert_eq!(
+        materialized_chunks, expected_materialized_chunks,
+        "fsync should materialize only content chunks touched by sparse data"
+    );
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn read_sees_buffered_data_before_flush() {
     let (mut fs, root) = wb_open_temp("read-sees-buffered");
     fs.set_write_buffer_config(WriteBufferConfig {

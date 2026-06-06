@@ -67,8 +67,8 @@ use tidefs_types_posix_filesystem_adapter_core::{
 use crate::mount_options::MountOptions;
 use tidefs_dataset_lifecycle::SyncGuarantee;
 use tidefs_inode_attributes::timestamp::TimestampPolicy as EngineTimestampPolicy;
+use tidefs_posix_filesystem_adapter_daemon::MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES;
 
-const MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 const MOUNT_VFS_TXG_COMMIT_INTERVAL_SECS: u64 = 30;
 
 fn mount_vfs_store_options(config: &MountVfsConfig) -> tidefs_local_object_store::StoreOptions {
@@ -307,7 +307,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("open store: {e}"))?;
-    lfs.set_write_buffer_flush_threshold_bytes(MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES);
+    lfs.set_write_buffer_flush_threshold_bytes(MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES);
 
     // Enable org.tidefs:dedup dataset feature when requested by the operator.
     if config.enable_dedup {
