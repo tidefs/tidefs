@@ -156,19 +156,22 @@ the command routes to the exact owner or fails closed.
 The old `--pool <pool>` spelling is not the operator form. It must not be
 kept as a parallel control path for imported state.
 
-=== Kernel Control Probe
+=== Kernel Runtime Inventory
 
-`tidefsctl kernel status` reports the declared kernel control endpoint without
-opening it or issuing ioctls. The default control endpoint is
-`/dev/tidefs-control`, and `--control-dev <path>` may point the probe at a
-different path for tests or operator diagnostics.
+`tidefsctl kernel status` reports the declared kernel control endpoint and the
+source-visible TideFS kernel runtime surfaces without opening the endpoint or
+issuing ioctls. The default control endpoint is `/dev/tidefs-control`, and
+`--control-dev <path>` may point the probe at a different path for tests or
+operator diagnostics.
 
 The current command is an honesty boundary, not proof of full-kernel control.
 It reports whether the path is missing, present as a character device, or
-present with the wrong file type. It always reports that production kernel UAPI
-wiring is not implemented until a later kernel-control issue wires a real
-client. It must not treat `/run/tidefs/pools/.../owner.json` manifests as
-kernel authority.
+present with the wrong file type. It also reports that the current kernel
+source does not wire TideFS-owned kthreads or runtime workqueues as product
+surfaces. It always reports that production kernel UAPI wiring is not
+implemented until a later kernel-control issue wires a real client. It must not
+open `/dev/tidefs-control`, issue control ioctls, or treat
+`/run/tidefs/pools/.../owner.json` manifests as kernel authority.
 
 [source,sh]
 ----
@@ -176,6 +179,10 @@ tidefsctl kernel status
 tidefsctl kernel status --json
 tidefsctl kernel status --control-dev /dev/null --json
 ----
+
+The JSON form exposes stable passive-inventory fields including
+`status_is_passive`, `control_endpoint_opened`,
+`tidefs_owned_kthreads_wired`, and `tidefs_owned_workqueues_wired`.
 
 === Command Classes
 

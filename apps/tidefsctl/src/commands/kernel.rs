@@ -1,8 +1,9 @@
 //! Kernel-resident TideFS operator probes.
 //!
-//! This module reports whether the declared kernel control endpoint exists.
-//! It intentionally does not open the endpoint or issue ioctls; until the
-//! production kernel UAPI is wired, `tidefsctl` must stay an honest observer.
+//! This module reports whether the declared kernel control endpoint exists and
+//! inventories the current kernel runtime surfaces. It intentionally does not
+//! open the endpoint or issue ioctls; until the production kernel UAPI is
+//! wired, `tidefsctl` must stay an honest observer.
 
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 
 const DEFAULT_KERNEL_CONTROL_DEVICE: &str = "/dev/tidefs-control";
+const RUNTIME_INVENTORY_SOURCE: &str = "static-source-inventory";
 
 #[derive(Subcommand, Debug)]
 pub enum KernelCommand {
@@ -48,9 +50,13 @@ fn handle_status(control_dev: &Path, json: bool) {
 struct KernelControlStatus {
     control_device: PathBuf,
     device_state: DeviceState,
+    runtime_inventory_source: &'static str,
+    control_endpoint_opened: bool,
     production_uapi_wired: bool,
     mutating_ioctls_issued: bool,
     owner_manifest_authority: bool,
+    tidefs_owned_kthreads: RuntimeSurfaceState,
+    tidefs_owned_workqueues: RuntimeSurfaceState,
 }
 
 impl KernelControlStatus {
@@ -58,9 +64,13 @@ impl KernelControlStatus {
         Self {
             control_device: control_device.to_path_buf(),
             device_state: DeviceState::probe(control_device),
+            runtime_inventory_source: RUNTIME_INVENTORY_SOURCE,
+            control_endpoint_opened: false,
             production_uapi_wired: false,
             mutating_ioctls_issued: false,
             owner_manifest_authority: false,
+            tidefs_owned_kthreads: RuntimeSurfaceState::NotWired,
+            tidefs_owned_workqueues: RuntimeSurfaceState::NotWired,
         }
     }
 
@@ -70,15 +80,28 @@ impl KernelControlStatus {
             "control_device": self.control_device.display().to_string(),
             "device_state": self.device_state.label(),
             "device_kind": self.device_state.kind_label(),
+            "runtime_inventory_source": self.runtime_inventory_source,
+            "status_is_passive": self.status_is_passive(),
+            "control_endpoint_opened": self.control_endpoint_opened,
             "control_device_present": self.control_device_present(),
             "control_device_character": self.control_device_character(),
             "production_uapi_wired": self.production_uapi_wired,
             "control_uapi_usable": self.control_uapi_usable(),
             "mutating_ioctls_issued": self.mutating_ioctls_issued,
             "owner_manifest_authority": self.owner_manifest_authority,
+            "tidefs_owned_kthreads": self.tidefs_owned_kthreads.label(),
+            "tidefs_owned_kthreads_wired": self.tidefs_owned_kthreads.is_wired(),
+            "tidefs_owned_workqueues": self.tidefs_owned_workqueues.label(),
+            "tidefs_owned_workqueues_wired": self.tidefs_owned_workqueues.is_wired(),
             "message": self.message(),
         });
         serde_json::to_string_pretty(&value).expect("kernel status JSON should format")
+    }
+
+    fn status_is_passive(&self) -> bool {
+        !self.control_endpoint_opened
+            && !self.mutating_ioctls_issued
+            && !self.owner_manifest_authority
     }
 
     fn control_device_present(&self) -> bool {
@@ -104,6 +127,25 @@ impl KernelControlStatus {
             DeviceState::WrongType(_) => {
                 "declared TideFS kernel control path exists but is not a character device"
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeSurfaceState {
+    NotWired,
+}
+
+impl RuntimeSurfaceState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotWired => "not-wired",
+        }
+    }
+
+    fn is_wired(self) -> bool {
+        match self {
+            Self::NotWired => false,
         }
     }
 }
@@ -193,6 +235,15 @@ fn print_plain(report: &KernelControlStatus) {
     println!("device_state: {}", report.device_state.label());
     println!("device_kind: {}", report.device_state.kind_label());
     println!(
+        "runtime_inventory_source: {}",
+        report.runtime_inventory_source
+    );
+    println!("status_is_passive: {}", report.status_is_passive());
+    println!(
+        "control_endpoint_opened: {}",
+        report.control_endpoint_opened
+    );
+    println!(
         "control_device_present: {}",
         report.control_device_present()
     );
@@ -206,6 +257,22 @@ fn print_plain(report: &KernelControlStatus) {
     println!(
         "owner_manifest_authority: {}",
         report.owner_manifest_authority
+    );
+    println!(
+        "tidefs_owned_kthreads: {}",
+        report.tidefs_owned_kthreads.label()
+    );
+    println!(
+        "tidefs_owned_kthreads_wired: {}",
+        report.tidefs_owned_kthreads.is_wired()
+    );
+    println!(
+        "tidefs_owned_workqueues: {}",
+        report.tidefs_owned_workqueues.label()
+    );
+    println!(
+        "tidefs_owned_workqueues_wired: {}",
+        report.tidefs_owned_workqueues.is_wired()
     );
     println!("message: {}", report.message());
 }
@@ -222,9 +289,19 @@ mod tests {
         let report = KernelControlStatus::probe(&missing);
 
         assert_eq!(report.device_state, DeviceState::Missing);
+        assert_eq!(report.runtime_inventory_source, RUNTIME_INVENTORY_SOURCE);
+        assert!(report.status_is_passive());
+        assert!(!report.control_endpoint_opened);
         assert!(!report.production_uapi_wired);
         assert!(!report.mutating_ioctls_issued);
         assert!(!report.owner_manifest_authority);
+        assert_eq!(report.tidefs_owned_kthreads, RuntimeSurfaceState::NotWired);
+        assert_eq!(
+            report.tidefs_owned_workqueues,
+            RuntimeSurfaceState::NotWired
+        );
+        assert!(!report.tidefs_owned_kthreads.is_wired());
+        assert!(!report.tidefs_owned_workqueues.is_wired());
         assert!(!report.control_device_present());
         assert!(!report.control_device_character());
         assert!(!report.control_uapi_usable());
@@ -242,12 +319,19 @@ mod tests {
         assert_eq!(json["probe_completed"], true);
         assert_eq!(json["control_device"], missing.display().to_string());
         assert_eq!(json["device_state"], "missing");
+        assert_eq!(json["runtime_inventory_source"], RUNTIME_INVENTORY_SOURCE);
+        assert_eq!(json["status_is_passive"], true);
+        assert_eq!(json["control_endpoint_opened"], false);
         assert_eq!(json["control_device_present"], false);
         assert_eq!(json["control_device_character"], false);
         assert_eq!(json["production_uapi_wired"], false);
         assert_eq!(json["control_uapi_usable"], false);
         assert_eq!(json["mutating_ioctls_issued"], false);
         assert_eq!(json["owner_manifest_authority"], false);
+        assert_eq!(json["tidefs_owned_kthreads"], "not-wired");
+        assert_eq!(json["tidefs_owned_kthreads_wired"], false);
+        assert_eq!(json["tidefs_owned_workqueues"], "not-wired");
+        assert_eq!(json["tidefs_owned_workqueues_wired"], false);
     }
 
     #[test]
@@ -267,6 +351,9 @@ mod tests {
         assert!(report.control_device_present());
         assert!(!report.control_device_character());
         assert!(!report.control_uapi_usable());
+        assert!(report.status_is_passive());
+        assert!(!report.tidefs_owned_kthreads.is_wired());
+        assert!(!report.tidefs_owned_workqueues.is_wired());
     }
 
     #[test]
@@ -284,5 +371,9 @@ mod tests {
         assert!(report.control_device_present());
         assert!(report.control_device_character());
         assert!(!report.control_uapi_usable());
+        assert!(report.status_is_passive());
+        assert!(!report.control_endpoint_opened);
+        assert!(!report.tidefs_owned_kthreads.is_wired());
+        assert!(!report.tidefs_owned_workqueues.is_wired());
     }
 }
