@@ -878,7 +878,7 @@ pub mod device_health;
 pub mod parity_raid;
 pub mod pool_label;
 
-pub use device::{DeviceClass, DeviceConfig, DeviceKind, IoClass as DeviceIoClass};
+pub use device::{DeviceBacking, DeviceClass, DeviceConfig, DeviceKind, IoClass as DeviceIoClass};
 pub use device_layout::{
     recommend_segment_size, DeviceClassPolicy, DeviceLayoutStats, DeviceMediaClass, WriteAllocator,
 };

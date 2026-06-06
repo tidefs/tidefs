@@ -376,10 +376,10 @@ use tidefs_dataset_lifecycle::{
 use tidefs_dataset_properties::PropertySet;
 use tidefs_extent_map::ExtentAllocator;
 use tidefs_local_object_store::{
-    device_layout::DeviceMediaClass, CompressionConfig, CrashInjectionPoint, DeviceClass,
-    DeviceConfig, DeviceIoClass, DeviceKind, EncryptionConfig, IntegrityDigest64, IoClass,
-    LocalObjectStore, ObjectKey, Pool, PoolConfig, PoolProperties, StoreEncryptionKey, StoreError,
-    StoreOptions,
+    device_layout::DeviceMediaClass, CompressionConfig, CrashInjectionPoint, DeviceBacking,
+    DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, EncryptionConfig, IntegrityDigest64,
+    IoClass, LocalObjectStore, ObjectKey, Pool, PoolConfig, PoolProperties, StoreEncryptionKey,
+    StoreError, StoreOptions,
 };
 use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
 use tidefs_quorum_write_runtime::{QuorumConfig, QuorumObjectStore};
@@ -2035,6 +2035,7 @@ impl LocalFileSystem {
         let mut devices = vec![DeviceConfig {
             media_class: DeviceMediaClass::Ssd,
             path: root.to_path_buf(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             class: DeviceClass::Data,
             kind: DeviceKind::Single {
                 path: root.to_path_buf(),
@@ -2051,6 +2052,7 @@ impl LocalFileSystem {
                 DeviceConfig {
                     media_class: DeviceMediaClass::Ssd,
                     path: log_device_path.to_path_buf(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::IntentLog,
                     kind: DeviceKind::LogDevice {
                         path: log_device_path.to_path_buf(),
@@ -2080,9 +2082,11 @@ impl LocalFileSystem {
     ) -> Result<Pool> {
         let mut devices: Vec<DeviceConfig> = Vec::with_capacity(block_devices.len());
         for dev_path in block_devices.iter() {
+            let backing = Self::byte_addressable_device_backing(dev_path)?;
             devices.push(DeviceConfig {
                 media_class: DeviceMediaClass::Ssd,
                 path: dev_path.clone(),
+                backing,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Block {
                     path: dev_path.clone(),
@@ -2097,6 +2101,21 @@ impl LocalFileSystem {
             devices,
         };
         Ok(Pool::create(config, PoolProperties::default(), options)?)
+    }
+
+    fn byte_addressable_device_backing(path: &std::path::Path) -> Result<DeviceBacking> {
+        match tidefs_pool_scan::classify_pool_device_backing(path).map_err(|source| {
+            FileSystemError::Store(StoreError::Io {
+                operation: "pool_device_backing",
+                path: path.to_path_buf(),
+                source,
+            })
+        })? {
+            tidefs_pool_scan::PoolDeviceBacking::BlockDevice => Ok(DeviceBacking::BlockDevice),
+            tidefs_pool_scan::PoolDeviceBacking::RegularFileDev => {
+                Ok(DeviceBacking::RegularFileDev)
+            }
+        }
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -2337,7 +2356,7 @@ impl LocalFileSystem {
         )
     }
 
-    /// Attempt to open a directory-backed filesystem with encryption enabled.
+    /// Attempt to open a compatibility directory-store filesystem with encryption enabled.
     ///
     /// Currently fails closed until TFR-006 raw-store bypasses are removed or
     /// proven raw-only for mounted filesystem operation.

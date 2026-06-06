@@ -619,7 +619,7 @@ impl ExportOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{DeviceClass, DeviceConfig, DeviceKind};
+    use crate::device::{DeviceBacking, DeviceClass, DeviceConfig, DeviceKind};
     use crate::pool_label::{seal_label, PoolLabelV1, POOL_LABEL_MAGIC};
 
     #[test]
@@ -637,6 +637,7 @@ mod tests {
         let config = DeviceConfig {
             media_class: Default::default(),
             path: dir.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             class: DeviceClass::Data,
             kind: DeviceKind::Single { path: dir.clone() },
             compression: None,
@@ -753,6 +754,7 @@ mod tests {
         let config = DeviceConfig {
             media_class: Default::default(),
             path: dir.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             class: DeviceClass::Data,
             kind: DeviceKind::Single { path: dir.clone() },
             compression: None,
@@ -833,6 +835,7 @@ mod tests {
         let config = DeviceConfig {
             media_class: Default::default(),
             path: dir.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             class: DeviceClass::Data,
             kind: DeviceKind::Single { path: dir.clone() },
             compression: None,
@@ -915,6 +918,7 @@ mod tests {
         let config = DeviceConfig {
             media_class: Default::default(),
             path: dir.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             class: DeviceClass::Data,
             kind: DeviceKind::Single { path: dir.clone() },
             compression: None,
@@ -992,6 +996,7 @@ mod tests {
         let config = DeviceConfig {
             media_class: Default::default(),
             path: dir.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             class: DeviceClass::Data,
             kind: DeviceKind::Single { path: dir.clone() },
             compression: None,
@@ -1122,6 +1127,7 @@ mod tests {
         let config = DeviceConfig {
             media_class: Default::default(),
             path: dir.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             class: DeviceClass::Data,
             kind: DeviceKind::Single { path: dir.clone() },
             compression: None,
@@ -1168,6 +1174,7 @@ mod tests {
         let config = DeviceConfig {
             media_class: Default::default(),
             path: dir.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             class: DeviceClass::Data,
             kind: DeviceKind::Single { path: dir.clone() },
             compression: None,

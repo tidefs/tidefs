@@ -25,8 +25,8 @@ use tidefs_types_pool_label_core::{
 };
 
 use crate::device::{
-    Device, DeviceClass, DeviceConfig, DeviceImpl, DeviceKind, DeviceState, DeviceStats,
-    DeviceStatus, IoClass,
+    Device, DeviceBacking, DeviceClass, DeviceConfig, DeviceImpl, DeviceKind, DeviceState,
+    DeviceStats, DeviceStatus, IoClass,
 };
 use crate::device_health::{DeviceHealth, DeviceHealthState, DeviceHealthTransition};
 use crate::device_layout::{
@@ -462,8 +462,9 @@ impl Pool {
         for vc in &config.devices {
             let device_root = device_root_path(vc);
 
-            // Block devices have labels at fixed offset 0, not in label files.
-            let buf = if matches!(vc.kind, DeviceKind::Block { .. }) {
+            // Byte-addressable pool members have labels at fixed offset 0,
+            // not in compatibility directory label files.
+            let buf = if vc.backing.uses_fixed_offset_pool_labels() {
                 match fs::File::open(&device_root) {
                     Ok(mut f) => {
                         use std::io::Read;
@@ -579,14 +580,14 @@ impl Pool {
 
         // root_path must be a directory for Pool::open to function
         // (it holds device subdirectories and label files).
-        // Block-device-backed pools always use Pool::create, not Pool::open.
+        // Byte-addressable pools always use Pool::create/import by device
+        // paths, not a directory root.
         if !config.root_path.is_dir() {
-            // If all devices are block devices, skip the directory check.
-            let all_block = config
+            let all_byte_addressable = config
                 .devices
                 .iter()
-                .all(|vc| matches!(vc.kind, DeviceKind::Block { .. }));
-            if !all_block {
+                .all(|vc| vc.backing.is_byte_addressable_pool_member());
+            if !all_byte_addressable {
                 return Err(StoreError::Io {
                     operation: "pool_open",
                     path: config.root_path.clone(),
@@ -1146,6 +1147,7 @@ impl Pool {
 
     /// Add a device to the running pool.
     pub fn add_device(&mut self, config: DeviceConfig, options: &StoreOptions) -> Result<()> {
+        let config_for_record = config.clone();
         let mut dev_opts = options.clone();
         dev_opts.max_segment_bytes = config.media_class.default_segment_size();
         let device = open_single_device(&config, &dev_opts)?;
@@ -1165,6 +1167,7 @@ impl Pool {
             .collect();
         self.write_allocator = WriteAllocator::new(self.media_classes.clone(), total_bytes);
         self.health = compute_health(&self.devices);
+        self.config.devices.push(config_for_record);
         self.record_health_transitions();
         Ok(())
     }
@@ -1188,30 +1191,8 @@ impl Pool {
         // have a label yet, so we generate one).
         let new_device_guid: [u8; 16] = rand::random();
 
-        // Collect existing device configs for label updates.
-        let existing_configs: Vec<DeviceConfig> = self
-            .devices
-            .iter()
-            .map(|d| DeviceConfig {
-                path: d.root().to_path_buf(),
-                media_class: Default::default(),
-                class: self
-                    .classes
-                    .get(
-                        self.devices
-                            .iter()
-                            .position(|v| v.root() == d.root())
-                            .unwrap_or(0),
-                    )
-                    .copied()
-                    .unwrap_or(DeviceClass::Data),
-                kind: DeviceKind::Single {
-                    path: d.root().to_path_buf(),
-                },
-                compression: None,
-                encryption: None,
-            })
-            .collect();
+        // Preserve explicit media identity while writing updated labels.
+        let existing_configs = self.config.devices.clone();
 
         // Add the device in-memory first.
         self.add_device(config.clone(), options)?;
@@ -1261,28 +1242,7 @@ impl Pool {
                 reason: "faulted device GUID not found in pool",
             })?;
 
-        // Collect existing device configs.
-        let existing_configs: Vec<DeviceConfig> = self
-            .devices
-            .iter()
-            .map(|d| {
-                let idx = self
-                    .devices
-                    .iter()
-                    .position(|v| v.root() == d.root())
-                    .unwrap_or(0);
-                DeviceConfig {
-                    path: d.root().to_path_buf(),
-                    media_class: Default::default(),
-                    class: self.classes.get(idx).copied().unwrap_or(DeviceClass::Data),
-                    kind: DeviceKind::Single {
-                        path: d.root().to_path_buf(),
-                    },
-                    compression: None,
-                    encryption: None,
-                }
-            })
-            .collect();
+        let existing_configs = self.config.devices.clone();
 
         // Delegate to DeviceManager for label persistence.
         let request = crate::device_manager::SpareActivationRequest {
@@ -1594,6 +1554,9 @@ impl Pool {
 
         // Swap the device in the pool list (old out, new in).
         let _old_device = std::mem::replace(&mut self.devices[idx], new_device);
+        if idx < self.config.devices.len() {
+            self.config.devices[idx] = new_config.clone();
+        }
         // Update device GUID for the replacement.
         if idx < self.device_guids.len() {
             self.device_guids[idx] = rand::random();
@@ -1652,6 +1615,7 @@ impl Pool {
         // Re-open the old device if possible.
         let old_config = DeviceConfig {
             path: replacement.old_path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             media_class: Default::default(),
             class: self.classes[replacement.device_index],
             kind: DeviceKind::Single {
@@ -2332,13 +2296,58 @@ fn open_devices(configs: &[DeviceConfig], options: &StoreOptions) -> Result<Vec<
 
 fn open_single_device(config: &DeviceConfig, options: &StoreOptions) -> Result<Device> {
     let device = match &config.kind {
-        DeviceKind::Single { path } => Device::open_single(path, options.clone()),
-        DeviceKind::Mirror { paths } => Device::open_mirror(paths, options),
-        DeviceKind::LogDevice { path } => Device::open_log_device(path, options.clone()),
-        DeviceKind::ParityRaid1 { paths } => Device::open_parity_raid1(paths, options),
-        DeviceKind::ParityRaid2 { paths } => Device::open_parity_raid2(paths, options),
-        DeviceKind::ParityRaid3 { paths } => Device::open_parity_raid3(paths, options),
-        DeviceKind::Block { path } => Device::open_single_block(path, options.clone()),
+        DeviceKind::Single { path } => {
+            if config.backing != DeviceBacking::DirectoryObjectStoreCompat {
+                return Err(StoreError::InvalidOptions {
+                    reason:
+                        "DeviceKind::Single requires directory object-store compatibility backing",
+                });
+            }
+            Device::open_single(path, options.clone())
+        }
+        DeviceKind::Mirror { paths } => {
+            require_directory_compat_backing(
+                config.backing,
+                "DeviceKind::Mirror requires directory object-store compatibility backing",
+            )?;
+            Device::open_mirror(paths, options)
+        }
+        DeviceKind::LogDevice { path } => {
+            require_directory_compat_backing(
+                config.backing,
+                "DeviceKind::LogDevice requires directory object-store compatibility backing",
+            )?;
+            Device::open_log_device(path, options.clone())
+        }
+        DeviceKind::ParityRaid1 { paths } => {
+            require_directory_compat_backing(
+                config.backing,
+                "DeviceKind::ParityRaid1 requires directory object-store compatibility backing",
+            )?;
+            Device::open_parity_raid1(paths, options)
+        }
+        DeviceKind::ParityRaid2 { paths } => {
+            require_directory_compat_backing(
+                config.backing,
+                "DeviceKind::ParityRaid2 requires directory object-store compatibility backing",
+            )?;
+            Device::open_parity_raid2(paths, options)
+        }
+        DeviceKind::ParityRaid3 { paths } => {
+            require_directory_compat_backing(
+                config.backing,
+                "DeviceKind::ParityRaid3 requires directory object-store compatibility backing",
+            )?;
+            Device::open_parity_raid3(paths, options)
+        }
+        DeviceKind::Block { path } => {
+            if !config.backing.is_byte_addressable_pool_member() {
+                return Err(StoreError::InvalidOptions {
+                    reason: "DeviceKind::Block requires block-device or regular-file backing",
+                });
+            }
+            Device::open_single_block(path, options.clone())
+        }
     }?;
     // Place compression outside encryption so writes compress plaintext first,
     // then encrypt the compressed frame before it reaches raw storage.
@@ -2351,6 +2360,14 @@ fn open_single_device(config: &DeviceConfig, options: &StoreOptions) -> Result<D
         Ok(Device::open_compressed(device, comp_cfg.clone()))
     } else {
         Ok(device)
+    }
+}
+
+fn require_directory_compat_backing(backing: DeviceBacking, reason: &'static str) -> Result<()> {
+    if backing == DeviceBacking::DirectoryObjectStoreCompat {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidOptions { reason })
     }
 }
 
@@ -2482,12 +2499,37 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: data_dir },
                 encryption: None,
                 compression: None,
             }],
         }
+    }
+
+    #[test]
+    fn block_device_kind_requires_byte_addressable_backing() {
+        let root = temp_dir("block-backing-mismatch");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("pool.img");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(2 * 1024 * 1024).unwrap();
+
+        let config = DeviceConfig {
+            media_class: Default::default(),
+            path: path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Block { path },
+            encryption: None,
+            compression: None,
+        };
+
+        let err = open_single_device(&config, &test_options()).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidOptions { reason } if reason.contains("Block")));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ------------------------------------------------------------------
@@ -2551,6 +2593,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: data_dir },
                 encryption: None,
@@ -2579,6 +2622,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: data_dir },
                 encryption: None,
@@ -2607,6 +2651,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: data_dir },
                 encryption: None,
@@ -2638,6 +2683,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d0.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d0 },
                     encryption: None,
@@ -2646,6 +2692,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d1.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d1 },
                     encryption: None,
@@ -2654,6 +2701,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d2.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d2 },
                     encryption: None,
@@ -2709,6 +2757,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d0.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d0 },
                     encryption: None,
@@ -2717,6 +2766,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d1.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d1 },
                     encryption: None,
@@ -2725,6 +2775,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d2.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d2 },
                     encryption: None,
@@ -2773,6 +2824,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d0.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d0 },
                     encryption: None,
@@ -2781,6 +2833,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d1.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d1 },
                     encryption: None,
@@ -2789,6 +2842,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d2.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d2 },
                     encryption: None,
@@ -2829,6 +2883,7 @@ mod tests {
             DeviceConfig {
                 media_class: Default::default(),
                 path: new_path.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: new_path },
                 encryption: None,
@@ -2853,6 +2908,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single {
                     path: data_dir.clone(),
@@ -2882,6 +2938,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d1.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d1.clone() },
                     encryption: None,
@@ -2890,6 +2947,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d2.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d2.clone() },
                     encryption: None,
@@ -2944,6 +3002,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: d1.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d1.clone() },
                 encryption: None,
@@ -2972,6 +3031,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d1.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d1.clone() },
                     encryption: None,
@@ -2980,6 +3040,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d2.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d2.clone() },
                     encryption: None,
@@ -2988,6 +3049,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d3.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d3.clone() },
                     encryption: None,
@@ -3069,6 +3131,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d1.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d1.clone() },
                     encryption: None,
@@ -3077,6 +3140,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: d2.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: d2.clone() },
                     encryption: None,
@@ -3155,6 +3219,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: d1.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d1.clone() },
                 encryption: None,
@@ -3171,6 +3236,7 @@ mod tests {
             DeviceConfig {
                 media_class: Default::default(),
                 path: d2.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d2.clone() },
                 encryption: None,
@@ -3207,6 +3273,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: d1.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d1.clone() },
                 encryption: None,
@@ -3221,6 +3288,7 @@ mod tests {
             DeviceConfig {
                 media_class: Default::default(),
                 path: d2.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d2.clone() },
                 encryption: None,
@@ -3236,6 +3304,7 @@ mod tests {
             DeviceConfig {
                 media_class: Default::default(),
                 path: d3.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d3.clone() },
                 encryption: None,
@@ -3260,6 +3329,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: d1.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d1.clone() },
                 encryption: None,
@@ -3273,6 +3343,7 @@ mod tests {
             DeviceConfig {
                 media_class: Default::default(),
                 path: d2.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d2 },
                 encryption: None,
@@ -3300,6 +3371,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: d1.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d1.clone() },
                 encryption: None,
@@ -3317,6 +3389,7 @@ mod tests {
             DeviceConfig {
                 media_class: Default::default(),
                 path: d2.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d2.clone() },
                 encryption: None,
@@ -3352,6 +3425,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: d1.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d1.clone() },
                 encryption: None,
@@ -3369,6 +3443,7 @@ mod tests {
             DeviceConfig {
                 media_class: Default::default(),
                 path: d2.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: d2.clone() },
                 encryption: None,
@@ -3612,6 +3687,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: log_dir.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::IntentLog,
                     kind: DeviceKind::Single { path: log_dir },
                     encryption: None,
@@ -3620,6 +3696,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: data_dir.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: data_dir },
                     encryption: None,
@@ -3657,6 +3734,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: data_dir },
                 encryption: None,
@@ -3692,6 +3770,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: log_dir.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::IntentLog,
                     kind: DeviceKind::Single {
                         path: log_dir.clone(),
@@ -3702,6 +3781,7 @@ mod tests {
                 DeviceConfig {
                     media_class: Default::default(),
                     path: data_dir.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single { path: data_dir },
                     encryption: None,
@@ -3732,6 +3812,7 @@ mod tests {
         let log2_config = DeviceConfig {
             media_class: Default::default(),
             path: log2_dir.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             class: DeviceClass::IntentLog,
             kind: DeviceKind::Single { path: log2_dir },
             encryption: None,
@@ -3765,6 +3846,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: Default::default(),
                 path: first,
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::ParityRaid1 { paths },
                 encryption: None,
@@ -3973,6 +4055,7 @@ mod tests {
                 devices: vec![DeviceConfig {
                     media_class: Default::default(),
                     path: root.join("device0"),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single {
                         path: root.join("device0"),
@@ -4003,6 +4086,7 @@ mod tests {
                 devices: vec![DeviceConfig {
                     media_class: Default::default(),
                     path: root.join("device0"),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single {
                         path: root.join("device0"),
@@ -4039,6 +4123,7 @@ mod tests {
                 devices: vec![DeviceConfig {
                     media_class: Default::default(),
                     path: root.join("device0"),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single {
                         path: root.join("device0"),
@@ -4080,6 +4165,7 @@ mod tests {
                 devices: vec![DeviceConfig {
                     media_class: Default::default(),
                     path: root.join("device0"),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     class: DeviceClass::Data,
                     kind: DeviceKind::Single {
                         path: root.join("device0"),
@@ -4352,6 +4438,7 @@ mod tests {
             devices: vec![
                 DeviceConfig {
                     path: hdd_path.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     media_class: DeviceMediaClass::Hdd,
                     class: DeviceClass::Metadata,
                     kind: DeviceKind::Single { path: hdd_path },
@@ -4360,6 +4447,7 @@ mod tests {
                 },
                 DeviceConfig {
                     path: nvme_path.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
                     media_class: DeviceMediaClass::Nvme,
                     class: DeviceClass::Metadata,
                     kind: DeviceKind::Single { path: nvme_path },
@@ -4405,6 +4493,7 @@ mod tests {
             root_path: root.clone(),
             devices: vec![DeviceConfig {
                 path: hdd_path.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 media_class: DeviceMediaClass::Hdd,
                 class: DeviceClass::Metadata,
                 kind: DeviceKind::Single { path: hdd_path },
@@ -4441,6 +4530,7 @@ mod tests {
             devices: vec![DeviceConfig {
                 media_class: DeviceMediaClass::Ssd,
                 path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
                 class: DeviceClass::Data,
                 kind: DeviceKind::Single { path: data_dir },
                 encryption: Some(enc_cfg),

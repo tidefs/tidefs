@@ -888,6 +888,51 @@ fn read_sysfs_u8(dir: &Path, rel_path: &str) -> Option<u8> {
         .and_then(|s| s.trim().parse::<u8>().ok())
 }
 
+/// Byte-addressable backing accepted for TideFS pool-member paths.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoolDeviceBacking {
+    /// Production block-device backing.
+    BlockDevice,
+    /// Explicit regular-file development backing.
+    RegularFileDev,
+}
+
+impl PoolDeviceBacking {
+    /// Human-readable media name for CLI and diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockDevice => "block-device",
+            Self::RegularFileDev => "regular-file-dev",
+        }
+    }
+}
+
+/// Classify a user-supplied pool device path.
+///
+/// Pool members must be byte-addressable media: production block devices or
+/// regular files used explicitly for development. Directory object stores are
+/// compatibility stores, not pool-member media.
+pub fn classify_pool_device_backing(path: &Path) -> Result<PoolDeviceBacking, std::io::Error> {
+    let meta = std::fs::metadata(path)?;
+    let file_type = meta.file_type();
+    if file_type.is_block_device() {
+        return Ok(PoolDeviceBacking::BlockDevice);
+    }
+    if meta.is_file() {
+        return Ok(PoolDeviceBacking::RegularFileDev);
+    }
+    let reason = if meta.is_dir() {
+        "pool device path is a directory; use a block device or regular file"
+    } else {
+        "pool device path is not a block device or regular file"
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        reason,
+    ))
+}
+
 /// Get the capacity of a block device or regular file in bytes.
 ///
 /// For Linux block devices, uses the `BLKGETSIZE64` ioctl to query the
@@ -897,9 +942,9 @@ fn read_sysfs_u8(dir: &Path, rel_path: &str) -> Option<u8> {
 /// The returned value is the usable byte capacity.  Labels and the
 /// commit-record region are written within this capacity.
 pub fn device_capacity_bytes(path: &Path) -> Result<u64, std::io::Error> {
-    let meta = std::fs::metadata(path)?;
-    if !meta.file_type().is_block_device() {
-        return Ok(meta.len());
+    match classify_pool_device_backing(path)? {
+        PoolDeviceBacking::RegularFileDev => return Ok(std::fs::metadata(path)?.len()),
+        PoolDeviceBacking::BlockDevice => {}
     }
     // Block device: use BLKGETSIZE64 ioctl on Linux.
     let capacity = blkgetsize64_from_path(path).unwrap_or(0);
@@ -909,7 +954,7 @@ pub fn device_capacity_bytes(path: &Path) -> Result<u64, std::io::Error> {
     // ioctl failed or returned zero — fall back to metadata (will be 0
     // for block special files, which is correct: an unreadable device
     // reports 0 and will be rejected by the caller's size check).
-    Ok(meta.len())
+    Ok(std::fs::metadata(path)?.len())
 }
 
 #[cfg(target_os = "linux")]
@@ -3384,12 +3429,27 @@ mod tests {
         }
         let size = device_capacity_bytes(&file_path).unwrap();
         assert_eq!(size, expected_size);
+        assert_eq!(
+            classify_pool_device_backing(&file_path).unwrap(),
+            PoolDeviceBacking::RegularFileDev
+        );
     }
 
     #[test]
     fn device_capacity_bytes_nonexistent() {
         let result = device_capacity_bytes(&PathBuf::from("/nonexistent/path/for/testing"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn device_capacity_bytes_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = device_capacity_bytes(dir.path());
+        assert!(result.is_err());
+
+        let err = classify_pool_device_backing(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("directory"));
     }
 
     #[test]

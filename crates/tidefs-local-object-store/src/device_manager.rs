@@ -11,9 +11,10 @@
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
-use crate::device::{DeviceClass as DeviceDeviceClass, DeviceConfig};
+use crate::device::{DeviceBacking, DeviceClass as DeviceDeviceClass, DeviceConfig};
 use crate::pool_label::{
     decode_label, encode_label, features, seal_label, LabelDeviceClass, PoolLabelV1,
     POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
@@ -342,7 +343,7 @@ impl DeviceManager {
     /// Write a label to a single device.
     fn write_single_device_label(request: LabelWriteRequest<'_>) -> Result<()> {
         let class = Self::map_device_class(request.device_config.class);
-        let capacity = Self::get_device_capacity(&request.device_config.path)?;
+        let capacity = Self::get_device_capacity(request.device_config)?;
 
         let label = PoolLabelV1 {
             magic: crate::pool_label::POOL_LABEL_MAGIC,
@@ -707,17 +708,38 @@ impl DeviceManager {
         }
     }
 
-    fn get_device_capacity(path: &Path) -> Result<u64> {
-        if path.is_dir() {
+    fn get_device_capacity(config: &DeviceConfig) -> Result<u64> {
+        let path = &config.path;
+        if config.backing == DeviceBacking::DirectoryObjectStoreCompat {
             Ok(1024u64 * 1024 * 1024 * 1024) // 1 TiB placeholder
         } else {
-            let metadata = fs::metadata(path).map_err(|e| StoreError::Io {
+            Self::get_byte_device_capacity(path).map_err(|e| StoreError::Io {
                 operation: "dm_get_capacity",
                 path: path.to_path_buf(),
                 source: e,
-            })?;
-            Ok(metadata.len())
+            })
         }
+    }
+
+    fn get_byte_device_capacity(path: &Path) -> std::io::Result<u64> {
+        let metadata = fs::metadata(path)?;
+        let file_type = metadata.file_type();
+        if metadata.is_file() {
+            return Ok(metadata.len());
+        }
+        if file_type.is_block_device() {
+            let mut file = fs::File::open(path)?;
+            return file.seek(SeekFrom::End(0));
+        }
+        let reason = if metadata.is_dir() {
+            "pool device path is a directory; use a block device or regular file"
+        } else {
+            "pool device path is not a block device or regular file"
+        };
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            reason,
+        ))
     }
 }
 
@@ -728,7 +750,7 @@ impl DeviceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{DeviceClass, DeviceConfig, DeviceKind};
+    use crate::device::{DeviceBacking, DeviceClass, DeviceConfig, DeviceKind};
 
     fn temp_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -749,6 +771,7 @@ mod tests {
         DeviceConfig {
             media_class: Default::default(),
             path: path.to_path_buf(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
             class: DeviceClass::Data,
             kind: DeviceKind::Single {
                 path: path.to_path_buf(),

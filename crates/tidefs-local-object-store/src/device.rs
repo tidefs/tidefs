@@ -3,7 +3,8 @@
 //! This module implements the device abstraction layer that sits between the
 //! raw `LocalObjectStore` and the pool. It provides:
 //!
-//! - `SingleDevice`: a single backing directory via one `LocalObjectStore`
+//! - `SingleDevice`: one compatibility directory store or one byte-addressable
+//!   block/file store via `LocalObjectStore`
 //! - `MirrorDevice`: N-way mirror that fans writes to all members and retries reads
 //!   from the first healthy member
 //! - `DeviceImpl` trait: the common interface every device satisfies
@@ -74,11 +75,54 @@ pub enum IoClass {
 // Device configuration
 // ---------------------------------------------------------------------------
 
+/// Backing media model for a configured device.
+///
+/// Product pool members are byte-addressable media: production block devices
+/// or regular files used explicitly for development. Directory object stores
+/// remain compatibility helpers for tests and old local paths; they are not a
+/// user-admitted pool-device backing model.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DeviceBacking {
+    /// Compatibility directory object-store layout.
+    #[default]
+    DirectoryObjectStoreCompat,
+    /// Production block-device backing.
+    BlockDevice,
+    /// Explicit regular-file development backing.
+    RegularFileDev,
+}
+
+impl DeviceBacking {
+    /// Whether this backing is a product pool-member byte device.
+    #[must_use]
+    pub const fn is_byte_addressable_pool_member(self) -> bool {
+        matches!(self, Self::BlockDevice | Self::RegularFileDev)
+    }
+
+    /// Whether pool labels live at fixed byte offsets on the backing.
+    #[must_use]
+    pub const fn uses_fixed_offset_pool_labels(self) -> bool {
+        self.is_byte_addressable_pool_member()
+    }
+
+    /// Human-readable media name for operator diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectoryObjectStoreCompat => "directory-object-store-compat",
+            Self::BlockDevice => "block-device",
+            Self::RegularFileDev => "regular-file-dev",
+        }
+    }
+}
+
 /// Configuration for a single device.
 #[derive(Clone, Debug)]
 pub struct DeviceConfig {
-    /// Root path for this device's backing directory.
+    /// Root path or byte-addressable path for this device backing.
     pub path: PathBuf,
+    /// Explicit backing media model for this device.
+    pub backing: DeviceBacking,
     /// Device class assignment.
     pub class: DeviceClass,
     /// Physical device media class (NVMe, SSD, HDD, or DM device).
@@ -102,7 +146,7 @@ pub struct DeviceConfig {
 /// Physical layout kind of a device.
 #[derive(Clone, Debug)]
 pub enum DeviceKind {
-    /// Single directory-backed device.
+    /// Single compatibility directory object-store device.
     Single {
         path: PathBuf,
     },
@@ -126,8 +170,8 @@ pub enum DeviceKind {
     ParityRaid3 {
         paths: Vec<PathBuf>,
     },
-    /// Single block device (raw block-device-backed storage).
-    /// Objects are written sequentially to the device with no segment files.
+    /// Single byte-addressable block or regular-file development device.
+    /// Objects are written sequentially with no segment files.
     Block {
         path: PathBuf,
     },
@@ -443,8 +487,8 @@ impl SingleDevice {
     /// Open a block device as a SingleDevice.
     ///
     /// Uses [`LocalObjectStore::open_block_device`] instead of the
-    /// directory-backed segment-file store. All I/O goes directly
-    /// to the block device without segment files or directory operations.
+    /// directory object-store path. All I/O goes directly to the
+    /// byte-addressable backing without segment files or directory operations.
     pub fn open_block(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
         let store = LocalObjectStore::open_block_device(path, options)?;
         Ok(Self {
@@ -750,7 +794,7 @@ impl DeviceImpl for SingleDevice {
         }
 
         Err(StoreError::InvalidOptions {
-            reason: "directory-backed device discard is not a proven storage capability",
+            reason: "directory object-store compatibility does not support discard",
         })
     }
 
@@ -4042,7 +4086,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(p);
         }
         let mut device = Device::open_parity_raid1(&paths, &test_options()).unwrap();
-        // PARITY_RAID1 inherits the directory-backed child capability boundary.
+        // PARITY_RAID1 inherits the directory object-store child boundary.
         assert!(!device.supports_discard());
         assert!(matches!(
             device.discard_range(0, 4096),
@@ -4739,7 +4783,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Non-zero discard is unsupported for directory-backed devices.
+    /// Non-zero discard is unsupported for directory object-store compatibility.
     #[test]
     fn single_device_discard_range_nonzero_is_unsupported() {
         let dir = temp_path("discard-no-seg");
@@ -4772,7 +4816,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Directory-backed SingleDevice does not prove discard capability.
+    /// Directory object-store compatibility does not prove discard capability.
     #[test]
     fn single_device_supports_discard_is_false() {
         let dir = temp_path("discard-supports");

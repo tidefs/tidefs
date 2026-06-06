@@ -238,10 +238,11 @@ pub trait DeviceImpl {
 }
 ```
 
-On Linux, these are read from `/sys/block/<dev>/queue/{logical_block_size,physical_block_size,optimal_io_size}`.
-For file-backed devices (the current `Single` and `Mirror` variants on directory paths),
-the sector info is derived from the underlying filesystem's `statvfs.f_bsize` and
-the kernel's `io_opt` from `statx`.
+On Linux block devices, these are read from
+`/sys/block/<dev>/queue/{logical_block_size,physical_block_size,optimal_io_size}`.
+For regular-file development devices, the sector info is derived from the
+underlying filesystem's `statvfs.f_bsize` and the kernel's `io_opt` from
+`statx`.
 
 ### 2.4 Device-to-Alignment Mapping Table
 

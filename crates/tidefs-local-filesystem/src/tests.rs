@@ -46,6 +46,39 @@ fn cleanup(root: &Path) {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn block_device_pool_accepts_regular_file_dev_backing() {
+    let root = temp_root("regular-file-dev-pool");
+    fs::create_dir_all(&root).unwrap();
+    let image = root.join("pool.img");
+    let file = fs::File::create(&image).unwrap();
+    file.set_len(2 * 1024 * 1024).unwrap();
+
+    assert_eq!(
+        LocalFileSystem::byte_addressable_device_backing(&image).unwrap(),
+        DeviceBacking::RegularFileDev
+    );
+
+    let metadata_dir = root.join("metadata");
+    let mut pool = LocalFileSystem::block_device_pool(
+        &metadata_dir,
+        std::slice::from_ref(&image),
+        None,
+        None,
+        &StoreOptions::test_fast(),
+    )
+    .expect("regular-file dev backing should create a byte-addressable pool");
+
+    let key = ObjectKey::from_name(b"regular-file-dev-backing");
+    pool.put(DeviceIoClass::Data, key, b"ok").unwrap();
+    assert_eq!(
+        pool.get(DeviceIoClass::Data, key).unwrap(),
+        Some(b"ok".to_vec())
+    );
+
+    cleanup(&root);
+}
+
 fn assert_record_has_wall_clock_posix_times(record: &InodeRecord, before_ns: i64, after_ns: i64) {
     let timestamps = [
         record.posix_time.atime_ns,

@@ -651,21 +651,24 @@ categories side by side, and the status table is not authority by itself.
 
 Device add/remove, discard, and privacy semantics are still staged.
 
-Directory-backed device capacity in `device_manager.rs` still reports a 1 TiB
-placeholder. The default device discard operation is unsupported, but
-`SingleDevice::supports_discard()` returns true and `discard_range()` shells
-out to `fallocate -p` over segment files, silently skipping missing files,
-unsupported filesystems, or missing utilities. Segment reclaim performs a
-similar best-effort hole punch. Pool `discard_ranges()`, `free_blocks()`, and
-`trim_free_space()` can report requested bytes after successful best-effort
-dispatch, but that is not a media-remanence guarantee.
+Pool-member backing must be byte-addressable: block devices for production and
+regular files for hidden development mode. Directory `LocalObjectStore`
+compatibility is not a valid pool-member device mode. The default device
+discard operation is unsupported, and issues #14 and #16 make that boundary
+explicit: pool-device admission rejects directories, `DeviceConfig` carries
+the explicit backing kind, byte-addressable file and block devices share the
+fixed-offset label/single-segment object-store path, directory object-store
+compatibility no longer advertises discard, non-zero direct discard fails
+explicitly, and directory-only pool trim/free paths report zero bytes
+discarded. Segment reclaim still performs best-effort hole punching in the
+compatibility path, but that is not a media-remanence guarantee.
 
 The public local-filesystem `trim_blocks()` call simply forwards explicit byte
 ranges to the store's discard path. Compression and encryption wrappers forward
 discard ranges unchanged and say transforms do not affect TRIM byte ranges;
 that needs a privacy contract, because discard observability and remanence are
-different for plaintext, encrypted, compressed, sparse-file-backed, and block
-device-backed pools.
+different for plaintext, encrypted, compressed, regular-file-backed
+development pools, and block-device-backed production pools.
 
 `tidefsctl device remove` now imports pool config from labels and persists
 updated survivor labels, which is progress. The flow still opens a target
