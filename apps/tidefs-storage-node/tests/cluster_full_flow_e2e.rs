@@ -233,6 +233,7 @@ fn cluster_full_flow_create_lease_catalog_heal() {
             failure_domain: FailureDomain::for_node(1),
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
     let req2 = ClusterPoolCreateRequest {
         request_id: 1,
@@ -247,6 +248,7 @@ fn cluster_full_flow_create_lease_catalog_heal() {
             failure_domain: FailureDomain::for_node(2),
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
 
     send_cp01(&mut client, sid1, &ClusterPoolMessage::CreateRequest(req1));
@@ -479,6 +481,7 @@ fn cluster_no_lease_config_lifecycle() {
             failure_domain: FailureDomain::for_node(1),
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
     send_cp01(&mut client, sid, &ClusterPoolMessage::CreateRequest(req));
     let create_resp = recv_cp01(&mut client, sid, 100);
@@ -543,6 +546,7 @@ fn cluster_full_flow_mirror_create_and_verify() {
                 failure_domain: FailureDomain::for_node(node_id),
             }],
             placement: ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 },
+            allow_file_devices: true,
         };
         send_cp01(&mut client, sid, &ClusterPoolMessage::CreateRequest(req));
     }
@@ -657,6 +661,7 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
             failure_domain: FailureDomain::for_node(1),
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
     send_cp01(
         &mut client,
@@ -721,6 +726,7 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
             failure_domain: FailureDomain::for_node(1),
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
     send_cp01(
         &mut client2,
@@ -781,6 +787,7 @@ fn partition_fenced_node_refuses_writes_then_recovers() {
             failure_domain: FailureDomain::for_node(1),
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
     send_cp01(
         &mut client3,

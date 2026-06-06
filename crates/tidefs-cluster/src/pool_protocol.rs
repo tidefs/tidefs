@@ -88,6 +88,12 @@ pub struct ClusterPoolCreateRequest {
     pub node_devices: Vec<NodeDeviceSpec>,
     /// Redundancy/placement policy for the pool.
     pub placement: ClusterPlacementPolicy,
+    /// Permit regular files as explicit development media on the target node.
+    ///
+    /// Block devices are always allowed. Regular files are accepted only when
+    /// this is true; directory/object-store roots are never valid pool media.
+    #[serde(default)]
+    pub allow_file_devices: bool,
 }
 
 /// Specification for a single device to be initialized on a node.
@@ -536,6 +542,7 @@ impl ClusterPoolMessage {
                 target_node_id: node_id,
                 node_devices,
                 placement: config.placement,
+                allow_file_devices: config.allow_file_devices,
             });
         }
 
@@ -622,6 +629,7 @@ mod tests {
                 failure_domain: FailureDomain::for_node(7),
             }],
             placement: ClusterPlacementPolicy::Stripe,
+            allow_file_devices: false,
         });
 
         let encoded = msg.encode().unwrap();
@@ -754,6 +762,7 @@ mod tests {
             target_node_id: 1,
             node_devices: vec![],
             placement: ClusterPlacementPolicy::Stripe,
+            allow_file_devices: false,
         });
         let msg2 = msg1.clone();
 
@@ -829,6 +838,14 @@ mod tests {
         for req in &requests {
             assert_eq!(req.node_devices.len(), 1);
         }
+    }
+
+    #[test]
+    fn build_create_requests_preserves_file_device_opt_in() {
+        let config = make_three_node_config().with_file_devices_for_development(true);
+        let requests = ClusterPoolMessage::build_create_requests(&config, 101);
+
+        assert!(requests.iter().all(|req| req.allow_file_devices));
     }
 
     #[test]

@@ -186,6 +186,7 @@ mod tests {
             target_node_id: 5,
             node_devices: vec![],
             placement: ClusterPlacementPolicy::Stripe,
+            allow_file_devices: false,
         });
 
         transport.send(5, msg.clone()).unwrap();
@@ -205,6 +206,7 @@ mod tests {
             target_node_id: 1,
             node_devices: vec![],
             placement: ClusterPlacementPolicy::Stripe,
+            allow_file_devices: false,
         });
         let msg2 = ClusterPoolMessage::CreateRequest(ClusterPoolCreateRequest {
             request_id: 1,
@@ -213,6 +215,7 @@ mod tests {
             target_node_id: 2,
             node_devices: vec![],
             placement: ClusterPlacementPolicy::Stripe,
+            allow_file_devices: false,
         });
 
         transport.send(1, msg1.clone()).unwrap();

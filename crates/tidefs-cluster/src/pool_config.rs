@@ -257,6 +257,12 @@ pub struct ClusterPoolConfig {
     pub topology_generation: u64,
     /// Redundancy policy.
     pub redundancy: ClusterRedundancy,
+    /// Permit regular files as development pool media during cluster create.
+    ///
+    /// Production clustered pools use block devices. Regular files are
+    /// accepted only when the initiating operator explicitly enables this
+    /// development mode, matching local `pool create --file-devices`.
+    pub allow_file_devices: bool,
 }
 
 impl ClusterPoolConfig {
@@ -295,7 +301,15 @@ impl ClusterPoolConfig {
             total_capacity_bytes,
             topology_generation: 0,
             redundancy,
+            allow_file_devices: false,
         }
+    }
+
+    /// Return this config with explicit regular-file development media
+    /// enabled or disabled.
+    pub fn with_file_devices_for_development(mut self, allow: bool) -> Self {
+        self.allow_file_devices = allow;
+        self
     }
 
     /// Number of nodes participating in this pool.
@@ -461,6 +475,22 @@ mod tests {
         assert_eq!(config.device_count(), 3);
         assert_eq!(config.node_ids, vec![1, 2, 3]);
         assert_eq!(config.total_capacity_bytes, 3 * 1024 * 1024 * 1024);
+        assert!(!config.allow_file_devices);
+    }
+
+    #[test]
+    fn cluster_pool_config_file_devices_default_off_and_opt_in() {
+        let devices = vec![make_test_device(1, 0, 0)];
+        let config = ClusterPoolConfig::new(
+            [0xAF; 16],
+            "devmedia".into(),
+            devices,
+            ClusterPlacementPolicy::Stripe,
+        );
+        assert!(!config.allow_file_devices);
+
+        let config = config.with_file_devices_for_development(true);
+        assert!(config.allow_file_devices);
     }
 
     #[test]

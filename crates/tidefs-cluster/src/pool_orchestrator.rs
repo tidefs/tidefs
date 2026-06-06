@@ -181,6 +181,7 @@ impl ClusterPoolOrchestrator {
                     target_node_id: node_id,
                     node_devices,
                     placement: config.placement,
+                    allow_file_devices: config.allow_file_devices,
                 },
             );
         }
@@ -492,6 +493,14 @@ mod tests {
         assert_eq!(requests[&20].node_devices.len(), 2);
         assert_eq!(requests[&10].target_node_id, 10);
         assert_eq!(requests[&20].target_node_id, 20);
+    }
+
+    #[test]
+    fn build_create_requests_preserves_file_device_opt_in() {
+        let config = make_three_node_config().with_file_devices_for_development(true);
+        let requests = ClusterPoolOrchestrator::build_create_requests(&config, 7);
+
+        assert!(requests.values().all(|req| req.allow_file_devices));
     }
 
     // -- build_import_requests tests --

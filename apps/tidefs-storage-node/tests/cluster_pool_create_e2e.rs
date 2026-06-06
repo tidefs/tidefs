@@ -221,6 +221,7 @@ fn cluster_pool_create_two_nodes_both_succeed() {
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
     let req2 = ClusterPoolCreateRequest {
         request_id: 1,
@@ -242,6 +243,7 @@ fn cluster_pool_create_two_nodes_both_succeed() {
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
 
     let resp1 = send_create_request(&mut client, sid1, &req1);
@@ -337,6 +339,7 @@ fn cluster_pool_create_duplicate_device_rejected() {
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
     let resp1 = send_create_request(&mut client, sid1, &req);
     assert!(
@@ -366,6 +369,7 @@ fn cluster_pool_create_duplicate_device_rejected() {
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
     let resp2 = send_create_request(&mut client, sid1, &req2);
     assert!(!resp2.success, "second create on same device must fail");
@@ -418,6 +422,7 @@ fn cluster_pool_create_partial_success_one_node_rejects() {
                 },
             }],
             placement: ClusterPlacementPolicy::Stripe,
+            allow_file_devices: true,
         };
         let resp_pre = send_create_request(&mut client, sid2, &req_pre);
         assert!(
@@ -448,6 +453,7 @@ fn cluster_pool_create_partial_success_one_node_rejects() {
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
     let req2 = ClusterPoolCreateRequest {
         request_id: 1,
@@ -469,6 +475,7 @@ fn cluster_pool_create_partial_success_one_node_rejects() {
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
 
     let resp1 = send_create_request(&mut client, sid1, &req1);
@@ -582,6 +589,7 @@ fn cluster_pool_create_import_and_restart_reimport() {
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
 
     let create_resp1 = send_create_request(&mut client, sid1, &create_req(1, &dev0, 0));
@@ -691,6 +699,7 @@ fn cluster_pool_import_fails_on_unlabeled_device_after_restart() {
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
     let resp = send_create_request(&mut client, sid1, &req);
     assert!(resp.success, "node 1 create: {:?}", resp.error);
@@ -777,6 +786,7 @@ fn cluster_pool_import_refuses_mismatched_guid_after_restart() {
                 },
             }],
             placement: ClusterPlacementPolicy::Stripe,
+            allow_file_devices: true,
         },
     );
     assert!(resp_a.success, "pool A create: {:?}", resp_a.error);
@@ -805,6 +815,7 @@ fn cluster_pool_import_refuses_mismatched_guid_after_restart() {
                 },
             }],
             placement: ClusterPlacementPolicy::Stripe,
+            allow_file_devices: true,
         },
     );
     assert!(resp_b.success, "pool B create: {:?}", resp_b.error);
@@ -870,6 +881,7 @@ fn cluster_pool_restart_varied_order_nodes_reimport() {
             },
         }],
         placement: ClusterPlacementPolicy::Stripe,
+        allow_file_devices: true,
     };
 
     let create_resp1 = send_create_request(&mut client, sid1, &create_req(1, &dev0, 0));
