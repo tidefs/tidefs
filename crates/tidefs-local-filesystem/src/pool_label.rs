@@ -172,7 +172,9 @@ fn collect_leaves_impl(node: &DeviceType, out: &mut Vec<LeafInfo>) {
                 device_class: *device_class,
             });
         }
-        DeviceType::Mirror { children } | DeviceType::ParityRaid { children, .. } => {
+        DeviceType::PoolWideData { children }
+        | DeviceType::Mirror { children }
+        | DeviceType::ParityRaid { children, .. } => {
             for child in children {
                 collect_leaves_impl(child, out);
             }
@@ -197,6 +199,13 @@ fn validate_topology(tree: &DeviceType) -> Result<usize, LabelInitError> {
             if n != 1 {
                 return Err(LabelInitError::TopologyError {
                     msg: "single-device topology must have exactly 1 leaf".to_string(),
+                });
+            }
+        }
+        DeviceType::PoolWideData { .. } => {
+            if n < 1 {
+                return Err(LabelInitError::TopologyError {
+                    msg: "pool-wide data topology requires at least 1 device".to_string(),
                 });
             }
         }
@@ -507,8 +516,8 @@ mod tests {
         }
     }
 
-    /// Build a 2-way mirror topology for testing.
-    fn mirror_tree(paths: &[PathBuf], capacities: &[u64]) -> DeviceType {
+    /// Build a pool-wide data-member topology for testing.
+    fn pool_wide_data_tree(paths: &[PathBuf], capacities: &[u64]) -> DeviceType {
         let children: Vec<DeviceType> = paths
             .iter()
             .enumerate()
@@ -524,7 +533,7 @@ mod tests {
                 checksum_errors: 0,
             })
             .collect();
-        DeviceType::Mirror { children }
+        DeviceType::PoolWideData { children }
     }
 
     /// Build a parity_raid1 (single parity) topology.
@@ -595,7 +604,7 @@ mod tests {
             .collect();
         let capacities = vec![1024 * 1024; 2];
 
-        let tree = mirror_tree(&paths, &capacities);
+        let tree = pool_wide_data_tree(&paths, &capacities);
         let result = create_initial_labels(&tree, "mirrorpool", 0).unwrap();
 
         assert_eq!(result.device_count, 2);
@@ -893,7 +902,7 @@ mod tests {
             create_device_file(p, c);
         }
 
-        let tree = mirror_tree(&paths, &capacities);
+        let tree = pool_wide_data_tree(&paths, &capacities);
         let result = pool_create(&tree, "mirrorint", 0, false).unwrap();
 
         assert_eq!(result.device_count, 2);
@@ -1346,7 +1355,7 @@ mod tests {
         for (p, &c) in paths.iter().zip(&capacities) {
             create_device_file(p, c);
         }
-        let tree = mirror_tree(&paths, &capacities);
+        let tree = pool_wide_data_tree(&paths, &capacities);
         let result = pool_create(&tree, "multi_mirror", 0, false).unwrap();
         assert_eq!(result.device_count, 3);
         for (i, (dev_path, label)) in result.device_labels.iter().enumerate() {

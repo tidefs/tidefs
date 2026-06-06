@@ -146,11 +146,9 @@ pub enum DeviceHealth {
     /// Device is fully operational.
     Online,
     /// One or more child devices are missing or faulted; the device is
-    /// still functional (mirror with enough replicas, PARITY_RAID within
-    /// parity tolerance).
+    /// still functional under the pool-wide redundancy policy.
     Degraded,
-    /// Device cannot satisfy I/O (all children faulted or missing, or
-    /// parity count exceeded).
+    /// Device cannot satisfy I/O under the pool-wide redundancy policy.
     Faulted,
     /// Device is administratively offline and does not participate in I/O.
     Offline,
@@ -1017,8 +1015,10 @@ fn format_size(bytes: u64) -> String {
 // DeviceType — a node in the device tree
 // ---------------------------------------------------------------------------
 
-/// A node in the assembled device tree.  Internal nodes are redundancy
-/// groups (mirror, PARITY_RAID); leaf nodes are physical devices.
+/// A node in the assembled device topology.  The normal data root is a
+/// pool-wide eligible member set; leaf nodes are byte-addressable devices.
+/// Legacy mirror/parity nodes are retained only for older serialized fixtures
+/// and compatibility callers.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DeviceType {
@@ -1043,16 +1043,23 @@ pub enum DeviceType {
         /// Accumulated checksum errors.
         checksum_errors: u64,
     },
-    /// N-way mirror (RAID-1).  All children hold identical data.
-    Mirror {
-        /// Child devices in the mirror.
+    /// Pool-wide eligible data-member set.  Placement receipts and the
+    /// pool-wide redundancy policy decide which children hold each object or
+    /// stripe.
+    PoolWideData {
+        /// Child devices eligible for policy-driven placement.
         children: Vec<DeviceType>,
     },
-    /// PARITY_RAID parity stripe group (PARITY_RAID1/2/3).
+    /// Legacy N-way mirror group.  Do not use for new imported pool topology.
+    Mirror {
+        /// Child devices in the legacy mirror.
+        children: Vec<DeviceType>,
+    },
+    /// Legacy parity stripe group.  Do not use for new imported pool topology.
     ParityRaid {
-        /// Number of parity devices (1, 2, or 3).
+        /// Number of parity devices in the legacy group.
         parity: u8,
-        /// Child devices in the stripe.
+        /// Child devices in the legacy stripe.
         children: Vec<DeviceType>,
     },
 }
@@ -1088,7 +1095,9 @@ impl DeviceType {
                 write_errors: *write_errors,
                 checksum_errors: *checksum_errors,
             }),
-            Self::Mirror { children } | Self::ParityRaid { children, .. } => {
+            Self::PoolWideData { children }
+            | Self::Mirror { children }
+            | Self::ParityRaid { children, .. } => {
                 for child in children {
                     child._collect_leaves_into(out);
                 }
@@ -1101,7 +1110,7 @@ impl DeviceType {
     pub fn aggregate_health(&self) -> DeviceHealth {
         match self {
             Self::Leaf { health, .. } => *health,
-            Self::Mirror { children } => {
+            Self::PoolWideData { children } | Self::Mirror { children } => {
                 let operational = children
                     .iter()
                     .filter(|c| c.aggregate_health().is_operational())
@@ -1136,7 +1145,9 @@ impl DeviceType {
     pub fn total_capacity_bytes(&self) -> u64 {
         match self {
             Self::Leaf { capacity_bytes, .. } => *capacity_bytes,
-            Self::Mirror { children } | Self::ParityRaid { children, .. } => {
+            Self::PoolWideData { children }
+            | Self::Mirror { children }
+            | Self::ParityRaid { children, .. } => {
                 children.iter().map(|c| c.total_capacity_bytes()).sum()
             }
         }
@@ -1147,9 +1158,9 @@ impl DeviceType {
     pub fn leaf_count(&self) -> usize {
         match self {
             Self::Leaf { .. } => 1,
-            Self::Mirror { children } | Self::ParityRaid { children, .. } => {
-                children.iter().map(|c| c.leaf_count()).sum()
-            }
+            Self::PoolWideData { children }
+            | Self::Mirror { children }
+            | Self::ParityRaid { children, .. } => children.iter().map(|c| c.leaf_count()).sum(),
         }
     }
     /// Look up a leaf device by its path, returning leaf fields if found.
@@ -1191,7 +1202,9 @@ impl DeviceType {
                 checksum_errors: *checksum_errors,
             }),
             Self::Leaf { .. } => None,
-            Self::Mirror { children } | Self::ParityRaid { children, .. } => {
+            Self::PoolWideData { children }
+            | Self::Mirror { children }
+            | Self::ParityRaid { children, .. } => {
                 children.iter().find_map(|c| c._find_leaf_by(pred))
             }
         }
@@ -1209,7 +1222,9 @@ impl DeviceType {
     fn collect_leaf_paths(&self, out: &mut Vec<PathBuf>) {
         match self {
             Self::Leaf { device_path, .. } => out.push(device_path.clone()),
-            Self::Mirror { children } | Self::ParityRaid { children, .. } => {
+            Self::PoolWideData { children }
+            | Self::Mirror { children }
+            | Self::ParityRaid { children, .. } => {
                 for child in children {
                     child.collect_leaf_paths(out);
                 }
@@ -1336,7 +1351,9 @@ impl PoolConfig {
                 label.features_compat = self.feature_flags;
                 out.push(label);
             }
-            DeviceType::Mirror { children } | DeviceType::ParityRaid { children, .. } => {
+            DeviceType::PoolWideData { children }
+            | DeviceType::Mirror { children }
+            | DeviceType::ParityRaid { children, .. } => {
                 for child in children {
                     self.collect_labels(child, out);
                 }
@@ -1348,7 +1365,7 @@ impl PoolConfig {
     /// Remove a device from the pool by path.
     ///
     /// Walks the device tree to find the leaf matching `device_path`,
-    /// removes it from its parent (Mirror or ParityRaid), updates
+    /// removes it from its parent data-member set, updates
     /// `device_count`, increments `topology_generation`, and adds the
     /// removed device index to `missing_indices`.
     ///
@@ -1387,7 +1404,9 @@ impl PoolConfig {
                 // leaf_count > 1 before descending.
                 *device_path == path
             }
-            DeviceType::Mirror { children } | DeviceType::ParityRaid { children, .. } => {
+            DeviceType::PoolWideData { children }
+            | DeviceType::Mirror { children }
+            | DeviceType::ParityRaid { children, .. } => {
                 if let Some(pos) = children.iter().position(|c| match c {
                     DeviceType::Leaf { device_path, .. } => device_path == path,
                     _ => false,
@@ -1395,7 +1414,7 @@ impl PoolConfig {
                     children.remove(pos);
                     return true;
                 }
-                // Recurse into nested groups.
+                // Recurse into nested topology.
                 for child in children.iter_mut() {
                     if Self::remove_leaf_from_tree(child, path) {
                         return true;
@@ -1436,9 +1455,11 @@ impl PoolConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeviceRole {
-    /// Add a child to an existing mirror group (increases redundancy).
+    /// Add a data member to the pool-wide eligible set.
+    PoolDataMember,
+    /// Legacy alias for [`DeviceRole::PoolDataMember`].
     MirrorMember,
-    /// Add a child to an existing parity RAID group.
+    /// Legacy alias for [`DeviceRole::PoolDataMember`].
     ParityRaidMember,
     /// Add a hot spare device.
     Spare,
@@ -1452,7 +1473,10 @@ impl DeviceRole {
     /// Returns true if the device type participates in data redundancy.
     #[must_use]
     pub const fn is_data_vdev(self) -> bool {
-        matches!(self, Self::MirrorMember | Self::ParityRaidMember)
+        matches!(
+            self,
+            Self::PoolDataMember | Self::MirrorMember | Self::ParityRaidMember
+        )
     }
 
     /// Returns true if the device type is a dedicated auxiliary device.
@@ -1465,8 +1489,9 @@ impl DeviceRole {
 impl std::fmt::Display for DeviceRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MirrorMember => f.write_str("mirror-member"),
-            Self::ParityRaidMember => f.write_str("parity-raid-member"),
+            Self::PoolDataMember | Self::MirrorMember | Self::ParityRaidMember => {
+                f.write_str("pool-data-member")
+            }
             Self::Spare => f.write_str("spare"),
             Self::Cache => f.write_str("cache"),
             Self::Log => f.write_str("log"),
@@ -1512,8 +1537,8 @@ pub enum DeviceAddError {
         /// Description of the invalid position.
         msg: String,
     },
-    /// The device type is incompatible with the target position in the
-    /// device tree (e.g., adding a mirror member to a non-mirror parent).
+    /// The device role is incompatible with the target position in the
+    /// device tree.
     IncompatibleType {
         /// The device type requested.
         vdev_type: DeviceRole,
@@ -1691,9 +1716,11 @@ impl PoolAddVdev {
             }
         }
 
-        // 4. Validate the device type against the current device tree.
+        // 4. Validate the device role against the current device tree.
         match vdev_type {
-            DeviceRole::MirrorMember | DeviceRole::ParityRaidMember => {
+            DeviceRole::PoolDataMember
+            | DeviceRole::MirrorMember
+            | DeviceRole::ParityRaidMember => {
                 Self::validate_data_vdev_position(&config.device_tree, vdev_type)?;
             }
             DeviceRole::Spare | DeviceRole::Cache | DeviceRole::Log => {
@@ -1750,36 +1777,15 @@ impl PoolAddVdev {
         tree: &DeviceType,
         vdev_type: DeviceRole,
     ) -> Result<(), DeviceAddError> {
+        if vdev_type.is_data_vdev() {
+            return Ok(());
+        }
+
         match tree {
-            DeviceType::Leaf { .. } => {
-                if vdev_type == DeviceRole::ParityRaidMember {
-                    return Err(DeviceAddError::IncompatibleType {
-                        vdev_type,
-                        msg:
-                            "cannot add parity_raid member to a single-device pool (need ParityRaid root)"
-                                .to_string(),
-                    });
-                }
-                Ok(())
-            }
-            DeviceType::Mirror { .. } => {
-                if vdev_type == DeviceRole::ParityRaidMember {
-                    return Err(DeviceAddError::IncompatibleType {
-                        vdev_type,
-                        msg: "cannot add parity_raid member to a mirror root".to_string(),
-                    });
-                }
-                Ok(())
-            }
-            DeviceType::ParityRaid { .. } => {
-                if vdev_type == DeviceRole::MirrorMember {
-                    return Err(DeviceAddError::IncompatibleType {
-                        vdev_type,
-                        msg: "cannot add mirror member to a parity raid root".to_string(),
-                    });
-                }
-                Ok(())
-            }
+            DeviceType::Leaf { .. } => Ok(()),
+            DeviceType::PoolWideData { .. }
+            | DeviceType::Mirror { .. }
+            | DeviceType::ParityRaid { .. } => Ok(()),
         }
     }
 
@@ -1792,8 +1798,49 @@ impl PoolAddVdev {
         vdev_type: DeviceRole,
     ) -> Result<DeviceType, DeviceAddError> {
         match vdev_type {
-            DeviceRole::MirrorMember => match tree {
-                DeviceType::Leaf {
+            DeviceRole::PoolDataMember
+            | DeviceRole::MirrorMember
+            | DeviceRole::ParityRaidMember => {
+                Self::insert_pool_data_member(tree, device_path, device_guid, device_index)
+            }
+            DeviceRole::Spare | DeviceRole::Cache | DeviceRole::Log => Ok(tree),
+        }
+    }
+
+    fn new_data_leaf(device_path: PathBuf, device_guid: [u8; 16], device_index: u32) -> DeviceType {
+        let capacity_bytes = device_capacity_bytes(&device_path).unwrap_or(0);
+        DeviceType::Leaf {
+            device_path,
+            device_guid,
+            device_index,
+            capacity_bytes,
+            device_class: DeviceClass::Hdd,
+            health: DeviceHealth::Online,
+            read_errors: 0,
+            write_errors: 0,
+            checksum_errors: 0,
+        }
+    }
+
+    fn insert_pool_data_member(
+        tree: DeviceType,
+        device_path: PathBuf,
+        device_guid: [u8; 16],
+        device_index: u32,
+    ) -> Result<DeviceType, DeviceAddError> {
+        match tree {
+            DeviceType::Leaf {
+                device_path: existing_path,
+                device_guid: existing_guid,
+                device_index: existing_index,
+                capacity_bytes,
+                device_class,
+                health,
+                read_errors,
+                write_errors,
+                checksum_errors,
+            } => {
+                let existing = DeviceType::Leaf {
                     device_path: existing_path,
                     device_guid: existing_guid,
                     device_index: existing_index,
@@ -1803,78 +1850,19 @@ impl PoolAddVdev {
                     read_errors,
                     write_errors,
                     checksum_errors,
-                } => {
-                    let existing = DeviceType::Leaf {
-                        device_path: existing_path,
-                        device_guid: existing_guid,
-                        device_index: existing_index,
-                        capacity_bytes,
-                        device_class,
-                        health,
-                        read_errors,
-                        write_errors,
-                        checksum_errors,
-                    };
-                    let new_leaf = DeviceType::Leaf {
-                        device_path,
-                        device_guid,
-                        device_index,
-                        capacity_bytes,
-                        device_class: DeviceClass::Hdd,
-                        health: DeviceHealth::Online,
-                        read_errors: 0,
-                        write_errors: 0,
-                        checksum_errors: 0,
-                    };
-                    Ok(DeviceType::Mirror {
-                        children: vec![existing, new_leaf],
-                    })
-                }
-                DeviceType::Mirror { mut children } => {
-                    let new_leaf = DeviceType::Leaf {
-                        device_path,
-                        device_guid,
-                        device_index,
-                        capacity_bytes: 0,
-                        device_class: DeviceClass::Hdd,
-                        health: DeviceHealth::Online,
-                        read_errors: 0,
-                        write_errors: 0,
-                        checksum_errors: 0,
-                    };
-                    children.push(new_leaf);
-                    Ok(DeviceType::Mirror { children })
-                }
-                _ => Err(DeviceAddError::IncompatibleType {
-                    vdev_type,
-                    msg: "cannot add mirror member to non-mirror root".to_string(),
-                }),
-            },
-            DeviceRole::ParityRaidMember => match tree {
-                DeviceType::ParityRaid {
-                    parity,
-                    mut children,
-                } => {
-                    let new_leaf = DeviceType::Leaf {
-                        device_path,
-                        device_guid,
-                        device_index,
-                        capacity_bytes: 0,
-                        device_class: DeviceClass::Hdd,
-                        health: DeviceHealth::Online,
-                        read_errors: 0,
-                        write_errors: 0,
-                        checksum_errors: 0,
-                    };
-                    children.push(new_leaf);
-                    Ok(DeviceType::ParityRaid { parity, children })
-                }
-                _ => Err(DeviceAddError::IncompatibleType {
-                    vdev_type,
-                    msg: "cannot add parity_raid member to non-parity-raid root".to_string(),
-                }),
-            },
-            DeviceRole::Spare | DeviceRole::Cache | DeviceRole::Log => Ok(tree),
+                };
+                let new_leaf = Self::new_data_leaf(device_path, device_guid, device_index);
+                Ok(DeviceType::PoolWideData {
+                    children: vec![existing, new_leaf],
+                })
+            }
+            DeviceType::PoolWideData { mut children }
+            | DeviceType::Mirror { mut children }
+            | DeviceType::ParityRaid { mut children, .. } => {
+                let new_leaf = Self::new_data_leaf(device_path, device_guid, device_index);
+                children.push(new_leaf);
+                Ok(DeviceType::PoolWideData { children })
+            }
         }
     }
 
@@ -2163,13 +2151,13 @@ impl PoolAssembler {
             }
         }
 
-        // Build the device tree: for phase 2, all leaves under a single
-        // Mirror node (since we don't yet reconstruct PARITY_RAID vs mirror
-        // from the label).
+        // Labels identify the eligible pool-member set; the pool-wide
+        // redundancy policy and persisted placement receipts decide per-object
+        // targets.
         let device_tree = if leaves.len() == 1 {
             leaves.into_iter().next().unwrap()
         } else {
-            DeviceType::Mirror { children: leaves }
+            DeviceType::PoolWideData { children: leaves }
         };
 
         let total_capacity = device_tree.total_capacity_bytes();
@@ -2599,12 +2587,12 @@ mod tests {
             config.redundancy_policy,
             PoolRedundancyPolicy::replicated(1)
         );
-        // Single device should be a Leaf, not wrapped in Mirror.
+        // Single device stays a Leaf; multi-device imports use PoolWideData.
         assert!(matches!(config.device_tree, DeviceType::Leaf { .. }));
     }
 
     #[test]
-    fn assemble_three_device_mirror() {
+    fn assemble_three_device_replicated_policy_as_pool_wide_data() {
         let pool_uuid = [0x22u8; 16];
         let entries = vec![
             make_labeled_entry(
@@ -2613,7 +2601,7 @@ mod tests {
                 0,
                 3,
                 1,
-                "mirrorpool",
+                "datapool",
                 PoolState::Active,
             ),
             make_labeled_entry(
@@ -2622,7 +2610,7 @@ mod tests {
                 1,
                 3,
                 1,
-                "mirrorpool",
+                "datapool",
                 PoolState::Active,
             ),
             make_labeled_entry(
@@ -2631,19 +2619,19 @@ mod tests {
                 2,
                 3,
                 1,
-                "mirrorpool",
+                "datapool",
                 PoolState::Active,
             ),
         ];
 
         let config = PoolAssembler::assemble(&entries, None).unwrap();
-        assert_eq!(config.pool_name, "mirrorpool");
+        assert_eq!(config.pool_name, "datapool");
         assert_eq!(config.device_count, 3);
         assert!(config.missing_indices.is_empty());
         assert_eq!(config.health, DeviceHealth::Online);
 
         match &config.device_tree {
-            DeviceType::Mirror { children } => {
+            DeviceType::PoolWideData { children } => {
                 assert_eq!(children.len(), 3);
                 for (i, child) in children.iter().enumerate() {
                     if let DeviceType::Leaf { device_index, .. } = child {
@@ -2653,33 +2641,42 @@ mod tests {
                     }
                 }
             }
-            _ => panic!("expected Mirror root for multi-device pool"),
+            _ => panic!("expected PoolWideData root for multi-device pool"),
         }
     }
 
     #[test]
-    fn assemble_four_device_parity_raid1() {
+    fn assemble_four_device_erasure_policy_as_pool_wide_data() {
         let pool_uuid = [0x33u8; 16];
         let entries: Vec<DeviceScanEntry> = (0..4u32)
             .map(|i| {
-                make_labeled_entry(
+                let mut entry = make_labeled_entry(
                     pool_uuid,
                     [0x10u8 + (i as u8); 16],
                     i,
                     4,
                     1,
-                    "parity_raidpool",
+                    "erasurepool",
                     PoolState::Active,
-                )
+                );
+                entry.redundancy_policy = Some(PoolRedundancyPolicy::erasure(3, 1));
+                entry
             })
             .collect();
 
         let config = PoolAssembler::assemble(&entries, None).unwrap();
-        assert_eq!(config.pool_name, "parity_raidpool");
+        assert_eq!(config.pool_name, "erasurepool");
         assert_eq!(config.device_count, 4);
         assert!(config.missing_indices.is_empty());
         assert_eq!(config.health, DeviceHealth::Online);
-        assert!(matches!(config.device_tree, DeviceType::Mirror { .. }));
+        assert_eq!(
+            config.redundancy_policy,
+            PoolRedundancyPolicy::erasure(3, 1)
+        );
+        assert!(matches!(
+            config.device_tree,
+            DeviceType::PoolWideData { .. }
+        ));
     }
 
     #[test]
@@ -3038,7 +3035,7 @@ mod tests {
         }
     }
 
-    fn make_parity_raid_config() -> PoolConfig {
+    fn make_legacy_parity_config() -> PoolConfig {
         let leaf1 = DeviceType::Leaf {
             device_path: PathBuf::from("/dev/test/disk0"),
             device_guid: [0x01u8; 16],
@@ -3067,7 +3064,7 @@ mod tests {
         };
         PoolConfig {
             pool_uuid: [0x33u8; 16],
-            pool_name: "raidpool".to_string(),
+            pool_name: "legacy-paritypool".to_string(),
             redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: tree,
             health: DeviceHealth::Online,
@@ -3083,24 +3080,24 @@ mod tests {
     }
 
     #[test]
-    fn add_mirror_member_single_to_two_way() {
+    fn add_pool_data_member_single_to_two_member_set() {
         let dir = tempfile::tempdir().unwrap();
         let device_path = dir.path().join("newdisk");
         std::fs::write(&device_path, []).unwrap();
 
         let mut config = make_single_device_config();
         let (stats, trigger) =
-            PoolAddVdev::add_vdev(device_path.clone(), DeviceRole::MirrorMember, &mut config)
+            PoolAddVdev::add_vdev(device_path.clone(), DeviceRole::PoolDataMember, &mut config)
                 .unwrap();
 
         assert_eq!(stats.device_path, device_path);
-        assert_eq!(stats.vdev_type, DeviceRole::MirrorMember);
+        assert_eq!(stats.vdev_type, DeviceRole::PoolDataMember);
         assert!(stats.add_time_ms < 1000);
         assert!(stats.rebalance_scheduled);
         assert_eq!(stats.new_device_count, 2);
 
         match &config.device_tree {
-            DeviceType::Mirror { children } => {
+            DeviceType::PoolWideData { children } => {
                 assert_eq!(children.len(), 2);
                 if let DeviceType::Leaf { device_index, .. } = &children[0] {
                     assert_eq!(*device_index, 0);
@@ -3119,7 +3116,7 @@ mod tests {
                     panic!("expected Leaf");
                 }
             }
-            _ => panic!("expected Mirror root"),
+            _ => panic!("expected PoolWideData root"),
         }
 
         assert_eq!(config.device_count, 2);
@@ -3128,11 +3125,11 @@ mod tests {
 
         assert_eq!(trigger.pool_uuid, [0x11u8; 16]);
         assert!(!trigger.is_urgent);
-        assert!(trigger.reason.contains("mirror-member"));
+        assert!(trigger.reason.contains("pool-data-member"));
     }
 
     #[test]
-    fn add_mirror_member_to_existing_mirror() {
+    fn add_pool_data_member_normalizes_legacy_mirror_root() {
         let dir = tempfile::tempdir().unwrap();
         let device_path = dir.path().join("thirddisk");
         std::fs::write(&device_path, []).unwrap();
@@ -3161,7 +3158,7 @@ mod tests {
         };
         let mut config = PoolConfig {
             pool_uuid: [0x11u8; 16],
-            pool_name: "mirrorpool".to_string(),
+            pool_name: "legacy-mirrorpool".to_string(),
             redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
             device_tree: DeviceType::Mirror {
                 children: vec![leaf1, leaf2],
@@ -3178,43 +3175,40 @@ mod tests {
         };
 
         let (stats, trigger) =
-            PoolAddVdev::add_vdev(device_path, DeviceRole::MirrorMember, &mut config).unwrap();
+            PoolAddVdev::add_vdev(device_path, DeviceRole::PoolDataMember, &mut config).unwrap();
 
+        assert_eq!(stats.vdev_type, DeviceRole::PoolDataMember);
         assert_eq!(stats.new_device_count, 3);
         match &config.device_tree {
-            DeviceType::Mirror { children } => assert_eq!(children.len(), 3),
-            _ => panic!("expected Mirror"),
+            DeviceType::PoolWideData { children } => assert_eq!(children.len(), 3),
+            _ => panic!("expected PoolWideData"),
         }
-        assert!(trigger.reason.contains("mirror-member"));
+        assert!(trigger.reason.contains("pool-data-member"));
     }
 
     #[test]
-    fn add_raidz_member() {
+    fn add_pool_data_member_normalizes_legacy_parity_root() {
         let dir = tempfile::tempdir().unwrap();
-        let device_path = dir.path().join("newparity_raid");
+        let device_path = dir.path().join("new-data-member");
         std::fs::write(&device_path, []).unwrap();
 
-        let mut config = make_parity_raid_config();
-        let (stats, trigger) = PoolAddVdev::add_vdev(
-            device_path.clone(),
-            DeviceRole::ParityRaidMember,
-            &mut config,
-        )
-        .unwrap();
+        let mut config = make_legacy_parity_config();
+        let (stats, trigger) =
+            PoolAddVdev::add_vdev(device_path.clone(), DeviceRole::PoolDataMember, &mut config)
+                .unwrap();
 
-        assert_eq!(stats.vdev_type, DeviceRole::ParityRaidMember);
+        assert_eq!(stats.vdev_type, DeviceRole::PoolDataMember);
         assert!(stats.rebalance_scheduled);
         assert_eq!(stats.new_device_count, 3);
 
         match &config.device_tree {
-            DeviceType::ParityRaid { parity, children } => {
-                assert_eq!(*parity, 1);
+            DeviceType::PoolWideData { children } => {
                 assert_eq!(children.len(), 3);
             }
-            _ => panic!("expected ParityRaid"),
+            _ => panic!("expected PoolWideData"),
         }
 
-        assert!(trigger.reason.contains("parity-raid-member"));
+        assert!(trigger.reason.contains("pool-data-member"));
     }
 
     #[test]
@@ -3225,7 +3219,7 @@ mod tests {
 
         let mut config = make_single_device_config();
         let (_stats, trigger) =
-            PoolAddVdev::add_vdev(device_path, DeviceRole::MirrorMember, &mut config).unwrap();
+            PoolAddVdev::add_vdev(device_path, DeviceRole::PoolDataMember, &mut config).unwrap();
 
         assert_eq!(trigger.pool_uuid, [0x11u8; 16]);
         assert_eq!(trigger.topology_generation, 2);
@@ -3256,7 +3250,7 @@ mod tests {
             pool_uuid: [0xFFu8; 16],
             pool_name: "fullpool".to_string(),
             redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
-            device_tree: DeviceType::Mirror { children: leaves },
+            device_tree: DeviceType::PoolWideData { children: leaves },
             health: DeviceHealth::Online,
             state: PoolState::Active,
             total_capacity_bytes: 0,
@@ -3268,7 +3262,7 @@ mod tests {
             removing_device_indices: vec![],
         };
 
-        let result = PoolAddVdev::add_vdev(device_path, DeviceRole::MirrorMember, &mut config);
+        let result = PoolAddVdev::add_vdev(device_path, DeviceRole::PoolDataMember, &mut config);
 
         match result {
             Err(DeviceAddError::PoolFull { current, maximum }) => {
@@ -3289,7 +3283,7 @@ mod tests {
 
         let mut config = make_single_device_config();
         let result =
-            PoolAddVdev::add_vdev(device_path.clone(), DeviceRole::MirrorMember, &mut config);
+            PoolAddVdev::add_vdev(device_path.clone(), DeviceRole::PoolDataMember, &mut config);
 
         match result {
             Err(DeviceAddError::AlreadyLabeled {
@@ -3321,16 +3315,23 @@ mod tests {
     fn vdev_add_stats_display() {
         let stats = DeviceAddStats {
             device_path: PathBuf::from("/dev/sdb"),
-            vdev_type: DeviceRole::MirrorMember,
+            vdev_type: DeviceRole::PoolDataMember,
             add_time_ms: 42,
             rebalance_scheduled: true,
             new_device_count: 2,
         };
         assert_eq!(stats.device_path, PathBuf::from("/dev/sdb"));
-        assert_eq!(stats.vdev_type, DeviceRole::MirrorMember);
+        assert_eq!(stats.vdev_type, DeviceRole::PoolDataMember);
         assert_eq!(stats.add_time_ms, 42);
         assert!(stats.rebalance_scheduled);
         assert_eq!(stats.new_device_count, 2);
+    }
+
+    #[test]
+    fn legacy_data_roles_display_as_pool_data_member() {
+        assert_eq!(DeviceRole::PoolDataMember.to_string(), "pool-data-member");
+        assert_eq!(DeviceRole::MirrorMember.to_string(), "pool-data-member");
+        assert_eq!(DeviceRole::ParityRaidMember.to_string(), "pool-data-member");
     }
 
     // -- Label round-trip property test --

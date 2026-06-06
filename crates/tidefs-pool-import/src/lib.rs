@@ -1295,7 +1295,9 @@ fn collect_leaves_impl(node: &DeviceType, out: &mut Vec<LeafDevice>) {
                 device_index: *device_index,
             });
         }
-        DeviceType::Mirror { children } | DeviceType::ParityRaid { children, .. } => {
+        DeviceType::PoolWideData { children }
+        | DeviceType::Mirror { children }
+        | DeviceType::ParityRaid { children, .. } => {
             for child in children {
                 collect_leaves_impl(child, out);
             }
@@ -1812,8 +1814,8 @@ mod tests {
     }
 
     #[test]
-    fn collect_leaves_three_way_mirror() {
-        let tree = DeviceType::Mirror {
+    fn collect_leaves_three_member_pool_wide_data() {
+        let tree = DeviceType::PoolWideData {
             children: vec![
                 DeviceType::Leaf {
                     device_path: PathBuf::from("/dev/sda"),

@@ -97,6 +97,7 @@ fn three_device_mirror_remove_middle_device_with_blake3_verification() {
         device_tree: DeviceType::Mirror {
             children: vec![leaf0, leaf1, leaf2],
         },
+        redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
         health: DeviceHealth::Online,
         state: PoolState::Active,
         total_capacity_bytes: 3 * 1024 * 1024 * 1024,
@@ -345,6 +346,7 @@ fn removal_with_zero_objects_on_target_device() {
         device_tree: DeviceType::Mirror {
             children: vec![leaf0, leaf1],
         },
+        redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
         health: DeviceHealth::Online,
         state: PoolState::Active,
         total_capacity_bytes: 2 * 1024 * 1024 * 1024,
@@ -381,6 +383,7 @@ fn last_device_removal_refused() {
         pool_uuid: [0x11u8; 16],
         pool_name: "solo-pool".to_string(),
         device_tree: leaf,
+        redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
         health: DeviceHealth::Online,
         state: PoolState::Active,
         total_capacity_bytes: 1024 * 1024 * 1024,
@@ -451,6 +454,7 @@ fn pool_label_writer_raw_device_roundtrip_after_removal() {
         device_tree: DeviceType::Mirror {
             children: vec![leaf0, leaf1, leaf2],
         },
+        redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
         health: tidefs_pool_scan::DeviceHealth::Online,
         state: PoolState::Active,
         total_capacity_bytes: 3 * 1024 * 1024 * 1024,
