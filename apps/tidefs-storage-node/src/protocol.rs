@@ -47,6 +47,7 @@ pub mod tag {
     /// Repair object:
     /// key_len(u32 LE) + key + placement_receipt_ref + payload_len(u32 LE) + authoritative_payload
     /// Response: ok(u8) + success(u8) + key_len(u32 LE) + key
+    ///           + optional has_repaired_receipt(u8) + placement_receipt_ref
     pub const RPRR: &[u8; 4] = b"RPRR";
 
     /// Snapshot lifecycle operations dispatched through the clustered path.
@@ -253,6 +254,7 @@ pub enum Frame {
     RepairObjectAck {
         key: Vec<u8>,
         success: bool,
+        repaired_placement_receipt_ref: Option<PlacementReceiptRef>,
     },
 
     // ── Snapshot lifecycle operations through the clustered storage-node path ──
@@ -477,12 +479,20 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             buf.extend_from_slice(&(authoritative_payload.len() as u32).to_le_bytes());
             buf.extend_from_slice(authoritative_payload);
         }
-        Frame::RepairObjectAck { key, success } => {
+        Frame::RepairObjectAck {
+            key,
+            success,
+            repaired_placement_receipt_ref,
+        } => {
             buf.extend_from_slice(tag::RPRR);
             buf.push(1u8);
             buf.push(u8::from(*success));
             buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
             buf.extend_from_slice(key);
+            if let Some(receipt) = repaired_placement_receipt_ref {
+                buf.push(1);
+                encode_placement_receipt_ref(&mut buf, receipt);
+            }
         }
         // ── Snapshot lifecycle encode ──
         Frame::SnapshotCreate { snapshot_name } => {
@@ -911,16 +921,47 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
                 return None;
             }
             if payload[0] == 1 && payload.len() >= 6 {
-                // Response: ok(u8=1) + success(u8) + key_len(u32 LE) + key.
+                // Response: ok(u8=1) + success(u8) + key_len(u32 LE) + key
+                // + optional has_repaired_receipt(u8) + placement_receipt_ref.
                 // A request with a one-byte key also starts with 1 because its
                 // key_len is u32(1), so only accept the ack shape when the frame
-                // length matches exactly; otherwise fall through to request
-                // decoding.
+                // length matches an ack shape; otherwise fall through to
+                // request decoding.
                 let key_len = u32::from_le_bytes(payload[2..6].try_into().ok()?) as usize;
                 if payload.len() == 6 + key_len {
                     let success = payload[1] != 0;
                     let key = payload[6..6 + key_len].to_vec();
-                    return Some(Frame::RepairObjectAck { key, success });
+                    return Some(Frame::RepairObjectAck {
+                        key,
+                        success,
+                        repaired_placement_receipt_ref: None,
+                    });
+                }
+                if payload.len() == 7 + key_len {
+                    let success = payload[1] != 0;
+                    let key = payload[6..6 + key_len].to_vec();
+                    if payload[6 + key_len] == 0 {
+                        return Some(Frame::RepairObjectAck {
+                            key,
+                            success,
+                            repaired_placement_receipt_ref: None,
+                        });
+                    }
+                }
+                if payload.len() == 7 + key_len + PLACEMENT_RECEIPT_REF_WIRE_LEN
+                    && payload[6 + key_len] == 1
+                {
+                    let success = payload[1] != 0;
+                    let key = payload[6..6 + key_len].to_vec();
+                    let (receipt, receipt_len) =
+                        decode_placement_receipt_ref(&payload[7 + key_len..])?;
+                    if receipt_len == PLACEMENT_RECEIPT_REF_WIRE_LEN {
+                        return Some(Frame::RepairObjectAck {
+                            key,
+                            success,
+                            repaired_placement_receipt_ref: Some(receipt),
+                        });
+                    }
                 }
             }
             if payload.len() >= 4 {
@@ -1380,6 +1421,7 @@ mod tests {
         let f = Frame::RepairObjectAck {
             key: b"fixed-obj".to_vec(),
             success: true,
+            repaired_placement_receipt_ref: None,
         };
         assert_eq!(decode(&encode(&f)), Some(f));
     }
@@ -1389,6 +1431,19 @@ mod tests {
         let f = Frame::RepairObjectAck {
             key: b"still-broken".to_vec(),
             success: false,
+            repaired_placement_receipt_ref: None,
+        };
+        assert_eq!(decode(&encode(&f)), Some(f));
+    }
+
+    #[test]
+    fn roundtrip_repair_object_ack_with_repaired_receipt() {
+        let key = b"fixed-obj".to_vec();
+        let payload = b"fixed-data";
+        let f = Frame::RepairObjectAck {
+            repaired_placement_receipt_ref: Some(receipt_ref(&key, payload, 19)),
+            key,
+            success: true,
         };
         assert_eq!(decode(&encode(&f)), Some(f));
     }

@@ -89,7 +89,12 @@ pub enum ReplicationMessage {
         authoritative_payload: Vec<u8>,
     },
     /// Acknowledge a repair operation.
-    RepairObjectAck { key: Vec<u8>, success: bool },
+    RepairObjectAck {
+        key: Vec<u8>,
+        success: bool,
+        /// Fresh durable placement receipt recorded by a pool-backed repair.
+        repaired_placement_receipt_ref: Option<PlacementReceiptRef>,
+    },
 }
 
 /// Send a structured replication message over a transport session.
@@ -236,6 +241,7 @@ mod tests {
                 .as_bytes32()
                 .to_vec(),
             success: true,
+            repaired_placement_receipt_ref: Some(receipt_ref("fixed-key", b"fixed", 15)),
         };
         let rt = bincode_roundtrip(&msg);
         assert_eq!(rt, msg);
@@ -248,6 +254,7 @@ mod tests {
                 .as_bytes32()
                 .to_vec(),
             success: false,
+            repaired_placement_receipt_ref: None,
         };
         let rt = bincode_roundtrip(&msg);
         assert_eq!(rt, msg);
@@ -281,7 +288,11 @@ mod tests {
             placement_receipt_ref: receipt_ref("k", &payload, 14),
             authoritative_payload: payload,
         };
-        let repair_ack = ReplicationMessage::RepairObjectAck { key, success: true };
+        let repair_ack = ReplicationMessage::RepairObjectAck {
+            key,
+            success: true,
+            repaired_placement_receipt_ref: Some(receipt_ref("k", &[], 15)),
+        };
         assert_ne!(repair_obj, repair_ack);
     }
 
