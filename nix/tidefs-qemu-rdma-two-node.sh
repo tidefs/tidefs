@@ -567,14 +567,17 @@ else
   echo "rping_connectivity=unknown_node_name"
 fi
 
-if [ -n "$RPING_SERVER_PID" ] && kill -0 "$RPING_SERVER_PID" 2>/dev/null; then
-  sleep 30
-fi
-if [ -n "$RPING_SERVER_PID" ] && kill -0 "$RPING_SERVER_PID" 2>/dev/null; then
-  echo "rping_server_timeout=30s"
-  kill "$RPING_SERVER_PID" 2>/dev/null || true
-fi
 if [ -n "$RPING_SERVER_PID" ]; then
+  RPING_WAITED=0
+  while kill -0 "$RPING_SERVER_PID" 2>/dev/null && [ "$RPING_WAITED" -lt 30 ]; do
+    sleep 1
+    RPING_WAITED=$((RPING_WAITED + 1))
+  done
+  echo "rping_server_wait_seconds=$RPING_WAITED"
+  if kill -0 "$RPING_SERVER_PID" 2>/dev/null; then
+    echo "rping_server_timeout=30s"
+    kill "$RPING_SERVER_PID" 2>/dev/null || true
+  fi
   if wait "$RPING_SERVER_PID" 2>/dev/null; then
     echo "rping_server_exit=0"
   else
@@ -632,10 +635,14 @@ if [ -z "$TIDEFS_BIN" ]; then
 else
   echo "tidefs_storage_node_binary=$TIDEFS_BIN"
   STORE_DIR="/tmp/tidefs-rdma-store"
+  TIDEFS_SMOKE_WINDOW_SECS=45
+  TIDEFS_CLIENT_TIMEOUT_SECS=30
+  TIDEFS_CLIENT_START_DELAY_SECS=35
   mkdir -p "$STORE_DIR"
 
   if [ "$NODE_NAME" = "node-a" ]; then
     echo "tidefs_data_path_role=server"
+    echo "tidefs_data_path_probe=health"
     "$TIDEFS_BIN" server \
       --node-id 1 \
       --bind "192.168.77.10:9800" \
@@ -647,10 +654,37 @@ else
     sleep 3
     if kill -0 "$TIDEFS_SERVER_PID" 2>/dev/null; then
       echo "tidefs_server_status=started"
-      if wait "$TIDEFS_SERVER_PID" 2>/dev/null; then
-        TIDEFS_SERVER_RC=0
+      echo "tidefs_server_smoke_window_seconds=$TIDEFS_SMOKE_WINDOW_SECS"
+      sleep "$TIDEFS_SMOKE_WINDOW_SECS"
+      if kill -0 "$TIDEFS_SERVER_PID" 2>/dev/null; then
+        echo "tidefs_server_status=survived_smoke_window"
+        echo "tidefs_data_path_smoke=pass"
+        kill "$TIDEFS_SERVER_PID" 2>/dev/null || true
+        TIDEFS_SERVER_STOP_WAITED=0
+        while kill -0 "$TIDEFS_SERVER_PID" 2>/dev/null && [ "$TIDEFS_SERVER_STOP_WAITED" -lt 5 ]; do
+          sleep 1
+          TIDEFS_SERVER_STOP_WAITED=$((TIDEFS_SERVER_STOP_WAITED + 1))
+        done
+        echo "tidefs_server_stop_wait_seconds=$TIDEFS_SERVER_STOP_WAITED"
+        if kill -0 "$TIDEFS_SERVER_PID" 2>/dev/null; then
+          echo "tidefs_server_stop=forced_after_smoke_window"
+          kill -KILL "$TIDEFS_SERVER_PID" 2>/dev/null || true
+        else
+          echo "tidefs_server_stop=terminated_after_smoke_window"
+        fi
+        if wait "$TIDEFS_SERVER_PID" 2>/dev/null; then
+          TIDEFS_SERVER_RC=0
+        else
+          TIDEFS_SERVER_RC=$?
+        fi
       else
-        TIDEFS_SERVER_RC=$?
+        if wait "$TIDEFS_SERVER_PID" 2>/dev/null; then
+          TIDEFS_SERVER_RC=0
+        else
+          TIDEFS_SERVER_RC=$?
+        fi
+        echo "tidefs_server_status=exited_during_smoke_window"
+        echo "tidefs_data_path_smoke=fail"
       fi
     else
       if wait "$TIDEFS_SERVER_PID" 2>/dev/null; then
@@ -663,29 +697,48 @@ else
       else
         echo "tidefs_server_status=failed_to_start"
       fi
+      echo "tidefs_data_path_smoke=fail"
     fi
     echo "tidefs_server_exit=$TIDEFS_SERVER_RC"
-    if [ "$TIDEFS_SERVER_RC" -eq 0 ]; then
-      echo "tidefs_data_path_smoke=pass"
-    else
-      echo "tidefs_data_path_smoke=fail"
-    fi
   elif [ "$NODE_NAME" = "node-b" ]; then
     echo "tidefs_data_path_role=client"
-    sleep 5
-    if "$TIDEFS_BIN" client \
-         --node-id 2 \
-         --server-node-id 1 \
-         --connect "192.168.77.10:9800" \
-         --rdma \
-         PING > "/tmp/tidefs-client.log" 2>&1; then
-      echo "tidefs_data_path_smoke=pass"
+    echo "tidefs_data_path_probe=health"
+    echo "tidefs_client_start_delay_seconds=$TIDEFS_CLIENT_START_DELAY_SECS"
+    sleep "$TIDEFS_CLIENT_START_DELAY_SECS"
+    if command -v timeout >/dev/null 2>&1; then
+      echo "tidefs_client_timeout_seconds=$TIDEFS_CLIENT_TIMEOUT_SECS"
+      if timeout "$TIDEFS_CLIENT_TIMEOUT_SECS" "$TIDEFS_BIN" client \
+           --node-id 2 \
+           --server-node-id 1 \
+           --connect "192.168.77.10:9800" \
+           --rdma \
+           health > "/tmp/tidefs-client.log" 2>&1; then
+        TIDEFS_CLIENT_RC=0
+        echo "tidefs_data_path_smoke=pass"
+      else
+        TIDEFS_CLIENT_RC=$?
+        echo "tidefs_data_path_smoke=fail"
+      fi
+      echo "tidefs_client_exit=$TIDEFS_CLIENT_RC"
     else
-      echo "tidefs_data_path_smoke=fail"
+      echo "tidefs_client_timeout=not_found"
+      echo "tidefs_data_path_smoke=blocked_no_timeout"
     fi
   fi
-  cat "/tmp/tidefs-server.log" 2>/dev/null || true
-  cat "/tmp/tidefs-client.log" 2>/dev/null || true
+  if [ -e "/tmp/tidefs-server.log" ]; then
+    echo "--- tidefs-server.log begin ---"
+    cat "/tmp/tidefs-server.log" 2>/dev/null || true
+    echo "--- tidefs-server.log end ---"
+  else
+    echo "tidefs_server_log=missing"
+  fi
+  if [ -e "/tmp/tidefs-client.log" ]; then
+    echo "--- tidefs-client.log begin ---"
+    cat "/tmp/tidefs-client.log" 2>/dev/null || true
+    echo "--- tidefs-client.log end ---"
+  else
+    echo "tidefs_client_log=missing"
+  fi
 fi
 echo "=== tidefs-guest-rdma complete ==="
 poweroff -f 2>/dev/null || reboot -f 2>/dev/null || halt -f 2>/dev/null || true
@@ -959,7 +1012,7 @@ classify_node() {
   # Look for guest RDMA script validation
   if grep -q "=== tidefs-guest-rdma" "$serial_log" 2>/dev/null; then
     emit_kv "${label}_guest_script_ran" "yes"
-    grep "module_\|rdma_link\|rdma_diag\|carrier_result\|transport_session\|infiniband_device\|netdev_\|rping_\|tidefs_data_path\|tidefs_storage_node\|tidefs_server\|guest_node_from\|rdma_libibverbs" \
+    grep "module_\|rdma_link\|rdma_diag\|carrier_result\|transport_session\|infiniband_device\|netdev_\|rping_\|tidefs_data_path\|tidefs_storage_node\|tidefs_server\|tidefs_client\|guest_node_from\|rdma_libibverbs" \
       "$serial_log" 2>/dev/null > "$out_dir/guest_carrier.env" || true
 
     # Extract TideFS RDMA data-path smoke result
@@ -967,6 +1020,8 @@ classify_node() {
       emit_kv "${label}_data_path_smoke" "pass"
     elif grep -q "tidefs_data_path_smoke=fail" "$serial_log" 2>/dev/null; then
       emit_kv "${label}_data_path_smoke" "fail"
+    elif grep -q "tidefs_data_path_smoke=blocked_no_timeout" "$serial_log" 2>/dev/null; then
+      emit_kv "${label}_data_path_smoke" "blocked_no_timeout"
     elif grep -q "tidefs_data_path_smoke=blocked_no_binary" "$serial_log" 2>/dev/null; then
       emit_kv "${label}_data_path_smoke" "blocked_no_binary"
     elif grep -q "tidefs_server_status=failed_to_start" "$serial_log" 2>/dev/null; then
@@ -975,6 +1030,10 @@ classify_node() {
     if grep -q "tidefs_server_exit=" "$serial_log" 2>/dev/null; then
       SRV_EXIT="$(grep "tidefs_server_exit=" "$serial_log" 2>/dev/null | head -1 | cut -d= -f2)"
       emit_kv "${label}_server_exit" "$SRV_EXIT"
+    fi
+    if grep -q "tidefs_client_exit=" "$serial_log" 2>/dev/null; then
+      CLIENT_EXIT="$(grep "tidefs_client_exit=" "$serial_log" 2>/dev/null | head -1 | cut -d= -f2)"
+      emit_kv "${label}_client_exit" "$CLIENT_EXIT"
     fi
   else
     emit_kv "${label}_guest_script_ran" "no"
@@ -1036,7 +1095,7 @@ grep -q "node_a_data_path_smoke=pass" "$summary_file" 2>/dev/null && node_a_data
 grep -q "node_b_data_path_smoke=pass" "$summary_file" 2>/dev/null && node_b_data_path_pass=true
 
 if $node_a_data_path_pass && $node_b_data_path_pass; then
-  emit_kv "tidefs_rdma_data_path_smoke" "client_server_ping_pass"
+  emit_kv "tidefs_rdma_data_path_smoke" "client_server_health_pass"
 elif $node_a_data_path_pass || $node_b_data_path_pass; then
   emit_kv "tidefs_rdma_data_path_smoke" "partial_one_node_pass"
 else
