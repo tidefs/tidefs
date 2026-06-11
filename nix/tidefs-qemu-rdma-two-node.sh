@@ -16,7 +16,8 @@ _qemu_cleanup() {
   fi
   # Remove temp overlay directory
   if [[ -n "${overlay_dir:-}" ]] && [[ -d "$overlay_dir" ]]; then
-    rm -rf "$overlay_dir"
+    chmod -R u+rwX "$overlay_dir" 2>/dev/null || true
+    rm -rf "$overlay_dir" 2>/dev/null || true
   fi
   # Remove any pid/sock files placed in the working directory
   rm -f qemu.pid qemu.sock qemu-*.pid qemu-*.sock 2>/dev/null || true
