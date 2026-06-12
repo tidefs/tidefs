@@ -479,6 +479,16 @@ pub enum BackfillError {
     EmptyPlan,
     #[error("no viable sources for object {0}")]
     NoViableSource(u64),
+    #[error("object {object_id} has a synthetic placement receipt ref")]
+    SyntheticReceiptRef { object_id: u64 },
+    #[error("object {object_id} has a malformed placement receipt policy")]
+    MalformedReceiptPolicy { object_id: u64 },
+    #[error("object {object_id} receipt target count {actual} is below required width {required}")]
+    InsufficientReceiptTargets {
+        object_id: u64,
+        required: u16,
+        actual: u16,
+    },
 }
 
 // ── Initiator ───────────────────────────────────────────────────────
@@ -609,6 +619,8 @@ impl RebuildBackfillInitiator {
             return Err(BackfillError::EmptyPlan);
         }
 
+        Self::validate_plan_receipts(&plan)?;
+
         let batches =
             Self::partition_plan(&plan, epoch, self.default_max_chunk_bytes, self.carrier);
 
@@ -625,6 +637,34 @@ impl RebuildBackfillInitiator {
 
         self.sessions.insert(backfill_id, session);
         Ok(backfill_id)
+    }
+
+    fn validate_plan_receipts(plan: &RebuildPlan) -> Result<(), BackfillError> {
+        for task in &plan.tasks {
+            if task.source_nodes.is_empty() || task.target_nodes.is_empty() {
+                continue;
+            }
+            let receipt = task.placement_receipt_ref;
+            if receipt.is_synthetic() {
+                return Err(BackfillError::SyntheticReceiptRef {
+                    object_id: task.object_id,
+                });
+            }
+            if !receipt.redundancy_policy.is_well_formed() {
+                return Err(BackfillError::MalformedReceiptPolicy {
+                    object_id: task.object_id,
+                });
+            }
+            let required = receipt.redundancy_policy.target_width();
+            if receipt.target_count < required {
+                return Err(BackfillError::InsufficientReceiptTargets {
+                    object_id: task.object_id,
+                    required,
+                    actual: receipt.target_count,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Partition a rebuild plan into per-target batches.
