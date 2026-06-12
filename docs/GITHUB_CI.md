@@ -29,6 +29,14 @@ may use non-secret repository variables for scheduling gates, such as
   `tidefs-schema-codec-posix-filesystem-adapter`, and
   `tidefs-secret-key-policy-runtime`, plus a targeted `tidefs-transport`
   session test.
+- `Focused Rust` is a manual self-hosted workflow for issue-specific PR
+  validation. Dispatch it against the feature branch with a comma-separated
+  crate list and optional extra `cargo test` arguments when the acceptance
+  criteria require touched-package Rust tests outside the standing smoke set.
+  It uses the same repo `.#ci` Nix development shell, host-local Cargo scratch,
+  JSON summary artifact, and per-run target cleanup as `Rust Fast`. It also
+  self-tests on pull requests that modify the focused workflow or its runner
+  helper so workflow changes get Actions coverage before merge.
 - `Secret Policy` runs on the same self-hosted TideFS runner labels and keeps
   the GitHub secret boundary checked without spending hosted Actions minutes.
 - `Nix Checks` runs on self-hosted TideFS runners and builds pure check
