@@ -126,6 +126,13 @@ Pool-backed `SyncResponse` entries likewise carry the real non-synthetic
 transport-backed compatibility stores keep sync entries receipt-less rather
 than synthesizing placement authority.
 
+Pool-backed `ReadPlanResponse` frames carry the same kind of validated
+`PlacementReceiptRef`, and `TransportReplicatedStore::get_planned_with_evidence()`
+preserves that ref with the returned payload and source member id. This is
+planned-read evidence plumbing only: replacement-node orchestration, repaired
+placement publication, broader cluster-state publication, and reclaim
+publication remain under the distributed receipt-authority work.
+
 Receipt-backed repair callers can use
 `TransportReplicatedStore::execute_receipt_repair_task_and_record_completion()`
 to execute `RepairObject` and record rebuild-runtime verified-task completion

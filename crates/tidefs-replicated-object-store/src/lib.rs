@@ -1045,6 +1045,17 @@ pub struct ReceiptRepairCompletionEvidence {
     pub completion_event: Option<RebuildCompleted>,
 }
 
+/// Payload and durable receipt evidence returned by a planned read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransportPlannedReadResult {
+    /// Bytes returned by the selected source.
+    pub payload: Vec<u8>,
+    /// Member id that served the read response.
+    pub source_member_id: u64,
+    /// Validated placement receipt authority, when the source exposes it.
+    pub placement_receipt_ref: Option<PlacementReceiptRef>,
+}
+
 fn validate_read_plan_response_receipt(
     plan: &ReplicatedReadPlan,
     payload: &[u8],
@@ -2077,6 +2088,19 @@ impl TransportReplicatedStore {
     ///
     /// Returns an error if the primary read fails.
     pub fn get_planned(&mut self, plan: &ReplicatedReadPlan) -> Result<Option<Vec<u8>>, String> {
+        self.get_planned_with_evidence(plan)
+            .map(|result| result.map(|result| result.payload))
+    }
+
+    /// Execute a model-generated read plan and preserve receipt evidence.
+    ///
+    /// This keeps the payload-only [`Self::get_planned`] API stable while
+    /// allowing rebuild and repair callers to consume validated placement
+    /// receipt authority from pool-backed read-plan responses.
+    pub fn get_planned_with_evidence(
+        &mut self,
+        plan: &ReplicatedReadPlan,
+    ) -> Result<Option<TransportPlannedReadResult>, String> {
         use tidefs_replication_model::ReplicatedReadClass;
 
         // Refuse unreadable plans
@@ -2091,7 +2115,11 @@ impl TransportReplicatedStore {
         match self.primary.get(key) {
             Ok(Some(data)) => {
                 self.stats.planned_reads += 1;
-                return Ok(Some(data));
+                return Ok(Some(TransportPlannedReadResult {
+                    payload: data,
+                    source_member_id: self.local_node_id(),
+                    placement_receipt_ref: None,
+                }));
             }
             Ok(None) => {}
             Err(e) => return Err(format!("primary read failed: {e}")),
@@ -2110,10 +2138,10 @@ impl TransportReplicatedStore {
                 .map(|r| (r.node_id, r.shadow_session_id))
             {
                 match self.request_planned_read(node_id, shadow_session_id, &plan_bytes, plan)? {
-                    Some(payload) => {
+                    Some(result) => {
                         self.stats.planned_reads += 1;
                         self.stats.degraded_reads += 1;
-                        return Ok(Some(payload));
+                        return Ok(Some(result));
                     }
                     None => {}
                 }
@@ -2133,10 +2161,10 @@ impl TransportReplicatedStore {
                 .map(|r| (r.node_id, r.shadow_session_id))
             {
                 match self.request_planned_read(node_id, shadow_session_id, &plan_bytes, plan)? {
-                    Some(payload) => {
+                    Some(result) => {
                         self.stats.planned_reads += 1;
                         self.stats.degraded_reads += 1;
-                        return Ok(Some(payload));
+                        return Ok(Some(result));
                     }
                     None => {}
                 }
@@ -2153,7 +2181,7 @@ impl TransportReplicatedStore {
         shadow_session_id: SessionId,
         plan_bytes: &[u8],
         plan: &ReplicatedReadPlan,
-    ) -> Result<Option<Vec<u8>>, String> {
+    ) -> Result<Option<TransportPlannedReadResult>, String> {
         let msg = ReplicationMessage::ReadPlan {
             plan_bytes: plan_bytes.to_vec(),
         };
@@ -2190,7 +2218,11 @@ impl TransportReplicatedStore {
             ));
         }
         validate_read_plan_response_payload(plan, &payload, placement_receipt_ref)?;
-        Ok(Some(payload))
+        Ok(Some(TransportPlannedReadResult {
+            payload,
+            source_member_id,
+            placement_receipt_ref,
+        }))
     }
 
     /// Full write path: generates a write plan from the membership model and
@@ -3994,6 +4026,145 @@ mod tests {
             let err =
                 validate_read_plan_response_payload(&plan, b"payload", Some(receipt)).unwrap_err();
             assert!(err.contains("synthetic"));
+        }
+
+        #[test]
+        fn planned_read_with_evidence_preserves_remote_receipt_authority() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let replica_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut replica = TransportReplicatedStore::open(
+                replica_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let (_client_session_id, server_session_id) =
+                connect_replica_pair(&mut primary, &mut replica, 2);
+
+            let payload = b"receipt-backed planned read".to_vec();
+            let object_key = tidefs_local_object_store::ObjectKey::from_name(b"planned-read");
+            let receipt = placement_receipt_ref(88, &object_key, &payload, 21);
+            let plan = read_plan_for_subject(88);
+            let server_payload = payload.clone();
+            let server = std::thread::spawn(move || {
+                let msg = recv_replication_msg(&mut replica.transport, server_session_id)
+                    .expect("read plan request received");
+                let ReplicationMessage::ReadPlan { plan_bytes } = msg else {
+                    panic!("expected ReadPlan request, got {msg:?}");
+                };
+                let received_plan: ReplicatedReadPlan =
+                    bincode::deserialize(&plan_bytes).expect("read plan decodes");
+                assert_eq!(received_plan.subject_ref, ReplicatedSubjectId::new(88));
+
+                send_replication_msg(
+                    &mut replica.transport,
+                    server_session_id,
+                    &ReplicationMessage::ReadPlanResponse {
+                        found: true,
+                        payload: server_payload,
+                        source_member_id: 2,
+                        placement_receipt_ref: Some(receipt),
+                    },
+                )
+                .expect("read plan response sent");
+            });
+
+            let result = primary
+                .get_planned_with_evidence(&plan)
+                .expect("planned read succeeds")
+                .expect("planned read found remote payload");
+
+            assert_eq!(result.payload, payload);
+            assert_eq!(result.source_member_id, 2);
+            assert_eq!(result.placement_receipt_ref, Some(receipt));
+            assert_eq!(primary.stats().planned_reads, 1);
+            assert_eq!(primary.stats().degraded_reads, 1);
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn planned_read_with_evidence_rejects_invalid_remote_receipt() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let replica_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut replica = TransportReplicatedStore::open(
+                replica_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let (_client_session_id, server_session_id) =
+                connect_replica_pair(&mut primary, &mut replica, 2);
+
+            let payload = b"receipt-backed planned read".to_vec();
+            let object_key = tidefs_local_object_store::ObjectKey::from_name(b"planned-read");
+            let mut receipt = placement_receipt_ref(88, &object_key, &payload, 22);
+            receipt.payload_digest = blake3::hash(b"different-payload").into();
+            let plan = read_plan_for_subject(88);
+            let server_payload = payload.clone();
+            let server = std::thread::spawn(move || {
+                let msg = recv_replication_msg(&mut replica.transport, server_session_id)
+                    .expect("read plan request received");
+                let ReplicationMessage::ReadPlan { .. } = msg else {
+                    panic!("expected ReadPlan request, got {msg:?}");
+                };
+
+                send_replication_msg(
+                    &mut replica.transport,
+                    server_session_id,
+                    &ReplicationMessage::ReadPlanResponse {
+                        found: true,
+                        payload: server_payload,
+                        source_member_id: 2,
+                        placement_receipt_ref: Some(receipt),
+                    },
+                )
+                .expect("read plan response sent");
+            });
+
+            let err = primary
+                .get_planned_with_evidence(&plan)
+                .expect_err("invalid receipt is rejected");
+
+            assert!(err.contains("digest mismatch"));
+            assert_eq!(primary.stats().planned_reads, 0);
+            assert_eq!(primary.stats().degraded_reads, 0);
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn payload_only_planned_read_api_stays_compatible() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = TransportReplicatedStore::open(
+                dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let plan = read_plan_for_subject(88);
+            let name = format!("obj-{:016x}", plan.subject_ref.0);
+            let key = tidefs_local_object_store::ObjectKey::from_name(&name);
+            store.primary.put(key, b"local-planned-payload").unwrap();
+
+            let payload = store
+                .get_planned(&plan)
+                .expect("payload-only planned read succeeds")
+                .expect("local payload found");
+
+            assert_eq!(payload, b"local-planned-payload".to_vec());
+            assert_eq!(store.stats().planned_reads, 1);
+            assert_eq!(store.stats().degraded_reads, 0);
         }
 
         #[test]
