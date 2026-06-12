@@ -2413,6 +2413,35 @@ impl TransportReplicatedStore {
         self.placement.as_ref().and_then(|p| p.placement_map())
     }
 
+    /// Try to set the placement map on the dispatch.
+    ///
+    /// The map version must be strictly greater than the current version.
+    /// When the placement map changes, callers should also update the
+    /// [`PlacementVersionTracker`] so membership views carry the new version.
+    pub fn try_set_placement_map(
+        &mut self,
+        map: tidefs_transport::PlacementMap,
+    ) -> Result<(), String> {
+        let placement = self
+            .placement
+            .as_mut()
+            .ok_or_else(|| "placement must be configured before setting a map".to_string())?;
+
+        if let Some(existing) = placement.placement_map() {
+            if !map.is_newer_than(existing) {
+                return Err(format!(
+                    "placement map version {} must be newer than {}",
+                    map.version, existing.version
+                ));
+            }
+        } else if !map.is_initialized() {
+            return Err("first placement map must be initialized".into());
+        }
+
+        placement.set_placement_map(map);
+        Ok(())
+    }
+
     /// Set the placement map on the dispatch, incrementing the version.
     ///
     /// The map version must be strictly greater than the current version.
@@ -2423,11 +2452,8 @@ impl TransportReplicatedStore {
     ///
     /// Panics if placement is not configured or if the map version is stale.
     pub fn set_placement_map(&mut self, map: tidefs_transport::PlacementMap) {
-        let placement = self
-            .placement
-            .as_mut()
-            .expect("placement must be configured before setting a map");
-        placement.set_placement_map(map);
+        self.try_set_placement_map(map)
+            .expect("placement map publication failed");
     }
 
     /// Return the list of connected node IDs available for placement.

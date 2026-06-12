@@ -71,9 +71,9 @@ use tidefs_replication_model::{
 };
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
-    send_replication_msg, send_segment_fetch_response, PlacementVersionTracker, ReplicationMessage,
-    SegmentFetchRequest, SegmentFetchResponse, SessionCloseReason, SyncEntry, Transport,
-    TransportError, SEGMENT_FETCH_REQUEST_MAGIC,
+    send_replication_msg, send_segment_fetch_response, PlacementMap as TransportPlacementMap,
+    PlacementVersionTracker, ReplicationMessage, SegmentFetchRequest, SegmentFetchResponse,
+    SessionCloseReason, SyncEntry, Transport, TransportError, SEGMENT_FETCH_REQUEST_MAGIC,
 };
 use tidefs_types_pool_label_core::PoolRedundancyPolicy as LabelPoolRedundancyPolicy;
 
@@ -128,6 +128,15 @@ pub struct StorageNodeRelocationPlacementPublication {
     pub flow_commit_result: FlowCommitResult,
     /// Placement-map state publication derived from the flow-commit result.
     pub placement_publication: RelocationFlowCommitPlacementPublication,
+}
+
+/// Storage-node summary for publishing cluster placement into transport reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageNodeTransportReadMapPublication {
+    /// Versioned transport read map installed into the replicated store.
+    pub read_map: TransportPlacementMap,
+    /// Previous placement version advertised by the membership tracker.
+    pub previous_tracker_version: u64,
 }
 
 /// Publish storage-node repair flow-commit evidence into a local placement map.
@@ -193,6 +202,77 @@ pub fn finalize_cluster_runtime_heal_from_repair_publications(
         repair_publications: repair_publications.to_vec(),
         rebuilt_placements: cluster_finalization.rebuilt_placements,
         completion_publication: cluster_finalization.completion_publication,
+    })
+}
+
+/// Convert cluster-owned placement state into a transport degraded-read map.
+///
+/// This is the storage-node boundary between receipt-backed heal completion and
+/// transport read routing. Callers pass the runtime placement after heal
+/// finalization, so the resulting map contains the current full placement view,
+/// not only the rebuilt-object delta from the completion publication.
+pub fn transport_read_map_from_cluster_placement(
+    placement_map: &PlacementMap,
+    version: u64,
+) -> Result<TransportPlacementMap, String> {
+    if version == 0 {
+        return Err("transport read map version 0 is not publishable".into());
+    }
+
+    let cluster_entries = placement_map.object_member_map();
+    if cluster_entries.is_empty() {
+        return Err("cluster placement map is empty; refusing empty transport read map".into());
+    }
+
+    let mut mapping = BTreeMap::new();
+    for (&object_id, members) in cluster_entries {
+        if members.is_empty() {
+            return Err(format!(
+                "cluster placement map object {object_id} has no read members"
+            ));
+        }
+
+        mapping.insert(
+            object_id,
+            members.iter().copied().map(MemberId::new).collect(),
+        );
+    }
+
+    Ok(TransportPlacementMap::new(
+        version,
+        EpochId::new(placement_map.epoch()),
+        mapping,
+    ))
+}
+
+/// Publish cluster-runtime placement into transport degraded-read routing.
+///
+/// The transport store owns the actual read-routing map; the tracker publishes
+/// its version into membership views. This helper updates both together after
+/// receipt-backed heal completion has already updated the cluster runtime.
+pub fn publish_cluster_runtime_read_map_to_transport_store(
+    runtime: &ClusterLeaseRuntime,
+    store: &mut TransportReplicatedStore,
+    tracker: &PlacementVersionTracker,
+) -> Result<StorageNodeTransportReadMapPublication, String> {
+    let previous_tracker_version = tracker.current_version();
+    let version_base = store.placement_version().max(previous_tracker_version);
+    let next_version = version_base
+        .checked_add(1)
+        .ok_or_else(|| "transport read map version overflow".to_string())?;
+    let read_map =
+        transport_read_map_from_cluster_placement(runtime.placement_map(), next_version)?;
+
+    store
+        .try_set_placement_map(read_map.clone())
+        .map_err(|err| {
+            format!("transport replicated store rejected read-map publication: {err}")
+        })?;
+    tracker.update(read_map.version);
+
+    Ok(StorageNodeTransportReadMapPublication {
+        read_map,
+        previous_tracker_version,
     })
 }
 
@@ -5179,6 +5259,28 @@ mod cluster_pool_handler_tests {
         )
     }
 
+    fn transport_store_with_placement() -> (tempfile::TempDir, TransportReplicatedStore) {
+        let tmp = tempfile::TempDir::with_prefix("storage-node-read-map-").unwrap();
+        let layout = DurabilityLayoutV1::mirror(2).unwrap();
+        let failure_domain = tidefs_durability_layout::FailureDomainV1::new(
+            tidefs_durability_layout::FailureDomainLevel::Node,
+            64,
+        )
+        .unwrap();
+        let sessions = tidefs_transport::TransportSessionSet::new();
+        let dispatch =
+            tidefs_transport::PlacementDispatch::new(layout, failure_domain, 0, sessions);
+        let store = TransportReplicatedStore::open(
+            tmp.path(),
+            1u64,
+            TransportReplicatedStoreConfig::default(),
+        )
+        .unwrap()
+        .with_placement(dispatch);
+
+        (tmp, store)
+    }
+
     fn assert_repair_flow_publication_refused_without_mutation(
         publication: ReceiptRepairFlowCommitPublication,
         old_receipt: PlacementReceiptRef,
@@ -5863,6 +5965,111 @@ mod cluster_pool_handler_tests {
                 .cloned()
                 .unwrap_or_default(),
             [2, 4].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn transport_read_map_publication_refuses_empty_cluster_placement() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime =
+            ClusterLeaseRuntime::new(1, EpochId::new(5), ClusterLeaseConfig::default(), tx);
+        let (_tmp, mut store) = transport_store_with_placement();
+        let tracker = PlacementVersionTracker::new();
+
+        let err =
+            publish_cluster_runtime_read_map_to_transport_store(&runtime, &mut store, &tracker)
+                .unwrap_err();
+
+        assert!(err.contains("cluster placement map is empty"), "{err}");
+        assert_eq!(tracker.current_version(), 0);
+        assert_eq!(store.placement_version(), 0);
+        assert!(store.placement_map().is_none());
+    }
+
+    #[test]
+    fn transport_read_map_publication_refuses_store_without_placement_dispatch() {
+        let old_receipt = receipt_ref(b"storage-node-read-map-old", b"old-payload", 1);
+        let runtime = cluster_runtime_with_old_receipt(old_receipt);
+        let tmp = tempfile::TempDir::with_prefix("storage-node-read-map-no-placement-").unwrap();
+        let mut store = TransportReplicatedStore::open(
+            tmp.path(),
+            1u64,
+            TransportReplicatedStoreConfig::default(),
+        )
+        .unwrap();
+        let tracker = PlacementVersionTracker::new();
+
+        let err =
+            publish_cluster_runtime_read_map_to_transport_store(&runtime, &mut store, &tracker)
+                .unwrap_err();
+
+        assert!(err.contains("placement must be configured"), "{err}");
+        assert_eq!(tracker.current_version(), 0);
+        assert_eq!(store.placement_version(), 0);
+        assert!(store.placement_map().is_none());
+    }
+
+    #[test]
+    fn heal_finalization_publishes_cluster_placement_to_transport_read_map() {
+        let (mut runtime, repair_publications, source_receipts, repaired_receipts) =
+            cluster_runtime_with_verifying_heal_and_repair_publications();
+        let accepted = repair_publications
+            .iter()
+            .map(|publication| {
+                publish_repair_flow_commit_into_cluster_runtime(&mut runtime, publication)
+                    .expect("repair publication is accepted")
+            })
+            .collect::<Vec<_>>();
+        let finalization =
+            finalize_cluster_runtime_heal_from_repair_publications(&mut runtime, &accepted)
+                .expect("complete repair publications finalize heal");
+        let (_tmp, mut store) = transport_store_with_placement();
+        let tracker = PlacementVersionTracker::with_version(7);
+
+        let publication =
+            publish_cluster_runtime_read_map_to_transport_store(&runtime, &mut store, &tracker)
+                .expect("completed heal placement publishes to transport read map");
+
+        assert_eq!(publication.previous_tracker_version, 7);
+        assert_eq!(publication.read_map.version, 8);
+        assert_eq!(publication.read_map.epoch, EpochId::new(9));
+        assert_eq!(tracker.current_version(), 8);
+        assert_eq!(store.placement_version(), 8);
+        assert_eq!(
+            store
+                .placement_map()
+                .expect("transport read map is installed"),
+            &publication.read_map
+        );
+        assert_eq!(
+            publication
+                .read_map
+                .members_for(repaired_receipts[0].object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [MemberId::new(2), MemberId::new(3)]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            publication
+                .read_map
+                .members_for(repaired_receipts[1].object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [MemberId::new(2), MemberId::new(4)]
+                .into_iter()
+                .collect()
+        );
+        for source_receipt in source_receipts {
+            assert!(!publication
+                .read_map
+                .members_for(source_receipt.object_id)
+                .is_some_and(|members| members.contains(&MemberId::new(1))));
+        }
+        assert_eq!(
+            finalization.completion_publication.final_map_epoch,
+            runtime.placement_map().epoch()
         );
     }
 
