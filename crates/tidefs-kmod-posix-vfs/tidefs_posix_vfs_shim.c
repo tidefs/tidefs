@@ -3568,9 +3568,12 @@ static ssize_t tidefs_posix_vfs_file_read_iter(struct kiocb *iocb,
 	if (pos < 0)
 		return -EINVAL;
 
-	/* Engine-backed path (#6642): read through the Rust engine using
-	 * the real file handle stored in file->private_data.  This bypasses
-	 * the C fixed-table buffer entirely for production mounts. */
+	/*
+	 * Engine-backed buffered reads must use the Linux page cache so dirty
+	 * folios remain the read authority until writeback drains them.  Direct
+	 * reads keep the explicit engine bridge after reconciling overlapping
+	 * cached writeback state below.
+	 */
 	if (ofs && ofs->engine_backed) {
 		struct tidefs_posix_vfs_mount *ctx = inode->i_sb->s_fs_info;
 		struct timespec64 old_atime = inode_get_atime(inode);
@@ -3581,6 +3584,20 @@ static ssize_t tidefs_posix_vfs_file_read_iter(struct kiocb *iocb,
 			ret = tidefs_posix_vfs_activate_engine(ctx);
 			if (ret < 0)
 				return ret;
+		}
+
+		if (!(iocb->ki_flags & IOCB_DIRECT)) {
+			ssize_t read_ret = generic_file_read_iter(iocb, to);
+
+			if (read_ret > 0) {
+				struct timespec64 new_atime;
+
+				new_atime = inode_get_atime(inode);
+				if (!timespec64_equal(&old_atime, &new_atime))
+					tidefs_posix_vfs_persist_inode_times_best_effort(
+						inode, 0x40);
+			}
+			return read_ret;
 		}
 
 		if (requested > 0) {
@@ -5304,14 +5321,14 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
  * write_end -- address_space_operations callback for buffered-write commit.
  *
  * Called after the kernel has written data into a folio prepared by
- * write_begin.  Writes the modified data back to VfsEngine::write() and
- * records the write-end lifecycle counter for QEMU validation.
+ * write_begin.  Marks the modified folio dirty and updates in-core inode
+ * state; writepages/fsync/syncfs are the single engine writeback authority for
+ * buffered data.
  *
  * The kernel passes `copied` bytes actually written; this may be less
  * than `len` for partial writes.  Only `copied` bytes are committed.
  *
- * No userspace daemon required: VfsEngine::write resolves within kernel
- * authority.
+ * No userspace daemon required.
  *
  * Returns the number of bytes committed (should be `copied` on success).
  */
@@ -5323,13 +5340,10 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 	struct tidefs_posix_vfs_mount *ctx = inode->i_sb->s_fs_info;
 	struct tidefs_posix_vfs_open_file_state *ofs;
 	struct file *file = iocb ? iocb->ki_filp : NULL;
-	void *kbuf;
 	size_t folio_off;
-	int ret;
 	bool i_size_changed = false;
 	loff_t old_size;
 	loff_t last_pos;
-	u64 fh_ino, fh_id;
 
 	(void)fsdata;
 	(void)len;
@@ -5361,41 +5375,6 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 	}
 
 	ofs = file ? file->private_data : NULL;
-	fh_ino = ofs ? ofs->fh_ino : inode->i_ino;
-	fh_id = ofs ? ofs->fh_id : inode->i_ino;
-
-	/* Extract the modified data from the folio. */
-	kbuf = kmalloc(copied, GFP_KERNEL);
-	if (!kbuf) {
-		mapping_set_error(mapping, -ENOMEM);
-		folio_unlock(folio);
-		folio_put(folio);
-		return -ENOMEM;
-	}
-
-	{
-		void *addr = kmap_local_folio(folio, 0);
-		memcpy(kbuf, (char *)addr + folio_off, copied);
-		kunmap_local(addr);
-	}
-
-	ret = tidefs_posix_vfs_engine_write(
-		fh_ino, fh_id, (u64)pos, kbuf, (u32)copied);
-	kfree(kbuf);
-
-	if (ret < 0) {
-		mapping_set_error(mapping, ret);
-		folio_unlock(folio);
-		folio_put(folio);
-		return ret;
-	}
-	if ((unsigned int)ret != copied) {
-		mapping_set_error(mapping, -EIO);
-		folio_unlock(folio);
-		folio_put(folio);
-		return -EIO;
-	}
-
 	old_size = i_size_read(inode);
 	last_pos = pos + copied;
 	if (last_pos > old_size) {
