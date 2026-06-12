@@ -523,13 +523,13 @@ fn parse_pool_redundancy_policy(
     let value = raw.trim().to_ascii_lowercase();
     match value.as_str() {
         "single" => return Ok(RedundancyPolicy::replicated(1)),
-        "none" => return Err(legacy_pool_redundancy_error(raw, "single")),
-        "mirror" => return Err(legacy_pool_redundancy_error(raw, "replicated=N")),
+        "none" => return Err(retired_pool_redundancy_alias_error(raw, "single")),
+        "mirror" => return Err(retired_pool_redundancy_alias_error(raw, "replicated=N")),
         _ => {}
     }
 
     if value.starts_with("mirror=") {
-        return Err(legacy_pool_redundancy_error(raw, "replicated=N"));
+        return Err(retired_pool_redundancy_alias_error(raw, "replicated=N"));
     }
 
     if let Some(rest) = value.strip_prefix("replicated=") {
@@ -547,9 +547,9 @@ fn parse_pool_redundancy_policy(
     ))
 }
 
-fn legacy_pool_redundancy_error(raw: &str, replacement: &str) -> String {
+fn retired_pool_redundancy_alias_error(raw: &str, replacement: &str) -> String {
     format!(
-        "legacy redundancy policy \"{raw}\" is no longer accepted; use {replacement} (expected single, replicated=N, or erasure=D+P)"
+        "retired redundancy alias \"{raw}\" is not accepted; use {replacement} (expected single, replicated=N, or erasure=D+P)"
     )
 }
 
@@ -1143,7 +1143,7 @@ fn handle_pool_integrity_check(
     }
 
     // ── Phase 2: segment-level integrity scan ──
-    // Compatibility directory stores use SegmentScanner. Byte-addressable
+    // Retired directory object-stores use SegmentScanner. Byte-addressable
     // pool members use the block-device object-store scanner when --devices is
     // present.
     let mut segment_scan_error: Option<String> = None;
@@ -1159,7 +1159,7 @@ fn handle_pool_integrity_check(
     let segment_report: Option<PoolScanReport> = if let Some(ref path) = backing_dir {
         if !path.exists() {
             eprintln!(
-                "tidefsctl: integrity-check compatibility directory object store does not exist: {}",
+                "tidefsctl: integrity-check retired directory object-store does not exist: {}",
                 path.display()
             );
             process::exit(2);
@@ -1926,17 +1926,17 @@ mod tests {
     }
 
     #[test]
-    fn redundancy_legacy_aliases_are_rejected() {
+    fn redundancy_retired_aliases_are_rejected() {
         let none = parse_pool_redundancy_policy("none").unwrap_err();
-        assert!(none.contains("legacy redundancy policy"));
+        assert!(none.contains("retired redundancy alias"));
         assert!(none.contains("single"));
 
         let mirror = parse_pool_redundancy_policy("mirror").unwrap_err();
-        assert!(mirror.contains("legacy redundancy policy"));
+        assert!(mirror.contains("retired redundancy alias"));
         assert!(mirror.contains("replicated=N"));
 
         let mirror_eq = parse_pool_redundancy_policy("mirror=2").unwrap_err();
-        assert!(mirror_eq.contains("legacy redundancy policy"));
+        assert!(mirror_eq.contains("retired redundancy alias"));
         assert!(mirror_eq.contains("replicated=N"));
     }
 
