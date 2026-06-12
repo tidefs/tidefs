@@ -1016,7 +1016,10 @@ impl ReplicatedObjectStore {
 
 use std::net::SocketAddr;
 use tidefs_rebuild_runtime::{
-    completion::RebuildCompletion, engine::ReceiptSegmentSource, task::BackfillTask,
+    admission::RebuildAdmission,
+    completion::{RebuildCompleted, RebuildCompletion},
+    engine::ReceiptSegmentSource,
+    task::BackfillTask,
 };
 use tidefs_transport::{
     build_read_responses, recv_replication_msg, recv_segment_fetch, recv_segment_fetch_response,
@@ -1031,6 +1034,16 @@ const REPLICA_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const REPLICA_ACK_TIMEOUT: Duration = Duration::from_millis(200);
 const REPLICA_ACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Evidence returned after a receipt-bound repair has also been recorded as
+/// verified rebuild completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptRepairCompletionEvidence {
+    /// Fresh repaired placement receipt returned by the target storage node.
+    pub repaired_placement_receipt_ref: PlacementReceiptRef,
+    /// Completion event emitted when this repair closes the member rebuild.
+    pub completion_event: Option<RebuildCompleted>,
+}
 
 fn validate_read_plan_response_receipt(
     plan: &ReplicatedReadPlan,
@@ -2437,6 +2450,30 @@ impl TransportReplicatedStore {
             })?;
 
         Ok(repaired_receipt)
+    }
+
+    /// Execute a receipt-bound repair and record verified rebuild completion
+    /// only after the target returns a repaired placement receipt.
+    pub fn execute_receipt_repair_task_and_record_completion(
+        &mut self,
+        task: &BackfillTask,
+        completion: &mut RebuildCompletion,
+        admission: &mut RebuildAdmission,
+    ) -> Result<ReceiptRepairCompletionEvidence, String> {
+        let repaired_receipt = self.execute_receipt_repair_task(task)?;
+        let completion_event = completion
+            .record_receipt_verified_task_completion(task, repaired_receipt, admission)
+            .map_err(|err| {
+                format!(
+                    "receipt-bound repair completion recording failed for object {}: {err:?}",
+                    task.placement_receipt_ref.object_id
+                )
+            })?;
+
+        Ok(ReceiptRepairCompletionEvidence {
+            repaired_placement_receipt_ref: repaired_receipt,
+            completion_event,
+        })
     }
 
     fn fetch_remote_segment_request(
@@ -3884,6 +3921,48 @@ mod tests {
             })
         }
 
+        fn rebuild_state_for_task(task: &BackfillTask) -> (RebuildCompletion, RebuildAdmission) {
+            let mut completion = RebuildCompletion::new();
+            completion.register(task.target_member, 1);
+
+            let loss = tidefs_rebuild_runtime::admission::LossRecord::from_placement_receipt_refs(
+                vec![task.target_member],
+                vec![task.source_member],
+                [task.placement_receipt_ref],
+                task.movement_class,
+                7,
+                task.created_at_ns,
+            )
+            .expect("task receipt admits rebuild loss");
+            let mut admission = RebuildAdmission::with_epoch(7);
+            let mut scheduler = tidefs_rebuild_runtime::scheduler::BackfillScheduler::new();
+            let outcome = admission.admit(&loss, &mut scheduler);
+            assert_eq!(outcome.admitted, vec![task.target_member]);
+            assert_eq!(outcome.refused, Vec::new());
+            assert_eq!(outcome.report_count, 1);
+            assert_eq!(outcome.intent_count, 1);
+            assert_eq!(
+                admission.status(task.target_member),
+                tidefs_rebuild_runtime::admission::RebuildAdmissionStatus::Rebuilding
+            );
+
+            (completion, admission)
+        }
+
+        fn assert_repair_completion_not_recorded(
+            completion: &mut RebuildCompletion,
+            admission: &RebuildAdmission,
+            member: MemberId,
+        ) {
+            assert_eq!(
+                admission.status(member),
+                tidefs_rebuild_runtime::admission::RebuildAdmissionStatus::Rebuilding
+            );
+            assert_eq!(completion.status(member).unwrap().subjects_completed, 0);
+            assert_eq!(completion.total_completed_subjects(), 0);
+            assert_eq!(completion.drain_events().len(), 0);
+        }
+
         #[test]
         fn read_plan_response_receipt_validates_payload_authority() {
             let payload = b"planned-read-authority";
@@ -4932,7 +5011,84 @@ mod tests {
         }
 
         #[test]
-        fn receipt_repair_task_refuses_receiptless_success_ack() {
+        fn receipt_repair_task_records_verified_completion() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let source_dir = tempfile::tempdir().unwrap();
+            let target_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut source = TransportReplicatedStore::open(
+                source_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut target = TransportReplicatedStore::open(
+                target_dir.path(),
+                3,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 1330u64;
+            let payload = b"receipt repair completion bridge payload".to_vec();
+            let receipt_key = tidefs_local_object_store::ObjectKey::from_name(
+                b"issue-133-repair-completion-bridge",
+            );
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &payload, 61);
+            let mut repaired_receipt = receipt;
+            repaired_receipt.receipt_generation = 62;
+            let task = backfill_task_for_receipt(receipt, 2, 3);
+            source.primary.put(receipt_key, &payload).unwrap();
+            let (mut completion, mut admission) = rebuild_state_for_task(&task);
+
+            let (_source_client_session, source_server_session) =
+                connect_replica_pair(&mut primary, &mut source, 2);
+            let (_target_client_session, target_server_session) =
+                connect_replica_pair(&mut primary, &mut target, 3);
+            let source_server = spawn_receipt_source(source, source_server_session);
+            let target_server = spawn_repair_target(
+                target,
+                target_server_session,
+                receipt,
+                Some(repaired_receipt),
+            );
+
+            let evidence = primary
+                .execute_receipt_repair_task_and_record_completion(
+                    &task,
+                    &mut completion,
+                    &mut admission,
+                )
+                .expect("receipt repair records verified completion");
+
+            assert_eq!(source_server.join().unwrap(), object_id);
+            assert_eq!(target_server.join().unwrap(), payload);
+            assert_eq!(evidence.repaired_placement_receipt_ref, repaired_receipt);
+            let event = evidence
+                .completion_event
+                .expect("single repaired task emits completion");
+            assert!(event.fully_successful);
+            assert_eq!(
+                completion
+                    .status(task.target_member)
+                    .unwrap()
+                    .subjects_completed,
+                1
+            );
+            assert_eq!(
+                admission.status(task.target_member),
+                tidefs_rebuild_runtime::admission::RebuildAdmissionStatus::Completed
+            );
+            assert_eq!(completion.drain_events(), vec![event]);
+        }
+
+        #[test]
+        fn receipt_repair_completion_refuses_receiptless_success_ack() {
             let primary_dir = tempfile::tempdir().unwrap();
             let source_dir = tempfile::tempdir().unwrap();
             let target_dir = tempfile::tempdir().unwrap();
@@ -4962,6 +5118,7 @@ mod tests {
             let receipt = placement_receipt_ref(object_id, &receipt_key, &payload, 41);
             let task = backfill_task_for_receipt(receipt, 2, 3);
             source.primary.put(receipt_key, &payload).unwrap();
+            let (mut completion, mut admission) = rebuild_state_for_task(&task);
 
             let (_source_client_session, source_server_session) =
                 connect_replica_pair(&mut primary, &mut source, 2);
@@ -4970,15 +5127,22 @@ mod tests {
             let source_server = spawn_receipt_source(source, source_server_session);
             let target_server = spawn_repair_target(target, target_server_session, receipt, None);
 
-            let err = primary.execute_receipt_repair_task(&task).unwrap_err();
+            let err = primary
+                .execute_receipt_repair_task_and_record_completion(
+                    &task,
+                    &mut completion,
+                    &mut admission,
+                )
+                .unwrap_err();
 
             assert!(err.contains("did not return repaired placement receipt"));
+            assert_repair_completion_not_recorded(&mut completion, &admission, task.target_member);
             assert_eq!(source_server.join().unwrap(), object_id);
             assert_eq!(target_server.join().unwrap(), payload);
         }
 
         #[test]
-        fn receipt_repair_task_refuses_mismatched_ack_receipt() {
+        fn receipt_repair_completion_refuses_mismatched_ack_receipt() {
             let primary_dir = tempfile::tempdir().unwrap();
             let source_dir = tempfile::tempdir().unwrap();
             let target_dir = tempfile::tempdir().unwrap();
@@ -5010,6 +5174,7 @@ mod tests {
             mismatched_receipt.payload_len += 1;
             let task = backfill_task_for_receipt(receipt, 2, 3);
             source.primary.put(receipt_key, &payload).unwrap();
+            let (mut completion, mut admission) = rebuild_state_for_task(&task);
 
             let (_source_client_session, source_server_session) =
                 connect_replica_pair(&mut primary, &mut source, 2);
@@ -5023,9 +5188,16 @@ mod tests {
                 Some(mismatched_receipt),
             );
 
-            let err = primary.execute_receipt_repair_task(&task).unwrap_err();
+            let err = primary
+                .execute_receipt_repair_task_and_record_completion(
+                    &task,
+                    &mut completion,
+                    &mut admission,
+                )
+                .unwrap_err();
 
             assert!(err.contains("PayloadLengthMismatch"));
+            assert_repair_completion_not_recorded(&mut completion, &admission, task.target_member);
             assert_eq!(source_server.join().unwrap(), object_id);
             assert_eq!(target_server.join().unwrap(), payload);
         }
