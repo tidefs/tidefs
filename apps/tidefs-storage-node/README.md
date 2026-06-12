@@ -104,7 +104,7 @@ deserialization for `tidefs_transport::ReplicationMessage`.
 | `SyncRequest` | Lists exact object payloads; responds `SyncResponse` entries with `PlacementReceiptRef` authority when the backend exposes pool receipts |
 | `ReadPlan { plan_bytes }` | Serves the planned subject locally; pool-backed responses carry a validated `PlacementReceiptRef`, while compatibility backends stay receipt-less |
 | `ScrubRequest` | Runs local segment scrub and reports findings plus receipt-inventory disclosure |
-| `RepairObject { key, placement_receipt_ref, authoritative_payload }` | Validates the shared placement receipt against the exact 32-byte object key, length, digest, policy, and target width before local repair write; responds `RepairObjectAck` |
+| `RepairObject { key, placement_receipt_ref, authoritative_payload }` | Validates the shared placement receipt against the exact 32-byte object key, length, digest, policy, and target width before local repair write; pool-backed repairs respond with a fresh repaired `PlacementReceiptRef` |
 
 Pool-backed scrub reports include `placement_receipt_refs`,
 `rebuild_admission`, and `rebuild_planner` previews. Both previews are built
@@ -122,6 +122,13 @@ Pool-backed `SyncResponse` entries likewise carry the real non-synthetic
 `PlacementReceiptRef` for the payload being transferred. Local path-backed and
 transport-backed compatibility stores keep sync entries receipt-less rather
 than synthesizing placement authority.
+
+Receipt-backed repair callers must treat `RepairObjectAck` as completion
+evidence only when `success` is true and the ack carries a non-synthetic
+`repaired_placement_receipt_ref` that passes the rebuild-runtime verified-task
+completion law. Compatibility acks without a repaired receipt are accepted as
+wire-format responses, but they do not advance receipt-backed rebuild
+completion.
 
 ### Local-Only Operations (LOCAL-ONLY boundary)
 

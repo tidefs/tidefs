@@ -234,6 +234,15 @@ impl RebuildCompletion {
         Ok(self.record_completion_unit(task.target_member, true, admission))
     }
 
+    /// Validate a repaired target receipt against the scheduled receipt-bound
+    /// task without mutating completion state.
+    pub fn validate_repaired_receipt_for_task(
+        task: &BackfillTask,
+        repaired_receipt_ref: PlacementReceiptRef,
+    ) -> Result<(), ReceiptCompletionError> {
+        Self::validate_repaired_receipt_ref(task, repaired_receipt_ref)
+    }
+
     fn validate_repaired_receipt_ref(
         task: &BackfillTask,
         repaired_receipt_ref: PlacementReceiptRef,
