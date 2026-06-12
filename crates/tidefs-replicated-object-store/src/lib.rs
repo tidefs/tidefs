@@ -1070,6 +1070,23 @@ pub struct TransportPlannedReadResult {
     pub placement_receipt_ref: Option<PlacementReceiptRef>,
 }
 
+/// Planned-read result suitable for repair/rebuild authority decisions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptBackedTransportPlannedReadResult {
+    /// Bytes returned by the selected source.
+    pub payload: Vec<u8>,
+    /// Member id that served the read response.
+    pub source_member_id: u64,
+    /// Validated non-synthetic placement receipt authority for the payload.
+    pub placement_receipt_ref: PlacementReceiptRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedReadReceiptRequirement {
+    Optional,
+    Required,
+}
+
 fn validate_read_plan_response_receipt(
     plan: &ReplicatedReadPlan,
     payload: &[u8],
@@ -1116,6 +1133,25 @@ fn validate_read_plan_response_receipt(
         ));
     }
     Ok(())
+}
+
+fn required_planned_read_receipt(
+    plan: &ReplicatedReadPlan,
+    result: &TransportPlannedReadResult,
+) -> Result<PlacementReceiptRef, String> {
+    let Some(receipt) = result.placement_receipt_ref else {
+        return Err(format!(
+            "receipt-authoritative planned read for subject {} returned payload without placement receipt evidence",
+            plan.subject_ref.0
+        ));
+    };
+    if receipt.is_synthetic() {
+        return Err(format!(
+            "receipt-authoritative planned read for subject {} returned synthetic placement receipt",
+            plan.subject_ref.0
+        ));
+    }
+    Ok(receipt)
 }
 
 fn validate_read_plan_response_payload(
@@ -2115,6 +2151,38 @@ impl TransportReplicatedStore {
         &mut self,
         plan: &ReplicatedReadPlan,
     ) -> Result<Option<TransportPlannedReadResult>, String> {
+        self.get_planned_with_evidence_inner(plan, PlannedReadReceiptRequirement::Optional)
+    }
+
+    /// Execute a model-generated read plan that must return receipt authority.
+    ///
+    /// Repair, rebuild, and reclaim callers can use this path when payload bytes
+    /// are not enough: a successful result carries a validated non-synthetic
+    /// [`PlacementReceiptRef`]. Receipt-less compatibility responses and local
+    /// primary hits without placement evidence fail closed here while remaining
+    /// valid for the optional evidence APIs above.
+    pub fn get_planned_with_required_receipt(
+        &mut self,
+        plan: &ReplicatedReadPlan,
+    ) -> Result<Option<ReceiptBackedTransportPlannedReadResult>, String> {
+        let Some(result) =
+            self.get_planned_with_evidence_inner(plan, PlannedReadReceiptRequirement::Required)?
+        else {
+            return Ok(None);
+        };
+        let placement_receipt_ref = required_planned_read_receipt(plan, &result)?;
+        Ok(Some(ReceiptBackedTransportPlannedReadResult {
+            payload: result.payload,
+            source_member_id: result.source_member_id,
+            placement_receipt_ref,
+        }))
+    }
+
+    fn get_planned_with_evidence_inner(
+        &mut self,
+        plan: &ReplicatedReadPlan,
+        receipt_requirement: PlannedReadReceiptRequirement,
+    ) -> Result<Option<TransportPlannedReadResult>, String> {
         use tidefs_replication_model::ReplicatedReadClass;
 
         // Refuse unreadable plans
@@ -2128,6 +2196,12 @@ impl TransportReplicatedStore {
         // Try local primary first
         match self.primary.get(key) {
             Ok(Some(data)) => {
+                if receipt_requirement == PlannedReadReceiptRequirement::Required {
+                    return Err(format!(
+                        "receipt-authoritative planned read for subject {} hit local primary without placement receipt evidence",
+                        plan.subject_ref.0
+                    ));
+                }
                 self.stats.planned_reads += 1;
                 return Ok(Some(TransportPlannedReadResult {
                     payload: data,
@@ -2153,6 +2227,9 @@ impl TransportReplicatedStore {
             {
                 match self.request_planned_read(node_id, shadow_session_id, &plan_bytes, plan)? {
                     Some(result) => {
+                        if receipt_requirement == PlannedReadReceiptRequirement::Required {
+                            required_planned_read_receipt(plan, &result)?;
+                        }
                         self.stats.planned_reads += 1;
                         self.stats.degraded_reads += 1;
                         return Ok(Some(result));
@@ -2176,6 +2253,9 @@ impl TransportReplicatedStore {
             {
                 match self.request_planned_read(node_id, shadow_session_id, &plan_bytes, plan)? {
                     Some(result) => {
+                        if receipt_requirement == PlannedReadReceiptRequirement::Required {
+                            required_planned_read_receipt(plan, &result)?;
+                        }
                         self.stats.planned_reads += 1;
                         self.stats.degraded_reads += 1;
                         return Ok(Some(result));
@@ -4192,6 +4272,136 @@ mod tests {
             assert_eq!(primary.stats().planned_reads, 0);
             assert_eq!(primary.stats().degraded_reads, 0);
             server.join().unwrap();
+        }
+
+        #[test]
+        fn authoritative_planned_read_accepts_valid_remote_receipt() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let replica_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut replica = TransportReplicatedStore::open(
+                replica_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let (_client_session_id, server_session_id) =
+                connect_replica_pair(&mut primary, &mut replica, 2);
+
+            let payload = b"authoritative planned read".to_vec();
+            let object_key = tidefs_local_object_store::ObjectKey::from_name(b"authoritative-read");
+            let receipt = placement_receipt_ref(88, &object_key, &payload, 23);
+            let plan = read_plan_for_subject(88);
+            let server_payload = payload.clone();
+            let server = std::thread::spawn(move || {
+                let msg = recv_replication_msg(&mut replica.transport, server_session_id)
+                    .expect("read plan request received");
+                let ReplicationMessage::ReadPlan { .. } = msg else {
+                    panic!("expected ReadPlan request, got {msg:?}");
+                };
+
+                send_replication_msg(
+                    &mut replica.transport,
+                    server_session_id,
+                    &ReplicationMessage::ReadPlanResponse {
+                        found: true,
+                        payload: server_payload,
+                        source_member_id: 2,
+                        placement_receipt_ref: Some(receipt),
+                    },
+                )
+                .expect("read plan response sent");
+            });
+
+            let result = primary
+                .get_planned_with_required_receipt(&plan)
+                .expect("authoritative planned read succeeds")
+                .expect("authoritative planned read found remote payload");
+
+            assert_eq!(result.payload, payload);
+            assert_eq!(result.source_member_id, 2);
+            assert_eq!(result.placement_receipt_ref, receipt);
+            assert_eq!(primary.stats().planned_reads, 1);
+            assert_eq!(primary.stats().degraded_reads, 1);
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn authoritative_planned_read_rejects_receiptless_remote_response() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let replica_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut replica = TransportReplicatedStore::open(
+                replica_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let (_client_session_id, server_session_id) =
+                connect_replica_pair(&mut primary, &mut replica, 2);
+
+            let plan = read_plan_for_subject(88);
+            let server = std::thread::spawn(move || {
+                let msg = recv_replication_msg(&mut replica.transport, server_session_id)
+                    .expect("read plan request received");
+                let ReplicationMessage::ReadPlan { .. } = msg else {
+                    panic!("expected ReadPlan request, got {msg:?}");
+                };
+
+                send_replication_msg(
+                    &mut replica.transport,
+                    server_session_id,
+                    &ReplicationMessage::ReadPlanResponse {
+                        found: true,
+                        payload: b"receiptless planned read".to_vec(),
+                        source_member_id: 2,
+                        placement_receipt_ref: None,
+                    },
+                )
+                .expect("read plan response sent");
+            });
+
+            let err = primary
+                .get_planned_with_required_receipt(&plan)
+                .expect_err("receiptless authority read is rejected");
+
+            assert!(err.contains("without placement receipt evidence"));
+            assert_eq!(primary.stats().planned_reads, 0);
+            assert_eq!(primary.stats().degraded_reads, 0);
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn authoritative_planned_read_rejects_local_primary_without_receipt() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = TransportReplicatedStore::open(
+                dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let plan = read_plan_for_subject(88);
+            let name = format!("obj-{:016x}", plan.subject_ref.0);
+            let key = tidefs_local_object_store::ObjectKey::from_name(&name);
+            store.primary.put(key, b"local-planned-payload").unwrap();
+
+            let err = store
+                .get_planned_with_required_receipt(&plan)
+                .expect_err("local primary hit without receipt is rejected");
+
+            assert!(err.contains("local primary without placement receipt evidence"));
+            assert_eq!(store.stats().planned_reads, 0);
+            assert_eq!(store.stats().degraded_reads, 0);
         }
 
         #[test]
