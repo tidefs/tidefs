@@ -157,9 +157,11 @@ convergence, and reclaim publication remain separate #18 work. The cluster
 placement map can consume the completed rebuild `FlowCommitResult` through
 `PlacementMap::publish_rebuild_flow_commit_result()` and update local
 cluster-visible repaired-placement state after validating subject, target,
-epoch, and receipt authority. That local placement-map publication is still
-not degraded-read routing, replacement orchestration, cluster-wide propagation,
-or reclaim completion.
+epoch, and receipt authority. `PlacementHealCoordinator` and
+`ClusterLeaseRuntime` expose the same local publication path through their
+owned placement state. These local placement-publication owner boundaries are
+still not degraded-read routing, replacement orchestration, cluster-wide
+propagation, or reclaim completion.
 Storage-node callers that already have the replicated-store repair publication
 can use `publish_repair_flow_commit_into_placement_map()` to cross-check the
 repair evidence against the flow-commit result before applying that local

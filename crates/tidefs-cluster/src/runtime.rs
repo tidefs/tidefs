@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::mpsc;
 
 use tidefs_membership_epoch::EpochId;
+use tidefs_replication_model::FlowCommitResult;
 
 use crate::authority::{AcquireOutcome, LeaseAuthority, RenewOutcome};
 use crate::dataset_catalog::{
@@ -28,6 +29,7 @@ use crate::dataset_catalog::{
 use crate::lease_state_machine::LeaseStateMachine;
 use crate::placement_heal::{
     HealState, HealStats, LossEvent, PlacementHealCoordinator, PlacementMap,
+    RebuildFlowCommitPlacementPublication,
 };
 use crate::pool_config::{ClusterPlacementPolicy, ClusterPoolConfig, FailureDomain};
 use crate::pool_lease_token::PoolLeaseToken;
@@ -906,6 +908,15 @@ impl ClusterLeaseRuntime {
             .insert(object_id, member_id);
     }
 
+    /// Publish a completed rebuild flow-commit result into cluster-owned placement state.
+    pub fn publish_rebuild_flow_commit_result(
+        &mut self,
+        result: &FlowCommitResult,
+    ) -> Result<RebuildFlowCommitPlacementPublication, String> {
+        self.heal_coordinator
+            .publish_rebuild_flow_commit_result(result)
+    }
+
     /// Return a validator for transport-layer write-fence checks, if configured.
     pub fn fence_validator(&self) -> Option<FenceValidator> {
         self.fence_authority.as_ref().map(|fa| fa.validator())
@@ -956,7 +967,11 @@ impl ClusterLeaseRuntime {
 mod tests {
     use super::*;
     use crate::protocol::{AcquireAck, AcquireRequest, ExpireNotify, ReleaseRequest, RenewRequest};
-    use tidefs_membership_epoch::{EpochId, HealthClass};
+    use tidefs_membership_epoch::{DomainId, EpochId, HealthClass, MemberId};
+    use tidefs_replication_model::{
+        FlowCommitClass, FlowState, ObjectDigest, PlacementReceiptRef, ReplicaCopyClass,
+        ReplicaCopyRecord, ReplicaPlacementReceipt, ReplicatedReceiptId, ReplicatedSubjectId,
+    };
 
     #[test]
     fn new_runtime_is_unleased() {
@@ -1324,20 +1339,64 @@ mod tests {
         RebuildPlan::new(plan_id, tasks, 0)
     }
 
-    fn receipt_ref(object_id: u64) -> tidefs_replication_model::PlacementReceiptRef {
+    fn receipt_ref_with_generation(object_id: u64, generation: u64) -> PlacementReceiptRef {
         let mut object_key = [0xA5; 32];
         object_key[..8].copy_from_slice(&object_id.to_le_bytes());
         let mut digest = [0x5A; 32];
         digest[..8].copy_from_slice(&object_id.to_le_bytes());
-        tidefs_replication_model::PlacementReceiptRef::replicated(
+        digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        PlacementReceiptRef::replicated(
             object_id,
             object_key,
             EpochId(1),
-            1,
+            generation,
             2,
             4096,
             digest,
         )
+    }
+
+    fn receipt_ref(object_id: u64) -> PlacementReceiptRef {
+        receipt_ref_with_generation(object_id, 1)
+    }
+
+    fn rebuild_flow_result(
+        object_id: u64,
+        target_member: u64,
+        placement_receipt_ref: PlacementReceiptRef,
+        epoch: u64,
+    ) -> FlowCommitResult {
+        let subject_ref = ReplicatedSubjectId::new(object_id);
+        let target_member = MemberId::new(target_member);
+        let digest_prefix = u64::from_le_bytes(
+            placement_receipt_ref.payload_digest[..8]
+                .try_into()
+                .unwrap(),
+        );
+        FlowCommitResult {
+            placement_receipt: ReplicaPlacementReceipt {
+                receipt_id: ReplicatedReceiptId(1000 + object_id),
+                verification_ref: ReplicatedReceiptId(2000 + object_id),
+                transfer_ref: ReplicatedReceiptId(3000 + object_id),
+                subject_refs: vec![subject_ref],
+                placed_on: target_member,
+                placement_epoch: EpochId(epoch),
+                subjects_placed: 1,
+                placement_receipt_refs: vec![placement_receipt_ref],
+            },
+            updated_copy: ReplicaCopyRecord {
+                subject_ref,
+                member_ref: target_member,
+                domain_ref: DomainId::new(target_member.0 * 10 + 1),
+                copy_class: ReplicaCopyClass::Verified,
+                payload_digest: ObjectDigest::new(digest_prefix),
+                freshness_frontier: epoch,
+                verification_receipt_ref: ReplicatedReceiptId(2000 + object_id),
+            },
+            final_flow_state: FlowState::Complete,
+            flow_class: FlowCommitClass::Rebuild,
+            commit_epoch: EpochId(epoch),
+        }
     }
 
     fn make_task(
@@ -1453,6 +1512,37 @@ mod tests {
         let map = rt.placement_map();
         assert_eq!(map.object_count(), 2);
         assert_eq!(map.member_count(), 2);
+    }
+
+    #[test]
+    fn publish_rebuild_flow_commit_result_delegates_to_heal_coordinator() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
+            .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
+        rt.record_placement(90, 20);
+
+        let repaired_receipt = receipt_ref_with_generation(90, 2);
+        let result = rebuild_flow_result(90, 30, repaired_receipt, 7);
+        let publication = rt
+            .publish_rebuild_flow_commit_result(&result)
+            .expect("runtime delegates completed rebuild flow publication");
+
+        assert_eq!(
+            publication,
+            RebuildFlowCommitPlacementPublication {
+                object_id: 90,
+                target_member: 30,
+                placement_receipt_ref: repaired_receipt,
+                map_epoch: 7,
+            }
+        );
+        let map = rt.placement_map();
+        assert_eq!(map.epoch(), 7);
+        assert_eq!(map.placement_receipt_ref(90), Some(repaired_receipt));
+        assert_eq!(
+            map.replicas_of(90).cloned().unwrap_or_default(),
+            [20, 30].into_iter().collect()
+        );
     }
 
     #[test]
