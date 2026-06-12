@@ -78,7 +78,9 @@ Test fixtures must not silently weaken the behavior being claimed.
 - If a fixture bypasses FUSE, kernel, ublk, or transport runtime boundaries,
   the test must not be cited as proof for those boundaries.
 - If a test is about an unreleased internal format, remove or redesign wrong
-  expectations instead of preserving compatibility stubs by default.
+  expectations instead of preserving compatibility stubs by default. See
+  `docs/UNRELEASED_AUTHORITY_POLICY.md` before keeping a stale pre-release
+  fixture as a compatibility or migration claim.
 
 ## Placement
 

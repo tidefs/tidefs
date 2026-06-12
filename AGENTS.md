@@ -38,6 +38,10 @@ otherwise. Do not start or depend on parked Nexus/Factory automation.
 - Do not add anonymous `TODO`, `FIXME`, `HACK`, or "continuation" debt. Record
   debt in `docs/REVIEW_TODO_REGISTER.md`; inline comments may only point to a
   register id such as `Review debt TFR-005`.
+- Do not add or preserve legacy compatibility, migration, downgrade, or
+  fallback behavior for unreleased TideFS data by default. Follow
+  `docs/UNRELEASED_AUTHORITY_POLICY.md`: choose current authority unless a
+  GitHub issue names a real external ABI/protocol or operator-owned data target.
 - Preserve the GPL-2.0-only WITH Linux-syscall-note licensing model.
 - See `docs/GITHUB_PR_DEVELOPMENT.md` for the full issue, worktree, PR,
   validation, and multi-Codex policy.

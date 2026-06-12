@@ -1417,7 +1417,8 @@ pub struct TransportReplicatedStore {
     verification_receipts: Vec<ReplicaVerificationReceipt>,
     /// Optional placement dispatch for deterministic replica selection.
     /// When set, writes and reads use NodePlacement to target only the
-    /// correct replica set; when None, all replicas are used (legacy).
+    /// correct replica set; when None, receiptless operations fan out to all
+    /// replicas.
     placement: Option<PlacementDispatch>,
     /// Lazily-initialized replicated object reader for degraded reads.
     reader: Option<ReplicatedObjectReader>,
@@ -2291,7 +2292,7 @@ impl TransportReplicatedStore {
     ///
     /// Repair, rebuild, and reclaim callers can use this path when payload bytes
     /// are not enough: a successful result carries a validated non-synthetic
-    /// [`PlacementReceiptRef`]. Receipt-less compatibility responses and local
+    /// [`PlacementReceiptRef`]. Receiptless non-pool responses and local
     /// primary hits without placement evidence fail closed here while remaining
     /// valid for the optional evidence APIs above.
     pub fn get_planned_with_required_receipt(
@@ -2517,7 +2518,7 @@ impl TransportReplicatedStore {
     ///
     /// When placement is set, writes and reads use BLAKE3-based
     /// deterministic node placement to target only the correct replica
-    /// set; when None, all replicas are used (legacy).
+    /// set; when None, receiptless operations fan out to all replicas.
     ///
     /// The placement engine is initialized separately and injected here
     /// so that the same placement can be shared across multiple stores.
@@ -4804,7 +4805,7 @@ mod tests {
         }
 
         #[test]
-        fn payload_only_planned_read_api_stays_compatible() {
+        fn payload_only_planned_read_api_accepts_optional_evidence() {
             let dir = tempfile::tempdir().unwrap();
             let mut store = TransportReplicatedStore::open(
                 dir.path(),
@@ -5825,14 +5826,17 @@ mod tests {
 
             let object_id = 52u64;
             let receipt_payload = b"receipt-bound movement payload".to_vec();
-            let legacy_payload = b"legacy object-id bytes".to_vec();
+            let object_id_payload = b"receiptless object-id bytes".to_vec();
             let receipt_key =
                 tidefs_local_object_store::ObjectKey::from_name(b"issue-52-receipt-key");
-            let legacy_key =
+            let object_id_key =
                 tidefs_local_object_store::ObjectKey::from_name(object_id.to_le_bytes());
             let receipt = placement_receipt_ref(object_id, &receipt_key, &receipt_payload, 11);
             replica.primary.put(receipt_key, &receipt_payload).unwrap();
-            replica.primary.put(legacy_key, &legacy_payload).unwrap();
+            replica
+                .primary
+                .put(object_id_key, &object_id_payload)
+                .unwrap();
 
             let (_client_session_id, server_session_id) =
                 connect_replica_pair(&mut primary, &mut replica, 2);
@@ -5847,7 +5851,7 @@ mod tests {
                 .expect("receipt-bound segment fetch");
 
             assert_eq!(fetched, receipt_payload[8..16].to_vec());
-            assert_ne!(fetched, legacy_payload[8..16].to_vec());
+            assert_ne!(fetched, object_id_payload[8..16].to_vec());
             assert_eq!(server.join().unwrap(), object_id);
         }
 
@@ -5876,10 +5880,10 @@ mod tests {
 
             let object_id = 5600u64;
             let receipt_payload = b"receipt-source engine payload".to_vec();
-            let legacy_payload = b"legacy path must not feed rebuild".to_vec();
+            let object_id_payload = b"receiptless path must not feed rebuild".to_vec();
             let receipt_key =
                 tidefs_local_object_store::ObjectKey::from_name(b"issue-56-receipt-key");
-            let legacy_key =
+            let object_id_key =
                 tidefs_local_object_store::ObjectKey::from_name(object_id.to_le_bytes());
             let receipt = placement_receipt_ref(object_id, &receipt_key, &receipt_payload, 56);
             let payload_digest_prefix =
@@ -5899,8 +5903,13 @@ mod tests {
             );
 
             replica.primary.put(receipt_key, &receipt_payload).unwrap();
-            replica.primary.put(legacy_key, &legacy_payload).unwrap();
-            target.put(legacy_key, b"existing legacy target").unwrap();
+            replica
+                .primary
+                .put(object_id_key, &object_id_payload)
+                .unwrap();
+            target
+                .put(object_id_key, b"existing object-id target")
+                .unwrap();
 
             let (_client_session_id, server_session_id) =
                 connect_replica_pair(&mut primary, &mut replica, 2);
@@ -5921,8 +5930,8 @@ mod tests {
             assert_eq!(server.join().unwrap(), object_id);
             assert_eq!(target.get(receipt_key).unwrap(), Some(receipt_payload));
             assert_eq!(
-                target.get(legacy_key).unwrap(),
-                Some(b"existing legacy target".to_vec())
+                target.get(object_id_key).unwrap(),
+                Some(b"existing object-id target".to_vec())
             );
             assert_eq!(
                 progress.state,
@@ -6659,7 +6668,7 @@ mod tests {
         }
 
         #[test]
-        fn fetch_remote_segment_legacy_uses_object_id_key() {
+        fn fetch_remote_segment_receiptless_uses_object_id_key() {
             let primary_dir = tempfile::tempdir().unwrap();
             let replica_dir = tempfile::tempdir().unwrap();
             let mut primary = TransportReplicatedStore::open(
@@ -6676,13 +6685,16 @@ mod tests {
             .unwrap();
 
             let object_id = 5200u64;
-            let legacy_payload = b"legacy object-id segment payload".to_vec();
+            let object_id_payload = b"receiptless object-id segment payload".to_vec();
             let receipt_payload = b"receipt payload must not be used".to_vec();
-            let legacy_key =
+            let object_id_key =
                 tidefs_local_object_store::ObjectKey::from_name(object_id.to_le_bytes());
             let receipt_key =
                 tidefs_local_object_store::ObjectKey::from_name(b"issue-52-unused-receipt-key");
-            replica.primary.put(legacy_key, &legacy_payload).unwrap();
+            replica
+                .primary
+                .put(object_id_key, &object_id_payload)
+                .unwrap();
             replica.primary.put(receipt_key, &receipt_payload).unwrap();
 
             let (_client_session_id, server_session_id) =
@@ -6690,14 +6702,14 @@ mod tests {
             let server = std::thread::spawn(move || {
                 replica
                     .handle_segment_fetch_request(server_session_id)
-                    .expect("legacy segment fetch served")
+                    .expect("receiptless segment fetch served")
             });
 
             let fetched = primary
                 .fetch_remote_segment(0, object_id, 7, 9)
-                .expect("legacy segment fetch");
+                .expect("receiptless segment fetch");
 
-            assert_eq!(fetched, legacy_payload[7..16].to_vec());
+            assert_eq!(fetched, object_id_payload[7..16].to_vec());
             assert_ne!(fetched, receipt_payload[7..16].to_vec());
             assert_eq!(server.join().unwrap(), object_id);
         }
@@ -6720,15 +6732,18 @@ mod tests {
             .unwrap();
 
             let object_id = 5201;
-            let legacy_payload = b"synthetic receipt fallback payload".to_vec();
+            let object_id_payload = b"synthetic receipt fallback payload".to_vec();
             let synthetic_payload = b"synthetic object-key payload".to_vec();
             let synthetic_receipt =
                 PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(object_id));
-            let legacy_key =
+            let object_id_key =
                 tidefs_local_object_store::ObjectKey::from_name(object_id.to_le_bytes());
             let synthetic_key =
                 tidefs_local_object_store::ObjectKey::from_bytes32(synthetic_receipt.object_key);
-            replica.primary.put(legacy_key, &legacy_payload).unwrap();
+            replica
+                .primary
+                .put(object_id_key, &object_id_payload)
+                .unwrap();
             replica
                 .primary
                 .put(synthetic_key, &synthetic_payload)

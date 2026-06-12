@@ -20,6 +20,9 @@ private until the operator gives an explicit public-release go-ahead.
   are only short pointers to register entries.
 - Test changes must follow `docs/TEST_SIGNAL_POLICY.md`: prefer product and
   invariant signal over test-count growth, marker checks, and stale fixtures.
+- Unreleased internal surfaces must follow
+  `docs/UNRELEASED_AUTHORITY_POLICY.md`: choose current authority instead of
+  preserving pre-release paths as legacy compatibility or migration debt.
 - Publishing-facing capability wording must pass
   `cargo run -p tidefs-xtask -- check-claims-gate`.
 - Commits should be clean, scoped, and bisectable in the same spirit as Linux

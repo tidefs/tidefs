@@ -2,7 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, or RDMA data-path capability before matching proof exists";
+pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, or RDMA data-path capability before matching proof exists; unreleased internal TideFS paths must not be framed as product compatibility or migration promises without a real external boundary";
 pub const CLAIMS_GATE_REQUIRED_COMMAND: &str = "cargo run -p tidefs-xtask -- check-claims-gate";
 
 pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
@@ -14,6 +14,7 @@ pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "docs/PREVIEW_USER_MANUAL.md",
     "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
     "docs/REVIEW_TODO_REGISTER.md",
+    "docs/UNRELEASED_AUTHORITY_POLICY.md",
     "docs/WHOLE_REPO_REVIEW.md",
 ];
 
@@ -89,6 +90,7 @@ pub enum ClaimGateRuleTopic {
     ForbiddenCurrentCapabilityClaims,
     RequiredLimitationMarkers,
     WorkStateAuthority,
+    UnreleasedAuthority,
     EvidenceBeforeEscalation,
 }
 
@@ -101,6 +103,7 @@ impl ClaimGateRuleTopic {
             }
             Self::RequiredLimitationMarkers => "claims_gate.required_limitation_markers",
             Self::WorkStateAuthority => "claims_gate.work_state_authority",
+            Self::UnreleasedAuthority => "claims_gate.unreleased_authority",
             Self::EvidenceBeforeEscalation => "claims_gate.evidence_before_escalation",
         }
     }
@@ -111,6 +114,7 @@ impl ClaimGateRuleTopic {
             Self::ForbiddenCurrentCapabilityClaims => "forbidden current capability claims",
             Self::RequiredLimitationMarkers => "required limitation markers",
             Self::WorkStateAuthority => "GitHub work-state authority",
+            Self::UnreleasedAuthority => "unreleased authority boundary",
             Self::EvidenceBeforeEscalation => "proof before stronger claims",
         }
     }
@@ -138,6 +142,10 @@ pub const CLAIMS_GATE_RULES: &[ClaimGateRule] = &[
     ClaimGateRule {
         topic: ClaimGateRuleTopic::WorkStateAuthority,
         rule: "GitHub issue and pull request state, not repo-local task, checklist, roadmap, queue, or ledger files, is the foreground Codex work-state authority.",
+    },
+    ClaimGateRule {
+        topic: ClaimGateRuleTopic::UnreleasedAuthority,
+        rule: "Because TideFS has not had a public release, old internal TideFS paths must not be presented as product compatibility, migration, downgrade, or fallback promises unless a tracked issue names a real external boundary or operator-owned data set.",
     },
     ClaimGateRule {
         topic: ClaimGateRuleTopic::EvidenceBeforeEscalation,
@@ -202,6 +210,7 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "ClaimGateRule",
             "CLAIMS_GATE_RULES",
             "GitHub issue and pull request state",
+            "unreleased authority boundary",
             "claims_gate_policy_covers_current_claim_boundaries",
         ],
         &mut missing,
@@ -216,6 +225,19 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "POSIX-complete",
             "check-claims-gate",
             "Proof Before Stronger Claims",
+            "Unreleased Authority Boundary",
+        ],
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "docs/UNRELEASED_AUTHORITY_POLICY.md",
+        &[
+            "TideFS has not had a public release",
+            "Do not add or preserve legacy",
+            "operator-owned data set",
+            "current authority",
+            "retired pre-release path",
         ],
         &mut missing,
     );
@@ -278,6 +300,7 @@ fn check_source_bound_claim_rules(missing: &mut Vec<String>) {
         ClaimGateRuleTopic::ForbiddenCurrentCapabilityClaims,
         ClaimGateRuleTopic::RequiredLimitationMarkers,
         ClaimGateRuleTopic::WorkStateAuthority,
+        ClaimGateRuleTopic::UnreleasedAuthority,
         ClaimGateRuleTopic::EvidenceBeforeEscalation,
     ] {
         if !rules.iter().any(|rule| rule.topic == topic) {
@@ -383,13 +406,14 @@ mod tests {
     #[test]
     fn claims_gate_policy_covers_current_claim_boundaries() {
         let rules = claims_gate_rules();
-        assert_eq!(rules.len(), 5);
+        assert_eq!(rules.len(), 6);
 
         for topic in [
             ClaimGateRuleTopic::ScannedPublishingSurfaces,
             ClaimGateRuleTopic::ForbiddenCurrentCapabilityClaims,
             ClaimGateRuleTopic::RequiredLimitationMarkers,
             ClaimGateRuleTopic::WorkStateAuthority,
+            ClaimGateRuleTopic::UnreleasedAuthority,
             ClaimGateRuleTopic::EvidenceBeforeEscalation,
         ] {
             assert!(
@@ -405,6 +429,7 @@ mod tests {
             "production-ready",
             "POSIX-complete",
             "GitHub issue and pull request state",
+            "public release",
             "proof",
         ] {
             assert!(
@@ -415,9 +440,11 @@ mod tests {
         }
 
         assert!(CLAIMS_GATE_POLICY_SPEC.contains("matching proof"));
+        assert!(CLAIMS_GATE_POLICY_SPEC.contains("unreleased internal TideFS paths"));
         assert!(CLAIMS_GATE_REQUIRED_COMMAND.contains("check-claims-gate"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"README.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/REVIEW_TODO_REGISTER.md"));
+        assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/UNRELEASED_AUTHORITY_POLICY.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/WHOLE_REPO_REVIEW.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md"));
     }
