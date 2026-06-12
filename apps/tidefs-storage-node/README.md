@@ -165,7 +165,10 @@ propagation, or reclaim completion.
 Storage-node callers that already have the replicated-store repair publication
 can use `publish_repair_flow_commit_into_placement_map()` to cross-check the
 repair evidence against the flow-commit result before applying that local
-placement-map update; it is the storage-node composition boundary only.
+placement-map update. Callers that own `ClusterLeaseRuntime` can use
+`publish_repair_flow_commit_into_cluster_runtime()` to perform the same
+storage-node cross-check and delegate to runtime-owned placement state. These
+are storage-node composition boundaries only.
 
 ### Local-Only Operations (LOCAL-ONLY boundary)
 
