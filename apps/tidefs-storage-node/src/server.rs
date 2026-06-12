@@ -114,6 +114,43 @@ pub fn publish_repair_flow_commit_into_placement_map(
     placement_map: &mut PlacementMap,
     publication: &ReceiptRepairFlowCommitPublication,
 ) -> Result<StorageNodeRepairPlacementPublication, String> {
+    validate_repair_flow_commit_publication(publication)?;
+
+    let placement_publication = placement_map
+        .publish_rebuild_flow_commit_result(&publication.flow_commit_result)
+        .map_err(|err| format!("storage-node placement-map publication failed: {err}"))?;
+
+    Ok(StorageNodeRepairPlacementPublication {
+        repair_flow_publication: publication.clone(),
+        placement_publication,
+    })
+}
+
+/// Publish storage-node repair flow-commit evidence through cluster runtime.
+///
+/// This keeps the same repair/flow evidence checks as placement-map
+/// publication, then delegates to the cluster runtime's owned placement state.
+/// It does not perform cluster-wide propagation, degraded-read routing,
+/// replacement-node orchestration, or reclaim.
+pub fn publish_repair_flow_commit_into_cluster_runtime(
+    runtime: &mut ClusterLeaseRuntime,
+    publication: &ReceiptRepairFlowCommitPublication,
+) -> Result<StorageNodeRepairPlacementPublication, String> {
+    validate_repair_flow_commit_publication(publication)?;
+
+    let placement_publication = runtime
+        .publish_rebuild_flow_commit_result(&publication.flow_commit_result)
+        .map_err(|err| format!("storage-node cluster-runtime publication failed: {err}"))?;
+
+    Ok(StorageNodeRepairPlacementPublication {
+        repair_flow_publication: publication.clone(),
+        placement_publication,
+    })
+}
+
+fn validate_repair_flow_commit_publication(
+    publication: &ReceiptRepairFlowCommitPublication,
+) -> Result<(), String> {
     let repair = &publication.repair_completion;
     let verified = repair.verified_receipt_completion;
     if repair.repaired_placement_receipt_ref != verified.repaired_placement_receipt_ref {
@@ -145,14 +182,7 @@ pub fn publish_repair_flow_commit_into_placement_map(
         }
     }
 
-    let placement_publication = placement_map
-        .publish_rebuild_flow_commit_result(result)
-        .map_err(|err| format!("storage-node placement-map publication failed: {err}"))?;
-
-    Ok(StorageNodeRepairPlacementPublication {
-        repair_flow_publication: publication.clone(),
-        placement_publication,
-    })
+    Ok(())
 }
 
 fn pool_name_key(name: impl AsRef<[u8]>) -> ObjectKey {
@@ -4886,6 +4916,17 @@ mod cluster_pool_handler_tests {
         placement_map
     }
 
+    fn cluster_runtime_with_old_receipt(old_receipt: PlacementReceiptRef) -> ClusterLeaseRuntime {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime =
+            ClusterLeaseRuntime::new(1, EpochId::new(1), ClusterLeaseConfig::default(), tx);
+        let seed = repair_flow_commit_publication(old_receipt, old_receipt, 1, 5);
+        runtime
+            .publish_rebuild_flow_commit_result(&seed.flow_commit_result)
+            .expect("seed runtime placement state");
+        runtime
+    }
+
     fn assert_repair_flow_publication_refused_without_mutation(
         publication: ReceiptRepairFlowCommitPublication,
         old_receipt: PlacementReceiptRef,
@@ -4904,6 +4945,34 @@ mod cluster_pool_handler_tests {
         );
         assert_eq!(
             placement_map
+                .replicas_of(old_receipt.object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [1].into_iter().collect()
+        );
+    }
+
+    fn assert_repair_flow_runtime_publication_refused_without_mutation(
+        publication: ReceiptRepairFlowCommitPublication,
+        old_receipt: PlacementReceiptRef,
+        expected: &str,
+    ) {
+        let mut runtime = cluster_runtime_with_old_receipt(old_receipt);
+
+        let err = publish_repair_flow_commit_into_cluster_runtime(&mut runtime, &publication)
+            .unwrap_err();
+
+        assert!(err.contains(expected), "{err}");
+        assert_eq!(runtime.placement_map().epoch(), 5);
+        assert_eq!(
+            runtime
+                .placement_map()
+                .placement_receipt_ref(old_receipt.object_id),
+            Some(old_receipt)
+        );
+        assert_eq!(
+            runtime
+                .placement_map()
                 .replicas_of(old_receipt.object_id)
                 .cloned()
                 .unwrap_or_default(),
@@ -5236,6 +5305,44 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
+    fn repair_flow_commit_publication_updates_cluster_runtime() {
+        let source_receipt = receipt_ref(b"storage-node-repair-source", b"old-payload", 1);
+        let repaired_receipt = receipt_ref(b"storage-node-repair-source", b"new-payload", 2);
+        let publication = repair_flow_commit_publication(source_receipt, repaired_receipt, 2, 9);
+        let mut runtime = cluster_runtime_with_old_receipt(source_receipt);
+
+        let summary = publish_repair_flow_commit_into_cluster_runtime(&mut runtime, &publication)
+            .expect("repair flow publication updates cluster runtime");
+
+        assert_eq!(summary.repair_flow_publication, publication);
+        assert_eq!(
+            summary.placement_publication.object_id,
+            repaired_receipt.object_id
+        );
+        assert_eq!(summary.placement_publication.target_member, 2);
+        assert_eq!(
+            summary.placement_publication.placement_receipt_ref,
+            repaired_receipt
+        );
+        assert_eq!(summary.placement_publication.map_epoch, 9);
+        assert_eq!(runtime.placement_map().epoch(), 9);
+        assert_eq!(
+            runtime
+                .placement_map()
+                .placement_receipt_ref(repaired_receipt.object_id),
+            Some(repaired_receipt)
+        );
+        assert_eq!(
+            runtime
+                .placement_map()
+                .replicas_of(repaired_receipt.object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [1, 2].into_iter().collect()
+        );
+    }
+
+    #[test]
     fn repair_flow_commit_publication_rejects_mismatches_without_mutation() {
         let source_receipt = receipt_ref(b"storage-node-repair-source", b"old-payload", 1);
         let repaired_receipt = receipt_ref(b"storage-node-repair-source", b"new-payload", 2);
@@ -5282,6 +5389,42 @@ mod cluster_pool_handler_tests {
             mismatched_flow_receipt,
             source_receipt,
             "flow-commit repaired placement receipt",
+        );
+    }
+
+    #[test]
+    fn repair_flow_commit_publication_rejects_runtime_inputs_without_mutation() {
+        let source_receipt = receipt_ref(b"storage-node-repair-source", b"old-payload", 1);
+        let repaired_receipt = receipt_ref(b"storage-node-repair-source", b"new-payload", 2);
+
+        let mut mismatched_target =
+            repair_flow_commit_publication(source_receipt, repaired_receipt, 2, 9);
+        mismatched_target.flow_commit_result.updated_copy.member_ref = MemberId::new(3);
+        assert_repair_flow_runtime_publication_refused_without_mutation(
+            mismatched_target,
+            source_receipt,
+            "does not match repair completion target",
+        );
+
+        let mut stale = repair_flow_commit_publication(source_receipt, repaired_receipt, 2, 4);
+        stale.flow_commit_result.placement_receipt.placement_epoch = EpochId::new(4);
+        assert_repair_flow_runtime_publication_refused_without_mutation(
+            stale,
+            source_receipt,
+            "stale",
+        );
+
+        let mut receiptless =
+            repair_flow_commit_publication(source_receipt, repaired_receipt, 2, 9);
+        receiptless
+            .flow_commit_result
+            .placement_receipt
+            .placement_receipt_refs
+            .clear();
+        assert_repair_flow_runtime_publication_refused_without_mutation(
+            receiptless,
+            source_receipt,
+            "exactly one placement receipt",
         );
     }
 
