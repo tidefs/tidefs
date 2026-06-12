@@ -60,6 +60,7 @@ use tidefs_rebuild_runtime::admission::{LossRecord, RebuildAdmission, ReceiptIng
 use tidefs_rebuild_runtime::scheduler::BackfillScheduler;
 use tidefs_rebuild_runtime::task::BackfillTask;
 use tidefs_replicated_object_store::{
+    PeerPlacementMapRequestReport as TransportStorePeerPlacementMapRequestReport,
     ReceiptRepairFlowCommitPublication, ReplicatedObjectStore, ReplicatedStoreConfig,
     TransportReplicatedStore, TransportReplicatedStoreConfig,
 };
@@ -164,6 +165,17 @@ struct StorageNodePeerReadMapRequest {
     advertised_version: u64,
 }
 
+/// Planned outbound request for a peer read map over replica control transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StorageNodePeerReplicaReadMapRequest {
+    /// Peer selected from membership placement-version convergence.
+    peer: MemberId,
+    /// Minimum map version that would make the local node non-stale.
+    minimum_version: u64,
+    /// Version advertised by the peer through membership.
+    advertised_version: u64,
+}
+
 /// Plan for converting placement-version convergence into read-map requests.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct StorageNodePeerReadMapRequestPlan {
@@ -179,15 +191,51 @@ struct StorageNodePeerReadMapRequestPlan {
     already_requested_peers: Vec<MemberId>,
 }
 
+/// Plan for replica-control placement read-map requests.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct StorageNodePeerReplicaReadMapRequestPlan {
+    /// Local placement version at planning time.
+    local_version: u64,
+    /// Newest peer placement version observed at planning time.
+    max_peer_version: u64,
+    /// Requests ready to send over replica control sessions.
+    requests: Vec<StorageNodePeerReplicaReadMapRequest>,
+    /// Ahead peers already requested at this advertised version.
+    already_requested_peers: Vec<MemberId>,
+}
+
+/// Storage-node summary for a peer read map installed over replica control transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StorageNodePeerReplicaReadMapApplication {
+    /// Peer that served the map.
+    peer: MemberId,
+    /// Version advertised by membership when the request was planned.
+    advertised_version: u64,
+    /// Minimum version sent in the request.
+    requested_minimum_version: u64,
+    /// Local store placement version before the peer map was installed.
+    previous_store_version: u64,
+    /// Previous placement version advertised by the membership tracker.
+    previous_tracker_version: u64,
+    /// Version installed from the peer response.
+    installed_version: u64,
+}
+
 /// Result of one best-effort request scheduling pass.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct StorageNodePeerReadMapRequestReport {
     /// The computed request plan.
     plan: StorageNodePeerReadMapRequestPlan,
+    /// The computed replica-control request plan.
+    replica_plan: StorageNodePeerReplicaReadMapRequestPlan,
     /// Peers successfully sent a request during this pass.
     sent_peers: Vec<MemberId>,
     /// Peers whose request send failed and may be retried.
     send_failed_peers: Vec<MemberId>,
+    /// Peer maps installed through replica control transport.
+    replica_installed_maps: Vec<StorageNodePeerReplicaReadMapApplication>,
+    /// Peers whose replica-control request failed and may be retried.
+    replica_failed_peers: Vec<MemberId>,
 }
 
 /// Publish storage-node repair flow-commit evidence into a local placement map.
@@ -463,6 +511,64 @@ fn plan_peer_transport_read_map_requests(
     plan
 }
 
+fn plan_peer_replica_read_map_requests(
+    convergence: &tidefs_membership_live::PlacementVersionConvergence,
+    requested_peer_versions: &BTreeMap<MemberId, u64>,
+) -> StorageNodePeerReplicaReadMapRequestPlan {
+    let mut plan = StorageNodePeerReplicaReadMapRequestPlan {
+        local_version: convergence.local_version,
+        max_peer_version: convergence.max_peer_version,
+        ..StorageNodePeerReplicaReadMapRequestPlan::default()
+    };
+
+    if !convergence.local_is_stale() {
+        return plan;
+    }
+
+    let Some(minimum_version) = convergence.local_version.checked_add(1) else {
+        return plan;
+    };
+
+    for peer in &convergence.peers_ahead {
+        let Some(&advertised_version) = convergence.peer_versions.get(peer) else {
+            continue;
+        };
+        if advertised_version <= convergence.local_version {
+            continue;
+        }
+        if requested_peer_versions
+            .get(peer)
+            .is_some_and(|requested_version| *requested_version >= advertised_version)
+        {
+            plan.already_requested_peers.push(*peer);
+            continue;
+        }
+
+        plan.requests.push(StorageNodePeerReplicaReadMapRequest {
+            peer: *peer,
+            minimum_version,
+            advertised_version,
+        });
+    }
+
+    plan
+}
+
+fn retain_current_peer_read_map_requests(
+    convergence: &tidefs_membership_live::PlacementVersionConvergence,
+    requested_peer_versions: &mut BTreeMap<MemberId, u64>,
+) {
+    requested_peer_versions.retain(|peer, requested_version| {
+        convergence
+            .peer_versions
+            .get(peer)
+            .is_some_and(|observed_version| {
+                observed_version == requested_version
+                    && *requested_version > convergence.local_version
+            })
+    });
+}
+
 fn storage_replication_sessions_by_member(
     transport: &Transport,
 ) -> BTreeMap<MemberId, tidefs_transport::SessionId> {
@@ -478,33 +584,95 @@ fn storage_replication_sessions_by_member(
     peer_sessions
 }
 
-fn request_peer_transport_read_maps_from_convergence(
-    membership: &Arc<Mutex<MembershipRuntime>>,
+fn advance_tracker_after_peer_replica_read_map(
+    tracker: &PlacementVersionTracker,
+    request: &StorageNodePeerReplicaReadMapRequest,
+    peer_report: &TransportStorePeerPlacementMapRequestReport,
+) -> Result<StorageNodePeerReplicaReadMapApplication, String> {
+    if peer_report.peer_node_id != request.peer.0 {
+        return Err(format!(
+            "peer map response came from node {} while request targeted {}",
+            peer_report.peer_node_id, request.peer.0
+        ));
+    }
+    if peer_report.requested_minimum_version != request.minimum_version {
+        return Err(format!(
+            "peer map response minimum {} does not match request minimum {}",
+            peer_report.requested_minimum_version, request.minimum_version
+        ));
+    }
+
+    let previous_tracker_version =
+        tracker
+            .try_update(peer_report.installed_version)
+            .map_err(|previous| {
+                format!(
+                    "placement tracker rejected replica peer map version {} after observing {}",
+                    peer_report.installed_version, previous
+                )
+            })?;
+
+    Ok(StorageNodePeerReplicaReadMapApplication {
+        peer: request.peer,
+        advertised_version: request.advertised_version,
+        requested_minimum_version: request.minimum_version,
+        previous_store_version: peer_report.previous_version,
+        previous_tracker_version,
+        installed_version: peer_report.installed_version,
+    })
+}
+
+fn request_peer_replica_read_maps_for_convergence(
+    convergence: &tidefs_membership_live::PlacementVersionConvergence,
+    store: &mut TransportReplicatedStore,
+    tracker: &PlacementVersionTracker,
+    requested_peer_versions: &mut BTreeMap<MemberId, u64>,
+) -> StorageNodePeerReadMapRequestReport {
+    let replica_plan = plan_peer_replica_read_map_requests(convergence, requested_peer_versions);
+    let mut report = StorageNodePeerReadMapRequestReport {
+        replica_plan,
+        ..StorageNodePeerReadMapRequestReport::default()
+    };
+
+    for request in &report.replica_plan.requests {
+        match store.request_peer_placement_map(request.peer.0, request.minimum_version) {
+            Ok(peer_report) => {
+                match advance_tracker_after_peer_replica_read_map(tracker, request, &peer_report) {
+                    Ok(application) => {
+                        requested_peer_versions.insert(request.peer, request.advertised_version);
+                        report.replica_installed_maps.push(application);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[storage-node] peer {} replica read-map tracker update failed: {err}",
+                            request.peer.0
+                        );
+                        report.replica_failed_peers.push(request.peer);
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "[storage-node] peer {} replica read-map request failed: {err}",
+                    request.peer.0
+                );
+                report.replica_failed_peers.push(request.peer);
+            }
+        }
+    }
+
+    report
+}
+
+fn request_peer_transport_read_maps_for_convergence(
+    convergence: &tidefs_membership_live::PlacementVersionConvergence,
     storage_transport: &Arc<Mutex<Transport>>,
     requested_peer_versions: &mut BTreeMap<MemberId, u64>,
 ) -> StorageNodePeerReadMapRequestReport {
-    let convergence = {
-        let runtime = membership.lock().unwrap();
-        runtime.placement_version_convergence()
-    };
-
-    requested_peer_versions.retain(|peer, requested_version| {
-        convergence
-            .peer_versions
-            .get(peer)
-            .is_some_and(|observed_version| {
-                observed_version == requested_version
-                    && *requested_version > convergence.local_version
-            })
-    });
-
     let mut transport = storage_transport.lock().unwrap();
     let peer_sessions = storage_replication_sessions_by_member(&transport);
-    let plan = plan_peer_transport_read_map_requests(
-        &convergence,
-        &peer_sessions,
-        requested_peer_versions,
-    );
+    let plan =
+        plan_peer_transport_read_map_requests(convergence, &peer_sessions, requested_peer_versions);
     let mut report = StorageNodePeerReadMapRequestReport {
         plan,
         ..StorageNodePeerReadMapRequestReport::default()
@@ -530,6 +698,39 @@ fn request_peer_transport_read_maps_from_convergence(
     }
 
     report
+}
+
+fn request_peer_read_maps_from_convergence(
+    membership: &Arc<Mutex<MembershipRuntime>>,
+    storage_transport: &Arc<Mutex<Transport>>,
+    store: &Arc<Mutex<StoreBackend>>,
+    tracker: &PlacementVersionTracker,
+    requested_peer_versions: &mut BTreeMap<MemberId, u64>,
+) -> StorageNodePeerReadMapRequestReport {
+    let convergence = {
+        let runtime = membership.lock().unwrap();
+        runtime.placement_version_convergence()
+    };
+
+    retain_current_peer_read_map_requests(&convergence, requested_peer_versions);
+
+    {
+        let mut store = store.lock().unwrap();
+        if let StoreBackend::TransportBacked(store) = &mut *store {
+            return request_peer_replica_read_maps_for_convergence(
+                &convergence,
+                store,
+                tracker,
+                requested_peer_versions,
+            );
+        }
+    }
+
+    request_peer_transport_read_maps_for_convergence(
+        &convergence,
+        storage_transport,
+        requested_peer_versions,
+    )
 }
 
 /// Publish storage-node relocation flow-commit evidence into a local placement map.
@@ -2171,6 +2372,7 @@ impl MembershipServiceHandle {
         membership: Arc<Mutex<MembershipRuntime>>,
         membership_transport: Arc<Mutex<MembershipTransport>>,
         storage_transport: Arc<Mutex<Transport>>,
+        store: Arc<Mutex<StoreBackend>>,
         placement_version_tracker: Arc<PlacementVersionTracker>,
         period: Duration,
         split_brain_guard: Option<Arc<Mutex<SplitBrainGuard>>>,
@@ -2210,16 +2412,27 @@ impl MembershipServiceHandle {
                         sync_partition_state_from_membership(&runtime, guard, my_id);
                     }
 
-                    let request_report = request_peer_transport_read_maps_from_convergence(
+                    let request_report = request_peer_read_maps_from_convergence(
                         &membership,
                         &storage_transport,
+                        &store,
+                        &placement_version_tracker,
                         &mut requested_peer_read_map_versions,
                     );
-                    if !request_report.sent_peers.is_empty() {
+                    if !request_report.sent_peers.is_empty()
+                        || !request_report.replica_installed_maps.is_empty()
+                    {
+                        let installed_peers = request_report
+                            .replica_installed_maps
+                            .iter()
+                            .map(|application| application.peer)
+                            .collect::<Vec<_>>();
                         eprintln!(
-                            "[storage-node] requested peer read maps from {:?} for local placement version {}",
+                            "[storage-node] requested peer read maps from {:?}, installed replica maps from {:?} for local placement version {}",
                             request_report.sent_peers,
+                            installed_peers,
                             request_report.plan.local_version
+                                .max(request_report.replica_plan.local_version)
                         );
                     }
 
@@ -2840,11 +3053,13 @@ impl StorageNode {
             };
 
         let storage_transport = Arc::new(Mutex::new(transport));
+        let store = Arc::new(Mutex::new(store_backend));
         let membership_service = membership_transport.as_ref().map(|membership_transport| {
             MembershipServiceHandle::spawn(
                 Arc::clone(&membership),
                 Arc::clone(membership_transport),
                 Arc::clone(&storage_transport),
+                Arc::clone(&store),
                 Arc::clone(&placement_version_tracker),
                 membership_period,
                 split_brain_guard.clone(),
@@ -2873,7 +3088,7 @@ impl StorageNode {
 
         Ok(Self {
             transport: storage_transport,
-            store: Arc::new(Mutex::new(store_backend)),
+            store,
             membership,
             membership_transport,
             _membership_service: membership_service,
@@ -6452,6 +6667,87 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
+    fn peer_replica_read_map_request_plan_selects_ahead_peers_without_storage_sessions() {
+        let convergence = placement_convergence(5, &[(2, 8), (3, 4), (4, 9), (5, 7)]);
+        let requested = BTreeMap::new();
+
+        let plan = plan_peer_replica_read_map_requests(&convergence, &requested);
+
+        assert_eq!(plan.local_version, 5);
+        assert_eq!(plan.max_peer_version, 9);
+        assert_eq!(
+            plan.requests,
+            vec![
+                StorageNodePeerReplicaReadMapRequest {
+                    peer: MemberId::new(2),
+                    minimum_version: 6,
+                    advertised_version: 8,
+                },
+                StorageNodePeerReplicaReadMapRequest {
+                    peer: MemberId::new(4),
+                    minimum_version: 6,
+                    advertised_version: 9,
+                },
+                StorageNodePeerReplicaReadMapRequest {
+                    peer: MemberId::new(5),
+                    minimum_version: 6,
+                    advertised_version: 7,
+                },
+            ]
+        );
+        assert!(plan.already_requested_peers.is_empty());
+    }
+
+    #[test]
+    fn peer_replica_read_map_request_plan_suppresses_repeated_peer_versions() {
+        let convergence = placement_convergence(5, &[(2, 8), (4, 10)]);
+        let requested = [(MemberId::new(2), 8), (MemberId::new(4), 9)]
+            .into_iter()
+            .collect();
+
+        let plan = plan_peer_replica_read_map_requests(&convergence, &requested);
+
+        assert_eq!(plan.already_requested_peers, vec![MemberId::new(2)]);
+        assert_eq!(
+            plan.requests,
+            vec![StorageNodePeerReplicaReadMapRequest {
+                peer: MemberId::new(4),
+                minimum_version: 6,
+                advertised_version: 10,
+            }]
+        );
+    }
+
+    #[test]
+    fn peer_replica_read_map_convergence_keeps_missing_replica_retryable() {
+        let convergence = placement_convergence(1, &[(2, 3)]);
+        let (_tmp, mut store) = transport_store_with_placement();
+        let tracker = PlacementVersionTracker::with_version(1);
+        let mut requested = BTreeMap::new();
+
+        let report = request_peer_replica_read_maps_for_convergence(
+            &convergence,
+            &mut store,
+            &tracker,
+            &mut requested,
+        );
+
+        assert_eq!(
+            report.replica_plan.requests,
+            vec![StorageNodePeerReplicaReadMapRequest {
+                peer: MemberId::new(2),
+                minimum_version: 2,
+                advertised_version: 3,
+            }]
+        );
+        assert_eq!(report.replica_failed_peers, vec![MemberId::new(2)]);
+        assert!(report.replica_installed_maps.is_empty());
+        assert!(requested.is_empty());
+        assert_eq!(tracker.current_version(), 1);
+        assert_eq!(store.placement_version(), 0);
+    }
+
+    #[test]
     fn transport_read_map_publication_refuses_empty_cluster_placement() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime =
@@ -6565,6 +6861,39 @@ mod cluster_pool_handler_tests {
         assert_eq!(tracker.current_version(), 3);
         assert_eq!(store.placement_version(), 3);
         assert_eq!(store.placement_map(), Some(&applied.read_map));
+    }
+
+    #[test]
+    fn peer_replica_read_map_application_advances_tracker_after_store_install() {
+        let tracker = PlacementVersionTracker::with_version(2);
+        let request = StorageNodePeerReplicaReadMapRequest {
+            peer: MemberId::new(2),
+            minimum_version: 3,
+            advertised_version: 5,
+        };
+        let peer_report = TransportStorePeerPlacementMapRequestReport {
+            peer_node_id: 2,
+            requested_minimum_version: 3,
+            previous_version: 1,
+            installed_version: 4,
+            installed_map: test_transport_read_map(4),
+        };
+
+        let applied = advance_tracker_after_peer_replica_read_map(&tracker, &request, &peer_report)
+            .expect("replica read-map report advances tracker");
+
+        assert_eq!(
+            applied,
+            StorageNodePeerReplicaReadMapApplication {
+                peer: MemberId::new(2),
+                advertised_version: 5,
+                requested_minimum_version: 3,
+                previous_store_version: 1,
+                previous_tracker_version: 2,
+                installed_version: 4,
+            }
+        );
+        assert_eq!(tracker.current_version(), 4);
     }
 
     #[test]
