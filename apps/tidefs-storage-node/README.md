@@ -142,7 +142,10 @@ evidence only when `success` is true and the ack carries a non-synthetic
 law; receipt-less, mismatched, or failed acks do not advance completion or
 admission state as success. Compatibility acks without a repaired receipt are
 accepted as wire-format responses, but they do not advance receipt-backed
-rebuild completion.
+rebuild completion. `RebuildCompletion::verified_receipt_completions()` exposes
+the successful source/repaired receipt pairs as a typed publication view for
+later cluster-state and reclaim consumers; it does not publish those broader
+states by itself.
 
 ### Local-Only Operations (LOCAL-ONLY boundary)
 
