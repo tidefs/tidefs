@@ -378,7 +378,7 @@ impl RebuildAdmission {
                     target_member_ref: target,
                     payload_digest: subject.payload_digest,
                     payload_len: subject.payload_len,
-                    verification_required: false,
+                    verification_required: true,
                 };
 
                 self.next_receipt_id += 1;
@@ -758,6 +758,7 @@ mod tests {
         );
         assert!(!intents[0].placement_receipt_ref.is_synthetic());
         assert_eq!(intents[0].source_member_ref, MemberId::new(20));
+        assert!(intents[0].verification_required);
         assert_eq!(intents[0].target_member_ref, MemberId::new(10));
         assert_eq!(
             intents[0].movement_class,

@@ -457,7 +457,7 @@ mod tests {
             target_member_ref: MemberId::new(member),
             payload_digest: receipt_digest_to_object_digest(placement_receipt_ref.payload_digest),
             payload_len: placement_receipt_ref.payload_len,
-            verification_required: false,
+            verification_required: true,
         }
     }
 

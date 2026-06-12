@@ -259,7 +259,14 @@ impl RebuildRuntime {
         intent_id: ReplicatedReceiptId,
         movement_class: ReplicaMovementClass,
         bytes: u64,
+        verification_required: bool,
     ) -> MovementOutcome {
+        if !verification_required {
+            return MovementOutcome::Failed {
+                reason: "movement intent requires verification",
+            };
+        }
+
         if !self.transfer_window.try_acquire(bytes) {
             return MovementOutcome::Deferred;
         }
@@ -376,13 +383,19 @@ impl IncrementalJob for RebuildRuntime {
             let intent_id = intent.intent_id;
             let movement_class = intent.movement_class;
             let payload_len = intent.payload_len;
+            let verification_required = intent.verification_required;
 
             // Per-item budget check
             if budget.max_bytes > 0 && bytes_processed + payload_len > max_bytes {
                 break;
             }
 
-            match self.execute_intent(intent_id, movement_class, payload_len) {
+            match self.execute_intent(
+                intent_id,
+                movement_class,
+                payload_len,
+                verification_required,
+            ) {
                 MovementOutcome::Completed { bytes_moved, .. } => {
                     items_processed += 1;
                     bytes_processed += bytes_moved;
@@ -392,6 +405,8 @@ impl IncrementalJob for RebuildRuntime {
                 MovementOutcome::Failed { .. } => {
                     self.stats.objects_failed += 1;
                     self.stats.objects_pending = self.stats.objects_pending.saturating_sub(1);
+                    self.stats.bytes_pending =
+                        self.stats.bytes_pending.saturating_sub(payload_len);
                     self.next_index += 1;
                     items_processed += 1;
                 }
@@ -507,7 +522,7 @@ mod tests {
             target_member_ref: MemberId::new(target),
             payload_digest: ObjectDigest::new(id),
             payload_len: bytes,
-            verification_required: false,
+            verification_required: true,
         }
     }
 
@@ -560,6 +575,30 @@ mod tests {
         assert!(result.is_complete);
         assert_eq!(rt.stats.objects_rebuilt, 1);
         assert_eq!(rt.stats.bytes_rebuilt, 4096);
+    }
+
+    #[test]
+    fn refuses_unverified_intent_without_completing_receipt() {
+        let mut intent = make_intent(
+            1,
+            ReplicaMovementClass::RebuildLostOrSuspectCopy,
+            10,
+            20,
+            100,
+            4096,
+        );
+        intent.verification_required = false;
+
+        let mut rt = RebuildRuntime::new(JobId(10), JobKind::Other(110), vec![intent]);
+        let result = rt.step(WorkBudget::DEFAULT_TICK).unwrap();
+
+        assert!(result.is_complete);
+        assert_eq!(rt.stats.objects_rebuilt, 0);
+        assert_eq!(rt.stats.bytes_rebuilt, 0);
+        assert_eq!(rt.stats.objects_failed, 1);
+        assert_eq!(rt.stats.objects_pending, 0);
+        assert_eq!(rt.stats.bytes_pending, 0);
+        assert_eq!(rt.completed_count(), 0);
     }
 
     #[test]
