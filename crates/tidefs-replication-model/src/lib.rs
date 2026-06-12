@@ -318,6 +318,13 @@ pub enum ReplicatedReadClass {
     Unavailable,
 }
 
+impl ReplicatedReadClass {
+    #[must_use]
+    pub const fn permits_payload_response(self) -> bool {
+        matches!(self, Self::Exact | Self::DegradedButValid)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RebuildPlanClass {
     NotRequired,
@@ -3081,6 +3088,14 @@ mod tests {
         assert_eq!(plan.missing_replica_count, 3);
         assert!(plan.rebuild_required);
         assert_eq!(plan.read_receipt_ref, ReplicatedReceiptId::default());
+    }
+
+    #[test]
+    fn read_class_payload_response_policy_is_fail_closed() {
+        assert!(ReplicatedReadClass::Exact.permits_payload_response());
+        assert!(ReplicatedReadClass::DegradedButValid.permits_payload_response());
+        assert!(!ReplicatedReadClass::RepairRequired.permits_payload_response());
+        assert!(!ReplicatedReadClass::Unavailable.permits_payload_response());
     }
 
     #[test]
