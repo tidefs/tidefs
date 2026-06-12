@@ -180,7 +180,7 @@ pub enum Frame {
     HealthCheck,
     /// Health check response: node identity, pool state, uptime, backend.
     /// The report_json field carries the multi-node operator health and topology
-    /// report as a JSON string (empty for compatibility with pre-MN-028 nodes).
+    /// report as a JSON string (empty for pre-MN-028 pre-release nodes).
     HealthCheckResponse {
         node_identity: String,
         pool_state: String,
@@ -966,7 +966,7 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
             }
             if payload.len() >= 4 {
                 // Request: key_len(u32 LE) + key + placement_receipt_ref
-                // + payload_len(u32 LE) + authoritative_payload. Legacy
+                // + payload_len(u32 LE) + authoritative_payload. Receiptless
                 // key+payload repair frames no longer decode as repair
                 // requests because repair must be placement-receipt-bound.
                 let key_len = u32::from_le_bytes(payload[0..4].try_into().ok()?) as usize;
@@ -1404,8 +1404,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_repair_without_receipt_does_not_decode() {
-        let key = b"legacy-key";
+    fn receiptless_repair_without_receipt_does_not_decode() {
+        let key = b"receiptless-key";
         let payload = b"fixed-data";
         let mut raw = Vec::new();
         raw.extend_from_slice(tag::RPRR);

@@ -612,33 +612,32 @@ fn health_check_roundtrip_via_client() {
 // Health check with pool device integration test
 // ---------------------------------------------------------------------------
 
-use std::io::{Seek, SeekFrom, Write};
-use tidefs_types_pool_label_core::{
-    encode_label, seal_label, PoolLabelV1, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
-};
+use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
 
-/// Write a valid TideFS pool label to a file, padded to POOL_LABEL_SIZE.
-fn write_pool_label_to_file(file: &mut std::fs::File, pool_name: &str) {
-    let label = PoolLabelV1::new([0xAAu8; 16], [0x01u8; 16], pool_name);
-    let sealed = seal_label(label).expect("seal pool label");
-    let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
-    encode_label(&sealed, &mut buf).expect("encode pool label");
-    file.seek(SeekFrom::Start(0)).expect("seek");
-    file.write_all(&buf).expect("write label");
-    let padding = vec![0u8; POOL_LABEL_SIZE - POOL_LABEL_V1_EXT_WIRE_SIZE];
-    file.write_all(&padding).expect("write padding");
-    file.flush().expect("flush");
+const HEALTH_POOL_DEVICE_BYTES: u64 = 2_000_000;
+
+fn create_importable_pool_device(path: &std::path::Path, pool_name: &str) {
+    let f = std::fs::File::create(path).expect("create pool device");
+    f.set_len(HEALTH_POOL_DEVICE_BYTES)
+        .expect("size pool device");
+    f.sync_all().expect("sync pool device");
+
+    let config = PoolCreateConfig {
+        pool_name: pool_name.into(),
+        pool_guid: Some([0xAAu8; 16]),
+        redundancy: RedundancyPolicy::replicated(1),
+        encryption_key: None,
+        clustered: false,
+    };
+    PoolCreator::create_pool(&[path.to_path_buf()], &config).expect("create importable pool");
 }
 
 #[test]
 fn health_check_returns_imported_when_pool_imported() {
-    // Create a temp file with a valid pool label.
+    // Create a temp regular-file pool device through the current pool bootstrap path.
     let dir = tempfile::tempdir().expect("tempdir");
     let pool_path = dir.path().join("test-pool-device0");
-    {
-        let mut f = std::fs::File::create(&pool_path).expect("create pool file");
-        write_pool_label_to_file(&mut f, "healthpool");
-    }
+    create_importable_pool_device(&pool_path, "healthpool");
 
     let lock_dir = dir.path().join("locks");
     let port = pick_port();
