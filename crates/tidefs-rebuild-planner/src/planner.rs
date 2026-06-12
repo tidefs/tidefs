@@ -10,8 +10,50 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tidefs_durability_layout::{DurabilityLayoutV1, DurabilityPolicy};
 use tidefs_membership_epoch::{DomainId, HealthClass, MemberId};
+use tidefs_replication_model::PlacementReceiptRef;
 
-use crate::plan::{RebuildPlan, ReconstructionTask};
+use crate::plan::{RebuildPlan, ReconstructionTask, ReconstructionTaskReceiptError};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptBackedObjectPlacement {
+    placement_receipt_ref: PlacementReceiptRef,
+    members: BTreeSet<MemberId>,
+}
+
+impl ReceiptBackedObjectPlacement {
+    pub fn new(
+        placement_receipt_ref: PlacementReceiptRef,
+        members: BTreeSet<MemberId>,
+    ) -> Result<Self, ReconstructionTaskReceiptError> {
+        ReconstructionTask::validate_receipt_ref(placement_receipt_ref)?;
+        Ok(Self {
+            placement_receipt_ref,
+            members,
+        })
+    }
+
+    #[must_use]
+    pub fn placement_receipt_ref(&self) -> PlacementReceiptRef {
+        self.placement_receipt_ref
+    }
+
+    #[must_use]
+    pub fn members(&self) -> &BTreeSet<MemberId> {
+        &self.members
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReconstructionPlanningError {
+    ReceiptObjectIdMismatch {
+        object_id: u64,
+        receipt_object_id: u64,
+    },
+    InvalidPlacementReceipt {
+        object_id: u64,
+        reason: ReconstructionTaskReceiptError,
+    },
+}
 
 /// Input for reconstruction planning.
 #[derive(Clone, Debug)]
@@ -24,8 +66,8 @@ pub struct ReconstructionInput {
     pub failed_nodes: BTreeSet<MemberId>,
     /// Failed device count (local device failures).
     pub failed_device_count: u32,
-    /// Current object placement: object_id -> set of members holding it.
-    pub object_placement: BTreeMap<u64, BTreeSet<MemberId>>,
+    /// Current receipt-backed placement: object_id -> members holding it.
+    pub object_placement: BTreeMap<u64, ReceiptBackedObjectPlacement>,
     /// In-flight rebuild object IDs (already being rebuilt, skip).
     pub in_flight_objects: BTreeSet<u64>,
     /// Failure-domain map: MemberId -> DomainId.
@@ -52,8 +94,9 @@ pub struct ReconstructionInput {
 /// 4. Assign priority: fewer healthy replicas = higher priority (lower u8).
 /// 5. Sort tasks by priority, then by object_id for determinism.
 /// 6. Return a [`RebuildPlan`] (caller can seal for BLAKE3 integrity).
-#[must_use]
-pub fn plan_reconstruction(input: &ReconstructionInput) -> RebuildPlan {
+pub fn plan_reconstruction(
+    input: &ReconstructionInput,
+) -> Result<RebuildPlan, ReconstructionPlanningError> {
     let min_replicas = minimum_replicas(&input.layout);
     let mut tasks: Vec<ReconstructionTask> = Vec::new();
 
@@ -66,15 +109,11 @@ pub fn plan_reconstruction(input: &ReconstructionInput) -> RebuildPlan {
         .filter(|m| !input.failed_nodes.contains(m))
         .collect();
 
-    // Build reverse map: member -> object_ids they hold
-    let mut member_objects: BTreeMap<MemberId, BTreeSet<u64>> = BTreeMap::new();
-    for (&obj_id, members) in &input.object_placement {
-        for &m in members {
-            member_objects.entry(m).or_default().insert(obj_id);
-        }
-    }
+    for (&object_id, placement) in &input.object_placement {
+        let placement_receipt_ref = placement.placement_receipt_ref();
+        validate_receipt_for_object(object_id, placement_receipt_ref)?;
+        let members = placement.members();
 
-    for (&object_id, members) in &input.object_placement {
         // Skip objects already being rebuilt elsewhere
         if input.in_flight_objects.contains(&object_id) {
             continue;
@@ -111,19 +150,42 @@ pub fn plan_reconstruction(input: &ReconstructionInput) -> RebuildPlan {
         // Priority: fewer healthy replicas = more urgent
         let priority = (healthy_count).min(255) as u8;
 
-        tasks.push(ReconstructionTask::new_full(
-            object_id, sources, targets, priority,
-        ));
+        tasks.push(
+            ReconstructionTask::new_full_with_receipt(
+                placement_receipt_ref,
+                sources,
+                targets,
+                priority,
+            )
+            .map_err(|reason| {
+                ReconstructionPlanningError::InvalidPlacementReceipt { object_id, reason }
+            })?,
+        );
     }
 
     // Sort deterministically: by priority (ascending), then by object_id
     tasks.sort_by(|a, b| {
         a.priority
             .cmp(&b.priority)
-            .then_with(|| a.object_id.cmp(&b.object_id))
+            .then_with(|| a.object_id().cmp(&b.object_id()))
     });
 
-    RebuildPlan::new(input.plan_id, tasks, input.now_ns)
+    Ok(RebuildPlan::new(input.plan_id, tasks, input.now_ns))
+}
+
+fn validate_receipt_for_object(
+    object_id: u64,
+    placement_receipt_ref: PlacementReceiptRef,
+) -> Result<(), ReconstructionPlanningError> {
+    if placement_receipt_ref.object_id != object_id {
+        return Err(ReconstructionPlanningError::ReceiptObjectIdMismatch {
+            object_id,
+            receipt_object_id: placement_receipt_ref.object_id,
+        });
+    }
+    ReconstructionTask::validate_receipt_ref(placement_receipt_ref).map_err(|reason| {
+        ReconstructionPlanningError::InvalidPlacementReceipt { object_id, reason }
+    })
 }
 
 /// Select target nodes with failure-domain separation.
