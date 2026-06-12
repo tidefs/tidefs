@@ -180,6 +180,11 @@ impl PlacementMap {
         self.epoch
     }
 
+    /// Return the object-to-member placement snapshot.
+    pub fn object_member_map(&self) -> &BTreeMap<u64, BTreeSet<u64>> {
+        &self.entries
+    }
+
     /// Set the epoch.
     pub fn set_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
