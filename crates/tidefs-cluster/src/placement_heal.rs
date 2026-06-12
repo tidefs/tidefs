@@ -670,6 +670,14 @@ impl PlacementHealCoordinator {
         &mut self.placement
     }
 
+    /// Publish a completed rebuild flow-commit result into owned placement state.
+    pub fn publish_rebuild_flow_commit_result(
+        &mut self,
+        result: &FlowCommitResult,
+    ) -> Result<RebuildFlowCommitPlacementPublication, String> {
+        self.placement.publish_rebuild_flow_commit_result(result)
+    }
+
     /// Return heal statistics.
     pub fn stats(&self) -> &HealStats {
         &self.stats
@@ -1354,6 +1362,61 @@ mod tests {
         insert_test_object_with_receipt(coordinator.placement_mut(), 2, &[10, 20]);
         insert_test_object_with_receipt(coordinator.placement_mut(), 3, &[20, 30]);
         coordinator
+    }
+
+    #[test]
+    fn coordinator_publishes_rebuild_flow_commit_result() {
+        let mut coord = make_coordinator();
+        let repaired_receipt = receipt_ref(1, 2);
+        let result = rebuild_flow_result(1, 40, repaired_receipt, 7);
+
+        let publication = coord
+            .publish_rebuild_flow_commit_result(&result)
+            .expect("coordinator publishes completed rebuild flow");
+
+        assert_eq!(
+            publication,
+            RebuildFlowCommitPlacementPublication {
+                object_id: 1,
+                target_member: 40,
+                placement_receipt_ref: repaired_receipt,
+                map_epoch: 7,
+            }
+        );
+        assert_eq!(coord.placement().epoch(), 7);
+        assert_eq!(
+            coord.placement().placement_receipt_ref(1),
+            Some(repaired_receipt)
+        );
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
+            [10, 20, 40].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn coordinator_rejects_rebuild_flow_commit_result_without_mutation() {
+        let mut coord = make_coordinator();
+        let old_receipt = coord.placement().placement_receipt_ref(1).unwrap();
+        let old_replicas = coord.placement().replicas_of(1).cloned().unwrap();
+        let mut result = rebuild_flow_result(1, 40, receipt_ref(1, 2), 7);
+        result.flow_class = FlowCommitClass::Relocation;
+
+        let err = coord
+            .publish_rebuild_flow_commit_result(&result)
+            .unwrap_err();
+
+        assert!(err.contains("not rebuild"), "{err}");
+        assert_eq!(coord.placement().epoch(), 1);
+        assert_eq!(
+            coord.placement().placement_receipt_ref(1),
+            Some(old_receipt)
+        );
+        assert_eq!(coord.placement().replicas_of(1), Some(&old_replicas));
     }
 
     #[test]

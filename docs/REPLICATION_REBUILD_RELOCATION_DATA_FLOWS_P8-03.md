@@ -258,10 +258,13 @@ placement map can consume the resulting completed rebuild `FlowCommitResult`
 through `PlacementMap::publish_rebuild_flow_commit_result()`, which publishes
 the repaired target member and repaired `PlacementReceiptRef` into local
 cluster-visible placement state after fail-closed subject, target, epoch, and
-receipt-authority checks. That is a placement-map state update only; it is not
-cluster-wide propagation, degraded-read routing, replacement-node
-orchestration, or reclaim completion. The storage-node boundary can now compose
-the replicated-store repair publication and the placement-map publication with
+receipt-authority checks. `PlacementHealCoordinator` and `ClusterLeaseRuntime`
+now expose that same checked publication path through their owned placement
+state, preserving the placement-map no-mutation refusal behavior. These are
+local placement-publication owner boundaries only; they are not cluster-wide
+propagation, degraded-read routing, replacement-node orchestration, or reclaim
+completion. The storage-node boundary can now compose the replicated-store
+repair publication and the placement-map publication with
 `publish_repair_flow_commit_into_placement_map()`, first cross-checking the
 repair completion evidence against the flow-commit result. That composition is
 still local state publication, not cluster-wide convergence or reclaim.
@@ -305,11 +308,12 @@ composition helper can now run the repair, verified completion recording, and
 flow-commit publication in one caller-facing path when supplied with a
 coordinator. This is not yet full replacement-node orchestration,
 degraded-read policy, cluster-state convergence, or reclaim publication. The
-cluster placement map can publish the completed rebuild flow result into its
-local repaired-placement state, but cluster-wide propagation and reclaim remain
-part of the broader #18 runtime closeout. Storage-node composition can now
-cross-check a `ReceiptRepairFlowCommitPublication` and apply that local
-placement-map publication, but it does not yet orchestrate replacement nodes,
+cluster placement map, heal coordinator, and lease runtime can publish the
+completed rebuild flow result into local repaired-placement state, but
+cluster-wide propagation and reclaim remain part of the broader #18 runtime
+closeout. Storage-node composition can now cross-check a
+`ReceiptRepairFlowCommitPublication` and apply that local placement-map
+publication, but it does not yet orchestrate replacement nodes,
 degraded-read policy, convergence, or reclaim.
 
 ## 7. Steady-state replication flow
