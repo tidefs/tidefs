@@ -18,12 +18,19 @@ may use non-secret repository variables for scheduling gates, such as
 
 ## Workflow Shape
 
-- `Rust Fast` runs on GitHub-hosted Ubuntu and covers workspace metadata plus
-  a focused Rust smoke set:
+- All TideFS development and release-candidate workflow jobs run on the
+  self-hosted TideFS runner VMs. Do not add `ubuntu-latest`, other
+  GitHub-hosted runner labels, or hosted-runner package-manager assumptions to
+  TideFS workflows.
+- `Rust Fast` runs on the TideFS self-hosted runner VMs through the repo
+  `.#ci` Nix development shell. It covers workspace metadata plus a focused
+  Rust smoke set:
   `tidefs-xtask`, `tidefs-extent-map`,
   `tidefs-schema-codec-posix-filesystem-adapter`, and
   `tidefs-secret-key-policy-runtime`, plus a targeted `tidefs-transport`
   session test.
+- `Secret Policy` runs on the same self-hosted TideFS runner labels and keeps
+  the GitHub secret boundary checked without spending hosted Actions minutes.
 - `Nix Checks` runs on self-hosted TideFS runners and builds pure check
   derivations plus the core Nix packages.
 - `QEMU Smoke` runs the outside-sandbox kernel bootstrap smoke on self-hosted
@@ -34,8 +41,9 @@ may use non-secret repository variables for scheduling gates, such as
   until they are ported to the outside-sandbox runner shape.
 - `xfstests` and `RDMA` are scheduled/manual lanes for longer filesystem and
   transport work.
-- `Release Candidate` is a manual-only workflow. The `smoke` profile runs Rust,
-  Nix, and QEMU smoke lanes; the `full` profile also runs xfstests and RDMA.
+- `Release Candidate` is a manual-only self-hosted workflow. The `smoke`
+  profile runs Rust, Nix, and QEMU smoke lanes; the `full` profile also runs
+  xfstests and RDMA.
 
 ## Runner Contract
 

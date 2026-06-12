@@ -21,38 +21,35 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
   CARGO_INCREMENTAL: 0
   CARGO_TEST_FLAGS: --locked
-  CARGO_TARGET_DIR: /tmp/tidefs-cargo-target
+  CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}
   RUST_BACKTRACE: 1
   TIDEFS_RUST_FAST_CRATES: tidefs-xtask,tidefs-extent-map,tidefs-schema-codec-posix-filesystem-adapter,tidefs-secret-key-policy-runtime
 
 jobs:
   rust-smoke:
     name: Rust smoke
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
     timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install system packages
+      - name: Prepare CI scratch
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq pkg-config libfuse3-dev libibverbs-dev librdmacm-dev
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+          mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
       - name: Check workspace metadata
-        run: cargo metadata --locked --format-version 1 --no-deps >/dev/null
+        run: nix develop .#ci --command bash -c 'cargo metadata --locked --format-version 1 --no-deps >/dev/null'
 
       - name: Run selected crate tests
-        run: ./scripts/ci-test-runner.sh --crates "$TIDEFS_RUST_FAST_CRATES" --json ci-test-summary.json
+        run: nix develop .#ci --command bash -c './scripts/ci-test-runner.sh --crates "$TIDEFS_RUST_FAST_CRATES" --json ci-test-summary.json'
 
       - name: Run transport smoke test
-        run: cargo test -p tidefs-transport --locked send_message_missing_session_fails
+        run: nix develop .#ci --command bash -c 'cargo test -p tidefs-transport --locked send_message_missing_session_fails'
 
       - name: Upload Rust summary
         if: always()
@@ -62,6 +59,10 @@ jobs:
           path: ci-test-summary.json
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Clean cargo target
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"
 
   nix:
     name: Nix build
