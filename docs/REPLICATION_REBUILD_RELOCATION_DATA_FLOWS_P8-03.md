@@ -229,6 +229,14 @@ without synthesizing placement from topology or compatibility listings, while
 distributed transfer execution, verification receipts, and repaired placement
 publication remain the runtime handoff work.
 
+For planned reads, pool-backed `ReadPlanResponse` frames can carry validated
+`PlacementReceiptRef` authority. The transport-backed replicated store now
+preserves that receipt evidence with the returned payload and source member id,
+while the legacy payload-only read API remains a compatibility wrapper. This is
+not replacement-node orchestration, repaired placement publication, cluster
+state publication, or reclaim publication; it is the evidence boundary those
+flows can consume later.
+
 ### 6.3 OW-305 executable rebuild/backfill/rebalance slice
 
 `crates/tidefs-replication-model` now also binds OW-305 movement planning to
