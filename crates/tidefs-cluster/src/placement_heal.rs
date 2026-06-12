@@ -547,6 +547,17 @@ impl PlacementHealCoordinator {
         self.state.is_active()
     }
 
+    fn receipt_ref_authorizes_heal(
+        object_id: u64,
+        placement_receipt_ref: PlacementReceiptRef,
+    ) -> bool {
+        placement_receipt_ref.object_id == object_id
+            && !placement_receipt_ref.is_synthetic()
+            && placement_receipt_ref.redundancy_policy.is_well_formed()
+            && placement_receipt_ref.target_count
+                >= placement_receipt_ref.redundancy_policy.target_width()
+    }
+
     // ── Loss detection ───────────────────────────────────────────
 
     /// Detect a loss event and transition to Assessing.
@@ -639,6 +650,21 @@ impl PlacementHealCoordinator {
             // How many additional replicas we need to restore.
             let needed = desired_replicas.saturating_sub(surviving_replica_count);
 
+            let Some(placement_receipt_ref) = self.placement.placement_receipt_ref(object_id)
+            else {
+                self.node_rebuild_load.clear();
+                self.state = HealState::Aborted;
+                self.stats.backfill_id = None;
+                return None;
+            };
+
+            if !Self::receipt_ref_authorizes_heal(object_id, placement_receipt_ref) {
+                self.node_rebuild_load.clear();
+                self.state = HealState::Aborted;
+                self.stats.backfill_id = None;
+                return None;
+            }
+
             // Candidates: healthy surviving members NOT holding this object,
             // sorted by failure-domain diversity then rebuild load.
             let mut candidates: Vec<(u64, u64)> = self
@@ -690,19 +716,13 @@ impl PlacementHealCoordinator {
                 continue;
             }
 
-            let task = if let Some(placement_receipt_ref) =
-                self.placement.placement_receipt_ref(object_id)
-            {
-                ReconstructionTask::new_full_with_receipt(
-                    object_id,
-                    placement_receipt_ref,
-                    sources,
-                    targets,
-                    0,
-                )
-            } else {
-                ReconstructionTask::new_full(object_id, sources, targets, 0)
-            };
+            let task = ReconstructionTask::new_full_with_receipt(
+                object_id,
+                placement_receipt_ref,
+                sources,
+                targets,
+                0,
+            );
             tasks.push(task);
         }
 
@@ -849,23 +869,64 @@ impl PlacementHealCoordinator {
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+fn test_receipt_ref(object_id: u64, generation: u64) -> PlacementReceiptRef {
+    let mut object_key = [0xA5; 32];
+    object_key[..8].copy_from_slice(&object_id.to_le_bytes());
+    let mut digest = [0x5A; 32];
+    digest[..8].copy_from_slice(&object_id.to_le_bytes());
+    digest[8..16].copy_from_slice(&generation.to_le_bytes());
+    PlacementReceiptRef::replicated(
+        object_id,
+        object_key,
+        EpochId(1),
+        generation,
+        2,
+        4096,
+        digest,
+    )
+}
+
+#[cfg(test)]
+fn insert_test_object_with_receipt(placement: &mut PlacementMap, object_id: u64, members: &[u64]) {
+    for &member in members {
+        placement.insert(object_id, member);
+    }
+    placement.record_placement_receipt_ref(object_id, test_receipt_ref(object_id, 1));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn receipt_ref(object_id: u64, generation: u64) -> PlacementReceiptRef {
-        let mut object_key = [0xA5; 32];
-        object_key[..8].copy_from_slice(&object_id.to_le_bytes());
-        let mut digest = [0x5A; 32];
-        digest[..8].copy_from_slice(&object_id.to_le_bytes());
-        digest[8..16].copy_from_slice(&generation.to_le_bytes());
-        PlacementReceiptRef::replicated(
-            object_id,
-            object_key,
-            EpochId(1),
-            generation,
+        test_receipt_ref(object_id, generation)
+    }
+
+    fn malformed_policy_receipt_ref(object_id: u64) -> PlacementReceiptRef {
+        let base = receipt_ref(object_id, 1);
+        PlacementReceiptRef::new(
+            base.object_id,
+            base.object_key,
+            base.receipt_epoch,
+            base.receipt_generation,
+            tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies: 0 },
+            base.payload_len,
+            base.payload_digest,
+            0,
+        )
+    }
+
+    fn under_width_receipt_ref(object_id: u64) -> PlacementReceiptRef {
+        let base = receipt_ref(object_id, 1);
+        PlacementReceiptRef::new(
+            base.object_id,
+            base.object_key,
+            base.receipt_epoch,
+            base.receipt_generation,
+            tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies: 3 },
+            base.payload_len,
+            base.payload_digest,
             2,
-            4096,
-            digest,
         )
     }
 
@@ -996,12 +1057,9 @@ mod tests {
     fn make_coordinator() -> PlacementHealCoordinator {
         let mut coordinator = PlacementHealCoordinator::new(1, None)
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
-        coordinator.placement_mut().insert(1, 10);
-        coordinator.placement_mut().insert(1, 20);
-        coordinator.placement_mut().insert(2, 10);
-        coordinator.placement_mut().insert(2, 20);
-        coordinator.placement_mut().insert(3, 20);
-        coordinator.placement_mut().insert(3, 30);
+        insert_test_object_with_receipt(coordinator.placement_mut(), 1, &[10, 20]);
+        insert_test_object_with_receipt(coordinator.placement_mut(), 2, &[10, 20]);
+        insert_test_object_with_receipt(coordinator.placement_mut(), 3, &[20, 30]);
         coordinator
     }
 
@@ -1162,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn open_backfill_rejects_legacy_synthetic_plan() {
+    fn build_rebuild_plan_refuses_receiptless_loss_before_backfill() {
         let initiator = RebuildBackfillInitiator::new(EpochId(1));
         let mut coord = PlacementHealCoordinator::new(1, Some(initiator))
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
@@ -1184,14 +1242,73 @@ mod tests {
             available_members: available,
         });
 
-        let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
-        assert!(plan
-            .tasks
-            .iter()
-            .all(|task| task.placement_receipt_ref.is_synthetic()));
-        let result = coord.open_backfill(plan, 1);
-        assert_eq!(result, Err("backfill error"));
-        assert_eq!(coord.state(), HealState::Planning);
+        let plan = coord.build_rebuild_plan(1, 1_000_000_001);
+        assert!(plan.is_none());
+        assert_eq!(coord.state(), HealState::Aborted);
+        assert!(coord.stats().backfill_id.is_none());
+    }
+
+    #[test]
+    fn build_rebuild_plan_refuses_unauthoritative_receipt_refs() {
+        let cases = [
+            PlacementReceiptRef::synthetic_for_subject(
+                tidefs_replication_model::ReplicatedSubjectId::new(1),
+            ),
+            malformed_policy_receipt_ref(1),
+            under_width_receipt_ref(1),
+        ];
+
+        for receipt in cases {
+            let mut coord = PlacementHealCoordinator::new(1, None)
+                .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
+            coord.placement_mut().insert(1, 10);
+            coord.placement_mut().insert(1, 20);
+            coord
+                .placement_mut()
+                .record_placement_receipt_ref(1, receipt);
+
+            let mut lost = BTreeSet::new();
+            lost.insert(10);
+            let mut available = BTreeMap::new();
+            available.insert(20, HealthClass::Healthy);
+            available.insert(30, HealthClass::Healthy);
+
+            coord.detect_loss(LossEvent {
+                lost_members: lost,
+                epoch: 1,
+                detected_at_ns: 1_000_000_000,
+                available_members: available,
+            });
+
+            assert!(coord.build_rebuild_plan(1, 1_000_000_001).is_none());
+            assert_eq!(coord.state(), HealState::Aborted);
+            assert!(coord.stats().backfill_id.is_none());
+        }
+
+        let mut coord = PlacementHealCoordinator::new(1, None)
+            .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
+        coord.placement_mut().insert(1, 10);
+        coord.placement_mut().insert(1, 20);
+        coord
+            .placement_mut()
+            .placement_receipt_refs
+            .insert(1, receipt_ref(2, 1));
+
+        let mut lost = BTreeSet::new();
+        lost.insert(10);
+        let mut available = BTreeMap::new();
+        available.insert(20, HealthClass::Healthy);
+        available.insert(30, HealthClass::Healthy);
+
+        coord.detect_loss(LossEvent {
+            lost_members: lost,
+            epoch: 1,
+            detected_at_ns: 1_000_000_000,
+            available_members: available,
+        });
+
+        assert!(coord.build_rebuild_plan(1, 1_000_000_001).is_none());
+        assert_eq!(coord.state(), HealState::Aborted);
         assert!(coord.stats().backfill_id.is_none());
     }
 
@@ -1316,9 +1433,7 @@ fn stripe_policy_skips_objects_with_surviving_replica() {
 fn mirror_3_restores_all_replicas() {
     let mut coord = PlacementHealCoordinator::new(1, None)
         .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 3 });
-    coord.placement_mut().insert(1, 10);
-    coord.placement_mut().insert(1, 20);
-    coord.placement_mut().insert(1, 30);
+    insert_test_object_with_receipt(coord.placement_mut(), 1, &[10, 20, 30]);
 
     let mut lost = BTreeSet::new();
     lost.insert(10);
@@ -1363,8 +1478,7 @@ fn failure_domain_avoids_same_node_domain() {
     let mut coord = PlacementHealCoordinator::new(1, None)
         .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 })
         .with_member_failure_domains(domains);
-    coord.placement_mut().insert(1, 10);
-    coord.placement_mut().insert(1, 20);
+    insert_test_object_with_receipt(coord.placement_mut(), 1, &[10, 20]);
 
     let mut lost = BTreeSet::new();
     lost.insert(10);
@@ -1407,8 +1521,7 @@ fn rebuild_load_is_distributed_evenly() {
         .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
     // 4 objects all on {10, 20}. Lose 10.
     for obj in 1..=4u64 {
-        coord.placement_mut().insert(obj, 10);
-        coord.placement_mut().insert(obj, 20);
+        insert_test_object_with_receipt(coord.placement_mut(), obj, &[10, 20]);
     }
 
     let mut lost = BTreeSet::new();
@@ -1449,12 +1562,7 @@ fn rebuild_load_is_distributed_evenly() {
 fn erasure_policy_restores_full_width() {
     let mut coord = PlacementHealCoordinator::new(1, None)
         .with_placement_policy(ClusterPlacementPolicy::ErasureCoded { data: 4, parity: 2 });
-    coord.placement_mut().insert(1, 10);
-    coord.placement_mut().insert(1, 20);
-    coord.placement_mut().insert(1, 30);
-    coord.placement_mut().insert(1, 40);
-    coord.placement_mut().insert(1, 50);
-    coord.placement_mut().insert(1, 60);
+    insert_test_object_with_receipt(coord.placement_mut(), 1, &[10, 20, 30, 40, 50, 60]);
 
     let mut lost = BTreeSet::new();
     lost.insert(10);
@@ -1767,8 +1875,7 @@ fn rebuild_plan_deterministic_across_restart() {
     // Build a 3-member cluster with 10 objects (2 replicas each).
     let mut pm = PlacementMap::new(1);
     for obj_id in 0..10u64 {
-        pm.insert(obj_id, 1);
-        pm.insert(obj_id, 2 + (obj_id % 2)); // member 2 or 3
+        insert_test_object_with_receipt(&mut pm, obj_id, &[1, 2 + (obj_id % 2)]);
     }
 
     let policy = ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 };
@@ -1843,8 +1950,7 @@ fn rebuild_plan_exactly_one_backfill_per_loss() {
     // surviving members 2 and 3 can receive rebuild targets.
     let mut pm = PlacementMap::new(1);
     for obj_id in 0..5u64 {
-        pm.insert(obj_id, 1);
-        pm.insert(obj_id, 2 + (obj_id % 2)); // member 2 or 3
+        insert_test_object_with_receipt(&mut pm, obj_id, &[1, 2 + (obj_id % 2)]);
     }
 
     let mut coord = PlacementHealCoordinator::new(1, None)
