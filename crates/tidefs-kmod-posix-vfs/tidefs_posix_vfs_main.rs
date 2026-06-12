@@ -598,7 +598,8 @@ impl KernelEngine {
         if size == 0 || offset >= file_size {
             return Ok(crate::tidefs_kmod_bridge::kernel_types::KmodVec::new());
         }
-        self.normalize_live_extents(crate::tidefs_kmod_bridge::kernel_types::InodeId::new(ino))?;
+        let inode = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(ino);
+        self.normalize_live_extents(inode)?;
 
         let read_len_u64 = core::cmp::min(size as u64, file_size.saturating_sub(offset));
         let read_len = usize::try_from(read_len_u64)
@@ -611,8 +612,22 @@ impl KernelEngine {
         let read_end = offset.saturating_add(read_len_u64);
         if !self.live_write_buffer_covers_range(ino, offset, read_len_u64) {
             let extents = self.live_extents.borrow();
+            let mut saw_inode = false;
+            // Live extents for an inode are kept contiguous and ordered by
+            // start offset, so read-side scans can stop once this inode/range
+            // is past instead of walking the whole global extent vector.
             for entry in extents.iter() {
-                if entry.inode.get() != ino || entry.kind != LiveExtentEntry::DATA {
+                if entry.inode != inode {
+                    if saw_inode {
+                        break;
+                    }
+                    continue;
+                }
+                saw_inode = true;
+                if entry.start >= read_end {
+                    break;
+                }
+                if entry.kind != LiveExtentEntry::DATA || entry.end <= offset {
                     continue;
                 }
                 let overlap_start = core::cmp::max(offset, entry.start);
