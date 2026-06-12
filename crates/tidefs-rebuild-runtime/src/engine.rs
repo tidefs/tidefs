@@ -32,9 +32,9 @@ pub enum EngineError {
     },
     /// An error from the underlying object store.
     StoreError(Box<dyn Error + Send + Sync>),
-    /// Receipt-bound execution was asked to use a compatibility placeholder.
+    /// Receipt-bound execution was asked to use a synthetic placeholder.
     SyntheticReceiptRef { object_id: u64 },
-    /// The compatibility object-store executor was asked to run a real
+    /// The receiptless object-store executor was asked to run a real
     /// receipt-bound movement task.
     ReceiptBoundTaskRequiresReceiptSource { object_id: u64 },
     /// The receipt source could not fetch bytes from the selected member.
@@ -164,7 +164,7 @@ impl Error for EngineError {
 /// Compute the deterministic ObjectKey for a backfill task.
 ///
 /// Real placement receipt refs carry the source object key that the local pool
-/// made durable. Synthetic compatibility refs fall back to the older
+/// made durable. Synthetic receipt refs fall back to the receiptless
 /// subject+digest derivation used by existing tests and scaffolding callers.
 ///
 /// For synthetic refs, the fallback key is the BLAKE3 hash of
@@ -235,7 +235,7 @@ impl<S: ObjectStore> DataMovementEngine<S> {
         }
     }
 
-    /// Execute a synthetic compatibility backfill task through object stores.
+    /// Execute a synthetic receiptless backfill task through object stores.
     ///
     /// This path is retained for local scaffolding that still uses synthetic
     /// receipt refs. Real receipt-bound rebuild/backfill movement must use
@@ -288,7 +288,7 @@ impl<S: ObjectStore> DataMovementEngine<S> {
     /// Execute a backfill task using receipt-bound source bytes.
     ///
     /// This is the distributed rebuild/backfill execution path. Unlike the
-    /// compatibility local-store executor, it refuses synthetic receipt refs and
+    /// receiptless local-store executor, it refuses synthetic receipt refs and
     /// asks the source to fetch by the exact `PlacementReceiptRef` carried by
     /// the admitted task.
     pub fn execute_from_receipt_source<R>(
@@ -548,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_executor_rejects_real_receipt_ref() {
+    fn receiptless_executor_rejects_real_receipt_ref() {
         let data = b"receipt-bound task must use receipt source";
         let receipt_key = ObjectKey::from_bytes32([0xA6; 32]);
         let mut digest = [0u8; 32];

@@ -91,8 +91,8 @@ pub struct AffectedSubject {
 /// subjects from placement receipt references.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiptIngestionError {
-    /// The caller supplied a compatibility placeholder instead of a durable
-    /// local placement receipt.
+    /// The caller supplied a synthetic placeholder instead of a durable local
+    /// placement receipt.
     SyntheticReceiptRef { object_id: u64 },
     /// The receipt carries a redundancy policy that cannot describe legal
     /// placement.
@@ -158,9 +158,9 @@ impl LossRecord {
     ///
     /// `placement_receipt_refs` is intentionally the same compact model
     /// returned by `tidefs_local_object_store::Pool::placement_receipt_refs`.
-    /// Synthetic compatibility refs are rejected here so rebuild admission
-    /// cannot accidentally treat legacy placeholders as durable source
-    /// placement authority.
+    /// Synthetic receipt refs are rejected here so rebuild admission cannot
+    /// accidentally treat receiptless placeholders as durable source placement
+    /// authority.
     pub fn from_placement_receipt_refs(
         lost_members: Vec<MemberId>,
         healthy_sources: Vec<MemberId>,
