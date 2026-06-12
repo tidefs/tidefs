@@ -151,6 +151,45 @@ pub struct StorageNodePeerReadMapApplication {
     pub previous_tracker_version: u64,
 }
 
+/// Planned outbound request for a peer transport read map.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StorageNodePeerReadMapRequest {
+    /// Peer selected from membership placement-version convergence.
+    peer: MemberId,
+    /// Storage-node replication session used for the request.
+    session_id: tidefs_transport::SessionId,
+    /// Minimum map version that would make the local node non-stale.
+    minimum_version: u64,
+    /// Version advertised by the peer through membership.
+    advertised_version: u64,
+}
+
+/// Plan for converting placement-version convergence into read-map requests.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct StorageNodePeerReadMapRequestPlan {
+    /// Local placement version at planning time.
+    local_version: u64,
+    /// Newest peer placement version observed at planning time.
+    max_peer_version: u64,
+    /// Requests ready to send over storage-node replication sessions.
+    requests: Vec<StorageNodePeerReadMapRequest>,
+    /// Ahead peers without an active storage-node replication session.
+    missing_session_peers: Vec<MemberId>,
+    /// Ahead peers already requested at this advertised version.
+    already_requested_peers: Vec<MemberId>,
+}
+
+/// Result of one best-effort request scheduling pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct StorageNodePeerReadMapRequestReport {
+    /// The computed request plan.
+    plan: StorageNodePeerReadMapRequestPlan,
+    /// Peers successfully sent a request during this pass.
+    sent_peers: Vec<MemberId>,
+    /// Peers whose request send failed and may be retried.
+    send_failed_peers: Vec<MemberId>,
+}
+
 /// Publish storage-node repair flow-commit evidence into a local placement map.
 ///
 /// This composes already-validated repair/flow evidence with local placement
@@ -372,6 +411,125 @@ pub fn apply_peer_transport_read_map_to_transport_store(
         previous_store_version,
         previous_tracker_version,
     })
+}
+
+fn plan_peer_transport_read_map_requests(
+    convergence: &tidefs_membership_live::PlacementVersionConvergence,
+    peer_sessions: &BTreeMap<MemberId, tidefs_transport::SessionId>,
+    requested_peer_versions: &BTreeMap<MemberId, u64>,
+) -> StorageNodePeerReadMapRequestPlan {
+    let mut plan = StorageNodePeerReadMapRequestPlan {
+        local_version: convergence.local_version,
+        max_peer_version: convergence.max_peer_version,
+        ..StorageNodePeerReadMapRequestPlan::default()
+    };
+
+    if !convergence.local_is_stale() {
+        return plan;
+    }
+
+    let Some(minimum_version) = convergence.local_version.checked_add(1) else {
+        return plan;
+    };
+
+    for peer in &convergence.peers_ahead {
+        let Some(&advertised_version) = convergence.peer_versions.get(peer) else {
+            continue;
+        };
+        if advertised_version <= convergence.local_version {
+            continue;
+        }
+        if requested_peer_versions
+            .get(peer)
+            .is_some_and(|requested_version| *requested_version >= advertised_version)
+        {
+            plan.already_requested_peers.push(*peer);
+            continue;
+        }
+
+        let Some(&session_id) = peer_sessions.get(peer) else {
+            plan.missing_session_peers.push(*peer);
+            continue;
+        };
+
+        plan.requests.push(StorageNodePeerReadMapRequest {
+            peer: *peer,
+            session_id,
+            minimum_version,
+            advertised_version,
+        });
+    }
+
+    plan
+}
+
+fn storage_replication_sessions_by_member(
+    transport: &Transport,
+) -> BTreeMap<MemberId, tidefs_transport::SessionId> {
+    let stats = transport.all_stats();
+    let mut peer_sessions = BTreeMap::new();
+    for session_id in stats.sessions.keys() {
+        if let Some(peer_id) = transport.peer_node(*session_id) {
+            peer_sessions
+                .entry(MemberId::new(peer_id))
+                .or_insert(*session_id);
+        }
+    }
+    peer_sessions
+}
+
+fn request_peer_transport_read_maps_from_convergence(
+    membership: &Arc<Mutex<MembershipRuntime>>,
+    storage_transport: &Arc<Mutex<Transport>>,
+    requested_peer_versions: &mut BTreeMap<MemberId, u64>,
+) -> StorageNodePeerReadMapRequestReport {
+    let convergence = {
+        let runtime = membership.lock().unwrap();
+        runtime.placement_version_convergence()
+    };
+
+    requested_peer_versions.retain(|peer, requested_version| {
+        convergence
+            .peer_versions
+            .get(peer)
+            .is_some_and(|observed_version| {
+                observed_version == requested_version
+                    && *requested_version > convergence.local_version
+            })
+    });
+
+    let mut transport = storage_transport.lock().unwrap();
+    let peer_sessions = storage_replication_sessions_by_member(&transport);
+    let plan = plan_peer_transport_read_map_requests(
+        &convergence,
+        &peer_sessions,
+        requested_peer_versions,
+    );
+    let mut report = StorageNodePeerReadMapRequestReport {
+        plan,
+        ..StorageNodePeerReadMapRequestReport::default()
+    };
+
+    for request in &report.plan.requests {
+        let message = ReplicationMessage::PlacementMapRequest {
+            minimum_version: request.minimum_version,
+        };
+        match send_replication_msg(&mut transport, request.session_id, &message) {
+            Ok(()) => {
+                requested_peer_versions.insert(request.peer, request.advertised_version);
+                report.sent_peers.push(request.peer);
+            }
+            Err(err) => {
+                eprintln!(
+                    "[storage-node] peer {} read-map request on session {} failed: {err:?}",
+                    request.peer.0, request.session_id
+                );
+                report.send_failed_peers.push(request.peer);
+            }
+        }
+    }
+
+    report
 }
 
 /// Publish storage-node relocation flow-commit evidence into a local placement map.
@@ -2012,6 +2170,7 @@ impl MembershipServiceHandle {
     fn spawn(
         membership: Arc<Mutex<MembershipRuntime>>,
         membership_transport: Arc<Mutex<MembershipTransport>>,
+        storage_transport: Arc<Mutex<Transport>>,
         placement_version_tracker: Arc<PlacementVersionTracker>,
         period: Duration,
         split_brain_guard: Option<Arc<Mutex<SplitBrainGuard>>>,
@@ -2025,6 +2184,7 @@ impl MembershipServiceHandle {
         let poll_interval = Duration::from_millis(10);
         let handle = thread::spawn(move || {
             let mut last_tick = Instant::now();
+            let mut requested_peer_read_map_versions = BTreeMap::new();
             while !stop_worker.load(Ordering::Relaxed) {
                 // Continuously receive and dispatch inbound membership
                 // messages on all connected peer sessions.
@@ -2048,6 +2208,19 @@ impl MembershipServiceHandle {
                     if let Some(ref guard) = split_brain_guard {
                         let runtime = membership.lock().unwrap();
                         sync_partition_state_from_membership(&runtime, guard, my_id);
+                    }
+
+                    let request_report = request_peer_transport_read_maps_from_convergence(
+                        &membership,
+                        &storage_transport,
+                        &mut requested_peer_read_map_versions,
+                    );
+                    if !request_report.sent_peers.is_empty() {
+                        eprintln!(
+                            "[storage-node] requested peer read maps from {:?} for local placement version {}",
+                            request_report.sent_peers,
+                            request_report.plan.local_version
+                        );
                     }
 
                     last_tick = Instant::now();
@@ -2666,10 +2839,12 @@ impl StorageNode {
                 None
             };
 
-        let membership_service = membership_transport.as_ref().map(|transport| {
+        let storage_transport = Arc::new(Mutex::new(transport));
+        let membership_service = membership_transport.as_ref().map(|membership_transport| {
             MembershipServiceHandle::spawn(
                 Arc::clone(&membership),
-                Arc::clone(transport),
+                Arc::clone(membership_transport),
+                Arc::clone(&storage_transport),
                 Arc::clone(&placement_version_tracker),
                 membership_period,
                 split_brain_guard.clone(),
@@ -2697,7 +2872,7 @@ impl StorageNode {
             };
 
         Ok(Self {
-            transport: Arc::new(Mutex::new(transport)),
+            transport: storage_transport,
             store: Arc::new(Mutex::new(store_backend)),
             membership,
             membership_transport,
@@ -5253,6 +5428,33 @@ mod cluster_pool_handler_tests {
         )
     }
 
+    fn placement_convergence(
+        local_version: u64,
+        versions: &[(u64, u64)],
+    ) -> tidefs_membership_live::PlacementVersionConvergence {
+        let peer_versions: BTreeMap<_, _> = versions
+            .iter()
+            .map(|(peer, version)| (MemberId::new(*peer), *version))
+            .collect();
+        let max_peer_version = peer_versions.values().copied().max().unwrap_or(0);
+        let peers_ahead = peer_versions
+            .iter()
+            .filter_map(|(peer, version)| (*version > local_version).then_some(*peer))
+            .collect();
+        let peers_behind = peer_versions
+            .iter()
+            .filter_map(|(peer, version)| (*version < local_version).then_some(*peer))
+            .collect();
+
+        tidefs_membership_live::PlacementVersionConvergence {
+            local_version,
+            max_peer_version,
+            peer_versions,
+            peers_ahead,
+            peers_behind,
+        }
+    }
+
     fn repair_flow_commit_publication(
         source_receipt: PlacementReceiptRef,
         repaired_receipt: PlacementReceiptRef,
@@ -6169,6 +6371,84 @@ mod cluster_pool_handler_tests {
         assert_eq!(convergence.max_peer_version, 12);
         assert_eq!(convergence.peers_ahead, vec![MemberId::new(2)]);
         assert!(convergence.local_is_stale());
+    }
+
+    #[test]
+    fn peer_read_map_request_plan_selects_ahead_peers_with_storage_sessions() {
+        let convergence = placement_convergence(5, &[(2, 8), (3, 4), (4, 9), (5, 7)]);
+        let peer_sessions = [
+            (MemberId::new(2), tidefs_transport::SessionId::new(22)),
+            (MemberId::new(5), tidefs_transport::SessionId::new(55)),
+        ]
+        .into_iter()
+        .collect();
+        let requested = BTreeMap::new();
+
+        let plan = plan_peer_transport_read_map_requests(&convergence, &peer_sessions, &requested);
+
+        assert_eq!(plan.local_version, 5);
+        assert_eq!(plan.max_peer_version, 9);
+        assert_eq!(
+            plan.requests,
+            vec![
+                StorageNodePeerReadMapRequest {
+                    peer: MemberId::new(2),
+                    session_id: tidefs_transport::SessionId::new(22),
+                    minimum_version: 6,
+                    advertised_version: 8,
+                },
+                StorageNodePeerReadMapRequest {
+                    peer: MemberId::new(5),
+                    session_id: tidefs_transport::SessionId::new(55),
+                    minimum_version: 6,
+                    advertised_version: 7,
+                },
+            ]
+        );
+        assert_eq!(plan.missing_session_peers, vec![MemberId::new(4)]);
+        assert!(plan.already_requested_peers.is_empty());
+    }
+
+    #[test]
+    fn peer_read_map_request_plan_suppresses_repeated_peer_versions() {
+        let convergence = placement_convergence(5, &[(2, 8), (4, 10)]);
+        let peer_sessions = [
+            (MemberId::new(2), tidefs_transport::SessionId::new(22)),
+            (MemberId::new(4), tidefs_transport::SessionId::new(44)),
+        ]
+        .into_iter()
+        .collect();
+        let requested = [(MemberId::new(2), 8), (MemberId::new(4), 9)]
+            .into_iter()
+            .collect();
+
+        let plan = plan_peer_transport_read_map_requests(&convergence, &peer_sessions, &requested);
+
+        assert_eq!(plan.already_requested_peers, vec![MemberId::new(2)]);
+        assert_eq!(
+            plan.requests,
+            vec![StorageNodePeerReadMapRequest {
+                peer: MemberId::new(4),
+                session_id: tidefs_transport::SessionId::new(44),
+                minimum_version: 6,
+                advertised_version: 10,
+            }]
+        );
+    }
+
+    #[test]
+    fn peer_read_map_request_plan_is_idle_when_local_is_not_stale() {
+        let convergence = placement_convergence(10, &[(2, 8), (3, 10)]);
+        let peer_sessions = [(MemberId::new(2), tidefs_transport::SessionId::new(22))]
+            .into_iter()
+            .collect();
+        let requested = BTreeMap::new();
+
+        let plan = plan_peer_transport_read_map_requests(&convergence, &peer_sessions, &requested);
+
+        assert!(plan.requests.is_empty());
+        assert!(plan.missing_session_peers.is_empty());
+        assert!(plan.already_requested_peers.is_empty());
     }
 
     #[test]
