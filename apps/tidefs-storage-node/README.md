@@ -107,16 +107,19 @@ deserialization for `tidefs_transport::ReplicationMessage`.
 | `RepairObject { key, placement_receipt_ref, authoritative_payload }` | Validates the shared placement receipt against the exact 32-byte object key, length, digest, policy, and target width before local repair write; pool-backed repairs respond with a fresh repaired `PlacementReceiptRef` |
 
 Pool-backed scrub reports include `placement_receipt_refs`,
-`rebuild_admission`, and `rebuild_planner` previews. Both previews are built
-from the same real `PlacementReceiptRef` values: admission runs them through
-`tidefs-rebuild-runtime`, while the planner preview feeds the live receipt
-inventory into `tidefs-rebuild-planner::plan_reconstruction()` with the local
-node as the healthy source and configured peers as replacement targets. This
-keeps later distributed rebuild orchestration tied to receipt-addressed tasks
-instead of deriving placement from current topology or compatibility store
-listings. Local path-backed and transport-backed compatibility stores report
-the rebuild previews as unavailable because they do not expose pool placement
-receipt inventory.
+`rebuild_admission`, `rebuild_planner`, and `rebuild_execution_candidates`
+previews. All three previews are built from the same real `PlacementReceiptRef`
+values: admission runs them through `tidefs-rebuild-runtime`, the planner
+preview feeds the live receipt inventory into
+`tidefs-rebuild-planner::plan_reconstruction()` with the local node as the
+healthy source and configured peers as replacement targets, and execution
+candidates are listed only when admission and planner agree on the receipt,
+source, target, payload length, and digest. This keeps later distributed
+rebuild orchestration tied to receipt-addressed tasks instead of deriving
+placement from current topology or compatibility store listings. Local
+path-backed and transport-backed compatibility stores report the rebuild
+previews as unavailable because they do not expose pool placement receipt
+inventory.
 
 Pool-backed `SyncResponse` entries likewise carry the real non-synthetic
 `PlacementReceiptRef` for the payload being transferred. Local path-backed and
