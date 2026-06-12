@@ -3595,7 +3595,7 @@ static ssize_t tidefs_posix_vfs_file_read_iter(struct kiocb *iocb,
 				new_atime = inode_get_atime(inode);
 				if (!timespec64_equal(&old_atime, &new_atime))
 					tidefs_posix_vfs_persist_inode_times_best_effort(
-						inode, 0x40);
+						inode, 0x10);
 			}
 			return read_ret;
 		}
