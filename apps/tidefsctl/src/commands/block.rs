@@ -5,7 +5,7 @@
 //!
 //! `tidefsctl block attach <pool>` is the operator entrypoint for ublk block
 //! device lifecycle. Imported pools route to the live owner. Directory
-//! object-store backing is a compatibility implementation detail, not an
+//! object-store backing is a hidden retired/offline path, not an
 //! operator block-volume backing mode.
 //!
 //! The block-volume-adapter-daemon binary `ublk-serve` subcommand is a
@@ -222,19 +222,19 @@ fn handle_attach(
 
     if !pool_path.exists() {
         return Err(format!(
-            "compatibility directory object store does not exist: {}",
+            "retired directory object-store backing does not exist: {}",
             pool_path.display()
         ));
     }
     if !pool_path.is_dir() {
         return Err(format!(
-            "compatibility directory object store is not a directory: {}",
+            "retired directory object-store backing is not a directory: {}",
             pool_path.display()
         ));
     }
 
     eprintln!(
-        "tidefsctl block attach: opening compatibility directory object store for pool '{pool}' at {}",
+        "tidefsctl block attach: opening retired directory object-store backing for pool '{pool}' at {}",
         pool_path.display()
     );
 
@@ -464,7 +464,7 @@ fn handle_block_send(
 
     if !pool_path.exists() {
         return Err(format!(
-            "compatibility directory object store does not exist: {}",
+            "retired directory object-store backing does not exist: {}",
             pool_path.display()
         ));
     }
@@ -526,7 +526,7 @@ fn handle_block_receive(
 
     if pool_path.exists() {
         return Err(format!(
-            "destination compatibility directory object store already exists: {} (receive requires an empty target)",
+            "destination retired directory object-store backing already exists: {} (receive requires an empty target)",
             pool_path.display()
         ));
     }
@@ -623,7 +623,7 @@ mod tests {
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
-            .contains("compatibility directory object store does not exist"),);
+            .contains("retired directory object-store backing does not exist"),);
     }
 
     #[test]
