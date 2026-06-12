@@ -126,12 +126,16 @@ Pool-backed `SyncResponse` entries likewise carry the real non-synthetic
 transport-backed compatibility stores keep sync entries receipt-less rather
 than synthesizing placement authority.
 
-Receipt-backed repair callers must treat `RepairObjectAck` as completion
+Receipt-backed repair callers can use
+`TransportReplicatedStore::execute_receipt_repair_task_and_record_completion()`
+to execute `RepairObject` and record rebuild-runtime verified-task completion
+in one fail-closed path. The bridge treats `RepairObjectAck` as completion
 evidence only when `success` is true and the ack carries a non-synthetic
-`repaired_placement_receipt_ref` that passes the rebuild-runtime verified-task
-completion law. Compatibility acks without a repaired receipt are accepted as
-wire-format responses, but they do not advance receipt-backed rebuild
-completion.
+`repaired_placement_receipt_ref` that passes the rebuild-runtime completion
+law; receipt-less, mismatched, or failed acks do not advance completion or
+admission state as success. Compatibility acks without a repaired receipt are
+accepted as wire-format responses, but they do not advance receipt-backed
+rebuild completion.
 
 ### Local-Only Operations (LOCAL-ONLY boundary)
 

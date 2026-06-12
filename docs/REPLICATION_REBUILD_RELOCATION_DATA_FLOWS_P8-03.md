@@ -252,12 +252,18 @@ The executable slice includes:
 
 It covers fault-injection, no-source refusal, lagged-copy backfill,
 capacity-movement rebalance, and reserve-floor blockage tests. The
-transport-backed store also has a narrow receipt-bound repair bridge: it fetches
-source bytes by `PlacementReceiptRef`, sends storage-node `RepairObject` to the
-target, and accepts completion evidence only from a successful ack with a fresh
-repaired placement receipt that passes rebuild-runtime verified-task completion.
-This is not yet full replacement-node orchestration, degraded-read policy, or
-reclaim publication; those remain part of the broader #18 runtime closeout.
+transport-backed store also has a narrow receipt-bound repair execution and
+completion bridge:
+`TransportReplicatedStore::execute_receipt_repair_task_and_record_completion()`
+fetches source bytes by `PlacementReceiptRef`, sends storage-node
+`RepairObject` to the target, requires a successful ack with a fresh repaired
+placement receipt, and records
+`RebuildCompletion::record_receipt_verified_task_completion()` only after that
+receipt passes the rebuild-runtime verification law. Receipt-less, mismatched,
+or failed acks do not advance completion or admission as success. This is not
+yet full replacement-node orchestration, degraded-read policy, repaired
+placement publication to broader cluster state, or reclaim publication; those
+remain part of the broader #18 runtime closeout.
 
 ## 7. Steady-state replication flow
 
