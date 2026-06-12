@@ -108,6 +108,15 @@ pub struct StorageNodeRepairPlacementPublication {
     pub placement_publication: RebuildFlowCommitPlacementPublication,
 }
 
+/// Storage-node summary for finalizing a verifying heal from accepted repair publications.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageNodeRepairHealFinalization {
+    /// Accepted repair publications that supplied the rebuilt-placement evidence.
+    pub repair_publications: Vec<StorageNodeRepairPlacementPublication>,
+    /// Rebuilt-placement evidence passed to the cluster runtime.
+    pub rebuilt_placements: BTreeMap<u64, BTreeSet<u64>>,
+}
+
 /// Storage-node summary for publishing a relocation flow result into placement state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageNodeRelocationPlacementPublication {
@@ -162,6 +171,29 @@ pub fn publish_repair_flow_commit_into_cluster_runtime(
     })
 }
 
+/// Finalize a verifying cluster-runtime heal from accepted repair publications.
+///
+/// The supplied publications must already have been accepted by
+/// [`publish_repair_flow_commit_into_cluster_runtime()`]. This helper derives
+/// the rebuilt-placement evidence required by
+/// [`ClusterLeaseRuntime::finalize_heal_with_rebuilt_placements()`]. It does
+/// not perform cluster-wide propagation, degraded-read routing, replacement
+/// orchestration, or reclaim.
+pub fn finalize_cluster_runtime_heal_from_repair_publications(
+    runtime: &mut ClusterLeaseRuntime,
+    repair_publications: &[StorageNodeRepairPlacementPublication],
+) -> Result<StorageNodeRepairHealFinalization, String> {
+    let rebuilt_placements = rebuilt_placements_from_repair_publications(repair_publications)?;
+    runtime
+        .finalize_heal_with_rebuilt_placements(&rebuilt_placements)
+        .map_err(|err| format!("storage-node repair heal finalization failed: {err}"))?;
+
+    Ok(StorageNodeRepairHealFinalization {
+        repair_publications: repair_publications.to_vec(),
+        rebuilt_placements,
+    })
+}
+
 /// Publish storage-node relocation flow-commit evidence into a local placement map.
 ///
 /// This composes completed relocation flow evidence with local placement state.
@@ -208,6 +240,56 @@ pub fn publish_relocation_flow_commit_into_cluster_runtime(
         flow_commit_result: result.clone(),
         placement_publication,
     })
+}
+
+fn rebuilt_placements_from_repair_publications(
+    repair_publications: &[StorageNodeRepairPlacementPublication],
+) -> Result<BTreeMap<u64, BTreeSet<u64>>, String> {
+    if repair_publications.is_empty() {
+        return Err("no repair placement publications supplied for heal finalization".into());
+    }
+
+    let mut rebuilt_placements: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for publication in repair_publications {
+        validate_repair_flow_commit_publication(&publication.repair_flow_publication)?;
+
+        let repair = &publication.repair_flow_publication.repair_completion;
+        let verified = repair.verified_receipt_completion;
+        let result = &publication.repair_flow_publication.flow_commit_result;
+        let placement = publication.placement_publication;
+
+        if placement.object_id != verified.subject_ref.0 {
+            return Err(format!(
+                "repair placement publication object {} does not match repair subject {:?}",
+                placement.object_id, verified.subject_ref
+            ));
+        }
+        if placement.target_member != verified.target_member.0 {
+            return Err(format!(
+                "repair placement publication target {} does not match repair target {:?}",
+                placement.target_member, verified.target_member
+            ));
+        }
+        if placement.placement_receipt_ref != verified.repaired_placement_receipt_ref {
+            return Err(format!(
+                "repair placement publication receipt for object {} does not match repair completion",
+                placement.object_id
+            ));
+        }
+        if placement.map_epoch != result.commit_epoch.0 {
+            return Err(format!(
+                "repair placement publication map epoch {} does not match flow commit epoch {:?}",
+                placement.map_epoch, result.commit_epoch
+            ));
+        }
+
+        rebuilt_placements
+            .entry(placement.object_id)
+            .or_default()
+            .insert(placement.target_member);
+    }
+
+    Ok(rebuilt_placements)
 }
 
 fn validate_repair_flow_commit_publication(
@@ -4827,6 +4909,7 @@ mod cluster_pool_handler_tests {
     use std::fs::File;
     use std::io::Write;
     use tidefs_cluster::pool_protocol::{ClusterPoolCreateResponse, ClusterPoolImportResponse};
+    use tidefs_cluster::HealState;
     use tidefs_local_object_store::ObjectKey;
     use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
     use tidefs_rebuild_runtime::completion::VerifiedReceiptCompletionRecord;
@@ -4926,6 +5009,24 @@ mod cluster_pool_handler_tests {
         receipt_ref_for_key(ObjectKey::from_name(name), payload, generation)
     }
 
+    fn receipt_ref_for_object(
+        object_id: u64,
+        name: &[u8],
+        payload: &[u8],
+        generation: u64,
+    ) -> PlacementReceiptRef {
+        PlacementReceiptRef::new(
+            object_id,
+            ObjectKey::from_name(name).as_bytes32(),
+            EpochId::new(11),
+            generation,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            payload.len() as u64,
+            blake3::hash(payload).into(),
+            2,
+        )
+    }
+
     fn repair_flow_commit_publication(
         source_receipt: PlacementReceiptRef,
         repaired_receipt: PlacementReceiptRef,
@@ -5018,6 +5119,65 @@ mod cluster_pool_handler_tests {
             .publish_rebuild_flow_commit_result(&seed.flow_commit_result)
             .expect("seed runtime placement state");
         runtime
+    }
+
+    fn cluster_runtime_with_verifying_heal_and_repair_publications() -> (
+        ClusterLeaseRuntime,
+        Vec<ReceiptRepairFlowCommitPublication>,
+        Vec<PlacementReceiptRef>,
+        Vec<PlacementReceiptRef>,
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime =
+            ClusterLeaseRuntime::new(1, EpochId::new(5), ClusterLeaseConfig::default(), tx)
+                .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
+
+        let source_receipts = vec![
+            receipt_ref_for_object(101, b"storage-node-heal-a", b"old-payload-a", 1),
+            receipt_ref_for_object(102, b"storage-node-heal-b", b"old-payload-b", 1),
+        ];
+        let repaired_receipts = vec![
+            receipt_ref_for_object(101, b"storage-node-heal-a", b"new-payload-a", 2),
+            receipt_ref_for_object(102, b"storage-node-heal-b", b"new-payload-b", 2),
+        ];
+
+        for source_receipt in &source_receipts {
+            let seed = repair_flow_commit_publication(*source_receipt, *source_receipt, 1, 5);
+            runtime
+                .publish_rebuild_flow_commit_result(&seed.flow_commit_result)
+                .expect("seed lost-member placement receipt");
+            runtime.record_placement(source_receipt.object_id, 2);
+        }
+
+        let mut lost = BTreeSet::new();
+        lost.insert(1);
+        let available = BTreeMap::from([
+            (2, HealthClass::Healthy),
+            (3, HealthClass::Healthy),
+            (4, HealthClass::Healthy),
+        ]);
+
+        let bid = runtime
+            .detect_member_loss(lost, available, 1_000_000_000)
+            .expect("receipt-backed heal starts backfill");
+        while rx.try_recv().is_ok() {}
+        runtime
+            .complete_backfill(bid)
+            .expect("test backfill completes transfer");
+        assert!(!runtime.heal_tick(2, 8192, 2_000_000_000));
+        assert_eq!(runtime.heal_state(), HealState::Verifying);
+
+        let repair_publications = vec![
+            repair_flow_commit_publication(source_receipts[0], repaired_receipts[0], 3, 9),
+            repair_flow_commit_publication(source_receipts[1], repaired_receipts[1], 4, 9),
+        ];
+
+        (
+            runtime,
+            repair_publications,
+            source_receipts,
+            repaired_receipts,
+        )
     }
 
     fn assert_repair_flow_publication_refused_without_mutation(
@@ -5567,6 +5727,128 @@ mod cluster_pool_handler_tests {
                 .cloned()
                 .unwrap_or_default(),
             [1, 2].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn repair_publications_empty_heal_finalization_is_rejected_without_mutation() {
+        let (mut runtime, _repair_publications, source_receipts, _repaired_receipts) =
+            cluster_runtime_with_verifying_heal_and_repair_publications();
+
+        let err =
+            finalize_cluster_runtime_heal_from_repair_publications(&mut runtime, &[]).unwrap_err();
+
+        assert!(
+            err.contains("no repair placement publications supplied"),
+            "{err}"
+        );
+        assert_eq!(runtime.heal_state(), HealState::Verifying);
+        for source_receipt in source_receipts {
+            assert_eq!(
+                runtime
+                    .placement_map()
+                    .replicas_of(source_receipt.object_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                [1, 2].into_iter().collect()
+            );
+        }
+    }
+
+    #[test]
+    fn repair_publications_incomplete_heal_finalization_preserves_verifying_state() {
+        let (mut runtime, repair_publications, source_receipts, _repaired_receipts) =
+            cluster_runtime_with_verifying_heal_and_repair_publications();
+        let accepted =
+            publish_repair_flow_commit_into_cluster_runtime(&mut runtime, &repair_publications[0])
+                .expect("first repair publication is accepted");
+
+        let err = finalize_cluster_runtime_heal_from_repair_publications(
+            &mut runtime,
+            &[accepted.clone()],
+        )
+        .unwrap_err();
+
+        assert!(err.contains("does not match objects to rebuild"), "{err}");
+        assert_eq!(runtime.heal_state(), HealState::Verifying);
+        assert!(runtime
+            .placement_map()
+            .objects_of(1)
+            .is_some_and(|objects| objects.contains(&source_receipts[0].object_id)
+                && objects.contains(&source_receipts[1].object_id)));
+        assert_eq!(
+            runtime
+                .placement_map()
+                .replicas_of(source_receipts[0].object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [1, 2, 3].into_iter().collect()
+        );
+        assert_eq!(
+            runtime
+                .placement_map()
+                .replicas_of(source_receipts[1].object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [1, 2].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn repair_publications_finalize_verifying_heal_when_scope_is_complete() {
+        let (mut runtime, repair_publications, source_receipts, repaired_receipts) =
+            cluster_runtime_with_verifying_heal_and_repair_publications();
+        let accepted = repair_publications
+            .iter()
+            .map(|publication| {
+                publish_repair_flow_commit_into_cluster_runtime(&mut runtime, publication)
+                    .expect("repair publication is accepted")
+            })
+            .collect::<Vec<_>>();
+
+        let finalization =
+            finalize_cluster_runtime_heal_from_repair_publications(&mut runtime, &accepted)
+                .expect("complete repair publications finalize heal");
+
+        assert_eq!(finalization.repair_publications, accepted);
+        assert_eq!(
+            finalization
+                .rebuilt_placements
+                .get(&repaired_receipts[0].object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [3].into_iter().collect()
+        );
+        assert_eq!(
+            finalization
+                .rebuilt_placements
+                .get(&repaired_receipts[1].object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [4].into_iter().collect()
+        );
+        assert_eq!(runtime.heal_state(), HealState::Complete);
+        assert!(!runtime.is_healing());
+        assert!(!runtime
+            .placement_map()
+            .objects_of(1)
+            .is_some_and(|objects| objects.contains(&source_receipts[0].object_id)
+                || objects.contains(&source_receipts[1].object_id)));
+        assert_eq!(
+            runtime
+                .placement_map()
+                .replicas_of(repaired_receipts[0].object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [2, 3].into_iter().collect()
+        );
+        assert_eq!(
+            runtime
+                .placement_map()
+                .replicas_of(repaired_receipts[1].object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [2, 4].into_iter().collect()
         );
     }
 

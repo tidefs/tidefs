@@ -167,8 +167,13 @@ can use `publish_repair_flow_commit_into_placement_map()` to cross-check the
 repair evidence against the flow-commit result before applying that local
 placement-map update. Callers that own `ClusterLeaseRuntime` can use
 `publish_repair_flow_commit_into_cluster_runtime()` to perform the same
-storage-node cross-check and delegate to runtime-owned placement state. These
-are storage-node composition boundaries only.
+storage-node cross-check and delegate to runtime-owned placement state. After
+those repair publications are accepted, the same owner can use
+`finalize_cluster_runtime_heal_from_repair_publications()` to derive the
+rebuilt-placement evidence required by the runtime's explicit heal
+finalization boundary. These are storage-node composition boundaries only; they
+still do not publish cluster-wide convergence, degraded-read routing,
+replacement orchestration, or reclaim completion.
 
 ### Local-Only Operations (LOCAL-ONLY boundary)
 
