@@ -34,11 +34,8 @@ jobs:
       matrix:
         include:
           - target: fuse
-            command: nix run .#fuse-xfstests-validation
           - target: kmod-smoke
-            command: nix run .#kmod-xfstests-smoke -- --timeout 3600
           - target: k7-vfs
-            command: nix run .#k7-vfs-xfstests-validation
 
     steps:
       - name: Checkout
@@ -51,16 +48,72 @@ jobs:
           test -c /dev/kvm
           test -c /dev/fuse
 
+      - name: Prepare xfstests artifact root
+        if: ${{ github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target }}
+        env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/tidefs-xfstests-artifacts/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.target }}
+          WORK_ROOT: ${{ runner.temp }}/tidefs-xfstests-work/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rm -rf "$ARTIFACT_ROOT"
+          rm -rf "$WORK_ROOT"
+          mkdir -p "$ARTIFACT_ROOT"
+          mkdir -p "$WORK_ROOT"
+          {
+            printf 'workflow=%s\n' "${GITHUB_WORKFLOW}"
+            printf 'run_id=%s\n' "${GITHUB_RUN_ID}"
+            printf 'run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT}"
+            printf 'job=%s\n' "${GITHUB_JOB}"
+            printf 'target=%s\n' "${{ matrix.target }}"
+            printf 'artifact_root=%s\n' "$ARTIFACT_ROOT"
+            printf 'work_root=%s\n' "$WORK_ROOT"
+            printf 'utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$ARTIFACT_ROOT/artifact-root.env"
+
       - name: Run target
         if: ${{ github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target }}
-        run: timeout --foreground 14400s bash -lc '${{ matrix.command }}'
+        env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/tidefs-xfstests-artifacts/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.target }}
+          WORK_ROOT: ${{ runner.temp }}/tidefs-xfstests-work/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            fuse)
+              TIDEFS_FUSE_XFSTESTS_TMPDIR="$WORK_ROOT/fuse" \
+                timeout --foreground 14400s \
+                  nix run .#fuse-xfstests-validation -- \
+                    --output "$ARTIFACT_ROOT/validation.json"
+              ;;
+            kmod-smoke)
+              TIDEFS_OUTPUT_ROOT="$ARTIFACT_ROOT" \
+                timeout --foreground 14400s \
+                  nix run .#kmod-xfstests-smoke -- --timeout 3600
+              ;;
+            k7-vfs)
+              TIDEFS_K7_TFS_XFSTESTS_TMPDIR="$WORK_ROOT/k7-vfs" \
+                timeout --foreground 14400s \
+                  nix run .#k7-vfs-xfstests-validation -- \
+                    --output "$ARTIFACT_ROOT/validation.json"
+              ;;
+            *)
+              echo "unknown xfstests target: ${{ matrix.target }}" >&2
+              exit 2
+              ;;
+          esac
 
       - name: Upload xfstests output
         if: ${{ always() && (github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target) }}
         uses: actions/upload-artifact@v7
         with:
           name: xfstests-${{ matrix.target }}
-          path: |
-            /tmp/tidefs-validation/**
+          path: ${{ runner.temp }}/tidefs-xfstests-artifacts/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.target }}/
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Cleanup xfstests work root
+        if: ${{ always() && (github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target) }}
+        env:
+          WORK_ROOT: ${{ runner.temp }}/tidefs-xfstests-work/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rm -rf "$WORK_ROOT"
