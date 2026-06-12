@@ -260,10 +260,13 @@ fetches source bytes by `PlacementReceiptRef`, sends storage-node
 placement receipt, and records
 `RebuildCompletion::record_receipt_verified_task_completion()` only after that
 receipt passes the rebuild-runtime verification law. Receipt-less, mismatched,
-or failed acks do not advance completion or admission as success. This is not
-yet full replacement-node orchestration, degraded-read policy, repaired
-placement publication to broader cluster state, or reclaim publication; those
-remain part of the broader #18 runtime closeout.
+or failed acks do not advance completion or admission as success. The
+flow-commit coordinator preserves those repaired `PlacementReceiptRef` values
+in `ReplicaPlacementReceipt` / `FlowCommitResult` outputs when callers supply
+validated target receipts; that is result publication only, not broader
+cluster-state publication. This is not yet full replacement-node orchestration,
+degraded-read policy, repaired placement publication to broader cluster state,
+or reclaim publication; those remain part of the broader #18 runtime closeout.
 
 ## 7. Steady-state replication flow
 
