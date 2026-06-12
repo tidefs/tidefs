@@ -10,6 +10,7 @@ description = "P8-03 data_copy_7 flow commit coordinator: receipt emission and s
 
 [dependencies]
 tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-rebuild-runtime = { path = "../tidefs-rebuild-runtime" }
 tidefs-rebuild-planner = { path = "../tidefs-rebuild-planner" }
 tidefs-relocation-planner = { path = "../tidefs-relocation-planner" }
 tidefs-verification-engine = { path = "../tidefs-verification-engine" }

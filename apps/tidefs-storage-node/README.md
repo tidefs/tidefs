@@ -144,10 +144,13 @@ admission state as success. Compatibility acks without a repaired receipt are
 accepted as wire-format responses, but they do not advance receipt-backed
 rebuild completion. `RebuildCompletion::verified_receipt_completions()` exposes
 the successful source/repaired receipt pairs as a typed publication view for
-later cluster-state and reclaim consumers; it does not publish those broader
-states by itself. The replicated-store repair bridge returns that same typed
-record in `ReceiptRepairCompletionEvidence` so callers do not have to inspect
-private completion state to carry the evidence forward.
+later consumers; it does not publish broader cluster or reclaim state by
+itself. The replicated-store repair bridge returns that same typed record in
+`ReceiptRepairCompletionEvidence`, and the flow-commit coordinator can publish
+the repaired target `PlacementReceiptRef` as `ReplicaPlacementReceipt` /
+`FlowCommitResult` rebuild evidence. That is repaired-placement publication
+through flow-commit only; replacement-node orchestration, cluster-state
+convergence, and reclaim publication remain separate #18 work.
 
 ### Local-Only Operations (LOCAL-ONLY boundary)
 

@@ -32,10 +32,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_rebuild_runtime::completion::VerifiedReceiptCompletionRecord;
 use tidefs_replication_model::{
-    FlowCommitClass, FlowCommitResult, FlowState, PlacementReceiptRef, ReplicaChunkState,
-    ReplicaCopyClass, ReplicaCopyRecord, ReplicaPlacementReceipt, ReplicaTransferReceipt,
-    ReplicaVerificationReceipt, ReplicatedReceiptId, ReplicatedSubjectId, VerificationStatus,
+    FlowCommitClass, FlowCommitResult, FlowState, ObjectDigest, PlacementReceiptRef,
+    ReplicaChunkState, ReplicaCopyClass, ReplicaCopyRecord, ReplicaPlacementReceipt,
+    ReplicaTransferReceipt, ReplicaVerificationReceipt, ReplicatedReceiptId, ReplicatedSubjectId,
+    VerificationStatus,
 };
 
 /// Gate constant for P8-03 data_copy_7 flow commit coordinator.
@@ -508,6 +510,159 @@ impl FlowCommitCoordinator {
         Ok(refs_by_subject)
     }
 
+    /// Publish a rebuild-runtime verified receipt completion as flow-commit
+    /// repaired-placement evidence.
+    ///
+    /// This path is for repair execution that already validated source bytes,
+    /// target write, and rebuild-runtime completion law. It records the
+    /// repaired target placement receipt in the same `ReplicaPlacementReceipt`
+    /// / `FlowCommitResult` surface used by the transfer/verification path.
+    ///
+    /// The coordinator validates all receipt refs and duplicate publication
+    /// before mutating state.
+    pub fn publish_verified_rebuild_completion(
+        &mut self,
+        record: VerifiedReceiptCompletionRecord,
+    ) -> Result<FlowCommitResult, String> {
+        Self::validate_verified_rebuild_completion_record(&record)?;
+        if self.has_rebuild_completion_publication(&record) {
+            return Err(format!(
+                "duplicate verified rebuild completion publication for subject {:?} target {:?}",
+                record.subject_ref, record.target_member
+            ));
+        }
+
+        let verification_ref =
+            derive_verified_rebuild_completion_receipt_id(0x7652_4255_494c_4456, &record);
+        let transfer_ref =
+            derive_verified_rebuild_completion_receipt_id(0x7652_4255_494c_4454, &record);
+        let placement_id =
+            derive_verified_rebuild_completion_receipt_id(0x7652_4255_494c_4450, &record);
+        if self.placement_receipts.contains_key(&placement_id.0) {
+            return Err(format!(
+                "duplicate verified rebuild completion placement receipt id {:?}",
+                placement_id
+            ));
+        }
+
+        let placement = ReplicaPlacementReceipt {
+            receipt_id: placement_id,
+            verification_ref,
+            transfer_ref,
+            subject_refs: vec![record.subject_ref],
+            placed_on: record.target_member,
+            placement_epoch: self.current_epoch,
+            subjects_placed: 1,
+            placement_receipt_refs: vec![record.repaired_placement_receipt_ref],
+        };
+        let result = FlowCommitResult {
+            placement_receipt: placement.clone(),
+            updated_copy: ReplicaCopyRecord {
+                subject_ref: record.subject_ref,
+                member_ref: record.target_member,
+                domain_ref: tidefs_membership_epoch::DomainId::new(record.target_member.0 * 10 + 1),
+                copy_class: ReplicaCopyClass::Verified,
+                payload_digest: object_digest_from_receipt_ref(
+                    record.repaired_placement_receipt_ref,
+                ),
+                freshness_frontier: self.current_epoch.0,
+                verification_receipt_ref: verification_ref,
+            },
+            final_flow_state: FlowState::Complete,
+            flow_class: FlowCommitClass::Rebuild,
+            commit_epoch: self.current_epoch,
+        };
+
+        self.placement_receipts.insert(placement_id.0, placement);
+        self.commit_results.push(result.clone());
+        Ok(result)
+    }
+
+    fn validate_verified_rebuild_completion_record(
+        record: &VerifiedReceiptCompletionRecord,
+    ) -> Result<(), String> {
+        Self::validate_completion_receipt_shape(
+            "source placement",
+            record.subject_ref,
+            record.source_placement_receipt_ref,
+        )?;
+        Self::validate_completion_receipt_shape(
+            "repaired placement",
+            record.subject_ref,
+            record.repaired_placement_receipt_ref,
+        )?;
+
+        if record.source_placement_receipt_ref.object_key
+            != record.repaired_placement_receipt_ref.object_key
+        {
+            return Err(format!(
+                "source/repaired receipt mismatch for subject {:?}: object key differs",
+                record.subject_ref
+            ));
+        }
+        if record.source_placement_receipt_ref.payload_len
+            != record.repaired_placement_receipt_ref.payload_len
+        {
+            return Err(format!(
+                "source/repaired receipt mismatch for subject {:?}: payload length differs",
+                record.subject_ref
+            ));
+        }
+        if record.source_placement_receipt_ref.payload_digest
+            != record.repaired_placement_receipt_ref.payload_digest
+        {
+            return Err(format!(
+                "source/repaired receipt mismatch for subject {:?}: payload digest differs",
+                record.subject_ref
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_completion_receipt_shape(
+        role: &str,
+        subject_ref: ReplicatedSubjectId,
+        receipt_ref: PlacementReceiptRef,
+    ) -> Result<(), String> {
+        let receipt_subject = ReplicatedSubjectId::new(receipt_ref.object_id);
+        if receipt_ref.is_synthetic() {
+            return Err(format!(
+                "{role} receipt ref for subject {receipt_subject:?} is synthetic"
+            ));
+        }
+        if receipt_subject != subject_ref {
+            return Err(format!(
+                "{role} receipt ref subject mismatch: record subject {subject_ref:?}, receipt subject {receipt_subject:?}"
+            ));
+        }
+        if !receipt_ref.redundancy_policy.is_well_formed() {
+            return Err(format!(
+                "{role} receipt ref for subject {subject_ref:?} has malformed redundancy policy"
+            ));
+        }
+        let required_count = receipt_ref.redundancy_policy.target_width();
+        if receipt_ref.target_count < required_count {
+            return Err(format!(
+                "{role} receipt ref for subject {subject_ref:?} is under-width: target_count {} < required_count {}",
+                receipt_ref.target_count, required_count
+            ));
+        }
+        Ok(())
+    }
+
+    fn has_rebuild_completion_publication(&self, record: &VerifiedReceiptCompletionRecord) -> bool {
+        self.commit_results.iter().any(|result| {
+            result.flow_class == FlowCommitClass::Rebuild
+                && result.updated_copy.subject_ref == record.subject_ref
+                && result.updated_copy.member_ref == record.target_member
+                && result
+                    .placement_receipt
+                    .placement_receipt_refs
+                    .contains(&record.repaired_placement_receipt_ref)
+        })
+    }
+
     // ── Algorithm 3: advance_flow_after_receipt_commit ────────────────
 
     /// Determine the next flow state from current receipts and advance the
@@ -760,6 +915,61 @@ impl FlowCommitCoordinator {
     pub fn sealed_batch_count(&self) -> usize {
         self.batches.values().filter(|b| b.sealed).count()
     }
+}
+
+fn object_digest_from_receipt_ref(receipt_ref: PlacementReceiptRef) -> ObjectDigest {
+    ObjectDigest::new(u64::from_le_bytes(
+        receipt_ref.payload_digest[..8]
+            .try_into()
+            .expect("digest prefix has 8 bytes"),
+    ))
+}
+
+fn derive_verified_rebuild_completion_receipt_id(
+    domain: u64,
+    record: &VerifiedReceiptCompletionRecord,
+) -> ReplicatedReceiptId {
+    let mut state = 0xcbf2_9ce4_8422_2325 ^ domain;
+    state = mix_hash_u64(state, record.target_member.0);
+    state = mix_hash_u64(state, record.subject_ref.0);
+    state = mix_placement_receipt_ref(state, record.source_placement_receipt_ref);
+    state = mix_placement_receipt_ref(state, record.repaired_placement_receipt_ref);
+    ReplicatedReceiptId(if state == 0 { domain } else { state })
+}
+
+fn mix_placement_receipt_ref(mut state: u64, receipt_ref: PlacementReceiptRef) -> u64 {
+    state = mix_hash_u64(state, receipt_ref.object_id);
+    state = mix_hash_bytes(state, &receipt_ref.object_key);
+    state = mix_hash_u64(state, receipt_ref.receipt_epoch.0);
+    state = mix_hash_u64(state, receipt_ref.receipt_generation);
+    state = match receipt_ref.redundancy_policy {
+        tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies } => {
+            mix_hash_u64(mix_hash_u64(state, 1), copies as u64)
+        }
+        tidefs_replication_model::ReceiptRedundancyPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        } => mix_hash_u64(
+            mix_hash_u64(mix_hash_u64(state, 2), data_shards as u64),
+            parity_shards as u64,
+        ),
+    };
+    state = mix_hash_u64(state, receipt_ref.payload_len);
+    state = mix_hash_bytes(state, &receipt_ref.payload_digest);
+    mix_hash_u64(state, receipt_ref.target_count as u64)
+}
+
+fn mix_hash_bytes(mut state: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        state = mix_hash_u64(state, *byte as u64);
+    }
+    state
+}
+
+fn mix_hash_u64(mut state: u64, value: u64) -> u64 {
+    state ^= value;
+    state = state.wrapping_mul(0x1000_0000_01b3);
+    state.rotate_left(13)
 }
 
 // ── Outcome types ──────────────────────────────────────────────────────
@@ -1126,6 +1336,29 @@ mod tests {
         )
     }
 
+    fn repaired_ref_for_source(
+        source: PlacementReceiptRef,
+        generation: u64,
+    ) -> PlacementReceiptRef {
+        PlacementReceiptRef {
+            receipt_generation: generation,
+            ..source
+        }
+    }
+
+    fn verified_rebuild_completion_record(
+        subject: ReplicatedSubjectId,
+    ) -> VerifiedReceiptCompletionRecord {
+        let source = durable_placement_ref(subject, 700);
+        let repaired = repaired_ref_for_source(source, 701);
+        VerifiedReceiptCompletionRecord {
+            target_member: MemberId::new(9),
+            subject_ref: subject,
+            source_placement_receipt_ref: source,
+            repaired_placement_receipt_ref: repaired,
+        }
+    }
+
     fn placement_ref_with_policy(
         subject: ReplicatedSubjectId,
         generation: u64,
@@ -1383,6 +1616,142 @@ mod tests {
             assert_eq!(chunk.verification_receipt_ref, None);
             assert_eq!(chunk.placement_receipt_ref, None);
             assert!(coord.verification_receipts.is_empty());
+            assert!(coord.placement_receipts.is_empty());
+            assert!(coord.commit_results.is_empty());
+        }
+    }
+
+    #[test]
+    fn publish_verified_rebuild_completion_records_repaired_placement() {
+        let subj = ReplicatedSubjectId::new(1400);
+        let record = verified_rebuild_completion_record(subj);
+        let mut coord = make_coordinator();
+        coord.set_epoch(EpochId::new(44));
+
+        let result = coord
+            .publish_verified_rebuild_completion(record)
+            .expect("verified rebuild completion publishes");
+
+        assert_eq!(result.flow_class, FlowCommitClass::Rebuild);
+        assert_eq!(result.final_flow_state, FlowState::Complete);
+        assert_eq!(result.commit_epoch, EpochId::new(44));
+        assert_eq!(result.updated_copy.subject_ref, subj);
+        assert_eq!(result.updated_copy.member_ref, record.target_member);
+        assert_eq!(
+            result.placement_receipt.placement_receipt_refs,
+            vec![record.repaired_placement_receipt_ref]
+        );
+        assert_eq!(coord.placement_receipts.len(), 1);
+        assert_eq!(
+            coord
+                .placement_receipts
+                .get(&result.placement_receipt.receipt_id.0)
+                .expect("stored placement receipt"),
+            &result.placement_receipt
+        );
+        assert_eq!(
+            coord.commit_results_for_class(FlowCommitClass::Rebuild),
+            vec![&result]
+        );
+        assert_eq!(coord.total_chunks(), 0);
+    }
+
+    #[test]
+    fn publish_verified_rebuild_completion_refuses_duplicate_without_mutation() {
+        let subj = ReplicatedSubjectId::new(1401);
+        let record = verified_rebuild_completion_record(subj);
+        let mut coord = make_coordinator();
+        coord
+            .publish_verified_rebuild_completion(record)
+            .expect("first publication succeeds");
+        let stored_receipt_count = coord.placement_receipts.len();
+        let stored_result_count = coord.commit_results.len();
+
+        let err = coord
+            .publish_verified_rebuild_completion(record)
+            .expect_err("duplicate publication fails");
+
+        assert!(err.contains("duplicate verified rebuild completion publication"));
+        assert_eq!(coord.placement_receipts.len(), stored_receipt_count);
+        assert_eq!(coord.commit_results.len(), stored_result_count);
+    }
+
+    #[test]
+    fn publish_verified_rebuild_completion_refuses_invalid_evidence_without_mutation() {
+        let subj = ReplicatedSubjectId::new(1402);
+        let valid = verified_rebuild_completion_record(subj);
+        let other = ReplicatedSubjectId::new(1999);
+        let malformed = placement_ref_with_policy(
+            subj,
+            710,
+            ReceiptRedundancyPolicy::Replicated { copies: 0 },
+            0,
+        );
+        let under_width = placement_ref_with_policy(
+            subj,
+            711,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            1,
+        );
+        let mismatched_subject = durable_placement_ref(other, 712);
+        let mut mismatched_repaired = valid.repaired_placement_receipt_ref;
+        mismatched_repaired.payload_len += 1;
+
+        let cases = vec![
+            (
+                "synthetic",
+                VerifiedReceiptCompletionRecord {
+                    source_placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(subj),
+                    ..valid
+                },
+            ),
+            (
+                "malformed redundancy policy",
+                VerifiedReceiptCompletionRecord {
+                    source_placement_receipt_ref: malformed,
+                    repaired_placement_receipt_ref: repaired_ref_for_source(malformed, 711),
+                    ..valid
+                },
+            ),
+            (
+                "under-width",
+                VerifiedReceiptCompletionRecord {
+                    source_placement_receipt_ref: under_width,
+                    repaired_placement_receipt_ref: repaired_ref_for_source(under_width, 712),
+                    ..valid
+                },
+            ),
+            (
+                "subject mismatch",
+                VerifiedReceiptCompletionRecord {
+                    source_placement_receipt_ref: mismatched_subject,
+                    repaired_placement_receipt_ref: repaired_ref_for_source(
+                        mismatched_subject,
+                        713,
+                    ),
+                    ..valid
+                },
+            ),
+            (
+                "source/repaired receipt mismatch",
+                VerifiedReceiptCompletionRecord {
+                    repaired_placement_receipt_ref: mismatched_repaired,
+                    ..valid
+                },
+            ),
+        ];
+
+        for (expected_error, record) in cases {
+            let mut coord = make_coordinator();
+
+            let err = coord
+                .publish_verified_rebuild_completion(record)
+                .expect_err("invalid completion evidence fails");
+
+            assert!(
+                err.contains(expected_error),
+                "expected error containing {expected_error:?}, got {err:?}"
+            );
             assert!(coord.placement_receipts.is_empty());
             assert!(coord.commit_results.is_empty());
         }

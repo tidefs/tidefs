@@ -2462,6 +2462,7 @@ dependencies = [
  "serde_json",
  "tidefs-membership-epoch",
  "tidefs-rebuild-planner",
+ "tidefs-rebuild-runtime",
  "tidefs-relocation-planner",
  "tidefs-replication-model",
  "tidefs-verification-engine",

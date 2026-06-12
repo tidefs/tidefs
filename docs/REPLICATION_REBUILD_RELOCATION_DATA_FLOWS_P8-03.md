@@ -241,11 +241,14 @@ For verified rebuild repair completions, `tidefs-rebuild-runtime` now exposes a
 typed publication view of successful receipt-backed task completions. Each
 record preserves the target member, subject, scheduled source placement receipt,
 and repaired target placement receipt after the repaired receipt passes the
-completion law. This is rebuild-runtime completion evidence only, not full
-cluster-state publication or reclaim publication. The replicated-store
-repair-and-record bridge returns the same typed record with its repair evidence
-so later consumers can carry receipt-addressed completion proof without
-re-reading private runtime state.
+completion law. The replicated-store repair-and-record bridge returns the same
+typed record with its repair evidence so later consumers can carry
+receipt-addressed completion proof without re-reading private runtime state.
+`FlowCommitCoordinator::publish_verified_rebuild_completion()` consumes that
+record and publishes the repaired target placement receipt as
+`ReplicaPlacementReceipt` / `FlowCommitResult` rebuild evidence. This is
+repaired-placement publication through flow-commit only, not full replacement
+orchestration, cluster-state convergence, or reclaim publication.
 
 ### 6.3 OW-305 executable rebuild/backfill/rebalance slice
 
@@ -279,12 +282,12 @@ placement receipt, and records
 `RebuildCompletion::record_receipt_verified_task_completion()` only after that
 receipt passes the rebuild-runtime verification law. Receipt-less, mismatched,
 or failed acks do not advance completion or admission as success. The
-flow-commit coordinator preserves those repaired `PlacementReceiptRef` values
-in `ReplicaPlacementReceipt` / `FlowCommitResult` outputs when callers supply
-validated target receipts; that is result publication only, not broader
-cluster-state publication. This is not yet full replacement-node orchestration,
-degraded-read policy, repaired placement publication to broader cluster state,
-or reclaim publication; those remain part of the broader #18 runtime closeout.
+flow-commit coordinator now also consumes the verified completion record and
+preserves the repaired target `PlacementReceiptRef` in
+`ReplicaPlacementReceipt` / `FlowCommitResult` outputs. This is not yet full
+replacement-node orchestration, degraded-read policy, cluster-state
+convergence, or reclaim publication; those remain part of the broader #18
+runtime closeout.
 
 ## 7. Steady-state replication flow
 
