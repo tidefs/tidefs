@@ -3359,9 +3359,7 @@ EOF
         let
           pkgs = pkgsFor system;
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-        in
-        {
-          default = pkgs.mkShell {
+          tidefsDefaultShell = pkgs.mkShell {
             packages = [
               rustToolchain
               self.packages.${system}.tidefsFsx
@@ -3401,7 +3399,21 @@ EOF
               echo "Kmod acceptance: run 'nix run .#kmod-acceptance -- /path/to/module.ko' for Nix/QEMU acceptance validation of a hot-loop-built module."
             '';
           };
-
+          tidefsCiShell = pkgs.mkShell {
+            packages = [
+              rustToolchain
+              pkgs.bash
+              pkgs.coreutils
+              pkgs.fuse3
+              pkgs.jq
+              pkgs.pkg-config
+              pkgs.rdma-core
+            ];
+          };
+        in
+        {
+          default = tidefsDefaultShell;
+          ci = tidefsCiShell;
         });
 
       apps = forAllSystems (system:
