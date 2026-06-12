@@ -12,7 +12,8 @@
 
 use tidefs_reclaim::{decode_reclaim_wire, encode_reclaim_wire, ReclaimWireError};
 use tidefs_reclaim_queue_core::{
-    BPlusTreeReclaimQueue, ReclaimQueueStorage, SegmentLivenessPersistError, SegmentLivenessQueue,
+    BPlusTreeReclaimQueue, DeadObjectReclaimQueue, ReclaimQueueStorage,
+    SegmentLivenessPersistError, SegmentLivenessQueue,
 };
 
 use crate::error::StoreError;
@@ -36,6 +37,9 @@ impl ReclaimQueueStorage for LocalObjectStore {
 
 /// Well-known name for the BPlusTreeReclaimQueue entries (refcount deltas).
 pub(crate) const RECLAIM_QUEUE_ENTRIES_OBJECT_NAME: &str = "tidefs-reclaim-queue-entries";
+
+/// Well-known name for receipt-bound dead-object reclaim entries.
+pub(crate) const DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME: &str = "tidefs-dead-object-reclaim-queue";
 
 /// Load a [`BPlusTreeReclaimQueue`] from the object store.
 pub(crate) fn load_reclaim_queue_entries(store: &LocalObjectStore) -> BPlusTreeReclaimQueue {
@@ -62,6 +66,37 @@ pub(crate) fn store_reclaim_queue_entries(
 ) -> Result<(), StoreError> {
     let bytes = queue.encode();
     store.put_named(RECLAIM_QUEUE_ENTRIES_OBJECT_NAME, &bytes)?;
+    Ok(())
+}
+
+/// Load a [`DeadObjectReclaimQueue`] from the object store.
+///
+/// Missing or corrupt persisted bytes fail closed to an empty queue; callers
+/// must only acknowledge dead-object reclamation after their own durable flush.
+pub(crate) fn load_dead_object_reclaim_queue(store: &LocalObjectStore) -> DeadObjectReclaimQueue {
+    match store.get_named(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME) {
+        Ok(Some(bytes)) => match DeadObjectReclaimQueue::decode(&bytes) {
+            Ok(queue) => queue,
+            Err(e) => {
+                eprintln!("tidefs: dead-object reclaim-queue decode error: {e}");
+                DeadObjectReclaimQueue::new()
+            }
+        },
+        Ok(None) => DeadObjectReclaimQueue::new(),
+        Err(e) => {
+            eprintln!("tidefs: dead-object reclaim-queue load error: {e}");
+            DeadObjectReclaimQueue::new()
+        }
+    }
+}
+
+/// Persist a [`DeadObjectReclaimQueue`] to the object store.
+pub(crate) fn store_dead_object_reclaim_queue(
+    queue: &DeadObjectReclaimQueue,
+    store: &mut LocalObjectStore,
+) -> Result<(), StoreError> {
+    let bytes = queue.encode();
+    store.put_named(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME, &bytes)?;
     Ok(())
 }
 
@@ -124,11 +159,36 @@ pub fn flush_segment_liveness_queue(
 mod tests {
     use super::*;
     use crate::store::LocalObjectStore;
+    use tidefs_types_reclaim_queue_core::{
+        DeadObjectEntry, DeadObjectReplacementReceipt, ObjectKey,
+    };
 
     fn temp_store() -> (LocalObjectStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = LocalObjectStore::open(dir.path()).expect("open");
         (store, dir)
+    }
+
+    fn dead_object_key(byte: u8) -> ObjectKey {
+        let mut key = [0u8; 32];
+        key[0] = byte;
+        ObjectKey(key)
+    }
+
+    fn digest(byte: u8) -> [u8; 32] {
+        let mut digest = [0u8; 32];
+        digest[0] = byte;
+        digest
+    }
+
+    fn receipt_for(key: ObjectKey, generation: u64) -> DeadObjectReplacementReceipt {
+        DeadObjectReplacementReceipt::replicated(key, 7, generation, 2, 4096, digest(key.0[0]))
+    }
+
+    fn dead_object_entry(byte: u8) -> DeadObjectEntry {
+        let key = dead_object_key(byte);
+        DeadObjectEntry::new(key, [byte; 16], 5, true, 5)
+            .with_replacement_receipt(receipt_for(key, byte as u64 + 1))
     }
 
     #[test]
@@ -278,6 +338,76 @@ mod tests {
         let loaded2 = load_reclaim_queue_entries(&store);
         assert_eq!(loaded2.len(), 1);
         assert_eq!(loaded2.get(&e.object_key), Some(e));
+    }
+
+    // -- DeadObjectReclaimQueue persistence tests --
+
+    #[test]
+    fn dead_object_reclaim_queue_loads_empty_when_absent() {
+        let (store, _dir) = temp_store();
+
+        let loaded = load_dead_object_reclaim_queue(&store);
+
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn dead_object_reclaim_queue_roundtrip_empty() {
+        let (mut store, _dir) = temp_store();
+        let queue = DeadObjectReclaimQueue::new();
+
+        store_dead_object_reclaim_queue(&queue, &mut store).expect("store empty");
+        let loaded = load_dead_object_reclaim_queue(&store);
+
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn dead_object_reclaim_queue_roundtrip_receipt_entries() {
+        let (mut store, _dir) = temp_store();
+        let mut queue = DeadObjectReclaimQueue::new();
+        let entry = dead_object_entry(0xAB);
+        assert!(queue.enqueue(entry));
+
+        store_dead_object_reclaim_queue(&queue, &mut store).expect("store populated");
+        let loaded = load_dead_object_reclaim_queue(&store);
+
+        assert_eq!(loaded, queue);
+        assert_eq!(loaded.all_entries(), vec![entry]);
+        assert_eq!(loaded.receipt_bound_eligible_count(6), 1);
+    }
+
+    #[test]
+    fn dead_object_reclaim_queue_persists_across_reopen() {
+        let (mut store, dir) = temp_store();
+        let mut queue = DeadObjectReclaimQueue::new();
+        queue.enqueue(dead_object_entry(0x11));
+        queue.enqueue(dead_object_entry(0x22));
+
+        store_dead_object_reclaim_queue(&queue, &mut store).expect("store populated");
+        store.sync_all().expect("sync store");
+        drop(store);
+
+        let reopened = LocalObjectStore::open(dir.path()).expect("reopen");
+        let loaded = load_dead_object_reclaim_queue(&reopened);
+
+        assert_eq!(loaded, queue);
+        assert_eq!(loaded.receipt_bound_eligible_count(6), 2);
+    }
+
+    #[test]
+    fn dead_object_reclaim_queue_corrupt_bytes_load_empty() {
+        let (mut store, _dir) = temp_store();
+
+        store
+            .put_named(
+                DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME,
+                b"not a dead-object queue",
+            )
+            .expect("store corrupt bytes");
+        let loaded = load_dead_object_reclaim_queue(&store);
+
+        assert!(loaded.is_empty());
     }
 
     // -- Wire-format corruption detection tests --
