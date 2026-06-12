@@ -330,6 +330,33 @@ pub struct PoolStats {
     pub compression_ratio: f64,
 }
 
+/// Aggregate stats from a receipt-bound dead-object drain across pool devices.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PoolReceiptBoundDeadObjectDrainStats {
+    /// Number of writable pool devices whose dead-object queues were examined.
+    pub devices_scanned: usize,
+    /// Number of receipt-authorized dead objects acknowledged.
+    pub objects_acked: usize,
+    /// Number of segments identified as fully dead and freed.
+    pub segments_reclaimed: u64,
+    /// Number of dead-object records accounted as freed.
+    pub blocks_freed: u64,
+    /// Remaining receipt-bound dead-object queue depth across scanned devices.
+    pub reclaim_queue_depth: usize,
+    /// Number of checkpoint batches emitted by lower-level drains.
+    pub checkpoint_batches: usize,
+}
+
+impl PoolReceiptBoundDeadObjectDrainStats {
+    fn absorb_reclaim_stats(&mut self, stats: tidefs_reclaim::ReclaimConsumerStats) {
+        self.objects_acked += stats.entries_processed;
+        self.segments_reclaimed += stats.segments_reclaimed;
+        self.blocks_freed += stats.blocks_freed;
+        self.reclaim_queue_depth += stats.reclaim_queue_depth;
+        self.checkpoint_batches += stats.checkpoint_batches;
+    }
+}
+
 /// Pool capacity statistics for filesystem-level statfs integration.
 ///
 /// Carries the capacity-oriented view of pool storage: total configured
@@ -2213,6 +2240,58 @@ impl Pool {
             deleted |= self.devices[idx].delete(receipt_key).unwrap_or(false);
         }
         Ok(deleted)
+    }
+
+    /// Drain receipt-authorized dead objects across the devices for an I/O class.
+    ///
+    /// The stable boundary is caller-supplied so higher layers can tie source
+    /// reclamation to the replacement placement receipt that made the new
+    /// placement legal.
+    pub fn drain_receipt_bound_dead_objects_at_txg(
+        &mut self,
+        class: IoClass,
+        stable_committed_txg: u64,
+        max_count: usize,
+    ) -> std::result::Result<
+        PoolReceiptBoundDeadObjectDrainStats,
+        crate::store::ReceiptBoundDeadObjectDrainError,
+    > {
+        if self.locked {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool is locked: encryption key required for receipt-bound reclaim",
+            }
+            .into());
+        }
+
+        let indices: Vec<usize> = self.class_map.get(class).to_vec();
+        if indices.is_empty() {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool has no devices for this I/O class",
+            }
+            .into());
+        }
+
+        let mut aggregate = PoolReceiptBoundDeadObjectDrainStats::default();
+        let mut remaining = max_count;
+        for idx in self.usable_candidates(&indices) {
+            let stats = self.devices[idx]
+                .store_mut()
+                .drain_receipt_bound_dead_objects_at_txg(stable_committed_txg, remaining)?;
+            aggregate.devices_scanned += 1;
+            aggregate.absorb_reclaim_stats(stats);
+            remaining = remaining.saturating_sub(stats.entries_processed);
+        }
+
+        if aggregate.devices_scanned == 0 {
+            return Err(StoreError::InvalidOptions {
+                reason: "receipt-bound reclaim found no writable pool devices",
+            }
+            .into());
+        }
+
+        self.health = compute_health(&self.devices);
+        self.record_health_transitions();
+        Ok(aggregate)
     }
 
     /// Flush all devices.
