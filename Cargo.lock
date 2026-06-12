@@ -3156,6 +3156,7 @@ dependencies = [
  "tidefs-binary_schema-checksum",
  "tidefs-binary_schema-core",
  "tidefs-btree",
+ "tidefs-replication-model",
  "tidefs-types-pool-label-core",
  "tidefs-types-reclaim-queue-core",
 ]
