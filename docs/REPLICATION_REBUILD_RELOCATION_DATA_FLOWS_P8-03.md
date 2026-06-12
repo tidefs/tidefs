@@ -253,7 +253,14 @@ for callers that already own the coordinator and want the repair, verified
 completion, and flow-commit publication composed without rebuilding receipt
 identity from looser fields. This is replicated-store-to-flow-commit
 publication plumbing only, not full replacement orchestration, degraded-read
-policy, cluster-state convergence, or reclaim publication.
+policy, cluster-state convergence, or reclaim publication. The cluster
+placement map can consume the resulting completed rebuild `FlowCommitResult`
+through `PlacementMap::publish_rebuild_flow_commit_result()`, which publishes
+the repaired target member and repaired `PlacementReceiptRef` into local
+cluster-visible placement state after fail-closed subject, target, epoch, and
+receipt-authority checks. That is a placement-map state update only; it is not
+cluster-wide propagation, degraded-read routing, replacement-node
+orchestration, or reclaim completion.
 
 ### 6.3 OW-305 executable rebuild/backfill/rebalance slice
 
@@ -293,8 +300,10 @@ preserves the repaired target `PlacementReceiptRef` in
 composition helper can now run the repair, verified completion recording, and
 flow-commit publication in one caller-facing path when supplied with a
 coordinator. This is not yet full replacement-node orchestration,
-degraded-read policy, cluster-state convergence, or reclaim publication; those
-remain part of the broader #18 runtime closeout.
+degraded-read policy, cluster-state convergence, or reclaim publication. The
+cluster placement map can publish the completed rebuild flow result into its
+local repaired-placement state, but cluster-wide propagation and reclaim remain
+part of the broader #18 runtime closeout.
 
 ## 7. Steady-state replication flow
 
