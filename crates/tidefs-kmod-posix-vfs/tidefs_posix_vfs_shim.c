@@ -5220,6 +5220,8 @@ static const struct file_operations tidefs_posix_vfs_dir_file_operations = {
 	.setlease = tidefs_posix_vfs_setlease_nosupport,
 };
 
+static char tidefs_posix_vfs_write_begin_zeroed;
+
 /*
  * write_begin -- address_space_operations callback for buffered-write prepare.
  *
@@ -5246,7 +5248,10 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
 	struct folio *folio;
 	void *kbuf;
 	loff_t folio_file_pos;
+	loff_t folio_end;
 	loff_t isize;
+	loff_t visible_end;
+	loff_t write_end;
 	size_t fsize;
 	size_t read_len;
 	int ret;
@@ -5282,11 +5287,32 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
 	folio_file_pos = folio_pos(folio);
 	fsize = folio_size(folio);
 	isize = i_size_read(inode);
+	if ((loff_t)len > LLONG_MAX - pos) {
+		folio_unlock(folio);
+		folio_put(folio);
+		*fsdata = NULL;
+		return -EFBIG;
+	}
+	write_end = pos + (loff_t)len;
 	if (folio_file_pos >= isize) {
 		folio_zero_range(folio, 0, fsize);
 		folio_mark_uptodate(folio);
 		*foliop = folio;
 		*fsdata = NULL;
+		return 0;
+	}
+
+	if ((loff_t)fsize > LLONG_MAX - folio_file_pos)
+		folio_end = LLONG_MAX;
+	else
+		folio_end = folio_file_pos + (loff_t)fsize;
+	visible_end = min_t(loff_t, folio_end, isize);
+	if (ctx->engine_backed && pos == folio_file_pos &&
+	    write_end >= visible_end) {
+		folio_zero_range(folio, 0, fsize);
+		folio_mark_uptodate(folio);
+		*foliop = folio;
+		*fsdata = &tidefs_posix_vfs_write_begin_zeroed;
 		return 0;
 	}
 
@@ -5357,13 +5383,14 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 	int ret;
 	bool i_size_changed = false;
 	bool engine_backed = false;
+	bool zeroed_existing_folio;
 	loff_t old_size;
 	loff_t last_pos;
 	u64 fh_ino;
 	u64 fh_id;
 
-	(void)fsdata;
-	(void)len;
+	zeroed_existing_folio =
+		fsdata == &tidefs_posix_vfs_write_begin_zeroed;
 
 	if (!ctx) {
 		folio_unlock(folio);
@@ -5374,18 +5401,24 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 	ctx->write_end_calls++;
 
 	if (copied == 0) {
+		if (zeroed_existing_folio)
+			folio_clear_uptodate(folio);
 		folio_unlock(folio);
 		folio_put(folio);
 		return 0;
 	}
 	folio_off = offset_in_folio(folio, pos);
 	if (folio_off + copied > folio_size(folio)) {
+		if (zeroed_existing_folio)
+			folio_clear_uptodate(folio);
 		folio_unlock(folio);
 		folio_put(folio);
 		return -EIO;
 	}
 	if (pos > LLONG_MAX - (loff_t)copied) {
 		mapping_set_error(mapping, -EFBIG);
+		if (zeroed_existing_folio)
+			folio_clear_uptodate(folio);
 		folio_unlock(folio);
 		folio_put(folio);
 		return -EFBIG;
@@ -5400,6 +5433,8 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 		kbuf = kmalloc(copied, GFP_KERNEL);
 		if (!kbuf) {
 			mapping_set_error(mapping, -ENOMEM);
+			if (zeroed_existing_folio)
+				folio_clear_uptodate(folio);
 			folio_unlock(folio);
 			folio_put(folio);
 			return -ENOMEM;
@@ -5418,12 +5453,16 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 
 		if (ret < 0) {
 			mapping_set_error(mapping, ret);
+			if (zeroed_existing_folio)
+				folio_clear_uptodate(folio);
 			folio_unlock(folio);
 			folio_put(folio);
 			return ret;
 		}
 		if ((unsigned int)ret != copied) {
 			mapping_set_error(mapping, -EIO);
+			if (zeroed_existing_folio)
+				folio_clear_uptodate(folio);
 			folio_unlock(folio);
 			folio_put(folio);
 			return -EIO;
@@ -5436,7 +5475,10 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 		i_size_write(inode, last_pos);
 		i_size_changed = true;
 	}
-	folio_mark_uptodate(folio);
+	if (zeroed_existing_folio && copied < len)
+		folio_clear_uptodate(folio);
+	else
+		folio_mark_uptodate(folio);
 	if (!engine_backed)
 		folio_mark_dirty(folio);
 	folio_unlock(folio);
@@ -5764,6 +5806,12 @@ static int tidefs_posix_vfs_sync_fs(struct super_block *sb, int wait)
 	}
 
 	ctx->sync_fs_calls++;
+
+	if (!wait) {
+		pr_debug("tidefs_posix_vfs: sync_fs super_operation: wait=0 deferred call=%u\n",
+			 ctx->sync_fs_calls);
+		return 0;
+	}
 
 	if (ctx->engine_backed && ctx->engine_activated) {
 		ret = tidefs_posix_vfs_activate_engine(ctx);
