@@ -532,7 +532,7 @@ fn receipt_source_execution_uses_receipt_key_not_logical_object_id() {
     let data = b"receipt source execution payload";
     let object_id = 7001u64;
     let receipt_key = ObjectKey::from_bytes32([0xA7; 32]);
-    let legacy_key = ObjectKey::from_name(object_id.to_le_bytes());
+    let object_id_key = ObjectKey::from_name(object_id.to_le_bytes());
     let receipt = receipt_ref_for_payload(object_id, receipt_key, data, 3);
     let task = task_from_receipt(receipt, 10, 20);
     let mut source = MockReceiptSource::default();
@@ -541,7 +541,9 @@ fn receipt_source_execution_uses_receipt_key_not_logical_object_id() {
     let mut progress = BackfillProgress::new(task.payload_len, task.max_retries);
 
     source.insert(receipt_key, data);
-    target.put(legacy_key, b"legacy target bytes").unwrap();
+    target
+        .put(object_id_key, b"receiptless target bytes")
+        .unwrap();
     progress.schedule().unwrap();
 
     engine
@@ -560,8 +562,8 @@ fn receipt_source_execution_uses_receipt_key_not_logical_object_id() {
     );
     assert_eq!(target.get(&receipt_key).unwrap(), Some(data.to_vec()));
     assert_eq!(
-        target.get(&legacy_key).unwrap(),
-        Some(b"legacy target bytes".to_vec())
+        target.get(&object_id_key).unwrap(),
+        Some(b"receiptless target bytes".to_vec())
     );
     assert_eq!(progress.state, TaskState::Complete);
 }

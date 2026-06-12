@@ -105,7 +105,7 @@ pub struct VerifiedReceiptCompletionRecord {
 /// Error returned when a repaired target receipt cannot prove task completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiptCompletionError {
-    /// The caller supplied a compatibility placeholder instead of a durable
+    /// The caller supplied a synthetic placeholder instead of a durable
     /// repaired target placement receipt.
     SyntheticReceiptRef { object_id: u64 },
     /// The repaired receipt carries a redundancy policy that cannot describe
