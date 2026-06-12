@@ -5321,9 +5321,9 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
  * write_end -- address_space_operations callback for buffered-write commit.
  *
  * Called after the kernel has written data into a folio prepared by
- * write_begin.  Marks the modified folio dirty and updates in-core inode
- * state; writepages/fsync/syncfs are the single engine writeback authority for
- * buffered data.
+ * write_begin.  Commits ordinary buffered writes to the engine immediately so
+ * close/remount durability does not depend on a later superblock-wide
+ * writeback pass, while mmap dirties still flow through dirty_folio/writepages.
  *
  * The kernel passes `copied` bytes actually written; this may be less
  * than `len` for partial writes.  Only `copied` bytes are committed.
@@ -5340,10 +5340,15 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 	struct tidefs_posix_vfs_mount *ctx = inode->i_sb->s_fs_info;
 	struct tidefs_posix_vfs_open_file_state *ofs;
 	struct file *file = iocb ? iocb->ki_filp : NULL;
+	void *kbuf = NULL;
 	size_t folio_off;
+	int ret;
 	bool i_size_changed = false;
+	bool engine_backed = false;
 	loff_t old_size;
 	loff_t last_pos;
+	u64 fh_ino;
+	u64 fh_id;
 
 	(void)fsdata;
 	(void)len;
@@ -5375,6 +5380,44 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 	}
 
 	ofs = file ? file->private_data : NULL;
+	engine_backed = ctx->engine_backed;
+	fh_ino = (ofs && ofs->engine_backed) ? ofs->fh_ino : inode->i_ino;
+	fh_id = (ofs && ofs->engine_backed) ? ofs->fh_id : inode->i_ino;
+
+	if (engine_backed) {
+		kbuf = kmalloc(copied, GFP_KERNEL);
+		if (!kbuf) {
+			mapping_set_error(mapping, -ENOMEM);
+			folio_unlock(folio);
+			folio_put(folio);
+			return -ENOMEM;
+		}
+
+		{
+			void *addr = kmap_local_folio(folio, 0);
+			memcpy(kbuf, (char *)addr + folio_off, copied);
+			kunmap_local(addr);
+		}
+
+		ret = tidefs_posix_vfs_engine_write(
+			fh_ino, fh_id, (u64)pos, kbuf, (u32)copied);
+		kfree(kbuf);
+		kbuf = NULL;
+
+		if (ret < 0) {
+			mapping_set_error(mapping, ret);
+			folio_unlock(folio);
+			folio_put(folio);
+			return ret;
+		}
+		if ((unsigned int)ret != copied) {
+			mapping_set_error(mapping, -EIO);
+			folio_unlock(folio);
+			folio_put(folio);
+			return -EIO;
+		}
+	}
+
 	old_size = i_size_read(inode);
 	last_pos = pos + copied;
 	if (last_pos > old_size) {
@@ -5382,7 +5425,8 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 		i_size_changed = true;
 	}
 	folio_mark_uptodate(folio);
-	folio_mark_dirty(folio);
+	if (!engine_backed)
+		folio_mark_dirty(folio);
 	folio_unlock(folio);
 	folio_put(folio);
 
@@ -5390,11 +5434,11 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 		pagecache_isize_extended(inode, old_size, pos);
 
 	inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
-	if (ofs && ofs->engine_backed)
+	if (engine_backed && ofs && ofs->engine_backed)
 		ofs->times_dirty = true;
-	if (i_size_changed || !(ofs && ofs->engine_backed))
+	if (i_size_changed || !engine_backed)
 		mark_inode_dirty(inode);
-	if (!(ofs && ofs->engine_backed))
+	if (!engine_backed)
 		tidefs_posix_vfs_persist_inode_times_best_effort(
 			inode, 0x20 | 0x80);
 
