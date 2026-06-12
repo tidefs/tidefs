@@ -3142,6 +3142,7 @@ dependencies = [
  "tidefs-binary_schema-checksum",
  "tidefs-dedup",
  "tidefs-pool-allocator",
+ "tidefs-reclaim-queue-core",
  "tidefs-spacemap-allocator",
  "tidefs-types-reclaim-queue-core",
 ]

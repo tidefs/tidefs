@@ -10,6 +10,7 @@ description = "Background segment reclaim pipeline for TideFS local object store
 
 [dependencies]
 tidefs-pool-allocator = { path = "../tidefs-pool-allocator" }
+tidefs-reclaim-queue-core = { path = "../tidefs-reclaim-queue-core" }
 tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
 tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
 tidefs-dedup = { path = "../tidefs-dedup" }
