@@ -20,7 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub mod constraint;
 pub mod node_placement;
 pub mod placement_plan;
-use tidefs_durability_layout::{DurabilityLayoutV1, FailureDomainLevel, FailureDomainV1};
+use tidefs_durability_layout::{
+    DurabilityLayoutV1, DurabilityPolicy, FailureDomainLevel, FailureDomainV1,
+};
 use tidefs_membership_epoch::{
     AntiAffinityClass, DomainId, EpochId, FailureDomainClass, FailureDomainPlacementPlan,
     FailureDomainPlacementPolicy, FailureDomainRecord, HealthClass, MemberId,
@@ -667,6 +669,12 @@ impl DeviceHealthCapacity {
         self.healthy && self.available_bytes() > 0
     }
 
+    /// Whether this device can accept a placement with the given byte budget.
+    #[must_use]
+    pub fn can_accept_bytes(&self, required_bytes: u64) -> bool {
+        self.healthy && self.available_bytes() >= required_bytes.max(1)
+    }
+
     /// Failure-domain key at the given level.
     #[must_use]
     pub fn failure_domain_key(&self, level: FailureDomainLevel) -> u64 {
@@ -909,11 +917,12 @@ impl HashRingPlacementPlanner {
         &self,
         devices: &[DeviceHealthCapacity],
         failure_domain: &FailureDomainV1,
+        required_bytes: u64,
     ) -> Vec<(u64, usize, u64)> {
         let mut ring = Vec::new();
 
         for (idx, device) in devices.iter().enumerate() {
-            if !device.can_accept() {
+            if !device.can_accept_bytes(required_bytes) {
                 continue;
             }
 
@@ -948,6 +957,7 @@ impl PlacementPlanner for HashRingPlacementPlanner {
                 available: 0,
             });
         }
+        let target_bytes = per_target_capacity_bytes(layout, request);
 
         // Pre-flight constraint satisfaction check.
         let constraint = crate::constraint::PlacementConstraint::new(layout, failure_domain);
@@ -972,8 +982,19 @@ impl PlacementPlanner for HashRingPlacementPlanner {
             };
         }
 
+        let capacity_eligible = devices
+            .iter()
+            .filter(|device| device.can_accept_bytes(target_bytes))
+            .count();
+        if capacity_eligible < required {
+            return Err(PlacementError::NotEnoughMembers {
+                required,
+                available: capacity_eligible,
+            });
+        }
+
         // Build the hash ring.
-        let ring = self.build_ring(devices, failure_domain);
+        let ring = self.build_ring(devices, failure_domain, target_bytes);
         if ring.is_empty() {
             return Err(PlacementError::NoMatchingDomainClass);
         }
@@ -1079,6 +1100,24 @@ const fn hash_ring_position(primary: u64, slot: u64, seed: u64) -> u64 {
     mix64(mixed)
 }
 
+fn per_target_capacity_bytes(layout: &DurabilityLayoutV1, request: &AllocationRequest) -> u64 {
+    match layout.policy {
+        DurabilityPolicy::Mirror { .. } => request.size_hint_bytes,
+        DurabilityPolicy::ErasureStyle { data_shards, .. }
+        | DurabilityPolicy::Hybrid { data_shards, .. } => {
+            div_ceil_u64(request.size_hint_bytes, u64::from(data_shards).max(1))
+        }
+    }
+}
+
+const fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
+    if value == 0 {
+        0
+    } else {
+        ((value - 1) / divisor) + 1
+    }
+}
+
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1093,6 +1132,8 @@ mod tests {
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
+
+    const GIB: u64 = 1024 * 1024 * 1024;
 
     fn make_member(id: u64) -> MemberId {
         MemberId(id)
@@ -1514,7 +1555,7 @@ mod tests {
             device_id: id,
             node_id: node,
             rack_id: rack,
-            total_bytes: total_gb * 1024 * 1024 * 1024,
+            total_bytes: total_gb * GIB,
             used_bytes: 0,
             healthy: true,
         }
@@ -1531,8 +1572,8 @@ mod tests {
             device_id: id,
             node_id: node,
             rack_id: rack,
-            total_bytes: total_gb * 1024 * 1024 * 1024,
-            used_bytes: used_gb * 1024 * 1024 * 1024,
+            total_bytes: total_gb * GIB,
+            used_bytes: used_gb * GIB,
             healthy: true,
         }
     }
@@ -1542,7 +1583,7 @@ mod tests {
             device_id: id,
             node_id: node,
             rack_id: rack,
-            total_bytes: 100 * 1024 * 1024 * 1024,
+            total_bytes: 100 * GIB,
             used_bytes: 0,
             healthy: false,
         }
@@ -1570,6 +1611,10 @@ mod tests {
 
     fn request(obj_id: u64, key: u64) -> AllocationRequest {
         AllocationRequest::new(obj_id, 1024 * 1024, key)
+    }
+
+    fn request_bytes(obj_id: u64, key: u64, bytes: u64) -> AllocationRequest {
+        AllocationRequest::new(obj_id, bytes, key)
     }
 
     fn default_planner() -> HashRingPlacementPlanner {
@@ -1846,6 +1891,89 @@ mod tests {
             .unwrap();
         assert!(!dec.device_targets.contains(&1));
         assert_eq!(dec.device_targets.len(), 2);
+    }
+
+    #[test]
+    fn hash_ring_nearly_full_device_below_request_size_skipped() {
+        let planner = default_planner();
+        let layout = mirror_layout(2);
+        let fd = device_fd();
+        let mut nearly_full = make_device(1, 1, 1, 2);
+        nearly_full.used_bytes = nearly_full.total_bytes - (512 * 1024 * 1024);
+        let devices = vec![
+            nearly_full,
+            make_device(2, 2, 2, 2),
+            make_device(3, 3, 3, 2),
+        ];
+        let req = request_bytes(1, 1, GIB);
+        let target_bytes = per_target_capacity_bytes(&layout, &req);
+
+        let ring = planner.build_ring(&devices, &fd, target_bytes);
+        let ring_devices: BTreeSet<u64> = ring
+            .iter()
+            .map(|(_, dev_idx, _)| devices[*dev_idx].device_id)
+            .collect();
+        assert!(!ring_devices.contains(&1));
+
+        let dec = planner
+            .plan_placement(&layout, &fd, &devices, &req)
+            .unwrap();
+        let replay = planner
+            .plan_placement(&layout, &fd, &devices, &req)
+            .unwrap();
+        assert_eq!(dec, replay);
+        assert_eq!(dec.device_targets.len(), 2);
+        assert!(!dec.device_targets.contains(&1));
+    }
+
+    #[test]
+    fn hash_ring_refuses_when_non_full_devices_lack_request_capacity() {
+        let planner = default_planner();
+        let layout = mirror_layout(2);
+        let fd = device_fd();
+        let mut first = make_device(1, 1, 1, 2);
+        let mut second = make_device(2, 2, 2, 2);
+        first.used_bytes = first.total_bytes - (512 * 1024 * 1024);
+        second.used_bytes = second.total_bytes - (512 * 1024 * 1024);
+        let devices = vec![first, second];
+        let req = request_bytes(1, 1, GIB);
+
+        let err = planner
+            .plan_placement(&layout, &fd, &devices, &req)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PlacementError::NotEnoughMembers {
+                required: 2,
+                available: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn hash_ring_erasure_capacity_budget_is_per_data_shard() {
+        let planner = default_planner();
+        let layout = erasure_layout(4, 2);
+        let fd = device_fd();
+        let devices: Vec<_> = (1..=6).map(|i| make_device(i, i, i, 1)).collect();
+
+        let req = request_bytes(1, 1, 4 * GIB);
+        let dec = planner
+            .plan_placement(&layout, &fd, &devices, &req)
+            .unwrap();
+        assert_eq!(dec.device_targets.len(), 6);
+
+        let oversized = request_bytes(1, 1, 4 * GIB + 1);
+        let err = planner
+            .plan_placement(&layout, &fd, &devices, &oversized)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PlacementError::NotEnoughMembers {
+                required: 6,
+                available: 0
+            }
+        ));
     }
 
     #[test]
