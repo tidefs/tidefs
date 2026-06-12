@@ -25,7 +25,7 @@ use tidefs_durability_layout::DurabilityLayoutV1;
 use tidefs_local_filesystem::{self as vfs, ChangedRecordExport, RootAuthenticationKey};
 use tidefs_local_object_store::device_layout::DeviceMediaClass;
 use tidefs_local_object_store::pool::{
-    Pool, PoolConfig as ObjectPoolConfig, PoolProperties,
+    Pool, PoolConfig as ObjectPoolConfig, PoolProperties, PoolReceiptBoundDeadObjectDrainStats,
     PoolRedundancyPolicy as ObjectPoolRedundancyPolicy,
 };
 use tidefs_local_object_store::{
@@ -67,8 +67,8 @@ use tidefs_replicated_object_store::{
 #[cfg(test)]
 use tidefs_replication_model::ReplicatedReadClass;
 use tidefs_replication_model::{
-    FlowCommitResult, ObjectDigest, PlacementReceiptRef, ReceiptRedundancyPolicy,
-    ReplicaMovementClass, ReplicatedReadPlan,
+    FlowCommitClass, FlowCommitResult, FlowState, ObjectDigest, PlacementReceiptRef,
+    ReceiptRedundancyPolicy, ReplicaMovementClass, ReplicatedReadPlan,
 };
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
@@ -92,7 +92,7 @@ const CLUSTER_POOL_MESSAGE_MAGIC: &[u8; 4] = b"CP01";
 /// transport-backed [`TransportReplicatedStore`]; otherwise it falls back
 /// to the local path-backed [`ReplicatedObjectStore`] for single-node or
 /// harness use.
-enum StoreBackend {
+pub enum StoreBackend {
     /// Local path-backed replicated store (single-node/harness path).
     Local(Box<ReplicatedObjectStore>),
     /// Transport-backed replicated store (live multi-node path).
@@ -139,6 +139,49 @@ pub struct StorageNodeRelocationReadMapPublication {
     pub relocation_publication: StorageNodeRelocationPlacementPublication,
     /// Transport read-map publication derived from post-relocation placement.
     pub read_map_publication: StorageNodeTransportReadMapPublication,
+}
+
+/// Storage-node projection of receipt-bound dead-object drain evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageNodeReceiptBoundDeadObjectDrainStats {
+    /// Number of pool devices whose receipt-bound dead-object queues were scanned.
+    pub devices_scanned: usize,
+    /// Number of receipt-authorized dead objects acknowledged by the drain.
+    pub objects_acked: usize,
+    /// Number of segments identified as fully dead and freed.
+    pub segments_reclaimed: u64,
+    /// Number of dead-object records accounted as freed.
+    pub blocks_freed: u64,
+    /// Remaining receipt-bound dead-object queue depth across scanned devices.
+    pub reclaim_queue_depth: usize,
+    /// Number of lower-level checkpoint batches emitted by the drain.
+    pub checkpoint_batches: usize,
+}
+
+impl From<PoolReceiptBoundDeadObjectDrainStats> for StorageNodeReceiptBoundDeadObjectDrainStats {
+    fn from(stats: PoolReceiptBoundDeadObjectDrainStats) -> Self {
+        Self {
+            devices_scanned: stats.devices_scanned,
+            objects_acked: stats.objects_acked,
+            segments_reclaimed: stats.segments_reclaimed,
+            blocks_freed: stats.blocks_freed,
+            reclaim_queue_depth: stats.reclaim_queue_depth,
+            checkpoint_batches: stats.checkpoint_batches,
+        }
+    }
+}
+
+/// Storage-node summary for composing relocation publication with source reclaim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageNodeRelocationReceiptBoundReclaimDrain {
+    /// Accepted relocation/read-map publication that gates the drain.
+    pub read_map_publication: StorageNodeRelocationReadMapPublication,
+    /// Replacement receipt that authorizes retiring the old source placement.
+    pub replacement_receipt_ref: PlacementReceiptRef,
+    /// Stable committed txg used for receipt-bound dead-object selection.
+    pub stable_committed_txg: u64,
+    /// Pool-backed drain evidence.
+    pub drain_stats: StorageNodeReceiptBoundDeadObjectDrainStats,
 }
 
 /// Storage-node summary for publishing cluster placement into transport reads.
@@ -811,6 +854,161 @@ pub fn publish_relocation_flow_commit_into_cluster_runtime_and_transport_read_ma
     Ok(StorageNodeRelocationReadMapPublication {
         relocation_publication,
         read_map_publication,
+    })
+}
+
+fn replacement_receipt_from_relocation_read_map_publication(
+    publication: &StorageNodeRelocationReadMapPublication,
+) -> Result<PlacementReceiptRef, String> {
+    let relocation = &publication.relocation_publication;
+    let placement = &relocation.placement_publication;
+    let result = &relocation.flow_commit_result;
+
+    if result.flow_class != FlowCommitClass::Relocation {
+        return Err(format!(
+            "relocation reclaim drain requires relocation flow evidence, got {:?}",
+            result.flow_class
+        ));
+    }
+    if result.final_flow_state != FlowState::Complete {
+        return Err(format!(
+            "relocation reclaim drain requires complete flow evidence, got {:?}",
+            result.final_flow_state
+        ));
+    }
+    if result.commit_epoch != EpochId::new(placement.map_epoch) {
+        return Err(format!(
+            "relocation reclaim drain map epoch {} does not match flow commit epoch {:?}",
+            placement.map_epoch, result.commit_epoch
+        ));
+    }
+    if result.updated_copy.subject_ref.0 != placement.object_id {
+        return Err(format!(
+            "relocation reclaim drain subject {} does not match publication object {}",
+            result.updated_copy.subject_ref.0, placement.object_id
+        ));
+    }
+    if result.updated_copy.member_ref.0 != placement.target_member {
+        return Err(format!(
+            "relocation reclaim drain target {:?} does not match publication target {}",
+            result.updated_copy.member_ref, placement.target_member
+        ));
+    }
+    if result.placement_receipt.placed_on.0 != placement.target_member {
+        return Err(format!(
+            "relocation reclaim drain receipt target {:?} does not match publication target {}",
+            result.placement_receipt.placed_on, placement.target_member
+        ));
+    }
+
+    let [replacement_receipt_ref] = result.placement_receipt.placement_receipt_refs.as_slice()
+    else {
+        return Err(format!(
+            "relocation reclaim drain requires exactly one replacement receipt, got {}",
+            result.placement_receipt.placement_receipt_refs.len()
+        ));
+    };
+    if *replacement_receipt_ref != placement.placement_receipt_ref {
+        return Err(format!(
+            "relocation reclaim drain replacement receipt for object {} does not match accepted placement publication",
+            placement.object_id
+        ));
+    }
+    if replacement_receipt_ref.is_synthetic() {
+        return Err(format!(
+            "relocation reclaim drain refuses synthetic replacement receipt for object {}",
+            replacement_receipt_ref.object_id
+        ));
+    }
+    if !replacement_receipt_ref.redundancy_policy.is_well_formed() {
+        return Err(format!(
+            "relocation reclaim drain refuses malformed replacement receipt policy for object {}",
+            replacement_receipt_ref.object_id
+        ));
+    }
+    let required_targets = replacement_receipt_ref.redundancy_policy.target_width();
+    if replacement_receipt_ref.target_count < required_targets {
+        return Err(format!(
+            "relocation reclaim drain refuses under-width replacement receipt for object {}: targets={} required={}",
+            replacement_receipt_ref.object_id,
+            replacement_receipt_ref.target_count,
+            required_targets
+        ));
+    }
+
+    let Some(members) = publication
+        .read_map_publication
+        .read_map
+        .members_for(placement.object_id)
+    else {
+        return Err(format!(
+            "relocation reclaim drain read map does not advertise object {}",
+            placement.object_id
+        ));
+    };
+    if !members.contains(&MemberId::new(placement.target_member)) {
+        return Err(format!(
+            "relocation reclaim drain read map does not advertise replacement target {} for object {}",
+            placement.target_member, placement.object_id
+        ));
+    }
+    if members.contains(&MemberId::new(relocation.source_member)) {
+        return Err(format!(
+            "relocation reclaim drain read map still advertises retired source {} for object {}",
+            relocation.source_member, placement.object_id
+        ));
+    }
+
+    Ok(*replacement_receipt_ref)
+}
+
+fn stable_txg_after_replacement_receipt(
+    replacement_receipt_ref: PlacementReceiptRef,
+) -> Result<u64, String> {
+    replacement_receipt_ref
+        .receipt_generation
+        .checked_add(1)
+        .ok_or_else(|| {
+            format!(
+                "relocation reclaim drain replacement receipt generation for object {} cannot become stable",
+                replacement_receipt_ref.object_id
+            )
+        })
+}
+
+pub fn drain_receipt_bound_dead_objects_after_relocation_read_map_publication(
+    store: &mut StoreBackend,
+    publication: Option<&StorageNodeRelocationReadMapPublication>,
+    max_count: usize,
+) -> Result<StorageNodeRelocationReceiptBoundReclaimDrain, String> {
+    if max_count == 0 {
+        return Err("relocation reclaim drain requires a non-zero max_count".into());
+    }
+    let publication = publication.ok_or_else(|| {
+        "relocation reclaim drain requires accepted read-map publication".to_string()
+    })?;
+    let replacement_receipt_ref =
+        replacement_receipt_from_relocation_read_map_publication(publication)?;
+    let stable_committed_txg = stable_txg_after_replacement_receipt(replacement_receipt_ref)?;
+    let StoreBackend::PoolBacked(pool) = store else {
+        return Err(
+            "relocation reclaim drain requires a pool-backed store with receipt authority".into(),
+        );
+    };
+
+    let drain_stats = pool
+        .drain_receipt_bound_dead_objects_at_txg(
+            ObjectIoClass::Data,
+            stable_committed_txg,
+            max_count,
+        )
+        .map_err(|err| format!("pool receipt-bound dead-object drain failed: {err}"))?;
+
+    Ok(StorageNodeRelocationReceiptBoundReclaimDrain {
+        read_map_publication: publication.clone(),
+        replacement_receipt_ref,
+        stable_committed_txg,
+        drain_stats: drain_stats.into(),
     })
 }
 
@@ -5878,6 +6076,59 @@ mod cluster_pool_handler_tests {
         (tmp, store)
     }
 
+    fn accepted_relocation_read_map_publication(
+        source_receipt: PlacementReceiptRef,
+        relocated_receipt: PlacementReceiptRef,
+    ) -> StorageNodeRelocationReadMapPublication {
+        let result = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        let mut runtime = cluster_runtime_with_old_receipt(source_receipt);
+        let (_tmp, mut store) = transport_store_with_placement();
+        let tracker = PlacementVersionTracker::with_version(7);
+
+        publish_relocation_flow_commit_into_cluster_runtime_and_transport_read_map(
+            &mut runtime,
+            &mut store,
+            &tracker,
+            1,
+            &result,
+        )
+        .expect("relocation read-map publication")
+    }
+
+    fn rewritten_pool_backend_with_receipts(
+        object_key: ObjectKey,
+        object_id: u64,
+        old_payload: &[u8],
+        new_payload: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        StoreBackend,
+        PlacementReceiptRef,
+        PlacementReceiptRef,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let mut pool = open_imported_pool_backend(&imported, &lock_dir).unwrap();
+
+        pool_put_key(&mut pool, object_key, old_payload).unwrap();
+        let source_receipt = pool_placement_receipt_ref_for_key(&pool, object_key, object_id)
+            .expect("source receipt");
+        pool_put_key(&mut pool, object_key, new_payload).unwrap();
+        let replacement_receipt = pool_placement_receipt_ref_for_key(&pool, object_key, object_id)
+            .expect("replacement receipt");
+
+        (
+            dir,
+            StoreBackend::PoolBacked(Box::new(pool)),
+            source_receipt,
+            replacement_receipt,
+        )
+    }
+
     fn test_transport_read_map(version: u64) -> TransportPlacementMap {
         let mut mapping = BTreeMap::new();
         mapping.insert(
@@ -7308,6 +7559,141 @@ mod cluster_pool_handler_tests {
                 .unwrap_or_default(),
             [2].into_iter().collect()
         );
+    }
+
+    #[test]
+    fn relocation_receipt_bound_reclaim_drain_composes_pool_publication_evidence() {
+        let object_key = ObjectKey::from_name(b"storage-node-relocation-reclaim-pool");
+        let (_dir, mut backend, source_receipt, replacement_receipt) =
+            rewritten_pool_backend_with_receipts(
+                object_key,
+                8_801,
+                b"old relocation reclaim payload",
+                b"new relocation reclaim payload",
+            );
+        let publication =
+            accepted_relocation_read_map_publication(source_receipt, replacement_receipt);
+
+        let drain = drain_receipt_bound_dead_objects_after_relocation_read_map_publication(
+            &mut backend,
+            Some(&publication),
+            16,
+        )
+        .expect("pool-backed relocation reclaim drain");
+
+        assert_eq!(drain.read_map_publication, publication);
+        assert_eq!(drain.replacement_receipt_ref, replacement_receipt);
+        assert_eq!(
+            drain.stable_committed_txg,
+            replacement_receipt.receipt_generation + 1
+        );
+        assert_eq!(drain.drain_stats.devices_scanned, 2);
+        assert_eq!(drain.drain_stats.objects_acked, 2);
+        assert_eq!(drain.drain_stats.reclaim_queue_depth, 0);
+
+        let StoreBackend::PoolBacked(pool) = &mut backend else {
+            unreachable!()
+        };
+        let after = pool
+            .drain_receipt_bound_dead_objects_at_txg(
+                ObjectIoClass::Data,
+                drain.stable_committed_txg,
+                16,
+            )
+            .expect("second drain is idle");
+        assert_eq!(after.objects_acked, 0);
+        assert_eq!(after.reclaim_queue_depth, 0);
+    }
+
+    #[test]
+    fn relocation_receipt_bound_reclaim_drain_rejects_missing_publication() {
+        let object_key = ObjectKey::from_name(b"storage-node-relocation-reclaim-missing");
+        let (_dir, mut backend, _source_receipt, _replacement_receipt) =
+            rewritten_pool_backend_with_receipts(
+                object_key,
+                8_802,
+                b"old missing publication payload",
+                b"new missing publication payload",
+            );
+
+        let err = drain_receipt_bound_dead_objects_after_relocation_read_map_publication(
+            &mut backend,
+            None,
+            16,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("requires accepted read-map publication"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relocation_receipt_bound_reclaim_drain_rejects_non_pool_backend() {
+        let source_receipt = receipt_ref(
+            b"storage-node-relocation-reclaim-non-pool",
+            b"old-payload",
+            1,
+        );
+        let replacement_receipt = receipt_ref(
+            b"storage-node-relocation-reclaim-non-pool",
+            b"new-payload",
+            2,
+        );
+        let publication =
+            accepted_relocation_read_map_publication(source_receipt, replacement_receipt);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().join("store")];
+        let store = ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
+        let mut backend = StoreBackend::Local(Box::new(store));
+
+        let err = drain_receipt_bound_dead_objects_after_relocation_read_map_publication(
+            &mut backend,
+            Some(&publication),
+            16,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("requires a pool-backed store"), "{err}");
+    }
+
+    #[test]
+    fn relocation_receipt_bound_reclaim_drain_rejects_unstable_replacement_generation() {
+        let object_key = ObjectKey::from_name(b"storage-node-relocation-reclaim-unstable");
+        let (_dir, mut backend, source_receipt, replacement_receipt) =
+            rewritten_pool_backend_with_receipts(
+                object_key,
+                8_803,
+                b"old unstable generation payload",
+                b"new unstable generation payload",
+            );
+        let mut unstable_receipt = replacement_receipt;
+        unstable_receipt.receipt_generation = u64::MAX;
+        let publication =
+            accepted_relocation_read_map_publication(source_receipt, unstable_receipt);
+
+        let err = drain_receipt_bound_dead_objects_after_relocation_read_map_publication(
+            &mut backend,
+            Some(&publication),
+            16,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("cannot become stable"), "{err}");
+
+        let StoreBackend::PoolBacked(pool) = &mut backend else {
+            unreachable!()
+        };
+        let held = pool
+            .drain_receipt_bound_dead_objects_at_txg(
+                ObjectIoClass::Data,
+                replacement_receipt.receipt_generation,
+                16,
+            )
+            .expect("replacement generation is not yet stable");
+        assert_eq!(held.objects_acked, 0);
+        assert_eq!(held.reclaim_queue_depth, 2);
     }
 
     #[test]
