@@ -28,6 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use tidefs_membership_epoch::{EpochId, HealthClass};
+use tidefs_replication_model::PlacementReceiptRef;
 
 use crate::pool_config::{ClusterPlacementPolicy, FailureDomain};
 use crate::rebuild_backfill::{
@@ -99,6 +100,9 @@ pub struct PlacementMap {
     by_member: BTreeMap<u64, BTreeSet<u64>>,
     /// object_id → PlacementObjectReceipt (one per placement).
     receipts: BTreeMap<u64, PlacementObjectReceipt>,
+    /// object_id → durable placement receipt ref suitable for transfer authority.
+    #[serde(default)]
+    placement_receipt_refs: BTreeMap<u64, PlacementReceiptRef>,
     /// Epoch this placement map reflects.
     epoch: u64,
 }
@@ -110,6 +114,7 @@ impl PlacementMap {
             entries: BTreeMap::new(),
             by_member: BTreeMap::new(),
             receipts: BTreeMap::new(),
+            placement_receipt_refs: BTreeMap::new(),
             epoch,
         }
     }
@@ -136,6 +141,30 @@ impl PlacementMap {
         self.receipts.insert(object_id, receipt);
     }
 
+    /// Record a placement receipt and its durable transfer-authority reference.
+    pub fn record_receipt_with_ref(
+        &mut self,
+        receipt: PlacementObjectReceipt,
+        placement_receipt_ref: PlacementReceiptRef,
+    ) {
+        let object_id = receipt.object_id;
+        debug_assert_eq!(object_id, placement_receipt_ref.object_id);
+        self.record_receipt(receipt);
+        self.placement_receipt_refs
+            .insert(object_id, placement_receipt_ref);
+    }
+
+    /// Attach a durable placement receipt ref to an already-tracked object.
+    pub fn record_placement_receipt_ref(
+        &mut self,
+        object_id: u64,
+        placement_receipt_ref: PlacementReceiptRef,
+    ) {
+        debug_assert_eq!(object_id, placement_receipt_ref.object_id);
+        self.placement_receipt_refs
+            .insert(object_id, placement_receipt_ref);
+    }
+
     /// Record that a member holds a replica of an object (lightweight, no extent metadata).
     pub fn insert(&mut self, object_id: u64, member_id: u64) {
         self.entries.entry(object_id).or_default().insert(member_id);
@@ -160,6 +189,7 @@ impl PlacementMap {
             }
         }
         self.receipts.remove(&object_id);
+        self.placement_receipt_refs.remove(&object_id);
     }
 
     /// Remove all entries for a member (e.g., on node loss).
@@ -181,6 +211,7 @@ impl PlacementMap {
         for &object_id in &affected {
             if !self.entries.contains_key(&object_id) {
                 self.receipts.remove(&object_id);
+                self.placement_receipt_refs.remove(&object_id);
             }
         }
         affected
@@ -216,6 +247,11 @@ impl PlacementMap {
         self.receipts.get(&object_id)
     }
 
+    /// Get the durable placement receipt ref for a specific object_id.
+    pub fn placement_receipt_ref(&self, object_id: u64) -> Option<PlacementReceiptRef> {
+        self.placement_receipt_refs.get(&object_id).copied()
+    }
+
     /// Find all receipts for a given inode.
     pub fn receipts_for_inode(&self, inode_id: u64) -> Vec<&PlacementObjectReceipt> {
         self.receipts
@@ -240,6 +276,11 @@ impl PlacementMap {
     /// Number of receipts stored.
     pub fn receipt_count(&self) -> usize {
         self.receipts.len()
+    }
+
+    /// Number of durable placement receipt refs stored.
+    pub fn placement_receipt_ref_count(&self) -> usize {
+        self.placement_receipt_refs.len()
     }
 
     /// Compute which objects are affected by the loss of the given members.
@@ -312,6 +353,7 @@ impl PlacementMap {
         self.entries.clear();
         self.by_member.clear();
         self.receipts.clear();
+        self.placement_receipt_refs.clear();
         self.epoch = new_epoch;
     }
 
@@ -648,7 +690,20 @@ impl PlacementHealCoordinator {
                 continue;
             }
 
-            tasks.push(ReconstructionTask::new_full(object_id, sources, targets, 0));
+            let task = if let Some(placement_receipt_ref) =
+                self.placement.placement_receipt_ref(object_id)
+            {
+                ReconstructionTask::new_full_with_receipt(
+                    object_id,
+                    placement_receipt_ref,
+                    sources,
+                    targets,
+                    0,
+                )
+            } else {
+                ReconstructionTask::new_full(object_id, sources, targets, 0)
+            };
+            tasks.push(task);
         }
 
         if tasks.is_empty() {
@@ -797,6 +852,23 @@ impl PlacementHealCoordinator {
 mod tests {
     use super::*;
 
+    fn receipt_ref(object_id: u64, generation: u64) -> PlacementReceiptRef {
+        let mut object_key = [0xA5; 32];
+        object_key[..8].copy_from_slice(&object_id.to_le_bytes());
+        let mut digest = [0x5A; 32];
+        digest[..8].copy_from_slice(&object_id.to_le_bytes());
+        digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        PlacementReceiptRef::replicated(
+            object_id,
+            object_key,
+            EpochId(1),
+            generation,
+            2,
+            4096,
+            digest,
+        )
+    }
+
     // ── PlacementMap tests ────────────────────────────────────
 
     #[test]
@@ -817,6 +889,28 @@ mod tests {
         let objects = pm.objects_of(10).unwrap();
         assert!(objects.contains(&100));
         assert!(objects.contains(&200));
+    }
+
+    #[test]
+    fn placement_map_keeps_receipt_ref_for_surviving_replicas() {
+        let mut pm = PlacementMap::new(1);
+        pm.insert(42, 10);
+        pm.insert(42, 20);
+
+        let receipt = receipt_ref(42, 7);
+        pm.record_placement_receipt_ref(42, receipt);
+
+        assert_eq!(pm.placement_receipt_ref(42), Some(receipt));
+        assert_eq!(pm.placement_receipt_ref_count(), 1);
+
+        let affected = pm.remove_member(10);
+        assert!(affected.contains(&42));
+        assert_eq!(pm.placement_receipt_ref(42), Some(receipt));
+
+        let affected = pm.remove_member(20);
+        assert!(affected.contains(&42));
+        assert_eq!(pm.placement_receipt_ref(42), None);
+        assert_eq!(pm.placement_receipt_ref_count(), 0);
     }
 
     #[test]
@@ -1091,10 +1185,51 @@ mod tests {
         });
 
         let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
+        assert!(plan
+            .tasks
+            .iter()
+            .all(|task| task.placement_receipt_ref.is_synthetic()));
         let result = coord.open_backfill(plan, 1);
         assert_eq!(result, Err("backfill error"));
         assert_eq!(coord.state(), HealState::Planning);
         assert!(coord.stats().backfill_id.is_none());
+    }
+
+    #[test]
+    fn open_backfill_accepts_receipt_authoritative_heal_plan() {
+        let initiator = RebuildBackfillInitiator::new(EpochId(1));
+        let mut coord = PlacementHealCoordinator::new(1, Some(initiator))
+            .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
+
+        let receipt = receipt_ref(1, 9);
+        coord.placement_mut().insert(1, 10);
+        coord.placement_mut().insert(1, 20);
+        coord
+            .placement_mut()
+            .record_placement_receipt_ref(1, receipt);
+
+        let mut lost = BTreeSet::new();
+        lost.insert(10);
+        let mut available = BTreeMap::new();
+        available.insert(20, HealthClass::Healthy);
+        available.insert(30, HealthClass::Healthy);
+
+        coord.detect_loss(LossEvent {
+            lost_members: lost,
+            epoch: 1,
+            detected_at_ns: 1_000_000_000,
+            available_members: available,
+        });
+
+        let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].placement_receipt_ref, receipt);
+        assert!(!plan.tasks[0].placement_receipt_ref.is_synthetic());
+
+        let backfill_id = coord.open_backfill(plan, 1).unwrap();
+        assert_eq!(backfill_id, 1);
+        assert_eq!(coord.state(), HealState::Rebuilding);
+        assert_eq!(coord.stats().backfill_id, Some(1));
     }
 
     #[test]
