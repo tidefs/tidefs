@@ -3026,7 +3026,12 @@ impl TransportReplicatedStore {
         }
 
         let obj_id = request.object_id;
-        let receipt_ref = request.non_synthetic_receipt_ref();
+        let receipt_ref = request.placement_receipt_ref;
+        if receipt_ref.is_some_and(PlacementReceiptRef::is_synthetic) {
+            return Err(format!(
+                "receipt-bound segment fetch for object {obj_id} requires non-synthetic placement receipt"
+            ));
+        }
         let key = receipt_ref.map_or_else(
             || tidefs_local_object_store::ObjectKey::from_name(obj_id.to_le_bytes()),
             |receipt| tidefs_local_object_store::ObjectKey::from_bytes32(receipt.object_key),
@@ -6698,7 +6703,7 @@ mod tests {
         }
 
         #[test]
-        fn handle_segment_fetch_request_synthetic_receipt_uses_legacy_object_id() {
+        fn handle_segment_fetch_request_rejects_synthetic_receipt() {
             let primary_dir = tempfile::tempdir().unwrap();
             let replica_dir = tempfile::tempdir().unwrap();
             let mut primary = TransportReplicatedStore::open(
@@ -6731,11 +6736,8 @@ mod tests {
 
             let (client_session_id, server_session_id) =
                 connect_replica_pair(&mut primary, &mut replica, 2);
-            let server = std::thread::spawn(move || {
-                replica
-                    .handle_segment_fetch_request(server_session_id)
-                    .expect("synthetic receipt segment fetch served")
-            });
+            let server =
+                std::thread::spawn(move || replica.handle_segment_fetch_request(server_session_id));
             let request = SegmentFetchRequest {
                 object_id,
                 placement_receipt_ref: Some(synthetic_receipt),
@@ -6744,12 +6746,9 @@ mod tests {
             };
 
             send_segment_fetch(&mut primary.transport, client_session_id, &request).unwrap();
-            let response =
-                recv_segment_fetch_response(&mut primary.transport, client_session_id).unwrap();
+            let err = server.join().unwrap().unwrap_err();
 
-            assert_eq!(response.payload, legacy_payload[10..18].to_vec());
-            assert_ne!(response.payload, synthetic_payload[10..18].to_vec());
-            assert_eq!(server.join().unwrap(), object_id);
+            assert!(err.contains("requires non-synthetic placement receipt"));
         }
 
         #[test]
