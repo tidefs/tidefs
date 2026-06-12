@@ -249,9 +249,13 @@ The executable slice includes:
   violating reserve floors.
 
 It covers fault-injection, no-source refusal, lagged-copy backfill,
-capacity-movement rebalance, and reserve-floor blockage tests. This remains an
-executable movement planner; async transfer workers, networked storage-node
-execution, erasure coding, and production distributed runtime remain deferred.
+capacity-movement rebalance, and reserve-floor blockage tests. The
+transport-backed store also has a narrow receipt-bound repair bridge: it fetches
+source bytes by `PlacementReceiptRef`, sends storage-node `RepairObject` to the
+target, and accepts completion evidence only from a successful ack with a fresh
+repaired placement receipt that passes rebuild-runtime verified-task completion.
+This is not yet full replacement-node orchestration, degraded-read policy, or
+reclaim publication; those remain part of the broader #18 runtime closeout.
 
 ## 7. Steady-state replication flow
 

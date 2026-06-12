@@ -1015,7 +1015,9 @@ impl ReplicatedObjectStore {
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::net::SocketAddr;
-use tidefs_rebuild_runtime::engine::ReceiptSegmentSource;
+use tidefs_rebuild_runtime::{
+    completion::RebuildCompletion, engine::ReceiptSegmentSource, task::BackfillTask,
+};
 use tidefs_transport::{
     build_read_responses, recv_replication_msg, recv_segment_fetch, recv_segment_fetch_response,
     recv_write_request, send_replication_msg, send_segment_fetch, send_segment_fetch_response,
@@ -2356,6 +2358,87 @@ impl TransportReplicatedStore {
         self.fetch_remote_segment_request(replica_idx, request)
     }
 
+    /// Execute a receipt-bound repair by fetching source bytes, sending them to
+    /// the target storage node, and requiring a repaired placement receipt ack.
+    pub fn execute_receipt_repair_task(
+        &mut self,
+        task: &BackfillTask,
+    ) -> Result<PlacementReceiptRef, String> {
+        validate_receipt_repair_task(task)?;
+        let payload = self.fetch_segment_by_receipt(
+            task.source_member,
+            task.placement_receipt_ref,
+            0,
+            task.payload_len,
+        )?;
+        validate_receipt_repair_payload(task, &payload)?;
+
+        let (target_node_id, data_session_id) = self
+            .replicas
+            .iter()
+            .find(|replica| replica.node_id == task.target_member.0)
+            .map(|replica| (replica.node_id, replica.data_session_id))
+            .ok_or_else(|| {
+                format!(
+                    "target member {} is not connected for receipt-bound repair of object {}",
+                    task.target_member.0, task.placement_receipt_ref.object_id
+                )
+            })?;
+
+        let expected_key = task.placement_receipt_ref.object_key.to_vec();
+        let request = ReplicationMessage::RepairObject {
+            key: expected_key.clone(),
+            placement_receipt_ref: task.placement_receipt_ref,
+            authoritative_payload: payload,
+        };
+        send_replication_msg(&mut self.transport, data_session_id, &request)
+            .map_err(|e| format!("send receipt-bound repair to node {target_node_id}: {e}"))?;
+
+        let response = Self::recv_replication_ack_bounded(&mut self.transport, data_session_id)
+            .map_err(|e| {
+                format!("recv receipt-bound repair ack from node {target_node_id}: {e}")
+            })?;
+
+        let ReplicationMessage::RepairObjectAck {
+            key,
+            success,
+            repaired_placement_receipt_ref,
+        } = response
+        else {
+            return Err(format!(
+                "receipt-bound repair to node {target_node_id} returned non-repair ack: {response:?}"
+            ));
+        };
+
+        if key != expected_key {
+            return Err(format!(
+                "receipt-bound repair ack key mismatch for object {} from node {target_node_id}",
+                task.placement_receipt_ref.object_id
+            ));
+        }
+        if !success {
+            return Err(format!(
+                "receipt-bound repair target node {target_node_id} refused object {}",
+                task.placement_receipt_ref.object_id
+            ));
+        }
+        let repaired_receipt = repaired_placement_receipt_ref.ok_or_else(|| {
+            format!(
+                "receipt-bound repair target node {target_node_id} did not return repaired placement receipt for object {}",
+                task.placement_receipt_ref.object_id
+            )
+        })?;
+        RebuildCompletion::validate_repaired_receipt_for_task(task, repaired_receipt)
+            .map_err(|err| {
+                format!(
+                    "receipt-bound repair ack from node {target_node_id} failed completion receipt validation for object {}: {err:?}",
+                    task.placement_receipt_ref.object_id
+                )
+            })?;
+
+        Ok(repaired_receipt)
+    }
+
     fn fetch_remote_segment_request(
         &mut self,
         replica_idx: usize,
@@ -2628,6 +2711,73 @@ impl TransportReplicatedStore {
         }
         self.replicas.clear();
     }
+}
+
+fn validate_receipt_repair_task(task: &BackfillTask) -> Result<(), String> {
+    let receipt = task.placement_receipt_ref;
+    if receipt.is_synthetic() {
+        return Err(format!(
+            "receipt-bound repair for object {} requires non-synthetic placement receipt",
+            receipt.object_id
+        ));
+    }
+    if !receipt.redundancy_policy.is_well_formed() {
+        return Err(format!(
+            "receipt-bound repair for object {} requires well-formed redundancy policy",
+            receipt.object_id
+        ));
+    }
+    let required_targets = receipt.redundancy_policy.target_width();
+    if receipt.target_count < required_targets {
+        return Err(format!(
+            "receipt-bound repair for object {} has {} receipt targets, needs {}",
+            receipt.object_id, receipt.target_count, required_targets
+        ));
+    }
+    if receipt.object_id != task.subject_ref.0 {
+        return Err(format!(
+            "receipt-bound repair task subject mismatch: task={} receipt={}",
+            task.subject_ref.0, receipt.object_id
+        ));
+    }
+    if task.payload_len != receipt.payload_len {
+        return Err(format!(
+            "receipt-bound repair task length mismatch for object {}: task {} receipt {}",
+            receipt.object_id, task.payload_len, receipt.payload_len
+        ));
+    }
+    let receipt_digest_prefix = u64::from_le_bytes(
+        receipt.payload_digest[..8]
+            .try_into()
+            .expect("digest prefix has 8 bytes"),
+    );
+    if task.payload_digest != ObjectDigest::new(receipt_digest_prefix) {
+        return Err(format!(
+            "receipt-bound repair task digest prefix mismatch for object {}",
+            receipt.object_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipt_repair_payload(task: &BackfillTask, payload: &[u8]) -> Result<(), String> {
+    let receipt = task.placement_receipt_ref;
+    if payload.len() as u64 != receipt.payload_len {
+        return Err(format!(
+            "receipt-bound repair source length mismatch for object {}: receipt {} actual {}",
+            receipt.object_id,
+            receipt.payload_len,
+            payload.len()
+        ));
+    }
+    let actual_digest: [u8; 32] = blake3::hash(payload).into();
+    if actual_digest != receipt.payload_digest {
+        return Err(format!(
+            "receipt-bound repair source digest mismatch for object {}",
+            receipt.object_id
+        ));
+    }
+    Ok(())
 }
 
 impl ReceiptSegmentSource for TransportReplicatedStore {
@@ -3659,6 +3809,81 @@ mod tests {
             }
         }
 
+        fn backfill_task_for_receipt(
+            receipt: PlacementReceiptRef,
+            source_member: u64,
+            target_member: u64,
+        ) -> tidefs_rebuild_runtime::task::BackfillTask {
+            let payload_digest_prefix =
+                u64::from_le_bytes(receipt.payload_digest[..8].try_into().unwrap());
+            tidefs_rebuild_runtime::task::BackfillTask::new(
+                tidefs_rebuild_runtime::task::BackfillTaskInit {
+                    subject_ref: ReplicatedSubjectId::new(receipt.object_id),
+                    placement_receipt_ref: receipt,
+                    source_member: MemberId::new(source_member),
+                    target_member: MemberId::new(target_member),
+                    movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
+                    payload_digest: ObjectDigest::new(payload_digest_prefix),
+                    payload_len: receipt.payload_len,
+                    created_at_ns: 1000,
+                    deadline_ns: 5000,
+                },
+            )
+        }
+
+        fn spawn_receipt_source(
+            mut source: TransportReplicatedStore,
+            server_session_id: SessionId,
+        ) -> std::thread::JoinHandle<u64> {
+            std::thread::spawn(move || {
+                source
+                    .handle_segment_fetch_request(server_session_id)
+                    .expect("receipt segment fetch served")
+            })
+        }
+
+        fn spawn_repair_target(
+            mut target: TransportReplicatedStore,
+            server_session_id: SessionId,
+            expected_receipt: PlacementReceiptRef,
+            repaired_receipt: Option<PlacementReceiptRef>,
+        ) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let msg = recv_replication_msg(&mut target.transport, server_session_id)
+                    .expect("repair request received");
+                let ReplicationMessage::RepairObject {
+                    key,
+                    placement_receipt_ref,
+                    authoritative_payload,
+                } = msg
+                else {
+                    panic!("expected RepairObject");
+                };
+
+                assert_eq!(key, expected_receipt.object_key.to_vec());
+                assert_eq!(placement_receipt_ref, expected_receipt);
+                let object_key =
+                    tidefs_local_object_store::ObjectKey::from_bytes32(expected_receipt.object_key);
+                target
+                    .primary
+                    .put(object_key, &authoritative_payload)
+                    .unwrap();
+
+                send_replication_msg(
+                    &mut target.transport,
+                    server_session_id,
+                    &ReplicationMessage::RepairObjectAck {
+                        key,
+                        success: true,
+                        repaired_placement_receipt_ref: repaired_receipt,
+                    },
+                )
+                .expect("repair ack sent");
+
+                target.primary.get(object_key).unwrap().unwrap()
+            })
+        }
+
         #[test]
         fn read_plan_response_receipt_validates_payload_authority() {
             let payload = b"planned-read-authority";
@@ -4639,6 +4864,170 @@ mod tests {
                 progress.state,
                 tidefs_rebuild_runtime::progress::TaskState::Complete
             );
+        }
+
+        #[test]
+        fn receipt_repair_task_returns_ack_receipt_for_completion() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let source_dir = tempfile::tempdir().unwrap();
+            let target_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut source = TransportReplicatedStore::open(
+                source_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut target = TransportReplicatedStore::open(
+                target_dir.path(),
+                3,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 1270u64;
+            let payload = b"receipt repair ack payload".to_vec();
+            let receipt_key = tidefs_local_object_store::ObjectKey::from_name(
+                b"issue-127-repair-ack-receipt-key",
+            );
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &payload, 33);
+            let mut repaired_receipt = receipt;
+            repaired_receipt.receipt_generation = 34;
+            let task = backfill_task_for_receipt(receipt, 2, 3);
+            source.primary.put(receipt_key, &payload).unwrap();
+
+            let (_source_client_session, source_server_session) =
+                connect_replica_pair(&mut primary, &mut source, 2);
+            let (_target_client_session, target_server_session) =
+                connect_replica_pair(&mut primary, &mut target, 3);
+            let source_server = spawn_receipt_source(source, source_server_session);
+            let target_server = spawn_repair_target(
+                target,
+                target_server_session,
+                receipt,
+                Some(repaired_receipt),
+            );
+
+            let ack_receipt = primary
+                .execute_receipt_repair_task(&task)
+                .expect("receipt repair task completes from ack receipt");
+
+            assert_eq!(source_server.join().unwrap(), object_id);
+            assert_eq!(target_server.join().unwrap(), payload);
+            assert_eq!(ack_receipt, repaired_receipt);
+
+            let mut completion = tidefs_rebuild_runtime::completion::RebuildCompletion::new();
+            let mut admission = tidefs_rebuild_runtime::admission::RebuildAdmission::with_epoch(7);
+            completion.register(MemberId::new(3), 1);
+            let event = completion
+                .record_receipt_verified_task_completion(&task, ack_receipt, &mut admission)
+                .expect("ack receipt passes completion law")
+                .expect("single repaired task emits completion");
+            assert!(event.fully_successful);
+        }
+
+        #[test]
+        fn receipt_repair_task_refuses_receiptless_success_ack() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let source_dir = tempfile::tempdir().unwrap();
+            let target_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut source = TransportReplicatedStore::open(
+                source_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut target = TransportReplicatedStore::open(
+                target_dir.path(),
+                3,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 1271u64;
+            let payload = b"receiptless ack must not complete".to_vec();
+            let receipt_key =
+                tidefs_local_object_store::ObjectKey::from_name(b"issue-127-receiptless-ack");
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &payload, 41);
+            let task = backfill_task_for_receipt(receipt, 2, 3);
+            source.primary.put(receipt_key, &payload).unwrap();
+
+            let (_source_client_session, source_server_session) =
+                connect_replica_pair(&mut primary, &mut source, 2);
+            let (_target_client_session, target_server_session) =
+                connect_replica_pair(&mut primary, &mut target, 3);
+            let source_server = spawn_receipt_source(source, source_server_session);
+            let target_server = spawn_repair_target(target, target_server_session, receipt, None);
+
+            let err = primary.execute_receipt_repair_task(&task).unwrap_err();
+
+            assert!(err.contains("did not return repaired placement receipt"));
+            assert_eq!(source_server.join().unwrap(), object_id);
+            assert_eq!(target_server.join().unwrap(), payload);
+        }
+
+        #[test]
+        fn receipt_repair_task_refuses_mismatched_ack_receipt() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let source_dir = tempfile::tempdir().unwrap();
+            let target_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut source = TransportReplicatedStore::open(
+                source_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut target = TransportReplicatedStore::open(
+                target_dir.path(),
+                3,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 1272u64;
+            let payload = b"mismatched ack receipt must not complete".to_vec();
+            let receipt_key =
+                tidefs_local_object_store::ObjectKey::from_name(b"issue-127-mismatched-ack");
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &payload, 50);
+            let mut mismatched_receipt = receipt;
+            mismatched_receipt.payload_len += 1;
+            let task = backfill_task_for_receipt(receipt, 2, 3);
+            source.primary.put(receipt_key, &payload).unwrap();
+
+            let (_source_client_session, source_server_session) =
+                connect_replica_pair(&mut primary, &mut source, 2);
+            let (_target_client_session, target_server_session) =
+                connect_replica_pair(&mut primary, &mut target, 3);
+            let source_server = spawn_receipt_source(source, source_server_session);
+            let target_server = spawn_repair_target(
+                target,
+                target_server_session,
+                receipt,
+                Some(mismatched_receipt),
+            );
+
+            let err = primary.execute_receipt_repair_task(&task).unwrap_err();
+
+            assert!(err.contains("PayloadLengthMismatch"));
+            assert_eq!(source_server.join().unwrap(), object_id);
+            assert_eq!(target_server.join().unwrap(), payload);
         }
 
         #[test]
