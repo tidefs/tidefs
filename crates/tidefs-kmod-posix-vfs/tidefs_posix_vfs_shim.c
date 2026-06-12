@@ -5246,7 +5246,9 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
 	struct folio *folio;
 	void *kbuf;
 	loff_t folio_file_pos;
+	loff_t isize;
 	size_t fsize;
+	size_t read_len;
 	int ret;
 	u64 fh_ino, fh_id;
 
@@ -5279,7 +5281,17 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
 
 	folio_file_pos = folio_pos(folio);
 	fsize = folio_size(folio);
-	kbuf = kmalloc(fsize, GFP_KERNEL);
+	isize = i_size_read(inode);
+	if (folio_file_pos >= isize) {
+		folio_zero_range(folio, 0, fsize);
+		folio_mark_uptodate(folio);
+		*foliop = folio;
+		*fsdata = NULL;
+		return 0;
+	}
+
+	read_len = min_t(loff_t, (loff_t)fsize, isize - folio_file_pos);
+	kbuf = kmalloc(read_len, GFP_KERNEL);
 	if (!kbuf) {
 		folio_unlock(folio);
 		folio_put(folio);
@@ -5287,10 +5299,10 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
 		return -ENOMEM;
 	}
 
-	memset(kbuf, 0, fsize);
+	memset(kbuf, 0, read_len);
 
 	ret = tidefs_posix_vfs_engine_read(
-		fh_ino, fh_id, (u64)folio_file_pos, kbuf, (u32)fsize);
+		fh_ino, fh_id, (u64)folio_file_pos, kbuf, (u32)read_len);
 	if (ret < 0) {
 		kfree(kbuf);
 		folio_unlock(folio);
@@ -5301,7 +5313,7 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
 
 	if (ret > 0 || fsize > 0) {
 		void *addr = kmap_local_folio(folio, 0);
-		size_t copy_len = min_t(size_t, (size_t)ret, fsize);
+		size_t copy_len = min_t(size_t, (size_t)ret, read_len);
 
 		if (copy_len > 0)
 			memcpy(addr, kbuf, copy_len);
@@ -5619,7 +5631,9 @@ static int tidefs_posix_vfs_read_folio(struct file *file, struct folio *folio)
 	struct tidefs_posix_vfs_mount *ctx = inode->i_sb->s_fs_info;
 	struct tidefs_posix_vfs_open_file_state *ofs;
 	loff_t pos = folio_pos(folio);
+	loff_t isize;
 	size_t fsize = folio_size(folio);
+	size_t read_len;
 	void *kbuf;
 	int ret;
 	u64 fh_ino, fh_id;
@@ -5636,15 +5650,24 @@ static int tidefs_posix_vfs_read_folio(struct file *file, struct folio *folio)
 	fh_ino = ofs ? ofs->fh_ino : inode->i_ino;
 	fh_id = ofs ? ofs->fh_id : inode->i_ino;
 
-	kbuf = kmalloc(fsize, GFP_KERNEL);
+	isize = i_size_read(inode);
+	if (pos >= isize) {
+		folio_zero_range(folio, 0, fsize);
+		folio_mark_uptodate(folio);
+		folio_unlock(folio);
+		return 0;
+	}
+
+	read_len = min_t(loff_t, (loff_t)fsize, isize - pos);
+	kbuf = kmalloc(read_len, GFP_KERNEL);
 	if (!kbuf) {
 		folio_unlock(folio);
 		return -ENOMEM;
 	}
 
-	memset(kbuf, 0, fsize);
+	memset(kbuf, 0, read_len);
 
-	ret = tidefs_posix_vfs_engine_read(fh_ino, fh_id, (u64)pos, kbuf, (u32)fsize);
+	ret = tidefs_posix_vfs_engine_read(fh_ino, fh_id, (u64)pos, kbuf, (u32)read_len);
 	if (ret < 0) {
 		kfree(kbuf);
 		mapping_set_error(folio->mapping, ret);
@@ -5655,7 +5678,7 @@ static int tidefs_posix_vfs_read_folio(struct file *file, struct folio *folio)
 	/* Copy engine data into the folio pages. */
 	if (ret > 0) {
 		void *addr = kmap_local_folio(folio, 0);
-		size_t copy_len = min_t(size_t, (size_t)ret, fsize);
+		size_t copy_len = min_t(size_t, (size_t)ret, read_len);
 		memcpy(addr, kbuf, copy_len);
 		kunmap_local(addr);
 		/* Zero-fill remainder for short reads (holes, EOF). */
