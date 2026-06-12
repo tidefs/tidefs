@@ -160,6 +160,10 @@ cluster-visible repaired-placement state after validating subject, target,
 epoch, and receipt authority. That local placement-map publication is still
 not degraded-read routing, replacement orchestration, cluster-wide propagation,
 or reclaim completion.
+Storage-node callers that already have the replicated-store repair publication
+can use `publish_repair_flow_commit_into_placement_map()` to cross-check the
+repair evidence against the flow-commit result before applying that local
+placement-map update; it is the storage-node composition boundary only.
 
 ### Local-Only Operations (LOCAL-ONLY boundary)
 
