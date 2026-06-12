@@ -29,7 +29,8 @@ use crate::dataset_catalog::{
 use crate::lease_state_machine::LeaseStateMachine;
 use crate::placement_heal::{
     HealState, HealStats, LossEvent, PlacementHealCoordinator, PlacementMap,
-    RebuildFlowCommitPlacementPublication, RelocationFlowCommitPlacementPublication,
+    RebuildFlowCommitPlacementPublication, RebuildPublicationHealFinalization,
+    RelocationFlowCommitPlacementPublication,
 };
 use crate::pool_config::{ClusterPlacementPolicy, ClusterPoolConfig, FailureDomain};
 use crate::pool_lease_token::PoolLeaseToken;
@@ -900,6 +901,15 @@ impl ClusterLeaseRuntime {
         self.heal_coordinator.finalize_heal(rebuilt_placements)
     }
 
+    /// Finalize a verifying heal from current rebuild placement publications.
+    pub fn finalize_heal_from_rebuild_publications(
+        &mut self,
+        rebuild_publications: &[RebuildFlowCommitPlacementPublication],
+    ) -> Result<RebuildPublicationHealFinalization, String> {
+        self.heal_coordinator
+            .finalize_heal_from_rebuild_publications(rebuild_publications)
+    }
+
     /// Access the placement map for external queries (e.g., show placement).
     pub fn placement_map(&self) -> &PlacementMap {
         self.heal_coordinator.placement()
@@ -1568,6 +1578,57 @@ mod tests {
         assert_eq!(map.placement_receipt_ref(90), Some(repaired_receipt));
         assert_eq!(
             map.replicas_of(90).cloned().unwrap_or_default(),
+            [20, 30].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn finalize_heal_from_rebuild_publications_delegates_to_heal_coordinator() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
+            .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
+        rt.record_placement(1, 10);
+        rt.record_placement(1, 20);
+        rt.heal_coordinator
+            .placement_mut()
+            .record_placement_receipt_ref(1, receipt_ref(1));
+
+        let mut lost = BTreeSet::new();
+        lost.insert(10);
+        let available = BTreeMap::from([(20, HealthClass::Healthy), (30, HealthClass::Healthy)]);
+        let bid = rt
+            .detect_member_loss(lost, available, 1_000_000_000)
+            .expect("receipt-backed loss starts heal backfill");
+        while rx.try_recv().is_ok() {}
+        rt.complete_backfill(bid).unwrap();
+        assert!(!rt.heal_tick(1, 4096, 2_000_000_000));
+        assert_eq!(rt.heal_state(), HealState::Verifying);
+
+        let repaired_receipt = receipt_ref_with_generation(1, 2);
+        let result = rebuild_flow_result(1, 30, repaired_receipt, 7);
+        let publication = rt
+            .publish_rebuild_flow_commit_result(&result)
+            .expect("runtime publishes repaired placement");
+
+        let finalization = rt
+            .finalize_heal_from_rebuild_publications(&[publication])
+            .expect("runtime finalizes from current rebuild publication");
+
+        assert_eq!(finalization.rebuild_publications, vec![publication]);
+        assert_eq!(
+            finalization
+                .rebuilt_placements
+                .get(&1)
+                .cloned()
+                .unwrap_or_default(),
+            [30].into_iter().collect()
+        );
+        assert_eq!(rt.heal_state(), HealState::Complete);
+        assert_eq!(
+            rt.placement_map()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
             [20, 30].into_iter().collect()
         );
     }

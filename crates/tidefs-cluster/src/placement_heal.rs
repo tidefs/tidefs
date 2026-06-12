@@ -123,6 +123,15 @@ pub struct RebuildFlowCommitPlacementPublication {
     pub map_epoch: u64,
 }
 
+/// Summary returned when receipt-backed rebuild publications finalize a heal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebuildPublicationHealFinalization {
+    /// Rebuild placement publications accepted as current placement evidence.
+    pub rebuild_publications: Vec<RebuildFlowCommitPlacementPublication>,
+    /// Rebuilt placement map derived from the accepted publications.
+    pub rebuilt_placements: BTreeMap<u64, BTreeSet<u64>>,
+}
+
 /// Summary returned when a relocation flow-commit result updates placement
 /// state and retires the caller-named source member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1125,6 +1134,62 @@ impl PlacementHealCoordinator {
         Ok(())
     }
 
+    /// Finalize a verifying heal from current rebuild placement publications.
+    ///
+    /// Each publication must already be reflected in the coordinator-owned
+    /// placement map with the same target member and durable placement receipt.
+    pub fn finalize_heal_from_rebuild_publications(
+        &mut self,
+        rebuild_publications: &[RebuildFlowCommitPlacementPublication],
+    ) -> Result<RebuildPublicationHealFinalization, String> {
+        let rebuilt_placements =
+            self.rebuilt_placements_from_rebuild_publications(rebuild_publications)?;
+        self.finalize_heal(&rebuilt_placements)
+            .map_err(|err| format!("rebuild publication heal finalization failed: {err}"))?;
+
+        Ok(RebuildPublicationHealFinalization {
+            rebuild_publications: rebuild_publications.to_vec(),
+            rebuilt_placements,
+        })
+    }
+
+    fn rebuilt_placements_from_rebuild_publications(
+        &self,
+        rebuild_publications: &[RebuildFlowCommitPlacementPublication],
+    ) -> Result<BTreeMap<u64, BTreeSet<u64>>, String> {
+        if rebuild_publications.is_empty() {
+            return Err("no rebuild placement publications supplied for heal finalization".into());
+        }
+
+        let mut rebuilt_placements: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+        for publication in rebuild_publications {
+            let stored_receipt = self.placement.placement_receipt_ref(publication.object_id);
+            if stored_receipt != Some(publication.placement_receipt_ref) {
+                return Err(format!(
+                    "rebuild publication for object {} is not current in placement map",
+                    publication.object_id
+                ));
+            }
+            if !self
+                .placement
+                .replicas_of(publication.object_id)
+                .is_some_and(|members| members.contains(&publication.target_member))
+            {
+                return Err(format!(
+                    "rebuild publication target {} for object {} is not current in placement map",
+                    publication.target_member, publication.object_id
+                ));
+            }
+
+            rebuilt_placements
+                .entry(publication.object_id)
+                .or_default()
+                .insert(publication.target_member);
+        }
+
+        Ok(rebuilt_placements)
+    }
+
     /// Abort the current heal operation.
     pub fn abort_heal(&mut self) {
         if !self.state.is_active() {
@@ -1944,6 +2009,81 @@ mod tests {
             [20, 30].into_iter().collect()
         );
         assert!(coord.placement().replicas_of(2).is_none());
+    }
+
+    #[test]
+    fn heal_finalize_from_rebuild_publications_uses_current_receipt_evidence() {
+        let mut coord = mixed_rebuildable_and_wholly_lost_coordinator();
+        let repaired_receipt = receipt_ref(1, 2);
+        let result = rebuild_flow_result(1, 30, repaired_receipt, 7);
+        let publication = coord
+            .publish_rebuild_flow_commit_result(&result)
+            .expect("rebuild flow publication updates placement state");
+
+        let finalization = coord
+            .finalize_heal_from_rebuild_publications(&[publication])
+            .expect("current rebuild publication finalizes heal");
+
+        assert_eq!(finalization.rebuild_publications, vec![publication]);
+        assert_eq!(
+            finalization
+                .rebuilt_placements
+                .get(&1)
+                .cloned()
+                .unwrap_or_default(),
+            [30].into_iter().collect()
+        );
+        assert_eq!(coord.state(), HealState::Complete);
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
+            [20, 30].into_iter().collect()
+        );
+        assert!(coord.placement().replicas_of(2).is_none());
+    }
+
+    #[test]
+    fn heal_finalize_from_rebuild_publications_rejects_stale_receipt_summary() {
+        let mut coord = mixed_rebuildable_and_wholly_lost_coordinator();
+        let repaired_receipt = receipt_ref(1, 2);
+        let result = rebuild_flow_result(1, 30, repaired_receipt, 7);
+        let mut publication = coord
+            .publish_rebuild_flow_commit_result(&result)
+            .expect("rebuild flow publication updates placement state");
+        publication.placement_receipt_ref = receipt_ref(1, 3);
+
+        let err = coord
+            .finalize_heal_from_rebuild_publications(&[publication])
+            .unwrap_err();
+
+        assert!(err.contains("not current in placement map"), "{err}");
+        assert_eq!(coord.state(), HealState::Verifying);
+        assert_eq!(
+            coord
+                .placement()
+                .placement_receipt_ref(1)
+                .expect("published receipt remains current"),
+            repaired_receipt
+        );
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
+            [10, 20, 30].into_iter().collect()
+        );
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(2)
+                .cloned()
+                .unwrap_or_default(),
+            [10].into_iter().collect()
+        );
     }
 
     #[test]
