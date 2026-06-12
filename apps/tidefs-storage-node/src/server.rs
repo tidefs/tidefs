@@ -175,22 +175,21 @@ pub fn publish_repair_flow_commit_into_cluster_runtime(
 ///
 /// The supplied publications must already have been accepted by
 /// [`publish_repair_flow_commit_into_cluster_runtime()`]. This helper derives
-/// the rebuilt-placement evidence required by
-/// [`ClusterLeaseRuntime::finalize_heal_with_rebuilt_placements()`]. It does
-/// not perform cluster-wide propagation, degraded-read routing, replacement
-/// orchestration, or reclaim.
+/// rebuild publication evidence and delegates finalization to the cluster
+/// runtime's receipt-backed heal boundary. It does not perform cluster-wide
+/// propagation, degraded-read routing, replacement orchestration, or reclaim.
 pub fn finalize_cluster_runtime_heal_from_repair_publications(
     runtime: &mut ClusterLeaseRuntime,
     repair_publications: &[StorageNodeRepairPlacementPublication],
 ) -> Result<StorageNodeRepairHealFinalization, String> {
-    let rebuilt_placements = rebuilt_placements_from_repair_publications(repair_publications)?;
-    runtime
-        .finalize_heal_with_rebuilt_placements(&rebuilt_placements)
+    let rebuild_publications = rebuild_publications_from_repair_publications(repair_publications)?;
+    let cluster_finalization = runtime
+        .finalize_heal_from_rebuild_publications(&rebuild_publications)
         .map_err(|err| format!("storage-node repair heal finalization failed: {err}"))?;
 
     Ok(StorageNodeRepairHealFinalization {
         repair_publications: repair_publications.to_vec(),
-        rebuilt_placements,
+        rebuilt_placements: cluster_finalization.rebuilt_placements,
     })
 }
 
@@ -242,14 +241,14 @@ pub fn publish_relocation_flow_commit_into_cluster_runtime(
     })
 }
 
-fn rebuilt_placements_from_repair_publications(
+fn rebuild_publications_from_repair_publications(
     repair_publications: &[StorageNodeRepairPlacementPublication],
-) -> Result<BTreeMap<u64, BTreeSet<u64>>, String> {
+) -> Result<Vec<RebuildFlowCommitPlacementPublication>, String> {
     if repair_publications.is_empty() {
         return Err("no repair placement publications supplied for heal finalization".into());
     }
 
-    let mut rebuilt_placements: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    let mut rebuild_publications = Vec::with_capacity(repair_publications.len());
     for publication in repair_publications {
         validate_repair_flow_commit_publication(&publication.repair_flow_publication)?;
 
@@ -283,13 +282,10 @@ fn rebuilt_placements_from_repair_publications(
             ));
         }
 
-        rebuilt_placements
-            .entry(placement.object_id)
-            .or_default()
-            .insert(placement.target_member);
+        rebuild_publications.push(placement);
     }
 
-    Ok(rebuilt_placements)
+    Ok(rebuild_publications)
 }
 
 fn validate_repair_flow_commit_publication(
@@ -5849,6 +5845,51 @@ mod cluster_pool_handler_tests {
                 .cloned()
                 .unwrap_or_default(),
             [2, 4].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn repair_publications_stale_runtime_publication_is_rejected() {
+        let (mut runtime, repair_publications, _source_receipts, repaired_receipts) =
+            cluster_runtime_with_verifying_heal_and_repair_publications();
+        let accepted = repair_publications
+            .iter()
+            .map(|publication| {
+                publish_repair_flow_commit_into_cluster_runtime(&mut runtime, publication)
+                    .expect("repair publication is accepted")
+            })
+            .collect::<Vec<_>>();
+
+        let newer_receipt = receipt_ref_for_object(
+            repaired_receipts[0].object_id,
+            b"storage-node-heal-a",
+            b"newer-payload-a",
+            3,
+        );
+        let newer_publication =
+            repair_flow_commit_publication(repaired_receipts[0], newer_receipt, 3, 10);
+        runtime
+            .publish_rebuild_flow_commit_result(&newer_publication.flow_commit_result)
+            .expect("newer placement publication supersedes accepted repair summary");
+
+        let err = finalize_cluster_runtime_heal_from_repair_publications(&mut runtime, &accepted)
+            .unwrap_err();
+
+        assert!(err.contains("not current in placement map"), "{err}");
+        assert_eq!(runtime.heal_state(), HealState::Verifying);
+        assert_eq!(
+            runtime
+                .placement_map()
+                .placement_receipt_ref(repaired_receipts[0].object_id),
+            Some(newer_receipt)
+        );
+        assert_eq!(
+            runtime
+                .placement_map()
+                .replicas_of(repaired_receipts[0].object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [1, 2, 3].into_iter().collect()
         );
     }
 
