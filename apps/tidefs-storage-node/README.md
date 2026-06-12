@@ -158,7 +158,18 @@ the repaired target `PlacementReceiptRef` as `ReplicaPlacementReceipt` /
 to execute the repair, record verified completion, and publish the repaired
 placement in one composed path. That is replicated-store-to-flow-commit
 publication plumbing only; replacement-node orchestration, cluster-state
-convergence, and reclaim publication remain separate #18 work. The cluster
+convergence, and reclaim publication remain separate #18 work. When the repair
+source was selected through the authoritative planned-read path, callers can
+use
+`TransportReplicatedStore::execute_receipt_repair_task_from_planned_read_and_record_completion()`
+or
+`TransportReplicatedStore::execute_receipt_repair_task_from_planned_read_record_completion_and_publish_flow_commit()`.
+These variants reuse the same target ack, repaired-receipt, completion, and
+flow-commit gates, but first require the planned-read source member,
+`PlacementReceiptRef`, payload length, and payload digest to match the
+scheduled `BackfillTask`. The planned-read bridge still does not perform
+replacement orchestration, cluster-wide convergence, degraded-read routing, or
+reclaim completion. The cluster
 placement map can consume the completed rebuild `FlowCommitResult` through
 `PlacementMap::publish_rebuild_flow_commit_result()` and update local
 cluster-visible repaired-placement state after validating subject, target,

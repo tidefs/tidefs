@@ -2511,7 +2511,32 @@ impl TransportReplicatedStore {
             task.payload_len,
         )?;
         validate_receipt_repair_payload(task, &payload)?;
+        self.send_receipt_repair_payload_to_target(task, payload)
+    }
 
+    /// Execute a receipt-bound repair from an already receipt-authoritative
+    /// planned-read result.
+    ///
+    /// This path is for callers that first used
+    /// [`Self::get_planned_with_required_receipt()`] to select and verify source
+    /// bytes. It preserves the same target ack and repaired-receipt validation as
+    /// [`Self::execute_receipt_repair_task()`], but refuses to repair if the
+    /// planned-read source, receipt, length, or digest differs from the scheduled
+    /// [`BackfillTask`].
+    pub fn execute_receipt_repair_task_from_planned_read(
+        &mut self,
+        task: &BackfillTask,
+        planned_read: &ReceiptBackedTransportPlannedReadResult,
+    ) -> Result<PlacementReceiptRef, String> {
+        validate_planned_read_repair_input(task, planned_read)?;
+        self.send_receipt_repair_payload_to_target(task, planned_read.payload.clone())
+    }
+
+    fn send_receipt_repair_payload_to_target(
+        &mut self,
+        task: &BackfillTask,
+        payload: Vec<u8>,
+    ) -> Result<PlacementReceiptRef, String> {
         let (target_node_id, data_session_id) = self
             .replicas
             .iter()
@@ -2578,15 +2603,12 @@ impl TransportReplicatedStore {
         Ok(repaired_receipt)
     }
 
-    /// Execute a receipt-bound repair and record verified rebuild completion
-    /// only after the target returns a repaired placement receipt.
-    pub fn execute_receipt_repair_task_and_record_completion(
-        &mut self,
+    fn record_receipt_repair_completion(
         task: &BackfillTask,
+        repaired_receipt: PlacementReceiptRef,
         completion: &mut RebuildCompletion,
         admission: &mut RebuildAdmission,
     ) -> Result<ReceiptRepairCompletionEvidence, String> {
-        let repaired_receipt = self.execute_receipt_repair_task(task)?;
         let completion_event = completion
             .record_receipt_verified_task_completion(task, repaired_receipt, admission)
             .map_err(|err| {
@@ -2609,6 +2631,32 @@ impl TransportReplicatedStore {
         })
     }
 
+    /// Execute a receipt-bound repair and record verified rebuild completion
+    /// only after the target returns a repaired placement receipt.
+    pub fn execute_receipt_repair_task_and_record_completion(
+        &mut self,
+        task: &BackfillTask,
+        completion: &mut RebuildCompletion,
+        admission: &mut RebuildAdmission,
+    ) -> Result<ReceiptRepairCompletionEvidence, String> {
+        let repaired_receipt = self.execute_receipt_repair_task(task)?;
+        Self::record_receipt_repair_completion(task, repaired_receipt, completion, admission)
+    }
+
+    /// Execute a planned-read-backed repair and record verified rebuild
+    /// completion only after the target returns a repaired placement receipt.
+    pub fn execute_receipt_repair_task_from_planned_read_and_record_completion(
+        &mut self,
+        task: &BackfillTask,
+        planned_read: &ReceiptBackedTransportPlannedReadResult,
+        completion: &mut RebuildCompletion,
+        admission: &mut RebuildAdmission,
+    ) -> Result<ReceiptRepairCompletionEvidence, String> {
+        let repaired_receipt =
+            self.execute_receipt_repair_task_from_planned_read(task, planned_read)?;
+        Self::record_receipt_repair_completion(task, repaired_receipt, completion, admission)
+    }
+
     /// Execute a receipt-bound repair, record verified rebuild completion, and
     /// publish the repaired placement receipt through flow-commit.
     ///
@@ -2629,6 +2677,38 @@ impl TransportReplicatedStore {
             .map_err(|err| {
                 format!(
                     "receipt-bound repair flow-commit publication failed for object {}: {err}",
+                    task.placement_receipt_ref.object_id
+                )
+            })?;
+
+        Ok(ReceiptRepairFlowCommitPublication {
+            repair_completion,
+            flow_commit_result,
+        })
+    }
+
+    /// Execute a planned-read-backed repair, record verified rebuild completion,
+    /// and publish the repaired placement receipt through flow-commit.
+    pub fn execute_receipt_repair_task_from_planned_read_record_completion_and_publish_flow_commit(
+        &mut self,
+        task: &BackfillTask,
+        planned_read: &ReceiptBackedTransportPlannedReadResult,
+        completion: &mut RebuildCompletion,
+        admission: &mut RebuildAdmission,
+        flow_commit: &mut FlowCommitCoordinator,
+    ) -> Result<ReceiptRepairFlowCommitPublication, String> {
+        let repair_completion = self
+            .execute_receipt_repair_task_from_planned_read_and_record_completion(
+                task,
+                planned_read,
+                completion,
+                admission,
+            )?;
+        let flow_commit_result = flow_commit
+            .publish_verified_rebuild_completion(repair_completion.verified_receipt_completion)
+            .map_err(|err| {
+                format!(
+                    "planned-read-backed repair flow-commit publication failed for object {}: {err}",
                     task.placement_receipt_ref.object_id
                 )
             })?;
@@ -2978,6 +3058,37 @@ fn validate_receipt_repair_payload(task: &BackfillTask, payload: &[u8]) -> Resul
         ));
     }
     Ok(())
+}
+
+fn validate_planned_read_repair_input(
+    task: &BackfillTask,
+    planned_read: &ReceiptBackedTransportPlannedReadResult,
+) -> Result<(), String> {
+    validate_receipt_repair_task(task)?;
+
+    let planned_receipt = planned_read.placement_receipt_ref;
+    if planned_receipt.is_synthetic() {
+        return Err(format!(
+            "planned-read-backed repair for object {} requires non-synthetic placement receipt evidence",
+            planned_receipt.object_id
+        ));
+    }
+    if planned_read.source_member_id != task.source_member.0 {
+        return Err(format!(
+            "planned-read-backed repair source mismatch for object {}: planned read source {} task source {}",
+            task.placement_receipt_ref.object_id,
+            planned_read.source_member_id,
+            task.source_member.0
+        ));
+    }
+    if planned_receipt != task.placement_receipt_ref {
+        return Err(format!(
+            "planned-read-backed repair receipt mismatch for object {}",
+            task.placement_receipt_ref.object_id
+        ));
+    }
+
+    validate_receipt_repair_payload(task, &planned_read.payload)
 }
 
 impl ReceiptSegmentSource for TransportReplicatedStore {
@@ -5636,6 +5747,226 @@ mod tests {
                 admission.status(task.target_member),
                 tidefs_rebuild_runtime::admission::RebuildAdmissionStatus::Completed
             );
+        }
+
+        #[test]
+        fn planned_read_repair_records_verified_completion_without_segment_fetch() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let target_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut target = TransportReplicatedStore::open(
+                target_dir.path(),
+                3,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 1670u64;
+            let payload = b"planned read repair completion payload".to_vec();
+            let receipt_key =
+                tidefs_local_object_store::ObjectKey::from_name(b"issue-167-planned-repair");
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &payload, 80);
+            let mut repaired_receipt = receipt;
+            repaired_receipt.receipt_generation = 81;
+            let task = backfill_task_for_receipt(receipt, 2, 3);
+            let planned_read = ReceiptBackedTransportPlannedReadResult {
+                payload: payload.clone(),
+                source_member_id: 2,
+                placement_receipt_ref: receipt,
+            };
+            let (mut completion, mut admission) = rebuild_state_for_task(&task);
+
+            let (_target_client_session, target_server_session) =
+                connect_replica_pair(&mut primary, &mut target, 3);
+            let target_server = spawn_repair_target(
+                target,
+                target_server_session,
+                receipt,
+                Some(repaired_receipt),
+            );
+
+            let evidence = primary
+                .execute_receipt_repair_task_from_planned_read_and_record_completion(
+                    &task,
+                    &planned_read,
+                    &mut completion,
+                    &mut admission,
+                )
+                .expect("planned-read-backed repair records completion");
+
+            assert_eq!(target_server.join().unwrap(), payload);
+            assert_eq!(evidence.repaired_placement_receipt_ref, repaired_receipt);
+            assert_eq!(
+                evidence.verified_receipt_completion,
+                tidefs_rebuild_runtime::completion::VerifiedReceiptCompletionRecord {
+                    target_member: task.target_member,
+                    subject_ref: task.subject_ref,
+                    source_placement_receipt_ref: task.placement_receipt_ref,
+                    repaired_placement_receipt_ref: repaired_receipt,
+                }
+            );
+            assert!(evidence.completion_event.unwrap().fully_successful);
+            assert_eq!(
+                completion
+                    .status(task.target_member)
+                    .unwrap()
+                    .subjects_completed,
+                1
+            );
+            assert_eq!(
+                admission.status(task.target_member),
+                tidefs_rebuild_runtime::admission::RebuildAdmissionStatus::Completed
+            );
+        }
+
+        #[test]
+        fn planned_read_repair_publishes_verified_completion_to_flow_commit() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let target_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut target = TransportReplicatedStore::open(
+                target_dir.path(),
+                3,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 1671u64;
+            let payload = b"planned read repair flow commit payload".to_vec();
+            let receipt_key =
+                tidefs_local_object_store::ObjectKey::from_name(b"issue-167-planned-flow");
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &payload, 82);
+            let mut repaired_receipt = receipt;
+            repaired_receipt.receipt_generation = 83;
+            let task = backfill_task_for_receipt(receipt, 2, 3);
+            let planned_read = ReceiptBackedTransportPlannedReadResult {
+                payload: payload.clone(),
+                source_member_id: 2,
+                placement_receipt_ref: receipt,
+            };
+            let (mut completion, mut admission) = rebuild_state_for_task(&task);
+            let mut flow_commit = FlowCommitCoordinator::new(EpochId::new(7));
+
+            let (_target_client_session, target_server_session) =
+                connect_replica_pair(&mut primary, &mut target, 3);
+            let target_server = spawn_repair_target(
+                target,
+                target_server_session,
+                receipt,
+                Some(repaired_receipt),
+            );
+
+            let publication = primary
+                .execute_receipt_repair_task_from_planned_read_record_completion_and_publish_flow_commit(
+                    &task,
+                    &planned_read,
+                    &mut completion,
+                    &mut admission,
+                    &mut flow_commit,
+                )
+                .expect("planned-read-backed repair publishes flow commit");
+
+            assert_eq!(target_server.join().unwrap(), payload);
+            assert_eq!(
+                publication.repair_completion.repaired_placement_receipt_ref,
+                repaired_receipt
+            );
+            assert_eq!(
+                publication
+                    .flow_commit_result
+                    .placement_receipt
+                    .placement_receipt_refs,
+                vec![repaired_receipt]
+            );
+            assert_eq!(
+                publication.flow_commit_result.updated_copy.subject_ref,
+                task.subject_ref
+            );
+            assert_eq!(
+                publication.flow_commit_result.updated_copy.member_ref,
+                task.target_member
+            );
+            assert_eq!(
+                publication.flow_commit_result.flow_class,
+                tidefs_replication_model::FlowCommitClass::Rebuild
+            );
+            assert_eq!(
+                flow_commit.commit_results,
+                vec![publication.flow_commit_result.clone()]
+            );
+            assert_eq!(flow_commit.placement_receipts.len(), 1);
+        }
+
+        #[test]
+        fn planned_read_repair_rejects_mismatched_evidence_before_target_send() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 1672u64;
+            let payload = b"planned read repair mismatch payload".to_vec();
+            let receipt_key =
+                tidefs_local_object_store::ObjectKey::from_name(b"issue-167-mismatch");
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &payload, 84);
+            let task = backfill_task_for_receipt(receipt, 2, 3);
+
+            let source_mismatch = ReceiptBackedTransportPlannedReadResult {
+                payload: payload.clone(),
+                source_member_id: 4,
+                placement_receipt_ref: receipt,
+            };
+            let err = primary
+                .execute_receipt_repair_task_from_planned_read(&task, &source_mismatch)
+                .unwrap_err();
+            assert!(err.contains("source mismatch"));
+
+            let synthetic_receipt = ReceiptBackedTransportPlannedReadResult {
+                payload: payload.clone(),
+                source_member_id: 2,
+                placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(task.subject_ref),
+            };
+            let err = primary
+                .execute_receipt_repair_task_from_planned_read(&task, &synthetic_receipt)
+                .unwrap_err();
+            assert!(err.contains("requires non-synthetic placement receipt"));
+
+            let mut stale_receipt = receipt;
+            stale_receipt.receipt_generation += 1;
+            let receipt_mismatch = ReceiptBackedTransportPlannedReadResult {
+                payload: payload.clone(),
+                source_member_id: 2,
+                placement_receipt_ref: stale_receipt,
+            };
+            let err = primary
+                .execute_receipt_repair_task_from_planned_read(&task, &receipt_mismatch)
+                .unwrap_err();
+            assert!(err.contains("receipt mismatch"));
+
+            let mut tampered_payload = payload.clone();
+            tampered_payload[0] ^= 0x01;
+            let digest_mismatch = ReceiptBackedTransportPlannedReadResult {
+                payload: tampered_payload,
+                source_member_id: 2,
+                placement_receipt_ref: receipt,
+            };
+            let err = primary
+                .execute_receipt_repair_task_from_planned_read(&task, &digest_mismatch)
+                .unwrap_err();
+            assert!(err.contains("source digest mismatch"));
         }
 
         #[test]
