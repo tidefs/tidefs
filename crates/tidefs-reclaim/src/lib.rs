@@ -29,6 +29,7 @@ use std::{
     fmt,
 };
 
+use tidefs_reclaim_queue_core::DeadObjectReclaimQueue;
 use tidefs_types_reclaim_queue_core::{ObjectKey, ReclaimQueueEntry};
 
 /// Configuration for the reclaim pipeline.
@@ -577,6 +578,30 @@ impl ReclaimConsumerStats {
     }
 }
 
+/// Result of one receipt-bound dead-object drain.
+///
+/// The consumer does not mutate the source [`DeadObjectReclaimQueue`]. After
+/// the caller has durably persisted queue state, it can pass
+/// [`ack_object_ids`](Self::ack_object_ids) to
+/// [`DeadObjectReclaimQueue::ack_reclaimed`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReceiptBoundDeadObjectDrain {
+    /// Segment reclaim accounting for this drain.
+    pub stats: ReclaimConsumerStats,
+    /// Exact dead-object ids whose segment liveness delta was applied and may
+    /// be acknowledged after queue persistence succeeds.
+    pub ack_object_ids: Vec<ObjectKey>,
+}
+
+impl ReceiptBoundDeadObjectDrain {
+    /// True when the drain selected no acknowledgeable dead objects and freed
+    /// no segments.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.stats.is_idle() && self.ack_object_ids.is_empty()
+    }
+}
+
 /// Errors that can occur during a drain cycle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DrainError<R: fmt::Debug + fmt::Display, F: fmt::Debug + fmt::Display> {
@@ -706,6 +731,94 @@ where
     Ok(stats)
 }
 
+/// Drain receipt-authorized dead objects into segment liveness accounting.
+///
+/// This is the release-facing dead-object physical reclaim entry point: it
+/// selects candidates through
+/// [`DeadObjectReclaimQueue::dequeue_receipt_bound_batch`] so legacy,
+/// synthetic, malformed, under-width, ineligible, or not-yet-stable entries
+/// remain queued. The caller owns source-queue mutation and should acknowledge
+/// only the returned object ids after any queue persistence succeeds.
+pub fn drain_receipt_bound_dead_objects<R, F>(
+    queue: &DeadObjectReclaimQueue,
+    stable_committed_txg: u64,
+    max_count: usize,
+    resolver: &impl SegmentResolver<Error = R>,
+    freer: &mut impl SegmentFreer<Error = F>,
+    live_counts: &mut SegmentLiveCounts,
+    config: &ReclaimConsumerConfig,
+) -> Result<ReceiptBoundDeadObjectDrain, DrainError<R, F>>
+where
+    R: fmt::Debug + fmt::Display,
+    F: fmt::Debug + fmt::Display,
+{
+    let limit = max_count.min(config.max_entries_per_drain);
+    let mut stats = ReclaimConsumerStats {
+        reclaim_queue_depth: queue.len(),
+        ..ReclaimConsumerStats::ZERO
+    };
+
+    if limit == 0 || queue.is_empty() {
+        return Ok(ReceiptBoundDeadObjectDrain {
+            stats,
+            ack_object_ids: Vec::new(),
+        });
+    }
+
+    let entries = queue.dequeue_receipt_bound_batch(limit, stable_committed_txg);
+    if entries.is_empty() {
+        return Ok(ReceiptBoundDeadObjectDrain {
+            stats,
+            ack_object_ids: Vec::new(),
+        });
+    }
+
+    let mut segment_entries: HashMap<u64, Vec<ObjectKey>> = HashMap::new();
+    let mut ack_object_ids = Vec::with_capacity(entries.len());
+
+    for entry in &entries {
+        let key = entry.object_id;
+        let Some(segment_id) = resolver
+            .resolve(&key)
+            .map_err(|error| DrainError::ResolveError { key, error })?
+        else {
+            continue;
+        };
+
+        live_counts.apply_delta(segment_id, -1);
+        segment_entries.entry(segment_id).or_default().push(key);
+        ack_object_ids.push(key);
+        stats.entries_processed += 1;
+    }
+
+    let dead_segments: Vec<u64> = segment_entries
+        .keys()
+        .copied()
+        .filter(|sid| live_counts.is_dead(*sid))
+        .collect();
+
+    for batch in dead_segments.chunks(config.max_free_batch) {
+        for &segment_id in batch {
+            freer
+                .free_segment(segment_id)
+                .map_err(|error| DrainError::FreeError { segment_id, error })?;
+            live_counts.remove(segment_id);
+            stats.segments_reclaimed += 1;
+            stats.blocks_freed += segment_entries
+                .get(&segment_id)
+                .map_or(0, |entries| entries.len() as u64);
+        }
+        stats.checkpoint_batches += 1;
+    }
+
+    stats.reclaim_queue_depth = queue.len().saturating_sub(ack_object_ids.len());
+
+    Ok(ReceiptBoundDeadObjectDrain {
+        stats,
+        ack_object_ids,
+    })
+}
+
 // =========================================================================
 // PoolAllocator SegmentFreer implementation
 // =========================================================================
@@ -793,6 +906,31 @@ impl ReclaimConsumerService {
     {
         drain_reclaim_queue(
             entries,
+            resolver,
+            freer,
+            &mut self.live_counts,
+            &self.config,
+        )
+    }
+
+    /// Drain receipt-authorized dead objects while preserving queue mutation
+    /// authority for the caller.
+    pub fn drain_receipt_bound_dead_objects<R, F>(
+        &mut self,
+        queue: &DeadObjectReclaimQueue,
+        stable_committed_txg: u64,
+        max_count: usize,
+        resolver: &impl SegmentResolver<Error = R>,
+        freer: &mut impl SegmentFreer<Error = F>,
+    ) -> Result<ReceiptBoundDeadObjectDrain, DrainError<R, F>>
+    where
+        R: fmt::Debug + fmt::Display,
+        F: fmt::Debug + fmt::Display,
+    {
+        drain_receipt_bound_dead_objects(
+            queue,
+            stable_committed_txg,
+            max_count,
             resolver,
             freer,
             &mut self.live_counts,
@@ -1523,6 +1661,38 @@ mod tests {
         )
     }
 
+    fn receipt_for(
+        key: ObjectKey,
+        generation: u64,
+    ) -> tidefs_types_reclaim_queue_core::DeadObjectReplacementReceipt {
+        let mut digest = [0u8; 32];
+        digest[0] = key.0[0];
+        digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        tidefs_types_reclaim_queue_core::DeadObjectReplacementReceipt::replicated(
+            key, 1, generation, 2, 4096, digest,
+        )
+    }
+
+    fn dead_entry(
+        id: u8,
+        death_commit_group: u64,
+        eligible: bool,
+        receipt_generation: Option<u64>,
+    ) -> tidefs_types_reclaim_queue_core::DeadObjectEntry {
+        let key = obj_key(id);
+        let entry = tidefs_types_reclaim_queue_core::DeadObjectEntry::new(
+            key,
+            [id; 16],
+            death_commit_group,
+            eligible,
+            death_commit_group,
+        );
+        match receipt_generation {
+            Some(generation) => entry.with_replacement_receipt(receipt_for(key, generation)),
+            None => entry,
+        }
+    }
+
     // -- drain_reclaim_queue tests --
 
     #[test]
@@ -1745,6 +1915,141 @@ mod tests {
             }
             _ => panic!("expected FreeError"),
         }
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_frees_authorized_segment() {
+        let mut queue = DeadObjectReclaimQueue::new();
+        queue.enqueue(dead_entry(1, 5, true, Some(10)));
+        queue.enqueue(dead_entry(2, 5, true, Some(11)));
+        queue.enqueue(dead_entry(3, 5, true, None));
+
+        let mut resolver = MockResolver::new();
+        resolver.set(1, 100);
+        resolver.set(2, 100);
+        resolver.set(3, 100);
+
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.set_live_count(100, 2);
+        let mut freer = MockFreer::new();
+        let config = ReclaimConsumerConfig::default();
+
+        let drain = drain_receipt_bound_dead_objects(
+            &queue,
+            6,
+            16,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+        )
+        .expect("receipt-bound drain");
+
+        assert_eq!(drain.ack_object_ids, vec![obj_key(1), obj_key(2)]);
+        assert_eq!(drain.stats.entries_processed, 2);
+        assert_eq!(drain.stats.segments_reclaimed, 1);
+        assert_eq!(drain.stats.blocks_freed, 2);
+        assert_eq!(drain.stats.reclaim_queue_depth, 1);
+        assert_eq!(freer.freed_segments(), vec![100]);
+        assert!(live_counts.is_dead(100));
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_refuses_legacy_and_unstable_entries() {
+        let mut queue = DeadObjectReclaimQueue::new();
+        queue.enqueue(dead_entry(1, 5, true, None));
+        queue.enqueue(dead_entry(2, 5, true, Some(0)));
+        queue.enqueue(dead_entry(3, 7, true, Some(12)));
+        queue.enqueue(dead_entry(4, 5, false, Some(13)));
+
+        let mut resolver = MockResolver::new();
+        for id in 1..=4u8 {
+            resolver.set(id, 100);
+        }
+
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.set_live_count(100, 4);
+        let mut freer = MockFreer::new();
+        let config = ReclaimConsumerConfig::default();
+
+        let drain = drain_receipt_bound_dead_objects(
+            &queue,
+            6,
+            16,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+        )
+        .expect("receipt-bound drain");
+
+        assert!(drain.is_idle());
+        assert_eq!(drain.stats.reclaim_queue_depth, 4);
+        assert_eq!(live_counts.live_count(100), 4);
+        assert!(freer.freed_segments().is_empty());
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_respects_service_limit() {
+        let mut queue = DeadObjectReclaimQueue::new();
+        for id in 1..=4u8 {
+            queue.enqueue(dead_entry(id, 5, true, Some(id as u64 + 10)));
+        }
+
+        let mut resolver = MockResolver::new();
+        for id in 1..=4u8 {
+            resolver.set(id, 200);
+        }
+
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.set_live_count(200, 4);
+        let mut freer = MockFreer::new();
+        let config = ReclaimConsumerConfig {
+            max_entries_per_drain: 2,
+            ..ReclaimConsumerConfig::default()
+        };
+
+        let drain = drain_receipt_bound_dead_objects(
+            &queue,
+            6,
+            4,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+        )
+        .expect("receipt-bound drain");
+
+        assert_eq!(drain.ack_object_ids, vec![obj_key(1), obj_key(2)]);
+        assert_eq!(drain.stats.entries_processed, 2);
+        assert_eq!(drain.stats.segments_reclaimed, 0);
+        assert_eq!(drain.stats.reclaim_queue_depth, 2);
+        assert_eq!(live_counts.live_count(200), 2);
+        assert!(freer.freed_segments().is_empty());
+    }
+
+    #[test]
+    fn consumer_service_drains_receipt_bound_dead_objects() {
+        let mut queue = DeadObjectReclaimQueue::new();
+        queue.enqueue(dead_entry(8, 5, true, Some(18)));
+
+        let mut resolver = MockResolver::new();
+        resolver.set(8, 300);
+
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.set_live_count(300, 1);
+        let mut service =
+            ReclaimConsumerService::new(ReclaimConsumerConfig::default(), live_counts);
+        let mut freer = MockFreer::new();
+
+        let drain = service
+            .drain_receipt_bound_dead_objects(&queue, 6, 8, &resolver, &mut freer)
+            .expect("service receipt-bound drain");
+
+        assert_eq!(drain.ack_object_ids, vec![obj_key(8)]);
+        assert_eq!(drain.stats.segments_reclaimed, 1);
+        assert_eq!(freer.freed_segments(), vec![300]);
+        assert!(service.live_counts().is_dead(300));
     }
 
     // -- SegmentLiveCounts tests --
