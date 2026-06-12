@@ -2,7 +2,7 @@
 //! put/get/delete/list/stats operations backed by a ReplicatedObjectStore,
 //! plus send/receive backed by a LocalFileSystem at a configured fs_root.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +17,7 @@ use tidefs_cluster::pool_protocol::{
 };
 use tidefs_cluster::{ClusterLeaseConfig, ClusterLeaseRuntime, FenceAuthority, FenceValidator};
 use tidefs_cluster::{ClusterPlacementPolicy, ClusterRedundancy};
+use tidefs_durability_layout::DurabilityLayoutV1;
 use tidefs_local_filesystem::{self as vfs, ChangedRecordExport, RootAuthenticationKey};
 use tidefs_local_object_store::device_layout::DeviceMediaClass;
 use tidefs_local_object_store::pool::{
@@ -29,7 +30,7 @@ use tidefs_local_object_store::{
 };
 use tidefs_membership_epoch::session_binding::{RosterSessionRegistry, SessionAcceptor};
 use tidefs_membership_epoch::EpochId;
-use tidefs_membership_epoch::{MemberClass, MemberId};
+use tidefs_membership_epoch::{DomainId, HealthClass, MemberClass, MemberId};
 use tidefs_membership_live::connection_acceptance::ConnectionAcceptor;
 use tidefs_membership_live::peer_eviction::EvictionAction;
 use tidefs_membership_live::peer_join::PeerJoinHandshake;
@@ -46,6 +47,11 @@ use tidefs_partition_runtime::types::PartitionFence;
 use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
 use tidefs_pool_import::{pool_import, ImportedPool};
 use tidefs_pool_scan::PoolDeviceBacking;
+use tidefs_rebuild_planner::plan::ReconstructionTaskReceiptError;
+use tidefs_rebuild_planner::planner::{
+    plan_reconstruction, ReceiptBackedObjectPlacement, ReconstructionInput,
+    ReconstructionPlanningError,
+};
 use tidefs_rebuild_runtime::admission::{LossRecord, RebuildAdmission, ReceiptIngestionError};
 use tidefs_rebuild_runtime::scheduler::BackfillScheduler;
 use tidefs_replicated_object_store::{
@@ -53,7 +59,8 @@ use tidefs_replicated_object_store::{
     TransportReplicatedStoreConfig,
 };
 use tidefs_replication_model::{
-    PlacementReceiptRef, ReplicaMovementClass, ReplicatedReadClass, ReplicatedReadPlan,
+    PlacementReceiptRef, ReceiptRedundancyPolicy, ReplicaMovementClass, ReplicatedReadClass,
+    ReplicatedReadPlan,
 };
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
@@ -483,6 +490,30 @@ fn configured_rebuild_target_members(config: &StorageNodeConfig) -> Vec<MemberId
     targets.into_iter().collect()
 }
 
+fn local_failure_domain(config: &StorageNodeConfig) -> DomainId {
+    DomainId::new(config.failure_domain.unwrap_or(config.node_id))
+}
+
+fn configured_rebuild_target_failure_domains(
+    config: &StorageNodeConfig,
+) -> BTreeMap<MemberId, DomainId> {
+    let local = MemberId::new(config.node_id);
+    let mut domains = BTreeMap::new();
+    for peer in config
+        .replica_peers
+        .iter()
+        .chain(config.membership_peers.iter())
+    {
+        let member = MemberId::new(peer.node_id);
+        if member != local {
+            domains
+                .entry(member)
+                .or_insert_with(|| DomainId::new(peer.failure_domain));
+        }
+    }
+    domains
+}
+
 fn receipt_ingestion_error_json(error: ReceiptIngestionError) -> serde_json::Value {
     match error {
         ReceiptIngestionError::SyntheticReceiptRef { object_id } => serde_json::json!({
@@ -503,6 +534,62 @@ fn receipt_ingestion_error_json(error: ReceiptIngestionError) -> serde_json::Val
             "required": required,
             "actual": actual,
         }),
+    }
+}
+
+fn placement_receipt_error_json(
+    object_id: u64,
+    reason: ReconstructionTaskReceiptError,
+) -> serde_json::Value {
+    match reason {
+        ReconstructionTaskReceiptError::SyntheticReceipt => serde_json::json!({
+            "class": "synthetic-receipt-ref",
+            "object_id": object_id,
+        }),
+        ReconstructionTaskReceiptError::MalformedRedundancyPolicy => serde_json::json!({
+            "class": "malformed-receipt-policy",
+            "object_id": object_id,
+        }),
+        ReconstructionTaskReceiptError::UnderWidthReceipt {
+            target_count,
+            required_count,
+        } => serde_json::json!({
+            "class": "insufficient-receipt-targets",
+            "object_id": object_id,
+            "required": required_count,
+            "actual": target_count,
+        }),
+    }
+}
+
+fn reconstruction_planning_error_json(error: ReconstructionPlanningError) -> serde_json::Value {
+    match error {
+        ReconstructionPlanningError::ReceiptObjectIdMismatch {
+            object_id,
+            receipt_object_id,
+        } => serde_json::json!({
+            "class": "receipt-object-id-mismatch",
+            "object_id": object_id,
+            "receipt_object_id": receipt_object_id,
+        }),
+        ReconstructionPlanningError::InvalidPlacementReceipt { object_id, reason } => {
+            placement_receipt_error_json(object_id, reason)
+        }
+    }
+}
+
+fn durability_layout_from_receipt_policy(
+    policy: ReceiptRedundancyPolicy,
+) -> Result<DurabilityLayoutV1, String> {
+    match policy {
+        ReceiptRedundancyPolicy::Replicated { copies } => {
+            DurabilityLayoutV1::mirror(copies).map_err(|err| format!("{err:?}"))
+        }
+        ReceiptRedundancyPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        } => DurabilityLayoutV1::erasure(data_shards, parity_shards)
+            .map_err(|err| format!("{err:?}")),
     }
 }
 
@@ -615,10 +702,216 @@ fn receipt_backed_rebuild_admission_from_refs_json(
     })
 }
 
+fn receipt_backed_rebuild_planner_json(
+    config: &StorageNodeConfig,
+    store: &StoreBackend,
+) -> serde_json::Value {
+    let StoreBackend::PoolBacked(pool) = store else {
+        return serde_json::json!({
+            "available": false,
+            "preview": false,
+            "receipt_ref_count": 0,
+            "task_count": 0,
+            "reason": "compatibility object-store backend does not expose pool placement receipts; rebuild planner preview requires Pool::placement_receipt_refs authority",
+        });
+    };
+
+    let receipt_refs = match pool.placement_receipt_refs(ObjectIoClass::Data) {
+        Ok(refs) => refs,
+        Err(e) => {
+            return serde_json::json!({
+                "available": false,
+                "preview": true,
+                "receipt_ref_count": 0,
+                "task_count": 0,
+                "reason": format!("pool placement receipt scan failed: {e}"),
+            });
+        }
+    };
+
+    receipt_backed_rebuild_planner_from_refs_json(config, receipt_refs)
+}
+
+fn receipt_backed_rebuild_planner_from_refs_json(
+    config: &StorageNodeConfig,
+    receipt_refs: Vec<PlacementReceiptRef>,
+) -> serde_json::Value {
+    let receipt_ref_count = receipt_refs.len();
+    let detected_epoch = receipt_refs
+        .iter()
+        .map(|receipt| receipt.receipt_epoch.0)
+        .max()
+        .unwrap_or(0);
+    let local_member = MemberId::new(config.node_id);
+    let target_members = configured_rebuild_target_members(config);
+    if target_members.is_empty() {
+        return serde_json::json!({
+            "available": false,
+            "preview": true,
+            "receipt_ref_count": receipt_ref_count,
+            "task_count": 0,
+            "detected_epoch": detected_epoch,
+            "healthy_sources": [local_member],
+            "candidate_targets": [],
+            "reason": "pool placement receipts are present but no remote membership or replica peer is configured as a rebuild target",
+        });
+    }
+
+    if receipt_refs.is_empty() {
+        return serde_json::json!({
+            "available": true,
+            "preview": true,
+            "receipt_ref_count": 0,
+            "task_count": 0,
+            "detected_epoch": detected_epoch,
+            "healthy_sources": [local_member],
+            "candidate_targets": target_members,
+            "tasks": [],
+            "reason": "pool placement receipt inventory is empty",
+        });
+    }
+
+    let policy = receipt_refs[0].redundancy_policy;
+    let mut placement_members = BTreeSet::new();
+    placement_members.insert(local_member);
+    let mut object_placement = BTreeMap::new();
+    for receipt in receipt_refs {
+        if receipt.redundancy_policy != policy {
+            return serde_json::json!({
+                "available": false,
+                "preview": true,
+                "receipt_ref_count": receipt_ref_count,
+                "task_count": 0,
+                "detected_epoch": detected_epoch,
+                "planner_error": {
+                    "class": "mixed-receipt-redundancy-policy",
+                    "object_id": receipt.object_id,
+                    "expected": policy,
+                    "actual": receipt.redundancy_policy,
+                },
+            });
+        }
+        let placement = match ReceiptBackedObjectPlacement::new(receipt, placement_members.clone())
+        {
+            Ok(placement) => placement,
+            Err(reason) => {
+                return serde_json::json!({
+                    "available": false,
+                    "preview": true,
+                    "receipt_ref_count": receipt_ref_count,
+                    "task_count": 0,
+                    "detected_epoch": detected_epoch,
+                    "planner_error": placement_receipt_error_json(receipt.object_id, reason),
+                });
+            }
+        };
+        if object_placement
+            .insert(receipt.object_id, placement)
+            .is_some()
+        {
+            return serde_json::json!({
+                "available": false,
+                "preview": true,
+                "receipt_ref_count": receipt_ref_count,
+                "task_count": 0,
+                "detected_epoch": detected_epoch,
+                "planner_error": {
+                    "class": "duplicate-placement-receipt-object",
+                    "object_id": receipt.object_id,
+                },
+            });
+        }
+    }
+
+    let layout = match durability_layout_from_receipt_policy(policy) {
+        Ok(layout) => layout,
+        Err(reason) => {
+            return serde_json::json!({
+                "available": false,
+                "preview": true,
+                "receipt_ref_count": receipt_ref_count,
+                "task_count": 0,
+                "detected_epoch": detected_epoch,
+                "layout_error": {
+                    "class": "invalid-receipt-redundancy-policy",
+                    "reason": reason,
+                },
+            });
+        }
+    };
+
+    let mut member_health = BTreeMap::new();
+    member_health.insert(local_member, HealthClass::Healthy);
+    for member in &target_members {
+        member_health.insert(*member, HealthClass::Healthy);
+    }
+
+    let mut failure_domains = configured_rebuild_target_failure_domains(config);
+    failure_domains.insert(local_member, local_failure_domain(config));
+    let input = ReconstructionInput {
+        layout,
+        member_health,
+        failed_nodes: BTreeSet::new(),
+        failed_device_count: 0,
+        object_placement,
+        in_flight_objects: BTreeSet::new(),
+        failure_domains,
+        plan_id: detected_epoch,
+        now_ns: 0,
+    };
+
+    let plan = match plan_reconstruction(&input) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return serde_json::json!({
+                "available": false,
+                "preview": true,
+                "receipt_ref_count": receipt_ref_count,
+                "task_count": 0,
+                "detected_epoch": detected_epoch,
+                "planner_error": reconstruction_planning_error_json(error),
+            });
+        }
+    };
+
+    let tasks = plan
+        .tasks
+        .iter()
+        .map(|task| {
+            serde_json::json!({
+                "object_id": task.object_id(),
+                "placement_receipt_ref": task.placement_receipt_ref,
+                "source_nodes": &task.source_nodes,
+                "target_nodes": &task.target_nodes,
+                "data_range": task.data_range,
+                "priority": task.priority,
+            })
+        })
+        .collect::<Vec<_>>();
+    let task_count = plan.task_count();
+    let total_target_replicas = plan.total_target_replicas();
+
+    serde_json::json!({
+        "available": true,
+        "preview": true,
+        "boundary": "storage-node-scrub-rebuild-planner-preview",
+        "receipt_ref_count": receipt_ref_count,
+        "detected_epoch": detected_epoch,
+        "healthy_sources": [local_member],
+        "candidate_targets": target_members,
+        "failed_nodes": [],
+        "plan_id": plan.plan_id,
+        "task_count": task_count,
+        "total_target_replicas": total_target_replicas,
+        "tasks": tasks,
+    })
+}
+
 fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> (String, u64) {
     let placement_receipt_refs = placement_receipt_inventory_json(store);
     let placement_receipt_ref_count = placement_receipt_refs["count"].as_u64().unwrap_or(0);
     let rebuild_admission = receipt_backed_rebuild_admission_json(config, store);
+    let rebuild_planner = receipt_backed_rebuild_planner_json(config, store);
     if matches!(store, StoreBackend::PoolBacked(_)) {
         let json = serde_json::json!({
             "backend": "pool",
@@ -631,6 +924,7 @@ fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> 
             "placement_receipt_ref_count": placement_receipt_ref_count,
             "placement_receipt_refs": placement_receipt_refs,
             "rebuild_admission": rebuild_admission,
+            "rebuild_planner": rebuild_planner,
         });
         return (json.to_string(), 0);
     }
@@ -652,6 +946,7 @@ fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> 
                 "placement_receipt_ref_count": placement_receipt_ref_count,
                 "placement_receipt_refs": placement_receipt_refs,
                 "rebuild_admission": rebuild_admission,
+                "rebuild_planner": rebuild_planner,
             });
             (json.to_string(), findings)
         }
@@ -661,6 +956,7 @@ fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> 
                 "placement_receipt_ref_count": placement_receipt_ref_count,
                 "placement_receipt_refs": placement_receipt_refs,
                 "rebuild_admission": rebuild_admission,
+                "rebuild_planner": rebuild_planner,
             });
             (json.to_string(), 0)
         }
@@ -4433,10 +4729,18 @@ mod cluster_pool_handler_tests {
             .as_str()
             .unwrap()
             .contains("does not expose pool placement receipts"));
+
+        let planner = receipt_backed_rebuild_planner_json(&minimal_config(), &backend);
+        assert_eq!(planner["available"], false);
+        assert_eq!(planner["task_count"], 0);
+        assert!(planner["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not expose pool placement receipts"));
     }
 
     #[test]
-    fn rebuild_admission_rejects_invalid_receipt_refs() {
+    fn receipt_backed_rebuild_previews_reject_invalid_receipt_refs() {
         let payload = b"invalid-receipt-payload";
         let object_key = ObjectKey::from_bytes32([0xE4; 32]);
         let mut under_width = receipt_ref_for_key(object_key, payload, 1);
@@ -4455,6 +4759,32 @@ mod cluster_pool_handler_tests {
         assert_eq!(admission["receipt_ingestion_error"]["required"], 2);
         assert_eq!(admission["receipt_ingestion_error"]["actual"], 1);
 
+        let planner = receipt_backed_rebuild_planner_from_refs_json(
+            &config_with_rebuild_peer(),
+            vec![under_width],
+        );
+        assert_eq!(planner["available"], false);
+        assert_eq!(planner["receipt_ref_count"], 1);
+        assert_eq!(
+            planner["planner_error"]["class"],
+            "insufficient-receipt-targets"
+        );
+        assert_eq!(planner["planner_error"]["required"], 2);
+        assert_eq!(planner["planner_error"]["actual"], 1);
+
+        let mut malformed = receipt_ref_for_key(object_key, payload, 2);
+        malformed.redundancy_policy = ReceiptRedundancyPolicy::Replicated { copies: 0 };
+        malformed.target_count = 0;
+        let planner = receipt_backed_rebuild_planner_from_refs_json(
+            &config_with_rebuild_peer(),
+            vec![malformed],
+        );
+        assert_eq!(planner["available"], false);
+        assert_eq!(
+            planner["planner_error"]["class"],
+            "malformed-receipt-policy"
+        );
+
         let synthetic = PlacementReceiptRef::synthetic_for_subject(
             tidefs_replication_model::ReplicatedSubjectId::new(99),
         );
@@ -4467,6 +4797,13 @@ mod cluster_pool_handler_tests {
             admission["receipt_ingestion_error"]["class"],
             "synthetic-receipt-ref"
         );
+
+        let planner = receipt_backed_rebuild_planner_from_refs_json(
+            &config_with_rebuild_peer(),
+            vec![synthetic],
+        );
+        assert_eq!(planner["available"], false);
+        assert_eq!(planner["planner_error"]["class"], "synthetic-receipt-ref");
     }
 
     #[test]
@@ -4794,17 +5131,47 @@ mod cluster_pool_handler_tests {
         assert_eq!(report["rebuild_admission"]["report_count"], 1);
         assert_eq!(report["rebuild_admission"]["intent_count"], 1);
         assert_eq!(report["rebuild_admission"]["scheduled_task_count"], 1);
+        assert_eq!(report["rebuild_planner"]["available"], true);
+        assert_eq!(report["rebuild_planner"]["preview"], true);
+        assert_eq!(
+            report["rebuild_planner"]["boundary"],
+            "storage-node-scrub-rebuild-planner-preview"
+        );
+        assert_eq!(report["rebuild_planner"]["receipt_ref_count"], 1);
+        assert_eq!(
+            report["rebuild_planner"]["healthy_sources"],
+            serde_json::json!([1])
+        );
+        assert_eq!(
+            report["rebuild_planner"]["candidate_targets"],
+            serde_json::json!([2])
+        );
+        assert_eq!(
+            report["rebuild_planner"]["failed_nodes"],
+            serde_json::json!([])
+        );
+        assert_eq!(report["rebuild_planner"]["task_count"], 1);
+        assert_eq!(report["rebuild_planner"]["total_target_replicas"], 1);
 
         let receipt_ref = &report["placement_receipt_refs"]["refs"][0];
-        let task = &report["rebuild_admission"]["scheduled_tasks"][0];
-        assert_eq!(task["source_member"], 1);
-        assert_eq!(task["target_member"], 2);
-        assert_eq!(task["subject_ref"], receipt_ref["object_id"]);
-        assert_eq!(task["payload_len"], receipt_ref["payload_len"]);
-        assert_eq!(task["placement_receipt_ref"], *receipt_ref);
+        let admission_task = &report["rebuild_admission"]["scheduled_tasks"][0];
+        assert_eq!(admission_task["source_member"], 1);
+        assert_eq!(admission_task["target_member"], 2);
+        assert_eq!(admission_task["subject_ref"], receipt_ref["object_id"]);
+        assert_eq!(admission_task["payload_len"], receipt_ref["payload_len"]);
+        assert_eq!(admission_task["placement_receipt_ref"], *receipt_ref);
         assert_eq!(
-            task["placement_receipt_ref"]["target_count"],
+            admission_task["placement_receipt_ref"]["target_count"],
             receipt_ref["target_count"]
+        );
+        let planner_task = &report["rebuild_planner"]["tasks"][0];
+        assert_eq!(planner_task["object_id"], receipt_ref["object_id"]);
+        assert_eq!(planner_task["source_nodes"], serde_json::json!([1]));
+        assert_eq!(planner_task["target_nodes"], serde_json::json!([2]));
+        assert_eq!(planner_task["placement_receipt_ref"], *receipt_ref);
+        assert_eq!(
+            planner_task["placement_receipt_ref"]["payload_digest"],
+            receipt_ref["payload_digest"]
         );
     }
 
