@@ -36,6 +36,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileTypeExt;
@@ -55,9 +56,9 @@ use crate::*;
 use std::convert::Infallible;
 use tidefs_checksum_tree::{ChecksumTree, ChecksumTreeBuilder, DomainTag, ObjectDigest};
 use tidefs_durability_layout::DurabilityLayoutV1;
-use tidefs_pool_allocator::{PoolAllocator, SpacePressureEvent};
+use tidefs_pool_allocator::{PoolAllocator, PoolAllocatorError, SpacePressureEvent};
 use tidefs_reclaim::{
-    ReclaimConfig, ReclaimConsumerConfig, ReclaimConsumerService, ReclaimScheduler,
+    DrainError, ReclaimConfig, ReclaimConsumerConfig, ReclaimConsumerService, ReclaimScheduler,
     SegmentLiveCounts,
 };
 use tidefs_reclaim_queue_core::{
@@ -68,7 +69,7 @@ use tidefs_space_accounting::{
 };
 use tidefs_spacemap_allocator::{SegmentFreeMap, SpaceMapCheckpointV1};
 use tidefs_types_reclaim_queue_core::{
-    ObjectKey as ReclaimObjectKey, QueueFamily, ReclaimQueueEntry,
+    DeadObjectEntry, ObjectKey as ReclaimObjectKey, QueueFamily, ReclaimQueueEntry,
 };
 
 use tidefs_reserve_ledger::{ReserveLedger, WritePriority};
@@ -111,6 +112,65 @@ pub struct FreeSegmentCounter {
     free_count: AtomicU64,
     low_watermark: AtomicBool,
     low_watermark_segments: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DeadObjectDrainSegmentResolver {
+    segments: BTreeMap<ReclaimObjectKey, u64>,
+}
+
+impl tidefs_reclaim::SegmentResolver for DeadObjectDrainSegmentResolver {
+    type Error = Infallible;
+
+    fn resolve(&self, key: &ReclaimObjectKey) -> std::result::Result<Option<u64>, Self::Error> {
+        Ok(self.segments.get(key).copied())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReceiptBoundDeadObjectDrainPlan {
+    resolver: DeadObjectDrainSegmentResolver,
+    dead_segments: Vec<u64>,
+}
+
+impl ReceiptBoundDeadObjectDrainPlan {
+    fn current_segment_would_be_reclaimed(&self, current_segment_id: u64) -> bool {
+        self.dead_segments.contains(&current_segment_id)
+    }
+}
+
+/// Error returned by the receipt-bound dead-object drain entry point.
+#[derive(Debug)]
+pub enum ReceiptBoundDeadObjectDrainError {
+    /// The reclaim consumer could not resolve or free a selected segment.
+    Reclaim(DrainError<Infallible, PoolAllocatorError>),
+    /// Queue persistence, segment rotation, or the durability barrier failed.
+    Store(StoreError),
+}
+
+impl fmt::Display for ReceiptBoundDeadObjectDrainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reclaim(error) => write!(f, "receipt-bound dead-object drain failed: {error}"),
+            Self::Store(error) => {
+                write!(f, "receipt-bound dead-object persistence failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReceiptBoundDeadObjectDrainError {}
+
+impl From<DrainError<Infallible, PoolAllocatorError>> for ReceiptBoundDeadObjectDrainError {
+    fn from(value: DrainError<Infallible, PoolAllocatorError>) -> Self {
+        Self::Reclaim(value)
+    }
+}
+
+impl From<StoreError> for ReceiptBoundDeadObjectDrainError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
 }
 
 impl FreeSegmentCounter {
@@ -2154,6 +2214,133 @@ impl LocalObjectStore {
             reclaim_queue_depth: self.reclaim_queue.len(),
             ..stats
         })
+    }
+
+    /// Enqueue one dead object whose old placement may be retired only after
+    /// replacement/base receipt evidence and commit-group stability agree.
+    ///
+    /// The inserted queue state is dirty in memory until [`sync_all`](Self::sync_all)
+    /// persists it. Duplicate object ids are accepted as idempotent replays and
+    /// return `Ok(false)`.
+    pub fn enqueue_receipt_bound_dead_object(&mut self, entry: DeadObjectEntry) -> Result<bool> {
+        self.ensure_writable("enqueue_receipt_bound_dead_object")?;
+        let Some(receipt) = entry.replacement_receipt else {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "missing replacement receipt",
+            });
+        };
+        if !receipt.authorizes_reclaim_for(entry.object_id) {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "replacement receipt does not authorize this object",
+            });
+        }
+
+        let inserted = self.dead_object_reclaim_queue.enqueue(entry);
+        if inserted {
+            self.dead_object_reclaim_queue_dirty = true;
+        }
+        Ok(inserted)
+    }
+
+    /// Drain receipt-authorized dead objects at a caller-supplied stable
+    /// committed transaction group.
+    ///
+    /// Selected entries pass through `ReclaimConsumerService` before this method
+    /// acknowledges them in the persisted dead-object queue. Completed stats are
+    /// returned only after the acknowledged queue state reaches `sync_all()`.
+    pub fn drain_receipt_bound_dead_objects_at_txg(
+        &mut self,
+        stable_committed_txg: u64,
+        max_count: usize,
+    ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
+    {
+        self.ensure_writable("drain_receipt_bound_dead_objects_at_txg")?;
+
+        let plan = self.receipt_bound_dead_object_drain_plan(stable_committed_txg, max_count);
+        if plan.current_segment_would_be_reclaimed(self.current_segment_id) {
+            self.rotate_segment()?;
+        }
+
+        let queue_snapshot = self.dead_object_reclaim_queue.clone();
+        let mut reclaim_consumer = std::mem::replace(
+            &mut self.reclaim_consumer,
+            ReclaimConsumerService::new(ReclaimConsumerConfig::default(), SegmentLiveCounts::new()),
+        );
+        let drain_result = reclaim_consumer.drain_receipt_bound_dead_objects(
+            &queue_snapshot,
+            stable_committed_txg,
+            max_count,
+            &plan.resolver,
+            self,
+        );
+        self.reclaim_consumer = reclaim_consumer;
+        let drain = drain_result?;
+
+        if drain.ack_object_ids.is_empty() {
+            return Ok(tidefs_reclaim::ReclaimConsumerStats {
+                reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
+                ..drain.stats
+            });
+        }
+
+        let removed = self
+            .dead_object_reclaim_queue
+            .ack_reclaimed(&drain.ack_object_ids);
+        if removed > 0 {
+            self.dead_object_reclaim_queue_dirty = true;
+        }
+
+        for segment_id in plan.dead_segments {
+            let seg_path = segment_path(&self.segments_dir, segment_id);
+            let _ = std::fs::remove_file(&seg_path);
+        }
+
+        self.sync_all()?;
+
+        Ok(tidefs_reclaim::ReclaimConsumerStats {
+            reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
+            ..drain.stats
+        })
+    }
+
+    fn receipt_bound_dead_object_drain_plan(
+        &self,
+        stable_committed_txg: u64,
+        max_count: usize,
+    ) -> ReceiptBoundDeadObjectDrainPlan {
+        let limit = max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
+        let entries = self
+            .dead_object_reclaim_queue
+            .dequeue_receipt_bound_batch(limit, stable_committed_txg);
+        let mut resolver = DeadObjectDrainSegmentResolver::default();
+        let mut segment_refdrops: std::collections::HashMap<u64, u64> =
+            std::collections::HashMap::new();
+
+        for entry in entries {
+            let Ok(Some(segment_id)) =
+                <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
+                    self,
+                    &entry.object_id,
+                )
+            else {
+                continue;
+            };
+            resolver.segments.insert(entry.object_id, segment_id);
+            *segment_refdrops.entry(segment_id).or_default() += 1;
+        }
+
+        let dead_segments = segment_refdrops
+            .into_iter()
+            .filter_map(|(segment_id, refdrops)| {
+                let live_count = self.reclaim_consumer.live_counts().live_count(segment_id);
+                (live_count <= refdrops).then_some(segment_id)
+            })
+            .collect();
+
+        ReceiptBoundDeadObjectDrainPlan {
+            resolver,
+            dead_segments,
+        }
     }
 
     #[must_use]
@@ -6748,6 +6935,22 @@ mod reclaim_queue_production_tests {
             .with_replacement_receipt(dead_object_receipt(key, byte as u64 + 1))
     }
 
+    fn dead_object_entry_for_key(
+        key: ReclaimObjectKey,
+        death_commit_group: u64,
+        eligible: bool,
+        receipt_generation: u64,
+    ) -> tidefs_types_reclaim_queue_core::DeadObjectEntry {
+        tidefs_types_reclaim_queue_core::DeadObjectEntry::new(
+            key,
+            [key.0[0]; 16],
+            death_commit_group,
+            eligible,
+            death_commit_group,
+        )
+        .with_replacement_receipt(dead_object_receipt(key, receipt_generation))
+    }
+
     #[test]
     fn reclaim_queue_overwrite_path_records_old_segment() {
         let (mut store, _dir) = temp_store();
@@ -6811,6 +7014,191 @@ mod reclaim_queue_production_tests {
                 .dead_object_reclaim_queue
                 .receipt_bound_eligible_count(6),
             2
+        );
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_enqueue_persists_across_reopen() {
+        let (mut store, dir) = temp_store();
+        let key = dead_object_key(0x51);
+        let entry = dead_object_entry_for_key(key, 5, true, 1);
+
+        assert!(store
+            .enqueue_receipt_bound_dead_object(entry)
+            .expect("enqueue receipt-bound dead object"));
+        assert!(!store
+            .enqueue_receipt_bound_dead_object(entry)
+            .expect("duplicate enqueue is idempotent"));
+        assert!(store.dead_object_reclaim_queue_dirty);
+        store.sync_all().expect("sync dead-object queue");
+        drop(store);
+
+        let reopened = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+            .expect("reopen store");
+        assert_eq!(reopened.dead_object_reclaim_queue.len(), 1);
+        assert_eq!(
+            reopened
+                .dead_object_reclaim_queue
+                .receipt_bound_eligible_count(6),
+            1
+        );
+        assert!(!reopened.dead_object_reclaim_queue_dirty);
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_enqueue_rejects_receiptless_entries() {
+        let (mut store, _dir) = temp_store();
+        let key = dead_object_key(0x52);
+        let entry =
+            tidefs_types_reclaim_queue_core::DeadObjectEntry::new(key, [0x52; 16], 5, true, 5);
+
+        let err = store
+            .enqueue_receipt_bound_dead_object(entry)
+            .expect_err("receiptless enqueue must fail");
+        assert!(matches!(
+            err,
+            StoreError::InvalidDeadObjectReceipt {
+                reason: "missing replacement receipt"
+            }
+        ));
+        assert!(store.dead_object_reclaim_queue.is_empty());
+        assert!(!store.dead_object_reclaim_queue_dirty);
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_acks_and_persists_queue() {
+        let (mut store, dir) = temp_store();
+        let key = ObjectKey::from_name(b"receipt-bound/dead-object/drain");
+
+        store.put(key, b"obsolete payload").expect("put");
+        let old_segment_id = store.index.get(&key).expect("location").segment_id;
+        assert!(store.delete(key).expect("delete"));
+
+        let reclaim_key = reclaim_key(key);
+        let entry = dead_object_entry_for_key(reclaim_key, 0, true, 1);
+        assert!(store
+            .enqueue_receipt_bound_dead_object(entry)
+            .expect("enqueue receipt-bound dead object"));
+
+        let stats = store
+            .drain_receipt_bound_dead_objects_at_txg(1, 16)
+            .expect("receipt-bound drain");
+
+        assert_eq!(stats.entries_processed, 1);
+        assert_eq!(stats.segments_reclaimed, 1);
+        assert_eq!(stats.blocks_freed, 1);
+        assert_eq!(stats.reclaim_queue_depth, 0);
+        assert!(store.dead_object_reclaim_queue.is_empty());
+        assert!(!store.dead_object_reclaim_queue_dirty);
+        assert!(
+            !segment_path(&store.segments_dir, old_segment_id).exists(),
+            "freed segment file must not be rediscovered on reopen"
+        );
+        drop(store);
+
+        let reopened = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+            .expect("reopen store");
+        assert!(reopened.dead_object_reclaim_queue.is_empty());
+        assert!(!segment_path(&reopened.segments_dir, old_segment_id).exists());
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_keeps_unauthorized_entries_queued() {
+        let (mut store, dir) = temp_store();
+        let receiptless_key = dead_object_key(0x61);
+        let synthetic_key = dead_object_key(0x62);
+        let malformed_key = dead_object_key(0x63);
+        let under_width_key = dead_object_key(0x64);
+        let ineligible_key = dead_object_key(0x65);
+        let not_stable_key = dead_object_key(0x66);
+        let mut digest = [0u8; 32];
+
+        store.dead_object_reclaim_queue.enqueue(
+            tidefs_types_reclaim_queue_core::DeadObjectEntry::new(
+                receiptless_key,
+                [0x61; 16],
+                5,
+                true,
+                5,
+            ),
+        );
+        store
+            .dead_object_reclaim_queue
+            .enqueue(dead_object_entry_for_key(synthetic_key, 5, true, 0));
+
+        digest[0] = malformed_key.0[0];
+        let malformed_receipt = tidefs_types_reclaim_queue_core::DeadObjectReplacementReceipt::new(
+            malformed_key,
+            7,
+            1,
+            tidefs_types_reclaim_queue_core::DeadObjectReceiptPolicy::Replicated { copies: 0 },
+            4096,
+            digest,
+            0,
+        );
+        store.dead_object_reclaim_queue.enqueue(
+            tidefs_types_reclaim_queue_core::DeadObjectEntry::new(
+                malformed_key,
+                [0x63; 16],
+                5,
+                true,
+                5,
+            )
+            .with_replacement_receipt(malformed_receipt),
+        );
+
+        digest[0] = under_width_key.0[0];
+        let under_width_receipt =
+            tidefs_types_reclaim_queue_core::DeadObjectReplacementReceipt::new(
+                under_width_key,
+                7,
+                1,
+                tidefs_types_reclaim_queue_core::DeadObjectReceiptPolicy::Erasure {
+                    data_shards: 2,
+                    parity_shards: 1,
+                },
+                4096,
+                digest,
+                2,
+            );
+        store.dead_object_reclaim_queue.enqueue(
+            tidefs_types_reclaim_queue_core::DeadObjectEntry::new(
+                under_width_key,
+                [0x64; 16],
+                5,
+                true,
+                5,
+            )
+            .with_replacement_receipt(under_width_receipt),
+        );
+
+        store
+            .dead_object_reclaim_queue
+            .enqueue(dead_object_entry_for_key(ineligible_key, 5, false, 1));
+        store
+            .dead_object_reclaim_queue
+            .enqueue(dead_object_entry_for_key(not_stable_key, 10, true, 1));
+        store.dead_object_reclaim_queue_dirty = true;
+        store.sync_all().expect("sync queued unauthorized entries");
+
+        let stats = store
+            .drain_receipt_bound_dead_objects_at_txg(6, 16)
+            .expect("unauthorized drain should be idle");
+
+        assert_eq!(stats.entries_processed, 0);
+        assert_eq!(stats.segments_reclaimed, 0);
+        assert_eq!(stats.reclaim_queue_depth, 6);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 6);
+        drop(store);
+
+        let reopened = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+            .expect("reopen store");
+        assert_eq!(reopened.dead_object_reclaim_queue.len(), 6);
+        assert_eq!(
+            reopened
+                .dead_object_reclaim_queue
+                .receipt_bound_eligible_count(6),
+            0
         );
     }
 }
