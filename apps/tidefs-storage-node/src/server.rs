@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tidefs_cluster::placement_heal::RelocationFlowCommitPlacementPublication;
 use tidefs_cluster::pool_protocol::{
     CatalogEntryRow, ClusterPoolCatalogDeltaResponse, ClusterPoolCatalogQueryResponse,
     ClusterPoolCreateResponse, ClusterPoolImportResponse, ClusterPoolLeaseResponse,
@@ -63,8 +64,8 @@ use tidefs_replicated_object_store::{
     TransportReplicatedStore, TransportReplicatedStoreConfig,
 };
 use tidefs_replication_model::{
-    ObjectDigest, PlacementReceiptRef, ReceiptRedundancyPolicy, ReplicaMovementClass,
-    ReplicatedReadClass, ReplicatedReadPlan,
+    FlowCommitResult, ObjectDigest, PlacementReceiptRef, ReceiptRedundancyPolicy,
+    ReplicaMovementClass, ReplicatedReadClass, ReplicatedReadPlan,
 };
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
@@ -103,6 +104,17 @@ pub struct StorageNodeRepairPlacementPublication {
     pub repair_flow_publication: ReceiptRepairFlowCommitPublication,
     /// Placement-map state publication derived from the flow-commit result.
     pub placement_publication: RebuildFlowCommitPlacementPublication,
+}
+
+/// Storage-node summary for publishing a relocation flow result into placement state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageNodeRelocationPlacementPublication {
+    /// Caller-named source member retired by the publication.
+    pub source_member: u64,
+    /// Relocation flow-commit evidence accepted by the cluster placement API.
+    pub flow_commit_result: FlowCommitResult,
+    /// Placement-map state publication derived from the flow-commit result.
+    pub placement_publication: RelocationFlowCommitPlacementPublication,
 }
 
 /// Publish storage-node repair flow-commit evidence into a local placement map.
@@ -144,6 +156,54 @@ pub fn publish_repair_flow_commit_into_cluster_runtime(
 
     Ok(StorageNodeRepairPlacementPublication {
         repair_flow_publication: publication.clone(),
+        placement_publication,
+    })
+}
+
+/// Publish storage-node relocation flow-commit evidence into a local placement map.
+///
+/// This composes completed relocation flow evidence with local placement state.
+/// It records the replacement receipt and retires only `source_member` through
+/// the cluster placement API. It does not perform cluster-wide propagation,
+/// degraded-read routing, relocation execution, or reclaim.
+pub fn publish_relocation_flow_commit_into_placement_map(
+    placement_map: &mut PlacementMap,
+    source_member: u64,
+    result: &FlowCommitResult,
+) -> Result<StorageNodeRelocationPlacementPublication, String> {
+    let placement_publication = placement_map
+        .publish_relocation_flow_commit_result(source_member, result)
+        .map_err(|err| {
+            format!("storage-node placement-map relocation publication failed: {err}")
+        })?;
+
+    Ok(StorageNodeRelocationPlacementPublication {
+        source_member,
+        flow_commit_result: result.clone(),
+        placement_publication,
+    })
+}
+
+/// Publish storage-node relocation flow-commit evidence through cluster runtime.
+///
+/// This delegates to the cluster runtime's owned placement state so the same
+/// source-retirement and replacement-receipt checks gate local runtime
+/// publication. It does not perform cluster-wide propagation, degraded-read
+/// routing, relocation execution, or reclaim.
+pub fn publish_relocation_flow_commit_into_cluster_runtime(
+    runtime: &mut ClusterLeaseRuntime,
+    source_member: u64,
+    result: &FlowCommitResult,
+) -> Result<StorageNodeRelocationPlacementPublication, String> {
+    let placement_publication = runtime
+        .publish_relocation_flow_commit_result(source_member, result)
+        .map_err(|err| {
+            format!("storage-node cluster-runtime relocation publication failed: {err}")
+        })?;
+
+    Ok(StorageNodeRelocationPlacementPublication {
+        source_member,
+        flow_commit_result: result.clone(),
         placement_publication,
     })
 }
@@ -4909,6 +4969,37 @@ mod cluster_pool_handler_tests {
         }
     }
 
+    fn relocation_flow_commit_result(
+        relocated_receipt: PlacementReceiptRef,
+        target_member_id: u64,
+        epoch: u64,
+    ) -> FlowCommitResult {
+        let subject_ref = ReplicatedSubjectId::new(relocated_receipt.object_id);
+        let target_member = MemberId::new(target_member_id);
+        FlowCommitResult {
+            placement_receipt: ReplicaPlacementReceipt {
+                receipt_id: ReplicatedReceiptId(40_000 + relocated_receipt.object_id),
+                verification_ref: ReplicatedReceiptId(50_000 + relocated_receipt.object_id),
+                transfer_ref: ReplicatedReceiptId(60_000 + relocated_receipt.object_id),
+                subject_refs: vec![subject_ref],
+                placed_on: target_member,
+                placement_epoch: EpochId::new(epoch),
+                subjects_placed: 1,
+                placement_receipt_refs: vec![relocated_receipt],
+            },
+            updated_copy: ReplicaCopyRecord::verified(
+                subject_ref,
+                target_member,
+                DomainId::new(target_member_id * 10 + 1),
+                receipt_digest_to_object_digest(relocated_receipt.payload_digest),
+                epoch,
+            ),
+            final_flow_state: FlowState::Complete,
+            flow_class: FlowCommitClass::Relocation,
+            commit_epoch: EpochId::new(epoch),
+        }
+    }
+
     fn placement_map_with_old_receipt(old_receipt: PlacementReceiptRef) -> PlacementMap {
         let mut placement_map = PlacementMap::new(5);
         placement_map.insert(old_receipt.object_id, 1);
@@ -4961,6 +5052,69 @@ mod cluster_pool_handler_tests {
 
         let err = publish_repair_flow_commit_into_cluster_runtime(&mut runtime, &publication)
             .unwrap_err();
+
+        assert!(err.contains(expected), "{err}");
+        assert_eq!(runtime.placement_map().epoch(), 5);
+        assert_eq!(
+            runtime
+                .placement_map()
+                .placement_receipt_ref(old_receipt.object_id),
+            Some(old_receipt)
+        );
+        assert_eq!(
+            runtime
+                .placement_map()
+                .replicas_of(old_receipt.object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [1].into_iter().collect()
+        );
+    }
+
+    fn assert_relocation_flow_publication_refused_without_mutation(
+        source_member: u64,
+        result: FlowCommitResult,
+        old_receipt: PlacementReceiptRef,
+        expected: &str,
+    ) {
+        let mut placement_map = placement_map_with_old_receipt(old_receipt);
+
+        let err = publish_relocation_flow_commit_into_placement_map(
+            &mut placement_map,
+            source_member,
+            &result,
+        )
+        .unwrap_err();
+
+        assert!(err.contains(expected), "{err}");
+        assert_eq!(placement_map.epoch(), 5);
+        assert_eq!(
+            placement_map.placement_receipt_ref(old_receipt.object_id),
+            Some(old_receipt)
+        );
+        assert_eq!(
+            placement_map
+                .replicas_of(old_receipt.object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [1].into_iter().collect()
+        );
+    }
+
+    fn assert_relocation_flow_runtime_publication_refused_without_mutation(
+        source_member: u64,
+        result: FlowCommitResult,
+        old_receipt: PlacementReceiptRef,
+        expected: &str,
+    ) {
+        let mut runtime = cluster_runtime_with_old_receipt(old_receipt);
+
+        let err = publish_relocation_flow_commit_into_cluster_runtime(
+            &mut runtime,
+            source_member,
+            &result,
+        )
+        .unwrap_err();
 
         assert!(err.contains(expected), "{err}");
         assert_eq!(runtime.placement_map().epoch(), 5);
@@ -5343,6 +5497,91 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
+    fn relocation_flow_commit_publication_updates_placement_map() {
+        let source_receipt = receipt_ref(b"storage-node-relocation-source", b"old-payload", 1);
+        let relocated_receipt = receipt_ref(b"storage-node-relocation-source", b"new-payload", 2);
+        let result = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        let mut placement_map = placement_map_with_old_receipt(source_receipt);
+
+        let summary =
+            publish_relocation_flow_commit_into_placement_map(&mut placement_map, 1, &result)
+                .expect("relocation flow publication updates placement map");
+
+        assert_eq!(summary.source_member, 1);
+        assert_eq!(summary.flow_commit_result, result);
+        assert_eq!(
+            summary.placement_publication.object_id,
+            relocated_receipt.object_id
+        );
+        assert_eq!(summary.placement_publication.retired_source_member, 1);
+        assert_eq!(summary.placement_publication.target_member, 2);
+        assert_eq!(
+            summary.placement_publication.placement_receipt_ref,
+            relocated_receipt
+        );
+        assert_eq!(summary.placement_publication.map_epoch, 9);
+        assert_eq!(placement_map.epoch(), 9);
+        assert_eq!(
+            placement_map.placement_receipt_ref(relocated_receipt.object_id),
+            Some(relocated_receipt)
+        );
+        assert_eq!(
+            placement_map
+                .replicas_of(relocated_receipt.object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [2].into_iter().collect()
+        );
+        assert!(!placement_map
+            .objects_of(1)
+            .is_some_and(|objects| objects.contains(&relocated_receipt.object_id)));
+    }
+
+    #[test]
+    fn relocation_flow_commit_publication_updates_cluster_runtime() {
+        let source_receipt = receipt_ref(b"storage-node-relocation-source", b"old-payload", 1);
+        let relocated_receipt = receipt_ref(b"storage-node-relocation-source", b"new-payload", 2);
+        let result = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        let mut runtime = cluster_runtime_with_old_receipt(source_receipt);
+
+        let summary = publish_relocation_flow_commit_into_cluster_runtime(&mut runtime, 1, &result)
+            .expect("relocation flow publication updates cluster runtime");
+
+        assert_eq!(summary.source_member, 1);
+        assert_eq!(summary.flow_commit_result, result);
+        assert_eq!(
+            summary.placement_publication.object_id,
+            relocated_receipt.object_id
+        );
+        assert_eq!(summary.placement_publication.retired_source_member, 1);
+        assert_eq!(summary.placement_publication.target_member, 2);
+        assert_eq!(
+            summary.placement_publication.placement_receipt_ref,
+            relocated_receipt
+        );
+        assert_eq!(summary.placement_publication.map_epoch, 9);
+        assert_eq!(runtime.placement_map().epoch(), 9);
+        assert_eq!(
+            runtime
+                .placement_map()
+                .placement_receipt_ref(relocated_receipt.object_id),
+            Some(relocated_receipt)
+        );
+        assert_eq!(
+            runtime
+                .placement_map()
+                .replicas_of(relocated_receipt.object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [2].into_iter().collect()
+        );
+        assert!(!runtime
+            .placement_map()
+            .objects_of(1)
+            .is_some_and(|objects| objects.contains(&relocated_receipt.object_id)));
+    }
+
+    #[test]
     fn repair_flow_commit_publication_rejects_mismatches_without_mutation() {
         let source_receipt = receipt_ref(b"storage-node-repair-source", b"old-payload", 1);
         let repaired_receipt = receipt_ref(b"storage-node-repair-source", b"new-payload", 2);
@@ -5448,6 +5687,89 @@ mod cluster_pool_handler_tests {
             receiptless,
             source_receipt,
             "exactly one placement receipt",
+        );
+    }
+
+    #[test]
+    fn relocation_flow_commit_publication_rejects_bad_inputs_without_mutation() {
+        let source_receipt = receipt_ref(b"storage-node-relocation-source", b"old-payload", 1);
+        let relocated_receipt = receipt_ref(b"storage-node-relocation-source", b"new-payload", 2);
+
+        let mut wrong_class = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        wrong_class.flow_class = FlowCommitClass::Rebuild;
+        assert_relocation_flow_publication_refused_without_mutation(
+            1,
+            wrong_class,
+            source_receipt,
+            "not relocation",
+        );
+
+        let mut incomplete = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        incomplete.final_flow_state = FlowState::Verified;
+        assert_relocation_flow_publication_refused_without_mutation(
+            1,
+            incomplete,
+            source_receipt,
+            "not complete",
+        );
+
+        let mut receiptless = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        receiptless.placement_receipt.placement_receipt_refs.clear();
+        assert_relocation_flow_publication_refused_without_mutation(
+            1,
+            receiptless,
+            source_receipt,
+            "exactly one placement receipt",
+        );
+
+        let wrong_source = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        assert_relocation_flow_publication_refused_without_mutation(
+            3,
+            wrong_source,
+            source_receipt,
+            "does not hold object",
+        );
+
+        let source_is_target = relocation_flow_commit_result(relocated_receipt, 1, 9);
+        assert_relocation_flow_publication_refused_without_mutation(
+            1,
+            source_is_target,
+            source_receipt,
+            "matches target member",
+        );
+    }
+
+    #[test]
+    fn relocation_flow_commit_publication_rejects_runtime_inputs_without_mutation() {
+        let source_receipt = receipt_ref(b"storage-node-relocation-source", b"old-payload", 1);
+        let relocated_receipt = receipt_ref(b"storage-node-relocation-source", b"new-payload", 2);
+
+        let mut stale = relocation_flow_commit_result(relocated_receipt, 2, 4);
+        stale.placement_receipt.placement_epoch = EpochId::new(4);
+        assert_relocation_flow_runtime_publication_refused_without_mutation(
+            1,
+            stale,
+            source_receipt,
+            "stale",
+        );
+
+        let mut mismatched_subject = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        mismatched_subject.updated_copy.subject_ref =
+            ReplicatedSubjectId::new(relocated_receipt.object_id + 1);
+        assert_relocation_flow_runtime_publication_refused_without_mutation(
+            1,
+            mismatched_subject,
+            source_receipt,
+            "does not match updated copy",
+        );
+
+        let mut mismatched_target = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        mismatched_target.placement_receipt.placed_on = MemberId::new(3);
+        assert_relocation_flow_runtime_publication_refused_without_mutation(
+            1,
+            mismatched_target,
+            source_receipt,
+            "does not match updated copy",
         );
     }
 
