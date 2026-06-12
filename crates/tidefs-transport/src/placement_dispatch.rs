@@ -14,7 +14,8 @@
 //! - Determine the ordered replica set for each object key.
 //! - Classify replica sessions as healthy, unhealthy, or unbound.
 //! - Check write quorum against healthy nodes only.
-//! - Select read replicas from the healthy subset.
+//! - Select read replicas from the versioned placement map when one records
+//!   the object, otherwise from computed placement.
 
 use crate::object_enumerator::PlacementMap;
 use crate::transport_session_set::{SessionHealth, TransportSessionSet};
@@ -218,6 +219,25 @@ impl PlacementDispatch {
         )
     }
 
+    fn read_target_nodes(
+        &self,
+        object_key: &[u8; 32],
+        available_nodes: &[u64],
+    ) -> Result<Vec<u64>, PlacementError> {
+        let (object_id, _) = Self::derive_ids(object_key);
+        if let Some(members) = self
+            .placement_map
+            .as_ref()
+            .and_then(|map| map.members_for(object_id))
+        {
+            return Ok(members.iter().map(|member| member.0).collect());
+        }
+
+        Ok(self
+            .compute_placement(object_key, available_nodes)?
+            .node_targets)
+    }
+
     // ── Placement resolution ──────────────────────────────────────────
 
     /// Resolve placement for a 32-byte object key: get the ordered node set
@@ -315,19 +335,20 @@ impl PlacementDispatch {
 
     /// Resolve the ordered set of read targets (session IDs) for an object key.
     ///
-    /// Returns healthy session IDs in placement order, followed by unhealthy
+    /// Returns healthy session IDs in placement-map order for mapped objects,
+    /// or computed placement order for unmapped objects, followed by unhealthy
     /// ones. TransportReplicatedStore tries them in order for degraded reads.
     pub fn resolve_read_targets(
         &self,
         object_key: &[u8; 32],
         available_nodes: &[u64],
     ) -> Result<Vec<SessionId>, PlacementDispatchError> {
-        let placement = self.compute_placement(object_key, available_nodes)?;
+        let target_nodes = self.read_target_nodes(object_key, available_nodes)?;
 
         let mut healthy_sids = Vec::new();
         let mut unhealthy_sids = Vec::new();
 
-        for &node_id in &placement.node_targets {
+        for &node_id in &target_nodes {
             match self.sessions.health(node_id) {
                 Some(SessionHealth::Healthy) | Some(SessionHealth::Unknown) => {
                     if let Some(sid) = self.sessions.get_session(node_id) {
@@ -398,6 +419,7 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
     use tidefs_durability_layout::{DurabilityLayoutV1, FailureDomainLevel, FailureDomainV1};
+    use tidefs_membership_epoch::MemberId;
 
     fn sid(v: u64) -> SessionId {
         SessionId::new(v)
@@ -422,6 +444,19 @@ mod tests {
             key[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
         }
         key
+    }
+
+    fn map_for_object(object_id: u64, members: &[u64]) -> PlacementMap {
+        let mut mapping = BTreeMap::new();
+        mapping.insert(
+            object_id,
+            members
+                .iter()
+                .copied()
+                .map(MemberId)
+                .collect::<BTreeSet<_>>(),
+        );
+        PlacementMap::new(1, EpochId(10), mapping)
     }
 
     #[test]
@@ -674,21 +709,32 @@ mod tests {
             dispatch.sessions_mut().mark_healthy(sid(100 + n));
         }
 
-        // Set a placement map
-        let mut mapping = BTreeMap::new();
-        mapping.insert(42, {
-            let s: std::collections::BTreeSet<tidefs_membership_epoch::MemberId> = nodes
-                .iter()
-                .map(|&n| tidefs_membership_epoch::MemberId(n))
-                .collect();
-            s
-        });
-        dispatch.set_placement_map(PlacementMap::new(1, EpochId(10), mapping));
-
-        // Placement dispatch still works
         let key = test_key(42);
+        let computed_targets = dispatch.resolve_write_targets(&key, &nodes).unwrap();
+        let computed_nodes: Vec<_> = computed_targets
+            .iter()
+            .map(|target| target.node_id)
+            .collect();
+        let mapped_nodes: Vec<u64> = nodes
+            .iter()
+            .copied()
+            .filter(|node| !computed_nodes.contains(node))
+            .take(2)
+            .collect();
+        assert_eq!(
+            mapped_nodes.len(),
+            2,
+            "test requires placement-map members outside computed placement"
+        );
+
+        dispatch.set_placement_map(map_for_object(42, &mapped_nodes));
+
         let targets = dispatch.resolve_write_targets(&key, &nodes).unwrap();
-        assert!(!targets.is_empty());
+        let target_nodes: Vec<_> = targets.iter().map(|target| target.node_id).collect();
+        assert_eq!(
+            target_nodes, computed_nodes,
+            "write targets must remain planner-driven for new allocations"
+        );
 
         // Version is observable
         assert_eq!(dispatch.placement_version(), Some(1));
@@ -792,6 +838,68 @@ mod tests {
             read_targets.contains(&sid(100 + first)),
             "unhealthy node should still appear at the end"
         );
+    }
+
+    #[test]
+    fn resolve_read_targets_uses_placement_map_for_mapped_object() {
+        let (mut dispatch, nodes) = make_dispatch(3);
+        for &n in &nodes {
+            dispatch.sessions_mut().add_binding(n, sid(100 + n));
+            dispatch.sessions_mut().mark_healthy(sid(100 + n));
+        }
+
+        let key = test_key(42);
+        let computed = dispatch.resolve(&key, &nodes).unwrap().nodes;
+        let mapped_nodes: Vec<u64> = nodes
+            .iter()
+            .copied()
+            .filter(|node| !computed.contains(node))
+            .take(2)
+            .collect();
+        assert_eq!(
+            mapped_nodes.len(),
+            2,
+            "test requires placement-map members outside computed placement"
+        );
+
+        dispatch.set_placement_map(map_for_object(42, &mapped_nodes));
+
+        let read_targets = dispatch.resolve_read_targets(&key, &nodes).unwrap();
+        let expected: Vec<_> = mapped_nodes.iter().map(|node| sid(100 + *node)).collect();
+        assert_eq!(read_targets, expected);
+    }
+
+    #[test]
+    fn resolve_read_targets_preserves_health_order_for_mapped_object() {
+        let (mut dispatch, nodes) = make_dispatch(3);
+        for &n in &nodes {
+            dispatch.sessions_mut().add_binding(n, sid(100 + n));
+            dispatch.sessions_mut().mark_healthy(sid(100 + n));
+        }
+        dispatch.sessions_mut().mark_unhealthy(sid(102));
+        dispatch.set_placement_map(map_for_object(77, &[2, 4, 5]));
+
+        let read_targets = dispatch
+            .resolve_read_targets(&test_key(77), &nodes)
+            .unwrap();
+
+        assert_eq!(read_targets, vec![sid(104), sid(105), sid(102)]);
+    }
+
+    #[test]
+    fn resolve_read_targets_falls_back_for_unmapped_object() {
+        let (mut dispatch, nodes) = make_dispatch(3);
+        for &n in &nodes {
+            dispatch.sessions_mut().add_binding(n, sid(100 + n));
+            dispatch.sessions_mut().mark_healthy(sid(100 + n));
+        }
+
+        let key = test_key(42);
+        let computed = dispatch.resolve_read_targets(&key, &nodes).unwrap();
+        dispatch.set_placement_map(map_for_object(7, &[4, 5]));
+
+        let with_unrelated_map = dispatch.resolve_read_targets(&key, &nodes).unwrap();
+        assert_eq!(with_unrelated_map, computed);
     }
 
     #[test]
