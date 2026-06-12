@@ -6,9 +6,22 @@
 
 const REBUILD_PLAN_CONTEXT: &str = "TideFS RebuildPlan v1";
 
+use tidefs_membership_epoch::EpochId;
+use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconstructionTaskReceiptError {
+    SyntheticReceipt,
+    MalformedRedundancyPolicy,
+    UnderWidthReceipt {
+        target_count: u16,
+        required_count: u16,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReconstructionTask {
-    pub object_id: u64,
+    pub placement_receipt_ref: PlacementReceiptRef,
     pub source_nodes: Vec<u64>,
     pub target_nodes: Vec<u64>,
     pub data_range: Option<(u64, u64)>,
@@ -16,29 +29,73 @@ pub struct ReconstructionTask {
 }
 
 impl ReconstructionTask {
-    pub fn new_full(
-        object_id: u64,
+    pub fn new_full_with_receipt(
+        placement_receipt_ref: PlacementReceiptRef,
         source_nodes: Vec<u64>,
         target_nodes: Vec<u64>,
         priority: u8,
-    ) -> Self {
-        Self {
-            object_id,
+    ) -> Result<Self, ReconstructionTaskReceiptError> {
+        Self::new_range_with_receipt(
+            placement_receipt_ref,
             source_nodes,
             target_nodes,
-            data_range: None,
+            None,
             priority,
-        }
+        )
     }
+
+    pub fn new_range_with_receipt(
+        placement_receipt_ref: PlacementReceiptRef,
+        source_nodes: Vec<u64>,
+        target_nodes: Vec<u64>,
+        data_range: Option<(u64, u64)>,
+        priority: u8,
+    ) -> Result<Self, ReconstructionTaskReceiptError> {
+        Self::validate_receipt_ref(placement_receipt_ref)?;
+        Ok(Self {
+            placement_receipt_ref,
+            source_nodes,
+            target_nodes,
+            data_range,
+            priority,
+        })
+    }
+
+    #[must_use]
+    pub fn object_id(&self) -> u64 {
+        self.placement_receipt_ref.object_id
+    }
+
+    pub fn validate_receipt_ref(
+        placement_receipt_ref: PlacementReceiptRef,
+    ) -> Result<(), ReconstructionTaskReceiptError> {
+        if placement_receipt_ref.is_synthetic() {
+            return Err(ReconstructionTaskReceiptError::SyntheticReceipt);
+        }
+        if !placement_receipt_ref.redundancy_policy.is_well_formed() {
+            return Err(ReconstructionTaskReceiptError::MalformedRedundancyPolicy);
+        }
+        let required_count = placement_receipt_ref.redundancy_policy.target_width();
+        if placement_receipt_ref.target_count < required_count {
+            return Err(ReconstructionTaskReceiptError::UnderWidthReceipt {
+                target_count: placement_receipt_ref.target_count,
+                required_count,
+            });
+        }
+        Ok(())
+    }
+
     pub fn has_viable_sources(&self) -> bool {
         !self.source_nodes.is_empty()
     }
+
     pub fn target_count(&self) -> usize {
         self.target_nodes.len()
     }
+
     fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&self.object_id.to_le_bytes());
+        encode_placement_receipt_ref(&mut buf, self.placement_receipt_ref);
         buf.extend_from_slice(&(self.source_nodes.len() as u32).to_le_bytes());
         for &n in &self.source_nodes {
             buf.extend_from_slice(&n.to_le_bytes());
@@ -58,13 +115,14 @@ impl ReconstructionTask {
         buf.push(self.priority);
         buf
     }
+
     fn decode(buf: &[u8]) -> Result<(Self, usize), String> {
-        if buf.len() < 12 {
-            return Err("too short".into());
+        let (placement_receipt_ref, mut pos) = decode_placement_receipt_ref(buf)?;
+        if buf.len() < pos + 4 {
+            return Err("too short for source count".into());
         }
-        let object_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let src_count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
-        let mut pos = 12;
+        let src_count = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
         let mut source_nodes = Vec::with_capacity(src_count);
         if buf.len() < pos + src_count * 8 + 4 {
             return Err("too short for sources".into());
@@ -101,17 +159,103 @@ impl ReconstructionTask {
         }
         let priority = buf[pos];
         pos += 1;
-        Ok((
-            Self {
-                object_id,
-                source_nodes,
-                target_nodes,
-                data_range,
-                priority,
-            },
-            pos,
-        ))
+        let task = Self::new_range_with_receipt(
+            placement_receipt_ref,
+            source_nodes,
+            target_nodes,
+            data_range,
+            priority,
+        )
+        .map_err(|err| format!("invalid placement receipt ref: {err:?}"))?;
+        Ok((task, pos))
     }
+}
+
+fn encode_placement_receipt_ref(buf: &mut Vec<u8>, receipt: PlacementReceiptRef) {
+    buf.extend_from_slice(&receipt.object_id.to_le_bytes());
+    buf.extend_from_slice(&receipt.object_key);
+    buf.extend_from_slice(&receipt.receipt_epoch.0.to_le_bytes());
+    buf.extend_from_slice(&receipt.receipt_generation.to_le_bytes());
+    match receipt.redundancy_policy {
+        ReceiptRedundancyPolicy::Replicated { copies } => {
+            buf.push(0);
+            buf.push(copies);
+            buf.push(0);
+        }
+        ReceiptRedundancyPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        } => {
+            buf.push(1);
+            buf.push(data_shards);
+            buf.push(parity_shards);
+        }
+    }
+    buf.extend_from_slice(&receipt.payload_len.to_le_bytes());
+    buf.extend_from_slice(&receipt.payload_digest);
+    buf.extend_from_slice(&receipt.target_count.to_le_bytes());
+}
+
+fn decode_placement_receipt_ref(buf: &[u8]) -> Result<(PlacementReceiptRef, usize), String> {
+    const RECEIPT_REF_LEN: usize = 8 + 32 + 8 + 8 + 3 + 8 + 32 + 2;
+    if buf.len() < RECEIPT_REF_LEN {
+        return Err("too short for placement receipt ref".into());
+    }
+
+    let mut pos = 0;
+    let object_id = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+
+    let mut object_key = [0u8; 32];
+    object_key.copy_from_slice(&buf[pos..pos + 32]);
+    pos += 32;
+
+    let receipt_epoch = EpochId(u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()));
+    pos += 8;
+
+    let receipt_generation = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+
+    let policy_tag = buf[pos];
+    pos += 1;
+    let policy_first = buf[pos];
+    pos += 1;
+    let policy_second = buf[pos];
+    pos += 1;
+    let redundancy_policy = match policy_tag {
+        0 => ReceiptRedundancyPolicy::Replicated {
+            copies: policy_first,
+        },
+        1 => ReceiptRedundancyPolicy::Erasure {
+            data_shards: policy_first,
+            parity_shards: policy_second,
+        },
+        other => return Err(format!("unknown redundancy policy tag {other}")),
+    };
+
+    let payload_len = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+
+    let mut payload_digest = [0u8; 32];
+    payload_digest.copy_from_slice(&buf[pos..pos + 32]);
+    pos += 32;
+
+    let target_count = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
+    pos += 2;
+
+    Ok((
+        PlacementReceiptRef::new(
+            object_id,
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            target_count,
+        ),
+        pos,
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
