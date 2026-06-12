@@ -29,7 +29,7 @@ use crate::dataset_catalog::{
 use crate::lease_state_machine::LeaseStateMachine;
 use crate::placement_heal::{
     HealState, HealStats, LossEvent, PlacementHealCoordinator, PlacementMap,
-    RebuildFlowCommitPlacementPublication,
+    RebuildFlowCommitPlacementPublication, RelocationFlowCommitPlacementPublication,
 };
 use crate::pool_config::{ClusterPlacementPolicy, ClusterPoolConfig, FailureDomain};
 use crate::pool_lease_token::PoolLeaseToken;
@@ -917,6 +917,17 @@ impl ClusterLeaseRuntime {
             .publish_rebuild_flow_commit_result(result)
     }
 
+    /// Publish a completed relocation flow-commit result into cluster-owned
+    /// placement state and retire the caller-named source member.
+    pub fn publish_relocation_flow_commit_result(
+        &mut self,
+        source_member: u64,
+        result: &FlowCommitResult,
+    ) -> Result<RelocationFlowCommitPlacementPublication, String> {
+        self.heal_coordinator
+            .publish_relocation_flow_commit_result(source_member, result)
+    }
+
     /// Return a validator for transport-layer write-fence checks, if configured.
     pub fn fence_validator(&self) -> Option<FenceValidator> {
         self.fence_authority.as_ref().map(|fa| fa.validator())
@@ -1399,6 +1410,18 @@ mod tests {
         }
     }
 
+    fn relocation_flow_result(
+        object_id: u64,
+        target_member: u64,
+        placement_receipt_ref: PlacementReceiptRef,
+        epoch: u64,
+    ) -> FlowCommitResult {
+        let mut result =
+            rebuild_flow_result(object_id, target_member, placement_receipt_ref, epoch);
+        result.flow_class = FlowCommitClass::Relocation;
+        result
+    }
+
     fn make_task(
         object_id: u64,
         sources: Vec<u64>,
@@ -1542,6 +1565,39 @@ mod tests {
         assert_eq!(
             map.replicas_of(90).cloned().unwrap_or_default(),
             [20, 30].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn publish_relocation_flow_commit_result_delegates_to_heal_coordinator() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
+            .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
+        rt.record_placement(90, 20);
+        rt.record_placement(90, 25);
+
+        let relocated_receipt = receipt_ref_with_generation(90, 2);
+        let result = relocation_flow_result(90, 30, relocated_receipt, 7);
+        let publication = rt
+            .publish_relocation_flow_commit_result(20, &result)
+            .expect("runtime delegates completed relocation flow publication");
+
+        assert_eq!(
+            publication,
+            RelocationFlowCommitPlacementPublication {
+                object_id: 90,
+                retired_source_member: 20,
+                target_member: 30,
+                placement_receipt_ref: relocated_receipt,
+                map_epoch: 7,
+            }
+        );
+        let map = rt.placement_map();
+        assert_eq!(map.epoch(), 7);
+        assert_eq!(map.placement_receipt_ref(90), Some(relocated_receipt));
+        assert_eq!(
+            map.replicas_of(90).cloned().unwrap_or_default(),
+            [25, 30].into_iter().collect()
         );
     }
 

@@ -123,6 +123,22 @@ pub struct RebuildFlowCommitPlacementPublication {
     pub map_epoch: u64,
 }
 
+/// Summary returned when a relocation flow-commit result updates placement
+/// state and retires the caller-named source member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelocationFlowCommitPlacementPublication {
+    /// Object whose relocated placement was published.
+    pub object_id: u64,
+    /// Source member retired from the object's placement set.
+    pub retired_source_member: u64,
+    /// Target member now recorded as holding the relocated object.
+    pub target_member: u64,
+    /// Replacement durable placement receipt stored for the object.
+    pub placement_receipt_ref: PlacementReceiptRef,
+    /// Placement-map epoch after publication.
+    pub map_epoch: u64,
+}
+
 impl PlacementMap {
     /// Create an empty placement map for the given epoch.
     pub fn new(epoch: u64) -> Self {
@@ -189,67 +205,12 @@ impl PlacementMap {
         &mut self,
         result: &FlowCommitResult,
     ) -> Result<RebuildFlowCommitPlacementPublication, String> {
-        if result.flow_class != FlowCommitClass::Rebuild {
-            return Err(format!(
-                "flow-commit result is {:?}, not rebuild",
-                result.flow_class
-            ));
-        }
-        if result.final_flow_state != FlowState::Complete {
-            return Err(format!(
-                "rebuild flow-commit result is {:?}, not complete",
-                result.final_flow_state
-            ));
-        }
-        if result.commit_epoch.0 < self.epoch {
-            return Err(format!(
-                "rebuild flow-commit epoch {} is stale for placement map epoch {}",
-                result.commit_epoch.0, self.epoch
-            ));
-        }
-
-        let placement = &result.placement_receipt;
-        if placement.placement_epoch != result.commit_epoch {
-            return Err(format!(
-                "rebuild placement epoch {:?} does not match commit epoch {:?}",
-                placement.placement_epoch, result.commit_epoch
-            ));
-        }
-        if placement.subjects_placed != 1 || placement.subject_refs.len() != 1 {
-            return Err(format!(
-                "rebuild placement publication must carry exactly one subject, got subjects_placed={} refs={}",
-                placement.subjects_placed,
-                placement.subject_refs.len()
-            ));
-        }
-        let subject_ref = placement.subject_refs[0];
-        if subject_ref != result.updated_copy.subject_ref {
-            return Err(format!(
-                "rebuild placement subject {:?} does not match updated copy {:?}",
-                subject_ref, result.updated_copy.subject_ref
-            ));
-        }
-        if placement.placed_on != result.updated_copy.member_ref {
-            return Err(format!(
-                "rebuild placement target {:?} does not match updated copy {:?}",
-                placement.placed_on, result.updated_copy.member_ref
-            ));
-        }
-        if result.updated_copy.copy_class != ReplicaCopyClass::Verified {
-            return Err(format!(
-                "rebuild updated copy is {:?}, not verified",
-                result.updated_copy.copy_class
-            ));
-        }
-        if placement.placement_receipt_refs.len() != 1 {
-            return Err(format!(
-                "rebuild placement publication must carry exactly one placement receipt ref, got {}",
-                placement.placement_receipt_refs.len()
-            ));
-        }
-
-        let placement_receipt_ref = placement.placement_receipt_refs[0];
-        Self::validate_rebuild_flow_placement_ref(subject_ref, placement_receipt_ref)?;
+        let (_subject_ref, placement_receipt_ref) = self
+            .validate_completed_single_subject_flow_commit(
+                result,
+                FlowCommitClass::Rebuild,
+                "rebuild",
+            )?;
 
         let object_id = placement_receipt_ref.object_id;
         let target_member = result.updated_copy.member_ref.0;
@@ -265,34 +226,157 @@ impl PlacementMap {
         })
     }
 
-    fn validate_rebuild_flow_placement_ref(
+    /// Publish a completed relocation flow-commit result into placement state.
+    ///
+    /// This records the relocated target and durable replacement receipt, then
+    /// retires the caller-named source member only after the flow result proves
+    /// a completed relocation for one subject.
+    pub fn publish_relocation_flow_commit_result(
+        &mut self,
+        source_member: u64,
+        result: &FlowCommitResult,
+    ) -> Result<RelocationFlowCommitPlacementPublication, String> {
+        let (_subject_ref, placement_receipt_ref) = self
+            .validate_completed_single_subject_flow_commit(
+                result,
+                FlowCommitClass::Relocation,
+                "relocation",
+            )?;
+
+        let object_id = placement_receipt_ref.object_id;
+        let target_member = result.updated_copy.member_ref.0;
+        if source_member == target_member {
+            return Err(format!(
+                "relocation source member {} matches target member for object {}",
+                source_member, object_id
+            ));
+        }
+        if !self
+            .entries
+            .get(&object_id)
+            .is_some_and(|members| members.contains(&source_member))
+        {
+            return Err(format!(
+                "relocation source member {} does not hold object {}",
+                source_member, object_id
+            ));
+        }
+
+        self.insert(object_id, target_member);
+        self.record_placement_receipt_ref(object_id, placement_receipt_ref);
+        self.remove_replica_preserving_receipt(object_id, source_member);
+        self.epoch = result.commit_epoch.0;
+
+        Ok(RelocationFlowCommitPlacementPublication {
+            object_id,
+            retired_source_member: source_member,
+            target_member,
+            placement_receipt_ref,
+            map_epoch: self.epoch,
+        })
+    }
+
+    fn validate_completed_single_subject_flow_commit(
+        &self,
+        result: &FlowCommitResult,
+        expected_class: FlowCommitClass,
+        flow_name: &str,
+    ) -> Result<(ReplicatedSubjectId, PlacementReceiptRef), String> {
+        if result.flow_class != expected_class {
+            return Err(format!(
+                "flow-commit result is {:?}, not {}",
+                result.flow_class, flow_name
+            ));
+        }
+        if result.final_flow_state != FlowState::Complete {
+            return Err(format!(
+                "{} flow-commit result is {:?}, not complete",
+                flow_name, result.final_flow_state
+            ));
+        }
+        if result.commit_epoch.0 < self.epoch {
+            return Err(format!(
+                "{} flow-commit epoch {} is stale for placement map epoch {}",
+                flow_name, result.commit_epoch.0, self.epoch
+            ));
+        }
+
+        let placement = &result.placement_receipt;
+        if placement.placement_epoch != result.commit_epoch {
+            return Err(format!(
+                "{} placement epoch {:?} does not match commit epoch {:?}",
+                flow_name, placement.placement_epoch, result.commit_epoch
+            ));
+        }
+        if placement.subjects_placed != 1 || placement.subject_refs.len() != 1 {
+            return Err(format!(
+                "{} placement publication must carry exactly one subject, got subjects_placed={} refs={}",
+                flow_name,
+                placement.subjects_placed,
+                placement.subject_refs.len()
+            ));
+        }
+        let subject_ref = placement.subject_refs[0];
+        if subject_ref != result.updated_copy.subject_ref {
+            return Err(format!(
+                "{} placement subject {:?} does not match updated copy {:?}",
+                flow_name, subject_ref, result.updated_copy.subject_ref
+            ));
+        }
+        if placement.placed_on != result.updated_copy.member_ref {
+            return Err(format!(
+                "{} placement target {:?} does not match updated copy {:?}",
+                flow_name, placement.placed_on, result.updated_copy.member_ref
+            ));
+        }
+        if result.updated_copy.copy_class != ReplicaCopyClass::Verified {
+            return Err(format!(
+                "{} updated copy is {:?}, not verified",
+                flow_name, result.updated_copy.copy_class
+            ));
+        }
+        if placement.placement_receipt_refs.len() != 1 {
+            return Err(format!(
+                "{} placement publication must carry exactly one placement receipt ref, got {}",
+                flow_name,
+                placement.placement_receipt_refs.len()
+            ));
+        }
+
+        let placement_receipt_ref = placement.placement_receipt_refs[0];
+        Self::validate_flow_placement_ref(flow_name, subject_ref, placement_receipt_ref)?;
+        Ok((subject_ref, placement_receipt_ref))
+    }
+
+    fn validate_flow_placement_ref(
+        flow_name: &str,
         subject_ref: ReplicatedSubjectId,
         placement_receipt_ref: PlacementReceiptRef,
     ) -> Result<(), String> {
         if placement_receipt_ref.is_synthetic() {
             return Err(format!(
-                "rebuild placement receipt ref for subject {:?} is synthetic",
-                subject_ref
+                "{} placement receipt ref for subject {:?} is synthetic",
+                flow_name, subject_ref
             ));
         }
         let receipt_subject = ReplicatedSubjectId::new(placement_receipt_ref.object_id);
         if receipt_subject != subject_ref {
             return Err(format!(
-                "rebuild placement receipt subject mismatch: result subject {:?}, receipt subject {:?}",
-                subject_ref, receipt_subject
+                "{} placement receipt subject mismatch: result subject {:?}, receipt subject {:?}",
+                flow_name, subject_ref, receipt_subject
             ));
         }
         if !placement_receipt_ref.redundancy_policy.is_well_formed() {
             return Err(format!(
-                "rebuild placement receipt ref for subject {:?} has malformed redundancy policy",
-                subject_ref
+                "{} placement receipt ref for subject {:?} has malformed redundancy policy",
+                flow_name, subject_ref
             ));
         }
         let required_count = placement_receipt_ref.redundancy_policy.target_width();
         if placement_receipt_ref.target_count < required_count {
             return Err(format!(
-                "rebuild placement receipt ref for subject {:?} is under-width: target_count {} < required_count {}",
-                subject_ref, placement_receipt_ref.target_count, required_count
+                "{} placement receipt ref for subject {:?} is under-width: target_count {} < required_count {}",
+                flow_name, subject_ref, placement_receipt_ref.target_count, required_count
             ));
         }
         Ok(())
@@ -323,6 +407,27 @@ impl PlacementMap {
         }
         self.receipts.remove(&object_id);
         self.placement_receipt_refs.remove(&object_id);
+    }
+
+    fn remove_replica_preserving_receipt(&mut self, object_id: u64, member_id: u64) {
+        let mut object_still_placed = false;
+        if let Some(members) = self.entries.get_mut(&object_id) {
+            members.remove(&member_id);
+            object_still_placed = !members.is_empty();
+            if members.is_empty() {
+                self.entries.remove(&object_id);
+            }
+        }
+        if let Some(objects) = self.by_member.get_mut(&member_id) {
+            objects.remove(&object_id);
+            if objects.is_empty() {
+                self.by_member.remove(&member_id);
+            }
+        }
+        if !object_still_placed {
+            self.receipts.remove(&object_id);
+            self.placement_receipt_refs.remove(&object_id);
+        }
     }
 
     /// Remove all entries for a member (e.g., on node loss).
@@ -676,6 +781,17 @@ impl PlacementHealCoordinator {
         result: &FlowCommitResult,
     ) -> Result<RebuildFlowCommitPlacementPublication, String> {
         self.placement.publish_rebuild_flow_commit_result(result)
+    }
+
+    /// Publish a completed relocation flow-commit result into owned placement
+    /// state and retire the caller-named source member.
+    pub fn publish_relocation_flow_commit_result(
+        &mut self,
+        source_member: u64,
+        result: &FlowCommitResult,
+    ) -> Result<RelocationFlowCommitPlacementPublication, String> {
+        self.placement
+            .publish_relocation_flow_commit_result(source_member, result)
     }
 
     /// Return heal statistics.
@@ -1114,6 +1230,18 @@ mod tests {
         }
     }
 
+    fn relocation_flow_result(
+        object_id: u64,
+        target_member: u64,
+        placement_receipt_ref: PlacementReceiptRef,
+        epoch: u64,
+    ) -> FlowCommitResult {
+        let mut result =
+            rebuild_flow_result(object_id, target_member, placement_receipt_ref, epoch);
+        result.flow_class = FlowCommitClass::Relocation;
+        result
+    }
+
     fn assert_rebuild_flow_result_refused_without_mutation(
         result: FlowCommitResult,
         expected: &str,
@@ -1124,6 +1252,29 @@ mod tests {
         pm.record_placement_receipt_ref(90, old_receipt);
 
         let err = pm.publish_rebuild_flow_commit_result(&result).unwrap_err();
+
+        assert!(err.contains(expected), "{err}");
+        assert_eq!(pm.epoch(), 5);
+        assert_eq!(pm.placement_receipt_ref(90), Some(old_receipt));
+        assert_eq!(
+            pm.replicas_of(90).cloned().unwrap_or_default(),
+            [20].into_iter().collect()
+        );
+    }
+
+    fn assert_relocation_flow_result_refused_without_mutation(
+        source_member: u64,
+        result: FlowCommitResult,
+        expected: &str,
+    ) {
+        let mut pm = PlacementMap::new(5);
+        let old_receipt = receipt_ref(90, 1);
+        pm.insert(90, 20);
+        pm.record_placement_receipt_ref(90, old_receipt);
+
+        let err = pm
+            .publish_relocation_flow_commit_result(source_member, &result)
+            .unwrap_err();
 
         assert!(err.contains(expected), "{err}");
         assert_eq!(pm.epoch(), 5);
@@ -1209,6 +1360,41 @@ mod tests {
     }
 
     #[test]
+    fn placement_map_publishes_relocation_flow_commit_result_and_retires_source() {
+        let mut pm = PlacementMap::new(1);
+        let old_receipt = receipt_ref(90, 1);
+        let relocated_receipt = receipt_ref(90, 2);
+        pm.insert(90, 20);
+        pm.insert(90, 25);
+        pm.record_placement_receipt_ref(90, old_receipt);
+
+        let result = relocation_flow_result(90, 30, relocated_receipt, 7);
+        let publication = pm
+            .publish_relocation_flow_commit_result(20, &result)
+            .expect("completed relocation flow publishes placement");
+
+        assert_eq!(
+            publication,
+            RelocationFlowCommitPlacementPublication {
+                object_id: 90,
+                retired_source_member: 20,
+                target_member: 30,
+                placement_receipt_ref: relocated_receipt,
+                map_epoch: 7,
+            }
+        );
+        assert_eq!(pm.epoch(), 7);
+        assert_eq!(pm.placement_receipt_ref(90), Some(relocated_receipt));
+        assert_eq!(
+            pm.replicas_of(90).cloned().unwrap_or_default(),
+            [25, 30].into_iter().collect()
+        );
+        assert!(!pm
+            .objects_of(20)
+            .is_some_and(|objects| objects.contains(&90)));
+    }
+
+    #[test]
     fn placement_map_rejects_bad_rebuild_flow_commit_results_before_mutation() {
         let repaired_receipt = receipt_ref(90, 2);
 
@@ -1273,6 +1459,31 @@ mod tests {
 
         let result = rebuild_flow_result(90, 30, receipt_ref(91, 2), 7);
         assert_rebuild_flow_result_refused_without_mutation(result, "subject mismatch");
+    }
+
+    #[test]
+    fn placement_map_rejects_bad_relocation_flow_commit_results_before_mutation() {
+        let relocated_receipt = receipt_ref(90, 2);
+
+        let result = rebuild_flow_result(90, 30, relocated_receipt, 7);
+        assert_relocation_flow_result_refused_without_mutation(20, result, "not relocation");
+
+        let mut result = relocation_flow_result(90, 30, relocated_receipt, 7);
+        result.final_flow_state = FlowState::Verifying;
+        assert_relocation_flow_result_refused_without_mutation(20, result, "not complete");
+
+        let result = relocation_flow_result(90, 30, relocated_receipt, 4);
+        assert_relocation_flow_result_refused_without_mutation(20, result, "stale");
+
+        let result = relocation_flow_result(90, 30, relocated_receipt, 7);
+        assert_relocation_flow_result_refused_without_mutation(30, result, "matches target");
+
+        let result = relocation_flow_result(90, 30, relocated_receipt, 7);
+        assert_relocation_flow_result_refused_without_mutation(25, result, "does not hold");
+
+        let synthetic = PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(90));
+        let result = relocation_flow_result(90, 30, synthetic, 7);
+        assert_relocation_flow_result_refused_without_mutation(20, result, "synthetic");
     }
 
     #[test]
@@ -1395,6 +1606,41 @@ mod tests {
                 .cloned()
                 .unwrap_or_default(),
             [10, 20, 40].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn coordinator_publishes_relocation_flow_commit_result() {
+        let mut coord = make_coordinator();
+        let relocated_receipt = receipt_ref(1, 2);
+        let result = relocation_flow_result(1, 40, relocated_receipt, 7);
+
+        let publication = coord
+            .publish_relocation_flow_commit_result(10, &result)
+            .expect("coordinator publishes completed relocation flow");
+
+        assert_eq!(
+            publication,
+            RelocationFlowCommitPlacementPublication {
+                object_id: 1,
+                retired_source_member: 10,
+                target_member: 40,
+                placement_receipt_ref: relocated_receipt,
+                map_epoch: 7,
+            }
+        );
+        assert_eq!(coord.placement().epoch(), 7);
+        assert_eq!(
+            coord.placement().placement_receipt_ref(1),
+            Some(relocated_receipt)
+        );
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
+            [20, 40].into_iter().collect()
         );
     }
 
