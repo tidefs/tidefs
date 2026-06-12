@@ -106,14 +106,17 @@ deserialization for `tidefs_transport::ReplicationMessage`.
 | `ScrubRequest` | Runs local segment scrub and reports findings plus receipt-inventory disclosure |
 | `RepairObject { key, placement_receipt_ref, authoritative_payload }` | Validates the shared placement receipt against the exact 32-byte object key, length, digest, policy, and target width before local repair write; responds `RepairObjectAck` |
 
-Pool-backed scrub reports include both `placement_receipt_refs` and a
-`rebuild_admission` preview. The preview is built from the same real
-`PlacementReceiptRef` values through `tidefs-rebuild-runtime` admission and
-scheduler types, so later distributed rebuild orchestration can consume
-receipt-addressed tasks instead of deriving placement from current topology or
-compatibility store listings. Local path-backed and transport-backed
-compatibility stores report rebuild admission as unavailable because they do
-not expose pool placement receipt inventory.
+Pool-backed scrub reports include `placement_receipt_refs`,
+`rebuild_admission`, and `rebuild_planner` previews. Both previews are built
+from the same real `PlacementReceiptRef` values: admission runs them through
+`tidefs-rebuild-runtime`, while the planner preview feeds the live receipt
+inventory into `tidefs-rebuild-planner::plan_reconstruction()` with the local
+node as the healthy source and configured peers as replacement targets. This
+keeps later distributed rebuild orchestration tied to receipt-addressed tasks
+instead of deriving placement from current topology or compatibility store
+listings. Local path-backed and transport-backed compatibility stores report
+the rebuild previews as unavailable because they do not expose pool placement
+receipt inventory.
 
 Pool-backed `SyncResponse` entries likewise carry the real non-synthetic
 `PlacementReceiptRef` for the payload being transferred. Local path-backed and

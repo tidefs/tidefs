@@ -218,6 +218,15 @@ The executable slice includes:
 It covers degraded read/write, explicit no-quorum refusal, and rebuild restoration tests.
 This is a deterministic replicated object/root storage model; networked replication transport, streaming chunk movement, relocation execution, and production distributed runtime remain deferred.
 
+The storage-node pool-backed scrub boundary now exposes a
+`rebuild_planner` preview that feeds live `Pool::placement_receipt_refs()`
+output into `tidefs-rebuild-planner::plan_reconstruction()`. The preview is
+intentionally scoped to receipt-backed planner input construction: it proves
+live pool receipt inventory can reach the strict reconstruction planner without
+synthesizing receiptless placement, while distributed transfer execution,
+verification receipts, and repaired placement publication remain the runtime
+handoff work.
+
 ### 6.3 OW-305 executable rebuild/backfill/rebalance slice
 
 `crates/tidefs-replication-model` now also binds OW-305 movement planning to
