@@ -719,6 +719,7 @@ pub struct ReplicaMovementIntentRecord {
     pub intent_id: ReplicatedReceiptId,
     pub movement_class: ReplicaMovementClass,
     pub subject_ref: ReplicatedSubjectId,
+    pub placement_receipt_ref: PlacementReceiptRef,
     pub source_member_ref: MemberId,
     pub target_member_ref: MemberId,
     pub payload_digest: ObjectDigest,
@@ -2376,6 +2377,34 @@ fn sort_and_dedup(refs: &mut Vec<MemberId>) {
     refs.dedup();
 }
 
+fn digest_bytes_for_model_receipt(digest: ObjectDigest) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&digest.0.to_le_bytes());
+    bytes
+}
+
+fn model_placement_receipt_ref(
+    subject: &ReplicatedObjectRootRecord,
+    source_member_refs: &[MemberId],
+) -> PlacementReceiptRef {
+    let mut object_key = [0u8; 32];
+    object_key[..8].copy_from_slice(&subject.subject_id.0.to_le_bytes());
+    object_key[8..16].copy_from_slice(&subject.publication_receipt_ref.0.to_le_bytes());
+    object_key[16..24].copy_from_slice(&subject.root_generation.to_le_bytes());
+    object_key[24..32].copy_from_slice(&subject.payload_len.to_le_bytes());
+
+    let copies = source_member_refs.len().clamp(1, u8::MAX as usize) as u8;
+    PlacementReceiptRef::replicated(
+        subject.subject_id.0,
+        object_key,
+        subject.membership_epoch_ref,
+        subject.root_generation,
+        copies,
+        subject.payload_len,
+        digest_bytes_for_model_receipt(subject.payload_digest),
+    )
+}
+
 fn movement_intents(
     movement_class: ReplicaMovementClass,
     subject: &ReplicatedObjectRootRecord,
@@ -2400,6 +2429,7 @@ fn movement_intents(
             )),
             movement_class,
             subject_ref: subject.subject_id,
+            placement_receipt_ref: model_placement_receipt_ref(subject, source_member_refs),
             source_member_ref,
             target_member_ref: *target_member_ref,
             payload_digest: subject.payload_digest,
@@ -2781,6 +2811,22 @@ mod tests {
         digest[..8].copy_from_slice(&object_id.to_le_bytes());
         digest[8..16].copy_from_slice(&generation.to_le_bytes());
         digest
+    }
+
+    fn intent_receipt_ref(
+        object_id: u64,
+        payload_len: u64,
+        generation: u64,
+    ) -> PlacementReceiptRef {
+        PlacementReceiptRef::replicated(
+            object_id,
+            receipt_key(object_id),
+            EpochId::new(1),
+            generation,
+            1,
+            payload_len,
+            receipt_digest(object_id, generation),
+        )
     }
 
     #[test]
@@ -3519,6 +3565,7 @@ mod tests {
             intent_id: ReplicatedReceiptId(100),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
             subject_ref: ReplicatedSubjectId::new(42),
+            placement_receipt_ref: intent_receipt_ref(42, 8192, 100),
             source_member_ref: MemberId::new(1),
             target_member_ref: MemberId::new(5),
             payload_digest: ObjectDigest::new(0xC0FFEE),
@@ -3544,6 +3591,7 @@ mod tests {
             intent_id: ReplicatedReceiptId(200),
             movement_class: ReplicaMovementClass::RebalanceCapacityPressure,
             subject_ref: ReplicatedSubjectId::new(99),
+            placement_receipt_ref: intent_receipt_ref(99, 4096, 200),
             source_member_ref: MemberId::new(2),
             target_member_ref: MemberId::new(3),
             payload_digest: ObjectDigest::new(0xBEEF),
@@ -3580,6 +3628,7 @@ mod tests {
             intent_id: ReplicatedReceiptId(300),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
             subject_ref: ReplicatedSubjectId::new(7),
+            placement_receipt_ref: intent_receipt_ref(7, 1024, 300),
             source_member_ref: MemberId::new(10),
             target_member_ref: MemberId::new(20),
             payload_digest: ObjectDigest::new(0xABCD),
@@ -3623,6 +3672,7 @@ mod tests {
             intent_id: ReplicatedReceiptId(400),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
             subject_ref: ReplicatedSubjectId::new(8),
+            placement_receipt_ref: intent_receipt_ref(8, 512, 400),
             source_member_ref: MemberId::new(11),
             target_member_ref: MemberId::new(21),
             payload_digest: ObjectDigest::new(0xCAFE),
@@ -3662,6 +3712,7 @@ mod tests {
             intent_id: ReplicatedReceiptId(500),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
             subject_ref: ReplicatedSubjectId::new(9),
+            placement_receipt_ref: intent_receipt_ref(9, 2048, 500),
             source_member_ref: MemberId::new(12),
             target_member_ref: MemberId::new(22),
             payload_digest: ObjectDigest::new(0xDEAD),
@@ -3711,6 +3762,7 @@ mod tests {
             intent_id: ReplicatedReceiptId(600),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
             subject_ref: ReplicatedSubjectId::new(55),
+            placement_receipt_ref: intent_receipt_ref(55, 4096, 600),
             source_member_ref: MemberId::new(10),
             target_member_ref: MemberId::new(30),
             payload_digest: expected_digest,
@@ -3769,6 +3821,7 @@ mod tests {
             intent_id: ReplicatedReceiptId(700),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
             subject_ref: ReplicatedSubjectId::new(56),
+            placement_receipt_ref: intent_receipt_ref(56, 4096, 700),
             source_member_ref: MemberId::new(11),
             target_member_ref: MemberId::new(31),
             payload_digest: expected_digest,
@@ -3812,6 +3865,7 @@ mod tests {
             intent_id: ReplicatedReceiptId(42),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
             subject_ref: ReplicatedSubjectId::new(100),
+            placement_receipt_ref: intent_receipt_ref(100, 8192, 42),
             source_member_ref: MemberId::new(1),
             target_member_ref: MemberId::new(2),
             payload_digest: ObjectDigest::new(0xC0FFEE),
@@ -4064,6 +4118,27 @@ mod orchestrator_tests {
     use super::*;
     // ── Transfer Orchestrator tests (P8-03 §2: data_copy_1) ──
 
+    fn orchestrator_receipt_ref(
+        subject: u64,
+        payload_len: u64,
+        generation: u64,
+    ) -> PlacementReceiptRef {
+        let mut object_key = [0xC3; 32];
+        object_key[..8].copy_from_slice(&subject.to_le_bytes());
+        let mut payload_digest = [0x3C; 32];
+        payload_digest[..8].copy_from_slice(&subject.to_le_bytes());
+        payload_digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        PlacementReceiptRef::replicated(
+            subject,
+            object_key,
+            EpochId::new(1),
+            generation,
+            1,
+            payload_len,
+            payload_digest,
+        )
+    }
+
     fn make_intent(
         id: u64,
         subject: u64,
@@ -4076,6 +4151,7 @@ mod orchestrator_tests {
             intent_id: ReplicatedReceiptId(id),
             movement_class: class,
             subject_ref: ReplicatedSubjectId(subject),
+            placement_receipt_ref: orchestrator_receipt_ref(subject, payload_len, id),
             source_member_ref: MemberId::new(source),
             target_member_ref: MemberId::new(target),
             payload_digest: ObjectDigest(subject * 100),
@@ -4977,6 +5053,23 @@ mod property_tests {
 
     // ========== Flow commit coordinator tests ==========
 
+    fn flow_receipt_ref(subject: u64, payload_len: u64, generation: u64) -> PlacementReceiptRef {
+        let mut object_key = [0xD4; 32];
+        object_key[..8].copy_from_slice(&subject.to_le_bytes());
+        let mut payload_digest = [0x4D; 32];
+        payload_digest[..8].copy_from_slice(&subject.to_le_bytes());
+        payload_digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        PlacementReceiptRef::replicated(
+            subject,
+            object_key,
+            EpochId::new(1),
+            generation,
+            1,
+            payload_len,
+            payload_digest,
+        )
+    }
+
     fn make_test_flow_data() -> (
         ReplicaCopyRecord,
         ReplicaTransferTicketRecord,
@@ -4998,6 +5091,7 @@ mod property_tests {
             intent_id: ReplicatedReceiptId(1000),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
             subject_ref: ReplicatedSubjectId::new(100),
+            placement_receipt_ref: flow_receipt_ref(100, 4096, 1000),
             source_member_ref: MemberId::new(10),
             target_member_ref: MemberId::new(50),
             payload_digest: expected_digest,
