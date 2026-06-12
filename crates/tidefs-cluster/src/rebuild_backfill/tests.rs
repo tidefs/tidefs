@@ -5,7 +5,7 @@ use crate::rebuild_backfill::{
 use crate::types::{DataPathCarrier, LeaseState};
 use std::collections::BTreeMap;
 use tidefs_membership_epoch::EpochId;
-use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
+use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy, ReplicatedSubjectId};
 
 // ── Helpers ───────────────────────────────────────────────────
 
@@ -34,7 +34,13 @@ fn synthetic_task(
     targets: Vec<u64>,
     priority: u8,
 ) -> ReconstructionTask {
-    ReconstructionTask::new_full(object_id, sources, targets, priority)
+    ReconstructionTask::new_full_with_receipt(
+        object_id,
+        PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(object_id)),
+        sources,
+        targets,
+        priority,
+    )
 }
 
 fn receipt_ref(object_id: u64, generation: u64) -> PlacementReceiptRef {
@@ -78,6 +84,26 @@ fn make_plan(plan_id: u64, tasks: Vec<ReconstructionTask>) -> RebuildPlan {
     RebuildPlan::new(plan_id, tasks, 0)
 }
 
+fn make_command(
+    source: u64,
+    target: u64,
+    object_ids: Vec<u64>,
+    max_chunk_bytes: u64,
+) -> BackfillCommand {
+    let placement_receipt_refs = object_ids
+        .iter()
+        .copied()
+        .map(|object_id| receipt_ref(object_id, 1))
+        .collect();
+    BackfillCommand::new_with_receipts(
+        source,
+        target,
+        object_ids,
+        placement_receipt_refs,
+        max_chunk_bytes,
+    )
+}
+
 // ── ReconstructionTask ────────────────────────────────────────
 
 #[test]
@@ -94,8 +120,16 @@ fn reconstruction_task_no_sources() {
 }
 
 #[test]
-fn reconstruction_task_range_new() {
-    let t = ReconstructionTask::new_range(1, vec![10], vec![20], 0, 4096, 0);
+fn reconstruction_task_range_with_receipt() {
+    let t = ReconstructionTask::new_range_with_receipt(
+        1,
+        receipt_ref(1, 1),
+        vec![10],
+        vec![20],
+        0,
+        4096,
+        0,
+    );
     assert_eq!(t.data_range, Some((0, 4096)));
 }
 
@@ -127,21 +161,26 @@ fn rebuild_plan_with_tasks() {
 
 #[test]
 fn command_empty() {
-    let cmd = BackfillCommand::new(1, 2, vec![], 4096);
+    let cmd = BackfillCommand::new_with_receipts(1, 2, vec![], vec![], 4096);
     assert!(cmd.is_empty());
     assert_eq!(cmd.object_count(), 0);
 }
 
 #[test]
-fn command_with_objects() {
-    let cmd = BackfillCommand::new(10, 20, vec![100, 200, 300], 65536);
+fn command_with_receipts() {
+    let refs = vec![
+        receipt_ref(100, 1),
+        receipt_ref(200, 1),
+        receipt_ref(300, 1),
+    ];
+    let cmd = BackfillCommand::new_with_receipts(10, 20, vec![100, 200, 300], refs.clone(), 65536);
     assert!(!cmd.is_empty());
     assert_eq!(cmd.object_count(), 3);
-    assert_eq!(cmd.placement_receipt_refs.len(), 3);
+    assert_eq!(cmd.placement_receipt_refs, refs);
     assert!(cmd
         .placement_receipt_refs
         .iter()
-        .all(|receipt| receipt.is_synthetic()));
+        .all(|receipt| !receipt.is_synthetic()));
     assert_eq!(cmd.source_node, 10);
     assert_eq!(cmd.target_node, 20);
 }
@@ -167,8 +206,8 @@ fn batch_empty() {
 #[test]
 fn batch_add_commands() {
     let mut batch = BackfillBatch::new(5, eid(1), DataPathCarrier::Unknown);
-    batch.add_command(BackfillCommand::new(1, 5, vec![10, 20], 4096));
-    batch.add_command(BackfillCommand::new(2, 5, vec![30], 4096));
+    batch.add_command(make_command(1, 5, vec![10, 20], 4096));
+    batch.add_command(make_command(2, 5, vec![30], 4096));
     assert!(!batch.is_empty());
     assert_eq!(batch.command_count(), 2);
     assert_eq!(batch.total_objects(), 3);
@@ -680,7 +719,7 @@ fn batches_for_backfill() {
 
 #[test]
 fn backfill_command_accessors() {
-    let cmd = BackfillCommand::new(10, 20, vec![100, 200], 65536);
+    let cmd = make_command(10, 20, vec![100, 200], 65536);
     assert_eq!(cmd.source_node, 10);
     assert_eq!(cmd.target_node, 20);
     assert_eq!(cmd.object_ids, vec![100, 200]);
