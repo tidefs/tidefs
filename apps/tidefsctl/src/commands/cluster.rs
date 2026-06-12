@@ -236,7 +236,7 @@ fn parse_node_addresses(raw: &[String]) -> Result<BTreeMap<u64, SocketAddr>, Str
 fn parse_placement(raw: &str) -> Result<ClusterPlacementPolicy, String> {
     match raw {
         "single" => return Ok(ClusterPlacementPolicy::Stripe),
-        "stripe" => return Err(legacy_redundancy_error(raw, "single")),
+        "stripe" => return Err(retired_redundancy_alias_error(raw, "single")),
         _ => {}
     }
 
@@ -250,7 +250,7 @@ fn parse_placement(raw: &str) -> Result<ClusterPlacementPolicy, String> {
     }
 
     if raw.starts_with("mirror=") {
-        return Err(legacy_redundancy_error(raw, "replicated=N"));
+        return Err(retired_redundancy_alias_error(raw, "replicated=N"));
     }
 
     if let Some(rest) = raw.strip_prefix("erasure=") {
@@ -259,7 +259,7 @@ fn parse_placement(raw: &str) -> Result<ClusterPlacementPolicy, String> {
     }
 
     if raw.starts_with("ec=") {
-        return Err(legacy_redundancy_error(raw, "erasure=D+P"));
+        return Err(retired_redundancy_alias_error(raw, "erasure=D+P"));
     }
 
     Err(format!(
@@ -301,9 +301,9 @@ fn parse_erasure_shards(raw_spec: &str, raw_policy: &str) -> Result<(u8, u8), St
     Ok((data, parity))
 }
 
-fn legacy_redundancy_error(raw: &str, replacement: &str) -> String {
+fn retired_redundancy_alias_error(raw: &str, replacement: &str) -> String {
     format!(
-        "legacy redundancy policy \"{raw}\" is no longer accepted; use {replacement} (expected single, replicated=N, or erasure=D+P)"
+        "retired redundancy alias \"{raw}\" is not accepted; use {replacement} (expected single, replicated=N, or erasure=D+P)"
     )
 }
 
@@ -1121,17 +1121,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_legacy_redundancy_forms_rejected() {
+    fn parse_retired_redundancy_aliases_rejected() {
         let stripe = parse_placement("stripe").unwrap_err();
-        assert!(stripe.contains("legacy redundancy policy"));
+        assert!(stripe.contains("retired redundancy alias"));
         assert!(stripe.contains("single"));
 
         let mirror = parse_placement("mirror=2").unwrap_err();
-        assert!(mirror.contains("legacy redundancy policy"));
+        assert!(mirror.contains("retired redundancy alias"));
         assert!(mirror.contains("replicated=N"));
 
         let ec = parse_placement("ec=4+2").unwrap_err();
-        assert!(ec.contains("legacy redundancy policy"));
+        assert!(ec.contains("retired redundancy alias"));
         assert!(ec.contains("erasure=D+P"));
     }
 
