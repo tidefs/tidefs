@@ -14,10 +14,133 @@
 
 use alloc::collections::BTreeMap as BTreeMapAlloc;
 use alloc::vec::Vec;
+use core::fmt;
 
 use tidefs_binary_schema_checksum::blake3_domain_digest;
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
-use tidefs_types_reclaim_queue_core::{DeadObjectEntry, ObjectKey};
+use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
+use tidefs_types_reclaim_queue_core::{
+    DeadObjectEntry, DeadObjectReceiptPolicy, DeadObjectReplacementReceipt, ObjectKey,
+};
+
+/// Reason a shared placement receipt reference cannot authorize dead-object reclaim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlacementReceiptRefReclaimError {
+    /// Generation-zero compatibility receipts are not durable placement authority.
+    SyntheticReceipt,
+    /// The shared receipt describes a different object key than the retired object.
+    ObjectKeyMismatch {
+        expected: ObjectKey,
+        found: ObjectKey,
+    },
+    /// The redundancy policy cannot describe usable replacement placement.
+    MalformedPolicy,
+    /// The receipt recorded fewer physical targets than its redundancy policy requires.
+    UnderWidthReceipt {
+        target_count: u16,
+        required_count: u16,
+    },
+}
+
+impl fmt::Display for PlacementReceiptRefReclaimError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SyntheticReceipt => {
+                f.write_str("synthetic placement receipt cannot authorize reclaim")
+            }
+            Self::ObjectKeyMismatch { expected, found } => write!(
+                f,
+                "placement receipt object key mismatch: expected {expected}, found {found}"
+            ),
+            Self::MalformedPolicy => {
+                f.write_str("placement receipt redundancy policy is malformed")
+            }
+            Self::UnderWidthReceipt {
+                target_count,
+                required_count,
+            } => write!(
+                f,
+                "placement receipt target count {target_count} is below required width {required_count}"
+            ),
+        }
+    }
+}
+
+/// Convert the shared distributed receipt policy into the dead-object queue
+/// policy projection without changing the persisted queue format.
+#[must_use]
+pub const fn dead_object_policy_from_placement_ref(
+    policy: ReceiptRedundancyPolicy,
+) -> DeadObjectReceiptPolicy {
+    match policy {
+        ReceiptRedundancyPolicy::Replicated { copies } => {
+            DeadObjectReceiptPolicy::Replicated { copies }
+        }
+        ReceiptRedundancyPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        } => DeadObjectReceiptPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        },
+    }
+}
+
+/// Build dead-object replacement evidence from the canonical distributed
+/// placement receipt reference.
+///
+/// The returned receipt is still keyed by the retired object id carried in the
+/// dead-object queue. This helper only admits exact-key, non-synthetic,
+/// policy-satisfying refs so callers cannot accidentally make receipt-bound
+/// reclaim looser than the queue's existing gate.
+pub fn replacement_receipt_from_placement_ref(
+    retired_object_key: ObjectKey,
+    placement_ref: PlacementReceiptRef,
+) -> Result<DeadObjectReplacementReceipt, PlacementReceiptRefReclaimError> {
+    if placement_ref.is_synthetic() {
+        return Err(PlacementReceiptRefReclaimError::SyntheticReceipt);
+    }
+
+    let found_key = ObjectKey(placement_ref.object_key);
+    if found_key != retired_object_key {
+        return Err(PlacementReceiptRefReclaimError::ObjectKeyMismatch {
+            expected: retired_object_key,
+            found: found_key,
+        });
+    }
+
+    if !placement_ref.redundancy_policy.is_well_formed() {
+        return Err(PlacementReceiptRefReclaimError::MalformedPolicy);
+    }
+
+    let required_count = placement_ref.redundancy_policy.target_width();
+    if placement_ref.target_count < required_count {
+        return Err(PlacementReceiptRefReclaimError::UnderWidthReceipt {
+            target_count: placement_ref.target_count,
+            required_count,
+        });
+    }
+
+    Ok(DeadObjectReplacementReceipt::new(
+        retired_object_key,
+        placement_ref.receipt_epoch.0,
+        placement_ref.receipt_generation,
+        dead_object_policy_from_placement_ref(placement_ref.redundancy_policy),
+        placement_ref.payload_len,
+        placement_ref.payload_digest,
+        placement_ref.target_count,
+    ))
+}
+
+/// Attach canonical placement receipt evidence to a dead-object entry.
+pub fn dead_object_entry_with_placement_ref(
+    entry: DeadObjectEntry,
+    placement_ref: PlacementReceiptRef,
+) -> Result<DeadObjectEntry, PlacementReceiptRefReclaimError> {
+    let replacement_receipt =
+        replacement_receipt_from_placement_ref(entry.object_id, placement_ref)?;
+    Ok(entry.with_replacement_receipt(replacement_receipt))
+}
 
 // ---------------------------------------------------------------------------
 // DeadObjectReclaimQueue
@@ -437,7 +560,7 @@ impl core::fmt::Display for DeadObjectQueueDecodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_types_reclaim_queue_core::{DeadObjectReceiptPolicy, DeadObjectReplacementReceipt};
+    use tidefs_replication_model::{ReceiptRedundancyPolicy, ReplicatedSubjectId};
 
     fn oid(byte: u8) -> ObjectKey {
         let mut k = [0u8; 32];
@@ -463,6 +586,24 @@ mod tests {
 
     fn receipt(id: u8) -> DeadObjectReplacementReceipt {
         DeadObjectReplacementReceipt::replicated(oid(id), 7, 1, 2, 4096, digest(id))
+    }
+
+    fn placement_ref(
+        key: ObjectKey,
+        generation: u64,
+        redundancy_policy: ReceiptRedundancyPolicy,
+        target_count: u16,
+    ) -> PlacementReceiptRef {
+        PlacementReceiptRef {
+            object_id: u64::from(key.0[0]),
+            object_key: key.0,
+            receipt_epoch: Default::default(),
+            receipt_generation: generation,
+            redundancy_policy,
+            payload_len: 4096,
+            payload_digest: digest(key.0[0]),
+            target_count,
+        }
     }
 
     fn entry_with_receipt(
@@ -654,6 +795,104 @@ mod tests {
         assert_eq!(batch[0].object_id, oid(3));
         assert_eq!(q.eligible_count(10), 1);
         assert_eq!(q.receipt_bound_eligible_count(10), 1);
+    }
+
+    #[test]
+    fn placement_ref_bridge_authorizes_receipt_bound_dequeue() {
+        let key = oid(0x70);
+        let entry = DeadObjectEntry::new(key, [0x70; 16], 5, true, 4);
+        let placement_ref =
+            placement_ref(key, 9, ReceiptRedundancyPolicy::Replicated { copies: 2 }, 2);
+
+        let bridged =
+            dead_object_entry_with_placement_ref(entry, placement_ref).expect("bridge receipt");
+        assert_eq!(
+            bridged.replacement_receipt.unwrap(),
+            DeadObjectReplacementReceipt::replicated(key, 0, 9, 2, 4096, digest(0x70))
+        );
+
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(bridged);
+
+        let batch = q.dequeue_receipt_bound_batch(10, 6);
+        assert_eq!(batch, vec![bridged]);
+    }
+
+    #[test]
+    fn placement_ref_bridge_rejects_synthetic_receipts() {
+        let key = oid(0x71);
+        let entry = DeadObjectEntry::new(key, [0x71; 16], 5, true, 4);
+        let synthetic = PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(0x71));
+
+        let err = dead_object_entry_with_placement_ref(entry, synthetic)
+            .expect_err("synthetic ref must not authorize reclaim");
+        assert_eq!(err, PlacementReceiptRefReclaimError::SyntheticReceipt);
+
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry);
+        assert!(q.dequeue_receipt_bound_batch(10, 6).is_empty());
+    }
+
+    #[test]
+    fn placement_ref_bridge_rejects_object_key_mismatch() {
+        let entry = DeadObjectEntry::new(oid(0x72), [0x72; 16], 5, true, 4);
+        let placement_ref = placement_ref(
+            oid(0x73),
+            10,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            2,
+        );
+
+        let err = dead_object_entry_with_placement_ref(entry, placement_ref)
+            .expect_err("mismatched ref must fail");
+        assert_eq!(
+            err,
+            PlacementReceiptRefReclaimError::ObjectKeyMismatch {
+                expected: oid(0x72),
+                found: oid(0x73),
+            }
+        );
+    }
+
+    #[test]
+    fn placement_ref_bridge_rejects_malformed_policy() {
+        let key = oid(0x74);
+        let entry = DeadObjectEntry::new(key, [0x74; 16], 5, true, 4);
+        let placement_ref = placement_ref(
+            key,
+            10,
+            ReceiptRedundancyPolicy::Replicated { copies: 0 },
+            0,
+        );
+
+        let err = dead_object_entry_with_placement_ref(entry, placement_ref)
+            .expect_err("malformed policy must fail");
+        assert_eq!(err, PlacementReceiptRefReclaimError::MalformedPolicy);
+    }
+
+    #[test]
+    fn placement_ref_bridge_rejects_under_width_receipts() {
+        let key = oid(0x75);
+        let entry = DeadObjectEntry::new(key, [0x75; 16], 5, true, 4);
+        let placement_ref = placement_ref(
+            key,
+            10,
+            ReceiptRedundancyPolicy::Erasure {
+                data_shards: 2,
+                parity_shards: 1,
+            },
+            2,
+        );
+
+        let err = dead_object_entry_with_placement_ref(entry, placement_ref)
+            .expect_err("under-width receipt must fail");
+        assert_eq!(
+            err,
+            PlacementReceiptRefReclaimError::UnderWidthReceipt {
+                target_count: 2,
+                required_count: 3,
+            }
+        );
     }
 
     // ── ack_reclaimed ──────────────────────────────────────────────────
