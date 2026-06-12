@@ -2115,9 +2115,8 @@ fn dispatch_inbound_membership_msg(
             }
         }
         MembershipWireMessage::View(view) => {
-            // Inbound view snapshots are informational; the runtime's own
-            // view is authoritative. No-op for now.
-            let _ = view;
+            let mut runtime = membership.lock().unwrap();
+            let _ = runtime.observe_membership_view_placement_version(&view);
         }
         MembershipWireMessage::IndirectPingRequest(req) => {
             // Processed via FailureDetector when full indirect-ping relay
@@ -5969,6 +5968,49 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
+    fn inbound_membership_view_records_peer_placement_version() {
+        let membership = Arc::new(Mutex::new(MembershipRuntime::new(
+            MembershipConfig {
+                ping_interval_ms: 50,
+                ping_timeout_ms: 200,
+                suspicion_window_ms: 500,
+                indirect_ping_count: 2,
+                min_voters_for_quorum: 2,
+                max_failed_pings_before_suspect: 3,
+            },
+            MemberId::new(1),
+            MemberClass::Voter,
+            1,
+        )));
+        membership
+            .lock()
+            .unwrap()
+            .add_peer(MemberId::new(2), MemberClass::Voter, 2);
+        let membership_transport = Arc::new(Mutex::new(MembershipTransport::new(1)));
+
+        let view = MembershipView {
+            epoch: EpochId::new(1),
+            config_class: tidefs_membership_epoch::ConfigClass::Normal,
+            local_member: MemberId::new(2),
+            nodes: Vec::new(),
+            placement_version: 12,
+        };
+        dispatch_inbound_membership_msg(
+            &membership,
+            &membership_transport,
+            tidefs_transport::SessionId::new(88),
+            MembershipWireMessage::View(view),
+        );
+
+        let runtime = membership.lock().unwrap();
+        assert_eq!(runtime.peer_placement_version(MemberId::new(2)), Some(12));
+        let convergence = runtime.placement_version_convergence();
+        assert_eq!(convergence.max_peer_version, 12);
+        assert_eq!(convergence.peers_ahead, vec![MemberId::new(2)]);
+        assert!(convergence.local_is_stale());
+    }
+
+    #[test]
     fn transport_read_map_publication_refuses_empty_cluster_placement() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime =
@@ -6047,9 +6089,7 @@ mod cluster_pool_handler_tests {
                 .members_for(repaired_receipts[0].object_id)
                 .cloned()
                 .unwrap_or_default(),
-            [MemberId::new(2), MemberId::new(3)]
-                .into_iter()
-                .collect()
+            [MemberId::new(2), MemberId::new(3)].into_iter().collect()
         );
         assert_eq!(
             publication
@@ -6057,9 +6097,7 @@ mod cluster_pool_handler_tests {
                 .members_for(repaired_receipts[1].object_id)
                 .cloned()
                 .unwrap_or_default(),
-            [MemberId::new(2), MemberId::new(4)]
-                .into_iter()
-                .collect()
+            [MemberId::new(2), MemberId::new(4)].into_iter().collect()
         );
         for source_receipt in source_receipts {
             assert!(!publication
