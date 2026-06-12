@@ -1026,9 +1026,9 @@ use tidefs_rebuild_runtime::{
 use tidefs_transport::{
     build_read_responses, recv_replication_msg, recv_segment_fetch, recv_segment_fetch_response,
     recv_write_request, send_replication_msg, send_segment_fetch, send_segment_fetch_response,
-    send_write_ack, NodeInfo, ObjectTransferMessage, PlacementDispatch, ReplicationMessage,
-    SegmentFetchRequest, SegmentFetchResponse, SessionCloseReason, SessionId, Transport,
-    TransportError, WriteStatus, MAX_CHUNK_PAYLOAD,
+    send_write_ack, NodeInfo, ObjectTransferMessage, PlacementDispatch, PlacementMapRefusalReason,
+    ReplicationMessage, SegmentFetchRequest, SegmentFetchResponse, SessionCloseReason, SessionId,
+    Transport, TransportError, WriteStatus, MAX_CHUNK_PAYLOAD,
 };
 
 #[cfg(not(test))]
@@ -1237,6 +1237,139 @@ pub struct TransportReplicatedPutResult {
     /// Whether the write was fully committed (all replicas acked).
     pub fully_committed: bool,
 }
+
+/// Successful peer placement read-map installation over a replica control session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerPlacementMapRequestReport {
+    /// Peer node that served the map.
+    pub peer_node_id: u64,
+    /// Minimum version sent in the request.
+    pub requested_minimum_version: u64,
+    /// Local store placement version before the peer map was installed.
+    pub previous_version: u64,
+    /// Version installed from the peer response.
+    pub installed_version: u64,
+    /// Exact map accepted through the placement dispatch validation path.
+    pub installed_map: tidefs_transport::PlacementMap,
+}
+
+/// Fail-closed outcomes for a peer placement read-map request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PeerPlacementMapRequestError {
+    /// The requested peer is not in this store's replica session set.
+    ReplicaNotConnected { peer_node_id: u64 },
+    /// The request could not be sent.
+    SendFailed { peer_node_id: u64, message: String },
+    /// No bounded response was received.
+    ReceiveFailed { peer_node_id: u64, message: String },
+    /// The peer replied with a different message type.
+    UnexpectedResponse { peer_node_id: u64, actual: String },
+    /// The peer response did not echo the request minimum version.
+    MinimumVersionMismatch {
+        peer_node_id: u64,
+        requested_minimum_version: u64,
+        response_minimum_version: u64,
+    },
+    /// The peer explicitly refused the request.
+    Refused {
+        peer_node_id: u64,
+        requested_minimum_version: u64,
+        reason: PlacementMapRefusalReason,
+    },
+    /// The peer returned neither a map nor a refusal reason.
+    MissingMap {
+        peer_node_id: u64,
+        requested_minimum_version: u64,
+    },
+    /// The peer map did not advance the requested/local version boundary.
+    Stale {
+        peer_node_id: u64,
+        requested_minimum_version: u64,
+        available_version: u64,
+        local_version: u64,
+    },
+    /// The local placement dispatch rejected the peer map.
+    InstallRejected {
+        peer_node_id: u64,
+        requested_minimum_version: u64,
+        map_version: u64,
+        message: String,
+    },
+}
+
+impl std::fmt::Display for PeerPlacementMapRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReplicaNotConnected { peer_node_id } => {
+                write!(f, "replica node {peer_node_id} is not connected")
+            }
+            Self::SendFailed {
+                peer_node_id,
+                message,
+            } => write!(
+                f,
+                "send placement map request to replica node {peer_node_id} failed: {message}"
+            ),
+            Self::ReceiveFailed {
+                peer_node_id,
+                message,
+            } => write!(
+                f,
+                "receive placement map response from replica node {peer_node_id} failed: {message}"
+            ),
+            Self::UnexpectedResponse {
+                peer_node_id,
+                actual,
+            } => write!(
+                f,
+                "replica node {peer_node_id} returned unexpected placement map response: {actual}"
+            ),
+            Self::MinimumVersionMismatch {
+                peer_node_id,
+                requested_minimum_version,
+                response_minimum_version,
+            } => write!(
+                f,
+                "replica node {peer_node_id} echoed placement map minimum {response_minimum_version}, requested {requested_minimum_version}"
+            ),
+            Self::Refused {
+                peer_node_id,
+                requested_minimum_version,
+                reason,
+            } => write!(
+                f,
+                "replica node {peer_node_id} refused placement map request minimum {requested_minimum_version}: {reason:?}"
+            ),
+            Self::MissingMap {
+                peer_node_id,
+                requested_minimum_version,
+            } => write!(
+                f,
+                "replica node {peer_node_id} returned no placement map for minimum {requested_minimum_version}"
+            ),
+            Self::Stale {
+                peer_node_id,
+                requested_minimum_version,
+                available_version,
+                local_version,
+            } => write!(
+                f,
+                "replica node {peer_node_id} returned placement map version {available_version}, requested minimum {requested_minimum_version}, local version {local_version}"
+            ),
+            Self::InstallRejected {
+                peer_node_id,
+                requested_minimum_version,
+                map_version,
+                message,
+            } => write!(
+                f,
+                "replica node {peer_node_id} placement map version {map_version} for minimum {requested_minimum_version} was rejected: {message}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PeerPlacementMapRequestError {}
 
 /// A remote replica node with per-endpoint-family sessions.
 ///
@@ -2440,6 +2573,101 @@ impl TransportReplicatedStore {
 
         placement.set_placement_map(map);
         Ok(())
+    }
+
+    /// Request and install a peer's transport placement read map.
+    ///
+    /// The request uses the peer's outbound replica Control session. The local
+    /// placement map is only mutated when the peer response echoes the requested
+    /// minimum, carries no refusal, and contains a map whose version satisfies
+    /// both the requested minimum and the local monotonic-version boundary.
+    pub fn request_peer_placement_map(
+        &mut self,
+        peer_node_id: u64,
+        minimum_version: u64,
+    ) -> Result<PeerPlacementMapRequestReport, PeerPlacementMapRequestError> {
+        let control_session_id = self
+            .replicas
+            .iter()
+            .find(|replica| replica.node_id == peer_node_id)
+            .map(|replica| replica.control_session_id)
+            .ok_or(PeerPlacementMapRequestError::ReplicaNotConnected { peer_node_id })?;
+
+        let request = ReplicationMessage::PlacementMapRequest { minimum_version };
+        send_replication_msg(&mut self.transport, control_session_id, &request).map_err(
+            |error| PeerPlacementMapRequestError::SendFailed {
+                peer_node_id,
+                message: error.to_string(),
+            },
+        )?;
+
+        let response = Self::recv_replication_ack_bounded(&mut self.transport, control_session_id)
+            .map_err(|error| PeerPlacementMapRequestError::ReceiveFailed {
+                peer_node_id,
+                message: error.to_string(),
+            })?;
+
+        let ReplicationMessage::PlacementMapResponse {
+            requested_minimum_version,
+            map,
+            refusal,
+        } = response
+        else {
+            return Err(PeerPlacementMapRequestError::UnexpectedResponse {
+                peer_node_id,
+                actual: format!("{response:?}"),
+            });
+        };
+
+        if requested_minimum_version != minimum_version {
+            return Err(PeerPlacementMapRequestError::MinimumVersionMismatch {
+                peer_node_id,
+                requested_minimum_version: minimum_version,
+                response_minimum_version: requested_minimum_version,
+            });
+        }
+
+        if let Some(reason) = refusal {
+            return Err(PeerPlacementMapRequestError::Refused {
+                peer_node_id,
+                requested_minimum_version,
+                reason,
+            });
+        }
+
+        let Some(map) = map else {
+            return Err(PeerPlacementMapRequestError::MissingMap {
+                peer_node_id,
+                requested_minimum_version,
+            });
+        };
+
+        let previous_version = self.placement_version();
+        if map.version < requested_minimum_version || map.version <= previous_version {
+            return Err(PeerPlacementMapRequestError::Stale {
+                peer_node_id,
+                requested_minimum_version,
+                available_version: map.version,
+                local_version: previous_version,
+            });
+        }
+
+        self.try_set_placement_map(map.clone()).map_err(|error| {
+            PeerPlacementMapRequestError::InstallRejected {
+                peer_node_id,
+                requested_minimum_version,
+                map_version: map.version,
+                message: error,
+            }
+        })?;
+
+        Ok(PeerPlacementMapRequestReport {
+            peer_node_id,
+            requested_minimum_version,
+            previous_version,
+            installed_version: map.version,
+            installed_map: map,
+        })
     }
 
     /// Set the placement map on the dispatch, incrementing the version.
@@ -4080,6 +4308,9 @@ mod tests {
 
     mod transport_replicated {
         use super::*;
+        use std::collections::{BTreeMap, BTreeSet};
+        use tidefs_durability_layout::{DurabilityLayoutV1, FailureDomainLevel, FailureDomainV1};
+        use tidefs_transport::{PlacementMap, TransportSessionSet};
 
         fn blocking_accept(transport: &mut Transport) -> SessionId {
             for _ in 0..100 {
@@ -4114,6 +4345,32 @@ mod tests {
                 shadow_session_id: client_session_id,
             });
             (client_session_id, server_session_id)
+        }
+
+        fn transport_store_with_placement(
+            node_id: u64,
+        ) -> (tempfile::TempDir, TransportReplicatedStore) {
+            let tmp = tempfile::TempDir::with_prefix("rep-obj-read-map-").unwrap();
+            let layout = DurabilityLayoutV1::mirror(2).unwrap();
+            let failure_domain = FailureDomainV1::new(FailureDomainLevel::Node, 64).unwrap();
+            let sessions = TransportSessionSet::new();
+            let dispatch = PlacementDispatch::new(layout, failure_domain, 0, sessions);
+            let store = TransportReplicatedStore::open(
+                tmp.path(),
+                node_id,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap()
+            .with_placement(dispatch);
+
+            (tmp, store)
+        }
+
+        fn test_placement_map(version: u64) -> PlacementMap {
+            let mut mapping = BTreeMap::new();
+            mapping.insert(1001, BTreeSet::from([MemberId::new(1), MemberId::new(2)]));
+            mapping.insert(1002, BTreeSet::from([MemberId::new(2), MemberId::new(3)]));
+            PlacementMap::new(version, EpochId::new(9), mapping)
         }
 
         fn placement_receipt_ref(
@@ -5045,6 +5302,160 @@ mod tests {
             assert_eq!(five.total_replicas, 5);
             assert_eq!(five.write_quorum, 3);
             assert!(five.write_quorum > five.total_replicas / 2);
+        }
+
+        #[test]
+        fn request_peer_placement_map_installs_newer_map() {
+            let (_primary_dir, mut primary) = transport_store_with_placement(1);
+            let replica_dir = tempfile::tempdir().unwrap();
+            let mut replica = TransportReplicatedStore::open(
+                replica_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let (_client_session_id, server_session_id) =
+                connect_replica_pair(&mut primary, &mut replica, 2);
+            let installed = test_placement_map(1);
+            let peer_map = test_placement_map(3);
+            primary.set_placement_map(installed.clone());
+
+            let peer_map_for_thread = peer_map.clone();
+            let replica_thread = std::thread::spawn(move || {
+                let request = TransportReplicatedStore::recv_replication_ack_bounded(
+                    &mut replica.transport,
+                    server_session_id,
+                )
+                .unwrap();
+                assert_eq!(
+                    request,
+                    ReplicationMessage::PlacementMapRequest { minimum_version: 2 }
+                );
+                send_replication_msg(
+                    &mut replica.transport,
+                    server_session_id,
+                    &ReplicationMessage::PlacementMapResponse {
+                        requested_minimum_version: 2,
+                        map: Some(peer_map_for_thread),
+                        refusal: None,
+                    },
+                )
+                .unwrap();
+            });
+
+            let report = primary.request_peer_placement_map(2, 2).unwrap();
+
+            assert_eq!(report.peer_node_id, 2);
+            assert_eq!(report.requested_minimum_version, 2);
+            assert_eq!(report.previous_version, 1);
+            assert_eq!(report.installed_version, 3);
+            assert_eq!(report.installed_map, peer_map);
+            assert_eq!(primary.placement_map(), Some(&peer_map));
+            replica_thread.join().unwrap();
+        }
+
+        #[test]
+        fn request_peer_placement_map_refusal_does_not_mutate() {
+            let (_primary_dir, mut primary) = transport_store_with_placement(1);
+            let replica_dir = tempfile::tempdir().unwrap();
+            let mut replica = TransportReplicatedStore::open(
+                replica_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let (_client_session_id, server_session_id) =
+                connect_replica_pair(&mut primary, &mut replica, 2);
+            let installed = test_placement_map(5);
+            primary.set_placement_map(installed.clone());
+
+            let replica_thread = std::thread::spawn(move || {
+                let request = TransportReplicatedStore::recv_replication_ack_bounded(
+                    &mut replica.transport,
+                    server_session_id,
+                )
+                .unwrap();
+                assert_eq!(
+                    request,
+                    ReplicationMessage::PlacementMapRequest { minimum_version: 6 }
+                );
+                send_replication_msg(
+                    &mut replica.transport,
+                    server_session_id,
+                    &ReplicationMessage::PlacementMapResponse {
+                        requested_minimum_version: 6,
+                        map: None,
+                        refusal: Some(PlacementMapRefusalReason::NoInstalledMap),
+                    },
+                )
+                .unwrap();
+            });
+
+            let err = primary.request_peer_placement_map(2, 6).unwrap_err();
+
+            assert_eq!(
+                err,
+                PeerPlacementMapRequestError::Refused {
+                    peer_node_id: 2,
+                    requested_minimum_version: 6,
+                    reason: PlacementMapRefusalReason::NoInstalledMap,
+                }
+            );
+            assert_eq!(primary.placement_map(), Some(&installed));
+            replica_thread.join().unwrap();
+        }
+
+        #[test]
+        fn request_peer_placement_map_rejects_stale_map_without_mutation() {
+            let (_primary_dir, mut primary) = transport_store_with_placement(1);
+            let replica_dir = tempfile::tempdir().unwrap();
+            let mut replica = TransportReplicatedStore::open(
+                replica_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let (_client_session_id, server_session_id) =
+                connect_replica_pair(&mut primary, &mut replica, 2);
+            let installed = test_placement_map(5);
+            let stale_peer_map = test_placement_map(4);
+            primary.set_placement_map(installed.clone());
+
+            let replica_thread = std::thread::spawn(move || {
+                let request = TransportReplicatedStore::recv_replication_ack_bounded(
+                    &mut replica.transport,
+                    server_session_id,
+                )
+                .unwrap();
+                assert_eq!(
+                    request,
+                    ReplicationMessage::PlacementMapRequest { minimum_version: 4 }
+                );
+                send_replication_msg(
+                    &mut replica.transport,
+                    server_session_id,
+                    &ReplicationMessage::PlacementMapResponse {
+                        requested_minimum_version: 4,
+                        map: Some(stale_peer_map),
+                        refusal: None,
+                    },
+                )
+                .unwrap();
+            });
+
+            let err = primary.request_peer_placement_map(2, 4).unwrap_err();
+
+            assert_eq!(
+                err,
+                PeerPlacementMapRequestError::Stale {
+                    peer_node_id: 2,
+                    requested_minimum_version: 4,
+                    available_version: 4,
+                    local_version: 5,
+                }
+            );
+            assert_eq!(primary.placement_map(), Some(&installed));
+            replica_thread.join().unwrap();
         }
 
         #[test]
