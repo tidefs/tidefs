@@ -84,6 +84,8 @@ pub struct MembershipRuntime {
     pub fencing: FencingWatchdog,
     /// Current placement map version from the transport layer (0 = none).
     placement_version: u64,
+    /// Newest nonzero placement map version observed from each known peer.
+    peer_placement_versions: BTreeMap<MemberId, u64>,
     /// Epoch fence for stale-proposer and fenced-peer rejection.
     pub epoch_fence: Option<Arc<MembershipEpochFence>>,
     /// Gossip batcher for disseminating suspicion and membership events.
@@ -205,6 +207,38 @@ pub struct PendingTransition {
     pub required_accepts: usize,
 }
 
+/// Result of applying a peer-advertised placement version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerPlacementVersionObservation {
+    pub peer: MemberId,
+    pub advertised_version: u64,
+    pub previous_version: Option<u64>,
+    pub recorded_version: Option<u64>,
+    pub accepted: bool,
+}
+
+/// Snapshot of local placement-version convergence against observed peers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementVersionConvergence {
+    pub local_version: u64,
+    pub max_peer_version: u64,
+    pub peer_versions: BTreeMap<MemberId, u64>,
+    pub peers_ahead: Vec<MemberId>,
+    pub peers_behind: Vec<MemberId>,
+}
+
+impl PlacementVersionConvergence {
+    #[must_use]
+    pub fn local_is_stale(&self) -> bool {
+        self.max_peer_version > self.local_version
+    }
+
+    #[must_use]
+    pub fn all_observed_peers_converged(&self) -> bool {
+        !self.local_is_stale() && self.peers_behind.is_empty()
+    }
+}
+
 impl MembershipRuntime {
     /// Create a new membership runtime.
     pub fn new(
@@ -238,6 +272,7 @@ impl MembershipRuntime {
             tick_count: 0,
             fencing: FencingWatchdog::new(),
             placement_version: 0,
+            peer_placement_versions: BTreeMap::new(),
             epoch_fence: None,
             bootstrapping: true,
             event_publisher: MembershipEventPublisher::new(),
@@ -407,6 +442,7 @@ impl MembershipRuntime {
             tick_count: 0,
             fencing: FencingWatchdog::new(),
             placement_version: 0,
+            peer_placement_versions: BTreeMap::new(),
             epoch_fence: None,
             bootstrapping: start_members.len() <= 1,
             event_publisher: MembershipEventPublisher::new(),
@@ -1533,6 +1569,85 @@ impl MembershipRuntime {
         self.placement_version
     }
 
+    /// Return the newest nonzero placement version observed from a peer.
+    #[must_use]
+    pub fn peer_placement_version(&self, peer: MemberId) -> Option<u64> {
+        self.peer_placement_versions.get(&peer).copied()
+    }
+
+    /// Record a peer-advertised placement version without moving backward.
+    pub fn observe_peer_placement_version(
+        &mut self,
+        peer: MemberId,
+        advertised_version: u64,
+    ) -> PeerPlacementVersionObservation {
+        let previous_version = self.peer_placement_versions.get(&peer).copied();
+
+        if peer == self.my_id || advertised_version == 0 || !self.detector.has_peer(peer) {
+            return PeerPlacementVersionObservation {
+                peer,
+                advertised_version,
+                previous_version,
+                recorded_version: previous_version,
+                accepted: false,
+            };
+        }
+
+        if previous_version.is_some_and(|previous| advertised_version < previous) {
+            return PeerPlacementVersionObservation {
+                peer,
+                advertised_version,
+                previous_version,
+                recorded_version: previous_version,
+                accepted: false,
+            };
+        }
+
+        self.peer_placement_versions
+            .insert(peer, advertised_version);
+
+        PeerPlacementVersionObservation {
+            peer,
+            advertised_version,
+            previous_version,
+            recorded_version: Some(advertised_version),
+            accepted: true,
+        }
+    }
+
+    /// Record the placement version advertised by a received membership view.
+    pub fn observe_membership_view_placement_version(
+        &mut self,
+        view: &MembershipView,
+    ) -> PeerPlacementVersionObservation {
+        self.observe_peer_placement_version(view.local_member, view.placement_version)
+    }
+
+    /// Return local-vs-peer placement-version convergence state.
+    #[must_use]
+    pub fn placement_version_convergence(&self) -> PlacementVersionConvergence {
+        let mut peers_ahead = Vec::new();
+        let mut peers_behind = Vec::new();
+        let mut max_peer_version = 0;
+
+        for (&peer, &version) in &self.peer_placement_versions {
+            max_peer_version = max_peer_version.max(version);
+            if version > self.placement_version {
+                peers_ahead.push(peer);
+            } else if version < self.placement_version {
+                peers_behind.push(peer);
+            }
+        }
+
+        PlacementVersionConvergence {
+            local_version: self.placement_version,
+            max_peer_version,
+            peer_versions: self.peer_placement_versions.clone(),
+            peers_ahead,
+            peers_behind,
+        }
+    }
+
     /// Return an immutable snapshot of the current membership state.
     pub fn view(&self) -> MembershipView {
         MembershipView {
@@ -1780,6 +1895,76 @@ mod tests {
         assert_eq!(view.epoch, EpochId::new(1));
         assert_eq!(captured_peer.member_class, MemberClass::Learner);
         assert_eq!(captured_peer.failure_domain, 42);
+    }
+
+    #[test]
+    fn placement_version_observation_tracks_known_peers_monotonically() {
+        let mut rt = make_runtime(1, MemberClass::Voter);
+        rt.add_peer(MemberId::new(2), MemberClass::Voter, 2);
+
+        let accepted = rt.observe_peer_placement_version(MemberId::new(2), 4);
+        assert!(accepted.accepted);
+        assert_eq!(accepted.previous_version, None);
+        assert_eq!(accepted.recorded_version, Some(4));
+        assert_eq!(rt.peer_placement_version(MemberId::new(2)), Some(4));
+
+        let stale = rt.observe_peer_placement_version(MemberId::new(2), 3);
+        assert!(!stale.accepted);
+        assert_eq!(stale.previous_version, Some(4));
+        assert_eq!(stale.recorded_version, Some(4));
+        assert_eq!(rt.peer_placement_version(MemberId::new(2)), Some(4));
+
+        let equal = rt.observe_peer_placement_version(MemberId::new(2), 4);
+        assert!(equal.accepted);
+        assert_eq!(equal.previous_version, Some(4));
+        assert_eq!(equal.recorded_version, Some(4));
+    }
+
+    #[test]
+    fn placement_version_observation_ignores_self_unknown_and_zero_views() {
+        let mut rt = make_runtime(1, MemberClass::Voter);
+        rt.add_peer(MemberId::new(2), MemberClass::Voter, 2);
+
+        let self_observation = rt.observe_peer_placement_version(MemberId::new(1), 7);
+        assert!(!self_observation.accepted);
+        assert_eq!(rt.peer_placement_version(MemberId::new(1)), None);
+
+        let unknown = rt.observe_peer_placement_version(MemberId::new(3), 7);
+        assert!(!unknown.accepted);
+        assert_eq!(rt.peer_placement_version(MemberId::new(3)), None);
+
+        let zero = rt.observe_peer_placement_version(MemberId::new(2), 0);
+        assert!(!zero.accepted);
+        assert_eq!(rt.peer_placement_version(MemberId::new(2)), None);
+    }
+
+    #[test]
+    fn membership_view_observation_reports_local_staleness() {
+        let mut rt = make_runtime(1, MemberClass::Voter);
+        rt.add_peer(MemberId::new(2), MemberClass::Voter, 2);
+        rt.set_placement_version(8);
+        let view = MembershipView {
+            epoch: EpochId::new(1),
+            config_class: ConfigClass::Normal,
+            local_member: MemberId::new(2),
+            nodes: Vec::new(),
+            placement_version: 10,
+        };
+
+        let observed = rt.observe_membership_view_placement_version(&view);
+        assert!(observed.accepted);
+
+        let convergence = rt.placement_version_convergence();
+        assert_eq!(convergence.local_version, 8);
+        assert_eq!(convergence.max_peer_version, 10);
+        assert_eq!(convergence.peers_ahead, vec![MemberId::new(2)]);
+        assert!(convergence.local_is_stale());
+        assert!(!convergence.all_observed_peers_converged());
+
+        rt.set_placement_version(10);
+        let convergence = rt.placement_version_convergence();
+        assert!(!convergence.local_is_stale());
+        assert!(convergence.all_observed_peers_converged());
     }
 
     #[test]

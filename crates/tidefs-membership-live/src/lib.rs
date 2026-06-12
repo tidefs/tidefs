@@ -224,7 +224,10 @@ pub use roster_gossip::{
     RosterGossipHandler, RosterGossipRound, RosterMerge,
 };
 pub use roster_session_bridge::{RosterSessionHandle, SessionReady, TransportSessionOps};
-pub use runtime::{MembershipRuntime, PendingTransition, RuntimeTickResult};
+pub use runtime::{
+    MembershipRuntime, PeerPlacementVersionObservation, PendingTransition,
+    PlacementVersionConvergence, RuntimeTickResult,
+};
 pub use seed_discovery::{
     DiscoveredSeed, SeedDiscovery, SeedDiscoveryConfig, SeedDiscoveryError, SeedFailureReason,
 };
