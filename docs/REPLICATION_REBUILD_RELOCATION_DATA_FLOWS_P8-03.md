@@ -237,6 +237,13 @@ not replacement-node orchestration, repaired placement publication, cluster
 state publication, or reclaim publication; it is the evidence boundary those
 flows can consume later.
 
+For verified rebuild repair completions, `tidefs-rebuild-runtime` now exposes a
+typed publication view of successful receipt-backed task completions. Each
+record preserves the target member, subject, scheduled source placement receipt,
+and repaired target placement receipt after the repaired receipt passes the
+completion law. This is rebuild-runtime completion evidence only, not full
+cluster-state publication or reclaim publication.
+
 ### 6.3 OW-305 executable rebuild/backfill/rebalance slice
 
 `crates/tidefs-replication-model` now also binds OW-305 movement planning to

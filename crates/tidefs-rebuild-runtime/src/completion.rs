@@ -93,6 +93,15 @@ pub struct RebuildCompleted {
     pub fully_successful: bool,
 }
 
+/// Receipt evidence for a verified rebuild task that completed successfully.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerifiedReceiptCompletionRecord {
+    pub target_member: MemberId,
+    pub subject_ref: ReplicatedSubjectId,
+    pub source_placement_receipt_ref: PlacementReceiptRef,
+    pub repaired_placement_receipt_ref: PlacementReceiptRef,
+}
+
 /// Error returned when a repaired target receipt cannot prove task completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiptCompletionError {
@@ -397,6 +406,26 @@ impl RebuildCompletion {
             + self.completed_verified_receipt_tasks.len()) as u64
     }
 
+    #[must_use]
+    pub fn verified_receipt_completions(&self) -> Vec<VerifiedReceiptCompletionRecord> {
+        self.completed_verified_receipt_tasks
+            .iter()
+            .map(
+                |(
+                    target_member,
+                    subject_ref,
+                    source_placement_receipt_ref,
+                    repaired_placement_receipt_ref,
+                )| VerifiedReceiptCompletionRecord {
+                    target_member: *target_member,
+                    subject_ref: *subject_ref,
+                    source_placement_receipt_ref: *source_placement_receipt_ref,
+                    repaired_placement_receipt_ref: *repaired_placement_receipt_ref,
+                },
+            )
+            .collect()
+    }
+
     pub fn reset(&mut self) {
         self.members.clear();
         self.completed_intent_subjects.clear();
@@ -690,6 +719,15 @@ mod tests {
             admission.status(member),
             crate::admission::RebuildAdmissionStatus::Completed
         );
+        assert_eq!(
+            completion.verified_receipt_completions(),
+            vec![VerifiedReceiptCompletionRecord {
+                target_member: member,
+                subject_ref: task.subject_ref,
+                source_placement_receipt_ref: task.placement_receipt_ref,
+                repaired_placement_receipt_ref: repaired,
+            }]
+        );
     }
 
     #[test]
@@ -712,8 +750,51 @@ mod tests {
 
         assert_eq!(completion.total_completed_subjects(), 1);
         assert_eq!(completion.status(member).unwrap().subjects_completed, 1);
+        assert_eq!(completion.verified_receipt_completions().len(), 1);
         assert_eq!(completion.drain_events().len(), 1);
         assert_eq!(completion.drain_events().len(), 0);
+    }
+
+    #[test]
+    fn receipt_verified_completions_are_ordered_and_reset() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 2);
+        let later = make_task(43, 10, 1);
+        let earlier = make_task(42, 10, 1);
+        let later_repaired = repaired_receipt_for_task(&later, 3);
+        let earlier_repaired = repaired_receipt_for_task(&earlier, 2);
+
+        assert!(completion
+            .record_receipt_verified_task_completion(&later, later_repaired, &mut admission)
+            .expect("later receipt should verify")
+            .is_none());
+        assert!(completion
+            .record_receipt_verified_task_completion(&earlier, earlier_repaired, &mut admission)
+            .expect("earlier receipt should verify")
+            .is_some());
+
+        assert_eq!(
+            completion.verified_receipt_completions(),
+            vec![
+                VerifiedReceiptCompletionRecord {
+                    target_member: member,
+                    subject_ref: earlier.subject_ref,
+                    source_placement_receipt_ref: earlier.placement_receipt_ref,
+                    repaired_placement_receipt_ref: earlier_repaired,
+                },
+                VerifiedReceiptCompletionRecord {
+                    target_member: member,
+                    subject_ref: later.subject_ref,
+                    source_placement_receipt_ref: later.placement_receipt_ref,
+                    repaired_placement_receipt_ref: later_repaired,
+                },
+            ]
+        );
+
+        completion.reset();
+        assert!(completion.verified_receipt_completions().is_empty());
     }
 
     #[test]
