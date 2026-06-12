@@ -34,6 +34,9 @@ pub enum EngineError {
     StoreError(Box<dyn Error + Send + Sync>),
     /// Receipt-bound execution was asked to use a compatibility placeholder.
     SyntheticReceiptRef { object_id: u64 },
+    /// The compatibility object-store executor was asked to run a real
+    /// receipt-bound movement task.
+    ReceiptBoundTaskRequiresReceiptSource { object_id: u64 },
     /// The receipt source could not fetch bytes from the selected member.
     ReceiptSourceError {
         source_member: MemberId,
@@ -88,6 +91,10 @@ impl fmt::Display for EngineError {
             Self::SyntheticReceiptRef { object_id } => write!(
                 f,
                 "receipt-bound rebuild fetch for object {object_id} requires non-synthetic placement receipt"
+            ),
+            Self::ReceiptBoundTaskRequiresReceiptSource { object_id } => write!(
+                f,
+                "receipt-bound rebuild task for object {object_id} must use execute_from_receipt_source"
             ),
             Self::ReceiptSourceError {
                 source_member,
@@ -228,7 +235,12 @@ impl<S: ObjectStore> DataMovementEngine<S> {
         }
     }
 
-    /// Execute a backfill task.
+    /// Execute a synthetic compatibility backfill task through object stores.
+    ///
+    /// This path is retained for local scaffolding that still uses synthetic
+    /// receipt refs. Real receipt-bound rebuild/backfill movement must use
+    /// [`Self::execute_from_receipt_source`] so source selection and payload
+    /// verification remain tied to the durable placement receipt.
     ///
     /// 1. Read object data from `source_store` using the deterministic key.
     /// 2. Verify the BLAKE3 checksum.
@@ -243,6 +255,11 @@ impl<S: ObjectStore> DataMovementEngine<S> {
         target_store: &mut S,
         progress: &mut BackfillProgress,
     ) -> Result<(), EngineError> {
+        if !task.placement_receipt_ref.is_synthetic() {
+            return Err(EngineError::ReceiptBoundTaskRequiresReceiptSource {
+                object_id: task.placement_receipt_ref.object_id,
+            });
+        }
         if task.payload_len == 0 {
             return Err(EngineError::EmptyPayload);
         }
@@ -528,6 +545,52 @@ mod tests {
             .execute(&task, &source, &mut target, &mut progress)
             .unwrap_err();
         assert!(matches!(err, EngineError::EmptyPayload));
+    }
+
+    #[test]
+    fn compatibility_executor_rejects_real_receipt_ref() {
+        let data = b"receipt-bound task must use receipt source";
+        let receipt_key = ObjectKey::from_bytes32([0xA6; 32]);
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(blake3::hash(data).as_bytes());
+        let task = BackfillTask::new(BackfillTaskInit {
+            subject_ref: ReplicatedSubjectId::new(7003),
+            placement_receipt_ref: PlacementReceiptRef::replicated(
+                7003,
+                receipt_key.as_bytes32(),
+                tidefs_membership_epoch::EpochId::new(7),
+                1,
+                2,
+                data.len() as u64,
+                digest,
+            ),
+            source_member: MemberId::new(10),
+            target_member: MemberId::new(20),
+            movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
+            payload_digest: ObjectDigest::new(0xCAFE),
+            payload_len: data.len() as u64,
+            created_at_ns: 1000,
+            deadline_ns: 5000,
+        });
+        let mut source = MemStore::default();
+        let mut target = MemStore::default();
+        let engine = DataMovementEngine::new();
+        let mut progress = BackfillProgress::new(task.payload_len, 3);
+
+        source.put(receipt_key, data).unwrap();
+        progress.schedule().unwrap();
+
+        let err = engine
+            .execute(&task, &source, &mut target, &mut progress)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            EngineError::ReceiptBoundTaskRequiresReceiptSource { object_id: 7003 }
+        ));
+        assert!(target.objects.is_empty());
+        assert_eq!(progress.state, TaskState::Scheduled);
+        assert_eq!(progress.bytes_transferred, 0);
     }
 
     #[test]
