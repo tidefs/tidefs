@@ -8,9 +8,10 @@ Start here:
 4. `docs/GITHUB_CI.md`
 5. `docs/TEST_SIGNAL_POLICY.md`
 6. `docs/REVIEW_TODO_POLICY.md`
-7. `docs/REVIEW_TODO_REGISTER.md`
-8. `docs/WHOLE_REPO_REVIEW.md`
-9. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
+7. `docs/UNRELEASED_AUTHORITY_POLICY.md`
+8. `docs/REVIEW_TODO_REGISTER.md`
+9. `docs/WHOLE_REPO_REVIEW.md`
+10. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
 
 Book:
 
@@ -32,4 +33,5 @@ Key current design and policy areas:
 - `docs/ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md`
 - `docs/RDMA_TRANSPORT_POSITION.md`
 - `docs/TEST_SIGNAL_POLICY.md`
+- `docs/UNRELEASED_AUTHORITY_POLICY.md`
 - `docs/workspace-package-classification.md`

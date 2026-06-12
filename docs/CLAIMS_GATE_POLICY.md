@@ -46,6 +46,15 @@ Stronger wording requires all of the following:
 3. an updated current-status or review-register row;
 4. an updated claims gate rule that allows the specific stronger claim.
 
+## Unreleased Authority Boundary
+
+TideFS has not had a public release. Publishing-facing docs must not describe
+old internal TideFS paths as legacy product compatibility, migration, downgrade,
+or fallback promises unless a tracked GitHub issue names the released external
+boundary or operator-owned data set being preserved. Current design wording
+should choose current authority, retire the stale pre-release path, or mark the
+material as historical input.
+
 ## Scanned surfaces
 
 `tidefs-xtask check-claims-gate` scans the top-level README, current policy
@@ -56,7 +65,7 @@ the whole-repo review. It also verifies that the source rule table in
 ## Work-State Boundary
 
 GitHub issue and pull request state is the active work-state authority for
-foreground Codex development. Legacy Forgejo helper commands remain available
-for historical/local diagnostics, but stale Forgejo ownership assumptions must
-not block `check-claims-gate` from scanning publishing claims in a valid
+foreground Codex development. Forgejo helper commands remain available for
+historical/local diagnostics, but stale Forgejo ownership assumptions must not
+block `check-claims-gate` from scanning publishing claims in a valid
 GitHub/Codex worktree.
