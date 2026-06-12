@@ -470,8 +470,25 @@ impl RebuildRuntimeBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_membership_epoch::MemberId;
-    use tidefs_replication_model::{ObjectDigest, ReplicatedSubjectId};
+    use tidefs_membership_epoch::{EpochId, MemberId};
+    use tidefs_replication_model::{ObjectDigest, PlacementReceiptRef, ReplicatedSubjectId};
+
+    fn receipt_ref(subject: u64, bytes: u64, generation: u64) -> PlacementReceiptRef {
+        let mut object_key = [0xA5; 32];
+        object_key[..8].copy_from_slice(&subject.to_le_bytes());
+        let mut digest = [0x5A; 32];
+        digest[..8].copy_from_slice(&subject.to_le_bytes());
+        digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        PlacementReceiptRef::replicated(
+            subject,
+            object_key,
+            EpochId::new(1),
+            generation,
+            1,
+            bytes,
+            digest,
+        )
+    }
 
     fn make_intent(
         id: u64,
@@ -485,6 +502,7 @@ mod tests {
             intent_id: ReplicatedReceiptId(id),
             movement_class: class,
             subject_ref: ReplicatedSubjectId::new(subject),
+            placement_receipt_ref: receipt_ref(subject, bytes, id),
             source_member_ref: MemberId::new(source),
             target_member_ref: MemberId::new(target),
             payload_digest: ObjectDigest::new(id),

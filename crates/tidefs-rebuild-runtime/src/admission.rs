@@ -373,6 +373,7 @@ impl RebuildAdmission {
                     intent_id: ReplicatedReceiptId(self.next_receipt_id),
                     movement_class: subject.movement_class,
                     subject_ref: subject.subject_ref,
+                    placement_receipt_ref: subject.placement_receipt_ref,
                     source_member_ref: source,
                     target_member_ref: target,
                     payload_digest: subject.payload_digest,
@@ -482,13 +483,13 @@ mod tests {
     use crate::scheduler::BackfillScheduler;
 
     fn make_subject(id: u64, class: ReplicaMovementClass, lost_on: Vec<u64>) -> AffectedSubject {
+        let payload = format!("admission subject payload {id}");
+        let placement_receipt_ref = receipt_ref(id, 1, payload.as_bytes());
         AffectedSubject {
             subject_ref: ReplicatedSubjectId::new(id),
-            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
-                ReplicatedSubjectId::new(id),
-            ),
-            payload_digest: ObjectDigest::new(id * 100),
-            payload_len: 4096,
+            placement_receipt_ref,
+            payload_digest: receipt_digest_to_object_digest(placement_receipt_ref.payload_digest),
+            payload_len: placement_receipt_ref.payload_len,
             movement_class: class,
             lost_on: lost_on.into_iter().map(MemberId::new).collect(),
         }
@@ -751,6 +752,11 @@ mod tests {
         let intents = admission.generate_intents(&loss);
         assert_eq!(intents.len(), 1);
         assert_eq!(intents[0].subject_ref, ReplicatedSubjectId::new(1));
+        assert_eq!(
+            intents[0].placement_receipt_ref,
+            loss.affected_subjects[0].placement_receipt_ref
+        );
+        assert!(!intents[0].placement_receipt_ref.is_synthetic());
         assert_eq!(intents[0].source_member_ref, MemberId::new(20));
         assert_eq!(intents[0].target_member_ref, MemberId::new(10));
         assert_eq!(

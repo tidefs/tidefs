@@ -83,4 +83,12 @@ fn local_pool_receipt_refs_feed_rebuild_admission() {
     assert_eq!(tasks[0].target_member, MemberId::new(1));
     assert_eq!(tasks[0].payload_len, payload.len() as u64);
     assert!(!tasks[0].placement_receipt_ref.is_synthetic());
+
+    let intents = admission.generate_intents(&loss);
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].placement_receipt_ref, receipt_ref);
+    assert_eq!(intents[0].source_member_ref, MemberId::new(2));
+    assert_eq!(intents[0].target_member_ref, MemberId::new(1));
+    assert_eq!(intents[0].payload_len, payload.len() as u64);
+    assert!(!intents[0].placement_receipt_ref.is_synthetic());
 }

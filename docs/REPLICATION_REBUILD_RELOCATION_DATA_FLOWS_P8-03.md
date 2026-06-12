@@ -226,8 +226,8 @@ records instead of treating repair as a hidden side effect.
 
 The executable slice includes:
 
-- `ReplicaMovementIntentRecord` for source, target, digest, byte count, and
-  required verification on each planned transfer;
+- `ReplicaMovementIntentRecord` for source placement receipt, source, target,
+  digest, byte count, and required verification on each planned transfer;
 - `ReplicaCapacityRecord` for capacity and reserved rebuild floor inputs;
 - `ReplicaMovementPlan` for explicit rebuild, backfill, and rebalance outcomes;
 - `open_rebuild_flow_from_loss_event()` for fault-injection cases where missing,

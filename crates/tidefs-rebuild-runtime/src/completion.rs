@@ -14,6 +14,7 @@ use crate::admission::RebuildAdmission;
 use crate::task::BackfillTask;
 
 type IntentCompletionKey = (MemberId, ReplicatedSubjectId);
+type ReceiptIntentCompletionKey = (MemberId, ReplicatedSubjectId, PlacementReceiptRef);
 type ReceiptCompletionKey = (MemberId, ReplicatedSubjectId, PlacementReceiptRef);
 type VerifiedReceiptCompletionKey = (
     MemberId,
@@ -130,6 +131,7 @@ pub enum ReceiptCompletionError {
 pub struct RebuildCompletion {
     members: BTreeMap<MemberId, CompletionStatus>,
     completed_intent_subjects: BTreeSet<IntentCompletionKey>,
+    completed_receipt_intents: BTreeSet<ReceiptIntentCompletionKey>,
     completed_receipt_tasks: BTreeSet<ReceiptCompletionKey>,
     completed_verified_receipt_tasks: BTreeSet<VerifiedReceiptCompletionKey>,
     pending_events: Vec<RebuildCompleted>,
@@ -141,6 +143,7 @@ impl RebuildCompletion {
         Self {
             members: BTreeMap::new(),
             completed_intent_subjects: BTreeSet::new(),
+            completed_receipt_intents: BTreeSet::new(),
             completed_receipt_tasks: BTreeSet::new(),
             completed_verified_receipt_tasks: BTreeSet::new(),
             pending_events: Vec::new(),
@@ -167,6 +170,25 @@ impl RebuildCompletion {
         self.completed_intent_subjects.insert(dedup_key);
 
         self.record_completion_unit(member, success, admission)
+    }
+
+    pub fn record_receipt_intent_completion(
+        &mut self,
+        intent: &ReplicaMovementIntentRecord,
+        success: bool,
+        admission: &mut RebuildAdmission,
+    ) -> Option<RebuildCompleted> {
+        let dedup_key = (
+            intent.target_member_ref,
+            intent.subject_ref,
+            intent.placement_receipt_ref,
+        );
+        if self.completed_receipt_intents.contains(&dedup_key) {
+            return None;
+        }
+        self.completed_receipt_intents.insert(dedup_key);
+
+        self.record_completion_unit(intent.target_member_ref, success, admission)
     }
 
     pub fn record_task_completion(
@@ -309,12 +331,7 @@ impl RebuildCompletion {
     ) -> Vec<RebuildCompleted> {
         let mut events = Vec::new();
         for intent in completed_intents {
-            if let Some(event) = self.record_intent_completion(
-                intent.target_member_ref,
-                intent.subject_ref,
-                true,
-                admission,
-            ) {
+            if let Some(event) = self.record_receipt_intent_completion(intent, true, admission) {
                 events.push(event);
             }
         }
@@ -366,6 +383,7 @@ impl RebuildCompletion {
     #[must_use]
     pub fn total_completed_subjects(&self) -> u64 {
         (self.completed_intent_subjects.len()
+            + self.completed_receipt_intents.len()
             + self.completed_receipt_tasks.len()
             + self.completed_verified_receipt_tasks.len()) as u64
     }
@@ -373,6 +391,7 @@ impl RebuildCompletion {
     pub fn reset(&mut self) {
         self.members.clear();
         self.completed_intent_subjects.clear();
+        self.completed_receipt_intents.clear();
         self.completed_receipt_tasks.clear();
         self.completed_verified_receipt_tasks.clear();
         self.pending_events.clear();
@@ -385,19 +404,21 @@ mod tests {
     use crate::task::{BackfillTask, BackfillTaskInit};
     use tidefs_membership_epoch::MemberId;
     use tidefs_replication_model::{
-        ObjectDigest, PlacementReceiptRef, ReceiptRedundancyPolicy, ReplicaMovementClass,
-        ReplicatedReceiptId, ReplicatedSubjectId,
+        PlacementReceiptRef, ReceiptRedundancyPolicy, ReplicaMovementClass, ReplicatedReceiptId,
+        ReplicatedSubjectId,
     };
 
     fn make_intent(id: u64, member: u64, subject: u64) -> ReplicaMovementIntentRecord {
+        let placement_receipt_ref = receipt_ref(subject, id);
         ReplicaMovementIntentRecord {
             intent_id: ReplicatedReceiptId(id),
             movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
             subject_ref: ReplicatedSubjectId::new(subject),
+            placement_receipt_ref,
             source_member_ref: MemberId::new(1),
             target_member_ref: MemberId::new(member),
-            payload_digest: ObjectDigest::new(id * 100),
-            payload_len: 4096,
+            payload_digest: receipt_digest_to_object_digest(placement_receipt_ref.payload_digest),
+            payload_len: placement_receipt_ref.payload_len,
             verification_required: false,
         }
     }
@@ -558,6 +579,30 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].fully_successful);
         assert!(completion.is_member_complete(member));
+    }
+
+    #[test]
+    fn batch_completion_keeps_intent_receipt_generations_distinct() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        completion.register(member, 2);
+        admission
+            .member_status
+            .insert(member, crate::admission::RebuildAdmissionStatus::Rebuilding);
+
+        let intents = vec![make_intent(1, 10, 7), make_intent(2, 10, 7)];
+        assert_ne!(
+            intents[0].placement_receipt_ref,
+            intents[1].placement_receipt_ref
+        );
+
+        let events = completion.record_batch_completion(&intents, &mut admission);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].succeeded, 2);
+        assert!(events[0].fully_successful);
+        assert_eq!(completion.total_completed_subjects(), 2);
     }
 
     #[test]
