@@ -835,6 +835,10 @@ let
                 rc == 0
                 and re.search(r"Passed all\s+0\s+tests", combined, re.IGNORECASE)
             )
+            completed_pass_run = (
+                not bad_text.strip()
+                and re.search(r"Passed all\s+[1-9][0-9]*\s+tests", combined, re.IGNORECASE)
+            )
 
             if notrun_text.strip():
                 status = classify_notrun(notrun_text)
@@ -850,6 +854,11 @@ let
                        log_path=guest_log_path)
                 clear_active_xfstest(test_name)
             elif rc == 0 and not bad_text.strip():
+                record(test_name, "pass", check_text.strip() or stdout.strip(),
+                       duration_secs=round(duration, 3),
+                       log_path=guest_log_path)
+                clear_active_xfstest(test_name)
+            elif completed_pass_run:
                 record(test_name, "pass", check_text.strip() or stdout.strip(),
                        duration_secs=round(duration, 3),
                        log_path=guest_log_path)
