@@ -48,7 +48,11 @@ source changes. This policy supersedes direct implementation on the root
 - Validate after substantial implementation, not after every tiny edit.
 - A substantial slice is either multiple coherent changes or one root-cause fix
   expected to affect several observations.
-- Use focused touched-package tests and `git diff --check` for normal PRs.
+- Use self-hosted GitHub Actions for focused touched-package tests and
+  `git diff --check` for normal PRs. When the standing `Rust Fast` smoke set
+  does not cover the touched crates, dispatch the manual `Focused Rust`
+  workflow against the feature branch with the issue-specific crate list and
+  any required cargo test filter arguments.
 - Use runtime rows only after mounted/FUSE/kernel behavior has actually changed.
 - Reserve broad xfstests, RDMA, kernel, and release-candidate runs for PR or
   milestone gates.

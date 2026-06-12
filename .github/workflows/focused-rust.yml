@@ -1,0 +1,81 @@
+name: Focused Rust
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - .github/workflows/focused-rust.yml
+      - scripts/ci-test-runner.sh
+      - flake.nix
+      - flake.lock
+  workflow_dispatch:
+    inputs:
+      crates:
+        description: Comma-separated workspace crates to test
+        required: true
+        default: tidefs-xtask
+        type: string
+      cargo_test_args:
+        description: Extra cargo test arguments after --locked
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.crates }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}
+  CARGO_TEST_FLAGS: ${{ github.event_name == 'workflow_dispatch' && format('--locked {0}', inputs.cargo_test_args) || '--locked' }}
+  RUST_BACKTRACE: 1
+  TIDEFS_FOCUSED_CRATES: ${{ github.event_name == 'workflow_dispatch' && inputs.crates || 'tidefs-xtask' }}
+
+jobs:
+  focused:
+    name: Focused crate tests
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare CI scratch
+        run: |
+          mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
+
+      - name: Run focused crate tests
+        run: nix develop .#ci --command bash -c './scripts/ci-test-runner.sh --crates "$TIDEFS_FOCUSED_CRATES" --json ci-test-summary.json'
+
+      - name: Upload test summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: focused-rust-summary
+          path: ci-test-summary.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Report summary
+        if: always()
+        run: |
+          if [[ -f ci-test-summary.json ]]; then
+            echo '## Focused Rust Results' >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            nix develop .#ci --command jq -c '.[] | {crate, status, tests}' ci-test-summary.json >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+            failed=$(nix develop .#ci --command jq '[.[] | select(.status != "pass")] | length' ci-test-summary.json)
+            echo "**$failed crate(s) did not pass**" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Clean cargo target
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"
