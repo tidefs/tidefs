@@ -20,6 +20,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tidefs_flow_commit_coordinator::FlowCommitCoordinator;
 use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions};
 use tidefs_membership_epoch::{
     ClusterMemberRecord, EpochId, FailureDomainPlacementPolicy, MemberId, MembershipConfigRecord,
@@ -36,10 +37,11 @@ use tidefs_replication::{
     QuorumWriteTransport, ReplicatedWrite, ReplicationWriteError, ReplicationWritePath,
 };
 use tidefs_replication_model::{
-    commit_replicated_object_root_write, plan_replicated_object_root_read, ObjectDigest,
-    PlacementReceiptRef, ReplicaCopyRecord, ReplicaTransferReceipt, ReplicaVerificationReceipt,
-    ReplicatedObjectRootRecord, ReplicatedReadPlan, ReplicatedReceiptId, ReplicatedSubjectClass,
-    ReplicatedSubjectId, ReplicatedWriteClass, ReplicatedWritePlan,
+    commit_replicated_object_root_write, plan_replicated_object_root_read, FlowCommitResult,
+    ObjectDigest, PlacementReceiptRef, ReplicaCopyRecord, ReplicaTransferReceipt,
+    ReplicaVerificationReceipt, ReplicatedObjectRootRecord, ReplicatedReadPlan,
+    ReplicatedReceiptId, ReplicatedSubjectClass, ReplicatedSubjectId, ReplicatedWriteClass,
+    ReplicatedWritePlan,
 };
 #[cfg(test)]
 use tidefs_replication_model::{ReplicaMovementClass, VerificationStatus};
@@ -1045,6 +1047,16 @@ pub struct ReceiptRepairCompletionEvidence {
     pub verified_receipt_completion: VerifiedReceiptCompletionRecord,
     /// Completion event emitted when this repair closes the member rebuild.
     pub completion_event: Option<RebuildCompleted>,
+}
+
+/// Evidence returned after receipt-bound repair completion is also published
+/// through the flow-commit coordinator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptRepairFlowCommitPublication {
+    /// Repair execution and rebuild-runtime completion evidence.
+    pub repair_completion: ReceiptRepairCompletionEvidence,
+    /// Flow-commit publication that records the repaired placement receipt.
+    pub flow_commit_result: FlowCommitResult,
 }
 
 /// Payload and durable receipt evidence returned by a planned read.
@@ -2514,6 +2526,36 @@ impl TransportReplicatedStore {
             repaired_placement_receipt_ref: repaired_receipt,
             verified_receipt_completion,
             completion_event,
+        })
+    }
+
+    /// Execute a receipt-bound repair, record verified rebuild completion, and
+    /// publish the repaired placement receipt through flow-commit.
+    ///
+    /// This is a convenience bridge for callers that already own the
+    /// flow-commit coordinator. The lower-level repair and completion APIs
+    /// remain available when callers need to stage publication separately.
+    pub fn execute_receipt_repair_task_record_completion_and_publish_flow_commit(
+        &mut self,
+        task: &BackfillTask,
+        completion: &mut RebuildCompletion,
+        admission: &mut RebuildAdmission,
+        flow_commit: &mut FlowCommitCoordinator,
+    ) -> Result<ReceiptRepairFlowCommitPublication, String> {
+        let repair_completion =
+            self.execute_receipt_repair_task_and_record_completion(task, completion, admission)?;
+        let flow_commit_result = flow_commit
+            .publish_verified_rebuild_completion(repair_completion.verified_receipt_completion)
+            .map_err(|err| {
+                format!(
+                    "receipt-bound repair flow-commit publication failed for object {}: {err}",
+                    task.placement_receipt_ref.object_id
+                )
+            })?;
+
+        Ok(ReceiptRepairFlowCommitPublication {
+            repair_completion,
+            flow_commit_result,
         })
     }
 
@@ -5274,6 +5316,248 @@ mod tests {
                 tidefs_rebuild_runtime::admission::RebuildAdmissionStatus::Completed
             );
             assert_eq!(completion.drain_events(), vec![event]);
+        }
+
+        #[test]
+        fn receipt_repair_task_publishes_verified_completion_to_flow_commit() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let source_dir = tempfile::tempdir().unwrap();
+            let target_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut source = TransportReplicatedStore::open(
+                source_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut target = TransportReplicatedStore::open(
+                target_dir.path(),
+                3,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 1450u64;
+            let payload = b"repair completion flow commit bridge payload".to_vec();
+            let receipt_key = tidefs_local_object_store::ObjectKey::from_name(
+                b"issue-145-repair-flow-commit-bridge",
+            );
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &payload, 70);
+            let mut repaired_receipt = receipt;
+            repaired_receipt.receipt_generation = 71;
+            let task = backfill_task_for_receipt(receipt, 2, 3);
+            source.primary.put(receipt_key, &payload).unwrap();
+            let (mut completion, mut admission) = rebuild_state_for_task(&task);
+            let mut flow_commit = FlowCommitCoordinator::new(EpochId::new(7));
+
+            let (_source_client_session, source_server_session) =
+                connect_replica_pair(&mut primary, &mut source, 2);
+            let (_target_client_session, target_server_session) =
+                connect_replica_pair(&mut primary, &mut target, 3);
+            let source_server = spawn_receipt_source(source, source_server_session);
+            let target_server = spawn_repair_target(
+                target,
+                target_server_session,
+                receipt,
+                Some(repaired_receipt),
+            );
+
+            let publication = primary
+                .execute_receipt_repair_task_record_completion_and_publish_flow_commit(
+                    &task,
+                    &mut completion,
+                    &mut admission,
+                    &mut flow_commit,
+                )
+                .expect("receipt repair publishes verified completion to flow commit");
+
+            assert_eq!(source_server.join().unwrap(), object_id);
+            assert_eq!(target_server.join().unwrap(), payload);
+            assert_eq!(
+                publication.repair_completion.repaired_placement_receipt_ref,
+                repaired_receipt
+            );
+            assert_eq!(
+                publication.repair_completion.verified_receipt_completion,
+                tidefs_rebuild_runtime::completion::VerifiedReceiptCompletionRecord {
+                    target_member: task.target_member,
+                    subject_ref: task.subject_ref,
+                    source_placement_receipt_ref: task.placement_receipt_ref,
+                    repaired_placement_receipt_ref: repaired_receipt,
+                }
+            );
+            assert_eq!(
+                publication
+                    .flow_commit_result
+                    .placement_receipt
+                    .placement_receipt_refs,
+                vec![repaired_receipt]
+            );
+            assert_eq!(
+                publication.flow_commit_result.updated_copy.subject_ref,
+                task.subject_ref
+            );
+            assert_eq!(
+                publication.flow_commit_result.updated_copy.member_ref,
+                task.target_member
+            );
+            assert_eq!(
+                publication.flow_commit_result.flow_class,
+                tidefs_replication_model::FlowCommitClass::Rebuild
+            );
+            assert_eq!(
+                flow_commit.commit_results,
+                vec![publication.flow_commit_result.clone()]
+            );
+            assert_eq!(flow_commit.placement_receipts.len(), 1);
+            assert_eq!(
+                completion
+                    .status(task.target_member)
+                    .unwrap()
+                    .subjects_completed,
+                1
+            );
+            assert_eq!(
+                admission.status(task.target_member),
+                tidefs_rebuild_runtime::admission::RebuildAdmissionStatus::Completed
+            );
+        }
+
+        #[test]
+        fn receipt_repair_flow_commit_publication_refuses_receiptless_success_ack() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let source_dir = tempfile::tempdir().unwrap();
+            let target_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut source = TransportReplicatedStore::open(
+                source_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut target = TransportReplicatedStore::open(
+                target_dir.path(),
+                3,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 1451u64;
+            let payload = b"receiptless ack must not publish flow commit".to_vec();
+            let receipt_key =
+                tidefs_local_object_store::ObjectKey::from_name(b"issue-145-receiptless-publish");
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &payload, 72);
+            let task = backfill_task_for_receipt(receipt, 2, 3);
+            source.primary.put(receipt_key, &payload).unwrap();
+            let (mut completion, mut admission) = rebuild_state_for_task(&task);
+            let mut flow_commit = FlowCommitCoordinator::new(EpochId::new(7));
+
+            let (_source_client_session, source_server_session) =
+                connect_replica_pair(&mut primary, &mut source, 2);
+            let (_target_client_session, target_server_session) =
+                connect_replica_pair(&mut primary, &mut target, 3);
+            let source_server = spawn_receipt_source(source, source_server_session);
+            let target_server = spawn_repair_target(target, target_server_session, receipt, None);
+
+            let err = primary
+                .execute_receipt_repair_task_record_completion_and_publish_flow_commit(
+                    &task,
+                    &mut completion,
+                    &mut admission,
+                    &mut flow_commit,
+                )
+                .unwrap_err();
+
+            assert!(err.contains("did not return repaired placement receipt"));
+            assert!(flow_commit.commit_results.is_empty());
+            assert!(flow_commit.placement_receipts.is_empty());
+            assert_repair_completion_not_recorded(&mut completion, &admission, task.target_member);
+            assert_eq!(source_server.join().unwrap(), object_id);
+            assert_eq!(target_server.join().unwrap(), payload);
+        }
+
+        #[test]
+        fn receipt_repair_flow_commit_publication_refuses_duplicate_result() {
+            let primary_dir = tempfile::tempdir().unwrap();
+            let source_dir = tempfile::tempdir().unwrap();
+            let target_dir = tempfile::tempdir().unwrap();
+            let mut primary = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut source = TransportReplicatedStore::open(
+                source_dir.path(),
+                2,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+            let mut target = TransportReplicatedStore::open(
+                target_dir.path(),
+                3,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let object_id = 1452u64;
+            let payload = b"duplicate flow commit publication must fail".to_vec();
+            let receipt_key =
+                tidefs_local_object_store::ObjectKey::from_name(b"issue-145-duplicate-publish");
+            let receipt = placement_receipt_ref(object_id, &receipt_key, &payload, 73);
+            let mut repaired_receipt = receipt;
+            repaired_receipt.receipt_generation = 74;
+            let task = backfill_task_for_receipt(receipt, 2, 3);
+            source.primary.put(receipt_key, &payload).unwrap();
+            let (mut completion, mut admission) = rebuild_state_for_task(&task);
+            let mut flow_commit = FlowCommitCoordinator::new(EpochId::new(7));
+            let existing_result = flow_commit
+                .publish_verified_rebuild_completion(
+                    tidefs_rebuild_runtime::completion::VerifiedReceiptCompletionRecord {
+                        target_member: task.target_member,
+                        subject_ref: task.subject_ref,
+                        source_placement_receipt_ref: task.placement_receipt_ref,
+                        repaired_placement_receipt_ref: repaired_receipt,
+                    },
+                )
+                .expect("pre-existing publication seeds duplicate guard");
+
+            let (_source_client_session, source_server_session) =
+                connect_replica_pair(&mut primary, &mut source, 2);
+            let (_target_client_session, target_server_session) =
+                connect_replica_pair(&mut primary, &mut target, 3);
+            let source_server = spawn_receipt_source(source, source_server_session);
+            let target_server = spawn_repair_target(
+                target,
+                target_server_session,
+                receipt,
+                Some(repaired_receipt),
+            );
+
+            let err = primary
+                .execute_receipt_repair_task_record_completion_and_publish_flow_commit(
+                    &task,
+                    &mut completion,
+                    &mut admission,
+                    &mut flow_commit,
+                )
+                .unwrap_err();
+
+            assert!(err.contains("duplicate verified rebuild completion publication"));
+            assert_eq!(flow_commit.commit_results, vec![existing_result]);
+            assert_eq!(flow_commit.placement_receipts.len(), 1);
+            assert_eq!(source_server.join().unwrap(), object_id);
+            assert_eq!(target_server.join().unwrap(), payload);
         }
 
         #[test]

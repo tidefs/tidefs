@@ -3214,6 +3214,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tidefs-flow-commit-coordinator",
  "tidefs-local-object-store",
  "tidefs-membership-epoch",
  "tidefs-quorum-write",
