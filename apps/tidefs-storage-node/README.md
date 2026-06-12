@@ -153,7 +153,13 @@ the repaired target `PlacementReceiptRef` as `ReplicaPlacementReceipt` /
 to execute the repair, record verified completion, and publish the repaired
 placement in one composed path. That is replicated-store-to-flow-commit
 publication plumbing only; replacement-node orchestration, cluster-state
-convergence, and reclaim publication remain separate #18 work.
+convergence, and reclaim publication remain separate #18 work. The cluster
+placement map can consume the completed rebuild `FlowCommitResult` through
+`PlacementMap::publish_rebuild_flow_commit_result()` and update local
+cluster-visible repaired-placement state after validating subject, target,
+epoch, and receipt authority. That local placement-map publication is still
+not degraded-read routing, replacement orchestration, cluster-wide propagation,
+or reclaim completion.
 
 ### Local-Only Operations (LOCAL-ONLY boundary)
 

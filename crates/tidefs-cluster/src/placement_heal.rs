@@ -28,7 +28,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use tidefs_membership_epoch::{EpochId, HealthClass};
-use tidefs_replication_model::PlacementReceiptRef;
+use tidefs_replication_model::{
+    FlowCommitClass, FlowCommitResult, FlowState, PlacementReceiptRef, ReplicaCopyClass,
+    ReplicatedSubjectId,
+};
 
 use crate::pool_config::{ClusterPlacementPolicy, FailureDomain};
 use crate::rebuild_backfill::{
@@ -107,6 +110,19 @@ pub struct PlacementMap {
     epoch: u64,
 }
 
+/// Summary returned when a rebuild flow-commit result updates placement state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RebuildFlowCommitPlacementPublication {
+    /// Object whose repaired placement was published.
+    pub object_id: u64,
+    /// Target member now recorded as holding the repaired object.
+    pub target_member: u64,
+    /// Repaired durable placement receipt stored for the object.
+    pub placement_receipt_ref: PlacementReceiptRef,
+    /// Placement-map epoch after publication.
+    pub map_epoch: u64,
+}
+
 impl PlacementMap {
     /// Create an empty placement map for the given epoch.
     pub fn new(epoch: u64) -> Self {
@@ -163,6 +179,123 @@ impl PlacementMap {
         debug_assert_eq!(object_id, placement_receipt_ref.object_id);
         self.placement_receipt_refs
             .insert(object_id, placement_receipt_ref);
+    }
+
+    /// Publish a completed rebuild flow-commit result into placement state.
+    ///
+    /// This records the target member and repaired durable placement receipt
+    /// only after the flow result proves a completed rebuild for one subject.
+    pub fn publish_rebuild_flow_commit_result(
+        &mut self,
+        result: &FlowCommitResult,
+    ) -> Result<RebuildFlowCommitPlacementPublication, String> {
+        if result.flow_class != FlowCommitClass::Rebuild {
+            return Err(format!(
+                "flow-commit result is {:?}, not rebuild",
+                result.flow_class
+            ));
+        }
+        if result.final_flow_state != FlowState::Complete {
+            return Err(format!(
+                "rebuild flow-commit result is {:?}, not complete",
+                result.final_flow_state
+            ));
+        }
+        if result.commit_epoch.0 < self.epoch {
+            return Err(format!(
+                "rebuild flow-commit epoch {} is stale for placement map epoch {}",
+                result.commit_epoch.0, self.epoch
+            ));
+        }
+
+        let placement = &result.placement_receipt;
+        if placement.placement_epoch != result.commit_epoch {
+            return Err(format!(
+                "rebuild placement epoch {:?} does not match commit epoch {:?}",
+                placement.placement_epoch, result.commit_epoch
+            ));
+        }
+        if placement.subjects_placed != 1 || placement.subject_refs.len() != 1 {
+            return Err(format!(
+                "rebuild placement publication must carry exactly one subject, got subjects_placed={} refs={}",
+                placement.subjects_placed,
+                placement.subject_refs.len()
+            ));
+        }
+        let subject_ref = placement.subject_refs[0];
+        if subject_ref != result.updated_copy.subject_ref {
+            return Err(format!(
+                "rebuild placement subject {:?} does not match updated copy {:?}",
+                subject_ref, result.updated_copy.subject_ref
+            ));
+        }
+        if placement.placed_on != result.updated_copy.member_ref {
+            return Err(format!(
+                "rebuild placement target {:?} does not match updated copy {:?}",
+                placement.placed_on, result.updated_copy.member_ref
+            ));
+        }
+        if result.updated_copy.copy_class != ReplicaCopyClass::Verified {
+            return Err(format!(
+                "rebuild updated copy is {:?}, not verified",
+                result.updated_copy.copy_class
+            ));
+        }
+        if placement.placement_receipt_refs.len() != 1 {
+            return Err(format!(
+                "rebuild placement publication must carry exactly one placement receipt ref, got {}",
+                placement.placement_receipt_refs.len()
+            ));
+        }
+
+        let placement_receipt_ref = placement.placement_receipt_refs[0];
+        Self::validate_rebuild_flow_placement_ref(subject_ref, placement_receipt_ref)?;
+
+        let object_id = placement_receipt_ref.object_id;
+        let target_member = result.updated_copy.member_ref.0;
+        self.insert(object_id, target_member);
+        self.record_placement_receipt_ref(object_id, placement_receipt_ref);
+        self.epoch = result.commit_epoch.0;
+
+        Ok(RebuildFlowCommitPlacementPublication {
+            object_id,
+            target_member,
+            placement_receipt_ref,
+            map_epoch: self.epoch,
+        })
+    }
+
+    fn validate_rebuild_flow_placement_ref(
+        subject_ref: ReplicatedSubjectId,
+        placement_receipt_ref: PlacementReceiptRef,
+    ) -> Result<(), String> {
+        if placement_receipt_ref.is_synthetic() {
+            return Err(format!(
+                "rebuild placement receipt ref for subject {:?} is synthetic",
+                subject_ref
+            ));
+        }
+        let receipt_subject = ReplicatedSubjectId::new(placement_receipt_ref.object_id);
+        if receipt_subject != subject_ref {
+            return Err(format!(
+                "rebuild placement receipt subject mismatch: result subject {:?}, receipt subject {:?}",
+                subject_ref, receipt_subject
+            ));
+        }
+        if !placement_receipt_ref.redundancy_policy.is_well_formed() {
+            return Err(format!(
+                "rebuild placement receipt ref for subject {:?} has malformed redundancy policy",
+                subject_ref
+            ));
+        }
+        let required_count = placement_receipt_ref.redundancy_policy.target_width();
+        if placement_receipt_ref.target_count < required_count {
+            return Err(format!(
+                "rebuild placement receipt ref for subject {:?} is under-width: target_count {} < required_count {}",
+                subject_ref, placement_receipt_ref.target_count, required_count
+            ));
+        }
+        Ok(())
     }
 
     /// Record that a member holds a replica of an object (lightweight, no extent metadata).
@@ -897,6 +1030,10 @@ fn insert_test_object_with_receipt(placement: &mut PlacementMap, object_id: u64,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_membership_epoch::{DomainId, MemberId};
+    use tidefs_replication_model::{
+        ObjectDigest, ReplicaCopyRecord, ReplicaPlacementReceipt, ReplicatedReceiptId,
+    };
 
     fn receipt_ref(object_id: u64, generation: u64) -> PlacementReceiptRef {
         test_receipt_ref(object_id, generation)
@@ -928,6 +1065,65 @@ mod tests {
             base.payload_digest,
             2,
         )
+    }
+
+    fn rebuild_flow_result(
+        object_id: u64,
+        target_member: u64,
+        placement_receipt_ref: PlacementReceiptRef,
+        epoch: u64,
+    ) -> FlowCommitResult {
+        let subject_ref = ReplicatedSubjectId::new(object_id);
+        let target_member = MemberId::new(target_member);
+        let digest_prefix = u64::from_le_bytes(
+            placement_receipt_ref.payload_digest[..8]
+                .try_into()
+                .unwrap(),
+        );
+        FlowCommitResult {
+            placement_receipt: ReplicaPlacementReceipt {
+                receipt_id: ReplicatedReceiptId(1000 + object_id),
+                verification_ref: ReplicatedReceiptId(2000 + object_id),
+                transfer_ref: ReplicatedReceiptId(3000 + object_id),
+                subject_refs: vec![subject_ref],
+                placed_on: target_member,
+                placement_epoch: EpochId(epoch),
+                subjects_placed: 1,
+                placement_receipt_refs: vec![placement_receipt_ref],
+            },
+            updated_copy: ReplicaCopyRecord {
+                subject_ref,
+                member_ref: target_member,
+                domain_ref: DomainId::new(target_member.0 * 10 + 1),
+                copy_class: ReplicaCopyClass::Verified,
+                payload_digest: ObjectDigest::new(digest_prefix),
+                freshness_frontier: epoch,
+                verification_receipt_ref: ReplicatedReceiptId(2000 + object_id),
+            },
+            final_flow_state: FlowState::Complete,
+            flow_class: FlowCommitClass::Rebuild,
+            commit_epoch: EpochId(epoch),
+        }
+    }
+
+    fn assert_rebuild_flow_result_refused_without_mutation(
+        result: FlowCommitResult,
+        expected: &str,
+    ) {
+        let mut pm = PlacementMap::new(5);
+        let old_receipt = receipt_ref(90, 1);
+        pm.insert(90, 20);
+        pm.record_placement_receipt_ref(90, old_receipt);
+
+        let err = pm.publish_rebuild_flow_commit_result(&result).unwrap_err();
+
+        assert!(err.contains(expected), "{err}");
+        assert_eq!(pm.epoch(), 5);
+        assert_eq!(pm.placement_receipt_ref(90), Some(old_receipt));
+        assert_eq!(
+            pm.replicas_of(90).cloned().unwrap_or_default(),
+            [20].into_iter().collect()
+        );
     }
 
     // ── PlacementMap tests ────────────────────────────────────
@@ -972,6 +1168,103 @@ mod tests {
         assert!(affected.contains(&42));
         assert_eq!(pm.placement_receipt_ref(42), None);
         assert_eq!(pm.placement_receipt_ref_count(), 0);
+    }
+
+    #[test]
+    fn placement_map_publishes_rebuild_flow_commit_result() {
+        let mut pm = PlacementMap::new(1);
+        let old_receipt = receipt_ref(90, 1);
+        let repaired_receipt = receipt_ref(90, 2);
+        pm.insert(90, 20);
+        pm.record_placement_receipt_ref(90, old_receipt);
+
+        let result = rebuild_flow_result(90, 30, repaired_receipt, 7);
+        let publication = pm
+            .publish_rebuild_flow_commit_result(&result)
+            .expect("completed rebuild flow publishes placement");
+
+        assert_eq!(
+            publication,
+            RebuildFlowCommitPlacementPublication {
+                object_id: 90,
+                target_member: 30,
+                placement_receipt_ref: repaired_receipt,
+                map_epoch: 7,
+            }
+        );
+        assert_eq!(pm.epoch(), 7);
+        assert_eq!(pm.placement_receipt_ref(90), Some(repaired_receipt));
+        assert_eq!(
+            pm.replicas_of(90).cloned().unwrap_or_default(),
+            [20, 30].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn placement_map_rejects_bad_rebuild_flow_commit_results_before_mutation() {
+        let repaired_receipt = receipt_ref(90, 2);
+
+        let mut result = rebuild_flow_result(90, 30, repaired_receipt, 7);
+        result.flow_class = FlowCommitClass::Relocation;
+        assert_rebuild_flow_result_refused_without_mutation(result, "not rebuild");
+
+        let mut result = rebuild_flow_result(90, 30, repaired_receipt, 7);
+        result.final_flow_state = FlowState::Verifying;
+        assert_rebuild_flow_result_refused_without_mutation(result, "not complete");
+
+        let result = rebuild_flow_result(90, 30, repaired_receipt, 4);
+        assert_rebuild_flow_result_refused_without_mutation(result, "stale");
+
+        let mut result = rebuild_flow_result(90, 30, repaired_receipt, 7);
+        result.placement_receipt.placement_epoch = EpochId(6);
+        assert_rebuild_flow_result_refused_without_mutation(result, "does not match commit epoch");
+
+        let mut result = rebuild_flow_result(90, 30, repaired_receipt, 7);
+        result.placement_receipt.subject_refs.clear();
+        result.placement_receipt.subjects_placed = 0;
+        assert_rebuild_flow_result_refused_without_mutation(result, "exactly one subject");
+
+        let mut result = rebuild_flow_result(90, 30, repaired_receipt, 7);
+        result.placement_receipt.subject_refs[0] = ReplicatedSubjectId::new(91);
+        assert_rebuild_flow_result_refused_without_mutation(result, "does not match updated copy");
+
+        let mut result = rebuild_flow_result(90, 30, repaired_receipt, 7);
+        result.placement_receipt.placed_on = MemberId::new(31);
+        assert_rebuild_flow_result_refused_without_mutation(result, "does not match updated copy");
+
+        let mut result = rebuild_flow_result(90, 30, repaired_receipt, 7);
+        result.updated_copy.copy_class = ReplicaCopyClass::Rebuilding;
+        assert_rebuild_flow_result_refused_without_mutation(result, "not verified");
+
+        let mut result = rebuild_flow_result(90, 30, repaired_receipt, 7);
+        result.placement_receipt.placement_receipt_refs.clear();
+        assert_rebuild_flow_result_refused_without_mutation(
+            result,
+            "exactly one placement receipt",
+        );
+
+        let mut result = rebuild_flow_result(90, 30, repaired_receipt, 7);
+        result
+            .placement_receipt
+            .placement_receipt_refs
+            .push(receipt_ref(90, 3));
+        assert_rebuild_flow_result_refused_without_mutation(
+            result,
+            "exactly one placement receipt",
+        );
+
+        let synthetic = PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(90));
+        let result = rebuild_flow_result(90, 30, synthetic, 7);
+        assert_rebuild_flow_result_refused_without_mutation(result, "synthetic");
+
+        let result = rebuild_flow_result(90, 30, malformed_policy_receipt_ref(90), 7);
+        assert_rebuild_flow_result_refused_without_mutation(result, "malformed");
+
+        let result = rebuild_flow_result(90, 30, under_width_receipt_ref(90), 7);
+        assert_rebuild_flow_result_refused_without_mutation(result, "under-width");
+
+        let result = rebuild_flow_result(90, 30, receipt_ref(91, 2), 7);
+        assert_rebuild_flow_result_refused_without_mutation(result, "subject mismatch");
     }
 
     #[test]
