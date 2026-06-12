@@ -352,16 +352,22 @@ impl BlockVolumeObjectStoreBackend {
                 Self::decode_written_block_index(&payload, geometry).map(|blocks| (blocks, false))
             }
             None => {
-                let rebuilt = Self::rebuild_written_block_index(store, geometry)?;
-                Ok((rebuilt, !store.is_read_only()))
+                let block_payloads = Self::scan_block_payload_keys(store, geometry);
+                if !block_payloads.is_empty() {
+                    return Err(BackendError::Other(format!(
+                        "block-volume object store is missing current written index but contains {} block payload object(s); refusing pre-index block data",
+                        block_payloads.len()
+                    )));
+                }
+                Ok((BTreeSet::new(), !store.is_read_only()))
             }
         }
     }
 
-    fn rebuild_written_block_index(
+    fn scan_block_payload_keys(
         store: &LocalObjectStore,
         geometry: tidefs_block_volume_adapter_core::BlockVolumeGeometryRecord,
-    ) -> Result<BTreeSet<usize>, BackendError> {
+    ) -> BTreeSet<usize> {
         let live_keys: BTreeSet<ObjectKey> = store.list_keys().into_iter().collect();
         let mut written_blocks = BTreeSet::new();
         for block in 0..geometry.block_count {
@@ -369,7 +375,7 @@ impl BlockVolumeObjectStoreBackend {
                 written_blocks.insert(block);
             }
         }
-        Ok(written_blocks)
+        written_blocks
     }
 
     fn decode_written_block_index(
@@ -874,7 +880,7 @@ mod ublk_io_backend_tests {
     }
 
     #[test]
-    fn object_store_missing_written_index_is_rebuilt_before_discard() {
+    fn object_store_missing_written_index_with_block_payloads_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let geometry = BlockVolumeGeometryRecord::new(BlockVolumeId::new(401_201), 4096, 128, 1);
         {
@@ -884,21 +890,17 @@ mod ublk_io_backend_tests {
                     BlockVolumeObjectStoreBackend::block_key(77),
                     &[0x77u8; 4096],
                 )
-                .expect("legacy block write without index");
+                .expect("pre-index block payload write");
             store.sync().expect("sync raw store");
         }
 
-        let mut backend =
-            BlockVolumeObjectStoreBackend::open(dir.path(), geometry).expect("open backend");
-        assert!(backend.written_blocks.contains(&77));
-
-        backend
-            .discard_blocks(0, 128, 4096)
-            .expect("discard rebuilt-index block");
-        let read = backend
-            .read_blocks(77, 1, 4096)
-            .expect("read discarded legacy block");
-        assert_eq!(read.payload.expect("payload"), vec![0u8; 4096]);
+        let err = match BlockVolumeObjectStoreBackend::open(dir.path(), geometry) {
+            Ok(_) => panic!("accepted pre-index block payloads without written index"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("missing current written index"));
+        assert!(message.contains("refusing pre-index block data"));
     }
 
     fn make_io_desc(op: u8, start_sector: u64, sector_count: u32) -> UblkIoDescriptor {
