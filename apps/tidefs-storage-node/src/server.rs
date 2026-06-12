@@ -132,6 +132,15 @@ pub struct StorageNodeRelocationPlacementPublication {
     pub placement_publication: RelocationFlowCommitPlacementPublication,
 }
 
+/// Storage-node summary for publishing relocation placement into transport reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageNodeRelocationReadMapPublication {
+    /// Accepted relocation placement publication.
+    pub relocation_publication: StorageNodeRelocationPlacementPublication,
+    /// Transport read-map publication derived from post-relocation placement.
+    pub read_map_publication: StorageNodeTransportReadMapPublication,
+}
+
 /// Storage-node summary for publishing cluster placement into transport reads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageNodeTransportReadMapPublication {
@@ -778,6 +787,30 @@ pub fn publish_relocation_flow_commit_into_cluster_runtime(
         source_member,
         flow_commit_result: result.clone(),
         placement_publication,
+    })
+}
+
+/// Publish relocation placement and refresh transport degraded-read routing.
+///
+/// This composes the cluster-runtime relocation publication boundary with the
+/// transport read-map publication boundary. It does not execute relocation,
+/// perform cluster-wide propagation, or reclaim retired source placement.
+pub fn publish_relocation_flow_commit_into_cluster_runtime_and_transport_read_map(
+    runtime: &mut ClusterLeaseRuntime,
+    store: &mut TransportReplicatedStore,
+    tracker: &PlacementVersionTracker,
+    source_member: u64,
+    result: &FlowCommitResult,
+) -> Result<StorageNodeRelocationReadMapPublication, String> {
+    let relocation_publication =
+        publish_relocation_flow_commit_into_cluster_runtime(runtime, source_member, result)?;
+    let read_map_publication =
+        publish_cluster_runtime_read_map_to_transport_store(runtime, store, tracker)
+            .map_err(|err| format!("storage-node relocation read-map publication failed: {err}"))?;
+
+    Ok(StorageNodeRelocationReadMapPublication {
+        relocation_publication,
+        read_map_publication,
     })
 }
 
@@ -7128,6 +7161,153 @@ mod cluster_pool_handler_tests {
             .placement_map()
             .objects_of(1)
             .is_some_and(|objects| objects.contains(&relocated_receipt.object_id)));
+    }
+
+    #[test]
+    fn relocation_flow_commit_publication_refreshes_transport_read_map() {
+        let source_receipt = receipt_ref(b"storage-node-relocation-source", b"old-payload", 1);
+        let relocated_receipt = receipt_ref(b"storage-node-relocation-source", b"new-payload", 2);
+        let result = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        let mut runtime = cluster_runtime_with_old_receipt(source_receipt);
+        let (_tmp, mut store) = transport_store_with_placement();
+        let tracker = PlacementVersionTracker::with_version(7);
+
+        let summary = publish_relocation_flow_commit_into_cluster_runtime_and_transport_read_map(
+            &mut runtime,
+            &mut store,
+            &tracker,
+            1,
+            &result,
+        )
+        .expect("relocation publication refreshes transport read map");
+
+        assert_eq!(summary.relocation_publication.source_member, 1);
+        assert_eq!(summary.relocation_publication.flow_commit_result, result);
+        assert_eq!(
+            summary
+                .relocation_publication
+                .placement_publication
+                .object_id,
+            relocated_receipt.object_id
+        );
+        assert_eq!(
+            summary
+                .relocation_publication
+                .placement_publication
+                .retired_source_member,
+            1
+        );
+        assert_eq!(summary.read_map_publication.previous_tracker_version, 7);
+        assert_eq!(summary.read_map_publication.read_map.version, 8);
+        assert_eq!(summary.read_map_publication.read_map.epoch, EpochId::new(9));
+        assert_eq!(tracker.current_version(), 8);
+        assert_eq!(store.placement_version(), 8);
+        assert_eq!(
+            store
+                .placement_map()
+                .expect("transport read map is installed"),
+            &summary.read_map_publication.read_map
+        );
+        assert_eq!(
+            summary
+                .read_map_publication
+                .read_map
+                .members_for(relocated_receipt.object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [MemberId::new(2)].into_iter().collect()
+        );
+        assert!(!summary
+            .read_map_publication
+            .read_map
+            .members_for(relocated_receipt.object_id)
+            .is_some_and(|members| members.contains(&MemberId::new(1))));
+    }
+
+    #[test]
+    fn relocation_read_map_publication_rejects_bad_relocation_without_store_mutation() {
+        let source_receipt = receipt_ref(b"storage-node-relocation-source", b"old-payload", 1);
+        let relocated_receipt = receipt_ref(b"storage-node-relocation-source", b"new-payload", 2);
+        let result = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        let mut runtime = cluster_runtime_with_old_receipt(source_receipt);
+        let (_tmp, mut store) = transport_store_with_placement();
+        let installed = test_transport_read_map(6);
+        store.set_placement_map(installed.clone());
+        let tracker = PlacementVersionTracker::with_version(6);
+
+        let err = publish_relocation_flow_commit_into_cluster_runtime_and_transport_read_map(
+            &mut runtime,
+            &mut store,
+            &tracker,
+            3,
+            &result,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("does not hold object"), "{err}");
+        assert_eq!(runtime.placement_map().epoch(), 5);
+        assert_eq!(
+            runtime
+                .placement_map()
+                .placement_receipt_ref(source_receipt.object_id),
+            Some(source_receipt)
+        );
+        assert_eq!(
+            runtime
+                .placement_map()
+                .replicas_of(source_receipt.object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [1].into_iter().collect()
+        );
+        assert_eq!(tracker.current_version(), 6);
+        assert_eq!(store.placement_version(), 6);
+        assert_eq!(
+            store.placement_map().expect("existing read map remains"),
+            &installed
+        );
+    }
+
+    #[test]
+    fn relocation_read_map_publication_surfaces_transport_rejection() {
+        let source_receipt = receipt_ref(b"storage-node-relocation-source", b"old-payload", 1);
+        let relocated_receipt = receipt_ref(b"storage-node-relocation-source", b"new-payload", 2);
+        let result = relocation_flow_commit_result(relocated_receipt, 2, 9);
+        let mut runtime = cluster_runtime_with_old_receipt(source_receipt);
+        let tmp = tempfile::TempDir::with_prefix("storage-node-relocation-no-placement-").unwrap();
+        let mut store = TransportReplicatedStore::open(
+            tmp.path(),
+            1u64,
+            TransportReplicatedStoreConfig::default(),
+        )
+        .unwrap();
+        let tracker = PlacementVersionTracker::new();
+
+        let err = publish_relocation_flow_commit_into_cluster_runtime_and_transport_read_map(
+            &mut runtime,
+            &mut store,
+            &tracker,
+            1,
+            &result,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("storage-node relocation read-map publication failed"),
+            "{err}"
+        );
+        assert!(err.contains("placement must be configured"), "{err}");
+        assert_eq!(tracker.current_version(), 0);
+        assert_eq!(store.placement_version(), 0);
+        assert!(store.placement_map().is_none());
+        assert_eq!(
+            runtime
+                .placement_map()
+                .replicas_of(relocated_receipt.object_id)
+                .cloned()
+                .unwrap_or_default(),
+            [2].into_iter().collect()
+        );
     }
 
     #[test]
