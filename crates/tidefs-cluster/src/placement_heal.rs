@@ -1069,9 +1069,33 @@ impl PlacementHealCoordinator {
     ///
     /// After finalization, the placement map is updated so that rebuilt
     /// objects now include their new replica locations.
-    pub fn finalize_heal(&mut self, rebuilt_placements: &BTreeMap<u64, BTreeSet<u64>>) {
+    pub fn finalize_heal(
+        &mut self,
+        rebuilt_placements: &BTreeMap<u64, BTreeSet<u64>>,
+    ) -> Result<(), &'static str> {
         if self.state != HealState::Verifying {
-            return;
+            return Err("not in Verifying state");
+        }
+        let required_objects = self.stats.objects_to_rebuild as usize;
+        if rebuilt_placements.len() != required_objects {
+            return Err("rebuilt placement evidence does not match objects to rebuild");
+        }
+        if rebuilt_placements.values().any(BTreeSet::is_empty) {
+            return Err("rebuilt placement evidence contains an empty target set");
+        }
+        let impacted = self.placement.compute_loss_impact(&self.lost_members);
+        if !rebuilt_placements
+            .keys()
+            .all(|object_id| impacted.contains_key(object_id))
+        {
+            return Err("rebuilt placement evidence contains an object outside heal scope");
+        }
+        if rebuilt_placements.values().any(|members| {
+            members
+                .iter()
+                .any(|member_id| self.lost_members.contains(member_id))
+        }) {
+            return Err("rebuilt placement evidence targets a lost member");
         }
         // Remove lost members from the placement map now that rebuild is complete.
         let lost: Vec<u64> = self.lost_members.iter().copied().collect();
@@ -1091,6 +1115,7 @@ impl PlacementHealCoordinator {
         self.state = HealState::Complete;
         self.stats.objects_rebuilt = self.stats.objects_to_rebuild;
         self.stats.objects_remaining = 0;
+        Ok(())
     }
 
     /// Abort the current heal operation.
@@ -1772,10 +1797,72 @@ mod tests {
         assert_eq!(coord.state(), HealState::Verifying);
 
         let mut rebuilt = BTreeMap::new();
-        rebuilt.insert(1, BTreeSet::from([20u64]));
-        rebuilt.insert(2, BTreeSet::from([20u64]));
-        coord.finalize_heal(&rebuilt);
+        rebuilt.insert(1, BTreeSet::from([30u64]));
+        rebuilt.insert(2, BTreeSet::from([30u64]));
+        coord.finalize_heal(&rebuilt).unwrap();
         assert_eq!(coord.state(), HealState::Complete);
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
+            [20, 30].into_iter().collect()
+        );
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(2)
+                .cloned()
+                .unwrap_or_default(),
+            [20, 30].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn heal_finalize_refuses_missing_rebuilt_placement_evidence() {
+        let mut coord = make_coordinator();
+
+        let mut lost = BTreeSet::new();
+        lost.insert(10);
+        let mut available = BTreeMap::new();
+        available.insert(20, HealthClass::Healthy);
+        available.insert(30, HealthClass::Healthy);
+
+        coord.detect_loss(LossEvent {
+            lost_members: lost,
+            epoch: 1,
+            detected_at_ns: 1_000_000_000,
+            available_members: available,
+        });
+        let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+
+        coord.state = HealState::Rebuilding;
+        coord.record_rebuild_progress(2, 8192).unwrap();
+        coord.complete_rebuild(2_000_000_000).unwrap();
+        assert_eq!(coord.state(), HealState::Verifying);
+
+        let err = coord.finalize_heal(&BTreeMap::new()).unwrap_err();
+
+        assert!(err.contains("does not match objects to rebuild"), "{err}");
+        assert_eq!(coord.state(), HealState::Verifying);
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
+            [10, 20].into_iter().collect()
+        );
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(2)
+                .cloned()
+                .unwrap_or_default(),
+            [10, 20].into_iter().collect()
+        );
     }
 
     #[test]

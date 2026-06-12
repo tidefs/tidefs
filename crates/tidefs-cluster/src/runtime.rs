@@ -860,7 +860,9 @@ impl ClusterLeaseRuntime {
     ///
     /// Called periodically; checks whether the backfill session
     /// associated with the current heal has completed.
-    /// Returns true if the heal transitioned to Complete or Failed.
+    /// Returns true if the heal is terminal. Completed backfill transfer moves
+    /// the heal into Verifying, but explicit placement convergence evidence is
+    /// required before the heal can complete.
     pub fn heal_tick(
         &mut self,
         objects_completed: u64,
@@ -887,13 +889,15 @@ impl ClusterLeaseRuntime {
             }
         }
 
-        // Auto-finalize: move Verifying → Complete once rebuild transfer is done.
-        if self.heal_coordinator.state() == HealState::Verifying {
-            self.heal_coordinator.finalize_heal(&BTreeMap::new());
-            return true;
-        }
-
         self.heal_coordinator.state().is_terminal()
+    }
+
+    /// Finalize a verifying heal with explicit rebuilt placement evidence.
+    pub fn finalize_heal_with_rebuilt_placements(
+        &mut self,
+        rebuilt_placements: &BTreeMap<u64, BTreeSet<u64>>,
+    ) -> Result<(), &'static str> {
+        self.heal_coordinator.finalize_heal(rebuilt_placements)
     }
 
     /// Access the placement map for external queries (e.g., show placement).
@@ -1625,19 +1629,90 @@ mod tests {
     }
 
     #[test]
-    fn heal_tick_completes_after_backfill_done() {
+    fn heal_tick_waits_for_convergence_after_backfill_done() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
-        let plan = make_plan(100, vec![make_task(1, vec![10], vec![20])]);
-        let bid = rt.on_member_departure(plan, EpochId(1)).unwrap();
+        rt.record_placement(1, 10);
+        rt.record_placement(1, 20);
+        rt.heal_coordinator
+            .placement_mut()
+            .record_placement_receipt_ref(1, receipt_ref(1));
+        let mut lost = BTreeSet::new();
+        lost.insert(10);
+        let mut available = BTreeMap::new();
+        available.insert(20, HealthClass::Healthy);
+        available.insert(30, HealthClass::Healthy);
+
+        let bid = rt
+            .detect_member_loss(lost, available, 1_000_000_000)
+            .expect("receipt-backed loss starts heal backfill");
         while rx.try_recv().is_ok() {}
-        rt.backfill_initiator_mut().start_transferring(bid).unwrap();
-        rt.heal_coordinator.record_backfill_opened(bid);
         rt.complete_backfill(bid).unwrap();
-        let finished = rt.heal_tick(0, 0, 2_000_000_000);
-        assert!(finished);
+        let finished = rt.heal_tick(1, 4096, 2_000_000_000);
+
+        assert!(!finished);
+        assert!(rt.is_healing());
+        assert_eq!(rt.heal_state(), HealState::Verifying);
+        assert_eq!(
+            rt.placement_map()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
+            [10, 20].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn explicit_heal_finalization_requires_rebuilt_placements() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
+            .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
+        rt.record_placement(1, 10);
+        rt.record_placement(1, 20);
+        rt.heal_coordinator
+            .placement_mut()
+            .record_placement_receipt_ref(1, receipt_ref(1));
+        let mut lost = BTreeSet::new();
+        lost.insert(10);
+        let mut available = BTreeMap::new();
+        available.insert(20, HealthClass::Healthy);
+        available.insert(30, HealthClass::Healthy);
+
+        let bid = rt
+            .detect_member_loss(lost, available, 1_000_000_000)
+            .expect("receipt-backed loss starts heal backfill");
+        while rx.try_recv().is_ok() {}
+        rt.complete_backfill(bid).unwrap();
+        assert!(!rt.heal_tick(1, 4096, 2_000_000_000));
+
+        let err = rt
+            .finalize_heal_with_rebuilt_placements(&BTreeMap::new())
+            .unwrap_err();
+
+        assert!(err.contains("does not match objects to rebuild"), "{err}");
+        assert_eq!(rt.heal_state(), HealState::Verifying);
+        assert_eq!(
+            rt.placement_map()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
+            [10, 20].into_iter().collect()
+        );
+
+        let mut rebuilt = BTreeMap::new();
+        rebuilt.insert(1, BTreeSet::from([30u64]));
+        rt.finalize_heal_with_rebuilt_placements(&rebuilt).unwrap();
+
+        assert_eq!(rt.heal_state(), HealState::Complete);
         assert!(!rt.is_healing());
+        assert_eq!(
+            rt.placement_map()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
+            [20, 30].into_iter().collect()
+        );
     }
 
     #[test]
