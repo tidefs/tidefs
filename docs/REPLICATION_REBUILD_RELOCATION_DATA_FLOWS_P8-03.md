@@ -242,7 +242,10 @@ typed publication view of successful receipt-backed task completions. Each
 record preserves the target member, subject, scheduled source placement receipt,
 and repaired target placement receipt after the repaired receipt passes the
 completion law. This is rebuild-runtime completion evidence only, not full
-cluster-state publication or reclaim publication.
+cluster-state publication or reclaim publication. The replicated-store
+repair-and-record bridge returns the same typed record with its repair evidence
+so later consumers can carry receipt-addressed completion proof without
+re-reading private runtime state.
 
 ### 6.3 OW-305 executable rebuild/backfill/rebalance slice
 

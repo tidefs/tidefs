@@ -1017,7 +1017,7 @@ impl ReplicatedObjectStore {
 use std::net::SocketAddr;
 use tidefs_rebuild_runtime::{
     admission::RebuildAdmission,
-    completion::{RebuildCompleted, RebuildCompletion},
+    completion::{RebuildCompleted, RebuildCompletion, VerifiedReceiptCompletionRecord},
     engine::ReceiptSegmentSource,
     task::BackfillTask,
 };
@@ -1041,6 +1041,8 @@ const REPLICA_ACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub struct ReceiptRepairCompletionEvidence {
     /// Fresh repaired placement receipt returned by the target storage node.
     pub repaired_placement_receipt_ref: PlacementReceiptRef,
+    /// Source and repaired receipt evidence recorded by rebuild-runtime.
+    pub verified_receipt_completion: VerifiedReceiptCompletionRecord,
     /// Completion event emitted when this repair closes the member rebuild.
     pub completion_event: Option<RebuildCompleted>,
 }
@@ -2501,9 +2503,16 @@ impl TransportReplicatedStore {
                     task.placement_receipt_ref.object_id
                 )
             })?;
+        let verified_receipt_completion = VerifiedReceiptCompletionRecord {
+            target_member: task.target_member,
+            subject_ref: task.subject_ref,
+            source_placement_receipt_ref: task.placement_receipt_ref,
+            repaired_placement_receipt_ref: repaired_receipt,
+        };
 
         Ok(ReceiptRepairCompletionEvidence {
             repaired_placement_receipt_ref: repaired_receipt,
+            verified_receipt_completion,
             completion_event,
         })
     }
@@ -5240,6 +5249,15 @@ mod tests {
             assert_eq!(source_server.join().unwrap(), object_id);
             assert_eq!(target_server.join().unwrap(), payload);
             assert_eq!(evidence.repaired_placement_receipt_ref, repaired_receipt);
+            assert_eq!(
+                evidence.verified_receipt_completion,
+                tidefs_rebuild_runtime::completion::VerifiedReceiptCompletionRecord {
+                    target_member: task.target_member,
+                    subject_ref: task.subject_ref,
+                    source_placement_receipt_ref: task.placement_receipt_ref,
+                    repaired_placement_receipt_ref: repaired_receipt,
+                }
+            );
             let event = evidence
                 .completion_event
                 .expect("single repaired task emits completion");

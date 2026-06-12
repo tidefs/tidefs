@@ -145,7 +145,9 @@ accepted as wire-format responses, but they do not advance receipt-backed
 rebuild completion. `RebuildCompletion::verified_receipt_completions()` exposes
 the successful source/repaired receipt pairs as a typed publication view for
 later cluster-state and reclaim consumers; it does not publish those broader
-states by itself.
+states by itself. The replicated-store repair bridge returns that same typed
+record in `ReceiptRepairCompletionEvidence` so callers do not have to inspect
+private completion state to carry the evidence forward.
 
 ### Local-Only Operations (LOCAL-ONLY boundary)
 
