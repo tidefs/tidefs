@@ -184,7 +184,7 @@ impl ObjectEnumerator for PlacementTableObjectEnumerator {
 /// delta between two [`PlacementMap`] instances (via [`enumerate`]) yields
 /// the exact set of objects that must move. No object moves between two
 /// identical versions.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlacementMap {
     /// Monotonically increasing placement version (1..).
     pub version: u64,

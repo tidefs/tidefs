@@ -72,8 +72,9 @@ use tidefs_replication_model::{
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
     send_replication_msg, send_segment_fetch_response, PlacementMap as TransportPlacementMap,
-    PlacementVersionTracker, ReplicationMessage, SegmentFetchRequest, SegmentFetchResponse,
-    SessionCloseReason, SyncEntry, Transport, TransportError, SEGMENT_FETCH_REQUEST_MAGIC,
+    PlacementMapRefusalReason, PlacementVersionTracker, ReplicationMessage, SegmentFetchRequest,
+    SegmentFetchResponse, SessionCloseReason, SyncEntry, Transport, TransportError,
+    SEGMENT_FETCH_REQUEST_MAGIC,
 };
 use tidefs_types_pool_label_core::PoolRedundancyPolicy as LabelPoolRedundancyPolicy;
 
@@ -135,6 +136,17 @@ pub struct StorageNodeRelocationPlacementPublication {
 pub struct StorageNodeTransportReadMapPublication {
     /// Versioned transport read map installed into the replicated store.
     pub read_map: TransportPlacementMap,
+    /// Previous placement version advertised by the membership tracker.
+    pub previous_tracker_version: u64,
+}
+
+/// Storage-node summary for applying a peer transport read map.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageNodePeerReadMapApplication {
+    /// Versioned transport read map installed into the replicated store.
+    pub read_map: TransportPlacementMap,
+    /// Previous placement version installed in the transport store.
+    pub previous_store_version: u64,
     /// Previous placement version advertised by the membership tracker.
     pub previous_tracker_version: u64,
 }
@@ -272,6 +284,92 @@ pub fn publish_cluster_runtime_read_map_to_transport_store(
 
     Ok(StorageNodeTransportReadMapPublication {
         read_map,
+        previous_tracker_version,
+    })
+}
+
+fn transport_read_map_response_from_store(
+    store: &StoreBackend,
+    requested_minimum_version: u64,
+) -> ReplicationMessage {
+    let Some(map) = (match store {
+        StoreBackend::TransportBacked(store) => store.placement_map(),
+        StoreBackend::Local(_) | StoreBackend::PoolBacked(_) => {
+            return ReplicationMessage::PlacementMapResponse {
+                requested_minimum_version,
+                map: None,
+                refusal: Some(PlacementMapRefusalReason::NoTransportPlacement),
+            };
+        }
+    }) else {
+        return ReplicationMessage::PlacementMapResponse {
+            requested_minimum_version,
+            map: None,
+            refusal: Some(PlacementMapRefusalReason::NoInstalledMap),
+        };
+    };
+
+    if !map.is_initialized() {
+        return ReplicationMessage::PlacementMapResponse {
+            requested_minimum_version,
+            map: None,
+            refusal: Some(PlacementMapRefusalReason::UninitializedMap),
+        };
+    }
+
+    if map.version < requested_minimum_version {
+        return ReplicationMessage::PlacementMapResponse {
+            requested_minimum_version,
+            map: None,
+            refusal: Some(PlacementMapRefusalReason::Stale {
+                available_version: map.version,
+            }),
+        };
+    }
+
+    ReplicationMessage::PlacementMapResponse {
+        requested_minimum_version,
+        map: Some(map.clone()),
+        refusal: None,
+    }
+}
+
+/// Apply a peer transport read map through the local store and membership tracker.
+pub fn apply_peer_transport_read_map_to_transport_store(
+    store: &mut TransportReplicatedStore,
+    tracker: &PlacementVersionTracker,
+    read_map: TransportPlacementMap,
+) -> Result<StorageNodePeerReadMapApplication, String> {
+    if !read_map.is_initialized() {
+        return Err("peer transport read map version 0 is not publishable".into());
+    }
+    if read_map.object_count() == 0 {
+        return Err("peer transport read map is empty".into());
+    }
+
+    let previous_store_version = store.placement_version();
+    let previous_tracker_version = tracker.current_version();
+    let local_version = previous_store_version.max(previous_tracker_version);
+    if read_map.version <= local_version {
+        return Err(format!(
+            "peer transport read map version {} is not newer than local version {}",
+            read_map.version, local_version
+        ));
+    }
+
+    store
+        .try_set_placement_map(read_map.clone())
+        .map_err(|err| format!("transport replicated store rejected peer read map: {err}"))?;
+    tracker.try_update(read_map.version).map_err(|previous| {
+        format!(
+            "placement tracker rejected peer read map version {} after observing {}",
+            read_map.version, previous
+        )
+    })?;
+
+    Ok(StorageNodePeerReadMapApplication {
+        read_map,
+        previous_store_version,
         previous_tracker_version,
     })
 }
@@ -3094,6 +3192,56 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     let entries = sync_entries_from_store(&s);
                     ReplicationMessage::SyncResponse { entries }
                 }
+                ReplicationMessage::PlacementMapRequest { minimum_version } => {
+                    let s = ctx.store.lock().unwrap();
+                    transport_read_map_response_from_store(&s, *minimum_version)
+                }
+                ReplicationMessage::PlacementMapResponse {
+                    requested_minimum_version: _,
+                    map: Some(map),
+                    refusal: None,
+                } => {
+                    let result = {
+                        let mut s = ctx.store.lock().unwrap();
+                        match &mut *s {
+                            StoreBackend::TransportBacked(store) => {
+                                apply_peer_transport_read_map_to_transport_store(
+                                    store,
+                                    &ctx.placement_version_tracker,
+                                    map.clone(),
+                                )
+                                .map(|_| ())
+                            }
+                            StoreBackend::Local(_) | StoreBackend::PoolBacked(_) => Err(
+                                "peer placement map application requires transport-backed store"
+                                    .to_string(),
+                            ),
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!(
+                            "[storage-node] session {session_id}: peer placement map refused: {err}"
+                        );
+                        ReplicationMessage::Ack {
+                            key_hash: "placement-map".into(),
+                            success: false,
+                        }
+                    } else {
+                        ReplicationMessage::Ack {
+                            key_hash: "placement-map".into(),
+                            success: true,
+                        }
+                    }
+                }
+                ReplicationMessage::PlacementMapResponse { refusal, .. } => {
+                    eprintln!(
+                        "[storage-node] session {session_id}: peer placement map unavailable: {refusal:?}"
+                    );
+                    ReplicationMessage::Ack {
+                        key_hash: "placement-map".into(),
+                        success: false,
+                    }
+                }
                 ReplicationMessage::ReadPlan { plan_bytes } => {
                     let s = ctx.store.lock().unwrap();
                     read_plan_response_from_store(&s, plan_bytes, ctx.config.node_id)
@@ -5280,6 +5428,19 @@ mod cluster_pool_handler_tests {
         (tmp, store)
     }
 
+    fn test_transport_read_map(version: u64) -> TransportPlacementMap {
+        let mut mapping = BTreeMap::new();
+        mapping.insert(
+            1001,
+            [MemberId::new(2), MemberId::new(3)].into_iter().collect(),
+        );
+        mapping.insert(
+            1002,
+            [MemberId::new(2), MemberId::new(4)].into_iter().collect(),
+        );
+        TransportPlacementMap::new(version, EpochId::new(9), mapping)
+    }
+
     fn assert_repair_flow_publication_refused_without_mutation(
         publication: ReceiptRepairFlowCommitPublication,
         old_receipt: PlacementReceiptRef,
@@ -6044,6 +6205,125 @@ mod cluster_pool_handler_tests {
         let err =
             publish_cluster_runtime_read_map_to_transport_store(&runtime, &mut store, &tracker)
                 .unwrap_err();
+
+        assert!(err.contains("placement must be configured"), "{err}");
+        assert_eq!(tracker.current_version(), 0);
+        assert_eq!(store.placement_version(), 0);
+        assert!(store.placement_map().is_none());
+    }
+
+    #[test]
+    fn peer_read_map_response_refuses_missing_map_without_empty_publication() {
+        let (_tmp, store) = transport_store_with_placement();
+        let backend = StoreBackend::TransportBacked(Box::new(store));
+
+        let response = transport_read_map_response_from_store(&backend, 1);
+
+        assert_eq!(
+            response,
+            ReplicationMessage::PlacementMapResponse {
+                requested_minimum_version: 1,
+                map: None,
+                refusal: Some(PlacementMapRefusalReason::NoInstalledMap),
+            }
+        );
+    }
+
+    #[test]
+    fn peer_read_map_response_refuses_stale_installed_map() {
+        let (_tmp, mut store) = transport_store_with_placement();
+        let map = test_transport_read_map(4);
+        store.set_placement_map(map);
+        let backend = StoreBackend::TransportBacked(Box::new(store));
+
+        let response = transport_read_map_response_from_store(&backend, 5);
+
+        assert_eq!(
+            response,
+            ReplicationMessage::PlacementMapResponse {
+                requested_minimum_version: 5,
+                map: None,
+                refusal: Some(PlacementMapRefusalReason::Stale {
+                    available_version: 4,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn peer_read_map_response_serves_satisfying_installed_map() {
+        let (_tmp, mut store) = transport_store_with_placement();
+        let map = test_transport_read_map(5);
+        store.set_placement_map(map.clone());
+        let backend = StoreBackend::TransportBacked(Box::new(store));
+
+        let response = transport_read_map_response_from_store(&backend, 5);
+
+        assert_eq!(
+            response,
+            ReplicationMessage::PlacementMapResponse {
+                requested_minimum_version: 5,
+                map: Some(map),
+                refusal: None,
+            }
+        );
+    }
+
+    #[test]
+    fn peer_read_map_application_installs_newer_map_and_tracker_version() {
+        let (_tmp, mut store) = transport_store_with_placement();
+        let tracker = PlacementVersionTracker::with_version(2);
+        let map = test_transport_read_map(3);
+
+        let applied =
+            apply_peer_transport_read_map_to_transport_store(&mut store, &tracker, map.clone())
+                .expect("newer peer map installs");
+
+        assert_eq!(applied.previous_store_version, 0);
+        assert_eq!(applied.previous_tracker_version, 2);
+        assert_eq!(applied.read_map, map);
+        assert_eq!(tracker.current_version(), 3);
+        assert_eq!(store.placement_version(), 3);
+        assert_eq!(store.placement_map(), Some(&applied.read_map));
+    }
+
+    #[test]
+    fn peer_read_map_application_refuses_equal_or_stale_versions() {
+        let (_tmp, mut store) = transport_store_with_placement();
+        let tracker = PlacementVersionTracker::with_version(5);
+        let installed = test_transport_read_map(5);
+        store.set_placement_map(installed.clone());
+
+        let err = apply_peer_transport_read_map_to_transport_store(
+            &mut store,
+            &tracker,
+            test_transport_read_map(5),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("is not newer than local version 5"), "{err}");
+        assert_eq!(tracker.current_version(), 5);
+        assert_eq!(store.placement_version(), 5);
+        assert_eq!(store.placement_map(), Some(&installed));
+    }
+
+    #[test]
+    fn peer_read_map_application_refuses_unconfigured_transport_store() {
+        let tmp = tempfile::TempDir::with_prefix("storage-node-peer-map-unconfigured-").unwrap();
+        let mut store = TransportReplicatedStore::open(
+            tmp.path(),
+            1u64,
+            TransportReplicatedStoreConfig::default(),
+        )
+        .unwrap();
+        let tracker = PlacementVersionTracker::new();
+
+        let err = apply_peer_transport_read_map_to_transport_store(
+            &mut store,
+            &tracker,
+            test_transport_read_map(1),
+        )
+        .unwrap_err();
 
         assert!(err.contains("placement must be configured"), "{err}");
         assert_eq!(tracker.current_version(), 0);

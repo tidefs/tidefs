@@ -5,6 +5,7 @@
 //! opaque frames via the Transport send_message/recv_message primitives.
 
 use crate::error::TransportError;
+use crate::object_enumerator::PlacementMap;
 use crate::transport::Transport;
 use crate::types::SessionId;
 use tidefs_replication_model::PlacementReceiptRef;
@@ -50,6 +51,19 @@ impl SyncEntry {
     }
 }
 
+/// Typed reason a peer did not return a requested placement map.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
+pub enum PlacementMapRefusalReason {
+    /// The peer store is not transport-placement-backed.
+    NoTransportPlacement,
+    /// The peer has no installed transport placement map.
+    NoInstalledMap,
+    /// The peer has only an uninitialized zero-version map.
+    UninitializedMap,
+    /// The peer's installed map is older than the requested minimum.
+    Stale { available_version: u64 },
+}
+
 /// Wire message types for distributed object replication.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub enum ReplicationMessage {
@@ -65,6 +79,20 @@ pub enum ReplicationMessage {
     SyncRequest,
     /// Sync response: exact object payloads, with receipt authority when known.
     SyncResponse { entries: Vec<SyncEntry> },
+    /// Request the peer's installed transport placement read map.
+    PlacementMapRequest {
+        /// Minimum acceptable version for the requester.
+        minimum_version: u64,
+    },
+    /// Response to [`ReplicationMessage::PlacementMapRequest`].
+    PlacementMapResponse {
+        /// Requested minimum version echoed from the request.
+        requested_minimum_version: u64,
+        /// Installed placement map when the peer can satisfy the request.
+        map: Option<PlacementMap>,
+        /// Typed refusal when no map is returned.
+        refusal: Option<PlacementMapRefusalReason>,
+    },
     /// Delete an object by name with generation counter for race prevention.
     Delete {
         name: String,
@@ -166,7 +194,9 @@ pub fn recv_replication_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use tidefs_membership_epoch::EpochId;
+    use tidefs_membership_epoch::MemberId;
     use tidefs_replication_model::ReceiptRedundancyPolicy;
 
     // ── Helper: round-trip a message through bincode ──
@@ -399,6 +429,32 @@ mod tests {
         };
         let rt = bincode_roundtrip(&msg);
         assert_eq!(rt, msg);
+    }
+
+    #[test]
+    fn placement_map_exchange_bincode_roundtrip() {
+        let mut mapping = BTreeMap::new();
+        mapping.insert(42, BTreeSet::from([MemberId::new(2), MemberId::new(3)]));
+        let map = PlacementMap::new(7, EpochId::new(9), mapping);
+
+        let request = ReplicationMessage::PlacementMapRequest { minimum_version: 7 };
+        assert_eq!(bincode_roundtrip(&request), request);
+
+        let response = ReplicationMessage::PlacementMapResponse {
+            requested_minimum_version: 7,
+            map: Some(map.clone()),
+            refusal: None,
+        };
+        assert_eq!(bincode_roundtrip(&response), response);
+
+        let refused = ReplicationMessage::PlacementMapResponse {
+            requested_minimum_version: 8,
+            map: None,
+            refusal: Some(PlacementMapRefusalReason::Stale {
+                available_version: map.version,
+            }),
+        };
+        assert_eq!(bincode_roundtrip(&refused), refused);
     }
 
     #[test]
