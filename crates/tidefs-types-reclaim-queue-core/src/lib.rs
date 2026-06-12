@@ -634,6 +634,202 @@ impl QueueBudget {
 }
 
 // ---------------------------------------------------------------------------
+// DeadObjectReceiptPolicy -- replacement/base placement receipt policy
+// ---------------------------------------------------------------------------
+
+/// Redundancy policy identity carried by replacement/base receipt evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeadObjectReceiptPolicy {
+    /// Full replicas on distinct placement targets.
+    Replicated { copies: u8 },
+    /// One erasure stripe with data plus parity shard targets.
+    Erasure { data_shards: u8, parity_shards: u8 },
+}
+
+impl Default for DeadObjectReceiptPolicy {
+    fn default() -> Self {
+        Self::Replicated { copies: 1 }
+    }
+}
+
+impl DeadObjectReceiptPolicy {
+    const REPLICATED_DISCRIMINANT: u8 = 0;
+    const ERASURE_DISCRIMINANT: u8 = 1;
+    const ENCODED_SIZE: usize = 3;
+
+    /// Number of physical targets required by this policy.
+    #[must_use]
+    pub const fn target_width(self) -> u16 {
+        match self {
+            Self::Replicated { copies } => copies as u16,
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => data_shards as u16 + parity_shards as u16,
+        }
+    }
+
+    /// True when the policy can describe a usable receipt placement.
+    #[must_use]
+    pub const fn is_well_formed(self) -> bool {
+        match self {
+            Self::Replicated { copies } => copies > 0,
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => data_shards > 0 && parity_shards > 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn encode(self) -> [u8; Self::ENCODED_SIZE] {
+        match self {
+            Self::Replicated { copies } => [Self::REPLICATED_DISCRIMINANT, copies, 0],
+            Self::Erasure {
+                data_shards,
+                parity_shards,
+            } => [Self::ERASURE_DISCRIMINANT, data_shards, parity_shards],
+        }
+    }
+
+    pub fn decode(buf: [u8; Self::ENCODED_SIZE]) -> Result<Self, DeadObjectEntryDecodeError> {
+        match buf[0] {
+            Self::REPLICATED_DISCRIMINANT => {
+                if buf[2] != 0 {
+                    return Err(
+                        DeadObjectEntryDecodeError::InvalidReceiptPolicyReservedByte {
+                            found: buf[2],
+                        },
+                    );
+                }
+                Ok(Self::Replicated { copies: buf[1] })
+            }
+            Self::ERASURE_DISCRIMINANT => Ok(Self::Erasure {
+                data_shards: buf[1],
+                parity_shards: buf[2],
+            }),
+            found => Err(DeadObjectEntryDecodeError::UnknownReceiptPolicy { found }),
+        }
+    }
+}
+
+/// Replacement/base placement receipt evidence required before receipt-bound
+/// dead-object reclaim may retire old physical storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeadObjectReplacementReceipt {
+    /// Logical object key covered by the replacement/base receipt.
+    pub object_key: ObjectKey,
+    /// Placement or membership epoch when the receipt was issued.
+    pub receipt_epoch: u64,
+    /// Monotonic receipt write generation. Zero is the compatibility/synthetic
+    /// sentinel and does not authorize reclaim.
+    pub receipt_generation: u64,
+    /// Redundancy policy identity in force for the replacement placement.
+    pub redundancy_policy: DeadObjectReceiptPolicy,
+    /// Logical payload length covered by this receipt.
+    pub payload_len: u64,
+    /// BLAKE3 digest of the logical payload.
+    pub payload_digest: [u8; 32],
+    /// Number of physical targets recorded by the placement receipt.
+    pub target_count: u16,
+}
+
+impl DeadObjectReplacementReceipt {
+    pub const ENCODED_SIZE: usize = 32 + 8 + 8 + DeadObjectReceiptPolicy::ENCODED_SIZE + 8 + 32 + 2;
+
+    #[must_use]
+    pub const fn new(
+        object_key: ObjectKey,
+        receipt_epoch: u64,
+        receipt_generation: u64,
+        redundancy_policy: DeadObjectReceiptPolicy,
+        payload_len: u64,
+        payload_digest: [u8; 32],
+        target_count: u16,
+    ) -> Self {
+        Self {
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            target_count,
+        }
+    }
+
+    #[must_use]
+    pub const fn replicated(
+        object_key: ObjectKey,
+        receipt_epoch: u64,
+        receipt_generation: u64,
+        copies: u8,
+        payload_len: u64,
+        payload_digest: [u8; 32],
+    ) -> Self {
+        let redundancy_policy = DeadObjectReceiptPolicy::Replicated { copies };
+        Self::new(
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            redundancy_policy.target_width(),
+        )
+    }
+
+    /// True when this evidence is the legacy compatibility placeholder rather
+    /// than a durable placement receipt.
+    #[must_use]
+    pub const fn is_synthetic(self) -> bool {
+        self.receipt_generation == 0
+    }
+
+    /// True when this receipt can authorize reclaim for `object_key`.
+    #[must_use]
+    pub fn authorizes_reclaim_for(self, object_key: ObjectKey) -> bool {
+        !self.is_synthetic()
+            && self.object_key.0 == object_key.0
+            && self.redundancy_policy.is_well_formed()
+            && self.target_count >= self.redundancy_policy.target_width()
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::ENCODED_SIZE] {
+        let mut buf = [0u8; Self::ENCODED_SIZE];
+        buf[0..32].copy_from_slice(&self.object_key.0);
+        buf[32..40].copy_from_slice(&self.receipt_epoch.to_le_bytes());
+        buf[40..48].copy_from_slice(&self.receipt_generation.to_le_bytes());
+        buf[48..51].copy_from_slice(&self.redundancy_policy.encode());
+        buf[51..59].copy_from_slice(&self.payload_len.to_le_bytes());
+        buf[59..91].copy_from_slice(&self.payload_digest);
+        buf[91..93].copy_from_slice(&self.target_count.to_le_bytes());
+        buf
+    }
+
+    pub fn decode(buf: &[u8; Self::ENCODED_SIZE]) -> Result<Self, DeadObjectEntryDecodeError> {
+        let object_key = ObjectKey(buf[0..32].try_into().unwrap());
+        let receipt_epoch = u64::from_le_bytes(buf[32..40].try_into().unwrap());
+        let receipt_generation = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+        let redundancy_policy = DeadObjectReceiptPolicy::decode(buf[48..51].try_into().unwrap())?;
+        let payload_len = u64::from_le_bytes(buf[51..59].try_into().unwrap());
+        let payload_digest = buf[59..91].try_into().unwrap();
+        let target_count = u16::from_le_bytes(buf[91..93].try_into().unwrap());
+
+        Ok(Self {
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            target_count,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DeadObjectEntry -- commit_group-anchored dead-object reclaim entry
 // ---------------------------------------------------------------------------
 
@@ -646,7 +842,10 @@ impl QueueBudget {
 ///
 /// When `eligible` is `false`, the entry is held back even if its
 /// `death_commit_group` is below the stable committed commit_group -- typically because a
-/// snapshot or clone still references the object.
+/// snapshot or clone still references the object.  Receipt-bound reclaim also
+/// requires replacement/base placement receipt evidence, so decoded legacy
+/// entries without that evidence stay queued until a receipt-aware caller
+/// attaches it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeadObjectEntry {
     /// Object identifier for the dead object.
@@ -660,6 +859,9 @@ pub struct DeadObjectEntry {
     pub eligible: bool,
     /// Transaction group at which this entry was enqueued.
     pub enqueued_at_txg: u64,
+    /// Replacement/base placement receipt evidence that authorizes retiring
+    /// this dead object's old physical placement.
+    pub replacement_receipt: Option<DeadObjectReplacementReceipt>,
 }
 
 impl DeadObjectEntry {
@@ -678,7 +880,18 @@ impl DeadObjectEntry {
             death_commit_group,
             eligible,
             enqueued_at_txg,
+            replacement_receipt: None,
         }
+    }
+
+    /// Attach replacement/base receipt evidence to this dead-object entry.
+    #[must_use]
+    pub const fn with_replacement_receipt(
+        mut self,
+        replacement_receipt: DeadObjectReplacementReceipt,
+    ) -> Self {
+        self.replacement_receipt = Some(replacement_receipt);
+        self
     }
 
     /// Returns `true` if this entry is eligible for reclamation given
@@ -691,10 +904,28 @@ impl DeadObjectEntry {
         self.eligible && self.death_commit_group < stable_committed_txg
     }
 
-    /// Size of a single encoded entry in bytes.
+    /// Returns `true` when the normal txg/eligibility gate and replacement
+    /// receipt evidence both authorize reclaim.
+    #[must_use]
+    pub fn is_receipt_bound_reclaimable(self, stable_committed_txg: u64) -> bool {
+        if !self.is_reclaimable(stable_committed_txg) {
+            return false;
+        }
+        match self.replacement_receipt {
+            Some(receipt) => receipt.authorizes_reclaim_for(self.object_id),
+            None => false,
+        }
+    }
+
+    /// Size of a legacy v1 encoded entry in bytes.
     /// object_id(32) + dataset_uuid(16) + death_commit_group(8) + eligible(1) +
     /// enqueued_at_txg(8) = 65 bytes.
-    pub const ENCODED_SIZE: usize = 65;
+    pub const ENCODED_SIZE_V1: usize = 65;
+
+    /// Size of a v2 encoded entry in bytes.
+    /// v1 fields + replacement receipt presence flag + receipt evidence.
+    pub const ENCODED_SIZE: usize =
+        Self::ENCODED_SIZE_V1 + 1 + DeadObjectReplacementReceipt::ENCODED_SIZE;
 
     /// Encode this entry into a fixed-size byte array.
     ///
@@ -704,6 +935,8 @@ impl DeadObjectEntry {
     /// - 8 bytes: death_commit_group (u64 LE)
     /// - 1 byte: eligible flag (0 or 1)
     /// - 8 bytes: enqueued_at_txg (u64 LE)
+    /// - 1 byte: replacement receipt presence (0 or 1)
+    /// - 93 bytes: replacement receipt evidence, zeroed when absent
     #[must_use]
     pub fn encode(self) -> [u8; Self::ENCODED_SIZE] {
         let mut buf = [0u8; Self::ENCODED_SIZE];
@@ -712,6 +945,10 @@ impl DeadObjectEntry {
         buf[48..56].copy_from_slice(&self.death_commit_group.to_le_bytes());
         buf[56] = u8::from(self.eligible);
         buf[57..65].copy_from_slice(&self.enqueued_at_txg.to_le_bytes());
+        if let Some(receipt) = self.replacement_receipt {
+            buf[65] = 1;
+            buf[66..159].copy_from_slice(&receipt.encode());
+        }
         buf
     }
 
@@ -719,9 +956,35 @@ impl DeadObjectEntry {
     ///
     /// # Errors
     ///
-    /// Returns `DeadObjectEntryDecodeError::InvalidEligibleByte` if the
-    /// eligible byte is neither 0 nor 1.
+    /// Returns [`DeadObjectEntryDecodeError`] when a boolean flag or receipt
+    /// policy discriminant is malformed.
     pub fn decode(buf: &[u8; Self::ENCODED_SIZE]) -> Result<Self, DeadObjectEntryDecodeError> {
+        let mut entry = Self::decode_v1(
+            buf[0..Self::ENCODED_SIZE_V1]
+                .try_into()
+                .expect("v2 entry contains v1 prefix"),
+        )?;
+
+        let replacement_receipt = match buf[65] {
+            0 => {
+                if buf[66..159].iter().any(|byte| *byte != 0) {
+                    return Err(DeadObjectEntryDecodeError::UnexpectedReceiptBytes);
+                }
+                None
+            }
+            1 => Some(DeadObjectReplacementReceipt::decode(
+                buf[66..159].try_into().unwrap(),
+            )?),
+            found => return Err(DeadObjectEntryDecodeError::InvalidReceiptFlag { found }),
+        };
+        entry.replacement_receipt = replacement_receipt;
+        Ok(entry)
+    }
+
+    /// Decode a legacy v1 entry that has no replacement receipt evidence.
+    pub fn decode_v1(
+        buf: &[u8; Self::ENCODED_SIZE_V1],
+    ) -> Result<Self, DeadObjectEntryDecodeError> {
         let object_id = ObjectKey(buf[0..32].try_into().unwrap());
         let dataset_uuid = buf[32..48].try_into().unwrap();
         let death_commit_group = u64::from_le_bytes(buf[48..56].try_into().unwrap());
@@ -742,6 +1005,7 @@ impl DeadObjectEntry {
             death_commit_group,
             eligible,
             enqueued_at_txg,
+            replacement_receipt: None,
         })
     }
 }
@@ -754,6 +1018,7 @@ impl Default for DeadObjectEntry {
             death_commit_group: 0,
             eligible: false,
             enqueued_at_txg: 0,
+            replacement_receipt: None,
         }
     }
 }
@@ -762,8 +1027,12 @@ impl fmt::Display for DeadObjectEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "DeadObjectEntry(object_id={} death_commit_group={} eligible={} enqueued_at={})",
-            self.object_id, self.death_commit_group, self.eligible, self.enqueued_at_txg
+            "DeadObjectEntry(object_id={} death_commit_group={} eligible={} enqueued_at={} replacement_receipt={})",
+            self.object_id,
+            self.death_commit_group,
+            self.eligible,
+            self.enqueued_at_txg,
+            self.replacement_receipt.is_some()
         )
     }
 }
@@ -778,6 +1047,14 @@ impl fmt::Display for DeadObjectEntry {
 pub enum DeadObjectEntryDecodeError {
     /// The eligible byte was neither 0 (false) nor 1 (true).
     InvalidEligibleByte { found: u8 },
+    /// The replacement receipt presence byte was neither 0 (false) nor 1 (true).
+    InvalidReceiptFlag { found: u8 },
+    /// The replacement receipt policy discriminant is unknown.
+    UnknownReceiptPolicy { found: u8 },
+    /// A replicated receipt policy carried nonzero reserved bytes.
+    InvalidReceiptPolicyReservedByte { found: u8 },
+    /// Receipt bytes were present while the replacement receipt flag was absent.
+    UnexpectedReceiptBytes,
 }
 
 impl fmt::Display for DeadObjectEntryDecodeError {
@@ -785,6 +1062,21 @@ impl fmt::Display for DeadObjectEntryDecodeError {
         match self {
             Self::InvalidEligibleByte { found } => {
                 write!(f, "invalid eligible byte in dead-object entry: {found}")
+            }
+            Self::InvalidReceiptFlag { found } => {
+                write!(f, "invalid receipt flag in dead-object entry: {found}")
+            }
+            Self::UnknownReceiptPolicy { found } => {
+                write!(f, "unknown dead-object receipt policy: {found}")
+            }
+            Self::InvalidReceiptPolicyReservedByte { found } => {
+                write!(
+                    f,
+                    "invalid dead-object receipt policy reserved byte: {found}"
+                )
+            }
+            Self::UnexpectedReceiptBytes => {
+                f.write_str("unexpected receipt bytes in receipt-less dead-object entry")
             }
         }
     }
@@ -1352,6 +1644,18 @@ mod tests {
 
     // ── DeadObjectEntry ──────────────────────────────────────────────────
 
+    fn dead_object_key(byte: u8) -> ObjectKey {
+        let mut key = [0u8; 32];
+        key[0] = byte;
+        ObjectKey(key)
+    }
+
+    fn receipt_for(key: ObjectKey) -> DeadObjectReplacementReceipt {
+        let mut digest = [0u8; 32];
+        digest[0] = key.0[0];
+        DeadObjectReplacementReceipt::replicated(key, 7, 1, 2, 4096, digest)
+    }
+
     #[test]
     fn dead_object_entry_new() {
         let mut oid = [0u8; 32];
@@ -1363,6 +1667,7 @@ mod tests {
         assert_eq!(entry.death_commit_group, 100);
         assert!(entry.eligible);
         assert_eq!(entry.enqueued_at_txg, 95);
+        assert_eq!(entry.replacement_receipt, None);
     }
 
     #[test]
@@ -1385,6 +1690,59 @@ mod tests {
     }
 
     #[test]
+    fn replacement_receipt_authorizes_reclaim_for_matching_key() {
+        let key = dead_object_key(0x33);
+        let receipt = receipt_for(key);
+
+        assert!(receipt.authorizes_reclaim_for(key));
+        assert!(!receipt.authorizes_reclaim_for(dead_object_key(0x44)));
+    }
+
+    #[test]
+    fn receipt_policy_validation_rejects_malformed_or_under_width() {
+        let key = dead_object_key(0x34);
+        let digest = [0xAB; 32];
+        let synthetic = DeadObjectReplacementReceipt::replicated(key, 7, 0, 2, 4096, digest);
+        let malformed = DeadObjectReplacementReceipt::new(
+            key,
+            7,
+            1,
+            DeadObjectReceiptPolicy::Replicated { copies: 0 },
+            4096,
+            digest,
+            0,
+        );
+        let under_width = DeadObjectReplacementReceipt::new(
+            key,
+            7,
+            1,
+            DeadObjectReceiptPolicy::Erasure {
+                data_shards: 2,
+                parity_shards: 1,
+            },
+            4096,
+            digest,
+            2,
+        );
+
+        assert!(!synthetic.authorizes_reclaim_for(key));
+        assert!(!malformed.authorizes_reclaim_for(key));
+        assert!(!under_width.authorizes_reclaim_for(key));
+    }
+
+    #[test]
+    fn dead_object_entry_receipt_bound_reclaim_requires_evidence() {
+        let key = dead_object_key(0x35);
+        let entry = DeadObjectEntry::new(key, [0u8; 16], 10, true, 9);
+        assert!(entry.is_reclaimable(11));
+        assert!(!entry.is_receipt_bound_reclaimable(11));
+
+        let receipt_bound = entry.with_replacement_receipt(receipt_for(key));
+        assert!(receipt_bound.is_receipt_bound_reclaimable(11));
+        assert!(!receipt_bound.is_receipt_bound_reclaimable(10));
+    }
+
+    #[test]
     fn dead_object_entry_default() {
         let entry = DeadObjectEntry::default();
         assert_eq!(entry.object_id, ObjectKey::NONE);
@@ -1392,6 +1750,7 @@ mod tests {
         assert_eq!(entry.death_commit_group, 0);
         assert!(!entry.eligible);
         assert_eq!(entry.enqueued_at_txg, 0);
+        assert_eq!(entry.replacement_receipt, None);
     }
 
     #[test]
@@ -1411,7 +1770,8 @@ mod tests {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
             0x0F, 0x10,
         ];
-        let entry = DeadObjectEntry::new(ObjectKey(oid), uuid, 500, true, 490);
+        let entry = DeadObjectEntry::new(ObjectKey(oid), uuid, 500, true, 490)
+            .with_replacement_receipt(receipt_for(ObjectKey(oid)));
         let encoded = entry.encode();
         let decoded = DeadObjectEntry::decode(&encoded).unwrap();
         assert_eq!(decoded, entry);
@@ -1424,21 +1784,89 @@ mod tests {
     }
 
     #[test]
-    fn dead_object_entry_encode_size_is_65() {
+    fn dead_object_entry_legacy_decode_has_no_receipt_evidence() {
+        let mut legacy = [0u8; DeadObjectEntry::ENCODED_SIZE_V1];
+        legacy[0] = 0x36;
+        legacy[48..56].copy_from_slice(&10u64.to_le_bytes());
+        legacy[56] = 1;
+        legacy[57..65].copy_from_slice(&9u64.to_le_bytes());
+
+        let decoded = DeadObjectEntry::decode_v1(&legacy).unwrap();
+        assert_eq!(decoded.object_id, dead_object_key(0x36));
+        assert!(decoded.is_reclaimable(11));
+        assert!(!decoded.is_receipt_bound_reclaimable(11));
+        assert_eq!(decoded.replacement_receipt, None);
+    }
+
+    #[test]
+    fn dead_object_entry_encode_size_is_current_v2() {
         let entry = DeadObjectEntry::default();
         let encoded = entry.encode();
-        assert_eq!(encoded.len(), 65);
-        assert_eq!(DeadObjectEntry::ENCODED_SIZE, 65);
+        assert_eq!(DeadObjectEntry::ENCODED_SIZE_V1, 65);
+        assert_eq!(DeadObjectReplacementReceipt::ENCODED_SIZE, 93);
+        assert_eq!(encoded.len(), 159);
+        assert_eq!(DeadObjectEntry::ENCODED_SIZE, 159);
     }
 
     #[test]
     fn dead_object_entry_decode_rejects_invalid_eligible_byte() {
-        let mut buf = [0u8; 65];
+        let mut buf = [0u8; DeadObjectEntry::ENCODED_SIZE_V1];
         buf[56] = 99; // not 0 or 1
-        let result = DeadObjectEntry::decode(&buf);
+        let result = DeadObjectEntry::decode_v1(&buf);
         assert_eq!(
             result,
             Err(DeadObjectEntryDecodeError::InvalidEligibleByte { found: 99 })
+        );
+    }
+
+    #[test]
+    fn dead_object_entry_decode_rejects_invalid_receipt_flag() {
+        let mut buf = DeadObjectEntry::default().encode();
+        buf[65] = 99;
+        let result = DeadObjectEntry::decode(&buf);
+        assert_eq!(
+            result,
+            Err(DeadObjectEntryDecodeError::InvalidReceiptFlag { found: 99 })
+        );
+    }
+
+    #[test]
+    fn dead_object_entry_decode_rejects_unknown_receipt_policy() {
+        let key = dead_object_key(0x37);
+        let entry = DeadObjectEntry::new(key, [0u8; 16], 10, true, 9)
+            .with_replacement_receipt(receipt_for(key));
+        let mut buf = entry.encode();
+        buf[65] = 1;
+        buf[66 + 48] = 99;
+        let result = DeadObjectEntry::decode(&buf);
+        assert_eq!(
+            result,
+            Err(DeadObjectEntryDecodeError::UnknownReceiptPolicy { found: 99 })
+        );
+    }
+
+    #[test]
+    fn dead_object_entry_decode_rejects_replicated_policy_reserved_byte() {
+        let key = dead_object_key(0x38);
+        let entry = DeadObjectEntry::new(key, [0u8; 16], 10, true, 9)
+            .with_replacement_receipt(receipt_for(key));
+        let mut buf = entry.encode();
+        buf[66 + 50] = 99;
+        let result = DeadObjectEntry::decode(&buf);
+        assert_eq!(
+            result,
+            Err(DeadObjectEntryDecodeError::InvalidReceiptPolicyReservedByte { found: 99 })
+        );
+    }
+
+    #[test]
+    fn dead_object_entry_decode_rejects_absent_receipt_with_payload_bytes() {
+        let mut buf = DeadObjectEntry::default().encode();
+        buf[66] = 1;
+        let result = DeadObjectEntry::decode(&buf);
+        assert_eq!(
+            result,
+            Err(DeadObjectEntryDecodeError::UnexpectedReceiptBytes)
         );
     }
 
