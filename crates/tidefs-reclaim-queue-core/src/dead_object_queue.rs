@@ -2,7 +2,9 @@
 //!
 //! Provides a persistent, crash-safe queue for objects whose storage space
 //! is eligible for reclamation only after the stable committed commit_group advances
-//! past the object's `death_commit_group`.  Enqueue is idempotent by object ID.
+//! past the object's `death_commit_group`.  Receipt-bound drains also require
+//! durable replacement/base receipt evidence before old physical placement is
+//! retired. Enqueue is idempotent by object ID.
 //!
 //! # Integration
 //!
@@ -36,7 +38,8 @@ use tidefs_types_reclaim_queue_core::{DeadObjectEntry, ObjectKey};
 ///
 /// [`dequeue_batch`](Self::dequeue_batch) returns only entries whose
 /// `death_commit_group` is strictly less than the provided `stable_committed_txg`
-/// and whose `eligible` flag is `true`.
+/// and whose `eligible` flag is `true`.  [`dequeue_receipt_bound_batch`] adds
+/// the release-facing replacement/base receipt evidence gate.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DeadObjectReclaimQueue {
     entries: BTreeMapAlloc<ObjectKey, DeadObjectEntry>,
@@ -110,6 +113,30 @@ impl DeadObjectReclaimQueue {
             .collect()
     }
 
+    /// Dequeue up to `max_count` entries authorized by txg, eligibility, and
+    /// replacement/base placement receipt evidence.
+    ///
+    /// Compatibility callers may still use [`Self::dequeue_batch`]. Release
+    /// reclaim drains that retire obsolete/source placement should use this
+    /// receipt-bound path so legacy or malformed entries stay queued until
+    /// durable replacement placement authority is attached.
+    #[must_use]
+    pub fn dequeue_receipt_bound_batch(
+        &self,
+        max_count: usize,
+        stable_committed_txg: u64,
+    ) -> Vec<DeadObjectEntry> {
+        if max_count == 0 || self.is_empty() {
+            return Vec::new();
+        }
+        self.entries
+            .values()
+            .filter(|e| e.is_receipt_bound_reclaimable(stable_committed_txg))
+            .take(max_count)
+            .copied()
+            .collect()
+    }
+
     /// Remove successfully reclaimed entries from the queue.
     ///
     /// Call this after the allocator has freed the objects' space.
@@ -173,6 +200,15 @@ impl DeadObjectReclaimQueue {
             .count()
     }
 
+    /// Number of entries currently eligible for receipt-bound reclamation.
+    #[must_use]
+    pub fn receipt_bound_eligible_count(&self, stable_committed_txg: u64) -> usize {
+        self.entries
+            .values()
+            .filter(|e| e.is_receipt_bound_reclaimable(stable_committed_txg))
+            .count()
+    }
+
     /// Remove all entries from the queue.
     pub fn clear(&mut self) {
         self.entries.clear();
@@ -185,8 +221,11 @@ impl DeadObjectReclaimQueue {
     /// Magic bytes identifying a dead-object reclaim-queue payload.
     const MAGIC: &'static [u8; 4] = b"DRCL";
 
+    /// Legacy binary format version without replacement receipt evidence.
+    const FORMAT_VERSION_V1: u32 = 1;
+
     /// Current binary format version.
-    const FORMAT_VERSION: u32 = 1;
+    const FORMAT_VERSION: u32 = 2;
 
     /// Schema family identifier for dead-object-queue BLAKE3 domain context.
     const FAMILY_ID: SchemaFamilyId = SchemaFamilyId(0x4452_434C_0000_0001);
@@ -195,7 +234,10 @@ impl DeadObjectReclaimQueue {
     const TYPE_ID: SchemaTypeId = SchemaTypeId(1);
 
     /// Schema version for dead-object-queue format v1.0.
-    const VERSION: SchemaVersion = SchemaVersion::new(1, 0);
+    const VERSION_V1: SchemaVersion = SchemaVersion::new(1, 0);
+
+    /// Schema version for dead-object-queue format v2.0.
+    const VERSION: SchemaVersion = SchemaVersion::new(2, 0);
 
     /// Domain tag for dead-object-queue payload integrity.
     const DOMAIN_TAG: DomainTag = DomainTag::SectionBody;
@@ -206,7 +248,7 @@ impl DeadObjectReclaimQueue {
     /// - 4 bytes: magic `DRCL`
     /// - 4 bytes: format version (u32)
     /// - 4 bytes: entry count (u32)
-    /// - N * 65 bytes: per-entry encoded records
+    /// - N * current-version per-entry encoded records
     /// - 32 bytes: BLAKE3 domain-separated digest over all preceding bytes
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -262,12 +304,16 @@ impl DeadObjectReclaimQueue {
 
         // Verify version
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != Self::FORMAT_VERSION {
-            return Err(DeadObjectQueueDecodeError::UnsupportedVersion {
-                found: version,
-                expected: Self::FORMAT_VERSION,
-            });
-        }
+        let (entry_size, schema_version) = match version {
+            Self::FORMAT_VERSION_V1 => (DeadObjectEntry::ENCODED_SIZE_V1, Self::VERSION_V1),
+            Self::FORMAT_VERSION => (DeadObjectEntry::ENCODED_SIZE, Self::VERSION),
+            found => {
+                return Err(DeadObjectQueueDecodeError::UnsupportedVersion {
+                    found,
+                    expected: Self::FORMAT_VERSION,
+                })
+            }
+        };
 
         // Verify BLAKE3 integrity footer
         let body_len = data.len() - 32;
@@ -275,7 +321,7 @@ impl DeadObjectReclaimQueue {
             &data[..body_len],
             Self::FAMILY_ID,
             Self::TYPE_ID,
-            Self::VERSION,
+            schema_version,
             Self::DOMAIN_TAG,
         );
         let actual_digest: [u8; 32] = data[body_len..].try_into().unwrap();
@@ -288,7 +334,7 @@ impl DeadObjectReclaimQueue {
         let expected_body_len = 12usize
             .checked_add(
                 count
-                    .checked_mul(DeadObjectEntry::ENCODED_SIZE)
+                    .checked_mul(entry_size)
                     .ok_or(DeadObjectQueueDecodeError::Truncated)?,
             )
             .ok_or(DeadObjectQueueDecodeError::Truncated)?;
@@ -296,17 +342,31 @@ impl DeadObjectReclaimQueue {
         if body_len < expected_body_len {
             return Err(DeadObjectQueueDecodeError::Truncated);
         }
+        if body_len > expected_body_len {
+            return Err(DeadObjectQueueDecodeError::TrailingBytes {
+                found: body_len,
+                expected: expected_body_len,
+            });
+        }
 
         // Parse entries (enqueue is idempotent, so duplicates in data are harmless)
         let mut queue = Self::new();
         for i in 0..count {
-            let offset = 12 + i * DeadObjectEntry::ENCODED_SIZE;
-            let entry_bytes: &[u8; DeadObjectEntry::ENCODED_SIZE] = data
-                [offset..offset + DeadObjectEntry::ENCODED_SIZE]
-                .try_into()
-                .map_err(|_| DeadObjectQueueDecodeError::Truncated)?;
-            let entry = DeadObjectEntry::decode(entry_bytes)
-                .map_err(|e| DeadObjectQueueDecodeError::EntryDecode(alloc::format!("{e}")))?;
+            let offset = 12 + i * entry_size;
+            let entry = if version == Self::FORMAT_VERSION_V1 {
+                let entry_bytes: &[u8; DeadObjectEntry::ENCODED_SIZE_V1] = data
+                    [offset..offset + DeadObjectEntry::ENCODED_SIZE_V1]
+                    .try_into()
+                    .map_err(|_| DeadObjectQueueDecodeError::Truncated)?;
+                DeadObjectEntry::decode_v1(entry_bytes)
+            } else {
+                let entry_bytes: &[u8; DeadObjectEntry::ENCODED_SIZE] = data
+                    [offset..offset + DeadObjectEntry::ENCODED_SIZE]
+                    .try_into()
+                    .map_err(|_| DeadObjectQueueDecodeError::Truncated)?;
+                DeadObjectEntry::decode(entry_bytes)
+            }
+            .map_err(|e| DeadObjectQueueDecodeError::EntryDecode(alloc::format!("{e}")))?;
             queue.enqueue(entry);
         }
 
@@ -337,6 +397,8 @@ pub enum DeadObjectQueueDecodeError {
     UnsupportedVersion { found: u32, expected: u32 },
     /// A per-entry decode failed.
     EntryDecode(String),
+    /// The body carried bytes beyond the declared entry count.
+    TrailingBytes { found: usize, expected: usize },
     /// The BLAKE3 integrity footer did not verify.
     IntegrityFooterMismatch,
 }
@@ -355,6 +417,12 @@ impl core::fmt::Display for DeadObjectQueueDecodeError {
             Self::EntryDecode(msg) => {
                 write!(f, "dead-object-queue entry decode error: {msg}")
             }
+            Self::TrailingBytes { found, expected } => {
+                write!(
+                    f,
+                    "dead-object-queue trailing bytes: found body length {found}, expected {expected}"
+                )
+            }
             Self::IntegrityFooterMismatch => {
                 f.write_str("dead-object-queue BLAKE3 integrity footer mismatch")
             }
@@ -369,6 +437,7 @@ impl core::fmt::Display for DeadObjectQueueDecodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_types_reclaim_queue_core::{DeadObjectReceiptPolicy, DeadObjectReplacementReceipt};
 
     fn oid(byte: u8) -> ObjectKey {
         let mut k = [0u8; 32];
@@ -384,6 +453,35 @@ mod tests {
             eligible,
             enqueued_at,
         )
+    }
+
+    fn digest(byte: u8) -> [u8; 32] {
+        let mut digest = [0u8; 32];
+        digest[0] = byte;
+        digest
+    }
+
+    fn receipt(id: u8) -> DeadObjectReplacementReceipt {
+        DeadObjectReplacementReceipt::replicated(oid(id), 7, 1, 2, 4096, digest(id))
+    }
+
+    fn entry_with_receipt(
+        id: u8,
+        death_commit_group: u64,
+        eligible: bool,
+        enqueued_at: u64,
+    ) -> DeadObjectEntry {
+        entry(id, death_commit_group, eligible, enqueued_at).with_replacement_receipt(receipt(id))
+    }
+
+    fn encode_v1_entry(entry: DeadObjectEntry) -> [u8; DeadObjectEntry::ENCODED_SIZE_V1] {
+        let mut buf = [0u8; DeadObjectEntry::ENCODED_SIZE_V1];
+        buf[0..32].copy_from_slice(&entry.object_id.0);
+        buf[32..48].copy_from_slice(&entry.dataset_uuid);
+        buf[48..56].copy_from_slice(&entry.death_commit_group.to_le_bytes());
+        buf[56] = u8::from(entry.eligible);
+        buf[57..65].copy_from_slice(&entry.enqueued_at_txg.to_le_bytes());
+        buf
     }
 
     // ── enqueue / idempotency ─────────────────────────────────────────
@@ -491,6 +589,73 @@ mod tests {
         assert!(q.dequeue_batch(0, 100).is_empty());
     }
 
+    #[test]
+    fn receipt_bound_dequeue_requires_replacement_receipt() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 0));
+        q.enqueue(entry_with_receipt(2, 5, true, 0));
+
+        let compatibility_batch = q.dequeue_batch(10, 10);
+        assert_eq!(compatibility_batch.len(), 2);
+
+        let receipt_bound_batch = q.dequeue_receipt_bound_batch(10, 10);
+        assert_eq!(receipt_bound_batch.len(), 1);
+        assert_eq!(receipt_bound_batch[0].object_id, oid(2));
+    }
+
+    #[test]
+    fn receipt_bound_dequeue_rejects_synthetic_malformed_and_under_width() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(1, 5, true, 0).with_replacement_receipt(
+            DeadObjectReplacementReceipt::replicated(oid(1), 7, 0, 2, 4096, digest(1)),
+        ));
+        q.enqueue(entry(2, 5, true, 0).with_replacement_receipt(
+            DeadObjectReplacementReceipt::new(
+                oid(2),
+                7,
+                1,
+                DeadObjectReceiptPolicy::Replicated { copies: 0 },
+                4096,
+                digest(2),
+                0,
+            ),
+        ));
+        q.enqueue(entry(3, 5, true, 0).with_replacement_receipt(
+            DeadObjectReplacementReceipt::new(
+                oid(3),
+                7,
+                1,
+                DeadObjectReceiptPolicy::Erasure {
+                    data_shards: 2,
+                    parity_shards: 1,
+                },
+                4096,
+                digest(3),
+                2,
+            ),
+        ));
+        q.enqueue(entry_with_receipt(4, 5, true, 0));
+
+        let batch = q.dequeue_receipt_bound_batch(10, 10);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].object_id, oid(4));
+        assert_eq!(q.receipt_bound_eligible_count(10), 1);
+    }
+
+    #[test]
+    fn receipt_bound_dequeue_still_respects_txg_and_eligible_flag() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_with_receipt(1, 10, true, 0));
+        q.enqueue(entry_with_receipt(2, 5, false, 0));
+        q.enqueue(entry_with_receipt(3, 5, true, 0));
+
+        let batch = q.dequeue_receipt_bound_batch(10, 10);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].object_id, oid(3));
+        assert_eq!(q.eligible_count(10), 1);
+        assert_eq!(q.receipt_bound_eligible_count(10), 1);
+    }
+
     // ── ack_reclaimed ──────────────────────────────────────────────────
 
     #[test]
@@ -588,11 +753,36 @@ mod tests {
     #[test]
     fn encode_decode_single_entry() {
         let mut q = DeadObjectReclaimQueue::new();
-        q.enqueue(entry(42, 10, true, 5));
+        q.enqueue(entry_with_receipt(42, 10, true, 5));
         let bytes = q.encode();
         let decoded = DeadObjectReclaimQueue::decode(&bytes).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded.all_entries(), q.all_entries());
+        assert_eq!(decoded.receipt_bound_eligible_count(11), 1);
+    }
+
+    #[test]
+    fn decode_v1_queue_entries_lack_receipt_evidence() {
+        let legacy_entry = entry(7, 5, true, 0);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DeadObjectReclaimQueue::MAGIC);
+        bytes.extend_from_slice(&DeadObjectReclaimQueue::FORMAT_VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&encode_v1_entry(legacy_entry));
+        let digest = blake3_domain_digest(
+            &bytes,
+            DeadObjectReclaimQueue::FAMILY_ID,
+            DeadObjectReclaimQueue::TYPE_ID,
+            DeadObjectReclaimQueue::VERSION_V1,
+            DeadObjectReclaimQueue::DOMAIN_TAG,
+        );
+        bytes.extend_from_slice(&digest);
+
+        let decoded = DeadObjectReclaimQueue::decode(&bytes).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded.dequeue_batch(10, 10).len(), 1);
+        assert!(decoded.dequeue_receipt_bound_batch(10, 10).is_empty());
+        assert_eq!(decoded.all_entries()[0].replacement_receipt, None);
     }
 
     #[test]
@@ -659,8 +849,8 @@ mod tests {
         for i in 0..n {
             q.enqueue(entry(i as u8, 1, true, 0));
         }
-        // 12 header + n*65 entries + 32 footer
-        assert_eq!(q.encoded_len(), 12 + n * 65 + 32);
+        // 12 header + current-version entries + 32 footer.
+        assert_eq!(q.encoded_len(), 12 + n * DeadObjectEntry::ENCODED_SIZE + 32);
     }
 
     // ── decode error conditions ────────────────────────────────────────
@@ -712,7 +902,7 @@ mod tests {
             DeadObjectReclaimQueue::decode(&data),
             Err(DeadObjectQueueDecodeError::UnsupportedVersion {
                 found: 99,
-                expected: 1,
+                expected: 2,
             })
         );
     }
@@ -731,6 +921,32 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_trailing_body_bytes() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_with_receipt(1, 5, true, 0));
+        let mut bytes = q.encode();
+        let footer = bytes.split_off(bytes.len() - 32);
+        bytes.push(0xA5);
+        let digest = blake3_domain_digest(
+            &bytes,
+            DeadObjectReclaimQueue::FAMILY_ID,
+            DeadObjectReclaimQueue::TYPE_ID,
+            DeadObjectReclaimQueue::VERSION,
+            DeadObjectReclaimQueue::DOMAIN_TAG,
+        );
+        assert_ne!(digest, footer.as_slice());
+        bytes.extend_from_slice(&digest);
+
+        assert_eq!(
+            DeadObjectReclaimQueue::decode(&bytes),
+            Err(DeadObjectQueueDecodeError::TrailingBytes {
+                found: 12 + DeadObjectEntry::ENCODED_SIZE + 1,
+                expected: 12 + DeadObjectEntry::ENCODED_SIZE,
+            })
+        );
+    }
+
+    #[test]
     fn decode_errors_display_non_empty() {
         let variants = [
             DeadObjectQueueDecodeError::Truncated,
@@ -740,6 +956,10 @@ mod tests {
                 expected: 1,
             },
             DeadObjectQueueDecodeError::EntryDecode("test".into()),
+            DeadObjectQueueDecodeError::TrailingBytes {
+                found: 1,
+                expected: 0,
+            },
             DeadObjectQueueDecodeError::IntegrityFooterMismatch,
         ];
         for err in &variants {
