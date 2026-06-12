@@ -48,7 +48,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use tidefs_membership_epoch::EpochId;
-use tidefs_replication_model::{PlacementReceiptRef, ReplicatedSubjectId};
+use tidefs_replication_model::PlacementReceiptRef;
 
 use crate::types::{DataPathCarrier, LeaseState};
 
@@ -76,22 +76,6 @@ pub struct ReconstructionTask {
 }
 
 impl ReconstructionTask {
-    /// Create a task for full-object reconstruction.
-    pub fn new_full(
-        object_id: u64,
-        source_nodes: Vec<u64>,
-        target_nodes: Vec<u64>,
-        priority: u8,
-    ) -> Self {
-        Self::new_full_with_receipt(
-            object_id,
-            PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(object_id)),
-            source_nodes,
-            target_nodes,
-            priority,
-        )
-    }
-
     /// Create a task for full-object reconstruction from receipt authority.
     pub fn new_full_with_receipt(
         object_id: u64,
@@ -108,26 +92,6 @@ impl ReconstructionTask {
             data_range: None,
             priority,
         }
-    }
-
-    /// Create a task for partial-range reconstruction.
-    pub fn new_range(
-        object_id: u64,
-        source_nodes: Vec<u64>,
-        target_nodes: Vec<u64>,
-        start: u64,
-        end: u64,
-        priority: u8,
-    ) -> Self {
-        Self::new_range_with_receipt(
-            object_id,
-            PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(object_id)),
-            source_nodes,
-            target_nodes,
-            start,
-            end,
-            priority,
-        )
     }
 
     /// Create a task for partial-range reconstruction from receipt authority.
@@ -223,24 +187,6 @@ pub struct BackfillCommand {
 }
 
 impl BackfillCommand {
-    /// Create a new backfill command.
-    pub fn new(source: u64, target: u64, object_ids: Vec<u64>, max_chunk_bytes: u64) -> Self {
-        let placement_receipt_refs = object_ids
-            .iter()
-            .copied()
-            .map(|object_id| {
-                PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(object_id))
-            })
-            .collect();
-        Self::new_with_receipts(
-            source,
-            target,
-            object_ids,
-            placement_receipt_refs,
-            max_chunk_bytes,
-        )
-    }
-
     /// Create a new backfill command from receipt-authoritative object refs.
     pub fn new_with_receipts(
         source: u64,
