@@ -63,9 +63,11 @@ use tidefs_replicated_object_store::{
     ReceiptRepairFlowCommitPublication, ReplicatedObjectStore, ReplicatedStoreConfig,
     TransportReplicatedStore, TransportReplicatedStoreConfig,
 };
+#[cfg(test)]
+use tidefs_replication_model::ReplicatedReadClass;
 use tidefs_replication_model::{
     FlowCommitResult, ObjectDigest, PlacementReceiptRef, ReceiptRedundancyPolicy,
-    ReplicaMovementClass, ReplicatedReadClass, ReplicatedReadPlan,
+    ReplicaMovementClass, ReplicatedReadPlan,
 };
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
@@ -396,7 +398,7 @@ fn read_plan_payload_from_store(
     store: &StoreBackend,
     plan: &ReplicatedReadPlan,
 ) -> Result<Option<(Vec<u8>, Option<PlacementReceiptRef>)>, String> {
-    if plan.read_class == ReplicatedReadClass::Unavailable {
+    if !plan.read_class.permits_payload_response() {
         return Ok(None);
     }
 
@@ -5196,6 +5198,78 @@ mod cluster_pool_handler_tests {
                 assert_eq!(placement_receipt_ref, None);
             }
             other => panic!("expected ReadPlanResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_backend_degraded_valid_read_plan_response_is_receiptless() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().join("store")];
+        let mut store =
+            ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
+        let mut plan = read_plan(89);
+        plan.read_class = ReplicatedReadClass::DegradedButValid;
+        plan.missing_replica_count = 1;
+        plan.rebuild_required = true;
+        let object_name = read_plan_object_name(&plan);
+        store
+            .put_named(&object_name, b"degraded-planned-payload")
+            .unwrap();
+        let backend = StoreBackend::Local(Box::new(store));
+
+        let response = read_plan_response_from_store(&backend, &encode_read_plan(&plan), 1);
+
+        match response {
+            ReplicationMessage::ReadPlanResponse {
+                found,
+                payload,
+                source_member_id,
+                placement_receipt_ref,
+            } => {
+                assert!(found);
+                assert_eq!(payload, b"degraded-planned-payload".to_vec());
+                assert_eq!(source_member_id, 1);
+                assert_eq!(placement_receipt_ref, None);
+            }
+            other => panic!("expected ReadPlanResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_backend_unreadable_read_plans_return_empty_response() {
+        for read_class in [
+            ReplicatedReadClass::RepairRequired,
+            ReplicatedReadClass::Unavailable,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = vec![dir.path().join("store")];
+            let mut store =
+                ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
+            let mut plan = read_plan(90);
+            plan.read_class = read_class;
+            plan.rebuild_required = true;
+            let object_name = read_plan_object_name(&plan);
+            store
+                .put_named(&object_name, b"must-not-be-served")
+                .unwrap();
+            let backend = StoreBackend::Local(Box::new(store));
+
+            let response = read_plan_response_from_store(&backend, &encode_read_plan(&plan), 1);
+
+            match response {
+                ReplicationMessage::ReadPlanResponse {
+                    found,
+                    payload,
+                    source_member_id,
+                    placement_receipt_ref,
+                } => {
+                    assert!(!found, "{read_class:?} should fail closed");
+                    assert!(payload.is_empty(), "{read_class:?} returned payload");
+                    assert_eq!(source_member_id, 1);
+                    assert_eq!(placement_receipt_ref, None);
+                }
+                other => panic!("expected ReadPlanResponse, got {other:?}"),
+            }
         }
     }
 
