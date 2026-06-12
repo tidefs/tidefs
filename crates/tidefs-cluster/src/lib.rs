@@ -97,7 +97,7 @@ pub use lease_state_machine::LeaseStateMachine;
 pub use placement_heal::{
     HealState, HealStats, LossEvent, PlacementHealCoordinator, PlacementMap,
     PlacementObjectReceipt, RebuildFlowCommitPlacementPublication,
-    RebuildPublicationHealFinalization,
+    RebuildHealCompletionPublication, RebuildPublicationHealFinalization,
 };
 pub use placement_transfer::{
     ObjectRange, PlacementTransferCoordinator, PlanEntry, TransferError, TransferPlan,

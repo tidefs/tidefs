@@ -18,7 +18,7 @@ use tidefs_cluster::pool_protocol::{
 };
 use tidefs_cluster::{
     ClusterLeaseConfig, ClusterLeaseRuntime, FenceAuthority, FenceValidator, PlacementMap,
-    RebuildFlowCommitPlacementPublication,
+    RebuildFlowCommitPlacementPublication, RebuildHealCompletionPublication,
 };
 use tidefs_cluster::{ClusterPlacementPolicy, ClusterRedundancy};
 use tidefs_durability_layout::DurabilityLayoutV1;
@@ -115,6 +115,8 @@ pub struct StorageNodeRepairHealFinalization {
     pub repair_publications: Vec<StorageNodeRepairPlacementPublication>,
     /// Rebuilt-placement evidence passed to the cluster runtime.
     pub rebuilt_placements: BTreeMap<u64, BTreeSet<u64>>,
+    /// Cluster-visible completion evidence returned by the runtime.
+    pub completion_publication: RebuildHealCompletionPublication,
 }
 
 /// Storage-node summary for publishing a relocation flow result into placement state.
@@ -190,6 +192,7 @@ pub fn finalize_cluster_runtime_heal_from_repair_publications(
     Ok(StorageNodeRepairHealFinalization {
         repair_publications: repair_publications.to_vec(),
         rebuilt_placements: cluster_finalization.rebuilt_placements,
+        completion_publication: cluster_finalization.completion_publication,
     })
 }
 
@@ -5805,6 +5808,10 @@ mod cluster_pool_handler_tests {
         let finalization =
             finalize_cluster_runtime_heal_from_repair_publications(&mut runtime, &accepted)
                 .expect("complete repair publications finalize heal");
+        let accepted_rebuild_publications = accepted
+            .iter()
+            .map(|publication| publication.placement_publication)
+            .collect::<Vec<_>>();
 
         assert_eq!(finalization.repair_publications, accepted);
         assert_eq!(
@@ -5823,6 +5830,17 @@ mod cluster_pool_handler_tests {
                 .unwrap_or_default(),
             [4].into_iter().collect()
         );
+        assert_eq!(
+            finalization
+                .completion_publication
+                .accepted_rebuild_publications,
+            accepted_rebuild_publications
+        );
+        assert_eq!(
+            finalization.completion_publication.retired_lost_members,
+            [1].into_iter().collect()
+        );
+        assert_eq!(finalization.completion_publication.final_map_epoch, 9);
         assert_eq!(runtime.heal_state(), HealState::Complete);
         assert!(!runtime.is_healing());
         assert!(!runtime

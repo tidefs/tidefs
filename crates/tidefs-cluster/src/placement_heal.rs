@@ -130,6 +130,21 @@ pub struct RebuildPublicationHealFinalization {
     pub rebuild_publications: Vec<RebuildFlowCommitPlacementPublication>,
     /// Rebuilt placement map derived from the accepted publications.
     pub rebuilt_placements: BTreeMap<u64, BTreeSet<u64>>,
+    /// Cluster-visible completion evidence emitted by this finalization.
+    pub completion_publication: RebuildHealCompletionPublication,
+}
+
+/// Receipt-backed publication emitted when a heal reaches complete state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebuildHealCompletionPublication {
+    /// Rebuild placement publications accepted as legal replacement evidence.
+    pub accepted_rebuild_publications: Vec<RebuildFlowCommitPlacementPublication>,
+    /// Rebuilt placement map derived from the accepted publications.
+    pub rebuilt_placements: BTreeMap<u64, BTreeSet<u64>>,
+    /// Lost members retired by the final placement map update.
+    pub retired_lost_members: BTreeSet<u64>,
+    /// Placement-map epoch after finalization completes.
+    pub final_map_epoch: u64,
 }
 
 /// Summary returned when a relocation flow-commit result updates placement
@@ -1144,12 +1159,21 @@ impl PlacementHealCoordinator {
     ) -> Result<RebuildPublicationHealFinalization, String> {
         let rebuilt_placements =
             self.rebuilt_placements_from_rebuild_publications(rebuild_publications)?;
+        let retired_lost_members = self.lost_members.clone();
         self.finalize_heal(&rebuilt_placements)
             .map_err(|err| format!("rebuild publication heal finalization failed: {err}"))?;
+        let rebuild_publications = rebuild_publications.to_vec();
+        let completion_publication = RebuildHealCompletionPublication {
+            accepted_rebuild_publications: rebuild_publications.clone(),
+            rebuilt_placements: rebuilt_placements.clone(),
+            retired_lost_members,
+            final_map_epoch: self.placement.epoch(),
+        };
 
         Ok(RebuildPublicationHealFinalization {
-            rebuild_publications: rebuild_publications.to_vec(),
+            rebuild_publications,
             rebuilt_placements,
+            completion_publication,
         })
     }
 
@@ -2033,6 +2057,26 @@ mod tests {
                 .unwrap_or_default(),
             [30].into_iter().collect()
         );
+        assert_eq!(
+            finalization
+                .completion_publication
+                .accepted_rebuild_publications,
+            vec![publication]
+        );
+        assert_eq!(
+            finalization
+                .completion_publication
+                .rebuilt_placements
+                .get(&1)
+                .cloned()
+                .unwrap_or_default(),
+            [30].into_iter().collect()
+        );
+        assert_eq!(
+            finalization.completion_publication.retired_lost_members,
+            [10].into_iter().collect()
+        );
+        assert_eq!(finalization.completion_publication.final_map_epoch, 7);
         assert_eq!(coord.state(), HealState::Complete);
         assert_eq!(
             coord

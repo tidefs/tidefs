@@ -1623,6 +1623,17 @@ mod tests {
                 .unwrap_or_default(),
             [30].into_iter().collect()
         );
+        assert_eq!(
+            finalization
+                .completion_publication
+                .accepted_rebuild_publications,
+            vec![publication]
+        );
+        assert_eq!(
+            finalization.completion_publication.retired_lost_members,
+            [10].into_iter().collect()
+        );
+        assert_eq!(finalization.completion_publication.final_map_epoch, 7);
         assert_eq!(rt.heal_state(), HealState::Complete);
         assert_eq!(
             rt.placement_map()
