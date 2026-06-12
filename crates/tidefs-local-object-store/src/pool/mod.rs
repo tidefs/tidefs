@@ -56,6 +56,10 @@ use tidefs_placement_planner::{
     PlacementPlanner,
 };
 use tidefs_space_accounting::{PoolCounters, StatfsResult};
+use tidefs_types_reclaim_queue_core::{
+    DeadObjectEntry, DeadObjectReceiptPolicy, DeadObjectReplacementReceipt,
+    ObjectKey as ReclaimObjectKey,
+};
 
 // ---------------------------------------------------------------------------
 // Pool configuration
@@ -553,6 +557,41 @@ impl PlacementReceipt {
             targets,
         })
     }
+}
+
+fn reclaim_object_key(key: ObjectKey) -> ReclaimObjectKey {
+    ReclaimObjectKey(key.as_bytes32())
+}
+
+fn dead_object_replacement_receipt_for_object(
+    object_key: ObjectKey,
+    receipt: &PlacementReceipt,
+) -> Result<DeadObjectReplacementReceipt> {
+    let target_count =
+        u16::try_from(receipt.targets.len()).map_err(|_| StoreError::InvalidOptions {
+            reason: "placement receipt target count exceeds dead-object receipt format",
+        })?;
+    let redundancy_policy = match receipt.policy {
+        PoolRedundancyPolicy::Replicated { copies } => {
+            DeadObjectReceiptPolicy::Replicated { copies }
+        }
+        PoolRedundancyPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        } => DeadObjectReceiptPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        },
+    };
+    Ok(DeadObjectReplacementReceipt::new(
+        reclaim_object_key(object_key),
+        receipt.epoch,
+        receipt.generation,
+        redundancy_policy,
+        receipt.payload_len,
+        receipt.payload_digest,
+        target_count,
+    ))
 }
 
 struct ReceiptCursor<'a> {
@@ -1661,18 +1700,25 @@ impl Pool {
         payload: &[u8],
         indices: &[usize],
     ) -> Result<StoredObject> {
+        let old_receipt = self.load_placement_receipt(indices, key)?;
         let mut receipt = self.plan_pool_wide_placement(class, key, payload.len(), indices)?;
         receipt.generation = self.allocate_placement_receipt_generation();
         receipt.payload_digest = digest32(payload);
 
-        match receipt.policy {
+        let stored = match receipt.policy {
             PoolRedundancyPolicy::Replicated { .. } => {
                 self.put_replicated_with_receipt(key, payload, indices, &mut receipt)
             }
             PoolRedundancyPolicy::Erasure { .. } => {
                 self.put_erasure_with_receipt(key, payload, indices, &mut receipt)
             }
+        }?;
+
+        if let Some(old_receipt) = old_receipt.as_ref() {
+            self.enqueue_obsolete_placement_after_replacement(old_receipt, &receipt)?;
         }
+
+        Ok(stored)
     }
 
     fn put_replicated_with_receipt(
@@ -1802,6 +1848,67 @@ impl Pool {
             len: payload.len() as u64,
             checksum: crate::store::checksum64(payload),
         })
+    }
+
+    fn enqueue_obsolete_placement_after_replacement(
+        &mut self,
+        old_receipt: &PlacementReceipt,
+        replacement_receipt: &PlacementReceipt,
+    ) -> Result<()> {
+        match old_receipt.policy {
+            PoolRedundancyPolicy::Replicated { .. } => {
+                let mut queued_indices = BTreeSet::new();
+                for target in &old_receipt.targets {
+                    let Some(idx) = self.resolve_receipt_target(target) else {
+                        continue;
+                    };
+                    if queued_indices.insert(idx) {
+                        self.enqueue_replaced_physical_object(
+                            idx,
+                            old_receipt.object_key,
+                            replacement_receipt,
+                        )?;
+                    }
+                }
+            }
+            PoolRedundancyPolicy::Erasure { .. } => {
+                let mut queued_objects = BTreeSet::new();
+                for target in &old_receipt.targets {
+                    let Some(idx) = self.resolve_receipt_target(target) else {
+                        continue;
+                    };
+                    let shard_key =
+                        placement_shard_object_key(old_receipt.object_key, target.shard_index);
+                    if queued_objects.insert((idx, shard_key)) {
+                        self.enqueue_replaced_physical_object(idx, shard_key, replacement_receipt)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_replaced_physical_object(
+        &mut self,
+        device_index: usize,
+        object_key: ObjectKey,
+        replacement_receipt: &PlacementReceipt,
+    ) -> Result<()> {
+        let replacement =
+            dead_object_replacement_receipt_for_object(object_key, replacement_receipt)?;
+        let death_txg = replacement.receipt_generation;
+        let entry = DeadObjectEntry::new(
+            reclaim_object_key(object_key),
+            self.pool_guid,
+            death_txg,
+            true,
+            death_txg,
+        )
+        .with_replacement_receipt(replacement);
+        self.devices[device_index]
+            .store_mut()
+            .enqueue_receipt_bound_dead_object(entry)?;
+        Ok(())
     }
 
     fn cleanup_stale_replicated_copies(
@@ -4066,6 +4173,193 @@ mod tests {
             pool.get(IoClass::Data, key).unwrap(),
             Some(b"new-payload".to_vec())
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replicated_rewrite_publishes_receipt_bound_dead_objects() {
+        let root = temp_dir("receipt-bound-rewrite-replicated");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-bound-rewrite-replicated");
+        pool.put(IoClass::Data, key, b"old replicated payload")
+            .unwrap();
+        let old_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("old receipt");
+        let old_target_indices: BTreeSet<usize> = old_receipt
+            .targets
+            .iter()
+            .map(|target| pool.resolve_receipt_target(target).unwrap())
+            .collect();
+
+        pool.put(IoClass::Data, key, b"new replicated payload")
+            .unwrap();
+        let replacement = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("replacement receipt");
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        let mut reopened = Pool::create(config, properties, &test_options()).unwrap();
+        let held_depth: usize = old_target_indices
+            .iter()
+            .map(|idx| {
+                let stats = reopened.devices[*idx]
+                    .store_mut()
+                    .drain_receipt_bound_dead_objects_at_txg(replacement.generation, 16)
+                    .expect("held drain");
+                assert_eq!(stats.entries_processed, 0);
+                stats.reclaim_queue_depth
+            })
+            .sum();
+        assert_eq!(held_depth, old_target_indices.len());
+
+        let processed: usize = old_target_indices
+            .iter()
+            .map(|idx| {
+                reopened.devices[*idx]
+                    .store_mut()
+                    .drain_receipt_bound_dead_objects_at_txg(
+                        replacement.generation.saturating_add(1),
+                        16,
+                    )
+                    .expect("stable drain")
+                    .entries_processed
+            })
+            .sum();
+        assert_eq!(processed, old_target_indices.len());
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(b"new replicated payload".to_vec()),
+            "receipt-bound drain must not reclaim the replacement placement"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn erasure_rewrite_publishes_receipt_bound_dead_shards() {
+        let root = temp_dir("receipt-bound-rewrite-erasure");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-bound-rewrite-erasure");
+        pool.put(IoClass::Data, key, b"old erasure payload with enough bytes")
+            .unwrap();
+        let old_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("old erasure receipt");
+        let old_physical_targets: BTreeSet<(usize, ObjectKey)> = old_receipt
+            .targets
+            .iter()
+            .map(|target| {
+                (
+                    pool.resolve_receipt_target(target).unwrap(),
+                    placement_shard_object_key(old_receipt.object_key, target.shard_index),
+                )
+            })
+            .collect();
+        let old_device_indices: BTreeSet<usize> =
+            old_physical_targets.iter().map(|(idx, _)| *idx).collect();
+
+        pool.put(IoClass::Data, key, b"new erasure payload with enough bytes")
+            .unwrap();
+        let replacement = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("replacement erasure receipt");
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        let mut reopened = Pool::create(config, properties, &test_options()).unwrap();
+        let held_depth: usize = old_device_indices
+            .iter()
+            .map(|idx| {
+                let stats = reopened.devices[*idx]
+                    .store_mut()
+                    .drain_receipt_bound_dead_objects_at_txg(replacement.generation, 16)
+                    .expect("held erasure drain");
+                assert_eq!(stats.entries_processed, 0);
+                stats.reclaim_queue_depth
+            })
+            .sum();
+        assert_eq!(held_depth, old_physical_targets.len());
+
+        let processed: usize = old_device_indices
+            .iter()
+            .map(|idx| {
+                reopened.devices[*idx]
+                    .store_mut()
+                    .drain_receipt_bound_dead_objects_at_txg(
+                        replacement.generation.saturating_add(1),
+                        16,
+                    )
+                    .expect("stable erasure drain")
+                    .entries_processed
+            })
+            .sum();
+        assert_eq!(processed, old_physical_targets.len());
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(b"new erasure payload with enough bytes".to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_delete_without_replacement_receipt_does_not_enqueue_dead_objects() {
+        let root = temp_dir("receipt-bound-delete-no-synthetic");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-bound-delete-no-synthetic");
+        pool.put(IoClass::Data, key, b"delete payload").unwrap();
+        let old_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt before delete");
+        let old_target_indices: BTreeSet<usize> = old_receipt
+            .targets
+            .iter()
+            .map(|target| pool.resolve_receipt_target(target).unwrap())
+            .collect();
+
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+        pool.sync_all().unwrap();
+
+        for idx in old_target_indices {
+            let stats = pool.devices[idx]
+                .store_mut()
+                .drain_receipt_bound_dead_objects_at_txg(u64::MAX, 16)
+                .expect("delete drain");
+            assert_eq!(stats.entries_processed, 0);
+            assert_eq!(stats.reclaim_queue_depth, 0);
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

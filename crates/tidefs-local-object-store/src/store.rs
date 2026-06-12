@@ -538,7 +538,6 @@ impl LocalObjectStore {
                     if let Some(old) = index.remove(&record.key) {
                         history.entry(record.key).or_default().push(old);
                     }
-                    history.entry(record.key).or_default().push(location);
                 }
             }
 
@@ -2606,6 +2605,11 @@ impl LocalObjectStore {
                 self.enqueue_reclaim_entry(key);
                 self.segment_liveness
                     .record_overwrite(old_loc.segment_id, old_loc.payload_len);
+                if track_liveness {
+                    self.reclaim_consumer
+                        .live_counts_mut()
+                        .apply_delta(location.segment_id, 1);
+                }
 
                 // Auto-update space accounting: overwrite replaces old data.
                 if let Some(ds_id) = self.current_dataset_id {
@@ -7103,6 +7107,50 @@ mod reclaim_queue_production_tests {
     }
 
     #[test]
+    fn receipt_bound_dead_object_drain_resolves_overwrite_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut options = StoreOptions::test_fast();
+        options.max_segment_bytes = 2048;
+        let mut store =
+            LocalObjectStore::open_with_options(dir.path(), options).expect("open store");
+        let key = ObjectKey::from_name(b"receipt-bound/dead-object/overwrite-history");
+        let old_payload = vec![0xA5; 1536];
+        let new_payload = vec![0x5A; 1536];
+
+        store.put(key, &old_payload).expect("old put");
+        let old_segment_id = store.index.get(&key).expect("old location").segment_id;
+        store.put(key, &new_payload).expect("replacement put");
+        let replacement_segment_id = store
+            .index
+            .get(&key)
+            .expect("replacement location")
+            .segment_id;
+        assert_ne!(old_segment_id, replacement_segment_id);
+
+        let entry = dead_object_entry_for_key(reclaim_key(key), 5, true, 1);
+        assert!(store
+            .enqueue_receipt_bound_dead_object(entry)
+            .expect("enqueue receipt-bound overwritten object"));
+
+        let stats = store
+            .drain_receipt_bound_dead_objects_at_txg(6, 16)
+            .expect("receipt-bound drain");
+
+        assert_eq!(stats.entries_processed, 1);
+        assert_eq!(stats.segments_reclaimed, 1);
+        assert_eq!(stats.blocks_freed, 1);
+        assert!(
+            !segment_path(&store.segments_dir, old_segment_id).exists(),
+            "old overwritten segment should be reclaimed"
+        );
+        assert!(
+            segment_path(&store.segments_dir, replacement_segment_id).exists(),
+            "replacement segment must stay present"
+        );
+        assert_eq!(store.get(key).unwrap(), Some(new_payload));
+    }
+
+    #[test]
     fn receipt_bound_dead_object_drain_keeps_unauthorized_entries_queued() {
         let (mut store, dir) = temp_store();
         let receiptless_key = dead_object_key(0x61);
@@ -7555,12 +7603,15 @@ impl tidefs_reclaim::SegmentResolver for LocalObjectStore {
         key: &tidefs_types_reclaim_queue_core::ObjectKey,
     ) -> std::result::Result<Option<u64>, Self::Error> {
         let store_key = ObjectKey(key.0);
-        if let Some(loc) = self.index.get(&store_key) {
-            return Ok(Some(loc.segment_id));
-        }
+        let live_location = self.index.get(&store_key).copied();
         if let Some(locations) = self.history.get(&store_key) {
-            if let Some(last) = locations.last() {
-                return Ok(Some(last.segment_id));
+            if let Some(dead_location) = locations
+                .iter()
+                .rev()
+                .copied()
+                .find(|location| Some(*location) != live_location)
+            {
+                return Ok(Some(dead_location.segment_id));
             }
         }
         Ok(None)
