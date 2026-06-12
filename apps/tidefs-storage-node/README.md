@@ -132,6 +132,11 @@ preserves that ref with the returned payload and source member id. This is
 planned-read evidence plumbing only: replacement-node orchestration, repaired
 placement publication, broader cluster-state publication, and reclaim
 publication remain under the distributed receipt-authority work.
+Callers that will use planned-read bytes as repair, rebuild, or reclaim
+authority must use
+`TransportReplicatedStore::get_planned_with_required_receipt()`, which rejects
+receipt-less compatibility responses and local-primary hits that do not carry
+durable placement receipt evidence.
 
 Receipt-backed repair callers can use
 `TransportReplicatedStore::execute_receipt_repair_task_and_record_completion()`
