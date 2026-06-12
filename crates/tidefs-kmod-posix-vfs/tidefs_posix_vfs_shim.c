@@ -3175,7 +3175,8 @@ static int tidefs_posix_vfs_dir_fsync(struct file *file, loff_t start,
 		int ret = tidefs_posix_vfs_activate_engine(ctx);
 		if (ret < 0)
 			return ret;
-		return tidefs_posix_vfs_engine_sync_fs(datasync ? 1 : 0);
+		/* fsync and fdatasync are both wait barriers for directory state. */
+		return tidefs_posix_vfs_engine_sync_fs(1);
 	}
 
 	pool = tidefs_posix_vfs_pool_core_from_sb(file_inode(file)->i_sb);
