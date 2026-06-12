@@ -523,8 +523,9 @@ impl PlacementMap {
 
     /// Compute which objects are affected by the loss of the given members.
     ///
-    /// Returns a map of object_id → set of lost member_ids, only including
-    /// objects that still have at least one surviving replica.
+    /// Returns a map of object_id → set of lost member_ids. This includes
+    /// wholly lost objects; callers that need rebuildable objects must subtract
+    /// [`Self::compute_wholly_lost_objects`].
     pub fn compute_loss_impact(
         &self,
         lost_members: &BTreeSet<u64>,
@@ -1084,11 +1085,17 @@ impl PlacementHealCoordinator {
             return Err("rebuilt placement evidence contains an empty target set");
         }
         let impacted = self.placement.compute_loss_impact(&self.lost_members);
-        if !rebuilt_placements
+        let wholly_lost = self
+            .placement
+            .compute_wholly_lost_objects(&self.lost_members);
+        let rebuildable_objects: BTreeSet<u64> = impacted
             .keys()
-            .all(|object_id| impacted.contains_key(object_id))
-        {
-            return Err("rebuilt placement evidence contains an object outside heal scope");
+            .copied()
+            .filter(|object_id| !wholly_lost.contains(object_id))
+            .collect();
+        let rebuilt_objects: BTreeSet<u64> = rebuilt_placements.keys().copied().collect();
+        if rebuildable_objects.len() != required_objects || rebuilt_objects != rebuildable_objects {
+            return Err("rebuilt placement evidence does not match rebuildable objects");
         }
         if rebuilt_placements.values().any(|members| {
             members
@@ -1600,6 +1607,30 @@ mod tests {
         coordinator
     }
 
+    fn mixed_rebuildable_and_wholly_lost_coordinator() -> PlacementHealCoordinator {
+        let mut coordinator = PlacementHealCoordinator::new(1, None)
+            .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
+        insert_test_object_with_receipt(coordinator.placement_mut(), 1, &[10, 20]);
+        insert_test_object_with_receipt(coordinator.placement_mut(), 2, &[10]);
+
+        let mut lost = BTreeSet::new();
+        lost.insert(10);
+        let available = BTreeMap::from([(20, HealthClass::Healthy), (30, HealthClass::Healthy)]);
+
+        coordinator.detect_loss(LossEvent {
+            lost_members: lost,
+            epoch: 1,
+            detected_at_ns: 1_000_000_000,
+            available_members: available,
+        });
+
+        assert_eq!(coordinator.stats().objects_affected, 2);
+        assert_eq!(coordinator.stats().objects_wholly_lost, 1);
+        assert_eq!(coordinator.stats().objects_to_rebuild, 1);
+        coordinator.state = HealState::Verifying;
+        coordinator
+    }
+
     #[test]
     fn coordinator_publishes_rebuild_flow_commit_result() {
         let mut coord = make_coordinator();
@@ -1863,6 +1894,56 @@ mod tests {
                 .unwrap_or_default(),
             [10, 20].into_iter().collect()
         );
+    }
+
+    #[test]
+    fn heal_finalize_refuses_wholly_lost_object_as_rebuild_evidence() {
+        let mut coord = mixed_rebuildable_and_wholly_lost_coordinator();
+
+        let mut rebuilt = BTreeMap::new();
+        rebuilt.insert(2, BTreeSet::from([30u64]));
+
+        let err = coord.finalize_heal(&rebuilt).unwrap_err();
+
+        assert!(err.contains("does not match rebuildable objects"), "{err}");
+        assert_eq!(coord.state(), HealState::Verifying);
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
+            [10, 20].into_iter().collect()
+        );
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(2)
+                .cloned()
+                .unwrap_or_default(),
+            [10].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn heal_finalize_accepts_exact_rebuildable_evidence_with_wholly_lost_object() {
+        let mut coord = mixed_rebuildable_and_wholly_lost_coordinator();
+
+        let mut rebuilt = BTreeMap::new();
+        rebuilt.insert(1, BTreeSet::from([30u64]));
+
+        coord.finalize_heal(&rebuilt).unwrap();
+
+        assert_eq!(coord.state(), HealState::Complete);
+        assert_eq!(
+            coord
+                .placement()
+                .replicas_of(1)
+                .cloned()
+                .unwrap_or_default(),
+            [20, 30].into_iter().collect()
+        );
+        assert!(coord.placement().replicas_of(2).is_none());
     }
 
     #[test]
