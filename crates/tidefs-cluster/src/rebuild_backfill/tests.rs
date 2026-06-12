@@ -5,7 +5,7 @@ use crate::rebuild_backfill::{
 use crate::types::{DataPathCarrier, LeaseState};
 use std::collections::BTreeMap;
 use tidefs_membership_epoch::EpochId;
-use tidefs_replication_model::PlacementReceiptRef;
+use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 
 // ── Helpers ───────────────────────────────────────────────────
 
@@ -14,6 +14,21 @@ fn eid(n: u64) -> EpochId {
 }
 
 fn make_task(
+    object_id: u64,
+    sources: Vec<u64>,
+    targets: Vec<u64>,
+    priority: u8,
+) -> ReconstructionTask {
+    ReconstructionTask::new_full_with_receipt(
+        object_id,
+        receipt_ref(object_id, 1),
+        sources,
+        targets,
+        priority,
+    )
+}
+
+fn synthetic_task(
     object_id: u64,
     sources: Vec<u64>,
     targets: Vec<u64>,
@@ -29,6 +44,34 @@ fn receipt_ref(object_id: u64, generation: u64) -> PlacementReceiptRef {
     digest[..8].copy_from_slice(&object_id.to_le_bytes());
     digest[8..16].copy_from_slice(&generation.to_le_bytes());
     PlacementReceiptRef::replicated(object_id, object_key, eid(1), generation, 2, 4096, digest)
+}
+
+fn malformed_policy_receipt_ref(object_id: u64) -> PlacementReceiptRef {
+    let base = receipt_ref(object_id, 1);
+    PlacementReceiptRef::new(
+        base.object_id,
+        base.object_key,
+        base.receipt_epoch,
+        base.receipt_generation,
+        ReceiptRedundancyPolicy::Replicated { copies: 0 },
+        base.payload_len,
+        base.payload_digest,
+        0,
+    )
+}
+
+fn under_width_receipt_ref(object_id: u64) -> PlacementReceiptRef {
+    let base = receipt_ref(object_id, 1);
+    PlacementReceiptRef::new(
+        base.object_id,
+        base.object_key,
+        base.receipt_epoch,
+        base.receipt_generation,
+        ReceiptRedundancyPolicy::Replicated { copies: 3 },
+        base.payload_len,
+        base.payload_digest,
+        2,
+    )
 }
 
 fn make_plan(plan_id: u64, tasks: Vec<ReconstructionTask>) -> RebuildPlan {
@@ -176,6 +219,66 @@ fn open_backfill_epoch_mismatch() {
 }
 
 #[test]
+fn open_backfill_rejects_synthetic_receipt_ref() {
+    let mut init = RebuildBackfillInitiator::new(eid(1));
+    let plan = make_plan(100, vec![synthetic_task(1, vec![10], vec![20], 0)]);
+
+    let err = init.open_backfill(plan, eid(1)).unwrap_err();
+    assert!(matches!(
+        err,
+        BackfillError::SyntheticReceiptRef { object_id: 1 }
+    ));
+    assert_eq!(init.session_ids().next(), None);
+
+    let valid = make_plan(101, vec![make_task(2, vec![10], vec![20], 0)]);
+    assert_eq!(init.open_backfill(valid, eid(1)).unwrap(), 1);
+}
+
+#[test]
+fn open_backfill_rejects_malformed_receipt_policy() {
+    let mut init = RebuildBackfillInitiator::new(eid(1));
+    let task = ReconstructionTask::new_full_with_receipt(
+        1,
+        malformed_policy_receipt_ref(1),
+        vec![10],
+        vec![20],
+        0,
+    );
+    let plan = make_plan(100, vec![task]);
+
+    let err = init.open_backfill(plan, eid(1)).unwrap_err();
+    assert!(matches!(
+        err,
+        BackfillError::MalformedReceiptPolicy { object_id: 1 }
+    ));
+    assert_eq!(init.session_ids().next(), None);
+}
+
+#[test]
+fn open_backfill_rejects_under_width_receipt() {
+    let mut init = RebuildBackfillInitiator::new(eid(1));
+    let task = ReconstructionTask::new_full_with_receipt(
+        1,
+        under_width_receipt_ref(1),
+        vec![10],
+        vec![20],
+        0,
+    );
+    let plan = make_plan(100, vec![task]);
+
+    let err = init.open_backfill(plan, eid(1)).unwrap_err();
+    assert!(matches!(
+        err,
+        BackfillError::InsufficientReceiptTargets {
+            object_id: 1,
+            required: 3,
+            actual: 2
+        }
+    ));
+    assert_eq!(init.session_ids().next(), None);
+}
+
+#[test]
 fn open_backfill_single_task() {
     let mut init = RebuildBackfillInitiator::new(eid(1));
     let plan = make_plan(100, vec![make_task(1, vec![10], vec![20], 0)]);
@@ -263,7 +366,7 @@ fn open_backfill_skips_no_source_tasks() {
     let plan = make_plan(
         100,
         vec![
-            make_task(1, vec![], vec![20], 0),
+            synthetic_task(1, vec![], vec![20], 0),
             make_task(2, vec![10], vec![20], 0),
         ],
     );

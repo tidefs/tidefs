@@ -1068,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn open_backfill_with_initiator() {
+    fn open_backfill_rejects_legacy_synthetic_plan() {
         let initiator = RebuildBackfillInitiator::new(EpochId(1));
         let mut coord = PlacementHealCoordinator::new(1, Some(initiator))
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
@@ -1092,9 +1092,9 @@ mod tests {
 
         let plan = coord.build_rebuild_plan(1, 1_000_000_001).unwrap();
         let result = coord.open_backfill(plan, 1);
-        assert!(result.is_ok());
-        assert_eq!(coord.state(), HealState::Rebuilding);
-        assert!(coord.stats().backfill_id.is_some());
+        assert_eq!(result, Err("backfill error"));
+        assert_eq!(coord.state(), HealState::Planning);
+        assert!(coord.stats().backfill_id.is_none());
     }
 
     #[test]
@@ -1385,13 +1385,12 @@ mod scenario_tests {
         }
     }
 
-    // ── Scenario: full heal lifecycle ────────────────────────────
+    // ── Scenario: receiptless heal refusal ───────────────────────
 
-    /// Models a 5-member cluster. Member 1 fails; objects that had replicas
-    /// on member 1 must be rebuilt onto surviving members. After rebuild,
-    /// every object retains at least one replica.
+    /// Models a 5-member cluster. Member 1 fails, but the legacy placement map
+    /// has no placement receipt authority, so transfer admission must refuse.
     #[test]
-    fn five_member_loss_and_heal() {
+    fn five_member_loss_requires_receipts() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
@@ -1408,32 +1407,19 @@ mod scenario_tests {
             available.insert(m, HealthClass::Healthy);
         }
 
-        let backfill_id = rt
-            .detect_member_loss(lost, available, 1_000_000_000)
-            .expect("should detect loss and start heal");
-
-        assert!(rt.is_healing());
-        assert_eq!(rt.heal_state(), HealState::Rebuilding);
+        let backfill_id = rt.detect_member_loss(lost, available, 1_000_000_000);
+        assert!(backfill_id.is_none());
+        assert!(rx.try_recv().is_err());
+        assert!(!rt.is_healing());
+        assert_eq!(rt.heal_state(), HealState::Aborted);
 
         let stats = rt.heal_stats();
         assert!(stats.objects_to_rebuild > 0);
         assert!(stats.objects_wholly_lost == 0);
         assert_eq!(stats.objects_affected, 100);
 
-        // Drain messages produced by on_member_departure
-        while rx.try_recv().is_ok() {}
-
-        // Complete the backfill
-        rt.complete_backfill(backfill_id)
-            .expect("should complete backfill");
-
-        // Tick heal to finalization
-        let finished = rt.heal_tick(0, 0, 2_000_000_000);
-        assert!(finished, "heal should finish after backfill complete");
-        assert!(!rt.is_healing());
-
-        // Verify post-heal placement: every object should still have
-        // at least one replica on surviving members
+        // Verify every object had a surviving source, even though no transfer
+        // was admitted without receipt authority.
         let map = rt.placement_map();
         for obj_id in 0..100u64 {
             let replicas = map
@@ -1447,11 +1433,11 @@ mod scenario_tests {
         }
     }
 
-    // ── Scenario: duplicate loss during heal ─────────────────────
+    // ── Scenario: duplicate loss before admitted heal ─────────────
 
-    /// A second member failure during an active heal should be rejected.
+    /// A receiptless loss must not create an active heal window.
     #[test]
-    fn duplicate_loss_during_active_heal() {
+    fn receiptless_loss_does_not_start_active_heal() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
@@ -1466,28 +1452,17 @@ mod scenario_tests {
         }
 
         let bid1 = rt.detect_member_loss(lost1, available1, 1_000_000_000);
-        assert!(bid1.is_some());
-        assert!(rt.is_healing());
-
-        while rx.try_recv().is_ok() {}
-
-        // Second loss during heal: member 2
-        let mut lost2 = BTreeSet::new();
-        lost2.insert(2);
-        let mut available2 = BTreeMap::new();
-        available2.insert(3, HealthClass::Healthy);
-        available2.insert(4, HealthClass::Healthy);
-        available2.insert(5, HealthClass::Healthy);
-
-        let bid2 = rt.detect_member_loss(lost2, available2, 2_000_000_000);
-        assert!(bid2.is_none(), "second loss should be rejected during heal");
+        assert!(bid1.is_none());
+        assert!(rx.try_recv().is_err());
+        assert!(!rt.is_healing());
+        assert_eq!(rt.heal_state(), HealState::Aborted);
     }
 
-    // ── Scenario: epoch transition aborts heal ───────────────────
+    // ── Scenario: epoch transition after refused heal ─────────────
 
-    /// An epoch transition during an active heal should abort the heal.
+    /// An epoch transition must leave a receiptless refused heal terminal.
     #[test]
-    fn epoch_transition_aborts_active_heal() {
+    fn epoch_transition_preserves_refused_heal() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
@@ -1501,11 +1476,10 @@ mod scenario_tests {
         }
 
         rt.detect_member_loss(lost, available, 1_000_000_000);
-        assert!(rt.is_healing());
+        assert!(rx.try_recv().is_err());
+        assert!(!rt.is_healing());
+        assert_eq!(rt.heal_state(), HealState::Aborted);
 
-        while rx.try_recv().is_ok() {}
-
-        // Epoch transition should abort the heal
         rt.on_epoch_transition(EpochId(2));
         assert!(!rt.is_healing());
         assert_eq!(rt.heal_state(), HealState::Aborted);
@@ -1537,13 +1511,13 @@ mod scenario_tests {
         available.insert(2, HealthClass::Healthy);
         available.insert(3, HealthClass::Healthy);
 
-        // Objects 0-49 are on {1,2} and can be rebuilt to member 3.
-        // Objects 50-99 are on {1} only and are wholly lost.
+        // Objects 0-49 are on {1,2} and would be rebuildable to member 3 if
+        // receipt authority existed. Objects 50-99 are wholly lost.
         let result = rt.detect_member_loss(lost, available, 1_000_000_000);
-        if let Some(_bid) = result {
-            let stats = rt.heal_stats();
-            assert!(stats.objects_wholly_lost >= 50);
-        }
+        assert!(result.is_none());
+        let stats = rt.heal_stats();
+        assert!(stats.objects_wholly_lost >= 50);
+        assert_eq!(rt.heal_state(), HealState::Aborted);
     }
 
     // ── Scenario: empty loss (no members lost) ───────────────────
@@ -1569,12 +1543,12 @@ mod scenario_tests {
         assert!(result.is_none());
     }
 
-    // ── Scenario: placement map convergence after heal ────────────
+    // ── Scenario: placement map preservation after refusal ───────
 
-    /// After a heal completes, verify the placement map reflects the
-    /// expected post-heal state by checking object_count and member_count.
+    /// When receiptless heal admission is refused, the placement map remains
+    /// unchanged rather than pretending movement completed.
     #[test]
-    fn placement_convergence_after_heal() {
+    fn placement_map_preserved_when_receiptless_heal_refused() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
@@ -1590,37 +1564,30 @@ mod scenario_tests {
             available.insert(m, HealthClass::Healthy);
         }
 
-        let backfill_id = rt
-            .detect_member_loss(lost, available, 1_000_000_000)
-            .expect("should detect loss");
+        let backfill_id = rt.detect_member_loss(lost, available, 1_000_000_000);
+        assert!(backfill_id.is_none());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(rt.heal_state(), HealState::Aborted);
 
-        while rx.try_recv().is_ok() {}
-        rt.complete_backfill(backfill_id).unwrap();
-        rt.heal_tick(0, 0, 2_000_000_000);
-
-        // After heal, the placement map should still track all objects
-        // (member 1's entries were removed, but the objects still exist
-        //  on surviving members)
         let post_object_count = rt.placement_map().object_count();
         assert_eq!(
             post_object_count, pre_object_count,
-            "all objects should still exist in placement map after heal"
+            "receiptless refusal must not drop placement map objects"
         );
 
-        // Member 1 should no longer hold any objects
         let objects_of_1 = rt.placement_map().objects_of(1);
         assert!(
-            objects_of_1.is_none() || objects_of_1.unwrap().is_empty(),
-            "member 1 should have no objects after being removed"
+            objects_of_1.is_some_and(|objects| !objects.is_empty()),
+            "receiptless refusal must not fake source-member retirement"
         );
     }
 
     // ── Scenario: multi-object heal with progress tracking ───────
 
-    /// Exercise heal with multiple objects and verify progress tracking
-    /// through the heal_tick mechanism.
+    /// Exercise multi-object scope calculation while refusing receiptless
+    /// transfer admission.
     #[test]
-    fn multi_object_heal_with_progress() {
+    fn multi_object_receiptless_heal_tracks_scope_then_refuses() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
@@ -1638,29 +1605,18 @@ mod scenario_tests {
             available.insert(m, HealthClass::Healthy);
         }
 
-        let backfill_id = rt
-            .detect_member_loss(lost, available, 1_000_000_000)
-            .expect("loss should trigger heal");
+        let backfill_id = rt.detect_member_loss(lost, available, 1_000_000_000);
+        assert!(backfill_id.is_none());
 
-        let objects_to_rebuild = {
-            let stats = rt.heal_stats();
-            assert!(stats.objects_to_rebuild > 0);
-            assert_eq!(stats.objects_affected, 20);
-            assert_eq!(stats.objects_wholly_lost, 0);
-            stats.objects_to_rebuild
-        };
+        let stats = rt.heal_stats();
+        assert!(stats.objects_to_rebuild > 0);
+        assert_eq!(stats.objects_affected, 20);
+        assert_eq!(stats.objects_wholly_lost, 0);
 
-        while rx.try_recv().is_ok() {}
-
-        rt.complete_backfill(backfill_id).unwrap();
-
-        // heal_tick should finalize the heal
-        let finished = rt.heal_tick(objects_to_rebuild, 4096 * objects_to_rebuild, 2_000_000_000);
-        assert!(finished);
+        assert!(rx.try_recv().is_err());
         assert!(!rt.is_healing());
-
-        let final_stats = rt.heal_stats();
-        assert!(final_stats.completed_at_ns.is_some());
+        assert_eq!(rt.heal_state(), HealState::Aborted);
+        assert!(rt.heal_stats().completed_at_ns.is_none());
     }
 }
 

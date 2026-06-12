@@ -1324,12 +1324,34 @@ mod tests {
         RebuildPlan::new(plan_id, tasks, 0)
     }
 
+    fn receipt_ref(object_id: u64) -> tidefs_replication_model::PlacementReceiptRef {
+        let mut object_key = [0xA5; 32];
+        object_key[..8].copy_from_slice(&object_id.to_le_bytes());
+        let mut digest = [0x5A; 32];
+        digest[..8].copy_from_slice(&object_id.to_le_bytes());
+        tidefs_replication_model::PlacementReceiptRef::replicated(
+            object_id,
+            object_key,
+            EpochId(1),
+            1,
+            2,
+            4096,
+            digest,
+        )
+    }
+
     fn make_task(
         object_id: u64,
         sources: Vec<u64>,
         targets: Vec<u64>,
     ) -> crate::rebuild_backfill::ReconstructionTask {
-        crate::rebuild_backfill::ReconstructionTask::new_full(object_id, sources, targets, 0)
+        crate::rebuild_backfill::ReconstructionTask::new_full_with_receipt(
+            object_id,
+            receipt_ref(object_id),
+            sources,
+            targets,
+            0,
+        )
     }
 
     #[test]
@@ -1434,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_member_loss_triggers_heal() {
+    fn detect_member_loss_without_receipts_refuses_backfill() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
@@ -1450,10 +1472,10 @@ mod tests {
         available.insert(20, HealthClass::Healthy);
         available.insert(30, HealthClass::Healthy);
         let backfill_id = rt.detect_member_loss(lost, available, 1_000_000_000);
-        while rx.try_recv().is_ok() {}
-        assert!(backfill_id.is_some());
-        assert_eq!(rt.heal_state(), HealState::Rebuilding);
-        assert!(rt.is_healing());
+        assert!(backfill_id.is_none());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(rt.heal_state(), HealState::Aborted);
+        assert!(!rt.is_healing());
     }
 
     #[test]
@@ -1461,21 +1483,11 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
-        rt.record_placement(1, 10);
-        rt.record_placement(1, 20);
-        rt.record_placement(2, 10);
-        rt.record_placement(2, 20);
-        rt.record_placement(3, 20);
-        rt.record_placement(3, 30);
-        let mut lost = BTreeSet::new();
-        lost.insert(10);
-        let mut available = BTreeMap::new();
-        available.insert(20, HealthClass::Healthy);
-        available.insert(30, HealthClass::Healthy);
-        let bid = rt
-            .detect_member_loss(lost, available, 1_000_000_000)
-            .unwrap();
+        let plan = make_plan(100, vec![make_task(1, vec![10], vec![20])]);
+        let bid = rt.on_member_departure(plan, EpochId(1)).unwrap();
         while rx.try_recv().is_ok() {}
+        rt.backfill_initiator_mut().start_transferring(bid).unwrap();
+        rt.heal_coordinator.record_backfill_opened(bid);
         rt.complete_backfill(bid).unwrap();
         let finished = rt.heal_tick(0, 0, 2_000_000_000);
         assert!(finished);
@@ -1506,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn heal_lifecycle_full_flow() {
+    fn heal_lifecycle_full_flow_requires_receipts() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
@@ -1526,19 +1538,17 @@ mod tests {
         let mut available = BTreeMap::new();
         available.insert(20, HealthClass::Healthy);
         available.insert(30, HealthClass::Healthy);
-        let bid = rt
-            .detect_member_loss(lost, available, 1_000_000_000)
-            .unwrap();
+        let bid = rt.detect_member_loss(lost, available, 1_000_000_000);
         let stats = rt.heal_stats();
         assert!(stats.objects_to_rebuild > 0);
-        while rx.try_recv().is_ok() {}
-        rt.complete_backfill(bid).unwrap();
-        rt.heal_tick(0, 0, 2_000_000_000);
+        assert!(bid.is_none());
+        assert!(rx.try_recv().is_err());
         assert!(!rt.is_healing());
+        assert_eq!(rt.heal_state(), HealState::Aborted);
     }
 
     #[test]
-    fn duplicate_loss_during_heal_rejected() {
+    fn receiptless_loss_does_not_start_duplicate_window() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut rt = ClusterLeaseRuntime::new(1, EpochId(1), ClusterLeaseConfig::default(), tx)
             .with_placement_policy(ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 });
@@ -1554,12 +1564,10 @@ mod tests {
         available.insert(20, HealthClass::Healthy);
         available.insert(30, HealthClass::Healthy);
         let first = rt.detect_member_loss(lost.clone(), available.clone(), 1_000_000_000);
-        assert!(first.is_some());
-        while rx.try_recv().is_ok() {}
-        lost.insert(20);
-        available.remove(&20);
-        let second = rt.detect_member_loss(lost, available, 2_000_000_000);
-        assert!(second.is_none());
+        assert!(first.is_none());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(rt.heal_state(), HealState::Aborted);
+        assert!(!rt.is_healing());
     }
 
     #[test]
