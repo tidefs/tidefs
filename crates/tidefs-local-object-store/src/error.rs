@@ -88,6 +88,9 @@ pub enum StoreError {
         expected: ObjectDigest,
         actual: ObjectDigest,
     },
+    InvalidDeadObjectReceipt {
+        reason: &'static str,
+    },
     NoSpace,
     /// I/O scheduler refused an operation — the class token bucket was depleted.
     PressureRefused {
@@ -135,6 +138,9 @@ impl fmt::Display for StoreError {
                 "content address mismatch: expected key {expected}, actual key {actual} (bit-rot or corruption)"
             ),
             Self::ObjectChecksumMismatch { key, expected, actual } => write!(f, "object checksum mismatch for {key}: expected {expected}, actual {actual}"),
+            Self::InvalidDeadObjectReceipt { reason } => {
+                write!(f, "invalid dead-object replacement receipt: {reason}")
+            }
             Self::NoSpace => write!(f, "no space left on device"),
             Self::PressureRefused { class } => write!(
                 f, "I/O scheduler refused {} operation: token bucket depleted", class.label()
