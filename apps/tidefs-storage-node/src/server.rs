@@ -1472,7 +1472,7 @@ fn placement_receipt_inventory_json(store: &StoreBackend) -> serde_json::Value {
                 "available": false,
                 "count": 0,
                 "refs": [],
-                "reason": "compatibility object-store backend does not expose pool placement receipts; receipt-bound repair requests must carry PlacementReceiptRef explicitly",
+                "reason": "receiptless object-store backend does not expose pool placement receipts; receipt-bound repair requests must carry PlacementReceiptRef explicitly",
             })
         }
     }
@@ -1607,7 +1607,7 @@ fn receipt_backed_rebuild_admission_json(
             "preview": false,
             "receipt_ref_count": 0,
             "scheduled_task_count": 0,
-            "reason": "compatibility object-store backend does not expose pool placement receipts; rebuild admission requires Pool::placement_receipt_refs authority",
+            "reason": "receiptless object-store backend does not expose pool placement receipts; rebuild admission requires Pool::placement_receipt_refs authority",
         });
     };
 
@@ -1647,7 +1647,7 @@ fn receipt_backed_rebuild_planner_json(
             "preview": false,
             "receipt_ref_count": 0,
             "task_count": 0,
-            "reason": "compatibility object-store backend does not expose pool placement receipts; rebuild planner preview requires Pool::placement_receipt_refs authority",
+            "reason": "receiptless object-store backend does not expose pool placement receipts; rebuild planner preview requires Pool::placement_receipt_refs authority",
         });
     };
 
@@ -2007,7 +2007,7 @@ fn receipt_backed_rebuild_execution_candidates_json(
             "preview": false,
             "receipt_ref_count": 0,
             "execution_candidate_count": 0,
-            "reason": "compatibility object-store backend does not expose pool placement receipts; rebuild execution candidates require admission and planner receipt authority",
+            "reason": "receiptless object-store backend does not expose pool placement receipts; rebuild execution candidates require admission and planner receipt authority",
         });
     };
 
@@ -6590,7 +6590,7 @@ mod cluster_pool_handler_tests {
         assert!(inventory["reason"]
             .as_str()
             .unwrap()
-            .contains("compatibility object-store backend"));
+            .contains("receiptless object-store backend"));
 
         let admission = receipt_backed_rebuild_admission_json(&minimal_config(), &backend);
         assert_eq!(admission["available"], false);
@@ -8151,19 +8151,19 @@ mod cluster_pool_handler_tests {
             open_imported_pool_backend(&imported, &lock_dir).unwrap(),
         ));
 
-        let legacy_object_id: u64 = 44;
+        let object_id: u64 = 44;
         let receipt_key = ObjectKey::from_bytes32([0x5A; 32]);
         let receipt_payload = b"receipt-authoritative-payload";
-        let legacy_payload = b"legacy-object-id-payload";
+        let object_id_payload = b"receiptless-object-id-payload";
         let receipt = receipt_ref_for_key(receipt_key, receipt_payload, 8);
 
         if let StoreBackend::PoolBacked(pool) = &mut backend {
-            pool_put_named(pool, legacy_object_id.to_le_bytes(), legacy_payload).unwrap();
+            pool_put_named(pool, object_id.to_le_bytes(), object_id_payload).unwrap();
             pool_put_key(pool, receipt_key, receipt_payload).unwrap();
         }
 
         let request = SegmentFetchRequest {
-            object_id: legacy_object_id,
+            object_id,
             placement_receipt_ref: Some(receipt),
             segment_offset: 8,
             segment_length: 13,
@@ -8189,17 +8189,17 @@ mod cluster_pool_handler_tests {
             open_imported_pool_backend(&imported, &lock_dir).unwrap(),
         ));
 
-        let legacy_object_id: u64 = 45;
+        let object_id: u64 = 45;
         let receipt_key = ObjectKey::from_bytes32([0x6A; 32]);
         let receipt_payload = b"missing-receipt-authoritative-payload";
         let receipt = receipt_ref_for_key(receipt_key, receipt_payload, 9);
 
         if let StoreBackend::PoolBacked(pool) = &mut backend {
-            pool_put_named(pool, legacy_object_id.to_le_bytes(), b"legacy payload").unwrap();
+            pool_put_named(pool, object_id.to_le_bytes(), b"receiptless payload").unwrap();
         }
 
         let request = SegmentFetchRequest {
-            object_id: legacy_object_id,
+            object_id,
             placement_receipt_ref: Some(receipt),
             segment_offset: 0,
             segment_length: receipt.payload_len,
@@ -8214,7 +8214,7 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
-    fn pool_backend_segment_fetch_keeps_legacy_missing_fetch_empty() {
+    fn pool_backend_segment_fetch_keeps_receiptless_missing_fetch_empty() {
         let dir = tempfile::tempdir().unwrap();
         let (imported, lock_dir, _devices) = imported_regular_file_pool(
             &dir,

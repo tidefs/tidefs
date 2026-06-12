@@ -517,9 +517,18 @@ fn cluster_no_lease_config_lifecycle() {
 #[test]
 fn cluster_full_flow_mirror_create_and_verify() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let dev0 = make_test_device(dir.path(), "node1-dev0", TEST_DEVICE_BYTES);
-    let dev1 = make_test_device(dir.path(), "node2-dev0", TEST_DEVICE_BYTES);
-    let dev2 = make_test_device(dir.path(), "node3-dev0", TEST_DEVICE_BYTES);
+    let node1_devs = vec![
+        make_test_device(dir.path(), "node1-dev0", TEST_DEVICE_BYTES),
+        make_test_device(dir.path(), "node1-dev1", TEST_DEVICE_BYTES),
+    ];
+    let node2_devs = vec![
+        make_test_device(dir.path(), "node2-dev0", TEST_DEVICE_BYTES),
+        make_test_device(dir.path(), "node2-dev1", TEST_DEVICE_BYTES),
+    ];
+    let node3_devs = vec![
+        make_test_device(dir.path(), "node3-dev0", TEST_DEVICE_BYTES),
+        make_test_device(dir.path(), "node3-dev1", TEST_DEVICE_BYTES),
+    ];
 
     let pool_guid: [u8; 16] = [0xE1; 16];
     let pool_name = "mirror-pool";
@@ -534,20 +543,30 @@ fn cluster_full_flow_mirror_create_and_verify() {
     let sid2 = connect_client(&mut client, 2, server2.addr());
     let sid3 = connect_client(&mut client, 3, server3.addr());
 
-    // Create on each node.
-    for (sid, node_id, dev_path) in [(sid1, 1, &dev0), (sid2, 2, &dev1), (sid3, 3, &dev2)] {
+    // Create on each node. The current storage-node create handler maps
+    // MirrorAcrossNodes(copies=2) onto a local replicated(2) pool create, so
+    // each target node needs two local devices in this E2E.
+    for (sid, node_id, dev_paths) in [
+        (sid1, 1, &node1_devs),
+        (sid2, 2, &node2_devs),
+        (sid3, 3, &node3_devs),
+    ] {
         let req = ClusterPoolCreateRequest {
             request_id: 2,
             pool_guid,
             pool_name: pool_name.to_string(),
             target_node_id: node_id,
-            node_devices: vec![NodeDeviceSpec {
-                device_path: dev_path.to_string_lossy().to_string(),
-                local_device_index: 0,
-                global_device_index: (node_id - 1) as u32,
-                capacity_bytes: TEST_DEVICE_BYTES,
-                failure_domain: FailureDomain::for_node(node_id),
-            }],
+            node_devices: dev_paths
+                .iter()
+                .enumerate()
+                .map(|(local_index, dev_path)| NodeDeviceSpec {
+                    device_path: dev_path.to_string_lossy().to_string(),
+                    local_device_index: local_index as u32,
+                    global_device_index: ((node_id - 1) as u32 * 2) + local_index as u32,
+                    capacity_bytes: TEST_DEVICE_BYTES,
+                    failure_domain: FailureDomain::for_node(node_id),
+                })
+                .collect(),
             redundancy: ClusterRedundancy::MirrorAcrossNodes { copies: 2 },
             placement: ClusterPlacementPolicy::MirrorAcrossNodes { copies: 2 },
             allow_file_devices: true,
@@ -568,9 +587,14 @@ fn cluster_full_flow_mirror_create_and_verify() {
     assert_eq!(successes, 3, "all 3 mirror nodes must succeed");
 
     // Verify all labels.
-    let device_paths: Vec<PathBuf> = vec![dev0.clone(), dev1.clone(), dev2.clone()];
+    let device_paths: Vec<PathBuf> = node1_devs
+        .iter()
+        .chain(node2_devs.iter())
+        .chain(node3_devs.iter())
+        .cloned()
+        .collect();
     let scan_results = tidefs_pool_scan::scan_labels(&device_paths).expect("scan labels");
-    assert_eq!(scan_results.len(), 3);
+    assert_eq!(scan_results.len(), 6);
     for r in &scan_results {
         assert!(r.label_valid, "label must be valid: {}", r.label_status);
         assert_eq!(r.pool_guid, Some(pool_guid));

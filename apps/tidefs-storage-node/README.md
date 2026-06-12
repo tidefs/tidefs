@@ -102,7 +102,7 @@ deserialization for `tidefs_transport::ReplicationMessage`.
 | `Get { name }` | Reads from local primary store; responds `GetResponse` |
 | `Delete { name, generation }` | Deletes from local primary store; responds `DeleteAck` |
 | `SyncRequest` | Lists exact object payloads; responds `SyncResponse` entries with `PlacementReceiptRef` authority when the backend exposes pool receipts |
-| `ReadPlan { plan_bytes }` | Serves the planned subject locally; pool-backed responses carry a validated `PlacementReceiptRef`, while compatibility backends stay receipt-less |
+| `ReadPlan { plan_bytes }` | Serves the planned subject locally; pool-backed responses carry a validated `PlacementReceiptRef`, while receiptless backends stay receipt-less |
 | `ScrubRequest` | Runs local segment scrub and reports findings plus receipt-inventory disclosure |
 | `RepairObject { key, placement_receipt_ref, authoritative_payload }` | Validates the shared placement receipt against the exact 32-byte object key, length, digest, policy, and target width before local repair write; pool-backed repairs respond with a fresh repaired `PlacementReceiptRef` |
 
@@ -116,14 +116,14 @@ healthy source and configured peers as replacement targets, and execution
 candidates are listed only when admission and planner agree on the receipt,
 source, target, payload length, and digest. This keeps later distributed
 rebuild orchestration tied to receipt-addressed tasks instead of deriving
-placement from current topology or compatibility store listings. Local
-path-backed and transport-backed compatibility stores report the rebuild
+placement from current topology or receiptless store listings. Local
+path-backed and transport-backed receiptless stores report the rebuild
 previews as unavailable because they do not expose pool placement receipt
 inventory.
 
 Pool-backed `SyncResponse` entries likewise carry the real non-synthetic
 `PlacementReceiptRef` for the payload being transferred. Local path-backed and
-transport-backed compatibility stores keep sync entries receipt-less rather
+transport-backed receiptless stores keep sync entries receipt-less rather
 than synthesizing placement authority.
 
 Pool-backed `ReadPlanResponse` frames carry the same kind of validated
@@ -135,7 +135,7 @@ publication remain under the distributed receipt-authority work.
 Callers that will use planned-read bytes as repair, rebuild, or reclaim
 authority must use
 `TransportReplicatedStore::get_planned_with_required_receipt()`, which rejects
-receipt-less compatibility responses and local-primary hits that do not carry
+receipt-less responses and local-primary hits that do not carry
 durable placement receipt evidence.
 
 Receipt-backed repair callers can use
@@ -145,7 +145,7 @@ in one fail-closed path. The bridge treats `RepairObjectAck` as completion
 evidence only when `success` is true and the ack carries a non-synthetic
 `repaired_placement_receipt_ref` that passes the rebuild-runtime completion
 law; receipt-less, mismatched, or failed acks do not advance completion or
-admission state as success. Compatibility acks without a repaired receipt are
+admission state as success. Receiptless acks without a repaired receipt are
 accepted as wire-format responses, but they do not advance receipt-backed
 rebuild completion. `RebuildCompletion::verified_receipt_completions()` exposes
 the successful source/repaired receipt pairs as a typed publication view for
