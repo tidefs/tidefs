@@ -33,9 +33,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tidefs_membership_epoch::{EpochId, MemberId};
 use tidefs_replication_model::{
-    FlowCommitClass, FlowCommitResult, FlowState, ReplicaChunkState, ReplicaCopyClass,
-    ReplicaCopyRecord, ReplicaPlacementReceipt, ReplicaTransferReceipt, ReplicaVerificationReceipt,
-    ReplicatedReceiptId, ReplicatedSubjectId, VerificationStatus,
+    FlowCommitClass, FlowCommitResult, FlowState, PlacementReceiptRef, ReplicaChunkState,
+    ReplicaCopyClass, ReplicaCopyRecord, ReplicaPlacementReceipt, ReplicaTransferReceipt,
+    ReplicaVerificationReceipt, ReplicatedReceiptId, ReplicatedSubjectId, VerificationStatus,
 };
 
 /// Gate constant for P8-03 data_copy_7 flow commit coordinator.
@@ -300,11 +300,29 @@ impl FlowCommitCoordinator {
         &mut self,
         receipt: ReplicaVerificationReceipt,
     ) -> Result<CommitVerificationOutcome, String> {
-        let receipt_id = receipt.receipt_id;
+        self.commit_verification_receipt_inner(receipt, None)
+    }
 
-        // Store the receipt
-        self.verification_receipts
-            .insert(receipt_id.0, receipt.clone());
+    /// Record a verified receipt and publish caller-supplied durable target
+    /// placement receipt refs into the resulting placement receipts.
+    ///
+    /// This path fails before mutating coordinator state if the durable refs do
+    /// not exactly cover the matched transferring chunk subjects or if any ref
+    /// is synthetic, malformed, under-width, duplicated, or subject-mismatched.
+    pub fn commit_verification_receipt_with_placement_refs(
+        &mut self,
+        receipt: ReplicaVerificationReceipt,
+        placement_receipt_refs: &[PlacementReceiptRef],
+    ) -> Result<CommitVerificationOutcome, String> {
+        self.commit_verification_receipt_inner(receipt, Some(placement_receipt_refs))
+    }
+
+    fn commit_verification_receipt_inner(
+        &mut self,
+        receipt: ReplicaVerificationReceipt,
+        placement_receipt_refs: Option<&[PlacementReceiptRef]>,
+    ) -> Result<CommitVerificationOutcome, String> {
+        let receipt_id = receipt.receipt_id;
 
         // Find chunks whose subject_refs match the receipt's subject_refs
         let receipt_subject_set: BTreeSet<ReplicatedSubjectId> =
@@ -327,6 +345,30 @@ impl FlowCommitCoordinator {
         }
 
         let is_verified = receipt.status == VerificationStatus::Verified;
+        let durable_refs_by_subject = if is_verified {
+            placement_receipt_refs
+                .map(|refs| {
+                    Self::validate_placement_receipt_refs(
+                        &receipt_subject_set,
+                        &matched_chunks,
+                        &self.chunks,
+                        refs,
+                    )
+                })
+                .transpose()?
+        } else {
+            if let Some(refs) = placement_receipt_refs {
+                if !refs.is_empty() {
+                    return Err(format!(
+                        "placement receipt refs require Verified status for receipt {receipt_id:?}"
+                    ));
+                }
+            }
+            None
+        };
+
+        self.verification_receipts
+            .insert(receipt_id.0, receipt.clone());
 
         for chunk_id in &matched_chunks {
             if let Some(chunk) = self.chunks.get_mut(chunk_id) {
@@ -344,6 +386,11 @@ impl FlowCommitCoordinator {
             let mut commit_results = Vec::new();
             for chunk_id in &matched_chunks {
                 if let Some(chunk) = self.chunks.get(chunk_id) {
+                    let placement_receipt_refs = durable_refs_by_subject
+                        .as_ref()
+                        .and_then(|refs| refs.get(&chunk.subject_ref).copied())
+                        .into_iter()
+                        .collect();
                     let placement = ReplicaPlacementReceipt {
                         receipt_id: ReplicatedReceiptId(
                             receipt_id.0.wrapping_mul(13).wrapping_add(*chunk_id),
@@ -356,9 +403,11 @@ impl FlowCommitCoordinator {
                         placed_on: chunk.target_ref,
                         placement_epoch: self.current_epoch,
                         subjects_placed: 1,
+                        placement_receipt_refs,
                     };
+                    let placement_id = placement.receipt_id;
                     self.placement_receipts
-                        .insert(placement.receipt_id.0, placement.clone());
+                        .insert(placement_id.0, placement.clone());
 
                     let result = FlowCommitResult {
                         placement_receipt: placement,
@@ -381,6 +430,9 @@ impl FlowCommitCoordinator {
                         flow_class: chunk.flow_class,
                         commit_epoch: self.current_epoch,
                     };
+                    if let Some(chunk) = self.chunks.get_mut(chunk_id) {
+                        chunk.placement_receipt_ref = Some(placement_id);
+                    }
                     commit_results.push(result);
                 }
             }
@@ -392,6 +444,68 @@ impl FlowCommitCoordinator {
             is_verified,
             total_commit_results: if is_verified { matched_chunks.len() } else { 0 },
         })
+    }
+
+    fn validate_placement_receipt_refs(
+        receipt_subject_set: &BTreeSet<ReplicatedSubjectId>,
+        matched_chunks: &[u64],
+        chunks: &BTreeMap<u64, TrackedChunk>,
+        placement_receipt_refs: &[PlacementReceiptRef],
+    ) -> Result<BTreeMap<ReplicatedSubjectId, PlacementReceiptRef>, String> {
+        let matched_subjects: BTreeSet<ReplicatedSubjectId> = matched_chunks
+            .iter()
+            .filter_map(|chunk_id| chunks.get(chunk_id).map(|chunk| chunk.subject_ref))
+            .collect();
+        let mut refs_by_subject = BTreeMap::new();
+
+        for placement_receipt_ref in placement_receipt_refs {
+            let subject = ReplicatedSubjectId::new(placement_receipt_ref.object_id);
+            if placement_receipt_ref.is_synthetic() {
+                return Err(format!(
+                    "placement receipt ref for subject {subject:?} is synthetic"
+                ));
+            }
+            if !placement_receipt_ref.redundancy_policy.is_well_formed() {
+                return Err(format!(
+                    "placement receipt ref for subject {subject:?} has malformed redundancy policy"
+                ));
+            }
+            let required_count = placement_receipt_ref.redundancy_policy.target_width();
+            if placement_receipt_ref.target_count < required_count {
+                return Err(format!(
+                    "placement receipt ref for subject {subject:?} is under-width: target_count {} < required_count {}",
+                    placement_receipt_ref.target_count, required_count
+                ));
+            }
+            if !receipt_subject_set.contains(&subject) {
+                return Err(format!(
+                    "placement receipt ref for subject {subject:?} is not in verification receipt"
+                ));
+            }
+            if !matched_subjects.contains(&subject) {
+                return Err(format!(
+                    "placement receipt ref for subject {subject:?} has no matched transferring chunk"
+                ));
+            }
+            if refs_by_subject
+                .insert(subject, *placement_receipt_ref)
+                .is_some()
+            {
+                return Err(format!(
+                    "duplicate placement receipt ref for subject {subject:?}"
+                ));
+            }
+        }
+
+        for subject in &matched_subjects {
+            if !refs_by_subject.contains_key(subject) {
+                return Err(format!(
+                    "missing placement receipt ref for matched subject {subject:?}"
+                ));
+            }
+        }
+
+        Ok(refs_by_subject)
     }
 
     // ── Algorithm 3: advance_flow_after_receipt_commit ────────────────
@@ -967,7 +1081,8 @@ mod tests {
     use super::*;
     use tidefs_membership_epoch::EpochId;
     use tidefs_replication_model::{
-        ObjectDigest, ReplicatedReceiptId, ReplicatedSubjectId, VerificationStatus,
+        ObjectDigest, PlacementReceiptRef, ReceiptRedundancyPolicy, ReplicatedReceiptId,
+        ReplicatedSubjectId, VerificationStatus,
     };
 
     fn make_coordinator() -> FlowCommitCoordinator {
@@ -1000,6 +1115,54 @@ mod tests {
             verification_epoch: EpochId::new(1),
             status,
         }
+    }
+
+    fn durable_placement_ref(subject: ReplicatedSubjectId, generation: u64) -> PlacementReceiptRef {
+        placement_ref_with_policy(
+            subject,
+            generation,
+            ReceiptRedundancyPolicy::Replicated { copies: 1 },
+            1,
+        )
+    }
+
+    fn placement_ref_with_policy(
+        subject: ReplicatedSubjectId,
+        generation: u64,
+        redundancy_policy: ReceiptRedundancyPolicy,
+        target_count: u16,
+    ) -> PlacementReceiptRef {
+        let mut object_key = [0xA5; 32];
+        object_key[..8].copy_from_slice(&subject.0.to_le_bytes());
+        let mut payload_digest = [0x5A; 32];
+        payload_digest[..8].copy_from_slice(&subject.0.to_le_bytes());
+        payload_digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        PlacementReceiptRef::new(
+            subject.0,
+            object_key,
+            EpochId::new(1),
+            generation,
+            redundancy_policy,
+            4096,
+            payload_digest,
+            target_count,
+        )
+    }
+
+    fn coordinator_with_transferring_chunk(subject: ReplicatedSubjectId) -> FlowCommitCoordinator {
+        let mut coord = make_coordinator();
+        let ticket = ReplicatedReceiptId(1000);
+        let _ = coord.register_chunk(
+            subject,
+            MemberId::new(1),
+            MemberId::new(2),
+            FlowCommitClass::Rebuild,
+            ticket,
+        );
+        coord
+            .commit_transfer_receipt(make_transfer_receipt(500, 1000))
+            .unwrap();
+        coord
     }
 
     // ── Chunk registration ──────────────────────────────────────────
@@ -1134,6 +1297,95 @@ mod tests {
         assert_eq!(outcome.total_commit_results, 1);
         assert_eq!(coord.chunk(1).unwrap().state, ReplicaChunkState::Committed);
         assert_eq!(coord.commit_results.len(), 1);
+    }
+
+    #[test]
+    fn commit_verified_receipt_with_placement_receipt_refs_publishes_durable_ref() {
+        let subj = ReplicatedSubjectId::new(100);
+        let mut coord = coordinator_with_transferring_chunk(subj);
+        let durable_ref = durable_placement_ref(subj, 700);
+        let v_receipt = make_verification_receipt(600, &[subj], VerificationStatus::Verified);
+
+        let outcome = coord
+            .commit_verification_receipt_with_placement_refs(v_receipt, &[durable_ref])
+            .unwrap();
+
+        assert!(outcome.is_verified);
+        assert_eq!(outcome.advanced_chunks, vec![1]);
+        assert_eq!(outcome.total_commit_results, 1);
+        let chunk = coord.chunk(1).unwrap();
+        assert_eq!(chunk.state, ReplicaChunkState::Committed);
+        let placement_id = chunk.placement_receipt_ref.expect("placement receipt id");
+        let stored = coord
+            .placement_receipts
+            .get(&placement_id.0)
+            .expect("stored placement receipt");
+        assert_eq!(stored.placement_receipt_refs, vec![durable_ref]);
+        assert_eq!(coord.commit_results.len(), 1);
+        assert_eq!(
+            coord.commit_results[0]
+                .placement_receipt
+                .placement_receipt_refs,
+            vec![durable_ref]
+        );
+    }
+
+    #[test]
+    fn commit_verified_receipt_with_bad_placement_receipt_refs_fails_without_mutation() {
+        let subj = ReplicatedSubjectId::new(100);
+        let other = ReplicatedSubjectId::new(999);
+        let durable_ref = durable_placement_ref(subj, 701);
+        let cases: Vec<(&str, Vec<PlacementReceiptRef>)> = vec![
+            ("missing placement receipt ref", vec![]),
+            (
+                "synthetic",
+                vec![PlacementReceiptRef::synthetic_for_subject(subj)],
+            ),
+            (
+                "malformed redundancy policy",
+                vec![placement_ref_with_policy(
+                    subj,
+                    702,
+                    ReceiptRedundancyPolicy::Replicated { copies: 0 },
+                    0,
+                )],
+            ),
+            (
+                "under-width",
+                vec![placement_ref_with_policy(
+                    subj,
+                    703,
+                    ReceiptRedundancyPolicy::Replicated { copies: 2 },
+                    1,
+                )],
+            ),
+            (
+                "not in verification receipt",
+                vec![durable_placement_ref(other, 704)],
+            ),
+            ("duplicate", vec![durable_ref, durable_ref]),
+        ];
+
+        for (expected_error, refs) in cases {
+            let mut coord = coordinator_with_transferring_chunk(subj);
+            let v_receipt = make_verification_receipt(600, &[subj], VerificationStatus::Verified);
+
+            let err = coord
+                .commit_verification_receipt_with_placement_refs(v_receipt, &refs)
+                .expect_err("invalid placement refs must fail");
+
+            assert!(
+                err.contains(expected_error),
+                "expected error containing {expected_error:?}, got {err:?}"
+            );
+            let chunk = coord.chunk(1).unwrap();
+            assert_eq!(chunk.state, ReplicaChunkState::Transferring);
+            assert_eq!(chunk.verification_receipt_ref, None);
+            assert_eq!(chunk.placement_receipt_ref, None);
+            assert!(coord.verification_receipts.is_empty());
+            assert!(coord.placement_receipts.is_empty());
+            assert!(coord.commit_results.is_empty());
+        }
     }
 
     #[test]

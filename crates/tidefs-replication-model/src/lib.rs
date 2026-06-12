@@ -1138,6 +1138,11 @@ pub struct ReplicaPlacementReceipt {
     pub placement_epoch: EpochId,
     /// Number of subjects placed.
     pub subjects_placed: u64,
+    /// Durable placement receipt refs emitted by the target placement
+    /// authority. Empty for deterministic or compatibility commit paths that
+    /// have not yet carried target pool receipts into the flow coordinator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placement_receipt_refs: Vec<PlacementReceiptRef>,
 }
 
 /// Canonical flow commit class: the type of data flow being committed.
@@ -2011,6 +2016,7 @@ pub fn emit_replica_placement_receipt(
         placed_on,
         placement_epoch,
         subjects_placed: verification.subject_refs.len() as u64,
+        placement_receipt_refs: Vec::new(),
     }
 }
 
@@ -5311,6 +5317,7 @@ mod property_tests {
             placed_on: MemberId::new(99),
             placement_epoch: EpochId::new(15),
             subjects_placed: 1,
+            placement_receipt_refs: Vec::new(),
         };
         let json = serde_json::to_string(&receipt).expect("serialize");
         let round: ReplicaPlacementReceipt = serde_json::from_str(&json).expect("deserialize");
@@ -5345,6 +5352,7 @@ mod property_tests {
                 placed_on: MemberId::new(7),
                 placement_epoch: EpochId::new(42),
                 subjects_placed: 1,
+                placement_receipt_refs: vec![flow_receipt_ref(1, 4096, 700)],
             },
             updated_copy: ReplicaCopyRecord {
                 subject_ref: ReplicatedSubjectId::new(1),
