@@ -148,8 +148,11 @@ later consumers; it does not publish broader cluster or reclaim state by
 itself. The replicated-store repair bridge returns that same typed record in
 `ReceiptRepairCompletionEvidence`, and the flow-commit coordinator can publish
 the repaired target `PlacementReceiptRef` as `ReplicaPlacementReceipt` /
-`FlowCommitResult` rebuild evidence. That is repaired-placement publication
-through flow-commit only; replacement-node orchestration, cluster-state
+`FlowCommitResult` rebuild evidence. Callers that own the coordinator can use
+`TransportReplicatedStore::execute_receipt_repair_task_record_completion_and_publish_flow_commit()`
+to execute the repair, record verified completion, and publish the repaired
+placement in one composed path. That is replicated-store-to-flow-commit
+publication plumbing only; replacement-node orchestration, cluster-state
 convergence, and reclaim publication remain separate #18 work.
 
 ### Local-Only Operations (LOCAL-ONLY boundary)

@@ -246,9 +246,14 @@ typed record with its repair evidence so later consumers can carry
 receipt-addressed completion proof without re-reading private runtime state.
 `FlowCommitCoordinator::publish_verified_rebuild_completion()` consumes that
 record and publishes the repaired target placement receipt as
-`ReplicaPlacementReceipt` / `FlowCommitResult` rebuild evidence. This is
-repaired-placement publication through flow-commit only, not full replacement
-orchestration, cluster-state convergence, or reclaim publication.
+`ReplicaPlacementReceipt` / `FlowCommitResult` rebuild evidence. The
+replicated-store bridge also exposes
+`TransportReplicatedStore::execute_receipt_repair_task_record_completion_and_publish_flow_commit()`
+for callers that already own the coordinator and want the repair, verified
+completion, and flow-commit publication composed without rebuilding receipt
+identity from looser fields. This is replicated-store-to-flow-commit
+publication plumbing only, not full replacement orchestration, degraded-read
+policy, cluster-state convergence, or reclaim publication.
 
 ### 6.3 OW-305 executable rebuild/backfill/rebalance slice
 
@@ -284,10 +289,12 @@ receipt passes the rebuild-runtime verification law. Receipt-less, mismatched,
 or failed acks do not advance completion or admission as success. The
 flow-commit coordinator now also consumes the verified completion record and
 preserves the repaired target `PlacementReceiptRef` in
-`ReplicaPlacementReceipt` / `FlowCommitResult` outputs. This is not yet full
-replacement-node orchestration, degraded-read policy, cluster-state
-convergence, or reclaim publication; those remain part of the broader #18
-runtime closeout.
+`ReplicaPlacementReceipt` / `FlowCommitResult` outputs. The replicated-store
+composition helper can now run the repair, verified completion recording, and
+flow-commit publication in one caller-facing path when supplied with a
+coordinator. This is not yet full replacement-node orchestration,
+degraded-read policy, cluster-state convergence, or reclaim publication; those
+remain part of the broader #18 runtime closeout.
 
 ## 7. Steady-state replication flow
 

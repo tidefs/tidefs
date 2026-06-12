@@ -9,6 +9,7 @@ authors.workspace = true
 description = "N-replica replicated object store wrapping N LocalObjectStore instances with quorum write protocol I/O coordination"
 
 [dependencies]
+tidefs-flow-commit-coordinator = { path = "../tidefs-flow-commit-coordinator" }
 tidefs-local-object-store = { path = "../tidefs-local-object-store" }
 tidefs-quorum-write = { path = "../tidefs-quorum-write" }
 tidefs-quorum-write-runtime = { path = "../tidefs-quorum-write-runtime" }
