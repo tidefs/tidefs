@@ -1,3 +1,4 @@
+mod authz;
 pub mod block;
 pub mod classification;
 pub mod cluster;

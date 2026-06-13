@@ -3813,6 +3813,7 @@ dependencies = [
  "rand 0.8.6",
  "serde_json",
  "tempfile",
+ "tidefs-auth",
  "tidefs-block-volume-adapter-core",
  "tidefs-block-volume-adapter-daemon",
  "tidefs-block-volume-adapter-ublk-control-runtime",

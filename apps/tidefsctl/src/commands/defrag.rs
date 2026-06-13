@@ -9,6 +9,8 @@ use std::path::Path;
 
 /// Handle `tidefs defrag <path> [--recursive]`.
 pub fn handle_defrag(path: &Path, recursive: bool) {
+    let _guard = super::authz::require_local_only("defrag");
+
     match run_defrag(path, recursive) {
         Ok((before, after, reduction, inodes)) => {
             println!("extents_before: {before}");

@@ -9,6 +9,7 @@ authors.workspace = true
 description = "TideFS CLI for operator commands and development harnesses"
 
 [dependencies]
+tidefs-auth = { path = "../../crates/tidefs-auth" }
 tidefs-posix-filesystem-adapter-daemon = { path = "../../apps/tidefs-posix-filesystem-adapter-daemon" }
 tidefs-block-volume-adapter-core = { path = "../../crates/tidefs-block-volume-adapter-core" }
 tidefs-pool-import = { path = "../../crates/tidefs-pool-import" }

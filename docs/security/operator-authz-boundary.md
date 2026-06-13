@@ -24,18 +24,29 @@ ambiguous operation.
 
 | Action | Authz Class | Current Gate | Future Gate |
 |---|---|---|---|
-| `pool create` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::Publish)` |
-| `pool import` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::Stage)` |
-| `pool export` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::Stage)` |
-| `pool destroy` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::Publish)` |
-| `device remove` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::RepairPublish)` |
-| `encryption key enroll` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::RotateKey)` |
-| `dataset create/destroy` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::Stage)` |
-| `snapshot create/destroy` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::Stage)` |
-| `block attach/detach` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::Stage)` |
-| `defrag` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::RepairPublish)` |
-| `read audit log` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::ReadAuditLog)` |
-| `grant/revoke role` | LocalOnly | `LocalOnlyGuard` | `AuthorizationRequest(ActionClass::GrantRole)` |
+| `pool create/import/export/destroy/set` | LocalOnly | `tidefsctl` admission helper and lower pool guards where present | `AuthorizationRequest(ActionClass::Publish/Stage)` |
+| `device remove` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::RepairPublish)` |
+| `dataset create/destroy/rename/set` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::Stage)` |
+| `dataset set-strategy --enable/--disable` | LocalOnly | `tidefsctl` admission helper when mutating | `AuthorizationRequest(ActionClass::Stage)` |
+| `dataset upgrade` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::Stage)` |
+| `dataset seal-key/rotate-key` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::RotateKey)` |
+| `snapshot create/destroy/rollback/send/receive` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::Stage)` |
+| `block attach/detach/send/receive` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::Stage)` |
+| `defrag` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::RepairPublish)` |
+
+The `tidefsctl` admission helper is the public CLI/UAPI boundary for these
+commands. It maps each privileged command name to
+`LocalOnlyGuard::new("<command>")` and emits a consistent `tidefsctl <command>:
+...` operator error if the guard cannot prove a local process context.
+
+The following surfaces are consciously excluded from the privileged guard
+until they mutate state or a future issue gives them a stronger authorization
+class: help text, `pool scan`, `pool status`, `pool get`, `pool list-props`,
+`snapshot list`, `block list`, `dataset list`, `dataset get`,
+`dataset list-props`, `pool integrity-check`, `kernel status`, `diag`,
+userspace harnesses (`mount`, `pool mount`), prototype/development cluster
+commands, and removed directory-backed/offline surfaces that already fail
+closed before opening retired media.
 
 ## LocalOnlyGuard
 
@@ -99,12 +110,13 @@ to any CLI/API privileged action paths. Wiring it requires:
   call-site token instead of leaving auth/authz claims as record types alone.
   The remaining authz wiring (P9-02 pipeline to privileged handlers) is a
   deferred continuation gated on cluster operator path completion.
-- **A20** (tidefsctl Operator Surface): not directly addressed — the
-  `LocalOnlyGuard` is source-integrated in `tidefs-auth` and available for
-  wiring into `tidefsctl` privileged commands. Wiring it into tidefsctl is
-  deferred to the tidefsctl UAPI cleanup issue.
+- **A20** (tidefsctl Operator Surface): advanced — `tidefsctl` now has an
+  explicit local-only admission table for privileged public operator
+  mutations and data-movement paths. This does not claim remote cluster
+  operator authorization; it keeps the current live-owner routing model in
+  place until the P9-02 path is product-grade.
 
-## Implementation Status (2026-05-23)
+## Implementation Status (2026-06-13)
 
 ### Done
 - `LocalOnlyGuard` in `tidefs-auth::local_only` — zero-sized runtime token
@@ -121,8 +133,21 @@ to any CLI/API privileged action paths. Wiring it requires:
 - `ExportError::NotLocal` and `ImportError::NotLocal` variants with Display
   impls
   unchecked construction, copy semantics, and error display messages
+- `apps/tidefsctl/src/commands/authz.rs` — shared command admission helper
+  with guard/classification tests for privileged and unguarded command
+  surfaces.
+- `tidefsctl pool create/import/export/destroy/set`,
+  `device remove`, `snapshot create/destroy/rollback/send/receive`,
+  `block attach/detach/send/receive`,
+  `dataset create/destroy/rename/set-strategy` when mutating,
+  `dataset seal-key/rotate-key/upgrade/set`, and `defrag` now acquire a
+  `LocalOnlyGuard` at their CLI handler boundary before mutating state or
+  initiating privileged data movement.
 
 ### Next
-- Wire `LocalOnlyGuard` into remaining privileged entry points:
-  `tidefsctl pool create`, `tidefsctl pool destroy`, `tidefsctl device remove`,
-  `tidefsctl snapshot create/destroy`, `tidefsctl block attach/detach`
+- Keep new `tidefsctl` public operator commands wired through
+  `apps/tidefsctl/src/commands/authz.rs` so every command has an explicit
+  guarded or unguarded admission decision.
+- Replace the local-only guard with the full P9-02 authorization pipeline only
+  after the cluster operator path has product-grade principal, session,
+  transport, admin peer, authorization, and audit behavior.
