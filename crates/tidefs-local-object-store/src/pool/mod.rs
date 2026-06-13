@@ -621,6 +621,10 @@ fn dead_object_replacement_receipt_for_object(
     ))
 }
 
+fn receipt_supersedes(candidate: &PlacementReceipt, current: &PlacementReceipt) -> bool {
+    (candidate.epoch, candidate.generation) >= (current.epoch, current.generation)
+}
+
 struct ReceiptCursor<'a> {
     raw: &'a [u8],
     offset: usize,
@@ -1642,9 +1646,7 @@ impl Pool {
                 }
 
                 let replace = match receipts.get(&receipt.object_key) {
-                    Some(current) => {
-                        (receipt.generation, receipt.epoch) >= (current.generation, current.epoch)
-                    }
+                    Some(current) => receipt_supersedes(&receipt, current),
                     None => true,
                 };
                 if replace {
@@ -1684,9 +1686,7 @@ impl Pool {
                 continue;
             }
             let replace = match best.as_ref() {
-                Some(current) => {
-                    (receipt.generation, receipt.epoch) >= (current.generation, current.epoch)
-                }
+                Some(current) => receipt_supersedes(&receipt, current),
                 None => true,
             };
             if replace {
@@ -4251,6 +4251,69 @@ mod tests {
         assert_eq!(
             pool.get(IoClass::Data, key).unwrap(),
             Some(b"new-payload".to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn receipt_epoch_prefers_newer_topology_over_higher_old_generation() {
+        let root = temp_dir("receipt-epoch-authority");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"epoch-authority-rewrite");
+        pool.put(IoClass::Data, key, b"old-epoch-payload").unwrap();
+        let mut stale_epoch_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("old epoch receipt");
+        assert_eq!(stale_epoch_receipt.epoch, 1);
+
+        let new_path = root.join("data-3");
+        let new_config = DeviceConfig {
+            media_class: Default::default(),
+            path: new_path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: new_path },
+            encryption: None,
+            compression: None,
+        };
+        pool.add_device(new_config, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        assert_eq!(pool.placement_epoch(), 2);
+
+        pool.put(IoClass::Data, key, b"new-epoch-payload").unwrap();
+        let fresh_epoch_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("new epoch receipt");
+        assert_eq!(fresh_epoch_receipt.epoch, 2);
+
+        stale_epoch_receipt.generation = fresh_epoch_receipt.generation + 100;
+        let receipt_key = placement_receipt_object_key(key);
+        let stale_encoded = stale_epoch_receipt.encode().unwrap();
+        let last_idx = pool.devices.len() - 1;
+        pool.devices[last_idx]
+            .put(receipt_key, &stale_encoded)
+            .expect("inject stale higher-generation receipt");
+
+        let selected = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("selected receipt");
+        assert_eq!(selected.epoch, fresh_epoch_receipt.epoch);
+        assert_eq!(selected.generation, fresh_epoch_receipt.generation);
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(b"new-epoch-payload".to_vec())
         );
 
         let _ = std::fs::remove_dir_all(&root);
