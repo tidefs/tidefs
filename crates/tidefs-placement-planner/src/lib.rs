@@ -572,6 +572,204 @@ const fn mix64(mut value: u64) -> u64 {
 // PlacementDecision, DeviceHealthCapacity, AllocationRequest
 // ===========================================================================
 
+const PLACEMENT_REPLAY_RECEIPT_CONTEXT: &str = "TideFS PlacementReplayReceipt v1";
+
+/// Role of a target recorded by a placement replay receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementReplayShardRole {
+    /// Data replica or data erasure shard.
+    Data,
+    /// Parity erasure shard.
+    Parity,
+}
+
+impl PlacementReplayShardRole {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Data => 0,
+            Self::Parity => 1,
+        }
+    }
+}
+
+/// One target in persisted placement order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacementReplayTarget {
+    /// Ordered target position within the receipt.
+    pub target_index: u16,
+    /// Logical shard index within the redundancy policy.
+    pub shard_index: u16,
+    /// Whether the target carries data or parity.
+    pub shard_role: PlacementReplayShardRole,
+    /// Pool device selected by the planner.
+    pub device_id: u64,
+    /// Failure-domain key that was authoritative when the receipt was issued.
+    pub failure_domain_key: u64,
+}
+
+/// Errors produced while minting or consuming placement replay receipts.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PlacementReplayError {
+    #[error("placement receipt target width mismatch: expected {expected}, got {actual}")]
+    TargetWidthMismatch { expected: usize, actual: usize },
+    #[error("placement receipt target width {actual} exceeds receipt format")]
+    TargetWidthTooLarge { actual: usize },
+    #[error("placement receipt target device {device_id} is absent from the issuing topology")]
+    TargetDeviceMissing { device_id: u64 },
+    #[error("placement receipt seal verification failed")]
+    SealMismatch,
+}
+
+/// Replayable authority for a planner decision.
+///
+/// The receipt records the policy width, target order, failure-domain level,
+/// topology epoch, and deterministic seed that were authoritative at allocation
+/// time. Read, scrub, rebuild, and relocation code can replay the target order
+/// from this record without recomputing placement against a newer topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementReplayReceipt {
+    /// Object or chunk identifier being placed.
+    pub object_id: u64,
+    /// Placement key used for deterministic spreading.
+    pub placement_key: u64,
+    /// Allocation size hint used for capacity-aware target eligibility.
+    pub size_hint_bytes: u64,
+    /// Bytes each selected target needed to admit for this allocation.
+    pub per_target_bytes: u64,
+    /// Topology epoch that issued this placement authority.
+    pub topology_epoch: u64,
+    /// Deterministic ring seed used by the planner.
+    pub deterministic_seed: u64,
+    /// Durability policy that determines target width and shard roles.
+    pub policy: DurabilityPolicy,
+    /// Failure-domain level enforced by the planner.
+    pub failure_domain_level: FailureDomainLevel,
+    /// Whether strict failure-domain separation held for this decision.
+    pub failure_domain_separation: bool,
+    /// Persisted target order.
+    pub targets: Vec<PlacementReplayTarget>,
+    /// BLAKE3 seal over every recorded authority field.
+    pub seal: [u8; 32],
+}
+
+impl PlacementReplayReceipt {
+    /// Mint a replay receipt from a placement decision and the topology that
+    /// was authoritative when that decision was made.
+    pub fn from_decision(
+        decision: &PlacementDecision,
+        layout: &DurabilityLayoutV1,
+        devices: &[DeviceHealthCapacity],
+        request: &AllocationRequest,
+        topology_epoch: u64,
+    ) -> Result<Self, PlacementReplayError> {
+        let expected = layout.policy.total_shards();
+        let actual = decision.device_targets.len();
+        if actual != expected || decision.replica_count != expected {
+            return Err(PlacementReplayError::TargetWidthMismatch { expected, actual });
+        }
+        if actual > u16::MAX as usize {
+            return Err(PlacementReplayError::TargetWidthTooLarge { actual });
+        }
+
+        let mut targets = Vec::with_capacity(actual);
+        for (target_index, device_id) in decision.device_targets.iter().copied().enumerate() {
+            let Some(device) = devices.iter().find(|device| device.device_id == device_id) else {
+                return Err(PlacementReplayError::TargetDeviceMissing { device_id });
+            };
+            let (shard_index, shard_role) =
+                replay_shard_for_slot(layout.policy, target_index as u16);
+            targets.push(PlacementReplayTarget {
+                target_index: target_index as u16,
+                shard_index,
+                shard_role,
+                device_id,
+                failure_domain_key: device.failure_domain_key(decision.failure_domain_level),
+            });
+        }
+
+        let mut receipt = Self {
+            object_id: decision.object_id,
+            placement_key: request.placement_key,
+            size_hint_bytes: request.size_hint_bytes,
+            per_target_bytes: per_target_capacity_bytes(layout, request),
+            topology_epoch,
+            deterministic_seed: decision.deterministic_seed,
+            policy: layout.policy,
+            failure_domain_level: decision.failure_domain_level,
+            failure_domain_separation: decision.failure_domain_separation,
+            targets,
+            seal: [0; 32],
+        };
+        receipt.seal = receipt.compute_seal();
+        Ok(receipt)
+    }
+
+    /// Return the receipt seal.
+    #[must_use]
+    pub const fn seal(&self) -> [u8; 32] {
+        self.seal
+    }
+
+    /// Verify the receipt seal against the recorded authority fields.
+    #[must_use]
+    pub fn verify_seal(&self) -> bool {
+        constant_time_eq_32(&self.seal, &self.compute_seal())
+    }
+
+    /// Replay target device order from the receipt.
+    #[must_use]
+    pub fn device_targets(&self) -> Vec<u64> {
+        self.targets.iter().map(|target| target.device_id).collect()
+    }
+
+    /// Rebuild a placement decision from receipt authority.
+    ///
+    /// This consumes only persisted receipt fields: it verifies the seal and
+    /// policy width, then returns the recorded target order without consulting
+    /// any current topology inventory.
+    pub fn replay_decision(&self) -> Result<PlacementDecision, PlacementReplayError> {
+        if !self.verify_seal() {
+            return Err(PlacementReplayError::SealMismatch);
+        }
+        let expected = self.policy.total_shards();
+        let actual = self.targets.len();
+        if actual != expected {
+            return Err(PlacementReplayError::TargetWidthMismatch { expected, actual });
+        }
+
+        Ok(PlacementDecision::new(
+            self.device_targets(),
+            expected,
+            self.failure_domain_separation,
+            self.deterministic_seed,
+            self.object_id,
+            self.failure_domain_level,
+        ))
+    }
+
+    fn compute_seal(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(PLACEMENT_REPLAY_RECEIPT_CONTEXT);
+        hasher.update(&self.object_id.to_le_bytes());
+        hasher.update(&self.placement_key.to_le_bytes());
+        hasher.update(&self.size_hint_bytes.to_le_bytes());
+        hasher.update(&self.per_target_bytes.to_le_bytes());
+        hasher.update(&self.topology_epoch.to_le_bytes());
+        hasher.update(&self.deterministic_seed.to_le_bytes());
+        seal_policy(&mut hasher, self.policy);
+        hasher.update(&[self.failure_domain_level.discriminant()]);
+        hasher.update(&[self.failure_domain_separation as u8]);
+        hasher.update(&(self.targets.len() as u64).to_le_bytes());
+        for target in &self.targets {
+            hasher.update(&target.target_index.to_le_bytes());
+            hasher.update(&target.shard_index.to_le_bytes());
+            hasher.update(&[target.shard_role.code()]);
+            hasher.update(&target.device_id.to_le_bytes());
+            hasher.update(&target.failure_domain_key.to_le_bytes());
+        }
+        hasher.finalize().into()
+    }
+}
+
 /// A placement decision produced by a [`PlacementPlanner`].
 ///
 /// Encodes which devices receive replicas or shards for a given allocation
@@ -623,6 +821,17 @@ impl PlacementDecision {
     #[must_use]
     pub fn satisfied(&self) -> bool {
         self.device_targets.len() >= self.replica_count
+    }
+
+    /// Mint a replay receipt for this decision.
+    pub fn to_replay_receipt(
+        &self,
+        layout: &DurabilityLayoutV1,
+        devices: &[DeviceHealthCapacity],
+        request: &AllocationRequest,
+        topology_epoch: u64,
+    ) -> Result<PlacementReplayReceipt, PlacementReplayError> {
+        PlacementReplayReceipt::from_decision(self, layout, devices, request, topology_epoch)
     }
 }
 
@@ -1116,6 +1325,67 @@ const fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
     } else {
         ((value - 1) / divisor) + 1
     }
+}
+
+fn replay_shard_for_slot(
+    policy: DurabilityPolicy,
+    target_index: u16,
+) -> (u16, PlacementReplayShardRole) {
+    match policy {
+        DurabilityPolicy::Mirror { .. } => (target_index, PlacementReplayShardRole::Data),
+        DurabilityPolicy::ErasureStyle { data_shards, .. } => {
+            let role = if target_index < u16::from(data_shards) {
+                PlacementReplayShardRole::Data
+            } else {
+                PlacementReplayShardRole::Parity
+            };
+            (target_index, role)
+        }
+        DurabilityPolicy::Hybrid {
+            data_shards,
+            parity_shards,
+            ..
+        } => {
+            let copy_width = u16::from(data_shards) + u16::from(parity_shards);
+            let shard_index = target_index % copy_width;
+            let role = if shard_index < u16::from(data_shards) {
+                PlacementReplayShardRole::Data
+            } else {
+                PlacementReplayShardRole::Parity
+            };
+            (shard_index, role)
+        }
+    }
+}
+
+fn seal_policy(hasher: &mut blake3::Hasher, policy: DurabilityPolicy) {
+    hasher.update(&[policy.discriminant()]);
+    match policy {
+        DurabilityPolicy::Mirror { copies } => {
+            hasher.update(&[copies]);
+        }
+        DurabilityPolicy::ErasureStyle {
+            data_shards,
+            parity_shards,
+        } => {
+            hasher.update(&[data_shards, parity_shards]);
+        }
+        DurabilityPolicy::Hybrid {
+            mirror_copies,
+            data_shards,
+            parity_shards,
+        } => {
+            hasher.update(&[mirror_copies, data_shards, parity_shards]);
+        }
+    }
+}
+
+fn constant_time_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut acc = 0u8;
+    for i in 0..32 {
+        acc |= a[i] ^ b[i];
+    }
+    acc == 0
 }
 
 // Tests
@@ -1680,6 +1950,108 @@ mod tests {
             d1.device_targets, d2.device_targets,
             "different ring seeds should diverge placement"
         );
+    }
+
+    #[test]
+    fn replay_receipt_preserves_old_epoch_targets() {
+        let layout = mirror_layout(3);
+        let fd = node_fd();
+        let old_devices: Vec<_> = (0..10).map(|i| make_device(i, i, i, 100)).collect();
+        let new_devices: Vec<_> = (0..14).map(|i| make_device(i, i, i, 100)).collect();
+        let req = request(1, 1);
+
+        let old_epoch = 0;
+        let old_planner = HashRingPlacementPlanner::new(8, old_epoch);
+        let old_decision = old_planner
+            .plan_placement(&layout, &fd, &old_devices, &req)
+            .unwrap();
+        let receipt = old_decision
+            .to_replay_receipt(&layout, &old_devices, &req, old_epoch)
+            .unwrap();
+
+        let mut new_decision = None;
+        for new_epoch in 1..64 {
+            let planner = HashRingPlacementPlanner::new(8, new_epoch);
+            let candidate = planner
+                .plan_placement(&layout, &fd, &new_devices, &req)
+                .unwrap();
+            if candidate.device_targets != old_decision.device_targets {
+                new_decision = Some(candidate);
+                break;
+            }
+        }
+        let new_decision =
+            new_decision.expect("new topology epoch should choose a different target order");
+
+        assert!(receipt.verify_seal());
+        assert_eq!(receipt.topology_epoch, old_epoch);
+        assert_eq!(receipt.policy.total_shards(), 3);
+        assert_ne!(new_decision.device_targets, old_decision.device_targets);
+
+        let replayed = receipt.replay_decision().unwrap();
+        assert_eq!(replayed.device_targets, old_decision.device_targets);
+        assert_ne!(replayed.device_targets, new_decision.device_targets);
+        assert_eq!(replayed.deterministic_seed, old_epoch);
+    }
+
+    #[test]
+    fn replay_receipt_records_erasure_width_and_roles() {
+        let planner = default_planner();
+        let layout = erasure_layout(4, 2);
+        let fd = device_fd();
+        let devices: Vec<_> = (1..=6).map(|i| make_device(i, i, i, 1)).collect();
+        let req = request_bytes(7, 9, 4 * GIB);
+        let decision = planner
+            .plan_placement(&layout, &fd, &devices, &req)
+            .unwrap();
+
+        let receipt = decision
+            .to_replay_receipt(&layout, &devices, &req, 0)
+            .unwrap();
+
+        assert_eq!(receipt.targets.len(), 6);
+        assert_eq!(receipt.per_target_bytes, GIB);
+        assert_eq!(
+            receipt
+                .targets
+                .iter()
+                .filter(|target| target.shard_role == PlacementReplayShardRole::Data)
+                .count(),
+            4
+        );
+        assert_eq!(
+            receipt
+                .targets
+                .iter()
+                .filter(|target| target.shard_role == PlacementReplayShardRole::Parity)
+                .count(),
+            2
+        );
+        assert_eq!(receipt.replay_decision().unwrap(), decision);
+    }
+
+    #[test]
+    fn replay_receipt_seal_rejects_tampered_targets() {
+        let planner = default_planner();
+        let layout = mirror_layout(2);
+        let fd = device_fd();
+        let devices = vec![make_device(1, 1, 1, 100), make_device(2, 2, 2, 100)];
+        let req = request(11, 13);
+        let decision = planner
+            .plan_placement(&layout, &fd, &devices, &req)
+            .unwrap();
+        let mut receipt = decision
+            .to_replay_receipt(&layout, &devices, &req, 0)
+            .unwrap();
+
+        assert!(receipt.verify_seal());
+        receipt.targets[0].device_id ^= 0x55;
+
+        assert!(!receipt.verify_seal());
+        assert!(matches!(
+            receipt.replay_decision(),
+            Err(PlacementReplayError::SealMismatch)
+        ));
     }
 
     // -- Failure-domain separation ---------------------------------
