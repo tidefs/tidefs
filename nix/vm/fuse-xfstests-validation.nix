@@ -1555,6 +1555,7 @@ CRASHCMDS
     QEMU_PID=$!
 
     QEMU_RC=0
+    QEMU_TIMED_OUT=0
     DUMPED_FOR_PANIC=0
     DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
     while kill -0 "$QEMU_PID" 2>/dev/null; do
@@ -1567,6 +1568,7 @@ CRASHCMDS
       now=$(date +%s)
       if [ "$now" -ge "$DEADLINE" ]; then
         echo "  QEMU timeout after ''${TIMEOUT_SEC}s"
+        QEMU_TIMED_OUT=1
         capture_guest_crashdump "timeout"
         analyze_guest_crashdump
         kill -TERM "$QEMU_PID" 2>/dev/null || true
@@ -1626,6 +1628,25 @@ CRASHCMDS
       echo "BLOCKED: harness_no_validation_rows -- no validation rows parsed from QEMU boot log" >> "$VAL_LOG"
     fi
     ALL_OPS=$(validation_ops)
+
+    if [ "$QEMU_TIMED_OUT" -eq 1 ]; then
+      ACTIVE_XFSTEST=$(
+        grep -aE '^=== Running [^[:space:]]+ ===$' "$VAL_LOG" 2>/dev/null \
+          | tail -1 \
+          | sed 's/^=== Running //; s/ ===$//' \
+          | tr -d '\r' || true
+      )
+      if [ -n "$ACTIVE_XFSTEST" ]; then
+        active_op="xfstests_$ACTIVE_XFSTEST"
+        if ! printf '%s\n' "$ALL_OPS" | grep -Fx "$active_op" >/dev/null 2>&1; then
+          echo "FAIL: $active_op -- QEMU timeout after ''${TIMEOUT_SEC}s while row was active" >> "$VAL_LOG"
+          ALL_OPS=$(validation_ops)
+        fi
+      else
+        echo "BLOCKED: qemu_timeout -- QEMU timeout after ''${TIMEOUT_SEC}s before an active xfstests row was identified" >> "$VAL_LOG"
+        ALL_OPS=$(validation_ops)
+      fi
+    fi
 
     for requested in $TEST_LIST; do
       requested_op="xfstests_$requested"
