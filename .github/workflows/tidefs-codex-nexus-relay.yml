@@ -52,7 +52,7 @@ jobs:
 
           delivery="actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           signature="$(
-            "$perl_bin" -MDigest::SHA=hmac_sha256_hex -0777 -e '
+            "$perl_bin" -MDigest::SHA=hmac_sha256_hex -e '
               my ($secret_path, $event_path) = @ARGV;
               open my $sfh, "<", $secret_path or die "open secret: $!";
               my $secret = <$sfh>;
