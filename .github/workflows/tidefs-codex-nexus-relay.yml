@@ -1,0 +1,71 @@
+name: Codex Nexus Relay
+
+on:
+  issues:
+    types: [opened, edited, reopened, closed, assigned, unassigned, labeled, unlabeled]
+  issue_comment:
+    types: [created, edited, deleted]
+  pull_request:
+    branches: [master]
+    types: [opened, edited, synchronize, reopened, ready_for_review, converted_to_draft, closed, labeled, unlabeled]
+  push:
+    branches: [master]
+  workflow_run:
+    workflows:
+      - Focused Rust
+      - Nix Checks
+      - QEMU Smoke
+      - RDMA
+      - Release Candidate
+      - Rust Fast
+      - Secret Policy
+      - xfstests
+    types: [requested, completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    name: Relay event
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1' }}
+    runs-on: [self-hosted, linux, x64, tidefs]
+    timeout-minutes: 5
+    env:
+      NEXUS_WEBHOOK_URL: http://172.16.106.12/tidefs-codex-nexus/webhook/github
+      NEXUS_SECRET_FILE: /etc/tidefs-codex-nexus/webhook-secret
+
+    steps:
+      - name: Post signed event
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -r "$GITHUB_EVENT_PATH"
+          test -r "$NEXUS_SECRET_FILE"
+
+          delivery="actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          signature="$(
+            perl -MDigest::SHA=hmac_sha256_hex -0777 -e '
+              my ($secret_path, $event_path) = @ARGV;
+              open my $sfh, "<", $secret_path or die "open secret: $!";
+              my $secret = <$sfh>;
+              chomp $secret;
+              local $/;
+              open my $efh, "<", $event_path or die "open event: $!";
+              my $payload = <$efh>;
+              print "sha256=", hmac_sha256_hex($payload, $secret);
+            ' "$NEXUS_SECRET_FILE" "$GITHUB_EVENT_PATH"
+          )"
+
+          curl --fail --show-error --silent --max-time 20 \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Event: ${GITHUB_EVENT_NAME}" \
+            -H "X-GitHub-Delivery: ${delivery}" \
+            -H "X-Hub-Signature-256: ${signature}" \
+            --data-binary @"$GITHUB_EVENT_PATH" \
+            "$NEXUS_WEBHOOK_URL"
