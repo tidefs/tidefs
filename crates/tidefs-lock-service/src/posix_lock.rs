@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! POSIX byte-range lock manager with deadlock detection.
 //!
 //! Provides a local (non-clustered) per-inode lock table implementing

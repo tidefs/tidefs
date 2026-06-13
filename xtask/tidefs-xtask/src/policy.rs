@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Family {
@@ -148,6 +149,7 @@ pub fn check_current_workspace() -> Result<(), WorkspacePolicyError> {
     }
     check_package_profile_doc_name_drift(&root, &mut violations);
     check_excluded_fuzz_manifest_licenses(&root, &mut violations);
+    check_file_local_provenance_markers(&root, &mut violations);
 
     // ── Member-consistency audit: warn but don't fail ──
     let mut member_consistency_warnings = Vec::new();
@@ -271,6 +273,350 @@ fn parse_manifest_string_value(value: &str) -> Option<String> {
         result.push(ch);
     }
     None
+}
+
+const FUSER_GPLV2_EXAMPLE_FILES: &[&str] = &[
+    "crates/tidefs-fuser/examples/notify_inval_entry.rs",
+    "crates/tidefs-fuser/examples/notify_inval_inode.rs",
+    "crates/tidefs-fuser/examples/poll.rs",
+    "crates/tidefs-fuser/examples/poll_client.rs",
+];
+
+const KERNEL_GPL2_SPDX_FILES: &[&str] = &[
+    "crates/tidefs-block-kmod/tidefs_block_kmod.rs",
+    "crates/tidefs-kmod-posix-vfs/src/kernel_intent_writer.rs",
+    "crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_main.rs",
+    "crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_shim.c",
+    "kmod/smoke_module/rust_tidefs_smoke.rs",
+];
+
+const KERNEL_MODULE_LICENSE_FILES: &[&str] = &[
+    "crates/tidefs-block-kmod/tidefs_block_kmod.rs",
+    "crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_main.rs",
+    "kmod/smoke_module/rust_tidefs_smoke.rs",
+];
+
+const REQUIRED_PROVENANCE_DOC_ENTRIES: &[(&str, &str)] = &[
+    ("crates/tidefs-fuser", "MIT"),
+    (
+        "crates/tidefs-fuser/examples/notify_inval_entry.rs",
+        "GPLv2",
+    ),
+    (
+        "crates/tidefs-fuser/examples/notify_inval_inode.rs",
+        "GPLv2",
+    ),
+    ("crates/tidefs-fuser/examples/poll.rs", "GPLv2"),
+    ("crates/tidefs-fuser/examples/poll_client.rs", "GPLv2"),
+    ("crates/tidefs-block-kmod/tidefs_block_kmod.rs", "GPL-2.0"),
+    (
+        "crates/tidefs-kmod-posix-vfs/src/kernel_intent_writer.rs",
+        "GPL-2.0",
+    ),
+    (
+        "crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_main.rs",
+        "GPL-2.0",
+    ),
+    (
+        "crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_shim.c",
+        "GPL-2.0",
+    ),
+    ("kmod/smoke_module/rust_tidefs_smoke.rs", "GPL-2.0"),
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProvenanceMarkerKind {
+    SpdxLicense,
+    ManifestLicense,
+    KernelModuleLicense,
+    CopyrightNotice,
+    LicenseNotice,
+    PermissionNotice,
+    StaleLicenseString,
+}
+
+impl ProvenanceMarkerKind {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::SpdxLicense => "SPDX license",
+            Self::ManifestLicense => "manifest license",
+            Self::KernelModuleLicense => "kernel module license",
+            Self::CopyrightNotice => "copyright",
+            Self::LicenseNotice => "license notice",
+            Self::PermissionNotice => "permission notice",
+            Self::StaleLicenseString => "stale license string",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProvenanceMarker {
+    line: usize,
+    kind: ProvenanceMarkerKind,
+    value: String,
+}
+
+fn check_file_local_provenance_markers(root: &Path, violations: &mut Vec<String>) {
+    check_required_provenance_doc_entries(root, violations);
+
+    let files = match tracked_provenance_files(root) {
+        Ok(files) => files,
+        Err(err) => {
+            violations.push(err);
+            return;
+        }
+    };
+
+    for rel_path in files {
+        let path = root.join(&rel_path);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                violations.push(format!("cannot read provenance input {rel_path}: {err}"));
+                continue;
+            }
+        };
+
+        for marker in collect_file_local_provenance_markers(&rel_path, &text) {
+            if is_registered_provenance_marker(&rel_path, &marker) {
+                continue;
+            }
+            violations.push(format!(
+                "{}:{} has unregistered file-local {} marker `{}`; document the exception in docs/LICENSING.md or align it with `{}`",
+                rel_path,
+                marker.line,
+                marker.kind.as_str(),
+                provenance_marker_snippet(&marker.value),
+                TIDEFS_LICENSE,
+            ));
+        }
+    }
+}
+
+fn check_required_provenance_doc_entries(root: &Path, violations: &mut Vec<String>) {
+    let rel = "docs/LICENSING.md";
+    let text = match fs::read_to_string(root.join(rel)) {
+        Ok(text) => text,
+        Err(err) => {
+            violations.push(format!("cannot read {rel} for provenance inventory: {err}"));
+            return;
+        }
+    };
+
+    for (path, license) in REQUIRED_PROVENANCE_DOC_ENTRIES {
+        if !text.contains(path) || !text.contains(license) {
+            violations.push(format!(
+                "{rel} must document provenance exception `{path}` with license `{license}`"
+            ));
+        }
+    }
+}
+
+fn tracked_provenance_files(root: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|err| format!("cannot run git ls-files for provenance audit: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-files failed for provenance audit with status {}",
+            output.status
+        ));
+    }
+
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .filter(|rel_path| should_scan_provenance_file(rel_path))
+        .collect())
+}
+
+fn should_scan_provenance_file(rel_path: &str) -> bool {
+    if rel_path == "Cargo.lock"
+        || rel_path == "COPYING"
+        || rel_path == "docs/LICENSING.md"
+        || rel_path.starts_with("LICENSES/")
+    {
+        return false;
+    }
+
+    rel_path == "Cargo.toml"
+        || rel_path.ends_with("/Cargo.toml")
+        || rel_path.ends_with(".c")
+        || rel_path.ends_with(".h")
+        || rel_path.ends_with(".json")
+        || rel_path.ends_with(".md")
+        || rel_path.ends_with(".nix")
+        || rel_path.ends_with(".rs")
+        || rel_path.ends_with(".sh")
+        || rel_path.ends_with(".toml")
+        || rel_path.ends_with(".yaml")
+        || rel_path.ends_with(".yml")
+        || rel_path.ends_with("Dockerfile")
+        || rel_path.ends_with(".Dockerfile")
+        || rel_path.ends_with("Makefile")
+}
+
+fn collect_file_local_provenance_markers(rel_path: &str, text: &str) -> Vec<ProvenanceMarker> {
+    let mut markers = Vec::new();
+    for (line_idx, raw_line) in text.lines().enumerate() {
+        let line_number = line_idx + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if rel_path == "Cargo.toml" || rel_path.ends_with("/Cargo.toml") {
+            if let Some((key, value)) = trimmed.split_once('=') {
+                if key.trim() == "license" {
+                    if let Some(value) = parse_manifest_string_value(value.trim()) {
+                        markers.push(ProvenanceMarker {
+                            line: line_number,
+                            kind: ProvenanceMarkerKind::ManifestLicense,
+                            value,
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some((key, value)) = trimmed.split_once(':') {
+            if key.trim() == "license" {
+                if let Some(value) = parse_manifest_string_value(value.trim()) {
+                    markers.push(ProvenanceMarker {
+                        line: line_number,
+                        kind: ProvenanceMarkerKind::KernelModuleLicense,
+                        value,
+                    });
+                }
+            }
+        }
+
+        let Some(notice_text) = provenance_notice_text(rel_path, trimmed) else {
+            continue;
+        };
+        let lower_notice = notice_text.to_ascii_lowercase();
+
+        if notice_text.contains("UNLICENSED") || lower_notice.contains("proprietary codebase") {
+            markers.push(ProvenanceMarker {
+                line: line_number,
+                kind: ProvenanceMarkerKind::StaleLicenseString,
+                value: notice_text.to_string(),
+            });
+        }
+
+        if let Some(value) = notice_text.strip_prefix("SPDX-License-Identifier:") {
+            markers.push(ProvenanceMarker {
+                line: line_number,
+                kind: ProvenanceMarkerKind::SpdxLicense,
+                value: value.trim().to_string(),
+            });
+        }
+
+        if notice_text.contains("Copyright") || notice_text.starts_with("SPDX-FileCopyrightText:") {
+            markers.push(ProvenanceMarker {
+                line: line_number,
+                kind: ProvenanceMarkerKind::CopyrightNotice,
+                value: notice_text.to_string(),
+            });
+        }
+
+        if notice_text.contains("Permission is hereby granted") {
+            markers.push(ProvenanceMarker {
+                line: line_number,
+                kind: ProvenanceMarkerKind::PermissionNotice,
+                value: notice_text.to_string(),
+            });
+        }
+
+        if lower_notice.contains("licensed under")
+            || notice_text.contains("MIT License")
+            || notice_text.contains("Apache License")
+            || notice_text.contains("BSD 2-Clause License")
+            || notice_text.contains("BSD 3-Clause License")
+            || notice_text.contains("Mozilla Public License")
+            || notice_text.contains("ISC License")
+        {
+            markers.push(ProvenanceMarker {
+                line: line_number,
+                kind: ProvenanceMarkerKind::LicenseNotice,
+                value: notice_text.to_string(),
+            });
+        }
+    }
+    markers
+}
+
+fn provenance_notice_text<'a>(rel_path: &str, trimmed: &'a str) -> Option<&'a str> {
+    if is_comment_or_script_style_file(rel_path) {
+        return strip_provenance_comment_prefix(trimmed);
+    }
+    Some(trimmed)
+}
+
+fn is_comment_or_script_style_file(rel_path: &str) -> bool {
+    rel_path.ends_with(".c")
+        || rel_path.ends_with(".h")
+        || rel_path.ends_with(".json")
+        || rel_path.ends_with(".nix")
+        || rel_path.ends_with(".rs")
+        || rel_path.ends_with(".sh")
+        || rel_path.ends_with(".toml")
+        || rel_path.ends_with(".yaml")
+        || rel_path.ends_with(".yml")
+        || rel_path.ends_with("Dockerfile")
+        || rel_path.ends_with(".Dockerfile")
+        || rel_path.ends_with("Makefile")
+}
+
+fn strip_provenance_comment_prefix(trimmed: &str) -> Option<&str> {
+    for prefix in ["//!", "///", "//", "#", "*", "/*", "<!--"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return Some(rest.trim());
+        }
+    }
+    None
+}
+
+fn is_registered_provenance_marker(rel_path: &str, marker: &ProvenanceMarker) -> bool {
+    match marker.kind {
+        ProvenanceMarkerKind::StaleLicenseString => false,
+        ProvenanceMarkerKind::SpdxLicense => {
+            marker.value == TIDEFS_LICENSE
+                || (marker.value == "GPL-2.0" && KERNEL_GPL2_SPDX_FILES.contains(&rel_path))
+        }
+        ProvenanceMarkerKind::ManifestLicense => {
+            marker.value == TIDEFS_LICENSE
+                || (marker.value == "MIT" && rel_path == "crates/tidefs-fuser/Cargo.toml")
+        }
+        ProvenanceMarkerKind::KernelModuleLicense => {
+            marker.value == "GPL" && KERNEL_MODULE_LICENSE_FILES.contains(&rel_path)
+        }
+        ProvenanceMarkerKind::CopyrightNotice
+        | ProvenanceMarkerKind::LicenseNotice
+        | ProvenanceMarkerKind::PermissionNotice => is_registered_notice_file(rel_path),
+    }
+}
+
+fn is_registered_notice_file(rel_path: &str) -> bool {
+    rel_path == "crates/tidefs-fuser/LICENSE.md"
+        || rel_path == "crates/tidefs-fuser/README.md"
+        || FUSER_GPLV2_EXAMPLE_FILES.contains(&rel_path)
+}
+
+fn provenance_marker_snippet(value: &str) -> String {
+    const MAX: usize = 96;
+    let flattened = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= MAX {
+        flattened
+    } else {
+        format!("{}...", flattened.chars().take(MAX).collect::<String>())
+    }
 }
 
 /// Check that workspace members in root Cargo.toml match on-disk crate
@@ -1475,6 +1821,93 @@ mod tests {
         );
 
         assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn file_local_provenance_accepts_tidefs_spdx_marker() {
+        let text = "// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note\n";
+        let markers =
+            collect_file_local_provenance_markers("crates/tidefs-example/src/lib.rs", text);
+
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, ProvenanceMarkerKind::SpdxLicense);
+        assert!(is_registered_provenance_marker(
+            "crates/tidefs-example/src/lib.rs",
+            &markers[0],
+        ));
+    }
+
+    #[test]
+    fn file_local_provenance_rejects_unregistered_apache_spdx_marker() {
+        let text = "// SPDX-License-Identifier: Apache-2.0\n";
+        let markers =
+            collect_file_local_provenance_markers("crates/tidefs-example/src/lib.rs", text);
+
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, ProvenanceMarkerKind::SpdxLicense);
+        assert!(!is_registered_provenance_marker(
+            "crates/tidefs-example/src/lib.rs",
+            &markers[0],
+        ));
+    }
+
+    #[test]
+    fn file_local_provenance_accepts_registered_kernel_module_markers() {
+        let text = concat!(
+            "// SPDX-License-Identifier: GPL-2.0\n",
+            "license: \"GPL\",\n",
+        );
+        let markers =
+            collect_file_local_provenance_markers("kmod/smoke_module/rust_tidefs_smoke.rs", text);
+
+        assert_eq!(markers.len(), 2);
+        assert!(markers.iter().all(|marker| is_registered_provenance_marker(
+            "kmod/smoke_module/rust_tidefs_smoke.rs",
+            marker,
+        )));
+    }
+
+    #[test]
+    fn file_local_provenance_accepts_registered_fuser_notices() {
+        let text = r#"
+The MIT License (MIT)
+Copyright (c) 2020-present Christopher Berner
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+"#;
+        let markers = collect_file_local_provenance_markers("crates/tidefs-fuser/LICENSE.md", text);
+
+        assert_eq!(markers.len(), 3);
+        assert!(markers.iter().all(|marker| is_registered_provenance_marker(
+            "crates/tidefs-fuser/LICENSE.md",
+            marker,
+        )));
+    }
+
+    #[test]
+    fn file_local_provenance_flags_stale_license_strings() {
+        let text = "# Permissive licenses compatible with UNLICENSED proprietary codebase\n";
+        let markers = collect_file_local_provenance_markers("deny.toml", text);
+
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, ProvenanceMarkerKind::StaleLicenseString);
+        assert!(!is_registered_provenance_marker("deny.toml", &markers[0]));
+    }
+
+    #[test]
+    fn file_local_provenance_accepts_registered_fuser_manifest_license() {
+        let text = r#"
+[package]
+name = "fuser"
+license = "MIT"
+"#;
+        let markers = collect_file_local_provenance_markers("crates/tidefs-fuser/Cargo.toml", text);
+
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, ProvenanceMarkerKind::ManifestLicense);
+        assert!(is_registered_provenance_marker(
+            "crates/tidefs-fuser/Cargo.toml",
+            &markers[0],
+        ));
     }
 
     #[test]
