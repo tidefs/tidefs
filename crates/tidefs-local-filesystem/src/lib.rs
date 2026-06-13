@@ -2721,45 +2721,35 @@ impl LocalFileSystem {
         }
 
         let mut lifecycle = DatasetLifecycle::new();
+        let mut expected_snapshot_catalog_names = BTreeSet::new();
         for record in state.snapshots.values() {
-            let snapshot_root = TraversalRoot::new(
-                TraversalRootType::SnapshotCatalog,
-                BlockPointer(record.root.transaction_id),
-                record.root.generation,
-            );
-            let _ = lifecycle.pin_root(snapshot_root);
+            if !snapshot::snapshot_record_retains_data(record) {
+                continue;
+            }
+            lifecycle
+                .pin_root(snapshot::snapshot_record_traversal_root(record))
+                .map_err(|_| FileSystemError::CorruptState {
+                    reason: "snapshot authority lifecycle pin set is full during reopen",
+                })?;
+            expected_snapshot_catalog_names.insert(snapshot::snapshot_record_catalog_name(record));
+            snapshot::reconcile_snapshot_record_catalog_entry(&mut dataset_catalog, record)?;
         }
 
         // Reconcile durable snapshot state into the canonical dataset catalog.
-        // Each snapshot in state.snapshots is registered with a name-derived
-        // stable DatasetId so the catalog can serve mount_lookup and online
-        // rename for the mounted filesystem.
-        for (name_bytes, record) in &state.snapshots {
-            let name = match std::str::from_utf8(name_bytes) {
-                Ok(s) => s.to_string(),
-                Err(_) => continue,
-            };
-            if name == "root" {
-                continue;
+        // Only data-retaining snapshots and clones own dataset catalog entries;
+        // bookmarks are lightweight replication anchors and do not pin roots.
+        let catalog_entries =
+            dataset_catalog
+                .list_children("")
+                .map_err(|_| FileSystemError::CorruptState {
+                    reason: "snapshot authority catalog could not be inspected during reopen",
+                })?;
+        for (entry_name, _dataset_id) in catalog_entries {
+            if entry_name.starts_with("root@")
+                && !expected_snapshot_catalog_names.contains(&entry_name)
+            {
+                let _ = dataset_catalog.destroy(&entry_name);
             }
-            let catalog_name = format!("root@{name}");
-            if dataset_catalog.contains(&catalog_name) {
-                continue;
-            }
-            // Derive a stable DatasetId from the snapshot name.
-            let mut id_bytes = [0u8; 16];
-            let hash = blake3::hash(name.as_bytes());
-            id_bytes.copy_from_slice(&hash.as_bytes()[..16]);
-            let dataset_id = DatasetId::from_bytes(id_bytes);
-            let _ = dataset_catalog.create(
-                &catalog_name,
-                dataset_id,
-                DatasetType::Snapshot,
-                record.root.generation,
-                vec![],
-                DatasetFlags::NONE,
-                SyncGuarantee::default(),
-            );
         }
 
         // Persist the canonical dataset catalog to the pool store only for
@@ -4507,6 +4497,7 @@ impl LocalFileSystem {
         &mut self,
         name: impl AsRef<str>,
     ) -> Result<SnapshotRollbackReport> {
+        self.ensure_snapshot_authority_consistent()?;
         let name = snapshot_name_bytes(name.as_ref())?;
         let snapshot = self.state.snapshots.get(&name).cloned().ok_or_else(|| {
             FileSystemError::SnapshotNotFound {
@@ -4545,6 +4536,7 @@ impl LocalFileSystem {
     }
 
     pub fn export_changed_records(&mut self) -> Result<ChangedRecordExport> {
+        self.ensure_snapshot_authority_consistent()?;
         self.sync_all()?;
         let current_root = self.selected_current_root_summary()?;
         export_changed_records_from_root(
@@ -4566,6 +4558,7 @@ impl LocalFileSystem {
         &mut self,
         from_root: &CommittedRootSummary,
     ) -> Result<ChangedRecordExport> {
+        self.ensure_snapshot_authority_consistent()?;
         self.sync_all()?;
         let to_root = self.selected_current_root_summary()?;
         export_incremental_changed_records(

@@ -20,6 +20,10 @@ use crate::types::SnapshotSummary;
 use crate::LocalFileSystem;
 use crate::Result;
 use crate::ROOT_INODE_ID;
+use tidefs_dataset_lifecycle::{
+    BlockPointer, DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
+    TraversalRoot, TraversalRootType,
+};
 
 // ---------------------------------------------------------------------------
 // Public summary types
@@ -109,11 +113,258 @@ pub struct SnapshotRetentionReport {
     pub excluded_catalog_entries: usize,
 }
 
+pub(crate) fn snapshot_record_retains_data(record: &SnapshotRecord) -> bool {
+    matches!(record.kind, SnapshotKind::Snapshot | SnapshotKind::Clone)
+}
+
+pub(crate) fn snapshot_record_display_name(record: &SnapshotRecord) -> String {
+    String::from_utf8_lossy(&record.name).into_owned()
+}
+
+pub(crate) fn snapshot_record_catalog_name(record: &SnapshotRecord) -> String {
+    format!("root@{}", snapshot_record_display_name(record))
+}
+
+pub(crate) fn snapshot_record_dataset_id(record: &SnapshotRecord) -> DatasetId {
+    let display_name = snapshot_record_display_name(record);
+    let mut id_bytes = [0u8; 16];
+    let hash = blake3::hash(display_name.as_bytes());
+    id_bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    DatasetId::from_bytes(id_bytes)
+}
+
+pub(crate) fn snapshot_record_catalog_flags(record: &SnapshotRecord) -> DatasetFlags {
+    if record.kind == SnapshotKind::Clone {
+        DatasetFlags::NONE.union(DatasetFlags::CLONE)
+    } else {
+        DatasetFlags::NONE
+    }
+}
+
+pub(crate) fn snapshot_record_traversal_root(record: &SnapshotRecord) -> TraversalRoot {
+    TraversalRoot::new(
+        TraversalRootType::SnapshotCatalog,
+        BlockPointer(record.root.transaction_id),
+        record.root.generation,
+    )
+}
+
+pub(crate) fn snapshot_catalog_entry_matches(
+    catalog: &DatasetCatalog,
+    record: &SnapshotRecord,
+) -> bool {
+    if !snapshot_record_retains_data(record) {
+        return true;
+    }
+
+    let catalog_name = snapshot_record_catalog_name(record);
+    let Ok(dataset_id) = catalog.snapshot_lookup(&catalog_name) else {
+        return false;
+    };
+    let Some((path, _parent, dataset_type, _creation_txg, flags, _lifecycle_state)) =
+        catalog.get_by_id(&dataset_id)
+    else {
+        return false;
+    };
+
+    path == catalog_name
+        && dataset_type == DatasetType::Snapshot
+        && flags.contains(DatasetFlags::CLONE)
+            == snapshot_record_catalog_flags(record).contains(DatasetFlags::CLONE)
+}
+
+pub(crate) fn reconcile_snapshot_record_catalog_entry(
+    catalog: &mut DatasetCatalog,
+    record: &SnapshotRecord,
+) -> Result<bool> {
+    if !snapshot_record_retains_data(record) {
+        return Ok(false);
+    }
+
+    let catalog_name = snapshot_record_catalog_name(record);
+    let mut changed = false;
+
+    if catalog.contains(&catalog_name) && !snapshot_catalog_entry_matches(catalog, record) {
+        catalog
+            .destroy(&catalog_name)
+            .map_err(|_| FileSystemError::CorruptState {
+                reason: "snapshot authority catalog entry could not be replaced",
+            })?;
+        changed = true;
+    }
+
+    if !catalog.contains(&catalog_name) {
+        catalog
+            .create(
+                &catalog_name,
+                snapshot_record_dataset_id(record),
+                DatasetType::Snapshot,
+                record.root.generation,
+                vec![],
+                snapshot_record_catalog_flags(record),
+                SyncGuarantee::default(),
+            )
+            .map_err(|_| FileSystemError::CorruptState {
+                reason: "snapshot authority catalog entry could not be created",
+            })?;
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
+pub(crate) fn remove_snapshot_record_catalog_entry(
+    catalog: &mut DatasetCatalog,
+    record: &SnapshotRecord,
+) -> Result<bool> {
+    if !snapshot_record_retains_data(record) {
+        return Ok(false);
+    }
+
+    let catalog_name = snapshot_record_catalog_name(record);
+    if !catalog.contains(&catalog_name) {
+        return Ok(false);
+    }
+    catalog
+        .destroy(&catalog_name)
+        .map_err(|_| FileSystemError::CorruptState {
+            reason: "snapshot authority catalog entry could not be removed",
+        })?;
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // Clone operations
 // ---------------------------------------------------------------------------
 
 impl LocalFileSystem {
+    pub(crate) fn ensure_snapshot_authority_consistent(&self) -> Result<()> {
+        let mut expected_catalog_names = Vec::new();
+        let mut expected_roots = Vec::<(TraversalRoot, u32)>::new();
+
+        for record in self.state.snapshots.values() {
+            if !snapshot_record_retains_data(record) {
+                continue;
+            }
+
+            if !snapshot_catalog_entry_matches(&self.dataset_catalog, record) {
+                return Err(FileSystemError::CorruptState {
+                    reason: "snapshot authority catalog entry does not match snapshot state",
+                });
+            }
+
+            expected_catalog_names.push(snapshot_record_catalog_name(record));
+            let root = snapshot_record_traversal_root(record);
+            if let Some((_existing, count)) = expected_roots
+                .iter_mut()
+                .find(|(existing_root, _count)| *existing_root == root)
+            {
+                *count = count.saturating_add(1);
+            } else {
+                expected_roots.push((root, 1));
+            }
+        }
+
+        expected_catalog_names.sort();
+        let catalog_entries =
+            self.dataset_catalog
+                .list_children("")
+                .map_err(|_| FileSystemError::CorruptState {
+                    reason: "snapshot authority catalog could not be inspected",
+                })?;
+        for (entry_name, _dataset_id) in catalog_entries {
+            if entry_name.starts_with("root@")
+                && expected_catalog_names.binary_search(&entry_name).is_err()
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "snapshot authority catalog contains an orphan snapshot entry",
+                });
+            }
+        }
+
+        let expected_pin_total = expected_roots
+            .iter()
+            .map(|(_root, count)| *count)
+            .sum::<u32>();
+        if self
+            .lifecycle
+            .gc_pin_set()
+            .pin_count_by_type(TraversalRootType::SnapshotCatalog)
+            != expected_pin_total
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "snapshot authority lifecycle pin count does not match snapshot state",
+            });
+        }
+
+        for (root, expected_count) in expected_roots {
+            if self.lifecycle.gc_pin_set().pin_count(root) != expected_count {
+                return Err(FileSystemError::CorruptState {
+                    reason:
+                        "snapshot authority lifecycle pin refcount does not match snapshot state",
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ensure_snapshot_record_authority(&self, record: &SnapshotRecord) -> Result<()> {
+        if !snapshot_record_retains_data(record) {
+            return Err(FileSystemError::CorruptState {
+                reason: "snapshot authority record does not retain data",
+            });
+        }
+        if !snapshot_catalog_entry_matches(&self.dataset_catalog, record) {
+            return Err(FileSystemError::CorruptState {
+                reason: "snapshot authority catalog entry does not match snapshot record",
+            });
+        }
+        if self
+            .lifecycle
+            .gc_pin_set()
+            .pin_count(snapshot_record_traversal_root(record))
+            == 0
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "snapshot authority lifecycle pin is missing for snapshot record",
+            });
+        }
+        Ok(())
+    }
+
+    fn pin_snapshot_record_root(&mut self, record: &SnapshotRecord) -> Result<()> {
+        if !snapshot_record_retains_data(record) {
+            return Ok(());
+        }
+        self.lifecycle
+            .pin_root(snapshot_record_traversal_root(record))
+            .map_err(|_| FileSystemError::CorruptState {
+                reason: "snapshot authority lifecycle pin set is full",
+            })
+    }
+
+    fn unpin_snapshot_record_root(&mut self, record: &SnapshotRecord) {
+        if snapshot_record_retains_data(record) {
+            self.lifecycle
+                .unpin_root(snapshot_record_traversal_root(record));
+        }
+    }
+
+    fn reconcile_snapshot_record_catalog_entry(&mut self, record: &SnapshotRecord) -> Result<()> {
+        if reconcile_snapshot_record_catalog_entry(&mut self.dataset_catalog, record)? {
+            self.persist_dataset_catalog()?;
+        }
+        Ok(())
+    }
+
+    fn remove_snapshot_record_catalog_entry(&mut self, record: &SnapshotRecord) -> Result<()> {
+        if remove_snapshot_record_catalog_entry(&mut self.dataset_catalog, record)? {
+            self.persist_dataset_catalog()?;
+        }
+        Ok(())
+    }
+
     /// Create a writable clone from a source snapshot.
     ///
     /// The clone shares blocks with the origin snapshot. Writes to the clone
@@ -138,8 +389,26 @@ impl LocalFileSystem {
             });
         }
 
-        // Verify the source snapshot exists
-        let source = self.snapshot_summary(source_snapshot)?;
+        self.ensure_snapshot_authority_consistent()?;
+
+        // Verify the source snapshot exists and is protected by the snapshot
+        // catalog plus lifecycle-pin authority before sharing its root.
+        let source_record = self
+            .state
+            .snapshots
+            .get(&source_name_bytes)
+            .cloned()
+            .ok_or_else(|| FileSystemError::SnapshotNotFound {
+                name: source_snapshot.to_string(),
+            })?;
+        if !snapshot_record_retains_data(&source_record) {
+            return Err(FileSystemError::Unsupported {
+                operation: "create clone",
+                reason: "clone source must be a data-retaining snapshot or clone",
+            });
+        }
+        self.ensure_snapshot_record_authority(&source_record)?;
+        let source = source_record.summary();
 
         // Ensure no snapshot/clone/bookmark already has this name
         if self.state.snapshots.contains_key(&clone_name_bytes) {
@@ -173,6 +442,8 @@ impl LocalFileSystem {
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary_snapshot = summary.clone();
         self.commit_mutation(summary_snapshot)?;
+        self.pin_snapshot_record_root(&record)?;
+        self.reconcile_snapshot_record_catalog_entry(&record)?;
 
         Ok(clone_summary)
     }
@@ -207,12 +478,17 @@ impl LocalFileSystem {
             });
         }
 
+        self.ensure_snapshot_authority_consistent()?;
+
         self.begin_mutation();
         self.bump_generation();
         self.state.snapshots.remove(&name_bytes);
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
-        self.commit_mutation(record.summary())
+        let summary = self.commit_mutation(record.summary())?;
+        self.unpin_snapshot_record_root(&record);
+        self.remove_snapshot_record_catalog_entry(&record)?;
+        Ok(summary)
     }
 
     /// Promote a clone to an independent snapshot, severing the origin link.
@@ -246,6 +522,19 @@ impl LocalFileSystem {
             })?;
 
         let origin_str = String::from_utf8_lossy(&origin_name).into_owned();
+        self.ensure_snapshot_authority_consistent()?;
+        let origin_record = self.state.snapshots.get(&origin_name).cloned().ok_or(
+            FileSystemError::CorruptState {
+                reason: "clone promotion origin snapshot is missing",
+            },
+        )?;
+        if !snapshot_record_retains_data(&origin_record) {
+            return Err(FileSystemError::CorruptState {
+                reason: "clone promotion origin is not data-retaining",
+            });
+        }
+        self.ensure_snapshot_record_authority(&record)?;
+        self.ensure_snapshot_record_authority(&origin_record)?;
 
         self.begin_mutation();
         let generation = self.bump_generation();
@@ -263,6 +552,12 @@ impl LocalFileSystem {
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         self.commit_mutation(())?;
+        let promoted = self.state.snapshots.get(&record.name).cloned().ok_or(
+            FileSystemError::CorruptState {
+                reason: "promoted snapshot record disappeared before catalog reconciliation",
+            },
+        )?;
+        self.reconcile_snapshot_record_catalog_entry(&promoted)?;
 
         Ok(PromoteReport {
             name: name.to_string(),
@@ -791,6 +1086,39 @@ mod tests {
         fs.lifecycle().stats().per_root_pins[TraversalRootType::SnapshotCatalog.to_u8() as usize]
     }
 
+    fn snapshot_root(summary: &SnapshotSummary) -> TraversalRoot {
+        TraversalRoot::new(
+            TraversalRootType::SnapshotCatalog,
+            BlockPointer(summary.source_transaction_id),
+            summary.source_generation,
+        )
+    }
+
+    fn catalog_clone_flag(fs: &LocalFileSystem, name: &str) -> bool {
+        let catalog_name = format!("root@{name}");
+        let dataset_id = fs
+            .dataset_catalog()
+            .snapshot_lookup(&catalog_name)
+            .expect("snapshot catalog lookup");
+        let (path, _parent, dataset_type, _creation_txg, flags, _state) = fs
+            .dataset_catalog()
+            .get_by_id(&dataset_id)
+            .expect("snapshot catalog entry");
+        assert_eq!(path, catalog_name);
+        assert_eq!(dataset_type, DatasetType::Snapshot);
+        flags.contains(DatasetFlags::CLONE)
+    }
+
+    fn assert_snapshot_authority_error(err: FileSystemError) {
+        match err {
+            FileSystemError::CorruptState { reason } => assert!(
+                reason.contains("snapshot authority"),
+                "unexpected corrupt-state reason: {reason}"
+            ),
+            other => panic!("expected snapshot authority corrupt state, got {other:?}"),
+        }
+    }
+
     #[test]
     fn clone_create_delete() {
         let dir = temp_dir();
@@ -800,10 +1128,16 @@ mod tests {
 
         let snap = fs.create_snapshot("snap1").expect("create snapshot");
         assert_eq!(snap.name, "snap1");
+        assert!(fs.dataset_catalog().contains("root@snap1"));
+        assert!(!catalog_clone_flag(&fs, "snap1"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 1);
 
         let clone = fs.create_clone("clone1", "snap1").expect("create clone");
         assert_eq!(clone.origin, "snap1");
         assert_eq!(clone.name, "clone1");
+        assert!(fs.dataset_catalog().contains("root@clone1"));
+        assert!(catalog_clone_flag(&fs, "clone1"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 2);
 
         // Verify clone appears in extended listing
         let ext = fs.list_snapshots_extended();
@@ -817,9 +1151,13 @@ mod tests {
         // Delete clone
         let summary = fs.delete_clone("clone1").expect("delete clone");
         assert_eq!(summary.name, "clone1");
+        assert!(!fs.dataset_catalog().contains("root@clone1"));
+        assert!(fs.dataset_catalog().contains("root@snap1"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 1);
 
         // Clone gone but snapshot remains
         assert!(fs.delete_snapshot("snap1").is_ok());
+        assert_eq!(snapshot_catalog_pin_count(&fs), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -834,10 +1172,14 @@ mod tests {
         fs.create_snapshot("origin").expect("snapshot");
         let clone = fs.create_clone("myclone", "origin").expect("clone");
         assert_eq!(clone.origin, "origin");
+        assert!(catalog_clone_flag(&fs, "myclone"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 2);
 
         // Promote
         let report = fs.promote_clone("myclone").expect("promote");
         assert_eq!(report.previous_origin, "origin");
+        assert!(!catalog_clone_flag(&fs, "myclone"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 2);
 
         // Now it's a regular snapshot
         let ext = fs.list_snapshots_extended();
@@ -850,7 +1192,66 @@ mod tests {
 
         // Can delete both now
         fs.delete_snapshot("myclone").expect("delete promoted");
+        assert_eq!(snapshot_catalog_pin_count(&fs), 1);
         fs.delete_snapshot("origin").expect("delete origin");
+        assert_eq!(snapshot_catalog_pin_count(&fs), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clone_reopen_reconciles_missing_catalog_entry_and_pins() {
+        let dir = temp_dir();
+        {
+            let mut fs = new_fs(&dir);
+            seed_file(&mut fs, "/data.bin", b"clone-reconcile");
+            fs.create_snapshot("snap1").expect("snapshot");
+            fs.create_clone("clone1", "snap1").expect("clone");
+            fs.dataset_catalog_mut()
+                .destroy("root@clone1")
+                .expect("remove clone catalog entry");
+            fs.persist_dataset_catalog()
+                .expect("persist missing clone catalog entry");
+            assert!(!fs.dataset_catalog().contains("root@clone1"));
+        }
+
+        let fs = reopen_fs(&dir);
+        assert!(fs.dataset_catalog().contains("root@snap1"));
+        assert!(fs.dataset_catalog().contains("root@clone1"));
+        assert!(catalog_clone_flag(&fs, "clone1"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_rejects_snapshot_catalog_authority_mismatch() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        seed_file(&mut fs, "/data.bin", b"catalog-mismatch");
+        fs.create_snapshot("snap1").expect("snapshot");
+        fs.dataset_catalog_mut()
+            .destroy("root@snap1")
+            .expect("remove snapshot catalog entry");
+
+        let err = fs.rollback_to_snapshot("snap1").unwrap_err();
+        assert_snapshot_authority_error(err);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn send_export_rejects_snapshot_pin_authority_mismatch() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        seed_file(&mut fs, "/data.bin", b"pin-mismatch");
+        let snap = fs.create_snapshot("snap1").expect("snapshot");
+        fs.lifecycle_mut().unpin_root(snapshot_root(&snap));
+
+        let err = fs.export_changed_records().unwrap_err();
+        assert_snapshot_authority_error(err);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

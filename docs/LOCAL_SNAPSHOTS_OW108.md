@@ -52,6 +52,33 @@ Allocator reservation counts snapshot roots even when a snapshot source root is
 hidden behind newer root-slot versions, so new writes cannot spend capacity that
 is still needed for rollback.
 
+## Current lifecycle authority
+
+Current mounted snapshot lifecycle authority is the intersection of:
+
+- `state.snapshots` entries whose kind is a data-retaining regular snapshot or
+  clone;
+- the canonical dataset catalog entry at `root@<name>`;
+- the lifecycle GC pin for the full snapshot traversal-root identity.
+
+Retention pruning uses the explicit snapshot delete path, so hold-protected
+snapshots are skipped and pruned snapshots release the matching dataset catalog
+entry and lifecycle pin. Clone create/delete/promote transitions now maintain
+the same catalog and lifecycle-pin authority. Clone catalog entries carry the
+clone flag until promotion, and promotion repairs the catalog entry to a
+regular snapshot entry while preserving the traversal-root pin reference.
+
+Rollback and send/export entry points fail closed when data-retaining snapshot
+records do not match catalog entries or lifecycle pin refcounts. Reopen
+reconciles missing data-retaining snapshot catalog entries and pins from the
+durable snapshot catalog, and removes stale `root@...` catalog entries that no
+longer have a data-retaining snapshot record.
+
+This authority still does not close TFR-010. Snapshot-pinned bytes must later
+feed the placement receipt and rebuild/reclaim authority tracked by #17 and
+#18 before TideFS can claim unified deadlist, capacity, or distributed
+snapshot-reclaim correctness.
+
 ## Source surfaces
 
 - `LOCAL_SNAPSHOT_ROLLBACK_SPEC`
@@ -62,6 +89,10 @@ is still needed for rollback.
 - `LocalFileSystem::snapshot_summary`
 - `LocalFileSystem::create_snapshot`
 - `LocalFileSystem::delete_snapshot`
+- `LocalFileSystem::prune_snapshots`
+- `LocalFileSystem::create_clone`
+- `LocalFileSystem::delete_clone`
+- `LocalFileSystem::promote_clone`
 - `LocalFileSystem::rollback_to_snapshot`
 
 
