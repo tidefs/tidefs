@@ -568,6 +568,7 @@ mod tests {
             placed_on: member,
             placement_epoch: EpochId::new(1),
             subjects_placed: 1,
+            placement_receipt_refs: Vec::new(),
         };
         reg.record_placement(receipt);
 
