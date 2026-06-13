@@ -76,6 +76,12 @@ locations from the latest topology and assume the old bytes moved. When several
 receipts for the same logical object exist at the same topology epoch, the
 highest receipt generation is the newest locator authority.
 
+Before publishing receipt-backed allocations for a topology epoch, the local
+pool writes ACTIVE labels containing the pool GUID, device GUIDs, device count,
+and topology generation used by those receipts. A later open or create over the
+same media must recover that label authority before interpreting persisted
+receipts.
+
 Topology changes increment the placement epoch. Old receipts remain readable
 against their recorded device GUIDs while new allocations use the new epoch and
 the current eligible device set. Rebalance, rebuild, and reclaim are explicit
