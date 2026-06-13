@@ -39,6 +39,11 @@ may use non-secret repository variables for scheduling gates, such as
   helper so workflow changes get Actions coverage before merge.
 - `Secret Policy` runs on the same self-hosted TideFS runner labels and keeps
   the GitHub secret boundary checked without spending hosted Actions minutes.
+- `Codex Nexus Relay` is a self-hosted event bridge for the local
+  `tidefs-codex-nexus` dashboard. It does not run tests or checkout source; it
+  signs the original GitHub event payload with the host-local
+  `/etc/tidefs-codex-nexus/webhook-secret` file on `ci1`/`ci2` and posts it to
+  `http://172.16.106.12/tidefs-codex-nexus/webhook/github`.
 - `Nix Checks` runs on self-hosted TideFS runners and builds pure check
   derivations plus the core Nix packages.
 - `QEMU Smoke` runs the outside-sandbox kernel bootstrap smoke on self-hosted
@@ -71,3 +76,18 @@ gate so a specific lane can be run during bring-up.
 
 Runner host configuration and bring-up notes live in
 `tidefs/tidefs-infra-configuration`.
+
+## Codex Nexus Relay Recovery
+
+The relay HMAC secret is intentionally host-local. It must be present on each
+self-hosted runner VM as:
+
+```text
+/etc/tidefs-codex-nexus/webhook-secret
+```
+
+The file should be owned by `root:github-runner` with mode `0640`. To validate
+the event bridge after runner maintenance, confirm that the NixOS system
+profile still exposes the relay signer tools on each runner, dispatch the
+`Codex Nexus Relay` workflow against the target branch, and confirm the local
+dashboard event log records a signed `workflow_dispatch` event.
