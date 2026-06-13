@@ -4,25 +4,10 @@
 //!
 //! # Command classification
 //!
-//! | Command | Stage |
-//! |---|---|
-//! | `mount` | userspace harness (FUSE daemon launch) |
-//! | `pool create/scan/status/import/export/destroy` | operator commands |
-//! | `pool get/set/list-props` | operator commands |
-//! | `pool mount` | userspace harness (pool import + FUSE daemon launch) |
-//! | `pool integrity-check` | operator diagnostic |
-//! | `snapshot create/list/destroy/rollback/send/receive` | operator commands |
-//! | `device remove` | operator command; TFR-012 remains open |
-//! | `device rebuild` | operator command; TFR-012 remains open |
-//! | `defrag` | operator command |
-//! | `block attach/detach/list/send/receive` | operator commands |
-//! | `dataset create/list/destroy/rename` | operator command (catalog-backed) |
-//! | `dataset set-strategy/seal-key/rotate-key/upgrade/get/set/list-props` | operator commands |
-//! | `kernel status` | operator diagnostic/runtime inventory; production kernel UAPI not wired |
-//! | `diag` | operator diagnostic/support bundle |
-//! | `cluster pool create` | cluster operator prototype; TFR-017 remains open |
-//! | `cluster placement exercise` | development diagnostic exercise |
-//! | `cluster heal exercise` | development diagnostic exercise |
+//! The source of truth lives in
+//! [`commands::classification::COMMAND_SURFACES`]. Help text, docs, and claim
+//! gates consume or check that registry instead of keeping a separate command
+//! maturity table.
 //!
 //! # Pool owner routing
 //!
@@ -47,33 +32,7 @@ use tidefs_posix_filesystem_adapter_daemon::{self, MountConfig};
     name = "tidefsctl",
     version = env!("CARGO_PKG_VERSION"),
     about = "TideFS operator CLI and development harnesses",
-    long_about = r#"TideFS command-line interface.
-
-Primary operator groups:
-  pool      create, discover, import/export, inspect, and tune pools
-  dataset   manage the pool-wide dataset catalog and dataset properties
-  snapshot  create, list, destroy, roll back, send, and receive snapshots
-  device    remove or rebuild pool devices
-  block     attach, list, detach, send, and receive ublk block devices
-  kernel    inspect the declared kernel control endpoint and runtime inventory
-  diag      collect a redacted support bundle
-
-Development harnesses:
-  mount                         launch the current FUSE harness
-  pool mount                    import a pool and launch the FUSE harness
-  cluster placement exercise    run placement diagnostics
-  cluster heal exercise         run healing diagnostics
-
-Pool routing rule:
-  A pool name identifies an imported pool. Imported state is cached and must
-  be queried or changed through the live owner: the kernel UAPI in kernel
-  mode, or the userspace daemon owner in userspace mode. Explicit --devices
-  inputs are for offline, discovery, import, or not-yet-imported work, not
-  overrides for an imported pool. Directory object-store backing is not pool
-  media.
-
-TideFS is pre-alpha. Help text should mark harnesses as such instead of
-treating them as the final kernel runtime."#,
+    long_about = commands::classification::root_long_about(),
     after_help = "Start with `tidefsctl pool --help`, `tidefsctl dataset --help`, `tidefsctl kernel --help`, or `tidefsctl diag --help`. The book source lives under docs/book/.",
     arg_required_else_help = true,
 )]
@@ -268,6 +227,13 @@ fn handle_mount(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    fn render_long_help(mut command: clap::Command) -> String {
+        let mut buf = Vec::new();
+        command.write_long_help(&mut buf).expect("render help");
+        String::from_utf8(buf).expect("help should be UTF-8")
+    }
 
     #[test]
     fn cli_parse_mount_minimum() {
@@ -352,12 +318,12 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_pool_list_is_not_exposed() {
+    fn cli_parse_pool_list_as_hidden_removed_surface() {
         use clap::Parser;
         let args = Cli::try_parse_from(["tidefsctl", "pool", "list"]);
         assert!(
-            args.is_err(),
-            "pool list should not parse without a real pool registry"
+            args.is_ok(),
+            "pool list is a hidden removed surface so it can fail with a clear runtime error"
         );
     }
 
@@ -537,6 +503,83 @@ mod tests {
         use clap::Parser;
         let args = Cli::try_parse_from(["tidefsctl", "--help"]);
         assert!(args.is_err() || args.is_ok(), "--help should not panic");
+    }
+
+    #[test]
+    fn cli_long_help_uses_command_classification() {
+        let help = render_long_help(Cli::command());
+        assert!(help.contains(commands::classification::COMMAND_CLASSIFICATION_DOC_MARKER));
+        assert!(help.contains(commands::classification::COMMAND_CLASSIFICATION_SOURCE_PATH));
+        assert!(help.contains("Public operator commands:"));
+        assert!(help.contains("Userspace harnesses:"));
+        assert!(help.contains("Prototype surfaces:"));
+        assert!(help.contains("cluster placement exercise"));
+        assert!(help.contains("development-exercise"));
+        assert!(help.contains("not final distributed operator UAPI"));
+        assert!(help.contains("Explicit --devices"));
+    }
+
+    #[test]
+    fn command_help_hides_removed_surfaces() {
+        let pool_command = commands::pool::PoolCommand::command();
+        assert!(pool_command
+            .get_subcommands()
+            .find(|command| command.get_name() == "list")
+            .expect("hidden pool list command exists")
+            .is_hide_set());
+        let pool_help = render_long_help(pool_command);
+        assert!(!pool_help
+            .lines()
+            .any(|line| line.trim_start().starts_with("list ")));
+
+        #[derive(clap::Parser)]
+        struct DeviceHelpCli {
+            #[command(subcommand)]
+            cmd: commands::device::DeviceCommand,
+        }
+
+        let device_help = render_long_help(DeviceHelpCli::command());
+        assert!(!device_help
+            .lines()
+            .any(|line| line.trim_start().starts_with("rebuild ")));
+    }
+
+    #[test]
+    fn preview_uapi_doc_declares_command_classification_contract() {
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md");
+        let doc = std::fs::read_to_string(&doc_path).expect("read preview UAPI doc");
+
+        assert!(doc.contains(commands::classification::COMMAND_CLASSIFICATION_DOC_MARKER));
+        assert!(doc.contains(commands::classification::COMMAND_CLASSIFICATION_SOURCE_PATH));
+
+        for class in [
+            "public-operator",
+            "userspace-harness",
+            "operator-diagnostic",
+            "prototype",
+            "development-diagnostic",
+            "removed-or-unsupported",
+        ] {
+            assert!(
+                doc.contains(class),
+                "preview UAPI doc should mention classification class {class}"
+            );
+        }
+
+        for critical_surface in [
+            "cluster placement exercise",
+            "cluster heal exercise",
+            "cluster pool create",
+            "pool list",
+            "device rebuild",
+            "pool integrity-check --backing-dir",
+        ] {
+            assert!(
+                doc.contains(critical_surface),
+                "preview UAPI doc should mention {critical_surface}"
+            );
+        }
     }
 
     #[test]

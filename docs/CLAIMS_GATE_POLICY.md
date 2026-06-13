@@ -33,6 +33,8 @@ line clearly frames the capability as absent today, future work, or a goal:
 - must not claim mounted device-level compression or mounted device-level
   encryption while the TFR-006 raw-store inventory has blocked production
   rows.
+- must not claim final distributed operator UAPI status for prototype or
+  development-exercise `tidefsctl` commands.
 
 A line may mention one of those topics only when it is clearly framed as one of:
 
@@ -57,6 +59,17 @@ object-store compression and encryption wrappers may be discussed as helper
 or library-tier surfaces, but publishing-facing text must not present them as
 end-to-end mounted filesystem support until the transform authority records no
 blocked production raw-store paths.
+
+## Operator Command Classification
+
+The `tidefsctl` command classification authority is
+`apps/tidefsctl/src/commands/classification.rs`, marker
+`tidefsctl-command-classification-v1`. Publishing-facing docs must preserve
+the distinction between `public-operator`, `userspace-harness`,
+`operator-diagnostic`, `prototype`, `development-diagnostic`, and
+`removed-or-unsupported` command surfaces. In particular, `cluster placement
+exercise`, `cluster heal exercise`, and `cluster pool create` are not final
+distributed operator UAPI.
 
 ## Unreleased Authority Boundary
 

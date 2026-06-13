@@ -58,6 +58,7 @@ pub enum DeviceCommand {
     },
 
     /// Retired directory object-store device rebuild mode.
+    #[command(hide = true)]
     Rebuild {
         /// Retired directory object-store survivor mode.
         #[arg(

@@ -2,7 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, or RDMA data-path capability before matching proof exists; unreleased internal TideFS paths must not be framed as product compatibility or migration promises without a real external boundary";
+pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, RDMA data-path, or final distributed operator UAPI capability before matching proof exists; unreleased internal TideFS paths must not be framed as product compatibility or migration promises without a real external boundary; tidefsctl command classification is the public operator/harness/diagnostic/prototype/removed boundary";
 pub const CLAIMS_GATE_REQUIRED_COMMAND: &str = "cargo run -p tidefs-xtask -- check-claims-gate";
 
 pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
@@ -40,6 +40,7 @@ pub const CLAIMS_GATE_SENSITIVE_PATTERNS: &[&str] = &[
     "mounted compression",
     "mounted encryption",
     "end-to-end mounted filesystem support",
+    "final distributed operator uapi",
 ];
 
 const CLAIMS_GATE_ALLOWED_FRAMES: &[&str] = &[
@@ -106,6 +107,7 @@ pub enum ClaimGateRuleTopic {
     UnreleasedAuthority,
     EvidenceBeforeEscalation,
     MountedTransformAuthority,
+    OperatorCommandClassification,
 }
 
 impl ClaimGateRuleTopic {
@@ -120,6 +122,7 @@ impl ClaimGateRuleTopic {
             Self::UnreleasedAuthority => "claims_gate.unreleased_authority",
             Self::EvidenceBeforeEscalation => "claims_gate.evidence_before_escalation",
             Self::MountedTransformAuthority => "claims_gate.mounted_transform_authority",
+            Self::OperatorCommandClassification => "claims_gate.operator_command_classification",
         }
     }
 
@@ -132,6 +135,7 @@ impl ClaimGateRuleTopic {
             Self::UnreleasedAuthority => "unreleased authority boundary",
             Self::EvidenceBeforeEscalation => "proof before stronger claims",
             Self::MountedTransformAuthority => "mounted transform authority",
+            Self::OperatorCommandClassification => "operator command classification",
         }
     }
 }
@@ -171,6 +175,10 @@ pub const CLAIMS_GATE_RULES: &[ClaimGateRule] = &[
         topic: ClaimGateRuleTopic::MountedTransformAuthority,
         rule: "Mounted device-level compression and mounted device-level encryption claims are blocked until the TFR-006 raw-store inventory records no blocked production paths; lower object-store wrappers are helper/library tier, not end-to-end mounted filesystem support.",
     },
+    ClaimGateRule {
+        topic: ClaimGateRuleTopic::OperatorCommandClassification,
+        rule: "tidefsctl command classification must keep public operator commands, userspace harnesses, diagnostics, prototypes, development exercises, and removed surfaces in separate checked buckets; cluster placement/heal exercises and cluster pool prototypes are not final distributed operator UAPI.",
+    },
 ];
 
 pub const fn claims_gate_rules() -> &'static [ClaimGateRule] {
@@ -209,6 +217,27 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
         ],
         &mut missing,
     );
+    check_source_markers(
+        &root,
+        "apps/tidefsctl/src/commands/classification.rs",
+        &[
+            "tidefsctl-command-classification-v1",
+            "COMMAND_SURFACES",
+            "public-operator",
+            "userspace-harness",
+            "operator-diagnostic",
+            "prototype",
+            "development-diagnostic",
+            "removed-or-unsupported",
+            "cluster placement exercise",
+            "cluster heal exercise",
+            "not final distributed operator UAPI",
+            "pool list",
+            "device rebuild",
+            "live-owner-or-offline-input",
+        ],
+        &mut missing,
+    );
 
     for rel in CLAIMS_GATE_SCANNED_DOCS
         .iter()
@@ -232,6 +261,7 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "GitHub issue and pull request state",
             "unreleased authority boundary",
             "mounted transform authority",
+            "operator command classification",
             "MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY",
             "claims_gate_policy_covers_current_claim_boundaries",
         ],
@@ -250,6 +280,9 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "Unreleased Authority Boundary",
             "Mounted Transform Authority",
             "raw-store inventory",
+            "Operator Command Classification",
+            "tidefsctl-command-classification-v1",
+            "cluster placement exercise",
         ],
         &mut missing,
     );
@@ -294,6 +327,20 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "vfs_boundary_mirror",
             "production Linux ioctl, statx, or ublk ABI",
             "not proof that TideFS is kernelspace-ready",
+            "tidefsctl-command-classification-v1",
+            "apps/tidefsctl/src/commands/classification.rs",
+            "public-operator",
+            "userspace-harness",
+            "operator-diagnostic",
+            "prototype",
+            "development-diagnostic",
+            "removed-or-unsupported",
+            "cluster placement exercise",
+            "cluster heal exercise",
+            "not final distributed operator UAPI",
+            "pool list",
+            "device rebuild",
+            "pool integrity-check --backing-dir",
         ],
         &mut missing,
     );
@@ -337,6 +384,8 @@ fn check_source_bound_claim_rules(missing: &mut Vec<String>) {
         ClaimGateRuleTopic::WorkStateAuthority,
         ClaimGateRuleTopic::UnreleasedAuthority,
         ClaimGateRuleTopic::EvidenceBeforeEscalation,
+        ClaimGateRuleTopic::MountedTransformAuthority,
+        ClaimGateRuleTopic::OperatorCommandClassification,
     ] {
         if !rules.iter().any(|rule| rule.topic == topic) {
             missing.push(format!(
@@ -441,7 +490,7 @@ mod tests {
     #[test]
     fn claims_gate_policy_covers_current_claim_boundaries() {
         let rules = claims_gate_rules();
-        assert_eq!(rules.len(), 7);
+        assert_eq!(rules.len(), 8);
 
         for topic in [
             ClaimGateRuleTopic::ScannedPublishingSurfaces,
@@ -451,6 +500,7 @@ mod tests {
             ClaimGateRuleTopic::UnreleasedAuthority,
             ClaimGateRuleTopic::EvidenceBeforeEscalation,
             ClaimGateRuleTopic::MountedTransformAuthority,
+            ClaimGateRuleTopic::OperatorCommandClassification,
         ] {
             assert!(
                 rules.iter().any(|rule| rule.topic == topic),
@@ -469,6 +519,8 @@ mod tests {
             "proof",
             "Mounted device-level compression",
             "raw-store inventory",
+            "tidefsctl command classification",
+            "final distributed operator UAPI",
         ] {
             assert!(
                 rules.iter().any(|rule| rule.rule.contains(marker))
@@ -479,6 +531,7 @@ mod tests {
 
         assert!(CLAIMS_GATE_POLICY_SPEC.contains("matching proof"));
         assert!(CLAIMS_GATE_POLICY_SPEC.contains("unreleased internal TideFS paths"));
+        assert!(CLAIMS_GATE_POLICY_SPEC.contains("tidefsctl command classification"));
         assert!(CLAIMS_GATE_REQUIRED_COMMAND.contains("check-claims-gate"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"README.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/REVIEW_TODO_REGISTER.md"));
@@ -555,6 +608,19 @@ mod tests {
         ));
         assert!(!line_has_present_tense_overclaim(
             "not yet full-kernel capable"
+        ));
+    }
+
+    #[test]
+    fn claims_gate_rejects_unframed_final_distributed_operator_uapi_claims() {
+        assert!(line_has_present_tense_overclaim(
+            "cluster placement exercise is final distributed operator UAPI."
+        ));
+        assert!(!line_has_present_tense_overclaim(
+            "cluster placement exercise is not final distributed operator UAPI."
+        ));
+        assert!(!line_has_present_tense_overclaim(
+            "cluster pool create remains a prototype and is not final distributed operator UAPI."
         ));
     }
 }
