@@ -41,9 +41,12 @@ may use non-secret repository variables for scheduling gates, such as
   the GitHub secret boundary checked without spending hosted Actions minutes.
 - `Codex Nexus Relay` is a self-hosted event bridge for the local
   `tidefs-codex-nexus` dashboard. It does not run tests or checkout source; it
-  signs the original GitHub event payload with the host-local
-  `/etc/tidefs-codex-nexus/webhook-secret` file on `ci1`/`ci2` and posts it to
-  `http://172.16.106.12/tidefs-codex-nexus/webhook/github`.
+  relays issue, pull-request, push, and manual-dispatch events by signing the
+  original GitHub event payload with the host-local
+  `/etc/tidefs-codex-nexus/webhook-secret` file on `ci1`/`ci2` and posting it
+  to `http://172.16.106.12/tidefs-codex-nexus/webhook/github`. Comment and
+  workflow-run events stay out of the relay to avoid recursive automation
+  chatter; the Nexus safety poll still refreshes workflow state.
 - `Nix Checks` runs on self-hosted TideFS runners and builds pure check
   derivations plus the core Nix packages.
 - `QEMU Smoke` runs the outside-sandbox kernel bootstrap smoke on self-hosted
