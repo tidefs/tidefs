@@ -834,7 +834,8 @@ impl PoolImport {
 
     /// Read the superblock from each device and verify all agree on the
     /// critical fields: pool_uuid, pool_state, topology_generation,
-    /// device_count, feature flags, and commit_group.
+    /// device_count, pool-wide redundancy policy, feature flags, and
+    /// commit_group.
     fn verify_superblock(&mut self) -> Result<(), ImportError> {
         // Gate: refuse import if pool state is Destroyed.
         if !self.pool_config.state.is_importable() {
@@ -848,6 +849,8 @@ impl PoolImport {
         let mut pool_states: Vec<tidefs_types_pool_label_core::PoolState> = Vec::new();
         let mut topology_generations: Vec<u64> = Vec::new();
         let mut device_counts: Vec<u32> = Vec::new();
+        let mut redundancy_policies: Vec<tidefs_types_pool_label_core::PoolRedundancyPolicy> =
+            Vec::new();
         let mut commit_groups: Vec<u64> = Vec::new();
         let mut incompat_flags: Vec<u64> = Vec::new();
 
@@ -859,6 +862,7 @@ impl PoolImport {
                     pool_states.push(label.pool_state);
                     topology_generations.push(label.topology_generation);
                     device_counts.push(label.device_count);
+                    redundancy_policies.push(label.redundancy_policy);
                     commit_groups.push(label.commit_group);
                     incompat_flags.push(label.features_incompat);
                 }
@@ -921,6 +925,30 @@ impl PoolImport {
                     values: device_counts.iter().map(|c| c.to_string()).collect(),
                 });
             }
+        }
+
+        // Pool-wide redundancy policy must agree across every member label.
+        // It is allocation policy identity, not a fixed vdev topology.
+        let first_policy = redundancy_policies[0];
+        for policy in &redundancy_policies {
+            if *policy != first_policy {
+                return Err(ImportError::SuperblockDisagreement {
+                    field: "redundancy_policy".to_string(),
+                    values: redundancy_policies
+                        .iter()
+                        .map(|policy| policy.to_string())
+                        .collect(),
+                });
+            }
+        }
+        if first_policy != self.pool_config.redundancy_policy {
+            return Err(ImportError::SuperblockDisagreement {
+                field: "redundancy_policy".to_string(),
+                values: vec![
+                    format!("config={}", self.pool_config.redundancy_policy),
+                    format!("label={first_policy}"),
+                ],
+            });
         }
 
         // Check for incompatible feature flags: only reject flags that are
@@ -1168,6 +1196,7 @@ impl PoolImport {
         let pool_name = self.pool_config.pool_name.clone();
         let topology_gen = self.pool_config.topology_generation;
         let device_count = self.pool_config.device_count;
+        let redundancy_policy = self.pool_config.redundancy_policy;
 
         for device in &mut self.devices {
             // Read and decode the existing label.
@@ -1202,6 +1231,7 @@ impl PoolImport {
             new_label.device_read_errors = old_label.device_read_errors;
             new_label.device_write_errors = old_label.device_write_errors;
             new_label.device_checksum_errors = old_label.device_checksum_errors;
+            new_label.redundancy_policy = redundancy_policy;
 
             // Seal (compute checksum), encode, and write.
             let sealed = tidefs_types_pool_label_core::seal_label(new_label).map_err(|e| {
@@ -1550,7 +1580,8 @@ mod tests {
     use std::io::Write;
     use tidefs_pool_scan::DeviceHealth;
     use tidefs_types_pool_label_core::{
-        encode_label, seal_label, DeviceClass, PoolLabelV1, PoolState, POOL_LABEL_V1_EXT_WIRE_SIZE,
+        encode_label, seal_label, DeviceClass, PoolLabelV1, PoolRedundancyPolicy, PoolState,
+        POOL_LABEL_V1_EXT_WIRE_SIZE,
     };
 
     /// Build a minimal single-device PoolConfig for testing.
@@ -1583,6 +1614,54 @@ mod tests {
         }
     }
 
+    fn make_two_device_config(
+        dev0: PathBuf,
+        dev1: PathBuf,
+        redundancy_policy: PoolRedundancyPolicy,
+    ) -> PoolConfig {
+        let tree = DeviceType::PoolWideData {
+            children: vec![
+                DeviceType::Leaf {
+                    device_path: dev0,
+                    device_guid: [0x10u8; 16],
+                    device_index: 0,
+                    capacity_bytes: 1024 * 1024,
+                    device_class: DeviceClass::Hdd,
+                    health: DeviceHealth::Online,
+                    read_errors: 0,
+                    write_errors: 0,
+                    checksum_errors: 0,
+                },
+                DeviceType::Leaf {
+                    device_path: dev1,
+                    device_guid: [0x11u8; 16],
+                    device_index: 1,
+                    capacity_bytes: 1024 * 1024,
+                    device_class: DeviceClass::Hdd,
+                    health: DeviceHealth::Online,
+                    read_errors: 0,
+                    write_errors: 0,
+                    checksum_errors: 0,
+                },
+            ],
+        };
+        PoolConfig {
+            pool_uuid: [0xAAu8; 16],
+            pool_name: "testpool".to_string(),
+            redundancy_policy,
+            device_tree: tree,
+            health: DeviceHealth::Online,
+            state: PoolState::Active,
+            total_capacity_bytes: 2 * 1024 * 1024,
+            allocated_bytes: 0,
+            feature_flags: 0,
+            topology_generation: 1,
+            device_count: 2,
+            missing_indices: Vec::new(),
+            removing_device_indices: vec![],
+        }
+    }
+
     /// Write a valid TideFS pool label at the start of a file.
     fn write_test_label(file: &mut File, pool_name: &str) {
         let label = PoolLabelV1::new([0xAAu8; 16], [0x01u8; 16], pool_name);
@@ -1607,10 +1686,33 @@ mod tests {
         device_count: u32,
         state: PoolState,
     ) {
+        write_test_label_for_device_with_policy(
+            file,
+            pool_guid,
+            device_guid,
+            pool_name,
+            device_index,
+            device_count,
+            state,
+            PoolRedundancyPolicy::replicated(1),
+        );
+    }
+
+    fn write_test_label_for_device_with_policy(
+        file: &mut File,
+        pool_guid: [u8; 16],
+        device_guid: [u8; 16],
+        pool_name: &str,
+        device_index: u32,
+        device_count: u32,
+        state: PoolState,
+        redundancy_policy: PoolRedundancyPolicy,
+    ) {
         let mut label = PoolLabelV1::new(pool_guid, device_guid, pool_name);
         label.pool_state = state;
         label.device_index = device_index;
         label.device_count = device_count;
+        label.redundancy_policy = redundancy_policy;
         let sealed = seal_label(label).unwrap();
         let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         encode_label(&sealed, &mut buf).unwrap();
@@ -1699,6 +1801,57 @@ mod tests {
         match result.unwrap_err() {
             ImportError::BadPoolState { .. } => {}
             e => panic!("expected BadPoolState, got {e}"),
+        }
+    }
+
+    #[test]
+    fn verify_superblock_rejects_redundancy_policy_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = dir.path().join("device0");
+        let dev1 = dir.path().join("device1");
+        {
+            let mut f = File::create(&dev0).unwrap();
+            write_test_label_for_device_with_policy(
+                &mut f,
+                [0xAAu8; 16],
+                [0x10u8; 16],
+                "testpool",
+                0,
+                2,
+                PoolState::Active,
+                PoolRedundancyPolicy::replicated(2),
+            );
+        }
+        {
+            let mut f = File::create(&dev1).unwrap();
+            write_test_label_for_device_with_policy(
+                &mut f,
+                [0xAAu8; 16],
+                [0x11u8; 16],
+                "testpool",
+                1,
+                2,
+                PoolState::Active,
+                PoolRedundancyPolicy::erasure(1, 1),
+            );
+        }
+
+        let config = make_two_device_config(
+            dev0.clone(),
+            dev1.clone(),
+            PoolRedundancyPolicy::replicated(2),
+        );
+        let lock_dir = dir.path().join("locks");
+        let mut import = PoolImport::new(config, &lock_dir, None, None);
+        import.open_vdevs().unwrap();
+
+        match import.verify_superblock().unwrap_err() {
+            ImportError::SuperblockDisagreement { field, values } => {
+                assert_eq!(field, "redundancy_policy");
+                assert!(values.contains(&"replicated=2".to_string()));
+                assert!(values.contains(&"erasure=1+1".to_string()));
+            }
+            err => panic!("expected redundancy policy disagreement, got {err}"),
         }
     }
 
@@ -2135,6 +2288,61 @@ mod tests {
             reopened.stats.key_fingerprint, outcome.encryption_key_fingerprint,
             "re-import key fingerprint must match create key fingerprint"
         );
+    }
+
+    #[test]
+    fn pool_import_preserves_erasure_policy_after_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = dir.path().join("device0");
+        let dev1 = dir.path().join("device1");
+        let dev2 = dir.path().join("device2");
+        for path in [&dev0, &dev1, &dev2] {
+            let f = File::create(path).unwrap();
+            f.set_len(2 * 1024 * 1024).unwrap();
+        }
+
+        let policy = PoolRedundancyPolicy::erasure(2, 1);
+        let config = crate::create::PoolCreateConfig {
+            pool_name: "erasure_import".into(),
+            pool_guid: Some([0xE1u8; 16]),
+            redundancy: policy,
+            encryption_key: None,
+            clustered: false,
+        };
+        crate::create::PoolCreator::create_pool(
+            &[dev0.clone(), dev1.clone(), dev2.clone()],
+            &config,
+        )
+        .unwrap();
+
+        let imported = pool_import(
+            &[dev0.clone(), dev1.clone(), dev2.clone()],
+            &dir.path().join("locks1"),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(imported.config.redundancy_policy, policy);
+
+        for (path, expected_index) in [(&dev0, 0), (&dev1, 1), (&dev2, 2)] {
+            let mut handle = DeviceHandle::open_ro(path, expected_index).unwrap();
+            let label =
+                tidefs_types_pool_label_core::decode_label(&handle.read_label_bytes().unwrap())
+                    .unwrap();
+            assert_eq!(label.pool_state, PoolState::Active);
+            assert_eq!(label.redundancy_policy, policy);
+        }
+
+        let reopened = pool_import(
+            &[dev0, dev1, dev2],
+            &dir.path().join("locks2"),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened.config.redundancy_policy, policy);
     }
 
     #[test]
