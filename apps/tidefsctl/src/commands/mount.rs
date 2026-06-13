@@ -385,7 +385,7 @@ pub fn handle_mount(args: PoolMountArgs) {
     };
 
     // Cluster label validation and lease acquisition.
-    let cluster_lease_token_bytes: Option<Vec<u8>> = if args.cluster {
+    let mount_authority = if args.cluster {
         match validate_cluster_pool_labels(&backing_dir, &args.devices) {
             Ok(()) => {
                 println!("cluster: pool labels confirmed CLUSTER_POOL_INCOMPAT");
@@ -541,14 +541,13 @@ pub fn handle_mount(args: PoolMountArgs) {
             }
         }
 
-        let token_bytes = bincode::serialize(&token).unwrap_or_default();
-        if token_bytes.is_empty() {
-            eprintln!("tidefsctl pool mount: failed to serialize lease token");
-            process::exit(1);
-        }
-        Some(token_bytes)
+        tidefs_posix_filesystem_adapter_daemon::MountAuthority::cluster_lease(pool_guid, token)
+            .unwrap_or_else(|err| {
+                eprintln!("tidefsctl pool mount: {err}");
+                process::exit(1);
+            })
     } else {
-        None
+        tidefs_posix_filesystem_adapter_daemon::MountAuthority::standalone()
     };
 
     let config = tidefs_posix_filesystem_adapter_daemon::MountConfig {
@@ -564,8 +563,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         block_devices: args.devices.clone(),
         dataset_path: Some(args.dataset.clone()),
         encryption: encryption_config,
-        cluster_authorized: args.cluster,
-        cluster_lease_token_bytes,
+        mount_authority,
     };
 
     if let Err(err) = tidefs_posix_filesystem_adapter_daemon::run_mount(config) {

@@ -25,7 +25,7 @@ use std::process;
 use clap::{Parser, Subcommand};
 
 use tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile;
-use tidefs_posix_filesystem_adapter_daemon::{self, MountConfig};
+use tidefs_posix_filesystem_adapter_daemon::{self, MountAuthority, MountConfig};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -214,8 +214,7 @@ fn handle_mount(
         block_devices: None,
         dataset_path: Some(dataset),
         encryption: encryption_config,
-        cluster_authorized: false,
-        cluster_lease_token_bytes: None,
+        mount_authority: MountAuthority::standalone(),
     };
 
     if let Err(err) = tidefs_posix_filesystem_adapter_daemon::run_mount(config) {

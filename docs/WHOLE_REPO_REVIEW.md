@@ -636,9 +636,9 @@ contradicted live handlers and cluster maturity:
 - commit `7dbb0759` also changes the source classification table so cluster
   placement/heal exercise commands are development diagnostics rather than
   final UAPI claims.
-- `mount` is a userspace harness path and hard-codes cluster authorization off
-  (`cluster_authorized: false`), while `pool mount --cluster` has separate
-  lease-token logic in the pool command module.
+- Issue #243 makes `mount` construct standalone daemon mount authority and
+  routes `pool mount --cluster` through typed `PoolLeaseToken` daemon
+  admission instead of a separate boolean/raw-token pairing.
 - `cluster pool create` now has a TCP transport adapter and quorum reporting,
   while adjacent cluster/orchestrator docs still say parts of live dispatch and
   runtime authority remain TFR-017 work.

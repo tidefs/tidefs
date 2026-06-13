@@ -432,19 +432,125 @@ pub struct MountConfig {
     /// When None, the root dataset is mounted.
     pub dataset_path: Option<String>,
 
-    /// When true, the mount was requested through cluster authority
-    /// (--cluster flag). The mount refuses to open the backing store
-    /// unless the cluster lease token is present and valid.
-    /// Default: false (standalone mount).
-    pub cluster_authorized: bool,
+    /// Authority used to admit the mount as standalone/local or
+    /// cluster-lease-authorized.
+    pub mount_authority: MountAuthority,
+}
 
-    /// Cluster lease token acquired from the storage-node when --cluster
-    /// is set. When present and valid, the mount proceeds with cluster
-    /// authority. When cluster_authorized is true and this is None, the
-    /// mount refuses.
-    /// Serialized as bincode bytes since the daemon crate does not depend
-    /// on tidefs-cluster directly.
-    pub cluster_lease_token_bytes: Option<Vec<u8>>,
+/// Mount authority material accepted by the daemon admission boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountAuthority {
+    /// Standalone/local mount with no cluster lease material.
+    Standalone,
+    /// Cluster mount authorized by a validated pool lease token.
+    ClusterLease(ClusterMountAuthority),
+}
+
+/// Raw mount authority material decoded at the daemon boundary.
+#[derive(Debug, Clone, Copy)]
+pub enum MountAuthorityWire<'a> {
+    Standalone {
+        lease_token_bytes: Option<&'a [u8]>,
+    },
+    ClusterLease {
+        expected_pool_guid: [u8; 16],
+        lease_token_bytes: Option<&'a [u8]>,
+    },
+}
+
+/// Validated cluster lease authority for a mounted pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterMountAuthority {
+    token: tidefs_cluster::PoolLeaseToken,
+}
+
+impl MountAuthority {
+    pub fn standalone() -> Self {
+        Self::Standalone
+    }
+
+    pub fn cluster_lease(
+        expected_pool_guid: [u8; 16],
+        token: tidefs_cluster::PoolLeaseToken,
+    ) -> Result<Self, String> {
+        validate_cluster_lease_token(&token, &expected_pool_guid)?;
+        Ok(Self::ClusterLease(ClusterMountAuthority { token }))
+    }
+
+    pub fn from_wire(wire: MountAuthorityWire<'_>) -> Result<Self, String> {
+        match wire {
+            MountAuthorityWire::Standalone {
+                lease_token_bytes: None,
+            } => Ok(Self::standalone()),
+            MountAuthorityWire::Standalone {
+                lease_token_bytes: Some(_),
+            } => Err("standalone mount cannot carry cluster lease token material".to_string()),
+            MountAuthorityWire::ClusterLease {
+                expected_pool_guid,
+                lease_token_bytes,
+            } => {
+                use bincode::Options;
+
+                let token_bytes = lease_token_bytes.ok_or_else(|| {
+                    "cluster mount requested but no cluster lease token provided: \
+                     acquire a lease from a live storage-node before mounting"
+                        .to_string()
+                })?;
+                let token: tidefs_cluster::PoolLeaseToken = bincode::DefaultOptions::new()
+                    .reject_trailing_bytes()
+                    .deserialize(token_bytes)
+                    .map_err(|e| {
+                        format!("cluster mount: corrupt or truncated lease token bytes: {e}")
+                    })?;
+                Self::cluster_lease(expected_pool_guid, token)
+            }
+        }
+    }
+
+    pub fn is_cluster_authorized(&self) -> bool {
+        matches!(self, Self::ClusterLease(_))
+    }
+
+    fn validate_for_pool(
+        &self,
+        pool_uuid: Option<&[u8; 16]>,
+    ) -> Result<Option<&tidefs_cluster::PoolLeaseToken>, String> {
+        match self {
+            Self::Standalone => Ok(None),
+            Self::ClusterLease(authority) => {
+                let expected_pool_guid = pool_uuid.ok_or_else(|| {
+                    "cluster mount: pool UUID is required to validate lease authority".to_string()
+                })?;
+                validate_cluster_lease_token(&authority.token, expected_pool_guid)?;
+                Ok(Some(&authority.token))
+            }
+        }
+    }
+}
+
+impl ClusterMountAuthority {
+    pub fn token(&self) -> &tidefs_cluster::PoolLeaseToken {
+        &self.token
+    }
+}
+
+fn validate_cluster_lease_token(
+    token: &tidefs_cluster::PoolLeaseToken,
+    expected_pool_guid: &[u8; 16],
+) -> Result<(), String> {
+    if token.node_id == 0 {
+        return Err("cluster mount: lease token has zero node_id".to_string());
+    }
+    if token.epoch.0 == 0 {
+        return Err("cluster mount: lease token has zero epoch".to_string());
+    }
+    if token.lease_id == 0 {
+        return Err("cluster mount: lease token has zero lease_id".to_string());
+    }
+    if !token.authorizes_pool(expected_pool_guid) {
+        return Err("cluster mount: lease token pool GUID mismatch".to_string());
+    }
+    Ok(())
 }
 
 /// Bootstrap the TideFS FUSE mount lifecycle.
@@ -467,46 +573,9 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     use tidefs_local_filesystem::vfs_engine_impl::VfsLocalFileSystem;
     use tidefs_local_filesystem::LocalFileSystem;
 
-    // Cluster mount gating: refuse to proceed without valid cluster lease.
-    if config.cluster_authorized {
-        match &config.cluster_lease_token_bytes {
-            Some(token_bytes) => {
-                // Decode the bincode-serialized PoolLeaseToken minimally.
-                // The token wire format starts with: node_id(u64), pool_guid([u8;16]),
-                // epoch(u64), lease_id(u64), slot(u64), write_fence(epoch u64, counter u64),
-                // expiration_deadline_ms(u64).
-                // Total = 8 + 16 + 8 + 8 + 8 + 8 + 8 + 8 = 72 bytes minimum.
-                if token_bytes.len() < 72 {
-                    return Err(
-                        "cluster mount: lease token bytes too short (corrupt or invalid)"
-                            .to_string(),
-                    );
-                }
-                // Validate node_id (first 8 bytes, little-endian) is nonzero.
-                let node_id = u64::from_le_bytes([
-                    token_bytes[0],
-                    token_bytes[1],
-                    token_bytes[2],
-                    token_bytes[3],
-                    token_bytes[4],
-                    token_bytes[5],
-                    token_bytes[6],
-                    token_bytes[7],
-                ]);
-                if node_id == 0 {
-                    return Err(
-                        "cluster mount: lease token has zero node_id (uninitialized)".to_string(),
-                    );
-                }
-            }
-            None => {
-                return Err(
-                    "cluster mount requested but no cluster lease token provided:                      the lease token must be acquired from a live storage-node via                      --cluster-node-addr before clustered pool mount can proceed"
-                        .to_string(),
-                );
-            }
-        }
-    }
+    let cluster_lease_token = config
+        .mount_authority
+        .validate_for_pool(config.pool_uuid.as_ref())?;
 
     fs::create_dir_all(&config.backing_dir)
         .map_err(|e| format!("create backing dir {}: {e}", config.backing_dir.display()))?;
@@ -619,29 +688,20 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     }
 
     // When cluster-authorized, wrap the engine in a placement-recording layer.
-    let vfs_engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> = if config
-        .cluster_authorized
-    {
-        let member_id = config
-            .cluster_lease_token_bytes
-            .as_ref()
-            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-            .unwrap_or(1);
-        let epoch = config
-            .cluster_lease_token_bytes
-            .as_ref()
-            .map(|b| u64::from_le_bytes([b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]]))
-            .unwrap_or(1);
-        let cluster_engine = crate::placement_recorder::ClusterPlacementVfsEngine::new(
-            base_engine,
-            config.backing_dir.clone(),
-            member_id,
-            epoch,
-        );
-        Box::new(cluster_engine)
-    } else {
-        Box::new(base_engine)
-    };
+    let vfs_engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> =
+        if let Some(token) = cluster_lease_token {
+            let member_id = token.node_id;
+            let epoch = token.epoch.0;
+            let cluster_engine = crate::placement_recorder::ClusterPlacementVfsEngine::new(
+                base_engine,
+                config.backing_dir.clone(),
+                member_id,
+                epoch,
+            );
+            Box::new(cluster_engine)
+        } else {
+            Box::new(base_engine)
+        };
     let mut adapter = fuse_vfs_adapter::FuseVfsAdapter::new(vfs_engine)
         .map_err(|e| format!("adapter init: {e:?}"))?
         .with_coherency_profile(config.coherency_profile);
@@ -949,6 +1009,160 @@ pub fn check_idmapped_mount(mountpoint: &std::path::Path) -> Result<(), String> 
     match check_idmapped_mount_from_text(&mountinfo, mountpoint) {
         Ok(()) => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod mount_authority_tests {
+    use super::*;
+    use tidefs_cluster::{EpochId, PoolLeaseToken, WriteFence};
+
+    const POOL_GUID: [u8; 16] = [0x42; 16];
+    const OTHER_POOL_GUID: [u8; 16] = [0x24; 16];
+
+    fn lease_token(node_id: u64, pool_guid: [u8; 16], epoch: u64, lease_id: u64) -> PoolLeaseToken {
+        PoolLeaseToken::new(
+            node_id,
+            pool_guid,
+            EpochId(epoch),
+            lease_id,
+            3,
+            WriteFence::new(EpochId(epoch), 9),
+            60_000,
+        )
+    }
+
+    fn token_bytes(token: &PoolLeaseToken) -> Vec<u8> {
+        bincode::serialize(token).expect("serialize lease token")
+    }
+
+    #[test]
+    fn standalone_mount_authority_is_local_only() {
+        let authority = MountAuthority::standalone();
+
+        assert!(!authority.is_cluster_authorized());
+        assert!(authority.validate_for_pool(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn standalone_wire_rejects_token_material() {
+        let bytes = token_bytes(&lease_token(7, POOL_GUID, 2, 99));
+        let err = MountAuthority::from_wire(MountAuthorityWire::Standalone {
+            lease_token_bytes: Some(&bytes),
+        })
+        .unwrap_err();
+
+        assert!(
+            err.contains("standalone mount cannot carry cluster lease token material"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cluster_wire_rejects_missing_token() {
+        let err = MountAuthority::from_wire(MountAuthorityWire::ClusterLease {
+            expected_pool_guid: POOL_GUID,
+            lease_token_bytes: None,
+        })
+        .unwrap_err();
+
+        assert!(
+            err.contains("no cluster lease token provided"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cluster_wire_rejects_short_token() {
+        let bytes = [0xAA, 0xBB, 0xCC];
+        let err = MountAuthority::from_wire(MountAuthorityWire::ClusterLease {
+            expected_pool_guid: POOL_GUID,
+            lease_token_bytes: Some(&bytes),
+        })
+        .unwrap_err();
+
+        assert!(
+            err.contains("corrupt or truncated lease token bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cluster_wire_rejects_corrupt_token() {
+        let mut bytes = token_bytes(&lease_token(7, POOL_GUID, 2, 99));
+        bytes.push(0xFF);
+        let err = MountAuthority::from_wire(MountAuthorityWire::ClusterLease {
+            expected_pool_guid: POOL_GUID,
+            lease_token_bytes: Some(&bytes),
+        })
+        .unwrap_err();
+
+        assert!(
+            err.contains("corrupt or truncated lease token bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cluster_wire_rejects_zero_node_token() {
+        let bytes = token_bytes(&lease_token(0, POOL_GUID, 2, 99));
+        let err = MountAuthority::from_wire(MountAuthorityWire::ClusterLease {
+            expected_pool_guid: POOL_GUID,
+            lease_token_bytes: Some(&bytes),
+        })
+        .unwrap_err();
+
+        assert!(err.contains("zero node_id"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn cluster_wire_rejects_pool_mismatch() {
+        let bytes = token_bytes(&lease_token(7, OTHER_POOL_GUID, 2, 99));
+        let err = MountAuthority::from_wire(MountAuthorityWire::ClusterLease {
+            expected_pool_guid: POOL_GUID,
+            lease_token_bytes: Some(&bytes),
+        })
+        .unwrap_err();
+
+        assert!(
+            err.contains("pool GUID mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cluster_wire_accepts_valid_lease_authority() {
+        let token = lease_token(7, POOL_GUID, 2, 99);
+        let bytes = token_bytes(&token);
+        let authority = MountAuthority::from_wire(MountAuthorityWire::ClusterLease {
+            expected_pool_guid: POOL_GUID,
+            lease_token_bytes: Some(&bytes),
+        })
+        .expect("valid token should decode into cluster mount authority");
+
+        let admitted = authority
+            .validate_for_pool(Some(&POOL_GUID))
+            .expect("authority should validate")
+            .expect("cluster authority should return lease token");
+
+        assert!(authority.is_cluster_authorized());
+        assert_eq!(admitted.node_id, token.node_id);
+        assert_eq!(admitted.epoch, token.epoch);
+        assert_eq!(admitted.lease_id, token.lease_id);
+    }
+
+    #[test]
+    fn cluster_authority_validates_for_mount_pool() {
+        let token = lease_token(7, POOL_GUID, 2, 99);
+        let authority = MountAuthority::cluster_lease(POOL_GUID, token.clone()).unwrap();
+        let admitted = authority
+            .validate_for_pool(Some(&POOL_GUID))
+            .expect("authority should validate")
+            .expect("cluster authority should return lease token");
+
+        assert!(authority.is_cluster_authorized());
+        assert_eq!(admitted.node_id, token.node_id);
+        assert_eq!(admitted.epoch, token.epoch);
     }
 }
 
