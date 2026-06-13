@@ -14,7 +14,7 @@ ignore = []
 version = 2
 confidence-threshold = 0.8
 
-# Permissive licenses compatible with UNLICENSED proprietary codebase
+# Permissive dependency licenses compatible with the TideFS GPLv2 syscall-note policy
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
