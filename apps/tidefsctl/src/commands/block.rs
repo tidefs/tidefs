@@ -200,6 +200,8 @@ fn handle_attach(
     drain_deadline_secs: u64,
     io_uring: bool,
 ) -> Result<(), String> {
+    let _guard = super::authz::require_local_only("block attach");
+
     let live_args = serde_json::json!({
         "nr_hw_queues": nr_hw_queues,
         "queue_depth": queue_depth,
@@ -355,6 +357,8 @@ fn handle_attach(
 // ── Detach ────────────────────────────────────────────────────────────
 
 fn handle_detach(device_id: u32) -> Result<(), String> {
+    let _guard = super::authz::require_local_only("block detach");
+
     use std::fs::OpenOptions;
     use std::os::fd::AsFd;
     use std::os::unix::fs::FileTypeExt;
@@ -443,6 +447,8 @@ fn handle_block_send(
     node_id: u64,
     server_node_id: u64,
 ) -> Result<(), String> {
+    let _guard = super::authz::require_local_only("block send");
+
     let live_args = serde_json::json!({
         "target_addr": target_addr.to_string(),
         "node_id": node_id,
@@ -505,6 +511,8 @@ fn handle_block_receive(
     node_id: u64,
     server_node_id: u64,
 ) -> Result<(), String> {
+    let _guard = super::authz::require_local_only("block receive");
+
     let live_args = serde_json::json!({
         "source_addr": source_addr.to_string(),
         "node_id": node_id,

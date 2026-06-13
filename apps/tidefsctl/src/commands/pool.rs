@@ -403,6 +403,8 @@ fn handle_pool_create(
     json: bool,
     file_devices: bool,
 ) {
+    let _guard = super::authz::require_local_only("pool create");
+
     // encryption is a pool-level feature; all other feature flags are
     // per-dataset (set via `tidefsctl dataset set-strategy`).
     let encrypt_pool = feature_flags.contains("encryption");
@@ -636,6 +638,8 @@ fn handle_pool_import(
     encryption_envelope: Option<PathBuf>,
     json: bool,
 ) {
+    let _guard = super::authz::require_local_only("pool import");
+
     let live_args = serde_json::json!({
         "read_only": read_only,
         "lock_dir": lock_dir.as_ref().map(|path| path.display().to_string()),
@@ -1525,6 +1529,8 @@ fn format_bytes(bytes: u64) -> String {
 // ---------------------------------------------------------------------------
 
 fn handle_pool_export(pool_name: String, devices: Option<Vec<PathBuf>>, force: bool) {
+    let _guard = super::authz::require_local_only("pool export");
+
     let device_paths = match devices {
         Some(d) if !d.is_empty() => d,
         _ => {
@@ -1577,6 +1583,8 @@ fn handle_pool_destroy(
     force: bool,
     zero_superblock: bool,
 ) {
+    let _guard = super::authz::require_local_only("pool destroy");
+
     let Some(devices) = devices.filter(|devices| !devices.is_empty()) else {
         super::live_owner::route_with_args(
             "pool",
@@ -1701,6 +1709,8 @@ fn handle_pool_get(pool: &str, devices: Option<&[PathBuf]>, property: &str) {
 }
 
 fn handle_pool_set(pool: &str, devices: Option<&[PathBuf]>, assignment: &str) {
+    let _guard = super::authz::require_local_only("pool set");
+
     let mut fs = open_pool_property_filesystem_with_live_args(
         pool,
         devices,

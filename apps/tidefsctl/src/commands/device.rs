@@ -92,6 +92,7 @@ pub fn handle_device(cmd: DeviceCommand) {
             failure_domain,
             force,
         } => {
+            let _guard = super::authz::require_local_only("device remove");
             if let Err(e) = handle_remove(
                 &pool_name,
                 &device_path,

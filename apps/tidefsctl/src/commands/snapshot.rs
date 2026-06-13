@@ -815,6 +815,8 @@ fn parse_incremental_from_root(
 }
 
 fn handle_create(args: SnapshotCreateArgs) {
+    let _guard = super::authz::require_local_only("snapshot create");
+
     let (pool, snapshot_name) =
         parse_named_snapshot_operands("create", args.backing_dir.as_ref(), &args.operands);
     let mut fs = open_filesystem_with_live_args(
@@ -867,6 +869,8 @@ fn handle_list(args: SnapshotListArgs) {
 }
 
 fn handle_destroy(args: SnapshotDestroyArgs) {
+    let _guard = super::authz::require_local_only("snapshot destroy");
+
     let (pool, snapshot_name) =
         parse_named_snapshot_operands("destroy", args.backing_dir.as_ref(), &args.operands);
     let mut fs = open_filesystem_with_live_args(
@@ -897,6 +901,8 @@ fn handle_destroy(args: SnapshotDestroyArgs) {
 }
 
 fn handle_rollback(args: SnapshotRollbackArgs) {
+    let _guard = super::authz::require_local_only("snapshot rollback");
+
     let (pool, snapshot_name) =
         parse_named_snapshot_operands("rollback", args.backing_dir.as_ref(), &args.operands);
     let mut fs = open_filesystem_with_live_args(
@@ -934,6 +940,8 @@ fn handle_rollback(args: SnapshotRollbackArgs) {
 }
 
 fn handle_send(args: SnapshotSendArgs) {
+    let _guard = super::authz::require_local_only("snapshot send");
+
     let live_args = serde_json::json!({
         "output": args.output.as_ref().map(|path| path.display().to_string()),
         "target_addr": args.target_addr.map(|addr| addr.to_string()),
@@ -1105,6 +1113,8 @@ fn handle_send(args: SnapshotSendArgs) {
 }
 
 fn handle_receive(args: SnapshotReceiveArgs) {
+    let _guard = super::authz::require_local_only("snapshot receive");
+
     if let Some(path) = args.backing_dir.as_ref() {
         eprintln!(
             "tidefsctl snapshot receive: {}",

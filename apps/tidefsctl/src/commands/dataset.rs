@@ -508,6 +508,8 @@ fn submit_cluster_delta(
 }
 
 fn handle_create(args: DatasetCreateArgs) {
+    let _guard = super::authz::require_local_only("dataset create");
+
     let devices_ref = args.devices.as_deref();
     let name = &args.name;
     let parent = &args.parent;
@@ -708,6 +710,8 @@ fn handle_list(args: DatasetListArgs) {
     }
 }
 fn handle_rename(args: DatasetRenameArgs) {
+    let _guard = super::authz::require_local_only("dataset rename");
+
     let old_name = &args.old_name;
     let new_name = &args.new_name;
 
@@ -786,6 +790,9 @@ fn handle_rename(args: DatasetRenameArgs) {
     }
 }
 fn handle_set_strategy(args: DatasetSetStrategyArgs) {
+    let mutates = !args.enable.is_empty() || !args.disable.is_empty();
+    let _guard = super::authz::require_local_only_when_mutating("dataset set-strategy", mutates);
+
     let devices_ref = args.devices.as_deref();
     let mut fs = open_filesystem_with_live_args(
         &args.pool,
@@ -957,6 +964,8 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
 /// are enabled with prerequisite checking (transitive dependencies are
 /// automatically satisfied in dependency order).
 fn handle_upgrade(args: DatasetUpgradeArgs) {
+    let _guard = super::authz::require_local_only("dataset upgrade");
+
     use tidefs_dataset_feature_flags::SupportedFeaturesV1;
     use tidefs_types_dataset_feature_flags_core::get_feature_class;
 
@@ -1158,6 +1167,8 @@ fn handle_get(args: DatasetGetArgs) {
     }
 }
 fn handle_set(args: DatasetSetArgs) {
+    let _guard = super::authz::require_local_only("dataset set");
+
     let mut fs = open_filesystem_with_live_args(
         &args.pool,
         args.devices.as_deref(),
@@ -1340,6 +1351,8 @@ fn handle_list_props(args: DatasetListPropsArgs) {
     }
 }
 fn handle_destroy(args: DatasetDestroyArgs) {
+    let _guard = super::authz::require_local_only("dataset destroy");
+
     let name = &args.name;
 
     if name == "root" {
@@ -1425,6 +1438,8 @@ fn format_dataset_id(id: &DatasetId) -> String {
 // ── seal-key handler ─────────────────────────────────────────────────
 
 fn handle_seal_key(args: DatasetSealKeyArgs) {
+    let _guard = super::authz::require_local_only("dataset seal-key");
+
     use tidefs_encryption::key_hierarchy::{DatasetDEK, PoolWrappingKey};
     use tidefs_encryption::key_manager::{KeyManager, KeyStore};
     use tidefs_local_object_store::StoreOptions;
@@ -1490,6 +1505,8 @@ fn handle_seal_key(args: DatasetSealKeyArgs) {
 // ── rotate-key handler ───────────────────────────────────────────────
 
 fn handle_rotate_key(args: DatasetRotateKeyArgs) {
+    let _guard = super::authz::require_local_only("dataset rotate-key");
+
     use tidefs_encryption::key_hierarchy::PoolWrappingKey;
     use tidefs_encryption::key_manager::{KeyRotation, KeyStore};
     use tidefs_local_object_store::StoreOptions;
