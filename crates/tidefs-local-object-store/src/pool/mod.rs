@@ -1438,7 +1438,7 @@ impl Pool {
 
     /// Build a PoolLabelV1 for a single device.
     fn build_label(&self, device_index: usize, device: &Device) -> PoolLabelV1 {
-        let device_guid: [u8; 16] = rand::random();
+        let device_guid = self.device_guid_for_index(device_index);
 
         let device_count = self.devices.len() as u32;
 
@@ -1648,16 +1648,9 @@ impl Pool {
     }
 
     fn resolve_receipt_target(&self, target: &PlacementReceiptTarget) -> Option<usize> {
-        if let Some(idx) = self
-            .device_guids
+        self.device_guids
             .iter()
             .position(|guid| *guid == target.device_guid)
-        {
-            return Some(idx);
-        }
-
-        let idx = target.device_index as usize;
-        (idx < self.devices.len()).then_some(idx)
     }
 
     fn device_health_capacity_for_index(&self, idx: usize) -> DeviceHealthCapacity {
@@ -4501,6 +4494,98 @@ mod tests {
         assert_invalid_options_reason_contains(
             pool.get(IoClass::Data, key),
             "placement receipt corrupt or unverifiable",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn receipt_target_resolution_requires_recorded_device_guid() {
+        let root = temp_dir("receipt-guid-authority");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let properties = PoolProperties::default();
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-guid-authority");
+        let payload = b"payload remains at same device index";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("placement receipt");
+        assert_eq!(receipt.targets.len(), 1);
+        let target_index = receipt.targets[0].device_index as usize;
+        assert_eq!(
+            pool.devices[target_index].get(key).unwrap(),
+            Some(payload.to_vec())
+        );
+
+        pool.device_guids[target_index] = deterministic_device_guid(99);
+
+        assert!(
+            pool.resolve_receipt_target(&receipt.targets[0]).is_none(),
+            "receipt targets are addressed by persistent GUID, not current index"
+        );
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            None,
+            "read must not fall back to the device currently occupying the old index"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn export_preserves_device_guids_used_by_existing_receipts() {
+        let root = temp_dir("receipt-guid-export");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-guid-export");
+        let payload = b"receipt survives export import by guid";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let before = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt before export");
+        let before_target_guids: BTreeSet<[u8; 16]> = before
+            .targets
+            .iter()
+            .map(|target| target.device_guid)
+            .collect();
+
+        pool.export().unwrap();
+        drop(pool);
+
+        let reopened = Pool::open(config, properties, &test_options()).unwrap();
+        let after = reopened
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt after import");
+        let after_target_guids: BTreeSet<[u8; 16]> = after
+            .targets
+            .iter()
+            .map(|target| target.device_guid)
+            .collect();
+
+        assert_eq!(after_target_guids, before_target_guids);
+        for target in &after.targets {
+            assert!(
+                reopened.resolve_receipt_target(target).is_some(),
+                "exported labels must preserve receipt target GUIDs"
+            );
+        }
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
         );
 
         let _ = std::fs::remove_dir_all(&root);

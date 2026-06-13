@@ -80,6 +80,11 @@ Topology changes increment the placement epoch. Old receipts remain readable
 against their recorded device GUIDs while new allocations use the new epoch and
 the current eligible device set. Rebalance, rebuild, and reclaim are explicit
 receipt-rewrite operations, not side effects of importing a newer topology map.
+Device labels must therefore preserve each member's stable `device_guid` across
+export/import, and receipt consumers must fail closed when a recorded GUID is
+absent. The old `device_index` field is only historical placement context; it is
+not a fallback locator after add, remove, replacement, or import changes the
+current device order.
 
 ### 3.1 PoolLabelV1 record
 
