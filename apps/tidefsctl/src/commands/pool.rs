@@ -74,6 +74,10 @@ pub enum PoolCommand {
         json: bool,
     },
 
+    /// Removed pool registry listing surface
+    #[command(hide = true)]
+    List,
+
     /// Show pool status
     Status {
         /// Pool name
@@ -319,6 +323,7 @@ pub fn handle_pool(cmd: PoolCommand) {
             json,
         } => handle_pool_status(pool_name, devices, json),
         PoolCommand::Scan { devices, json } => handle_pool_scan(devices, json),
+        PoolCommand::List => handle_removed_pool_list(),
         PoolCommand::Export {
             pool_name,
             devices,
@@ -786,6 +791,14 @@ fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
             entries.iter().filter(|e| e.has_tidefs_label).count()
         );
     }
+}
+
+fn handle_removed_pool_list() -> ! {
+    eprintln!(
+        "{}",
+        super::classification::removed_surface_error("pool list")
+    );
+    process::exit(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1956,6 +1969,18 @@ mod tests {
     fn redundancy_rejects_bad_erasure_shape() {
         let err = parse_pool_redundancy_policy("erasure=2").unwrap_err();
         assert!(err.contains("erasure=D+P"));
+    }
+
+    #[test]
+    fn pool_list_is_hidden_removed_surface_with_clear_error() {
+        use clap::Parser;
+        let cmd = PoolCommand::try_parse_from(["pool", "list"]).expect("parse hidden removal");
+        assert!(matches!(cmd, PoolCommand::List));
+
+        let msg = super::super::classification::removed_surface_error("pool list");
+        assert!(msg.contains("removed or unsupported"));
+        assert!(msg.contains("no authoritative pool registry exists"));
+        assert!(msg.contains("pool scan --devices"));
     }
 
     #[test]

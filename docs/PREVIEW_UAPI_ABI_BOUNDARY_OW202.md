@@ -29,7 +29,26 @@ exercised by `cargo test -p tidefs-schema-codec-vfs-boundary --all-targets`.
 This document is not proof that TideFS is kernelspace-ready. It does not freeze
 a production Linux ioctl, statx, or ublk ABI. The preview boundary mirrors are
 development scaffolding that will change before any production release.
-Production UAPI/ABI freeze requires a separate tracked Forgejo issue with
+Production UAPI/ABI freeze requires a separate tracked GitHub issue with
+
+## tidefsctl command classification contract
+
+Authority marker: `tidefsctl-command-classification-v1`.
+
+The source of truth is
+`apps/tidefsctl/src/commands/classification.rs`. `tidefsctl --help` consumes
+that registry for its long classification text, and focused tests check this
+document against the same marker. Command groups must not claim stronger
+stability than the class recorded there:
+
+| Class | Current surfaces | Contract |
+|---|---|---|
+| `public-operator` | `pool create`, `pool scan`, `pool status`, `pool import`, `pool export`, `pool destroy`, `pool get`, `pool set`, `pool list-props`, `snapshot create`, `snapshot list`, `snapshot destroy`, `snapshot rollback`, `snapshot send`, `snapshot receive`, `device remove`, `defrag`, `block attach`, `block detach`, `block list`, `block send`, `block receive`, `dataset create`, `dataset list`, `dataset destroy`, `dataset rename`, `dataset set-strategy`, `dataset seal-key`, `dataset rotate-key`, `dataset upgrade`, `dataset get`, `dataset set`, `dataset list-props` | Pool-name live state routes through the declared kernel/userspace live owner. Explicit `--devices` inputs are offline, discovery, import, or not-yet-imported inputs, not live-state overrides. |
+| `userspace-harness` | `mount`, `pool mount` | Current FUSE harness surfaces. They do not change mount default backing media, and they are not a production kernel runtime claim. |
+| `operator-diagnostic` | `pool integrity-check`, `kernel status`, `diag` | Diagnostic and support-bundle surfaces. `kernel status` is passive inventory while production kernel UAPI wiring is absent. |
+| `prototype` | `cluster pool create` | Prototype cluster operator surface. It is not final distributed operator UAPI and remains behind TFR-017 authority work. |
+| `development-diagnostic` | `cluster placement exercise`, `cluster heal exercise` | Development exercises for placement/heal code. They are not accepted as final distributed operator UAPI or proof of clustered product behavior. |
+| `removed-or-unsupported` | `pool list`, `device rebuild`, `directory-backed pool media`, `pool integrity-check --backing-dir`, `snapshot --backing-dir`, `block --backing-dir`, `device remove --backing-dir`, `device remove --surviving-dirs` | Hidden or retired surfaces must fail closed with clear errors. They must not appear as supported help entries or placeholder success paths. |
 
 ## Current Status
 

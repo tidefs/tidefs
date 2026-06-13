@@ -1,4 +1,5 @@
 pub mod block;
+pub mod classification;
 pub mod cluster;
 pub mod dataset;
 pub mod defrag;
