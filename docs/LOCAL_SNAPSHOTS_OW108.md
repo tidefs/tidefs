@@ -72,7 +72,9 @@ Rollback and send/export entry points fail closed when data-retaining snapshot
 records do not match catalog entries or lifecycle pin refcounts. Reopen
 reconciles missing data-retaining snapshot catalog entries and pins from the
 durable snapshot catalog, and removes stale `root@...` catalog entries that no
-longer have a data-retaining snapshot record.
+longer have a data-retaining snapshot record. Bookmark records remain
+non-retaining replication anchors and are excluded from send/recovery protected
+root expansion.
 
 This authority still does not close TFR-010. Snapshot-pinned bytes must later
 feed the placement receipt and rebuild/reclaim authority tracked by #17 and

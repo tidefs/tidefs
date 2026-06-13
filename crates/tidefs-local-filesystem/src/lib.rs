@@ -370,8 +370,8 @@ use tidefs_claim_ledger::{ClaimClass, ClaimEntryRecord, ClaimantRef};
 use tidefs_commit_group::{CommitGroupId, CommitGroupRecovery, CommitGroupSync, SyncGate};
 use tidefs_dataset_feature_flags::{FeatureFlags, SupportedFeaturesV1};
 use tidefs_dataset_lifecycle::{
-    BlockPointer, DatasetCatalog, DatasetFlags, DatasetId, DatasetLifecycle, DatasetType,
-    PoisonNotification, SyncGuarantee, TraversalRoot, TraversalRootType,
+    DatasetCatalog, DatasetFlags, DatasetId, DatasetLifecycle, DatasetType, PoisonNotification,
+    SyncGuarantee,
 };
 use tidefs_dataset_properties::PropertySet;
 use tidefs_extent_map::ExtentAllocator;
@@ -4403,40 +4403,18 @@ impl LocalFileSystem {
             hold_count: 0,
         };
         let summary = record.summary();
-        // Capture the display name before `name` is moved into state.snapshots.
-        let snapshot_display_name = String::from_utf8_lossy(&name).to_string();
-        let snapshot_catalog_name = format!("root@{snapshot_display_name}");
-        self.state.snapshots.insert(name, record);
+        self.state.snapshots.insert(name, record.clone());
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let result = self.commit_mutation(summary)?;
-        // Pin the snapshot catalog root in the GC pin set so the GC
-        // treats this snapshot’s object graph as reachable.
-        let snapshot_root = TraversalRoot::new(
-            TraversalRootType::SnapshotCatalog,
-            BlockPointer(result.source_transaction_id),
-            result.source_generation,
-        );
-        let _ = self.lifecycle.pin_root(snapshot_root);
-        // Update the canonical dataset catalog so it stays in sync with
-        // state.snapshots. Derive a stable DatasetId from the snapshot name.
-        if !self.dataset_catalog.contains(&snapshot_catalog_name) {
-            let mut id_bytes = [0u8; 16];
-            let hash = blake3::hash(snapshot_display_name.as_bytes());
-            id_bytes.copy_from_slice(&hash.as_bytes()[..16]);
-            let dataset_id = DatasetId::from_bytes(id_bytes);
-            let _ = self.dataset_catalog.create(
-                &snapshot_catalog_name,
-                dataset_id,
-                DatasetType::Snapshot,
-                result.source_generation,
-                vec![],
-                DatasetFlags::NONE,
-                SyncGuarantee::default(),
-            );
+        self.lifecycle
+            .pin_root(snapshot::snapshot_record_traversal_root(&record))
+            .map_err(|_| FileSystemError::CorruptState {
+                reason: "snapshot authority lifecycle pin set is full",
+            })?;
+        if snapshot::reconcile_snapshot_record_catalog_entry(&mut self.dataset_catalog, &record)? {
+            self.persist_dataset_catalog()?;
         }
-        // Persist the catalog so snapshot-catalog consistency survives crash.
-        let _ = self.persist_dataset_catalog();
         Ok(result)
     }
 
@@ -4460,36 +4438,18 @@ impl LocalFileSystem {
                 hold_count: record.hold_count,
             });
         }
-        // Unpin this specific snapshot root from the GC pin set so the GC
-        // can reclaim blocks that were only reachable via this snapshot.
-        // Unlike the old type-only unpin, this uses the full TraversalRoot
-        // identity (root_type + block_pointer) so deleting one snapshot
-        // does not unprotect another snapshot's object graph.
-        let snapshot_root = TraversalRoot::new(
-            TraversalRootType::SnapshotCatalog,
-            BlockPointer(record.root.transaction_id),
-            record.root.generation,
-        );
-        self.lifecycle.unpin_root(snapshot_root);
+        self.ensure_snapshot_authority_consistent()?;
         self.begin_mutation(); // was: let previous_state = self.state.clone()
         self.bump_generation();
-        // Capture display name before removing from state.snapshots.
-        let deleted_snapshot_name = String::from_utf8_lossy(&name).to_string();
         self.state.snapshots.remove(&name);
-        // Remove the snapshot from the canonical dataset catalog so the
-        // catalog stays in sync with state.snapshots.
-        let deleted_snapshot_catalog_name = format!("root@{deleted_snapshot_name}");
-        if self
-            .dataset_catalog
-            .contains(&deleted_snapshot_catalog_name)
-        {
-            let _ = self.dataset_catalog.destroy(&deleted_snapshot_catalog_name);
-        }
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary = self.commit_mutation(record.summary())?;
-        // Persist the catalog so snapshot removal survives crash.
-        let _ = self.persist_dataset_catalog();
+        self.lifecycle
+            .unpin_root(snapshot::snapshot_record_traversal_root(&record));
+        if snapshot::remove_snapshot_record_catalog_entry(&mut self.dataset_catalog, &record)? {
+            self.persist_dataset_catalog()?;
+        }
         Ok(summary)
     }
 
@@ -4504,6 +4464,13 @@ impl LocalFileSystem {
                 name: String::from_utf8_lossy(&name).into_owned(),
             }
         })?;
+        if !snapshot::snapshot_record_retains_data(&snapshot) {
+            return Err(FileSystemError::Unsupported {
+                operation: "rollback snapshot",
+                reason: "rollback target must be a data-retaining snapshot or clone",
+            });
+        }
+        self.ensure_snapshot_record_authority(&snapshot)?;
         // State-replacement operation: clone the old state as fallback,
         // then use the incremental loader to only reload changed inodes.
         let previous_state = self.state.clone();
