@@ -33,13 +33,13 @@
 //! - All others → `BLK_STS_IOERR`
 
 #[cfg(CONFIG_RUST)]
-use crate::tidefs_kmod_bridge::kernel_types::{Errno, KernelStorageIoCapabilities, VfsEngine};
+use crate::tidefs_kmod_bridge::kernel_types::{Errno, VfsEngine};
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge::BridgeError;
 #[cfg(not(CONFIG_RUST))]
 use tidefs_kmod_bridge::BridgeError;
 #[cfg(not(CONFIG_RUST))]
-use tidefs_vfs_engine::{Errno, KernelStorageIoCapabilities, VfsEngine};
+use tidefs_vfs_engine::{Errno, VfsEngine};
 
 // ── BlkMqStatus ─────────────────────────────────────────────────────────
 
@@ -411,8 +411,8 @@ mod tests {
     #[cfg(not(CONFIG_RUST))]
     use tidefs_kmod_bridge::kernel_types::KmodVec as Vec;
     use tidefs_vfs_engine::{
-        DirEntry, EngineDirHandle, EngineFileHandle, InodeAttr, InodeId, LockSpec, RequestCtx,
-        SetAttr,
+        DirEntry, EngineDirHandle, EngineFileHandle, InodeAttr, InodeId,
+        KernelStorageIoCapabilities, LockSpec, RequestCtx, SetAttr,
     };
 
     // ── In-memory block engine stub ────────────────────────────────────

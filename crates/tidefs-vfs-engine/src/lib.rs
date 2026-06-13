@@ -2202,7 +2202,7 @@ mod tests {
             attr.subtree_rev = attr.subtree_rev.saturating_add(1);
         }
 
-        fn next_timestamp(attr: &InodeAttr) -> u64 {
+        fn next_timestamp(attr: &InodeAttr) -> i64 {
             attr.posix
                 .atime_ns
                 .max(attr.posix.mtime_ns)
