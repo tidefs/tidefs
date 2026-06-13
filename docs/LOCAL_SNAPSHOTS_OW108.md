@@ -104,9 +104,15 @@ The source tests cover:
 - rollback publishing a new authenticated root instead of moving live state to
   an older root slot;
 - snapshot catalog persistence across reopen;
-- safe reclamation preserving snapshot roots so later rollback still works.
+- safe reclamation preserving snapshot roots so later rollback still works;
 - allocator reservation preserving hidden snapshot-root content before admitting
-  new writes.
+  new writes;
+- retention pruning of regular snapshots while skipping held snapshots and
+  excluding clones/bookmarks;
+- clone delete/promote/reopen reconciliation against catalog entries and
+  lifecycle pins;
+- rollback and send/export rejection when snapshot catalog or pin authority has
+  drifted.
 
 The implementation-tracked non-release gate is:
 
@@ -119,7 +125,7 @@ The stable implementation-tracked non-release command name is
 
 ## Still open
 
-This slice does not implement clones, a user-facing snapshot CLI, snapshot quota
+This slice does not implement a user-facing snapshot/clone CLI, snapshot quota
 policy, transparent snapshot browsing, incremental receive/resume, non-empty
 target merge, network send/receive transport, or distributed snapshot
 replication. v0.417 adds the first fresh-root changed-record send/receive pass
