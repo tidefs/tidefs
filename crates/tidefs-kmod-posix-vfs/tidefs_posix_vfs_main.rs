@@ -6803,9 +6803,6 @@ pub extern "C" fn tidefs_posix_vfs_engine_sync_fs(wait: core::ffi::c_int) -> cor
     }
 }
 
-/// Engine-backed final teardown hook for the C shim's kill_sb path.
-///
-/// The C shim keeps `s_fs_info` live until Linux has run `sync_fs` and
 /// Record cluster mount options on the mounted engine for carrier
 /// disclosure and node-identity tracking (issue #6671).
 ///
@@ -6870,6 +6867,9 @@ pub extern "C" fn tidefs_posix_vfs_engine_record_cluster_config(
     );
 }
 
+/// Engine-backed final teardown hook for the C shim's kill_sb path.
+///
+/// The C shim keeps `s_fs_info` live until Linux has run `sync_fs` and
 /// `put_super`, then calls this bridge for a final engine flush before it
 /// releases the mounted pool context.
 #[no_mangle]
