@@ -214,8 +214,7 @@ per-command routing labels.
 
 The command classes are part of the CLI contract. Help text, parser tests, and
 book text should change together when a command moves between classes. Cluster
-placement/heal exercises and `cluster pool create` are not final distributed
-operator UAPI.
+placement/heal exercises and `cluster pool create` are not final distributed operator UAPI.
 
 === Output Rules
 
