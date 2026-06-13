@@ -722,7 +722,10 @@ fn planner_replay_receipt_matches_receipt(receipt: &PlacementReceipt) -> bool {
     let Ok(layout) = receipt.policy.layout() else {
         return false;
     };
+    let (object_id, placement_key) = placement_key_pair(receipt.object_key);
     if replay_receipt.topology_epoch != receipt.epoch
+        || replay_receipt.object_id != object_id
+        || replay_receipt.placement_key != placement_key
         || replay_receipt.size_hint_bytes != receipt.payload_len
         || replay_receipt.failure_domain_level != receipt.failure_domain_level
         || replay_receipt.policy != layout.policy
@@ -4435,6 +4438,9 @@ mod tests {
         assert_eq!(replay.topology_epoch, receipt.epoch);
         assert_eq!(replay.size_hint_bytes, payload.len() as u64);
         assert_eq!(replay.policy, receipt.policy.layout().unwrap().policy);
+        let (expected_object_id, expected_placement_key) = placement_key_pair(key);
+        assert_eq!(replay.object_id, expected_object_id);
+        assert_eq!(replay.placement_key, expected_placement_key);
         assert_eq!(decision.device_targets, receipt_targets);
         assert_eq!(decision.failure_domain_level, receipt.failure_domain_level);
         assert_eq!(replay.targets.len(), receipt.targets.len());
@@ -4447,6 +4453,11 @@ mod tests {
                 target.role
             );
         }
+        let mut mismatched_key_receipt = receipt.clone();
+        mismatched_key_receipt.object_key = ObjectKey::from_name(b"wrong-replay-subject");
+        assert!(!planner_replay_receipt_matches_receipt(
+            &mismatched_key_receipt
+        ));
         assert_eq!(
             pool.get(IoClass::Data, key).unwrap(),
             Some(payload.to_vec())
