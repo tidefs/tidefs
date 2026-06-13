@@ -30,6 +30,8 @@ let
     QEMU_BIN="${pkgs.qemu}/bin/qemu-system-x86_64"
     BUSYBOX="${pkgs.busybox}/bin/busybox"
     GLIBC_LIB="${pkgs.glibc}/lib"
+    LDD_BIN="${pkgs.lib.getBin pkgs.glibc}/bin/ldd"
+    XZ_BIN="${pkgs.xz}/bin/xz"
     DEFAULT_KERNEL_IMG="${linuxKernel_7_0}/bzImage"
     DEFAULT_KERNEL_VMLINUX="${linuxKernel_7_0.dev}/vmlinux"
     DEFAULT_MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
@@ -173,7 +175,7 @@ if false; then
       exit 2
     fi
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$LDD_BIN"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -214,27 +216,35 @@ if false; then
     done
 
     if [ -z "$FUSE_KO" ]; then
-      echo "  FUSE: built-in or not found (CONFIG_FUSE_FS check)"
-      FUSE_BUILTIN=1
+      echo "  FUSE: no fuse.ko in module tree; guest will verify built-in support"
+      FUSE_KO_AVAILABLE=0
     else
       echo "  fuse.ko: $FUSE_KO"
-      FUSE_BUILTIN=0
+      FUSE_KO_AVAILABLE=1
     fi
+
+    ldd_runtime_paths() {
+      src="$1"
+      [ -f "$src" ] || return 0
+      if [ -x "$LDD_BIN" ]; then
+        "$LDD_BIN" "$src" 2>/dev/null
+      elif command -v ldd >/dev/null 2>&1; then
+        ldd "$src" 2>/dev/null
+      else
+        true
+      fi | grep -o "/nix/store/[^ ]*" | sort -u || true
+    }
 
     # ── Collect daemon shared library dependencies ─────────────────────
 
     echo "  Collecting daemon library dependencies..."
     DAEMON_LIBS=""
-    if command -v ldd >/dev/null 2>&1; then
-      DAEMON_LIBS=$(ldd "$FUSE_DAEMON" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
-    fi
+    DAEMON_LIBS=$(ldd_runtime_paths "$FUSE_DAEMON")
 
     # ── Collect xfstests dependencies ─────────────────────────────────
 
     XFSTESTS_LIBS=""
-    if [ -f "$XFSTESTS_BIN" ] && command -v ldd >/dev/null 2>&1; then
-      XFSTESTS_LIBS=$(ldd "$XFSTESTS_BIN" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
-    fi
+    XFSTESTS_LIBS=$(ldd_runtime_paths "$XFSTESTS_BIN")
 
     # ── Set up temp directory ──────────────────────────────────────────
 
@@ -288,12 +298,11 @@ if false; then
 
     copy_ldd_runtime_deps() {
       src="$1"
-      if command -v ldd >/dev/null 2>&1; then
-        (ldd "$src" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u || true) | while read -r lib; do
-          [ -f "$lib" ] || continue
-          copy_nix_store_file "$lib" 0 2>/dev/null || true
-        done
-      fi
+      ldd_runtime_paths "$src" | while read -r lib; do
+        [ -f "$lib" ] || continue
+        copy_nix_store_file "$lib" 0 2>/dev/null || true
+        cp -f "$lib" "$RUN_DIR/usr/lib/" 2>/dev/null || true
+      done
     }
 
     copy_runtime_binary() {
@@ -351,9 +360,9 @@ root:x:0:
 nobody:x:65534:
 GROUP
 
-    # Copy FUSE daemon binary
-    cp "$FUSE_DAEMON" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
-    chmod +x "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
+    # Copy the daemon and its runtime libraries through the same helper used
+    # for guest tools, so optional libraries such as libibverbs are staged.
+    copy_runtime_binary "$FUSE_DAEMON" tidefs-posix-filesystem-adapter-daemon
 
     # ── Install functional mount helper ──────────────────────────────
     cat > "$RUN_DIR/bin/tidefs-preview" << 'MOUNTHELPER'
@@ -493,17 +502,16 @@ MOUNTHELPER
     # Copy shared libraries
     for lib in $DAEMON_LIBS $XFSTESTS_LIBS; do
       if [ -f "$lib" ]; then
+        copy_nix_store_file "$lib" 0 2>/dev/null || true
         cp "$lib" "$RUN_DIR/usr/lib/" 2>/dev/null || true
       fi
     done
 
     # Copy the dynamic linker for the daemon
-    if command -v ldd >/dev/null 2>&1; then
-      LD_SO=$(ldd "$FUSE_DAEMON" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
-      if [ -n "$LD_SO" ] && [ -f "$LD_SO" ]; then
-        cp "$LD_SO" "$RUN_DIR/lib/" 2>/dev/null || true
-        chmod +x "$RUN_DIR/lib/$(basename "$LD_SO")" 2>/dev/null || true
-      fi
+    LD_SO=$(ldd_runtime_paths "$FUSE_DAEMON" | grep '/ld-linux' | head -1 || true)
+    if [ -n "$LD_SO" ] && [ -f "$LD_SO" ]; then
+      cp "$LD_SO" "$RUN_DIR/lib/" 2>/dev/null || true
+      chmod +x "$RUN_DIR/lib/$(basename "$LD_SO")" 2>/dev/null || true
     fi
 
     # Copy the glibc dynamic linker and essential shared libraries to
@@ -523,9 +531,17 @@ MOUNTHELPER
       echo "  WARNING: GLIBC_LIB not set; busybox/daemon may fail to start"
     fi
 
-    # Copy fuse.ko if available
-    if [ "$FUSE_BUILTIN" -eq 0 ]; then
-      cp "$FUSE_KO" "$RUN_DIR/lib/modules/fuse.ko"
+    # Copy fuse.ko if available. Compressed modules are expanded while the
+    # initrd is built so the tiny guest can use busybox insmod directly.
+    if [ "$FUSE_KO_AVAILABLE" -eq 1 ]; then
+      case "$FUSE_KO" in
+        *.xz)
+          "$XZ_BIN" -dc "$FUSE_KO" > "$RUN_DIR/lib/modules/fuse.ko"
+          ;;
+        *)
+          cp "$FUSE_KO" "$RUN_DIR/lib/modules/fuse.ko"
+          ;;
+      esac
     fi
 
     # ── Copy bash (extract shebang from xfstests-check) ───────────────
@@ -557,18 +573,17 @@ MOUNTHELPER
       ensure_run_dir "$RUN_DIR/$XFSTESTS_LIB"
       cp -R --no-preserve=mode,ownership "$XFSTESTS_LIB"/. "$RUN_DIR/$XFSTESTS_LIB/" 2>/dev/null || true
       find "$RUN_DIR/$XFSTESTS_LIB" -type d -exec chmod u+w {} + 2>/dev/null || true
-      if command -v ldd >/dev/null 2>&1; then
-        echo "  Collecting xfstests helper library dependencies..."
-        for helper_root in "$XFSTESTS_LIB/src" "$XFSTESTS_LIB/ltp"; do
-          [ -d "$helper_root" ] || continue
-          find "$helper_root" -maxdepth 2 -type f -perm -0100 -print 2>/dev/null | while read -r helper; do
-            (ldd "$helper" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u || true) | while read -r lib; do
-              [ -f "$lib" ] || continue
-              copy_nix_store_file "$lib" 0 2>/dev/null || true
-            done
+      echo "  Collecting xfstests helper library dependencies..."
+      for helper_root in "$XFSTESTS_LIB/src" "$XFSTESTS_LIB/ltp"; do
+        [ -d "$helper_root" ] || continue
+        find "$helper_root" -maxdepth 2 -type f -perm -0100 -print 2>/dev/null | while read -r helper; do
+          ldd_runtime_paths "$helper" | while read -r lib; do
+            [ -f "$lib" ] || continue
+            copy_nix_store_file "$lib" 0 2>/dev/null || true
+            cp -f "$lib" "$RUN_DIR/usr/lib/" 2>/dev/null || true
           done
         done
-      fi
+      done
     fi
 
     # ── Create custom xfstests-check wrapper ──────────────────────────
@@ -789,9 +804,9 @@ UMOUNTWRAP
 export PATH=/bin
 export LD_LIBRARY_PATH=/usr/lib:/lib
 
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev
 
 echo "=== TideFS FUSE xfstests Validation ==="
 echo "kernel_version=$(uname -r)"
@@ -870,39 +885,53 @@ for candidate in /dev/vda /dev/sda /dev/hda; do
         break
     fi
 done
-if [ -n "$STORE_DEV" ] && mount -t ext4 "$STORE_DEV" /store 2>/tmp/store-mount.err; then
+if [ -n "$STORE_DEV" ] && /bin/busybox mount -t ext4 "$STORE_DEV" /store 2>/tmp/store-mount.err; then
     pass "store_mount"
     df -h /store 2>/dev/null || true
 else
-    fail "store_mount" "$(cat /tmp/store-mount.err 2>/dev/null || echo 'no /store block device')"
+    if [ -n "$STORE_DEV" ]; then
+        fail "store_mount" "$(cat /tmp/store-mount.err 2>/dev/null || echo "could not mount $STORE_DEV on /store")"
+    else
+        fail "store_mount" "no /store block device among /dev/vda /dev/sda /dev/hda"
+    fi
 fi
 
 # ── Phase 0: FUSE kernel module ──────────────────────────────────────
 echo "--- Phase 0: FUSE kernel support ---"
 
+FUSE_KERNEL_READY=0
 FUSE_READY=0
 if [ -f /lib/modules/fuse.ko ]; then
     if insmod /lib/modules/fuse.ko 2>/tmp/fuse_insmod.err; then
         pass "fuse_module_load"
+        FUSE_KERNEL_READY=1
+    elif [ -d /sys/module/fuse ] || grep -qw fuse /proc/filesystems 2>/dev/null; then
+        pass "fuse_builtin"
+        FUSE_KERNEL_READY=1
     else
         fail "fuse_module_load" "$(cat /tmp/fuse_insmod.err)"
     fi
-elif grep -q fuse /proc/filesystems 2>/dev/null; then
+elif [ -d /sys/module/fuse ] || grep -qw fuse /proc/filesystems 2>/dev/null; then
     pass "fuse_builtin"
+    FUSE_KERNEL_READY=1
 else
-    blocked "fuse_module_load" "fuse.ko not found and FUSE not built-in"
+    blocked "fuse_module_load" "fuse.ko not staged and built-in FUSE not detected"
 fi
 
-# Create /dev/fuse if it doesn't exist
-if [ ! -e /dev/fuse ]; then
-    mknod /dev/fuse c 10 229 2>/dev/null || true
-fi
+if [ "$FUSE_KERNEL_READY" -eq 1 ]; then
+    # Create /dev/fuse if devtmpfs did not provide it.
+    if [ ! -e /dev/fuse ]; then
+        mknod /dev/fuse c 10 229 2>/dev/null || true
+    fi
 
-if [ -e /dev/fuse ]; then
-    pass "fuse_device"
-    FUSE_READY=1
+    if [ -e /dev/fuse ]; then
+        pass "fuse_device"
+        FUSE_READY=1
+    else
+        blocked "fuse_device" "/dev/fuse not available"
+    fi
 else
-    blocked "fuse_device" "/dev/fuse not available"
+    blocked "fuse_device" "FUSE kernel support unavailable"
 fi
 
 # ── Phase 1: Mount TideFS FUSE via mount helper ──────────────────────
@@ -1637,8 +1666,7 @@ CRASHCMDS
 
     # ── Produce JSON validation report ───────────────────────────────────
 
-    TIDEFS_WT=""; for d in /root/tidefs-worktrees/agent-* /root/tidefs; do if [ -d "$d/.git" ]; then TIDEFS_WT="$d"; break; fi; done
-    COMMIT="$(git -C "$TIDEFS_WT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     RUN_ID="fuse-xfstests-$(date -u +%Y%m%dT%H%M%SZ)"
     KERNEL_VER="$(grep 'kernel_version=' "$VAL_LOG" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '\r' || echo unknown)"
     TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
