@@ -878,7 +878,9 @@ pub(crate) fn roots_with_snapshot_roots(
     state: &FileSystemState,
 ) -> Vec<CommittedRootSummary> {
     for snapshot in state.snapshots.values() {
-        if !roots.contains(&snapshot.root) {
+        if crate::snapshot::snapshot_record_retains_data(snapshot)
+            && !roots.contains(&snapshot.root)
+        {
             roots.push(snapshot.root.clone());
         }
     }

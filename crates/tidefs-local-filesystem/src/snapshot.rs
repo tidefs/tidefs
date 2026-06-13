@@ -161,14 +161,16 @@ pub(crate) fn snapshot_catalog_entry_matches(
     let Ok(dataset_id) = catalog.snapshot_lookup(&catalog_name) else {
         return false;
     };
-    let Some((path, _parent, dataset_type, _creation_txg, flags, _lifecycle_state)) =
+    let Some((path, _parent, dataset_type, creation_txg, flags, _lifecycle_state)) =
         catalog.get_by_id(&dataset_id)
     else {
         return false;
     };
 
-    path == catalog_name
+    dataset_id == snapshot_record_dataset_id(record)
+        && path == catalog_name
         && dataset_type == DatasetType::Snapshot
+        && creation_txg == record.root.generation
         && flags.contains(DatasetFlags::CLONE)
             == snapshot_record_catalog_flags(record).contains(DatasetFlags::CLONE)
 }
