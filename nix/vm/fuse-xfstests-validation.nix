@@ -571,7 +571,7 @@ MOUNTHELPER
     # ── Copy xfstests lib ─────────────────────────────────────────────
     if [ -d "$XFSTESTS_LIB" ]; then
       ensure_run_dir "$RUN_DIR/$XFSTESTS_LIB"
-      cp -R --no-preserve=mode,ownership "$XFSTESTS_LIB"/. "$RUN_DIR/$XFSTESTS_LIB/" 2>/dev/null || true
+      cp -R --preserve=mode --no-preserve=ownership "$XFSTESTS_LIB"/. "$RUN_DIR/$XFSTESTS_LIB/" 2>/dev/null || true
       find "$RUN_DIR/$XFSTESTS_LIB" -type d -exec chmod u+w {} + 2>/dev/null || true
       echo "  Collecting xfstests helper library dependencies..."
       for helper_root in "$XFSTESTS_LIB/src" "$XFSTESTS_LIB/ltp"; do
