@@ -445,13 +445,15 @@ int tidefs_posix_vfs_engine_sync_namespace(
 int tidefs_posix_vfs_engine_init_mounted(
 	int (*write_fn)(unsigned long long, const unsigned char *, unsigned int),
 	int (*read_fn)(unsigned long long, unsigned char *, unsigned int),
-		unsigned int sector_size,
-		unsigned long long sb_offset,
-		unsigned long long sb_size,
-		unsigned long long device_capacity_bytes,
-		unsigned long long committed_txg,
-		unsigned long long root_ino,
-		const unsigned char *pool_uuid,
+	int (*flush_fn)(void),
+	int (*teardown_fn)(void),
+	unsigned int sector_size,
+	unsigned long long sb_offset,
+	unsigned long long sb_size,
+	unsigned long long device_capacity_bytes,
+	unsigned long long committed_txg,
+	unsigned long long root_ino,
+	const unsigned char *pool_uuid,
 	unsigned int major,
 	unsigned int minor,
 	unsigned long long inode_table_root,
@@ -1220,10 +1222,33 @@ static int tidefs_posix_vfs_engine_read_sectors(
 				     buf, len, false /* write=0 read */);
 }
 
+static int tidefs_posix_vfs_engine_flush(void)
+{
+	if (!g_engine_pool || !g_engine_pool->bdev)
+		return -ENODEV;
+
+	return sync_blockdev(g_engine_pool->bdev);
+}
+
+static int tidefs_posix_vfs_engine_teardown_pool_authority(void)
+{
+	if (!g_engine_pool || !g_engine_pool->bdev)
+		return -ENODEV;
+
+	/*
+	 * The Linux VFS owns the block-device lifetime for get_tree_bdev().
+	 * Rust owns the mounted engine state. This callback makes teardown
+	 * authority explicit without dropping the bdev behind the VFS.
+	 */
+	return 0;
+}
+
 static int tidefs_posix_vfs_activate_engine(struct tidefs_posix_vfs_mount *ctx)
 {
 	int (*write_fn)(unsigned long long, const unsigned char *, unsigned int) = NULL;
 	int (*read_fn)(unsigned long long, unsigned char *, unsigned int) = NULL;
+	int (*flush_fn)(void) = NULL;
+	int (*teardown_fn)(void) = NULL;
 	unsigned int major = 0;
 	unsigned int minor = 0;
 	int ret;
@@ -1255,12 +1280,16 @@ static int tidefs_posix_vfs_activate_engine(struct tidefs_posix_vfs_mount *ctx)
 	if (ctx->pool.bdev) {
 		write_fn = tidefs_posix_vfs_engine_write_sectors;
 		read_fn = tidefs_posix_vfs_engine_read_sectors;
+		flush_fn = tidefs_posix_vfs_engine_flush;
+		teardown_fn = tidefs_posix_vfs_engine_teardown_pool_authority;
 		major = MAJOR(ctx->pool.bdev->bd_dev);
 		minor = MINOR(ctx->pool.bdev->bd_dev);
 	}
 	ret = tidefs_posix_vfs_engine_init_mounted(
 		write_fn,
 		read_fn,
+		flush_fn,
+		teardown_fn,
 		ctx->block_size,
 		ctx->pool.superblock_offset,
 		ctx->pool.superblock_size,

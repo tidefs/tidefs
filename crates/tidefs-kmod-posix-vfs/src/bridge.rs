@@ -213,7 +213,8 @@ pub fn kmod_fill_super<E: VfsEngine + VfsEngineStatFs>(
 ///
 /// Called by the Linux kernel VFS on unmount. Flushes all dirty data
 /// and metadata via [`VfsEngine::syncfs`] and transitions the superblock
-/// context to Unmounted state. `ENOSYS` from syncfs is tolerated.
+/// context to Unmounted state. Unsupported sync is returned as an error
+/// for mounted filesystems that claim pool-backed durability.
 ///
 /// # Safety (kernel callback ABI)
 ///

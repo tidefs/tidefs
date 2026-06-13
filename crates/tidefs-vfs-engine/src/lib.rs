@@ -284,6 +284,85 @@ impl Default for BlockQueueGeometry {
     }
 }
 
+/// Explicit capability report for an engine-backed block I/O authority.
+///
+/// Kernel block-device and no-daemon mount paths use this before accepting an
+/// engine as a lower-device authority. Unsupported operations must be visible
+/// here instead of being inferred from synthetic capacity or `ENOSYS` defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelStorageIoCapabilities {
+    /// Engine deliberately supports sector reads.
+    pub read: bool,
+    /// Engine deliberately supports sector writes.
+    pub write: bool,
+    /// Engine deliberately supports durable flush barriers.
+    pub flush: bool,
+    /// Engine deliberately supports discard/trim.
+    pub discard: bool,
+    /// Engine deliberately supports write-zeroes.
+    pub write_zeroes: bool,
+    /// Engine deliberately supports zero-range semantics.
+    pub zero_range: bool,
+    /// Engine deliberately supports authority teardown.
+    pub teardown: bool,
+    /// Logical sector size in bytes.
+    pub sector_size: u32,
+    /// Total device capacity in sectors.
+    pub capacity_sectors: u64,
+}
+
+impl KernelStorageIoCapabilities {
+    /// Report no block I/O authority.
+    #[inline]
+    pub const fn unsupported() -> Self {
+        Self {
+            read: false,
+            write: false,
+            flush: false,
+            discard: false,
+            write_zeroes: false,
+            zero_range: false,
+            teardown: false,
+            sector_size: 0,
+            capacity_sectors: 0,
+        }
+    }
+
+    /// Report the minimal read/write/flush authority needed for a mounted pool.
+    #[inline]
+    pub const fn read_write_flush(sector_size: u32, capacity_sectors: u64, teardown: bool) -> Self {
+        Self {
+            read: true,
+            write: true,
+            flush: true,
+            discard: false,
+            write_zeroes: false,
+            zero_range: false,
+            teardown,
+            sector_size,
+            capacity_sectors,
+        }
+    }
+
+    /// Total capacity in bytes, saturating on overflow.
+    #[inline]
+    pub fn capacity_bytes(self) -> u64 {
+        self.capacity_sectors
+            .saturating_mul(u64::from(self.sector_size))
+    }
+
+    /// Whether this report is sufficient for mounted no-daemon pool authority.
+    #[inline]
+    pub const fn has_mounted_authority(self) -> bool {
+        self.read
+            && self.write
+            && self.flush
+            && self.teardown
+            && self.sector_size != 0
+            && self.capacity_sectors != 0
+    }
+}
+
 /// Outcome of a [`VfsEngine::setattr`] attribute mutation.
 ///
 /// Encodes the engine-level result of an attribute-mutation request:
@@ -1362,6 +1441,11 @@ pub trait VfsEngine {
 
     // ── Block-volume operations ─────────────────────────────────────────
 
+    /// Report whether this engine is a deliberate block I/O authority.
+    fn block_io_capabilities(&self) -> KernelStorageIoCapabilities {
+        KernelStorageIoCapabilities::unsupported()
+    }
+
     /// Read sectors from the block device into `buf`.
     ///
     /// `buf.len()` must be at least `sector_count * sector_size`.
@@ -1440,12 +1524,17 @@ pub trait VfsEngine {
 
     /// Total block device capacity in sectors.
     fn block_capacity_sectors(&self) -> u64 {
-        0
+        self.block_io_capabilities().capacity_sectors
     }
 
     /// Logical block (sector) size in bytes.
     fn block_sector_size(&self) -> u32 {
-        512
+        self.block_io_capabilities().sector_size
+    }
+
+    /// Tear down block-device authority.
+    fn block_teardown(&self) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
     }
 
     /// Return storage geometry for block-device queue-limit configuration.
@@ -6612,6 +6701,19 @@ mod tests {
         let engine = EmptyTestEngine;
         let g = engine.queue_limits();
         assert_eq!(g, BlockQueueGeometry::production());
+    }
+
+    #[test]
+    fn mock_engine_block_authority_defaults_are_unsupported() {
+        let engine = EmptyTestEngine;
+        let caps = engine.block_io_capabilities();
+
+        assert_eq!(caps, KernelStorageIoCapabilities::unsupported());
+        assert!(!caps.has_mounted_authority());
+        assert_eq!(caps.capacity_bytes(), 0);
+        assert_eq!(engine.block_capacity_sectors(), 0);
+        assert_eq!(engine.block_sector_size(), 0);
+        assert_eq!(engine.block_teardown(), Err(Errno::ENOSYS));
     }
 
     // ── Transaction-group lifecycle trait tests ───────────────────────

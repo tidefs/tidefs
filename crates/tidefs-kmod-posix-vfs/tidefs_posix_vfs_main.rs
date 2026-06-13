@@ -6415,10 +6415,35 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         self.txg_commit_barrier()
     }
     // ── Committed-root writeback ─────────────────────────────────────
+    fn mounted_pool_io_ctx(
+        &self,
+    ) -> core::result::Result<
+        crate::tidefs_kmod_bridge::kernel_types::CommittedRootIoCtx,
+        crate::tidefs_kmod_bridge::kernel_types::Errno,
+    > {
+        if !self.pool_is_mounted() {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
+        }
+        let Some(ref pool_core) = self.pool_core else {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
+        };
+        let io_ctx = pool_core.committed_root_io_ctx();
+        if !io_ctx.is_active() || !io_ctx.capabilities().has_mounted_authority() {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
+        }
+        Ok(io_ctx)
+    }
+
+    fn teardown_pool_authority(
+        &self,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
+        self.mounted_pool_io_ctx()?.teardown()
+    }
+
     /// Persist the committed root through KernelPoolCore authority.
     ///
-    /// Gates on Mounted pool state. On-disk persistence is blocked on
-    /// #6225 KernelPoolCore committed-root txg submission.
+    /// Gates on Mounted pool state and requires the C shim to register
+    /// explicit read, write, flush, capacity, and teardown authority.
     fn write_committed_root(
         &self,
         committed_root: &crate::tidefs_kmod_bridge::kernel_types::CommittedRoot,
@@ -6428,18 +6453,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
         }
 
-        // Use the pool core I/O context to persist the committed root.
-        // When the C shim has registered a write callback during mount,
-        // we encode VRBT/VCRP/VCRL and write them through the callback.
-        // When no I/O context is active, the root stays in-memory only.
-        let Some(ref pool_core) = self.pool_core else {
-            return Ok(());
-        };
-        let io_ctx = pool_core.committed_root_io_ctx();
-        if !io_ctx.is_active() {
-            // No I/O context registered; accept in-memory only.
-            return Ok(());
-        }
+        let io_ctx = self.mounted_pool_io_ctx()?;
 
         let root_hash = *committed_root.as_bytes();
         let committed_txg = io_ctx.committed_txg;
@@ -6449,7 +6463,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         //         [VCRP backup at offset+2*block_size] [VRBT at offset+3*block_size]
         let block_size = io_ctx.sector_size as u64;
         if block_size < 512 {
-            return Ok(());
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL);
         }
 
         let pointer_offset = io_ctx.superblock_offset.saturating_add(block_size);
@@ -6502,6 +6516,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             sector_size,
         )?;
         Self::write_padded_sector(write_fn, root_sector, &vrbt, sector_size)?;
+        io_ctx.flush()?;
 
         Ok(())
     }
@@ -6526,8 +6541,9 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         self.flush_live_write_buffer_to_storage(None, 0, 0)?;
         self.flush_intent_buffer_to_storage()?;
         self.persist_namespace_snapshot()?;
+        let io_ctx = self.mounted_pool_io_ctx()?;
         let Some(root) = self.take_committed_root() else {
-            return Ok(());
+            return io_ctx.flush();
         };
         self.committed_root.set(Some(root));
         self.write_committed_root(&root, 0)
@@ -6738,9 +6754,10 @@ pub extern "C" fn tidefs_posix_vfs_engine_statfs(
 #[no_mangle]
 pub extern "C" fn tidefs_posix_vfs_engine_sync_fs(wait: core::ffi::c_int) -> core::ffi::c_int {
     let request = crate::tidefs_kmod_bridge::kernel_types::RequestCtx::default();
+    let initialized = ENGINE_INITIALIZED.load(core::sync::atomic::Ordering::Acquire);
 
     // Use the persistent mounted engine when available.
-    let result = if ENGINE_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
+    let result = if initialized {
         with_mounted_engine(
             Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV),
             |engine| engine.syncfs(&request),
@@ -6758,7 +6775,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_sync_fs(wait: core::ffi::c_int) -> cor
             );
             0
         }
-        Err(e) if e == crate::tidefs_kmod_bridge::kernel_types::Errno::ENOSYS => {
+        Err(e) if !initialized && e == crate::tidefs_kmod_bridge::kernel_types::Errno::ENOSYS => {
             let errno_val: u16 = e.0;
             kernel::pr_info!(
                 "tidefs_posix_vfs: engine sync_fs: syncfs returned {} (tolerated; no dirty mounted engine state; wait={})\n",
@@ -6767,7 +6784,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_sync_fs(wait: core::ffi::c_int) -> cor
             );
             0
         }
-        Err(e) if e == crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV => {
+        Err(e) if !initialized && e == crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV => {
             kernel::pr_info!(
                 "tidefs_posix_vfs: engine sync_fs: pool not configured (tolerated; wait={})\n",
                 wait,
@@ -6857,7 +6874,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_record_cluster_config(
 /// releases the mounted pool context.
 #[no_mangle]
 pub extern "C" fn tidefs_posix_vfs_engine_kill_sb() -> core::ffi::c_int {
-    let ret = tidefs_posix_vfs_engine_sync_fs(1);
+    let mut ret = tidefs_posix_vfs_engine_sync_fs(1);
 
     if ret == 0 {
         kernel::pr_info!(
@@ -6866,7 +6883,10 @@ pub extern "C" fn tidefs_posix_vfs_engine_kill_sb() -> core::ffi::c_int {
     }
 
     // Tear down the persistent engine so the next mount gets a fresh one.
-    tidefs_posix_vfs_engine_teardown_mounted();
+    let teardown_ret = tidefs_posix_vfs_engine_teardown_mounted();
+    if ret == 0 && teardown_ret < 0 {
+        ret = teardown_ret;
+    }
 
     ret
 }
@@ -8214,6 +8234,8 @@ static mut TRANSPORT_CARRIER: Option<crate::tidefs_kmod_bridge::kernel_types::Km
 pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
     write_fn: Option<unsafe extern "C" fn(u64, *const u8, u32) -> core::ffi::c_int>,
     read_fn: Option<unsafe extern "C" fn(u64, *mut u8, u32) -> core::ffi::c_int>,
+    flush_fn: Option<unsafe extern "C" fn() -> core::ffi::c_int>,
+    teardown_fn: Option<unsafe extern "C" fn() -> core::ffi::c_int>,
     sector_size: u32,
     sb_offset: u64,
     sb_size: u64,
@@ -8232,6 +8254,28 @@ pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
     }
     if ENGINE_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
         kernel::pr_info!("tidefs_posix_vfs: engine already initialized; replacing\n");
+    }
+    if write_fn.is_none() || read_fn.is_none() || flush_fn.is_none() || teardown_fn.is_none() {
+        kernel::pr_err!(
+            "tidefs_posix_vfs: engine_init_mounted: missing explicit pool I/O authority callbacks\n"
+        );
+        return -19; // ENODEV
+    }
+    if sector_size == 0
+        || device_capacity_bytes == 0
+        || sb_size == 0
+        || sb_offset % u64::from(sector_size) != 0
+        || root_ino == 0
+    {
+        kernel::pr_err!(
+            "tidefs_posix_vfs: engine_init_mounted: invalid pool geometry sector={} sb_off={} sb_size={} capacity={} root={}\n",
+            sector_size,
+            sb_offset,
+            sb_size,
+            device_capacity_bytes,
+            root_ino,
+        );
+        return -22; // EINVAL
     }
 
     let mut uuid = [0u8; 32];
@@ -8258,25 +8302,29 @@ pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
         data_area_offset,
         write_sectors_fn: write_fn,
         read_sectors_fn: read_fn,
+        flush_fn,
+        teardown_fn,
         sector_size,
+        device_capacity_bytes,
         superblock_offset: sb_offset,
         superblock_size: sb_size,
         committed_txg,
         root_ino,
         pool_uuid: uuid,
     };
+    if !io_ctx.capabilities().has_mounted_authority() {
+        kernel::pr_err!(
+            "tidefs_posix_vfs: engine_init_mounted: pool I/O authority is not mount-capable\n"
+        );
+        return -19; // ENODEV
+    }
 
     // Create a minimal pool config (one device with placeholder params).
-    let device_capacity_bytes = if device_capacity_bytes == 0 {
-        sb_size
-    } else {
-        device_capacity_bytes
-    };
-    let sector_count = if sector_size == 0 {
-        0
-    } else {
-        device_capacity_bytes / sector_size as u64
-    };
+    let sector_count = device_capacity_bytes / sector_size as u64;
+    if sector_count == 0 {
+        kernel::pr_err!("tidefs_posix_vfs: engine_init_mounted: zero-capacity pool authority\n");
+        return -22; // EINVAL
+    }
     let desc = crate::tidefs_kmod_bridge::kernel_types::LowerDeviceDesc::new(
         major,
         minor,
@@ -8482,13 +8530,32 @@ pub extern "C" fn tidefs_posix_vfs_engine_teardown_mounted() -> core::ffi::c_int
     if !ENGINE_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
         return 0;
     }
+    let teardown_result = unsafe {
+        let engine_ptr: *const Option<KernelEngine> = &raw const MOUNTED_ENGINE;
+        match (*engine_ptr).as_ref() {
+            Some(engine) => engine.teardown_pool_authority(),
+            None => Ok(()),
+        }
+    };
     ENGINE_INITIALIZED.store(false, core::sync::atomic::Ordering::Release);
     unsafe {
         let engine_ptr: *mut Option<KernelEngine> = &raw mut MOUNTED_ENGINE;
         *engine_ptr = None;
     }
-    kernel::pr_info!("tidefs_posix_vfs: engine torn down\n");
-    0
+    match teardown_result {
+        Ok(()) => {
+            kernel::pr_info!("tidefs_posix_vfs: engine torn down\n");
+            0
+        }
+        Err(e) => {
+            let errno_val: u16 = e.0;
+            kernel::pr_err!(
+                "tidefs_posix_vfs: engine teardown failed (errno={})\n",
+                errno_val,
+            );
+            -(errno_val as core::ffi::c_int)
+        }
+    }
 }
 
 // -- Engine-backed open/release bridges (#6274) --------------------------

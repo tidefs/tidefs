@@ -29,7 +29,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::format::{self, DirPage, DIR_PAGE_SIZE};
-use tidefs_kernel_storage_io::KernelStorageIo;
+use tidefs_kernel_storage_io::{KernelStorageIo, KernelStorageIoCapabilities};
 use tidefs_types_polymorphic_directory_index_core::DirMicroEntry;
 use tidefs_types_vfs_core::Errno;
 
@@ -576,6 +576,20 @@ mod tests {
     }
 
     impl KernelStorageIo for TestStorage {
+        fn capabilities(&self) -> KernelStorageIoCapabilities {
+            KernelStorageIoCapabilities {
+                read: true,
+                write: false,
+                flush: true,
+                discard: false,
+                write_zeroes: false,
+                zero_range: false,
+                teardown: true,
+                sector_size: self.sector_size,
+                capacity_sectors: self.capacity_sectors(),
+            }
+        }
+
         fn read_sectors(&self, start_sector: u64, buf: &mut [u8]) -> Result<u32, Errno> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             let ss = self.sector_size as u64;
@@ -599,6 +613,10 @@ mod tests {
         }
         fn capacity_sectors(&self) -> u64 {
             (self.data.len() / self.sector_size as usize) as u64
+        }
+
+        fn teardown(&self) -> Result<(), Errno> {
+            Ok(())
         }
     }
 

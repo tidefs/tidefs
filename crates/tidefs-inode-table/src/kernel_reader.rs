@@ -41,7 +41,7 @@
 //! This module is `no_std` compatible. It uses only `core` primitives
 //! and the [`KernelStorageIo`] trait.
 
-use tidefs_kernel_storage_io::KernelStorageIo;
+use tidefs_kernel_storage_io::{KernelStorageIo, KernelStorageIoCapabilities};
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -468,6 +468,20 @@ mod tests {
     const EINVAL: u16 = 22;
 
     impl KernelStorageIo for TestStorage {
+        fn capabilities(&self) -> KernelStorageIoCapabilities {
+            KernelStorageIoCapabilities {
+                read: true,
+                write: false,
+                flush: true,
+                discard: false,
+                write_zeroes: false,
+                zero_range: false,
+                teardown: true,
+                sector_size: self.sector_size,
+                capacity_sectors: self.capacity_sectors(),
+            }
+        }
+
         fn read_sectors(
             &self,
             start_sector: u64,
@@ -502,6 +516,10 @@ mod tests {
 
         fn capacity_sectors(&self) -> u64 {
             (self.data.len() / self.sector_size as usize) as u64
+        }
+
+        fn teardown(&self) -> Result<(), tidefs_types_vfs_core::Errno> {
+            Ok(())
         }
     }
 

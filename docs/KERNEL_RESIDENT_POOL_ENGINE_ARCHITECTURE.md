@@ -188,6 +188,16 @@ Rules:
 - Read/write/flush/discard map to `KernelPoolCore` logical-volume operations.
 - FUA and flush must force the same durable ordering used by POSIX `fsync` and
   `syncfs`.
+- No-daemon POSIX VFS mounts must bind an explicit kernel pool I/O authority
+  before advertising durability: read, write, flush, capacity, and teardown
+  callbacks are mandatory. Discard, write-zeroes, and zero-range may be
+  reported unsupported, but that unsupported state must be explicit and must
+  not come from a zero-capacity fallback.
+- Under the Linux 7.0 Kbuild/QEMU path, `RawBlockFile` uses kernel VFS
+  `kernel_read`/`kernel_write` for data and `vfs_fsync` for flush/FUA-style
+  barriers on the opened lower file. The block-device mounted POSIX shim uses
+  the superblock's lower `bdev` and `sync_blockdev()` for its pool flush
+  callback. If either callback is absent, the mounted product path fails closed.
 - Discard must update logical extents and allocation/reclaim state through the
   transaction path. It may not silently zero a side buffer in production mode.
 - Queue limits come from the logical volume and pool geometry.
@@ -331,7 +341,7 @@ Write-path durability:
   success when durability requires it;
 - data writeback and metadata publication are ordered by transaction group;
 - `fsync`, `syncfs`, block flush, and FUA wait for the relevant transaction
-  boundary;
+  boundary and then the same lower-device flush authority;
   not only module load or mount success.
 
 

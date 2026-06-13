@@ -195,10 +195,12 @@ impl PoolCoreOps for RawBlockFile {
         }
         #[cfg(CONFIG_RUST)]
         {
-            // Flush is a no-op in kernel mode with file-backed storage.
-            // kernel_write ensures data reaches the backing file's page cache;
-            // the QEMU init script explicit sync commands provide durability.
-            Ok(())
+            let ret = unsafe { vfs_fsync(self.filp, 0) };
+            if ret < 0 {
+                Err(Errno((-ret) as u16))
+            } else {
+                Ok(())
+            }
         }
     }
 
