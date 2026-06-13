@@ -7272,7 +7272,7 @@ mod tests {
         ) -> Result<AllocatedInode, Errno> {
             let ino = self.next_ino.get();
             self.next_ino.set(ino + 1);
-            let now_ns = 1_700_000_000_000_000_000u64;
+            let now_ns = 1_700_000_000_000_000_000i64;
             let nlink = if kind == NodeKind::Dir { 2 } else { 1 };
             let attr = InodeAttr {
                 inode_id: InodeId::new(ino),

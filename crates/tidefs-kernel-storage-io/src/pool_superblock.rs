@@ -26,7 +26,7 @@ use tidefs_types_pool_label_core::{
 };
 use tidefs_types_vfs_core::Errno;
 
-use crate::traits::{KernelStorageIo, KernelStorageIoCapabilities};
+use crate::traits::KernelStorageIo;
 
 // ── KernelPoolSuperblock ───────────────────────────────────────────────
 
@@ -303,6 +303,7 @@ pub fn read_pool_superblock_at(
 mod tests {
     extern crate std;
     use super::*;
+    use crate::traits::KernelStorageIoCapabilities;
     use tidefs_types_pool_label_core::{
         encode_label, seal_label, PoolLabelV1, POOL_LABEL_V1_EXT_WIRE_SIZE,
     };
