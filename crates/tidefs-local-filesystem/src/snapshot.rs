@@ -311,7 +311,7 @@ impl LocalFileSystem {
         Ok(())
     }
 
-    fn ensure_snapshot_record_authority(&self, record: &SnapshotRecord) -> Result<()> {
+    pub(crate) fn ensure_snapshot_record_authority(&self, record: &SnapshotRecord) -> Result<()> {
         if !snapshot_record_retains_data(record) {
             return Err(FileSystemError::CorruptState {
                 reason: "snapshot authority record does not retain data",
