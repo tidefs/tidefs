@@ -447,13 +447,19 @@ fn should_scan_provenance_file(rel_path: &str) -> bool {
 
     rel_path == "Cargo.toml"
         || rel_path.ends_with("/Cargo.toml")
+        || rel_path.ends_with(".adoc")
         || rel_path.ends_with(".c")
+        || rel_path.ends_with(".fio")
         || rel_path.ends_with(".h")
+        || rel_path.ends_with(".inc")
         || rel_path.ends_with(".json")
+        || rel_path.ends_with(".jsonl")
         || rel_path.ends_with(".md")
         || rel_path.ends_with(".nix")
+        || rel_path.ends_with(".patch")
         || rel_path.ends_with(".rs")
         || rel_path.ends_with(".sh")
+        || rel_path.ends_with(".txt")
         || rel_path.ends_with(".toml")
         || rel_path.ends_with(".yaml")
         || rel_path.ends_with(".yml")
@@ -561,9 +567,12 @@ fn provenance_notice_text<'a>(rel_path: &str, trimmed: &'a str) -> Option<&'a st
 
 fn is_comment_or_script_style_file(rel_path: &str) -> bool {
     rel_path.ends_with(".c")
+        || rel_path.ends_with(".fio")
         || rel_path.ends_with(".h")
+        || rel_path.ends_with(".inc")
         || rel_path.ends_with(".json")
         || rel_path.ends_with(".nix")
+        || rel_path.ends_with(".patch")
         || rel_path.ends_with(".rs")
         || rel_path.ends_with(".sh")
         || rel_path.ends_with(".toml")
@@ -575,7 +584,10 @@ fn is_comment_or_script_style_file(rel_path: &str) -> bool {
 }
 
 fn strip_provenance_comment_prefix(trimmed: &str) -> Option<&str> {
-    for prefix in ["//!", "///", "//", "#", "*", "/*", "<!--"] {
+    for prefix in [
+        "+//!", "-//!", "+///", "-///", "+//", "-//", "+#", "-#", "//!", "///", "//", "#", ";",
+        "*", "/*", "<!--",
+    ] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             return Some(rest.trim());
         }
@@ -1906,6 +1918,68 @@ license = "MIT"
         assert_eq!(markers[0].kind, ProvenanceMarkerKind::ManifestLicense);
         assert!(is_registered_provenance_marker(
             "crates/tidefs-fuser/Cargo.toml",
+            &markers[0],
+        ));
+    }
+
+    #[test]
+    fn file_local_provenance_scans_docs_and_harness_inputs() {
+        for rel_path in [
+            "docs/book/chapters/00-preface.adoc",
+            "validation/fio/rand-read.fio",
+            "benchmarking/fio/common/global.inc",
+            "traces/golden/smoke_churn/pool_trace.jsonl",
+            "validation/seed-corpus/fsx-seeds.txt",
+            "crates/tidefs-witness-set/tests/witness_convergence_fix.patch",
+        ] {
+            assert!(
+                should_scan_provenance_file(rel_path),
+                "expected {rel_path} to be scanned"
+            );
+        }
+    }
+
+    #[test]
+    fn file_local_provenance_keeps_canonical_license_texts_out_of_scan() {
+        for rel_path in [
+            "Cargo.lock",
+            "COPYING",
+            "docs/LICENSING.md",
+            "LICENSES/preferred/GPL-2.0",
+        ] {
+            assert!(
+                !should_scan_provenance_file(rel_path),
+                "expected {rel_path} to be excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn file_local_provenance_flags_plaintext_harness_spdx_marker() {
+        let text = "SPDX-License-Identifier: Apache-2.0\n";
+        let markers =
+            collect_file_local_provenance_markers("validation/seed-corpus/fsx-seeds.txt", text);
+
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, ProvenanceMarkerKind::SpdxLicense);
+        assert!(!is_registered_provenance_marker(
+            "validation/seed-corpus/fsx-seeds.txt",
+            &markers[0],
+        ));
+    }
+
+    #[test]
+    fn file_local_provenance_flags_patch_comment_spdx_marker() {
+        let text = "+// SPDX-License-Identifier: Apache-2.0\n";
+        let markers = collect_file_local_provenance_markers(
+            "crates/tidefs-witness-set/tests/witness_convergence_fix.patch",
+            text,
+        );
+
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, ProvenanceMarkerKind::SpdxLicense);
+        assert!(!is_registered_provenance_marker(
+            "crates/tidefs-witness-set/tests/witness_convergence_fix.patch",
             &markers[0],
         ));
     }
