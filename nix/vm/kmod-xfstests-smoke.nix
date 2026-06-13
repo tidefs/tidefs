@@ -2,8 +2,8 @@
 #
 # Builds kmod-posix-vfs as an out-of-tree Linux 7.0 kernel module,
 # boots a QEMU VM, loads the module, verifies that nodev/bootstrap mounts
-# fail closed without explicit kernel pool I/O authority, and keeps the
-# focused smoke plumbing available for future block-device-backed runs.
+# fail closed without explicit kernel pool I/O authority, and mounts a
+# formatted virtio pool member through the configured kernel authority path.
 #
 # This harness is the prerequisite for #5832 (full generic-group
 # classification). It provides the build, boot, load, and mount
@@ -16,6 +16,7 @@
 {
   pkgs,
   linuxKernel_7_0,
+  tidefsPackage,
 }:
 
 let
@@ -31,6 +32,7 @@ let
     LDD_BIN="${pkgs.lib.getBin pkgs.glibc}/bin/ldd"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     KERNEL_VERSION="${linuxKernel_7_0.version}"
+    TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
 
     TMPDIR="''${TIDEFS_KMOD_XFSTESTS_TMPDIR:-/tmp/tidefs-kmod-xfstests-smoke}"
     TIMEOUT_SEC="''${TIDEFS_KMOD_XFSTESTS_TIMEOUT:-600}"
@@ -41,8 +43,8 @@ Usage: tidefs-kmod-xfstests-smoke [--timeout SECONDS] [--keep-tmp]
        [--tests "generic/001 generic/002 ..."] [--module PATH]
 
 Build kmod-posix-vfs, boot a QEMU VM with Linux 7.0, load the module,
-verify missing pool-authority mount refusal, and emit a classified
-pass/fail/blocked report.
+verify missing pool-authority mount refusal, then mount a configured
+TideFS pool member and emit a classified pass/fail/blocked report.
 
 Options:
   --timeout SECONDS    QEMU boot timeout (default: $TIMEOUT_SEC)
@@ -61,7 +63,7 @@ EOF
     }
 
     KEEP_TMP=""
-    SMOKE_TESTS="authority/missing-pool"
+    SMOKE_TESTS="authority/missing-pool configured-pool-member"
     KO_PATH_ARG=""
 
     while [[ "$#" -gt 0 ]]; do
@@ -83,7 +85,7 @@ EOF
     echo "  Timeout:    ''${TIMEOUT_SEC}s"
     echo ""
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$TIDEFSCTL"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -91,8 +93,9 @@ EOF
     done
 
     RUN_DIR="$TMPDIR/smoke-$$"
-    mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,var/lib/tidefs,etc,usr/bin}
+    mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,var/lib/tidefs,etc,usr/bin,run/tidefs/import}
     trap 'if [ -z "''${KEEP_TMP:-}" ]; then rm -rf "$RUN_DIR"; fi' EXIT
+    POOL_IMG="$RUN_DIR/configured-pool-member.img"
 
     # Resolve module .ko
     KO_PATH=""
@@ -160,9 +163,27 @@ EOF
       chmod +x "$RUN_DIR$LD_SO" 2>/dev/null || true
     fi
 
-    for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff reboot mknod mkdir rmdir dd stat cp mv rm touch find wc head tail seq awk which basename dirname cut tr test env true false printf sync mountpoint kill pidof ps uname date ln readlink lsmod; do
+    for applet in sh ls cat echo mount umount grep insmod rmmod dmesg sleep poweroff reboot mknod mkdir rmdir dd stat cp mv rm touch find wc head tail seq awk which basename dirname cut tr test env true false printf sync mountpoint kill pidof ps uname date ln readlink lsmod df; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
+
+    cp "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
+    chmod +x "$RUN_DIR/bin/tidefsctl"
+    TIDEFSCTL_DEPS=$("$LDD_BIN" "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
+    for lib in $TIDEFSCTL_DEPS; do
+      if [ -f "$lib" ]; then
+        lib_dir=$(dirname "$lib")
+        mkdir -p "$RUN_DIR$lib_dir"
+        cp "$lib" "$RUN_DIR$lib" 2>/dev/null || true
+      fi
+    done
+    TIDEFSCTL_LD_SO=$("$LDD_BIN" "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
+    if [ -n "$TIDEFSCTL_LD_SO" ] && [ -f "$TIDEFSCTL_LD_SO" ]; then
+      ld_dir=$(dirname "$TIDEFSCTL_LD_SO")
+      mkdir -p "$RUN_DIR$ld_dir"
+      cp "$TIDEFSCTL_LD_SO" "$RUN_DIR$TIDEFSCTL_LD_SO" 2>/dev/null || true
+      chmod +x "$RUN_DIR$TIDEFSCTL_LD_SO" 2>/dev/null || true
+    fi
 
     # Copy module if available
     MODULE_FOUND=0
@@ -206,6 +227,8 @@ refusal() { echo "REFUSAL: $1 -- $2"; REFUSAL=$((REFUSAL + 1)); }
 
 MNT=/mnt/tidefs
 SCRATCH_DIR=/var/lib/tidefs/scratch
+POOL_DEV=/dev/vda
+POOL_NAME=qemu_smoke_pool
 
 echo "--- Phase 0: Module Load ---"
 
@@ -233,13 +256,45 @@ echo "--- dmesg (tidefs lines) ---"
 dmesg | grep -i tidefs 2>/dev/null | head -10 || echo "  (no tidefs dmesg lines)"
 
 echo ""
-echo "--- Phase 1: Scratch Setup ---"
+echo "--- Phase 1: Configured Pool Member Setup ---"
 mkdir -p "$SCRATCH_DIR"
-echo "Creating 128 MiB scratch backing file..."
-if dd if=/dev/zero of="$SCRATCH_DIR/scratch.img" bs=1M count=128 2>/tmp/dd.err; then
-    pass "scratch_backing_file"
+POOL_DEVICE_READY=0
+POOL_READY=0
+echo "Waiting for virtio pool member $POOL_DEV..."
+for _ in $(seq 1 30); do
+    [ -b "$POOL_DEV" ] && break
+    sleep 1
+done
+if [ -b "$POOL_DEV" ]; then
+    POOL_DEVICE_READY=1
+    pass "configured_pool_device_present"
 else
-    blocked "scratch_backing_file" "$(cat /tmp/dd.err)"
+    blocked "configured_pool_device_present" "$POOL_DEV missing"
+fi
+
+if [ "$POOL_DEVICE_READY" -eq 1 ] && command -v tidefsctl >/dev/null 2>&1; then
+    echo "tidefsctl pool create $POOL_NAME --devices $POOL_DEV --json"
+    COUT=$(tidefsctl pool create "$POOL_NAME" --devices "$POOL_DEV" --json 2>&1); RC=$?
+    echo "  create exit=$RC"
+    if [ "$RC" -eq 0 ]; then
+        pass "configured_pool_member_created"
+        SOUT=$(tidefsctl pool scan --devices "$POOL_DEV" 2>&1); SRC=$?
+        if [ "$SRC" -eq 0 ] && echo "$SOUT" | grep -qi "label"; then
+            pass "configured_pool_label_verified"
+            POOL_READY=1
+        else
+            fail "configured_pool_label_verified" "$SOUT"
+        fi
+    else
+        fail "configured_pool_member_created" "$COUT"
+    fi
+else
+    if [ "$POOL_DEVICE_READY" -eq 0 ]; then
+        blocked "configured_pool_member_created" "virtio pool device missing"
+    else
+        blocked "configured_pool_member_created" "tidefsctl not found in initramfs"
+    fi
+    blocked "configured_pool_label_verified" "pool member was not created"
 fi
 
 echo ""
@@ -249,7 +304,7 @@ mkdir -p "$MNT"
 echo "mount -o bootstrap -t tidefs none $MNT"
 if mount -o bootstrap -t tidefs none "$MNT" 2>/tmp/mount.err; then
     fail "missing_pool_member_rejected" "bootstrap mount unexpectedly succeeded without explicit pool I/O authority"
-    MOUNTED=1
+    umount "$MNT" 2>/dev/null || true
 else
     err="$(head -3 /tmp/mount.err | tr '\n' ' ')"
     pass "missing_pool_member_rejected"
@@ -257,43 +312,73 @@ else
 fi
 
 echo ""
-echo "--- Phase 3: Mounted POSIX Smoke Tests ---"
+echo "--- Phase 3: Configured Pool Member Mount Tests ---"
+
+if [ "$POOL_READY" -eq 1 ]; then
+    echo "mount -t tidefs $POOL_DEV $MNT"
+    if mount -t tidefs "$POOL_DEV" "$MNT" 2>/tmp/configured-mount.err; then
+        pass "configured_pool_mount"
+        MOUNTED=1
+    else
+        fail "configured_pool_mount" "$(head -3 /tmp/configured-mount.err | tr '\n' ' ')"
+    fi
+else
+    blocked "configured_pool_mount" "pool member was not ready"
+fi
 
 if [ "$MOUNTED" -eq 1 ]; then
     echo "Running focused POSIX smoke tests on kernel-mounted TideFS..."
 
     echo ""
+    echo "-- smoke: statfs capacity from configured pool authority --"
+    if stat -f "$MNT" >/tmp/statfs.out 2>/tmp/statfs.err; then
+        pass "configured_pool_statfs"
+        statfs_out=$(cat /tmp/statfs.out)
+        echo "  statfs: $statfs_out"
+        total_blocks=$(awk '/Blocks:/ { for (i = 1; i <= NF; i++) if ($i == "Total:") { print $(i + 1); exit } }' /tmp/statfs.out)
+        if [ -n "$total_blocks" ] && [ "$total_blocks" -gt 0 ] 2>/dev/null; then
+            pass "configured_pool_statfs_capacity"
+            echo "  statfs_total_blocks=$total_blocks"
+        else
+            fail "configured_pool_statfs_capacity" "expected nonzero total blocks, got ''${total_blocks:-missing}"
+        fi
+    else
+        fail "configured_pool_statfs" "$(head -1 /tmp/statfs.err)"
+        blocked "configured_pool_statfs_capacity" "stat -f failed on mount point"
+    fi
+
+    echo ""
     echo "-- smoke: directory create/remove --"
     if mkdir "$MNT/g002_dir" 2>/tmp/t2.err; then
         if [ -d "$MNT/g002_dir" ]; then
-            pass "smoke_mkdir"
+            pass "configured_pool_mkdir"
         else
-            fail "smoke_mkdir" "directory not found after mkdir"
+            fail "configured_pool_mkdir" "directory not found after mkdir"
         fi
         rmdir "$MNT/g002_dir" 2>/dev/null || true
         if [ ! -d "$MNT/g002_dir" ]; then
-            pass "smoke_rmdir"
+            pass "configured_pool_rmdir"
         else
-            fail "smoke_rmdir" "directory still exists after rmdir"
+            fail "configured_pool_rmdir" "directory still exists after rmdir"
         fi
     else
-        fail "smoke_mkdir" "$(head -1 /tmp/t2.err)"
-        blocked "smoke_rmdir" "mkdir failed"
+        fail "configured_pool_mkdir" "$(head -1 /tmp/t2.err)"
+        blocked "configured_pool_rmdir" "mkdir failed"
     fi
 
     echo ""
     echo "-- smoke: symlink/readlink --"
     if ln -s "/bootstrap-target" "$MNT/g005_link" 2>/tmp/t5b.err; then
-        pass "smoke_symlink_create"
+        pass "configured_pool_symlink_create"
         target=$(readlink "$MNT/g005_link" 2>/dev/null || echo "")
         if [ "$target" = "/bootstrap-target" ]; then
-            pass "smoke_readlink"
+            pass "configured_pool_readlink"
         else
-            fail "smoke_readlink" "expected /bootstrap-target, got '$target'"
+            fail "configured_pool_readlink" "expected /bootstrap-target, got '$target'"
         fi
     else
-        blocked "smoke_symlink_create" "$(head -1 /tmp/t5b.err)"
-        blocked "smoke_readlink" "symlink create failed"
+        blocked "configured_pool_symlink_create" "$(head -1 /tmp/t5b.err)"
+        blocked "configured_pool_readlink" "symlink create failed"
     fi
     rm -f "$MNT/g005_link" 2>/dev/null || true
 
@@ -304,38 +389,48 @@ if [ "$MOUNTED" -eq 1 ]; then
         touch "$MNT/g006_dir/a" "$MNT/g006_dir/b" "$MNT/g006_dir/c" 2>/dev/null || true
         entry_count=$(ls -1 "$MNT/g006_dir" 2>/dev/null | wc -l)
         if [ "$entry_count" -ge 3 ]; then
-            pass "smoke_readdir"
+            pass "configured_pool_readdir"
         else
-            fail "smoke_readdir" "expected >=3 entries, got $entry_count"
+            fail "configured_pool_readdir" "expected >=3 entries, got $entry_count"
         fi
     else
-        blocked "smoke_readdir" "test directory could not be created"
+        blocked "configured_pool_readdir" "test directory could not be created"
     fi
     rm -rf "$MNT/g006_dir" 2>/dev/null || true
 
-    # statfs check
     echo ""
-    echo "-- smoke: statfs (filesystem statistics) --"
-    if stat -f "$MNT" >/dev/null 2>&1; then
-        pass "smoke_statfs"
-        statfs_out=$(stat -f "$MNT" 2>/dev/null || echo "")
-        echo "  statfs: $statfs_out"
+    echo "-- smoke: write plus syncfs/lower flush --"
+    if printf 'configured pool authority\n' > "$MNT/configured_pool_flush.txt" 2>/tmp/write.err; then
+        pass "configured_pool_write"
+        if sync -f "$MNT/configured_pool_flush.txt" 2>/tmp/syncfs.err; then
+            pass "configured_pool_syncfs"
+        else
+            fail "configured_pool_syncfs" "$(head -1 /tmp/syncfs.err)"
+        fi
     else
-        fail "smoke_statfs" "stat -f failed on mount point"
+        fail "configured_pool_write" "$(head -1 /tmp/write.err)"
+        blocked "configured_pool_syncfs" "write failed"
     fi
 
     echo ""
-    echo "-- smoke: sync --"
-    sync
-    pass "smoke_sync"
+    echo "-- smoke: clean teardown --"
+    if umount "$MNT" 2>/tmp/umount.err; then
+        pass "configured_pool_umount"
+        MOUNTED=0
+    else
+        fail "configured_pool_umount" "$(head -3 /tmp/umount.err | tr '\n' ' ')"
+    fi
 
 else
-    echo "Filesystem not mounted -- skipping smoke tests."
-    blocked "smoke_mkdir" "filesystem not mounted"
-    blocked "smoke_symlink_create" "filesystem not mounted"
-    blocked "smoke_readdir" "filesystem not mounted"
-    blocked "smoke_statfs" "filesystem not mounted"
-    blocked "smoke_sync" "filesystem not mounted"
+    echo "Filesystem not mounted -- skipping configured-pool smoke tests."
+    blocked "configured_pool_statfs" "filesystem not mounted"
+    blocked "configured_pool_statfs_capacity" "filesystem not mounted"
+    blocked "configured_pool_mkdir" "filesystem not mounted"
+    blocked "configured_pool_symlink_create" "filesystem not mounted"
+    blocked "configured_pool_readdir" "filesystem not mounted"
+    blocked "configured_pool_write" "filesystem not mounted"
+    blocked "configured_pool_syncfs" "filesystem not mounted"
+    blocked "configured_pool_umount" "filesystem not mounted"
 fi
 
 echo ""
@@ -372,6 +467,10 @@ INITSCRIPT
 
     chmod +x "$RUN_DIR/init"
 
+    echo "--- Creating configured pool member disk image ---"
+    dd if=/dev/zero of="$POOL_IMG" bs=1M count=128 2>/dev/null
+    echo "  Pool member image: $POOL_IMG ($(du -h "$POOL_IMG" | cut -f1))"
+
     # Build initramfs
     echo "--- Building initramfs ---"
     (cd "$RUN_DIR" && find . -path ./initrd.img -prune -o -print | "$CPIO" -o -H newc 2>/dev/null) > "$RUN_DIR/initrd.img"
@@ -383,6 +482,7 @@ INITSCRIPT
     timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
       -kernel "$KERNEL_IMG" \
       -initrd "$RUN_DIR/initrd.img" \
+      -drive file="$POOL_IMG",format=raw,if=virtio,index=0 \
       -append "console=ttyS0 quiet panic=10" \
       -nographic \
       -m 1024M \
@@ -424,6 +524,8 @@ INITSCRIPT
 
     if [ "$BLOCKED_COUNT" -gt 0 ] && [ "$PASS_COUNT" -eq 0 ] && [ "$FAIL_COUNT" -eq 0 ]; then
       VALIDATION_TIER="QEMU guest (all smoke tests blocked — kernel module not loadable)"
+    elif grep -q "^PASS: configured_pool_umount" "$RUN_DIR/qemu.log" 2>/dev/null; then
+      VALIDATION_TIER="mounted kernel VFS configured-pool authority"
     elif grep -q "^PASS: missing_pool_member_rejected" "$RUN_DIR/qemu.log" 2>/dev/null; then
       VALIDATION_TIER="kernel VFS authority refusal"
     elif [ "$PASS_COUNT" -gt 0 ] || [ "$FAIL_COUNT" -gt 0 ]; then

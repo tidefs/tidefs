@@ -225,6 +225,16 @@ C/Rust mounted path binds explicit kernel pool I/O authority for read, write,
 flush, capacity, and teardown as described in
 `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`.
 
+The standing `nix run .#kmod-xfstests-smoke` QEMU row now covers both sides of
+that rule. It keeps the bootstrap/no-device refusal, then creates a disposable
+128 MiB virtio pool member with `tidefsctl pool create`, mounts `/dev/vda`
+with `mount -t tidefs`, verifies statfs capacity from the configured pool
+authority, writes and calls `sync -f` through the mounted path, and unmounts
+cleanly.
+Passing that row is the minimum no-daemon configured-pool evidence; broader
+xfstests, crash-recovery, and final object/extent replay claims still need
+their own issue-scoped rows.
+
 ## 6. Required first proofs
 
 Before `kmod.posix_filesystem_adapter.vfs.k0` or

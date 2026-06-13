@@ -72,6 +72,10 @@ is no longer bootstrap-only:
   namespace/data table in the pool data region so Linux 7.0 QEMU can prove
   no-daemon create, write, read, mkdir, readdir, sync, remount readback,
   unlink, rmdir, clean unmount, and module unload;
+- the standing `kmod-xfstests-smoke` QEMU row creates a fresh configured pool
+  member, mounts it without a userspace daemon, checks nonzero statfs capacity
+  from the mounted pool authority, drives a write plus syncfs/lower flush, and
+  unmounts cleanly;
 - the mounted mutation path also republishes committed-root state after
   successful state/data writes. VCRL remains the current mount-selection
   ledger; new pool images reserve four system-area blocks so the same
@@ -87,6 +91,39 @@ is no longer bootstrap-only:
 Workers must use an explicit pool member/authority for mounted kernel VFS
 behavior. Bootstrap-only results prove only missing-authority refusal; they
 cannot close engine-backed, storage-backed, or full-kernel issues.
+
+## Configured QEMU Member Fixture
+
+The configured-member QEMU smoke fixture is created by
+`nix run .#kmod-xfstests-smoke`. The host-side script creates a disposable
+128 MiB raw disk image under the smoke temp directory, attaches it to the
+Linux 7.0 guest as virtio-blk `/dev/vda`, and bundles `tidefsctl` into the
+initramfs. Inside the guest, the fixture runs:
+
+```sh
+tidefsctl pool create qemu_smoke_pool --devices /dev/vda --json
+tidefsctl pool scan --devices /dev/vda
+mount -t tidefs /dev/vda /mnt/tidefs
+```
+
+The same guest first verifies that
+`mount -o bootstrap -t tidefs none /mnt/tidefs` still fails closed. The
+positive row then checks that mounted statfs reports a nonzero block count from
+the configured pool authority, performs a small mounted write, calls
+`sync -f` on that file to exercise the syncfs path, and unmounts the
+superblock.
+
+The durability claim for this row is deliberately narrow. The mounted POSIX
+shim binds read and write callbacks to the lower superblock, binds its flush
+callback to `sync_blockdev()` on the lower `bdev`, and exposes an explicit
+teardown callback while leaving actual `bdev` lifetime ownership with
+`get_tree_bdev()`/`kill_block_super()`. `sync_fs(wait=1)` activates that
+mounted authority even if no earlier operation has touched the Rust engine. If
+any required read, write, flush, capacity, or teardown callback is unavailable,
+the mounted path must fail closed instead of synthesizing capacity or
+pretending durability. Unsupported discard, write-zeroes, zero-range, and full
+object/extent/intent-log recovery claims remain outside this fixture unless
+their paths are explicitly admitted and proven by a later row.
 
 ## Kernel Pool Core
 

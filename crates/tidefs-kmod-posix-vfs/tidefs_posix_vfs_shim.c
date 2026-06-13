@@ -5817,7 +5817,7 @@ static int tidefs_posix_vfs_sync_fs(struct super_block *sb, int wait)
 		return 0;
 	}
 
-	if (ctx->engine_backed && ctx->engine_activated) {
+	if (ctx->engine_backed) {
 		ret = tidefs_posix_vfs_activate_engine(ctx);
 		if (ret == 0)
 			ret = tidefs_posix_vfs_engine_sync_fs(wait);
