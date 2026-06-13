@@ -374,6 +374,31 @@ impl KernelEngine {
         self.committed_root.get().is_some()
     }
 
+    fn mounted_pool_io_ctx(
+        &self,
+    ) -> core::result::Result<
+        crate::tidefs_kmod_bridge::kernel_types::CommittedRootIoCtx,
+        crate::tidefs_kmod_bridge::kernel_types::Errno,
+    > {
+        if !self.pool_is_mounted() {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
+        }
+        let Some(ref pool_core) = self.pool_core else {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
+        };
+        let io_ctx = pool_core.committed_root_io_ctx();
+        if !io_ctx.is_active() || !io_ctx.capabilities().has_mounted_authority() {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
+        }
+        Ok(io_ctx)
+    }
+
+    fn teardown_pool_authority(
+        &self,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
+        self.mounted_pool_io_ctx()?.teardown()
+    }
+
     /// Seed the mounted root inode into the engine namespace table.
     fn ensure_root_inode(&self, root_ino: u64, sector_size: u32) {
         if root_ino == 0 || self.find_inode(root_ino).is_some() {
@@ -6415,31 +6440,6 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         self.txg_commit_barrier()
     }
     // ── Committed-root writeback ─────────────────────────────────────
-    fn mounted_pool_io_ctx(
-        &self,
-    ) -> core::result::Result<
-        crate::tidefs_kmod_bridge::kernel_types::CommittedRootIoCtx,
-        crate::tidefs_kmod_bridge::kernel_types::Errno,
-    > {
-        if !self.pool_is_mounted() {
-            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
-        }
-        let Some(ref pool_core) = self.pool_core else {
-            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
-        };
-        let io_ctx = pool_core.committed_root_io_ctx();
-        if !io_ctx.is_active() || !io_ctx.capabilities().has_mounted_authority() {
-            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
-        }
-        Ok(io_ctx)
-    }
-
-    fn teardown_pool_authority(
-        &self,
-    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
-        self.mounted_pool_io_ctx()?.teardown()
-    }
-
     /// Persist the committed root through KernelPoolCore authority.
     ///
     /// Gates on Mounted pool state and requires the C shim to register
