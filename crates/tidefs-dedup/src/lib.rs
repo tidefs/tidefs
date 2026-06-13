@@ -10,6 +10,21 @@
 //! to walk all extent maps, hash data payloads, and merge duplicates found
 //! after the fact. Runs at `BestEffort` priority under the background
 //! scheduler.
+//!
+//! ## Mounted transform ordering
+//!
+//! Dedup identity is plaintext identity: the content hash is computed before
+//! compression frame and encryption frame placement. The current guardrail
+//! vocabulary is:
+//!
+//! ```text
+//! plaintext identity -> compression frame -> encryption frame -> checksum -> raw media bytes
+//! ```
+//!
+//! Reclaim identity is the committed object key or locator used to retire
+//! storage, not the plaintext hash itself. Mounted compression/encryption
+//! remains blocked until the raw media bytes and reclaim identity paths are
+//! classified by `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`.
 
 use std::collections::HashMap;
 

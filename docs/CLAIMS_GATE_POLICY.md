@@ -30,6 +30,9 @@ line clearly frames the capability as absent today, future work, or a goal:
 - must not claim distributed storage capability;
 - must not claim kernelspace-ready or full-kernel operation;
 - must not claim an RDMA data path.
+- must not claim mounted device-level compression or mounted device-level
+  encryption while the TFR-006 raw-store inventory has blocked production
+  rows.
 
 A line may mention one of those topics only when it is clearly framed as one of:
 
@@ -45,6 +48,15 @@ Stronger wording requires all of the following:
 2. recorded proof that covers the full claimed behavior;
 3. an updated current-status or review-register row;
 4. an updated claims gate rule that allows the specific stronger claim.
+
+## Mounted Transform Authority
+
+The mounted local-filesystem compression/encryption claim is blocked behind
+`docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`. The lower
+object-store compression and encryption wrappers may be discussed as helper
+or library-tier surfaces, but publishing-facing text must not present them as
+end-to-end mounted filesystem support until the transform authority records no
+blocked production raw-store paths.
 
 ## Unreleased Authority Boundary
 

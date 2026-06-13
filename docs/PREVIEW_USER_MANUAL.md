@@ -46,6 +46,12 @@ not yet have full-kernel capability. Do not use it for real data. All claims
 are governed by the project Claims gate
 (`cargo run -p tidefs-xtask -- check-claims-gate`).
 
+Mounted device-level compression and encryption are currently blocked by the
+TFR-006 transform authority. The lower object-store transform wrappers are not
+an end-to-end mounted filesystem capability while the raw-store inventory in
+[docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md](MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md)
+still has blocked production rows.
+
 For current status see [docs/REVIEW_TODO_REGISTER.md](REVIEW_TODO_REGISTER.md)
 and [docs/WHOLE_REPO_REVIEW.md](WHOLE_REPO_REVIEW.md). The old status,
 feature-matrix, and release-focus docs are not current TideFS authority unless

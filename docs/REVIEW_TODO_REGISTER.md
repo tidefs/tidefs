@@ -280,29 +280,29 @@ Important 2026-06-01 findings:
   pre-existing formatting drift in unrelated object-store files/regions, so it
   remains open for the raw primary-store bypasses, mounted-content/device
   transform authority split, dedup ordering, checksum order, and key handling.
-- `TFR-006`: a focused raw-store inventory on 2026-06-01 found 139
-  local-filesystem raw-store call matches:
-  `crates/tidefs-local-filesystem/src/lib.rs` has 73,
+- `TFR-006`: issue #218 adds the checked raw-store inventory at
+  `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`. The source check
+  guards current `raw_primary_store()` and `raw_primary_store_mut()` matches:
+  `crates/tidefs-local-filesystem/src/lib.rs` has 89,
   `crates/tidefs-local-filesystem/src/crash_recovery.rs` has 21,
-  `crates/tidefs-local-filesystem/src/journal_cleaner.rs` has 7, and
-  `crates/tidefs-local-filesystem/src/tests.rs` has 38. The production
-  hotspots include committed-root load/persist and intent-log recovery during
-  open, explicit recovery probes, scrub/reclaim/allocation scans, sync/fsync
-  and intent-log flushing, directory reads, and the mounted file content path:
-  `create_file()` writes initial content through `write_chunked_content(...,
-  self.store.raw_primary_store_mut(), ...)`, full replacement and overlay
-  rewrites do the same, and `read_file()` calls `read_content_from_store()`
-  with `self.store.raw_primary_store()`. This confirms that the device-level
-  encryption/compression API surface remains unsafe to treat as an end-to-end
-  filesystem transform until those paths are classified and moved behind a
-  single transform-aware authority or explicitly proven raw-only.
+  `crates/tidefs-local-filesystem/src/journal_cleaner.rs` has 7,
+  `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` has 6, and
+  `crates/tidefs-local-object-store/src/pool/mod.rs` has 7 lower accessor or
+  escape-hatch matches. The inventory classifies production mounted paths as
+  transform-aware, metadata/raw-only, blocked, or owned by later
+  receipt/placement issues, and it names the ordering terms plaintext identity,
+  compression frame, encryption frame, checksum, raw media bytes, and reclaim
+  identity. The device-level encryption/compression API surface remains unsafe
+  to treat as an end-to-end mounted filesystem transform while blocked rows
+  remain.
 - `TFR-006`: commit `8b5b0f70` makes the mounted local-filesystem
   device-transform helpers fail closed instead of silently claiming end-to-end
   encryption or compression. `LocalFileSystem` now rejects open configs with
   device-level encryption or compression using `FileSystemError::Unsupported`
-  while TFR-006 raw-store bypasses remain. The object-store pool transform
-  stack still exists for lower-level pool use; this gate only prevents the
-  mounted filesystem API from presenting incomplete transform coverage as a
+  while the TFR-006 raw-store inventory has blocked production rows. The
+  object-store pool transform stack still exists for lower-level pool use; this
+  gate only prevents the mounted filesystem API from presenting incomplete
+  transform coverage as a
   `CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target cargo test -p
   tidefs-local-filesystem --locked
   device_transform_open_helpers_fail_closed_until_tfr_006_authority`,
