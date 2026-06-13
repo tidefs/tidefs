@@ -11,7 +11,7 @@
 //! | Operation        | Status      | VfsEngine dependency        | Daemon required |
 //! |------------------|-------------|-----------------------------|-----------------|
 //! | `fault`          | Implemented | `VfsEngine::read()`         | No              |
-//! | `page_mkwrite`   | Implemented | `DirtyFolioTracker::add()`  | No              |
+//! | `page_mkwrite`   | Implemented | `DirtyFolioTracker::try_add()` | No           |
 //!
 //! # No-daemon boundary
 //!
@@ -241,7 +241,7 @@ impl<'a, E: VfsEngine> KmodVfsVmOps<'a, E> {
             .page_authority
             .acquire(self.engine, inode, page_idx, PageOwnershipMode::Write)
             .map_err(|c| c.to_errno())?;
-        self.dirty_tracker.add(inode, offset, length);
+        self.dirty_tracker.try_add(inode, offset, length)?;
         guard.commit();
         Ok(VmFaultResult::Locked)
     }
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn fault_empty_read_returns_minor() {
+    fn fault_empty_read_returns_no_page() {
         let mut e = make_engine();
         let fh = make_fh();
         e.read_fn = Box::new(|_, _, _, _| Ok(vec![]));
@@ -314,7 +314,7 @@ mod tests {
             .unwrap();
 
         assert!(data.is_empty());
-        assert_eq!(result, VmFaultResult::Minor);
+        assert_eq!(result, VmFaultResult::NoPage);
     }
 
     #[test]

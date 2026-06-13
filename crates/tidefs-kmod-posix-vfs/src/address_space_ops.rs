@@ -20,7 +20,7 @@
 //! | `dirty_folio`    | Implemented | `writeback::DirtyFolioTracker` | No           |
 //! | `writepages`     | Implemented | `VfsEngine::writeback_folios()` + `DirtyFolioTracker` (batched 3-phase: alloc->intent recording->writeback with per-range errors) | No    |
 //! | `writepage`      | Implemented | `VfsEngine::writeback_folios()` | No    |
-//! | `page_mkwrite`   | Implemented | `DirtyFolioTracker::add()`  | No              |
+//! | `page_mkwrite`   | Implemented | `DirtyFolioTracker::try_add()` | No           |
 //! | `invalidate_folio` | Implemented | `VfsEngine::invalidate_cache_range()` + `DirtyFolioTracker::remove_range()` | No         |
 //!
 //! # No-daemon boundary
@@ -265,7 +265,7 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
             .acquire(self.engine, fh.inode_id, page_idx, PageOwnershipMode::Write)
             .map_err(|c| c.to_errno())?;
         let written = self.engine.write(fh, offset, data, ctx)?;
-        self.dirty_tracker.add(fh.inode_id, offset, written);
+        self.dirty_tracker.try_add(fh.inode_id, offset, written)?;
         // Commit: kernel retains write ownership until writeback completes.
         guard.commit();
         Ok(written)
@@ -297,8 +297,10 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
     /// 3. *Writeback*: execute each writeback, tracking per-range
     ///    errors and re-dirtying failed ranges.
     ///
-    /// Returns [`WritebackBatchResult`] with total bytes written,
-    /// per-range writeback errors, and per-range allocation errors.
+    /// Returns [`WritebackBatchResult`] with total bytes written when all
+    /// ranges complete. If any allocation, intent-recording, or writeback
+    /// step fails, the failed range is re-dirtied and the method returns the
+    /// first errno so the kernel writeback path fails closed.
     ///
     /// # Linux kernel signature
     /// `int (*writepages)(struct address_space *, struct writeback_control *)`
@@ -316,6 +318,7 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         let dirty_ranges = self.dirty_tracker.drain_inode(inode);
         let mut plans: crate::TideVec<WritebackPlan> = crate::TideVec::new();
         let mut alloc_errors: crate::TideVec<(DirtyRange, Errno)> = crate::TideVec::new();
+        let mut first_error: Option<Errno> = None;
 
         // -- Phase 1: allocate extents and encode write-intent entries --
 
@@ -331,6 +334,9 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
                         // Allocation failure -- re-dirty the full range and
                         // record the error for batch reporting.
                         self.dirty_tracker.add(inode, range.offset, range.length);
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
                         alloc_errors.push((*range, e));
                         continue;
                     }
@@ -368,6 +374,9 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
             if record_intent(self.engine, &plan.entry).is_err() {
                 self.dirty_tracker
                     .add(inode, plan.range.offset, plan.range.length);
+                if first_error.is_none() {
+                    first_error = Some(Errno::EIO);
+                }
                 failed_indices.push(i);
             }
         }
@@ -394,6 +403,9 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
                     // and record the error.
                     self.dirty_tracker
                         .add(inode, plan.range.offset, plan.range.length);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
                     writeback_errors.push((plan.range, e));
                     continue;
                 }
@@ -434,6 +446,10 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
                     self.dirty_tracker.add(inode, unalloc_offset, unalloc_len);
                 }
             }
+        }
+
+        if let Some(err) = first_error {
+            return Err(err);
         }
 
         Ok(WritebackBatchResult {
@@ -523,7 +539,7 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         offset: u64,
         _ctx: &RequestCtx,
     ) -> Result<(), Errno> {
-        self.dirty_tracker.add(inode, offset, 4096);
+        self.dirty_tracker.try_add(inode, offset, 4096)?;
         Ok(())
     }
 
