@@ -66,12 +66,15 @@ logical object or stripe by the pool-wide redundancy policy:
 Every successful non-log allocation persists a placement receipt. The receipt
 records the logical object key, epoch, redundancy policy, failure-domain level,
 monotonic receipt generation, payload digest, shard length for erasure objects,
-and the exact device GUIDs and shard roles selected for the write. Reads,
-scrub, evacuation, rebuild, and distributed replay consume this receipt
-authority. They must not recompute locations from the latest topology and
-assume the old bytes moved. When several receipts for the same logical object
-exist at the same topology epoch, the highest receipt generation is the newest
-locator authority.
+and the exact device GUIDs and shard roles selected for the write. Current
+local object-store receipts also embed the sealed planner replay record that
+issued the target order: placement key, size hint, per-target byte budget,
+topology epoch, deterministic seed, durability policy, failure-domain level,
+target failure-domain keys, and seal. Reads, scrub, evacuation, rebuild, and
+distributed replay consume this receipt authority. They must not recompute
+locations from the latest topology and assume the old bytes moved. When several
+receipts for the same logical object exist at the same topology epoch, the
+highest receipt generation is the newest locator authority.
 
 Topology changes increment the placement epoch. Old receipts remain readable
 against their recorded device GUIDs while new allocations use the new epoch and
