@@ -241,29 +241,74 @@ if false; then
     RUN_DIR="$TMPDIR/validation-$$"
     mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,etc,lib/modules,mnt/tidefs,store,usr/lib,var/lib/tidefs}
 
+    ensure_run_dir() {
+      dst="$1"
+      case "$dst" in
+        "$RUN_DIR"|"$RUN_DIR"/*) ;;
+        *)
+          echo "ERROR: refusing to prepare path outside run directory: $dst" >&2
+          exit 2
+          ;;
+      esac
+
+      current="$RUN_DIR"
+      rel="''${dst#$RUN_DIR}"
+      rel="''${rel#/}"
+      chmod u+w "$current" 2>/dev/null || true
+
+      old_ifs="$IFS"
+      IFS='/'
+      for part in $rel; do
+        [ -n "$part" ] || continue
+        chmod u+w "$current" 2>/dev/null || true
+        if [ -L "$current/$part" ]; then
+          rm -f "$current/$part"
+        fi
+        if [ ! -d "$current/$part" ]; then
+          mkdir "$current/$part"
+        fi
+        current="$current/$part"
+        chmod u+w "$current" 2>/dev/null || true
+      done
+      IFS="$old_ifs"
+    }
+
+    copy_nix_store_file() {
+      src="$1"
+      executable="''${2:-0}"
+      [ -f "$src" ] || return 0
+
+      dst_dir="$RUN_DIR/$(dirname "$src")"
+      ensure_run_dir "$dst_dir"
+      cp -f "$src" "$dst_dir/"
+      if [ "$executable" = "1" ]; then
+        chmod +x "$dst_dir/$(basename "$src")" 2>/dev/null || true
+      fi
+    }
+
+    copy_ldd_runtime_deps() {
+      src="$1"
+      if command -v ldd >/dev/null 2>&1; then
+        (ldd "$src" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u || true) | while read -r lib; do
+          [ -f "$lib" ] || continue
+          copy_nix_store_file "$lib" 0 2>/dev/null || true
+        done
+      fi
+    }
+
     copy_runtime_binary() {
       src="$1"
       link_name="''${2:-}"
       [ -f "$src" ] || return 0
 
-      dst_dir="$RUN_DIR/$(dirname "$src")"
-      mkdir -p "$dst_dir"
-      cp "$src" "$dst_dir/" 2>/dev/null || true
-      chmod +x "$dst_dir/$(basename "$src")" 2>/dev/null || true
+      copy_nix_store_file "$src" 1 2>/dev/null || true
 
       if [ -n "$link_name" ]; then
         rm -f "$RUN_DIR/bin/$link_name"
         ln -sf "$src" "$RUN_DIR/bin/$link_name" 2>/dev/null || true
       fi
 
-      if command -v ldd >/dev/null 2>&1; then
-        (ldd "$src" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u || true) | while read -r lib; do
-          [ -f "$lib" ] || continue
-          d="$RUN_DIR/$(dirname "$lib")"
-          mkdir -p "$d"
-          cp "$lib" "$d/" 2>/dev/null || true
-        done
-      fi
+      copy_ldd_runtime_deps "$src"
     }
 
     cleanup() {
@@ -466,7 +511,7 @@ MOUNTHELPER
     # GLIBC_LIB is interpolated at Nix build time (e.g. /nix/store/...-glibc-.../lib).
     if [ -n "$GLIBC_LIB" ] && [ -d "$GLIBC_LIB" ]; then
       NIX_LD_DIR="$RUN_DIR/$GLIBC_LIB"
-      mkdir -p "$NIX_LD_DIR"
+      ensure_run_dir "$NIX_LD_DIR"
       for f in ld-linux-x86-64.so.2 libm.so.6 libc.so.6 libresolv.so.2 libpthread.so.0 libdl.so.2 libutil.so.1 librt.so.1; do
         if [ -f "$GLIBC_LIB/$f" ]; then
           cp "$GLIBC_LIB/$f" "$NIX_LD_DIR/" 2>/dev/null || true
@@ -490,14 +535,10 @@ MOUNTHELPER
 " || true)
     fi
     if [ -n "$XFSTESTS_SHEBANG_BASH" ] && [ -f "$XFSTESTS_SHEBANG_BASH" ]; then
-      BASH_DIR="$RUN_DIR/$(dirname "$XFSTESTS_SHEBANG_BASH")"
-      mkdir -p "$BASH_DIR"
-      cp "$XFSTESTS_SHEBANG_BASH" "$BASH_DIR/"
+      copy_nix_store_file "$XFSTESTS_SHEBANG_BASH" 1
       ln -sf "$XFSTESTS_SHEBANG_BASH" "$RUN_DIR/bin/bash" 2>/dev/null || true
     elif [ -f "$BASH_BIN" ]; then
-      BASH_DIR="$RUN_DIR/$(dirname "$BASH_BIN")"
-      mkdir -p "$BASH_DIR"
-      cp "$BASH_BIN" "$BASH_DIR/"
+      copy_nix_store_file "$BASH_BIN" 1
       ln -sf "$BASH_BIN" "$RUN_DIR/bin/bash" 2>/dev/null || true
     fi
     if [ -d "$XFSTESTS_LIB" ]; then
@@ -506,25 +547,16 @@ MOUNTHELPER
         | sort -u \
         | while read -r bash_path; do
           [ -f "$bash_path" ] || continue
-          BASH_DIR="$RUN_DIR/$(dirname "$bash_path")"
-          mkdir -p "$BASH_DIR"
-          cp "$bash_path" "$BASH_DIR/"
-          chmod +x "$BASH_DIR/$(basename "$bash_path")" 2>/dev/null || true
-          if command -v ldd >/dev/null 2>&1; then
-            ldd "$bash_path" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u | while read lib; do
-              [ -f "$lib" ] || continue
-              d="$RUN_DIR/$(dirname "$lib")"
-              mkdir -p "$d"
-              cp "$lib" "$d/" 2>/dev/null || true
-            done
-          fi
+          copy_nix_store_file "$bash_path" 1
+          copy_ldd_runtime_deps "$bash_path"
         done
     fi
 
     # ── Copy xfstests lib ─────────────────────────────────────────────
     if [ -d "$XFSTESTS_LIB" ]; then
-      mkdir -p "$RUN_DIR/$XFSTESTS_LIB"
-      cp -r "$XFSTESTS_LIB"/* "$RUN_DIR/$XFSTESTS_LIB/" 2>/dev/null || true
+      ensure_run_dir "$RUN_DIR/$XFSTESTS_LIB"
+      cp -R --no-preserve=mode,ownership "$XFSTESTS_LIB"/. "$RUN_DIR/$XFSTESTS_LIB/" 2>/dev/null || true
+      find "$RUN_DIR/$XFSTESTS_LIB" -type d -exec chmod u+w {} + 2>/dev/null || true
       if command -v ldd >/dev/null 2>&1; then
         echo "  Collecting xfstests helper library dependencies..."
         for helper_root in "$XFSTESTS_LIB/src" "$XFSTESTS_LIB/ltp"; do
@@ -532,9 +564,7 @@ MOUNTHELPER
           find "$helper_root" -maxdepth 2 -type f -perm -0100 -print 2>/dev/null | while read -r helper; do
             (ldd "$helper" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u || true) | while read -r lib; do
               [ -f "$lib" ] || continue
-              d="$RUN_DIR/$(dirname "$lib")"
-              mkdir -p "$d"
-              cp "$lib" "$d/" 2>/dev/null || true
+              copy_nix_store_file "$lib" 0 2>/dev/null || true
             done
           done
         done
@@ -543,6 +573,7 @@ MOUNTHELPER
 
     # ── Create custom xfstests-check wrapper ──────────────────────────
     if [ -f "$XFSTESTS_BIN" ]; then
+      rm -f "$RUN_DIR/bin/xfstests-check"
       cat > "$RUN_DIR/bin/xfstests-check" << 'XFWRAP'
 #!/bin/bash
 set -e
@@ -586,72 +617,36 @@ XFWRAP
 
     # ── Copy perl ─────────────────────────────────────────────────────
     if [ -f "$PERL_BIN" ]; then
-      PERL_DIR="$RUN_DIR/$(dirname "$PERL_BIN")"
-      mkdir -p "$PERL_DIR"
-      cp "$PERL_BIN" "$PERL_DIR/"
+      copy_nix_store_file "$PERL_BIN" 1
       ln -sf "$PERL_BIN" "$RUN_DIR/bin/perl" 2>/dev/null || true
-      if command -v ldd >/dev/null 2>&1; then
-        ldd "$PERL_BIN" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u | while read lib; do
-          [ -f "$lib" ] || continue
-          d="$RUN_DIR/$(dirname "$lib")"
-          mkdir -p "$d"
-          cp "$lib" "$d/" 2>/dev/null || true
-        done
-      fi
+      copy_ldd_runtime_deps "$PERL_BIN"
     fi
 
     # ── Copy bc ──────────────────────────────────────────────────────
     if [ -f "$BC_BIN" ]; then
-      BC_DIR="$RUN_DIR/$(dirname "$BC_BIN")"
-      mkdir -p "$BC_DIR"
-      cp "$BC_BIN" "$BC_DIR/"
+      copy_nix_store_file "$BC_BIN" 1
       ln -sf "$BC_BIN" "$RUN_DIR/bin/bc" 2>/dev/null || true
-      if command -v ldd >/dev/null 2>&1; then
-        ldd "$BC_BIN" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u | while read lib; do
-          [ -f "$lib" ] || continue
-          d="$RUN_DIR/$(dirname "$lib")"
-          mkdir -p "$d"
-          cp "$lib" "$d/" 2>/dev/null || true
-        done
-      fi
+      copy_ldd_runtime_deps "$BC_BIN"
     fi
 
     # ── Copy xfs_io ──────────────────────────────────────────────────
     if [ -f "$XFSIO_BIN" ]; then
-      XFSIO_DIR="$RUN_DIR/$(dirname "$XFSIO_BIN")"
-      mkdir -p "$XFSIO_DIR"
-      cp "$XFSIO_BIN" "$XFSIO_DIR/"
+      copy_nix_store_file "$XFSIO_BIN" 1
       ln -sf "$XFSIO_BIN" "$RUN_DIR/bin/xfs_io" 2>/dev/null || true
-      if command -v ldd >/dev/null 2>&1; then
-        ldd "$XFSIO_BIN" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u | while read lib; do
-          [ -f "$lib" ] || continue
-          d="$RUN_DIR/$(dirname "$lib")"
-          mkdir -p "$d"
-          cp "$lib" "$d/" 2>/dev/null || true
-        done
-      fi
+      copy_ldd_runtime_deps "$XFSIO_BIN"
     fi
 
     # ── Copy GNU readlink (needed for readlink -e) ───────────────────
     if [ -f "$READLINK_BIN" ]; then
-      READLINK_DIR="$RUN_DIR/$(dirname "$READLINK_BIN")"
-      mkdir -p "$READLINK_DIR"
-      cp "$READLINK_BIN" "$READLINK_DIR/"
+      copy_nix_store_file "$READLINK_BIN" 1
       rm -f "$RUN_DIR/bin/readlink"
       ln -sf "$READLINK_BIN" "$RUN_DIR/bin/readlink" 2>/dev/null || true
-      if command -v ldd >/dev/null 2>&1; then
-        ldd "$READLINK_BIN" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u | while read lib; do
-          [ -f "$lib" ] || continue
-          d="$RUN_DIR/$(dirname "$lib")"
-          mkdir -p "$d"
-          cp "$lib" "$d/" 2>/dev/null || true
-        done
-      fi
+      copy_ldd_runtime_deps "$READLINK_BIN"
     fi
 
     # ── Copy libgmp (needed by readlink, coreutils) ──────────────────
     if [ -d "$GMP_LIB" ]; then
-      mkdir -p "$RUN_DIR/$GMP_LIB"
+      ensure_run_dir "$RUN_DIR/$GMP_LIB"
       for f in libgmp.so.10 libgmp.so; do
         [ -f "$GMP_LIB/$f" ] && cp "$GMP_LIB/$f" "$RUN_DIR/$GMP_LIB/" 2>/dev/null || true
       done
@@ -659,26 +654,15 @@ XFWRAP
 
     # ── Copy coreutils df (busybox df lacks -T flag) ────────────────
     if [ -f "$DF_BIN" ]; then
-      DF_DIR="$RUN_DIR/$(dirname "$DF_BIN")"
-      mkdir -p "$DF_DIR"
-      cp "$DF_BIN" "$DF_DIR/"
+      copy_nix_store_file "$DF_BIN" 1
       rm -f "$RUN_DIR/bin/df"
       ln -sf "$DF_BIN" "$RUN_DIR/bin/df" 2>/dev/null || true
-      if command -v ldd >/dev/null 2>&1; then
-        ldd "$DF_BIN" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u | while read lib; do
-          [ -f "$lib" ] || continue
-          d="$RUN_DIR/$(dirname "$lib")"
-          mkdir -p "$d"
-          cp "$lib" "$d/" 2>/dev/null || true
-        done
-      fi
+      copy_ldd_runtime_deps "$DF_BIN"
     fi
 
     # ── Copy util-linux mount (supports FUSE helpers) ────────────────
     if [ -f "$MOUNT_BIN" ]; then
-      MOUNT_DIR="$RUN_DIR/$(dirname "$MOUNT_BIN")"
-      mkdir -p "$MOUNT_DIR"
-      cp "$MOUNT_BIN" "$MOUNT_DIR/"
+      copy_nix_store_file "$MOUNT_BIN" 1
       rm -f "$RUN_DIR/bin/mount"
       ln -sf "$MOUNT_BIN" "$RUN_DIR/bin/mount.real" 2>/dev/null || true
       cat > "$RUN_DIR/bin/mount" << 'MOUNTWRAP'
@@ -729,21 +713,12 @@ fi
 exec /bin/mount.real "$@"
 MOUNTWRAP
       chmod +x "$RUN_DIR/bin/mount"
-      if command -v ldd >/dev/null 2>&1; then
-        ldd "$MOUNT_BIN" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u | while read lib; do
-          [ -f "$lib" ] || continue
-          d="$RUN_DIR/$(dirname "$lib")"
-          mkdir -p "$d"
-          cp "$lib" "$d/" 2>/dev/null || true
-        done
-      fi
+      copy_ldd_runtime_deps "$MOUNT_BIN"
     fi
 
     # ── Copy findmnt (xfstests common/rc needs it) ───────────────────
     if [ -f "$FINDMNT_BIN" ]; then
-      FINDMNT_DIR="$RUN_DIR/$(dirname "$FINDMNT_BIN")"
-      mkdir -p "$FINDMNT_DIR"
-      cp "$FINDMNT_BIN" "$FINDMNT_DIR/"
+      copy_nix_store_file "$FINDMNT_BIN" 1
       ln -sf "$FINDMNT_BIN" "$RUN_DIR/bin/findmnt" 2>/dev/null || true
       rm -f "$RUN_DIR/bin/umount"
       cat > "$RUN_DIR/bin/umount" << 'UMOUNTWRAP'
@@ -782,14 +757,7 @@ fi
 exec /bin/busybox umount "$@"
 UMOUNTWRAP
       chmod +x "$RUN_DIR/bin/umount"
-      if command -v ldd >/dev/null 2>&1; then
-        ldd "$FINDMNT_BIN" 2>/dev/null | grep -o "/nix/store/[^ ]*" | sort -u | while read lib; do
-          [ -f "$lib" ] || continue
-          d="$RUN_DIR/$(dirname "$lib")"
-          mkdir -p "$d"
-          cp "$lib" "$d/" 2>/dev/null || true
-        done
-      fi
+      copy_ldd_runtime_deps "$FINDMNT_BIN"
     fi
 
     # ── Copy xfstests guest command dependencies ─────────────────────
