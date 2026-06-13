@@ -3,24 +3,11 @@ name: Codex Nexus Relay
 on:
   issues:
     types: [opened, edited, reopened, closed, assigned, unassigned, labeled, unlabeled]
-  issue_comment:
-    types: [created, edited, deleted]
   pull_request:
     branches: [master]
     types: [opened, edited, synchronize, reopened, ready_for_review, converted_to_draft, closed, labeled, unlabeled]
   push:
     branches: [master]
-  workflow_run:
-    workflows:
-      - Focused Rust
-      - Nix Checks
-      - QEMU Smoke
-      - RDMA
-      - Release Candidate
-      - Rust Fast
-      - Secret Policy
-      - xfstests
-    types: [requested, completed]
   workflow_dispatch:
 
 permissions:
