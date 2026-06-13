@@ -1631,7 +1631,7 @@ CRASHCMDS
 
     if [ "$QEMU_TIMED_OUT" -eq 1 ]; then
       ACTIVE_XFSTEST=$(
-        grep -aE '^=== Running [^[:space:]]+ ===$' "$VAL_LOG" 2>/dev/null \
+        grep -aEo '=== Running [^[:space:]]+ ===' "$VAL_LOG" 2>/dev/null \
           | tail -1 \
           | sed 's/^=== Running //; s/ ===$//' \
           | tr -d '\r' || true
