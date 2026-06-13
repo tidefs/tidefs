@@ -497,6 +497,7 @@ impl MountAuthority {
                         .to_string()
                 })?;
                 let token: tidefs_cluster::PoolLeaseToken = bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
                     .reject_trailing_bytes()
                     .deserialize(token_bytes)
                     .map_err(|e| {
