@@ -87,6 +87,7 @@ self-hosted runner VM as:
 ```
 
 The file should be owned by `root:github-runner` with mode `0640`. To validate
-the event bridge after runner maintenance, dispatch the `Codex Nexus Relay`
-workflow against the target branch and confirm the local dashboard event log
-records a signed `workflow_dispatch` event.
+the event bridge after runner maintenance, confirm that the NixOS system
+profile still exposes the relay signer tools on each runner, dispatch the
+`Codex Nexus Relay` workflow against the target branch, and confirm the local
+dashboard event log records a signed `workflow_dispatch` event.

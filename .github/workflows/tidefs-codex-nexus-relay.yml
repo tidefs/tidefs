@@ -47,10 +47,12 @@ jobs:
           set -euo pipefail
           test -r "$GITHUB_EVENT_PATH"
           test -r "$NEXUS_SECRET_FILE"
+          export PATH="/run/current-system/sw/bin:/usr/bin:/bin:${PATH:-}"
+          perl_bin="$(command -v perl)"
 
           delivery="actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           signature="$(
-            perl -MDigest::SHA=hmac_sha256_hex -0777 -e '
+            "$perl_bin" -MDigest::SHA=hmac_sha256_hex -0777 -e '
               my ($secret_path, $event_path) = @ARGV;
               open my $sfh, "<", $secret_path or die "open secret: $!";
               my $secret = <$sfh>;
