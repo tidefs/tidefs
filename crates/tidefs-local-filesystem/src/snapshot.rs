@@ -437,7 +437,9 @@ impl LocalFileSystem {
             source_generation: summary.source_generation,
             created_at_generation: summary.created_at_generation,
         };
-        self.state.snapshots.insert(clone_name_bytes, record);
+        self.state
+            .snapshots
+            .insert(clone_name_bytes, record.clone());
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary_snapshot = summary.clone();
