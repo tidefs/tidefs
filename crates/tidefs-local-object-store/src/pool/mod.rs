@@ -273,6 +273,8 @@ pub struct DeviceReplacement {
     pub old_path: PathBuf,
     /// Original configured media for the old device.
     pub old_config: DeviceConfig,
+    /// Original stable device GUID for receipts that still target the old media.
+    pub old_device_guid: [u8; 16],
     /// Path of the new replacement device.
     pub new_path: PathBuf,
     /// Current replacement state.
@@ -283,11 +285,17 @@ pub struct DeviceReplacement {
 
 impl DeviceReplacement {
     /// Create a new replacement tracker.
-    pub fn new(old_config: DeviceConfig, new_path: PathBuf, device_index: usize) -> Self {
+    pub fn new(
+        old_config: DeviceConfig,
+        old_device_guid: [u8; 16],
+        new_path: PathBuf,
+        device_index: usize,
+    ) -> Self {
         let old_path = old_config.path.clone();
         Self {
             old_path,
             old_config,
+            old_device_guid,
             new_path,
             state: ReplacementState::InProgress {
                 bytes_copied: 0,
@@ -2963,6 +2971,7 @@ impl Pool {
                 encryption: None,
                 compression: None,
             });
+        let old_device_guid = self.device_guid_for_index(idx);
 
         // Open the replacement device.
         let new_device =
@@ -2996,6 +3005,7 @@ impl Pool {
         // Review debt TFR-012: track the replacement for evacuate + detach.
         self.replacement = Some(DeviceReplacement::new(
             old_config,
+            old_device_guid,
             new_config.path.clone(),
             idx,
         ));
@@ -3039,6 +3049,9 @@ impl Pool {
             self.devices[replacement.device_index] = old_device;
             if replacement.device_index < self.config.devices.len() {
                 self.config.devices[replacement.device_index] = replacement.old_config.clone();
+            }
+            if replacement.device_index < self.device_guids.len() {
+                self.device_guids[replacement.device_index] = replacement.old_device_guid;
             }
             if replacement.device_index < self.classes.len() {
                 self.classes[replacement.device_index] = replacement.old_config.class;
