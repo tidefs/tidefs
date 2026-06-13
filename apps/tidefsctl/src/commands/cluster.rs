@@ -1,5 +1,5 @@
-//! Cluster commands: manage multi-node TideFS clusters and clustered
-//! pool lifecycle (create, import, mount across nodes).
+//! Cluster commands: manage prototype multi-node TideFS cluster surfaces and
+//! development diagnostics.
 //!
 //! `cluster pool create` dispatches per-node create requests through
 //! live transport sessions.  Each target storage node writes real
@@ -29,7 +29,7 @@ use tidefs_transport::{NodeInfo, SessionId, Transport, TransportAddr};
 
 #[derive(Subcommand, Debug)]
 pub enum ClusterCommand {
-    /// Manage clustered pools
+    /// Manage prototype clustered pools
     Pool {
         #[command(subcommand)]
         cmd: ClusterPoolCommand,
@@ -50,7 +50,7 @@ pub enum ClusterCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum ClusterPoolCommand {
-    /// Create a new pool across multiple cluster nodes
+    /// Prototype clustered pool creation; not final distributed operator UAPI
     Create {
         /// Pool name (max 255 bytes UTF-8)
         pool_name: String,

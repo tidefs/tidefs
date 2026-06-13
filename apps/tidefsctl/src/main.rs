@@ -583,6 +583,37 @@ mod tests {
     }
 
     #[test]
+    fn book_chapter_declares_command_classification_contract() {
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/book/chapters/10-tidefsctl.adoc");
+        let doc = std::fs::read_to_string(&doc_path).expect("read tidefsctl book chapter");
+
+        assert!(doc.contains(commands::classification::COMMAND_CLASSIFICATION_DOC_MARKER));
+        assert!(doc.contains(commands::classification::COMMAND_CLASSIFICATION_SOURCE_PATH));
+
+        for class in [
+            "public-operator",
+            "userspace-harness",
+            "operator-diagnostic",
+            "prototype",
+            "development-diagnostic",
+            "removed-or-unsupported",
+        ] {
+            assert!(
+                doc.contains(class),
+                "tidefsctl book chapter should mention classification class {class}"
+            );
+        }
+
+        assert!(doc.contains("cluster placement exercise"));
+        assert!(doc.contains("cluster heal exercise"));
+        assert!(doc.contains("cluster pool create"));
+        assert!(doc.contains("not final distributed operator UAPI"));
+        assert!(doc.contains("pool list"));
+        assert!(doc.contains("device rebuild"));
+    }
+
+    #[test]
     fn cli_parse_pool_import_minimum() {
         use clap::Parser;
         let args = Cli::try_parse_from(["tidefsctl", "pool", "import", "mypool"]);

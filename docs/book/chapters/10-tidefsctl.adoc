@@ -173,31 +173,49 @@ The JSON form exposes stable passive-inventory fields including
 
 === Command Classes
 
+Authority marker: `tidefsctl-command-classification-v1`.
+
+The source of truth is
+`apps/tidefsctl/src/commands/classification.rs`. Top-level
+`tidefsctl --help` is generated from that registry and carries the detailed
+per-command routing labels.
+
 [cols="1,2",options="header"]
 |===
 | Class | Commands
 
-| Current operator surface
+| `public-operator`
 | `pool create`, `pool scan`, `pool status`, owner-mediated `pool import`,
-  `pool export`, `pool destroy`, `pool integrity-check`, `pool get`, `pool set`,
+  `pool export`, `pool destroy`, `pool get`, `pool set`,
   `pool list-props`; `dataset create`, `dataset list`, `dataset destroy`,
   `dataset rename`, `dataset set-strategy`, `dataset seal-key`,
   `dataset rotate-key`, `dataset upgrade`, `dataset get`, `dataset set`,
   `dataset list-props`; `snapshot create`, `snapshot list`, `snapshot destroy`,
   `snapshot rollback`, `snapshot send`, `snapshot receive`; `device remove`,
-  `device rebuild`; `block attach`, `block detach`, `block list`,
-  `block send`, `block receive`; `kernel status`; `defrag`; `diag`
+  `block attach`, `block detach`, `block list`, `block send`,
+  `block receive`; `defrag`
 
-| Development harness
-| `mount`, `pool mount`, hidden `pool create --file-devices`,
-  `cluster placement exercise`, `cluster heal exercise`
+| `userspace-harness`
+| `mount`, `pool mount`
 
-| Cluster operator prototype
+| `operator-diagnostic`
+| `pool integrity-check`, `kernel status`, `diag`
+
+| `prototype`
 | `cluster pool create`
+
+| `development-diagnostic`
+| `cluster placement exercise`, `cluster heal exercise`
+
+| `removed-or-unsupported`
+| `pool list`, `device rebuild`, directory-backed pool media, retired
+  `--backing-dir` and `--surviving-dirs` directory object-store modes
 |===
 
 The command classes are part of the CLI contract. Help text, parser tests, and
-book text should change together when a command moves between classes.
+book text should change together when a command moves between classes. Cluster
+placement/heal exercises and `cluster pool create` are not final distributed
+operator UAPI.
 
 === Output Rules
 
