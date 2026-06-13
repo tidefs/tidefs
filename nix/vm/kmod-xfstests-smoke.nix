@@ -1,10 +1,9 @@
 # TideFS: kmod-posix-vfs kernel xfstests smoke harness in QEMU.
 #
 # Builds kmod-posix-vfs as an out-of-tree Linux 7.0 kernel module,
-# boots a QEMU VM, loads the module, mounts the explicit bootstrap kernel
-# VFS root, and executes a focused smoke set for the operations that bootstrap
-# mounts currently support. Engine-backed storage smoke belongs to the block
-# device source path, not the bootstrap path.
+# boots a QEMU VM, loads the module, verifies that nodev/bootstrap mounts
+# fail closed without explicit kernel pool I/O authority, and keeps the
+# focused smoke plumbing available for future block-device-backed runs.
 #
 # This harness is the prerequisite for #5832 (full generic-group
 # classification). It provides the build, boot, load, and mount
@@ -42,16 +41,14 @@ Usage: tidefs-kmod-xfstests-smoke [--timeout SECONDS] [--keep-tmp]
        [--tests "generic/001 generic/002 ..."] [--module PATH]
 
 Build kmod-posix-vfs, boot a QEMU VM with Linux 7.0, load the module,
-provision a TideFS pool, mount it via mount(2), and execute focused
-xfstests smoke tests. Produces a classified pass/fail/blocked report.
+verify missing pool-authority mount refusal, and emit a classified
+pass/fail/blocked report.
 
 Options:
   --timeout SECONDS    QEMU boot timeout (default: $TIMEOUT_SEC)
   --keep-tmp           Do not remove temp directory on exit
-  --tests "T1 T2 ..."  Space-separated test names to run
-                       (default: generic/001 generic/002 generic/003
-                                 generic/004 generic/005 generic/006
-                                 generic/007 generic/013)
+  --tests "T1 T2 ..."  Space-separated test labels to report
+                       (default: authority/missing-pool)
   --module PATH        Path to pre-built .ko file
                        (default: auto-build from repo tree)
   --help, -h           Show this message
@@ -64,7 +61,7 @@ EOF
     }
 
     KEEP_TMP=""
-    SMOKE_TESTS="bootstrap/mount bootstrap/dir bootstrap/symlink bootstrap/readdir bootstrap/statfs"
+    SMOKE_TESTS="authority/missing-pool"
     KO_PATH_ARG=""
 
     while [[ "$#" -gt 0 ]]; do
@@ -205,7 +202,7 @@ TOTAL_TESTS=0
 pass() { echo "PASS: $1"; PASSED=$((PASSED + 1)); TOTAL_TESTS=$((TOTAL_TESTS + 1)); }
 fail() { echo "FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); TOTAL_TESTS=$((TOTAL_TESTS + 1)); }
 blocked() { echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
-refusal() { echo "REFUSAL: $1 -- $2"; REFUSED=$((REFUSAL + 1)); }
+refusal() { echo "REFUSAL: $1 -- $2"; REFUSAL=$((REFUSAL + 1)); }
 
 MNT=/mnt/tidefs
 SCRATCH_DIR=/var/lib/tidefs/scratch
@@ -246,74 +243,73 @@ else
 fi
 
 echo ""
-echo "--- Phase 2: Mount Attempt ---"
+echo "--- Phase 2: Missing Pool Authority Mount Attempt ---"
 MOUNTED=0
 mkdir -p "$MNT"
 echo "mount -o bootstrap -t tidefs none $MNT"
 if mount -o bootstrap -t tidefs none "$MNT" 2>/tmp/mount.err; then
-    pass "mount"
+    fail "missing_pool_member_rejected" "bootstrap mount unexpectedly succeeded without explicit pool I/O authority"
     MOUNTED=1
 else
     err="$(head -3 /tmp/mount.err | tr '\n' ' ')"
-    fail "mount" "$err"
-    echo "Available filesystem types:"
-    cat /proc/filesystems 2>/dev/null | grep -v nodev | head -10 || echo "  (could not read /proc/filesystems)"
+    pass "missing_pool_member_rejected"
+    echo "  refusal: $err"
 fi
 
 echo ""
-echo "--- Phase 3: Bootstrap POSIX Smoke Tests ---"
+echo "--- Phase 3: Mounted POSIX Smoke Tests ---"
 
 if [ "$MOUNTED" -eq 1 ]; then
-    echo "Running focused bootstrap POSIX smoke tests on kernel-mounted TideFS..."
+    echo "Running focused POSIX smoke tests on kernel-mounted TideFS..."
 
     echo ""
-    echo "-- smoke: bootstrap directory create/remove --"
+    echo "-- smoke: directory create/remove --"
     if mkdir "$MNT/g002_dir" 2>/tmp/t2.err; then
         if [ -d "$MNT/g002_dir" ]; then
-            pass "smoke_bootstrap_mkdir"
+            pass "smoke_mkdir"
         else
-            fail "smoke_bootstrap_mkdir" "directory not found after mkdir"
+            fail "smoke_mkdir" "directory not found after mkdir"
         fi
         rmdir "$MNT/g002_dir" 2>/dev/null || true
         if [ ! -d "$MNT/g002_dir" ]; then
-            pass "smoke_bootstrap_rmdir"
+            pass "smoke_rmdir"
         else
-            fail "smoke_bootstrap_rmdir" "directory still exists after rmdir"
+            fail "smoke_rmdir" "directory still exists after rmdir"
         fi
     else
-        fail "smoke_bootstrap_mkdir" "$(head -1 /tmp/t2.err)"
-        blocked "smoke_bootstrap_rmdir" "mkdir failed"
+        fail "smoke_mkdir" "$(head -1 /tmp/t2.err)"
+        blocked "smoke_rmdir" "mkdir failed"
     fi
 
     echo ""
-    echo "-- smoke: bootstrap symlink/readlink --"
+    echo "-- smoke: symlink/readlink --"
     if ln -s "/bootstrap-target" "$MNT/g005_link" 2>/tmp/t5b.err; then
-        pass "smoke_bootstrap_symlink_create"
+        pass "smoke_symlink_create"
         target=$(readlink "$MNT/g005_link" 2>/dev/null || echo "")
         if [ "$target" = "/bootstrap-target" ]; then
-            pass "smoke_bootstrap_readlink"
+            pass "smoke_readlink"
         else
-            fail "smoke_bootstrap_readlink" "expected /bootstrap-target, got '$target'"
+            fail "smoke_readlink" "expected /bootstrap-target, got '$target'"
         fi
     else
-        blocked "smoke_bootstrap_symlink_create" "$(head -1 /tmp/t5b.err)"
-        blocked "smoke_bootstrap_readlink" "symlink create failed"
+        blocked "smoke_symlink_create" "$(head -1 /tmp/t5b.err)"
+        blocked "smoke_readlink" "symlink create failed"
     fi
     rm -f "$MNT/g005_link" 2>/dev/null || true
 
     echo ""
-    echo "-- smoke: bootstrap readdir --"
+    echo "-- smoke: readdir --"
     mkdir "$MNT/g006_dir" 2>/tmp/t6a.err || true
     if [ -d "$MNT/g006_dir" ]; then
         touch "$MNT/g006_dir/a" "$MNT/g006_dir/b" "$MNT/g006_dir/c" 2>/dev/null || true
         entry_count=$(ls -1 "$MNT/g006_dir" 2>/dev/null | wc -l)
         if [ "$entry_count" -ge 3 ]; then
-            pass "smoke_bootstrap_readdir"
+            pass "smoke_readdir"
         else
-            fail "smoke_bootstrap_readdir" "expected >=3 entries, got $entry_count"
+            fail "smoke_readdir" "expected >=3 entries, got $entry_count"
         fi
     else
-        blocked "smoke_bootstrap_readdir" "test directory could not be created"
+        blocked "smoke_readdir" "test directory could not be created"
     fi
     rm -rf "$MNT/g006_dir" 2>/dev/null || true
 
@@ -335,9 +331,9 @@ if [ "$MOUNTED" -eq 1 ]; then
 
 else
     echo "Filesystem not mounted -- skipping smoke tests."
-    blocked "smoke_bootstrap_mkdir" "filesystem not mounted"
-    blocked "smoke_bootstrap_symlink_create" "filesystem not mounted"
-    blocked "smoke_bootstrap_readdir" "filesystem not mounted"
+    blocked "smoke_mkdir" "filesystem not mounted"
+    blocked "smoke_symlink_create" "filesystem not mounted"
+    blocked "smoke_readdir" "filesystem not mounted"
     blocked "smoke_statfs" "filesystem not mounted"
     blocked "smoke_sync" "filesystem not mounted"
 fi
@@ -352,7 +348,7 @@ if mountpoint -q "$MNT" 2>/dev/null; then
         refusal "no_daemon_fuse_mount" "tidefs appears mounted via FUSE ($mounts_fuse)"
     fi
 else
-    blocked "no_daemon_fuse_mount" "filesystem not mounted"
+    pass "no_daemon_fuse_mount"
 fi
 
 ublk_run=$(ps 2>/dev/null | grep -v grep | grep ublk || true)
@@ -428,6 +424,8 @@ INITSCRIPT
 
     if [ "$BLOCKED_COUNT" -gt 0 ] && [ "$PASS_COUNT" -eq 0 ] && [ "$FAIL_COUNT" -eq 0 ]; then
       VALIDATION_TIER="QEMU guest (all smoke tests blocked — kernel module not loadable)"
+    elif grep -q "^PASS: missing_pool_member_rejected" "$RUN_DIR/qemu.log" 2>/dev/null; then
+      VALIDATION_TIER="kernel VFS authority refusal"
     elif [ "$PASS_COUNT" -gt 0 ] || [ "$FAIL_COUNT" -gt 0 ]; then
       VALIDATION_TIER="mounted kernel VFS"
     else

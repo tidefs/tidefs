@@ -6,8 +6,8 @@
  * tree, so the Rust module entry point calls this C shim during init/drop.
  *
  * Mount paths (four tiers):
- *   Tier 0: -o bootstrap  → C-only nodev superblock with synthetic root inode.
- *                            Explicit development root proof only.
+ *   Tier 0: -o bootstrap  → fail-closed; the historical synthetic root is not
+ *                            an authoritative no-daemon pool mount.
  *   Tier 1: default        → fail-closed when no block device is supplied.
  *   Tier 2: mount /dev/... → engine-backed mount: reads PoolLabelV1,
  *                            parses label via Rust bridge, locates and reads
@@ -807,32 +807,6 @@ static int tidefs_posix_vfs_mount_copy_cluster_options(
 	}
 
 	return 0;
-}
-
-static struct tidefs_posix_vfs_mount *tidefs_posix_vfs_mount_new(bool bootstrap_only)
-{
-	struct tidefs_posix_vfs_mount *ctx;
-
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-	if (!ctx)
-		return NULL;
-
-	ctx->bootstrap_only = bootstrap_only;
-	ctx->root_ino = 1;
-	ctx->fsid = 0x5449444546530001ULL;
-	ctx->committed_txg = 0;
-	ctx->block_size = PAGE_SIZE;
-	ctx->total_blocks = 1;
-	ctx->free_blocks = 1;
-	ctx->avail_blocks = 1;
-	ctx->total_inodes = 1;
-	ctx->free_inodes = 0;
-	ctx->name_max = NAME_MAX;
-	refcount_set(&ctx->pool.refs, 1);
-	ctx->pool.next_ino = ctx->root_ino + 1;
-	ctx->pool.next_generation = 1;
-	ctx->pool.nr_inodes = 0;
-	return ctx;
 }
 
 /* Create an engine-backed mount context from the Rust bridge mount output. */
@@ -6555,63 +6529,6 @@ out_free:
 	return ret;
 }
 
-static int tidefs_posix_vfs_fill_super(struct super_block *sb,
-				       struct fs_context *fc)
-{
-	struct tidefs_posix_vfs_mount *ctx;
-	struct inode *root;
-	struct tidefs_posix_vfs_fs_context *tidefs_fc = fc->fs_private;
-
-	if (!tidefs_fc || !tidefs_fc->bootstrap)
-		return -ENODEV;
-
-	ctx = tidefs_posix_vfs_mount_new(tidefs_fc->bootstrap);
-	if (!ctx)
-		return -ENOMEM;
-
-	sb->s_fs_info = ctx;
-	sb->s_magic = TIDEFS_POSIX_TFS_MAGIC;
-	sb->s_maxbytes = MAX_LFS_FILESIZE;
-	sb->s_blocksize = ctx->block_size;
-	sb->s_blocksize_bits = PAGE_SHIFT;
-	sb->s_op = &tidefs_posix_vfs_super_ops;
-	set_default_d_op(sb, &tidefs_posix_vfs_dentry_ops);
-	sb->s_export_op = &tidefs_posix_vfs_export_ops;
-	sb->s_xattr = tidefs_posix_vfs_xattr_handlers;
-	sb->s_time_gran = 1;
-
-	root = new_inode(sb);
-	if (!root)
-		goto err_nomem;
-
-	root->i_ino = ctx->root_ino;
-	root->i_generation = ctx->root_ino;
-	inode_init_owner(&nop_mnt_idmap, root, NULL, S_IFDIR | 0755);
-	/* Use engine-backed inode/file operations so create/mkdir/open
-	 * dispatch through the Rust KernelEngine. Mark the pool as imported
-	 * so pool_core_from_sb returns a valid pool pointer. */
-	ctx->engine_backed = true;
-	ctx->pool.imported = true;
-	root->i_op = &tidefs_posix_vfs_dir_inode_operations;
-	root->i_fop = &tidefs_posix_vfs_dir_file_operations;
-	set_nlink(root, 2);
-	simple_inode_init_ts(root);
-
-	sb->s_root = d_make_root(root);
-	if (!sb->s_root)
-		goto err_nomem;
-
-	pr_info("tidefs_posix_vfs: mounted bootstrap-only kernel VFS root ino=%llu txg=%llu\n",
-		ctx->root_ino, ctx->committed_txg);
-	return 0;
-
-err_nomem:
-	sb->s_fs_info = NULL;
-	tidefs_posix_vfs_mount_free(ctx);
-	return -ENOMEM;
-}
-
-/* Forward declaration for the block-device-backed fill_super. */
 static int tidefs_posix_vfs_get_tree(struct fs_context *fc)
 {
 	struct tidefs_posix_vfs_fs_context *ctx = fc->fs_private;
@@ -6619,9 +6536,11 @@ static int tidefs_posix_vfs_get_tree(struct fs_context *fc)
 	if (!ctx)
 		return -EINVAL;
 
-	/* Tier 0: Bootstrap path — explicit development root proof. */
-	if (ctx->bootstrap)
-		return get_tree_nodev(fc, tidefs_posix_vfs_fill_super);
+	/* Tier 0: Bootstrap path — retired for product no-daemon mounts. */
+	if (ctx->bootstrap) {
+		pr_warn("tidefs_posix_vfs: mount refused: -o bootstrap has no explicit kernel pool I/O authority; supply a TideFS block device\n");
+		return -EOPNOTSUPP;
+	}
 
 	/* If device= was passed as a mount option, use it as the source. */
 	if (!fc->source && ctx->device_path) {
@@ -6635,7 +6554,7 @@ static int tidefs_posix_vfs_get_tree(struct fs_context *fc)
 		return get_tree_bdev(fc, tidefs_posix_vfs_fill_super_bdev);
 
 	/* Tier 1: No device and no bootstrap — fail-closed. */
-	pr_warn("tidefs_posix_vfs: mount refused: no block device and no -o bootstrap; use -o bootstrap for development root proof or supply a TideFS block device\n");
+	pr_warn("tidefs_posix_vfs: mount refused: no block device supplied; supply a TideFS block device\n");
 	return -ENODEV;
 }
 

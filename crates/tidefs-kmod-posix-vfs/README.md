@@ -13,7 +13,7 @@ progress toward full-kernel autonomy:
 
 | Tier | Mount Command | Behavior | Kernel Context |
 |------|---------------|----------|----------------|
-| **Tier 0: Bootstrap** | `mount -t tidefs -o bootstrap none <mnt>` | Synthetic root inode with minimal statfs. Development root proof only. | `tidefs_posix_vfs_mount` with `bootstrap_only=true` |
+| **Tier 0: Authority refusal** | `mount -t tidefs -o bootstrap none <mnt>` | Refused with EOPNOTSUPP: no explicit kernel pool I/O authority is bound. | None |
 | **Tier 1: Fail-closed** | `mount -t tidefs none <mnt>` | Refused with ENODEV: no block device supplied. | None |
 | **Tier 2: Engine-backed** | `mount -t tidefs /dev/... <mnt>` | Reads PoolLabelV1 from block device, locates and validates committed-root ledger via Rust replay adapter (`tidefs_posix_vfs_kernel_replay_mount` — #6262), creates real root inode with engine-derived superblock parameters. Statfs reports pool-backed capacity. Individual VFS operation rewiring to object/extent/intent readers is owned by sibling work items #6258-#6261. | `tidefs_posix_vfs_mount` with `engine_backed=true`, populated from `TidefsReplayMountOut`; `fill_super_bdev` delegates mount authority to the Rust replay adapter. Validation tier: Kbuild (module build). QEMU guest mount validation is owned by #6263 (K7-REPLAY-008). |
 | **Tier 3: Full-kernel** | (future) | No userspace daemon required for any normal mounted I/O, writeback, recovery, placement, reserve, or admission. | Full kernel-resident VfsEngine with all 29 VFS operations active |
@@ -38,7 +38,7 @@ progress toward full-kernel autonomy:
 
 | Tier | Mount Command | Behavior | Kernel Context |
 |------|---------------|----------|----------------|
-| **Tier 0: Bootstrap** | `mount -t tidefs -o bootstrap none <mnt>` | Synthetic root inode with minimal statfs. Development root proof only. | `tidefs_posix_vfs_mount` with `bootstrap_only=true` |
+| **Tier 0: Authority refusal** | `mount -t tidefs -o bootstrap none <mnt>` | Refused with EOPNOTSUPP: no explicit kernel pool I/O authority is bound. | None |
 | **Tier 1: Fail-closed** | `mount -t tidefs none <mnt>` | Refused with ENODEV: no block device supplied. | None |
 | **Tier 2: Engine-backed** | `mount -t tidefs /dev/... <mnt>` | Reads PoolLabelV1 from block device, locates and validates committed-root ledger via Rust bridge, creates real root inode with engine-derived superblock parameters. Statfs reports pool-backed capacity. | `tidefs_posix_vfs_mount` with `engine_backed=true`, populated from `TidefsMountOut` |
 | **Tier 3: Full-kernel** | (future) | No userspace daemon required for any normal mounted I/O, writeback, recovery, placement, reserve, or admission. | Full kernel-resident VfsEngine with all 29 VFS operations active |
@@ -927,10 +927,10 @@ the "tidefs" filesystem type on module init and unregisters it on module drop.
 Once built and loaded into a Linux 7.0 kernel with CONFIG_RUST=y:
 
 - `/proc/filesystems` will list `tidefs`.
-- **Bootstrap path**: `mount -t tidefs -o bootstrap <mountpoint>` creates a
-  working mounted kernel VFS root with `simple_dir_inode_operations` /
-  `simple_dir_operations`, C-backed statfs, and proper `kill_sb` teardown.
-  This is an explicit development root proof, not full-kernel TideFS storage.
+- **Bootstrap path**: `mount -t tidefs -o bootstrap <mountpoint>` is refused
+  with `EOPNOTSUPP` unless a real kernel pool I/O authority is supplied through
+  the block-device-backed mount path. The historical synthetic root proof is
+  retired for product no-daemon mounts.
 - **Engine-backed path**: `mount -t tidefs /dev/... <mountpoint>` (no bootstrap flag)
   calls the Rust engine bridge via `tidefs_posix_vfs_engine_fill_super()`,
   which runs the full `KmodSuperContext` mount-validation pipeline
@@ -945,8 +945,7 @@ Once built and loaded into a Linux 7.0 kernel with CONFIG_RUST=y:
   explicit lower-device read, write, flush, capacity, and teardown authority;
   `sync_fs` routes through `tidefs_posix_vfs_engine_sync_fs()` and propagates
   missing or unsupported durability authority instead of treating it as a clean
-  mounted sync.  Bootstrap-only mounts remain the explicit unbound development
-  proof.  Other ordinary VFS operations still depend on further
+  mounted sync. Other ordinary VFS operations still depend on further
   kernel-resident pool/device backing.  Mounted kernel VFS validation,
   xfstests, O_DIRECT, unlink, mmap, and crash consistency claims depend on
   closing those remaining operation gates.

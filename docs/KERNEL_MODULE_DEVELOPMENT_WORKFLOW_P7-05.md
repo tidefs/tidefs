@@ -216,15 +216,13 @@ set explicitly, otherwise the helper reads `modinfo -F name` from the `.ko`.
 
 For POSIX VFS registration smoke, set `EXPECT_FS_TYPE=tidefs` with
 `KO_PATH=<module-out>/tidefs_posix_vfs.ko`. The hot-loop guest then verifies
-`/proc/filesystems`, attempts `mount -t tidefs`, records the mount result,
-runs `df -P` against the mount to exercise `statfs`, unmounts, unloads the
-module, and destroys the guest. A pass must include `FS_MOUNTED`,
-`FS_STATFS_OK`, `FS_UNMOUNTED`, and `MODULE_UNLOADED` markers. A
+`/proc/filesystems`, attempts the requested `mount -t tidefs`, records the
+mount result, unloads the module, and destroys the guest.
 
-`EXPECT_FS_OPTIONS=bootstrap`. Without that explicit option, an unbound product
-mount must continue to fail closed. A block-device-backed product mount may
-proceed only after the C/Rust mounted path binds explicit kernel pool I/O
-authority for read, write, flush, capacity, and teardown as described in
+Unbound product mounts must fail closed even when `EXPECT_FS_OPTIONS=bootstrap`
+is supplied. A block-device-backed product mount may proceed only after the
+C/Rust mounted path binds explicit kernel pool I/O authority for read, write,
+flush, capacity, and teardown as described in
 `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`.
 
 ## 6. Required first proofs

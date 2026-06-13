@@ -62,9 +62,9 @@ kernel UAPI. They may not be required as always-running support daemons.
 The current `tidefs_posix_vfs.ko` integration tier is intentionally narrow but
 is no longer bootstrap-only:
 
-- `mount -o bootstrap -t tidefs none <mountpoint>` is a development proof only;
-- the bootstrap mount allocates in-kernel mount state, root inode, `statfs`,
-  and `kill_sb` teardown, then proves those in Linux 7.0 QEMU;
+- `mount -o bootstrap -t tidefs none <mountpoint>` is refused with
+  `EOPNOTSUPP`; the historical synthetic root is not an authoritative
+  no-daemon pool mount;
 - default `mount -t tidefs /dev/<pool-device> <mountpoint>` reads the pool
   label from the lower block device, creates an engine-backed superblock, and
   stores a mounted `KernelPoolCore` context in `s_fs_info`;
@@ -84,9 +84,9 @@ is no longer bootstrap-only:
   roots plus replayable intent records, or record the exact primitive that
   blocks that replacement.
 
-Workers may use the bootstrap path to test Linux VFS mechanics. They must not
-close engine-backed, storage-backed, or full-kernel issues with bootstrap-only
-the specific mounted operations it exercises; higher tiers still require the
+Workers must use an explicit pool member/authority for mounted kernel VFS
+behavior. Bootstrap-only results prove only missing-authority refusal; they
+cannot close engine-backed, storage-backed, or full-kernel issues.
 
 ## Kernel Pool Core
 
@@ -350,7 +350,7 @@ Write-path durability:
 |---|---|---|
 | Kbuild | `.ko` builds against Linux 7.0 | runtime behavior |
 | QEMU module load | module loads/unloads in Linux 7.0 | mount, I/O, no-daemon |
-| bootstrap mounted VFS | `-o bootstrap` root/statfs/teardown path | storage, read/write, xfstests, full-kernel |
+| authority refusal | missing explicit pool I/O rejects mount before root/statfs synthesis | mounted behavior, storage, read/write, xfstests |
 | engine mounted VFS | imported pool, committed root, real root inode, statfs, at least one VFS operation | block export, crash consistency |
 | kernel block I/O | registered block device and real read/write/flush/discard through `queue_rq` | POSIX VFS correctness |
 | crash/remount | committed-root and replay-cursor survive forced shutdown | performance or full soak |
@@ -360,7 +360,7 @@ No issue may close a higher tier with a lower-tier artifact.
 
 ## Implementation Order
 
-1. Keep the bootstrap POSIX mount option as a VFS mechanics proof.
+1. Refuse unbound/bootstrap POSIX mounts before root/statfs synthesis.
 2. Build `KernelPoolCore` skeleton with lower-device import, label read,
    committed-root selection, refcounting, and teardown.
 3. Replace bootstrap mount with engine mount for a read-only root.
