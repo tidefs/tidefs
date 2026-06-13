@@ -53,7 +53,7 @@ use tidefs_erasure_coding::{
 };
 use tidefs_placement_planner::{
     AllocationRequest, DeviceHealthCapacity, HashRingPlacementPlanner, PlacementDecision,
-    PlacementPlanner,
+    PlacementPlanner, PlacementReplayReceipt, PlacementReplayShardRole, PlacementReplayTarget,
 };
 use tidefs_space_accounting::{PoolCounters, StatfsResult};
 use tidefs_types_reclaim_queue_core::{
@@ -437,10 +437,13 @@ pub struct PlacementReceipt {
     pub payload_digest: [u8; 32],
     /// Physical targets selected by the placement planner.
     pub targets: Vec<PlacementReceiptTarget>,
+    /// Sealed planner replay authority for the placement decision.
+    pub planner_replay_receipt: Option<PlacementReplayReceipt>,
 }
 
 const PLACEMENT_RECEIPT_MAGIC_V1: &[u8; 8] = b"TFSPRC1\0";
 const PLACEMENT_RECEIPT_MAGIC_V2: &[u8; 8] = b"TFSPRC2\0";
+const PLACEMENT_RECEIPT_MAGIC_V3: &[u8; 8] = b"TFSPRC3\0";
 const PLACEMENT_RECEIPT_CONTEXT: &str = "TideFS pool placement receipt object key v1";
 const PLACEMENT_HASH_RING_VNODES_PER_GB: u64 = 16;
 
@@ -488,8 +491,26 @@ impl PlacementReceipt {
                 reason: "placement receipt target count exceeds wire format",
             });
         }
-        let mut out = Vec::with_capacity(104 + self.targets.len() * 55);
-        out.extend_from_slice(PLACEMENT_RECEIPT_MAGIC_V2);
+        let Some(replay_receipt) = self.planner_replay_receipt.as_ref() else {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt missing planner replay authority",
+            });
+        };
+        if replay_receipt.targets.len() > u16::MAX as usize {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement replay receipt target count exceeds wire format",
+            });
+        }
+        let replay_policy = replay_receipt.policy.encode();
+        if replay_policy.len() > u8::MAX as usize {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement replay receipt policy exceeds wire format",
+            });
+        }
+
+        let mut out =
+            Vec::with_capacity(194 + self.targets.len() * 55 + replay_receipt.targets.len() * 21);
+        out.extend_from_slice(PLACEMENT_RECEIPT_MAGIC_V3);
         out.extend_from_slice(&self.object_key.as_bytes32());
         out.extend_from_slice(&self.epoch.to_le_bytes());
         out.extend_from_slice(&self.generation.to_le_bytes());
@@ -520,15 +541,17 @@ impl PlacementReceipt {
             out.push(target.role.as_u8());
             out.extend_from_slice(&target.stored_digest);
         }
+        encode_planner_replay_receipt(&mut out, replay_receipt, &replay_policy);
         Ok(out)
     }
 
     fn decode(raw: &[u8]) -> Option<Self> {
         let mut cursor = ReceiptCursor::new(raw);
-        let magic = cursor.take(PLACEMENT_RECEIPT_MAGIC_V2.len())?;
-        let has_generation = match magic {
-            m if m == PLACEMENT_RECEIPT_MAGIC_V2 => true,
-            m if m == PLACEMENT_RECEIPT_MAGIC_V1 => false,
+        let magic = cursor.take(PLACEMENT_RECEIPT_MAGIC_V3.len())?;
+        let (has_generation, has_replay_receipt) = match magic {
+            m if m == PLACEMENT_RECEIPT_MAGIC_V3 => (true, true),
+            m if m == PLACEMENT_RECEIPT_MAGIC_V2 => (true, false),
+            m if m == PLACEMENT_RECEIPT_MAGIC_V1 => (false, false),
             _ => return None,
         };
         let object_key = ObjectKey::from_bytes32(cursor.array()?);
@@ -569,10 +592,15 @@ impl PlacementReceipt {
                 stored_digest,
             });
         }
+        let planner_replay_receipt = if has_replay_receipt {
+            Some(decode_planner_replay_receipt(&mut cursor)?)
+        } else {
+            None
+        };
         if !cursor.is_finished() {
             return None;
         }
-        Some(Self {
+        let receipt = Self {
             object_key,
             epoch,
             generation,
@@ -582,8 +610,144 @@ impl PlacementReceipt {
             shard_len,
             payload_digest,
             targets,
-        })
+            planner_replay_receipt,
+        };
+        if !planner_replay_receipt_matches_receipt(&receipt) {
+            return None;
+        }
+        Some(receipt)
     }
+}
+
+fn encode_planner_replay_receipt(
+    out: &mut Vec<u8>,
+    receipt: &PlacementReplayReceipt,
+    encoded_policy: &[u8],
+) {
+    out.extend_from_slice(&receipt.object_id.to_le_bytes());
+    out.extend_from_slice(&receipt.placement_key.to_le_bytes());
+    out.extend_from_slice(&receipt.size_hint_bytes.to_le_bytes());
+    out.extend_from_slice(&receipt.per_target_bytes.to_le_bytes());
+    out.extend_from_slice(&receipt.topology_epoch.to_le_bytes());
+    out.extend_from_slice(&receipt.deterministic_seed.to_le_bytes());
+    out.push(encoded_policy.len() as u8);
+    out.extend_from_slice(encoded_policy);
+    out.push(receipt.failure_domain_level.discriminant());
+    out.push(u8::from(receipt.failure_domain_separation));
+    out.extend_from_slice(&(receipt.targets.len() as u16).to_le_bytes());
+    for target in &receipt.targets {
+        out.extend_from_slice(&target.target_index.to_le_bytes());
+        out.extend_from_slice(&target.shard_index.to_le_bytes());
+        out.push(replay_shard_role_as_u8(target.shard_role));
+        out.extend_from_slice(&target.device_id.to_le_bytes());
+        out.extend_from_slice(&target.failure_domain_key.to_le_bytes());
+    }
+    out.extend_from_slice(&receipt.seal());
+}
+
+fn decode_planner_replay_receipt(cursor: &mut ReceiptCursor<'_>) -> Option<PlacementReplayReceipt> {
+    let object_id = u64::from_le_bytes(cursor.array()?);
+    let placement_key = u64::from_le_bytes(cursor.array()?);
+    let size_hint_bytes = u64::from_le_bytes(cursor.array()?);
+    let per_target_bytes = u64::from_le_bytes(cursor.array()?);
+    let topology_epoch = u64::from_le_bytes(cursor.array()?);
+    let deterministic_seed = u64::from_le_bytes(cursor.array()?);
+    let policy_len = cursor.u8()? as usize;
+    let policy = DurabilityPolicy::decode(cursor.take(policy_len)?).ok()?;
+    let failure_domain_level = FailureDomainLevel::from_u8(cursor.u8()?)?;
+    let failure_domain_separation = match cursor.u8()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let target_count = u16::from_le_bytes(cursor.array()?) as usize;
+    let mut targets = Vec::with_capacity(target_count);
+    for _ in 0..target_count {
+        targets.push(PlacementReplayTarget {
+            target_index: u16::from_le_bytes(cursor.array()?),
+            shard_index: u16::from_le_bytes(cursor.array()?),
+            shard_role: replay_shard_role_from_u8(cursor.u8()?)?,
+            device_id: u64::from_le_bytes(cursor.array()?),
+            failure_domain_key: u64::from_le_bytes(cursor.array()?),
+        });
+    }
+    let seal = cursor.array()?;
+    let receipt = PlacementReplayReceipt {
+        object_id,
+        placement_key,
+        size_hint_bytes,
+        per_target_bytes,
+        topology_epoch,
+        deterministic_seed,
+        policy,
+        failure_domain_level,
+        failure_domain_separation,
+        targets,
+        seal,
+    };
+    receipt.replay_decision().ok()?;
+    Some(receipt)
+}
+
+const fn replay_shard_role_as_u8(role: PlacementReplayShardRole) -> u8 {
+    match role {
+        PlacementReplayShardRole::Data => 0,
+        PlacementReplayShardRole::Parity => 1,
+    }
+}
+
+const fn replay_shard_role_from_u8(raw: u8) -> Option<PlacementReplayShardRole> {
+    match raw {
+        0 => Some(PlacementReplayShardRole::Data),
+        1 => Some(PlacementReplayShardRole::Parity),
+        _ => None,
+    }
+}
+
+const fn placement_role_from_replay(role: PlacementReplayShardRole) -> PlacementTargetRole {
+    match role {
+        PlacementReplayShardRole::Data => PlacementTargetRole::Data,
+        PlacementReplayShardRole::Parity => PlacementTargetRole::Parity,
+    }
+}
+
+fn placement_target_device_id(target: &PlacementReceiptTarget) -> u64 {
+    u64::from_le_bytes(target.device_guid[..8].try_into().unwrap())
+}
+
+fn planner_replay_receipt_matches_receipt(receipt: &PlacementReceipt) -> bool {
+    let Some(replay_receipt) = receipt.planner_replay_receipt.as_ref() else {
+        return true;
+    };
+    let Ok(layout) = receipt.policy.layout() else {
+        return false;
+    };
+    if replay_receipt.topology_epoch != receipt.epoch
+        || replay_receipt.size_hint_bytes != receipt.payload_len
+        || replay_receipt.failure_domain_level != receipt.failure_domain_level
+        || replay_receipt.policy != layout.policy
+        || replay_receipt.targets.len() != receipt.targets.len()
+    {
+        return false;
+    }
+    let Ok(decision) = replay_receipt.replay_decision() else {
+        return false;
+    };
+    if decision.device_targets.len() != receipt.targets.len() {
+        return false;
+    }
+    for (idx, target) in receipt.targets.iter().enumerate() {
+        let replay_target = &replay_receipt.targets[idx];
+        if replay_target.target_index as usize != idx
+            || replay_target.shard_index != target.shard_index
+            || placement_role_from_replay(replay_target.shard_role) != target.role
+            || replay_target.device_id != placement_target_device_id(target)
+            || decision.device_targets[idx] != placement_target_device_id(target)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn reclaim_object_key(key: ObjectKey) -> ReclaimObjectKey {
@@ -1543,7 +1707,13 @@ impl Pool {
                 reason: "pool-wide placement planner could not satisfy redundancy policy",
             })?;
 
-        self.receipt_from_decision(key, payload_len, decision, &candidates)
+        let replay_receipt = decision
+            .to_replay_receipt(&layout, &devices, &request, self.placement_epoch)
+            .map_err(|_| StoreError::InvalidOptions {
+                reason: "pool-wide placement planner could not mint replay receipt",
+            })?;
+
+        self.receipt_from_decision(key, payload_len, decision, &candidates, replay_receipt)
     }
 
     fn receipt_from_decision(
@@ -1552,6 +1722,7 @@ impl Pool {
         payload_len: usize,
         decision: PlacementDecision,
         candidates: &[usize],
+        planner_replay_receipt: PlacementReplayReceipt,
     ) -> Result<PlacementReceipt> {
         let device_to_index: BTreeMap<u64, usize> = candidates
             .iter()
@@ -1600,6 +1771,7 @@ impl Pool {
             shard_len: 0,
             payload_digest: [0u8; 32],
             targets,
+            planner_replay_receipt: Some(planner_replay_receipt),
         })
     }
 
@@ -1674,15 +1846,18 @@ impl Pool {
     ) -> Result<Option<PlacementReceipt>> {
         let receipt_key = placement_receipt_object_key(key);
         let mut best: Option<PlacementReceipt> = None;
+        let mut saw_invalid_receipt = false;
         for idx in self.usable_candidates(indices) {
             let raw = match self.devices[idx].get(receipt_key) {
                 Ok(Some(raw)) => raw,
                 Ok(None) | Err(_) => continue,
             };
             let Some(receipt) = PlacementReceipt::decode(&raw) else {
+                saw_invalid_receipt = true;
                 continue;
             };
             if receipt.object_key != key {
+                saw_invalid_receipt = true;
                 continue;
             }
             let replace = match best.as_ref() {
@@ -1693,6 +1868,11 @@ impl Pool {
                 best = Some(receipt);
             }
         }
+        if best.is_none() && saw_invalid_receipt {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt corrupt or unverifiable",
+            });
+        }
         Ok(best)
     }
 
@@ -1701,6 +1881,7 @@ impl Pool {
         indices: &[usize],
         receipt: &PlacementReceipt,
     ) -> Result<()> {
+        self.ensure_receipt_replay_authority(receipt)?;
         let receipt_key = placement_receipt_object_key(receipt.object_key);
         let encoded = receipt.encode()?;
         let mut wrote = false;
@@ -1717,6 +1898,16 @@ impl Pool {
             Err(last_err.unwrap_or(StoreError::InvalidOptions {
                 reason: "placement receipt could not be persisted",
             }))
+        }
+    }
+
+    fn ensure_receipt_replay_authority(&self, receipt: &PlacementReceipt) -> Result<()> {
+        if planner_replay_receipt_matches_receipt(receipt) {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidOptions {
+                reason: "placement replay receipt does not match local locator authority",
+            })
         }
     }
 
@@ -2084,6 +2275,7 @@ impl Pool {
     }
 
     fn get_replicated_with_receipt(&self, receipt: &PlacementReceipt) -> Result<Option<Vec<u8>>> {
+        self.ensure_receipt_replay_authority(receipt)?;
         for target in &receipt.targets {
             let Some(idx) = self.resolve_receipt_target(target) else {
                 continue;
@@ -2101,6 +2293,7 @@ impl Pool {
     }
 
     fn get_erasure_with_receipt(&self, receipt: &PlacementReceipt) -> Result<Option<Vec<u8>>> {
+        self.ensure_receipt_replay_authority(receipt)?;
         let PoolRedundancyPolicy::Erasure {
             data_shards,
             parity_shards,
@@ -4203,6 +4396,100 @@ mod tests {
             seen.len(),
             5,
             "pool-wide placement should eventually use every eligible data device"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_embeds_planner_replay_authority() {
+        let root = temp_dir("receipt-replay-authority");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"replay-authority-erasure");
+        let payload = b"planner replay authority payload";
+        pool.put(IoClass::Data, key, payload).unwrap();
+
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("placement receipt");
+        let replay = receipt
+            .planner_replay_receipt
+            .as_ref()
+            .expect("planner replay receipt");
+        let decision = replay.replay_decision().expect("replay decision");
+        let receipt_targets: Vec<u64> = receipt
+            .targets
+            .iter()
+            .map(placement_target_device_id)
+            .collect();
+
+        assert_eq!(replay.topology_epoch, receipt.epoch);
+        assert_eq!(replay.size_hint_bytes, payload.len() as u64);
+        assert_eq!(replay.policy, receipt.policy.layout().unwrap().policy);
+        assert_eq!(decision.device_targets, receipt_targets);
+        assert_eq!(decision.failure_domain_level, receipt.failure_domain_level);
+        assert_eq!(replay.targets.len(), receipt.targets.len());
+        for (idx, target) in receipt.targets.iter().enumerate() {
+            let replay_target = &replay.targets[idx];
+            assert_eq!(replay_target.target_index as usize, idx);
+            assert_eq!(replay_target.shard_index, target.shard_index);
+            assert_eq!(
+                placement_role_from_replay(replay_target.shard_role),
+                target.role
+            );
+        }
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrupt_replay_receipt_blocks_topology_fallback_read() {
+        let root = temp_dir("receipt-replay-corrupt");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"corrupt-replay-seal");
+        let payload = b"payload remains on physical targets";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+
+        let receipt_key = placement_receipt_object_key(key);
+        for idx in 0..pool.devices.len() {
+            let Some(mut raw) = pool.devices[idx].get(receipt_key).unwrap() else {
+                continue;
+            };
+            let last = raw.len() - 1;
+            raw[last] ^= 0x5a;
+            pool.devices[idx]
+                .put(receipt_key, &raw)
+                .expect("replace receipt with bad replay seal");
+        }
+
+        assert_invalid_options_reason_contains(
+            pool.get(IoClass::Data, key),
+            "placement receipt corrupt or unverifiable",
         );
 
         let _ = std::fs::remove_dir_all(&root);
