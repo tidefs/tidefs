@@ -223,7 +223,8 @@ impl<E: VfsEngine + VfsEngineStatFs> MountLifecycle<E> {
     /// Execute kill_sb: flush dirty state and transition to Unmounted.
     ///
     /// Calls [`VfsEngine::syncfs`] to flush all dirty data and metadata
-    /// before transitioning. `ENOSYS` from syncfs is treated as success.
+    /// before transitioning. Unsupported sync is propagated for mounted
+    /// filesystems so teardown cannot claim durability without authority.
     pub fn unmount(&mut self, ctx: &RequestCtx) -> Result<(), Errno> {
         match &self.state {
             MountState::Unmounted => return Ok(()),
@@ -232,7 +233,7 @@ impl<E: VfsEngine + VfsEngineStatFs> MountLifecycle<E> {
 
         // Flush dirty state before teardown.
         match self.vfs.engine().syncfs(ctx) {
-            Ok(()) | Err(Errno::ENOSYS) => {}
+            Ok(()) => {}
             Err(e) => return Err(e),
         }
 
@@ -479,6 +480,17 @@ mod tests {
         lc.mount(&MockEngine::test_ctx(), None, None, 7, &[], false)
             .unwrap();
         assert_eq!(lc.unmount(&MockEngine::test_ctx()), Err(Errno::EIO));
+    }
+
+    #[test]
+    fn unmount_propagates_unsupported_sync() {
+        let mut engine = mount_ready_engine();
+        engine.syncfs_fn = Box::new(|_| Err(Errno::ENOSYS));
+        let mut lc = MountLifecycle::new(engine);
+        lc.mount(&MockEngine::test_ctx(), None, None, 7, &[], false)
+            .unwrap();
+        assert_eq!(lc.unmount(&MockEngine::test_ctx()), Err(Errno::ENOSYS));
+        assert!(lc.is_mounted());
     }
 
     #[test]

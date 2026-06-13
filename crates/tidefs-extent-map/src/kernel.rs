@@ -36,7 +36,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use tidefs_kernel_storage_io::KernelStorageIo;
+use tidefs_kernel_storage_io::{KernelStorageIo, KernelStorageIoCapabilities};
 use tidefs_types_extent_map_core::{
     ExtentMapEntryV2, LocatorId, EXTENT_MAP_DEFAULT_PAGE_SIZE, EXTENT_MAP_ENTRY_V2_SIZE,
     EXTENT_MAP_PAGE_HEADER_SIZE, EXTENT_MAP_PAGE_MAGIC,
@@ -860,6 +860,20 @@ mod tests {
     }
 
     impl KernelStorageIo for MockStorageIo {
+        fn capabilities(&self) -> KernelStorageIoCapabilities {
+            KernelStorageIoCapabilities {
+                read: true,
+                write: false,
+                flush: true,
+                discard: false,
+                write_zeroes: false,
+                zero_range: false,
+                teardown: true,
+                sector_size: self.sector_size,
+                capacity_sectors: self.capacity_sectors,
+            }
+        }
+
         fn read_sectors(&self, start_sector: u64, buf: &mut [u8]) -> Result<u32, Errno> {
             let ss = self.sector_size as u64;
             if ss == 0 {
@@ -907,6 +921,10 @@ mod tests {
 
         fn capacity_sectors(&self) -> u64 {
             self.capacity_sectors
+        }
+
+        fn teardown(&self) -> Result<(), Errno> {
+            Ok(())
         }
     }
 

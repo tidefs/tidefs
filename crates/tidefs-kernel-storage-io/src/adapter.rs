@@ -24,7 +24,7 @@ use core::fmt;
 
 use tidefs_types_vfs_core::Errno;
 
-use crate::traits::{KernelStorageIo, RawBlockIo};
+use crate::traits::{KernelStorageIo, KernelStorageIoCapabilities, RawBlockIo};
 
 // ── KernelStorageAdapter ───────────────────────────────────────────────
 
@@ -59,8 +59,16 @@ impl<B: RawBlockIo> KernelStorageAdapter<B> {
 
 impl<B: RawBlockIo> KernelStorageIo for KernelStorageAdapter<B> {
     #[inline]
+    fn capabilities(&self) -> KernelStorageIoCapabilities {
+        self.backend.capabilities()
+    }
+
+    #[inline]
     fn read_sectors(&self, start_sector: u64, buf: &mut [u8]) -> Result<u32, Errno> {
         let ss = u64::from(self.sector_size());
+        if ss == 0 {
+            return Err(Errno::EINVAL);
+        }
         let offset = start_sector.checked_mul(ss).ok_or(Errno::EINVAL)?;
         let len = buf.len() as u64;
         if len % ss != 0 {
@@ -73,6 +81,9 @@ impl<B: RawBlockIo> KernelStorageIo for KernelStorageAdapter<B> {
     #[inline]
     fn write_sectors(&self, start_sector: u64, data: &[u8]) -> Result<u32, Errno> {
         let ss = u64::from(self.sector_size());
+        if ss == 0 {
+            return Err(Errno::EINVAL);
+        }
         let offset = start_sector.checked_mul(ss).ok_or(Errno::EINVAL)?;
         let len = data.len() as u64;
         if len % ss != 0 {
@@ -85,6 +96,50 @@ impl<B: RawBlockIo> KernelStorageIo for KernelStorageAdapter<B> {
     #[inline]
     fn flush(&self) -> Result<(), Errno> {
         self.backend.flush_bytes()
+    }
+
+    #[inline]
+    fn discard_sectors(&self, start_sector: u64, sector_count: u32) -> Result<(), Errno> {
+        let ss = u64::from(self.sector_size());
+        if ss == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let offset = start_sector.checked_mul(ss).ok_or(Errno::EINVAL)?;
+        let len = u64::from(sector_count)
+            .checked_mul(ss)
+            .ok_or(Errno::EINVAL)?;
+        self.backend.discard_bytes(offset, len)
+    }
+
+    #[inline]
+    fn write_zeroes(&self, start_sector: u64, sector_count: u32) -> Result<(), Errno> {
+        let ss = u64::from(self.sector_size());
+        if ss == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let offset = start_sector.checked_mul(ss).ok_or(Errno::EINVAL)?;
+        let len = u64::from(sector_count)
+            .checked_mul(ss)
+            .ok_or(Errno::EINVAL)?;
+        self.backend.write_zeroes_bytes(offset, len)
+    }
+
+    #[inline]
+    fn zero_range(&self, start_sector: u64, sector_count: u32) -> Result<(), Errno> {
+        let ss = u64::from(self.sector_size());
+        if ss == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let offset = start_sector.checked_mul(ss).ok_or(Errno::EINVAL)?;
+        let len = u64::from(sector_count)
+            .checked_mul(ss)
+            .ok_or(Errno::EINVAL)?;
+        self.backend.zero_range_bytes(offset, len)
+    }
+
+    #[inline]
+    fn teardown(&self) -> Result<(), Errno> {
+        self.backend.teardown_bytes()
     }
 
     #[inline]
@@ -131,6 +186,8 @@ mod tests {
         buffer: Mutex<Box<[u8]>>,
         block_size: u32,
         flush_supported: bool,
+        teardown_supported: bool,
+        teardown_count: Mutex<u64>,
         flush_count: Mutex<u64>,
     }
 
@@ -140,6 +197,8 @@ mod tests {
                 buffer: Mutex::new(alloc::vec![0u8; capacity_bytes as usize].into_boxed_slice()),
                 block_size,
                 flush_supported: true,
+                teardown_supported: true,
+                teardown_count: Mutex::new(0),
                 flush_count: Mutex::new(0),
             }
         }
@@ -147,9 +206,31 @@ mod tests {
         fn flush_count(&self) -> u64 {
             *self.flush_count.lock().unwrap()
         }
+
+        fn teardown_count(&self) -> u64 {
+            *self.teardown_count.lock().unwrap()
+        }
     }
 
     impl RawBlockIo for MemoryBackend {
+        fn capabilities(&self) -> KernelStorageIoCapabilities {
+            KernelStorageIoCapabilities {
+                read: true,
+                write: true,
+                flush: self.flush_supported,
+                discard: false,
+                write_zeroes: false,
+                zero_range: false,
+                teardown: self.teardown_supported,
+                sector_size: self.block_size,
+                capacity_sectors: if self.block_size == 0 {
+                    0
+                } else {
+                    self.total_capacity_bytes() / u64::from(self.block_size)
+                },
+            }
+        }
+
         fn read_bytes(&self, offset_bytes: u64, buf: &mut [u8]) -> Result<u32, Errno> {
             let off = offset_bytes as usize;
             let data = self.buffer.lock().unwrap();
@@ -177,6 +258,14 @@ mod tests {
                 return Err(Errno::ENOSYS);
             }
             *self.flush_count.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        fn teardown_bytes(&self) -> Result<(), Errno> {
+            if !self.teardown_supported {
+                return Err(Errno::ENOSYS);
+            }
+            *self.teardown_count.lock().unwrap() += 1;
             Ok(())
         }
 
@@ -299,6 +388,33 @@ mod tests {
         let adapter = KernelStorageAdapter::new(backend);
         let err = adapter.flush().unwrap_err();
         assert_eq!(err, Errno::ENOSYS);
+    }
+
+    #[test]
+    fn unsupported_optional_operations_are_explicit() {
+        let adapter = make_adapter(4096, 512);
+        assert_eq!(adapter.discard_sectors(0, 1), Err(Errno::ENOSYS));
+        assert_eq!(adapter.write_zeroes(0, 1), Err(Errno::ENOSYS));
+        assert_eq!(adapter.zero_range(0, 1), Err(Errno::ENOSYS));
+    }
+
+    #[test]
+    fn capabilities_report_mounted_authority() {
+        let adapter = make_adapter(4096, 512);
+        let caps = adapter.capabilities();
+        assert!(caps.has_mounted_authority());
+        assert_eq!(caps.capacity_bytes(), 4096);
+        assert!(!caps.discard);
+        assert!(!caps.write_zeroes);
+        assert!(!caps.zero_range);
+    }
+
+    #[test]
+    fn teardown_increments_counter() {
+        let backend = MemoryBackend::new(4096, 512);
+        let adapter = KernelStorageAdapter::new(backend);
+        adapter.teardown().unwrap();
+        assert_eq!(adapter.backend().teardown_count(), 1);
     }
 
     // ── Capacity and sector size ────────────────────────────────────

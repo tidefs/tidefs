@@ -1408,14 +1408,19 @@ mod kbuild_impl {
 
         // ── Block device operations (kmod-block-kmod) ──────────────
 
+        /// Report whether this engine is a deliberate block I/O authority.
+        fn block_io_capabilities(&self) -> KernelStorageIoCapabilities {
+            KernelStorageIoCapabilities::unsupported()
+        }
+
         /// Return the total block device capacity in sectors.
         fn block_capacity_sectors(&self) -> u64 {
-            0
+            self.block_io_capabilities().capacity_sectors
         }
 
         /// Return the logical sector size in bytes.
         fn block_sector_size(&self) -> u32 {
-            512
+            self.block_io_capabilities().sector_size
         }
 
         /// Read sectors from the block device.
@@ -1458,6 +1463,11 @@ mod kbuild_impl {
         /// readable (no fault on access) and MUST return zeroes.  Maps to
         /// Linux FALLOC_FL_ZERO_RANGE / REQ_OP_WRITE_ZEROES with no-unmap.
         fn block_zero_range(&self, _start_sector: u64, _sector_count: u32) -> Result<(), Errno> {
+            Err(Errno::ENOSYS)
+        }
+
+        /// Tear down block-device authority.
+        fn block_teardown(&self) -> Result<(), Errno> {
             Err(Errno::ENOSYS)
         }
         // ── Committed-root writeback (kernel-mode) ────────────
@@ -2105,10 +2115,86 @@ mod kbuild_impl {
     /// This mirrors `tidefs_kernel_storage_io::KernelStorageIo` so Kbuild
     /// users of `tidefs-kmod-posix-vfs` see the same trait surface as Cargo
     /// builds without linking Cargo crates from the Linux build system.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct KernelStorageIoCapabilities {
+        pub read: bool,
+        pub write: bool,
+        pub flush: bool,
+        pub discard: bool,
+        pub write_zeroes: bool,
+        pub zero_range: bool,
+        pub teardown: bool,
+        pub sector_size: u32,
+        pub capacity_sectors: u64,
+    }
+
+    impl KernelStorageIoCapabilities {
+        #[inline]
+        pub const fn unsupported() -> Self {
+            Self {
+                read: false,
+                write: false,
+                flush: false,
+                discard: false,
+                write_zeroes: false,
+                zero_range: false,
+                teardown: false,
+                sector_size: 0,
+                capacity_sectors: 0,
+            }
+        }
+
+        #[inline]
+        pub const fn read_write_flush(
+            sector_size: u32,
+            capacity_sectors: u64,
+            teardown: bool,
+        ) -> Self {
+            Self {
+                read: true,
+                write: true,
+                flush: true,
+                discard: false,
+                write_zeroes: false,
+                zero_range: false,
+                teardown,
+                sector_size,
+                capacity_sectors,
+            }
+        }
+
+        #[inline]
+        pub const fn has_mounted_authority(self) -> bool {
+            self.read
+                && self.write
+                && self.flush
+                && self.teardown
+                && self.sector_size != 0
+                && self.capacity_sectors != 0
+        }
+
+        #[inline]
+        pub fn capacity_bytes(self) -> u64 {
+            self.capacity_sectors
+                .saturating_mul(u64::from(self.sector_size))
+        }
+    }
+
     pub trait KernelStorageIo: Send + Sync {
+        fn capabilities(&self) -> KernelStorageIoCapabilities;
         fn read_sectors(&self, start_sector: u64, buf: &mut [u8]) -> Result<u32, Errno>;
         fn write_sectors(&self, start_sector: u64, data: &[u8]) -> Result<u32, Errno>;
         fn flush(&self) -> Result<(), Errno>;
+        fn discard_sectors(&self, _start_sector: u64, _sector_count: u32) -> Result<(), Errno> {
+            Err(Errno::ENOSYS)
+        }
+        fn write_zeroes(&self, _start_sector: u64, _sector_count: u32) -> Result<(), Errno> {
+            Err(Errno::ENOSYS)
+        }
+        fn zero_range(&self, _start_sector: u64, _sector_count: u32) -> Result<(), Errno> {
+            Err(Errno::ENOSYS)
+        }
+        fn teardown(&self) -> Result<(), Errno>;
         fn sector_size(&self) -> u32;
         fn capacity_sectors(&self) -> u64;
 
@@ -2132,9 +2218,20 @@ mod kbuild_impl {
 
     /// Low-level byte-offset block I/O trait used by [`KernelStorageAdapter`].
     pub trait RawBlockIo: Send + Sync {
+        fn capabilities(&self) -> KernelStorageIoCapabilities;
         fn read_bytes(&self, offset_bytes: u64, buf: &mut [u8]) -> Result<u32, Errno>;
         fn write_bytes(&self, offset_bytes: u64, data: &[u8]) -> Result<u32, Errno>;
         fn flush_bytes(&self) -> Result<(), Errno>;
+        fn discard_bytes(&self, _offset_bytes: u64, _len_bytes: u64) -> Result<(), Errno> {
+            Err(Errno::ENOSYS)
+        }
+        fn write_zeroes_bytes(&self, _offset_bytes: u64, _len_bytes: u64) -> Result<(), Errno> {
+            Err(Errno::ENOSYS)
+        }
+        fn zero_range_bytes(&self, _offset_bytes: u64, _len_bytes: u64) -> Result<(), Errno> {
+            Err(Errno::ENOSYS)
+        }
+        fn teardown_bytes(&self) -> Result<(), Errno>;
         fn block_size(&self) -> u32;
         fn total_capacity_bytes(&self) -> u64;
     }
@@ -2162,6 +2259,11 @@ mod kbuild_impl {
     }
 
     impl<B: RawBlockIo> KernelStorageIo for KernelStorageAdapter<B> {
+        #[inline]
+        fn capabilities(&self) -> KernelStorageIoCapabilities {
+            self.backend.capabilities()
+        }
+
         #[inline]
         fn read_sectors(&self, start_sector: u64, buf: &mut [u8]) -> Result<u32, Errno> {
             let ss = u64::from(self.sector_size());
@@ -2195,6 +2297,50 @@ mod kbuild_impl {
         #[inline]
         fn flush(&self) -> Result<(), Errno> {
             self.backend.flush_bytes()
+        }
+
+        #[inline]
+        fn discard_sectors(&self, start_sector: u64, sector_count: u32) -> Result<(), Errno> {
+            let ss = u64::from(self.sector_size());
+            if ss == 0 {
+                return Err(Errno::EINVAL);
+            }
+            let offset = start_sector.checked_mul(ss).ok_or(Errno::EINVAL)?;
+            let len = u64::from(sector_count)
+                .checked_mul(ss)
+                .ok_or(Errno::EINVAL)?;
+            self.backend.discard_bytes(offset, len)
+        }
+
+        #[inline]
+        fn write_zeroes(&self, start_sector: u64, sector_count: u32) -> Result<(), Errno> {
+            let ss = u64::from(self.sector_size());
+            if ss == 0 {
+                return Err(Errno::EINVAL);
+            }
+            let offset = start_sector.checked_mul(ss).ok_or(Errno::EINVAL)?;
+            let len = u64::from(sector_count)
+                .checked_mul(ss)
+                .ok_or(Errno::EINVAL)?;
+            self.backend.write_zeroes_bytes(offset, len)
+        }
+
+        #[inline]
+        fn zero_range(&self, start_sector: u64, sector_count: u32) -> Result<(), Errno> {
+            let ss = u64::from(self.sector_size());
+            if ss == 0 {
+                return Err(Errno::EINVAL);
+            }
+            let offset = start_sector.checked_mul(ss).ok_or(Errno::EINVAL)?;
+            let len = u64::from(sector_count)
+                .checked_mul(ss)
+                .ok_or(Errno::EINVAL)?;
+            self.backend.zero_range_bytes(offset, len)
+        }
+
+        #[inline]
+        fn teardown(&self) -> Result<(), Errno> {
+            self.backend.teardown_bytes()
         }
 
         #[inline]
@@ -2627,26 +2773,38 @@ mod kbuild_impl {
     /// gate on Mounted state. The committed root is tracked externally;
     /// see KernelEngine for the kernel-side committed-root protocol.
 
+    pub type KernelPoolWriteSectorsFn =
+        unsafe extern "C" fn(start_sector: u64, data: *const u8, len: u32) -> core::ffi::c_int;
+    pub type KernelPoolReadSectorsFn =
+        unsafe extern "C" fn(start_sector: u64, buf: *mut u8, len: u32) -> core::ffi::c_int;
+    pub type KernelPoolFlushFn = unsafe extern "C" fn() -> core::ffi::c_int;
+    pub type KernelPoolTeardownFn = unsafe extern "C" fn() -> core::ffi::c_int;
+
     /// C-provided I/O context for writing committed-root records to disk.
     ///
     /// The C shim owns block-device I/O (sb_bread). This context bridges
-    /// Rust-side committed-root encoding to C-side sector writes. All
-    /// fields zero when unset; persistence gates on write_sectors_fn.
+    /// Rust-side committed-root encoding to C-side sector writes and flushes.
+    /// All fields zero when unset; mounted persistence requires read, write,
+    /// flush, nonzero capacity, and teardown callbacks.
     #[derive(Clone, Copy)]
     pub struct CommittedRootIoCtx {
         /// C callback: write  bytes to . Returns 0 on
         /// success, negative errno on failure.
         pub data_area_offset: u64,
-        pub write_sectors_fn: Option<
-            unsafe extern "C" fn(start_sector: u64, data: *const u8, len: u32) -> core::ffi::c_int,
-        >,
+        pub write_sectors_fn: Option<KernelPoolWriteSectorsFn>,
         /// C callback: read sectors from block device. Returns 0 on
         /// success, negative errno on failure.
-        pub read_sectors_fn: Option<
-            unsafe extern "C" fn(start_sector: u64, buf: *mut u8, len: u32) -> core::ffi::c_int,
-        >,
+        pub read_sectors_fn: Option<KernelPoolReadSectorsFn>,
+        /// C callback: flush lower-device write cache. Returns 0 on
+        /// success, negative errno on failure.
+        pub flush_fn: Option<KernelPoolFlushFn>,
+        /// C callback: tear down lower-device authority after final sync.
+        /// Returns 0 on success, negative errno on failure.
+        pub teardown_fn: Option<KernelPoolTeardownFn>,
         /// Device sector size in bytes.
         pub sector_size: u32,
+        /// Total lower-device capacity in bytes.
+        pub device_capacity_bytes: u64,
         /// Byte offset of the superblock region on the block device.
         pub superblock_offset: u64,
         /// Size of the superblock region in bytes.
@@ -2666,7 +2824,10 @@ mod kbuild_impl {
                 data_area_offset: 0,
                 write_sectors_fn: None,
                 read_sectors_fn: None,
+                flush_fn: None,
+                teardown_fn: None,
                 sector_size: 0,
+                device_capacity_bytes: 0,
                 superblock_offset: 0,
                 superblock_size: 0,
                 committed_txg: 0,
@@ -2677,7 +2838,50 @@ mod kbuild_impl {
 
         #[must_use]
         pub fn is_active(&self) -> bool {
-            self.write_sectors_fn.is_some() && self.sector_size > 0
+            self.write_sectors_fn.is_some()
+                && self.read_sectors_fn.is_some()
+                && self.flush_fn.is_some()
+                && self.teardown_fn.is_some()
+                && self.sector_size > 0
+                && self.device_capacity_bytes > 0
+        }
+
+        #[must_use]
+        pub fn capabilities(&self) -> KernelStorageIoCapabilities {
+            let sector_count = if self.sector_size == 0 {
+                0
+            } else {
+                self.device_capacity_bytes / u64::from(self.sector_size)
+            };
+            KernelStorageIoCapabilities {
+                read: self.read_sectors_fn.is_some(),
+                write: self.write_sectors_fn.is_some(),
+                flush: self.flush_fn.is_some(),
+                discard: false,
+                write_zeroes: false,
+                zero_range: false,
+                teardown: self.teardown_fn.is_some(),
+                sector_size: self.sector_size,
+                capacity_sectors: sector_count,
+            }
+        }
+
+        pub fn flush(&self) -> Result<(), Errno> {
+            let flush_fn = self.flush_fn.ok_or(Errno::ENODEV)?;
+            let ret = unsafe { flush_fn() };
+            if ret < 0 {
+                return Err(Errno((-ret) as u16));
+            }
+            Ok(())
+        }
+
+        pub fn teardown(&self) -> Result<(), Errno> {
+            let teardown_fn = self.teardown_fn.ok_or(Errno::ENODEV)?;
+            let ret = unsafe { teardown_fn() };
+            if ret < 0 {
+                return Err(Errno((-ret) as u16));
+            }
+            Ok(())
         }
     }
 
@@ -2844,6 +3048,87 @@ mod kbuild_impl {
 
 // Under Kbuild, re-export from the local module.
 pub use kbuild_impl::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn write_ok(
+        _start_sector: u64,
+        _data: *const u8,
+        _len: u32,
+    ) -> core::ffi::c_int {
+        0
+    }
+
+    unsafe extern "C" fn read_ok(_start_sector: u64, _buf: *mut u8, _len: u32) -> core::ffi::c_int {
+        0
+    }
+
+    unsafe extern "C" fn flush_ok() -> core::ffi::c_int {
+        0
+    }
+
+    unsafe extern "C" fn teardown_ok() -> core::ffi::c_int {
+        0
+    }
+
+    fn active_io_ctx() -> CommittedRootIoCtx {
+        CommittedRootIoCtx {
+            data_area_offset: 4096,
+            write_sectors_fn: Some(write_ok),
+            read_sectors_fn: Some(read_ok),
+            flush_fn: Some(flush_ok),
+            teardown_fn: Some(teardown_ok),
+            sector_size: 512,
+            device_capacity_bytes: 4096,
+            superblock_offset: 0,
+            superblock_size: 4096,
+            committed_txg: 1,
+            root_ino: 2,
+            pool_uuid: [7u8; 32],
+        }
+    }
+
+    #[test]
+    fn committed_root_io_unset_is_not_authority() {
+        let ctx = CommittedRootIoCtx::unset();
+        assert!(!ctx.is_active());
+        assert!(!ctx.capabilities().has_mounted_authority());
+        assert_eq!(ctx.flush(), Err(Errno::ENODEV));
+        assert_eq!(ctx.teardown(), Err(Errno::ENODEV));
+    }
+
+    #[test]
+    fn committed_root_io_reports_mounted_authority() {
+        let ctx = active_io_ctx();
+        let caps = ctx.capabilities();
+        assert!(ctx.is_active());
+        assert!(caps.has_mounted_authority());
+        assert_eq!(caps.sector_size, 512);
+        assert_eq!(caps.capacity_sectors, 8);
+        assert!(!caps.discard);
+        assert!(!caps.write_zeroes);
+        assert!(!caps.zero_range);
+        assert_eq!(ctx.flush(), Ok(()));
+        assert_eq!(ctx.teardown(), Ok(()));
+    }
+
+    #[test]
+    fn committed_root_io_requires_flush_and_teardown() {
+        let mut ctx = active_io_ctx();
+        ctx.flush_fn = None;
+        assert!(!ctx.is_active());
+        assert!(!ctx.capabilities().has_mounted_authority());
+        assert_eq!(ctx.flush(), Err(Errno::ENODEV));
+
+        let mut ctx = active_io_ctx();
+        ctx.teardown_fn = None;
+        assert!(!ctx.is_active());
+        assert!(!ctx.capabilities().has_mounted_authority());
+        assert_eq!(ctx.teardown(), Err(Errno::ENODEV));
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Minimal BLAKE3 implementation for Kbuild.

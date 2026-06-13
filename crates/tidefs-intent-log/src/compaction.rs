@@ -302,9 +302,14 @@ mod tests {
     use crate::reader::SegmentRecord;
     use crate::replay::{IntentReplayEngine, IntentReplayHandler};
     use crate::{IntentLogFrame, IntentLogRecord, IntentLogWriter};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_TEMPDIR_ID: AtomicU64 = AtomicU64::new(0);
 
     fn test_tempdir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("tidefs-compaction-{}", std::process::id()));
+        let id = TEST_TEMPDIR_ID.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("tidefs-compaction-{}-{}", std::process::id(), id));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

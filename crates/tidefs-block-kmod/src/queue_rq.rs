@@ -33,13 +33,13 @@
 //! - All others → `BLK_STS_IOERR`
 
 #[cfg(CONFIG_RUST)]
-use crate::tidefs_kmod_bridge::kernel_types::{Errno, VfsEngine};
+use crate::tidefs_kmod_bridge::kernel_types::{Errno, KernelStorageIoCapabilities, VfsEngine};
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge::BridgeError;
 #[cfg(not(CONFIG_RUST))]
 use tidefs_kmod_bridge::BridgeError;
 #[cfg(not(CONFIG_RUST))]
-use tidefs_vfs_engine::{Errno, VfsEngine};
+use tidefs_vfs_engine::{Errno, KernelStorageIoCapabilities, VfsEngine};
 
 // ── BlkMqStatus ─────────────────────────────────────────────────────────
 
@@ -455,6 +455,20 @@ mod tests {
     // Stub VfsEngine impl: all non-block methods return ENOSYS.
     #[allow(unused_variables)]
     impl VfsEngine for BlockEngineStub {
+        fn block_io_capabilities(&self) -> KernelStorageIoCapabilities {
+            KernelStorageIoCapabilities {
+                read: true,
+                write: true,
+                flush: self.flush_supported,
+                discard: self.discard_supported,
+                write_zeroes: false,
+                zero_range: false,
+                teardown: true,
+                sector_size: self.sector_size,
+                capacity_sectors: self.capacity_sectors,
+            }
+        }
+
         fn get_root_inode(&self, ctx: &RequestCtx) -> Result<InodeId, Errno> {
             Err(Errno::ENOSYS)
         }

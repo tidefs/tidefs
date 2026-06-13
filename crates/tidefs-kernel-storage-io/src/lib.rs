@@ -55,4 +55,4 @@ pub use adapter::KernelStorageAdapter;
 pub use pool_superblock::{
     read_pool_superblock, read_pool_superblock_at, KernelPoolSuperblock, PoolSuperblockError,
 };
-pub use traits::{KernelStorageIo, RawBlockIo};
+pub use traits::{KernelStorageIo, KernelStorageIoCapabilities, RawBlockIo};

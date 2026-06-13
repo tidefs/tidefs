@@ -10,7 +10,7 @@ use alloc::vec;
 use crate::txg_sequence::TxgSequenceCounter;
 use crate::types::CommitGroupId;
 use crate::writer::{CommitGroupWriter, CommittedRootBlock};
-use tidefs_kernel_storage_io::KernelStorageIo;
+use tidefs_kernel_storage_io::{KernelStorageIo, KernelStorageIoCapabilities};
 use tidefs_types_vfs_core::Errno;
 
 const POINTER_MAGIC: &[u8; 4] = b"VCRP";
@@ -455,6 +455,10 @@ mod tests {
     }
 
     impl KernelStorageIo for MemoryKernelStorage {
+        fn capabilities(&self) -> KernelStorageIoCapabilities {
+            KernelStorageIoCapabilities::read_write_flush(self.sector_size, self.sectors, true)
+        }
+
         fn read_sectors(&self, start_sector: u64, buf: &mut [u8]) -> Result<u32, Errno> {
             let sector_size = self.sector_size as usize;
             if sector_size == 0 || buf.len() % sector_size != 0 {
@@ -513,6 +517,10 @@ mod tests {
 
         fn capacity_sectors(&self) -> u64 {
             self.sectors
+        }
+
+        fn teardown(&self) -> Result<(), Errno> {
+            Ok(())
         }
     }
 

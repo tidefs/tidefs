@@ -941,12 +941,15 @@ Once built and loaded into a Linux 7.0 kernel with CONFIG_RUST=y:
   `KernelEngine`/`VfsEngineStatFs` and fails closed on invalid or missing
   mounted-pool state.  The same mounted context remains live through Linux
   `sync_fs`, `put_super`, and forced-unmount `umount_begin` superblock
-  callbacks; `sync_fs` routes through `tidefs_posix_vfs_engine_sync_fs()` and
-  tolerates ENOSYS only while the kernel engine has no dirty mounted state to
-  flush.  Other ordinary VFS operations still depend on further kernel-resident
-  pool/device backing.  Mounted kernel VFS validation, xfstests, O_DIRECT,
-  unlink, mmap, and crash consistency claims depend on closing those remaining
-  operation gates.
+  callbacks.  Product-facing engine mounts now require the C shim to register
+  explicit lower-device read, write, flush, capacity, and teardown authority;
+  `sync_fs` routes through `tidefs_posix_vfs_engine_sync_fs()` and propagates
+  missing or unsupported durability authority instead of treating it as a clean
+  mounted sync.  Bootstrap-only mounts remain the explicit unbound development
+  proof.  Other ordinary VFS operations still depend on further
+  kernel-resident pool/device backing.  Mounted kernel VFS validation,
+  xfstests, O_DIRECT, unlink, mmap, and crash consistency claims depend on
+  closing those remaining operation gates.
 
 **Config**: `CONFIG_RUST=y` and `CONFIG_MODULES=y` have been added to
 `nix/vm/kernel-7.0-config`. `nix/packages/linux-7.0-kernel.nix` now includes

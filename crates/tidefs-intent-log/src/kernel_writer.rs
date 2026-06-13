@@ -6,7 +6,7 @@
 
 use alloc::vec::Vec;
 
-use tidefs_kernel_storage_io::KernelStorageIo;
+use tidefs_kernel_storage_io::{KernelStorageIo, KernelStorageIoCapabilities};
 use tidefs_types_vfs_core::Errno;
 
 use crate::{IntentLogError, IntentLogFrame, IntentLogRecord};
@@ -235,6 +235,20 @@ mod tests {
     }
 
     impl KernelStorageIo for MemoryIo {
+        fn capabilities(&self) -> KernelStorageIoCapabilities {
+            KernelStorageIoCapabilities {
+                read: true,
+                write: true,
+                flush: true,
+                discard: false,
+                write_zeroes: false,
+                zero_range: false,
+                teardown: true,
+                sector_size: self.sector_size,
+                capacity_sectors: self.capacity_sectors(),
+            }
+        }
+
         fn read_sectors(&self, start_sector: u64, buf: &mut [u8]) -> Result<u32, Errno> {
             let sector_size = usize::try_from(self.sector_size).unwrap();
             if buf.len() % sector_size != 0 {
@@ -281,6 +295,10 @@ mod tests {
 
         fn capacity_sectors(&self) -> u64 {
             self.data.lock().unwrap().len() as u64 / u64::from(self.sector_size)
+        }
+
+        fn teardown(&self) -> Result<(), Errno> {
+            Ok(())
         }
     }
 

@@ -129,8 +129,8 @@ pub fn fill_super<E: VfsEngine + VfsEngineStatFs>(
 /// teardown. The engine is responsible for releasing backing-device resources
 /// and marking the superblock clean.
 ///
-/// `ENOSYS` from `syncfs` is treated as success since engines that do not
-/// implement full-filesystem sync may still have clean superblock state.
+/// Unsupported `syncfs` is propagated for mounted filesystems so kernel
+/// teardown cannot report clean durability without pool authority.
 ///
 /// # Safety (kernel callback ABI)
 ///
@@ -138,10 +138,7 @@ pub fn fill_super<E: VfsEngine + VfsEngineStatFs>(
 /// this superblock.  After `kill_sb` returns, the kernel frees the
 /// superblock; this function must not retain references to it.
 pub fn kill_sb<E: VfsEngine>(engine: &E, ctx: &RequestCtx) -> Result<(), Errno> {
-    match engine.syncfs(ctx) {
-        Ok(()) | Err(Errno::ENOSYS) => Ok(()),
-        Err(e) => Err(e),
-    }
+    engine.syncfs(ctx)
 }
 
 /// statfs: Query filesystem capacity statistics.
@@ -318,10 +315,13 @@ mod tests {
     }
 
     #[test]
-    fn kill_sb_success_when_syncfs_is_enosys() {
+    fn kill_sb_propagates_unsupported_syncfs() {
         let engine = MockEngine::new();
         // syncfs_fn defaults to ENOSYS
-        assert_eq!(kill_sb(&engine, &MockEngine::test_ctx()), Ok(()));
+        assert_eq!(
+            kill_sb(&engine, &MockEngine::test_ctx()),
+            Err(Errno::ENOSYS)
+        );
     }
 
     #[test]

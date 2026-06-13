@@ -26,7 +26,7 @@ use tidefs_types_pool_label_core::{
 };
 use tidefs_types_vfs_core::Errno;
 
-use crate::traits::KernelStorageIo;
+use crate::traits::{KernelStorageIo, KernelStorageIoCapabilities};
 
 // ── KernelPoolSuperblock ───────────────────────────────────────────────
 
@@ -348,6 +348,20 @@ mod tests {
     }
 
     impl KernelStorageIo for MemStorageIo {
+        fn capabilities(&self) -> KernelStorageIoCapabilities {
+            KernelStorageIoCapabilities {
+                read: true,
+                write: false,
+                flush: true,
+                discard: false,
+                write_zeroes: false,
+                zero_range: false,
+                teardown: true,
+                sector_size: self.sector_size,
+                capacity_sectors: self.capacity_sectors(),
+            }
+        }
+
         fn read_sectors(&self, start_sector: u64, buf: &mut [u8]) -> Result<u32, Errno> {
             if *self.fail_read.lock().unwrap() {
                 return Err(Errno::EIO);
@@ -378,6 +392,10 @@ mod tests {
         fn capacity_sectors(&self) -> u64 {
             let data = self.data.lock().unwrap();
             (data.len() as u64) / u64::from(self.sector_size)
+        }
+
+        fn teardown(&self) -> Result<(), Errno> {
+            Ok(())
         }
     }
 

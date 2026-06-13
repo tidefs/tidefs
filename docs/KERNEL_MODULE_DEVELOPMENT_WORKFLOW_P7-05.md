@@ -221,9 +221,11 @@ runs `df -P` against the mount to exercise `statfs`, unmounts, unloads the
 module, and destroys the guest. A pass must include `FS_MOUNTED`,
 `FS_STATFS_OK`, `FS_UNMOUNTED`, and `MODULE_UNLOADED` markers. A
 
-`EXPECT_FS_OPTIONS=bootstrap`. Without that explicit option, the product mount
-must continue to fail closed until the kernel-resident pool engine described in
-`docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md` is wired.
+`EXPECT_FS_OPTIONS=bootstrap`. Without that explicit option, an unbound product
+mount must continue to fail closed. A block-device-backed product mount may
+proceed only after the C/Rust mounted path binds explicit kernel pool I/O
+authority for read, write, flush, capacity, and teardown as described in
+`docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`.
 
 ## 6. Required first proofs
 
