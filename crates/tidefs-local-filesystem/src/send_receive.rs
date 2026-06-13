@@ -359,6 +359,9 @@ pub(crate) fn validate_changed_record_export(
         })?;
 
     for snapshot in current.state.snapshots.values() {
+        if !crate::snapshot::snapshot_record_retains_data(snapshot) {
+            continue;
+        }
         let snapshot_identity = RootIdentity::from_summary(&snapshot.root);
         if snapshot.root.transaction_id >= export.current_root.transaction_id {
             return Err(FileSystemError::Decode {
@@ -2041,6 +2044,89 @@ mod tests {
         let snapshots = received.list_snapshots();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].name, "snap1");
+        drop(received);
+
+        let _ = std::fs::remove_dir_all(&source_root);
+        let _ = std::fs::remove_dir_all(&target_root);
+    }
+
+    #[test]
+    fn receive_accepts_bookmark_without_retained_snapshot_root() {
+        let source_root = std::env::temp_dir().join(format!(
+            "tidefs-bookmark-send-source-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let target_root = std::env::temp_dir().join(format!(
+            "tidefs-bookmark-send-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let auth_key = crate::types::RootAuthenticationKey::from_bytes32(
+            [0xEE_u8; crate::constants::ROOT_AUTHENTICATION_KEY_LEN],
+        );
+        let opts = StoreOptions::test_fast();
+
+        let mut source = crate::LocalFileSystem::open_with_root_authentication_key(
+            &source_root,
+            opts.clone(),
+            auth_key,
+        )
+        .expect("open source fs");
+        source.create_dir("/data", 0o755).expect("create /data");
+        source
+            .create_file("/data/f", 0o644)
+            .expect("create /data/f");
+        source
+            .write_file("/data/f", 0, b"bookmark-only-send")
+            .expect("write /data/f");
+        source.sync_all().expect("sync source");
+        let snapshot = source.create_snapshot("snap1").expect("create snapshot");
+        source
+            .create_bookmark("bookmark1", "snap1")
+            .expect("create bookmark");
+        source
+            .delete_snapshot("snap1")
+            .expect("delete bookmarked snapshot");
+
+        let export = source
+            .export_changed_records()
+            .expect("export changed records");
+        let bookmark_root = RootIdentity::from_summary(&snapshot.source_root);
+        assert!(
+            export
+                .roots
+                .iter()
+                .all(|root| RootIdentity::from_summary(&root.source_root) != bookmark_root),
+            "bookmark roots must not be exported as data-retaining roots"
+        );
+        validate_changed_record_export(&export, false).expect("validate bookmark-only export");
+        drop(source);
+
+        crate::LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
+            &target_root,
+            opts.clone(),
+            &export,
+            auth_key,
+        )
+        .expect("receive bookmark-only export");
+
+        let received =
+            crate::LocalFileSystem::open_with_root_authentication_key(&target_root, opts, auth_key)
+                .expect("open received fs");
+        let bookmarks = received.list_bookmarks();
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].name, "bookmark1");
+        assert_eq!(bookmarks[0].source_snapshot, "snap1");
+        let descriptors = received.list_snapshots_extended();
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].kind, crate::records::SnapshotKind::Bookmark);
         drop(received);
 
         let _ = std::fs::remove_dir_all(&source_root);
