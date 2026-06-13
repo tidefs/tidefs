@@ -21,8 +21,8 @@ use clap::Subcommand;
 
 use tidefs_cluster::{
     ClusterPlacementPolicy, ClusterPoolConfig, ClusterPoolMessage, ClusterPoolOrchestrator,
-    ClusterRedundancy, FailureDomain, HealState, LossEvent, NodeDevice, PlacementHealCoordinator,
-    PlacementMap, PoolTransport,
+    FailureDomain, HealState, LossEvent, NodeDevice, PlacementHealCoordinator, PlacementMap,
+    PoolTransport,
 };
 use tidefs_membership_epoch::HealthClass;
 use tidefs_transport::{NodeInfo, SessionId, Transport, TransportAddr};
@@ -1173,7 +1173,8 @@ mod tests {
 
     #[test]
     fn tcp_transport_frame_roundtrip() {
-        use tidefs_cluster::ClusterPoolCreateRequest;
+        use tidefs_cluster::{ClusterPoolCreateRequest, ClusterRedundancy};
+
         let msg = ClusterPoolMessage::CreateRequest(ClusterPoolCreateRequest {
             request_id: 42,
             pool_guid: [0x11; 16],

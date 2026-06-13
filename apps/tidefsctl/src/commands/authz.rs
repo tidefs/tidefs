@@ -10,6 +10,7 @@ pub(crate) enum CommandAdmission {
 }
 
 impl CommandAdmission {
+    #[cfg(test)]
     pub(crate) const fn requires_local_only(self) -> bool {
         matches!(self, Self::LocalOnly | Self::LocalOnlyWhenMutating)
     }

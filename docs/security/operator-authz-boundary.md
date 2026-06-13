@@ -48,6 +48,32 @@ userspace harnesses (`mount`, `pool mount`), prototype/development cluster
 commands, and removed directory-backed/offline surfaces that already fail
 closed before opening retired media.
 
+## Mount Authority Boundary
+
+Userspace mount admission is token-driven, not boolean-driven.
+`tidefsctl mount` is an explicitly standalone development harness and builds
+only local mount authority. It has no CLI path that can claim cluster
+authorization or attach cluster lease material.
+
+`tidefsctl pool mount --cluster` is the cluster lease-authorized mount path.
+Before it starts the FUSE daemon, it validates `CLUSTER_POOL_INCOMPAT` pool
+labels, reads the pool GUID from device labels, acquires a non-empty
+`PoolLeaseToken` from the requested storage-node, validates clustered import
+with that token, and passes one typed mount authority value to the daemon.
+
+The FUSE daemon validates that typed authority before opening the mounted
+filesystem. Standalone mounts are admitted without cluster token material.
+Cluster mounts are refused when lease material is missing, corrupt, truncated,
+zero-node, or scoped to a different pool. Token material presented without
+cluster mount authority is rejected by the constructor boundary instead of
+being ignored. When admission succeeds, the daemon derives the cluster member
+and epoch used by the placement recorder from the validated lease token.
+
+This mount authority boundary is not the P9-02 remote operator authorization
+pipeline. P9-02 still requires product-grade principal, session, transport,
+admin peer, authorization decision, and audit behavior before remote
+operator-routed privilege can replace local-only guards or lease admission.
+
 ## LocalOnlyGuard
 
 The `LocalOnlyGuard` struct in `tidefs-auth::local_only` provides a runtime
@@ -108,8 +134,8 @@ to any CLI/API privileged action paths. Wiring it requires:
 - **A17** (Security/Auth/Encryption Design): advanced — this document and
   `LocalOnlyGuard` wire the operator authz boundary to an explicit, checkable
   call-site token instead of leaving auth/authz claims as record types alone.
-  The remaining authz wiring (P9-02 pipeline to privileged handlers) is a
-  deferred continuation gated on cluster operator path completion.
+  The remaining authz wiring (P9-02 pipeline to privileged handlers) stays
+  future work gated on cluster operator path completion.
 - **A20** (tidefsctl Operator Surface): advanced — `tidefsctl` now has an
   explicit local-only admission table for privileged public operator
   mutations and data-movement paths. This does not claim remote cluster
@@ -143,6 +169,10 @@ to any CLI/API privileged action paths. Wiring it requires:
   `dataset seal-key/rotate-key/upgrade/set`, and `defrag` now acquire a
   `LocalOnlyGuard` at their CLI handler boundary before mutating state or
   initiating privileged data movement.
+- `tidefsctl mount` and `tidefsctl pool mount --cluster` now use typed mount
+  authority: standalone mounts cannot carry cluster lease material, and
+  clustered mounts must carry a validated pool lease token through daemon
+  admission.
 
 ### Next
 - Keep new `tidefsctl` public operator commands wired through
