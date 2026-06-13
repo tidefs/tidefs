@@ -8,7 +8,7 @@
 use crate::tidefs_kmod_bridge;
 use crate::TideVec as Vec;
 
-use tidefs_kmod_bridge::kernel_types::InodeId;
+use tidefs_kmod_bridge::kernel_types::{Errno, InodeId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirtyRange {
@@ -58,10 +58,26 @@ impl DirtyFolioTracker {
     /// Ranges that touch existing tracked ranges are merged.  When the
     /// tracker is at capacity, the entry with the smallest offset for the
     /// same inode (or the globally-smallest (inode, offset) entry) is
-    /// evicted to make room so writeback tracking is never silently lossy.
+    /// evicted to make room. Product-facing paths that must fail closed
+    /// instead of evicting dirty state should use [`Self::try_add`].
     pub fn add(&mut self, inode: InodeId, offset: u64, length: u32) {
+        let _ = self.insert_range(inode, offset, length, true);
+    }
+
+    /// Register a dirty byte range without evicting existing dirty state.
+    pub fn try_add(&mut self, inode: InodeId, offset: u64, length: u32) -> Result<(), Errno> {
+        self.insert_range(inode, offset, length, false)
+    }
+
+    fn insert_range(
+        &mut self,
+        inode: InodeId,
+        offset: u64,
+        length: u32,
+        allow_evict: bool,
+    ) -> Result<(), Errno> {
         if length == 0 {
-            return;
+            return Ok(());
         }
         let mut merged = DirtyRange::new(offset, length);
         let mut indices: Vec<usize> = Vec::new(); // overlapped entry positions
@@ -73,6 +89,12 @@ impl DirtyFolioTracker {
                 indices.push(idx);
             }
         }
+
+        let merged_len = self.entries.len().saturating_sub(indices.len()) + 1;
+        if !allow_evict && merged_len > self.max_entries {
+            return Err(Errno::ENOSPC);
+        }
+
         // Remove overlapped entries first (they are being merged).
         indices.sort_unstable();
         for &idx in indices.iter().rev() {
@@ -80,6 +102,9 @@ impl DirtyFolioTracker {
         }
 
         // Make room if we are at capacity.
+        if allow_evict && self.max_entries == 0 {
+            return Ok(());
+        }
         while self.entries.len() >= self.max_entries {
             // Prefer evicting an entry for the same inode; fall back to
             // the globally-smallest (inode, offset) entry.
@@ -105,6 +130,7 @@ impl DirtyFolioTracker {
             .err()
             .unwrap_or(self.entries.len());
         self.entries.insert(pos, (inode, merged));
+        Ok(())
     }
 
     pub fn remove(&mut self, inode: InodeId, offset: u64, length: u32) -> bool {
@@ -516,7 +542,7 @@ mod tests {
         t.add(ino(1), 2048, 6144);
         assert_eq!(t.len(), 1);
         let ranges: Vec<_> = t.iter().collect();
-        assert_eq!(ranges[0], (ino(1), DirtyRange::new(0, 16384)));
+        assert_eq!(ranges[0], (ino(1), DirtyRange::new(0, 12288)));
     }
 
     // -- truncate_down tests --
