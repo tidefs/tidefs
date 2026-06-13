@@ -30,6 +30,7 @@ This document is not proof that TideFS is kernelspace-ready. It does not freeze
 a production Linux ioctl, statx, or ublk ABI. The preview boundary mirrors are
 development scaffolding that will change before any production release.
 Production UAPI/ABI freeze requires a separate tracked GitHub issue with
+implementation proof and an explicit freeze decision.
 
 ## tidefsctl command classification contract
 
