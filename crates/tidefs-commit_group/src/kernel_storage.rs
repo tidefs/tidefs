@@ -10,7 +10,7 @@ use alloc::vec;
 use crate::txg_sequence::TxgSequenceCounter;
 use crate::types::CommitGroupId;
 use crate::writer::{CommitGroupWriter, CommittedRootBlock};
-use tidefs_kernel_storage_io::{KernelStorageIo, KernelStorageIoCapabilities};
+use tidefs_kernel_storage_io::KernelStorageIo;
 use tidefs_types_vfs_core::Errno;
 
 const POINTER_MAGIC: &[u8; 4] = b"VCRP";
@@ -410,6 +410,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::vec::Vec;
+    use tidefs_kernel_storage_io::KernelStorageIoCapabilities;
 
     struct MemoryKernelStorage {
         sector_size: u32,
