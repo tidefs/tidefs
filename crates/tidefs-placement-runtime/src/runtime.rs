@@ -920,6 +920,7 @@ mod tests {
             placed_on: MemberId::new(2),
             placement_epoch: EpochId::new(1),
             subjects_placed: 1,
+            placement_receipt_refs: Vec::new(),
         };
 
         let committed = rt.verify(&[receipt], &[decision]).expect("verify");

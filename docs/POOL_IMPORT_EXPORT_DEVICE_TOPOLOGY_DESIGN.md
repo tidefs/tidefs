@@ -503,3 +503,8 @@ flags are used for pool-level capability changes within a label version.
   erasure object placement; full mounted-filesystem locator integration,
   distributed transport execution, scrub/repair orchestration, and complete
   TFR-007 capacity semantics remain governed by their own tracked work.
+- Direct placement-plan dispatch surfaces that do not yet persist placement
+  receipts must pass a stable logical object or stripe placement key into the
+  planner. Recomputing from current topology remains a non-authoritative
+  compatibility boundary until the mounted and distributed receipt read paths
+  consume persisted locator authority end to end.

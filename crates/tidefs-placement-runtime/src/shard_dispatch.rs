@@ -439,7 +439,7 @@ impl<T: ShardTransport> ShardDispatcher<T> {
 
     /// Dispatch shards according to the placement plan.
     ///
-    /// 1. Assigns devices via the plan.
+    /// 1. Assigns devices via the plan using `placement_key`.
     /// 2. Maps each assigned device to a target node.
     /// 3. For each shard, sends a placement request via the transport.
     /// 4. Retries on transient failures with exponential backoff.
@@ -466,7 +466,7 @@ impl<T: ShardTransport> ShardDispatcher<T> {
         let start = Instant::now();
 
         // 1. Assign devices from the plan.
-        let assignments = plan.assign_devices(candidates)?;
+        let assignments = plan.assign_devices_for_key(candidates, placement_key)?;
 
         // 2. Build device→node mapping.
         let node_map = Self::build_node_map(candidates);
