@@ -2417,11 +2417,12 @@ impl LocalFileSystem {
         } = config;
         allocator_policy.validate()?;
         // Fail closed until TFR-006 moves mounted content and recovery paths
-        // behind one transform-aware authority.
+        // behind one transform-aware authority and the raw-store inventory
+        // has no blocked production rows.
         if encryption.is_some() || compression.is_some() {
             return Err(FileSystemError::Unsupported {
                 operation: "local filesystem device transforms",
-                reason: "device-level compression/encryption is not end-to-end while TFR-006 raw-store bypasses remain",
+                reason: "device-level compression/encryption is blocked by the TFR-006 raw-store inventory",
             });
         }
         let root_path = root.as_ref().to_path_buf();

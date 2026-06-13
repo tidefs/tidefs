@@ -26,6 +26,21 @@
 //! snapshot root) is independently encrypted.  This is more granular than
 //! ZFS's dataset-level encryption and means even metadata is opaque to the
 //! storage layer.
+//!
+//! ## Mounted authority boundary
+//!
+//! This crate provides a lower object-store encryption frame helper. It is not
+//! proof that mounted local-filesystem encryption is end-to-end. The mounted
+//! transform guardrail uses the ordered terms:
+//!
+//! ```text
+//! plaintext identity -> compression frame -> encryption frame -> checksum -> raw media bytes
+//! ```
+//!
+//! The encryption frame is only one step in that order. Mounted support remains
+//! blocked until checksum authority, raw media bytes, plaintext identity,
+//! compression frame placement, and reclaim identity are classified in
+//! `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`.
 
 pub mod key_hierarchy;
 pub mod key_manager;

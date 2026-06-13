@@ -5644,129 +5644,44 @@ fn format_version_too_old_code_refused_by_min_gate() {
     );
 }
 
-#[test]
-fn compression_write_read_roundtrip() {
-    let root = temp_root("compression-roundtrip");
-    let config = CompressionConfig {
+fn zstd_device_transform_config() -> CompressionConfig {
+    CompressionConfig {
         algorithm: CompressionAlgorithm::Zstd,
         level: 3,
         min_compress_bytes: 0,
-    };
-    let mut fs = LocalFileSystem::open_with_compression(&root, options(), config.clone())
-        .expect("open with compression");
-    let data: Vec<u8> = (0..64u8).cycle().take(8192).collect();
-    fs.create_file("/compressible.bin", 0o644)
-        .expect("create file");
-    fs.write_file("/compressible.bin", 0, &data)
-        .expect("write compressible");
-    fs.sync_all().expect("sync");
-    let read_back = fs.read_file("/compressible.bin").expect("read back");
-    assert_eq!(read_back, data);
-    drop(fs);
-    let reopened = LocalFileSystem::open_with_compression(&root, options(), config)
-        .expect("reopen with compression");
-    assert_eq!(
-        reopened
-            .read_file("/compressible.bin")
-            .expect("re-read after reopen"),
-        data
-    );
-    cleanup(&root);
-}
-
-#[test]
-fn compression_uncompressed_backward_compat() {
-    let root = temp_root("compression-backward-compat");
-    {
-        let mut fs =
-            LocalFileSystem::open_with_options(&root, options()).expect("open uncompressed");
-        let data = b"uncompressed data";
-        fs.create_file("/plain.txt", 0o644).expect("create file");
-        fs.write_file("/plain.txt", 0, data).expect("write");
-        fs.sync_all().expect("sync");
     }
-    let config = CompressionConfig {
-        algorithm: CompressionAlgorithm::Zstd,
-        level: 3,
+}
+
+fn lz4_device_transform_config() -> CompressionConfig {
+    CompressionConfig {
+        algorithm: CompressionAlgorithm::Lz4,
+        level: 0,
         min_compress_bytes: 0,
+    }
+}
+
+fn assert_transform_rejected(result: Result<LocalFileSystem>) {
+    let err = match result {
+        Ok(_) => panic!("device-level transform helper must fail closed"),
+        Err(err) => err,
     };
-    let mut fs = LocalFileSystem::open_with_compression(&root, options(), config)
-        .expect("open with compression on uncompressed store");
-    assert_eq!(
-        fs.read_file("/plain.txt").expect("read plain"),
-        b"uncompressed data"
-    );
-    let new_data: Vec<u8> = (0..64u8).cycle().take(4096).collect();
-    fs.write_file("/plain.txt", 0, &new_data)
-        .expect("overwrite with compressible");
-    fs.sync_all().expect("sync");
-    assert_eq!(
-        fs.read_file("/plain.txt").expect("read after overwrite"),
-        new_data
-    );
-    cleanup(&root);
+    match err {
+        FileSystemError::Unsupported { operation, reason } => {
+            assert_eq!(operation, "local filesystem device transforms");
+            assert!(reason.contains("TFR-006"), "{reason}");
+            assert!(reason.contains("raw-store inventory"), "{reason}");
+            assert!(reason.contains("blocked"), "{reason}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
-fn compression_reduces_object_size() {
-    let root = temp_root("compression-ratio");
-    let data: Vec<u8> = vec![b'A'; 65536];
-    let config = CompressionConfig {
-        algorithm: CompressionAlgorithm::Zstd,
-        level: 3,
-        min_compress_bytes: 0,
-    };
-    let mut fs = LocalFileSystem::open_with_compression(&root, options(), config.clone())
-        .expect("open compressed");
-    fs.create_file("/big.txt", 0o644).expect("create file");
-    fs.write_file("/big.txt", 0, &data)
-        .expect("write compressed");
-    fs.sync_all().expect("sync");
-    // Roundtrip: read back must match
-    assert_eq!(fs.read_file("/big.txt").expect("read back"), data);
-    drop(fs);
-    // Reopen and verify roundtrip
-    let fs2 = LocalFileSystem::open_with_compression(&root, options(), config)
-        .expect("reopen compressed");
-    assert_eq!(
-        fs2.read_file("/big.txt").expect("re-read after reopen"),
-        data
-    );
-    let live = fs2.stats().object_store.live_bytes;
-    assert!(
-        live < data.len() as u64 / 2,
-        "compressed live_bytes {} should be less than data.len()/2 = {}",
-        live,
-        data.len() as u64 / 2
-    );
-    cleanup(&root);
-}
-
-#[test]
-fn device_transform_open_helpers_fail_closed_until_tfr_006_authority() {
+fn device_transform_open_helpers_fail_closed_until_tfr_006_inventory() {
     let root = temp_root("device-transform-fail-closed");
     let enc_config = EncryptionConfig {
         key: StoreEncryptionKey::generate(),
     };
-    let cmp_config = CompressionConfig {
-        algorithm: CompressionAlgorithm::Zstd,
-        level: 3,
-        min_compress_bytes: 0,
-    };
-
-    fn assert_transform_rejected(result: Result<LocalFileSystem>) {
-        let err = match result {
-            Ok(_) => panic!("device-level transform helper must fail closed"),
-            Err(err) => err,
-        };
-        match err {
-            FileSystemError::Unsupported { operation, reason } => {
-                assert_eq!(operation, "local filesystem device transforms");
-                assert!(reason.contains("TFR-006"), "{reason}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
 
     assert_transform_rejected(LocalFileSystem::open_with_encryption(
         root.join("enc"),
@@ -5774,593 +5689,90 @@ fn device_transform_open_helpers_fail_closed_until_tfr_006_authority() {
         enc_config.clone(),
     ));
     assert_transform_rejected(LocalFileSystem::open_with_compression(
-        root.join("comp"),
+        root.join("zstd"),
         options(),
-        cmp_config.clone(),
+        zstd_device_transform_config(),
     ));
-    let result = LocalFileSystem::open_with_encryption_and_compression(
+    assert_transform_rejected(LocalFileSystem::open_with_compression(
+        root.join("lz4"),
+        options(),
+        lz4_device_transform_config(),
+    ));
+    assert_transform_rejected(LocalFileSystem::open_with_encryption_and_compression(
         root.join("both"),
         options(),
+        enc_config.clone(),
+        zstd_device_transform_config(),
+    ));
+    assert_transform_rejected(
+        LocalFileSystem::open_with_root_authentication_key_and_encryption(
+            root.join("root-auth-enc"),
+            options(),
+            default_root_authentication_key().expect("auth key"),
+            enc_config.clone(),
+        ),
+    );
+    assert_transform_rejected(LocalFileSystem::open_with_block_devices_and_encryption(
+        root.join("block-meta"),
+        &[root.join("missing-block-device.img")],
+        options(),
+        default_root_authentication_key().expect("auth key"),
         enc_config,
-        cmp_config,
-    );
-    assert_transform_rejected(result);
+    ));
+
     cleanup(&root);
 }
 
 #[test]
-fn compression_lz4_write_read_roundtrip() {
-    let root = temp_root("compression-lz4-roundtrip");
-    let config = CompressionConfig {
-        algorithm: CompressionAlgorithm::Lz4,
-        level: 0,
-        min_compress_bytes: 0,
+fn device_transform_open_config_rejects_before_pool_creation() {
+    let root = temp_root("device-transform-open-config");
+    let enc_config = EncryptionConfig {
+        key: StoreEncryptionKey::generate(),
     };
-    let mut fs = LocalFileSystem::open_with_compression(&root, options(), config.clone())
-        .expect("open with lz4 compression");
-    let data: Vec<u8> = (0..64u8).cycle().take(8192).collect();
-    fs.create_file("/lz4_compressible.bin", 0o644)
-        .expect("create file");
-    fs.write_file("/lz4_compressible.bin", 0, &data)
-        .expect("write lz4");
-    fs.sync_all().expect("sync");
-    let read_back = fs.read_file("/lz4_compressible.bin").expect("read back");
-    assert_eq!(read_back, data);
-    drop(fs);
-    let reopened =
-        LocalFileSystem::open_with_compression(&root, options(), config).expect("reopen with lz4");
-    assert_eq!(
-        reopened
-            .read_file("/lz4_compressible.bin")
-            .expect("re-read after reopen"),
-        data
-    );
-    cleanup(&root);
-}
 
-#[test]
-fn compression_mixed_zstd_to_lz4_rewrite_remount() {
-    // Write with zstd, remount with lz4, overwrite with new data, read back.
-    let root = temp_root("mixed-zstd-to-lz4");
-    let zstd_config = CompressionConfig {
-        algorithm: CompressionAlgorithm::Zstd,
-        level: 3,
-        min_compress_bytes: 0,
-    };
-    let lz4_config = CompressionConfig {
-        algorithm: CompressionAlgorithm::Lz4,
-        level: 0,
-        min_compress_bytes: 0,
-    };
-    let original: Vec<u8> = (0..64u8).cycle().take(4096).collect();
-    let rewrite: Vec<u8> = (128..192u8).cycle().take(4096).collect();
-
-    // Session 1: write with zstd
-    {
-        let mut fs = LocalFileSystem::open_with_compression(&root, options(), zstd_config)
-            .expect("open with zstd");
-        fs.create_file("/mixed.bin", 0o644).expect("create");
-        fs.write_file("/mixed.bin", 0, &original)
-            .expect("write zstd");
-        fs.sync_all().expect("sync");
-        assert_eq!(fs.read_file("/mixed.bin").expect("read"), original);
-    }
-
-    // Session 2: reopen with lz4, overwrite
-    {
-        let mut fs = LocalFileSystem::open_with_compression(&root, options(), lz4_config.clone())
-            .expect("reopen with lz4");
-        assert_eq!(fs.read_file("/mixed.bin").expect("read old"), original);
-        fs.write_file("/mixed.bin", 0, &rewrite)
-            .expect("overwrite with lz4");
-        fs.sync_all().expect("sync");
-        assert_eq!(fs.read_file("/mixed.bin").expect("read new"), rewrite);
-    }
-
-    // Session 3: reopen with lz4 again, verify rewrite persisted
-    {
-        let fs = LocalFileSystem::open_with_compression(&root, options(), lz4_config)
-            .expect("reopen after rewrite");
-        assert_eq!(fs.read_file("/mixed.bin").expect("read persisted"), rewrite);
-    }
-
-    cleanup(&root);
-}
-
-#[test]
-fn compression_mixed_lz4_to_zstd_rewrite_remount() {
-    // Write with lz4, remount with zstd, overwrite with new data, read back.
-    let root = temp_root("mixed-lz4-to-zstd");
-    let lz4_config = CompressionConfig {
-        algorithm: CompressionAlgorithm::Lz4,
-        level: 0,
-        min_compress_bytes: 0,
-    };
-    let zstd_config = CompressionConfig {
-        algorithm: CompressionAlgorithm::Zstd,
-        level: 3,
-        min_compress_bytes: 0,
-    };
-    let original: Vec<u8> = (0..64u8).cycle().take(4096).collect();
-    let rewrite: Vec<u8> = (192..=255u8).cycle().take(4096).collect();
-
-    // Session 1: write with lz4
-    {
-        let mut fs = LocalFileSystem::open_with_compression(&root, options(), lz4_config)
-            .expect("open with lz4");
-        fs.create_file("/mixed2.bin", 0o644).expect("create");
-        fs.write_file("/mixed2.bin", 0, &original)
-            .expect("write lz4");
-        fs.sync_all().expect("sync");
-        assert_eq!(fs.read_file("/mixed2.bin").expect("read"), original);
-    }
-
-    // Session 2: reopen with zstd, overwrite
-    {
-        let mut fs = LocalFileSystem::open_with_compression(&root, options(), zstd_config.clone())
-            .expect("reopen with zstd");
-        assert_eq!(fs.read_file("/mixed2.bin").expect("read old"), original);
-        fs.write_file("/mixed2.bin", 0, &rewrite)
-            .expect("overwrite with zstd");
-        fs.sync_all().expect("sync");
-        assert_eq!(fs.read_file("/mixed2.bin").expect("read new"), rewrite);
-    }
-
-    // Session 3: reopen with zstd again, verify rewrite persisted
-    {
-        let fs = LocalFileSystem::open_with_compression(&root, options(), zstd_config)
-            .expect("reopen after rewrite");
-        assert_eq!(
-            fs.read_file("/mixed2.bin").expect("read persisted"),
-            rewrite
-        );
-    }
-
-    cleanup(&root);
-}
-
-#[test]
-fn compression_mixed_mode_scrub_clean() {
-    // Write files with different compression algorithms in separate sessions,
-    // then scrub and verify all blocks are clean.
-    let root = temp_root("mixed-mode-scrub");
-    let data_a: Vec<u8> = (0..64u8).cycle().take(4096).collect();
-    let data_b: Vec<u8> = (65..129u8).cycle().take(4096).collect();
-
-    // Session 1: write with zstd
-    {
-        let mut fs = LocalFileSystem::open_with_compression(
-            &root,
-            options(),
-            CompressionConfig {
-                algorithm: CompressionAlgorithm::Zstd,
-                level: 3,
-                min_compress_bytes: 0,
-            },
-        )
-        .expect("open zstd");
-        fs.create_file("/zstd_file.bin", 0o644).expect("create");
-        fs.write_file("/zstd_file.bin", 0, &data_a)
-            .expect("write zstd");
-        fs.sync_all().expect("sync");
-    }
-
-    // Session 2: write with lz4
-    {
-        let mut fs = LocalFileSystem::open_with_compression(
-            &root,
-            options(),
-            CompressionConfig {
-                algorithm: CompressionAlgorithm::Lz4,
-                level: 0,
-                min_compress_bytes: 0,
-            },
-        )
-        .expect("open lz4");
-        fs.create_file("/lz4_file.bin", 0o644).expect("create");
-        fs.write_file("/lz4_file.bin", 0, &data_b)
-            .expect("write lz4");
-        fs.sync_all().expect("sync");
-    }
-
-    // Session 3: scrub all inodes and verify clean
-    {
-        let fs = LocalFileSystem::open_with_compression(
-            &root,
-            options(),
-            CompressionConfig {
-                algorithm: CompressionAlgorithm::Zstd,
-                level: 3,
-                min_compress_bytes: 0,
-            },
-        )
-        .expect("open for scrub");
-        let report =
-            crate::scrub::scrub_inodes_content(fs.store_ref(), fs.inode_records()).expect("scrub");
-        assert!(
-            report.is_clean(),
-            "scrub should be clean after mixed-mode writes; report: {report:?}"
-        );
-        assert!(report.blocks_scanned > 0, "should have scanned some blocks");
-        assert_eq!(report.blocks_corrupt, 0);
-        assert_eq!(report.blocks_unreadable, 0);
-    }
-
-    cleanup(&root);
-}
-
-#[test]
-fn compression_mixed_mode_all_algos_remount_roundtrip() {
-    // Write files with zstd, lz4, and uncompressed in the same store,
-    // then reopen and verify all three roundtrip correctly.
-    let root = temp_root("mixed-all-algos-roundtrip");
-    let zstd_data: Vec<u8> = b"zstd compressed payload ".repeat(80).to_vec();
-    let lz4_data: Vec<u8> = b"lz4 compressed payload ".repeat(80).to_vec();
-
-    // Write with zstd
-    {
-        let mut fs = LocalFileSystem::open_with_compression(
-            &root,
-            options(),
-            CompressionConfig {
-                algorithm: CompressionAlgorithm::Zstd,
-                level: 3,
-                min_compress_bytes: 0,
-            },
-        )
-        .expect("open zstd");
-        fs.create_file("/zstd.bin", 0o644).expect("create");
-        fs.write_file("/zstd.bin", 0, &zstd_data)
-            .expect("write zstd");
-        fs.sync_all().expect("sync");
-    }
-
-    // Write with lz4
-    {
-        let mut fs = LocalFileSystem::open_with_compression(
-            &root,
-            options(),
-            CompressionConfig {
-                algorithm: CompressionAlgorithm::Lz4,
-                level: 0,
-                min_compress_bytes: 0,
-            },
-        )
-        .expect("open lz4");
-        fs.create_file("/lz4.bin", 0o644).expect("create");
-        fs.write_file("/lz4.bin", 0, &lz4_data).expect("write lz4");
-        fs.sync_all().expect("sync");
-    }
-
-    // Reopen and verify all files
-    {
-        let fs =
-            LocalFileSystem::open_with_compression(&root, options(), CompressionConfig::balanced())
-                .expect("reopen");
-        assert_eq!(fs.read_file("/zstd.bin").expect("read zstd"), zstd_data);
-        assert_eq!(fs.read_file("/lz4.bin").expect("read lz4"), lz4_data);
-    }
-
-    cleanup(&root);
-}
-
-#[test]
-fn compression_mixed_mode_send_receive_roundtrip() {
-    // Write files with zstd and lz4 compression in separate sessions,
-    // then export, import, and verify all content survives send/receive.
-    let source_root = temp_root("mixed-sr-source");
-    let target_root = temp_root("mixed-sr-target");
-    let source_key = RootAuthenticationKey::from_bytes32([0x71_u8; ROOT_AUTHENTICATION_KEY_LEN]);
-    let target_key = RootAuthenticationKey::from_bytes32([0x72_u8; ROOT_AUTHENTICATION_KEY_LEN]);
-
-    let zstd_data: Vec<u8> = b"zstd send/receive payload ".repeat(80).to_vec();
-    let lz4_data: Vec<u8> = b"lz4 send/receive payload ".repeat(80).to_vec();
-
-    // Session 1: write with zstd
-    {
-        let mut fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            &source_root,
+    let direct_compression_root = root.join("direct-compression");
+    assert_transform_rejected(
+        LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+            &direct_compression_root,
             LocalFileSystemOpenConfig {
                 options: options(),
                 allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: source_key,
+                root_authentication_key: default_root_authentication_key().expect("auth key"),
                 encryption: None,
-                compression: Some(CompressionConfig {
-                    algorithm: CompressionAlgorithm::Zstd,
-                    level: 3,
-                    min_compress_bytes: 0,
-                }),
+                compression: Some(zstd_device_transform_config()),
                 log_device_device_path: None,
                 recovery_policy: RecoveryPolicy::default(),
                 block_devices: None,
             },
-        )
-        .expect("open zstd");
-        fs.create_file("/zstd_file.bin", 0o644)
-            .expect("create zstd file");
-        fs.write_file("/zstd_file.bin", 0, &zstd_data)
-            .expect("write zstd");
-        fs.sync_all().expect("sync zstd");
-    }
-
-    // Session 2: write with lz4 (reopens same pool)
-    {
-        let mut fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            &source_root,
-            LocalFileSystemOpenConfig {
-                options: options(),
-                allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: source_key,
-                encryption: None,
-                compression: Some(CompressionConfig {
-                    algorithm: CompressionAlgorithm::Lz4,
-                    level: 0,
-                    min_compress_bytes: 0,
-                }),
-                log_device_device_path: None,
-                recovery_policy: RecoveryPolicy::default(),
-                block_devices: None,
-            },
-        )
-        .expect("open lz4");
-        fs.create_file("/lz4_file.bin", 0o644)
-            .expect("create lz4 file");
-        fs.write_file("/lz4_file.bin", 0, &lz4_data)
-            .expect("write lz4");
-        fs.sync_all().expect("sync lz4");
-    }
-
-    // Reopen and export
-    let mut source =
-        LocalFileSystem::open_with_root_authentication_key(&source_root, options(), source_key)
-            .expect("open source for export");
-    let export = source.export_changed_records().expect("export");
-    assert!(export.total_records > 0);
-    assert!(export.payload_bytes > 0);
-
-    // Import into target
-    let report =
-        LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
-            &target_root,
-            options(),
-            &export,
-            target_key,
-        )
-        .expect("receive");
-    assert_eq!(report.imported_records, export.total_records);
-    assert_eq!(report.imported_payload_bytes, export.payload_bytes);
-
-    // Open target and verify both files roundtrip
-    let target =
-        LocalFileSystem::open_with_root_authentication_key(&target_root, options(), target_key)
-            .expect("open target");
-    assert_eq!(
-        target
-            .read_file("/zstd_file.bin")
-            .expect("read zstd after receive"),
-        zstd_data
+        ),
     );
-    assert_eq!(
-        target
-            .read_file("/lz4_file.bin")
-            .expect("read lz4 after receive"),
-        lz4_data
+    assert!(
+        !direct_compression_root.exists(),
+        "transform rejection must happen before creating a pool"
     );
 
-    cleanup(&source_root);
-    cleanup(&target_root);
-}
-
-/// Verify that content-addressed canonical objects are reused across sessions.
-/// Writes the same chunk content in two separate filesystem sessions; the second
-/// write should find the canonical object via store.contains_key() and use a
-/// redirect instead of writing a new copy.
-#[test]
-fn compression_mixed_mode_full_stack_validation() {
-    // Tier 3 storage runtime validation: end-to-end mixed-compression test
-    // exercising rewrite, scrub, send/receive, and remount in one scenario.
-    // Validation written to /root/ai/tmp/tidefs-validation/compression-mixed-mode-validation.log
-    use std::io::Write;
-
-    let source_root = temp_root("full-stack-source");
-    let target_root = temp_root("full-stack-target");
-    let key = RootAuthenticationKey::from_bytes32([0x91_u8; ROOT_AUTHENTICATION_KEY_LEN]);
-    // Determine repo root from CARGO_MANIFEST_DIR at compile time.
-    let validation_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap() // crates/tidefs-local-filesystem -> crates
-        .parent()
-        .unwrap() // crates -> repo root
-        .join("/root/ai/tmp/tidefs-validation/compression-mixed-mode-validation.log");
-
-    let mut log = Vec::<u8>::new();
-    let mut record = |msg: &str| {
-        let line = format!(
-            "[{}] {}
-",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            msg
-        );
-        log.extend_from_slice(line.as_bytes());
-    };
-
-    record("NEXT-STOR-025 compression mixed-mode full-stack validation start");
-    record(&format!("source_root={source_root:?}"));
-    record(&format!("target_root={target_root:?}"));
-
-    let zstd_data: Vec<u8> = b"zstd compressed payload ".repeat(100).to_vec();
-    let lz4_data: Vec<u8> = b"lz4 compressed payload ".repeat(100).to_vec();
-
-    // Phase 1: Write with zstd
-    {
-        let mut fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            &source_root,
+    let direct_both_root = root.join("direct-both");
+    assert_transform_rejected(
+        LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+            &direct_both_root,
             LocalFileSystemOpenConfig {
                 options: options(),
                 allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: key,
-                encryption: None,
-                compression: Some(CompressionConfig {
-                    algorithm: CompressionAlgorithm::Zstd,
-                    level: 3,
-                    min_compress_bytes: 0,
-                }),
+                root_authentication_key: default_root_authentication_key().expect("auth key"),
+                encryption: Some(enc_config),
+                compression: Some(lz4_device_transform_config()),
                 log_device_device_path: None,
                 recovery_policy: RecoveryPolicy::default(),
-                block_devices: None,
+                block_devices: Some(&[root.join("missing-block-device.img")]),
             },
-        )
-        .expect("open zstd");
-        fs.create_file("/zstd_file.bin", 0o644)
-            .expect("create zstd file");
-        fs.write_file("/zstd_file.bin", 0, &zstd_data)
-            .expect("write zstd");
-        fs.sync_all().expect("sync zstd");
-    }
-    record("Phase 1: zstd write complete");
-
-    // Phase 2: Write with lz4
-    {
-        let mut fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            &source_root,
-            LocalFileSystemOpenConfig {
-                options: options(),
-                allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: key,
-                encryption: None,
-                compression: Some(CompressionConfig {
-                    algorithm: CompressionAlgorithm::Lz4,
-                    level: 0,
-                    min_compress_bytes: 0,
-                }),
-                log_device_device_path: None,
-                recovery_policy: RecoveryPolicy::default(),
-                block_devices: None,
-            },
-        )
-        .expect("open lz4");
-        fs.create_file("/lz4_file.bin", 0o644)
-            .expect("create lz4 file");
-        fs.write_file("/lz4_file.bin", 0, &lz4_data)
-            .expect("write lz4");
-        fs.sync_all().expect("sync lz4");
-    }
-    record("Phase 2: lz4 write complete");
-
-    // Phase 3: Rewrite (zstd-written file overwritten with lz4 config)
-    {
-        let rewrite_data: Vec<u8> = b"rewritten with lz4 ".repeat(60).to_vec();
-        let mut fs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            &source_root,
-            LocalFileSystemOpenConfig {
-                options: options(),
-                allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: key,
-                encryption: None,
-                compression: Some(CompressionConfig {
-                    algorithm: CompressionAlgorithm::Lz4,
-                    level: 0,
-                    min_compress_bytes: 0,
-                }),
-                log_device_device_path: None,
-                recovery_policy: RecoveryPolicy::default(),
-                block_devices: None,
-            },
-        )
-        .expect("open for rewrite");
-        fs.replace_file("/zstd_file.bin", &rewrite_data)
-            .expect("rewrite");
-        fs.sync_all().expect("sync rewrite");
-        assert_eq!(
-            fs.read_file("/zstd_file.bin").expect("read rewrite"),
-            rewrite_data
-        );
-    }
-    record("Phase 3: rewrite complete");
-
-    // Phase 4: Scrub
-    {
-        let fs = LocalFileSystem::open_with_root_authentication_key(&source_root, options(), key)
-            .expect("open for scrub");
-        let report =
-            crate::scrub::scrub_inodes_content(fs.store_ref(), fs.inode_records()).expect("scrub");
-        assert!(report.is_clean(), "scrub must be clean; report: {report:?}");
-        record(&format!(
-            "Phase 4: scrub clean — scanned={} clean={} corrupt={}",
-            report.blocks_scanned, report.blocks_clean, report.blocks_corrupt
-        ));
-    }
-
-    // Phase 5: Send/receive
-    {
-        let mut source =
-            LocalFileSystem::open_with_root_authentication_key(&source_root, options(), key)
-                .expect("open source for export");
-        let export = source.export_changed_records().expect("export");
-        record(&format!(
-            "Phase 5: export — records={} bytes={} roots={}",
-            export.total_records,
-            export.payload_bytes,
-            export.roots.len()
-        ));
-
-        let report =
-            LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
-                &target_root,
-                options(),
-                &export,
-                key,
-            )
-            .expect("receive");
-        record(&format!(
-            "Phase 5: import — records={} bytes={}",
-            report.imported_records, report.imported_payload_bytes
-        ));
-    }
-
-    // Phase 6: Remount and verify
-    {
-        let target =
-            LocalFileSystem::open_with_root_authentication_key(&target_root, options(), key)
-                .expect("open target");
-        let expected_rewrite = b"rewritten with lz4 ".repeat(60).to_vec();
-        assert_eq!(
-            target.read_file("/zstd_file.bin").expect("read zstd"),
-            expected_rewrite
-        );
-        assert_eq!(
-            target.read_file("/lz4_file.bin").expect("read lz4"),
-            lz4_data
-        );
-    }
-    record("Phase 6: remount verify — both files match");
-
-    // Finalize and write validation (drop record closure first by ending block)
-    {
-        // The record closure borrows log mutably; finish recording then write.
-    }
-    if let Ok(mut f) = std::fs::File::create(&validation_path) {
-        f.write_all(&log).ok();
-    }
-    // Log final result directly without the closure
-    let line = format!(
-        "[{}] NEXT-STOR-025 compression mixed-mode full-stack validation PASSED
-",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
+        ),
     );
-    log.extend_from_slice(line.as_bytes());
-    if let Ok(mut f) = std::fs::File::create(&validation_path) {
-        f.write_all(&log).ok();
-    }
+    assert!(
+        !direct_both_root.exists(),
+        "block-device transform rejection must happen before pool creation"
+    );
 
-    cleanup(&source_root);
-    cleanup(&target_root);
+    cleanup(&root);
 }
 
 #[test]

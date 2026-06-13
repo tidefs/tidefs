@@ -409,6 +409,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        Some("check-mounted-transform-authority" | "check-transform-authority") => {
+            if let Err(err) = storage::check_mounted_transform_authority_current_workspace() {
+                eprintln!("{err}");
+                process::exit(1);
+            }
+        }
         Some("check-btree") => {
             if let Err(err) = storage::check_btree_current_workspace() {
                 eprintln!("{err}");
@@ -1311,6 +1317,9 @@ fn run_all_checks() {
     if let Err(e) = storage::check_local_filesystem_current_workspace() {
         errors.push(format!("storage/check-local-filesystem: {e}"));
     }
+    if let Err(e) = storage::check_mounted_transform_authority_current_workspace() {
+        errors.push(format!("storage/check-mounted-transform-authority: {e}"));
+    }
     if let Err(e) = storage::check_no_fsck_recovery_current_workspace() {
         errors.push(format!("storage/check-no-fsck-recovery: {e}"));
     }
@@ -1891,6 +1900,10 @@ fn print_help() {
     println!("  check-v3-record-integrity alias for check-production-integrity-v3");
     println!("  check-root-authentication validate OW-015 committed-root authentication markers");
     println!("  check-root-auth        alias for check-root-authentication");
+    println!(
+        "  check-mounted-transform-authority validate TFR-006 mounted raw-store inventory and transform claim guard"
+    );
+    println!("  check-transform-authority alias for check-mounted-transform-authority");
     println!("  check-local-snapshots validate OW-108 snapshot and rollback markers");
     println!("  check-snapshot-rollback alias for check-local-snapshots");
     println!("  check-send-receive validate OW-109 changed-record export/import markers");

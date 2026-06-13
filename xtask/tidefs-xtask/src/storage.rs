@@ -4243,6 +4243,163 @@ pub fn check_poolstore_compression_current_workspace() -> Result<(), StorageChec
         })
     }
 }
+
+const MOUNTED_TRANSFORM_RAW_STORE_COUNTS: &[(&str, usize)] = &[
+    ("crates/tidefs-local-object-store/src/pool/mod.rs", 7),
+    ("crates/tidefs-local-filesystem/src/lib.rs", 89),
+    ("crates/tidefs-local-filesystem/src/crash_recovery.rs", 21),
+    ("crates/tidefs-local-filesystem/src/journal_cleaner.rs", 7),
+    ("crates/tidefs-local-filesystem/src/vfs_engine_impl.rs", 6),
+];
+
+pub fn check_mounted_transform_authority_current_workspace() -> Result<(), StorageCheckError> {
+    let root = find_workspace_root().ok_or_else(|| StorageCheckError {
+        title: "mounted transform authority raw-store inventory check",
+        missing: vec!["could not locate workspace root Cargo.toml".to_string()],
+    })?;
+    let mut missing = Vec::new();
+
+    for rel in [
+        "docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md",
+        "docs/CLAIMS_GATE_POLICY.md",
+        "docs/PREVIEW_USER_MANUAL.md",
+        "crates/tidefs-compression/src/lib.rs",
+        "crates/tidefs-encryption/src/lib.rs",
+        "crates/tidefs-dedup/src/lib.rs",
+        "crates/tidefs-local-filesystem/src/lib.rs",
+        "crates/tidefs-local-filesystem/src/tests.rs",
+        "xtask/tidefs-xtask/src/claims.rs",
+    ] {
+        check_required_file(&root, rel, &mut missing);
+    }
+
+    check_mounted_transform_raw_store_counts(&root, &mut missing);
+
+    check_source_markers(
+        &root,
+        "docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md",
+        &[
+            "plaintext identity -> compression frame -> encryption frame -> checksum -> raw media bytes",
+            "reclaim identity",
+            "transform-aware",
+            "metadata/raw-only",
+            "blocked",
+            "later receipt/placement issue",
+            "Mounted local-filesystem device-level compression and encryption are blocked",
+            "must fail closed while any production `blocked` row remains",
+            "`crates/tidefs-local-filesystem/src/lib.rs` | 89",
+            "`crates/tidefs-local-filesystem/src/crash_recovery.rs` | 21",
+            "`crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7",
+            "`crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` | 6",
+        ],
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "docs/CLAIMS_GATE_POLICY.md",
+        &[
+            "Mounted Transform Authority",
+            "mounted local-filesystem compression/encryption claim is blocked",
+            "raw-store inventory",
+            "end-to-end mounted filesystem support",
+        ],
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "crates/tidefs-local-filesystem/src/lib.rs",
+        &[
+            "Fail closed until TFR-006 moves mounted content and recovery paths",
+            "local filesystem device transforms",
+            "raw-store inventory",
+        ],
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "crates/tidefs-local-filesystem/src/tests.rs",
+        &[
+            "device_transform_open_helpers_fail_closed_until_tfr_006_inventory",
+            "device_transform_open_config_rejects_before_pool_creation",
+            "assert_transform_rejected",
+            "raw-store inventory",
+        ],
+        &mut missing,
+    );
+    check_forbidden_markers(
+        &root,
+        "crates/tidefs-local-filesystem/src/tests.rs",
+        &[
+            "compression_write_read_roundtrip",
+            "compression_uncompressed_backward_compat",
+            "compression_reduces_object_size",
+            "compression_mixed_mode_full_stack_validation",
+            "NEXT-STOR-025 compression mixed-mode full-stack validation",
+        ],
+        &mut missing,
+    );
+    for rel in [
+        "crates/tidefs-compression/src/lib.rs",
+        "crates/tidefs-encryption/src/lib.rs",
+        "crates/tidefs-dedup/src/lib.rs",
+    ] {
+        check_source_markers(
+            &root,
+            rel,
+            &[
+                "plaintext identity -> compression frame -> encryption frame -> checksum -> raw media bytes",
+                "reclaim identity",
+                "MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY",
+            ],
+            &mut missing,
+        );
+    }
+    check_source_markers(
+        &root,
+        "xtask/tidefs-xtask/src/claims.rs",
+        &[
+            "MountedTransformAuthority",
+            "mounted device-level compression",
+            "mounted device-level encryption",
+            "raw-store inventory",
+        ],
+        &mut missing,
+    );
+
+    if missing.is_empty() {
+        println!("mounted transform authority ok: raw-store inventory counts are current and mounted compression/encryption claims remain blocked behind TFR-006");
+        Ok(())
+    } else {
+        Err(StorageCheckError {
+            title: "mounted transform authority raw-store inventory check",
+            missing,
+        })
+    }
+}
+
+fn check_mounted_transform_raw_store_counts(root: &Path, missing: &mut Vec<String>) {
+    for (rel, expected) in MOUNTED_TRANSFORM_RAW_STORE_COUNTS {
+        let path = root.join(rel);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                missing.push(format!("read {rel}: {err}"));
+                continue;
+            }
+        };
+        let actual = raw_primary_store_match_count(&text);
+        if actual != *expected {
+            missing.push(format!(
+                "{rel} has {actual} raw-primary-store matches; update inventory classification for expected {expected}"
+            ));
+        }
+    }
+}
+
+fn raw_primary_store_match_count(text: &str) -> usize {
+    text.matches("raw_primary_store(").count() + text.matches("raw_primary_store_mut(").count()
+}
+
 pub fn check_btree_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
         title: "B+tree crate check",

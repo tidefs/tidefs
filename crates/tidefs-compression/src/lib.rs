@@ -44,6 +44,18 @@
 //! use this crate's `put_extent`/`get_extent` as validation that per-dataset
 //! compression policy is wired into mounted content writes.
 //!
+//! The mounted transform guardrail uses the ordered terms:
+//!
+//! ```text
+//! plaintext identity -> compression frame -> encryption frame -> checksum -> raw media bytes
+//! ```
+//!
+//! `CompressedExtentPayload` is a compression frame helper. It does not define
+//! encryption frame placement, checksum authority, raw media bytes, or reclaim
+//! identity for the mounted filesystem. See
+//! `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md` for the current
+//! mounted claim blocker.
+//!
 //! ## ZFS comparison
 //!
 //! ZFS compresses at the block level with per-dataset algorithm selection

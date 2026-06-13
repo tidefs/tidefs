@@ -23,6 +23,9 @@ private until the operator gives an explicit public-release go-ahead.
 - Unreleased internal surfaces must follow
   `docs/UNRELEASED_AUTHORITY_POLICY.md`: choose current authority instead of
   preserving pre-release paths as legacy compatibility or migration debt.
+- Mounted device-level compression and encryption are blocked behind
+  `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`; lower object-store
+  wrappers are not an end-to-end mounted filesystem claim.
 - Publishing-facing capability wording must pass
   `cargo run -p tidefs-xtask -- check-claims-gate`.
 - Commits should be clean, scoped, and bisectable in the same spirit as Linux

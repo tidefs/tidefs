@@ -11,6 +11,7 @@ pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "docs/CLAIMS_GATE_POLICY.md",
     "docs/GETTING_STARTED.md",
     "docs/INDEX.md",
+    "docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md",
     "docs/PREVIEW_USER_MANUAL.md",
     "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
     "docs/REVIEW_TODO_REGISTER.md",
@@ -34,6 +35,11 @@ pub const CLAIMS_GATE_SENSITIVE_PATTERNS: &[&str] = &[
     "hardware-rdma claim",
     "full-kernel",
     "full kernel",
+    "mounted device-level compression",
+    "mounted device-level encryption",
+    "mounted compression",
+    "mounted encryption",
+    "end-to-end mounted filesystem support",
 ];
 
 const CLAIMS_GATE_ALLOWED_FRAMES: &[&str] = &[
@@ -67,6 +73,13 @@ const CLAIMS_GATE_ALLOWED_FRAMES: &[&str] = &[
     "not full-kernel",
     "pre-full-kernel",
     "no FUSE daemon",
+    "blocked",
+    "fail closed",
+    "raw-store inventory",
+    "raw-store bypass",
+    "transform authority",
+    "helper/library tier",
+    "not an end-to-end mounted filesystem",
 ];
 
 #[derive(Debug)]
@@ -92,6 +105,7 @@ pub enum ClaimGateRuleTopic {
     WorkStateAuthority,
     UnreleasedAuthority,
     EvidenceBeforeEscalation,
+    MountedTransformAuthority,
 }
 
 impl ClaimGateRuleTopic {
@@ -105,6 +119,7 @@ impl ClaimGateRuleTopic {
             Self::WorkStateAuthority => "claims_gate.work_state_authority",
             Self::UnreleasedAuthority => "claims_gate.unreleased_authority",
             Self::EvidenceBeforeEscalation => "claims_gate.evidence_before_escalation",
+            Self::MountedTransformAuthority => "claims_gate.mounted_transform_authority",
         }
     }
 
@@ -116,6 +131,7 @@ impl ClaimGateRuleTopic {
             Self::WorkStateAuthority => "GitHub work-state authority",
             Self::UnreleasedAuthority => "unreleased authority boundary",
             Self::EvidenceBeforeEscalation => "proof before stronger claims",
+            Self::MountedTransformAuthority => "mounted transform authority",
         }
     }
 }
@@ -150,6 +166,10 @@ pub const CLAIMS_GATE_RULES: &[ClaimGateRule] = &[
     ClaimGateRule {
         topic: ClaimGateRuleTopic::EvidenceBeforeEscalation,
         rule: "Any stronger claim requires a tracked GitHub issue, recorded proof, and an update to this gate before the wording can become present-tense product capability.",
+    },
+    ClaimGateRule {
+        topic: ClaimGateRuleTopic::MountedTransformAuthority,
+        rule: "Mounted device-level compression and mounted device-level encryption claims are blocked until the TFR-006 raw-store inventory records no blocked production paths; lower object-store wrappers are helper/library tier, not end-to-end mounted filesystem support.",
     },
 ];
 
@@ -211,6 +231,8 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "CLAIMS_GATE_RULES",
             "GitHub issue and pull request state",
             "unreleased authority boundary",
+            "mounted transform authority",
+            "MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY",
             "claims_gate_policy_covers_current_claim_boundaries",
         ],
         &mut missing,
@@ -226,6 +248,19 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "check-claims-gate",
             "Proof Before Stronger Claims",
             "Unreleased Authority Boundary",
+            "Mounted Transform Authority",
+            "raw-store inventory",
+        ],
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md",
+        &[
+            "plaintext identity -> compression frame -> encryption frame -> checksum -> raw media bytes",
+            "reclaim identity",
+            "mounted filesystem open with device compression or encryption",
+            "must fail closed",
         ],
         &mut missing,
     );
@@ -406,7 +441,7 @@ mod tests {
     #[test]
     fn claims_gate_policy_covers_current_claim_boundaries() {
         let rules = claims_gate_rules();
-        assert_eq!(rules.len(), 6);
+        assert_eq!(rules.len(), 7);
 
         for topic in [
             ClaimGateRuleTopic::ScannedPublishingSurfaces,
@@ -415,6 +450,7 @@ mod tests {
             ClaimGateRuleTopic::WorkStateAuthority,
             ClaimGateRuleTopic::UnreleasedAuthority,
             ClaimGateRuleTopic::EvidenceBeforeEscalation,
+            ClaimGateRuleTopic::MountedTransformAuthority,
         ] {
             assert!(
                 rules.iter().any(|rule| rule.topic == topic),
@@ -431,6 +467,8 @@ mod tests {
             "GitHub issue and pull request state",
             "public release",
             "proof",
+            "Mounted device-level compression",
+            "raw-store inventory",
         ] {
             assert!(
                 rules.iter().any(|rule| rule.rule.contains(marker))
@@ -447,6 +485,8 @@ mod tests {
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/UNRELEASED_AUTHORITY_POLICY.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/WHOLE_REPO_REVIEW.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md"));
+        assert!(CLAIMS_GATE_SCANNED_DOCS
+            .contains(&"docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md"));
     }
 
     #[test]
@@ -482,6 +522,26 @@ mod tests {
         ));
         assert!(line_has_present_tense_overclaim(
             "Full kernel mode is now operational."
+        ));
+    }
+
+    #[test]
+    fn claims_gate_rejects_unframed_mounted_transform_claims() {
+        assert!(line_has_present_tense_overclaim(
+            "TideFS has mounted compression for normal filesystem mounts."
+        ));
+        assert!(line_has_present_tense_overclaim(
+            "TideFS provides mounted device-level encryption today."
+        ));
+    }
+
+    #[test]
+    fn claims_gate_allows_blocked_mounted_transform_context() {
+        assert!(!line_has_present_tense_overclaim(
+            "Mounted device-level compression is blocked behind the raw-store inventory."
+        ));
+        assert!(!line_has_present_tense_overclaim(
+            "Object-store compression is helper/library tier, not an end-to-end mounted filesystem support claim."
         ));
     }
 

@@ -428,27 +428,28 @@ selection, content read/write, snapshot export/import, fsync and intent-log
 paths, scrub, reclaim, allocator scans, and space accounting. This is a
 transform-boundary problem, not only a missing wrapper.
 
-A focused raw-store inventory on 2026-06-01 found 139 local-filesystem
-raw-store call matches: 73 in `crates/tidefs-local-filesystem/src/lib.rs`, 21
-in `crates/tidefs-local-filesystem/src/crash_recovery.rs`, 7 in
-`crates/tidefs-local-filesystem/src/journal_cleaner.rs`, and 38 in
-`crates/tidefs-local-filesystem/src/tests.rs`. The production write/read
-hotspots include open-time committed-root load/persist, v0.390 migration,
-intent-log load/recovery, recovery probes, scrub/reclaim/allocation scans,
-sync/fsync and intent-log flushing, directory reads, and mounted file content.
-The file-content path is especially direct: `create_file()` writes initial
-content through `write_chunked_content(..., self.store.raw_primary_store_mut(),
-...)`, full replacement and overlay rewrites do the same, and `read_file()`
-calls `read_content_from_store(self.store.raw_primary_store(), ...)`. That
-means the encryption/compression open helpers cannot be treated as complete
-filesystem transforms until these paths are classified and moved behind one
-transform-aware authority or explicitly marked raw-only.
+Issue #218 moved the raw-store inventory into the checked current-policy doc
+`docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`. The guarded counts
+are now 89 matches in `crates/tidefs-local-filesystem/src/lib.rs`, 21 in
+`crates/tidefs-local-filesystem/src/crash_recovery.rs`, 7 in
+`crates/tidefs-local-filesystem/src/journal_cleaner.rs`, 6 in
+`crates/tidefs-local-filesystem/src/vfs_engine_impl.rs`, and 7 lower
+object-store accessor/escape-hatch matches in
+`crates/tidefs-local-object-store/src/pool/mod.rs`. The inventory classifies
+mounted production paths as transform-aware, metadata/raw-only, blocked, or
+owned by later receipt/placement issues, and it names the ordering terms
+plaintext identity, compression frame, encryption frame, checksum, raw media
+bytes, and reclaim identity. The blocked rows still cover open/recovery,
+file-content read/write, snapshot export/import, intent-log and fsync paths,
+scrub, reclaim, allocator scans, directory/inode fallback reads, and validation
+fixtures.
 
 Commit `8b5b0f70` therefore makes the mounted local-filesystem
 device-transform helpers fail closed for now. `LocalFileSystem` rejects open
 configs carrying device-level encryption or compression with
-`FileSystemError::Unsupported` while TFR-006 raw-store bypasses remain. The
-lower-level object-store pool transform stack is still present; this gate
+`FileSystemError::Unsupported` while the TFR-006 raw-store inventory has
+blocked production rows. The lower-level object-store pool transform stack is
+still present; this gate
 prevents the mounted filesystem API from presenting incomplete encryption or
 compression coverage as a working end-to-end feature.
 

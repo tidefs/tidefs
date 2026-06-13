@@ -26,6 +26,10 @@ or the runtime device substrate. Nix builds artifacts only; autonomous runtime
 
 ## Mounting the Filesystem
 
+Mounted device-level compression and encryption are blocked behind the TFR-006
+transform authority raw-store inventory; the preview mount command below does
+not enable those transforms.
+
     mkdir -p /tmp/tidefs-store /tmp/tidefs-mnt
     export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX="$(openssl rand -hex 32)"
     cargo run -p tidefs-posix-filesystem-adapter-daemon -- \
