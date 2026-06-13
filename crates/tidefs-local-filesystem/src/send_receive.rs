@@ -1116,6 +1116,9 @@ pub(crate) fn rewrite_snapshot_roots_for_import(
     require_all: bool,
 ) -> Result<()> {
     for snapshot in state.snapshots.values_mut() {
+        if !crate::snapshot::snapshot_record_retains_data(snapshot) {
+            continue;
+        }
         let identity = RootIdentity::from_summary(&snapshot.root);
         if let Some(imported) = imported_summaries.get(&identity) {
             snapshot.root = imported.clone();
