@@ -402,15 +402,14 @@ Important 2026-06-01 findings:
   Commit `7dbb0759` removes the fake `pool list` parser surface instead of
   accepting a command whose handler only said scaffolding had been removed, and
   downgrades cluster placement/heal exercise wording to development
-  diagnostics. The item remains open because the top-level mount path still
-  hard-codes `cluster_authorized: false`, `pool mount --cluster` has a separate
-  lease path, and cluster diagnostic commands still sit beside live-ish
-  transport dispatch. UAPI status must therefore be derived from real handler
-  behavior, not help text alone. Issue #239 adds a `tidefsctl` local-only
-  admission table and wires privileged pool, device, dataset, snapshot, block,
-  and defrag handlers through `LocalOnlyGuard`, but TFR-011 remains open until
-  the operator surface, live-owner routing, cluster authorization, and kernel
-  UAPI authority are one reviewed boundary.
+  diagnostics. Issue #239 adds a `tidefsctl` local-only admission table and
+  wires privileged pool, device, dataset, snapshot, block, and defrag handlers
+  through `LocalOnlyGuard`. Issue #243 removes the FUSE daemon's independent
+  `cluster_authorized` boolean/raw-token pairing: `tidefsctl mount` constructs
+  standalone mount authority, while `pool mount --cluster` carries a typed,
+  validated `PoolLeaseToken` into daemon admission. TFR-011 remains open until
+  the operator surface, live-owner routing, cluster diagnostics/authorization,
+  and kernel UAPI authority are one reviewed boundary.
 - `TFR-012`: Device lifecycle and media privacy remain incomplete. Pool-member
   backing must be one byte-addressable media model: block devices for
   production and regular files for hidden development mode. Directory

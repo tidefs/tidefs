@@ -48,6 +48,16 @@ userspace harnesses (`mount`, `pool mount`), prototype/development cluster
 commands, and removed directory-backed/offline surfaces that already fail
 closed before opening retired media.
 
+`mount` remains explicitly standalone/local: it constructs only standalone
+daemon mount authority and cannot assert cluster admission. `pool mount
+--cluster` is separate from P9-02 remote operator authorization; it is admitted
+only after clustered pool labels are validated, the pool GUID is read from the
+labels, a non-empty `PoolLeaseToken` is acquired from the storage-node, and the
+daemon receives one typed cluster lease authority. The daemon rejects missing,
+corrupt, invalid, or pool-mismatched lease material before opening the mounted
+filesystem, and it rejects cluster lease material on standalone authority
+instead of ignoring it.
+
 ## LocalOnlyGuard
 
 The `LocalOnlyGuard` struct in `tidefs-auth::local_only` provides a runtime
@@ -143,6 +153,10 @@ to any CLI/API privileged action paths. Wiring it requires:
   `dataset seal-key/rotate-key/upgrade/set`, and `defrag` now acquire a
   `LocalOnlyGuard` at their CLI handler boundary before mutating state or
   initiating privileged data movement.
+- `tidefsctl mount`, `tidefsctl pool mount --cluster`, and the POSIX adapter
+  daemon mount config now use typed mount authority: standalone mounts carry no
+  cluster lease material, while clustered pool mounts carry a validated
+  `PoolLeaseToken` through daemon admission.
 
 ### Next
 - Keep new `tidefsctl` public operator commands wired through
