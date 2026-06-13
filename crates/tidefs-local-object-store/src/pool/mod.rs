@@ -16,7 +16,7 @@
 pub mod commit_group;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -928,6 +928,8 @@ pub struct Pool {
     /// selected their targets while later topology changes can steer new
     /// allocations elsewhere.
     placement_epoch: u64,
+    /// Topology epoch currently reflected by durable pool labels.
+    persisted_label_epoch: Option<u64>,
     /// Next monotonic receipt generation for distinguishing same-topology
     /// rewrites of the same logical object.
     next_placement_receipt_generation: u64,
@@ -1010,6 +1012,10 @@ impl Pool {
         properties: PoolProperties,
         options: &StoreOptions,
     ) -> Result<Self> {
+        if pool_config_has_label_authority(&config) {
+            return Self::open(config, properties, options);
+        }
+
         // Only create the root directory if it is a directory path.
         // Block-device-backed pools use the block device itself as the root;
         // the metadata directory is created separately by the caller.
@@ -1062,6 +1068,7 @@ impl Pool {
             pool_guid,
             device_guids,
             placement_epoch: 1,
+            persisted_label_epoch: None,
             next_placement_receipt_generation,
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
@@ -1286,6 +1293,7 @@ impl Pool {
             pool_guid: pg,
             device_guids,
             placement_epoch: topology_generation.unwrap_or(1).max(1),
+            persisted_label_epoch: Some(topology_generation.unwrap_or(1).max(1)),
             next_placement_receipt_generation,
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
@@ -1310,37 +1318,15 @@ impl Pool {
             log_device.commit()?;
         }
         for (i, device) in self.devices.iter().enumerate() {
-            let root = device.root().to_path_buf();
-            fs::create_dir_all(&root).map_err(|e| StoreError::Io {
-                operation: "pool_export_create_dir",
-                path: root.clone(),
-                source: e,
-            })?;
-
+            let config = self
+                .config
+                .devices
+                .get(i)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "pool export missing device config",
+                })?;
             let label = self.build_label(i, device);
-
-            let sealed = pool_label::seal_label(label).map_err(|_| StoreError::InvalidOptions {
-                reason: "label seal failed",
-            })?;
-
-            let mut buf = [0u8; pool_label::POOL_LABEL_V1_EXT_WIRE_SIZE];
-            pool_label::encode_label(&sealed, &mut buf).map_err(|_| {
-                StoreError::InvalidOptions {
-                    reason: "label encode failed",
-                }
-            })?;
-
-            let lp = label_file_path(&root);
-            let mut f = fs::File::create(&lp).map_err(|e| StoreError::Io {
-                operation: "pool_export_write_label",
-                path: lp.clone(),
-                source: e,
-            })?;
-            f.write_all(&buf).map_err(|e| StoreError::Io {
-                operation: "pool_export_write_label",
-                path: lp,
-                source: e,
-            })?;
+            write_pool_label(config, label, "pool_export_write_label")?;
         }
         Ok(())
     }
@@ -1446,6 +1432,16 @@ impl Pool {
 
     /// Build a PoolLabelV1 for a single device.
     fn build_label(&self, device_index: usize, device: &Device) -> PoolLabelV1 {
+        self.build_label_with_state(device_index, device, PoolState::Exported)
+    }
+
+    /// Build a PoolLabelV1 for a single device with the requested pool state.
+    fn build_label_with_state(
+        &self,
+        device_index: usize,
+        device: &Device,
+        pool_state: PoolState,
+    ) -> PoolLabelV1 {
         let device_guid = self.device_guid_for_index(device_index);
 
         let device_count = self.devices.len() as u32;
@@ -1454,7 +1450,7 @@ impl Pool {
             pool_guid: self.pool_guid,
             device_guid,
             pool_name_len: self.config.name.len().min(255) as u16,
-            pool_state: PoolState::Exported,
+            pool_state,
             device_index: device_index as u32,
             topology_generation: self.placement_epoch,
             device_count,
@@ -1476,6 +1472,27 @@ impl Pool {
             redundancy_policy: self.properties.redundancy_policy.to_label_policy(),
             ..PoolLabelV1::new(self.pool_guid, device_guid, &self.config.name)
         }
+    }
+
+    fn persist_active_labels_if_needed(&mut self) -> Result<()> {
+        if self.persisted_label_epoch == Some(self.placement_epoch) {
+            return Ok(());
+        }
+
+        for (device_index, device) in self.devices.iter().enumerate() {
+            let config =
+                self.config
+                    .devices
+                    .get(device_index)
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "pool device label persistence missing device config",
+                    })?;
+            let label = self.build_label_with_state(device_index, device, PoolState::Active);
+            write_pool_label(config, label, "pool_active_write_label")?;
+        }
+
+        self.persisted_label_epoch = Some(self.placement_epoch);
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -1926,6 +1943,7 @@ impl Pool {
         let mut receipt = self.plan_pool_wide_placement(class, key, payload.len(), indices)?;
         receipt.generation = self.allocate_placement_receipt_generation();
         receipt.payload_digest = digest32(payload);
+        self.persist_active_labels_if_needed()?;
 
         let stored = match receipt.policy {
             PoolRedundancyPolicy::Replicated { .. } => {
@@ -3893,6 +3911,90 @@ fn label_file_path(device_root: &Path) -> PathBuf {
     device_root.join(".tidefs_label")
 }
 
+fn pool_config_has_label_authority(config: &PoolConfig) -> bool {
+    config.devices.iter().any(device_config_has_label_authority)
+}
+
+fn device_config_has_label_authority(config: &DeviceConfig) -> bool {
+    let device_root = device_root_path(config);
+    if config.backing.uses_fixed_offset_pool_labels() {
+        let Ok(mut file) = fs::File::open(&device_root) else {
+            return false;
+        };
+        let mut magic = [0u8; 4];
+        return file.read_exact(&mut magic).is_ok() && magic == pool_label::POOL_LABEL_MAGIC;
+    }
+
+    label_file_path(&device_root).exists()
+}
+
+fn write_pool_label(
+    device_config: &DeviceConfig,
+    label: PoolLabelV1,
+    operation: &'static str,
+) -> Result<()> {
+    let sealed = pool_label::seal_label(label).map_err(|_| StoreError::InvalidOptions {
+        reason: "label seal failed",
+    })?;
+
+    let mut buf = [0u8; pool_label::POOL_LABEL_V1_EXT_WIRE_SIZE];
+    pool_label::encode_label(&sealed, &mut buf).map_err(|_| StoreError::InvalidOptions {
+        reason: "label encode failed",
+    })?;
+
+    let device_root = device_root_path(device_config);
+    if device_config.backing.uses_fixed_offset_pool_labels() {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(&device_root)
+            .map_err(|e| StoreError::Io {
+                operation,
+                path: device_root.clone(),
+                source: e,
+            })?;
+        file.seek(SeekFrom::Start(0)).map_err(|e| StoreError::Io {
+            operation,
+            path: device_root.clone(),
+            source: e,
+        })?;
+        file.write_all(&buf).map_err(|e| StoreError::Io {
+            operation,
+            path: device_root.clone(),
+            source: e,
+        })?;
+        file.sync_all().map_err(|e| StoreError::Io {
+            operation,
+            path: device_root,
+            source: e,
+        })?;
+        return Ok(());
+    }
+
+    fs::create_dir_all(&device_root).map_err(|e| StoreError::Io {
+        operation,
+        path: device_root.clone(),
+        source: e,
+    })?;
+    let label_path = label_file_path(&device_root);
+    let mut file = fs::File::create(&label_path).map_err(|e| StoreError::Io {
+        operation,
+        path: label_path.clone(),
+        source: e,
+    })?;
+    file.write_all(&buf).map_err(|e| StoreError::Io {
+        operation,
+        path: label_path.clone(),
+        source: e,
+    })?;
+    file.sync_all().map_err(|e| StoreError::Io {
+        operation,
+        path: label_path,
+        source: e,
+    })?;
+    Ok(())
+}
+
 /// Map the runtime [`crate::device::DeviceClass`] to the on-disk
 /// [`tidefs_types_pool_label_core::DeviceClass`].
 fn runtime_class_to_label(class: Option<DeviceClass>) -> LabelDeviceClass {
@@ -4594,6 +4696,44 @@ mod tests {
             assert!(
                 reopened.resolve_receipt_target(target).is_some(),
                 "exported labels must preserve receipt target GUIDs"
+            );
+        }
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_reuses_active_labels_used_by_existing_receipts() {
+        let root = temp_dir("receipt-guid-active-labels");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-guid-active-labels");
+        let payload = b"receipt survives active create reopen by guid";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let pool_guid = pool.pool_guid;
+        let before = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt before active-label reopen");
+        drop(pool);
+
+        let reopened = Pool::create(config, properties, &test_options()).unwrap();
+        assert_eq!(reopened.pool_guid, pool_guid);
+        for target in &before.targets {
+            assert!(
+                reopened.resolve_receipt_target(target).is_some(),
+                "active labels must preserve receipt target GUIDs"
             );
         }
         assert_eq!(
