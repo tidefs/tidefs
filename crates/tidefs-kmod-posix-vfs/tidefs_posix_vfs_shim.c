@@ -4814,8 +4814,17 @@ static int tidefs_posix_vfs_file_mmap(
 	struct file *file, struct vm_area_struct *vma)
 {
 	struct inode *inode = file_inode(file);
+	struct tidefs_posix_vfs_mount *ctx = inode->i_sb->s_fs_info;
 	struct timespec64 old_atime = inode_get_atime(inode);
 	int ret;
+
+	/*
+	 * Only the engine-backed mounted pool has a writeback authority for
+	 * mmap dirties.  Bootstrap/fixed-table files fail closed instead of
+	 * admitting a mapping whose dirty folios would have no durable sink.
+	 */
+	if (!ctx || !ctx->engine_backed)
+		return -EOPNOTSUPP;
 
 	ret = generic_file_mmap(file, vma);
 	if (ret == 0) {
@@ -5584,17 +5593,13 @@ static int tidefs_posix_vfs_writepages(struct address_space *mapping,
 		int ret;
 
 		if (pos < 0 || pos >= isize) {
-			folio_start_writeback(folio);
 			folio_unlock(folio);
-			folio_end_writeback(folio);
 			continue;
 		}
 
 		len = min_t(loff_t, (loff_t)folio_size(folio), isize - pos);
 		if (len == 0) {
-			folio_start_writeback(folio);
 			folio_unlock(folio);
-			folio_end_writeback(folio);
 			continue;
 		}
 
@@ -5610,9 +5615,6 @@ static int tidefs_posix_vfs_writepages(struct address_space *mapping,
 		memcpy(kbuf, addr, len);
 		kunmap_local(addr);
 
-		folio_start_writeback(folio);
-		folio_unlock(folio);
-
 		ret = tidefs_posix_vfs_engine_write(
 			fh_ino, fh_id, (u64)pos,
 			(const unsigned char *)kbuf, (u32)len);
@@ -5622,21 +5624,19 @@ static int tidefs_posix_vfs_writepages(struct address_space *mapping,
 			pr_err("tidefs_posix_vfs: writepages engine_write failed ino=%lu pos=%lld len=%zu ret=%d\n",
 			       inode->i_ino, pos, len, ret);
 			mapping_set_error(mapping, ret);
-			/* Review debt TFR-018: writeback_iter() cleared dirty. */
 			folio_redirty_for_writepage(wbc, folio);
 			error = ret;
 		} else if ((size_t)ret != len) {
 			pr_err("tidefs_posix_vfs: writepages short engine_write ino=%lu pos=%lld len=%zu ret=%d\n",
 			       inode->i_ino, pos, len, ret);
 			mapping_set_error(mapping, -EIO);
-			/* Review debt TFR-018: preserve the folio for retry. */
 			folio_redirty_for_writepage(wbc, folio);
 			error = -EIO;
 		} else {
 			wrote_any = true;
 		}
 
-		folio_end_writeback(folio);
+		folio_unlock(folio);
 	}
 
 	if (wrote_any && !error) {
