@@ -7,7 +7,7 @@
 #![allow(missing_docs)]
 
 use super::is_mounted;
-use super::mount_options::{is_driver_mount_option, option_to_string, MountOption};
+use super::mount_options::{is_fusermount_mount_option, option_to_string, MountOption};
 use libc::c_int;
 use log::{debug, error};
 use std::ffi::{CStr, CString, OsStr};
@@ -278,7 +278,7 @@ fn fuse_mount_fusermount(
     builder.stdout(Stdio::piped()).stderr(Stdio::piped());
     let driver_options: Vec<String> = options
         .iter()
-        .filter(|option| is_driver_mount_option(option))
+        .filter(|option| is_fusermount_mount_option(option))
         .map(option_to_string)
         .collect();
     if !driver_options.is_empty() {
@@ -317,6 +317,18 @@ fn fuse_mount_fusermount(
         }
     };
     let mut receive_socket = Some(receive_socket);
+
+    if let Err(err) = apply_fusermount_atime_remount(mountpoint, options) {
+        drop(file);
+        drop(mem::take(&mut receive_socket));
+        if let Ok(c_mountpoint) = CString::new(mountpoint.as_bytes()) {
+            fuse_unmount_pure(&c_mountpoint);
+        }
+        if !options.contains(&MountOption::AutoUnmount) {
+            let _ = fusermount_child.wait_with_output();
+        }
+        return Err(err);
+    }
 
     if !options.contains(&MountOption::AutoUnmount) {
         // Only close the socket, if auto unmount is not set.
@@ -371,6 +383,73 @@ fn fuse_mount_fusermount(
     }
 
     Ok((file, receive_socket))
+}
+
+#[cfg(target_os = "linux")]
+fn apply_fusermount_atime_remount(
+    mountpoint: &OsStr,
+    options: &[MountOption],
+) -> Result<(), io::Error> {
+    let Some(flags) = fusermount_atime_remount_flags(options) else {
+        return Ok(());
+    };
+    let c_mountpoint = CString::new(mountpoint.as_bytes())
+        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid mountpoint: {e}")))?;
+
+    // SAFETY: remounting uses a valid null-terminated mountpoint string.
+    // For MS_REMOUNT, Linux ignores the null source, filesystem type, and data
+    // pointers; flags are assembled from MS_* constants only.
+    let result = unsafe {
+        libc::mount(
+            ptr::null::<libc::c_char>(),
+            c_mountpoint.as_ptr(),
+            ptr::null::<libc::c_char>(),
+            flags,
+            ptr::null::<libc::c_void>(),
+        )
+    };
+    if result == -1 {
+        let err = Error::last_os_error();
+        Err(Error::new(
+            err.kind(),
+            format!("Error remounting FUSE atime policy at {mountpoint:?}: {err}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_fusermount_atime_remount(
+    _mountpoint: &OsStr,
+    _options: &[MountOption],
+) -> Result<(), io::Error> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn fusermount_atime_remount_flags(options: &[MountOption]) -> Option<libc::c_ulong> {
+    let needs_remount = options
+        .iter()
+        .any(|option| matches!(option, MountOption::NoAtime | MountOption::StrictAtime));
+    if !needs_remount {
+        return None;
+    }
+
+    let mut flags = libc::MS_REMOUNT;
+    if !options.contains(&MountOption::Dev) {
+        flags |= libc::MS_NODEV;
+    }
+    if !options.contains(&MountOption::Suid) {
+        flags |= libc::MS_NOSUID;
+    }
+    for flag in options
+        .iter()
+        .filter(|x| option_group(x) == MountOptionGroup::KernelFlag)
+    {
+        flags |= option_to_flag(flag);
+    }
+    Some(flags)
 }
 
 // If returned option is none. Then fusermount binary should be tried
@@ -619,5 +698,54 @@ mod tests {
             libc::MS_STRICTATIME
         );
         assert_eq!(option_to_flag(&MountOption::NoAtime), libc::MS_NOATIME);
+    }
+
+    #[test]
+    fn fusermount_options_skip_kernel_atime_policy_flags() {
+        let options = [
+            MountOption::FSName("tidefs".to_string()),
+            MountOption::Atime,
+            MountOption::Relatime,
+            MountOption::StrictAtime,
+            MountOption::NoAtime,
+            MountOption::RO,
+            MountOption::WritebackCache,
+        ];
+
+        let driver_options: Vec<String> = options
+            .iter()
+            .filter(|option| is_fusermount_mount_option(option))
+            .map(option_to_string)
+            .collect();
+
+        assert_eq!(driver_options, ["fsname=tidefs", "ro"]);
+    }
+
+    #[test]
+    fn fusermount_strictatime_remount_preserves_default_flags() {
+        assert_eq!(
+            fusermount_atime_remount_flags(&[MountOption::StrictAtime]),
+            Some(libc::MS_REMOUNT | libc::MS_NODEV | libc::MS_NOSUID | libc::MS_STRICTATIME)
+        );
+    }
+
+    #[test]
+    fn fusermount_noatime_remount_respects_dev_and_suid() {
+        assert_eq!(
+            fusermount_atime_remount_flags(&[
+                MountOption::NoAtime,
+                MountOption::Dev,
+                MountOption::Suid
+            ]),
+            Some(libc::MS_REMOUNT | libc::MS_NOATIME)
+        );
+    }
+
+    #[test]
+    fn fusermount_relatime_uses_kernel_default_without_remount() {
+        assert_eq!(
+            fusermount_atime_remount_flags(&[MountOption::Relatime]),
+            None
+        );
     }
 }
