@@ -523,6 +523,14 @@ impl Default for DentryPolicy {
 }
 
 impl DentryPolicy {
+    fn for_timestamp_policy(self, timestamp_policy: TimestampPolicy, read_only: bool) -> Self {
+        let mut policy = self;
+        if !read_only && timestamp_policy != TimestampPolicy::NoAtime {
+            policy.positive_attr_ttl = Duration::ZERO;
+        }
+        policy
+    }
+
     fn positive_lookup_config(self) -> LookupConfig {
         lookup_config_from_ttls(self.positive_entry_ttl, self.positive_attr_ttl)
     }
@@ -2386,6 +2394,7 @@ pub struct FuseVfsAdapter {
     /// on setattr or write to the same inode.
     getattr_cache: Mutex<HashMap<u64, (FuseAttrOut, std::time::Instant)>>,
     path_lookup_cache: Mutex<PathLookupCache<InodeAttr>>,
+    base_dentry_policy: DentryPolicy,
     pub(crate) rename_dispatch: FuseRenameDispatch,
     /// WritebackInodeCache for per-inode dirty tracking and reclaim protection.
     writeback_cache: Mutex<WritebackInodeCache>,
@@ -2479,11 +2488,14 @@ impl FuseVfsAdapter {
         let notifier = Arc::new(Mutex::new(None));
         let mmap_coherency = Arc::new(MmapCoherency::new(Arc::clone(&notifier)));
         let engine = Arc::new(Mutex::new(engine));
+        let timestamp_policy = TimestampPolicy::default();
+        let base_dentry_policy = DentryPolicy::default();
         Ok(Self {
             engine: Arc::clone(&engine),
             file_handles: Mutex::new(AdapterFileHandleTable::default()),
             dir_handles: Mutex::new(AdapterDirHandleTable::default()),
-            dentry_policy: DentryPolicy::default(),
+            dentry_policy: base_dentry_policy.for_timestamp_policy(timestamp_policy, false),
+            base_dentry_policy,
             lock_dispatch: DaemonLockDispatch::new(),
             dentry_invalidations: Mutex::new(DentryInvalidationState::default()),
             negative_cache: Mutex::new(NegativeLookupCache::new(256, Duration::from_millis(250))),
@@ -2518,7 +2530,7 @@ impl FuseVfsAdapter {
             writeback_range_tracker: None,
             force_sync_writes: false,
             force_direct_io: false,
-            timestamp_policy: TimestampPolicy::default(),
+            timestamp_policy,
             suppress_dir_atime: false,
             notifier: notifier.clone(),
             mmap_coherency,
@@ -2604,6 +2616,7 @@ impl FuseVfsAdapter {
     #[must_use]
     pub fn with_timestamp_policy(mut self, policy: TimestampPolicy) -> Self {
         self.timestamp_policy = policy;
+        self.refresh_dentry_policy_for_timestamp_mode();
         self
     }
 
@@ -2619,6 +2632,7 @@ impl FuseVfsAdapter {
     #[must_use]
     pub fn with_read_only(mut self) -> Self {
         self.read_only = true;
+        self.refresh_dentry_policy_for_timestamp_mode();
         self
     }
 
@@ -2693,11 +2707,18 @@ impl FuseVfsAdapter {
     ) -> Self {
         let params = profile.params();
 
-        self.dentry_policy = DentryPolicy::from_coherency_params(params);
+        self.base_dentry_policy = DentryPolicy::from_coherency_params(params);
+        self.refresh_dentry_policy_for_timestamp_mode();
         self.force_direct_io =
             matches!(profile, crate::coherency_profile::CoherencyProfile::Strict);
 
         self
+    }
+
+    fn refresh_dentry_policy_for_timestamp_mode(&mut self) {
+        self.dentry_policy = self
+            .base_dentry_policy
+            .for_timestamp_policy(self.timestamp_policy, self.read_only);
     }
 
     /// Attach the stable DatasetId resolved through the dataset catalog.
@@ -41733,6 +41754,65 @@ mod tests {
         assert!(
             !adapter.is_writeback_cache_enabled(),
             "Writeback profile controls TTLs only; --writeback-cache must opt in"
+        );
+    }
+
+    #[test]
+    fn read_atime_policy_zeroes_positive_attr_ttl() {
+        let adapter = fresh_test_adapter()
+            .with_coherency_profile(crate::coherency_profile::CoherencyProfile::Writeback)
+            .with_timestamp_policy(TimestampPolicy::RelativeAtime);
+
+        assert_eq!(
+            adapter.base_dentry_policy.positive_attr_ttl,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            adapter.dentry_policy.positive_entry_ttl,
+            Duration::from_secs(5)
+        );
+        assert_eq!(adapter.dentry_policy.positive_attr_ttl, Duration::ZERO);
+        assert_eq!(adapter.dentry_policy.positive_reply_ttl(), Duration::ZERO);
+    }
+
+    #[test]
+    fn noatime_policy_keeps_profile_positive_attr_ttl() {
+        let adapter = fresh_test_adapter()
+            .with_coherency_profile(crate::coherency_profile::CoherencyProfile::Writeback)
+            .with_timestamp_policy(TimestampPolicy::NoAtime);
+
+        assert_eq!(
+            adapter.dentry_policy.positive_entry_ttl,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            adapter.dentry_policy.positive_attr_ttl,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            adapter.dentry_policy.positive_reply_ttl(),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn read_only_mount_keeps_profile_positive_attr_ttl() {
+        let adapter = fresh_test_adapter()
+            .with_coherency_profile(crate::coherency_profile::CoherencyProfile::Writeback)
+            .with_timestamp_policy(TimestampPolicy::RelativeAtime)
+            .with_read_only();
+
+        assert_eq!(
+            adapter.dentry_policy.positive_entry_ttl,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            adapter.dentry_policy.positive_attr_ttl,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            adapter.dentry_policy.positive_reply_ttl(),
+            Duration::from_secs(5)
         );
     }
 
