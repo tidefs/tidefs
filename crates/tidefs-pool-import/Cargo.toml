@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 description = """
-Pool import: vdev activation, superblock verification, intent log replay,
+Pool import: device activation, superblock verification, intent log replay,
 dataset mount readiness, and pool activation. Phase 3 of pool import/export.
 """
 
