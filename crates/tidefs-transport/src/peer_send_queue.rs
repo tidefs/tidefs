@@ -11,6 +11,10 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, Notify};
 
+use crate::send_admission::{
+    DroppedSendEvidence, SendAdmissionEvidence, SendAdmissionOutcome, SendAdmissionPolicy,
+    SendCapacityClass, SendCapacityEvidence, SendWakeEvidence,
+};
 use crate::PeerId;
 
 /// Backpressure policy applied when a peer's send queue is full.
@@ -36,14 +40,24 @@ pub struct QueueStats {
 }
 
 /// Reason a send operation failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SendError {
     /// Queue is full and policy is `Error`.
     #[error("peer send queue is full")]
-    Full,
+    Full { evidence: SendAdmissionEvidence },
     /// Queue has been closed (peer removed or shutting down).
     #[error("peer send queue is closed")]
-    Closed,
+    Closed { evidence: SendAdmissionEvidence },
+}
+
+impl SendError {
+    /// Return the admission evidence carried by this send error.
+    #[must_use]
+    pub fn evidence(&self) -> &SendAdmissionEvidence {
+        match self {
+            Self::Full { evidence } | Self::Closed { evidence } => evidence,
+        }
+    }
 }
 
 /// Cloneable sender handle for enqueuing messages into a specific peer's queue.
@@ -52,6 +66,7 @@ pub enum SendError {
 /// and enqueue messages concurrently. Ordering is FIFO per queue but
 /// interleaving across concurrent senders is non-deterministic.
 pub struct PeerQueueSender<M> {
+    peer_id: PeerId,
     inner: Arc<Mutex<InnerQueue<M>>>,
     notify: Arc<Notify>,
 }
@@ -59,6 +74,7 @@ pub struct PeerQueueSender<M> {
 impl<M> Clone for PeerQueueSender<M> {
     fn clone(&self) -> Self {
         Self {
+            peer_id: self.peer_id,
             inner: Arc::clone(&self.inner),
             notify: Arc::clone(&self.notify),
         }
@@ -70,6 +86,7 @@ impl<M> Clone for PeerQueueSender<M> {
 /// The transport send path holds exactly one receiver per peer and
 /// forwards dequeued messages to frame encoding.
 pub struct PeerQueueReceiver<M> {
+    peer_id: PeerId,
     inner: Arc<Mutex<InnerQueue<M>>>,
     notify: Arc<Notify>,
 }
@@ -141,7 +158,8 @@ impl<M> PeerSendQueue<M> {
         if let Some(sender) = self.senders.get(&peer_id) {
             return Some(sender.clone());
         }
-        let (sender, receiver) = Self::make_pair(self.max_queued_per_peer, self.default_policy);
+        let (sender, receiver) =
+            Self::make_pair(peer_id, self.max_queued_per_peer, self.default_policy);
         self.senders.insert(peer_id, sender.clone());
         self.receivers.insert(peer_id, receiver);
         Some(sender)
@@ -187,16 +205,22 @@ impl<M> PeerSendQueue<M> {
     }
 
     fn make_pair(
+        peer_id: PeerId,
         capacity: usize,
         policy: BackpressurePolicy,
     ) -> (PeerQueueSender<M>, PeerQueueReceiver<M>) {
         let inner = Arc::new(Mutex::new(InnerQueue::new(capacity, policy)));
         let notify = Arc::new(Notify::new());
         let sender = PeerQueueSender {
+            peer_id,
             inner: Arc::clone(&inner),
             notify: Arc::clone(&notify),
         };
-        let receiver = PeerQueueReceiver { inner, notify };
+        let receiver = PeerQueueReceiver {
+            peer_id,
+            inner,
+            notify,
+        };
         (sender, receiver)
     }
 }
@@ -210,34 +234,67 @@ impl<M> PeerQueueSender<M> {
     ///   capacity frees up.
     /// - [`DropOldest`](BackpressurePolicy::DropOldest): evicts the oldest
     ///   message to make room if the queue is full.
-    /// - [`Error`](BackpressurePolicy::Error): returns [`SendError::Full`]
+    /// - [`Error`](BackpressurePolicy::Error): returns full-queue evidence
     ///   immediately if the queue is at capacity.
     ///
-    /// Returns [`SendError::Closed`] if the peer's queue has been removed.
-    pub async fn send(&self, msg: M) -> Result<(), SendError> {
+    /// Returns closed evidence if the peer's queue has been removed.
+    pub async fn send(&self, msg: M) -> Result<SendAdmissionEvidence, SendError> {
+        let mut waited = false;
         loop {
+            let notified = self.notify.notified();
             {
                 let mut guard = self.inner.lock().await;
                 if guard.closed {
-                    return Err(SendError::Closed);
+                    let wake = if waited {
+                        SendWakeEvidence::ClosedObserved
+                    } else {
+                        SendWakeEvidence::NotApplicable
+                    };
+                    return Err(SendError::Closed {
+                        evidence: self
+                            .evidence(SendAdmissionOutcome::Closed, &guard)
+                            .with_policy(SendAdmissionPolicy::Shutdown)
+                            .with_wake(wake),
+                    });
                 }
                 if guard.queue.len() < guard.capacity {
                     guard.queue.push_back(msg);
                     guard.stats.total_enqueued += 1;
                     self.notify.notify_one();
-                    return Ok(());
+                    let outcome = if waited {
+                        SendAdmissionOutcome::Blocked
+                    } else {
+                        SendAdmissionOutcome::Queued
+                    };
+                    let wake = if waited {
+                        SendWakeEvidence::DrainObserved
+                    } else {
+                        SendWakeEvidence::NotApplicable
+                    };
+                    return Ok(self
+                        .evidence(outcome, &guard)
+                        .with_policy(self.policy_evidence(guard.policy))
+                        .with_wake(wake));
                 }
                 match guard.policy {
                     BackpressurePolicy::Error => {
-                        return Err(SendError::Full);
+                        return Err(SendError::Full {
+                            evidence: self
+                                .evidence(SendAdmissionOutcome::Backpressured, &guard)
+                                .with_policy(SendAdmissionPolicy::Error),
+                        });
                     }
                     BackpressurePolicy::DropOldest => {
+                        let depth_before = guard.queue.len();
                         let _oldest = guard.queue.pop_front();
                         guard.stats.total_dropped += 1;
                         guard.queue.push_back(msg);
                         guard.stats.total_enqueued += 1;
                         self.notify.notify_one();
-                        return Ok(());
+                        return Ok(self
+                            .evidence(SendAdmissionOutcome::DroppedOldest, &guard)
+                            .with_policy(SendAdmissionPolicy::DropOldest)
+                            .with_dropped(vec![DroppedSendEvidence::message(depth_before)]));
                     }
                     BackpressurePolicy::Block => {
                         // Fall through: drop lock, wait for space.
@@ -245,37 +302,61 @@ impl<M> PeerQueueSender<M> {
                 }
             }
             // Queue full under Block policy; wait for receiver to drain.
-            self.notify.notified().await;
+            notified.await;
+            waited = true;
         }
     }
 
     /// Attempt to enqueue without blocking.
     ///
-    /// Returns `Ok(())` on success, `Err(SendError::Full)` if the queue
+    /// Returns queued evidence on success, full evidence if the queue
     /// is at capacity under a policy that doesn't resolve synchronously,
-    /// or `Err(SendError::Closed)` if the queue is closed.
-    pub fn try_send(&self, msg: M) -> Result<(), SendError> {
-        let mut guard = self.inner.try_lock().map_err(|_| SendError::Closed)?;
+    /// or closed evidence if the queue is closed.
+    pub fn try_send(&self, msg: M) -> Result<SendAdmissionEvidence, SendError> {
+        let mut guard = self.inner.try_lock().map_err(|_| SendError::Full {
+            evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Backpressured)
+                .with_peer_id(self.peer_id)
+                .with_wake(SendWakeEvidence::Unavailable),
+        })?;
         if guard.closed {
-            return Err(SendError::Closed);
+            return Err(SendError::Closed {
+                evidence: self
+                    .evidence(SendAdmissionOutcome::Closed, &guard)
+                    .with_policy(SendAdmissionPolicy::Shutdown),
+            });
         }
         if guard.queue.len() < guard.capacity {
             guard.queue.push_back(msg);
             guard.stats.total_enqueued += 1;
             self.notify.notify_one();
-            return Ok(());
+            return Ok(self
+                .evidence(SendAdmissionOutcome::Queued, &guard)
+                .with_policy(self.policy_evidence(guard.policy)));
         }
         match guard.policy {
-            BackpressurePolicy::Error => Err(SendError::Full),
+            BackpressurePolicy::Error => Err(SendError::Full {
+                evidence: self
+                    .evidence(SendAdmissionOutcome::Backpressured, &guard)
+                    .with_policy(SendAdmissionPolicy::Error),
+            }),
             BackpressurePolicy::DropOldest => {
+                let depth_before = guard.queue.len();
                 let _oldest = guard.queue.pop_front();
                 guard.stats.total_dropped += 1;
                 guard.queue.push_back(msg);
                 guard.stats.total_enqueued += 1;
                 self.notify.notify_one();
-                Ok(())
+                Ok(self
+                    .evidence(SendAdmissionOutcome::DroppedOldest, &guard)
+                    .with_policy(SendAdmissionPolicy::DropOldest)
+                    .with_dropped(vec![DroppedSendEvidence::message(depth_before)]))
             }
-            BackpressurePolicy::Block => Err(SendError::Full),
+            BackpressurePolicy::Block => Err(SendError::Full {
+                evidence: self
+                    .evidence(SendAdmissionOutcome::Backpressured, &guard)
+                    .with_policy(SendAdmissionPolicy::Block)
+                    .with_wake(SendWakeEvidence::Unavailable),
+            }),
         }
     }
 
@@ -286,9 +367,39 @@ impl<M> PeerQueueSender<M> {
             Err(_) => QueueStats::default(),
         }
     }
+
+    fn policy_evidence(&self, policy: BackpressurePolicy) -> SendAdmissionPolicy {
+        match policy {
+            BackpressurePolicy::Block => SendAdmissionPolicy::Block,
+            BackpressurePolicy::DropOldest => SendAdmissionPolicy::DropOldest,
+            BackpressurePolicy::Error => SendAdmissionPolicy::Error,
+        }
+    }
+
+    fn evidence(
+        &self,
+        outcome: SendAdmissionOutcome,
+        guard: &InnerQueue<M>,
+    ) -> SendAdmissionEvidence {
+        SendAdmissionEvidence::new(outcome)
+            .with_peer_id(self.peer_id)
+            .with_queue_depth(guard.queue.len())
+            .with_capacity(SendCapacityEvidence::new(
+                SendCapacityClass::Message,
+                guard.queue.len(),
+                Some(1),
+                Some(guard.capacity),
+            ))
+    }
 }
 
 impl<M> PeerQueueReceiver<M> {
+    /// Return the peer identity associated with this receiver.
+    #[must_use]
+    pub const fn peer_id(&self) -> PeerId {
+        self.peer_id
+    }
+
     /// Receive the next message from the peer's FIFO queue.
     ///
     /// Returns `Some(msg)` when a message is available, or `None` when
@@ -359,18 +470,16 @@ mod tests {
         }
 
         let s2 = sender.clone();
-        let handle = tokio::spawn(async move {
-            s2.send(100).await.unwrap();
-            100u32
-        });
+        let handle = tokio::spawn(async move { s2.send(100).await.unwrap() });
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         let first = receiver.recv().await;
         assert_eq!(first, Some(0));
 
-        let sent = handle.await.unwrap();
-        assert_eq!(sent, 100);
+        let evidence = handle.await.unwrap();
+        assert_eq!(evidence.outcome, SendAdmissionOutcome::Blocked);
+        assert_eq!(evidence.wake, SendWakeEvidence::DrainObserved);
     }
 
     #[tokio::test]
@@ -405,7 +514,14 @@ mod tests {
         sender.send(2).await.unwrap();
 
         let result = sender.send(3).await;
-        assert!(matches!(result, Err(SendError::Full)));
+        match result {
+            Err(SendError::Full { evidence }) => {
+                assert_eq!(evidence.outcome, SendAdmissionOutcome::Backpressured);
+                assert_eq!(evidence.peer_id, Some(1));
+                assert_eq!(evidence.queue_depth, Some(2));
+            }
+            other => panic!("expected full evidence, got {other:?}"),
+        }
 
         assert_eq!(receiver.recv().await, Some(1));
         assert_eq!(receiver.recv().await, Some(2));
@@ -490,7 +606,13 @@ mod tests {
 
         // Subsequent sends fail.
         let result = sender.send(2).await;
-        assert!(matches!(result, Err(SendError::Closed)));
+        match result {
+            Err(SendError::Closed { evidence }) => {
+                assert_eq!(evidence.outcome, SendAdmissionOutcome::Closed);
+                assert_eq!(evidence.peer_id, Some(1));
+            }
+            other => panic!("expected closed evidence, got {other:?}"),
+        }
 
         assert!(psq.sender(1).is_none());
     }
@@ -512,7 +634,13 @@ mod tests {
         receiver.close().await;
 
         let result = handle.await.unwrap();
-        assert!(matches!(result, Err(SendError::Closed)));
+        match result {
+            Err(SendError::Closed { evidence }) => {
+                assert_eq!(evidence.outcome, SendAdmissionOutcome::Closed);
+                assert_eq!(evidence.wake, SendWakeEvidence::ClosedObserved);
+            }
+            other => panic!("expected closed wake evidence, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -537,7 +665,13 @@ mod tests {
 
         sender.try_send(1).unwrap();
         sender.try_send(2).unwrap();
-        assert!(matches!(sender.try_send(3), Err(SendError::Full)));
+        match sender.try_send(3) {
+            Err(SendError::Full { evidence }) => {
+                assert_eq!(evidence.outcome, SendAdmissionOutcome::Backpressured);
+                assert_eq!(evidence.queue_depth, Some(2));
+            }
+            other => panic!("expected try_send full evidence, got {other:?}"),
+        }
 
         assert_eq!(receiver.recv().await, Some(1));
         assert_eq!(receiver.recv().await, Some(2));
@@ -551,7 +685,9 @@ mod tests {
 
         sender.try_send(1).unwrap();
         sender.try_send(2).unwrap();
-        sender.try_send(3).unwrap(); // drops 1
+        let evidence = sender.try_send(3).unwrap(); // drops 1
+        assert_eq!(evidence.outcome, SendAdmissionOutcome::DroppedOldest);
+        assert_eq!(evidence.dropped.len(), 1);
 
         assert_eq!(receiver.recv().await, Some(2));
         assert_eq!(receiver.recv().await, Some(3));

@@ -1226,7 +1226,18 @@ impl Session {
     /// if the buffer is at capacity, or [`Backpressure::Shutdown`] if the
     /// buffer has been closed.
     pub fn try_enqueue_send(&mut self, frame: bytes::Bytes) -> Backpressure {
-        self.send_buffer.try_enqueue(frame)
+        match self.send_buffer.try_enqueue(frame).outcome {
+            crate::send_admission::SendAdmissionOutcome::Accepted
+            | crate::send_admission::SendAdmissionOutcome::Queued
+            | crate::send_admission::SendAdmissionOutcome::DroppedOldest => Backpressure::Ok,
+            crate::send_admission::SendAdmissionOutcome::Backpressured
+            | crate::send_admission::SendAdmissionOutcome::Blocked
+            | crate::send_admission::SendAdmissionOutcome::ExpiredBeforeEnqueue => {
+                Backpressure::PeerFull
+            }
+            crate::send_admission::SendAdmissionOutcome::Closed
+            | crate::send_admission::SendAdmissionOutcome::NoConnection => Backpressure::Shutdown,
+        }
     }
 
     /// Dequeue the next frame from the send buffer for wire transmission.

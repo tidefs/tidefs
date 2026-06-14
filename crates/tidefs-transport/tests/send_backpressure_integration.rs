@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 use tidefs_transport::connection_registry::ConnectionState;
 use tidefs_transport::envelope::MessageFamily;
 use tidefs_transport::outbound_send::SendPipeline;
+use tidefs_transport::send_admission::{SendAdmissionOutcome, SendCapacityClass, SendWakeEvidence};
 use tidefs_transport::send_backpressure::{SendCapacitySet, SendWatermarkConfig};
 use tidefs_transport::send_deadline::DeadlineOutcome;
 use tidefs_transport::send_scheduler::SendPriority;
@@ -99,7 +100,10 @@ async fn try_send_with_backpressure_enqueues_when_capacity_available() {
         "send should succeed when capacity is available"
     );
 
-    let token = result.unwrap();
+    let admission = result.unwrap();
+    assert_eq!(admission.evidence.outcome, SendAdmissionOutcome::Accepted);
+    assert_eq!(admission.evidence.priority, Some(SendPriority::Data));
+    let token = admission.value.unwrap();
     let outcome = token.wait().await.unwrap();
     assert_eq!(outcome, DeadlineOutcome::Delivered);
 
@@ -147,7 +151,17 @@ async fn try_send_with_backpressure_expired_deadline_returns_cancelled() {
         .await;
 
     assert!(result.is_ok(), "should return Ok with Cancelled token");
-    let token = result.unwrap();
+    let admission = result.unwrap();
+    assert_eq!(
+        admission.evidence.outcome,
+        SendAdmissionOutcome::ExpiredBeforeEnqueue
+    );
+    assert_eq!(admission.evidence.queue_depth, Some(3));
+    assert_eq!(
+        admission.evidence.capacity.unwrap().class,
+        SendCapacityClass::PriorityWatermark
+    );
+    let token = admission.value.unwrap();
     let outcome = token.wait().await.unwrap();
     assert_eq!(
         outcome,
@@ -212,7 +226,11 @@ async fn try_send_with_backpressure_waits_then_sends_after_drain() {
     // enqueues the message to the pipeline.
     let result = tokio::time::timeout(Duration::from_secs(5), send_task).await;
     match result {
-        Ok(Ok(Ok(token))) => {
+        Ok(Ok(Ok(admission))) => {
+            assert_eq!(admission.evidence.outcome, SendAdmissionOutcome::Blocked);
+            assert_eq!(admission.evidence.wake, SendWakeEvidence::DrainObserved);
+            assert_eq!(admission.evidence.priority, Some(SendPriority::Data));
+            let token = admission.value.unwrap();
             let outcome = token.wait().await.unwrap();
             assert_eq!(outcome, DeadlineOutcome::Delivered);
         }
@@ -271,6 +289,11 @@ async fn capacity_transitions_via_pipeline_drain_loop() {
         )
         .await;
     assert!(result.is_ok(), "try_send_with_backpressure should succeed");
+    let admission = result.unwrap();
+    assert!(matches!(
+        admission.evidence.outcome,
+        SendAdmissionOutcome::Accepted | SendAdmissionOutcome::Blocked
+    ));
 
     drop(handle);
     pipeline_task.await.unwrap();

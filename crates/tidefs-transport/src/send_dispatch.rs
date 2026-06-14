@@ -12,7 +12,7 @@
 //!        +-- lookup conn_id -> SendQueue
 //!        +-- enqueue into bounded FIFO queue
 //!        |   (max messages + max bytes guards)
-//!        +-- return Ok or Backpressure
+//!        +-- return admission evidence or SendError evidence
 //!              |
 //!              v
 //!         SendDrainer per connection
@@ -24,18 +24,19 @@
 //!
 //! ## Backpressure contract
 //!
-//! Callers must inspect the [`SendError`] returned by `enqueue`:
+//! Callers must inspect the admission evidence returned by `enqueue` or
+//! carried by [`SendError`]:
 //!
-//! | Variant             | Meaning                                                    |
+//! | Outcome/error       | Meaning                                                    |
 //! |---------------------|------------------------------------------------------------|
-//! | `Ok`                | Message accepted into the per-connection send queue.       |
+//! | `Queued`            | Message accepted into the per-connection send queue.       |
 //! | `Backpressure`      | Queue at capacity; caller should delay, drop, or shed.     |
-//! | `NoConnection`      | No queue exists for the given connection ID.               |
+//! | `SendQueueFull`     | Lane-class queue depth is at capacity.                     |
 //! | `Shutdown`          | Queue has been shut down (connection closed).              |
 //!
 //! `Backpressure` is a soft signal — it does not tear down the connection.
 //! Callers can inspect the connection ID, current queue depth, and current
-//! byte depth to make load-shedding decisions.
+//! byte depth from the evidence to make load-shedding decisions.
 //!
 //! ## Configuration
 //!
@@ -43,7 +44,7 @@
 //! - `max_messages`: maximum number of messages the queue will hold.
 //! - `max_bytes`: maximum total bytes of payload the queue will hold.
 //!
-//! Enqueue returns `Backpressure` when either threshold is exceeded.
+//! Enqueue returns `Backpressured` evidence when either threshold is exceeded.
 //!
 //! ## Integration points
 //!
@@ -64,6 +65,10 @@ use crate::error_classification::{
     default_recovery_action, ErrorClassifier, ErrorObserver, TransportErrorKind,
 };
 use crate::lane_demux::LaneClass;
+use crate::send_admission::{
+    SendAdmissionEvidence, SendAdmissionOutcome, SendAdmissionPolicy, SendCapacityClass,
+    SendCapacityEvidence, SendWakeEvidence,
+};
 use crate::send_concurrency::{SendConcurrencyError, SendConcurrencyLimiter};
 use crate::send_queue_depth::{SendQueueDepth, SendQueueDepthConfig};
 use crate::PeerId;
@@ -133,15 +138,27 @@ pub enum SendError {
         depth: usize,
         /// Current total bytes queued.
         byte_depth: usize,
+        /// Typed admission evidence for this rejection.
+        evidence: SendAdmissionEvidence,
     },
     /// No queue exists for the given connection ID.
     /// The connection has not been registered or has been removed.
-    NoConnection { conn_id: PeerId },
+    NoConnection {
+        conn_id: PeerId,
+        evidence: SendAdmissionEvidence,
+    },
     /// Queue has been shut down (connection closed).
-    Shutdown { conn_id: PeerId },
+    Shutdown {
+        conn_id: PeerId,
+        evidence: SendAdmissionEvidence,
+    },
     /// Send-concurrency limit exceeded for this connection;
     /// the caller should back off or retry.
-    SendConcurrencyLimitExceeded { conn_id: PeerId, max: usize },
+    SendConcurrencyLimitExceeded {
+        conn_id: PeerId,
+        max: usize,
+        evidence: SendAdmissionEvidence,
+    },
     /// Per-session-class send-queue depth limit reached.
     /// The lane class is at capacity; caller should delay, drop, or shed.
     SendQueueFull {
@@ -151,7 +168,23 @@ pub enum SendError {
         depth: usize,
         /// Configured maximum depth for this lane.
         max_depth: usize,
+        /// Typed admission evidence for this rejection.
+        evidence: SendAdmissionEvidence,
     },
+}
+
+impl SendError {
+    /// Return the admission evidence carried by this send error.
+    #[must_use]
+    pub fn evidence(&self) -> &SendAdmissionEvidence {
+        match self {
+            Self::Backpressure { evidence, .. }
+            | Self::NoConnection { evidence, .. }
+            | Self::Shutdown { evidence, .. }
+            | Self::SendConcurrencyLimitExceeded { evidence, .. }
+            | Self::SendQueueFull { evidence, .. } => evidence,
+        }
+    }
 }
 
 impl fmt::Display for SendError {
@@ -161,19 +194,20 @@ impl fmt::Display for SendError {
                 conn_id,
                 depth,
                 byte_depth,
+                ..
             } => {
                 write!(
                     f,
                     "backpressure on conn {conn_id}: depth={depth} msgs, byte_depth={byte_depth}B"
                 )
             }
-            Self::NoConnection { conn_id } => {
+            Self::NoConnection { conn_id, .. } => {
                 write!(f, "no send queue for conn {conn_id}")
             }
-            Self::Shutdown { conn_id } => {
+            Self::Shutdown { conn_id, .. } => {
                 write!(f, "send queue shut down for conn {conn_id}")
             }
-            Self::SendConcurrencyLimitExceeded { conn_id, max } => {
+            Self::SendConcurrencyLimitExceeded { conn_id, max, .. } => {
                 write!(
                     f,
                     "send concurrency limit exceeded for conn {conn_id}: max={max}"
@@ -183,6 +217,7 @@ impl fmt::Display for SendError {
                 lane,
                 depth,
                 max_depth,
+                ..
             } => {
                 write!(
                     f,
@@ -229,8 +264,8 @@ impl OutboundMessage {
 /// A bounded FIFO send queue for a single remote connection.
 ///
 /// Holds [`OutboundMessage`] entries with configurable limits on message
-/// count and total byte occupancy. Enqueue returns `Ok(())` or
-/// [`SendError::Backpressure`] when either limit would be exceeded.
+/// count and total byte occupancy. Enqueue returns typed admission evidence
+/// or [`SendError::Backpressure`] when either limit would be exceeded.
 ///
 /// The queue is internally mutex-protected and can be shared between the
 /// dispatch path (producer) and the drainer path (consumer).
@@ -265,29 +300,73 @@ impl SendQueue {
 
     /// Try to enqueue a message into the send queue.
     ///
-    /// Returns `Ok(())` on success, or [`SendError::Backpressure`] if the
-    /// queue is at capacity (message count or byte limit), or
+    /// Returns queued evidence on success, [`SendError::Backpressure`] if
+    /// the queue is at capacity (message count or byte limit), or
     /// [`SendError::Shutdown`] if the queue has been shut down.
-    pub fn try_enqueue(&self, conn_id: PeerId, msg: OutboundMessage) -> Result<(), SendError> {
-        let mut inner = self
-            .inner
-            .try_lock()
-            .map_err(|_| SendError::Shutdown { conn_id })?;
+    pub fn try_enqueue(
+        &self,
+        conn_id: PeerId,
+        msg: OutboundMessage,
+    ) -> Result<SendAdmissionEvidence, SendError> {
+        let mut inner = self.inner.try_lock().map_err(|_| SendError::Shutdown {
+            conn_id,
+            evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Closed)
+                .with_conn_id(conn_id)
+                .with_policy(SendAdmissionPolicy::Shutdown)
+                .with_wake(SendWakeEvidence::Unavailable),
+        })?;
 
         if inner.shutdown {
-            return Err(SendError::Shutdown { conn_id });
+            return Err(SendError::Shutdown {
+                conn_id,
+                evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Closed)
+                    .with_conn_id(conn_id)
+                    .with_family(msg.family)
+                    .with_lane(msg.family.preferred_lane())
+                    .with_queue_depth(inner.depth)
+                    .with_byte_depth(inner.byte_depth)
+                    .with_policy(SendAdmissionPolicy::Shutdown),
+            });
         }
 
         let msg_bytes = msg.byte_len();
+        let family = msg.family;
+        let lane = family.preferred_lane();
 
         // Check both capacity limits.
         if inner.depth >= inner.config.max_messages
             || inner.byte_depth + msg_bytes > inner.config.max_bytes
         {
+            let (class, current, limit) = if inner.depth >= inner.config.max_messages {
+                (
+                    SendCapacityClass::Message,
+                    inner.depth,
+                    inner.config.max_messages,
+                )
+            } else {
+                (
+                    SendCapacityClass::Byte,
+                    inner.byte_depth,
+                    inner.config.max_bytes,
+                )
+            };
             return Err(SendError::Backpressure {
                 conn_id,
                 depth: inner.depth,
                 byte_depth: inner.byte_depth,
+                evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Backpressured)
+                    .with_conn_id(conn_id)
+                    .with_family(family)
+                    .with_lane(lane)
+                    .with_queue_depth(inner.depth)
+                    .with_byte_depth(inner.byte_depth)
+                    .with_policy(SendAdmissionPolicy::Error)
+                    .with_capacity(SendCapacityEvidence::new(
+                        class,
+                        current,
+                        Some(msg_bytes),
+                        Some(limit),
+                    )),
             });
         }
 
@@ -295,7 +374,18 @@ impl SendQueue {
         inner.byte_depth += msg_bytes;
         inner.queue.push_back(msg);
         self.notify.notify_one();
-        Ok(())
+        Ok(SendAdmissionEvidence::new(SendAdmissionOutcome::Queued)
+            .with_conn_id(conn_id)
+            .with_family(family)
+            .with_lane(lane)
+            .with_queue_depth(inner.depth)
+            .with_byte_depth(inner.byte_depth)
+            .with_capacity(SendCapacityEvidence::new(
+                SendCapacityClass::Message,
+                inner.depth,
+                Some(1),
+                Some(inner.config.max_messages),
+            )))
     }
 
     /// Dequeue the next message from the front of the queue.
@@ -482,18 +572,47 @@ impl SendDispatcher {
     /// Returns [`SendError::Backpressure`] if the queue is at capacity,
     /// [`SendError::SendQueueFull`] if the lane class depth is exceeded,
     /// or [`SendError::Shutdown`] if the queue has been shut down.
-    pub fn enqueue(&self, conn_id: PeerId, msg: OutboundMessage) -> Result<(), SendError> {
+    pub fn enqueue(
+        &self,
+        conn_id: PeerId,
+        msg: OutboundMessage,
+    ) -> Result<SendAdmissionEvidence, SendError> {
         let lane = msg.family.preferred_lane();
+        let family = msg.family;
 
         // Acquire a send-concurrency permit before enqueueing.
         let _permit = if let Some(max_inflight) = self.max_inflight {
             let limiter = self.get_or_create_limiter(conn_id, max_inflight)?;
-            Some(limiter.try_acquire().map_err(|e| match e {
-                SendConcurrencyError::LimitExceeded { max } => {
-                    SendError::SendConcurrencyLimitExceeded { conn_id, max }
-                }
-                SendConcurrencyError::ConnectionNotSendable | SendConcurrencyError::Shutdown => {
-                    SendError::Shutdown { conn_id }
+            Some(limiter.try_acquire().map_err(|e| {
+                match e {
+                    SendConcurrencyError::LimitExceeded { max } => {
+                        SendError::SendConcurrencyLimitExceeded {
+                            conn_id,
+                            max,
+                            evidence: SendAdmissionEvidence::new(
+                                SendAdmissionOutcome::Backpressured,
+                            )
+                            .with_conn_id(conn_id)
+                            .with_family(family)
+                            .with_lane(lane)
+                            .with_policy(SendAdmissionPolicy::Concurrency)
+                            .with_capacity(SendCapacityEvidence::new(
+                                SendCapacityClass::Concurrency,
+                                max,
+                                Some(1),
+                                Some(max),
+                            )),
+                        }
+                    }
+                    SendConcurrencyError::ConnectionNotSendable
+                    | SendConcurrencyError::Shutdown => SendError::Shutdown {
+                        conn_id,
+                        evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Closed)
+                            .with_conn_id(conn_id)
+                            .with_family(family)
+                            .with_lane(lane)
+                            .with_policy(SendAdmissionPolicy::Shutdown),
+                    },
                 }
             })?)
         } else {
@@ -507,11 +626,31 @@ impl SendDispatcher {
                     lane: e.lane,
                     depth: e.depth,
                     max_depth: e.max_depth,
+                    evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Backpressured)
+                        .with_conn_id(conn_id)
+                        .with_family(family)
+                        .with_lane(e.lane)
+                        .with_queue_depth(e.depth)
+                        .with_policy(SendAdmissionPolicy::LaneDepth)
+                        .with_capacity(SendCapacityEvidence::new(
+                            SendCapacityClass::Lane,
+                            e.depth,
+                            Some(1),
+                            Some(e.max_depth),
+                        )),
                 });
             }
         }
 
-        let queue = self.get_or_create_queue(conn_id)?;
+        let queue = match self.get_or_create_queue(conn_id) {
+            Ok(queue) => queue,
+            Err(err) => {
+                if let Some(ref qd) = self.queue_depth {
+                    qd.release(lane);
+                }
+                return Err(err);
+            }
+        };
         let result = queue.try_enqueue(conn_id, msg);
         if let Err(ref send_err) = &result {
             // Release the depth reservation if enqueue failed.
@@ -597,14 +736,22 @@ impl SendDispatcher {
 
     /// Get or create the send queue for a connection.
     fn get_or_create_queue(&self, conn_id: PeerId) -> Result<Arc<SendQueue>, SendError> {
-        let mut queues = self
-            .queues
-            .try_lock()
-            .map_err(|_| SendError::Shutdown { conn_id })?;
+        let mut queues = self.queues.try_lock().map_err(|_| SendError::Shutdown {
+            conn_id,
+            evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Closed)
+                .with_conn_id(conn_id)
+                .with_policy(SendAdmissionPolicy::Shutdown)
+                .with_wake(SendWakeEvidence::Unavailable),
+        })?;
 
         if let Some(queue) = queues.get(&conn_id) {
             if queue.is_shutdown() {
-                return Err(SendError::Shutdown { conn_id });
+                return Err(SendError::Shutdown {
+                    conn_id,
+                    evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Closed)
+                        .with_conn_id(conn_id)
+                        .with_policy(SendAdmissionPolicy::Shutdown),
+                });
             }
             return Ok(Arc::clone(queue));
         }
@@ -620,10 +767,13 @@ impl SendDispatcher {
         conn_id: PeerId,
         max: usize,
     ) -> Result<Arc<SendConcurrencyLimiter>, SendError> {
-        let mut limiters = self
-            .limiters
-            .try_lock()
-            .map_err(|_| SendError::Shutdown { conn_id })?;
+        let mut limiters = self.limiters.try_lock().map_err(|_| SendError::Shutdown {
+            conn_id,
+            evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Closed)
+                .with_conn_id(conn_id)
+                .with_policy(SendAdmissionPolicy::Shutdown)
+                .with_wake(SendWakeEvidence::Unavailable),
+        })?;
 
         if let Some(limiter) = limiters.get(&conn_id) {
             return Ok(Arc::clone(limiter));
@@ -874,8 +1024,12 @@ mod tests {
 
         let result = q.try_enqueue(1, make_msg(b"d"));
         match result {
-            Err(SendError::Backpressure { depth, .. }) => {
+            Err(SendError::Backpressure {
+                depth, evidence, ..
+            }) => {
                 assert_eq!(depth, 3);
+                assert_eq!(evidence.outcome, SendAdmissionOutcome::Backpressured);
+                assert_eq!(evidence.capacity.unwrap().class, SendCapacityClass::Message);
             }
             other => panic!("expected Backpressure, got: {other:?}"),
         }
@@ -893,8 +1047,14 @@ mod tests {
         // Next 15-byte payload would push to 32 bytes > 20 → backpressure
         let result = q.try_enqueue(1, make_msg(&[0u8; 15]));
         match result {
-            Err(SendError::Backpressure { byte_depth, .. }) => {
+            Err(SendError::Backpressure {
+                byte_depth,
+                evidence,
+                ..
+            }) => {
                 assert_eq!(byte_depth, 16);
+                assert_eq!(evidence.outcome, SendAdmissionOutcome::Backpressured);
+                assert_eq!(evidence.capacity.unwrap().class, SendCapacityClass::Byte);
             }
             other => panic!("expected Backpressure, got: {other:?}"),
         }
@@ -1157,6 +1317,10 @@ mod tests {
             conn_id: 42,
             depth: 10,
             byte_depth: 4096,
+            evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Backpressured)
+                .with_conn_id(42)
+                .with_queue_depth(10)
+                .with_byte_depth(4096),
         };
         let s = format!("{e}");
         assert!(s.contains("42"));
@@ -1166,7 +1330,11 @@ mod tests {
 
     #[test]
     fn send_error_display_no_connection() {
-        let e = SendError::NoConnection { conn_id: 7 };
+        let e = SendError::NoConnection {
+            conn_id: 7,
+            evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::NoConnection)
+                .with_conn_id(7),
+        };
         let s = format!("{e}");
         assert!(s.contains("7"));
         assert!(s.contains("no send queue"));
@@ -1174,7 +1342,10 @@ mod tests {
 
     #[test]
     fn send_error_display_shutdown() {
-        let e = SendError::Shutdown { conn_id: 3 };
+        let e = SendError::Shutdown {
+            conn_id: 3,
+            evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Closed).with_conn_id(3),
+        };
         let s = format!("{e}");
         assert!(s.contains("3"));
         assert!(s.contains("shut down"));
@@ -1433,6 +1604,7 @@ mod tests {
                 conn_id: cid,
                 depth,
                 byte_depth,
+                ..
             }) => {
                 assert_eq!(cid, 7);
                 assert_eq!(depth, 2);
@@ -1459,6 +1631,14 @@ mod tests {
         let e = SendError::SendConcurrencyLimitExceeded {
             conn_id: 42,
             max: 5,
+            evidence: SendAdmissionEvidence::new(SendAdmissionOutcome::Backpressured)
+                .with_conn_id(42)
+                .with_capacity(SendCapacityEvidence::new(
+                    SendCapacityClass::Concurrency,
+                    5,
+                    Some(1),
+                    Some(5),
+                )),
         };
         let s = format!("{e}");
         assert!(s.contains("42"), "display should mention conn_id");

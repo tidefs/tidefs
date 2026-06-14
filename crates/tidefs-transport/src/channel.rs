@@ -721,10 +721,12 @@ use crate::peer_send_queue::{PeerQueueSender, SendError};
 
 impl ChannelEnvelopeSender for PeerQueueSender<ChannelEnvelope> {
     fn try_send(&self, env: ChannelEnvelope) -> Result<(), ChannelEnvelopeSendError> {
-        PeerQueueSender::try_send(self, env).map_err(|e| match e {
-            SendError::Full => ChannelEnvelopeSendError::Full,
-            SendError::Closed => ChannelEnvelopeSendError::Closed,
-        })
+        PeerQueueSender::try_send(self, env)
+            .map(|_| ())
+            .map_err(|e| match e {
+                SendError::Full { .. } => ChannelEnvelopeSendError::Full,
+                SendError::Closed { .. } => ChannelEnvelopeSendError::Closed,
+            })
     }
 }
 

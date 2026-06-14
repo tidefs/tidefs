@@ -142,6 +142,10 @@ use crate::frame_governance::{FrameSizeError, FrameSizeGovernor};
 use crate::idle_timeout::IdleTracker;
 use crate::receive_flow::SenderCreditTracker;
 use crate::receive_loop::message_family_to_family_id;
+use crate::send_admission::{
+    SendAdmission, SendAdmissionEvidence, SendAdmissionOutcome, SendAdmissionPolicy,
+    SendCapacityClass, SendCapacityEvidence, SendWakeEvidence,
+};
 use crate::send_backpressure::{SendCapacity, SendCapacitySet, SendWatermarkConfig};
 use crate::send_coalesce::{CoalesceKey, SendCoalescer};
 use crate::send_concurrency::{SendConcurrencyError, SendConcurrencyLimiter};
@@ -692,38 +696,229 @@ impl SendPipelineHandle {
     /// Otherwise awaits [`SendCapacity::wait_for_capacity`] before
     /// enqueuing, subject to the message's send deadline.
     ///
-    /// Returns `Err` if the deadline expires while waiting for capacity,
-    /// or if the pipeline is shut down.
+    /// Returns admission evidence for accepted, waited, expired-before-enqueue,
+    /// capacity, roster, and closed outcomes.
     pub async fn try_send_with_backpressure(
         &self,
         family: MessageFamily,
         priority: SendPriority,
         payload: &[u8],
         deadline: Option<std::time::Duration>,
-    ) -> Result<DeadlineToken, SendPipelineError> {
+    ) -> Result<SendAdmission<DeadlineToken>, SendPipelineError> {
+        let mut waited = false;
+        let mut wake = SendWakeEvidence::NotApplicable;
+
         // If a capacity set is configured and this priority is under
         // backpressure, wait until capacity is available.
         if let Some(ref cs) = self.capacity_set {
             let cap = cs.capacity(priority);
             if !cap.is_available() {
-                // Check send deadline before waiting.
-                let dl = resolve_deadline(
-                    self.deadline_config
-                        .as_ref()
-                        .unwrap_or(&SendDeadlineConfig::default()),
-                    deadline,
-                );
+                let dl = self.resolve_backpressure_wait_deadline(deadline);
                 if dl.is_expired() {
-                    let (token, tx) = deadline_channel();
-                    let _ = tx.send(DeadlineOutcome::Cancelled);
-                    return Ok(token);
+                    return Ok(self.expired_before_enqueue_admission(family, priority, payload));
                 }
-                cap.wait_for_capacity().await;
+
+                waited = true;
+                if let Some(remaining) = dl.remaining() {
+                    tokio::select! {
+                        observed = cap.wait_for_capacity_evidence() => {
+                            wake = observed;
+                        }
+                        () = tokio::time::sleep(remaining) => {
+                            return Ok(self.expired_before_enqueue_admission(family, priority, payload));
+                        }
+                    }
+                } else {
+                    wake = cap.wait_for_capacity_evidence().await;
+                }
             }
         }
-        // Delegate to the existing prioritized deadline send.
-        self.send_with_priority_and_deadline(family, priority, payload, deadline)
-            .await
+
+        match self.try_send_with_priority_and_deadline(family, priority, payload, deadline) {
+            Ok(token) => {
+                let outcome = if waited {
+                    SendAdmissionOutcome::Blocked
+                } else {
+                    SendAdmissionOutcome::Accepted
+                };
+                Ok(SendAdmission::with_value(
+                    self.admission_base(outcome, family, priority, payload.len())
+                        .with_wake(wake),
+                    token,
+                ))
+            }
+            Err(err) => {
+                if let Some(evidence) =
+                    self.pipeline_error_evidence(&err, family, priority, payload.len(), wake)
+                {
+                    Ok(SendAdmission::without_value(evidence))
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    fn resolve_backpressure_wait_deadline(
+        &self,
+        caller_deadline: Option<std::time::Duration>,
+    ) -> MessageDeadline {
+        match caller_deadline {
+            Some(deadline) => MessageDeadline::from_duration(deadline),
+            None => resolve_deadline(
+                self.deadline_config
+                    .as_ref()
+                    .unwrap_or(&SendDeadlineConfig::default()),
+                None,
+            ),
+        }
+    }
+
+    fn expired_before_enqueue_admission(
+        &self,
+        family: MessageFamily,
+        priority: SendPriority,
+        payload: &[u8],
+    ) -> SendAdmission<DeadlineToken> {
+        let (token, tx) = deadline_channel();
+        let _ = tx.send(DeadlineOutcome::Cancelled);
+        SendAdmission::with_value(
+            self.admission_base(
+                SendAdmissionOutcome::ExpiredBeforeEnqueue,
+                family,
+                priority,
+                payload.len(),
+            )
+            .with_policy(SendAdmissionPolicy::Watermark)
+            .with_wake(SendWakeEvidence::Waiting),
+            token,
+        )
+    }
+
+    fn admission_base(
+        &self,
+        outcome: SendAdmissionOutcome,
+        family: MessageFamily,
+        priority: SendPriority,
+        payload_len: usize,
+    ) -> SendAdmissionEvidence {
+        let byte_depth = self.backpressure_depth().unwrap_or(0);
+        let mut evidence = SendAdmissionEvidence::new(outcome)
+            .with_priority(priority)
+            .with_family(family)
+            .with_byte_depth(byte_depth)
+            .with_capacity(SendCapacityEvidence::new(
+                SendCapacityClass::Byte,
+                byte_depth,
+                Some(SendFramer::wire_size(payload_len)),
+                self.backpressure_config
+                    .map(|config| config.high_water_mark),
+            ));
+        if let Some(ref capacity_set) = self.capacity_set {
+            let snapshot = capacity_set.snapshot(priority);
+            evidence =
+                evidence
+                    .with_queue_depth(snapshot.depth)
+                    .with_capacity(SendCapacityEvidence::new(
+                        SendCapacityClass::PriorityWatermark,
+                        snapshot.depth,
+                        Some(1),
+                        Some(snapshot.high_watermark),
+                    ));
+        }
+        if let Some(session_id) = self.session_id {
+            evidence = evidence.with_session_id(session_id);
+        }
+        if let Some(peer_id) = self.peer_id {
+            evidence = evidence.with_peer_id(peer_id);
+        }
+        evidence
+    }
+
+    fn pipeline_error_evidence(
+        &self,
+        err: &SendPipelineError,
+        family: MessageFamily,
+        priority: SendPriority,
+        payload_len: usize,
+        wake: SendWakeEvidence,
+    ) -> Option<SendAdmissionEvidence> {
+        let base = |outcome| self.admission_base(outcome, family, priority, payload_len);
+        Some(match err {
+            SendPipelineError::ConnectionStateClosed(_) => base(SendAdmissionOutcome::Closed)
+                .with_policy(SendAdmissionPolicy::ConnectionState)
+                .with_capacity(SendCapacityEvidence::new(
+                    SendCapacityClass::ConnectionState,
+                    0,
+                    Some(1),
+                    Some(1),
+                ))
+                .with_wake(wake),
+            SendPipelineError::ChannelFull(capacity) => base(SendAdmissionOutcome::Backpressured)
+                .with_policy(SendAdmissionPolicy::BoundedChannel)
+                .with_capacity(SendCapacityEvidence::new(
+                    SendCapacityClass::PipelineChannel,
+                    *capacity,
+                    Some(1),
+                    Some(*capacity),
+                ))
+                .with_wake(wake),
+            SendPipelineError::Shutdown => base(SendAdmissionOutcome::Closed)
+                .with_policy(SendAdmissionPolicy::Shutdown)
+                .with_wake(wake),
+            SendPipelineError::ConcurrencyLimitExceeded(SendConcurrencyError::LimitExceeded {
+                max,
+            }) => base(SendAdmissionOutcome::Backpressured)
+                .with_policy(SendAdmissionPolicy::Concurrency)
+                .with_capacity(SendCapacityEvidence::new(
+                    SendCapacityClass::Concurrency,
+                    *max,
+                    Some(1),
+                    Some(*max),
+                ))
+                .with_wake(wake),
+            SendPipelineError::ConcurrencyLimitExceeded(_) => base(SendAdmissionOutcome::Closed)
+                .with_policy(SendAdmissionPolicy::Shutdown)
+                .with_wake(wake),
+            SendPipelineError::PeerNotInRoster(peer_id) => base(SendAdmissionOutcome::NoConnection)
+                .with_peer_id(*peer_id)
+                .with_policy(SendAdmissionPolicy::Roster)
+                .with_capacity(SendCapacityEvidence::new(
+                    SendCapacityClass::Roster,
+                    0,
+                    Some(1),
+                    Some(1),
+                ))
+                .with_wake(wake),
+            SendPipelineError::SendBackpressure {
+                session_id,
+                queue_depth,
+            } => base(SendAdmissionOutcome::Backpressured)
+                .with_session_id(*session_id)
+                .with_policy(SendAdmissionPolicy::Watermark)
+                .with_byte_depth(*queue_depth)
+                .with_capacity(SendCapacityEvidence::new(
+                    SendCapacityClass::Byte,
+                    *queue_depth,
+                    Some(SendFramer::wire_size(payload_len)),
+                    self.backpressure_config
+                        .map(|config| config.high_water_mark),
+                ))
+                .with_wake(wake),
+            SendPipelineError::FrameTooLarge(FrameSizeError::SendPayloadTooLarge {
+                limit,
+                actual,
+            }) => base(SendAdmissionOutcome::Backpressured)
+                .with_policy(SendAdmissionPolicy::Error)
+                .with_capacity(SendCapacityEvidence::new(
+                    SendCapacityClass::Byte,
+                    *actual,
+                    Some(*actual),
+                    Some(*limit),
+                ))
+                .with_wake(wake),
+            SendPipelineError::FrameTooLarge(_) | SendPipelineError::Io(_) => return None,
+        })
     }
 
     /// Attach a frame-size governor to this handle.
@@ -891,7 +1086,8 @@ impl SendPipelineHandle {
         }
 
         // Check backpressure water marks before enqueue (uses wire_size).
-        self.check_backpressure_before_enqueue(SendFramer::wire_size(payload.len()))?;
+        let wire_size = SendFramer::wire_size(payload.len());
+        self.check_backpressure_before_enqueue(wire_size)?;
         let frame = SendFramer::frame(family, channel_id, payload);
 
         // Route through send coalescer if configured.
@@ -910,9 +1106,12 @@ impl SendPipelineHandle {
                 self.tx
                     .send((flush.key.priority, OutboundFrame::new(flush.data)))
                     .await
-                    .map_err(|_| SendPipelineError::Shutdown)
+                    .map_err(|_| SendPipelineError::Shutdown)?;
+                self.record_backpressure_enqueue(wire_size);
+                Ok(())
             } else {
                 // Message queued in coalescer, no flush triggered.
+                self.record_backpressure_enqueue(wire_size);
                 Ok(())
             }
         } else {
@@ -920,7 +1119,9 @@ impl SendPipelineHandle {
             self.tx
                 .send((priority, OutboundFrame::new(frame)))
                 .await
-                .map_err(|_| SendPipelineError::Shutdown)
+                .map_err(|_| SendPipelineError::Shutdown)?;
+            self.record_backpressure_enqueue(wire_size);
+            Ok(())
         }
     }
 
@@ -999,7 +1200,8 @@ impl SendPipelineHandle {
         }
 
         // Check backpressure water marks before enqueue.
-        self.check_backpressure_before_enqueue(SendFramer::wire_size(payload.len()))?;
+        let wire_size = SendFramer::wire_size(payload.len());
+        self.check_backpressure_before_enqueue(wire_size)?;
 
         // Resolve deadline: create the oneshot pair and build OutboundFrame.
         let (dl, token, outcome_tx) = self.prepare_deadline_send(deadline);
@@ -1017,6 +1219,7 @@ impl SendPipelineHandle {
             .send((priority, outbound))
             .await
             .map_err(|_| SendPipelineError::Shutdown)?;
+        self.record_backpressure_enqueue(wire_size);
 
         Ok(token)
     }
@@ -1089,7 +1292,8 @@ impl SendPipelineHandle {
         }
 
         // Check backpressure water marks before enqueue.
-        self.check_backpressure_before_enqueue(SendFramer::wire_size(payload.len()))?;
+        let wire_size = SendFramer::wire_size(payload.len());
+        self.check_backpressure_before_enqueue(wire_size)?;
 
         // Resolve deadline: create the oneshot pair and build OutboundFrame.
         let (dl, token, outcome_tx) = self.prepare_deadline_send(deadline);
@@ -1109,6 +1313,7 @@ impl SendPipelineHandle {
                 mpsc::error::TrySendError::Full(_) => SendPipelineError::ChannelFull(self.capacity),
                 mpsc::error::TrySendError::Closed(_) => SendPipelineError::Shutdown,
             })?;
+        self.record_backpressure_enqueue(wire_size);
 
         Ok(token)
     }
@@ -1218,7 +1423,8 @@ impl SendPipelineHandle {
         if let Some(ref governor) = self.frame_size_governor {
             governor.check_send(self.session_class, payload.len())?;
         }
-        self.check_backpressure_before_enqueue(SendFramer::wire_size(payload.len()))?;
+        let wire_size = SendFramer::wire_size(payload.len());
+        self.check_backpressure_before_enqueue(wire_size)?;
         let frame = SendFramer::frame(family, channel_id, payload);
 
         // Route through send coalescer if configured.
@@ -1238,10 +1444,13 @@ impl SendPipelineHandle {
                             SendPipelineError::ChannelFull(self.capacity)
                         }
                         mpsc::error::TrySendError::Closed(_) => SendPipelineError::Shutdown,
-                    })
+                    })?;
+                self.record_backpressure_enqueue(wire_size);
+                Ok(())
             } else {
                 // Message queued in coalescer, no flush triggered.
                 self.counter.increment();
+                self.record_backpressure_enqueue(wire_size);
                 Ok(())
             }
         } else {
@@ -1254,7 +1463,9 @@ impl SendPipelineHandle {
                         SendPipelineError::ChannelFull(self.capacity)
                     }
                     mpsc::error::TrySendError::Closed(_) => SendPipelineError::Shutdown,
-                })
+                })?;
+            self.record_backpressure_enqueue(wire_size);
+            Ok(())
         }
     }
 
@@ -1323,6 +1534,8 @@ impl SendPipelineHandle {
 
     /// Check backpressure water marks before enqueuing a frame.
     /// Returns `Err(SendBackpressure)` if depth would exceed high-water mark.
+    /// This does not mutate byte-depth accounting; callers commit with
+    /// `record_backpressure_enqueue` only after the frame is actually queued.
     fn check_backpressure_before_enqueue(&self, wire_size: usize) -> Result<(), SendPipelineError> {
         if let (Some(ref state), Some(ref config)) =
             (&self.backpressure_state, &self.backpressure_config)
@@ -1333,9 +1546,14 @@ impl SendPipelineHandle {
                     queue_depth: current_depth,
                 });
             }
-            state.record_enqueue(wire_size);
         }
         Ok(())
+    }
+
+    fn record_backpressure_enqueue(&self, wire_size: usize) {
+        if let (Some(ref state), Some(_)) = (&self.backpressure_state, &self.backpressure_config) {
+            state.record_enqueue(wire_size);
+        }
     }
 
     /// Send a framed message with drain-token completion tracking.
