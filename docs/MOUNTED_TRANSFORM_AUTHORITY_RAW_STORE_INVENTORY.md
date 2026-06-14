@@ -57,7 +57,7 @@ Current `raw_primary_store()` and `raw_primary_store_mut()` matches:
 | Path | Current matches | Inventory note |
 |---|---:|---|
 | `crates/tidefs-local-object-store/src/pool/mod.rs` | 7 | Pool accessors and `PoolStore` escape hatches. This is the lower object-store authority, not a mounted-filesystem proof. |
-| `crates/tidefs-local-filesystem/src/lib.rs` | 89 | 88 mounted production matches plus one in-file test raw drain assertion. |
+| `crates/tidefs-local-filesystem/src/lib.rs` | 82 | 81 mounted production matches plus one in-file test raw drain assertion. |
 | `crates/tidefs-local-filesystem/src/crash_recovery.rs` | 21 | Crash-matrix validation helpers stage raw commit-boundary objects. |
 | `crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7 | One production key-scan path plus six unit-test assertions. |
 | `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` | 6 | Four live mounted VFS/admin paths plus two encryption-feature tests. |
@@ -70,7 +70,7 @@ branch can pass the guard.
 
 | Mounted path group | Source surface | Status | Classification |
 |---|---|---|---|
-| Open, committed-root selection, v0.390 import, intent-log load, commit-group recovery, allocator scan | `LocalFileSystem::open_with_allocator_policy_and_root_authentication_key` in `src/lib.rs` | blocked | These paths pick or publish mounted filesystem truth through raw state objects before a transform authority can verify plaintext identity, frames, checksums, and raw media bytes together. |
+| Open, committed-root selection, v0.390 import, intent-log load, commit-group recovery, allocator scan | `MountedOpenRecoveryAuthority` in `src/lib.rs` | transform-aware in raw-only mode | The mounted open path now rejects configured device transforms before pool creation, then routes committed-root selection, v0.390 import, intent-log load, commit-group recovery, txg replay, quota/space/orphan metadata, and allocator scan through one raw-only/no-device-transforms authority. Raw primary-store trust in this group is scoped to the current fail-closed transform mode and remains a non-claim for mounted device-level compression/encryption while any other production blocked row remains. |
 | Recovery probe, audit, online verifier, root retention | `probe_recovery*`, `recovery_audit`, `online_verifier_report`, `root_retention_plan` in `src/lib.rs` | blocked | These operator repair paths inspect or mutate committed roots through raw handles and need the same frame-order contract before device transforms can mount. |
 | Public/raw internal store exposure | `object_store`, `store_ref` in `src/lib.rs` | blocked | These expose the bypass directly to mounted callers and tests, so they cannot coexist with mounted device-transform claims. |
 | Reclaim and snapshot-protection key scans | `record_reclaim_delta`, `collect_snapshot_protected_content_keys`, `drain_local_reclaim_queue_into_store`, `reclaim_unprotected_objects`, `commit_space_delta`, and journal cleaner key scans | metadata/raw-only for keys; blocked for content-layout reads | Reclaim identity is an object-key/locator lifetime concern, but several scans still read mounted content layouts through the raw store. |

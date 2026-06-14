@@ -4246,7 +4246,7 @@ pub fn check_poolstore_compression_current_workspace() -> Result<(), StorageChec
 
 const MOUNTED_TRANSFORM_RAW_STORE_COUNTS: &[(&str, usize)] = &[
     ("crates/tidefs-local-object-store/src/pool/mod.rs", 7),
-    ("crates/tidefs-local-filesystem/src/lib.rs", 89),
+    ("crates/tidefs-local-filesystem/src/lib.rs", 82),
     ("crates/tidefs-local-filesystem/src/crash_recovery.rs", 21),
     ("crates/tidefs-local-filesystem/src/journal_cleaner.rs", 7),
     ("crates/tidefs-local-filesystem/src/vfs_engine_impl.rs", 6),
@@ -4285,9 +4285,11 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
             "metadata/raw-only",
             "blocked",
             "later receipt/placement issue",
+            "MountedOpenRecoveryAuthority",
+            "transform-aware in raw-only mode",
             "Mounted local-filesystem device-level compression and encryption are blocked",
             "must fail closed while any production `blocked` row remains",
-            "`crates/tidefs-local-filesystem/src/lib.rs` | 89",
+            "`crates/tidefs-local-filesystem/src/lib.rs` | 82",
             "`crates/tidefs-local-filesystem/src/crash_recovery.rs` | 21",
             "`crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7",
             "`crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` | 6",
@@ -4312,6 +4314,10 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
             "Fail closed until TFR-006 moves mounted content and recovery paths",
             "local filesystem device transforms",
             "raw-store inventory",
+            "MountedOpenRecoveryAuthority",
+            "RawOnlyNoDeviceTransforms",
+            "raw_recovery_store",
+            "raw-only transform authority",
         ],
         &mut missing,
     );
@@ -4319,6 +4325,8 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
         &root,
         "crates/tidefs-local-filesystem/src/tests.rs",
         &[
+            "mounted_open_recovery_authority_raw_only_initializes_empty_pool",
+            "mounted_open_recovery_authority_rejects_device_transforms",
             "device_transform_open_helpers_fail_closed_until_tfr_006_inventory",
             "device_transform_open_config_rejects_before_pool_creation",
             "assert_transform_rejected",

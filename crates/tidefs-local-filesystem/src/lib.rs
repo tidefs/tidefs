@@ -1451,6 +1451,239 @@ pub struct LocalFileSystemOpenConfig<'a> {
     pub block_devices: Option<&'a [std::path::PathBuf]>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MountedOpenRecoveryTransformMode {
+    RawOnlyNoDeviceTransforms,
+}
+
+pub(crate) struct MountedOpenRecoveryAuthority<'a> {
+    store: &'a mut Pool,
+    root_authentication_key: RootAuthenticationKey,
+    recovery_policy: RecoveryPolicy,
+    transform_mode: MountedOpenRecoveryTransformMode,
+}
+
+impl<'a> MountedOpenRecoveryAuthority<'a> {
+    pub(crate) fn reject_device_transforms(
+        encryption: Option<&EncryptionConfig>,
+        compression: Option<&CompressionConfig>,
+    ) -> Result<()> {
+        if encryption.is_some() || compression.is_some() {
+            return Err(FileSystemError::Unsupported {
+                operation: "local filesystem device transforms",
+                reason: "device-level compression/encryption is blocked by the TFR-006 raw-store inventory while mounted open/recovery uses the raw-only transform authority and other blocked production rows remain",
+            });
+        }
+        Ok(())
+    }
+
+    fn raw_only(
+        store: &'a mut Pool,
+        root_authentication_key: RootAuthenticationKey,
+        recovery_policy: RecoveryPolicy,
+    ) -> Self {
+        Self {
+            store,
+            root_authentication_key,
+            recovery_policy,
+            transform_mode: MountedOpenRecoveryTransformMode::RawOnlyNoDeviceTransforms,
+        }
+    }
+
+    fn transform_mode(&self) -> MountedOpenRecoveryTransformMode {
+        self.transform_mode
+    }
+
+    fn raw_recovery_store(&self) -> &LocalObjectStore {
+        self.store.raw_primary_store()
+    }
+
+    fn raw_recovery_store_mut(&mut self) -> &mut LocalObjectStore {
+        self.store.raw_primary_store_mut()
+    }
+
+    fn load_or_initialize_state(&mut self) -> Result<FileSystemState> {
+        match load_latest_committed_state(
+            self.raw_recovery_store_mut(),
+            self.root_authentication_key,
+            self.recovery_policy,
+        )? {
+            Some(state) => Ok(state),
+            None => match self.store.primary_store().get(superblock_object_key())? {
+                Some(bytes) => {
+                    let state =
+                        load_v0390_fixed_object_state(self.raw_recovery_store_mut(), &bytes)?;
+                    persist_state(
+                        self.raw_recovery_store_mut(),
+                        &state,
+                        self.root_authentication_key,
+                    )?;
+                    Ok(state)
+                }
+                None => {
+                    let state = initial_state();
+                    persist_state(
+                        self.raw_recovery_store_mut(),
+                        &state,
+                        self.root_authentication_key,
+                    )?;
+                    Ok(state)
+                }
+            },
+        }
+    }
+
+    fn load_operational_intent_log(&self) -> Result<IntentLog> {
+        IntentLog::load(self.raw_recovery_store())
+    }
+
+    fn load_quota_table(&self) -> QuotaTable {
+        match self.store.primary_store().get(quota_table_object_key()) {
+            Ok(Some(bytes)) => QuotaTable::decode(&bytes).unwrap_or_else(|e| {
+                eprintln!("warning: quota table decode failed: {e}; starting empty");
+                QuotaTable::new()
+            }),
+            Ok(None) => QuotaTable::new(),
+            Err(e) => {
+                eprintln!("warning: quota table load failed: {e}; starting empty");
+                QuotaTable::new()
+            }
+        }
+    }
+
+    fn merge_space_counters_into(&self, state: &mut FileSystemState) {
+        if let Ok(Some(bytes)) = self.store.primary_store().get(space_counters_object_key()) {
+            state.space_accounting = SpaceAccounting::new(
+                decode_space_counters(&bytes).unwrap_or_default(),
+                SpaceDomainId::NONE,
+            );
+        }
+    }
+
+    fn merge_dataset_usage_into(&self, state: &mut FileSystemState) {
+        if let Some(usage) = self.raw_recovery_store().get_dataset_usage(ROOT_DATASET_ID) {
+            let mut counters = *state.space_accounting.counters();
+            counters.logical_used_bytes = counters.logical_used_bytes.max(usage.bytes_used);
+            counters.reserved_bytes = counters.reserved_bytes.max(usage.bytes_reserved);
+            state.space_accounting =
+                SpaceAccounting::new(counters, state.space_accounting.domain_id());
+        }
+    }
+
+    fn load_orphan_index(&self) -> OrphanIndex {
+        match self.store.primary_store().get(orphan_index_object_key()) {
+            Ok(Some(bytes)) => match OrphanIndex::recover_from_log(&bytes) {
+                Ok((idx, corrupted)) => {
+                    if !corrupted.is_empty() {
+                        eprintln!(
+                            "warning: {} orphan index entries had checksum failures; skipped",
+                            corrupted.len()
+                        );
+                    }
+                    idx
+                }
+                Err(e) => {
+                    eprintln!("warning: orphan index recovery failed ({e}); starting empty");
+                    OrphanIndex::new()
+                }
+            },
+            Ok(None) => OrphanIndex::new(),
+            Err(e) => {
+                eprintln!("warning: orphan index load failed ({e}); starting empty");
+                OrphanIndex::new()
+            }
+        }
+    }
+
+    fn recover_commit_group_generation(&self, generation: u64) -> u64 {
+        let mut recovered_generation = generation;
+        if self.recovery_policy.allows_replay() {
+            match CommitGroupRecovery::recover(self.raw_recovery_store()) {
+                Ok(recovery) => {
+                    let recovered_commit_group = recovery.next_commit_group_id.0;
+                    if recovered_commit_group > recovered_generation {
+                        recovered_generation = recovered_commit_group;
+                    }
+                    if !recovery.replayed_commit_groups.is_empty() {
+                        eprintln!(
+                        "commit_group recovery: replayed {} torn commit_group(s), recovered {} object key(s)",
+                        recovery.replayed_commit_groups.len(),
+                        recovery.committed_keys.len(),
+                    );
+                    }
+                    if !recovery.torn_commit_groups.is_empty() {
+                        eprintln!(
+                        "commit_group recovery: {} torn commit_group(s) could not be replayed (corrupt or missing payload)",
+                        recovery.torn_commit_groups.len(),
+                    );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: commit_group recovery failed: {e:?}; continuing without replay"
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "recovery: policy={} skips commit_group journal recovery",
+                self.recovery_policy.label(),
+            );
+        }
+        recovered_generation
+    }
+
+    fn replay_committed_txgs(
+        &mut self,
+        state: &mut FileSystemState,
+        recovered_generation: &mut u64,
+    ) -> Result<()> {
+        if self.recovery_policy.allows_replay() {
+            let engine = crate::txg_replay::TxgReplayEngine::new(Default::default());
+            match engine.replay(
+                self.raw_recovery_store_mut(),
+                state,
+                self.root_authentication_key,
+            ) {
+                Ok(Some((replayed_state, outcome))) => {
+                    *state = replayed_state;
+                    let replay_gen = outcome.highest_applied_txg;
+                    if replay_gen > *recovered_generation {
+                        *recovered_generation = replay_gen;
+                    }
+                    eprintln!(
+                        "txg_replay: replayed {} committed txg(s),                          highest applied txg={replay_gen},                          resumed_from_marker={}",
+                        outcome.replayed_count,
+                        outcome.resumed_from_marker,
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("txg_replay: BLAKE3 chain verification failed: {e}");
+                    return Err(FileSystemError::CorruptState {
+                        reason: "txg replay BLAKE3 mismatch; aborting mount",
+                    });
+                }
+            }
+        } else {
+            eprintln!(
+                "recovery: policy={} skips committed txg replay",
+                self.recovery_policy.label(),
+            );
+        }
+        Ok(())
+    }
+
+    fn pool_stats(&self) -> tidefs_local_object_store::pool::PoolStats {
+        self.store.pool_stats()
+    }
+
+    fn committed_content_used_bytes(&self, state: &FileSystemState) -> Result<u64> {
+        content_allocation_entries_for_state(self.raw_recovery_store(), state)
+            .and_then(|entries| allocation_bytes(&entries))
+    }
+}
+
 /// Intent-log payload for a `copy_file_range` operation.
 pub struct CopyFileRangeIntent {
     pub src_ino: InodeId,
@@ -2424,12 +2657,10 @@ impl LocalFileSystem {
         // Fail closed until TFR-006 moves mounted content and recovery paths
         // behind one transform-aware authority and the raw-store inventory
         // has no blocked production rows.
-        if encryption.is_some() || compression.is_some() {
-            return Err(FileSystemError::Unsupported {
-                operation: "local filesystem device transforms",
-                reason: "device-level compression/encryption is blocked by the TFR-006 raw-store inventory",
-            });
-        }
+        MountedOpenRecoveryAuthority::reject_device_transforms(
+            encryption.as_ref(),
+            compression.as_ref(),
+        )?;
         let root_path = root.as_ref().to_path_buf();
         let key_for_struct = encryption.as_ref().map(|c| c.key.clone());
         let mut store = if let Some(devices) = block_devices {
@@ -2458,40 +2689,20 @@ impl LocalFileSystem {
             });
         }
         check_crash_hook(CrashInjectionPoint::RecoveryBeforeRootSelect);
-        let mut state = match load_latest_committed_state(
-            store.raw_primary_store_mut(),
+        let mut open_recovery = MountedOpenRecoveryAuthority::raw_only(
+            &mut store,
             root_authentication_key,
             recovery_policy,
-        )? {
-            Some(state) => state,
-            None => match store.primary_store().get(superblock_object_key())? {
-                Some(bytes) => {
-                    let state =
-                        load_v0390_fixed_object_state(store.raw_primary_store_mut(), &bytes)?;
-                    persist_state(
-                        store.raw_primary_store_mut(),
-                        &state,
-                        root_authentication_key,
-                    )?;
-                    state
-                }
-                None => {
-                    let state = initial_state();
-                    persist_state(
-                        store.raw_primary_store_mut(),
-                        &state,
-                        root_authentication_key,
-                    )?;
-                    state
-                }
-            },
-        };
-        // Start with empty orphan index; load persisted data below.
-        let mut orphan_index_inner = OrphanIndex::new();
+        );
+        debug_assert_eq!(
+            open_recovery.transform_mode(),
+            MountedOpenRecoveryTransformMode::RawOnlyNoDeviceTransforms
+        );
+        let mut state = open_recovery.load_or_initialize_state()?;
 
         // Load intent log for operational use (crash replay was already
         // handled by load_latest_committed_state above).
-        let mut intent_log = match IntentLog::load(store.raw_primary_store()) {
+        let mut intent_log = match open_recovery.load_operational_intent_log() {
             Ok(log) => log,
             Err(err) => {
                 eprintln!("warning: intent log load failed: {err}; starting with empty log");
@@ -2504,24 +2715,9 @@ impl LocalFileSystem {
         }
 
         // Load persisted quota table; start empty if missing or corrupt.
-        state.quota_table = match store.primary_store().get(quota_table_object_key()) {
-            Ok(Some(bytes)) => QuotaTable::decode(&bytes).unwrap_or_else(|e| {
-                eprintln!("warning: quota table decode failed: {e}; starting empty");
-                QuotaTable::new()
-            }),
-            Ok(None) => QuotaTable::new(),
-            Err(e) => {
-                eprintln!("warning: quota table load failed: {e}; starting empty");
-                QuotaTable::new()
-            }
-        };
+        state.quota_table = open_recovery.load_quota_table();
         // Load persisted space counters; start with default zeros if missing.
-        if let Ok(Some(bytes)) = store.primary_store().get(space_counters_object_key()) {
-            state.space_accounting = SpaceAccounting::new(
-                decode_space_counters(&bytes).unwrap_or_default(),
-                SpaceDomainId::NONE,
-            );
-        }
+        open_recovery.merge_space_counters_into(&mut state);
 
         // Sync from the store-layer SpaceBook (which was loaded from the
         // segment write pipeline during LocalObjectStore construction) to
@@ -2529,31 +2725,10 @@ impl LocalFileSystem {
         // written with a higher TXG than the legacy space_counters_object,
         // so we take the max of each counter to avoid regressing on crash
         // recovery.
-        if let Some(usage) = store.raw_primary_store().get_dataset_usage(ROOT_DATASET_ID) {
-            let mut counters = *state.space_accounting.counters();
-            counters.logical_used_bytes = counters.logical_used_bytes.max(usage.bytes_used);
-            counters.reserved_bytes = counters.reserved_bytes.max(usage.bytes_reserved);
-            state.space_accounting =
-                SpaceAccounting::new(counters, state.space_accounting.domain_id());
-        }
+        open_recovery.merge_dataset_usage_into(&mut state);
 
         // Load persisted orphan index; start empty if missing or corrupt.
-        if let Ok(Some(bytes)) = store.primary_store().get(orphan_index_object_key()) {
-            match OrphanIndex::recover_from_log(&bytes) {
-                Ok((idx, corrupted)) => {
-                    if !corrupted.is_empty() {
-                        eprintln!(
-                            "warning: {} orphan index entries had checksum failures; skipped",
-                            corrupted.len()
-                        );
-                    }
-                    orphan_index_inner = idx;
-                }
-                Err(e) => {
-                    eprintln!("warning: orphan index recovery failed ({e}); starting empty");
-                }
-            }
-        }
+        let orphan_index_inner = open_recovery.load_orphan_index();
         // Production recovery must not call run_fsck during mount: fsck is
         // an explicit operator command, not a mount-time recovery authority.
         // The caller's RecoveryPolicy governs all state loading and replay.
@@ -2563,40 +2738,8 @@ impl LocalFileSystem {
         // the recovered journal records can be reconciled against the loaded
         // committed state. Recovery is best-effort: failures are logged and
         // the mount continues with the generation-derived commit_group.
-        let mut recovered_generation = state.generation;
-        if recovery_policy.allows_replay() {
-            match CommitGroupRecovery::recover(store.raw_primary_store()) {
-                Ok(recovery) => {
-                    let recovered_commit_group = recovery.next_commit_group_id.0;
-                    if recovered_commit_group > recovered_generation {
-                        recovered_generation = recovered_commit_group;
-                    }
-                    if !recovery.replayed_commit_groups.is_empty() {
-                        eprintln!(
-                        "commit_group recovery: replayed {} torn commit_group(s), recovered {} object key(s)",
-                        recovery.replayed_commit_groups.len(),
-                        recovery.committed_keys.len(),
-                    );
-                    }
-                    if !recovery.torn_commit_groups.is_empty() {
-                        eprintln!(
-                        "commit_group recovery: {} torn commit_group(s) could not be replayed (corrupt or missing payload)",
-                        recovery.torn_commit_groups.len(),
-                    );
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "warning: commit_group recovery failed: {e:?}; continuing without replay"
-                    );
-                }
-            }
-        } else {
-            eprintln!(
-                "recovery: policy={} skips commit_group journal recovery",
-                recovery_policy.label(),
-            );
-        }
+        let mut recovered_generation =
+            open_recovery.recover_commit_group_generation(state.generation);
 
         // Run committed txg replay to roll forward any transaction groups
         // committed beyond the recovered root-slot state. This bridges the
@@ -2604,48 +2747,14 @@ impl LocalFileSystem {
         // Replay loads each txg's transaction superblock, verifies the
         // BLAKE3 chain, and applies the latest consistent state.
         // A BLAKE3 mismatch aborts mount with CorruptState.
-        if recovery_policy.allows_replay() {
-            let engine = crate::txg_replay::TxgReplayEngine::new(Default::default());
-            match engine.replay(
-                store.raw_primary_store_mut(),
-                &state,
-                root_authentication_key,
-            ) {
-                Ok(Some((replayed_state, outcome))) => {
-                    state = replayed_state;
-                    let replay_gen = outcome.highest_applied_txg;
-                    if replay_gen > recovered_generation {
-                        recovered_generation = replay_gen;
-                    }
-                    eprintln!(
-                        "txg_replay: replayed {} committed txg(s),                          highest applied txg={replay_gen},                          resumed_from_marker={}",
-                        outcome.replayed_count,
-                        outcome.resumed_from_marker,
-                    );
-                }
-                Ok(None) => {
-                    // No txgs needed replaying — clean mount.
-                }
-                Err(e) => {
-                    eprintln!("txg_replay: BLAKE3 chain verification failed: {e}");
-                    return Err(FileSystemError::CorruptState {
-                        reason: "txg replay BLAKE3 mismatch; aborting mount",
-                    });
-                }
-            }
-        } else {
-            eprintln!(
-                "recovery: policy={} skips committed txg replay",
-                recovery_policy.label(),
-            );
-        }
+        open_recovery.replay_committed_txgs(&mut state, &mut recovered_generation)?;
 
         let generation = recovered_generation;
         // Construct the capacity authority from pool geometry and committed
         // usage. This is the single production source for used/free/reserved/
         // pending byte counters for the lifetime of this filesystem instance.
         let capacity_authority = {
-            let pool_stats = store.pool_stats();
+            let pool_stats = open_recovery.pool_stats();
             let block_size = StatfsResult::DEFAULT_BLOCK_SIZE as u32;
             let root_reserve_bytes = 0; // no root reserve in local-filesystem policy
                                         // Cap total capacity to the allocator policy ceiling so
@@ -2663,11 +2772,10 @@ impl LocalFileSystem {
             // rather than raw object-store usage. The raw pool counter includes
             // metadata/log bytes, while LocalStorageAllocatorPolicy's capacity
             // is the user-content ceiling enforced by fallocate/write paths.
-            let used_bytes =
-                content_allocation_entries_for_state(store.raw_primary_store(), &state)
-                    .and_then(|entries| allocation_bytes(&entries))
-                    .unwrap_or(pool_stats.used_bytes)
-                    .min(total_bytes);
+            let used_bytes = open_recovery
+                .committed_content_used_bytes(&state)
+                .unwrap_or(pool_stats.used_bytes)
+                .min(total_bytes);
             CapacityAuthority::from_pool_stats(
                 total_bytes,
                 used_bytes,
@@ -2675,6 +2783,7 @@ impl LocalFileSystem {
                 root_reserve_bytes,
             )
         };
+        drop(open_recovery);
         // Reconstruct snapshot GC pins from the durable snapshot catalog.
         // Each snapshot root is pinned by full TraversalRoot identity so the GC
         // treats its object graph as reachable. Without this step, snapshot
