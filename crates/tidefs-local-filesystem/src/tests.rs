@@ -5677,6 +5677,79 @@ fn assert_transform_rejected(result: Result<LocalFileSystem>) {
 }
 
 #[test]
+fn mounted_open_recovery_authority_raw_only_initializes_empty_pool() {
+    let root = temp_root("mounted-open-recovery-authority");
+    {
+        let mut store =
+            LocalFileSystem::default_pool(&root, &options(), None, None, None).expect("open pool");
+        let mut authority = MountedOpenRecoveryAuthority::raw_only(
+            &mut store,
+            default_root_authentication_key().expect("auth key"),
+            RecoveryPolicy::default(),
+        );
+        assert_eq!(
+            authority.transform_mode(),
+            MountedOpenRecoveryTransformMode::RawOnlyNoDeviceTransforms
+        );
+
+        let mut state = authority
+            .load_or_initialize_state()
+            .expect("initialize state through mounted open/recovery authority");
+        authority.merge_space_counters_into(&mut state);
+        authority.merge_dataset_usage_into(&mut state);
+
+        let intent_log = authority
+            .load_operational_intent_log()
+            .expect("load intent log through authority");
+        assert!(
+            intent_log.is_empty(),
+            "new pool should not have pending intent-log entries"
+        );
+        assert_eq!(
+            authority.recover_commit_group_generation(state.generation),
+            state.generation
+        );
+        assert_eq!(
+            authority
+                .committed_content_used_bytes(&state)
+                .expect("scan committed content allocations through authority"),
+            0
+        );
+    }
+
+    let fs = LocalFileSystem::open_with_options(&root, options())
+        .expect("regular open should load authority-initialized pool");
+    assert_eq!(fs.state.generation, 1);
+
+    cleanup(&root);
+}
+
+#[test]
+fn mounted_open_recovery_authority_rejects_device_transforms() {
+    let enc_config = EncryptionConfig {
+        key: StoreEncryptionKey::generate(),
+    };
+    let compression = zstd_device_transform_config();
+
+    assert!(MountedOpenRecoveryAuthority::reject_device_transforms(None, None).is_ok());
+    let err = MountedOpenRecoveryAuthority::reject_device_transforms(
+        Some(&enc_config),
+        Some(&compression),
+    )
+    .expect_err("device transforms must fail before open/recovery raw authority");
+    match err {
+        FileSystemError::Unsupported { operation, reason } => {
+            assert_eq!(operation, "local filesystem device transforms");
+            assert!(reason.contains("TFR-006"), "{reason}");
+            assert!(reason.contains("raw-store inventory"), "{reason}");
+            assert!(reason.contains("raw-only transform authority"), "{reason}");
+            assert!(reason.contains("blocked production rows"), "{reason}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn device_transform_open_helpers_fail_closed_until_tfr_006_inventory() {
     let root = temp_root("device-transform-fail-closed");
     let enc_config = EncryptionConfig {
