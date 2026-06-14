@@ -154,7 +154,8 @@ The stable implementation-tracked non-release command name is
 ## Still open
 
 This slice does not implement snapshot quota policy, transparent snapshot
-browsing, incremental receive/resume, non-empty target merge, unified
-deadlists, placement receipts, snapshot-reclaim accounting, or distributed
-snapshot replication. v0.417 adds the first fresh-root changed-record
-send/receive pass
+browsing, incremental receive resume, non-empty target merge, unified deadlists,
+placement receipts, snapshot-reclaim accounting, or distributed snapshot
+replication. v0.417 adds the first fresh-root changed-record send/receive pass,
+and the local incremental receive path now fails closed unless the receiver owns
+the protected base root and omitted content.

@@ -37,6 +37,18 @@ Snapshot roots are imported before the current root. The current snapshot
 catalog is rewritten to reference the destination-signed root summaries, so
 snapshot rollback still works after receive with the destination key.
 
+Incremental receive is local-only authority for an existing target. The stream
+must be marked incremental and carry `from_root`; the target must already have
+that exact manifest-backed, authenticated base identity in recovery audit and
+the base must be protected by a data-retaining snapshot or clone record with
+matching catalog and lifecycle-pin authority. Before publishing the received
+current root, receive verifies the target can load the protected base root and
+that every content object named by incoming manifests, including omitted
+unchanged content, is present and checksum-valid in the target store. Placement
+epochs are reported as stable only when both sides carry the same explicit
+epoch; mismatched explicit epochs refuse the incremental receive, and absent
+evidence remains unknown/unstable.
+
 ## Source Surfaces
 
 - `SEND_RECEIVE_CHANGED_RECORD_SPEC`
@@ -55,6 +67,9 @@ The source tests cover:
 - encoded stream round-trip through `VFSSEND1`;
 - rollback to an imported snapshot after receive;
 - corrupt changed-record payload rejection before the target root is published.
+- incremental receive refusal for missing, loose, divergent, or unprotected
+  base roots and for missing omitted content before a new selected root is
+  published.
 
 The implementation-tracked non-release gate is:
 
@@ -66,7 +81,9 @@ The stable implementation-tracked non-release command name is `tidefs-xtask chec
 
 ## Still Open
 
-This slice does not implement incremental resume, non-empty target merges,
-network transport, distributed authorization, or multi-writer conflict
-resolution. It is the first local send/receive proof that committed-root
-without operator repair.
+This slice does not implement incremental resume, distributed replication,
+network transport authorization, placement receipts, deadlist/reclaim
+accounting, non-empty target conflict resolution, or multi-writer conflict
+resolution. It is local send/receive authority for committed-root
+round-tripping and fail-closed incremental apply; it is not an OpenZFS/Ceph-class
+replication claim.

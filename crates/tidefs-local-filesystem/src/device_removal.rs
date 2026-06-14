@@ -745,6 +745,7 @@ mod tests {
             objects_to_evacuate: vec![],
             total_evacuation_bytes: 0,
             object_count: 0,
+            evacuation_outcome: tidefs_pool_scan::EvacuationPlanOutcome::EmptySuccess,
             topology_generation: 2,
             replication_intent: tidefs_replication_model::ReplicationIntent::new_mirror(
                 2,
@@ -819,6 +820,7 @@ mod tests {
             objects_to_evacuate: vec![],
             total_evacuation_bytes: 0,
             object_count: 0,
+            evacuation_outcome: tidefs_pool_scan::EvacuationPlanOutcome::EmptySuccess,
             topology_generation: 1,
             replication_intent: tidefs_replication_model::ReplicationIntent::new_mirror(
                 2,
