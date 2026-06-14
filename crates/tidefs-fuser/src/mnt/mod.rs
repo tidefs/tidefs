@@ -23,7 +23,7 @@ use std::fs::File;
 use std::io;
 
 #[cfg(any(feature = "libfuse", test))]
-use mount_options::{is_fusermount_mount_option, MountOption};
+use mount_options::{is_driver_mount_option, MountOption};
 
 /// Helper function to provide options as a fuse_args struct
 /// (which contains an argc count and an argv pointer)
@@ -36,7 +36,7 @@ fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(options: &[MountOption], f: F) 
     use std::ffi::CString;
 
     let mut args = vec![CString::new("rust-fuse").unwrap()]; // hardcoded string, never contains NUL
-    for x in options.iter().filter(|x| is_fusermount_mount_option(x)) {
+    for x in options.iter().filter(|x| is_driver_mount_option(x)) {
         // "-o" is hardcoded, never contains NUL
         // Mount options with interior NUL bytes are rejected gracefully
         let opt_str = match CString::new(option_to_string(x)) {
@@ -153,6 +153,44 @@ mod test {
                     })
                     .collect();
                 assert_eq!(*v, ["rust-fuse", "-o", "foo", "-o", "bar"]);
+            },
+        );
+    }
+
+    #[test]
+    fn fuse_args_include_atime_policy_options() {
+        with_fuse_args(
+            &[
+                MountOption::Atime,
+                MountOption::Relatime,
+                MountOption::StrictAtime,
+                MountOption::NoAtime,
+                MountOption::WritebackCache,
+            ],
+            |args| {
+                let v: Vec<_> = (0..args.argc)
+                    // SAFETY: args.argv points at argc valid NUL-terminated
+                    // strings owned by with_fuse_args for this callback.
+                    .map(|n| unsafe {
+                        CStr::from_ptr(*args.argv.offset(n as isize))
+                            .to_str()
+                            .unwrap()
+                    })
+                    .collect();
+                assert_eq!(
+                    *v,
+                    [
+                        "rust-fuse",
+                        "-o",
+                        "atime",
+                        "-o",
+                        "relatime",
+                        "-o",
+                        "strictatime",
+                        "-o",
+                        "noatime",
+                    ]
+                );
             },
         );
     }

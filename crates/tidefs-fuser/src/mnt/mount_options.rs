@@ -70,6 +70,7 @@ pub(crate) fn is_driver_mount_option(option: &MountOption) -> bool {
     !matches!(option, MountOption::WritebackCache)
 }
 
+#[cfg(any(test, not(feature = "libfuse")))]
 pub(crate) fn is_fusermount_mount_option(option: &MountOption) -> bool {
     is_driver_mount_option(option)
         && !matches!(
