@@ -790,6 +790,107 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_snapshot_clone_lifecycle() {
+        use clap::Parser;
+        for argv in [
+            [
+                "tidefsctl",
+                "snapshot",
+                "clone",
+                "create",
+                "mypool",
+                "clone-a",
+                "snap-a",
+            ]
+            .as_slice(),
+            [
+                "tidefsctl",
+                "snapshot",
+                "clone",
+                "delete",
+                "mypool",
+                "clone-a",
+            ]
+            .as_slice(),
+            [
+                "tidefsctl",
+                "snapshot",
+                "clone",
+                "promote",
+                "mypool",
+                "clone-a",
+            ]
+            .as_slice(),
+        ] {
+            let args = Cli::try_parse_from(argv.iter().copied());
+            assert!(
+                args.is_ok(),
+                "snapshot clone lifecycle should parse: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_parse_snapshot_bookmark_lifecycle() {
+        use clap::Parser;
+        let create = Cli::try_parse_from([
+            "tidefsctl",
+            "snapshot",
+            "bookmark",
+            "create",
+            "mypool",
+            "bm-a",
+            "snap-a",
+        ]);
+        assert!(create.is_ok(), "snapshot bookmark create should parse");
+
+        let delete = Cli::try_parse_from([
+            "tidefsctl",
+            "snapshot",
+            "bookmark",
+            "delete",
+            "mypool",
+            "bm-a",
+        ]);
+        assert!(delete.is_ok(), "snapshot bookmark delete should parse");
+    }
+
+    #[test]
+    fn cli_parse_snapshot_holds_and_prune() {
+        use clap::Parser;
+        for argv in [
+            ["tidefsctl", "snapshot", "hold", "mypool", "snap-a"].as_slice(),
+            ["tidefsctl", "snapshot", "release", "mypool", "snap-a"].as_slice(),
+            ["tidefsctl", "snapshot", "holds", "mypool"].as_slice(),
+            ["tidefsctl", "snapshot", "holds", "mypool", "snap-a"].as_slice(),
+            [
+                "tidefsctl",
+                "snapshot",
+                "prune",
+                "mypool",
+                "--keep-latest",
+                "2",
+            ]
+            .as_slice(),
+            [
+                "tidefsctl",
+                "snapshot",
+                "prune",
+                "mypool",
+                "--max-age-generations",
+                "24",
+            ]
+            .as_slice(),
+        ] {
+            let args = Cli::try_parse_from(argv.iter().copied());
+            assert!(
+                args.is_ok(),
+                "snapshot hold/release/prune command should parse: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cli_parse_snapshot_destroy_rejects_backing_dir() {
         use clap::Parser;
         let args = Cli::try_parse_from([

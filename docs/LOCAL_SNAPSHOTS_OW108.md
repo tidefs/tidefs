@@ -76,6 +76,28 @@ longer have a data-retaining snapshot record. Bookmark records remain
 non-retaining replication anchors and are excluded from send/recovery protected
 root expansion.
 
+## Operator CLI surface
+
+`tidefsctl snapshot` exposes the local lifecycle authority through the public
+operator boundary:
+
+- `snapshot list <pool>` reports every catalog entry with kind, origin,
+  hold count, source transaction/generation, and created generation.
+- `snapshot clone create/delete/promote` routes clone lifecycle mutations
+  through the same live-owner or explicit `--devices` offline rules as
+  ordinary snapshot create/destroy.
+- `snapshot bookmark create/delete` manages local non-retaining bookmark
+  records without claiming distributed send/receive anchoring.
+- `snapshot hold`, `snapshot release`, and `snapshot holds` manage and inspect
+  deletion-prevention holds on snapshots and clones; bookmarks cannot be held.
+- `snapshot prune` maps `--keep-latest` and `--max-age-generations` onto
+  `SnapshotRetentionPolicy`, and refuses pruning when no effective policy is
+  supplied.
+
+The mutating commands remain local-only operator actions. They do not bypass
+hold checks, clone/bookmark exclusions, catalog cleanup, lifecycle-pin
+reconciliation, or live-owner routing for imported pools.
+
 This authority still does not close TFR-010. Snapshot-pinned bytes must later
 feed the placement receipt and rebuild/reclaim authority tracked by #17 and
 #18 before TideFS can claim unified deadlist, capacity, or distributed
@@ -96,6 +118,10 @@ snapshot-reclaim correctness.
 - `LocalFileSystem::delete_clone`
 - `LocalFileSystem::promote_clone`
 - `LocalFileSystem::rollback_to_snapshot`
+- `tidefsctl snapshot clone create/delete/promote`
+- `tidefsctl snapshot bookmark create/delete`
+- `tidefsctl snapshot hold/release/holds`
+- `tidefsctl snapshot prune`
 
 
 The source tests cover:
@@ -112,7 +138,9 @@ The source tests cover:
 - clone delete/promote/reopen reconciliation against catalog entries and
   lifecycle pins;
 - rollback and send/export rejection when snapshot catalog or pin authority has
-  drifted.
+  drifted;
+- CLI parsing/classification/authz and extended list/prune formatting for the
+  local lifecycle commands.
 
 The implementation-tracked non-release gate is:
 
@@ -125,7 +153,8 @@ The stable implementation-tracked non-release command name is
 
 ## Still open
 
-This slice does not implement a user-facing snapshot/clone CLI, snapshot quota
-policy, transparent snapshot browsing, incremental receive/resume, non-empty
-target merge, network send/receive transport, or distributed snapshot
-replication. v0.417 adds the first fresh-root changed-record send/receive pass
+This slice does not implement snapshot quota policy, transparent snapshot
+browsing, incremental receive/resume, non-empty target merge, unified
+deadlists, placement receipts, snapshot-reclaim accounting, or distributed
+snapshot replication. v0.417 adds the first fresh-root changed-record
+send/receive pass

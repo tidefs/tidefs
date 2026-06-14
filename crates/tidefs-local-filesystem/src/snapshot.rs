@@ -10,8 +10,9 @@
 //!
 //! Implementation note: clones and bookmarks are stored as `SnapshotRecord`
 //! entries with `SnapshotKind::Clone` / `SnapshotKind::Bookmark` in the
-//! existing snapshot catalog. This avoids adding new storage structures while
-//! providing the full ZFS-equivalent lifecycle semantics.
+//! existing snapshot catalog. This exposes the current local lifecycle surface
+//! while TFR-010 still tracks the unfinished deadlist, send/receive, and
+//! reclaim authority model.
 
 use crate::error::FileSystemError;
 use crate::helpers::snapshot_name_bytes;
