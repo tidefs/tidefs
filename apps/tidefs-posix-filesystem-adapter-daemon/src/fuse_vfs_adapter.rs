@@ -1311,9 +1311,9 @@ fn fuse_access_requested_from_mask(mask: i32) -> Result<u8, Errno> {
 /// - O_APPEND under kernel writeback-cache -> FOPEN_DIRECT_IO: keep append
 ///   offset authority in the daemon because the engine size is stale until
 ///   the kernel writes dirty cached pages back.
-/// - Kernel writeback-cache ordinary opens -> FOPEN_KEEP_CACHE: preserving
-///   the kernel page cache across reopen is required so dirty cached bytes
-///   are not discarded before the kernel writes them back to the daemon.
+/// - Kernel writeback-cache ordinary opens may add FOPEN_KEEP_CACHE in the
+///   adapter helper below when preserving cached pages is safe for the active
+///   timestamp policy.
 /// - Otherwise: no special flags (0). FOPEN_KEEP_CACHE is not set without
 ///   explicit kernel writeback-cache because the adapter uses a
 ///   non-authoritative read cache that is invalidated on writes, not closes.
@@ -2899,7 +2899,32 @@ impl FuseVfsAdapter {
         datasync
     }
 
-    fn fuse_open_flags_for_request(&self, open_flags: u32) -> u32 {
+    fn active_read_atime_policy(&self) -> bool {
+        !self.read_only && self.timestamp_policy != TimestampPolicy::NoAtime
+    }
+
+    fn writeback_open_should_keep_cache(
+        &self,
+        open_flags: u32,
+        existing_open_state: InodeOpenState,
+    ) -> bool {
+        if open_flags_allow_write(open_flags).unwrap_or(false) {
+            return true;
+        }
+        if !open_flags_allow_read(open_flags).unwrap_or(false) {
+            return true;
+        }
+        if existing_open_state.has_writable {
+            return true;
+        }
+        !self.active_read_atime_policy()
+    }
+
+    fn fuse_open_flags_for_existing_state(
+        &self,
+        open_flags: u32,
+        existing_open_state: InodeOpenState,
+    ) -> u32 {
         let mut reply_flags = fuse_open_reply_flags(open_flags);
         if self.force_direct_io {
             reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
@@ -2907,10 +2932,17 @@ impl FuseVfsAdapter {
         if self.writeback_cache_enabled && (open_flags & libc::O_APPEND as u32) != 0 {
             reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
         }
-        if self.writeback_cache_enabled && (reply_flags & fuser::consts::FOPEN_DIRECT_IO) == 0 {
+        if self.writeback_cache_enabled
+            && (reply_flags & fuser::consts::FOPEN_DIRECT_IO) == 0
+            && self.writeback_open_should_keep_cache(open_flags, existing_open_state)
+        {
             reply_flags |= fuser::consts::FOPEN_KEEP_CACHE;
         }
         reply_flags
+    }
+
+    fn fuse_open_flags_for_request(&self, open_flags: u32) -> u32 {
+        self.fuse_open_flags_for_existing_state(open_flags, InodeOpenState::default())
     }
 
     fn invalidate_inode_metadata_local(&self, ino: u64) {
@@ -3737,15 +3769,15 @@ impl FuseVfsAdapter {
             tidefs_types_vfs_core::FileHandleId::new(0),
             0,
         );
+        let fuse_open_flags = self.fuse_open_flags_for_request(open_flags);
         let adapter_fh = {
             let mut handles = self.file_handles.lock().unwrap();
             let adapter_fh = handles.allocate(attr.inode_id.get(), open_flags, engine_fh);
             if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
-                handle.fuse_open_flags = self.fuse_open_flags_for_request(open_flags);
+                handle.fuse_open_flags = fuse_open_flags;
             }
             adapter_fh
         };
-        let fuse_open_flags = self.fuse_open_flags_for_request(open_flags);
         self.file_handles.lock().unwrap().inc_open_ref(ino);
         self.remember_writeback_inode(ino);
         Ok(VfsCreateDispatch {
@@ -5092,12 +5124,12 @@ impl FuseVfsAdapter {
         {
             Ok((attr, fh)) => {
                 self.record_dentry_child_mutation(parent, name);
+                let fuse_open_flags = self.fuse_open_flags_for_request(engine_open_flags);
                 let adapter_fh = {
                     let mut handles = self.file_handles.lock().unwrap();
                     let adapter_fh = handles.allocate(attr.inode_id.get(), engine_open_flags, fh);
                     if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
-                        handle.fuse_open_flags =
-                            self.fuse_open_flags_for_request(engine_open_flags);
+                        handle.fuse_open_flags = fuse_open_flags;
                     }
                     adapter_fh
                 };
@@ -5111,7 +5143,6 @@ impl FuseVfsAdapter {
                     .unwrap()
                     .inc_open_ref(attr.inode_id.get());
                 self.remember_writeback_inode(attr.inode_id.get());
-                let fuse_open_flags = self.fuse_open_flags_for_request(engine_open_flags);
                 Ok(VfsCreateDispatch {
                     attr,
                     adapter_fh,
@@ -8174,13 +8205,16 @@ impl FuseVfsAdapter {
             )?;
             e.open(InodeId::new(ino), engine_open_flags, ctx)?
         };
-        let adapter_fh = {
+        let (adapter_fh, fuse_flags) = {
             let mut handles = self.file_handles.lock().unwrap();
+            let existing_open_state = handles.inode_open_state(ino);
+            let fuse_flags =
+                self.fuse_open_flags_for_existing_state(engine_open_flags, existing_open_state);
             let adapter_fh = handles.allocate(ino, engine_open_flags, engine_fh);
             if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
-                handle.fuse_open_flags = self.fuse_open_flags_for_request(engine_open_flags);
+                handle.fuse_open_flags = fuse_flags;
             }
-            adapter_fh
+            (adapter_fh, fuse_flags)
         };
         Self::emit_open_lifecycle_observation(OpenLifecycleObservation::opened(
             ino, adapter_fh, engine_fh,
@@ -8188,16 +8222,7 @@ impl FuseVfsAdapter {
         self.file_handles.lock().unwrap().inc_open_ref(ino);
         self.remember_writeback_inode(ino);
         self.finish_successful_read_open_atime(ino, engine_open_flags, ctx);
-        // FUSE reply flags already computed and stored by AdapterFileHandle::new
-        // during allocate(). Read them back for the reply.
         self.mmap_coherency.register(ino, 0);
-        let fuse_flags = {
-            let fht = self.file_handles.lock().unwrap();
-            fht.handles
-                .get(&adapter_fh)
-                .map(|h| h.fuse_open_flags)
-                .unwrap_or(0)
-        };
         Ok(VfsOpenDispatch {
             adapter_fh,
             open_flags: fuse_flags,
@@ -8244,11 +8269,12 @@ impl FuseVfsAdapter {
             e.tmpfile(parent, file_mode, engine_flags, ctx)?
         };
         let ino = attr.inode_id.get();
+        let fuse_flags = self.fuse_open_flags_for_request(engine_flags);
         let adapter_fh = {
             let mut handles = self.file_handles.lock().unwrap();
             let adapter_fh = handles.allocate(ino, engine_flags, engine_fh);
             if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
-                handle.fuse_open_flags = self.fuse_open_flags_for_request(engine_flags);
+                handle.fuse_open_flags = fuse_flags;
             }
             adapter_fh
         };
@@ -8257,14 +8283,6 @@ impl FuseVfsAdapter {
         ));
         self.file_handles.lock().unwrap().inc_open_ref(ino);
         self.remember_writeback_inode(ino);
-        // FUSE reply flags already computed by AdapterFileHandle::new in allocate().
-        let fuse_flags = {
-            let fht = self.file_handles.lock().unwrap();
-            fht.handles
-                .get(&adapter_fh)
-                .map(|h| h.fuse_open_flags)
-                .unwrap_or(0)
-        };
         Ok(VfsOpenDispatch {
             adapter_fh,
             open_flags: fuse_flags,
@@ -11011,6 +11029,11 @@ mod tests {
             .adapter
             .dispatch_open(&ctx, created.attr.inode_id.get(), libc::O_RDONLY as u32)
             .expect("open read-only handle");
+        assert_eq!(
+            read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
+            0,
+            "active-atime read opens after the writer closes must enter the daemon read path"
+        );
 
         let after_read_open = {
             let engine = fixture.adapter.engine.lock().unwrap();
@@ -39561,7 +39584,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_readonly_open_preserves_kernel_page_cache() {
+    fn writeback_readonly_open_preserves_kernel_page_cache_while_writer_open() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let root = {
@@ -39591,7 +39614,83 @@ mod tests {
         assert_ne!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
             0,
-            "read-only reopen must preserve dirty kernel writeback-cache pages"
+            "read-only opens must preserve kernel cache while a writable handle can still own dirty pages"
+        );
+    }
+
+    #[test]
+    fn writeback_active_atime_readonly_reopen_drops_kernel_page_cache() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let create = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"wb-readonly-atime-no-keep-cache.txt",
+                0o644,
+                libc::O_WRONLY as u32,
+            )
+            .expect("create writeback-cache file");
+
+        fixture
+            .adapter
+            .dispatch_release(create.attr.inode_id.get(), create.adapter_fh, 0, None, true)
+            .expect("release writer");
+
+        let read_open = fixture
+            .adapter
+            .dispatch_open(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
+            .expect("open read-only under active atime");
+        assert_eq!(
+            read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
+            0,
+            "active-atime read-only writeback opens must still use buffered I/O"
+        );
+        assert_eq!(
+            read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
+            0,
+            "clean active-atime read-only reopens must invalidate page cache so reads reach the daemon"
+        );
+    }
+
+    #[test]
+    fn writeback_noatime_readonly_reopen_preserves_kernel_page_cache() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        fixture.adapter.timestamp_policy = TimestampPolicy::NoAtime;
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let create = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"wb-readonly-noatime-keep-cache.txt",
+                0o644,
+                libc::O_WRONLY as u32,
+            )
+            .expect("create writeback-cache file");
+
+        fixture
+            .adapter
+            .dispatch_release(create.attr.inode_id.get(), create.adapter_fh, 0, None, true)
+            .expect("release writer");
+
+        let read_open = fixture
+            .adapter
+            .dispatch_open(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
+            .expect("open read-only under noatime");
+        assert_ne!(
+            read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
+            0,
+            "noatime read-only reopens do not need daemon read observation"
         );
     }
 
