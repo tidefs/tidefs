@@ -3743,12 +3743,13 @@ impl FuseVfsAdapter {
         Ok(attr)
     }
 
-    /// Namespace-backed lookup: call [`tidefs_namespace::Namespace::lookup`]
-    /// to resolve a (parent, name) pair through the directory index and
-    /// retrieve the child's inode attributes via
-    /// [`tidefs_namespace::Namespace::get_attrs`].
+    /// Namespace-backed lookup: use [`tidefs_namespace::Namespace::lookup`]
+    /// to resolve a (parent, name) pair through the directory index.  When
+    /// the VFS engine also knows the inode, return the engine attributes so
+    /// remounted namespace metadata cannot synthesize fresh timestamps.
     fn dispatch_lookup_via_namespace(
         &self,
+        ctx: &RequestCtx,
         ns: &Namespace,
         parent: u64,
         name: &[u8],
@@ -3758,6 +3759,21 @@ impl FuseVfsAdapter {
             .lookup(parent, name_str)
             .map_err(namespace_error_to_errno)?
             .ok_or(Errno::ENOENT)?;
+        let engine_attr = {
+            let e = self.engine.lock().unwrap();
+            e.getattr(InodeId::new(ino), None, ctx)
+        };
+        match engine_attr {
+            Ok(attr) => {
+                self.sync_namespace_attrs_local(ino, &attr);
+                self.cache_path_lookup(parent, name, &attr);
+                self.record_lookup_count(attr.inode_id.get());
+                return Ok(attr);
+            }
+            Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) => {}
+            Err(errno) => return Err(errno),
+        }
+
         let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
         let attr = namespace_attrs_to_inode_attr(&ns_attrs);
         self.cache_path_lookup(parent, name, &attr);
@@ -4282,7 +4298,7 @@ impl FuseVfsAdapter {
         // to the engine when the lookup misses (fresh pool with empty
         // namespace but authoritative engine data).
         if let Some(ref ns) = self.namespace {
-            match self.dispatch_lookup_via_namespace(ns, parent, name) {
+            match self.dispatch_lookup_via_namespace(ctx, ns, parent, name) {
                 Ok(attr) => return Ok(attr),
                 Err(Errno::ENOENT) | Err(Errno::EIO) | Err(Errno::ESTALE) => {} // fall through
                 Err(e) => return Err(e),
@@ -33320,6 +33336,75 @@ mod tests {
         let ns_attrs = ns.get_attrs(child_ino).expect("ns get_attrs");
         assert_eq!(ns_attrs.nlink, 2);
         assert_eq!(ns_attrs.mode & 0o170000, 0o040000); // S_IFDIR
+    }
+
+    #[test]
+    fn namespace_lookup_uses_engine_attrs_when_namespace_timestamps_are_stale() {
+        let fixture = adapter_fixture_with_namespace();
+        let ctx = root_ctx();
+        let ns = fixture.adapter.namespace_handle().expect("namespace");
+        let root_ino_id = fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .get_root_inode(&ctx)
+            .expect("root inode");
+
+        let (created_attr, create_fh) = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .create(root_ino_id, b"stale-lookup-ctime.txt", 0o644, 0, &ctx)
+                .expect("create engine file")
+        };
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.release(&create_fh).expect("release create handle");
+        }
+        let engine_attr = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(created_attr.inode_id, None, &ctx)
+                .expect("engine getattr")
+        };
+
+        let ns_ino = ns
+            .create_file(
+                root_ino_id.get(),
+                "stale-lookup-ctime.txt",
+                tidefs_namespace::InodeAttributes::new_file(created_attr.inode_id.get()),
+            )
+            .expect("create namespace dentry");
+        assert_eq!(ns_ino, created_attr.inode_id.get());
+
+        let mut stale = ns.get_attrs(ns_ino).expect("namespace attrs");
+        stale.atime = UNIX_EPOCH;
+        stale.mtime = UNIX_EPOCH;
+        stale.ctime = UNIX_EPOCH;
+        ns.update_attrs(ns_ino, stale)
+            .expect("make namespace timestamps stale");
+
+        let attr = fixture
+            .adapter
+            .dispatch_lookup(&ctx, root_ino_id.get(), b"stale-lookup-ctime.txt")
+            .expect("lookup via namespace");
+
+        assert_eq!(attr.inode_id, engine_attr.inode_id);
+        assert_eq!(attr.posix.ctime_ns, engine_attr.posix.ctime_ns);
+        assert_ne!(attr.posix.ctime_ns, 0);
+
+        let mut cache = fixture.adapter.path_lookup_cache.lock().unwrap();
+        let entry = cache
+            .get(root_ino_id.get(), b"stale-lookup-ctime.txt")
+            .expect("lookup caches engine attr");
+        assert_eq!(entry.value.posix.ctime_ns, engine_attr.posix.ctime_ns);
+        drop(cache);
+
+        let repaired = ns.get_attrs(ns_ino).expect("repaired namespace attrs");
+        assert_eq!(
+            system_time_to_ns(repaired.ctime),
+            engine_attr.posix.ctime_ns
+        );
     }
 
     #[test]
