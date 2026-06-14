@@ -1495,7 +1495,7 @@ SendDispatcher::enqueue(conn_id, msg)
        +-- lookup conn_id -> SendQueue
        +-- enqueue into bounded FIFO queue
        |   (max messages + max bytes guards)
-       +-- return Ok or SendError::Backpressure
+       +-- return SendAdmissionEvidence or SendError with evidence
              |
              v
         SendDrainer per connection
@@ -1508,8 +1508,9 @@ SendDispatcher::enqueue(conn_id, msg)
 ### SendQueue
 
 A bounded FIFO queue per remote connection with configurable limits on both
-message count and total byte occupancy. Enqueue returns `Ok(())` or
-`SendError::Backpressure` when either threshold is exceeded.
+message count and total byte occupancy. Enqueue returns accepted
+`SendAdmissionEvidence` or `SendError::Backpressure` evidence when either
+threshold is exceeded.
 
 **Configuration** via `SendQueueConfig`:
 - `max_messages` (default 256): maximum messages the queue will hold
@@ -1531,16 +1532,16 @@ first enqueue to a connection. Exposes:
 ### Backpressure signal
 
 `SendError::Backpressure` carries the connection ID, current queue depth
-(message count), and current byte depth. This is a non-fatal signal --
-callers can inspect the depths and decide whether to delay, drop, or shed
-load without tearing down the connection.
+(message count), current byte depth, and typed send-admission evidence. This
+is a non-fatal signal -- callers can inspect the depths and evidence and decide
+whether to delay, drop, or shed load without tearing down the connection.
 
 | Variant | Meaning |
 |---|---|
-| `Ok` | Message accepted into the queue |
-| `Backpressure { conn_id, depth, byte_depth }` | Queue at capacity; caller should react |
-| `NoConnection { conn_id }` | No queue exists for the connection |
-| `Shutdown { conn_id }` | Queue has been shut down |
+| `Ok(evidence)` | Message accepted into the queue with admission evidence |
+| `Backpressure { conn_id, depth, byte_depth, evidence }` | Queue at capacity; caller should react |
+| `NoConnection { conn_id, evidence }` | No queue exists for the connection |
+| `Shutdown { conn_id, evidence }` | Queue has been shut down |
 
 ### SendDrainer
 
@@ -1681,11 +1682,10 @@ only Control and Demand lanes).
 
 
 
-`SendError::SendQueueFull { lane, depth, max_depth }` is returned when a
-
-lane class is at capacity. This is a non-fatal signal — callers can inspect
-
-the lane and current depth to make load-shedding decisions.
+`SendError::SendQueueFull { lane, depth, max_depth, evidence }` is returned
+when a lane class is at capacity. This is a non-fatal signal -- callers can
+inspect the lane, current depth, configured limit, and admission evidence to
+make load-shedding decisions.
 
 
 ## Session Rekeying
@@ -3333,9 +3333,10 @@ queue depth for the dequeue priority class is fed to
 - `with_capacity_set(cs)` — attach a custom [`SendCapacitySet`].
 - `send_capacity(pri)` — obtain a [`SendCapacity`] handle for the given
   priority class.
-- `try_send_with_backpressure(family, pri, payload, deadline)` — enqueues
-  immediately if capacity permits; otherwise awaits `wait_for_capacity()` then
-  enqueues, respecting the message send deadline.
+- `try_send_with_backpressure(family, pri, payload, deadline)` — returns typed
+  send-admission evidence for accepted, blocked, expired-before-enqueue,
+  closed, roster, and capacity outcomes while respecting the message send
+  deadline.
 
 A default [`SendCapacitySet`] is created automatically when a [`SendPipeline`]
 is constructed, so all transport sessions get backpressure signals without
