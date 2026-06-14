@@ -13,6 +13,11 @@ on:
           - fuse
           - kmod-smoke
           - k7-vfs
+      tests:
+        description: Optional space-separated focused tests, e.g. generic/003
+        required: false
+        default: ''
+        type: string
   schedule:
     - cron: '17 1 * * *'
 
@@ -75,24 +80,33 @@ jobs:
         env:
           ARTIFACT_ROOT: ${{ runner.temp }}/tidefs-xfstests-artifacts/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.target }}
           WORK_ROOT: ${{ runner.temp }}/tidefs-xfstests-work/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.target }}
+          XFSTESTS_TESTS: ${{ github.event_name == 'workflow_dispatch' && inputs.tests || '' }}
         run: |
           set -euo pipefail
+          maybe_tests_args=()
+          if [ -n "$XFSTESTS_TESTS" ]; then
+            maybe_tests_args=(--tests "$XFSTESTS_TESTS")
+          fi
           case "${{ matrix.target }}" in
             fuse)
               TIDEFS_FUSE_XFSTESTS_TMPDIR="$WORK_ROOT/fuse" \
                 timeout --foreground 14400s \
                   nix run .#fuse-xfstests-validation -- \
+                    "${maybe_tests_args[@]}" \
                     --output "$ARTIFACT_ROOT/validation.json"
               ;;
             kmod-smoke)
               TIDEFS_OUTPUT_ROOT="$ARTIFACT_ROOT" \
                 timeout --foreground 14400s \
-                  nix run .#kmod-xfstests-smoke -- --timeout 3600
+                  nix run .#kmod-xfstests-smoke -- \
+                    --timeout 3600 \
+                    "${maybe_tests_args[@]}"
               ;;
             k7-vfs)
               TIDEFS_K7_TFS_XFSTESTS_TMPDIR="$WORK_ROOT/k7-vfs" \
                 timeout --foreground 14400s \
                   nix run .#k7-vfs-xfstests-validation -- \
+                    "${maybe_tests_args[@]}" \
                     --output "$ARTIFACT_ROOT/validation.json"
               ;;
             *)
