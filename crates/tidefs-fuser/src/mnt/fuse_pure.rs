@@ -7,7 +7,10 @@
 #![allow(missing_docs)]
 
 use super::is_mounted;
-use super::mount_options::{is_fusermount_mount_option, option_to_string, MountOption};
+use super::mount_options::{
+    atime_remount_flags, is_fusermount_mount_option, option_group, option_to_flag,
+    option_to_string, MountOption, MountOptionGroup,
+};
 use libc::c_int;
 use log::{debug, error};
 use std::ffi::{CStr, CString, OsStr};
@@ -390,7 +393,7 @@ fn apply_fusermount_atime_remount(
     mountpoint: &OsStr,
     options: &[MountOption],
 ) -> Result<(), io::Error> {
-    let Some(flags) = fusermount_atime_remount_flags(options) else {
+    let Some(flags) = atime_remount_flags(options) else {
         return Ok(());
     };
     let c_mountpoint = CString::new(mountpoint.as_bytes())
@@ -425,34 +428,6 @@ fn apply_fusermount_atime_remount(
     _options: &[MountOption],
 ) -> Result<(), io::Error> {
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn fusermount_atime_remount_flags(options: &[MountOption]) -> Option<libc::c_ulong> {
-    let needs_remount = options.iter().any(|option| {
-        matches!(
-            option,
-            MountOption::Atime | MountOption::NoAtime | MountOption::StrictAtime
-        )
-    });
-    if !needs_remount {
-        return None;
-    }
-
-    let mut flags = libc::MS_REMOUNT;
-    if !options.contains(&MountOption::Dev) {
-        flags |= libc::MS_NODEV;
-    }
-    if !options.contains(&MountOption::Suid) {
-        flags |= libc::MS_NOSUID;
-    }
-    for flag in options
-        .iter()
-        .filter(|x| option_group(x) == MountOptionGroup::KernelFlag)
-    {
-        flags |= option_to_flag(flag);
-    }
-    Some(flags)
 }
 
 // If returned option is none. Then fusermount binary should be tried
@@ -611,84 +586,6 @@ fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<
     Ok(Some(file))
 }
 
-#[derive(PartialEq)]
-pub enum MountOptionGroup {
-    KernelOption,
-    KernelFlag,
-    Fusermount,
-}
-
-pub fn option_group(option: &MountOption) -> MountOptionGroup {
-    match option {
-        MountOption::FSName(_) => MountOptionGroup::Fusermount,
-        MountOption::Subtype(_) => MountOptionGroup::Fusermount,
-        MountOption::CUSTOM(_) => MountOptionGroup::KernelOption,
-        MountOption::AutoUnmount => MountOptionGroup::Fusermount,
-        MountOption::AllowOther => MountOptionGroup::KernelOption,
-        MountOption::Dev => MountOptionGroup::KernelFlag,
-        MountOption::NoDev => MountOptionGroup::KernelFlag,
-        MountOption::Suid => MountOptionGroup::KernelFlag,
-        MountOption::NoSuid => MountOptionGroup::KernelFlag,
-        MountOption::RO => MountOptionGroup::KernelFlag,
-        MountOption::RW => MountOptionGroup::KernelFlag,
-        MountOption::Exec => MountOptionGroup::KernelFlag,
-        MountOption::NoExec => MountOptionGroup::KernelFlag,
-        MountOption::Atime => MountOptionGroup::KernelFlag,
-        MountOption::Relatime => MountOptionGroup::KernelFlag,
-        MountOption::StrictAtime => MountOptionGroup::KernelFlag,
-        MountOption::NoAtime => MountOptionGroup::KernelFlag,
-        MountOption::DirSync => MountOptionGroup::KernelFlag,
-        MountOption::Sync => MountOptionGroup::KernelFlag,
-        MountOption::Async => MountOptionGroup::KernelFlag,
-        MountOption::AllowRoot => MountOptionGroup::KernelOption,
-        MountOption::DefaultPermissions => MountOptionGroup::KernelOption,
-        MountOption::WritebackCache => MountOptionGroup::Fusermount,
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub fn option_to_flag(option: &MountOption) -> libc::c_ulong {
-    match option {
-        MountOption::Dev => 0, // There is no option for dev. It's the absence of NoDev
-        MountOption::NoDev => libc::MS_NODEV,
-        MountOption::Suid => 0,
-        MountOption::NoSuid => libc::MS_NOSUID,
-        MountOption::RW => 0,
-        MountOption::RO => libc::MS_RDONLY,
-        MountOption::Exec => 0,
-        MountOption::NoExec => libc::MS_NOEXEC,
-        MountOption::Atime => libc::MS_STRICTATIME,
-        MountOption::Relatime => libc::MS_RELATIME,
-        MountOption::StrictAtime => libc::MS_STRICTATIME,
-        MountOption::NoAtime => libc::MS_NOATIME,
-        MountOption::Async => 0,
-        MountOption::Sync => libc::MS_SYNCHRONOUS,
-        MountOption::DirSync => libc::MS_DIRSYNC,
-        _ => unreachable!(),
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub fn option_to_flag(option: &MountOption) -> libc::c_int {
-    match option {
-        MountOption::Dev => 0, // There is no option for dev. It's the absence of NoDev
-        MountOption::NoDev => libc::MNT_NODEV,
-        MountOption::Suid => 0,
-        MountOption::NoSuid => libc::MNT_NOSUID,
-        MountOption::RW => 0,
-        MountOption::RO => libc::MNT_RDONLY,
-        MountOption::Exec => 0,
-        MountOption::NoExec => libc::MNT_NOEXEC,
-        MountOption::Atime => 0,
-        MountOption::Relatime => 0,
-        MountOption::StrictAtime => 0,
-        MountOption::NoAtime => libc::MNT_NOATIME,
-        MountOption::Async => 0,
-        MountOption::Sync => libc::MNT_SYNCHRONOUS,
-        _ => unreachable!(),
-    }
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -728,7 +625,7 @@ mod tests {
     #[test]
     fn fusermount_strictatime_remount_preserves_default_flags() {
         assert_eq!(
-            fusermount_atime_remount_flags(&[MountOption::StrictAtime]),
+            atime_remount_flags(&[MountOption::StrictAtime]),
             Some(libc::MS_REMOUNT | libc::MS_NODEV | libc::MS_NOSUID | libc::MS_STRICTATIME)
         );
     }
@@ -736,7 +633,7 @@ mod tests {
     #[test]
     fn fusermount_atime_remount_uses_strictatime_flag() {
         assert_eq!(
-            fusermount_atime_remount_flags(&[MountOption::Atime]),
+            atime_remount_flags(&[MountOption::Atime]),
             Some(libc::MS_REMOUNT | libc::MS_NODEV | libc::MS_NOSUID | libc::MS_STRICTATIME)
         );
     }
@@ -744,20 +641,13 @@ mod tests {
     #[test]
     fn fusermount_noatime_remount_respects_dev_and_suid() {
         assert_eq!(
-            fusermount_atime_remount_flags(&[
-                MountOption::NoAtime,
-                MountOption::Dev,
-                MountOption::Suid
-            ]),
+            atime_remount_flags(&[MountOption::NoAtime, MountOption::Dev, MountOption::Suid]),
             Some(libc::MS_REMOUNT | libc::MS_NOATIME)
         );
     }
 
     #[test]
     fn fusermount_relatime_uses_kernel_default_without_remount() {
-        assert_eq!(
-            fusermount_atime_remount_flags(&[MountOption::Relatime]),
-            None
-        );
+        assert_eq!(atime_remount_flags(&[MountOption::Relatime]), None);
     }
 }

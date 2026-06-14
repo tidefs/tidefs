@@ -48,6 +48,7 @@ impl Mount {
             if result != 0 {
                 return Err(ensure_last_os_error());
             }
+            super::apply_libfuse_atime_remount(mnt.as_c_str(), options)?;
             // SAFETY: session is valid and mounted; returns the FUSE fd or -1.
             let fd = unsafe { fuse_session_fd(mount.fuse_session) };
             if fd < 0 {
