@@ -39,17 +39,69 @@ Authority marker: `tidefsctl-command-classification-v1`.
 The source of truth is
 `apps/tidefsctl/src/commands/classification.rs`. `tidefsctl --help` consumes
 that registry for its long classification text, and focused tests check this
-document against the same marker. Command groups must not claim stronger
-stability than the class recorded there:
+document against the same marker and the exact registry/admission table below.
+Command groups must not claim stronger stability than the class recorded here:
 
-| Class | Current surfaces | Contract |
-|---|---|---|
-| `public-operator` | `pool create`, `pool scan`, `pool status`, `pool import`, `pool export`, `pool destroy`, `pool get`, `pool set`, `pool list-props`, `snapshot create`, `snapshot list`, `snapshot clone create`, `snapshot clone delete`, `snapshot clone promote`, `snapshot bookmark create`, `snapshot bookmark delete`, `snapshot hold`, `snapshot release`, `snapshot holds`, `snapshot prune`, `snapshot destroy`, `snapshot rollback`, `snapshot send`, `snapshot receive`, `device remove`, `defrag`, `block attach`, `block detach`, `block list`, `block send`, `block receive`, `dataset create`, `dataset list`, `dataset destroy`, `dataset rename`, `dataset set-strategy`, `dataset seal-key`, `dataset rotate-key`, `dataset upgrade`, `dataset get`, `dataset set`, `dataset list-props` | Pool-name live state routes through the declared kernel/userspace live owner. Explicit `--devices` inputs are offline, discovery, import, or not-yet-imported inputs, not live-state overrides. |
-| `userspace-harness` | `mount`, `pool mount` | Current FUSE harness surfaces. They do not change mount default backing media, and they are not a production kernel runtime claim. |
-| `operator-diagnostic` | `pool integrity-check`, `kernel status`, `diag` | Diagnostic and support-bundle surfaces. `kernel status` is passive inventory while production kernel UAPI wiring is absent. |
-| `prototype` | `cluster pool create` | Prototype cluster operator surface. It is not final distributed operator UAPI and remains behind TFR-017 authority work. |
-| `development-diagnostic` | `cluster placement exercise`, `cluster heal exercise` | Development exercises for placement/heal code. They are not accepted as final distributed operator UAPI or proof of clustered product behavior. |
-| `removed-or-unsupported` | `pool list`, `device rebuild`, `directory-backed pool media`, `pool integrity-check --backing-dir`, `snapshot --backing-dir`, `block --backing-dir`, `device remove --backing-dir`, `device remove --surviving-dirs` | Hidden or retired surfaces must fail closed with clear errors. They must not appear as supported help entries or placeholder success paths. |
+| Command | Class | Routing | Admission | Help | Summary |
+|---|---|---|---|---|---|
+| `pool create` | `public-operator` | `offline-discovery-or-import-input` | `local-only` | `visible` | create an exported pool from explicit byte-addressable devices |
+| `pool scan` | `public-operator` | `offline-discovery-or-import-input` | `unguarded` | `visible` | scan explicit devices for pool labels |
+| `pool status` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | query the live owner by pool name, or scan explicit offline devices |
+| `pool import` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | request owner-mediated import; explicit devices are import inputs |
+| `pool export` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | export through the live owner, or operate on exported explicit devices |
+| `pool destroy` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | destroy through the live owner, or operate on exported explicit devices |
+| `pool get` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | read pool properties through owner authority or explicit offline devices |
+| `pool set` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | set pool properties through owner authority or explicit offline devices |
+| `pool list-props` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list pool property definitions and effective values |
+| `snapshot create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create snapshots through the live owner or explicit offline devices |
+| `snapshot list` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list local snapshot catalog entries with kind, origin, hold, and generation metadata |
+| `snapshot clone create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create local snapshot clones through the live owner or explicit offline devices |
+| `snapshot clone delete` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | delete local snapshot clones through the live owner or explicit offline devices |
+| `snapshot clone promote` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | promote local snapshot clones through the live owner or explicit offline devices |
+| `snapshot bookmark create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create local snapshot bookmarks through the live owner or explicit offline devices |
+| `snapshot bookmark delete` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | delete local snapshot bookmarks through the live owner or explicit offline devices |
+| `snapshot hold` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | place local deletion-prevention holds on snapshots or clones |
+| `snapshot release` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | release local deletion-prevention holds on snapshots or clones |
+| `snapshot holds` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | inspect local snapshot and clone hold counts |
+| `snapshot prune` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | prune regular local snapshots by retention policy while excluding clones and bookmarks |
+| `snapshot destroy` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | destroy snapshots through the live owner or explicit offline devices |
+| `snapshot rollback` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | roll back through the live owner or explicit offline devices |
+| `snapshot send` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | export snapshot streams through owner authority or explicit offline devices |
+| `snapshot receive` | `public-operator` | `live-owner` | `local-only` | `visible` | receive snapshot streams through the live owner; offline receive is unsupported |
+| `device remove` | `public-operator` | `live-owner` | `local-only` | `visible` | route device evacuation/removal through live placement and refcount authority |
+| `defrag` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | request online extent-map defragmentation for a path |
+| `block attach` | `public-operator` | `live-owner` | `local-only` | `visible` | attach an imported pool as a ublk block device through owner authority |
+| `block detach` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | detach an existing ublk device by numeric id |
+| `block list` | `public-operator` | `no-live-pool-state` | `unguarded` | `visible` | list attached ublk devices |
+| `block send` | `public-operator` | `live-owner` | `local-only` | `visible` | send block-volume state through live owner and transport authority |
+| `block receive` | `public-operator` | `live-owner` | `local-only` | `visible` | receive block-volume state through live owner and transport authority |
+| `dataset create` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | create catalog-backed datasets through owner authority or explicit devices |
+| `dataset list` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list catalog-backed datasets through owner authority or explicit devices |
+| `dataset destroy` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | destroy catalog entries through owner authority or explicit devices |
+| `dataset rename` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | rename catalog entries through owner authority or explicit devices |
+| `dataset set-strategy` | `public-operator` | `live-owner-or-offline-input` | `local-only-when-mutating` | `visible` | set dataset feature strategy through owner authority or explicit devices |
+| `dataset seal-key` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | seal dataset keys through owner authority or explicit devices |
+| `dataset rotate-key` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | rotate dataset wrapping keys through owner authority or explicit devices |
+| `dataset upgrade` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | enable supported dataset features through owner authority or explicit devices |
+| `dataset get` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | read dataset properties through owner authority or explicit devices |
+| `dataset set` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | set dataset properties through owner authority or explicit devices |
+| `dataset list-props` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list dataset property definitions and effective values |
+| `mount` | `userspace-harness` | `userspace-harness` | `unguarded` | `visible` | launch the current direct FUSE development harness |
+| `pool mount` | `userspace-harness` | `userspace-harness` | `unguarded` | `visible` | import explicit devices and launch the current FUSE owner harness |
+| `pool integrity-check` | `operator-diagnostic` | `live-owner-or-offline-input` | `unguarded` | `visible` | run live-owner or explicit-device integrity diagnostics |
+| `kernel status` | `operator-diagnostic` | `passive-diagnostic` | `unguarded` | `visible` | passively inspect the declared kernel control endpoint |
+| `diag` | `operator-diagnostic` | `passive-diagnostic` | `unguarded` | `visible` | collect a redacted diagnostic support bundle |
+| `cluster pool create` | `prototype` | `prototype-only` | `unguarded` | `visible` | prototype clustered pool creation; not final distributed operator UAPI |
+| `cluster placement exercise` | `development-diagnostic` | `development-exercise` | `unguarded` | `visible` | development diagnostic exercise for placement-map code |
+| `cluster heal exercise` | `development-diagnostic` | `development-exercise` | `unguarded` | `visible` | development diagnostic exercise for placement-heal code |
+| `pool list` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | no authoritative pool registry exists; use pool scan --devices or pool status <pool> |
+| `device rebuild` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | offline directory object-store rebuild is retired; use live pool repair authority |
+| `directory-backed pool media` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | directory object-store pool media is retired for operator pool commands |
+| `pool integrity-check --backing-dir` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | directory object-store integrity scan mode is retired; use --devices or live owner |
+| `snapshot --backing-dir` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | directory object-store snapshot mode is retired |
+| `block --backing-dir` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | directory object-store block-volume mode is retired |
+| `device remove --backing-dir` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | offline directory device removal is retired |
+| `device remove --surviving-dirs` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | offline directory survivor-device removal is retired |
 
 ## Current Status
 

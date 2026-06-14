@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, RDMA data-path, or final distributed operator UAPI capability before matching proof exists; unreleased internal TideFS paths must not be framed as product compatibility or migration promises without a real external boundary; tidefsctl command classification is the public operator/harness/diagnostic/prototype/removed boundary";
+pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, RDMA data-path, or final distributed operator UAPI capability before matching proof exists; unreleased internal TideFS paths must not be framed as product compatibility or migration promises without a real external boundary; tidefsctl command classification/admission is the public operator/harness/diagnostic/prototype/removed boundary";
 pub const CLAIMS_GATE_REQUIRED_COMMAND: &str = "cargo run -p tidefs-xtask -- check-claims-gate";
 
 pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
@@ -108,6 +109,21 @@ const CRATE_INDEX_LIMITATION_MARKERS: &[&str] = &[
     "`cargo run -p tidefs-xtask -- check-claims-gate`",
 ];
 
+const COMMAND_AUTHORITY_TABLE_DOCS: &[&str] = &[
+    "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
+    "docs/book/chapters/10-tidefsctl.adoc",
+    "docs/security/operator-authz-boundary.md",
+    "docs/CLAIMS_GATE_POLICY.md",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommandSurfaceFact {
+    path: String,
+    class: String,
+    routing: String,
+    summary: String,
+}
+
 #[derive(Debug)]
 pub struct ClaimsGateCheckError {
     missing: Vec<String>,
@@ -202,7 +218,7 @@ pub const CLAIMS_GATE_RULES: &[ClaimGateRule] = &[
     },
     ClaimGateRule {
         topic: ClaimGateRuleTopic::OperatorCommandClassification,
-        rule: "tidefsctl command classification must keep public operator commands, userspace harnesses, diagnostics, prototypes, development exercises, and removed surfaces in separate checked buckets; cluster placement/heal exercises and cluster pool prototypes are not final distributed operator UAPI.",
+        rule: "tidefsctl command classification and admission must keep public operator commands, userspace harnesses, diagnostics, prototypes, development exercises, and removed surfaces in one checked registry table; cluster placement/heal exercises and cluster pool prototypes are not final distributed operator UAPI.",
     },
 ];
 
@@ -272,6 +288,8 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
         check_required_file(&root, rel, &mut missing);
     }
 
+    check_command_authority_docs(&root, &mut missing);
+
     check_source_markers(
         &root,
         "xtask/tidefs-xtask/src/claims.rs",
@@ -287,6 +305,8 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "unreleased authority boundary",
             "mounted transform authority",
             "operator command classification",
+            "command_authority_table_from_workspace",
+            "command_admission",
             "MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY",
             "claims_gate_policy_covers_current_claim_boundaries",
         ],
@@ -311,7 +331,9 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "raw-store inventory",
             "Operator Command Classification",
             "tidefsctl-command-classification-v1",
-            "`cluster placement\nexercise`",
+            "apps/tidefsctl/src/commands/authz.rs",
+            "command_admission",
+            "cluster placement exercise",
         ],
         &mut missing,
     );
@@ -448,6 +470,263 @@ fn check_source_bound_claim_rules(missing: &mut Vec<String>) {
     }
 }
 
+fn check_command_authority_docs(root: &Path, missing: &mut Vec<String>) {
+    let table = match command_authority_table_from_workspace(root) {
+        Ok(table) => table,
+        Err(err) => {
+            missing.push(err);
+            return;
+        }
+    };
+
+    for rel in COMMAND_AUTHORITY_TABLE_DOCS {
+        let path = root.join(rel);
+        let Ok(text) = fs::read_to_string(&path) else {
+            missing.push(format!("could not read `{rel}`"));
+            continue;
+        };
+        if !text.contains(&table) {
+            missing.push(format!(
+                "`{rel}` does not match the exact tidefsctl command authority table from COMMAND_SURFACES and command_admission"
+            ));
+        }
+    }
+}
+
+fn command_authority_table_from_workspace(root: &Path) -> Result<String, String> {
+    let classification =
+        fs::read_to_string(root.join("apps/tidefsctl/src/commands/classification.rs"))
+            .map_err(|err| format!("read tidefsctl command classification registry: {err}"))?;
+    let authz = fs::read_to_string(root.join("apps/tidefsctl/src/commands/authz.rs"))
+        .map_err(|err| format!("read tidefsctl command admission registry: {err}"))?;
+
+    render_command_authority_table(
+        parse_command_surfaces(&classification)?,
+        parse_command_admissions(&authz)?,
+    )
+}
+
+fn render_command_authority_table(
+    surfaces: Vec<CommandSurfaceFact>,
+    mut admissions: BTreeMap<String, String>,
+) -> Result<String, String> {
+    let mut table = String::from("| Command | Class | Routing | Admission | Help | Summary |\n");
+    table.push_str("|---|---|---|---|---|---|\n");
+
+    for surface in surfaces {
+        let admission = admissions
+            .remove(&surface.path)
+            .ok_or_else(|| format!("missing command_admission entry for `{}`", surface.path))?;
+        table.push_str("| `");
+        table.push_str(&surface.path);
+        table.push_str("` | `");
+        table.push_str(&surface.class);
+        table.push_str("` | `");
+        table.push_str(&surface.routing);
+        table.push_str("` | `");
+        table.push_str(&admission);
+        table.push_str("` | `");
+        table.push_str(if surface.class == "removed-or-unsupported" {
+            "hidden"
+        } else {
+            "visible"
+        });
+        table.push_str("` | ");
+        table.push_str(&surface.summary);
+        table.push_str(" |\n");
+    }
+
+    if !admissions.is_empty() {
+        let extra = admissions.keys().cloned().collect::<Vec<_>>().join(", ");
+        return Err(format!(
+            "command_admission entries are not present in COMMAND_SURFACES: {extra}"
+        ));
+    }
+
+    Ok(table)
+}
+
+fn parse_command_surfaces(source: &str) -> Result<Vec<CommandSurfaceFact>, String> {
+    let array = source_array_body(source, "pub(crate) const COMMAND_SURFACES")
+        .ok_or_else(|| "missing COMMAND_SURFACES array".to_string())?;
+    let mut surfaces = Vec::new();
+
+    for entry in array.split("CommandSurface {").skip(1) {
+        let block = entry
+            .split_once("},")
+            .map(|(block, _)| block)
+            .ok_or_else(|| "unterminated CommandSurface entry".to_string())?;
+        surfaces.push(CommandSurfaceFact {
+            path: extract_string_field(block, "path")?,
+            class: command_class_label(&extract_enum_field(block, "class", "CommandClass::")?)?
+                .to_string(),
+            routing: routing_label(&extract_enum_field(block, "routing", "RoutingSemantics::")?)?
+                .to_string(),
+            summary: extract_string_field(block, "summary")?,
+        });
+    }
+
+    if surfaces.is_empty() {
+        return Err("COMMAND_SURFACES did not yield any command surfaces".to_string());
+    }
+
+    Ok(surfaces)
+}
+
+fn parse_command_admissions(source: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut admissions = BTreeMap::new();
+    for (array, label) in [
+        ("LOCAL_ONLY_COMMANDS", "local-only"),
+        (
+            "LOCAL_ONLY_WHEN_MUTATING_COMMANDS",
+            "local-only-when-mutating",
+        ),
+        ("UNGUARDED_COMMANDS", "unguarded"),
+    ] {
+        for command in parse_string_array(source, array)? {
+            if let Some(previous) = admissions.insert(command.clone(), label.to_string()) {
+                return Err(format!(
+                    "`{command}` appears in multiple command_admission buckets: {previous} and {label}"
+                ));
+            }
+        }
+    }
+    Ok(admissions)
+}
+
+fn parse_string_array(source: &str, const_name: &str) -> Result<Vec<String>, String> {
+    let body = source_array_body(source, const_name)
+        .ok_or_else(|| format!("missing `{const_name}` array"))?;
+    parse_string_literals(body)
+}
+
+fn source_array_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let start = source.find(name)?;
+    let after_name = &source[start..];
+    let array_start = after_name.find("= &[")? + 4;
+    let after_open = &after_name[array_start..];
+    let array_end = after_open.find("];")?;
+    Some(&after_open[..array_end])
+}
+
+fn extract_string_field(block: &str, field: &str) -> Result<String, String> {
+    let marker = format!("{field}:");
+    let after_field = block
+        .split_once(&marker)
+        .map(|(_, after)| after)
+        .ok_or_else(|| format!("missing `{field}` field in CommandSurface entry"))?;
+    parse_first_string_literal(after_field)
+        .ok_or_else(|| format!("missing string literal for `{field}` field"))
+}
+
+fn extract_enum_field(block: &str, field: &str, prefix: &str) -> Result<String, String> {
+    let marker = format!("{field}:");
+    let after_field = block
+        .split_once(&marker)
+        .map(|(_, after)| after)
+        .ok_or_else(|| format!("missing `{field}` field in CommandSurface entry"))?;
+    let after_prefix = after_field
+        .split_once(prefix)
+        .map(|(_, after)| after)
+        .ok_or_else(|| format!("missing `{prefix}` enum value for `{field}` field"))?;
+    let value = after_prefix
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect::<String>();
+    if value.is_empty() {
+        Err(format!("empty enum value for `{field}` field"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn parse_string_literals(input: &str) -> Result<Vec<String>, String> {
+    let mut literals = Vec::new();
+    let mut rest = input;
+
+    while let Some(literal) = parse_first_string_literal(rest) {
+        let start = rest
+            .find('"')
+            .expect("literal parser found a quoted string");
+        let consumed = quoted_literal_len(&rest[start..])
+            .ok_or_else(|| "unterminated string literal".to_string())?;
+        literals.push(literal);
+        rest = &rest[start + consumed..];
+    }
+
+    Ok(literals)
+}
+
+fn parse_first_string_literal(input: &str) -> Option<String> {
+    let start = input.find('"')?;
+    let quoted = &input[start..];
+    let mut out = String::new();
+    let mut escaped = false;
+
+    for ch in quoted[1..].chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            return Some(out);
+        }
+        out.push(ch);
+    }
+
+    None
+}
+
+fn quoted_literal_len(input: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, ch) in input[1..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            return Some(offset + 2);
+        }
+    }
+    None
+}
+
+fn command_class_label(value: &str) -> Result<&'static str, String> {
+    match value {
+        "PublicOperator" => Ok("public-operator"),
+        "UserspaceHarness" => Ok("userspace-harness"),
+        "OperatorDiagnostic" => Ok("operator-diagnostic"),
+        "Prototype" => Ok("prototype"),
+        "DevelopmentDiagnostic" => Ok("development-diagnostic"),
+        "RemovedOrUnsupported" => Ok("removed-or-unsupported"),
+        other => Err(format!("unknown CommandClass::{other}")),
+    }
+}
+
+fn routing_label(value: &str) -> Result<&'static str, String> {
+    match value {
+        "NoLivePoolState" => Ok("no-live-pool-state"),
+        "LiveOwner" => Ok("live-owner"),
+        "LiveOwnerOrOfflineInput" => Ok("live-owner-or-offline-input"),
+        "OfflineDiscoveryOrImportInput" => Ok("offline-discovery-or-import-input"),
+        "UserspaceHarness" => Ok("userspace-harness"),
+        "PassiveDiagnostic" => Ok("passive-diagnostic"),
+        "PrototypeOnly" => Ok("prototype-only"),
+        "DevelopmentExercise" => Ok("development-exercise"),
+        "Removed" => Ok("removed"),
+        other => Err(format!("unknown RoutingSemantics::{other}")),
+    }
+}
+
 fn scan_public_claim_surfaces(root: &Path, missing: &mut Vec<String>) {
     for rel in CLAIMS_GATE_SCANNED_DOCS {
         let path = root.join(rel);
@@ -524,7 +803,8 @@ fn find_workspace_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        claims_gate_rules, line_has_present_tense_overclaim, ClaimGateRuleTopic,
+        claims_gate_rules, line_has_present_tense_overclaim, parse_command_admissions,
+        parse_command_surfaces, render_command_authority_table, ClaimGateRuleTopic,
         APP_INDEX_LIMITATION_MARKERS, CLAIMS_GATE_POLICY_SPEC, CLAIMS_GATE_REQUIRED_COMMAND,
         CLAIMS_GATE_SCANNED_DOCS, CRATE_INDEX_LIMITATION_MARKERS,
     };
@@ -615,6 +895,108 @@ mod tests {
                 "crates index should require marker {marker}"
             );
         }
+    }
+
+    #[test]
+    fn command_authority_table_changes_with_registry_or_admission_drift() {
+        const BASE_CLASSIFICATION: &str = r#"
+pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
+    CommandSurface {
+        path: "pool scan",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::OfflineDiscoveryOrImportInput,
+        summary: "scan explicit devices for pool labels",
+    },
+];
+"#;
+        const TWO_SURFACE_CLASSIFICATION: &str = r#"
+pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
+    CommandSurface {
+        path: "pool scan",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::OfflineDiscoveryOrImportInput,
+        summary: "scan explicit devices for pool labels",
+    },
+    CommandSurface {
+        path: "diag",
+        class: CommandClass::OperatorDiagnostic,
+        routing: RoutingSemantics::PassiveDiagnostic,
+        summary: "collect a redacted local support bundle",
+    },
+];
+"#;
+        const BASE_AUTHZ: &str = r#"
+const LOCAL_ONLY_COMMANDS: &[&str] = &[];
+const LOCAL_ONLY_WHEN_MUTATING_COMMANDS: &[&str] = &[];
+const UNGUARDED_COMMANDS: &[&str] = &["pool scan"];
+"#;
+        const TWO_SURFACE_AUTHZ: &str = r#"
+const LOCAL_ONLY_COMMANDS: &[&str] = &[];
+const LOCAL_ONLY_WHEN_MUTATING_COMMANDS: &[&str] = &[];
+const UNGUARDED_COMMANDS: &[&str] = &["pool scan", "diag"];
+"#;
+        const MISSING_AUTHZ: &str = r#"
+const LOCAL_ONLY_COMMANDS: &[&str] = &[];
+const LOCAL_ONLY_WHEN_MUTATING_COMMANDS: &[&str] = &[];
+const UNGUARDED_COMMANDS: &[&str] = &[];
+"#;
+        const EXTRA_AUTHZ: &str = r#"
+const LOCAL_ONLY_COMMANDS: &[&str] = &[];
+const LOCAL_ONLY_WHEN_MUTATING_COMMANDS: &[&str] = &[];
+const UNGUARDED_COMMANDS: &[&str] = &["pool scan", "diag"];
+"#;
+
+        let table = fixture_table(BASE_CLASSIFICATION, BASE_AUTHZ).expect("base fixture table");
+        let added =
+            fixture_table(TWO_SURFACE_CLASSIFICATION, TWO_SURFACE_AUTHZ).expect("added command");
+        assert_ne!(
+            table, added,
+            "adding a command must change the required table"
+        );
+
+        let reclassified = fixture_table(
+            &BASE_CLASSIFICATION.replace("CommandClass::PublicOperator", "CommandClass::Prototype"),
+            BASE_AUTHZ,
+        )
+        .expect("reclassified command");
+        assert_ne!(
+            table, reclassified,
+            "reclassifying a command must change the required table"
+        );
+
+        let rerouted = fixture_table(
+            &BASE_CLASSIFICATION.replace(
+                "RoutingSemantics::OfflineDiscoveryOrImportInput",
+                "RoutingSemantics::PassiveDiagnostic",
+            ),
+            BASE_AUTHZ,
+        )
+        .expect("rerouted command");
+        assert_ne!(
+            table, rerouted,
+            "rerouting a command must change the required table"
+        );
+
+        let deleted =
+            fixture_table(BASE_CLASSIFICATION, BASE_AUTHZ).expect("single-command fixture");
+        assert_ne!(
+            added, deleted,
+            "deleting a command from a larger table must change the required table"
+        );
+
+        assert!(fixture_table(BASE_CLASSIFICATION, MISSING_AUTHZ)
+            .expect_err("missing admission should fail")
+            .contains("missing command_admission entry"));
+        assert!(fixture_table(BASE_CLASSIFICATION, EXTRA_AUTHZ)
+            .expect_err("extra admission should fail")
+            .contains("not present in COMMAND_SURFACES"));
+    }
+
+    fn fixture_table(classification: &str, authz: &str) -> Result<String, String> {
+        render_command_authority_table(
+            parse_command_surfaces(classification)?,
+            parse_command_admissions(authz)?,
+        )
     }
 
     #[test]

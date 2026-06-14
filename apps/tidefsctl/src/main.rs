@@ -548,37 +548,14 @@ mod tests {
         let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md");
         let doc = std::fs::read_to_string(&doc_path).expect("read preview UAPI doc");
+        let table = commands::command_surface_authority_table();
 
         assert!(doc.contains(commands::classification::COMMAND_CLASSIFICATION_DOC_MARKER));
         assert!(doc.contains(commands::classification::COMMAND_CLASSIFICATION_SOURCE_PATH));
-
-        for class in [
-            "public-operator",
-            "userspace-harness",
-            "operator-diagnostic",
-            "prototype",
-            "development-diagnostic",
-            "removed-or-unsupported",
-        ] {
-            assert!(
-                doc.contains(class),
-                "preview UAPI doc should mention classification class {class}"
-            );
-        }
-
-        for critical_surface in [
-            "cluster placement exercise",
-            "cluster heal exercise",
-            "cluster pool create",
-            "pool list",
-            "device rebuild",
-            "pool integrity-check --backing-dir",
-        ] {
-            assert!(
-                doc.contains(critical_surface),
-                "preview UAPI doc should mention {critical_surface}"
-            );
-        }
+        assert!(
+            doc.contains(&table),
+            "preview UAPI doc must carry the exact command registry/admission table"
+        );
     }
 
     #[test]
@@ -586,30 +563,14 @@ mod tests {
         let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/book/chapters/10-tidefsctl.adoc");
         let doc = std::fs::read_to_string(&doc_path).expect("read tidefsctl book chapter");
+        let table = commands::command_surface_authority_table();
 
         assert!(doc.contains(commands::classification::COMMAND_CLASSIFICATION_DOC_MARKER));
         assert!(doc.contains(commands::classification::COMMAND_CLASSIFICATION_SOURCE_PATH));
-
-        for class in [
-            "public-operator",
-            "userspace-harness",
-            "operator-diagnostic",
-            "prototype",
-            "development-diagnostic",
-            "removed-or-unsupported",
-        ] {
-            assert!(
-                doc.contains(class),
-                "tidefsctl book chapter should mention classification class {class}"
-            );
-        }
-
-        assert!(doc.contains("cluster placement exercise"));
-        assert!(doc.contains("cluster heal exercise"));
-        assert!(doc.contains("cluster pool create"));
-        assert!(doc.contains("not final distributed operator UAPI"));
-        assert!(doc.contains("pool list"));
-        assert!(doc.contains("device rebuild"));
+        assert!(
+            doc.contains(&table),
+            "tidefsctl book chapter must carry the exact command registry/admission table"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Local-only admission for privileged `tidefsctl` command handlers.
 
+use crate::commands::classification::COMMAND_SURFACES;
 use tidefs_auth::local_only::{LocalOnlyError, LocalOnlyGuard};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,6 +13,14 @@ pub(crate) enum CommandAdmission {
 impl CommandAdmission {
     pub(crate) const fn requires_local_only(self) -> bool {
         matches!(self, Self::LocalOnly | Self::LocalOnlyWhenMutating)
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "local-only",
+            Self::LocalOnlyWhenMutating => "local-only-when-mutating",
+            Self::Unguarded => "unguarded",
+        }
     }
 }
 
@@ -92,6 +101,35 @@ pub(crate) fn command_admission(command: &str) -> Option<CommandAdmission> {
     }
 }
 
+pub(crate) fn command_surface_authority_table() -> String {
+    let mut out = String::from("| Command | Class | Routing | Admission | Help | Summary |\n");
+    out.push_str("|---|---|---|---|---|---|\n");
+
+    for surface in COMMAND_SURFACES {
+        let admission =
+            command_admission(surface.path).expect("classified command surface admission");
+        out.push_str("| `");
+        out.push_str(surface.path);
+        out.push_str("` | `");
+        out.push_str(surface.class.label());
+        out.push_str("` | `");
+        out.push_str(surface.routing.label());
+        out.push_str("` | `");
+        out.push_str(admission.label());
+        out.push_str("` | `");
+        out.push_str(if surface.visible_in_root_help() {
+            "visible"
+        } else {
+            "hidden"
+        });
+        out.push_str("` | ");
+        out.push_str(surface.summary);
+        out.push_str(" |\n");
+    }
+
+    out
+}
+
 pub(crate) fn require_local_only(command: &'static str) -> LocalOnlyGuard {
     debug_assert!(
         matches!(
@@ -122,7 +160,7 @@ fn refuse(command: &'static str, err: LocalOnlyError) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::classification::{CommandClass, COMMAND_SURFACES};
+    use crate::commands::classification::CommandClass;
 
     #[test]
     fn issue_239_privileged_commands_require_local_only() {
@@ -219,5 +257,89 @@ mod tests {
                 surface.path
             );
         }
+    }
+
+    #[test]
+    fn admission_entries_all_point_at_registered_command_surfaces() {
+        for command in LOCAL_ONLY_COMMANDS
+            .iter()
+            .copied()
+            .chain(LOCAL_ONLY_WHEN_MUTATING_COMMANDS.iter().copied())
+            .chain(UNGUARDED_COMMANDS.iter().copied())
+        {
+            assert!(
+                COMMAND_SURFACES
+                    .iter()
+                    .any(|surface| surface.path == command),
+                "admission entry {command} is missing from COMMAND_SURFACES"
+            );
+        }
+    }
+
+    #[test]
+    fn non_final_and_removed_surfaces_do_not_inherit_privileged_claims() {
+        for surface in COMMAND_SURFACES.iter().filter(|surface| {
+            matches!(
+                surface.class,
+                CommandClass::Prototype
+                    | CommandClass::DevelopmentDiagnostic
+                    | CommandClass::RemovedOrUnsupported
+            )
+        }) {
+            assert_eq!(
+                command_admission(surface.path),
+                Some(CommandAdmission::Unguarded),
+                "{} should stay explicitly unguarded rather than borrowing privileged/public claims",
+                surface.path
+            );
+        }
+    }
+
+    #[test]
+    fn command_surface_authority_table_carries_registry_and_admission_facts() {
+        let table = command_surface_authority_table();
+        assert!(table.contains("| Command | Class | Routing | Admission | Help | Summary |"));
+
+        for surface in COMMAND_SURFACES {
+            assert!(
+                table.contains(surface.path),
+                "authority table missing command {}",
+                surface.path
+            );
+            assert!(
+                table.contains(surface.class.label()),
+                "authority table missing class {}",
+                surface.class.label()
+            );
+            assert!(
+                table.contains(surface.routing.label()),
+                "authority table missing routing {}",
+                surface.routing.label()
+            );
+            let admission = command_admission(surface.path).expect("admission decision");
+            assert!(
+                table.contains(admission.label()),
+                "authority table missing admission {}",
+                admission.label()
+            );
+            assert!(
+                table.contains(surface.summary),
+                "authority table missing summary for {}",
+                surface.path
+            );
+        }
+    }
+
+    #[test]
+    fn operator_authz_boundary_contains_exact_command_authority_table() {
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/security/operator-authz-boundary.md");
+        let doc = std::fs::read_to_string(&doc_path).expect("read operator authz boundary doc");
+        let table = command_surface_authority_table();
+
+        assert!(
+            doc.contains(&table),
+            "operator authz boundary doc must carry the exact command registry/admission table"
+        );
     }
 }

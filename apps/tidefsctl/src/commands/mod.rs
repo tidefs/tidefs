@@ -13,6 +13,9 @@ mod offline_pool;
 pub mod pool;
 pub mod snapshot;
 
+#[cfg(test)]
+pub(crate) use authz::command_surface_authority_table;
+
 pub(crate) use offline_pool::refuse_runtime_pool_path;
 
 use std::path::PathBuf;
