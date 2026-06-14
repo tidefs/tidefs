@@ -6011,7 +6011,7 @@ impl FuseVfsAdapter {
                     && (copy_start != off || copy_end != off.saturating_add(page_size))
                 {
                     match u32::try_from(page_size) {
-                        Ok(read_size) => engine.read(efh, off, read_size, ctx).ok(),
+                        Ok(read_size) => engine.read_for_cache_fill(efh, off, read_size, ctx).ok(),
                         Err(_) => None,
                     }
                 } else {
@@ -10927,6 +10927,116 @@ mod tests {
             after_read.posix.ctime_ns, after_write.posix.ctime_ns,
             "automatic read atime updates must not advance ctime"
         );
+    }
+
+    #[test]
+    fn read_open_after_write_advances_relatime_atime_without_ctime() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let created = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"xfstests-generic-003-open-atime.txt",
+                0o644,
+                libc::O_WRONLY as u32,
+            )
+            .expect("create write-only handle");
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, created.attr.inode_id.get(), &stale_atime, None)
+            .expect("force old atime before write");
+
+        let before_write = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(created.attr.inode_id, None, &ctx)
+                .expect("getattr before write")
+        };
+        assert_eq!(before_write.posix.atime_ns, 1);
+
+        std::thread::sleep(Duration::from_millis(1));
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                created.attr.inode_id.get(),
+                created.adapter_fh,
+                0,
+                b"aaa\n",
+                0,
+            )
+            .expect("write payload");
+        let after_write = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(created.attr.inode_id, None, &ctx)
+                .expect("getattr after write")
+        };
+        assert_eq!(
+            after_write.posix.atime_ns, before_write.posix.atime_ns,
+            "write-only updates must leave atime for the later read"
+        );
+        assert!(
+            after_write.posix.mtime_ns >= before_write.posix.mtime_ns,
+            "write-only updates must advance mtime"
+        );
+        assert!(
+            after_write.posix.ctime_ns >= before_write.posix.ctime_ns,
+            "write-only updates must advance ctime"
+        );
+
+        fixture
+            .adapter
+            .dispatch_release(
+                created.attr.inode_id.get(),
+                created.adapter_fh,
+                0,
+                None,
+                true,
+            )
+            .expect("release writer");
+
+        std::thread::sleep(Duration::from_millis(1));
+        let read_open = fixture
+            .adapter
+            .dispatch_open(&ctx, created.attr.inode_id.get(), libc::O_RDONLY as u32)
+            .expect("open read-only handle");
+
+        let after_read_open = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(created.attr.inode_id, None, &ctx)
+                .expect("getattr after read open")
+        };
+        assert!(
+            after_read_open.posix.atime_ns > after_write.posix.atime_ns,
+            "the first read-only open after a write must advance relatime atime"
+        );
+        assert_eq!(
+            after_read_open.posix.ctime_ns, after_write.posix.ctime_ns,
+            "read-open atime updates must not advance ctime"
+        );
+
+        fixture
+            .adapter
+            .dispatch_release(
+                created.attr.inode_id.get(),
+                read_open.adapter_fh,
+                0,
+                None,
+                false,
+            )
+            .expect("release reader");
     }
 
     #[test]
