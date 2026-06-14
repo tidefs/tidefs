@@ -2897,13 +2897,6 @@ impl FuseVfsAdapter {
         if self.writeback_cache_enabled && (open_flags & libc::O_APPEND as u32) != 0 {
             reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
         }
-        if self.writeback_cache_enabled
-            && !self.read_only
-            && self.timestamp_policy != TimestampPolicy::NoAtime
-            && (open_flags & libc::O_ACCMODE as u32) == libc::O_RDONLY as u32
-        {
-            reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
-        }
         if self.writeback_cache_enabled && (reply_flags & fuser::consts::FOPEN_DIRECT_IO) == 0 {
             reply_flags |= fuser::consts::FOPEN_KEEP_CACHE;
         }
@@ -39203,7 +39196,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_read_atime_read_open_uses_fuse_direct_io() {
+    fn writeback_readonly_open_preserves_kernel_page_cache() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let root = {
@@ -39215,44 +39208,7 @@ mod tests {
             .dispatch_create_entry(
                 &ctx,
                 root.get(),
-                b"wb-read-atime-direct-io.txt",
-                0o644,
-                libc::O_RDWR as u32,
-            )
-            .expect("create writeback-cache file");
-
-        let read_open = fixture
-            .adapter
-            .dispatch_open(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
-            .expect("open read-only under writeback cache");
-        assert_ne!(
-            read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
-            0,
-            "read-atime writeback-cache read opens must enter the daemon"
-        );
-        assert_eq!(
-            read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
-            0,
-            "direct I/O read-atime opens must not ask the kernel to keep cache"
-        );
-    }
-
-    #[test]
-    fn writeback_noatime_read_open_preserves_kernel_page_cache() {
-        let mut fixture = adapter_fixture_with_writeback_cache();
-        fixture.adapter.timestamp_policy = TimestampPolicy::NoAtime;
-        fixture.adapter.refresh_dentry_policy_for_timestamp_mode();
-        let ctx = root_ctx();
-        let root = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine.get_root_inode(&ctx).expect("root inode")
-        };
-        let create = fixture
-            .adapter
-            .dispatch_create_entry(
-                &ctx,
-                root.get(),
-                b"wb-noatime-keep-cache.txt",
+                b"wb-readonly-keep-cache.txt",
                 0o644,
                 libc::O_RDWR as u32,
             )
@@ -39265,12 +39221,12 @@ mod tests {
         assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
             0,
-            "noatime writeback-cache read opens do not need daemon-visible reads"
+            "read-only writeback-cache opens must not force direct I/O"
         );
         assert_ne!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
             0,
-            "noatime read opens should preserve kernel page-cache reuse"
+            "read-only reopen must preserve dirty kernel writeback-cache pages"
         );
     }
 
