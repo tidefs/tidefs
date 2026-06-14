@@ -47,6 +47,10 @@ pub enum MountOption {
     NoExec,
     /// Support inode access time
     Atime,
+    /// Update inode access time using Linux relatime rules
+    Relatime,
+    /// Update inode access time on every access
+    StrictAtime,
     /// Don't update inode access time
     NoAtime,
     /// All modifications to directories will be done synchronously
@@ -98,8 +102,26 @@ fn conflicts_with(option: &MountOption) -> Vec<MountOption> {
         MountOption::RW => vec![MountOption::RO],
         MountOption::Exec => vec![MountOption::NoExec],
         MountOption::NoExec => vec![MountOption::Exec],
-        MountOption::Atime => vec![MountOption::NoAtime],
-        MountOption::NoAtime => vec![MountOption::Atime],
+        MountOption::Atime => vec![
+            MountOption::NoAtime,
+            MountOption::Relatime,
+            MountOption::StrictAtime,
+        ],
+        MountOption::Relatime => vec![
+            MountOption::Atime,
+            MountOption::NoAtime,
+            MountOption::StrictAtime,
+        ],
+        MountOption::StrictAtime => vec![
+            MountOption::Atime,
+            MountOption::Relatime,
+            MountOption::NoAtime,
+        ],
+        MountOption::NoAtime => vec![
+            MountOption::Atime,
+            MountOption::Relatime,
+            MountOption::StrictAtime,
+        ],
         MountOption::DirSync => vec![],
         MountOption::Sync => vec![MountOption::Async],
         MountOption::Async => vec![MountOption::Sync],
@@ -128,6 +150,8 @@ pub fn option_to_string(option: &MountOption) -> String {
         MountOption::Exec => "exec".to_string(),
         MountOption::NoExec => "noexec".to_string(),
         MountOption::Atime => "atime".to_string(),
+        MountOption::Relatime => "relatime".to_string(),
+        MountOption::StrictAtime => "strictatime".to_string(),
         MountOption::NoAtime => "noatime".to_string(),
         MountOption::DirSync => "dirsync".to_string(),
         MountOption::Sync => "sync".to_string(),
@@ -145,11 +169,17 @@ mod test {
     fn option_checking() {
         assert!(check_option_conflicts(&[MountOption::Suid, MountOption::NoSuid]).is_err());
         assert!(check_option_conflicts(&[MountOption::Suid, MountOption::NoExec]).is_ok());
+        assert!(check_option_conflicts(&[MountOption::Relatime, MountOption::NoAtime]).is_err());
+        assert!(
+            check_option_conflicts(&[MountOption::StrictAtime, MountOption::Relatime]).is_err()
+        );
     }
 
     #[test]
     fn writeback_cache_is_session_only() {
         assert!(!is_driver_mount_option(&MountOption::WritebackCache));
+        assert!(is_driver_mount_option(&MountOption::Relatime));
+        assert!(is_driver_mount_option(&MountOption::StrictAtime));
         assert!(is_driver_mount_option(&MountOption::NoAtime));
     }
 }

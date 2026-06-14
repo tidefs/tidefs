@@ -26,15 +26,14 @@ pub enum TimestampPolicy {
 impl TimestampPolicy {
     /// Return the FUSE kernel mount option needed for this timestamp policy.
     ///
-    /// libfuse accepts `noatime` but rejects `atime`; strict atime is therefore
-    /// a daemon-enforced policy with no extra kernel mount option.
-    /// `RelativeAtime` maps to `NoAtime` because the daemon enforces relatime.
+    /// The daemon also records read access in the backing VFS engine, but the
+    /// kernel still needs the matching mount flag for reads served from its
+    /// page cache without crossing the daemon boundary.
     pub fn to_fuse_mount_option(self) -> Option<fuser::MountOption> {
         match self {
-            TimestampPolicy::StrictAtime => None,
-            TimestampPolicy::RelativeAtime | TimestampPolicy::NoAtime => {
-                Some(fuser::MountOption::NoAtime)
-            }
+            TimestampPolicy::StrictAtime => Some(fuser::MountOption::StrictAtime),
+            TimestampPolicy::RelativeAtime => Some(fuser::MountOption::Relatime),
+            TimestampPolicy::NoAtime => Some(fuser::MountOption::NoAtime),
         }
     }
 
@@ -242,15 +241,17 @@ mod tests {
 
     #[test]
     fn timestamp_policy_to_fuse_mount_option_atime() {
-        assert_eq!(TimestampPolicy::StrictAtime.to_fuse_mount_option(), None);
+        assert_eq!(
+            TimestampPolicy::StrictAtime.to_fuse_mount_option(),
+            Some(fuser::MountOption::StrictAtime)
+        );
     }
 
     #[test]
     fn timestamp_policy_to_fuse_mount_option_relatime() {
-        // relatime is enforced in userspace; kernel gets NoAtime.
         assert_eq!(
             TimestampPolicy::RelativeAtime.to_fuse_mount_option(),
-            Some(fuser::MountOption::NoAtime)
+            Some(fuser::MountOption::Relatime)
         );
     }
 
@@ -413,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_atime_does_not_emit_rejected_fuse_atime_option() {
+    fn strict_atime_emits_kernel_strictatime_option() {
         let opts = MountOptions {
             timestamp_policy: TimestampPolicy::StrictAtime,
             sync: false,
@@ -422,7 +423,26 @@ mod tests {
             dev: false,
             intent_log_write: true,
         };
-        assert!(opts.to_fuse_mount_options().is_empty());
+        assert_eq!(
+            opts.to_fuse_mount_options(),
+            vec![fuser::MountOption::StrictAtime]
+        );
+    }
+
+    #[test]
+    fn relative_atime_emits_kernel_relatime_option() {
+        let opts = MountOptions {
+            timestamp_policy: TimestampPolicy::RelativeAtime,
+            sync: false,
+            sync_guarantee: SyncGuarantee::Local,
+            allow_other: false,
+            dev: false,
+            intent_log_write: true,
+        };
+        assert_eq!(
+            opts.to_fuse_mount_options(),
+            vec![fuser::MountOption::Relatime]
+        );
     }
     // -- intent_log_write mount-option parsing ------------------------
 
