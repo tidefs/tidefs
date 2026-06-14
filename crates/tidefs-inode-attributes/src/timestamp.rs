@@ -20,12 +20,12 @@ use tidefs_types_vfs_core::PosixAttrs;
 /// POSIX requires atime to be updated on read(2) unless the filesystem
 /// is mounted with a policy that suppresses it. `Relatime` (the default)
 /// balances correctness and write amplification by only updating atime
-/// when the previous atime is behind mtime or ctime, or more than 24 hours
-/// have elapsed since the last atime update.
+/// when the previous atime is not newer than mtime or ctime, or more than
+/// 24 hours have elapsed since the last atime update.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimestampPolicy {
-    /// `relatime`: update atime only when previous atime < mtime,
-    /// previous atime < ctime, or >24h since last atime update.
+    /// `relatime`: update atime only when previous atime <= mtime,
+    /// previous atime <= ctime, or >24h since last atime update.
     Relatime,
     /// `noatime`: suppress atime updates except when the operation also
     /// changes mtime or ctime.
@@ -126,8 +126,8 @@ fn apply_ctime_only_rules(attrs: &mut PosixAttrs, now_ns: i64) -> bool {
 ///
 /// `strictatime` always updates. `noatime` suppresses updates.
 /// `relatime` updates only when:
-/// - the previous atime is older than mtime, or
-/// - the previous atime is older than ctime, or
+/// - the previous atime is not newer than mtime, or
+/// - the previous atime is not newer than ctime, or
 /// - more than 24 hours have elapsed since the last atime update.
 fn apply_atime_rules(attrs: &mut PosixAttrs, policy: TimestampPolicy, now_ns: i64) -> bool {
     match policy {
@@ -149,10 +149,10 @@ fn apply_atime_rules(attrs: &mut PosixAttrs, policy: TimestampPolicy, now_ns: i6
 
 /// Relatime decision: should atime be updated?
 fn should_update_atime_relatime(attrs: &PosixAttrs, now_ns: i64) -> bool {
-    if attrs.atime_ns < attrs.mtime_ns {
+    if attrs.atime_ns <= attrs.mtime_ns {
         return true;
     }
-    if attrs.atime_ns < attrs.ctime_ns {
+    if attrs.atime_ns <= attrs.ctime_ns {
         return true;
     }
     if now_ns.saturating_sub(attrs.atime_ns) >= RELATIME_24H_NS {
@@ -427,6 +427,38 @@ mod tests {
             9_000_000_000,
         );
         assert!(changed);
+    }
+
+    #[test]
+    fn relatime_boundary_equal_mtime_triggers_update() {
+        let mut attrs = base_attrs();
+        attrs.atime_ns = 5_000_000_000;
+        attrs.mtime_ns = 5_000_000_000;
+        attrs.ctime_ns = 4_000_000_000;
+        let changed = apply_timestamp_rules_at(
+            TimestampUpdate::Read,
+            &mut attrs,
+            TimestampPolicy::Relatime,
+            9_000_000_000,
+        );
+        assert!(changed);
+        assert_eq!(attrs.atime_ns, 9_000_000_000);
+    }
+
+    #[test]
+    fn relatime_boundary_equal_ctime_triggers_update() {
+        let mut attrs = base_attrs();
+        attrs.atime_ns = 5_000_000_000;
+        attrs.mtime_ns = 4_000_000_000;
+        attrs.ctime_ns = 5_000_000_000;
+        let changed = apply_timestamp_rules_at(
+            TimestampUpdate::Read,
+            &mut attrs,
+            TimestampPolicy::Relatime,
+            9_000_000_000,
+        );
+        assert!(changed);
+        assert_eq!(attrs.atime_ns, 9_000_000_000);
     }
 
     #[test]

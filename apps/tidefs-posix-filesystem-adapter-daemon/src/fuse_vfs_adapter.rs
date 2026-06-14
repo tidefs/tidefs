@@ -1767,6 +1767,10 @@ fn is_timestamp_only_setattr(attr: &SetAttr) -> bool {
     attr.valid & timestamp_bits != 0 && attr.valid & !timestamp_bits == 0
 }
 
+fn is_fuse_read_atime_setattr(attr: &SetAttr, fh: Option<u64>) -> bool {
+    fh.is_none() && (attr.valid == FATTR_ATIME || attr.valid == FATTR_ATIME_NOW)
+}
+
 fn orphan_timestamp_attr_out(ino: u64, attr: &SetAttr, ctx: &RequestCtx) -> FuseAttrOut {
     let now_ns = system_time_to_ns(SystemTime::now());
     let atime_ns = if attr.valid & FATTR_ATIME != 0 {
@@ -4513,6 +4517,62 @@ impl FuseVfsAdapter {
         } else {
             self.invalidate_inode_metadata_local(ino);
         }
+
+        Ok(crate::workers_meta::fuse_attr_out(
+            ino,
+            &updated.posix,
+            updated.kind,
+        ))
+    }
+
+    fn dispatch_fuse_setattr(
+        &self,
+        ctx: &RequestCtx,
+        unique: u64,
+        ino: u64,
+        attr: &SetAttr,
+        fh: Option<u64>,
+    ) -> Result<FuseAttrOut, Errno> {
+        if is_fuse_read_atime_setattr(attr, fh) {
+            return self.dispatch_fuse_read_atime_setattr(ctx, unique, ino);
+        }
+        self.dispatch_setattr(ctx, unique, ino, attr, fh)
+    }
+
+    fn dispatch_fuse_read_atime_setattr(
+        &self,
+        ctx: &RequestCtx,
+        unique: u64,
+        ino: u64,
+    ) -> Result<FuseAttrOut, Errno> {
+        if self.read_only || self.timestamp_policy == TimestampPolicy::NoAtime {
+            return self.dispatch_getattr(ctx, ino, unique, None);
+        }
+
+        let inode_id = InodeId::new(ino);
+        let updated = {
+            let e = self.engine.lock().unwrap();
+            match e.record_read_access(inode_id, ctx) {
+                Ok(()) => {}
+                Err(Errno::ENOENT | Errno::ESTALE) if self.namespace.is_some() => {
+                    drop(e);
+                    return self.dispatch_getattr(ctx, ino, unique, None);
+                }
+                Err(Errno::ENOENT) => return Err(Errno::ESTALE),
+                Err(errno) => return Err(errno),
+            }
+            match e.getattr(inode_id, None, ctx) {
+                Ok(attr) => attr,
+                Err(Errno::ENOENT | Errno::ESTALE) if self.namespace.is_some() => {
+                    drop(e);
+                    return self.dispatch_getattr(ctx, ino, unique, None);
+                }
+                Err(Errno::ENOENT) => return Err(Errno::ESTALE),
+                Err(errno) => return Err(errno),
+            }
+        };
+        self.sync_namespace_attrs_local(ino, &updated);
+        self.invalidate_atime_caches_after_read(ino);
 
         Ok(crate::workers_meta::fuse_attr_out(
             ino,
@@ -8651,7 +8711,7 @@ impl Filesystem for FuseVfsAdapter {
                 sa.valid
             );
         }
-        let result = self.dispatch_setattr(&ctx, req.unique(), ino, &sa, fh);
+        let result = self.dispatch_fuse_setattr(&ctx, req.unique(), ino, &sa, fh);
         if diagnostic {
             eprintln!(
                 "tidefs-diagnostic: fuse setattr end unique={} ino={} status={} errno={:?} elapsed_ms={}",
@@ -10751,6 +10811,106 @@ mod tests {
         assert_eq!(
             after_read.posix.ctime_ns, after_write.posix.ctime_ns,
             "automatic read atime updates must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn fuse_callback_atime_only_setattr_records_read_without_ctime() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"fuse-atime-setattr.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before automatic atime")
+        };
+        assert_eq!(before.posix.atime_ns, 1);
+
+        std::thread::sleep(Duration::from_millis(1));
+        let mut read_atime = SetAttr::new();
+        read_atime.valid = FATTR_ATIME_NOW;
+        fixture
+            .adapter
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .expect("automatic fuse atime setattr");
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after automatic atime")
+        };
+        assert!(
+            after.posix.atime_ns > before.posix.atime_ns,
+            "automatic FUSE atime setattr should record read access"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "automatic FUSE atime setattr must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn read_only_fuse_callback_atime_only_setattr_is_suppressed() {
+        let mut fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"read-only-fuse-atime-setattr.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before read-only automatic atime")
+        };
+
+        fixture.adapter.timestamp_policy = TimestampPolicy::StrictAtime;
+        fixture.adapter.set_read_only();
+        let mut read_atime = SetAttr::new();
+        read_atime.valid = FATTR_ATIME_NOW;
+        fixture
+            .adapter
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .expect("read-only automatic fuse atime setattr");
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after read-only automatic atime")
+        };
+        assert_eq!(
+            after.posix.atime_ns, before.posix.atime_ns,
+            "read-only FUSE atime setattr must not advance atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "read-only FUSE atime setattr must not advance ctime"
         );
     }
 
