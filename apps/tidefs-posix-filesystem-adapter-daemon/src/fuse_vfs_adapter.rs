@@ -525,7 +525,7 @@ impl Default for DentryPolicy {
 impl DentryPolicy {
     fn for_timestamp_policy(self, timestamp_policy: TimestampPolicy, read_only: bool) -> Self {
         let mut policy = self;
-        if !read_only && timestamp_policy != TimestampPolicy::NoAtime {
+        if read_only || timestamp_policy != TimestampPolicy::NoAtime {
             policy.positive_attr_ttl = Duration::ZERO;
         }
         policy
@@ -2639,6 +2639,7 @@ impl FuseVfsAdapter {
     /// Enable read-only mode on an already-constructed adapter (for tests).
     pub fn set_read_only(&mut self) {
         self.read_only = true;
+        self.refresh_dentry_policy_for_timestamp_mode();
     }
 
     /// Return Err(EROFS) when the adapter is in read-only mount mode.
@@ -2894,6 +2895,13 @@ impl FuseVfsAdapter {
             reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
         }
         if self.writeback_cache_enabled && (open_flags & libc::O_APPEND as u32) != 0 {
+            reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
+        }
+        if self.writeback_cache_enabled
+            && !self.read_only
+            && self.timestamp_policy != TimestampPolicy::NoAtime
+            && (open_flags & libc::O_ACCMODE as u32) == libc::O_RDONLY as u32
+        {
             reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
         }
         if self.writeback_cache_enabled && (reply_flags & fuser::consts::FOPEN_DIRECT_IO) == 0 {
@@ -39195,7 +39203,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_readonly_open_preserves_kernel_page_cache() {
+    fn writeback_read_atime_read_open_uses_fuse_direct_io() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let root = {
@@ -39207,7 +39215,44 @@ mod tests {
             .dispatch_create_entry(
                 &ctx,
                 root.get(),
-                b"wb-readonly-keep-cache.txt",
+                b"wb-read-atime-direct-io.txt",
+                0o644,
+                libc::O_RDWR as u32,
+            )
+            .expect("create writeback-cache file");
+
+        let read_open = fixture
+            .adapter
+            .dispatch_open(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
+            .expect("open read-only under writeback cache");
+        assert_ne!(
+            read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
+            0,
+            "read-atime writeback-cache read opens must enter the daemon"
+        );
+        assert_eq!(
+            read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
+            0,
+            "direct I/O read-atime opens must not ask the kernel to keep cache"
+        );
+    }
+
+    #[test]
+    fn writeback_noatime_read_open_preserves_kernel_page_cache() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        fixture.adapter.timestamp_policy = TimestampPolicy::NoAtime;
+        fixture.adapter.refresh_dentry_policy_for_timestamp_mode();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let create = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"wb-noatime-keep-cache.txt",
                 0o644,
                 libc::O_RDWR as u32,
             )
@@ -39220,12 +39265,12 @@ mod tests {
         assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
             0,
-            "read-only writeback-cache opens must not force direct I/O"
+            "noatime writeback-cache read opens do not need daemon-visible reads"
         );
         assert_ne!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
             0,
-            "read-only reopen must preserve dirty kernel writeback-cache pages"
+            "noatime read opens should preserve kernel page-cache reuse"
         );
     }
 
@@ -41796,7 +41841,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_mount_keeps_profile_positive_attr_ttl() {
+    fn read_only_mount_zeroes_positive_attr_ttl() {
         let adapter = fresh_test_adapter()
             .with_coherency_profile(crate::coherency_profile::CoherencyProfile::Writeback)
             .with_timestamp_policy(TimestampPolicy::RelativeAtime)
@@ -41806,14 +41851,29 @@ mod tests {
             adapter.dentry_policy.positive_entry_ttl,
             Duration::from_secs(5)
         );
+        assert_eq!(adapter.dentry_policy.positive_attr_ttl, Duration::ZERO);
+        assert_eq!(adapter.dentry_policy.positive_reply_ttl(), Duration::ZERO);
+    }
+
+    #[test]
+    fn set_read_only_refreshes_timestamp_dentry_policy() {
+        let mut adapter = fresh_test_adapter()
+            .with_coherency_profile(crate::coherency_profile::CoherencyProfile::Writeback)
+            .with_timestamp_policy(TimestampPolicy::NoAtime);
+
         assert_eq!(
             adapter.dentry_policy.positive_attr_ttl,
             Duration::from_secs(5)
         );
+
+        adapter.set_read_only();
+
         assert_eq!(
-            adapter.dentry_policy.positive_reply_ttl(),
+            adapter.dentry_policy.positive_entry_ttl,
             Duration::from_secs(5)
         );
+        assert_eq!(adapter.dentry_policy.positive_attr_ttl, Duration::ZERO);
+        assert_eq!(adapter.dentry_policy.positive_reply_ttl(), Duration::ZERO);
     }
 
     /// CoherencyProfile::Strict sets writeback_cache_enabled to false.
