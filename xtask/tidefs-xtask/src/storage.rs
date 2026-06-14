@@ -4346,8 +4346,18 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
         ],
         &mut missing,
     );
-    for rel in [
+    check_source_markers(
+        &root,
         "crates/tidefs-compression/src/lib.rs",
+        &[
+            "plaintext identity -> compression frame -> encryption frame -> checksum -> raw media bytes",
+            "raw media bytes, or reclaim",
+            "identity for the mounted filesystem",
+            "MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY",
+        ],
+        &mut missing,
+    );
+    for rel in [
         "crates/tidefs-encryption/src/lib.rs",
         "crates/tidefs-dedup/src/lib.rs",
     ] {
@@ -5123,5 +5133,16 @@ pub fn check_space_accounting_watermarks_current_workspace() -> Result<(), Stora
             title: "space-accounting watermarks source check",
             missing,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mounted_transform_authority_inventory_check_passes_current_workspace() {
+        check_mounted_transform_authority_current_workspace()
+            .expect("mounted transform authority inventory check should pass");
     }
 }
