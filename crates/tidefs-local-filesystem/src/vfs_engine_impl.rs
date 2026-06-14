@@ -2739,6 +2739,74 @@ fn live_property_table(
     live_admin_ok_text(out)
 }
 
+impl VfsLocalFileSystem {
+    fn read_impl(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        size: u32,
+        _ctx: &RequestCtx,
+        record_access: bool,
+    ) -> std::result::Result<Vec<u8>, Errno> {
+        let live = self.validate_file_handle(fh)?;
+        if live.enforce_access_mode && !open_flags_allow_read(live.open_flags) {
+            return Err(Errno::EBADF);
+        }
+        if let Some(file) = self.anonymous_tmpfiles.borrow().get(&fh.inode_id) {
+            return file.data.read_at(offset, size, file.attr.posix.size);
+        }
+        let path = self.inode_path(fh.inode_id)?;
+
+        // Keep read-pattern accounting for both user reads and internal cache
+        // fills; only user-visible reads are POSIX atime events.
+        let file_size = self
+            .fs
+            .borrow()
+            .inode(fh.inode_id)
+            .map_err(|e| map_errno(&e))?
+            .size;
+        let readahead_plan =
+            self.readahead_tracker
+                .record_read(fh.inode_id, offset, size, file_size);
+
+        let data = match self
+            .fs
+            .borrow()
+            .read_file_range(&path, offset, size as usize)
+        {
+            Ok(data) => data,
+            Err(err) => {
+                let errno = map_errno(&err);
+                if errno == Errno::EIO && vfs_op_diagnostics_enabled() {
+                    eprintln!(
+                        "tidefs-diagnostic: vfs read error ino={} fh={} offset={} size={} errno={:?} err={:?}",
+                        fh.inode_id.get(),
+                        fh.fh_id.0,
+                        offset,
+                        size,
+                        errno,
+                        err
+                    );
+                }
+                return Err(errno);
+            }
+        };
+        if record_access {
+            let _ = self.fs.borrow_mut().apply_timestamp_update(
+                fh.inode_id,
+                TimestampUpdate::Read,
+                self.timestamp_policy,
+            );
+        }
+
+        if let Some((ra_offset, ra_len)) = readahead_plan {
+            crate::readahead::issue_readahead(&self.fs.borrow(), &path, ra_offset, ra_len);
+        }
+
+        Ok(data)
+    }
+}
+
 // ── VfsEngine for VfsLocalFileSystem ──────────────────────────────────────
 
 impl VfsEngine for VfsLocalFileSystem {
@@ -3523,62 +3591,19 @@ impl VfsEngine for VfsLocalFileSystem {
         fh: &EngineFileHandle,
         offset: u64,
         size: u32,
-        _ctx: &RequestCtx,
+        ctx: &RequestCtx,
     ) -> std::result::Result<Vec<u8>, Errno> {
-        let live = self.validate_file_handle(fh)?;
-        if live.enforce_access_mode && !open_flags_allow_read(live.open_flags) {
-            return Err(Errno::EBADF);
-        }
-        if let Some(file) = self.anonymous_tmpfiles.borrow().get(&fh.inode_id) {
-            return file.data.read_at(offset, size, file.attr.posix.size);
-        }
-        let path = self.inode_path(fh.inode_id)?;
+        self.read_impl(fh, offset, size, ctx, true)
+    }
 
-        // Record read access for sequential detection and readahead planning.
-        let file_size = self
-            .fs
-            .borrow()
-            .inode(fh.inode_id)
-            .map_err(|e| map_errno(&e))?
-            .size;
-        let readahead_plan =
-            self.readahead_tracker
-                .record_read(fh.inode_id, offset, size, file_size);
-
-        let data = match self
-            .fs
-            .borrow()
-            .read_file_range(&path, offset, size as usize)
-        {
-            Ok(data) => data,
-            Err(err) => {
-                let errno = map_errno(&err);
-                if errno == Errno::EIO && vfs_op_diagnostics_enabled() {
-                    eprintln!(
-                        "tidefs-diagnostic: vfs read error ino={} fh={} offset={} size={} errno={:?} err={:?}",
-                        fh.inode_id.get(),
-                        fh.fh_id.0,
-                        offset,
-                        size,
-                        errno,
-                        err
-                    );
-                }
-                return Err(errno);
-            }
-        };
-        let _ = self.fs.borrow_mut().apply_timestamp_update(
-            fh.inode_id,
-            TimestampUpdate::Read,
-            self.timestamp_policy,
-        );
-
-        // Issue best-effort readahead to warm caches for sequential streams.
-        if let Some((ra_offset, ra_len)) = readahead_plan {
-            crate::readahead::issue_readahead(&self.fs.borrow(), &path, ra_offset, ra_len);
-        }
-
-        Ok(data)
+    fn read_for_cache_fill(
+        &self,
+        fh: &EngineFileHandle,
+        offset: u64,
+        size: u32,
+        ctx: &RequestCtx,
+    ) -> std::result::Result<Vec<u8>, Errno> {
+        self.read_impl(fh, offset, size, ctx, false)
     }
 
     fn record_read_access(
