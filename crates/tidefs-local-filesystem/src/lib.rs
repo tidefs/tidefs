@@ -4913,6 +4913,7 @@ impl LocalFileSystem {
             .unwrap_or(0);
         let entry_inode = entry.inode_id;
         self.insert_directory_entry(parent_id, name, entry, tick)?;
+        self.update_parent_metadata_timestamps(parent_id, tick);
         self.mark_dir_dirty(parent_id);
         self.mark_inode_metadata_dirty(parent_id);
         self.mark_inode_metadata_dirty(entry_inode);
@@ -4941,6 +4942,7 @@ impl LocalFileSystem {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         self.remove_directory_entry(parent_id, name, tick)?;
+        self.update_parent_metadata_timestamps(parent_id, tick);
         self.mark_dir_dirty(parent_id);
         self.mark_inode_metadata_dirty(parent_id);
         if removed_was_child_dir {
@@ -5153,6 +5155,7 @@ impl LocalFileSystem {
         });
         let mut updated = source_record.clone();
         updated.nlink = updated.nlink.saturating_add(1);
+        updated.posix_time.ctime_ns = Self::next_metadata_ctime_ns(updated.posix_time.ctime_ns);
         updated.metadata_version = tick;
         // If nlink transitions from 0 to 1, the inode is no longer orphaned.
         if updated.nlink == 1 {
@@ -5171,6 +5174,7 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
+        self.update_parent_metadata_timestamps(parent_id, tick);
         self.mark_inode_metadata_dirty(inode_id);
         self.mark_dir_dirty(parent_id);
         self.mark_inode_metadata_dirty(parent_id);
@@ -5301,6 +5305,7 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
+        self.update_parent_metadata_timestamps(parent_id, tick);
 
         self.mark_inode_content_dirty(inode_id);
         self.invalidate_hot_read_cache_for_inode(inode_id);
@@ -7482,10 +7487,12 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
+        self.update_parent_metadata_timestamps(parent_id, tick);
         check_crash_hook(CrashInjectionPoint::OpUnlinkBeforeNlinkDecr);
         if was_multilinked {
             let mut updated = record;
             updated.nlink -= 1;
+            updated.posix_time.ctime_ns = Self::next_metadata_ctime_ns(updated.posix_time.ctime_ns);
             updated.metadata_version = tick;
             let moved_inode_id = updated.inode_id;
             Arc::make_mut(&mut self.state.inodes).insert(moved_inode_id, updated);
@@ -7856,10 +7863,17 @@ impl LocalFileSystem {
             }
         }
 
+        self.update_parent_metadata_timestamps(old_parent_id, tick);
+        if new_parent_id != old_parent_id {
+            self.update_parent_metadata_timestamps(new_parent_id, tick);
+        }
+
         // Update the moved inode's ctime (metadata_version) so that
         // POSIX rename semantics are satisfied: the renamed object's
         // change time advances.
         if let Some(moved_inode) = Arc::make_mut(&mut self.state.inodes).get_mut(&moved_inode_id) {
+            moved_inode.posix_time.ctime_ns =
+                Self::next_metadata_ctime_ns(moved_inode.posix_time.ctime_ns);
             moved_inode.metadata_version = tick;
         }
         self.inode_cache.borrow_mut().invalidate(moved_inode_id);
@@ -7868,6 +7882,8 @@ impl LocalFileSystem {
         if let Some(tid) = target_inode_id {
             if tid != moved_inode_id {
                 if let Some(swapped) = Arc::make_mut(&mut self.state.inodes).get_mut(&tid) {
+                    swapped.posix_time.ctime_ns =
+                        Self::next_metadata_ctime_ns(swapped.posix_time.ctime_ns);
                     swapped.metadata_version = tick;
                 }
                 self.inode_cache.borrow_mut().invalidate(tid);
@@ -8442,6 +8458,7 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
+        self.update_parent_metadata_timestamps(parent_id, tick);
         self.mark_inode_content_dirty(inode_id);
         self.invalidate_hot_read_cache_for_inode(inode_id);
         let record = self.commit_mutation(record)?;
@@ -9841,9 +9858,8 @@ impl LocalFileSystem {
     fn update_parent_metadata_for_subdir_add(&mut self, parent_id: InodeId, tick: u64) {
         if let Some(parent) = std::sync::Arc::make_mut(&mut self.state.inodes).get_mut(&parent_id) {
             parent.nlink = parent.nlink.saturating_add(1);
-            parent.metadata_version = tick;
-            parent.data_version = tick;
         }
+        self.update_parent_metadata_timestamps(parent_id, tick);
     }
 
     /// Drop parent directory nlink, mtime, and ctime when a subdirectory
@@ -9851,15 +9867,19 @@ impl LocalFileSystem {
     fn update_parent_metadata_for_subdir_remove(&mut self, parent_id: InodeId, tick: u64) {
         if let Some(parent) = std::sync::Arc::make_mut(&mut self.state.inodes).get_mut(&parent_id) {
             parent.nlink = parent.nlink.saturating_sub(1).max(2);
-            parent.metadata_version = tick;
-            parent.data_version = tick;
         }
+        self.update_parent_metadata_timestamps(parent_id, tick);
     }
 
     /// Bump parent directory mtime and ctime for a child file/dir
     /// creation, deletion, or rename without changing nlink.
     fn update_parent_metadata_timestamps(&mut self, parent_id: InodeId, tick: u64) {
         if let Some(parent) = std::sync::Arc::make_mut(&mut self.state.inodes).get_mut(&parent_id) {
+            let next_time = crate::types::current_posix_time_ns()
+                .max(parent.posix_time.mtime_ns.saturating_add(1))
+                .max(parent.posix_time.ctime_ns.saturating_add(1));
+            parent.posix_time.mtime_ns = next_time;
+            parent.posix_time.ctime_ns = next_time;
             parent.metadata_version = tick;
             parent.data_version = tick;
         }
@@ -11025,6 +11045,25 @@ mod orphan_index_integration_tests {
         Ok((root, fs))
     }
 
+    fn assert_parent_metadata_time_advanced(
+        before: crate::types::PosixTimeRecord,
+        after: crate::types::PosixTimeRecord,
+        operation: &str,
+    ) {
+        assert!(
+            after.mtime_ns > before.mtime_ns,
+            "{operation} must advance parent directory mtime: before={} after={}",
+            before.mtime_ns,
+            after.mtime_ns
+        );
+        assert!(
+            after.ctime_ns > before.ctime_ns,
+            "{operation} must advance parent directory ctime: before={} after={}",
+            before.ctime_ns,
+            after.ctime_ns
+        );
+    }
+
     #[test]
     fn bridge_dir_entry_updates_parent_link_count_and_parent_lookup() {
         let (_root, mut fs) = make_test_fs("lf_bridge_dir_parent").expect("open");
@@ -11940,6 +11979,60 @@ mod orphan_index_integration_tests {
         assert_eq!(
             fs.read_file("/b/child.txt").expect("read child"),
             b"child-data"
+        );
+    }
+
+    #[test]
+    fn namespace_mutations_advance_parent_mtime_and_ctime() {
+        let (_root, mut fs) = make_test_fs("s5_parent_dir_timestamp_churn").expect("open");
+        fs.create_dir("/work", DEFAULT_DIRECTORY_PERMISSIONS)
+            .expect("create work dir");
+
+        let before_create = fs.stat("/work").expect("stat work").posix_time;
+        fs.create_file("/work/file", DEFAULT_FILE_PERMISSIONS)
+            .expect("create child file");
+        let after_create = fs.stat("/work").expect("stat work after create").posix_time;
+        assert_parent_metadata_time_advanced(before_create, after_create, "create");
+
+        fs.create_dir("/work/subdir", DEFAULT_DIRECTORY_PERMISSIONS)
+            .expect("create child dir");
+        let after_mkdir = fs.stat("/work").expect("stat work after mkdir").posix_time;
+        assert_parent_metadata_time_advanced(after_create, after_mkdir, "mkdir");
+
+        let before_link_inode = fs.stat("/work/file").expect("stat file before link");
+        fs.link_file("/work/file", "/work/file.link")
+            .expect("link child file");
+        let after_link = fs.stat("/work").expect("stat work after link").posix_time;
+        assert_parent_metadata_time_advanced(after_mkdir, after_link, "link");
+        let after_link_inode = fs.stat("/work/file").expect("stat file after link");
+        assert!(
+            after_link_inode.posix_time.ctime_ns > before_link_inode.posix_time.ctime_ns,
+            "hard link must advance linked inode ctime"
+        );
+
+        fs.unlink("/work/file").expect("unlink original");
+        let after_unlink = fs.stat("/work").expect("stat work after unlink").posix_time;
+        assert_parent_metadata_time_advanced(after_link, after_unlink, "unlink");
+        let after_unlink_inode = fs.stat("/work/file.link").expect("stat link after unlink");
+        assert!(
+            after_unlink_inode.posix_time.ctime_ns > after_link_inode.posix_time.ctime_ns,
+            "unlink of one hard link must advance remaining inode ctime"
+        );
+
+        fs.renameat2(
+            "/work/file.link",
+            "/work/file.renamed",
+            crate::namespace::rename::RenameAt2Flags::EMPTY,
+        )
+        .expect("rename linked file");
+        let after_rename = fs.stat("/work").expect("stat work after rename").posix_time;
+        assert_parent_metadata_time_advanced(after_unlink, after_rename, "rename");
+        let after_rename_inode = fs
+            .stat("/work/file.renamed")
+            .expect("stat renamed file after rename");
+        assert!(
+            after_rename_inode.posix_time.ctime_ns > after_unlink_inode.posix_time.ctime_ns,
+            "rename must advance moved inode ctime"
         );
     }
 

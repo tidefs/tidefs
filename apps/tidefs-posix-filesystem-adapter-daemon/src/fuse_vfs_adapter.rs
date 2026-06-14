@@ -7394,45 +7394,23 @@ impl FuseVfsAdapter {
 
     // Readdir dispatch prefers namespace iteration when available. When no
     // namespace is attached, the existing VFS engine path is used.
-    /// Conditionally update the inode access time (relatime-aware).
+    /// Conditionally record automatic read access time.
     ///
-    /// Updates atime via the engine when atime is older than mtime
-    /// or ctime, or when atime is more than 24 hours old.
+    /// Cached adapter reads do not call `VfsEngine::read`, so they need a
+    /// separate atime hook. This must remain an automatic read timestamp update:
+    /// explicit setattr-style atime changes also advance ctime, while read
+    /// access updates must not.
     fn maybe_update_atime(&self, ino: u64, ctx: &RequestCtx) {
-        let now_ns = system_time_to_ns(std::time::SystemTime::now());
-        let day_ns: i64 = 86_400_000_000_000;
-        let mut updated = false;
-        if let Ok(e) = self.engine.lock() {
-            if let Ok(attr) = e.getattr(InodeId::new(ino), None, ctx) {
-                let atime_ns = attr.posix.atime_ns;
-                let mtime_ns = attr.posix.mtime_ns;
-                let ctime_ns = attr.posix.ctime_ns;
-                let needs_update = match self.timestamp_policy {
-                    TimestampPolicy::StrictAtime => true,
-                    TimestampPolicy::NoAtime => false,
-                    TimestampPolicy::RelativeAtime => {
-                        atime_ns < mtime_ns
-                            || atime_ns < ctime_ns
-                            || now_ns.saturating_sub(atime_ns) >= day_ns
-                    }
-                };
-                if needs_update {
-                    let sa = tidefs_types_vfs_core::SetAttr {
-                        atime_ns: now_ns,
-                        valid: tidefs_types_vfs_core::FATTR_ATIME,
-                        ..Default::default()
-                    };
-                    updated = e.setattr(InodeId::new(ino), &sa, None, ctx).is_ok();
-                }
-            }
+        if self.read_only || self.timestamp_policy == TimestampPolicy::NoAtime {
+            return;
         }
-        if updated {
-            self.invalidate_atime_caches_after_read(ino);
+        if let Ok(e) = self.engine.lock() {
+            let _ = e.record_read_access(InodeId::new(ino), ctx);
         }
     }
 
     fn finish_successful_read_atime(&self, ino: u64, ctx: &RequestCtx) {
-        if self.timestamp_policy == TimestampPolicy::NoAtime {
+        if self.read_only || self.timestamp_policy == TimestampPolicy::NoAtime {
             return;
         }
         self.maybe_update_atime(ino, ctx);
@@ -7440,7 +7418,7 @@ impl FuseVfsAdapter {
     }
 
     fn invalidate_atime_caches_after_read(&self, ino: u64) {
-        if self.timestamp_policy == TimestampPolicy::NoAtime {
+        if self.read_only || self.timestamp_policy == TimestampPolicy::NoAtime {
             return;
         }
         self.getattr_cache.lock().unwrap().remove(&ino);
@@ -10656,6 +10634,8 @@ mod tests {
             compose_posix_time_ns(cached_attr.attr.atime as i64, cached_attr.attr.atimensec),
             1
         );
+        let cached_ctime =
+            compose_posix_time_ns(cached_attr.attr.ctime as i64, cached_attr.attr.ctimensec);
 
         let second = fixture
             .adapter
@@ -10670,6 +10650,11 @@ mod tests {
         assert!(
             compose_posix_time_ns(after.attr.atime as i64, after.attr.atimensec) > 1,
             "cached reads must advance atime and invalidate stale getattr cache"
+        );
+        assert_eq!(
+            compose_posix_time_ns(after.attr.ctime as i64, after.attr.ctimensec),
+            cached_ctime,
+            "automatic read atime updates must not advance ctime"
         );
     }
 
@@ -10708,6 +10693,8 @@ mod tests {
             compose_posix_time_ns(cached_attr.attr.atime as i64, cached_attr.attr.atimensec),
             1
         );
+        let cached_ctime =
+            compose_posix_time_ns(cached_attr.attr.ctime as i64, cached_attr.attr.ctimensec);
 
         let data = fixture
             .adapter
@@ -10722,6 +10709,75 @@ mod tests {
         assert!(
             compose_posix_time_ns(after.attr.atime as i64, after.attr.atimensec) > 1,
             "engine reads must advance atime and invalidate stale getattr cache"
+        );
+        assert_eq!(
+            compose_posix_time_ns(after.attr.ctime as i64, after.attr.ctimensec),
+            cached_ctime,
+            "automatic read atime updates must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn read_only_cached_read_does_not_advance_atime_or_ctime() {
+        let mut fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let payload = b"read-only cached read timestamp regression";
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"read-only-cache-atime.txt",
+            libc::O_RDWR as u32,
+        );
+
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, payload, &ctx)
+                .expect("write payload");
+        }
+
+        let first = fixture
+            .adapter
+            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
+            .expect("first read fills cache");
+        assert_eq!(first, payload);
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+
+        fixture.adapter.timestamp_policy = TimestampPolicy::StrictAtime;
+        fixture.adapter.set_read_only();
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before read-only cached read")
+        };
+
+        let second = fixture
+            .adapter
+            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
+            .expect("second read served from cache");
+        assert_eq!(second, payload);
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after read-only cached read")
+        };
+        assert_eq!(
+            after.posix.atime_ns, before.posix.atime_ns,
+            "read-only cached reads must not advance atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "read-only cached reads must not advance ctime"
         );
     }
 

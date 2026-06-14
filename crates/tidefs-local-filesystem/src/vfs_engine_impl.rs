@@ -1111,6 +1111,7 @@ impl VfsLocalFileSystem {
             fs.rollback_mutation_delta();
             return Err(map_errno(&err));
         }
+        fs.update_parent_metadata_timestamps(parent_id, tick);
 
         fs.commit_mutation(record)
             .map(|record| record.to_inode_attr())
@@ -3578,6 +3579,17 @@ impl VfsEngine for VfsLocalFileSystem {
         }
 
         Ok(data)
+    }
+
+    fn record_read_access(
+        &self,
+        inode: InodeId,
+        _ctx: &RequestCtx,
+    ) -> std::result::Result<(), Errno> {
+        self.fs
+            .borrow_mut()
+            .apply_timestamp_update(inode, TimestampUpdate::Read, self.timestamp_policy)
+            .map_err(|e| map_errno(&e))
     }
 
     fn write(

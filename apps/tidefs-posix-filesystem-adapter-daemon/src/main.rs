@@ -372,10 +372,16 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     lfs.set_max_uncommitted_mutations(16 * 1024);
 
     let writeback_tracker = std::sync::Arc::clone(lfs.writeback_range_tracker());
-    let engine_timestamp_policy = match config.mount_opts.timestamp_policy {
-        crate::mount_options::TimestampPolicy::StrictAtime => EngineTimestampPolicy::Strictatime,
-        crate::mount_options::TimestampPolicy::RelativeAtime => EngineTimestampPolicy::Relatime,
-        crate::mount_options::TimestampPolicy::NoAtime => EngineTimestampPolicy::Noatime,
+    let engine_timestamp_policy = if config.read_only {
+        EngineTimestampPolicy::Noatime
+    } else {
+        match config.mount_opts.timestamp_policy {
+            crate::mount_options::TimestampPolicy::StrictAtime => {
+                EngineTimestampPolicy::Strictatime
+            }
+            crate::mount_options::TimestampPolicy::RelativeAtime => EngineTimestampPolicy::Relatime,
+            crate::mount_options::TimestampPolicy::NoAtime => EngineTimestampPolicy::Noatime,
+        }
     };
     let mut vfs_engine = VfsLocalFileSystem::new(lfs).with_sync_guarantee(effective_sync_guarantee);
     vfs_engine.set_timestamp_policy(engine_timestamp_policy);
@@ -409,7 +415,17 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     } else {
         adapter
     };
-    let adapter = adapter.with_timestamp_policy(config.mount_opts.timestamp_policy);
+    let adapter_timestamp_policy = if config.read_only {
+        crate::mount_options::TimestampPolicy::NoAtime
+    } else {
+        config.mount_opts.timestamp_policy
+    };
+    let adapter = adapter.with_timestamp_policy(adapter_timestamp_policy);
+    let adapter = if config.read_only {
+        adapter.with_read_only()
+    } else {
+        adapter
+    };
 
     let adapter = if config.intent_log_write {
         let buf = Arc::new(IntentLogBuffer::new());
