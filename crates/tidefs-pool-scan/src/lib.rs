@@ -59,8 +59,9 @@ pub mod scanner;
 pub use device_removal::{
     build_object_placements, check_removal_redundancy, run_device_removal, DeviceObjectMap,
     DeviceRemovalError, DeviceRemovalExecutor, DeviceRemovalHooks, DeviceRemovalPhase,
-    DeviceRemovalPlan, DeviceRemovalPlanner, DeviceRemovalResult, DeviceRemovalState,
-    EvacuationEntry, NoopDeviceRemovalHooks, ObjectPlacement, VdevRemoveStats,
+    DeviceRemovalPlan, DeviceRemovalPlanner, DeviceRemovalRefusal, DeviceRemovalRefusalClass,
+    DeviceRemovalResult, DeviceRemovalState, EvacuationEntry, EvacuationPlanOutcome,
+    NoopDeviceRemovalHooks, ObjectPlacement, VdevRemoveStats,
 };
 // ---------------------------------------------------------------------------
 // DeviceKind — runtime device classification (not the on-disk enum)

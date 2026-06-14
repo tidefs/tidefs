@@ -15,11 +15,125 @@ use tidefs_replication_model::{LayoutValidator, PlacementEntry, ReplicationInten
 use crate::DeviceType;
 
 // ---------------------------------------------------------------------------
+// DeviceRemovalRefusal
+// ---------------------------------------------------------------------------
+
+/// Stable refusal/failure classes shared by the planner and removal driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeviceRemovalRefusalClass {
+    /// Requested target path is not a member of the pool topology.
+    TargetNotFound,
+    /// Removal would leave the pool with no surviving data device.
+    WouldEmptyPool,
+    /// Target device health does not permit safe evacuation.
+    UnhealthyTarget,
+    /// Surviving topology cannot satisfy the requested redundancy policy.
+    InsufficientSurvivingTopology,
+    /// Placement or failure-domain constraints reject the evacuation plan.
+    DomainConstraintViolation,
+    /// Caller planned against an older topology generation.
+    StaleTopologyGeneration,
+    /// An object evacuation I/O or relocation operation failed.
+    EvacuationFailed,
+    /// Not every live object was evacuated.
+    EvacuationIncomplete,
+    /// Persisted checkpoint identity does not match this removal.
+    CheckpointReplayRejected,
+    /// Committed topology root does not match the removal plan.
+    CommittedTopologyMismatch,
+}
+
+impl core::fmt::Display for DeviceRemovalRefusalClass {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TargetNotFound => f.write_str("target-not-found"),
+            Self::WouldEmptyPool => f.write_str("would-empty-pool"),
+            Self::UnhealthyTarget => f.write_str("unhealthy-target"),
+            Self::InsufficientSurvivingTopology => f.write_str("insufficient-surviving-topology"),
+            Self::DomainConstraintViolation => f.write_str("domain-constraint-violation"),
+            Self::StaleTopologyGeneration => f.write_str("stale-topology-generation"),
+            Self::EvacuationFailed => f.write_str("evacuation-failed"),
+            Self::EvacuationIncomplete => f.write_str("evacuation-incomplete"),
+            Self::CheckpointReplayRejected => f.write_str("checkpoint-replay-rejected"),
+            Self::CommittedTopologyMismatch => f.write_str("committed-topology-mismatch"),
+        }
+    }
+}
+
+/// Durable typed evidence explaining why a removal did not proceed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRemovalRefusal {
+    /// Stable refusal/failure class for machine consumers.
+    pub class: DeviceRemovalRefusalClass,
+    /// Target device requested for removal.
+    pub target_device: PathBuf,
+    /// Human-readable details suitable for operator output.
+    pub details: String,
+    /// Topology generation the caller expected, when applicable.
+    pub expected_topology_generation: Option<u64>,
+    /// Topology generation observed in the pool snapshot, when applicable.
+    pub observed_topology_generation: Option<u64>,
+    /// Number of surviving devices available after removal.
+    pub surviving_devices: Option<u32>,
+    /// Number of surviving devices required by the policy or plan.
+    pub required_surviving_devices: Option<u32>,
+}
+
+impl DeviceRemovalRefusal {
+    /// Build refusal evidence with only a class, target, and details.
+    #[must_use]
+    pub fn new(
+        class: DeviceRemovalRefusalClass,
+        target_device: PathBuf,
+        details: impl Into<String>,
+    ) -> Self {
+        Self {
+            class,
+            target_device,
+            details: details.into(),
+            expected_topology_generation: None,
+            observed_topology_generation: None,
+            surviving_devices: None,
+            required_surviving_devices: None,
+        }
+    }
+
+    /// Add topology generation evidence.
+    #[must_use]
+    pub const fn with_topology_generations(mut self, expected: u64, observed: u64) -> Self {
+        self.expected_topology_generation = Some(expected);
+        self.observed_topology_generation = Some(observed);
+        self
+    }
+
+    /// Add surviving-topology cardinality evidence.
+    #[must_use]
+    pub const fn with_surviving_topology(mut self, surviving: u32, required: u32) -> Self {
+        self.surviving_devices = Some(surviving);
+        self.required_surviving_devices = Some(required);
+        self
+    }
+}
+
+impl core::fmt::Display for DeviceRemovalRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} for {}: {}",
+            self.class,
+            self.target_device.display(),
+            self.details
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DeviceRemovalError
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur during device removal planning.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceRemovalError {
     /// The target device was not found in the pool device tree.
     TargetDeviceNotFound {
@@ -44,6 +158,30 @@ pub enum DeviceRemovalError {
     InsufficientRedundancy {
         /// Human-readable details about the redundancy shortfall.
         details: String,
+    },
+
+    /// One or more object evacuations failed.
+    EvacuationFailed {
+        /// Human-readable evacuation failure summary.
+        details: String,
+    },
+
+    /// Target device health rejects removal.
+    DeviceNotHealthy {
+        /// Path of the unhealthy target.
+        path: PathBuf,
+        /// Current target health.
+        health: crate::DeviceHealth,
+    },
+
+    /// Caller planned against a stale topology generation.
+    StaleTopologyGeneration {
+        /// Path of the target requested for removal.
+        path: PathBuf,
+        /// Expected current topology generation.
+        expected: u64,
+        /// Observed topology generation in the pool snapshot.
+        observed: u64,
     },
 }
 
@@ -71,11 +209,107 @@ impl core::fmt::Display for DeviceRemovalError {
             Self::InsufficientRedundancy { details } => {
                 write!(f, "insufficient redundancy: {details}")
             }
+            Self::EvacuationFailed { details } => {
+                write!(f, "evacuation failed: {details}")
+            }
+            Self::DeviceNotHealthy { path, health } => {
+                write!(
+                    f,
+                    "target device {} health {health} does not permit removal",
+                    path.display()
+                )
+            }
+            Self::StaleTopologyGeneration {
+                path,
+                expected,
+                observed,
+            } => {
+                write!(
+                    f,
+                    "stale topology generation for {}: expected {expected}, observed {observed}",
+                    path.display()
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for DeviceRemovalError {}
+
+impl DeviceRemovalError {
+    /// Return the stable refusal class for this planning error.
+    #[must_use]
+    pub const fn refusal_class(&self) -> DeviceRemovalRefusalClass {
+        match self {
+            Self::TargetDeviceNotFound { .. } => DeviceRemovalRefusalClass::TargetNotFound,
+            Self::DomainConstraintViolation { .. } => {
+                DeviceRemovalRefusalClass::DomainConstraintViolation
+            }
+            Self::NoObjectsOnDevice => DeviceRemovalRefusalClass::EvacuationIncomplete,
+            Self::WouldEmptyPool => DeviceRemovalRefusalClass::WouldEmptyPool,
+            Self::InsufficientRedundancy { .. } => {
+                DeviceRemovalRefusalClass::InsufficientSurvivingTopology
+            }
+            Self::EvacuationFailed { .. } => DeviceRemovalRefusalClass::EvacuationFailed,
+            Self::DeviceNotHealthy { .. } => DeviceRemovalRefusalClass::UnhealthyTarget,
+            Self::StaleTopologyGeneration { .. } => {
+                DeviceRemovalRefusalClass::StaleTopologyGeneration
+            }
+        }
+    }
+
+    /// Convert this error into durable refusal evidence.
+    #[must_use]
+    pub fn refusal_evidence(&self, target_device: &Path) -> DeviceRemovalRefusal {
+        match self {
+            Self::TargetDeviceNotFound { path } => DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::TargetNotFound,
+                path.clone(),
+                "target device is not present in the pool topology",
+            ),
+            Self::DomainConstraintViolation { details } => DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::DomainConstraintViolation,
+                target_device.to_path_buf(),
+                details.clone(),
+            ),
+            Self::NoObjectsOnDevice => DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::EvacuationIncomplete,
+                target_device.to_path_buf(),
+                "planner could not enumerate live objects on the target device",
+            ),
+            Self::WouldEmptyPool => DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::WouldEmptyPool,
+                target_device.to_path_buf(),
+                "removal would leave the pool with zero devices",
+            ),
+            Self::InsufficientRedundancy { details } => DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::InsufficientSurvivingTopology,
+                target_device.to_path_buf(),
+                details.clone(),
+            ),
+            Self::EvacuationFailed { details } => DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::EvacuationFailed,
+                target_device.to_path_buf(),
+                details.clone(),
+            ),
+            Self::DeviceNotHealthy { path, health } => DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::UnhealthyTarget,
+                path.clone(),
+                format!("target health is {health}"),
+            ),
+            Self::StaleTopologyGeneration {
+                path,
+                expected,
+                observed,
+            } => DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::StaleTopologyGeneration,
+                path.clone(),
+                "topology generation changed before removal planning",
+            )
+            .with_topology_generations(*expected, *observed),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ObjectPlacement — identifies which device an object lives on
@@ -124,6 +358,20 @@ pub struct EvacuationEntry {
 }
 
 // ---------------------------------------------------------------------------
+// EvacuationPlanOutcome
+// ---------------------------------------------------------------------------
+
+/// Explicit evacuation-planning outcome for the target device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvacuationPlanOutcome {
+    /// No live objects were resident on the target, so evacuation is complete.
+    EmptySuccess,
+    /// Planner enumerated live objects that must be moved.
+    ObjectsEnumerated,
+}
+
+// ---------------------------------------------------------------------------
 // DeviceRemovalPlan — the complete evacuation plan
 // ---------------------------------------------------------------------------
 
@@ -149,6 +397,8 @@ pub struct DeviceRemovalPlan {
     pub total_evacuation_bytes: u64,
     /// Number of objects to evacuate.
     pub object_count: u64,
+    /// Explicit evacuation-planning outcome.
+    pub evacuation_outcome: EvacuationPlanOutcome,
     /// New topology generation to use after removal.
     pub topology_generation: u64,
     /// The replication intent used to validate the new placement.
@@ -195,6 +445,40 @@ impl DeviceRemovalPlanner {
         intent: ReplicationIntent,
         topology_generation: u64,
     ) -> Result<DeviceRemovalPlan, DeviceRemovalError> {
+        Self::plan_removal_with_expected_generation(
+            device_tree,
+            target_device,
+            object_placements,
+            intent,
+            topology_generation,
+            topology_generation,
+        )
+    }
+
+    /// Compute a device removal plan after checking the caller's expected
+    /// topology generation against the observed pool snapshot.
+    pub fn plan_removal_with_expected_generation(
+        device_tree: &DeviceType,
+        target_device: &Path,
+        object_placements: &[ObjectPlacement],
+        intent: ReplicationIntent,
+        topology_generation: u64,
+        expected_topology_generation: u64,
+    ) -> Result<DeviceRemovalPlan, DeviceRemovalError> {
+        if topology_generation != expected_topology_generation {
+            return Err(DeviceRemovalError::StaleTopologyGeneration {
+                path: target_device.to_path_buf(),
+                expected: expected_topology_generation,
+                observed: topology_generation,
+            });
+        }
+
+        if intent.total_targets() == 0 {
+            return Err(DeviceRemovalError::DomainConstraintViolation {
+                details: "replication intent requires zero placement targets".into(),
+            });
+        }
+
         let all_leaves = Self::flatten_leaves(device_tree);
 
         let target_leaf = all_leaves
@@ -203,6 +487,13 @@ impl DeviceRemovalPlanner {
             .ok_or_else(|| DeviceRemovalError::TargetDeviceNotFound {
                 path: target_device.to_path_buf(),
             })?;
+
+        if !target_leaf.health.is_operational() {
+            return Err(DeviceRemovalError::DeviceNotHealthy {
+                path: target_device.to_path_buf(),
+                health: target_leaf.health,
+            });
+        }
 
         let surviving_leaves: Vec<&LeafInfo> = all_leaves
             .iter()
@@ -213,19 +504,44 @@ impl DeviceRemovalPlanner {
             return Err(DeviceRemovalError::WouldEmptyPool);
         }
 
+        let required_survivors = intent.total_targets() as usize;
+        if surviving_leaves.len() < required_survivors {
+            return Err(DeviceRemovalError::InsufficientRedundancy {
+                details: format!(
+                    "removal would leave {} surviving device(s), but intent requires {} target(s)",
+                    surviving_leaves.len(),
+                    required_survivors
+                ),
+            });
+        }
+
         let objects_on_target: Vec<&ObjectPlacement> = object_placements
             .iter()
             .filter(|op| op.device_path == target_device)
             .collect();
 
-        if objects_on_target.is_empty() {
-            return Err(DeviceRemovalError::NoObjectsOnDevice);
-        }
-
         let surviving_paths: Vec<PathBuf> = surviving_leaves
             .iter()
             .map(|l| l.device_path.clone())
             .collect();
+
+        if objects_on_target.is_empty() {
+            return Ok(DeviceRemovalPlan {
+                target_device: target_device.to_path_buf(),
+                target_device_guid: target_leaf.device_guid,
+                target_device_index: target_leaf.device_index,
+                surviving_devices: surviving_paths,
+                device_count_before: all_leaves.len() as u32,
+                device_count_after: surviving_leaves.len() as u32,
+                objects_to_evacuate: Vec::new(),
+                total_evacuation_bytes: 0,
+                object_count: 0,
+                evacuation_outcome: EvacuationPlanOutcome::EmptySuccess,
+                topology_generation: topology_generation.saturating_add(1),
+                replication_intent: intent,
+                plan_validated: true,
+            });
+        }
 
         let (evacuation_entries, plan_validated) = Self::assign_evacuation_targets(
             &objects_on_target,
@@ -233,6 +549,11 @@ impl DeviceRemovalPlanner {
             &surviving_paths,
             &intent,
         )?;
+        if !plan_validated {
+            return Err(DeviceRemovalError::DomainConstraintViolation {
+                details: "evacuation targets do not satisfy failure-domain constraints".into(),
+            });
+        }
 
         let total_bytes: u64 = evacuation_entries.iter().map(|e| e.size_bytes).sum();
 
@@ -246,6 +567,7 @@ impl DeviceRemovalPlanner {
             objects_to_evacuate: evacuation_entries,
             total_evacuation_bytes: total_bytes,
             object_count: objects_on_target.len() as u64,
+            evacuation_outcome: EvacuationPlanOutcome::ObjectsEnumerated,
             topology_generation: topology_generation.saturating_add(1),
             replication_intent: intent,
             plan_validated,
@@ -319,6 +641,7 @@ impl DeviceRemovalPlanner {
                 device_guid,
                 device_index,
                 capacity_bytes,
+                health,
                 ..
             } => {
                 out.push(LeafInfo {
@@ -326,6 +649,7 @@ impl DeviceRemovalPlanner {
                     device_guid: *device_guid,
                     device_index: *device_index,
                     capacity_bytes: *capacity_bytes,
+                    health: *health,
                 });
             }
             DeviceType::PoolWideData { children }
@@ -354,6 +678,8 @@ pub struct LeafInfo {
     pub device_index: u32,
     /// Device capacity in bytes.
     pub capacity_bytes: u64,
+    /// Device health from the pool topology.
+    pub health: crate::DeviceHealth,
 }
 
 // ---------------------------------------------------------------------------
@@ -395,8 +721,8 @@ pub struct DeviceRemovalResult {
 /// 1. Iterates over every [`EvacuationEntry`] in the plan.
 /// 2. For each entry, calls `read_object` to fetch the object data.
 /// 3. Calls `write_object` to place the data on the target device.
-/// 4. On any failure, records the failure and continues (best-effort).
-/// 5. Calls `anchor_removal` after all objects are processed.
+/// 4. On any failure, records the failure and refuses committed-root anchoring.
+/// 5. Calls `anchor_removal` only after all objects are processed cleanly.
 /// 6. Returns a [`DeviceRemovalResult`] summarising success/failure counts.
 pub struct DeviceRemovalExecutor;
 
@@ -445,7 +771,12 @@ impl DeviceRemovalExecutor {
             committed_root_anchored: false,
         };
 
-        let anchored = anchor_removal(&result);
+        let expected_objects = plan.objects_to_evacuate.len() as u64;
+        let anchored = if objects_failed == 0 && objects_evacuated == expected_objects {
+            anchor_removal(&result)
+        } else {
+            false
+        };
 
         DeviceRemovalResult {
             committed_root_anchored: anchored,
@@ -634,6 +965,8 @@ pub struct DeviceRemovalState {
     pub objects_failed: u64,
     /// Human-readable error message if the removal entered the Failed phase.
     pub error: Option<String>,
+    /// Typed refusal/failure evidence if the removal entered the Failed phase.
+    pub failure_evidence: Option<DeviceRemovalRefusal>,
 }
 
 impl DeviceRemovalState {
@@ -647,6 +980,7 @@ impl DeviceRemovalState {
             objects_evacuated: 0,
             objects_failed: 0,
             error: None,
+            failure_evidence: None,
         }
     }
 
@@ -669,6 +1003,13 @@ impl DeviceRemovalState {
     pub fn fail(&mut self, error: impl Into<String>) {
         self.phase = DeviceRemovalPhase::Failed;
         self.error = Some(error.into());
+    }
+
+    /// Transition to the Failed phase with typed refusal evidence.
+    pub fn fail_with_evidence(&mut self, evidence: DeviceRemovalRefusal) {
+        self.phase = DeviceRemovalPhase::Failed;
+        self.error = Some(evidence.details.clone());
+        self.failure_evidence = Some(evidence);
     }
 }
 
@@ -782,6 +1123,20 @@ where
 
     state.objects_evacuated = result.objects_evacuated;
     state.objects_failed = result.objects_failed;
+    if result.objects_failed > 0 || result.objects_evacuated != plan.object_count {
+        let evidence = DeviceRemovalRefusal::new(
+            DeviceRemovalRefusalClass::EvacuationFailed,
+            state.target_device.clone(),
+            format!(
+                "evacuated {} of {} object(s); {} object(s) failed",
+                result.objects_evacuated, plan.object_count, result.objects_failed
+            ),
+        );
+        state.fail_with_evidence(evidence.clone());
+        return Err(DeviceRemovalError::EvacuationFailed {
+            details: evidence.details,
+        });
+    }
     state.advance()?;
 
     // --- Phase 3: Verify ---
@@ -845,7 +1200,7 @@ mod tests {
             make_object(200, "/dev/disk1", 4096),
             make_object(300, "/dev/disk2", 16384),
         ];
-        let intent = ReplicationIntent::new_mirror(3, FailureDomain::Device).unwrap();
+        let intent = ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap();
         let plan = DeviceRemovalPlanner::plan_removal(
             &tree,
             Path::new("/dev/disk0"),
@@ -861,6 +1216,10 @@ mod tests {
         assert_eq!(plan.topology_generation, 6);
         assert_eq!(plan.total_evacuation_bytes, 4096 + 8192);
         assert_eq!(plan.object_count, 2);
+        assert_eq!(
+            plan.evacuation_outcome,
+            EvacuationPlanOutcome::ObjectsEnumerated
+        );
         for entry in &plan.objects_to_evacuate {
             assert_ne!(entry.target_device, PathBuf::from("/dev/disk0"));
         }
@@ -871,17 +1230,21 @@ mod tests {
         let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
+            make_leaf("/dev/disk2", 3, 2, 1024 * 1024 * 1024),
         ]);
         let placements = vec![make_object(200, "/dev/disk1", 4096)];
-        let intent = ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap();
-        let result = DeviceRemovalPlanner::plan_removal(
+        let intent = ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap();
+        let plan = DeviceRemovalPlanner::plan_removal(
             &tree,
             Path::new("/dev/disk0"),
             &placements,
             intent,
             1,
-        );
-        assert!(matches!(result, Err(DeviceRemovalError::NoObjectsOnDevice)));
+        )
+        .unwrap();
+        assert!(plan.is_empty());
+        assert_eq!(plan.object_count, 0);
+        assert_eq!(plan.evacuation_outcome, EvacuationPlanOutcome::EmptySuccess);
     }
 
     #[test]
@@ -916,7 +1279,7 @@ mod tests {
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
         let placements = vec![make_object(100, "/dev/disk0", 4096)];
-        let intent = ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap();
+        let intent = ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap();
         let result = DeviceRemovalPlanner::plan_removal(
             &tree,
             Path::new("/dev/nonexistent"),
@@ -930,6 +1293,76 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn planner_refuses_stale_topology_generation_with_typed_class() {
+        let tree = make_pool_data(vec![
+            make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
+            make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
+        ]);
+        let err = DeviceRemovalPlanner::plan_removal_with_expected_generation(
+            &tree,
+            Path::new("/dev/disk0"),
+            &[],
+            ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap(),
+            7,
+            6,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.refusal_class(),
+            DeviceRemovalRefusalClass::StaleTopologyGeneration
+        );
+        let evidence = err.refusal_evidence(Path::new("/dev/disk0"));
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(json.contains("stale-topology-generation"));
+    }
+
+    #[test]
+    fn planner_refuses_insufficient_surviving_topology_with_typed_class() {
+        let tree = make_pool_data(vec![
+            make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
+            make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
+        ]);
+        let placements = vec![
+            make_object(100, "/dev/disk0", 4096),
+            make_object(101, "/dev/disk0", 4096),
+        ];
+        let err = DeviceRemovalPlanner::plan_removal(
+            &tree,
+            Path::new("/dev/disk0"),
+            &placements,
+            ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap(),
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.refusal_class(),
+            DeviceRemovalRefusalClass::InsufficientSurvivingTopology
+        );
+    }
+
+    #[test]
+    fn planner_refuses_domain_constraint_violation_with_typed_class() {
+        let tree = make_pool_data(vec![
+            make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
+            make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
+            make_leaf("/dev/disk2", 3, 2, 1024 * 1024 * 1024),
+        ]);
+        let placements = vec![make_object(100, "/dev/disk0", 4096)];
+        let err = DeviceRemovalPlanner::plan_removal(
+            &tree,
+            Path::new("/dev/disk0"),
+            &placements,
+            ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap(),
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.refusal_class(),
+            DeviceRemovalRefusalClass::DomainConstraintViolation
+        );
+    }
+
     // ---------- Planner: failure domain constraints ----------
 
     #[test]
@@ -939,7 +1372,7 @@ mod tests {
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
         let placements = vec![make_object(100, "/dev/disk0", 4096)];
-        let intent = ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap();
+        let intent = ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap();
         let plan = DeviceRemovalPlanner::plan_removal(
             &tree,
             Path::new("/dev/disk0"),
@@ -958,6 +1391,7 @@ mod tests {
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
             make_leaf("/dev/disk2", 3, 2, 1024 * 1024 * 1024),
+            make_leaf("/dev/disk3", 4, 3, 1024 * 1024 * 1024),
         ]);
         let placements: Vec<ObjectPlacement> = (0..3)
             .map(|i| make_object(100 + i, "/dev/disk0", 4096))
@@ -972,7 +1406,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.objects_to_evacuate.len(), 3);
-        assert_eq!(plan.device_count_after, 2);
+        assert_eq!(plan.device_count_after, 3);
     }
 
     #[test]
@@ -1065,6 +1499,7 @@ mod tests {
             }],
             total_evacuation_bytes: 4096,
             object_count: 1,
+            evacuation_outcome: EvacuationPlanOutcome::ObjectsEnumerated,
             topology_generation: 7,
             replication_intent: ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap(),
             plan_validated: true,
@@ -1086,6 +1521,7 @@ mod tests {
             objects_to_evacuate: vec![],
             total_evacuation_bytes: 0,
             object_count: 0,
+            evacuation_outcome: EvacuationPlanOutcome::EmptySuccess,
             topology_generation: 1,
             replication_intent: ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap(),
             plan_validated: false,
@@ -1117,6 +1553,60 @@ mod tests {
         assert!(DeviceRemovalError::WouldEmptyPool
             .to_string()
             .contains("last device"));
+    }
+
+    #[test]
+    fn refusal_evidence_serializes_stable_class() {
+        let target = Path::new("/dev/disk0");
+        let errors = vec![
+            (
+                DeviceRemovalError::TargetDeviceNotFound {
+                    path: target.to_path_buf(),
+                },
+                DeviceRemovalRefusalClass::TargetNotFound,
+            ),
+            (
+                DeviceRemovalError::WouldEmptyPool,
+                DeviceRemovalRefusalClass::WouldEmptyPool,
+            ),
+            (
+                DeviceRemovalError::DeviceNotHealthy {
+                    path: target.to_path_buf(),
+                    health: crate::DeviceHealth::Faulted,
+                },
+                DeviceRemovalRefusalClass::UnhealthyTarget,
+            ),
+            (
+                DeviceRemovalError::InsufficientRedundancy {
+                    details: "only one survivor".into(),
+                },
+                DeviceRemovalRefusalClass::InsufficientSurvivingTopology,
+            ),
+            (
+                DeviceRemovalError::DomainConstraintViolation {
+                    details: "failure domain collision".into(),
+                },
+                DeviceRemovalRefusalClass::DomainConstraintViolation,
+            ),
+            (
+                DeviceRemovalError::StaleTopologyGeneration {
+                    path: target.to_path_buf(),
+                    expected: 7,
+                    observed: 8,
+                },
+                DeviceRemovalRefusalClass::StaleTopologyGeneration,
+            ),
+        ];
+
+        for (error, expected) in errors {
+            assert_eq!(error.refusal_class(), expected);
+            let evidence = error.refusal_evidence(target);
+            assert_eq!(evidence.class, expected);
+            let json = serde_json::to_string(&evidence).unwrap();
+            assert!(json.contains(&expected.to_string()));
+            let round: DeviceRemovalRefusal = serde_json::from_str(&json).unwrap();
+            assert_eq!(round.class, expected);
+        }
     }
 
     #[test]
@@ -1164,6 +1654,7 @@ mod tests {
             ],
             total_evacuation_bytes: 12288,
             object_count: 2,
+            evacuation_outcome: EvacuationPlanOutcome::ObjectsEnumerated,
             topology_generation: 2,
             replication_intent: ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap(),
             plan_validated: true,
@@ -1220,6 +1711,7 @@ mod tests {
             ],
             total_evacuation_bytes: 12288,
             object_count: 2,
+            evacuation_outcome: EvacuationPlanOutcome::ObjectsEnumerated,
             topology_generation: 2,
             replication_intent: ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap(),
             plan_validated: true,
@@ -1244,6 +1736,7 @@ mod tests {
         assert_eq!(result.objects_evacuated, 1);
         assert_eq!(result.bytes_evacuated, 4096);
         assert_eq!(result.objects_failed, 1);
+        assert!(!result.committed_root_anchored);
         assert_eq!(written.len(), 1);
     }
 
@@ -1265,6 +1758,7 @@ mod tests {
             }],
             total_evacuation_bytes: 4096,
             object_count: 1,
+            evacuation_outcome: EvacuationPlanOutcome::ObjectsEnumerated,
             topology_generation: 2,
             replication_intent: ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap(),
             plan_validated: true,
@@ -1299,6 +1793,7 @@ mod tests {
             objects_to_evacuate: vec![],
             total_evacuation_bytes: 0,
             object_count: 0,
+            evacuation_outcome: EvacuationPlanOutcome::EmptySuccess,
             topology_generation: 1,
             replication_intent: ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap(),
             plan_validated: false,
@@ -1507,7 +2002,7 @@ mod tests {
             make_object(100, "/dev/disk0", 4096),
             make_object(101, "/dev/disk0", 8192),
         ];
-        let intent = ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap();
+        let intent = ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap();
 
         let mut state = DeviceRemovalState::new(PathBuf::from("/dev/disk0"), [0x01u8; 16]);
 
@@ -1551,7 +2046,7 @@ mod tests {
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
         let placements = vec![make_object(100, "/dev/disk0", 4096)];
-        let intent = ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap();
+        let intent = ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap();
 
         struct FailingQuiesceHooks;
         impl DeviceRemovalHooks for FailingQuiesceHooks {
@@ -1592,7 +2087,7 @@ mod tests {
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
         let placements = vec![make_object(100, "/dev/disk0", 4096)];
-        let intent = ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap();
+        let intent = ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap();
 
         struct FailingVerifyHooks;
         impl DeviceRemovalHooks for FailingVerifyHooks {
@@ -1641,7 +2136,7 @@ mod tests {
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
         let placements = vec![make_object(100, "/dev/disk0", 4096)];
-        let intent = ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap();
+        let intent = ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap();
 
         struct FailingCommitHooks;
         impl DeviceRemovalHooks for FailingCommitHooks {
@@ -1685,14 +2180,14 @@ mod tests {
     }
 
     #[test]
-    fn removal_pipeline_no_objects_on_device_is_error() {
+    fn removal_pipeline_no_objects_on_device_is_empty_success() {
         let tree = make_pool_data(vec![
             make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024),
             make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024),
         ]);
         // No objects on /dev/disk0.
         let placements = vec![make_object(200, "/dev/disk1", 4096)];
-        let intent = ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap();
+        let intent = ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap();
 
         let mut state = DeviceRemovalState::new(PathBuf::from("/dev/disk0"), [0x01u8; 16]);
         let mut hooks = NoopDeviceRemovalHooks;
@@ -1708,10 +2203,14 @@ mod tests {
             },
             |_id| Err(DeviceRemovalError::NoObjectsOnDevice),
             |_id, _data, _target| Ok(()),
-            |_| false,
+            |_| true,
         );
 
-        assert!(matches!(result, Err(DeviceRemovalError::NoObjectsOnDevice)));
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.objects_evacuated, 0);
+        assert_eq!(result.objects_failed, 0);
+        assert_eq!(state.phase, DeviceRemovalPhase::Complete);
     }
 
     #[test]
@@ -1941,6 +2440,7 @@ mod tests {
             objects_evacuated: 5,
             objects_failed: 1,
             error: Some("transient I/O error on disk1".into()),
+            failure_evidence: None,
         };
         let json = serde_json::to_string(&state).expect("serialize");
         let round: DeviceRemovalState = serde_json::from_str(&json).expect("deserialize");

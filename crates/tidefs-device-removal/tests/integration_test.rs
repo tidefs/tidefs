@@ -317,7 +317,7 @@ fn checkpoint_recovery_resumes_evacuation() {
     // Restore checkpoint.
     let cp: EvacuationCheckpoint = serde_json::from_slice(&serialized).unwrap();
     assert_eq!(cp.objects_evacuated, 2);
-    driver2.apply_checkpoint(&cp);
+    driver2.apply_checkpoint(&cp).unwrap();
 
     // Evacuate remaining 4 objects.
     let enumr2 = LocatorTableObjectEnumerator::new(locator.clone());
