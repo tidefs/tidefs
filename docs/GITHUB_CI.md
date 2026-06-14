@@ -61,7 +61,11 @@ may use non-secret repository variables for scheduling gates, such as
   the selected branch and uploads row artifacts under
   `kernel-mmap-validation`.
 - `xfstests` and `RDMA` are scheduled/manual lanes for longer filesystem and
-  transport work.
+  transport work. Manual `xfstests` dispatch accepts a `target` and an
+  optional space-separated `tests` list. Use the smallest known failing row set
+  such as `generic/003` while debugging an isolated failure; reserve broad
+  target dispatches such as `target=fuse` or `target=all` for acceptance gates,
+  scheduled coverage, or when the failure set is not yet isolated.
 - `Release Candidate` is a manual-only self-hosted workflow. The `smoke`
   profile runs Rust, Nix, and QEMU smoke lanes; the `full` profile also runs
   xfstests and RDMA.
