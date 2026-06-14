@@ -420,7 +420,9 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     } else {
         config.mount_opts.timestamp_policy
     };
-    let adapter = adapter.with_timestamp_policy(adapter_timestamp_policy);
+    let adapter = adapter
+        .with_timestamp_policy(adapter_timestamp_policy)
+        .with_suppress_dir_atime(config.mount_opts.suppress_dir_atime);
     let adapter = if config.read_only {
         adapter.with_read_only()
     } else {

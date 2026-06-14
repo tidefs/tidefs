@@ -1,8 +1,9 @@
 //! FUSE daemon mount-option parser.
 //!
-//! Parses `-o atime,relatime,noatime,sync,async,dev,nodev,...` comma-separated
+//! Parses `-o atime,relatime,noatime,nodiratime,sync,async,dev,nodev,...` comma-separated
 //! FUSE mount options into a typed [`MountOptions`] struct with
-//! timestamp policy, sync-mode flags, and device-node enablement.
+//! timestamp policy, directory-atime suppression, sync-mode flags, and
+//! device-node enablement.
 
 use std::str::FromStr;
 use tidefs_dataset_lifecycle::SyncGuarantee;
@@ -11,7 +12,7 @@ use tidefs_dataset_lifecycle::SyncGuarantee;
 ///
 /// Mirrors the Linux atime/relatime/noatime mount options and
 /// controls the FUSE daemon's atime-update behaviour in
-/// setattr, lookup, and write dispatch paths.
+/// setattr, lookup, and read dispatch paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimestampPolicy {
     /// Always update atime on every access (POSIX strict atime).
@@ -80,6 +81,8 @@ impl FromStr for TimestampPolicy {
 pub struct MountOptions {
     /// Timestamp update policy.
     pub timestamp_policy: TimestampPolicy,
+    /// When true, suppress automatic atime updates on directories.
+    pub suppress_dir_atime: bool,
     /// When true, every write waits for a durability barrier before
     /// replying to the kernel (FUSE `-o sync`).
     pub sync: bool,
@@ -101,6 +104,7 @@ impl Default for MountOptions {
     fn default() -> Self {
         MountOptions {
             timestamp_policy: TimestampPolicy::default(),
+            suppress_dir_atime: false,
             sync: false,
             sync_guarantee: SyncGuarantee::Local,
             allow_other: false,
@@ -114,6 +118,7 @@ impl MountOptions {
     /// Parse a comma-separated `-o` option string.
     ///
     /// Supported keys: `atime`, `strictatime`, `relatime`, `noatime`,
+    /// `nodiratime`, `diratime`,
     /// `sync`, `async`, `allow_other`, `noallow_other`, `dev`, `nodev`,
     /// `intent_log_write=true`,
     /// `intent_log_write=false`.
@@ -142,6 +147,12 @@ impl MountOptions {
                 "noatime" => {
                     opts.timestamp_policy = TimestampPolicy::NoAtime;
                 }
+                "nodiratime" => {
+                    opts.suppress_dir_atime = true;
+                }
+                "diratime" => {
+                    opts.suppress_dir_atime = false;
+                }
                 "sync" => opts.sync = true,
                 "async" => opts.sync = false,
                 "allow_other" => opts.allow_other = true,
@@ -166,7 +177,7 @@ impl MountOptions {
                     }
                     return Err(format!(
                         "unsupported mount option `{other}`; \
-                         supported: atime, relatime, noatime, sync, async,                          allow_other, noallow_other, dev, nodev,                          intent_log_write=true|false.                          Idmapped mounts are not supported."
+                         supported: atime, relatime, noatime, nodiratime, diratime, sync, async,                          allow_other, noallow_other, dev, nodev,                          intent_log_write=true|false.                          Idmapped mounts are not supported."
                     ));
                 }
             }
@@ -283,6 +294,7 @@ mod tests {
     fn mount_options_default() {
         let opts = MountOptions::default();
         assert_eq!(opts.timestamp_policy, TimestampPolicy::RelativeAtime);
+        assert!(!opts.suppress_dir_atime);
         assert!(!opts.sync);
         assert!(!opts.allow_other);
         assert!(!opts.dev);
@@ -321,6 +333,17 @@ mod tests {
     }
 
     #[test]
+    fn mount_options_parse_nodiratime_and_diratime() {
+        let opts = MountOptions::parse("relatime,nodiratime").unwrap();
+        assert_eq!(opts.timestamp_policy, TimestampPolicy::RelativeAtime);
+        assert!(opts.suppress_dir_atime);
+
+        let opts = MountOptions::parse("relatime,nodiratime,diratime").unwrap();
+        assert_eq!(opts.timestamp_policy, TimestampPolicy::RelativeAtime);
+        assert!(!opts.suppress_dir_atime);
+    }
+
+    #[test]
     fn mount_options_parse_sync() {
         let opts = MountOptions::parse("sync").unwrap();
         assert!(opts.sync);
@@ -354,6 +377,7 @@ mod tests {
     fn mount_options_parse_combined() {
         let opts = MountOptions::parse("noatime,sync,allow_other,dev").unwrap();
         assert_eq!(opts.timestamp_policy, TimestampPolicy::NoAtime);
+        assert!(!opts.suppress_dir_atime);
         assert!(opts.sync);
         assert!(opts.allow_other);
         assert!(opts.dev);
@@ -378,6 +402,12 @@ mod tests {
 
         let opts = MountOptions::parse("noallow_other,allow_other").unwrap();
         assert!(opts.allow_other);
+
+        let opts = MountOptions::parse("diratime,nodiratime").unwrap();
+        assert!(opts.suppress_dir_atime);
+
+        let opts = MountOptions::parse("nodiratime,diratime").unwrap();
+        assert!(!opts.suppress_dir_atime);
     }
 
     #[test]
@@ -400,6 +430,7 @@ mod tests {
     fn mount_options_to_fuse_mount_options() {
         let opts = MountOptions {
             timestamp_policy: TimestampPolicy::NoAtime,
+            suppress_dir_atime: false,
             sync: true,
             sync_guarantee: SyncGuarantee::Local,
             allow_other: true,
@@ -417,6 +448,7 @@ mod tests {
     fn strict_atime_emits_kernel_strictatime_option() {
         let opts = MountOptions {
             timestamp_policy: TimestampPolicy::StrictAtime,
+            suppress_dir_atime: false,
             sync: false,
             sync_guarantee: SyncGuarantee::Local,
             allow_other: false,
@@ -433,6 +465,7 @@ mod tests {
     fn relative_atime_emits_kernel_relatime_option() {
         let opts = MountOptions {
             timestamp_policy: TimestampPolicy::RelativeAtime,
+            suppress_dir_atime: false,
             sync: false,
             sync_guarantee: SyncGuarantee::Local,
             allow_other: false,

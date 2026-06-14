@@ -2424,6 +2424,8 @@ pub struct FuseVfsAdapter {
     force_direct_io: bool,
     /// Atime update policy: StrictAtime, RelativeAtime (default), or NoAtime.
     timestamp_policy: TimestampPolicy,
+    /// Suppress automatic atime updates for directory lookup/read access.
+    suppress_dir_atime: bool,
     /// Mmap cluster coherency: page invalidation on remote writes.
     mmap_coherency: Arc<MmapCoherency>,
     /// FUSE kernel cache invalidation notifier, filled after mount.
@@ -2509,6 +2511,7 @@ impl FuseVfsAdapter {
             force_sync_writes: false,
             force_direct_io: false,
             timestamp_policy: TimestampPolicy::default(),
+            suppress_dir_atime: false,
             notifier: notifier.clone(),
             mmap_coherency,
             orphan_index: Mutex::new(OrphanIndex::new()),
@@ -2593,6 +2596,13 @@ impl FuseVfsAdapter {
     #[must_use]
     pub fn with_timestamp_policy(mut self, policy: TimestampPolicy) -> Self {
         self.timestamp_policy = policy;
+        self
+    }
+
+    /// Suppress automatic directory atime updates for `nodiratime` mounts.
+    #[must_use]
+    pub fn with_suppress_dir_atime(mut self, suppress: bool) -> Self {
+        self.suppress_dir_atime = suppress;
         self
     }
 
@@ -2999,33 +3009,14 @@ impl FuseVfsAdapter {
     /// Conditionally update atime on a parent directory after a
     /// successful lookup, following the configured timestamp policy.
     ///
-    /// Under [`TimestampPolicy::RelativeAtime`], this calls
-    /// [`should_update_atime_relatime`] and bumps atime via a
-    /// lightweight `dispatch_setattr` call when the policy permits.
+    /// This is read-access timestamp behavior, not explicit setattr behavior:
+    /// automatic directory atime must never advance ctime.
     fn maybe_update_lookup_atime(&self, ctx: &RequestCtx, parent: u64) {
-        use fuser::setattr::should_update_atime_relatime;
-        use tidefs_types_vfs_core::{SetAttr, FATTR_ATIME_NOW};
-
-        if self.timestamp_policy != TimestampPolicy::RelativeAtime {
+        if self.suppress_dir_atime {
             return;
         }
 
-        let e = self.engine.lock().unwrap();
-        if let Ok(attr) = e.getattr(InodeId::new(parent), None, ctx) {
-            let now_ns = system_time_to_ns(SystemTime::now());
-            let atime_ns = attr.posix.atime_ns;
-            let mtime_ns = attr.posix.mtime_ns;
-            let ctime_ns = attr.posix.ctime_ns;
-
-            if should_update_atime_relatime(atime_ns, mtime_ns, ctime_ns, now_ns) {
-                drop(e);
-                let sa = SetAttr {
-                    valid: FATTR_ATIME_NOW,
-                    ..SetAttr::default()
-                };
-                let _ = self.dispatch_setattr(ctx, 0, parent, &sa, None);
-            }
-        }
+        self.maybe_update_atime(parent, ctx);
     }
 
     /// Conditionally update atime on a directory after a successful
@@ -4291,6 +4282,7 @@ impl FuseVfsAdapter {
         };
         if let Some((ino, attr)) = cache_hit {
             self.record_lookup_count(ino);
+            self.maybe_update_lookup_atime(ctx, parent);
             return Ok(attr);
         }
 
@@ -4299,7 +4291,10 @@ impl FuseVfsAdapter {
         // namespace but authoritative engine data).
         if let Some(ref ns) = self.namespace {
             match self.dispatch_lookup_via_namespace(ctx, ns, parent, name) {
-                Ok(attr) => return Ok(attr),
+                Ok(attr) => {
+                    self.maybe_update_lookup_atime(ctx, parent);
+                    return Ok(attr);
+                }
                 Err(Errno::ENOENT) | Err(Errno::EIO) | Err(Errno::ESTALE) => {} // fall through
                 Err(e) => return Err(e),
             }
@@ -4568,29 +4563,14 @@ impl FuseVfsAdapter {
             return self.dispatch_getattr(ctx, ino, unique, None);
         }
 
-        let inode_id = InodeId::new(ino);
-        let updated = {
-            let e = self.engine.lock().unwrap();
-            match e.record_read_access(inode_id, ctx) {
-                Ok(()) => {}
-                Err(Errno::ENOENT | Errno::ESTALE) if self.namespace.is_some() => {
-                    drop(e);
-                    return self.dispatch_getattr(ctx, ino, unique, None);
-                }
-                Err(Errno::ENOENT) => return Err(Errno::ESTALE),
-                Err(errno) => return Err(errno),
+        let updated = match self.record_read_access_and_sync(ino, ctx) {
+            Ok(attr) => attr,
+            Err(Errno::ENOENT | Errno::ESTALE) if self.namespace.is_some() => {
+                return self.dispatch_getattr(ctx, ino, unique, None);
             }
-            match e.getattr(inode_id, None, ctx) {
-                Ok(attr) => attr,
-                Err(Errno::ENOENT | Errno::ESTALE) if self.namespace.is_some() => {
-                    drop(e);
-                    return self.dispatch_getattr(ctx, ino, unique, None);
-                }
-                Err(Errno::ENOENT) => return Err(Errno::ESTALE),
-                Err(errno) => return Err(errno),
-            }
+            Err(Errno::ENOENT) => return Err(Errno::ESTALE),
+            Err(errno) => return Err(errno),
         };
-        self.sync_namespace_attrs_local(ino, &updated);
         self.invalidate_atime_caches_after_read(ino);
 
         Ok(crate::workers_meta::fuse_attr_out(
@@ -7439,21 +7419,28 @@ impl FuseVfsAdapter {
     /// separate atime hook. This must remain an automatic read timestamp update:
     /// explicit setattr-style atime changes also advance ctime, while read
     /// access updates must not.
+    fn record_read_access_and_sync(&self, ino: u64, ctx: &RequestCtx) -> Result<InodeAttr, Errno> {
+        let inode_id = InodeId::new(ino);
+        let updated = {
+            let e = self.engine.lock().unwrap();
+            e.record_read_access(inode_id, ctx)?;
+            e.getattr(inode_id, None, ctx)?
+        };
+        self.sync_namespace_attrs_local(ino, &updated);
+        Ok(updated)
+    }
+
     fn maybe_update_atime(&self, ino: u64, ctx: &RequestCtx) {
         if self.read_only || self.timestamp_policy == TimestampPolicy::NoAtime {
             return;
         }
-        if let Ok(e) = self.engine.lock() {
-            let _ = e.record_read_access(InodeId::new(ino), ctx);
+        if self.record_read_access_and_sync(ino, ctx).is_ok() {
+            self.invalidate_atime_caches_after_read(ino);
         }
     }
 
     fn finish_successful_read_atime(&self, ino: u64, ctx: &RequestCtx) {
-        if self.read_only || self.timestamp_policy == TimestampPolicy::NoAtime {
-            return;
-        }
         self.maybe_update_atime(ino, ctx);
-        self.invalidate_atime_caches_after_read(ino);
     }
 
     fn finish_successful_writeback_open_atime(&self, ino: u64, open_flags: u32, ctx: &RequestCtx) {
@@ -10841,6 +10828,183 @@ mod tests {
         assert_eq!(
             after_read.posix.ctime_ns, after_write.posix.ctime_ns,
             "automatic read atime updates must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn cached_read_syncs_namespace_atime_without_ctime() {
+        let mut fixture = adapter_fixture_with_namespace();
+        fixture.adapter.timestamp_policy = TimestampPolicy::StrictAtime;
+        let ctx = root_ctx();
+        let payload = b"namespace cached read atime";
+        let name = b"namespace-cache-atime.txt";
+        let (inode, adapter_fh, engine_fh) =
+            create_adapter_file_handle(&fixture.adapter, &ctx, name, libc::O_RDWR as u32);
+        let ns = fixture
+            .adapter
+            .namespace
+            .as_ref()
+            .expect("attached namespace");
+        let ns_ino = ns
+            .create_file(
+                1,
+                std::str::from_utf8(name).expect("test name is utf8"),
+                tidefs_namespace::InodeAttributes::new_file(0),
+            )
+            .expect("seed namespace mirror");
+        assert_eq!(ns_ino, inode.get());
+
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, payload, &ctx)
+                .expect("write payload");
+        }
+
+        let first = fixture
+            .adapter
+            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
+            .expect("first read fills cache");
+        assert_eq!(first, payload);
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before cached read")
+        };
+        let ns_before = ns.get_attrs(inode.get()).expect("namespace attrs before");
+        assert_eq!(before.posix.atime_ns, 1);
+        assert_eq!(system_time_to_ns(ns_before.atime), 1);
+
+        std::thread::sleep(Duration::from_millis(1));
+        let second = fixture
+            .adapter
+            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
+            .expect("second read served from cache");
+        assert_eq!(second, payload);
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after cached read")
+        };
+        let ns_after = ns.get_attrs(inode.get()).expect("namespace attrs after");
+        assert!(
+            after.posix.atime_ns > before.posix.atime_ns,
+            "cached reads must advance engine atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "cached read atime must not advance engine ctime"
+        );
+        assert_eq!(
+            system_time_to_ns(ns_after.atime),
+            after.posix.atime_ns,
+            "cached reads must sync namespace atime from the engine"
+        );
+        assert_eq!(
+            system_time_to_ns(ns_after.ctime),
+            after.posix.ctime_ns,
+            "cached read namespace ctime must stay aligned with engine ctime"
+        );
+    }
+
+    #[test]
+    fn namespace_lookup_dir_atime_uses_read_semantics_and_honors_nodiratime() {
+        let mut fixture = adapter_fixture_with_namespace();
+        let ctx = root_ctx();
+        let name = b"namespace-lookup-atime.txt";
+        let (inode, _adapter_fh, _engine_fh) =
+            create_adapter_file_handle(&fixture.adapter, &ctx, name, libc::O_RDWR as u32);
+        let ns = fixture
+            .adapter
+            .namespace
+            .as_ref()
+            .expect("attached namespace");
+        let ns_ino = ns
+            .create_file(
+                1,
+                std::str::from_utf8(name).expect("test name is utf8"),
+                tidefs_namespace::InodeAttributes::new_file(0),
+            )
+            .expect("seed namespace mirror");
+        assert_eq!(ns_ino, inode.get());
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, 1, &stale_atime, None)
+            .expect("force old root atime");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(InodeId::new(1), None, &ctx)
+                .expect("root attrs before namespace lookup")
+        };
+        assert_eq!(before.posix.atime_ns, 1);
+
+        std::thread::sleep(Duration::from_millis(1));
+        fixture
+            .adapter
+            .dispatch_lookup(&ctx, 1, name)
+            .expect("namespace lookup");
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(InodeId::new(1), None, &ctx)
+                .expect("root attrs after namespace lookup")
+        };
+        assert!(
+            after.posix.atime_ns > before.posix.atime_ns,
+            "directory lookup should record read atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "directory lookup atime must not advance ctime"
+        );
+
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 2, 1, &stale_atime, None)
+            .expect("force old root atime again");
+        fixture.adapter.suppress_dir_atime = true;
+        let suppressed_before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(InodeId::new(1), None, &ctx)
+                .expect("root attrs before nodiratime lookup")
+        };
+        assert_eq!(suppressed_before.posix.atime_ns, 1);
+
+        std::thread::sleep(Duration::from_millis(1));
+        fixture
+            .adapter
+            .dispatch_lookup(&ctx, 1, name)
+            .expect("cached namespace lookup with nodiratime");
+        let suppressed_after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(InodeId::new(1), None, &ctx)
+                .expect("root attrs after nodiratime lookup")
+        };
+        assert_eq!(
+            suppressed_after.posix.atime_ns, suppressed_before.posix.atime_ns,
+            "nodiratime must suppress directory atime on lookup"
+        );
+        assert_eq!(
+            suppressed_after.posix.ctime_ns, suppressed_before.posix.ctime_ns,
+            "nodiratime lookup suppression must not advance ctime"
         );
     }
 
@@ -33896,11 +34060,10 @@ mod tests {
     fn namespace_dispatch_setattr_atime_mtime_explicit() {
         let (ns, fixture) = namespace_fixture();
         let ctx = root_ctx();
-        let file_attr = fixture
-            .adapter
-            .dispatch_mkdir(&ctx, 1, b"utimens-test", 0o644)
-            .expect("mkdir");
-        let ino = file_attr.inode_id.get();
+        let file_attrs = tidefs_namespace::InodeAttributes::new_file(0);
+        let ino = ns
+            .create_file(1, "utimens-test", file_attrs)
+            .expect("create file in ns");
 
         let mut set = SetAttr::new();
         set.valid = FATTR_ATIME | FATTR_MTIME;
@@ -33930,11 +34093,10 @@ mod tests {
     fn namespace_dispatch_setattr_atime_now_mtime_now() {
         let (ns, fixture) = namespace_fixture();
         let ctx = root_ctx();
-        let file_attr = fixture
-            .adapter
-            .dispatch_mkdir(&ctx, 1, b"now-test", 0o644)
-            .expect("mkdir");
-        let ino = file_attr.inode_id.get();
+        let file_attrs = tidefs_namespace::InodeAttributes::new_file(0);
+        let ino = ns
+            .create_file(1, "now-test", file_attrs)
+            .expect("create file in ns");
         let before = std::time::SystemTime::now();
 
         let mut set = SetAttr::new();
