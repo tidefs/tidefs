@@ -3021,34 +3021,6 @@ impl FuseVfsAdapter {
         }
     }
 
-    /// Conditionally update atime on a file after a successful write,
-    /// following the configured timestamp policy.
-    fn maybe_update_write_atime(&self, ctx: &RequestCtx, ino: u64) {
-        use fuser::setattr::should_update_atime_relatime;
-        use tidefs_types_vfs_core::{SetAttr, FATTR_ATIME_NOW};
-
-        if self.timestamp_policy != TimestampPolicy::RelativeAtime {
-            return;
-        }
-
-        let e = self.engine.lock().unwrap();
-        if let Ok(attr) = e.getattr(InodeId::new(ino), None, ctx) {
-            let now_ns = system_time_to_ns(SystemTime::now());
-            let atime_ns = attr.posix.atime_ns;
-            let mtime_ns = attr.posix.mtime_ns;
-            let ctime_ns = attr.posix.ctime_ns;
-
-            if should_update_atime_relatime(atime_ns, mtime_ns, ctime_ns, now_ns) {
-                drop(e);
-                let sa = SetAttr {
-                    valid: FATTR_ATIME_NOW,
-                    ..SetAttr::default()
-                };
-                let _ = self.dispatch_setattr(ctx, 0, ino, &sa, None);
-            }
-        }
-    }
-
     /// Conditionally update atime on a directory after a successful
     /// lookup, following the configured timestamp policy.
     pub fn notifier_cell(&self) -> Arc<Mutex<Option<fuser::Notifier>>> {
@@ -5462,7 +5434,6 @@ impl FuseVfsAdapter {
         if is_writeback_cached || !handle_allows_write {
             let (
                 write_result,
-                should_update_write_atime,
                 sync_efh,
                 mut fallback_to_release,
                 sparse_zero_noop,
@@ -5514,11 +5485,10 @@ impl FuseVfsAdapter {
                         .err()
                 };
                 let result = if let Some(errno) = metadata_error {
-                    (Err(errno), false)
+                    Err(errno)
                 } else {
                     match e.write(write_efh, effective_offset as u64, data, ctx) {
                         Ok(written) => {
-                            let wrote_data = written > 0;
                             if written > 0 {
                                 if posix_direct_io {
                                     // Direct I/O bypasses the adapter page cache.
@@ -5553,14 +5523,13 @@ impl FuseVfsAdapter {
                                         e.getattr(InodeId::new(ino), Some(write_efh), ctx).ok();
                                 }
                             }
-                            (Ok(written), wrote_data)
+                            Ok(written)
                         }
-                        Err(errno) => (Err(errno), false),
+                        Err(errno) => Err(errno),
                     }
                 };
                 (
-                    result.0,
-                    result.1,
+                    result,
                     sync_efh,
                     fallback_efh,
                     sparse_zero_noop,
@@ -5643,9 +5612,6 @@ impl FuseVfsAdapter {
                     return Err(errno);
                 }
             }
-            if should_update_write_atime {
-                self.maybe_update_write_atime(ctx, ino);
-            }
             // O_SYNC / O_DSYNC durability (A11/A16 sync-edge gap):
             // when the file descriptor was opened with O_SYNC or O_DSYNC,
             // flush dirty data through the engine and commit to storage
@@ -5674,7 +5640,7 @@ impl FuseVfsAdapter {
         } else {
             let efh = resolved_efh.ok_or(Errno::EBADF)?;
             let mut post_write_attr = None;
-            let (write_result, should_update_write_atime) = {
+            let write_result = {
                 let e = self.engine.lock().unwrap();
                 // Capacity admission and allocation tracking are handled by the
                 // engine's CapacityAuthority during write dispatch; the adapter
@@ -5686,11 +5652,10 @@ impl FuseVfsAdapter {
                     Self::apply_write_killpriv_before_write(&**e, ctx, ino, &efh, write_flags).err()
                 };
                 if let Some(errno) = metadata_error {
-                    (Err(errno), false)
+                    Err(errno)
                 } else {
                     match e.write(&efh, effective_offset as u64, data, ctx) {
                         Ok(written) => {
-                            let wrote_data = written > 0;
                             if written > 0 {
                                 if posix_direct_io {
                                     // Direct I/O bypasses the adapter page cache.
@@ -5744,9 +5709,9 @@ impl FuseVfsAdapter {
                                     }
                                 }
                             }
-                            (Ok(written), wrote_data)
+                            Ok(written)
                         }
-                        Err(errno) => (Err(errno), false),
+                        Err(errno) => Err(errno),
                     }
                 }
             }; // engine lock dropped here
@@ -5769,11 +5734,6 @@ impl FuseVfsAdapter {
                 }
             }
 
-            // Relatime update locks the engine internally, so it must run after
-            // the write dispatch lock is released.
-            if should_update_write_atime {
-                self.maybe_update_write_atime(ctx, ino);
-            }
             if let Some(attr) = post_write_attr {
                 self.sync_namespace_attrs_after_engine_write(ino, &attr);
             }
@@ -10713,6 +10673,83 @@ mod tests {
         assert_eq!(
             compose_posix_time_ns(after.attr.ctime as i64, after.attr.ctimensec),
             cached_ctime,
+            "automatic read atime updates must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn write_leaves_relatime_atime_for_first_read() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let payload = b"xfstests generic 003 atime";
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"relatime-write-read-atime.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+
+        let before_write = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before write")
+        };
+        assert_eq!(before_write.posix.atime_ns, 1);
+
+        std::thread::sleep(Duration::from_millis(1));
+        let written = fixture
+            .adapter
+            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
+            .expect("write payload");
+        assert_eq!(written, payload.len() as u32);
+
+        let after_write = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after write")
+        };
+        assert_eq!(
+            after_write.posix.atime_ns, before_write.posix.atime_ns,
+            "writes must not advance atime"
+        );
+        assert!(
+            after_write.posix.mtime_ns >= before_write.posix.mtime_ns,
+            "writes must update mtime"
+        );
+        assert!(
+            after_write.posix.ctime_ns >= before_write.posix.ctime_ns,
+            "writes must update ctime"
+        );
+
+        std::thread::sleep(Duration::from_millis(1));
+        let data = fixture
+            .adapter
+            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
+            .expect("read payload");
+        assert_eq!(data, payload);
+
+        let after_read = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after read")
+        };
+        assert!(
+            after_read.posix.atime_ns > after_write.posix.atime_ns,
+            "the first read after a write must advance relatime atime"
+        );
+        assert_eq!(
+            after_read.posix.ctime_ns, after_write.posix.ctime_ns,
             "automatic read atime updates must not advance ctime"
         );
     }
