@@ -1768,7 +1768,10 @@ fn is_timestamp_only_setattr(attr: &SetAttr) -> bool {
 }
 
 fn is_fuse_read_atime_setattr(attr: &SetAttr, fh: Option<u64>) -> bool {
-    fh.is_none() && (attr.valid == FATTR_ATIME || attr.valid == FATTR_ATIME_NOW)
+    let valid_without_handle = attr.valid & !FATTR_FH;
+    let handle_bit_is_consistent = attr.valid & FATTR_FH == 0 || fh.is_some();
+    handle_bit_is_consistent
+        && (valid_without_handle == FATTR_ATIME || valid_without_handle == FATTR_ATIME_NOW)
 }
 
 fn orphan_timestamp_attr_out(ino: u64, attr: &SetAttr, ctx: &RequestCtx) -> FuseAttrOut {
@@ -10861,6 +10864,56 @@ mod tests {
         assert_eq!(
             after.posix.ctime_ns, before.posix.ctime_ns,
             "automatic FUSE atime setattr must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn fuse_callback_atime_only_setattr_with_file_handle_records_read_without_ctime() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"fuse-atime-setattr-fh.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before automatic atime")
+        };
+        assert_eq!(before.posix.atime_ns, 1);
+
+        std::thread::sleep(Duration::from_millis(1));
+        let mut read_atime = SetAttr::new();
+        read_atime.valid = FATTR_ATIME_NOW | FATTR_FH;
+        fixture
+            .adapter
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, Some(adapter_fh))
+            .expect("automatic fuse atime setattr with file handle");
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after automatic atime")
+        };
+        assert!(
+            after.posix.atime_ns > before.posix.atime_ns,
+            "automatic FUSE atime setattr with a file handle should record read access"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "automatic FUSE atime setattr with a file handle must not advance ctime"
         );
     }
 
