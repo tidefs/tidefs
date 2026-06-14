@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::Deserialize;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Family {
     Types,
@@ -104,6 +106,92 @@ struct Member {
     dependencies: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClassificationStatus {
+    WorkspaceMember,
+    WorkspaceExcluded,
+}
+
+impl ClassificationStatus {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "workspace-member" => Some(Self::WorkspaceMember),
+            "workspace-excluded" => Some(Self::WorkspaceExcluded),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkspaceMember => "workspace-member",
+            Self::WorkspaceExcluded => "workspace-excluded",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageRole {
+    ProductCode,
+    AdapterOperator,
+    PolicyTooling,
+    ProofHarness,
+    VendoredThirdParty,
+    StandaloneFuzz,
+    ScaffoldTransitional,
+    ArchiveDeleteCandidate,
+}
+
+impl PackageRole {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "product-code" => Some(Self::ProductCode),
+            "adapter-operator" => Some(Self::AdapterOperator),
+            "policy-tooling" => Some(Self::PolicyTooling),
+            "proof-harness" => Some(Self::ProofHarness),
+            "vendored-third-party" => Some(Self::VendoredThirdParty),
+            "standalone-fuzz" => Some(Self::StandaloneFuzz),
+            "scaffold-transitional" => Some(Self::ScaffoldTransitional),
+            "archive-delete-candidate" => Some(Self::ArchiveDeleteCandidate),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProductCode => "product-code",
+            Self::AdapterOperator => "adapter-operator",
+            Self::PolicyTooling => "policy-tooling",
+            Self::ProofHarness => "proof-harness",
+            Self::VendoredThirdParty => "vendored-third-party",
+            Self::StandaloneFuzz => "standalone-fuzz",
+            Self::ScaffoldTransitional => "scaffold-transitional",
+            Self::ArchiveDeleteCandidate => "archive-delete-candidate",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PackageClassificationRow {
+    package_root: String,
+    package_name: String,
+    status: ClassificationStatus,
+    role: PackageRole,
+    disposition: String,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoMetadataPackage>,
+    workspace_members: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadataPackage {
+    name: String,
+    id: String,
+    manifest_path: String,
+}
+
 #[derive(Debug)]
 pub struct WorkspacePolicyError {
     violations: Vec<String>,
@@ -150,6 +238,7 @@ pub fn check_current_workspace() -> Result<(), WorkspacePolicyError> {
     check_package_profile_doc_name_drift(&root, &mut violations);
     check_excluded_fuzz_manifest_licenses(&root, &mut violations);
     check_file_local_provenance_markers(&root, &mut violations);
+    check_package_classification_authority(&root, &members, &mut violations);
 
     // ── Member-consistency audit: warn but don't fail ──
     let mut member_consistency_warnings = Vec::new();
@@ -766,6 +855,667 @@ fn collect_member_entries(line: &str, out: &mut Vec<String>) {
     }
 }
 
+const PACKAGE_CLASSIFICATION_DOC: &str = "docs/workspace-package-classification.md";
+
+const SCAFFOLD_TRANSITIONAL_PACKAGES: &[&str] = &[
+    "tidefs-types-control-plane-core",
+    "tidefs-types-publication-pipeline-core",
+    "tidefs-types-response-registry-core",
+];
+
+fn check_package_classification_authority(
+    root: &Path,
+    members: &[Member],
+    violations: &mut Vec<String>,
+) {
+    let rows = match load_package_classification_rows(root) {
+        Ok(rows) => rows,
+        Err(err) => {
+            violations.push(err);
+            return;
+        }
+    };
+    let cargo_members = match cargo_metadata_workspace_packages(root) {
+        Ok(packages) => packages,
+        Err(err) => {
+            violations.push(err);
+            return;
+        }
+    };
+    let discovered_manifests = match discover_package_manifest_roots(root) {
+        Ok(manifests) => manifests,
+        Err(err) => {
+            violations.push(err);
+            return;
+        }
+    };
+
+    let workspace_roots: BTreeSet<String> = cargo_members.keys().cloned().collect();
+    let excluded_roots = parse_workspace_exclude_set(root);
+    let classified_roots: BTreeSet<String> =
+        rows.iter().map(|row| row.package_root.clone()).collect();
+    let expected_roots: BTreeSet<String> =
+        workspace_roots.union(&excluded_roots).cloned().collect();
+
+    check_classification_summary_counts(
+        root,
+        workspace_roots.len(),
+        excluded_roots.len(),
+        discovered_manifests.len(),
+        rows.len(),
+        violations,
+    );
+
+    for package_root in expected_roots.difference(&classified_roots) {
+        violations.push(format!(
+            "{PACKAGE_CLASSIFICATION_DOC} lacks package classification for `{package_root}`"
+        ));
+    }
+    for package_root in classified_roots.difference(&expected_roots) {
+        violations.push(format!(
+            "{PACKAGE_CLASSIFICATION_DOC} classifies `{package_root}`, but Cargo metadata and workspace.exclude do not"
+        ));
+    }
+    for package_root in discovered_manifests.keys() {
+        if !expected_roots.contains(package_root) {
+            violations.push(format!(
+                "Cargo manifest `{package_root}/Cargo.toml` is neither a workspace member nor listed in workspace.exclude"
+            ));
+        }
+    }
+    for package_root in &excluded_roots {
+        if !discovered_manifests.contains_key(package_root) {
+            violations.push(format!(
+                "workspace.exclude lists `{package_root}`, but `{package_root}/Cargo.toml` is not a package manifest"
+            ));
+        }
+    }
+
+    let mut rows_by_root: BTreeMap<&str, &PackageClassificationRow> = BTreeMap::new();
+    let mut rows_by_package: BTreeMap<&str, &PackageClassificationRow> = BTreeMap::new();
+    for row in &rows {
+        if let Some(previous) = rows_by_root.insert(row.package_root.as_str(), row) {
+            violations.push(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} has duplicate package-root rows `{}` and `{}`",
+                previous.package_root, row.package_root
+            ));
+        }
+        if let Some(previous) = rows_by_package.insert(row.package_name.as_str(), row) {
+            violations.push(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} has duplicate package rows `{}` at `{}` and `{}`",
+                row.package_name, previous.package_root, row.package_root
+            ));
+        }
+
+        let actual_status = if workspace_roots.contains(&row.package_root) {
+            Some(ClassificationStatus::WorkspaceMember)
+        } else if excluded_roots.contains(&row.package_root) {
+            Some(ClassificationStatus::WorkspaceExcluded)
+        } else {
+            None
+        };
+        if let Some(actual_status) = actual_status {
+            if row.status != actual_status {
+                violations.push(format!(
+                    "{PACKAGE_CLASSIFICATION_DOC} classifies `{}` as `{}`, but Cargo state is `{}`",
+                    row.package_root,
+                    row.status.as_str(),
+                    actual_status.as_str()
+                ));
+            }
+        }
+
+        let actual_name = cargo_members
+            .get(&row.package_root)
+            .or_else(|| discovered_manifests.get(&row.package_root));
+        match actual_name {
+            Some(actual_name) if actual_name == &row.package_name => {}
+            Some(actual_name) => violations.push(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} names `{}` as `{}`, but its manifest declares `{}`",
+                row.package_root, row.package_name, actual_name
+            )),
+            None => {}
+        }
+
+        check_classification_role_boundary(row, violations);
+    }
+
+    let excluded_classified_roots: BTreeSet<String> = rows
+        .iter()
+        .filter(|row| row.status == ClassificationStatus::WorkspaceExcluded)
+        .map(|row| row.package_root.clone())
+        .collect();
+    if excluded_classified_roots != excluded_roots {
+        for package_root in excluded_roots.difference(&excluded_classified_roots) {
+            violations.push(format!(
+                "workspace.exclude lists `{package_root}`, but {PACKAGE_CLASSIFICATION_DOC} does not mark it as workspace-excluded"
+            ));
+        }
+        for package_root in excluded_classified_roots.difference(&excluded_roots) {
+            violations.push(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} marks `{package_root}` as workspace-excluded, but root Cargo.toml does not exclude it"
+            ));
+        }
+    }
+
+    let reverse_counts = workspace_reverse_dependency_counts(members);
+    for member in members {
+        let Some(row) = rows_by_package.get(member.name.as_str()) else {
+            continue;
+        };
+        let reverse_count = reverse_counts
+            .get(member.name.as_str())
+            .copied()
+            .unwrap_or(0);
+        if reverse_count == 0 && !has_concrete_zero_reverse_disposition(&row.disposition) {
+            violations.push(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} row `{}` has zero workspace reverse dependencies but disposition `{}` is not concrete",
+                row.package_name, row.disposition
+            ));
+        }
+        if row.role == PackageRole::ScaffoldTransitional
+            && !has_scaffold_followup_disposition(&row.disposition)
+        {
+            violations.push(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} row `{}` is scaffold-transitional without a TFR-002 follow-up disposition",
+                row.package_name
+            ));
+        }
+    }
+
+    check_dependency_role_boundaries(members, &rows_by_package, violations);
+}
+
+fn load_package_classification_rows(root: &Path) -> Result<Vec<PackageClassificationRow>, String> {
+    let path = root.join(PACKAGE_CLASSIFICATION_DOC);
+    let text = fs::read_to_string(&path)
+        .map_err(|err| format!("cannot read {PACKAGE_CLASSIFICATION_DOC}: {err}"))?;
+    parse_package_classification_rows(&text)
+}
+
+fn parse_package_classification_rows(text: &str) -> Result<Vec<PackageClassificationRow>, String> {
+    const HEADER: &str = "| Package root | Package | Cargo status | Role | Disposition |";
+
+    let mut rows = Vec::new();
+    let mut in_table = false;
+    let mut saw_header = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line == HEADER {
+            in_table = true;
+            saw_header = true;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        if !line.starts_with('|') {
+            break;
+        }
+        let cells = split_markdown_table_row(line);
+        if cells.iter().all(|cell| is_markdown_separator_cell(cell)) {
+            continue;
+        }
+        if cells.len() != 5 {
+            return Err(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} package table row has {} cells, expected 5: {line}",
+                cells.len()
+            ));
+        }
+        let package_root = strip_markdown_code(&cells[0]);
+        let package_name = strip_markdown_code(&cells[1]);
+        let status_text = strip_markdown_code(&cells[2]);
+        let role_text = strip_markdown_code(&cells[3]);
+        let status = ClassificationStatus::parse(&status_text).ok_or_else(|| {
+            format!(
+                "{PACKAGE_CLASSIFICATION_DOC} row `{package_root}` has invalid Cargo status `{status_text}`"
+            )
+        })?;
+        let role = PackageRole::parse(&role_text).ok_or_else(|| {
+            format!(
+                "{PACKAGE_CLASSIFICATION_DOC} row `{package_root}` has invalid role `{role_text}`"
+            )
+        })?;
+        let disposition = cells[4].trim().to_string();
+        if package_root.is_empty() || package_name.is_empty() || disposition.is_empty() {
+            return Err(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} row `{package_root}` must have non-empty root, package, and disposition"
+            ));
+        }
+        rows.push(PackageClassificationRow {
+            package_root,
+            package_name,
+            status,
+            role,
+            disposition,
+        });
+    }
+
+    if !saw_header {
+        return Err(format!(
+            "{PACKAGE_CLASSIFICATION_DOC} must contain package classification table header `{HEADER}`"
+        ));
+    }
+    Ok(rows)
+}
+
+fn split_markdown_table_row(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+fn is_markdown_separator_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| ch == '-' || ch == ':' || ch == ' ')
+}
+
+fn strip_markdown_code(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some(stripped) = trimmed
+        .strip_prefix('`')
+        .and_then(|value| value.strip_suffix('`'))
+    {
+        stripped.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn cargo_metadata_workspace_packages(root: &Path) -> Result<BTreeMap<String, String>, String> {
+    let output = Command::new("cargo")
+        .current_dir(root)
+        .args(["metadata", "--no-deps", "--format-version=1"])
+        .output()
+        .map_err(|err| format!("cannot run cargo metadata for package classification: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata for package classification failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let metadata: CargoMetadata = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("cannot parse cargo metadata JSON: {err}"))?;
+    let workspace_members: BTreeSet<String> = metadata.workspace_members.into_iter().collect();
+    let mut packages = BTreeMap::new();
+    for package in metadata.packages {
+        if !workspace_members.contains(&package.id) {
+            continue;
+        }
+        let package_root = cargo_manifest_package_root(root, &package.manifest_path)?;
+        packages.insert(package_root, package.name);
+    }
+    Ok(packages)
+}
+
+fn cargo_manifest_package_root(root: &Path, manifest_path: &str) -> Result<String, String> {
+    let manifest_path = Path::new(manifest_path);
+    let rel = manifest_path.strip_prefix(root).map_err(|err| {
+        format!(
+            "cargo metadata manifest path {} is outside root: {err}",
+            manifest_path.display()
+        )
+    })?;
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    rel.strip_suffix("/Cargo.toml")
+        .map(|path| path.to_string())
+        .ok_or_else(|| format!("cargo metadata manifest path `{rel}` does not end in /Cargo.toml"))
+}
+
+fn discover_package_manifest_roots(root: &Path) -> Result<BTreeMap<String, String>, String> {
+    let mut manifests = BTreeMap::new();
+    collect_package_manifest_roots(root, root, &mut manifests)?;
+    Ok(manifests)
+}
+
+fn collect_package_manifest_roots(
+    root: &Path,
+    current_dir: &Path,
+    manifests: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let manifest_path = current_dir.join("Cargo.toml");
+    if manifest_path.exists() {
+        let text = fs::read_to_string(&manifest_path)
+            .map_err(|err| format!("read {}: {err}", manifest_path.display()))?;
+        if let Some(package_name) = manifest_package_name(&text) {
+            let rel_dir = current_dir
+                .strip_prefix(root)
+                .map_err(|err| format!("strip_prefix {}: {err}", current_dir.display()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !rel_dir.is_empty() {
+                manifests.insert(rel_dir, package_name);
+            }
+        }
+    }
+
+    let entries = fs::read_dir(current_dir)
+        .map_err(|err| format!("read_dir {}: {err}", current_dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| format!("read_dir {} entry: {err}", current_dir.display()))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if matches!(name, ".git" | "target" | ".direnv" | ".cargo" | ".github") {
+            continue;
+        }
+        collect_package_manifest_roots(root, &path, manifests)?;
+    }
+    Ok(())
+}
+
+fn manifest_package_name(text: &str) -> Option<String> {
+    let mut in_package = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "name" {
+            continue;
+        }
+        return parse_manifest_string_value(value.trim());
+    }
+    None
+}
+
+fn parse_workspace_exclude_set(root: &Path) -> BTreeSet<String> {
+    parse_workspace_string_array_set(root, "exclude")
+}
+
+fn parse_workspace_string_array_set(root: &Path, key: &str) -> BTreeSet<String> {
+    let manifest_path = root.join("Cargo.toml");
+    let text = match fs::read_to_string(&manifest_path) {
+        Ok(t) => t,
+        Err(_) => return BTreeSet::new(),
+    };
+    let mut paths: Vec<String> = Vec::new();
+    let mut in_workspace = false;
+    let mut in_array = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_workspace = trimmed == "[workspace]";
+            in_array = false;
+            continue;
+        }
+        if !in_workspace {
+            continue;
+        }
+        if let Some((lhs, rhs)) = trimmed.split_once('=') {
+            if lhs.trim() == key {
+                in_array = true;
+                collect_member_entries(rhs.trim(), &mut paths);
+                if rhs.contains(']') {
+                    in_array = false;
+                }
+                continue;
+            }
+        }
+        if in_array {
+            collect_member_entries(trimmed, &mut paths);
+            if trimmed.contains(']') {
+                in_array = false;
+            }
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn check_classification_summary_counts(
+    root: &Path,
+    workspace_count: usize,
+    excluded_count: usize,
+    discovered_count: usize,
+    classified_count: usize,
+    violations: &mut Vec<String>,
+) {
+    let path = root.join(PACKAGE_CLASSIFICATION_DOC);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) => {
+            violations.push(format!(
+                "cannot read {PACKAGE_CLASSIFICATION_DOC} for count table: {err}"
+            ));
+            return;
+        }
+    };
+    let counts = parse_classification_count_rows(&text);
+    for (label, expected) in [
+        ("Workspace packages", workspace_count),
+        ("Explicitly excluded package roots", excluded_count),
+        ("Discovered package manifests", discovered_count),
+        ("Classified package roots", classified_count),
+    ] {
+        match counts.get(label).copied() {
+            Some(actual) if actual == expected => {}
+            Some(actual) => violations.push(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} count `{label}` is {actual}, expected {expected}"
+            )),
+            None => violations.push(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} must document count `{label}`"
+            )),
+        }
+    }
+}
+
+fn parse_classification_count_rows(text: &str) -> BTreeMap<String, usize> {
+    const HEADER: &str = "| Counted set | Value |";
+
+    let mut counts = BTreeMap::new();
+    let mut in_table = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line == HEADER {
+            in_table = true;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        if !line.starts_with('|') {
+            break;
+        }
+        let cells = split_markdown_table_row(line);
+        if cells.iter().all(|cell| is_markdown_separator_cell(cell)) {
+            continue;
+        }
+        if cells.len() != 2 {
+            continue;
+        }
+        if let Ok(value) = strip_markdown_code(&cells[1]).parse::<usize>() {
+            counts.insert(strip_markdown_code(&cells[0]), value);
+        }
+    }
+    counts
+}
+
+fn check_classification_role_boundary(
+    row: &PackageClassificationRow,
+    violations: &mut Vec<String>,
+) {
+    if row.status == ClassificationStatus::WorkspaceExcluded
+        && !matches!(
+            row.role,
+            PackageRole::StandaloneFuzz | PackageRole::ArchiveDeleteCandidate
+        )
+    {
+        violations.push(format!(
+            "{PACKAGE_CLASSIFICATION_DOC} row `{}` is workspace-excluded but role is `{}`",
+            row.package_root,
+            row.role.as_str()
+        ));
+    }
+    if row.role == PackageRole::StandaloneFuzz {
+        if row.status != ClassificationStatus::WorkspaceExcluded {
+            violations.push(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} row `{}` is standalone-fuzz but is not workspace-excluded",
+                row.package_root
+            ));
+        }
+        if row.package_root != "fuzz" && !row.package_root.ends_with("/fuzz") {
+            violations.push(format!(
+                "{PACKAGE_CLASSIFICATION_DOC} row `{}` is standalone-fuzz but is not a fuzz package root",
+                row.package_root
+            ));
+        }
+    }
+    if row.role == PackageRole::VendoredThirdParty
+        && (row.package_name != "fuser" || row.package_root != "crates/tidefs-fuser")
+    {
+        violations.push(format!(
+            "{PACKAGE_CLASSIFICATION_DOC} row `{}` uses vendored-third-party outside the vendored fuser package",
+            row.package_root
+        ));
+    }
+    if row.role == PackageRole::ScaffoldTransitional
+        && !SCAFFOLD_TRANSITIONAL_PACKAGES.contains(&row.package_name.as_str())
+    {
+        violations.push(format!(
+            "{PACKAGE_CLASSIFICATION_DOC} row `{}` is scaffold-transitional but is not in the TFR-002 scaffold type allowlist",
+            row.package_name
+        ));
+    }
+    if row.package_root.starts_with("apps/")
+        && !matches!(
+            row.role,
+            PackageRole::AdapterOperator | PackageRole::ProofHarness
+        )
+    {
+        violations.push(format!(
+            "{PACKAGE_CLASSIFICATION_DOC} app root `{}` has role `{}`, expected adapter-operator or proof-harness",
+            row.package_root,
+            row.role.as_str()
+        ));
+    }
+    if row.package_root.starts_with("xtask/") && row.role != PackageRole::PolicyTooling {
+        violations.push(format!(
+            "{PACKAGE_CLASSIFICATION_DOC} xtask root `{}` has role `{}`, expected policy-tooling",
+            row.package_root,
+            row.role.as_str()
+        ));
+    }
+    if (row.package_root == "kmod"
+        || row.package_root == "crates/tidefs-block-kmod"
+        || row.package_root == "crates/tidefs-kmod-posix-vfs")
+        && row.role != PackageRole::AdapterOperator
+    {
+        violations.push(format!(
+            "{PACKAGE_CLASSIFICATION_DOC} kernel-facing root `{}` has role `{}`, expected adapter-operator",
+            row.package_root,
+            row.role.as_str()
+        ));
+    }
+}
+
+fn workspace_reverse_dependency_counts(members: &[Member]) -> BTreeMap<String, usize> {
+    let member_names: BTreeSet<&str> = members.iter().map(|member| member.name.as_str()).collect();
+    let mut reverse_counts = BTreeMap::new();
+    for member in members {
+        for dependency in &member.dependencies {
+            if member_names.contains(dependency.as_str()) {
+                *reverse_counts.entry(dependency.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    reverse_counts
+}
+
+fn has_concrete_zero_reverse_disposition(disposition: &str) -> bool {
+    let lower = disposition.to_ascii_lowercase();
+    [
+        "live entrypoint",
+        "operator entrypoint",
+        "demo entrypoint",
+        "policy gate",
+        "planned authority surface",
+        "follow-up issue required",
+        "vendored dependency",
+        "archive/delete candidate",
+        "standalone-checkable",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn has_scaffold_followup_disposition(disposition: &str) -> bool {
+    let lower = disposition.to_ascii_lowercase();
+    lower.contains("tfr-002") && lower.contains("follow-up issue required")
+}
+
+fn check_dependency_role_boundaries(
+    members: &[Member],
+    rows_by_package: &BTreeMap<&str, &PackageClassificationRow>,
+    violations: &mut Vec<String>,
+) {
+    let member_map: BTreeMap<_, _> = members.iter().map(|m| (m.name.as_str(), m)).collect();
+    for member in members {
+        let Some(source_row) = rows_by_package.get(member.name.as_str()) else {
+            continue;
+        };
+        for dependency in &member.dependencies {
+            let Some(_target) = member_map.get(dependency.as_str()) else {
+                continue;
+            };
+            let Some(target_row) = rows_by_package.get(dependency.as_str()) else {
+                continue;
+            };
+            if target_row.role == PackageRole::ArchiveDeleteCandidate
+                && source_row.role != PackageRole::ProofHarness
+            {
+                violations.push(format!(
+                    "{} ({}) depends on archive-delete-candidate {}",
+                    source_row.package_name,
+                    source_row.role.as_str(),
+                    target_row.package_name
+                ));
+            }
+            if target_row.role == PackageRole::ScaffoldTransitional
+                && matches!(
+                    source_row.role,
+                    PackageRole::ProductCode
+                        | PackageRole::AdapterOperator
+                        | PackageRole::PolicyTooling
+                )
+            {
+                violations.push(format!(
+                    "{} ({}) depends on scaffold-transitional {}",
+                    source_row.package_name,
+                    source_row.role.as_str(),
+                    target_row.package_name
+                ));
+            }
+        }
+    }
+}
+
 const STALE_PACKAGE_PROFILE_DOC_NAMES: &[(&str, &str)] = &[
     (
         "cap.package_profile_catalog.block_userspace.c3",
@@ -998,7 +1748,7 @@ fn parse_member(root: &Path, manifest_path: &Path) -> Result<Member, String> {
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
                 {
-                    dependencies.push(dep_name.replace('_', "-"));
+                    dependencies.push(dep_name.to_string());
                 }
             }
         }
@@ -1539,7 +2289,7 @@ fn extract_all_dependency_names(manifest_path: &Path) -> Vec<String> {
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
             {
-                key.replace('_', "-")
+                key.to_string()
             } else {
                 continue;
             };
@@ -1713,52 +2463,28 @@ mod tests {
         assert_eq!(class, CrateClass::Types);
 
         let (kind, family, class) = classify_member(
-            Path::new("crates/tidefs-schema-codec-control-plane/Cargo.toml"),
-            "tidefs-schema-codec-control-plane",
+            Path::new("crates/tidefs-schema-codec-vfs/Cargo.toml"),
+            "tidefs-schema-codec-vfs",
         );
         assert_eq!(kind, NodeKind::Library);
         assert_eq!(family, Family::SchemaCodec);
         assert_eq!(class, CrateClass::Schema);
 
         let (kind, family, class) = classify_member(
-            Path::new("crates/tidefs-policy-authority-client/Cargo.toml"),
-            "tidefs-policy-authority-client",
+            Path::new("crates/tidefs-secret-key-policy-runtime/Cargo.toml"),
+            "tidefs-secret-key-policy-runtime",
         );
         assert_eq!(kind, NodeKind::Library);
         assert_eq!(family, Family::PolicyAuthority);
-        assert_eq!(class, CrateClass::Client);
-
-        let (kind, family, class) = classify_member(
-            Path::new("crates/tidefs-control-plane-runtime/Cargo.toml"),
-            "tidefs-control-plane-runtime",
-        );
-        assert_eq!(kind, NodeKind::Library);
-        assert_eq!(family, Family::ControlPlane);
         assert_eq!(class, CrateClass::Runtime);
 
         let (kind, family, class) = classify_member(
-            Path::new("crates/tidefs-schema-codec-outcome/Cargo.toml"),
-            "tidefs-schema-codec-outcome",
+            Path::new("crates/tidefs-types-response-registry-core/Cargo.toml"),
+            "tidefs-types-response-registry-core",
         );
         assert_eq!(kind, NodeKind::Library);
-        assert_eq!(family, Family::SchemaCodec);
-        assert_eq!(class, CrateClass::Schema);
-
-        let (kind, family, class) = classify_member(
-            Path::new("crates/tidefs-observe-core/Cargo.toml"),
-            "tidefs-observe-core",
-        );
-        assert_eq!(kind, NodeKind::Library);
-        assert_eq!(family, Family::Observe);
-        assert_eq!(class, CrateClass::Observe);
-
-        let (kind, family, class) = classify_member(
-            Path::new("crates/tidefs-observe-core-truth-view-render/Cargo.toml"),
-            "tidefs-observe-core-truth-view-render",
-        );
-        assert_eq!(kind, NodeKind::Library);
-        assert_eq!(family, Family::Observe);
-        assert_eq!(class, CrateClass::Render);
+        assert_eq!(family, Family::Types);
+        assert_eq!(class, CrateClass::Types);
 
         let (kind, family, class) = classify_member(
             Path::new("crates/tidefs-local-object-store/Cargo.toml"),
@@ -1800,13 +2526,38 @@ mod tests {
         assert_eq!(family, Family::Storage);
         assert_eq!(class, CrateClass::ServiceRoot);
 
-        let (kind, family, class) = classify_member(
-            Path::new("apps/tidefs-control-plane-daemon/Cargo.toml"),
-            "tidefs-control-plane-daemon",
-        );
+        let (kind, family, class) =
+            classify_member(Path::new("apps/tidefsctl/Cargo.toml"), "tidefsctl");
         assert_eq!(kind, NodeKind::AppRoot);
         assert_eq!(family, Family::ControlPlane);
         assert_eq!(class, CrateClass::ServiceRoot);
+
+        let (kind, family, class) =
+            classify_member(Path::new("xtask/tidefs-xtask/Cargo.toml"), "tidefs-xtask");
+        assert_eq!(kind, NodeKind::Xtask);
+        assert_eq!(family, Family::Xtask);
+        assert_eq!(class, CrateClass::TestOrXtask);
+    }
+
+    #[test]
+    fn package_classification_table_parses_structured_rows() {
+        let text = r#"
+# Example
+
+| Package root | Package | Cargo status | Role | Disposition |
+| --- | --- | --- | --- | --- |
+| `crates/tidefs-local-object-store` | `tidefs-local-object-store` | `workspace-member` | `product-code` | current product component; capability claims remain limited. |
+| `fuzz` | `tidefs-fuzz` | `workspace-excluded` | `standalone-fuzz` | standalone-checkable fuzz package. |
+"#;
+        let rows = parse_package_classification_rows(text).expect("classification rows");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].package_root, "crates/tidefs-local-object-store");
+        assert_eq!(rows[0].status, ClassificationStatus::WorkspaceMember);
+        assert_eq!(rows[0].role, PackageRole::ProductCode);
+        assert_eq!(rows[1].package_root, "fuzz");
+        assert_eq!(rows[1].status, ClassificationStatus::WorkspaceExcluded);
+        assert_eq!(rows[1].role, PackageRole::StandaloneFuzz);
     }
 
     #[test]

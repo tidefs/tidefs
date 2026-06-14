@@ -19,6 +19,7 @@ pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "docs/REVIEW_TODO_REGISTER.md",
     "docs/UNRELEASED_AUTHORITY_POLICY.md",
     "docs/WHOLE_REPO_REVIEW.md",
+    "docs/workspace-package-classification.md",
 ];
 
 pub const CLAIMS_GATE_SENSITIVE_PATTERNS: &[&str] = &[
@@ -87,21 +88,22 @@ const CLAIMS_GATE_ALLOWED_FRAMES: &[&str] = &[
 ];
 
 const APP_INDEX_LIMITATION_MARKERS: &[&str] = &[
-    "inventory, not a production-readiness claim",
-    "`tidefsctl`",
-    "`TFR-011`/`TFR-019` review",
-    "non-production Local Filesystem demo",
-    "storage-node cluster authority remains under `TFR-017`",
-    "non-production Local Object Store demo",
+    "checked package-role authority",
+    "mirrors the current app-root inventory only for navigation",
+    "operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open",
+    "non-production Local Filesystem exercise only",
+    "cluster authority remains TFR-017",
+    "non-production Local Object Store exercise only",
+    "not production-readiness claims",
 ];
 
 const CRATE_INDEX_LIMITATION_MARKERS: &[&str] = &[
-    "package counts and tables below are stale",
-    "review input, not current package authority",
-    "not current package authority",
-    "source ownership index, not release proof",
-    "Capability claims",
-    "must follow `docs/REVIEW_TODO_REGISTER.md`",
+    "current package-role authority is `docs/workspace-package-classification.md`",
+    "validates that authority against Cargo metadata",
+    "manifest discovery",
+    "root `workspace.exclude` list",
+    "only a navigation aid, not a second package table",
+    "Capability wording for crates remains behind implementation reality",
     "`docs/CLAIMS_GATE_POLICY.md`",
     "`cargo run -p tidefs-xtask -- check-claims-gate`",
 ];
@@ -297,6 +299,7 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "tracked GitHub issue",
             "apps/README.md",
             "crates/README.md",
+            "docs/workspace-package-classification.md",
             "OpenZFS/Ceph successor claim",
             "production-ready",
             "POSIX-complete",
@@ -578,6 +581,7 @@ mod tests {
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/REVIEW_TODO_REGISTER.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/UNRELEASED_AUTHORITY_POLICY.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/WHOLE_REPO_REVIEW.md"));
+        assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/workspace-package-classification.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS
             .contains(&"docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md"));
@@ -586,10 +590,11 @@ mod tests {
     #[test]
     fn claims_gate_requires_top_level_index_limitations() {
         for marker in [
-            "inventory, not a production-readiness claim",
-            "`TFR-011`/`TFR-019` review",
-            "storage-node cluster authority remains under `TFR-017`",
-            "non-production Local Object Store demo",
+            "checked package-role authority",
+            "operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open",
+            "cluster authority remains TFR-017",
+            "non-production Local Object Store exercise only",
+            "not production-readiness claims",
         ] {
             assert!(
                 APP_INDEX_LIMITATION_MARKERS.contains(&marker),
@@ -598,12 +603,11 @@ mod tests {
         }
 
         for marker in [
-            "package counts and tables below are stale",
-            "review input, not current package authority",
-            "not current package authority",
-            "source ownership index, not release proof",
-            "Capability claims",
-            "must follow `docs/REVIEW_TODO_REGISTER.md`",
+            "current package-role authority is `docs/workspace-package-classification.md`",
+            "validates that authority against Cargo metadata",
+            "only a navigation aid, not a second package table",
+            "Capability wording for crates remains behind implementation reality",
+            "`docs/CLAIMS_GATE_POLICY.md`",
             "`cargo run -p tidefs-xtask -- check-claims-gate`",
         ] {
             assert!(
