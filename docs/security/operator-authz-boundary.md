@@ -30,7 +30,7 @@ ambiguous operation.
 | `dataset set-strategy --enable/--disable` | LocalOnly | `tidefsctl` admission helper when mutating | `AuthorizationRequest(ActionClass::Stage)` |
 | `dataset upgrade` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::Stage)` |
 | `dataset seal-key/rotate-key` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::RotateKey)` |
-| `snapshot create/destroy/rollback/send/receive` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::Stage)` |
+| `snapshot create/destroy/rollback/send/receive`, `snapshot clone create/delete/promote`, `snapshot bookmark create/delete`, `snapshot hold/release/prune` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::Stage)` |
 | `block attach/detach/send/receive` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::Stage)` |
 | `defrag` | LocalOnly | `tidefsctl` admission helper | `AuthorizationRequest(ActionClass::RepairPublish)` |
 
@@ -42,7 +42,7 @@ commands. It maps each privileged command name to
 The following surfaces are consciously excluded from the privileged guard
 until they mutate state or a future issue gives them a stronger authorization
 class: help text, `pool scan`, `pool status`, `pool get`, `pool list-props`,
-`snapshot list`, `block list`, `dataset list`, `dataset get`,
+`snapshot list`, `snapshot holds`, `block list`, `dataset list`, `dataset get`,
 `dataset list-props`, `pool integrity-check`, `kernel status`, `diag`,
 userspace harnesses (`mount`, `pool mount`), prototype/development cluster
 commands, and removed directory-backed/offline surfaces that already fail
@@ -148,6 +148,8 @@ to any CLI/API privileged action paths. Wiring it requires:
   surfaces.
 - `tidefsctl pool create/import/export/destroy/set`,
   `device remove`, `snapshot create/destroy/rollback/send/receive`,
+  `snapshot clone create/delete/promote`,
+  `snapshot bookmark create/delete`, `snapshot hold/release/prune`,
   `block attach/detach/send/receive`,
   `dataset create/destroy/rename/set-strategy` when mutating,
   `dataset seal-key/rotate-key/upgrade/set`, and `defrag` now acquire a

@@ -302,6 +302,25 @@ tidefsctl snapshot create mypool mysnap
 # List snapshots
 tidefsctl snapshot list mypool
 
+# Create, hold, release, and delete a local clone
+tidefsctl snapshot clone create mypool clone-a mysnap
+tidefsctl snapshot hold mypool clone-a
+tidefsctl snapshot holds mypool clone-a
+tidefsctl snapshot release mypool clone-a
+tidefsctl snapshot clone delete mypool clone-a
+
+# Promote a clone into an independent snapshot
+tidefsctl snapshot clone create mypool clone-b mysnap
+tidefsctl snapshot clone promote mypool clone-b
+tidefsctl snapshot destroy mypool clone-b
+
+# Create and delete a lightweight local bookmark
+tidefsctl snapshot bookmark create mypool repl-anchor mysnap
+tidefsctl snapshot bookmark delete mypool repl-anchor
+
+# Prune regular local snapshots by retention policy
+tidefsctl snapshot prune mypool --keep-latest 8
+
 # Destroy
 tidefsctl snapshot destroy mypool mysnap
 
@@ -315,6 +334,10 @@ mounted state. Owner-side receive, live network push, and live incremental
 send remain bounded follow-up paths; missing owner implementations fail closed
 instead of opening storage behind the owner. Directory object-store receive is
 not a pool media mode.
+
+The clone, bookmark, hold, release, and prune commands cover the current local
+snapshot lifecycle only. They do not claim distributed snapshot replication,
+deadlist correctness, placement receipts, or integrated snapshot reclaim.
 
 For exported/offline pools, the same dataset and snapshot commands may take
 `--devices` where the command supports direct byte-addressable access. That

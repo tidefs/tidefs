@@ -167,7 +167,65 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         path: "snapshot list",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "list snapshots through the live owner or explicit offline devices",
+        summary:
+            "list local snapshot catalog entries with kind, origin, hold, and generation metadata",
+    },
+    CommandSurface {
+        path: "snapshot clone create",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "create local snapshot clones through the live owner or explicit offline devices",
+    },
+    CommandSurface {
+        path: "snapshot clone delete",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "delete local snapshot clones through the live owner or explicit offline devices",
+    },
+    CommandSurface {
+        path: "snapshot clone promote",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "promote local snapshot clones through the live owner or explicit offline devices",
+    },
+    CommandSurface {
+        path: "snapshot bookmark create",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary:
+            "create local snapshot bookmarks through the live owner or explicit offline devices",
+    },
+    CommandSurface {
+        path: "snapshot bookmark delete",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary:
+            "delete local snapshot bookmarks through the live owner or explicit offline devices",
+    },
+    CommandSurface {
+        path: "snapshot hold",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "place local deletion-prevention holds on snapshots or clones",
+    },
+    CommandSurface {
+        path: "snapshot release",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "release local deletion-prevention holds on snapshots or clones",
+    },
+    CommandSurface {
+        path: "snapshot holds",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "inspect local snapshot and clone hold counts",
+    },
+    CommandSurface {
+        path: "snapshot prune",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary:
+            "prune regular local snapshots by retention policy while excluding clones and bookmarks",
     },
     CommandSurface {
         path: "snapshot destroy",
@@ -533,6 +591,9 @@ mod tests {
             "pool list-props",
             "dataset create",
             "snapshot create",
+            "snapshot clone create",
+            "snapshot bookmark create",
+            "snapshot prune",
             "device remove",
             "block attach",
         ] {

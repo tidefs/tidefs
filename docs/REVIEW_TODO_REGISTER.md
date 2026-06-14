@@ -387,17 +387,16 @@ Important 2026-06-01 findings:
   `RawBlockFile` flush path is a no-op that relies on guest-side sync. That is
   not yet one kernel-resident pool authority for VFS, block export, recovery,
   writeback, and remanence.
-- `TFR-010`: Snapshot lifecycle is not single-sourced. Basic create/delete
-  paths update `state.snapshots`, GC lifecycle pins, and the dataset catalog,
-  while retention pruning removes entries from `state.snapshots` without the
-  dataset-catalog and GC-pin parity of the explicit delete path. Clone,
-  bookmark, and hold support all share `SnapshotRecord`; clone promotion just
-  flips `SnapshotKind`, and the module still claims "full ZFS-equivalent
-  lifecycle semantics." Send/receive exports current and snapshot roots,
-  incremental export filters content by object key/checksum, and receive
-  republishes roots after staging, but these paths are not unified with
-  deadlist accounting, lifecycle pins, retention pruning, or dataset catalog
-  authority.
+- `TFR-010`: Snapshot lifecycle is not single-sourced. Basic create/delete,
+  clone create/delete/promote, hold-protected retention pruning, and catalog
+  listing now share the local `SnapshotRecord`, dataset catalog, and lifecycle
+  pin authority. Bookmark entries are non-retaining local anchors. The module
+  now frames that shape as local lifecycle surface rather than ZFS-equivalent
+  completeness. Send/receive exports current and snapshot roots, incremental
+  export filters content by object key/checksum, and receive republishes roots
+  after staging, but these paths are not unified with deadlist accounting,
+  placement receipts, distributed send/receive authority, or integrated
+  snapshot reclaim.
 - `TFR-011`: Operator/UAPI authority is not yet one boundary.
   Commit `7dbb0759` removes the fake `pool list` parser surface instead of
   accepting a command whose handler only said scaffolding had been removed, and

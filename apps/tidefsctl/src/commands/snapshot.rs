@@ -10,8 +10,9 @@ use std::process;
 
 use clap::{Args, Subcommand};
 use tidefs_local_filesystem::{
-    ChangedRecordExport, LocalFileSystem, LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy,
-    RecoveryPolicy, RootAuthenticationKey, SnapshotSummary,
+    ChangedRecordExport, HoldInfo, LocalFileSystem, LocalFileSystemOpenConfig,
+    LocalStorageAllocatorPolicy, RecoveryPolicy, RootAuthenticationKey, SnapshotDescriptor,
+    SnapshotKind, SnapshotRetentionPolicy, SnapshotRetentionReport, SnapshotSummary,
 };
 use tidefs_local_object_store::StoreOptions;
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
@@ -258,6 +259,18 @@ pub enum SnapshotCommand {
     Create(SnapshotCreateArgs),
     /// List snapshots stored in the backing filesystem
     List(SnapshotListArgs),
+    /// Manage writable local snapshot clones
+    Clone(SnapshotCloneArgs),
+    /// Manage lightweight local snapshot bookmarks
+    Bookmark(SnapshotBookmarkArgs),
+    /// Place a deletion-prevention hold on a snapshot or clone
+    Hold(SnapshotHoldArgs),
+    /// Release a deletion-prevention hold from a snapshot or clone
+    Release(SnapshotReleaseArgs),
+    /// Inspect snapshot and clone holds
+    Holds(SnapshotHoldsArgs),
+    /// Prune regular local snapshots by retention policy
+    Prune(SnapshotPruneArgs),
     /// Destroy a named snapshot, unpinning its object graph from GC
     Destroy(SnapshotDestroyArgs),
     /// Export a changed-record snapshot stream from the current filesystem root
@@ -325,6 +338,297 @@ pub struct SnapshotListArgs {
         requires = "pool"
     )]
     pub devices: Option<Vec<PathBuf>>,
+}
+
+/// `snapshot clone <create|delete|promote> ...`
+#[derive(Args, Debug)]
+pub struct SnapshotCloneArgs {
+    #[command(subcommand)]
+    pub cmd: SnapshotCloneCommand,
+}
+
+/// Subcommands for `snapshot clone`.
+#[derive(Subcommand, Debug)]
+pub enum SnapshotCloneCommand {
+    /// Create a writable clone from a source snapshot or clone
+    Create(SnapshotCloneCreateArgs),
+    /// Delete a clone through clone lifecycle authority
+    Delete(SnapshotCloneDeleteArgs),
+    /// Promote a clone to an independent regular snapshot
+    Promote(SnapshotClonePromoteArgs),
+}
+
+/// `snapshot clone create <pool> <clone> <source> [--devices <dev>...]`
+#[derive(Args, Debug)]
+pub struct SnapshotCloneCreateArgs {
+    /// Pool, clone name, and source snapshot/clone name
+    #[arg(
+        value_name = "POOL_CLONE_SOURCE",
+        num_args = 2..=3,
+        required = true
+    )]
+    pub operands: Vec<String>,
+
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
+    pub backing_dir: Option<PathBuf>,
+
+    /// Block devices for offline/not-yet-imported clone access
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
+    pub devices: Option<Vec<PathBuf>>,
+}
+
+/// `snapshot clone delete <pool> <clone> [--devices <dev>...]`
+#[derive(Args, Debug)]
+pub struct SnapshotCloneDeleteArgs {
+    /// Pool and clone name
+    #[arg(value_name = "POOL_AND_CLONE", num_args = 1..=2, required = true)]
+    pub operands: Vec<String>,
+
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
+    pub backing_dir: Option<PathBuf>,
+
+    /// Block devices for offline/not-yet-imported clone access
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
+    pub devices: Option<Vec<PathBuf>>,
+}
+
+/// `snapshot clone promote <pool> <clone> [--devices <dev>...]`
+#[derive(Args, Debug)]
+pub struct SnapshotClonePromoteArgs {
+    /// Pool and clone name
+    #[arg(value_name = "POOL_AND_CLONE", num_args = 1..=2, required = true)]
+    pub operands: Vec<String>,
+
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
+    pub backing_dir: Option<PathBuf>,
+
+    /// Block devices for offline/not-yet-imported clone access
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
+    pub devices: Option<Vec<PathBuf>>,
+}
+
+/// `snapshot bookmark <create|delete> ...`
+#[derive(Args, Debug)]
+pub struct SnapshotBookmarkArgs {
+    #[command(subcommand)]
+    pub cmd: SnapshotBookmarkCommand,
+}
+
+/// Subcommands for `snapshot bookmark`.
+#[derive(Subcommand, Debug)]
+pub enum SnapshotBookmarkCommand {
+    /// Create a lightweight bookmark from a source snapshot or clone
+    Create(SnapshotBookmarkCreateArgs),
+    /// Delete a bookmark through bookmark lifecycle authority
+    Delete(SnapshotBookmarkDeleteArgs),
+}
+
+/// `snapshot bookmark create <pool> <bookmark> <source> [--devices <dev>...]`
+#[derive(Args, Debug)]
+pub struct SnapshotBookmarkCreateArgs {
+    /// Pool, bookmark name, and source snapshot/clone name
+    #[arg(
+        value_name = "POOL_BOOKMARK_SOURCE",
+        num_args = 2..=3,
+        required = true
+    )]
+    pub operands: Vec<String>,
+
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
+    pub backing_dir: Option<PathBuf>,
+
+    /// Block devices for offline/not-yet-imported bookmark access
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
+    pub devices: Option<Vec<PathBuf>>,
+}
+
+/// `snapshot bookmark delete <pool> <bookmark> [--devices <dev>...]`
+#[derive(Args, Debug)]
+pub struct SnapshotBookmarkDeleteArgs {
+    /// Pool and bookmark name
+    #[arg(value_name = "POOL_AND_BOOKMARK", num_args = 1..=2, required = true)]
+    pub operands: Vec<String>,
+
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
+    pub backing_dir: Option<PathBuf>,
+
+    /// Block devices for offline/not-yet-imported bookmark access
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
+    pub devices: Option<Vec<PathBuf>>,
+}
+
+/// `snapshot hold <pool> <name> [--devices <dev>...]`
+#[derive(Args, Debug)]
+pub struct SnapshotHoldArgs {
+    /// Pool and snapshot/clone name
+    #[arg(value_name = "POOL_AND_ENTRY", num_args = 1..=2, required = true)]
+    pub operands: Vec<String>,
+
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
+    pub backing_dir: Option<PathBuf>,
+
+    /// Block devices for offline/not-yet-imported hold access
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
+    pub devices: Option<Vec<PathBuf>>,
+}
+
+/// `snapshot release <pool> <name> [--devices <dev>...]`
+#[derive(Args, Debug)]
+pub struct SnapshotReleaseArgs {
+    /// Pool and snapshot/clone name
+    #[arg(value_name = "POOL_AND_ENTRY", num_args = 1..=2, required = true)]
+    pub operands: Vec<String>,
+
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
+    pub backing_dir: Option<PathBuf>,
+
+    /// Block devices for offline/not-yet-imported hold access
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
+    pub devices: Option<Vec<PathBuf>>,
+}
+
+/// `snapshot holds <pool> [name] [--devices <dev>...]`
+#[derive(Args, Debug)]
+pub struct SnapshotHoldsArgs {
+    /// Pool and optional snapshot/clone name
+    #[arg(value_name = "POOL_AND_ENTRY", num_args = 1..=2, required = true)]
+    pub operands: Vec<String>,
+
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value
+    )]
+    pub backing_dir: Option<PathBuf>,
+
+    /// Block devices for offline/not-yet-imported hold inspection
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir"
+    )]
+    pub devices: Option<Vec<PathBuf>>,
+}
+
+/// `snapshot prune <pool> [--keep-latest <n>] [--max-age-generations <n>]`
+#[derive(Args, Debug)]
+pub struct SnapshotPruneArgs {
+    /// Retired directory object-store backing mode.
+    #[arg(
+        long = "backing-dir",
+        short = 'b',
+        hide = true,
+        value_parser = crate::commands::reject_directory_pool_media_value,
+        conflicts_with = "pool",
+        required_unless_present = "pool"
+    )]
+    pub backing_dir: Option<PathBuf>,
+
+    /// Pool name for imported-pool pruning routed through the live owner
+    #[arg(
+        value_name = "POOL",
+        conflicts_with = "backing_dir",
+        required_unless_present = "backing_dir"
+    )]
+    pub pool: Option<String>,
+
+    /// Block devices for offline/not-yet-imported prune access
+    #[arg(
+        short = 'd',
+        long = "devices",
+        num_args = 1..,
+        conflicts_with = "backing_dir",
+        requires = "pool"
+    )]
+    pub devices: Option<Vec<PathBuf>>,
+
+    /// Keep at most this many newest regular snapshots
+    #[arg(long = "keep-latest", value_name = "COUNT")]
+    pub keep_latest: Option<usize>,
+
+    /// Delete regular snapshots older than this many filesystem generations
+    #[arg(long = "max-age-generations", value_name = "GENERATIONS")]
+    pub max_age_generations: Option<u64>,
 }
 
 /// `snapshot destroy <pool> <name> [--devices <dev>...]`
@@ -499,6 +803,12 @@ pub fn handle_snapshot(cmd: SnapshotCommand) {
     match cmd {
         SnapshotCommand::Create(args) => handle_create(args),
         SnapshotCommand::List(args) => handle_list(args),
+        SnapshotCommand::Clone(args) => handle_clone(args.cmd),
+        SnapshotCommand::Bookmark(args) => handle_bookmark(args.cmd),
+        SnapshotCommand::Hold(args) => handle_hold(args),
+        SnapshotCommand::Release(args) => handle_release(args),
+        SnapshotCommand::Holds(args) => handle_holds(args),
+        SnapshotCommand::Prune(args) => handle_prune(args),
         SnapshotCommand::Destroy(args) => handle_destroy(args),
         SnapshotCommand::Send(args) => handle_send(args),
         SnapshotCommand::Receive(args) => handle_receive(args),
@@ -689,6 +999,76 @@ fn parse_named_snapshot_operands(
     }
 }
 
+fn parse_pair_snapshot_operands(
+    operation: &str,
+    backing_dir: Option<&PathBuf>,
+    operands: &[String],
+) -> (Option<String>, String, String) {
+    match (backing_dir.is_some(), operands) {
+        (true, [name, source]) => (None, name.clone(), source.clone()),
+        (true, []) | (true, [_]) => {
+            eprintln!("tidefsctl snapshot {operation}: entry name and source name are required");
+            process::exit(1);
+        }
+        (true, _) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: directory-backed object-store mode is retired"
+            );
+            process::exit(1);
+        }
+        (false, [pool, name, source]) => (Some(pool.clone()), name.clone(), source.clone()),
+        (false, []) | (false, [_]) | (false, [_, _]) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: expected '<pool> <entry> <source>' for live pool mode"
+            );
+            process::exit(1);
+        }
+        (false, _) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: expected '<pool> <entry> <source>' for live pool mode"
+            );
+            process::exit(1);
+        }
+    }
+}
+
+fn parse_optional_snapshot_operand(
+    operation: &str,
+    backing_dir: Option<&PathBuf>,
+    operands: &[String],
+) -> (Option<String>, Option<String>) {
+    match (backing_dir.is_some(), operands) {
+        (true, []) => (None, None),
+        (true, [name]) => (None, Some(name.clone())),
+        (true, _) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: directory-backed object-store mode is retired"
+            );
+            process::exit(1);
+        }
+        (false, [pool]) => (Some(pool.clone()), None),
+        (false, [pool, name]) => (Some(pool.clone()), Some(name.clone())),
+        (false, []) => {
+            eprintln!("tidefsctl snapshot {operation}: pool name is required");
+            process::exit(1);
+        }
+        (false, _) => {
+            eprintln!(
+                "tidefsctl snapshot {operation}: expected '<pool> [snapshot-or-clone]' for live pool mode"
+            );
+            process::exit(1);
+        }
+    }
+}
+
+fn snapshot_kind_label(kind: SnapshotKind) -> &'static str {
+    match kind {
+        SnapshotKind::Snapshot => "snapshot",
+        SnapshotKind::Clone => "clone",
+        SnapshotKind::Bookmark => "bookmark",
+    }
+}
+
 fn snapshot_summary_line(summary: &SnapshotSummary) -> String {
     format!(
         "snapshot '{}' (source tx={}, source gen={}, created gen={})",
@@ -697,6 +1077,93 @@ fn snapshot_summary_line(summary: &SnapshotSummary) -> String {
         summary.source_generation,
         summary.created_at_generation
     )
+}
+
+fn snapshot_descriptor_line(descriptor: &SnapshotDescriptor) -> String {
+    let kind = snapshot_kind_label(descriptor.kind);
+    let origin = descriptor
+        .origin
+        .as_ref()
+        .map(|origin| format!("'{origin}'"))
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "snapshot entry '{}' kind={} origin={} holds={} source tx={} source gen={} created gen={}",
+        descriptor.name,
+        kind,
+        origin,
+        descriptor.hold_count,
+        descriptor.source_transaction_id,
+        descriptor.source_generation,
+        descriptor.created_at_generation
+    )
+}
+
+fn hold_info_line(info: &HoldInfo) -> String {
+    format!(
+        "snapshot hold '{}' kind={} holds={}",
+        info.snapshot_name,
+        snapshot_kind_label(info.kind),
+        info.hold_count
+    )
+}
+
+fn retention_policy_from_args(args: &SnapshotPruneArgs) -> Result<SnapshotRetentionPolicy, String> {
+    if args.keep_latest.is_none() && args.max_age_generations.is_none() {
+        return Err(
+            "no effective retention policy; pass --keep-latest or --max-age-generations".into(),
+        );
+    }
+    Ok(SnapshotRetentionPolicy {
+        max_count: args.keep_latest,
+        max_age_generations: args.max_age_generations,
+    })
+}
+
+fn snapshot_names(summaries: &[SnapshotSummary]) -> String {
+    if summaries.is_empty() {
+        return "-".into();
+    }
+    summaries
+        .iter()
+        .map(|summary| summary.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn retention_policy_summary(policy: &SnapshotRetentionPolicy) -> String {
+    let keep_latest = policy
+        .max_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "-".into());
+    let max_age_generations = policy
+        .max_age_generations
+        .map(|generations| generations.to_string())
+        .unwrap_or_else(|| "-".into());
+    format!("keep_latest={keep_latest}, max_age_generations={max_age_generations}")
+}
+
+fn retention_report_lines(report: &SnapshotRetentionReport) -> Vec<String> {
+    vec![
+        format!(
+            "snapshot retention prune evaluated gen {} -> published gen {} ({}, pruned={}, retained={}, skipped held={}, excluded catalog entries={})",
+            report.evaluated_at_generation,
+            report.published_generation,
+            retention_policy_summary(&report.policy),
+            report.pruned_snapshots.len(),
+            report.retained_snapshots.len(),
+            report.skipped_held_snapshots.len(),
+            report.excluded_catalog_entries
+        ),
+        format!("pruned snapshots: {}", snapshot_names(&report.pruned_snapshots)),
+        format!(
+            "retained snapshots: {}",
+            snapshot_names(&report.retained_snapshots)
+        ),
+        format!(
+            "skipped held snapshots: {}",
+            snapshot_names(&report.skipped_held_snapshots)
+        ),
+    ]
 }
 
 #[allow(dead_code)]
@@ -851,7 +1318,7 @@ fn handle_list(args: SnapshotListArgs) {
         "list",
         RecoveryPolicy::ReadOnly,
     );
-    let mut snapshots = fs.list_snapshots();
+    let mut snapshots = fs.list_snapshots_extended();
     snapshots.sort_by(|a, b| {
         a.created_at_generation
             .cmp(&b.created_at_generation)
@@ -863,8 +1330,324 @@ fn handle_list(args: SnapshotListArgs) {
         return;
     }
 
-    for summary in snapshots {
-        println!("{}", snapshot_summary_line(&summary));
+    for descriptor in snapshots {
+        println!("{}", snapshot_descriptor_line(&descriptor));
+    }
+}
+
+fn handle_clone(cmd: SnapshotCloneCommand) {
+    match cmd {
+        SnapshotCloneCommand::Create(args) => handle_clone_create(args),
+        SnapshotCloneCommand::Delete(args) => handle_clone_delete(args),
+        SnapshotCloneCommand::Promote(args) => handle_clone_promote(args),
+    }
+}
+
+fn handle_clone_create(args: SnapshotCloneCreateArgs) {
+    let _guard = super::authz::require_local_only("snapshot clone create");
+
+    let (pool, clone_name, source_name) =
+        parse_pair_snapshot_operands("clone create", args.backing_dir.as_ref(), &args.operands);
+    let mut fs = open_filesystem_with_live_args(
+        args.backing_dir.as_ref(),
+        pool.as_deref(),
+        args.devices.as_deref(),
+        "clone create",
+        RecoveryPolicy::default(),
+        serde_json::json!({
+            "clone": &clone_name,
+            "source": &source_name,
+        }),
+    );
+
+    match fs.create_clone(&clone_name, &source_name) {
+        Ok(summary) => {
+            println!(
+                "clone '{}' created from '{}' (source tx={}, source gen={}, created gen={})",
+                summary.name,
+                summary.origin,
+                summary.source_transaction_id,
+                summary.source_generation,
+                summary.created_at_generation
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "tidefsctl snapshot clone create: failed to create clone '{clone_name}' from '{source_name}': {err}"
+            );
+            process::exit(1);
+        }
+    }
+}
+
+fn handle_clone_delete(args: SnapshotCloneDeleteArgs) {
+    let _guard = super::authz::require_local_only("snapshot clone delete");
+
+    let (pool, clone_name) =
+        parse_named_snapshot_operands("clone delete", args.backing_dir.as_ref(), &args.operands);
+    let mut fs = open_filesystem_with_live_args(
+        args.backing_dir.as_ref(),
+        pool.as_deref(),
+        args.devices.as_deref(),
+        "clone delete",
+        RecoveryPolicy::default(),
+        serde_json::json!({
+            "clone": &clone_name,
+        }),
+    );
+
+    match fs.delete_clone(&clone_name) {
+        Ok(summary) => {
+            println!(
+                "clone '{}' deleted (source tx={}, source gen={}, created gen={})",
+                summary.name,
+                summary.source_transaction_id,
+                summary.source_generation,
+                summary.created_at_generation
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "tidefsctl snapshot clone delete: failed to delete clone '{clone_name}': {err}"
+            );
+            process::exit(1);
+        }
+    }
+}
+
+fn handle_clone_promote(args: SnapshotClonePromoteArgs) {
+    let _guard = super::authz::require_local_only("snapshot clone promote");
+
+    let (pool, clone_name) =
+        parse_named_snapshot_operands("clone promote", args.backing_dir.as_ref(), &args.operands);
+    let mut fs = open_filesystem_with_live_args(
+        args.backing_dir.as_ref(),
+        pool.as_deref(),
+        args.devices.as_deref(),
+        "clone promote",
+        RecoveryPolicy::default(),
+        serde_json::json!({
+            "clone": &clone_name,
+        }),
+    );
+
+    match fs.promote_clone(&clone_name) {
+        Ok(report) => {
+            println!(
+                "clone '{}' promoted to snapshot (previous origin='{}', generation={})",
+                report.name, report.previous_origin, report.generation
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "tidefsctl snapshot clone promote: failed to promote clone '{clone_name}': {err}"
+            );
+            process::exit(1);
+        }
+    }
+}
+
+fn handle_bookmark(cmd: SnapshotBookmarkCommand) {
+    match cmd {
+        SnapshotBookmarkCommand::Create(args) => handle_bookmark_create(args),
+        SnapshotBookmarkCommand::Delete(args) => handle_bookmark_delete(args),
+    }
+}
+
+fn handle_bookmark_create(args: SnapshotBookmarkCreateArgs) {
+    let _guard = super::authz::require_local_only("snapshot bookmark create");
+
+    let (pool, bookmark_name, source_name) =
+        parse_pair_snapshot_operands("bookmark create", args.backing_dir.as_ref(), &args.operands);
+    let mut fs = open_filesystem_with_live_args(
+        args.backing_dir.as_ref(),
+        pool.as_deref(),
+        args.devices.as_deref(),
+        "bookmark create",
+        RecoveryPolicy::default(),
+        serde_json::json!({
+            "bookmark": &bookmark_name,
+            "source": &source_name,
+        }),
+    );
+
+    match fs.create_bookmark(&bookmark_name, &source_name) {
+        Ok(summary) => {
+            println!(
+                "bookmark '{}' created from '{}' (source tx={}, source gen={}, created gen={})",
+                summary.name,
+                summary.source_snapshot,
+                summary.source_transaction_id,
+                summary.source_generation,
+                summary.created_at_generation
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "tidefsctl snapshot bookmark create: failed to create bookmark '{bookmark_name}' from '{source_name}': {err}"
+            );
+            process::exit(1);
+        }
+    }
+}
+
+fn handle_bookmark_delete(args: SnapshotBookmarkDeleteArgs) {
+    let _guard = super::authz::require_local_only("snapshot bookmark delete");
+
+    let (pool, bookmark_name) =
+        parse_named_snapshot_operands("bookmark delete", args.backing_dir.as_ref(), &args.operands);
+    let mut fs = open_filesystem_with_live_args(
+        args.backing_dir.as_ref(),
+        pool.as_deref(),
+        args.devices.as_deref(),
+        "bookmark delete",
+        RecoveryPolicy::default(),
+        serde_json::json!({
+            "bookmark": &bookmark_name,
+        }),
+    );
+
+    match fs.delete_bookmark(&bookmark_name) {
+        Ok(summary) => {
+            println!(
+                "bookmark '{}' deleted (source tx={}, source gen={}, created gen={})",
+                summary.name,
+                summary.source_transaction_id,
+                summary.source_generation,
+                summary.created_at_generation
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "tidefsctl snapshot bookmark delete: failed to delete bookmark '{bookmark_name}': {err}"
+            );
+            process::exit(1);
+        }
+    }
+}
+
+fn handle_hold(args: SnapshotHoldArgs) {
+    let _guard = super::authz::require_local_only("snapshot hold");
+
+    let (pool, name) =
+        parse_named_snapshot_operands("hold", args.backing_dir.as_ref(), &args.operands);
+    let mut fs = open_filesystem_with_live_args(
+        args.backing_dir.as_ref(),
+        pool.as_deref(),
+        args.devices.as_deref(),
+        "hold",
+        RecoveryPolicy::default(),
+        serde_json::json!({
+            "name": &name,
+        }),
+    );
+
+    match fs.hold_snapshot(&name) {
+        Ok(info) => {
+            println!("{} held", hold_info_line(&info));
+        }
+        Err(err) => {
+            eprintln!("tidefsctl snapshot hold: failed to hold '{name}': {err}");
+            process::exit(1);
+        }
+    }
+}
+
+fn handle_release(args: SnapshotReleaseArgs) {
+    let _guard = super::authz::require_local_only("snapshot release");
+
+    let (pool, name) =
+        parse_named_snapshot_operands("release", args.backing_dir.as_ref(), &args.operands);
+    let mut fs = open_filesystem_with_live_args(
+        args.backing_dir.as_ref(),
+        pool.as_deref(),
+        args.devices.as_deref(),
+        "release",
+        RecoveryPolicy::default(),
+        serde_json::json!({
+            "name": &name,
+        }),
+    );
+
+    match fs.release_snapshot(&name) {
+        Ok(info) => {
+            println!("{} released", hold_info_line(&info));
+        }
+        Err(err) => {
+            eprintln!("tidefsctl snapshot release: failed to release '{name}': {err}");
+            process::exit(1);
+        }
+    }
+}
+
+fn handle_holds(args: SnapshotHoldsArgs) {
+    let (pool, name) =
+        parse_optional_snapshot_operand("holds", args.backing_dir.as_ref(), &args.operands);
+    let fs = open_filesystem_with_live_args(
+        args.backing_dir.as_ref(),
+        pool.as_deref(),
+        args.devices.as_deref(),
+        "holds",
+        RecoveryPolicy::ReadOnly,
+        serde_json::json!({
+            "name": name.as_deref(),
+        }),
+    );
+
+    if let Some(name) = name {
+        match fs.hold_info(&name) {
+            Ok(info) => println!("{}", hold_info_line(&info)),
+            Err(err) => {
+                eprintln!("tidefsctl snapshot holds: failed to inspect '{name}': {err}");
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let mut holds = fs.list_holds();
+    holds.sort_by(|a, b| a.snapshot_name.cmp(&b.snapshot_name));
+    if holds.is_empty() {
+        println!("no snapshot holds");
+        return;
+    }
+    for info in holds {
+        println!("{}", hold_info_line(&info));
+    }
+}
+
+fn handle_prune(args: SnapshotPruneArgs) {
+    let _guard = super::authz::require_local_only("snapshot prune");
+
+    let policy = match retention_policy_from_args(&args) {
+        Ok(policy) => policy,
+        Err(err) => {
+            eprintln!("tidefsctl snapshot prune: {err}");
+            process::exit(1);
+        }
+    };
+    let mut fs = open_filesystem_with_live_args(
+        args.backing_dir.as_ref(),
+        args.pool.as_deref(),
+        args.devices.as_deref(),
+        "prune",
+        RecoveryPolicy::default(),
+        serde_json::json!({
+            "keep_latest": args.keep_latest,
+            "max_age_generations": args.max_age_generations,
+        }),
+    );
+
+    match fs.prune_snapshots(policy) {
+        Ok(report) => {
+            for line in retention_report_lines(&report) {
+                println!("{line}");
+            }
+        }
+        Err(err) => {
+            eprintln!("tidefsctl snapshot prune: failed to prune snapshots: {err}");
+            process::exit(1);
+        }
     }
 }
 
@@ -1164,6 +1947,32 @@ fn handle_receive(args: SnapshotReceiveArgs) {
 mod tests {
     use super::*;
 
+    fn test_snapshot_summary(name: &str) -> SnapshotSummary {
+        SnapshotSummary {
+            name: name.into(),
+            source_transaction_id: 1,
+            source_generation: 2,
+            created_at_generation: 3,
+            source_root: tidefs_local_filesystem::CommittedRootSummary {
+                slot: 0,
+                transaction_id: 1,
+                generation: 2,
+                next_inode_id: 3,
+                inode_count: 4,
+                superblock_checksum: tidefs_local_object_store::IntegrityDigest64(0),
+                has_transaction_manifest: false,
+                manifest_checksum: tidefs_local_object_store::IntegrityDigest64(0),
+                manifest_entry_count: 0,
+                has_root_authentication: false,
+                root_authentication_policy_epoch: None,
+                root_authentication_algorithm_suite_id: None,
+                superblock_digest: None,
+                manifest_digest: None,
+                root_authentication_code: None,
+            },
+        }
+    }
+
     #[test]
     fn snapshot_create_args_bindings() {
         let args = SnapshotCreateArgs {
@@ -1224,6 +2033,12 @@ mod tests {
             }
             SnapshotCommand::Create(_)
             | SnapshotCommand::List(_)
+            | SnapshotCommand::Clone(_)
+            | SnapshotCommand::Bookmark(_)
+            | SnapshotCommand::Hold(_)
+            | SnapshotCommand::Release(_)
+            | SnapshotCommand::Holds(_)
+            | SnapshotCommand::Prune(_)
             | SnapshotCommand::Send(_)
             | SnapshotCommand::Receive(_)
             | SnapshotCommand::Rollback(_) => {
@@ -1268,5 +2083,83 @@ mod tests {
         assert_eq!(args.backing_dir, None);
         assert_eq!(args.input, Some(PathBuf::from("/tmp/stream.vfssend1")));
         assert!(args.source_addr.is_none());
+    }
+
+    #[test]
+    fn snapshot_extended_line_reports_lifecycle_metadata() {
+        let line = snapshot_descriptor_line(&SnapshotDescriptor {
+            name: "clone-a".into(),
+            kind: SnapshotKind::Clone,
+            origin: Some("snap-a".into()),
+            hold_count: 2,
+            source_transaction_id: 7,
+            source_generation: 9,
+            created_at_generation: 11,
+        });
+
+        assert!(line.contains("kind=clone"));
+        assert!(line.contains("origin='snap-a'"));
+        assert!(line.contains("holds=2"));
+        assert!(line.contains("source tx=7"));
+        assert!(line.contains("source gen=9"));
+        assert!(line.contains("created gen=11"));
+    }
+
+    #[test]
+    fn snapshot_prune_rejects_empty_retention_policy() {
+        let args = SnapshotPruneArgs {
+            backing_dir: None,
+            pool: Some("mypool".into()),
+            devices: None,
+            keep_latest: None,
+            max_age_generations: None,
+        };
+
+        let err = retention_policy_from_args(&args).expect_err("empty policy rejected");
+        assert!(err.contains("no effective retention policy"));
+    }
+
+    #[test]
+    fn snapshot_prune_accepts_combined_retention_policy() {
+        let args = SnapshotPruneArgs {
+            backing_dir: None,
+            pool: Some("mypool".into()),
+            devices: Some(vec![PathBuf::from("/dev/sdb")]),
+            keep_latest: Some(3),
+            max_age_generations: Some(42),
+        };
+
+        let policy = retention_policy_from_args(&args).expect("retention policy");
+        assert_eq!(policy.max_count, Some(3));
+        assert_eq!(policy.max_age_generations, Some(42));
+        assert_eq!(
+            retention_policy_summary(&policy),
+            "keep_latest=3, max_age_generations=42"
+        );
+    }
+
+    #[test]
+    fn snapshot_prune_report_lines_include_policy_counts_and_names() {
+        let report = SnapshotRetentionReport {
+            policy: SnapshotRetentionPolicy {
+                max_count: Some(1),
+                max_age_generations: Some(10),
+            },
+            evaluated_at_generation: 100,
+            published_generation: 101,
+            pruned_snapshots: vec![test_snapshot_summary("old")],
+            retained_snapshots: vec![test_snapshot_summary("new")],
+            skipped_held_snapshots: vec![test_snapshot_summary("held")],
+            excluded_catalog_entries: 2,
+        };
+
+        let lines = retention_report_lines(&report);
+        assert_eq!(
+            lines[0],
+            "snapshot retention prune evaluated gen 100 -> published gen 101 (keep_latest=1, max_age_generations=10, pruned=1, retained=1, skipped held=1, excluded catalog entries=2)"
+        );
+        assert_eq!(lines[1], "pruned snapshots: old");
+        assert_eq!(lines[2], "retained snapshots: new");
+        assert_eq!(lines[3], "skipped held snapshots: held");
     }
 }
