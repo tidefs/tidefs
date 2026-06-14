@@ -584,6 +584,15 @@ INITSCRIPT
     FAILED=0
     BLOCKED=0
     UNSUPPORTED=0
+    ROW_SUMMARY="$RUN_DIR/row-summary.txt"
+    : > "$ROW_SUMMARY"
+
+    record_row() {
+      local row="$1"
+
+      echo "  $row"
+      echo "$row" >> "$ROW_SUMMARY"
+    }
 
     for op in \
       module_load module_lsmod configured_pool_device_present \
@@ -596,33 +605,33 @@ INITSCRIPT
       # Some ops are reported by C test binary directly (PASS:/FAIL:),
       # others by the init shell script.
       if grep -q "PASS: $op" "$VAL_LOG" 2>/dev/null; then
-        echo "  PASS: $op"
+        record_row "PASS: $op"
         PASSED=$((PASSED + 1))
       elif grep -q "FAIL: $op" "$VAL_LOG" 2>/dev/null; then
-        detail=$(grep "FAIL: $op" "$VAL_LOG" 2>/dev/null | head -1 | sed "s/^.*FAIL: $op //")
-        echo "  FAIL: $op -- $detail"
+        detail=$(grep "FAIL: $op" "$VAL_LOG" 2>/dev/null | head -1 | sed "s/^.*FAIL: $op[[:space:]]*--[[:space:]]*//")
+        record_row "FAIL: $op -- $detail"
         FAILED=$((FAILED + 1))
       elif grep -q "BLOCKED: $op" "$VAL_LOG" 2>/dev/null; then
-        detail=$(grep "BLOCKED: $op" "$VAL_LOG" 2>/dev/null | head -1 | sed "s/^.*BLOCKED: $op //")
-        echo "  BLOCKED: $op -- $detail"
+        detail=$(grep "BLOCKED: $op" "$VAL_LOG" 2>/dev/null | head -1 | sed "s/^.*BLOCKED: $op[[:space:]]*--[[:space:]]*//")
+        record_row "BLOCKED: $op -- $detail"
         BLOCKED=$((BLOCKED + 1))
       elif grep -q "UNSUPPORTED: $op" "$VAL_LOG" 2>/dev/null; then
-        detail=$(grep "UNSUPPORTED: $op" "$VAL_LOG" 2>/dev/null | head -1 | sed "s/^.*UNSUPPORTED: $op //")
-        echo "  UNSUPPORTED: $op -- $detail"
+        detail=$(grep "UNSUPPORTED: $op" "$VAL_LOG" 2>/dev/null | head -1 | sed "s/^.*UNSUPPORTED: $op[[:space:]]*--[[:space:]]*//")
+        record_row "UNSUPPORTED: $op -- $detail"
         UNSUPPORTED=$((UNSUPPORTED + 1))
       else
-        echo "  MISSING: $op (no validation in log)"
+        record_row "BLOCKED: $op -- no validation in log"
         BLOCKED=$((BLOCKED + 1))
       fi
     done
 
     for op in custom-rust-vm-ops crash-consistency; do
       if grep -q "UNSUPPORTED: $op" "$VAL_LOG" 2>/dev/null; then
-        detail=$(grep "UNSUPPORTED: $op" "$VAL_LOG" 2>/dev/null | head -1 | sed "s/^.*UNSUPPORTED: $op //")
-        echo "  UNSUPPORTED: $op -- $detail"
+        detail=$(grep "UNSUPPORTED: $op" "$VAL_LOG" 2>/dev/null | head -1 | sed "s/^.*UNSUPPORTED: $op[[:space:]]*--[[:space:]]*//")
+        record_row "UNSUPPORTED: $op -- $detail"
         UNSUPPORTED=$((UNSUPPORTED + 1))
       else
-        echo "  MISSING: $op unsupported disclosure"
+        record_row "BLOCKED: $op -- unsupported disclosure missing"
         BLOCKED=$((BLOCKED + 1))
       fi
     done
@@ -635,12 +644,14 @@ INITSCRIPT
     OUTPUT_DIR="$OUTPUT_ROOT/kernel-mmap-validation/$(date -u +%Y-%m-%dT%H%M%SZ)"
     mkdir -p "$OUTPUT_DIR"
     cp "$VAL_LOG" "$OUTPUT_DIR/qemu.log"
+    cp "$ROW_SUMMARY" "$OUTPUT_DIR/row-summary.txt"
     {
       echo "pass=$PASSED"
       echo "fail=$FAILED"
       echo "blocked=$BLOCKED"
       echo "unsupported=$UNSUPPORTED"
       echo "validation_log=$OUTPUT_DIR/qemu.log"
+      echo "row_summary=$OUTPUT_DIR/row-summary.txt"
     } > "$OUTPUT_DIR/summary.env"
     echo "Validation output directory: $OUTPUT_DIR"
 
