@@ -722,14 +722,15 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
 
 fn fuse_mount_options_for_mode(
     mount_opts: &MountOptions,
-    _read_only: bool,
+    read_only: bool,
 ) -> Vec<fuser::MountOption> {
     let mut effective = mount_opts.clone();
-    // The daemon is the timestamp authority. Kernel-side FUSE atime can update
-    // only cached inode attrs without committing the engine/namespace record,
-    // so keep the kernel layer noatime and apply the selected policy in the
-    // adapter read-access hooks.
-    effective.timestamp_policy = crate::mount_options::TimestampPolicy::NoAtime;
+    // Read-write mounts keep the kernel-visible atime policy so cached reads
+    // update user-visible attrs. The adapter still records read access in the
+    // engine/namespace authority; read-only mounts suppress both paths.
+    if read_only {
+        effective.timestamp_policy = crate::mount_options::TimestampPolicy::NoAtime;
+    }
     effective.to_fuse_mount_options()
 }
 
@@ -3937,7 +3938,7 @@ mod tests {
     }
 
     #[test]
-    fn read_write_mount_forces_kernel_noatime_policy() {
+    fn read_write_mount_preserves_kernel_atime_policy() {
         let opts = MountOptions {
             timestamp_policy: crate::mount_options::TimestampPolicy::StrictAtime,
             suppress_dir_atime: false,
@@ -3948,10 +3949,10 @@ mod tests {
             intent_log_write: false,
         };
 
-        let mount_options = fuse_mount_options_for_mode(&opts, false);
-
-        assert!(mount_options.contains(&fuser::MountOption::NoAtime));
-        assert!(!mount_options.contains(&fuser::MountOption::StrictAtime));
+        assert_eq!(
+            fuse_mount_options_for_mode(&opts, false),
+            vec![fuser::MountOption::StrictAtime]
+        );
     }
 
     #[test]
