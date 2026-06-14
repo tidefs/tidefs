@@ -1,9 +1,9 @@
 //! Kernel-mode mmap fault-handling validation module.
 //!
-//! Produces tier-classified validation output for the kmod-posix-vfs mmap
-//! and page-fault dispatch path — private read faults, shared read faults,
-//! write faults via page_mkwrite, and msync-after-write fault patterns —
-//! operating without a userspace daemon.
+//! Produces tier-classified validation output for the kmod-posix-vfs mounted
+//! mmap and writeback path: configured-pool create/write, `MAP_SHARED` read
+//! fault, `MAP_SHARED` write fault, `msync(MS_SYNC)`, `munmap`, and
+//! post-sync readback on a Linux 7.0 kernel mount without a userspace daemon.
 //!
 //! # Validation tiers
 //!
@@ -11,25 +11,28 @@
 //! |---|---|
 //! | `SourceModel` | Schema types, FNV-1a digest, and in-process fault-path verification |
 //! | `CargoUnit` | `cargo test -p tidefs-validation -- kmod_mmap_fault` — digest correctness, error-type consistency |
-//! | `QemuFullStack` | Linux 7.0 boot, module load, pool create, mount, mmap fault exercise, committed-root verification |
+//! | `QemuFullStack` | Linux 7.0 boot, module load, configured-pool mount, mmap fault/writeback exercise |
 //!
 //! # Fault kinds
 //!
-//! - **PrivateReadFault** — MAP_PRIVATE read fault, filemap_fault resolves via VfsEngine::read
-//! - **SharedReadFault** — MAP_SHARED read fault, filemap_fault resolves via VfsEngine::read
-//! - **WriteFault** — write fault, page_mkwrite transitions read-only page to writable
-//! - **MsyncAfterWrite** — msync/fsync after mmap write, durability verification
+//! - **CreateAndWriteInitial** — create a regular file and seed contents through write(2)
+//! - **MmapShared** — admit a `MAP_SHARED` mapping through the mounted C shim
+//! - **FaultReadShared** — `MAP_SHARED` read fault through generic filemap and C `read_folio`
+//! - **FaultWriteShared** — shared write fault dirties Linux folios for C `writepages`
+//! - **MsyncSync** — `msync(MS_SYNC)` drains dirty folios through writeback
+//! - **Munmap** — unmap cleanup leaves no silent dirty-state drop
+//! - **PostSyncReadback** — read(2) observes data after sync/writeback
 //!
 //! # Current validation role
 //!
-//! This module is the validation surface for kernel-mode mmap fault-handling.
-//! It provides the schema, digest, and source/model tier verification for the
-//! VfsEngine::fault and KmodVfsVmOps::page_mkwrite dispatch paths.
-//!
-//! The full no-daemon mmap fault-path validation (QEMU tier) depends on the
-//! existing KmodVfsVmOps implementation in crates/tidefs-kmod-posix-vfs/src/mmap.rs,
-//! which dispatches fault() and page_mkwrite() through the kmod-bridge VfsEngine
-//! and DirtyFolioTracker without requiring a userspace daemon.
+//! This module is the validation surface for mounted kernel mmap/writeback
+//! artifact rows. The live C shim currently admits mmap through
+//! `generic_file_mmap()` and relies on Linux filemap plus C
+//! `address_space_operations` for read faults, dirtying, writeback, fsync,
+//! and unmap cleanup. The Rust `KmodVfsVmOps` type remains a source-model
+//! dispatch spine until a C `vm_operations_struct` bridge is registered; that
+//! unsupported state is reported as its own validation outcome rather than as
+//! a runtime pass.
 
 use crate::runtime_artifact_source::RuntimeArtifactSource;
 use serde::{Deserialize, Serialize};
@@ -57,13 +60,32 @@ pub fn fnv1a_str(s: &str) -> u64 {
 
 // ── Mmap fault kind ────────────────────────────────────────────────────────
 
-/// Classification of mmap page-fault patterns exercised by kernel-mode validation.
+/// Classification of mmap/writeback artifact rows exercised by kernel validation.
 ///
-/// Each variant corresponds to a specific kernel vm_operations_struct dispatch
-/// path exercised in no-daemon mode.
+/// Mounted rows are emitted by the Linux 7.0 QEMU workload. Legacy variants
+/// remain for source/model fault-path rows that predate the mounted C
+/// generic-filemap proof.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum MmapFaultKind {
+    /// Create a regular file and seed initial data through write(2).
+    CreateAndWriteInitial,
+    /// Admit a MAP_SHARED mapping on the mounted kernel filesystem.
+    MmapShared,
+    /// MAP_SHARED read fault through Linux filemap and C read_folio.
+    FaultReadShared,
+    /// MAP_SHARED write fault that dirties Linux folios for writepages.
+    FaultWriteShared,
+    /// Read-after-write coherence inside the mapped range.
+    WriteReadCoherence,
+    /// msync(MS_SYNC) drains dirty folios through writeback.
+    MsyncSync,
+    /// munmap returns after dirty-state cleanup/writeback handoff.
+    Munmap,
+    /// read(2) observes mmap writes after sync/writeback.
+    PostSyncReadback,
+    /// Custom Rust vm_operations_struct bridge is not registered by the C shim.
+    CustomRustVmOps,
     /// MAP_PRIVATE read fault — filemap_fault resolves via VfsEngine::read.
     PrivateReadFault,
     /// MAP_SHARED read fault — filemap_fault resolves via VfsEngine::read.
@@ -79,6 +101,15 @@ pub enum MmapFaultKind {
 impl fmt::Display for MmapFaultKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CreateAndWriteInitial => write!(f, "create-and-write-initial"),
+            Self::MmapShared => write!(f, "mmap-shared"),
+            Self::FaultReadShared => write!(f, "fault-read-shared"),
+            Self::FaultWriteShared => write!(f, "fault-write-shared"),
+            Self::WriteReadCoherence => write!(f, "write-read-coherence"),
+            Self::MsyncSync => write!(f, "msync-sync"),
+            Self::Munmap => write!(f, "munmap"),
+            Self::PostSyncReadback => write!(f, "post-sync-readback"),
+            Self::CustomRustVmOps => write!(f, "custom-rust-vm-ops"),
             Self::PrivateReadFault => write!(f, "private-read-fault"),
             Self::SharedReadFault => write!(f, "shared-read-fault"),
             Self::WriteFault => write!(f, "write-fault"),
@@ -98,8 +129,8 @@ pub enum KmodMmapFaultTier {
     /// Cargo test run validating digest correctness, error-type consistency,
     /// and mock-engine integration patterns.
     CargoUnit,
-    /// Full QEMU guest: Linux 7.0 boot, module load, pool create, mount,
-    /// mmap fault exercise, committed-root verification.
+    /// Full QEMU guest: Linux 7.0 boot, module load, configured-pool mount,
+    /// mmap fault/writeback exercise, and unsupported-row disclosure.
     QemuFullStack,
 }
 
@@ -113,9 +144,24 @@ pub enum ValidationOutcome {
     Pass,
     /// Row-level validation fail — the fault kind did not resolve as expected.
     Fail,
+    /// Row-level unsupported classification — the path is intentionally not wired.
+    Unsupported,
     /// Validation row skipped — the tier or environment refused to run.
     Skipped,
 }
+
+/// Mounted-kernel mmap rows required by the issue #258 QEMU artifact.
+pub const MOUNTED_MMAP_REQUIRED_ROWS: [MmapFaultKind; 9] = [
+    MmapFaultKind::CreateAndWriteInitial,
+    MmapFaultKind::MmapShared,
+    MmapFaultKind::FaultReadShared,
+    MmapFaultKind::FaultWriteShared,
+    MmapFaultKind::WriteReadCoherence,
+    MmapFaultKind::MsyncSync,
+    MmapFaultKind::Munmap,
+    MmapFaultKind::PostSyncReadback,
+    MmapFaultKind::CustomRustVmOps,
+];
 
 // ── Validation row ───────────────────────────────────────────────────────────
 
@@ -302,6 +348,33 @@ mod tests {
     #[test]
     fn mmap_fault_kind_display() {
         assert_eq!(
+            format!("{}", MmapFaultKind::CreateAndWriteInitial),
+            "create-and-write-initial"
+        );
+        assert_eq!(format!("{}", MmapFaultKind::MmapShared), "mmap-shared");
+        assert_eq!(
+            format!("{}", MmapFaultKind::FaultReadShared),
+            "fault-read-shared"
+        );
+        assert_eq!(
+            format!("{}", MmapFaultKind::FaultWriteShared),
+            "fault-write-shared"
+        );
+        assert_eq!(
+            format!("{}", MmapFaultKind::WriteReadCoherence),
+            "write-read-coherence"
+        );
+        assert_eq!(format!("{}", MmapFaultKind::MsyncSync), "msync-sync");
+        assert_eq!(format!("{}", MmapFaultKind::Munmap), "munmap");
+        assert_eq!(
+            format!("{}", MmapFaultKind::PostSyncReadback),
+            "post-sync-readback"
+        );
+        assert_eq!(
+            format!("{}", MmapFaultKind::CustomRustVmOps),
+            "custom-rust-vm-ops"
+        );
+        assert_eq!(
             format!("{}", MmapFaultKind::PrivateReadFault),
             "private-read-fault"
         );
@@ -319,6 +392,15 @@ mod tests {
     #[test]
     fn mmap_fault_kind_serialization_roundtrip() {
         for kind in &[
+            MmapFaultKind::CreateAndWriteInitial,
+            MmapFaultKind::MmapShared,
+            MmapFaultKind::FaultReadShared,
+            MmapFaultKind::FaultWriteShared,
+            MmapFaultKind::WriteReadCoherence,
+            MmapFaultKind::MsyncSync,
+            MmapFaultKind::Munmap,
+            MmapFaultKind::PostSyncReadback,
+            MmapFaultKind::CustomRustVmOps,
             MmapFaultKind::PrivateReadFault,
             MmapFaultKind::SharedReadFault,
             MmapFaultKind::WriteFault,
@@ -332,6 +414,42 @@ mod tests {
 
     #[test]
     fn mmap_fault_kind_serialization_values() {
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::CreateAndWriteInitial).unwrap(),
+            "\"create-and-write-initial\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::MmapShared).unwrap(),
+            "\"mmap-shared\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::FaultReadShared).unwrap(),
+            "\"fault-read-shared\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::FaultWriteShared).unwrap(),
+            "\"fault-write-shared\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::WriteReadCoherence).unwrap(),
+            "\"write-read-coherence\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::MsyncSync).unwrap(),
+            "\"msync-sync\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::Munmap).unwrap(),
+            "\"munmap\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::PostSyncReadback).unwrap(),
+            "\"post-sync-readback\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::CustomRustVmOps).unwrap(),
+            "\"custom-rust-vm-ops\""
+        );
         assert_eq!(
             serde_json::to_string(&MmapFaultKind::PrivateReadFault).unwrap(),
             "\"private-read-fault\""
@@ -365,6 +483,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mounted_mmap_required_rows_are_named_artifact_rows() {
+        let names: Vec<String> = MOUNTED_MMAP_REQUIRED_ROWS
+            .iter()
+            .map(|kind| kind.to_string())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "create-and-write-initial",
+                "mmap-shared",
+                "fault-read-shared",
+                "fault-write-shared",
+                "write-read-coherence",
+                "msync-sync",
+                "munmap",
+                "post-sync-readback",
+                "custom-rust-vm-ops",
+            ]
+        );
+    }
+
     // ── Validation row tests ─────────────────────────────────────────────
 
     #[test]
@@ -379,6 +520,21 @@ mod tests {
         assert_eq!(row.kind, MmapFaultKind::PrivateReadFault);
         assert_eq!(row.tier, KmodMmapFaultTier::SourceModel);
         assert_eq!(row.outcome, ValidationOutcome::Pass);
+    }
+
+    #[test]
+    fn validation_row_records_unsupported_outcome() {
+        let row = KmodMmapFaultValidationRow::new(
+            MmapFaultKind::CustomRustVmOps,
+            KmodMmapFaultTier::QemuFullStack,
+            ValidationOutcome::Unsupported,
+            "custom Rust vm_ops bridge is not registered by the mounted C shim",
+        );
+
+        assert_eq!(row.kind, MmapFaultKind::CustomRustVmOps);
+        assert_eq!(row.outcome, ValidationOutcome::Unsupported);
+        assert_ne!(row.digest, 0);
+        assert!(!row.is_genuine_runtime_pass());
     }
 
     #[test]

@@ -284,10 +284,11 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
     /// inode->i_mapping->a_ops = &tidefs_address_space_ops;
     /// ```
     ///
-    /// Each function pointer in the vtable delegates to the corresponding
-    /// method on [`AddressSpaceOps`] via the kmod-bridge substrate.
-    /// The kernel VFS calls these methods on page fault, readahead,
-    /// writeback, and invalidation events.
+    /// The mounted C shim currently registers its own C vtable and calls
+    /// Rust engine bridge exports directly for the callbacks it wires. A
+    /// future direct C-to-Rust vtable bridge may delegate each function
+    /// pointer to [`AddressSpaceOps`], but the live mounted path must not be
+    /// documented as doing that until the bridge is registered.
     ///
     /// This method is the userspace-model analogue: it returns the
     /// dispatch spine that the kernel-side vtable would reference.

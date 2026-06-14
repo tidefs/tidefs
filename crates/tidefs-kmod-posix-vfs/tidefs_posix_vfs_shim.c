@@ -4805,6 +4805,10 @@ static loff_t tidefs_posix_vfs_remap_file_range_nosupport(
  * engine supplies read_folio/write_begin/write_end address-space callbacks,
  * so page faults and shared writable mappings still resolve through the same
  * kernel-resident VfsEngine read/write path as ordinary buffered I/O.
+ *
+ * This C shim does not install the Rust KmodVfsVmOps model as vma->vm_ops;
+ * unsupported runtime rows for that custom bridge must stay explicit until a
+ * real vm_operations_struct registration exists.
  */
 static int tidefs_posix_vfs_file_mmap(
 	struct file *file, struct vm_area_struct *vma)
@@ -5744,12 +5748,14 @@ static int tidefs_posix_vfs_read_folio(struct file *file, struct folio *folio)
 /*
  * address_space_operations vtable for TideFS regular files.
  *
- * Wires the kernel page cache to the Rust VfsEngine for page-cache
- * population, buffered writeback, and future mmap admission.
+ * Wires the kernel page cache to the Rust VfsEngine bridge for page-cache
+ * population, buffered writes, mmap fault population, and writeback.
  *
  * Implemented: read_folio, write_begin, write_end, dirty_folio,
- * writepages.  Remaining: readahead (a_ops callback) blocked on
- * Review debt TFR-018 in historical issue #6622 (KVFS-AOPS-001).
+ * writepages.  `dirty_folio` records Linux dirty accounting only; writeback
+ * copies the folio contents to the engine and re-dirties on engine failure for
+ * retry. Remaining: readahead and C-to-Rust invalidate_folio/page-authority
+ * bridge work under Review debt TFR-018.
  */
 static const struct address_space_operations tidefs_posix_vfs_aops = {
 	.write_begin = tidefs_posix_vfs_write_begin,

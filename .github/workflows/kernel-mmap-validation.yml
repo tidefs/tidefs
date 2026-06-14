@@ -1,0 +1,58 @@
+name: Kernel mmap validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_seconds:
+        description: QEMU boot timeout in seconds
+        required: false
+        default: "900"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mmap:
+    name: Mounted mmap/writeback row
+    runs-on: [self-hosted, linux, x64, tidefs, nix, kvm]
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Host preflight
+        run: |
+          test -c /dev/kvm
+
+      - name: Run kernel mmap validation
+        run: |
+          timeout --foreground 7200s nix run .#kernel-mmap-validation -- --timeout "${{ inputs.timeout_seconds }}"
+
+      - name: Upload mmap validation output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-mmap-validation
+          path: |
+            /tmp/tidefs-validation/kernel-mmap-validation/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Report summary
+        if: always()
+        run: |
+          echo "## Kernel mmap validation" >> "$GITHUB_STEP_SUMMARY"
+          latest=$(find /tmp/tidefs-validation/kernel-mmap-validation -name summary.env -type f 2>/dev/null | sort | tail -1 || true)
+          if [[ -n "$latest" && -f "$latest" ]]; then
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat "$latest" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No summary.env artifact was produced." >> "$GITHUB_STEP_SUMMARY"
+          fi

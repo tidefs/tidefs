@@ -885,6 +885,18 @@ Important 2026-06-01 findings:
   `/root/ai/tmp/tidefs-kmod-redirty-invariant/module-out` with the same
   pre-existing Rust objtool fall-through warnings. This is an invariant
   documentation slice, not mounted runtime closure.
+- `TFR-018`: issue #258 narrows the mounted-kernel mmap/writeback proof to the
+  live Linux 7.0 C/generic-filemap path. The authority chain is
+  `tidefs_posix_vfs_file_mmap()` -> `generic_file_mmap()` ->
+  C `read_folio`/`dirty_folio`/`writepages` -> Rust engine read/write/fsync
+  bridge calls, with writeback failures re-dirtying folios for retry and
+  truncate/direct-write invalidation using Linux page-cache discard helpers for
+  the affected ranges. The Rust `KmodVfsVmOps`, `DirtyFolioTracker`, and
+  page-authority direct C bridge remain unregistered/source-model only and are
+  classified as unsupported in the mounted artifact. This first-boot row does
+  not close crash-consistent mmap, broad xfstests, direct-I/O, FUSE
+  writeback-cache correctness, placement receipt correctness, or distributed
+  mmap coherency.
 - `TFR-018`: commit `822848b7` routes live inode writes through the active
   storage path when a mounted `KernelPoolCore` I/O context is available.
   `stage_live_inode_write()` now asks
