@@ -49,12 +49,17 @@ may use non-secret repository variables for scheduling gates, such as
   chatter; the Nexus safety poll still refreshes workflow state.
 - `Nix Checks` runs on self-hosted TideFS runners and builds pure check
   derivations plus the core Nix packages.
-- `QEMU Smoke` runs the outside-sandbox kernel bootstrap smoke on self-hosted
-  TideFS runners with KVM and FUSE access: load `tidefs_posix_vfs.ko`, mount
-  the explicit bootstrap VFS root, exercise supported directory/symlink/
-  readdir/statfs operations, and keep engine-backed storage checks in the
-  longer filesystem lanes. Legacy runNixOSTest QEMU apps stay out of Actions
-  until they are ported to the outside-sandbox runner shape.
+- `QEMU Smoke` runs outside-sandbox kernel runtime rows on self-hosted
+  TideFS runners with KVM and FUSE access. Pushes to `master` run the default
+  `kmod-xfstests-smoke` target: load `tidefs_posix_vfs.ko`, mount the explicit
+  bootstrap VFS root, exercise supported directory/symlink/readdir/statfs
+  operations, and keep engine-backed storage checks in the longer filesystem
+  lanes. Manual dispatch can select the default target, the mounted
+  `kernel-mmap-validation` target, or both.
+- `Kernel mmap validation` is a narrow manual self-hosted workflow for the
+  mounted mmap/writeback QEMU row. It runs `.#kernel-mmap-validation` against
+  the selected branch and uploads row artifacts under
+  `kernel-mmap-validation`.
 - `xfstests` and `RDMA` are scheduled/manual lanes for longer filesystem and
   transport work.
 - `Release Candidate` is a manual-only self-hosted workflow. The `smoke`
