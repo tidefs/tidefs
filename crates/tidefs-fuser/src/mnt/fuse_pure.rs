@@ -552,6 +552,8 @@ pub fn option_group(option: &MountOption) -> MountOptionGroup {
         MountOption::Exec => MountOptionGroup::KernelFlag,
         MountOption::NoExec => MountOptionGroup::KernelFlag,
         MountOption::Atime => MountOptionGroup::KernelFlag,
+        MountOption::Relatime => MountOptionGroup::KernelFlag,
+        MountOption::StrictAtime => MountOptionGroup::KernelFlag,
         MountOption::NoAtime => MountOptionGroup::KernelFlag,
         MountOption::DirSync => MountOptionGroup::KernelFlag,
         MountOption::Sync => MountOptionGroup::KernelFlag,
@@ -574,6 +576,8 @@ pub fn option_to_flag(option: &MountOption) -> libc::c_ulong {
         MountOption::Exec => 0,
         MountOption::NoExec => libc::MS_NOEXEC,
         MountOption::Atime => 0,
+        MountOption::Relatime => libc::MS_RELATIME,
+        MountOption::StrictAtime => libc::MS_STRICTATIME,
         MountOption::NoAtime => libc::MS_NOATIME,
         MountOption::Async => 0,
         MountOption::Sync => libc::MS_SYNCHRONOUS,
@@ -594,9 +598,26 @@ pub fn option_to_flag(option: &MountOption) -> libc::c_int {
         MountOption::Exec => 0,
         MountOption::NoExec => libc::MNT_NOEXEC,
         MountOption::Atime => 0,
+        MountOption::Relatime => 0,
+        MountOption::StrictAtime => 0,
         MountOption::NoAtime => libc::MNT_NOATIME,
         MountOption::Async => 0,
         MountOption::Sync => libc::MNT_SYNCHRONOUS,
         _ => unreachable!(),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atime_policy_options_set_linux_mount_flags() {
+        assert_eq!(option_to_flag(&MountOption::Relatime), libc::MS_RELATIME);
+        assert_eq!(
+            option_to_flag(&MountOption::StrictAtime),
+            libc::MS_STRICTATIME
+        );
+        assert_eq!(option_to_flag(&MountOption::NoAtime), libc::MS_NOATIME);
     }
 }
