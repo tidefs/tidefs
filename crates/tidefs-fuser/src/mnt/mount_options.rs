@@ -70,6 +70,17 @@ pub(crate) fn is_driver_mount_option(option: &MountOption) -> bool {
     !matches!(option, MountOption::WritebackCache)
 }
 
+pub(crate) fn is_fusermount_mount_option(option: &MountOption) -> bool {
+    is_driver_mount_option(option)
+        && !matches!(
+            option,
+            MountOption::Atime
+                | MountOption::Relatime
+                | MountOption::StrictAtime
+                | MountOption::NoAtime
+        )
+}
+
 pub fn check_option_conflicts(options: &[MountOption]) -> Result<(), io::Error> {
     let mut options_set = HashSet::new();
     options_set.extend(options.iter().cloned());
@@ -181,5 +192,16 @@ mod test {
         assert!(is_driver_mount_option(&MountOption::Relatime));
         assert!(is_driver_mount_option(&MountOption::StrictAtime));
         assert!(is_driver_mount_option(&MountOption::NoAtime));
+    }
+
+    #[test]
+    fn atime_policy_options_are_not_fusermount_cli_options() {
+        assert!(is_fusermount_mount_option(&MountOption::AllowOther));
+        assert!(is_fusermount_mount_option(&MountOption::Dev));
+        assert!(!is_fusermount_mount_option(&MountOption::Atime));
+        assert!(!is_fusermount_mount_option(&MountOption::Relatime));
+        assert!(!is_fusermount_mount_option(&MountOption::StrictAtime));
+        assert!(!is_fusermount_mount_option(&MountOption::NoAtime));
+        assert!(!is_fusermount_mount_option(&MountOption::WritebackCache));
     }
 }
