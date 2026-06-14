@@ -151,12 +151,16 @@ impl ReservePressureState {
         reserve_floor_bytes: u64,
         total_capacity: u64,
     ) -> Self {
-        let _ = total_capacity; // reserved for future use
-        let reserve_exhausted = reserve_floor_bytes == 0 || free_bytes == 0;
-        let encroached = free_bytes < reserve_floor_bytes * 2;
-        let violated = free_bytes < reserve_floor_bytes;
-        let emergency =
-            reserve_exhausted || (reserve_floor_bytes > 0 && free_bytes < reserve_floor_bytes / 4);
+        let effective_free_bytes = free_bytes.min(total_capacity);
+        let reserve_exhausted = reserve_floor_bytes == 0 || effective_free_bytes == 0;
+        let reserve_floor_unsatisfied = reserve_floor_bytes > total_capacity;
+        let encroached = match reserve_floor_bytes.checked_mul(2) {
+            Some(encroachment_floor_bytes) => effective_free_bytes < encroachment_floor_bytes,
+            None => true,
+        };
+        let violated = reserve_floor_unsatisfied || effective_free_bytes < reserve_floor_bytes;
+        let emergency = reserve_exhausted
+            || (reserve_floor_bytes > 0 && effective_free_bytes < reserve_floor_bytes / 4);
 
         match self {
             Self::Healthy => {
@@ -833,6 +837,54 @@ mod tests {
     fn pressure_emergency_recovery() {
         let state = ReservePressureState::Emergency.transition(200, 100, 1000);
         assert_eq!(state, ReservePressureState::Healthy);
+    }
+
+    #[test]
+    fn pressure_zero_reserve_floor_is_emergency() {
+        let state = ReservePressureState::Healthy.transition(1_000, 0, 1_000);
+        assert_eq!(state, ReservePressureState::Emergency);
+    }
+
+    #[test]
+    fn pressure_zero_free_bytes_is_emergency() {
+        let state = ReservePressureState::Healthy.transition(0, 400, 1_000);
+        assert_eq!(state, ReservePressureState::Emergency);
+    }
+
+    #[test]
+    fn pressure_unsatisfied_floor_fails_closed() {
+        let state = ReservePressureState::Healthy.transition(1_000, 1_200, 1_000);
+        assert_eq!(state, ReservePressureState::Violated);
+    }
+
+    #[test]
+    fn pressure_clamps_free_bytes_to_capacity() {
+        let state = ReservePressureState::Healthy.transition(u64::MAX, 800, 1_000);
+        assert_eq!(state, ReservePressureState::Encroached);
+    }
+
+    #[test]
+    fn pressure_overflow_sized_floor_fails_closed_from_all_origins() {
+        let reserve_floor_bytes = u64::MAX / 2 + 1;
+        let total_capacity = reserve_floor_bytes - 1;
+
+        for origin in [
+            ReservePressureState::Healthy,
+            ReservePressureState::Encroached,
+            ReservePressureState::Violated,
+            ReservePressureState::Emergency,
+        ] {
+            let state = origin.transition(total_capacity, reserve_floor_bytes, total_capacity);
+            assert_eq!(state, ReservePressureState::Violated);
+        }
+    }
+
+    #[test]
+    fn pressure_overflow_threshold_at_max_capacity_encroaches() {
+        let reserve_floor_bytes = u64::MAX / 2 + 1;
+        let state =
+            ReservePressureState::Healthy.transition(u64::MAX, reserve_floor_bytes, u64::MAX);
+        assert_eq!(state, ReservePressureState::Encroached);
     }
 
     #[test]
