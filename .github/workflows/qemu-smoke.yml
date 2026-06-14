@@ -4,6 +4,16 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      target:
+        description: Smoke target to run
+        required: false
+        default: kmod-xfstests-smoke
+        type: choice
+        options:
+          - kmod-xfstests-smoke
+          - kernel-mmap-validation
+          - all
 
 permissions:
   contents: read
@@ -22,19 +32,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: kmod-xfstests-smoke
+          - id: kmod-xfstests-smoke
+            name: kmod-xfstests-smoke
             command: nix run .#kmod-xfstests-smoke -- --timeout 1800
+          - id: kernel-mmap-validation
+            name: kernel-mmap-validation
+            command: nix run .#kernel-mmap-validation -- --timeout 900
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Host preflight
+        if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke') }}
         run: |
           test -c /dev/kvm
           test -c /dev/fuse
 
       - name: Run smoke target
+        if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke') }}
         run: timeout --foreground 7200s bash -lc '${{ matrix.command }}'
 
       - name: Upload runtime output
