@@ -235,7 +235,7 @@ impl std::fmt::Display for ImportError {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PoolImportStats {
     /// Number of leaf devices successfully opened.
-    pub vdevs_opened: usize,
+    pub devices_opened: usize,
     /// Whether the superblock was verified consistent across all devices.
     pub superblock_verified: bool,
     /// Number of intent log records replayed.
@@ -676,7 +676,7 @@ impl PoolImport {
         self.acquire_import_lock()?;
 
         // 2. Open all leaf devices.
-        self.open_vdevs()?;
+        self.open_devices()?;
 
         // 3. Verify superblock consistency.
         self.verify_superblock()?;
@@ -719,7 +719,7 @@ impl PoolImport {
         self.acquire_import_lock()?;
 
         // 2. Open all leaf devices read-only.
-        self.open_vdevs_readonly()?;
+        self.open_devices_readonly()?;
 
         // 3. Verify superblock consistency.
         self.verify_superblock()?;
@@ -807,24 +807,24 @@ impl PoolImport {
     // ------------------------------------------------------------------
 
     /// Open all leaf devices for read/write.
-    fn open_vdevs(&mut self) -> Result<(), ImportError> {
+    fn open_devices(&mut self) -> Result<(), ImportError> {
         let leaves = collect_leaves(&self.pool_config.device_tree);
         self.devices = leaves
             .iter()
             .map(|leaf| DeviceHandle::open_rw(&leaf.device_path, leaf.device_index))
             .collect::<Result<Vec<_>, _>>()?;
-        self.stats.vdevs_opened = self.devices.len();
+        self.stats.devices_opened = self.devices.len();
         Ok(())
     }
 
     /// Open all leaf devices for read-only.
-    fn open_vdevs_readonly(&mut self) -> Result<(), ImportError> {
+    fn open_devices_readonly(&mut self) -> Result<(), ImportError> {
         let leaves = collect_leaves(&self.pool_config.device_tree);
         self.devices = leaves
             .iter()
             .map(|leaf| DeviceHandle::open_ro(&leaf.device_path, leaf.device_index))
             .collect::<Result<Vec<_>, _>>()?;
-        self.stats.vdevs_opened = self.devices.len();
+        self.stats.devices_opened = self.devices.len();
         Ok(())
     }
 
@@ -1724,10 +1724,10 @@ mod tests {
         file.flush().unwrap();
     }
 
-    // -- open_vdevs tests --
+    // -- open_devices tests --
 
     #[test]
-    fn open_vdevs_single_device() {
+    fn open_devices_single_device() {
         let dir = tempfile::tempdir().unwrap();
         let dev_path = dir.path().join("device0");
         {
@@ -1739,13 +1739,13 @@ mod tests {
         let lock_dir = dir.path().join("locks");
         let mut import = PoolImport::new(config, &lock_dir, None, None);
 
-        import.open_vdevs().unwrap();
+        import.open_devices().unwrap();
         assert_eq!(import.devices.len(), 1);
-        assert_eq!(import.stats.vdevs_opened, 1);
+        assert_eq!(import.stats.devices_opened, 1);
     }
 
     #[test]
-    fn open_vdevs_missing_device() {
+    fn open_devices_missing_device() {
         let dir = tempfile::tempdir().unwrap();
         let dev_path = dir.path().join("nonexistent");
 
@@ -1753,7 +1753,7 @@ mod tests {
         let lock_dir = dir.path().join("locks");
         let mut import = PoolImport::new(config, &lock_dir, None, None);
 
-        let result = import.open_vdevs();
+        let result = import.open_devices();
         assert!(result.is_err());
         match result.unwrap_err() {
             ImportError::DeviceOpen { .. } => {}
@@ -1775,7 +1775,7 @@ mod tests {
         let config = make_single_device_config(dev_path);
         let lock_dir = dir.path().join("locks");
         let mut import = PoolImport::new(config, &lock_dir, None, None);
-        import.open_vdevs().unwrap();
+        import.open_devices().unwrap();
 
         import.verify_superblock().unwrap();
         assert!(import.stats.superblock_verified);
@@ -1794,7 +1794,7 @@ mod tests {
         config.state = PoolState::Destroyed;
         let lock_dir = dir.path().join("locks");
         let mut import = PoolImport::new(config, &lock_dir, None, None);
-        import.open_vdevs().unwrap();
+        import.open_devices().unwrap();
 
         let result = import.verify_superblock();
         assert!(result.is_err());
@@ -1843,7 +1843,7 @@ mod tests {
         );
         let lock_dir = dir.path().join("locks");
         let mut import = PoolImport::new(config, &lock_dir, None, None);
-        import.open_vdevs().unwrap();
+        import.open_devices().unwrap();
 
         match import.verify_superblock().unwrap_err() {
             ImportError::SuperblockDisagreement { field, values } => {
@@ -1889,7 +1889,7 @@ mod tests {
     // -- read-only import tests --
 
     #[test]
-    fn open_vdevs_readonly() {
+    fn open_devices_readonly() {
         let dir = tempfile::tempdir().unwrap();
         let dev_path = dir.path().join("device0");
         {
@@ -1901,8 +1901,8 @@ mod tests {
         let lock_dir = dir.path().join("locks");
         let mut import = PoolImport::new(config, &lock_dir, None, None);
 
-        import.open_vdevs_readonly().unwrap();
-        assert_eq!(import.stats.vdevs_opened, 1);
+        import.open_devices_readonly().unwrap();
+        assert_eq!(import.stats.devices_opened, 1);
     }
 
     // -- full import integration test --
@@ -1921,7 +1921,7 @@ mod tests {
         let mut import = PoolImport::new(config, &lock_dir, None, None);
 
         let stats = import.import().unwrap();
-        assert_eq!(stats.vdevs_opened, 1);
+        assert_eq!(stats.devices_opened, 1);
         assert!(stats.superblock_verified);
         assert!(!stats.read_only);
         // import_time_ms can be 0 for sub-millisecond imports
@@ -1941,7 +1941,7 @@ mod tests {
         let mut import = PoolImport::new(config, &lock_dir, None, None);
 
         let stats = import.import_readonly().unwrap();
-        assert_eq!(stats.vdevs_opened, 1);
+        assert_eq!(stats.devices_opened, 1);
         assert!(stats.read_only);
         // import_time_ms can be 0 for sub-millisecond imports
     }
