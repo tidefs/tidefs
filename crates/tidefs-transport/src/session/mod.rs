@@ -15,8 +15,8 @@ use crate::session_cipher::{CipherError, Direction, SessionKeyMaterial, Transpor
 use crate::types::{CohortMembership, FamilyVersion, HlcTimestamp, NodeIdentity, SessionId};
 use std::time::Instant;
 use tidefs_clock_timing::{HlcValue, HybridLogicalClock};
-use tidefs_types_transport_session::EndpointFamily;
 pub use tidefs_types_transport_session::MessageSequenceNumber;
+use tidefs_types_transport_session::{ClosureClass, DrainResultClass, EndpointFamily};
 
 use crate::keepalive::{
     session_keepalive_check, HeartbeatState, KeepaliveHealth, SessionKeepalive,
@@ -1516,6 +1516,50 @@ pub enum SessionCloseReason {
     RdmaRegistrationFailure,
 }
 
+impl SessionCloseReason {
+    #[must_use]
+    /// Convert the runtime close reason to the shared transport-session model.
+    pub const fn to_type_model(self) -> tidefs_types_transport_session::SessionCloseReason {
+        match self {
+            Self::PeerRemoved => tidefs_types_transport_session::SessionCloseReason::PeerRemoved,
+            Self::AuthFailed => tidefs_types_transport_session::SessionCloseReason::AuthFailed,
+            Self::ProtocolVersionMismatch => {
+                tidefs_types_transport_session::SessionCloseReason::ProtocolVersionMismatch
+            }
+            Self::LocalShutdown => {
+                tidefs_types_transport_session::SessionCloseReason::LocalShutdown
+            }
+            Self::TransportError => {
+                tidefs_types_transport_session::SessionCloseReason::TransportError
+            }
+            Self::RdmaCarrierLost => {
+                tidefs_types_transport_session::SessionCloseReason::RdmaCarrierLost
+            }
+            Self::RdmaRegistrationFailure => {
+                tidefs_types_transport_session::SessionCloseReason::RdmaRegistrationFailure
+            }
+        }
+    }
+
+    #[must_use]
+    /// Return the authoritative closure class for this runtime close reason.
+    pub const fn closure_class(self) -> ClosureClass {
+        self.to_type_model().closure_class()
+    }
+
+    #[must_use]
+    /// Return the default drain result class for this runtime close reason.
+    pub const fn drain_result_class(self) -> DrainResultClass {
+        self.to_type_model().drain_result_class()
+    }
+
+    #[must_use]
+    /// Return the shared model label used as the close receipt trigger.
+    pub const fn trigger_ref(self) -> &'static str {
+        self.to_type_model().as_str()
+    }
+}
+
 impl fmt::Display for SessionCloseReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1771,6 +1815,26 @@ mod tests {
         .can_resume());
         assert!(!SessionState::Bound { since: ts }.can_resume());
         assert!(!SessionState::Unconnected.can_resume());
+    }
+
+    #[test]
+    fn runtime_close_reasons_convert_to_shared_receipt_model() {
+        let cases = [
+            SessionCloseReason::PeerRemoved,
+            SessionCloseReason::AuthFailed,
+            SessionCloseReason::ProtocolVersionMismatch,
+            SessionCloseReason::LocalShutdown,
+            SessionCloseReason::TransportError,
+            SessionCloseReason::RdmaCarrierLost,
+            SessionCloseReason::RdmaRegistrationFailure,
+        ];
+
+        for reason in cases {
+            let model = reason.to_type_model();
+            assert_eq!(reason.trigger_ref(), model.as_str());
+            assert_eq!(reason.closure_class(), model.closure_class());
+            assert_eq!(reason.drain_result_class(), model.drain_result_class());
+        }
     }
 
     #[test]
