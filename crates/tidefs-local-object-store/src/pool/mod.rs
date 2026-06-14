@@ -158,6 +158,19 @@ impl PoolRedundancyPolicy {
         }
     }
 
+    fn from_label_policy(policy: pool_label::PoolRedundancyPolicy) -> Self {
+        match policy {
+            pool_label::PoolRedundancyPolicy::Replicated { copies } => Self::Replicated { copies },
+            pool_label::PoolRedundancyPolicy::Erasure {
+                data_shards,
+                parity_shards,
+            } => Self::Erasure {
+                data_shards,
+                parity_shards,
+            },
+        }
+    }
+
     /// Project this local pool policy into the shared distributed receipt
     /// policy identity.
     #[must_use]
@@ -1093,10 +1106,12 @@ impl Pool {
         properties: PoolProperties,
         options: &StoreOptions,
     ) -> Result<Self> {
+        let mut properties = properties;
         let mut pool_guid: Option<[u8; 16]> = None;
         let mut device_guids: Vec<[u8; 16]> = Vec::new();
         let mut label_health_states: Vec<(usize, u8, u64, u64, u64)> = Vec::new();
         let mut label_found = false;
+        let mut label_redundancy_policy: Option<PoolRedundancyPolicy> = None;
         // Pool-level feature bitmasks captured from the first valid label
         // for post-import compatibility gating.
         let mut saved_features_incompat: u64 = 0;
@@ -1140,6 +1155,17 @@ impl Pool {
             let label = pool_label::decode_label(&buf).map_err(|_| StoreError::InvalidOptions {
                 reason: "pool label corrupt or unreadable",
             })?;
+            let recovered_redundancy_policy =
+                PoolRedundancyPolicy::from_label_policy(label.redundancy_policy);
+            match label_redundancy_policy {
+                None => label_redundancy_policy = Some(recovered_redundancy_policy),
+                Some(existing) if existing != recovered_redundancy_policy => {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "pool redundancy policy mismatch across devices",
+                    });
+                }
+                Some(_) => {}
+            }
             device_guids.push(label.device_guid);
             topology_generation = Some(
                 topology_generation
@@ -1186,6 +1212,10 @@ impl Pool {
         if !label_found {
             // Legacy path: no labels present, create a fresh pool identity.
             return Self::create(config, properties, options);
+        }
+
+        if let Some(recovered_redundancy_policy) = label_redundancy_policy {
+            properties.redundancy_policy = recovered_redundancy_policy;
         }
 
         // -- Pool feature compatibility gate ----------------------------------------
@@ -6303,6 +6333,123 @@ mod tests {
             "pool GUID must survive export/import"
         );
         assert_eq!(pool2.name(), "testpool");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_restores_pool_label_redundancy_policy_over_caller_default() {
+        let root = temp_dir("import-label-policy");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let options = test_options();
+        let persisted_properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+
+        let pool = Pool::create(config.clone(), persisted_properties, &options).unwrap();
+        pool.export().unwrap();
+        drop(pool);
+
+        let caller_properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
+            ..PoolProperties::default()
+        };
+        let mut reopened = Pool::open(config, caller_properties, &options).unwrap();
+        assert_eq!(
+            reopened.redundancy_policy(),
+            PoolRedundancyPolicy::erasure(2, 1),
+            "pool label policy must be the authority for new allocations"
+        );
+
+        let key = ObjectKey::from_name(b"label-policy-erasure-write");
+        let payload = b"label policy survives exported pool import";
+        reopened.put(IoClass::Data, key, payload).unwrap();
+        let receipt = reopened
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("placement receipt after label-authoritative import");
+        assert_eq!(receipt.policy, PoolRedundancyPolicy::erasure(2, 1));
+        assert_eq!(receipt.targets.len(), 3);
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_reuses_active_label_redundancy_policy_over_caller_default() {
+        let root = temp_dir("active-label-policy");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let options = test_options();
+        let persisted_properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+
+        let mut pool = Pool::create(config.clone(), persisted_properties, &options).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let first_key = ObjectKey::from_name(b"active-label-policy-before-reopen");
+        pool.put(IoClass::Data, first_key, b"first").unwrap();
+        drop(pool);
+
+        let caller_properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
+            ..PoolProperties::default()
+        };
+        let mut reopened = Pool::create(config, caller_properties, &options).unwrap();
+        assert_eq!(
+            reopened.redundancy_policy(),
+            PoolRedundancyPolicy::replicated(2),
+            "active labels must keep the persisted pool-wide policy"
+        );
+
+        let second_key = ObjectKey::from_name(b"active-label-policy-after-reopen");
+        reopened.put(IoClass::Data, second_key, b"second").unwrap();
+        let receipt = reopened
+            .placement_receipt_for_key(IoClass::Data, second_key)
+            .unwrap()
+            .expect("placement receipt after active-label reopen");
+        assert_eq!(receipt.policy, PoolRedundancyPolicy::replicated(2));
+        assert_eq!(receipt.targets.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_rejects_mismatched_label_redundancy_policy() {
+        let root = temp_dir("label-policy-mismatch");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let options = test_options();
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+
+        let pool = Pool::create(config.clone(), properties, &options).unwrap();
+        pool.export().unwrap();
+        drop(pool);
+
+        let device_root = device_root_path(&config.devices[1]);
+        let label_path = label_file_path(&device_root);
+        let mut label = pool_label::decode_label(&fs::read(&label_path).unwrap()).unwrap();
+        label.redundancy_policy = pool_label::PoolRedundancyPolicy::erasure(2, 1);
+        write_pool_label(
+            &config.devices[1],
+            label,
+            "test_write_mismatched_redundancy_label",
+        )
+        .unwrap();
+
+        assert_invalid_options_reason_contains(
+            Pool::open(config, PoolProperties::default(), &options),
+            "redundancy policy mismatch",
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
