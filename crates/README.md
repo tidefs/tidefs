@@ -42,7 +42,7 @@ Authoritative companion docs:
 | Crate | Area | Purpose |
 | --- | --- | --- |
 | `fuser` | POSIX/FUSE | Vendored FUSE userspace binding used by the POSIX adapter. |
-| `tidefs-anti-entropy-auditor` | Distributed storage | Replica scan, compare, and audit bridge that identifies repair candidates. |
+| `tidefs-anti-entropy-auditor` | Distributed storage (not release proof) | Replica scan, compare, and audit bridge that identifies repair candidates. |
 | `tidefs-auth` | Control and policy | Node identity, attestation, principal, grant, and audit primitives. |
 | `tidefs-background-scheduler` | Maintenance | Tick-driven scheduler for incremental cleanup, scrub, and background jobs. |
 | `tidefs-binary_schema-checksum` | Schema and codec | CRC32C and BLAKE3 checksum helpers for binary-schema records. |
@@ -55,13 +55,13 @@ Authoritative companion docs:
 | `tidefs-btree` | Storage core | Generic `no_std` B+tree used by indexes, queues, and maps. |
 | `tidefs-cache-core` | Storage core | Cache-lattice registry, eviction, and coherency logic. |
 | `tidefs-checksum-tree` | Maintenance | Incremental Merkle checksum tree for integrity checking and scrub. |
-| `tidefs-chunk-shipper` | Distributed storage | Cross-node chunk staging, streaming, and receive orchestration. |
+| `tidefs-chunk-shipper` | Distributed storage (not release proof) | Cross-node chunk staging, streaming, and receive orchestration. |
 | `tidefs-claim-ledger` | Control and policy | Runtime claim ledger for capacity and resource admission. |
 | `tidefs-cleanup-engine` | Maintenance | Deferred cleanup executor with checkpointing and intent-log safety. |
 | `tidefs-cleanup-job-core` | Maintenance | `IncrementalJob` implementation for deferred cleanup work. |
 | `tidefs-cleanup-queue-core` | Maintenance | B+tree-backed queue for deferred cleanup records. |
 | `tidefs-clock-timing` | Control and policy | Hybrid logical clock, drift, timeout, and fence utilities. |
-| `tidefs-cluster` | Distributed storage | Deterministic cluster lease and membership transition helpers. |
+| `tidefs-cluster` | Distributed storage (not release proof) | Deterministic cluster lease and membership transition helpers. |
 | `tidefs-commit_group` | Storage core | Transaction-group commit pipeline between mutations and stable storage. |
 | `tidefs-compaction` | Maintenance | Background compaction job for derived and refcount catalog pages. |
 | `tidefs-compression` | Maintenance | zstd and LZ4 object compression wrapper. |
@@ -75,12 +75,12 @@ Authoritative companion docs:
 | `tidefs-derived-catalog` | Storage core | Cached derived directory and catalog views over authoritative indexes. |
 | `tidefs-device-removal` | Storage core | Device decommission state machine and evacuation planner. |
 | `tidefs-dir-index` | Storage core | Persistent directory index with inline and B+tree representations. |
-| `tidefs-durability-layout` | Distributed storage | Mirror and erasure durability policy descriptors across failure domains. |
+| `tidefs-durability-layout` | Distributed storage (not release proof) | Mirror and erasure durability policy descriptors across failure domains. |
 | `tidefs-encryption` | Maintenance | ChaCha20-Poly1305 object encryption wrapper. |
-| `tidefs-erasure-coded-store` | Distributed storage | Local object store wrapper that stripes data with erasure coding. |
+| `tidefs-erasure-coded-store` | Distributed storage (not release proof) | Local object store wrapper that stripes data with erasure coding. |
 | `tidefs-erasure-coding` | Maintenance | Reed-Solomon erasure-coding engine. |
 | `tidefs-extent-map` | Storage core | Per-file byte-range to physical extent map. |
-| `tidefs-flow-commit-coordinator` | Distributed storage | Distributed flow commit receipt and state advancement layer. |
+| `tidefs-flow-commit-coordinator` | Distributed storage (not release proof) | Distributed flow commit receipt and state advancement layer. |
 | `tidefs-frame` | Schema and codec | Compact per-object compression frame format. |
 | `tidefs-gc-pin-set` | Maintenance | Pinned traversal roots that protect datasets during GC and destroy. |
 | `tidefs-geometry-convert` | Storage core | Online durability-geometry conversion over locator entries. |
@@ -91,25 +91,25 @@ Authoritative companion docs:
 | `tidefs-kernel-cutover-runtime` | Kernel | Userspace cutover, fence, dry-run, and rollback executor for kernel transition. |
 | `tidefs-kernel-storage-io` | Kernel | Kernel-portable block I/O traits and `KernelPoolCore` primitives. |
 | `tidefs-kmod-posix-vfs` | Kernel | Linux POSIX VFS module delegating to the `VfsEngine` boundary. |
-| `tidefs-lease` | Distributed storage | Quorum-backed distributed leases and fencing. |
-| `tidefs-lease-manager` | Distributed storage | Lease grant, revoke, renew, and failure-revocation lifecycle. |
+| `tidefs-lease` | Distributed storage (not release proof) | Quorum-backed distributed leases and fencing. |
+| `tidefs-lease-manager` | Distributed storage (not release proof) | Lease grant, revoke, renew, and failure-revocation lifecycle. |
 | `tidefs-local-filesystem` | Storage core | Userspace filesystem core: namespace, file data, txg, snapshots, and recovery. |
 | `tidefs-local-object-store` | Storage core | Durable local object and segment store with pool-device backing. |
 | `tidefs-locator-table` | Storage core | Logical-to-physical extent locator table. |
-| `tidefs-lock-service` | Distributed storage | Sharded lock service protocol and phase-1 leader runtime. |
-| `tidefs-membership-epoch` | Distributed storage | Deterministic membership epoch and placement model. |
-| `tidefs-membership-live` | Distributed storage | Live SWIM-style membership, gossip, epoch, and transport session runtime. |
+| `tidefs-lock-service` | Distributed storage (not release proof) | Sharded lock service protocol and phase-1 leader runtime. |
+| `tidefs-membership-epoch` | Distributed storage (not release proof) | Deterministic membership epoch and placement model. |
+| `tidefs-membership-live` | Distributed storage (not release proof) | Live SWIM-style membership, gossip, epoch, and transport session runtime. |
 | `tidefs-membership-types` | Types | `no_std` membership service wire protocol types. |
 | `tidefs-namespace` | Storage core | Namespace path resolution and create, lookup, unlink, and rename operations. |
-| `tidefs-node-drain` | Distributed storage | Node drain, migration, fencing, and decommission flow. |
-| `tidefs-node-join` | Distributed storage | Node admission, staged promotion, discovery, and state transfer. |
+| `tidefs-node-drain` | Distributed storage (not release proof) | Node drain, migration, fencing, and decommission flow. |
+| `tidefs-node-join` | Distributed storage (not release proof) | Node admission, staged promotion, discovery, and state transfer. |
 | `tidefs-object-io` | Storage core | Offset read/write bridge between extent maps and object store. |
 | `tidefs-online-defrag` | Maintenance | Incremental extent-map defragmentation service. |
 | `tidefs-orphan-index` | Storage core | Persistent index for nlink-zero and orphan recovery. |
-| `tidefs-partition-runtime` | Distributed storage | Network partition detection, split-brain prevention, and healing. |
+| `tidefs-partition-runtime` | Distributed storage (not release proof) | Network partition detection, split-brain prevention, and healing. |
 | `tidefs-permission` | POSIX/FUSE | Unix mode, ACL, and xattr namespace access decisions. |
-| `tidefs-placement-planner` | Distributed storage | Replica target computation from policy and failure domains. |
-| `tidefs-placement-runtime` | Distributed storage | Executes placement plans with budgets and conflict handling. |
+| `tidefs-placement-planner` | Distributed storage (not release proof) | Replica target computation from policy and failure domains. |
+| `tidefs-placement-runtime` | Distributed storage (not release proof) | Executes placement plans with budgets and conflict handling. |
 | `tidefs-pool-allocator` | Storage core | Pool and metaslab allocator above segment free maps. |
 | `tidefs-pool-import` | Storage core | Pool activation, superblock verification, and intent replay. |
 | `tidefs-pool-scan` | Storage core | Device scan, label read, and topology report for pools. |
@@ -119,34 +119,34 @@ Authoritative companion docs:
 | `tidefs-posix-filesystem-adapter-workers-locks` | POSIX/FUSE | FUSE lock-wait worker-pool support. |
 | `tidefs-posix-guarantee-verifier` | Proof harness | Checks whether a coordination strategy satisfies POSIX operation guarantees. |
 | `tidefs-posix-semantics` | POSIX/FUSE | Pure POSIX helpers for sticky, setgid, killpriv, and relatime behavior. |
-| `tidefs-quorum-write` | Distributed storage | Deterministic prepare, transfer, commit, and witness write protocol. |
-| `tidefs-quorum-write-runtime` | Distributed storage | Runtime quorum-write coordinator for `LocalFileSystem` writes. |
-| `tidefs-rebalance-planner` | Distributed storage | Capacity rebalance planner with movement budgets and anti-affinity. |
-| `tidefs-rebuild-planner` | Distributed storage | Loss and suspect rebuild flow planner. |
-| `tidefs-rebuild-runtime` | Distributed storage | Async rebuild, backfill, and rebalance executor. |
-| `tidefs-receive-stream` | Distributed storage | Receive-side VFSSEND and chunk reassembly verification. |
+| `tidefs-quorum-write` | Distributed storage (not release proof) | Deterministic prepare, transfer, commit, and witness write protocol. |
+| `tidefs-quorum-write-runtime` | Distributed storage (not release proof) | Runtime quorum-write coordinator for `LocalFileSystem` writes. |
+| `tidefs-rebalance-planner` | Distributed storage (not release proof) | Capacity rebalance planner with movement budgets and anti-affinity. |
+| `tidefs-rebuild-planner` | Distributed storage (not release proof) | Loss and suspect rebuild flow planner. |
+| `tidefs-rebuild-runtime` | Distributed storage (not release proof) | Async rebuild, backfill, and rebalance executor. |
+| `tidefs-receive-stream` | Distributed storage (not release proof) | Receive-side VFSSEND and chunk reassembly verification. |
 | `tidefs-reclaim` | Maintenance | Segment reclaim pipeline for the local object store. |
 | `tidefs-reclaim-queue-core` | Maintenance | B+tree reclaim queue and dirty writeback engine. |
 | `tidefs-recovery-loop` | Maintenance | Failure recovery loop from detection through verification. |
-| `tidefs-relocation-planner` | Distributed storage | Relocation planner for tiering, drain, reclaim, and policy changes. |
-| `tidefs-replica-health` | Distributed storage | Per-chunk replica health, lag, and flap suppression. |
-| `tidefs-replicated-object-store` | Distributed storage | Multi-replica object-store wrapper with quorum write coordination. |
-| `tidefs-replication` | Distributed storage | Replication fanout, quorum ACK, degraded read, and policy runtime. |
-| `tidefs-replication-model` | Distributed storage | Deterministic replication topology and degraded read/write model. |
+| `tidefs-relocation-planner` | Distributed storage (not release proof) | Relocation planner for tiering, drain, reclaim, and policy changes. |
+| `tidefs-replica-health` | Distributed storage (not release proof) | Per-chunk replica health, lag, and flap suppression. |
+| `tidefs-replicated-object-store` | Distributed storage (not release proof) | Multi-replica object-store wrapper with quorum write coordination. |
+| `tidefs-replication` | Distributed storage (not release proof) | Replication fanout, quorum ACK, degraded read, and policy runtime. |
+| `tidefs-replication-model` | Distributed storage (not release proof) | Deterministic replication topology and degraded read/write model. |
 | `tidefs-reserve-ledger` | Control and policy | Reserve guarantees, pressure states, and budget-domain runtime. |
 | `tidefs-schema-codec-posix-filesystem-adapter` | Schema and codec | Fixed-width codecs for POSIX adapter wake and receipt records. |
 | `tidefs-schema-codec-vfs` | Schema and codec | VFS errno and operation codec hooks. |
 | `tidefs-scrub-core` | Maintenance | Background checksum scrub and repair scheduling core. |
 | `tidefs-secret-key-policy-runtime` | Control and policy | Secret-key seal, lease, rotate, revoke, activate, and recover runtime. |
 | `tidefs-segment-cleaner` | Maintenance | Segment cleaner that compacts live records and frees dead segments. |
-| `tidefs-send-stream` | Distributed storage | VFSSEND2 incremental dataset send stream writer. |
-| `tidefs-shard-group` | Distributed storage | Shard group lifecycle and erasure-coded shard layout. |
+| `tidefs-send-stream` | Distributed storage (not release proof) | VFSSEND2 incremental dataset send stream writer. |
+| `tidefs-shard-group` | Distributed storage (not release proof) | Shard group lifecycle and erasure-coded shard layout. |
 | `tidefs-snapshot-pruner` | Maintenance | Snapshot auto-pruner with retention policy. |
 | `tidefs-space-accounting` | Storage core | Logical and physical counters, statfs, ENOSPC, and capacity gates. |
 | `tidefs-spacemap-allocator` | Storage core | Deterministic segment-level free-space allocator. |
-| `tidefs-tdma-scheduler` | Distributed storage | Per-object TDMA slot scheduler for contending nodes. |
+| `tidefs-tdma-scheduler` | Distributed storage (not release proof) | Per-object TDMA slot scheduler for contending nodes. |
 | `tidefs-trace-oracle` | Proof harness | Deterministic operation recording and replay oracle. |
-| `tidefs-transport` | Distributed storage | TCP/RDMA transport, sessions, lanes, envelopes, and reconnection. |
+| `tidefs-transport` | Distributed storage (not release proof) | TCP/RDMA transport, sessions, lanes, envelopes, and reconnection. |
 | `tidefs-two-node-harness` | Proof harness | Deterministic two-node storage and transport scenario harness. |
 | `tidefs-types-cache-lattice-core` | Types | Cache lattice value types. |
 | `tidefs-types-claim-ledger-core` | Types | Claim, reserve, and witness value types. |
@@ -174,7 +174,7 @@ Authoritative companion docs:
 | `tidefs-verification-engine` | Maintenance | Replicated chunk and segment verification engine. |
 | `tidefs-vfs-engine` | VFS boundary | `VfsEngine` trait and canonical operation boundary. |
 | `tidefs-vfs-rpc` | VFS boundary | `VfsEngine` RPC forwarding protocol over transport. |
-| `tidefs-witness-set` | Distributed storage | Quorum witness selection and receipt tracking. |
+| `tidefs-witness-set` | Distributed storage (not release proof) | Quorum witness selection and receipt tracking. |
 | `tidefs-workload` | Proof harness | Workload signature and materialization classifier. |
 | `tidefs-xattr-storage` | Storage core | Polymorphic xattr storage runtime. |
 

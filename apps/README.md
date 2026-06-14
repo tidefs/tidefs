@@ -17,6 +17,7 @@ inventory, not a production-readiness claim:
   smoke test, and POSIX validation harness surface.
 - `tidefs-scrub` — scrub/repair CLI surface for the current scrub core.
 - `tidefs-storage-node` — storage-node daemon and transport-backed object-store
-  surface. Cluster and transport product authority remains under `TFR-017`.
+  surface. The storage-node cluster authority remains under `TFR-017`;
+  transport product authority is review-scoped there as well.
 - `tidefs-store-demo` — non-production Local Object Store demo that writes,
   reopens, replays, and reads real bytes from disk.
