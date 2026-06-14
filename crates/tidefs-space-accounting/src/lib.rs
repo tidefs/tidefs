@@ -5,6 +5,11 @@
 //! with statfs derivation, ENOSPC gating, delta accumulation, and pool-level
 //! capacity integration.
 //!
+//! This crate-local authority path is a TFR-007 reduction, not the completed
+//! TideFS capacity authority. Allocation extents, mounted filesystem admission,
+//! obligation ledgers, reclaim, persistent store authority, and distributed
+//! capacity behavior still have separate closure work.
+//!
 //! Implements the runtime from [`docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`].
 //!
 //! # Comparison to ZFS / Ceph
@@ -49,9 +54,10 @@ pub use tidefs_types_space_accounting_core::{
 /// Result of [`SpaceAccounting::statfs()`] ready for FUSE `statfs` or
 /// kernel `kstatfs`.
 ///
-/// **Deprecated for production**: the authoritative statfs result type is
+/// Mounted local-filesystem statfs currently reports through
 /// [`tidefs_local_filesystem::capacity_authority::CapacityStatfs`].
-/// This type is retained for crate-local tests and SpaceBook fallback.
+/// This type is retained for crate-local tests and SpaceBook fallback while
+/// TFR-007 capacity unification remains open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatfsResult {
     /// Optimal transfer block size (f_bsize / f_frsize).
@@ -279,9 +285,11 @@ impl SpaceAccounting {
     /// Check whether writing `requested` bytes would exceed the logical
     /// quota capacity of this dataset.
     ///
-    /// **Deprecated for production**: the authoritative ENOSPC gate is
+    /// Mounted local-filesystem writes currently gate through
     /// [`tidefs_local_filesystem::capacity_authority::CapacityAuthority::check_enospc`].
-    /// This method is retained for logical quota checks in crate-local tests.
+    /// This method is retained for logical quota checks in crate-local tests
+    /// while allocator extents, obligations, reclaim, and persistence remain
+    /// separate TFR-007 closure areas.
     ///
     /// Returns `true` if the write should be refused with `ENOSPC`.
     #[must_use]
@@ -308,9 +316,10 @@ impl SpaceAccounting {
 
     /// Run the full admission check from the types crate.
     ///
-    /// **Deprecated for production**: admission gating is now unified under
+    /// Mounted local-filesystem admission currently gates through
     /// [`tidefs_local_filesystem::capacity_authority::CapacityAuthority::check_enospc`].
-    /// This method is retained for crate-local tests.
+    /// This method is retained for crate-local tests; it is not a claim that
+    /// all TFR-007 capacity ledgers are unified.
     #[must_use]
     pub fn admission_check(&self, needed_bytes: u64) -> AdmissionResult {
         admission_check(&self.counters, self.phys_capacity_bytes(), needed_bytes)
@@ -326,7 +335,7 @@ impl SpaceAccounting {
 
     /// Derive statfs(2) fields from the current counters.
     ///
-    /// **Deprecated for production**: the authoritative statfs source is
+    /// Mounted local-filesystem statfs currently derives through
     /// [`tidefs_local_filesystem::capacity_authority::CapacityAuthority::derive_statfs`].
     /// This method is retained for crate-local tests and SpaceBook fallback.
     ///
@@ -335,8 +344,6 @@ impl SpaceAccounting {
     /// Snapshot-pinned bytes are excluded from free bytes.
     #[must_use]
     pub fn statfs(&self) -> StatfsResult {
-        let block_size = StatfsResult::DEFAULT_BLOCK_SIZE;
-
         // When quota is set (>0), use quota as the capacity ceiling.
         // When quota is unlimited (0), fall back to pool physical capacity.
         let capacity = if self.counters.quota_bytes > 0 {
@@ -344,13 +351,20 @@ impl SpaceAccounting {
         } else {
             self.phys_capacity_bytes()
         };
+        Self::statfs_from_counters_with_capacity(&self.counters, capacity)
+    }
+
+    fn statfs_from_counters_with_capacity(
+        counters: &DatasetSpaceCountersV1,
+        capacity: u64,
+    ) -> StatfsResult {
+        let block_size = StatfsResult::DEFAULT_BLOCK_SIZE;
         let total_blocks = capacity / block_size;
 
         // Free bytes = capacity - logical_used - snapshot_pinned.
-        let consumed = self
-            .counters
+        let consumed = counters
             .logical_used_bytes
-            .saturating_add(self.counters.pinned_snapshot_bytes);
+            .saturating_add(counters.pinned_snapshot_bytes);
         let free_bytes = capacity.saturating_sub(consumed);
         let free_blocks = free_bytes / block_size;
 
@@ -847,39 +861,33 @@ impl SpaceBook {
     ///
     /// When a [`DatasetQuotaHierarchy`] is configured and a `parent_of`
     /// function is supplied, the capacity ceiling used for `statfs` derivation
-    /// is the minimum of the pool's physical capacity and the most restrictive
-    /// ancestor quota.
+    /// is the minimum of the current pool-free authority, active reservation
+    /// headroom, and the most restrictive ancestor quota.
     ///
-    /// Returns `None` when the dataset has never been recorded in this book.
+    /// Returns `None` when the dataset has never been recorded in this book or
+    /// when current pool counters are unavailable.
     #[must_use]
     pub fn statfs_for_dataset_with_hierarchy<F>(
-        &mut self,
+        &self,
         dataset_id: [u8; 16],
         parent_of: F,
     ) -> Option<StatfsResult>
     where
         F: Fn(&[u8; 16]) -> Option<[u8; 16]>,
     {
-        let acct = self.datasets.get_mut(&dataset_id)?;
-        // Propagate pool counters.
-        if let Some(ref pool) = self.pool {
-            acct.update_pool_counters(*pool);
-        }
+        let acct = self.datasets.get(&dataset_id)?;
+        let pool = self.pool.as_ref()?;
         // Compute the effective capacity ceiling from the hierarchy.
-        let pool_cap = acct.phys_capacity_bytes();
+        let pool_cap = pool.phys_free_bytes;
         let effective_cap = if let Some(ref hierarchy) = self.quota_hierarchy {
             hierarchy.effective_capacity(dataset_id, pool_cap, &parent_of)
         } else {
             pool_cap
         };
-        // Derive statfs with the hierarchy-aware ceiling.
-        let saved_quota = acct.counters().quota_bytes;
-        if effective_cap < u64::MAX {
-            acct.set_quota(effective_cap);
-        }
-        let result = acct.statfs();
-        acct.set_quota(saved_quota);
-        Some(result)
+        Some(SpaceAccounting::statfs_from_counters_with_capacity(
+            acct.counters(),
+            effective_cap,
+        ))
     }
 
     /// Check whether a write of `requested_bytes` to `dataset_id` would
@@ -887,17 +895,29 @@ impl SpaceBook {
     ///
     /// Returns `Ok(())` if allowed, or a [`DatasetQuotaDecision`] refusal.
     /// When no hierarchy is configured, always returns `Ok(())`.
+    /// When a hierarchy is configured, current SpaceBook pool counters are
+    /// required; missing counters fail closed.
     pub fn check_hierarchy_enospc<F>(
         &self,
         dataset_id: [u8; 16],
         requested_bytes: u64,
-        pool_free_bytes: u64,
         parent_of: F,
     ) -> Result<(), DatasetQuotaDecision>
     where
         F: Fn(&[u8; 16]) -> Option<[u8; 16]>,
     {
         if let Some(ref hierarchy) = self.quota_hierarchy {
+            let pool_free_bytes = self
+                .pool
+                .as_ref()
+                .ok_or_else(|| DatasetQuotaDecision::ReservationViolation {
+                    dataset_id,
+                    reserved_bytes: hierarchy
+                        .reservation_pressure_bytes(requested_bytes)
+                        .unwrap_or(u64::MAX),
+                    free_bytes: 0,
+                })?
+                .phys_free_bytes;
             let decision =
                 hierarchy.check_delta(dataset_id, requested_bytes, 0, pool_free_bytes, parent_of);
             if decision.is_refusal() {
@@ -1092,6 +1112,12 @@ impl DatasetQuotaHierarchy {
     where
         F: Fn(&[u8; 16]) -> Option<[u8; 16]>,
     {
+        if let Some(decision) =
+            self.reservation_pressure_violation(dataset_id, delta_bytes, pool_free_bytes)
+        {
+            return decision;
+        }
+
         let mut current = Some(dataset_id);
         while let Some(id) = current {
             if let Some(entry) = self.entries.get(&id) {
@@ -1122,17 +1148,8 @@ impl DatasetQuotaHierarchy {
                     }
                 }
 
-                // Reservation enforcement
-                if cfg.reservation_bytes > 0 {
-                    let after = pool_free_bytes.saturating_sub(delta_bytes);
-                    if after < cfg.reservation_bytes {
-                        return DatasetQuotaDecision::ReservationViolation {
-                            dataset_id: id,
-                            reserved_bytes: cfg.reservation_bytes,
-                            free_bytes: pool_free_bytes,
-                        };
-                    }
-                }
+                // Reservation pressure is checked once against the aggregate
+                // active reservation set before ancestor hard limits.
             }
             current = parent_of(&id);
         }
@@ -1202,7 +1219,7 @@ impl DatasetQuotaHierarchy {
     where
         F: Fn(&[u8; 16]) -> Option<[u8; 16]>,
     {
-        let mut ceiling = pool_capacity_bytes;
+        let mut ceiling = self.reservation_available_bytes(pool_capacity_bytes);
         let mut current = Some(dataset_id);
         while let Some(id) = current {
             if let Some(entry) = self.entries.get(&id) {
@@ -1224,10 +1241,55 @@ impl DatasetQuotaHierarchy {
     /// Total reserved bytes across all quota entries.
     #[must_use]
     pub fn total_reserved_bytes(&self) -> u64 {
+        self.entries.values().fold(0u64, |sum, e| {
+            sum.saturating_add(e.config.reservation_bytes)
+        })
+    }
+
+    fn total_reserved_bytes_checked(&self) -> Option<u64> {
         self.entries
             .values()
-            .map(|e| e.config.reservation_bytes)
-            .sum()
+            .try_fold(0u64, |sum, e| sum.checked_add(e.config.reservation_bytes))
+    }
+
+    fn reservation_pressure_bytes(&self, requested_bytes: u64) -> Option<u64> {
+        self.total_reserved_bytes_checked()?
+            .checked_add(requested_bytes)
+    }
+
+    fn reservation_available_bytes(&self, pool_free_bytes: u64) -> u64 {
+        match self.total_reserved_bytes_checked() {
+            Some(reserved_bytes) => pool_free_bytes.saturating_sub(reserved_bytes),
+            None => 0,
+        }
+    }
+
+    fn reservation_pressure_violation(
+        &self,
+        dataset_id: [u8; 16],
+        requested_bytes: u64,
+        pool_free_bytes: u64,
+    ) -> Option<DatasetQuotaDecision> {
+        let required_bytes = match self.reservation_pressure_bytes(requested_bytes) {
+            Some(bytes) => bytes,
+            None => {
+                return Some(DatasetQuotaDecision::ReservationViolation {
+                    dataset_id,
+                    reserved_bytes: u64::MAX,
+                    free_bytes: pool_free_bytes,
+                });
+            }
+        };
+
+        if required_bytes > pool_free_bytes {
+            Some(DatasetQuotaDecision::ReservationViolation {
+                dataset_id,
+                reserved_bytes: required_bytes,
+                free_bytes: pool_free_bytes,
+            })
+        } else {
+            None
+        }
     }
 
     /// Iterate over all dataset ids with active quota configurations.
@@ -6039,6 +6101,109 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_sibling_reservations_reduce_pool_headroom() {
+        let mut h = DatasetQuotaHierarchy::new();
+        h.set_quota(
+            did(1),
+            DatasetQuotaConfig {
+                reservation_bytes: 700,
+                ..Default::default()
+            },
+        );
+        h.set_quota(
+            did(2),
+            DatasetQuotaConfig {
+                reservation_bytes: 400,
+                ..Default::default()
+            },
+        );
+
+        let decision = h.check_delta(did(3), 1, 0, 1_100, test_parent_of);
+        assert_eq!(
+            decision,
+            DatasetQuotaDecision::ReservationViolation {
+                dataset_id: did(3),
+                reserved_bytes: 1_101,
+                free_bytes: 1_100,
+            }
+        );
+    }
+
+    #[test]
+    fn hierarchy_overflow_sized_reservations_fail_closed() {
+        let mut h = DatasetQuotaHierarchy::new();
+        h.set_quota(
+            did(1),
+            DatasetQuotaConfig {
+                reservation_bytes: u64::MAX,
+                ..Default::default()
+            },
+        );
+        h.set_quota(
+            did(2),
+            DatasetQuotaConfig {
+                reservation_bytes: 1,
+                ..Default::default()
+            },
+        );
+
+        let decision = h.check_delta(did(1), 0, 0, u64::MAX, test_parent_of);
+        assert_eq!(
+            decision,
+            DatasetQuotaDecision::ReservationViolation {
+                dataset_id: did(1),
+                reserved_bytes: u64::MAX,
+                free_bytes: u64::MAX,
+            }
+        );
+        assert_eq!(h.total_reserved_bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn hierarchy_request_overflow_against_reservation_fails_closed() {
+        let mut h = DatasetQuotaHierarchy::new();
+        h.set_quota(
+            did(1),
+            DatasetQuotaConfig {
+                reservation_bytes: 1,
+                ..Default::default()
+            },
+        );
+
+        let decision = h.check_delta(did(1), u64::MAX, 0, u64::MAX, test_parent_of);
+        assert!(matches!(
+            decision,
+            DatasetQuotaDecision::ReservationViolation {
+                reserved_bytes: u64::MAX,
+                free_bytes: u64::MAX,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn hierarchy_effective_capacity_reserves_pool_headroom() {
+        let mut h = DatasetQuotaHierarchy::new();
+        h.set_quota(
+            did(1),
+            DatasetQuotaConfig {
+                reservation_bytes: 100,
+                ..Default::default()
+            },
+        );
+        h.set_quota(
+            did(2),
+            DatasetQuotaConfig {
+                reservation_bytes: 200,
+                ..Default::default()
+            },
+        );
+
+        let cap = h.effective_capacity(did(3), 1_000, test_parent_of);
+        assert_eq!(cap, 700);
+    }
+
+    #[test]
     fn hierarchy_iter_yields_all_ids() {
         let mut h = DatasetQuotaHierarchy::new();
         h.set_quota(
@@ -6090,8 +6255,13 @@ mod tests {
             },
         );
         book.set_quota_hierarchy(h);
+        book.update_pool_counters(PoolPhysicalCountersV1 {
+            phys_total_bytes: 10_000_000,
+            phys_free_bytes: 10_000_000,
+            ..Default::default()
+        });
         // No usage yet, 500K should be allowed
-        let result = book.check_hierarchy_enospc(did(1), 500_000, 10_000_000, test_parent_of);
+        let result = book.check_hierarchy_enospc(did(1), 500_000, test_parent_of);
         assert!(result.is_ok());
     }
 
@@ -6107,13 +6277,43 @@ mod tests {
             },
         );
         book.set_quota_hierarchy(h);
+        book.update_pool_counters(PoolPhysicalCountersV1 {
+            phys_total_bytes: 10_000_000,
+            phys_free_bytes: 10_000_000,
+            ..Default::default()
+        });
         // Charge 90K to a sibling child
         book.quota_hierarchy_mut()
             .unwrap()
             .charge_bytes(did(1), 90_000, 0, test_parent_of);
         // Now try 20K to another child -> 90K + 20K = 110K > 100K
-        let result = book.check_hierarchy_enospc(did(2), 20_000, 10_000_000, test_parent_of);
+        let result = book.check_hierarchy_enospc(did(2), 20_000, test_parent_of);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn spacebook_check_hierarchy_enospc_fails_closed_without_pool_counters() {
+        let mut book = SpaceBook::new();
+        let mut h = DatasetQuotaHierarchy::new();
+        h.set_quota(
+            did(0),
+            DatasetQuotaConfig {
+                hard_limit_bytes: 1_000_000,
+                reservation_bytes: 10_000,
+                ..Default::default()
+            },
+        );
+        book.set_quota_hierarchy(h);
+
+        let result = book.check_hierarchy_enospc(did(1), 4_096, test_parent_of);
+        assert_eq!(
+            result,
+            Err(DatasetQuotaDecision::ReservationViolation {
+                dataset_id: did(1),
+                reserved_bytes: 14_096,
+                free_bytes: 0,
+            })
+        );
     }
 
     #[test]
@@ -6142,5 +6342,107 @@ mod tests {
         // Effective capacity = min(10M, 1M-200K=800K) = 800K
         assert_eq!(statfs.block_size, 4096);
         assert_eq!(statfs.blocks, 800_000 / 4096);
+    }
+
+    #[test]
+    fn spacebook_statfs_with_hierarchy_accounts_for_reservation_pressure() {
+        let mut book = SpaceBook::new();
+        let mut h = DatasetQuotaHierarchy::new();
+        h.set_quota(
+            did(0),
+            DatasetQuotaConfig {
+                hard_limit_bytes: 5_000_000,
+                ..Default::default()
+            },
+        );
+        h.set_quota(
+            did(2),
+            DatasetQuotaConfig {
+                reservation_bytes: 700_000,
+                ..Default::default()
+            },
+        );
+        book.set_quota_hierarchy(h);
+        book.record_write(did(1), 100_000).unwrap();
+        book.update_pool_counters(PoolPhysicalCountersV1 {
+            phys_total_bytes: 5_000_000,
+            phys_free_bytes: 1_000_000,
+            ..Default::default()
+        });
+
+        let statfs = book
+            .statfs_for_dataset_with_hierarchy(did(1), test_parent_of)
+            .unwrap();
+
+        assert_eq!(statfs.blocks, 300_000 / 4096);
+        assert_eq!(statfs.blocks_free, 200_000 / 4096);
+        assert!(statfs.blocks_avail <= statfs.blocks_free);
+    }
+
+    #[test]
+    fn spacebook_statfs_with_hierarchy_requires_pool_counters() {
+        let mut book = SpaceBook::new();
+        let mut h = DatasetQuotaHierarchy::new();
+        h.set_quota(
+            did(0),
+            DatasetQuotaConfig {
+                hard_limit_bytes: 1_000_000,
+                ..Default::default()
+            },
+        );
+        book.set_quota_hierarchy(h);
+        book.record_write(did(1), 100_000).unwrap();
+
+        assert!(book
+            .statfs_for_dataset_with_hierarchy(did(1), test_parent_of)
+            .is_none());
+    }
+
+    #[test]
+    fn spacebook_statfs_with_hierarchy_has_no_dataset_side_effects() {
+        let mut book = SpaceBook::new();
+        let mut h = DatasetQuotaHierarchy::new();
+        h.set_quota(
+            did(0),
+            DatasetQuotaConfig {
+                hard_limit_bytes: 1_000_000,
+                ..Default::default()
+            },
+        );
+        book.set_quota_hierarchy(h);
+        book.record_write(did(1), 100_000).unwrap();
+        book.update_pool_counters(PoolPhysicalCountersV1 {
+            phys_total_bytes: 1_000_000,
+            phys_free_bytes: 900_000,
+            ..Default::default()
+        });
+
+        {
+            let acct = book.datasets.get_mut(&did(1)).unwrap();
+            acct.set_quota(123_456);
+            acct.accumulate_delta(SpaceDelta::new_reservation(4_096));
+        }
+
+        let before_counters = *book.datasets.get(&did(1)).unwrap().counters();
+        let before_pending = book.datasets.get(&did(1)).unwrap().pending_delta;
+        let before_dirty = book.dirty.clone();
+
+        let first = book
+            .statfs_for_dataset_with_hierarchy(did(1), test_parent_of)
+            .unwrap();
+        let second = book
+            .statfs_for_dataset_with_hierarchy(did(1), test_parent_of)
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            *book.datasets.get(&did(1)).unwrap().counters(),
+            before_counters
+        );
+        assert_eq!(
+            book.datasets.get(&did(1)).unwrap().pending_delta,
+            before_pending
+        );
+        assert_eq!(book.dirty, before_dirty);
     }
 }
