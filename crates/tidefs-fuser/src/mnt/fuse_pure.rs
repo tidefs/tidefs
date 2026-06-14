@@ -429,9 +429,12 @@ fn apply_fusermount_atime_remount(
 
 #[cfg(target_os = "linux")]
 fn fusermount_atime_remount_flags(options: &[MountOption]) -> Option<libc::c_ulong> {
-    let needs_remount = options
-        .iter()
-        .any(|option| matches!(option, MountOption::NoAtime | MountOption::StrictAtime));
+    let needs_remount = options.iter().any(|option| {
+        matches!(
+            option,
+            MountOption::Atime | MountOption::NoAtime | MountOption::StrictAtime
+        )
+    });
     if !needs_remount {
         return None;
     }
@@ -654,7 +657,7 @@ pub fn option_to_flag(option: &MountOption) -> libc::c_ulong {
         MountOption::RO => libc::MS_RDONLY,
         MountOption::Exec => 0,
         MountOption::NoExec => libc::MS_NOEXEC,
-        MountOption::Atime => 0,
+        MountOption::Atime => libc::MS_STRICTATIME,
         MountOption::Relatime => libc::MS_RELATIME,
         MountOption::StrictAtime => libc::MS_STRICTATIME,
         MountOption::NoAtime => libc::MS_NOATIME,
@@ -692,6 +695,7 @@ mod tests {
 
     #[test]
     fn atime_policy_options_set_linux_mount_flags() {
+        assert_eq!(option_to_flag(&MountOption::Atime), libc::MS_STRICTATIME);
         assert_eq!(option_to_flag(&MountOption::Relatime), libc::MS_RELATIME);
         assert_eq!(
             option_to_flag(&MountOption::StrictAtime),
@@ -725,6 +729,14 @@ mod tests {
     fn fusermount_strictatime_remount_preserves_default_flags() {
         assert_eq!(
             fusermount_atime_remount_flags(&[MountOption::StrictAtime]),
+            Some(libc::MS_REMOUNT | libc::MS_NODEV | libc::MS_NOSUID | libc::MS_STRICTATIME)
+        );
+    }
+
+    #[test]
+    fn fusermount_atime_remount_uses_strictatime_flag() {
+        assert_eq!(
+            fusermount_atime_remount_flags(&[MountOption::Atime]),
             Some(libc::MS_REMOUNT | libc::MS_NODEV | libc::MS_NOSUID | libc::MS_STRICTATIME)
         );
     }
