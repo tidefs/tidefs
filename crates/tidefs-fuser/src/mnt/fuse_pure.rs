@@ -321,7 +321,7 @@ fn fuse_mount_fusermount(
     };
     let mut receive_socket = Some(receive_socket);
 
-    if let Err(err) = apply_fusermount_atime_remount(mountpoint, options) {
+    if let Err(err) = apply_fuse_atime_remount(mountpoint, options) {
         drop(file);
         drop(mem::take(&mut receive_socket));
         if let Ok(c_mountpoint) = CString::new(mountpoint.as_bytes()) {
@@ -389,10 +389,7 @@ fn fuse_mount_fusermount(
 }
 
 #[cfg(target_os = "linux")]
-fn apply_fusermount_atime_remount(
-    mountpoint: &OsStr,
-    options: &[MountOption],
-) -> Result<(), io::Error> {
+fn apply_fuse_atime_remount(mountpoint: &OsStr, options: &[MountOption]) -> Result<(), io::Error> {
     let Some(flags) = atime_remount_flags(options) else {
         return Ok(());
     };
@@ -423,7 +420,7 @@ fn apply_fusermount_atime_remount(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn apply_fusermount_atime_remount(
+fn apply_fuse_atime_remount(
     _mountpoint: &OsStr,
     _options: &[MountOption],
 ) -> Result<(), io::Error> {
@@ -583,6 +580,11 @@ fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<
         }
     }
 
+    if let Err(err) = apply_fuse_atime_remount(mountpoint, options) {
+        fuse_unmount_pure(&c_mountpoint);
+        return Err(err);
+    }
+
     Ok(Some(file))
 }
 
@@ -623,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn fusermount_strictatime_remount_preserves_default_flags() {
+    fn fuse_strictatime_remount_preserves_default_flags() {
         assert_eq!(
             atime_remount_flags(&[MountOption::StrictAtime]),
             Some(libc::MS_REMOUNT | libc::MS_NODEV | libc::MS_NOSUID | libc::MS_STRICTATIME)
@@ -631,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn fusermount_atime_remount_uses_strictatime_flag() {
+    fn fuse_atime_remount_uses_strictatime_flag() {
         assert_eq!(
             atime_remount_flags(&[MountOption::Atime]),
             Some(libc::MS_REMOUNT | libc::MS_NODEV | libc::MS_NOSUID | libc::MS_STRICTATIME)
@@ -639,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn fusermount_noatime_remount_respects_dev_and_suid() {
+    fn fuse_noatime_remount_respects_dev_and_suid() {
         assert_eq!(
             atime_remount_flags(&[MountOption::NoAtime, MountOption::Dev, MountOption::Suid]),
             Some(libc::MS_REMOUNT | libc::MS_NOATIME)
@@ -647,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn fusermount_noatime_remount_preserves_read_only() {
+    fn fuse_noatime_remount_preserves_read_only() {
         assert_eq!(
             atime_remount_flags(&[MountOption::RO, MountOption::NoAtime, MountOption::Dev]),
             Some(libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NOATIME)
@@ -655,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn fusermount_relatime_remount_preserves_default_flags() {
+    fn fuse_relatime_remount_preserves_default_flags() {
         assert_eq!(
             atime_remount_flags(&[MountOption::Relatime]),
             Some(libc::MS_REMOUNT | libc::MS_NODEV | libc::MS_NOSUID | libc::MS_RELATIME)
