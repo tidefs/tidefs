@@ -1219,6 +1219,30 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         kill "-$signal" "$tree_pid" 2>/dev/null || true
     }
 
+    run_dump_xfstests_test_state_bounded() {
+        dump_label="$1"
+        shift
+        dump_timeout="$((PER_TEST_TIMEOUT / 3))"
+        [ "$dump_timeout" -ge 20 ] || dump_timeout=20
+        [ "$dump_timeout" -le 60 ] || dump_timeout=60
+        dump_xfstests_test_state "$@" &
+        dump_pid=$!
+        elapsed=0
+        while kill -0 "$dump_pid" 2>/dev/null; do
+            if [ "$elapsed" -ge "$dump_timeout" ]; then
+                echo "diagnostic timeout: $dump_label after ''${dump_timeout}s"
+                terminate_process_tree "$dump_pid" TERM
+                sleep 2
+                terminate_process_tree "$dump_pid" KILL
+                return 124
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        wait "$dump_pid" 2>/dev/null || true
+        return 0
+    }
+
     run_cleanup_xfstests_test_bounded() {
         cleanup_label="$1"
         cleanup_test="$2"
@@ -1232,11 +1256,10 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         while kill -0 "$cleanup_pid" 2>/dev/null; do
             if [ "$elapsed" -ge "$cleanup_timeout" ]; then
                 echo "cleanup timeout: $cleanup_label after ''${cleanup_timeout}s"
-                dump_xfstests_test_state "$cleanup_test" "$cleanup_result_base" "$cleanup_test_log"
+                run_dump_xfstests_test_state_bounded "cleanup-$cleanup_label" "$cleanup_test" "$cleanup_result_base" "$cleanup_test_log" || true
                 terminate_process_tree "$cleanup_pid" TERM
                 sleep 2
                 terminate_process_tree "$cleanup_pid" KILL
-                wait "$cleanup_pid" 2>/dev/null || true
                 return 124
             fi
             sleep 1
@@ -1255,11 +1278,10 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         elapsed=0
         while kill -0 "$check_pid" 2>/dev/null; do
             if [ "$elapsed" -ge "$PER_TEST_TIMEOUT" ]; then
-                dump_xfstests_test_state "$bounded_test" "$bounded_result_base" "$bounded_test_log"
+                run_dump_xfstests_test_state_bounded "timeout-$bounded_test" "$bounded_test" "$bounded_result_base" "$bounded_test_log" || true
                 terminate_process_tree "$check_pid" TERM
                 sleep 2
                 terminate_process_tree "$check_pid" KILL
-                wait "$check_pid" 2>/dev/null || true
                 return 124
             fi
             sleep 1
@@ -1323,7 +1345,7 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             if [ "$RC" -eq 124 ]; then
                 fail "xfstests_$test" "test timed out after ''${PER_TEST_TIMEOUT}s"
             elif [ "$RC" -eq 143 ]; then
-                dump_xfstests_test_state "$test" "$RESULT_BASE" "$TEST_LOG"
+                run_dump_xfstests_test_state_bounded "terminated-$test" "$test" "$RESULT_BASE" "$TEST_LOG" || true
                 fail "xfstests_$test" "test terminated after ''${PER_TEST_TIMEOUT}s window"
             else
                 NOTRUN_DETAIL=""
@@ -1369,7 +1391,7 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
                 else
                     echo "(none)"
                 fi
-                dump_xfstests_test_state "$test" "$RESULT_BASE" "$TEST_LOG"
+                run_dump_xfstests_test_state_bounded "failure-$test" "$test" "$RESULT_BASE" "$TEST_LOG" || true
                 fail "xfstests_$test" "$FAIL_DETAIL"
             fi
             TESTS_FAIL=$((TESTS_FAIL + 1))
