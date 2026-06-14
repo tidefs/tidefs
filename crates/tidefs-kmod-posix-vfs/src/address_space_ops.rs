@@ -35,6 +35,16 @@
 //! [`crate::fsync`]. The address_space_operations `fsync` entry point
 //! delegates to the same [`VfsEngine::fsync`] call. No separate
 //! implementation is needed here; this module documents the delegation.
+//!
+//! # Mounted C shim note
+//!
+//! The live Linux 7.0 module registers a C `address_space_operations` vtable
+//! in `tidefs_posix_vfs_shim.c`. That mounted path calls C bridge exports for
+//! `read_folio`, `write_begin`, `write_end`, `dirty_folio`, and `writepages`.
+//! The Rust [`AddressSpaceOps`] type remains the source/model authority for
+//! DirtyFolioTracker and page-authority behavior not yet bridged directly from
+//! the C vtable, including the Rust `invalidate_folio` and custom
+//! `page_mkwrite` paths.
 
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge;

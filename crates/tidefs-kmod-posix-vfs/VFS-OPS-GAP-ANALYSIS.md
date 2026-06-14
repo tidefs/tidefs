@@ -55,7 +55,7 @@ Cross-referenced against `VfsEngine` trait at `crates/tidefs-vfs-engine/src/lib.
 | write_iter | **Implemented** | `tidefs_posix_vfs_shim.c` `tidefs_posix_vfs_file_write_iter` | `copy_from_iter()->pool->inode_table[]` or `tidefs_posix_vfs_engine_write` | iov_iter-aware vectored write: engine-backed path copies iovec data into a kernel buffer and delegates to Rust engine; fixed-table path copies directly into pool. Registered in `file_operations`. K7-IOVEC-001. |
 | llseek | **Implemented** | `src/llseek.rs:46`, `tidefs_posix_vfs_main.rs` (C bridge), `tidefs_posix_vfs_shim.c` (callback) | `engine.data_ranges()` via `tidefs_posix_vfs_engine_llseek` | SEEK_SET/CUR/END computed from InodeAttr::size; SEEK_DATA/SEEK_HOLE routed through C bridge to VfsEngine::data_ranges() with dense-file fallback when engine unavailable. #6644. |
 | fsync | Implemented | `src/fsync.rs:13` | `engine.fsync()` | datasync flag propagated |
-| mmap | **Refused** | `tidefs_posix_vfs_shim.c:tidefs_posix_vfs_file_mmap_nosupport` | Returns -ENOSYS | Explicit refusal in file_operations: mmap(2) returns -ENOSYS until vm_operations_struct bridge is wired. Rust KmodVfsVmOps (mmap.rs) has fault/page_mkwrite dispatch but C bridge deferred. |
+| mmap | **Implemented, generic filemap** | `tidefs_posix_vfs_shim.c:tidefs_posix_vfs_file_mmap` | `generic_file_mmap()` + C `address_space_operations` | Mounted Linux mmap is admitted through the generic filemap VM operations. `MAP_SHARED` read faults populate folios through C `read_folio` -> `tidefs_posix_vfs_engine_read`; dirty shared mappings use Linux dirty folios and C `writepages` -> `tidefs_posix_vfs_engine_write`. The Rust `KmodVfsVmOps` model is not registered as `vma->vm_ops`; that custom bridge remains an explicit unsupported row under TFR-018. |
 | fallocate | Implemented | `src/fallocate.rs:7` | `engine.fallocate()` | Full mode/offset/length delegation |
 | fadvise | **Implemented** | `src/fadvise.rs:22` | `KmodPosixVfs::fadvise()` | No-op returning success. The kernel page cache applies default advice behavior. |
 | copy_file_range | **Wired** | `src/copy_file_range.rs:7` + C shim | `engine.copy_file_range()` via `tidefs_posix_vfs_engine_copy_file_range` bridge | Server-side copy delegation registered in `file_operations`. Falls back to `do_splice_direct` when engine is not mounted. 7 unit tests. |
@@ -107,10 +107,11 @@ dispatch and must not be treated as product validation.
 |---|---|---|---|---|
 | read_folio | **Implemented** | `src/address_space_ops.rs:161`, `tidefs_posix_vfs_shim.c:tidefs_posix_vfs_read_folio` | `engine.read()` via `tidefs_posix_vfs_engine_read` bridge | Page-cache population callback registered in `address_space_operations` vtable. Reads folio data through VfsEngine::read bridge, copies into folio pages via kmap_local_folio, marks uptodate. Set as `inode->i_mapping->a_ops->read_folio` on regular-file inode init. No userspace daemon required. |
 | readahead (a_ops) | OutOfScope | -- | -- | read_folio a_ops prereq is now wired (#6622). KmodAddressSpaceOps::readahead() exists at src/address_space_ops.rs:191-212; C callback wiring is Review debt TFR-018. |
-| writepages | **Implemented** | `tidefs_posix_vfs_shim.c:tidefs_posix_vfs_writepages` | Lifecycle counter (VfsEngine::writeback_folios bridge deferred) | Acknowledges kernel writeback requests; increments writepages_calls for QEMU validation. Registered in `address_space_operations` vtable. Dirty-page writeback through Rust bridge is Review debt TFR-018. |
+| writepages | **Implemented** | `tidefs_posix_vfs_shim.c:tidefs_posix_vfs_writepages` | `tidefs_posix_vfs_engine_write` | Drains Linux dirty folios discovered by `writeback_iter()`, copies folio bytes, writes them through the mounted Rust engine bridge, records mapping errors, and re-dirties the folio on engine error or short write so dirty data can be retried. Registered in `address_space_operations` vtable. Rust `DirtyFolioTracker::writeback_folios` and page-authority integration remain source-model only under TFR-018. |
 | write_begin | **Implemented** | `src/address_space_ops.rs:237`, `tidefs_posix_vfs_shim.c:tidefs_posix_vfs_write_begin` | `engine.read()` via `tidefs_posix_vfs_engine_read` bridge | Reads existing data into folio for partial-page merge during buffered writes. Registered in `address_space_operations` vtable. No userspace daemon required. |
 | write_end | **Implemented** | `src/address_space_ops.rs:261`, `tidefs_posix_vfs_shim.c:tidefs_posix_vfs_write_end` | `engine.write()` via `tidefs_posix_vfs_engine_write` bridge | Writes modified folio data back to engine after buffered write. Registered in `address_space_operations` vtable. Increments lifecycle counter for QEMU validation. No userspace daemon required. |
-| dirty_folio | **Implemented** | `src/address_space_ops.rs:284`, `tidefs_posix_vfs_shim.c:tidefs_posix_vfs_dirty_folio` | C lifecycle counter (Rust DirtyFolioTracker deferred) | Acknowledges dirty-folio transition from kernel page-cache layer. Registered in `address_space_operations` vtable. Full DirtyFolioTracker integration for writepages dispatch is Review debt TFR-018. |
+| dirty_folio | **Implemented** | `src/address_space_ops.rs:284`, `tidefs_posix_vfs_shim.c:tidefs_posix_vfs_dirty_folio` | Linux `filemap_dirty_folio()` | Acknowledges dirty-folio transition from the kernel page-cache layer and registers the folio with Linux dirty accounting. It deliberately does not sleep or call the engine from atomic MM paths. The Rust `DirtyFolioTracker` bridge remains deferred under TFR-018. |
+| invalidate_folio | **Missing in mounted C vtable** | `src/address_space_ops.rs:548`, C shim helpers | Kernel truncate/invalidate helpers | Rust model removes discarded byte ranges from `DirtyFolioTracker` and calls `VfsEngine::invalidate_cache_range()`, but the mounted C `address_space_operations` vtable does not register `.invalidate_folio`. Direct-write and truncate paths use C `filemap_write_and_wait_range`, `unmap_mapping_range`, `invalidate_inode_pages2_range`, and `truncate_setsize()` for the ranges Linux discards. Direct Rust page-authority cleanup remains TFR-018. |
 | bmap | OutOfScope | -- | -- | FIEMAP alternative preferred; not required. |
 | direct_IO | OutOfScope | -- | -- | Block-level direct I/O. TideFS uses file-level read/write delegation. |
 
@@ -179,7 +180,9 @@ dispatch and must not be treated as product validation.
 
 These operations are explicitly listed as out of scope in `lib.rs` lines 47-49 and do not block the kernel delivery gate unless the product direction changes:
 
-- writeback / mmap / setlkw (requires address_space_operations)
+- custom Rust vm_operations_struct bridge, Rust DirtyFolioTracker/page-authority
+  live C bridge, direct-I/O, distributed mmap coherency, crash consistency, and
+  setlkw
 - ACL / ioctl (get_inode_acl, set_acl, unlocked_ioctl, compat_ioctl)
 - freeze / thaw / remount
 
@@ -257,7 +260,10 @@ Standalone cargo/mock validation reports are retired from this count; use curren
 6. **Completed**: `lookup/create/unlink` dispatch coverage — See issue #5777. LookupPlan (15 tests), CreatePlan (16 tests), UnlinkPlan (16 tests). All 713 total tests pass.
 7. **Completed (2026-05-24, #6079)**: `readahead` forwarding — See issue #6079. File-operation readahead hints forwarded through engine.readahead() in file.rs:119-129 with error tolerance and zero-length skip (9 unit tests). Kernel address_space_ops callback registration requires #6622
 8. **Completed (2026-05-28, #6624)**: read_iter and write_iter implemented in tidefs_posix_vfs_shim.c with iov_iter-aware dispatch. See `tidefs_posix_vfs_file_read_iter` and `tidefs_posix_vfs_file_write_iter`. Registered in `file_operations` replacing legacy `.read`/`.write`. Kbuild validation: tidefs_posix_vfs.ko builds against Linux 7.0.
-9. **Out of scope for now**: address_space_operations, ACL, mmap, freeze/thaw — these require product direction changes before implementation
+9. **Still open for product closure**: custom Rust vm_operations_struct
+   registration, Rust DirtyFolioTracker/page-authority live C bridge,
+   direct-I/O, distributed mmap coherency, crash consistency, ACL, and
+   freeze/thaw remain outside this mounted mmap/writeback proof.
 10. **Partial**: `VfsEngine::allocate_inode` exists, but mock/unit coverage is
     not proof that kmod callbacks allocate through mounted `KernelPoolCore`.
     Closure requires real engine-backed wiring and Linux 7.0 validation.

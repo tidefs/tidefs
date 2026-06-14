@@ -555,14 +555,27 @@ pages, marks daemon caches clean, flushes block-volume ranges, calls the
 engine fsync/fdatasync path, commits the adapter txg cycle, and then uses the
 ownership a product boundary, not a settled implementation detail.
 
-Mmap and pre-full-kernel writeback remain especially risky. The local intent
-log has a `SharedMmapMsync` replay variant and tests for it, while the POSIX
-matrix still records live mmap coherency as deferred. The kmod VFS trait
-defaults `mmap()` to `PopulateOnFault`, makes `fault()` delegate to `read()`,
-engine overrides them. The kmod address-space ops module claims implemented
-main kmod engine bridge flushes an in-memory live write buffer to storage when
-a mounted pool core and active committed-root I/O context exist, and otherwise
-before any OpenZFS/Ceph-class durability or coherency claim is honest.
+Mmap and pre-full-kernel writeback remain especially risky, but the current
+mounted-kernel path is narrower and more concrete than the older source-model
+claims. The live C shim admits `mmap(2)` through
+`tidefs_posix_vfs_file_mmap()` -> `generic_file_mmap()`. Linux filemap then
+calls the registered C `address_space_operations`: `read_folio` reads through
+`tidefs_posix_vfs_engine_read`, `dirty_folio` records Linux dirty accounting,
+`writepages` copies dirty folio bytes into `tidefs_posix_vfs_engine_write`,
+and `fsync` drains `filemap_write_and_wait_range()` before
+`tidefs_posix_vfs_engine_fsync()`. Engine writeback errors and short writes
+re-dirty the folio for retry. Truncate and direct-write invalidation use the C
+`filemap_write_and_wait_range`, `unmap_mapping_range`,
+`invalidate_inode_pages2_range`, and `truncate_setsize()` helpers for the
+ranges Linux has discarded.
+
+That first-boot mounted C/generic-filemap proof is not TFR-008 or TFR-018
+closure. The Rust `KmodVfsVmOps`, `DirtyFolioTracker`, and page-authority
+model remain a source/model path until a C `vm_operations_struct` and direct
+Rust aops bridge are registered. Crash-consistent mmap, broad xfstests,
+direct-I/O, FUSE writeback-cache correctness, placement receipt correctness,
+and distributed mmap coherency remain open review debt before any
+OpenZFS/Ceph-class durability or coherency claim is honest.
 
 ### TFR-009: Kernel Residency And Block Authority
 
@@ -1063,26 +1076,27 @@ engine lookup path, so cached ENOENT is valid only while the engine still
 reports ENOENT and a newly resolved name forces a VFS lookup retry. Remaining
 writeback, xfstests, and mounted-kernel behavior still need separate review
 
-The kmod address-space state now has three partially divergent descriptions.
+The kmod address-space state now has two deliberately separate descriptions.
 Committed C code registers `generic_file_mmap()` plus
 `address_space_operations` callbacks for `read_folio`, `write_begin`,
 `write_end`, `dirty_folio`, and `writepages`. The C `writepages` path walks
 Linux dirty folios and writes copied bytes directly through
 `tidefs_posix_vfs_engine_write()`, while `dirty_folio` only calls
 `filemap_dirty_folio()` and increments lifecycle counters because the engine
-bridge can sleep from atomic MM paths. The Rust `address_space_ops.rs` model
-and kmod README describe a separate `DirtyFolioTracker`,
-`VfsEngine::writeback_folios()`, `writepage`, `page_mkwrite`, and
-is refused via a nonexistent `mmap_nosupport` path and later says
-address-space operations, ACL, mmap, and freeze/thaw are out of scope.
+bridge can sleep from atomic MM paths. The Rust `address_space_ops.rs` and
+`mmap.rs` modules describe the source-model `DirtyFolioTracker`,
+`VfsEngine::writeback_folios()`, `writepage`, `page_mkwrite`, Rust
+`invalidate_folio`, and `KmodVfsVmOps` authority model that is not yet wired
+as the mounted C callback path.
 
 The practical result is not "mmap solved" or "writeback solved." The C shim
 admits mmap via the generic filemap path, but no custom VM operations bridge
-the Rust `KmodVfsVmOps` policy, and the registered C a_ops table still lacks
-compliance doc also still says mmap is `NONE`, the POSIX subset doc says live
-mmap coherency is deferred, and the xfstests estimate says only a small
-measured subset has actually run. These conflicts are documentation-authority
-bugs and product-authority bugs: the next implementation commits must first
+registers the Rust `KmodVfsVmOps` policy, and the registered C a_ops table
+still lacks direct Rust DirtyFolioTracker/page-authority cleanup. POSIX
+matrix, compliance, and xfstests documents must continue to distinguish the
+first-boot mounted mmap/writeback row from crash consistency, direct-I/O, FUSE
+writeback-cache, distributed coherency, and broad xfstests closure. These
+boundaries remain review debt, not closure.
 
 The current page-cache reconciliation slice fixes real bugs without treating
 the area as closed. Direct engine writes now follow the Linux write path shape:

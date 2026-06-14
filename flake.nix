@@ -2950,6 +2950,7 @@ EOF
           kernelMmapValidation = import ./nix/vm/kernel-mmap-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
+            tidefsPackage = tidefsCtlRuntime;
           };
 
           kernelTruncateFallocateValidation = import ./nix/vm/kernel-truncate-fallocate-validation.nix {
@@ -3824,8 +3825,10 @@ EOF
             pkgs.cpio
             pkgs.qemu
             self.packages.${system}.kernelMmapValidation
+            self.packages.${system}.tidefsPosixVfsKmod
           ] ''
-            exec ${self.packages.${system}.kernelMmapValidation}/bin/tidefs-kmod-mmap-validation "$@"
+            exec ${self.packages.${system}.kernelMmapValidation}/bin/tidefs-kmod-mmap-validation \
+              --module ${self.packages.${system}.tidefsPosixVfsKmod}/tidefs_posix_vfs.ko "$@"
           '';
 
           kernel-pool-import-validation = script "tidefs-kmod-pool-import-validation" [

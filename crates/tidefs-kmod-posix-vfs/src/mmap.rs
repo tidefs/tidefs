@@ -1,10 +1,16 @@
 //! vm_operations_struct dispatch for the kernel VFS adapter.
 //!
-//! Implements the Linux 7.0 `vm_operations_struct` contract (`fault`,
-//! `page_mkwrite`) bridging mmap'd file access to [`VfsEngine`] reads
-//! and the [`DirtyFolioTracker`] writeback pipeline.  This module closes
-//! the page_mkwrite blocker row from #5817 and completes the
-//! address_space_operations mmap write pipeline.
+//! Source-model dispatch for the Linux 7.0 `vm_operations_struct` contract
+//! (`fault`, `page_mkwrite`) bridging mmap'd file access to [`VfsEngine`]
+//! reads and the [`DirtyFolioTracker`] writeback pipeline.
+//!
+//! The mounted C shim does not currently register this Rust vtable as
+//! `vma->vm_ops`. Live Linux mmap admission goes through
+//! `tidefs_posix_vfs_file_mmap()` -> `generic_file_mmap()`, then Linux
+//! filemap faults and dirtying call the registered C
+//! `address_space_operations` (`read_folio`, `dirty_folio`, `writepages`).
+//! Treat this module as the Rust authority model for a future direct vm_ops
+//! bridge, not as proof that the mounted C path calls these methods.
 //!
 //! # Implemented operations
 //!
@@ -22,9 +28,11 @@
 //!
 //! # Kernel wiring
 //!
-//! During `mmap(2)`, the kernel module sets `vma->vm_ops = &tidefs_vm_ops`
-//! on the VMA.  Each function pointer in the vtable delegates to the
-//! corresponding method on [`KmodVfsVmOps`] via the kmod-bridge substrate.
+//! A future direct bridge would set `vma->vm_ops = &tidefs_vm_ops` during
+//! `mmap(2)` and delegate each function pointer to [`KmodVfsVmOps`] via the
+//! kmod-bridge substrate. The mounted Linux 7.0 C shim deliberately does not
+//! claim that bridge today; unsupported runtime rows must stay explicit until
+//! it is registered.
 //!
 //! # Page lock/unlock lifecycle
 //!
