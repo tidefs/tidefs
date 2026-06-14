@@ -647,6 +647,14 @@ mod tests {
     }
 
     #[test]
+    fn fusermount_noatime_remount_preserves_read_only() {
+        assert_eq!(
+            atime_remount_flags(&[MountOption::RO, MountOption::NoAtime, MountOption::Dev]),
+            Some(libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NOATIME)
+        );
+    }
+
+    #[test]
     fn fusermount_relatime_uses_kernel_default_without_remount() {
         assert_eq!(atime_remount_flags(&[MountOption::Relatime]), None);
     }
