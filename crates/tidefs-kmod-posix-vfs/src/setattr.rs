@@ -132,17 +132,17 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
         }
         let outcome = bridge_setattr(&self.engine, inode, attr, handle, ctx)?;
 
-        // Truncation coordination: when the file shrank, clean up dirty
-        // writeback tracking and page-authority entries for pages beyond
-        // the new EOF.  This prevents writeback of pages the kernel has
-        // already freed, closing the mmap-truncate race window.
+        // Rust source-model truncation coordination: when the file shrank,
+        // clean up model dirty-writeback tracking and page-authority entries
+        // beyond the new EOF. The mounted C truncate path uses Linux
+        // page-cache discard helpers for live folios.
         if (attr.valid & tidefs_kmod_bridge::kernel_types::FATTR_SIZE) != 0 {
             let new_size = attr.size;
             let page_threshold = crate::page_authority::page_index(new_size);
-            // Remove dirty ranges beyond the new EOF.
+            // Remove source-model dirty ranges beyond the new EOF.
             self.dirty_folio_tracker.truncate_down(inode, new_size);
-            // Invalidate engine copies and clear page-authority entries
-            // for all pages at or beyond the new EOF page.
+            // Invalidate source-model engine copies and clear page-authority
+            // entries for all pages at or beyond the new EOF page.
             self.page_authority
                 .truncate_down(&self.engine, inode, page_threshold);
         }

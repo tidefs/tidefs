@@ -35,6 +35,14 @@
 //! All ownership tracking is in-memory kernel-resident state.  The
 //! engine callbacks (`page_ownership_acquired`, etc.) resolve within
 //! kernel authority through [`VfsEngine`] default methods.
+//!
+//! # Mounted callback status
+//!
+//! The live Linux 7.0 C shim does not register this table or call it from
+//! `vm_operations_struct`/`address_space_operations` callbacks. Mounted mmap
+//! and writeback currently use Linux filemap state plus the registered C
+//! `read_folio`, `dirty_folio`, and `writepages` callbacks. This module is a
+//! Rust source model until a direct C bridge is added and validated.
 
 // Kbuild: use crate::TideVec;
 #[cfg(CONFIG_RUST)]
@@ -443,13 +451,14 @@ impl PageAuthorityTable {
         self.insert(inode, page_idx, PageOwnership::EngineOwned);
     }
 
-    /// Remove page-authority entries for all pages at or beyond
+    /// Remove source-model page-authority entries for all pages at or beyond
     /// `page_threshold` for the given inode.
     ///
     /// Each affected page signals the engine to invalidate its copy
-    /// before the entry is removed.  This is used by the truncate-down
-    /// path to discard tracking for pages the kernel has freed via
-    /// setattr(FATTR_SIZE) shrink.
+    /// before the entry is removed. This is used by the Rust truncate-down
+    /// model to discard tracking for pages the kernel would have freed via
+    /// setattr(FATTR_SIZE) shrink. The mounted C truncate path uses Linux
+    /// page-cache invalidation helpers instead of this table.
     ///
     /// Returns the number of entries removed.
     pub fn truncate_down(

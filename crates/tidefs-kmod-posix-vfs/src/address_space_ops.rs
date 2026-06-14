@@ -1,16 +1,14 @@
-//! Address space operations dispatch spine for the kernel VFS adapter.
+//! Address space operations source model for the kernel VFS adapter.
 //!
-//! Implements the Linux 7.0 kernel `address_space_operations` contract,
-//! bridging the kernel page-cache infrastructure to [`VfsEngine`] where
-//! capability exists and documenting explicit blocker rows where it does
-//! not. This module advances A14 (full-kernel residency still mostly
-//! bridge/model-level) and A16 (page-cache claims design-level, readahead
-//! is no-op stats mirror) by replacing stub/scope-out lines with real
-//! operation dispatch and per-operation blocker documentation.
+//! Models the Linux 7.0 kernel `address_space_operations` contract in Rust,
+//! bridging page-cache-shaped calls to [`VfsEngine`] where capability exists
+//! and documenting explicit blocker rows where it does not. The live mounted
+//! product path registers a C vtable in `tidefs_posix_vfs_shim.c`; this Rust
+//! type is not itself installed as `inode->i_mapping->a_ops`.
 //!
 //! # Implemented operations
 //!
-//! | Operation        | Status      | VfsEngine dependency        | Daemon required |
+//! | Operation        | Rust model status | VfsEngine dependency        | Daemon required |
 //! |------------------|-------------|-----------------------------|-----------------|
 //! | `read_folio`     | Implemented | `VfsEngine::read()`         | No              |
 //! | `readahead`      | Implemented | `VfsEngine::read()`         | No              |
@@ -25,9 +23,9 @@
 //!
 //! # No-daemon boundary
 //!
-//! Every implemented operation resolves locally within kernel authority
-//! through VfsEngine. All operations resolve within kernel authority —
-//! no userspace daemon is required for any implemented aops method.
+//! Every modeled operation resolves locally through VfsEngine and requires no
+//! userspace daemon. That is source-model evidence only; mounted-kernel
+//! authority is limited to the callbacks actually registered in the C shim.
 //!
 //! # fsync note
 //!
@@ -41,10 +39,11 @@
 //! The live Linux 7.0 module registers a C `address_space_operations` vtable
 //! in `tidefs_posix_vfs_shim.c`. That mounted path calls C bridge exports for
 //! `read_folio`, `write_begin`, `write_end`, `dirty_folio`, and `writepages`.
-//! The Rust [`AddressSpaceOps`] type remains the source/model authority for
-//! DirtyFolioTracker and page-authority behavior not yet bridged directly from
-//! the C vtable, including the Rust `invalidate_folio` and custom
-//! `page_mkwrite` paths.
+//! `dirty_folio` records Linux dirty accounting only, and `writepages` copies
+//! dirty folio bytes to the engine. The Rust [`DirtyFolioTracker`],
+//! [`PageAuthorityTable`], `writepage`, `page_mkwrite`, and
+//! `invalidate_folio` model paths remain unsupported for the mounted product
+//! path until a direct C bridge is registered and QEMU-proven.
 
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge;
@@ -113,11 +112,11 @@ impl WritebackBatchResult {
         !self.errors.is_empty() || !self.alloc_errors.is_empty()
     }
 }
-/// Dispatch struct for Linux `address_space_operations` vtable methods.
+/// Source-model dispatch struct for Linux `address_space_operations` methods.
 ///
 /// Holds references to the [`VfsEngine`], [`KmodPageCacheTracker`],
 /// [`DirtyFolioTracker`], and [`PageAuthorityTable`] for per-operation
-/// statistics. Each method corresponds to a function pointer in the Linux
+/// statistics. Each method corresponds to a possible function pointer in the Linux
 /// kernel's `struct address_space_operations`.
 pub struct AddressSpaceOps<'a, E: VfsEngine> {
     engine: &'a E,
@@ -247,17 +246,17 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         self.engine.read(fh, offset, len, ctx)
     }
 
-    /// `write_end`: Complete a buffered write.
+    /// Source-model `write_end`: complete a buffered write.
     /// Writes the merged data through [`VfsEngine::write`] and marks
     /// the written range dirty in the [`DirtyFolioTracker`] for
-    /// subsequent writeback. Returns the number of bytes written.
+    /// subsequent source-model writeback. Returns the number of bytes written.
     /// # Linux kernel signature
     /// `int (*write_end)(struct file *, struct address_space *,
     /// loff_t pos, unsigned len, unsigned copied, struct folio *,
     /// void *fsdata)`
     /// # No-daemon boundary
-    /// VfsEngine::write and DirtyFolioTracker resolve within kernel
-    /// authority. No userspace daemon is required.
+    /// VfsEngine::write and DirtyFolioTracker resolve locally in this model.
+    /// Mounted Linux uses the C `write_end` callback instead.
     /// # Errors
     /// Propagates VfsEngine write errors.
     pub fn write_end(
@@ -281,21 +280,21 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         Ok(written)
     }
 
-    /// `dirty_folio`: Register a folio as dirty in the writeback tracker.
-    /// Called when the kernel marks a page dirty (e.g., from mmap
+    /// Source-model `dirty_folio`: register a folio as dirty in the tracker.
+    /// Models the point where the kernel marks a page dirty (e.g., from mmap
     /// `page_mkwrite` or direct page-cache dirtying). Records the
-    /// range in [`DirtyFolioTracker`] for subsequent writeout via
+    /// range in [`DirtyFolioTracker`] for subsequent source-model writeout via
     /// [`writepages`](Self::writepages).
     /// # Linux kernel signature
     /// `bool (*dirty_folio)(struct address_space *, struct folio *)`
     /// # No-daemon boundary
-    /// DirtyFolioTracker is local in-memory state. No userspace
-    /// daemon is required.
+    /// DirtyFolioTracker is local in-memory model state. The mounted C
+    /// `dirty_folio` callback uses Linux `filemap_dirty_folio()` instead.
     pub fn dirty_folio(&mut self, inode: InodeId, offset: u64, len: u32) {
         self.dirty_tracker.add(inode, offset, len);
     }
 
-    /// `writepages`: Write back dirty pages to storage with batched intent recording.
+    /// Source-model `writepages`: write dirty ranges with batched intent recording.
     ///
     /// Drains all dirty ranges for the given inode from the
     /// [`DirtyFolioTracker`] and flushes them through
@@ -310,15 +309,15 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
     /// Returns [`WritebackBatchResult`] with total bytes written when all
     /// ranges complete. If any allocation, intent-recording, or writeback
     /// step fails, the failed range is re-dirtied and the method returns the
-    /// first errno so the kernel writeback path fails closed.
+    /// first errno so the model fails closed. Mounted Linux uses the C
+    /// `writepages` callback and Linux dirty folios instead.
     ///
     /// # Linux kernel signature
     /// `int (*writepages)(struct address_space *, struct writeback_control *)`
     ///
     /// # No-daemon boundary
-    /// VfsEngine::writeback_folios resolves within kernel authority
-    /// through the engine's block I/O layer. No userspace daemon
-    /// is required.
+    /// VfsEngine::writeback_folios resolves locally in this model. No
+    /// userspace daemon is required.
     pub fn writepages(
         &mut self,
         inode: InodeId,
@@ -528,13 +527,13 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         Ok(outcome)
     }
 
-    /// `page_mkwrite`: Prepare a page for write access in an mmap region.
+    /// Source-model `page_mkwrite`: prepare a page for mmap write access.
     ///
     /// Registers the dirty byte range in the [`DirtyFolioTracker`] so that
-    /// subsequent [`writepages`](Self::writepages) flushes can persist the
-    /// mmap'd writes.  Called by the kernel VFS when a write-protected
-    /// page in an mmap region is first written to (write-notify / COW
-    /// break).  Uses PAGE_SIZE (4096) as the default page length.
+    /// subsequent source-model [`writepages`](Self::writepages) flushes can
+    /// persist the mmap'd writes. A mounted C `vm_operations_struct` bridge
+    /// does not call this method today; generic filemap handles the live
+    /// shared write fault and C `dirty_folio`/`writepages` handle writeback.
     ///
     /// # Linux kernel signature
     ///
@@ -542,7 +541,8 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
     ///
     /// # No-daemon boundary
     ///
-    /// DirtyFolioTracker is in-memory state.  No userspace daemon required.
+    /// DirtyFolioTracker is in-memory source-model state. No userspace daemon
+    /// is required.
     pub fn page_mkwrite(
         &mut self,
         inode: InodeId,
@@ -553,7 +553,7 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         Ok(())
     }
 
-    /// `invalidate_folio`: Invalidate a range within a folio.
+    /// Source-model `invalidate_folio`: invalidate a range within a folio.
     ///
     /// Bridges to [`VfsEngine::invalidate_cache_range`] so the engine
     /// can drop internal caches for the affected byte range. Records
@@ -564,8 +564,9 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
     /// size_t length)`
     ///
     /// # No-daemon boundary
-    /// Cache invalidation operates on in-memory engine state within
-    /// kernel authority. No userspace daemon is required.
+    /// Cache invalidation operates on in-memory engine state in this model.
+    /// Mounted truncate/direct-write cleanup uses C Linux page-cache discard
+    /// helpers because `.invalidate_folio` is not registered in the C vtable.
     pub fn invalidate_folio(
         &mut self,
         inode: InodeId,

@@ -7,9 +7,7 @@ use crate::errno::KernelErrno;
 use crate::fallocate::{FallocateMode, FallocatePlan};
 use crate::{KmodPosixVfs, OpenDirState, OpenFileState};
 use tidefs_kmod_bridge::kernel_types::VfsEngine;
-use tidefs_kmod_bridge::kernel_types::{
-    Errno, FiemapExtentVec, InodeAttr, InodeId, MmapPolicy, RequestCtx,
-};
+use tidefs_kmod_bridge::kernel_types::{Errno, FiemapExtentVec, InodeAttr, InodeId, RequestCtx};
 
 #[cfg(CONFIG_RUST)]
 use tidefs_kmod_bridge::kernel_types::ByteSliceExt;
@@ -781,8 +779,13 @@ mod tests {
 }
 
 impl<E: VfsEngine> KmodPosixVfs<E> {
-    /// Create a [`KmodVfsVmOps`] dispatch spine for the mmap(2) callback.
-    pub fn vm_ops(&mut self) -> crate::mmap::KmodVfsVmOps<'_, E> {
+    /// Create the source-model [`KmodVfsVmOps`] dispatch spine.
+    ///
+    /// This is not the mounted Linux product mmap callback. The live C shim
+    /// admits engine-backed mmap with `generic_file_mmap()` and the registered
+    /// C `address_space_operations` table. Keep this helper for Rust model
+    /// tests until a real C `vm_operations_struct` bridge is registered.
+    pub fn source_model_vm_ops(&mut self) -> crate::mmap::KmodVfsVmOps<'_, E> {
         crate::mmap::KmodVfsVmOps::new(
             &self.engine,
             &mut self.dirty_folio_tracker,
@@ -790,21 +793,18 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
         )
     }
 
-    /// `mmap` file_operation callback.
+    /// Unsupported Rust direct `mmap` callback path.
     ///
-    /// Consults [`VfsEngine::mmap`] for the mmap policy. Returns
-    /// [`KernelErrno::STORAGE_NO_DEVICE`] when the engine denies mmap for this inode.
-    pub fn mmap(
-        &mut self,
-        inode: InodeId,
-        flags: u32,
-        ctx: &RequestCtx,
-    ) -> Result<crate::mmap::KmodVfsVmOps<'_, E>, Errno> {
-        let policy = self.engine.mmap(inode, 0, 0, flags, ctx)?;
-        match policy {
-            MmapPolicy::Denied => Err(KernelErrno::STORAGE_NO_DEVICE),
-            MmapPolicy::PopulateOnFault | MmapPolicy::PreFaultPages => Ok(self.vm_ops()),
-        }
+    /// The mounted product path is implemented in the C shim via
+    /// `tidefs_posix_vfs_file_mmap()` -> `generic_file_mmap()` -> the
+    /// registered C `address_space_operations`. This Rust direct-vm-ops entry
+    /// point is deliberately fail-closed so no caller can accidentally treat
+    /// [`KmodVfsVmOps`](crate::mmap::KmodVfsVmOps),
+    /// [`DirtyFolioTracker`](crate::writeback::DirtyFolioTracker), or
+    /// [`PageAuthorityTable`](crate::page_authority::PageAuthorityTable) as
+    /// mounted callback authority.
+    pub fn mmap(&mut self, _inode: InodeId, _flags: u32, _ctx: &RequestCtx) -> Result<(), Errno> {
+        Err(KernelErrno::UNSUPPORTED_OP)
     }
 }
 
@@ -813,32 +813,30 @@ mod mmap_tests {
     use super::*;
     use crate::test_util::MockEngine;
     use crate::TideBox as Box;
-    use tidefs_kmod_bridge::kernel_types::{EngineFileHandle, FileHandleId, InodeId};
+    use tidefs_kmod_bridge::kernel_types::{EngineFileHandle, FileHandleId, InodeId, MmapPolicy};
 
     #[test]
-    fn mmap_returns_vm_ops() {
+    fn source_model_vm_ops_reads_fault_data() {
         let mut e = MockEngine::new();
         e.read_fn = Box::new(|_, _, _, _| Ok(b"mmap-data".to_vec()));
         let mut vfs = KmodPosixVfs::new(e);
-        let mut vmops = vfs
-            .mmap(InodeId::new(1), 0, &MockEngine::test_ctx())
-            .unwrap();
+        let mut vmops = vfs.source_model_vm_ops();
         let fh = EngineFileHandle::new(InodeId::new(1), 0, FileHandleId(0), 0);
         let (data, _) = vmops.fault(&fh, 0, 4096, &MockEngine::test_ctx()).unwrap();
         assert_eq!(data, b"mmap-data");
     }
 
     #[test]
-    fn vm_ops_accessor_returns_engine_reference() {
+    fn source_model_vm_ops_accessor_returns_engine_reference() {
         let e = MockEngine::new();
         let mut vfs = KmodPosixVfs::new(e);
-        let vmops = vfs.vm_ops();
+        let vmops = vfs.source_model_vm_ops();
         let root = vmops.engine().get_root_inode(&MockEngine::test_ctx());
         assert!(root.is_ok());
     }
 
     #[test]
-    fn mmap_returns_different_data_per_inode() {
+    fn source_model_vm_ops_returns_different_data_per_inode() {
         let mut e = MockEngine::new();
         e.read_fn = Box::new(|fh, _, _, _| {
             if fh.inode_id == InodeId::new(1) {
@@ -850,9 +848,7 @@ mod mmap_tests {
         let mut vfs = KmodPosixVfs::new(e);
 
         {
-            let mut vmops1 = vfs
-                .mmap(InodeId::new(1), 0, &MockEngine::test_ctx())
-                .unwrap();
+            let mut vmops1 = vfs.source_model_vm_ops();
             let fh1 = EngineFileHandle::new(InodeId::new(1), 0, FileHandleId(0), 0);
             let (d1, _) = vmops1
                 .fault(&fh1, 0, 4096, &MockEngine::test_ctx())
@@ -860,9 +856,7 @@ mod mmap_tests {
             assert_eq!(d1, b"inode-1");
         }
 
-        let mut vmops2 = vfs
-            .mmap(InodeId::new(2), 0, &MockEngine::test_ctx())
-            .unwrap();
+        let mut vmops2 = vfs.source_model_vm_ops();
         let fh2 = EngineFileHandle::new(InodeId::new(2), 0, FileHandleId(0), 0);
         let (d2, _) = vmops2
             .fault(&fh2, 0, 4096, &MockEngine::test_ctx())
@@ -871,62 +865,64 @@ mod mmap_tests {
     }
 
     #[test]
-    fn mmap_populate_on_fault_policy() {
+    fn source_model_does_not_change_engine_mmap_policy() {
         let mut e = MockEngine::new();
         e.mmap_fn = Box::new(|_, _, _, _, _| Ok(MmapPolicy::PopulateOnFault));
         let mut vfs = KmodPosixVfs::new(e);
-        let vmops = vfs
-            .mmap(InodeId::new(1), 0, &MockEngine::test_ctx())
-            .unwrap();
-        // Policy PopulateOnFault succeeds — vmops is returned.
+        let vmops = vfs.source_model_vm_ops();
         let engine_ref = vmops.engine();
-        assert!(engine_ref.get_root_inode(&MockEngine::test_ctx()).is_ok());
+        let policy = VfsEngine::mmap(
+            engine_ref,
+            InodeId::new(1),
+            0,
+            4096,
+            0,
+            &MockEngine::test_ctx(),
+        )
+        .unwrap();
+        assert_eq!(policy, MmapPolicy::PopulateOnFault);
     }
 
     #[test]
-    fn mmap_prefault_pages_policy() {
+    fn source_model_can_observe_prefault_policy() {
         let mut e = MockEngine::new();
         e.mmap_fn = Box::new(|_, _, _, _, _| Ok(MmapPolicy::PreFaultPages));
         let mut vfs = KmodPosixVfs::new(e);
-        let vmops = vfs
-            .mmap(InodeId::new(2), 0, &MockEngine::test_ctx())
-            .unwrap();
-        // Policy PreFaultPages succeeds — vmops is returned.
-        assert!(vmops
-            .engine()
-            .get_root_inode(&MockEngine::test_ctx())
-            .is_ok());
+        let vmops = vfs.source_model_vm_ops();
+        let policy = VfsEngine::mmap(
+            vmops.engine(),
+            InodeId::new(2),
+            0,
+            4096,
+            0,
+            &MockEngine::test_ctx(),
+        )
+        .unwrap();
+        assert_eq!(policy, MmapPolicy::PreFaultPages);
     }
 
     #[test]
-    fn mmap_denied_returns_enodev() {
+    fn rust_mmap_callback_path_fails_closed() {
         let mut e = MockEngine::new();
-        e.mmap_fn = Box::new(|_, _, _, _, _| Ok(MmapPolicy::Denied));
+        e.mmap_fn = Box::new(|_, _, _, _, _| {
+            panic!("Rust product mmap callback must not consult VfsEngine::mmap")
+        });
         let mut vfs = KmodPosixVfs::new(e);
         let result = vfs.mmap(InodeId::new(3), 0, &MockEngine::test_ctx());
-        match result {
-            Err(e) => assert_eq!(e, KernelErrno::STORAGE_NO_DEVICE),
-            Ok(_) => panic!("expected Err(ENODEV), got Ok"),
-        }
+        assert_eq!(result, Err(KernelErrno::UNSUPPORTED_OP));
     }
 
-    /// Default mmap policy (no mmap_fn override) returns PopulateOnFault.
     #[test]
-    fn mmap_default_policy_is_populate_on_fault() {
+    fn rust_mmap_callback_path_refuses_default_engine_policy() {
         let e = MockEngine::new();
-        // No mmap_fn override: default VfsEngine::mmap() returns PopulateOnFault.
         let engine_policy =
             VfsEngine::mmap(&e, InodeId::new(1), 0, 4096, 0, &MockEngine::test_ctx()).unwrap();
         assert_eq!(engine_policy, MmapPolicy::PopulateOnFault);
-        // And through KmodPosixVfs it also succeeds.
         let mut vfs = KmodPosixVfs::new(e);
-        let vmops = vfs
-            .mmap(InodeId::new(1), 0, &MockEngine::test_ctx())
-            .unwrap();
-        assert!(vmops
-            .engine()
-            .get_root_inode(&MockEngine::test_ctx())
-            .is_ok());
+        assert_eq!(
+            vfs.mmap(InodeId::new(1), 0, &MockEngine::test_ctx()),
+            Err(KernelErrno::UNSUPPORTED_OP)
+        );
     }
 }
 

@@ -162,15 +162,17 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
     }
 }
 // ---------------------------------------------------------------------------
-// Standalone bridge functions for kernel file_operations wiring
+// Source-model bridge functions for file_operations-shaped fsync wiring
 // ---------------------------------------------------------------------------
 
-/// Bridge kernel file_operations::fsync to VfsEngine::fsync.
+/// Source-model bridge from kernel file_operations::fsync to VfsEngine::fsync.
 ///
 /// Resolves the OpenFileState (kernel file->private_data), flushes
-/// dirty address_space pages for the inode byte range through the
-/// provided DirtyFolioTracker (when available), then calls
-/// VfsEngine::fsync to request a transaction-group commit barrier.
+/// dirty source-model address_space ranges through the provided
+/// DirtyFolioTracker (when available), then calls VfsEngine::fsync to request
+/// a transaction-group commit barrier. The mounted C shim does not use this
+/// tracker for mmap dirties; it calls `filemap_write_and_wait_range()` and the
+/// registered C `writepages` callback before `tidefs_posix_vfs_engine_fsync()`.
 ///
 /// When datasync is true, only data and the metadata needed to retrieve
 /// it (size, mtime) must be flushed; other metadata may be skipped.

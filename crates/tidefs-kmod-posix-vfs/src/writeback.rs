@@ -1,8 +1,11 @@
 //! Writeback tracking for the kernel VFS adapter.
 //!
-//! Provides DirtyFolioTracker for tracking dirty byte ranges pending
-//! writeout through VfsEngine. Used by AddressSpaceOps writeback
-//! bridge methods without a userspace daemon.
+//! Provides [`DirtyFolioTracker`] for the Rust address-space source model.
+//! The mounted Linux 7.0 product path does not register this tracker from C:
+//! `dirty_folio` uses Linux dirty accounting and `writepages` walks dirty
+//! folios through the C `address_space_operations` table. Keep this tracker
+//! as a fail-closed/model helper until a direct C-to-Rust writeback bridge is
+//! registered and proven.
 
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge;

@@ -293,86 +293,70 @@ cargo test -p tidefs-kmod-posix-vfs -- mount_options
 
 ## Address Space Operations
 
-The `address_space_ops` module bridges the Linux 7.0 `struct
-address_space_operations` vtable to `VfsEngine`, providing explicit source
-or blocker rows for every operation. This advances A14 (full-kernel residency
-bridge/model-level) and A16 (readahead is stats-only mirror) by replacing stub
-and scope-out lines with real dispatch.
+The mounted Linux 7.0 product path registers its live
+`address_space_operations` vtable in
+[`tidefs_posix_vfs_shim.c`](tidefs_posix_vfs_shim.c). Engine-backed mmap is
+admitted by `tidefs_posix_vfs_file_mmap()` through `generic_file_mmap()`, and
+Linux filemap then calls the registered C `read_folio`, `write_begin`,
+`write_end`, `dirty_folio`, and `writepages` callbacks. The Rust
+`address_space_ops` module remains a source-model dispatch spine for future
+direct C-to-Rust callback work; it is not registered as the mounted product
+vtable.
 
 ### Operation Matrix
 
-| Operation | Status | VfsEngine Dependency | Daemon Required | Errno (Blocked) |
+| Operation | Mounted status | VfsEngine Dependency | Daemon Required | Notes |
 |---|---|---|---|---|
-| `read_folio` | Implemented | `VfsEngine::read()` | No | — |
-| `readahead` | Implemented | `VfsEngine::read()` | No | — |
-| `write_begin` | Implemented | `VfsEngine::read()` | No | — |
-| `write_end` | Implemented | `VfsEngine::write()` + `DirtyFolioTracker` | No | — |
-| `dirty_folio` | Implemented | `DirtyFolioTracker::add()` | No | — |
-| `writepages` | Implemented | `VfsEngine::writeback_folios()` + `DirtyFolioTracker::drain_inode()` | No | — |
-| `writepage` | Implemented | `VfsEngine::writeback_folios()` | No | — |
-| `invalidate_folio` | Implemented | `VfsEngine::invalidate_cache_range()` | No | — |
-| `page_mkwrite` | Implemented | `DirtyFolioTracker::add()` | No | — |
-| `fsync` | Already wired | `VfsEngine::fsync()` | No | — |
+| `read_folio` | Registered in C | `tidefs_posix_vfs_engine_read` | No | Populates Linux folios for buffered reads and mmap faults. |
+| `write_begin` | Registered in C | `tidefs_posix_vfs_engine_read` | No | Reads existing bytes for partial-folio buffered writes. |
+| `write_end` | Registered in C | `tidefs_posix_vfs_engine_write` | No | Copies modified folio bytes to the engine. |
+| `dirty_folio` | Registered in C | Linux `filemap_dirty_folio()` | No | Records Linux dirty accounting only; it does not call the engine or `DirtyFolioTracker` from atomic MM paths. |
+| `writepages` | Registered in C | `tidefs_posix_vfs_engine_write` | No | Walks Linux dirty folios, writes copied bytes, and re-dirties on engine error or short write. |
+| `readahead` | Source model only | `VfsEngine::read()` | No | Rust model exists; no mounted C callback is registered yet. |
+| `writepage` | Source model only | `VfsEngine::writeback_folios()` | No | No mounted C callback is registered yet. |
+| `invalidate_folio` | Source model only | `VfsEngine::invalidate_cache_range()` | No | Mounted truncate/direct-write paths use C Linux page-cache discard helpers instead. |
+| `page_mkwrite` | Unsupported direct Rust bridge | `DirtyFolioTracker::try_add()` | No | Linux generic filemap handles shared writable mmap; no custom Rust vm_ops bridge is registered. |
+| `fsync` | Registered in C file ops | `tidefs_posix_vfs_engine_fsync` | No | C fsync drains `filemap_write_and_wait_range()` before the engine fsync bridge. |
 
 ### Implemented Operations
 
-**read_folio** (`src/address_space_ops.rs`): Bridges to `VfsEngine::read()` for
-the folio's page range, returning data for the caller to populate folio pages.
-Records a page-cache populate event on success, or a miss on empty reads (EOF).
-Resolves within kernel authority — no daemon dependency.
-
-**readahead** (`src/address_space_ops.rs`): Issues a prefetch read through
-`VfsEngine::read()` for the given byte range and records readahead/prefetch
-page-cache statistics. Extends the prior stats-only mirror (K7-06) into an
-active I/O tracking surface. Errors are silently discarded (advisory hint,
-fallback to synchronous `read_folio` on page fault).
-
-**invalidate_folio** (`src/address_space_ops.rs`): Bridges to
-`VfsEngine::invalidate_cache_range()` allowing the engine to drop internal
-caches for the affected byte range on truncate, hole-punch, or direct-I/O
-write. Records an eviction stat regardless of engine outcome. Resolves within
-kernel authority — no daemon dependency.
+The C `read_folio`, `write_begin`, `write_end`, `dirty_folio`, and
+`writepages` callbacks are the only mounted address-space authority today.
+The Rust `AddressSpaceOps` methods are cargo/source-model coverage for a
+future direct bridge and must not be cited as mounted runtime proof.
 
 ### Writeback Path
 
-The writeback bridge methods (`write_begin`, `write_end`, `dirty_folio`,
-`writepages`) are implemented in `src/address_space_ops.rs` using the
-`DirtyFolioTracker` from `src/writeback.rs`. The lifecycle is:
+The mounted writeback lifecycle is C/generic-filemap based:
 
-1. **write_begin**: Reads existing page data from `VfsEngine::read()` for
-   partial-page write merging. Returns the buffer (may be empty for holes).
-2. **write_end**: Writes merged data through `VfsEngine::write()` and marks
-   the byte range dirty in the `DirtyFolioTracker` for subsequent writeback.
-3. **dirty_folio**: Registers a byte range as dirty (called by the kernel on
-   mmap page_mkwrite or direct page-cache dirtying). Merges adjacent/overlapping
-   ranges automatically.
-4. **writepages**: Drains dirty ranges for an inode from the tracker and flushes
-   each range through `VfsEngine::writeback_folios()`. Partial writeback
-   progress is supported: unwritten remainders are re-added to the tracker.
-5. **writepage**: Single-page writeback dispatch that delegates to
-   `VfsEngine::writeback_folios()` for one page-sized range. Used by the
-   kernel VFS when batched writepages is not appropriate.
+1. **write_begin**: C reads existing page data through
+   `tidefs_posix_vfs_engine_read` for partial-page write merging.
+2. **write_end**: C writes modified folio bytes through
+   `tidefs_posix_vfs_engine_write`.
+3. **dirty_folio**: C calls Linux `filemap_dirty_folio()` and does not sleep or
+   enter the engine.
+4. **writepages**: C walks Linux dirty folios with `writeback_iter()`, copies
+   folio bytes, writes them through `tidefs_posix_vfs_engine_write`, records
+   mapping errors, and re-dirties failed folios for retry.
 
-All five methods resolve within kernel authority — no userspace daemon is
-required. The `DirtyFolioTracker` maintains an ordered, merged set of
-non-overlapping dirty byte ranges per inode with configurable capacity
-(default 1024 entries).
+The Rust `DirtyFolioTracker` maintains an ordered, merged set of
+non-overlapping dirty byte ranges for source-model tests. It is not wired into
+the mounted Linux callback chain.
 
 #### page_mkwrite
 
-`page_mkwrite` is implemented in `src/address_space_ops.rs` and bridges to
-`DirtyFolioTracker::add()`, registering the written page as dirty for
-subsequent writeback. The mmap fault path is wired through `src/mmap.rs`
-(`KmodVfsVmOps`) which provides `fault` (bridging `VfsEngine::read`) and
-`page_mkwrite` (DirtyFolioTracker registration). All methods resolve within
-kernel authority — no daemon dependency.
+`page_mkwrite` and `KmodVfsVmOps` are Rust source-model code only. The mounted
+C shim does not set `vma->vm_ops` to a Rust custom table. Engine-backed mmap
+uses Linux generic filemap VM operations plus the C address-space callbacks
+above. The Rust direct `KmodPosixVfs::mmap()` entry point fails closed with
+`EOPNOTSUPP` so this unsupported bridge cannot be mistaken for product
+authority.
 
 ### No-Daemon Boundary
 
-Every implemented operation resolves locally within kernel authority through
-VfsEngine. All `address_space_operations` methods are kernel-resident with
-no userspace daemon required. This module advances the A14 residency validation
-by disclosing the exact daemon boundary per operation.
+The registered C mmap/writeback callbacks resolve through kernel-resident
+engine bridges and require no userspace daemon. The Rust source-model helpers
+share that no-daemon shape but are not mounted callback proof.
 
 
 ## Intent-Log Recording Contract

@@ -573,8 +573,10 @@ ranges Linux has discarded.
 
 That first-boot mounted C/generic-filemap proof is not TFR-008 or TFR-018
 closure. The Rust `KmodVfsVmOps`, `DirtyFolioTracker`, and page-authority
-model remain a source/model path until a C `vm_operations_struct` and direct
-Rust aops bridge are registered. Crash-consistent mmap, broad xfstests,
+model remain a fail-closed source/model path until a C `vm_operations_struct`
+and direct Rust aops bridge are registered. `KmodPosixVfs::mmap()` returns
+`EOPNOTSUPP`; mounted mmap authority is the C generic-filemap path above.
+Crash-consistent mmap, broad xfstests,
 direct-I/O, FUSE writeback-cache correctness, placement receipt correctness,
 and distributed mmap coherency remain open review debt before any
 OpenZFS/Ceph-class durability or coherency claim is honest.
@@ -1095,7 +1097,9 @@ The practical result is not "mmap solved" or "writeback solved." The C shim
 admits engine-backed mounted-pool mmap via the generic filemap path, but no
 custom VM operations bridge registers the Rust `KmodVfsVmOps` policy, and the
 registered C a_ops table still lacks direct Rust DirtyFolioTracker/
-page-authority cleanup. POSIX
+page-authority cleanup. Issue #260 makes that unsupported state fail-closed in
+the Rust API: `KmodPosixVfs::mmap()` returns `EOPNOTSUPP`, and direct vm-ops
+construction is named as source-model only. POSIX
 matrix, compliance, and xfstests documents must continue to distinguish the
 first-boot mounted mmap/writeback row from crash consistency, direct-I/O, FUSE
 writeback-cache, distributed coherency, and broad xfstests closure. These
