@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use tokio::sync::watch;
 
+use crate::send_admission::SendWakeEvidence;
 use crate::send_scheduler::SendPriority;
 
 // ---------------------------------------------------------------------------
@@ -189,10 +190,15 @@ impl SendCapacity {
     /// Otherwise waits until the drain loop notifies that the queue
     /// has drained below the low watermark.
     pub async fn wait_for_capacity(&self) {
+        let _ = self.wait_for_capacity_evidence().await;
+    }
+
+    /// Await capacity and report the wake source observed by this waiter.
+    pub async fn wait_for_capacity_evidence(&self) -> SendWakeEvidence {
         let mut rx = self.rx.clone();
         // Borrow the current value first to avoid spurious wake-ups.
         if *rx.borrow() {
-            return;
+            return SendWakeEvidence::NotApplicable;
         }
         // Wait for a change to true.
         loop {
@@ -200,10 +206,10 @@ impl SendCapacity {
             let changed = rx.changed().await;
             if changed.is_err() {
                 // Sender dropped (shutdown): treat as available.
-                return;
+                return SendWakeEvidence::SenderDropped;
             }
             if *rx.borrow() {
-                return;
+                return SendWakeEvidence::DrainObserved;
             }
         }
     }
@@ -237,6 +243,18 @@ pub struct SendCapacitySet {
     senders: Arc<[watch::Sender<bool>; 5]>,
     /// Per-priority "currently under pressure" flags.
     under_pressure: Arc<[std::sync::atomic::AtomicBool; 5]>,
+    /// Last queue depth observed for each priority class.
+    depths: Arc<[std::sync::atomic::AtomicUsize; 5]>,
+}
+
+/// Point-in-time capacity state for a priority class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendCapacitySnapshot {
+    pub priority: SendPriority,
+    pub available: bool,
+    pub depth: usize,
+    pub high_watermark: usize,
+    pub low_watermark: usize,
 }
 
 impl SendCapacitySet {
@@ -264,6 +282,9 @@ impl SendCapacitySet {
             under_pressure: Arc::new(std::array::from_fn(|_| {
                 std::sync::atomic::AtomicBool::new(false)
             })),
+            depths: Arc::new(std::array::from_fn(|_| {
+                std::sync::atomic::AtomicUsize::new(0)
+            })),
         }
     }
 
@@ -287,6 +308,7 @@ impl SendCapacitySet {
         let idx = pri as usize;
         let high = self.config.high(pri);
         let low = self.config.low(pri);
+        self.depths[idx].store(depth, std::sync::atomic::Ordering::Release);
 
         if high == 0 {
             return; // Backpressure disabled for this class.
@@ -309,6 +331,18 @@ impl SendCapacitySet {
     /// Return the watermark configuration (read-only).
     pub fn config(&self) -> &SendWatermarkConfig {
         &self.config
+    }
+
+    /// Return the latest capacity state observed for a priority class.
+    pub fn snapshot(&self, pri: SendPriority) -> SendCapacitySnapshot {
+        let idx = pri as usize;
+        SendCapacitySnapshot {
+            priority: pri,
+            available: *self.senders[idx].borrow(),
+            depth: self.depths[idx].load(std::sync::atomic::Ordering::Acquire),
+            high_watermark: self.config.high(pri),
+            low_watermark: self.config.low(pri),
+        }
     }
 }
 
@@ -461,6 +495,11 @@ mod tests {
         // Drain to low watermark: clears.
         set.check_after_dequeue(SendPriority::Data, 1);
         assert!(cap.is_available());
+        let snapshot = set.snapshot(SendPriority::Data);
+        assert_eq!(snapshot.depth, 1);
+        assert_eq!(snapshot.high_watermark, 3);
+        assert_eq!(snapshot.low_watermark, 1);
+        assert!(snapshot.available);
 
         // Drain to 0: still available.
         set.check_after_dequeue(SendPriority::Data, 0);
@@ -518,6 +557,20 @@ mod tests {
         })
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn wait_for_capacity_reports_drain_wake() {
+        let cfg = SendWatermarkConfig::uniform(3, 1);
+        let set = SendCapacitySet::new(&cfg);
+        set.check_after_dequeue(SendPriority::Data, 3);
+        let cap = set.capacity(SendPriority::Data);
+
+        let waiter = tokio::spawn(async move { cap.wait_for_capacity_evidence().await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        set.check_after_dequeue(SendPriority::Data, 1);
+
+        assert_eq!(waiter.await.unwrap(), SendWakeEvidence::DrainObserved);
     }
 
     #[tokio::test]

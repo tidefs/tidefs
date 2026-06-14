@@ -6,9 +6,10 @@
 //! Each remote peer gets a [`PeerSendBuffer`] that holds serialized frames
 //! (`Bytes`) awaiting transmission on the wire. The buffer has a configurable
 //! `max_memory` cap (default 4 MiB, min 4 KiB, max 64 MiB). When a peer's
-//! buffer is full, [`try_enqueue`](PeerSendBuffer::try_enqueue) returns
-//! [`Backpressure::PeerFull`] so the producing subsystem can slow down or
-//! drop rather than growing memory without bound.
+//! buffer is full, [`try_enqueue`](PeerSendBuffer::try_enqueue) returns typed
+//! [`SendAdmissionEvidence`](crate::send_admission::SendAdmissionEvidence) so
+//! the producing subsystem can slow down or drop rather than growing memory
+//! without bound.
 //!
 //! The send buffer sits below the priority scheduler and above the wire,
 //! holding frames after scheduling decisions have been made. Flow control
@@ -16,18 +17,19 @@
 //!
 //! ### Backpressure contract
 //!
-//! Callers must inspect the [`Backpressure`] returned by `try_enqueue`:
+//! Callers must inspect the evidence returned by `try_enqueue`:
 //!
-//! | Variant      | Meaning                                              |
-//! |--------------|------------------------------------------------------|
-//! | `Ok`         | Frame accepted into the buffer.                      |
-//! | `PeerFull`   | Buffer at capacity; caller should slow down or drop. |
-//! | `Shutdown`   | Buffer has been shut down (peer departed/closed).    |
+//! | Outcome                 | Meaning                                              |
+//! |-------------------------|------------------------------------------------------|
+//! | `Accepted`              | Frame accepted into the buffer.                      |
+//! | `DroppedOldest`         | Frame accepted after older queued frames were dropped. |
+//! | `Backpressured`         | Buffer at capacity; caller should slow down or drop. |
+//! | `Closed`                | Buffer has been shut down (peer departed/closed).    |
 //!
-//! `PeerFull` is a soft-backpressure signal — distinct from circuit-breaker
+//! `Backpressured` is a soft pressure signal — distinct from circuit-breaker
 //! open, which is a hard-failure signal. Flow-control windows and circuit
-//! breakers should treat `PeerFull` as an advisory to reduce send rate,
-//! not as a reason to open the circuit.
+//! breakers should treat it as an advisory to reduce send rate, not as a
+//! reason to open the circuit.
 //!
 //! ### Memory accounting
 //!
@@ -39,6 +41,11 @@
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use crate::send_admission::{
+    DroppedSendEvidence, SendAdmissionEvidence, SendAdmissionOutcome, SendAdmissionPolicy,
+    SendCapacityClass, SendCapacityEvidence, SendWakeEvidence,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -167,6 +174,22 @@ impl std::fmt::Display for Backpressure {
     }
 }
 
+impl PartialEq<Backpressure> for SendAdmissionEvidence {
+    fn eq(&self, other: &Backpressure) -> bool {
+        matches!(
+            (self.outcome, other),
+            (
+                SendAdmissionOutcome::Accepted
+                    | SendAdmissionOutcome::Queued
+                    | SendAdmissionOutcome::Blocked
+                    | SendAdmissionOutcome::DroppedOldest,
+                Backpressure::Ok
+            ) | (SendAdmissionOutcome::Backpressured, Backpressure::PeerFull)
+                | (SendAdmissionOutcome::Closed, Backpressure::Shutdown)
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PeerBufferStats
 // ---------------------------------------------------------------------------
@@ -236,13 +259,13 @@ pub struct BufferStatsSnapshot {
 ///
 /// 1. Created via [`PeerSendBuffer::new`] with a [`SendBufferConfig`].
 /// 2. Frames are queued with [`try_enqueue`](Self::try_enqueue); when the
-///    buffer is full the caller receives [`Backpressure::PeerFull`].
+///    buffer is full the caller receives `Backpressured` evidence.
 /// 3. The I/O path pulls frames with [`dequeue`](Self::dequeue), which
 ///    releases capacity for subsequent enqueues.
 /// 4. On peer close or circuit-breaker open, [`drain`](Self::drain) drops
 ///    all queued frames and resets `allocated`.
 /// 5. After [`shutdown`](Self::shutdown), all further enqueues return
-///    [`Backpressure::Shutdown`].
+///    `Closed` evidence.
 #[derive(Debug)]
 pub struct PeerSendBuffer {
     /// Serialized frames queued for transmission.
@@ -275,23 +298,78 @@ impl PeerSendBuffer {
 
     /// Try to enqueue a frame for transmission.
     ///
-    /// Returns [`Backpressure::Ok`] on success, [`Backpressure::PeerFull`]
-    /// if the buffer cannot accommodate the frame, and
-    /// [`Backpressure::Shutdown`] if the buffer has been closed.
-    pub fn try_enqueue(&mut self, frame: Bytes) -> Backpressure {
+    /// Returns typed evidence for accepted, drop-oldest, backpressured, and
+    /// shutdown decisions.
+    pub fn try_enqueue(&mut self, frame: Bytes) -> SendAdmissionEvidence {
         if self.shutdown.load(Ordering::Acquire) {
             self.stats.rejected_shutdown.fetch_add(1, Ordering::Relaxed);
-            return Backpressure::Shutdown;
+            return self
+                .evidence(SendAdmissionOutcome::Closed, frame.len())
+                .with_policy(SendAdmissionPolicy::Shutdown);
         }
         let frame_len = frame.len() as u64;
-        if self.allocated + frame_len > self.max_memory {
+        if frame_len > self.max_memory {
             self.stats.rejected.fetch_add(1, Ordering::Relaxed);
-            return Backpressure::PeerFull;
+            return self
+                .evidence(SendAdmissionOutcome::Backpressured, frame.len())
+                .with_policy(self.admission_policy());
+        }
+        if self.allocated + frame_len > self.max_memory {
+            match self.config.backpressure_policy {
+                BackpressurePolicy::Error => {
+                    self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                    return self
+                        .evidence(SendAdmissionOutcome::Backpressured, frame.len())
+                        .with_policy(SendAdmissionPolicy::Error);
+                }
+                BackpressurePolicy::Block => {
+                    self.stats.blocks.fetch_add(1, Ordering::Relaxed);
+                    return self
+                        .evidence(SendAdmissionOutcome::Backpressured, frame.len())
+                        .with_policy(SendAdmissionPolicy::Block)
+                        .with_wake(SendWakeEvidence::Unavailable);
+                }
+                BackpressurePolicy::DropOldest => {
+                    let mut dropped = Vec::new();
+                    while self.allocated + frame_len > self.max_memory {
+                        let Some(front) = self.queue.pop_front() else {
+                            self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                            return self
+                                .evidence(SendAdmissionOutcome::Backpressured, frame.len())
+                                .with_policy(SendAdmissionPolicy::DropOldest)
+                                .with_dropped(dropped);
+                        };
+                        let queue_depth_before = self.queue.len() + 1;
+                        let byte_depth_before = self.allocated as usize;
+                        let len = front.len() as u64;
+                        self.allocated = self.allocated.saturating_sub(len);
+                        dropped.push(DroppedSendEvidence::frame(
+                            len as usize,
+                            queue_depth_before,
+                            byte_depth_before,
+                        ));
+                    }
+                    let dropped_count = dropped.len() as u64;
+                    if dropped_count > 0 {
+                        self.stats
+                            .dropped
+                            .fetch_add(dropped_count, Ordering::Relaxed);
+                    }
+                    self.allocated += frame_len;
+                    self.queue.push_back(frame);
+                    self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                    return self
+                        .evidence(SendAdmissionOutcome::DroppedOldest, frame_len as usize)
+                        .with_policy(SendAdmissionPolicy::DropOldest)
+                        .with_dropped(dropped);
+                }
+            }
         }
         self.allocated += frame_len;
         self.queue.push_back(frame);
         self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
-        Backpressure::Ok
+        self.evidence(SendAdmissionOutcome::Accepted, frame_len as usize)
+            .with_policy(self.admission_policy())
     }
 
     /// Remove and return the next frame from the front of the buffer.
@@ -331,7 +409,7 @@ impl PeerSendBuffer {
     /// Shut down the buffer: mark it as closed and drain all queued frames.
     ///
     /// After this call, all further [`try_enqueue`](Self::try_enqueue) calls
-    /// return [`Backpressure::Shutdown`].
+    /// return `Closed` evidence.
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         self.drain();
@@ -376,6 +454,26 @@ impl PeerSendBuffer {
     /// Return the configured backpressure policy.
     pub fn policy(&self) -> BackpressurePolicy {
         self.config.backpressure_policy
+    }
+
+    fn admission_policy(&self) -> SendAdmissionPolicy {
+        match self.config.backpressure_policy {
+            BackpressurePolicy::Error => SendAdmissionPolicy::Error,
+            BackpressurePolicy::DropOldest => SendAdmissionPolicy::DropOldest,
+            BackpressurePolicy::Block => SendAdmissionPolicy::Block,
+        }
+    }
+
+    fn evidence(&self, outcome: SendAdmissionOutcome, requested: usize) -> SendAdmissionEvidence {
+        SendAdmissionEvidence::new(outcome)
+            .with_queue_depth(self.queue.len())
+            .with_byte_depth(self.allocated as usize)
+            .with_capacity(SendCapacityEvidence::new(
+                SendCapacityClass::BufferMemory,
+                self.allocated as usize,
+                Some(requested),
+                Some(self.max_memory as usize),
+            ))
     }
 }
 
@@ -467,6 +565,31 @@ mod tests {
             buf.try_enqueue(Bytes::from_static(b"x")),
             Backpressure::PeerFull
         );
+    }
+
+    #[test]
+    fn full_buffer_rejection_reports_capacity_evidence_without_mutation() {
+        let config = SendBufferConfig {
+            max_memory: KB,
+            backpressure_policy: BackpressurePolicy::Error,
+        };
+        let mut buf = PeerSendBuffer::new(&config);
+        assert_eq!(
+            buf.try_enqueue(Bytes::from(vec![0u8; KB as usize])),
+            Backpressure::Ok
+        );
+
+        let evidence = buf.try_enqueue(Bytes::from_static(b"x"));
+        assert_eq!(evidence.outcome, SendAdmissionOutcome::Backpressured);
+        assert_eq!(evidence.policy, Some(SendAdmissionPolicy::Error));
+        assert_eq!(
+            evidence.capacity.unwrap().class,
+            SendCapacityClass::BufferMemory
+        );
+        assert_eq!(evidence.queue_depth, Some(1));
+        assert_eq!(evidence.byte_depth, Some(KB as usize));
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.allocated(), KB);
     }
 
     // --- Backpressure signal on full buffer ---
@@ -783,6 +906,52 @@ mod tests {
 
         // Can enqueue again
         assert_eq!(buf.try_enqueue(Bytes::from_static(b"x")), Backpressure::Ok);
+    }
+
+    #[test]
+    fn drop_oldest_try_enqueue_reports_dropped_frame_evidence() {
+        let config = SendBufferConfig {
+            max_memory: KB,
+            backpressure_policy: BackpressurePolicy::DropOldest,
+        };
+        let mut buf = PeerSendBuffer::new(&config);
+        assert_eq!(
+            buf.try_enqueue(Bytes::from(vec![0u8; KB as usize])),
+            Backpressure::Ok
+        );
+
+        let evidence = buf.try_enqueue(Bytes::from_static(b"x"));
+        assert_eq!(evidence.outcome, SendAdmissionOutcome::DroppedOldest);
+        assert_eq!(evidence.policy, Some(SendAdmissionPolicy::DropOldest));
+        assert_eq!(evidence.dropped.len(), 1);
+        assert_eq!(evidence.dropped[0].bytes, Some(KB as usize));
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.allocated(), 1);
+        assert_eq!(buf.stats.snapshot().dropped, 1);
+        assert_eq!(buf.stats.snapshot().rejected, 0);
+    }
+
+    #[test]
+    fn block_policy_reports_wait_unavailable_without_mutation() {
+        let config = SendBufferConfig {
+            max_memory: KB,
+            backpressure_policy: BackpressurePolicy::Block,
+        };
+        let mut buf = PeerSendBuffer::new(&config);
+        assert_eq!(
+            buf.try_enqueue(Bytes::from(vec![0u8; KB as usize])),
+            Backpressure::Ok
+        );
+
+        let evidence = buf.try_enqueue(Bytes::from_static(b"x"));
+        assert_eq!(evidence.outcome, SendAdmissionOutcome::Backpressured);
+        assert_eq!(evidence.policy, Some(SendAdmissionPolicy::Block));
+        assert_eq!(evidence.wake, SendWakeEvidence::Unavailable);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.allocated(), KB);
+        let stats = buf.stats.snapshot();
+        assert_eq!(stats.blocks, 1);
+        assert_eq!(stats.rejected, 0);
     }
 
     #[test]

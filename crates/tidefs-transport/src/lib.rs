@@ -307,6 +307,7 @@ pub mod rollback_compat;
 pub mod routing;
 pub mod secure_transport;
 pub mod segment_fetch;
+pub mod send_admission;
 pub mod send_backpressure;
 pub mod send_batcher;
 pub mod send_buffer;
@@ -503,8 +504,12 @@ pub use request_response::{
     CorrelationError, RequestResponseHandle, RequestResponseTable, TimeoutConfig,
 };
 pub use routing::{RouteEntry, RoutingTable};
+pub use send_admission::{
+    DroppedSendEvidence, SendAdmission, SendAdmissionEvidence, SendAdmissionOutcome,
+    SendAdmissionPolicy, SendCapacityClass, SendCapacityEvidence, SendWakeEvidence,
+};
 pub use send_backpressure::{
-    data_lane_pressure_fn, SendCapacity, SendCapacitySet, SendWatermarkConfig,
+    data_lane_pressure_fn, SendCapacity, SendCapacitySet, SendCapacitySnapshot, SendWatermarkConfig,
 };
 pub use send_batcher::{BatchResult, SendBatchConfig, SendBatcher};
 pub use send_coalesce::{CoalesceConfig, CoalesceFlush, CoalesceKey, SendCoalescer};
