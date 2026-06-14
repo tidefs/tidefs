@@ -411,9 +411,12 @@ Important 2026-06-01 findings:
   through `LocalOnlyGuard`. Issue #243 removes the FUSE daemon's independent
   `cluster_authorized` boolean/raw-token pairing: `tidefsctl mount` constructs
   standalone mount authority, while `pool mount --cluster` carries a typed,
-  validated `PoolLeaseToken` into daemon admission. TFR-011 remains open until
-  the operator surface, live-owner routing, cluster diagnostics/authorization,
-  and kernel UAPI authority are one reviewed boundary.
+  validated `PoolLeaseToken` into daemon admission. Issue #278 gates the
+  preview UAPI doc, tidefsctl book chapter, operator-authz boundary, and
+  claims-gate policy against the exact command classification/admission table.
+  TFR-011 remains open until the operator surface, live-owner routing, cluster
+  diagnostics/authorization, and kernel UAPI authority are one reviewed
+  boundary.
 - `TFR-012`: Device lifecycle and media privacy remain incomplete. Pool-member
   backing must be one byte-addressable media model: block devices for
   production and regular files for hidden development mode. Directory
