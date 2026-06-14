@@ -33,7 +33,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-daemon_opts="${TIDEFS_XFSTESTS_DAEMON_OPTIONS:-atime,dev}"
+daemon_opts="${TIDEFS_XFSTESTS_DAEMON_OPTIONS:-relatime,dev}"
 if [ -n "${mount_opts:-}" ]; then
     old_ifs="$IFS"
     IFS=,
@@ -41,6 +41,9 @@ if [ -n "${mount_opts:-}" ]; then
         case "$opt" in
             atime|strictatime|relatime|noatime)
                 daemon_opts="$opt"
+                ;;
+            nodiratime|diratime)
+                daemon_opts="$daemon_opts,$opt"
                 ;;
             sync|async|dev|nodev)
                 daemon_opts="$daemon_opts,$opt"

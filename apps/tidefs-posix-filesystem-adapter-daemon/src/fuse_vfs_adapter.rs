@@ -1712,6 +1712,7 @@ fn setattr_from_fuse(
     size: Option<u64>,
     atime: Option<fuser::TimeOrNow>,
     mtime: Option<fuser::TimeOrNow>,
+    ctime: Option<SystemTime>,
     fh: Option<u64>,
 ) -> (SetAttr, Option<u64>) {
     let mut valid: u32 = 0;
@@ -1754,6 +1755,10 @@ fn setattr_from_fuse(
             }
         }
     }
+    if let Some(ct) = ctime {
+        valid |= FATTR_CTIME;
+        sa.ctime_ns = system_time_to_ns(ct);
+    }
     if fh.is_some() {
         valid |= FATTR_FH;
     }
@@ -1770,8 +1775,11 @@ fn is_timestamp_only_setattr(attr: &SetAttr) -> bool {
 fn is_fuse_read_atime_setattr(attr: &SetAttr, fh: Option<u64>) -> bool {
     let valid_without_handle = attr.valid & !FATTR_FH;
     let handle_bit_is_consistent = attr.valid & FATTR_FH == 0 || fh.is_some();
-    handle_bit_is_consistent
-        && (valid_without_handle == FATTR_ATIME || valid_without_handle == FATTR_ATIME_NOW)
+    let is_read_atime_shape = valid_without_handle == FATTR_ATIME
+        || valid_without_handle == FATTR_ATIME_NOW
+        || valid_without_handle == (FATTR_ATIME | FATTR_CTIME)
+        || valid_without_handle == (FATTR_ATIME_NOW | FATTR_CTIME);
+    handle_bit_is_consistent && is_read_atime_shape
 }
 
 fn orphan_timestamp_attr_out(ino: u64, attr: &SetAttr, ctx: &RequestCtx) -> FuseAttrOut {
@@ -8719,7 +8727,7 @@ impl Filesystem for FuseVfsAdapter {
         size: Option<u64>,
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<SystemTime>,
+        ctime: Option<SystemTime>,
         fh: Option<u64>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
@@ -8730,7 +8738,7 @@ impl Filesystem for FuseVfsAdapter {
         let ctx = Self::ctx_from_req(req);
         let _p5_02 =
             Self::classify_fuse_setattr(req.unique(), ino, req.uid(), req.gid(), req.pid());
-        let (sa, fh) = setattr_from_fuse(mode, uid, gid, size, atime, mtime, fh);
+        let (sa, fh) = setattr_from_fuse(mode, uid, gid, size, atime, mtime, ctime, fh);
         let diagnostic = fuse_op_diagnostics_enabled();
         let start = std::time::Instant::now();
         if diagnostic {
@@ -11315,6 +11323,95 @@ mod tests {
             after.posix.ctime_ns, before.posix.ctime_ns,
             "automatic FUSE atime setattr with a file handle must not advance ctime"
         );
+    }
+
+    #[test]
+    fn fuser_setattr_conversion_preserves_ctime() {
+        let atime = UNIX_EPOCH + Duration::from_secs(11);
+        let ctime = UNIX_EPOCH + Duration::from_secs(17) + Duration::from_nanos(123);
+
+        let (attr, fh) = setattr_from_fuse(
+            None,
+            None,
+            None,
+            None,
+            Some(fuser::TimeOrNow::SpecificTime(atime)),
+            None,
+            Some(ctime),
+            Some(42),
+        );
+
+        assert_eq!(fh, Some(42));
+        assert_eq!(attr.valid & FATTR_ATIME, FATTR_ATIME);
+        assert_eq!(attr.valid & FATTR_CTIME, FATTR_CTIME);
+        assert_eq!(attr.valid & FATTR_FH, FATTR_FH);
+        assert_eq!(attr.atime_ns, system_time_to_ns(atime));
+        assert_eq!(attr.ctime_ns, system_time_to_ns(ctime));
+    }
+
+    #[test]
+    fn fuse_callback_atime_ctime_setattr_records_read_without_ctime() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"fuse-atime-ctime-setattr.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before automatic atime with ctime")
+        };
+        assert_eq!(before.posix.atime_ns, 1);
+
+        std::thread::sleep(Duration::from_millis(1));
+        let mut read_atime = SetAttr::new();
+        read_atime.valid = FATTR_ATIME_NOW | FATTR_CTIME;
+        read_atime.ctime_ns = before.posix.ctime_ns;
+        fixture
+            .adapter
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .expect("automatic fuse atime setattr with preserved ctime");
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after automatic atime with ctime")
+        };
+        assert!(
+            after.posix.atime_ns > before.posix.atime_ns,
+            "automatic FUSE atime+ctime setattr should record read access"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "automatic FUSE atime+ctime setattr must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn fuse_read_atime_setattr_accepts_kernel_ctime_preservation() {
+        let mut attr = SetAttr::new();
+        attr.valid = FATTR_ATIME | FATTR_CTIME;
+        assert!(is_fuse_read_atime_setattr(&attr, None));
+
+        attr.valid = FATTR_ATIME_NOW | FATTR_CTIME | FATTR_FH;
+        assert!(is_fuse_read_atime_setattr(&attr, Some(9)));
+        assert!(!is_fuse_read_atime_setattr(&attr, None));
+
+        attr.valid = FATTR_ATIME | FATTR_MTIME | FATTR_CTIME;
+        assert!(!is_fuse_read_atime_setattr(&attr, None));
     }
 
     #[test]

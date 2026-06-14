@@ -373,7 +373,7 @@ GROUP
 set -e
 dev="tidefs-xfstests-root"
 mnt=""
-daemon_opts="atime,dev,allow_other"
+daemon_opts="relatime,dev,allow_other"
 daemon_read_only=""
 daemon_coherency="writeback"
 daemon_writeback_cache="1"
