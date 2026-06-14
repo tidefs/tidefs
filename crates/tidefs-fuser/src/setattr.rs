@@ -258,8 +258,8 @@ pub const RELATIME_24H_NS: i64 = 24 * 3600 * 1_000_000_000;
 /// Returns `true` if atime should be bumped to the current time.
 ///
 /// Rules (matching Linux `relatime` behaviour):
-/// - Update if atime is older than mtime.
-/// - Update if atime is older than ctime.
+/// - Update if atime is not newer than mtime.
+/// - Update if atime is not newer than ctime.
 /// - Update if atime is more than 24 hours in the past from `now_ns`.
 #[must_use]
 pub fn should_update_atime_relatime(
@@ -268,7 +268,9 @@ pub fn should_update_atime_relatime(
     ctime_ns: i64,
     now_ns: i64,
 ) -> bool {
-    atime_ns < mtime_ns || atime_ns < ctime_ns || now_ns.saturating_sub(atime_ns) >= RELATIME_24H_NS
+    atime_ns <= mtime_ns
+        || atime_ns <= ctime_ns
+        || now_ns.saturating_sub(atime_ns) >= RELATIME_24H_NS
 }
 
 /// Current time as nanoseconds since UNIX epoch.
@@ -810,6 +812,16 @@ mod tests {
     #[test]
     fn relatime_updates_if_atime_before_ctime() {
         assert!(should_update_atime_relatime(100, 100, 200, 300));
+    }
+
+    #[test]
+    fn relatime_updates_if_atime_equals_mtime() {
+        assert!(should_update_atime_relatime(100, 100, 99, 300));
+    }
+
+    #[test]
+    fn relatime_updates_if_atime_equals_ctime() {
+        assert!(should_update_atime_relatime(100, 99, 100, 300));
     }
 
     #[test]
