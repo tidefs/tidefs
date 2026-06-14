@@ -1503,10 +1503,12 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
     }
 
     fn load_or_initialize_state(&mut self) -> Result<FileSystemState> {
+        let root_authentication_key = self.root_authentication_key;
+        let recovery_policy = self.recovery_policy;
         match load_latest_committed_state(
             self.raw_recovery_store_mut(),
-            self.root_authentication_key,
-            self.recovery_policy,
+            root_authentication_key,
+            recovery_policy,
         )? {
             Some(state) => Ok(state),
             None => match self.store.primary_store().get(superblock_object_key())? {
@@ -1516,7 +1518,7 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
                     persist_state(
                         self.raw_recovery_store_mut(),
                         &state,
-                        self.root_authentication_key,
+                        root_authentication_key,
                     )?;
                     Ok(state)
                 }
@@ -1525,7 +1527,7 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
                     persist_state(
                         self.raw_recovery_store_mut(),
                         &state,
-                        self.root_authentication_key,
+                        root_authentication_key,
                     )?;
                     Ok(state)
                 }
@@ -1639,11 +1641,12 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
         recovered_generation: &mut u64,
     ) -> Result<()> {
         if self.recovery_policy.allows_replay() {
+            let root_authentication_key = self.root_authentication_key;
             let engine = crate::txg_replay::TxgReplayEngine::new(Default::default());
             match engine.replay(
                 self.raw_recovery_store_mut(),
                 state,
-                self.root_authentication_key,
+                root_authentication_key,
             ) {
                 Ok(Some((replayed_state, outcome))) => {
                     *state = replayed_state;
@@ -1674,7 +1677,7 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
         Ok(())
     }
 
-    fn pool_stats(&self) -> tidefs_local_object_store::pool::PoolStats {
+    fn pool_stats(&self) -> tidefs_local_object_store::pool::PoolCapacityStats {
         self.store.pool_stats()
     }
 
