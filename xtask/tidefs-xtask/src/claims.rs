@@ -7,6 +7,8 @@ pub const CLAIMS_GATE_REQUIRED_COMMAND: &str = "cargo run -p tidefs-xtask -- che
 
 pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "README.md",
+    "apps/README.md",
+    "crates/README.md",
     "docs/00_user_requirements.md",
     "docs/CLAIMS_GATE_POLICY.md",
     "docs/GETTING_STARTED.md",
@@ -79,8 +81,29 @@ const CLAIMS_GATE_ALLOWED_FRAMES: &[&str] = &[
     "raw-store inventory",
     "raw-store bypass",
     "transform authority",
+    "mounted compression policy",
     "helper/library tier",
     "not an end-to-end mounted filesystem",
+];
+
+const APP_INDEX_LIMITATION_MARKERS: &[&str] = &[
+    "inventory, not a production-readiness claim",
+    "`tidefsctl`",
+    "`TFR-011`/`TFR-019` review",
+    "non-production Local Filesystem demo",
+    "storage-node cluster authority remains under `TFR-017`",
+    "non-production Local Object Store demo",
+];
+
+const CRATE_INDEX_LIMITATION_MARKERS: &[&str] = &[
+    "package counts and tables below are stale",
+    "review input, not current package authority",
+    "not current package authority",
+    "source ownership index, not release proof",
+    "Capability claims",
+    "must follow `docs/REVIEW_TODO_REGISTER.md`",
+    "`docs/CLAIMS_GATE_POLICY.md`",
+    "`cargo run -p tidefs-xtask -- check-claims-gate`",
 ];
 
 #[derive(Debug)]
@@ -272,18 +295,33 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
         "docs/CLAIMS_GATE_POLICY.md",
         &[
             "tracked GitHub issue",
+            "apps/README.md",
+            "crates/README.md",
             "OpenZFS/Ceph successor claim",
             "production-ready",
             "POSIX-complete",
             "check-claims-gate",
             "Proof Before Stronger Claims",
+            "explicit limitation framing",
             "Unreleased Authority Boundary",
             "Mounted Transform Authority",
             "raw-store inventory",
             "Operator Command Classification",
             "tidefsctl-command-classification-v1",
-            "cluster placement exercise",
+            "`cluster placement\nexercise`",
         ],
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "apps/README.md",
+        APP_INDEX_LIMITATION_MARKERS,
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "crates/README.md",
+        CRATE_INDEX_LIMITATION_MARKERS,
         &mut missing,
     );
     check_source_markers(
@@ -484,7 +522,8 @@ fn find_workspace_root() -> Option<PathBuf> {
 mod tests {
     use super::{
         claims_gate_rules, line_has_present_tense_overclaim, ClaimGateRuleTopic,
-        CLAIMS_GATE_POLICY_SPEC, CLAIMS_GATE_REQUIRED_COMMAND, CLAIMS_GATE_SCANNED_DOCS,
+        APP_INDEX_LIMITATION_MARKERS, CLAIMS_GATE_POLICY_SPEC, CLAIMS_GATE_REQUIRED_COMMAND,
+        CLAIMS_GATE_SCANNED_DOCS, CRATE_INDEX_LIMITATION_MARKERS,
     };
 
     #[test]
@@ -534,12 +573,44 @@ mod tests {
         assert!(CLAIMS_GATE_POLICY_SPEC.contains("tidefsctl command classification"));
         assert!(CLAIMS_GATE_REQUIRED_COMMAND.contains("check-claims-gate"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"README.md"));
+        assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"apps/README.md"));
+        assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"crates/README.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/REVIEW_TODO_REGISTER.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/UNRELEASED_AUTHORITY_POLICY.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/WHOLE_REPO_REVIEW.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS
             .contains(&"docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md"));
+    }
+
+    #[test]
+    fn claims_gate_requires_top_level_index_limitations() {
+        for marker in [
+            "inventory, not a production-readiness claim",
+            "`TFR-011`/`TFR-019` review",
+            "storage-node cluster authority remains under `TFR-017`",
+            "non-production Local Object Store demo",
+        ] {
+            assert!(
+                APP_INDEX_LIMITATION_MARKERS.contains(&marker),
+                "apps index should require marker {marker}"
+            );
+        }
+
+        for marker in [
+            "package counts and tables below are stale",
+            "review input, not current package authority",
+            "not current package authority",
+            "source ownership index, not release proof",
+            "Capability claims",
+            "must follow `docs/REVIEW_TODO_REGISTER.md`",
+            "`cargo run -p tidefs-xtask -- check-claims-gate`",
+        ] {
+            assert!(
+                CRATE_INDEX_LIMITATION_MARKERS.contains(&marker),
+                "crates index should require marker {marker}"
+            );
+        }
     }
 
     #[test]

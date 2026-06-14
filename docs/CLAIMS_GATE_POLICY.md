@@ -82,10 +82,17 @@ material as historical input.
 
 ## Scanned surfaces
 
-`tidefs-xtask check-claims-gate` scans the top-level README, current policy
-docs, preview handoff docs that remain in the tree, the review register, and
-the whole-repo review. It also verifies that the source rule table in
-`xtask/tidefs-xtask/src/claims.rs` and this policy document remain present.
+`tidefs-xtask check-claims-gate` scans the top-level README,
+`apps/README.md`, `crates/README.md`, current policy docs, preview handoff
+docs that remain in the tree, the review register, and the whole-repo review.
+It also verifies that the source rule table in `xtask/tidefs-xtask/src/claims.rs`
+and this policy document remain present.
+
+The top-level app and crate indexes are checked publishing surfaces. They may
+summarize maturity only with explicit limitation framing: app summaries must
+remain inventory text rather than production-readiness claims, and crate
+package counts, area tables, and capability summaries must remain review input
+rather than current package authority or release proof.
 
 ## Work-State Boundary
 
