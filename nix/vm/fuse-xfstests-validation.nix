@@ -386,6 +386,9 @@ merge_mount_opts() {
             atime|strictatime|relatime|noatime)
                 daemon_opts="$opt"
                 ;;
+            nodiratime|diratime)
+                daemon_opts="$daemon_opts,$opt"
+                ;;
             sync|async|allow_other|noallow_other|dev|nodev)
                 daemon_opts="$daemon_opts,$opt"
                 ;;
