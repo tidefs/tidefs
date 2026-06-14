@@ -10739,6 +10739,12 @@ impl LocalFileSystem {
         update: tidefs_inode_attributes::timestamp::TimestampUpdate,
         policy: tidefs_inode_attributes::timestamp::TimestampPolicy,
     ) -> Result<()> {
+        if !self.state.inodes.contains_key(&inode_id) {
+            if !self.state.known_inode_ids.contains(&inode_id) && inode_id != ROOT_INODE_ID {
+                return Ok(());
+            }
+            self.ensure_inode_loaded_for_write(inode_id)?;
+        }
         let record = self.state.inodes.get(&inode_id).cloned();
         let record = match record {
             Some(r) => r,
@@ -10776,6 +10782,12 @@ impl LocalFileSystem {
         update: tidefs_inode_attributes::timestamp::TimestampUpdate,
         policy: tidefs_inode_attributes::timestamp::TimestampPolicy,
     ) -> Result<()> {
+        if !self.state.inodes.contains_key(&inode_id) {
+            if !self.state.known_inode_ids.contains(&inode_id) && inode_id != ROOT_INODE_ID {
+                return Ok(());
+            }
+            self.ensure_inode_loaded_for_write(inode_id)?;
+        }
         let record = self.state.inodes.get(&inode_id).cloned();
         let record = match record {
             Some(r) => r,
