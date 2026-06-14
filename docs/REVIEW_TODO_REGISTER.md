@@ -393,10 +393,11 @@ Important 2026-06-01 findings:
   pin authority. Bookmark entries are non-retaining local anchors. The module
   now frames that shape as local lifecycle surface rather than ZFS-equivalent
   completeness. Send/receive exports current and snapshot roots, incremental
-  export filters content by object key/checksum, and receive republishes roots
-  after staging, but these paths are not unified with deadlist accounting,
-  placement receipts, distributed send/receive authority, or integrated
-  snapshot reclaim.
+  export filters content by object key/checksum, and local incremental receive
+  now refuses absent, loose, divergent, or unprotected base roots before
+  publishing a new selected root. These paths are not unified with deadlist
+  accounting, placement receipts, distributed send/receive authority, conflict
+  resolution, or integrated snapshot reclaim.
 - `TFR-011`: Operator/UAPI authority is not yet one boundary.
   Commit `7dbb0759` removes the fake `pool list` parser surface instead of
   accepting a command whose handler only said scaffolding had been removed, and

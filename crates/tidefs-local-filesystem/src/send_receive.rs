@@ -41,6 +41,7 @@ pub(crate) struct PreparedChangedRecordExport {
     roots: Vec<PreparedChangedRecordRoot>,
     total_records: u64,
     payload_bytes: u64,
+    stream_version: u16,
     /// Placement epoch from the decoded export; None when sender did not track it.
     placement_epoch: Option<u64>,
 }
@@ -148,7 +149,8 @@ pub(crate) fn export_incremental_changed_records(
         .collect();
 
     // Export all roots (including snapshot roots) then filter each.
-    let mut source_roots = roots_with_snapshot_roots(vec![to_root.clone()], current_state);
+    let mut source_roots =
+        roots_with_snapshot_roots(vec![from_root.clone(), to_root.clone()], current_state);
     source_roots.sort_by_key(|root| root.transaction_id);
 
     let mut seen_root_ids = BTreeSet::new();
@@ -337,6 +339,52 @@ pub(crate) fn validate_changed_record_export(
     }
 
     let current_identity = RootIdentity::from_summary(&export.current_root);
+    if is_incremental {
+        if !export.incremental {
+            return Err(FileSystemError::Unsupported {
+                operation: "incremental receive",
+                reason: "stream is a full export; use full receive into a fresh target",
+            });
+        }
+        let from_root = export.from_root.as_ref().ok_or(FileSystemError::Decode {
+            object: "local filesystem send/receive stream",
+            reason: "incremental stream is missing from_root",
+        })?;
+        if !from_root.has_transaction_manifest || !from_root.has_root_authentication {
+            return Err(FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "incremental from_root is not manifest-backed and authenticated",
+            });
+        }
+        if export.current_root.transaction_id <= from_root.transaction_id {
+            return Err(FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "incremental current root is not newer than from_root",
+            });
+        }
+        if RootIdentity::from_summary(from_root) == current_identity {
+            return Err(FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "incremental current root matches from_root",
+            });
+        }
+        if !export
+            .roots
+            .iter()
+            .any(|root| committed_root_stream_identity_matches(&root.source_root, from_root))
+        {
+            return Err(FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "incremental from_root is not present in stream roots",
+            });
+        }
+    } else if export.incremental || export.from_root.is_some() {
+        return Err(FileSystemError::Unsupported {
+            operation: "send/receive import",
+            reason: "incremental stream requires incremental receive into an existing target",
+        });
+    }
+
     let mut seen_roots = BTreeSet::new();
     let mut prepared_roots = Vec::new();
     for root in &export.roots {
@@ -402,7 +450,91 @@ pub(crate) fn validate_changed_record_export(
         roots: prepared_roots,
         total_records,
         payload_bytes,
+        stream_version: export.stream_version,
         placement_epoch: export.placement_epoch,
+    })
+}
+
+fn committed_root_stream_identity_matches(
+    candidate: &CommittedRootSummary,
+    expected: &CommittedRootSummary,
+) -> bool {
+    candidate.transaction_id == expected.transaction_id
+        && candidate.generation == expected.generation
+        && candidate.next_inode_id == expected.next_inode_id
+        && candidate.inode_count == expected.inode_count
+        && candidate.superblock_checksum == expected.superblock_checksum
+        && candidate.has_transaction_manifest
+        && expected.has_transaction_manifest
+        && candidate.manifest_checksum == expected.manifest_checksum
+        && candidate.manifest_entry_count == expected.manifest_entry_count
+        && candidate.has_root_authentication
+        && expected.has_root_authentication
+        && candidate.root_authentication_policy_epoch == expected.root_authentication_policy_epoch
+        && candidate.root_authentication_algorithm_suite_id
+            == expected.root_authentication_algorithm_suite_id
+        && candidate.superblock_digest == expected.superblock_digest
+        && candidate.manifest_digest == expected.manifest_digest
+        && candidate.root_authentication_code == expected.root_authentication_code
+}
+
+fn manifest_role_is_content(role: TransactionManifestObjectRole) -> bool {
+    matches!(
+        role,
+        TransactionManifestObjectRole::VersionedContent
+            | TransactionManifestObjectRole::VersionedContentChunk
+    )
+}
+
+fn committed_root_incremental_base_identity_matches(
+    candidate: &CommittedRootSummary,
+    expected: &CommittedRootSummary,
+) -> bool {
+    candidate.transaction_id == expected.transaction_id
+        && candidate.generation == expected.generation
+        && candidate.next_inode_id == expected.next_inode_id
+        && candidate.inode_count == expected.inode_count
+        && candidate.superblock_checksum == expected.superblock_checksum
+        && candidate.has_transaction_manifest
+        && expected.has_transaction_manifest
+        && candidate.has_root_authentication
+        && expected.has_root_authentication
+        && candidate.root_authentication_policy_epoch == expected.root_authentication_policy_epoch
+        && candidate.root_authentication_algorithm_suite_id
+            == expected.root_authentication_algorithm_suite_id
+        && candidate.superblock_digest == expected.superblock_digest
+}
+
+fn verify_incremental_base_root_authority(
+    existing: &LocalFileSystem,
+    audit: &RecoveryAuditReport,
+    from_root: &CommittedRootSummary,
+) -> Result<CommittedRootSummary> {
+    let Some(audited_base) = audit
+        .valid_committed_roots
+        .iter()
+        .find(|candidate| committed_root_incremental_base_identity_matches(candidate, from_root))
+    else {
+        return Err(FileSystemError::Unsupported {
+            operation: "incremental receive",
+            reason: "target recovery audit does not contain the incremental base root identity",
+        });
+    };
+
+    existing.ensure_snapshot_authority_consistent()?;
+    for record in existing.state.snapshots.values() {
+        if !crate::snapshot::snapshot_record_retains_data(record) {
+            continue;
+        }
+        if committed_root_incremental_base_identity_matches(&record.root, audited_base) {
+            existing.ensure_snapshot_record_authority(record)?;
+            return Ok(record.root.clone());
+        }
+    }
+
+    Err(FileSystemError::Unsupported {
+        operation: "incremental receive",
+        reason: "incremental base root is not protected by a data-retaining snapshot or clone",
     })
 }
 
@@ -466,12 +598,7 @@ pub(crate) fn prepare_changed_record_root(
                 // (VersionedContent / VersionedContentChunk) from the stream.
                 // The receiver already has them from the baseline state, so
                 // skipping them here is correct.
-                let is_content_role = matches!(
-                    entry.role,
-                    TransactionManifestObjectRole::VersionedContent
-                        | TransactionManifestObjectRole::VersionedContentChunk
-                );
-                if is_incremental && is_content_role {
+                if is_incremental && manifest_role_is_content(entry.role) {
                     continue;
                 }
                 return Err(FileSystemError::Decode {
@@ -1057,12 +1184,138 @@ pub(crate) fn changed_record_payload(
         })
 }
 
+fn validate_incremental_target_content_objects(
+    store: &LocalObjectStore,
+    prepared: &PreparedChangedRecordExport,
+) -> Result<()> {
+    for root in &prepared.roots {
+        let manifest_key = transaction_manifest_object_key(root.source_root.transaction_id);
+        let manifest_record = root
+            .records
+            .get(&manifest_key)
+            .ok_or(FileSystemError::Decode {
+                object: "local filesystem send/receive root",
+                reason: "incremental receive root is missing its transaction manifest record",
+            })?;
+        let manifest = decode_transaction_manifest(&manifest_record.payload)?;
+
+        for entry in manifest
+            .entries
+            .iter()
+            .filter(|entry| manifest_role_is_content(entry.role))
+        {
+            let payload = store
+                .get(entry.object_key)?
+                .ok_or(FileSystemError::Decode {
+                    object: "local filesystem incremental receive target",
+                    reason: "content object required by incoming manifest is missing from target",
+                })?;
+            if checksum64(&payload) != entry.checksum {
+                return Err(FileSystemError::Decode {
+                    object: "local filesystem incremental receive target",
+                    reason:
+                        "content object required by incoming manifest failed checksum validation",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_incremental_omitted_content_objects(
+    store: &LocalObjectStore,
+    prepared: &PreparedChangedRecordExport,
+) -> Result<()> {
+    for root in &prepared.roots {
+        let manifest_key = transaction_manifest_object_key(root.source_root.transaction_id);
+        let manifest_record = root
+            .records
+            .get(&manifest_key)
+            .ok_or(FileSystemError::Decode {
+                object: "local filesystem send/receive root",
+                reason: "incremental receive root is missing its transaction manifest record",
+            })?;
+        let manifest = decode_transaction_manifest(&manifest_record.payload)?;
+
+        for entry in manifest
+            .entries
+            .iter()
+            .filter(|entry| manifest_role_is_content(entry.role))
+        {
+            if root.records.contains_key(&entry.object_key) {
+                continue;
+            }
+            let payload = store
+                .get(entry.object_key)?
+                .ok_or(FileSystemError::Decode {
+                    object: "local filesystem incremental receive target",
+                    reason: "omitted content object required by incremental base is missing from target",
+                })?;
+            if checksum64(&payload) != entry.checksum {
+                return Err(FileSystemError::Decode {
+                    object: "local filesystem incremental receive target",
+                    reason:
+                        "omitted content object required by incremental base failed checksum validation",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn target_has_incremental_base_root_slot(
+    store: &LocalObjectStore,
+    from_root: &CommittedRootSummary,
+) -> Result<bool> {
+    for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
+        let slot_key = root_slot_object_key(slot);
+        for location in store.version_locations_of(slot_key).into_iter().rev() {
+            let bytes = match store.get_at_location(location) {
+                Ok(bytes) => bytes,
+                Err(err) if crate::is_skippable_store_error(&err) => continue,
+                Err(err) => return Err(FileSystemError::from(err)),
+            };
+            let root = match decode_root_commit(&bytes) {
+                Ok(root) => root,
+                Err(_) => continue,
+            };
+            if root.slot != slot {
+                continue;
+            }
+            if committed_root_incremental_base_identity_matches(&root.summary(), from_root) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn incremental_receive_placement_verified_stable(
+    local_epoch: Option<u64>,
+    stream_epoch: Option<u64>,
+) -> Result<bool> {
+    match (local_epoch, stream_epoch) {
+        (Some(local_epoch), Some(stream_epoch)) if local_epoch == stream_epoch => Ok(true),
+        (Some(_), Some(_)) => Err(FileSystemError::Unsupported {
+            operation: "incremental receive",
+            reason: "stream placement epoch does not match target placement epoch",
+        }),
+        _ => Ok(false),
+    }
+}
+
 pub(crate) fn receive_changed_records_into_empty_root(
     root: &Path,
     options: StoreOptions,
     export: &ChangedRecordExport,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<ChangedRecordImportReport> {
+    if export.incremental || export.from_root.is_some() {
+        return Err(FileSystemError::Unsupported {
+            operation: "send/receive import",
+            reason: "incremental stream requires incremental receive into an existing target",
+        });
+    }
     if root.exists() {
         return Err(FileSystemError::Unsupported {
             operation: "send/receive import",
@@ -1183,28 +1436,32 @@ pub(crate) fn receive_incremental_changed_records(
 
     let prepared = validate_changed_record_export(export, true)?;
 
-    // Verify the base root exists in the target filesystem.
-    let base_identity = RootIdentity::from_summary(from_root);
+    let preflight_store = LocalObjectStore::open_with_options(root, options.clone())?;
+    if target_has_incremental_base_root_slot(&preflight_store, from_root)? {
+        validate_incremental_omitted_content_objects(&preflight_store, &prepared)?;
+    }
+    drop(preflight_store);
+
+    // Verify the base root exists in the target filesystem and is protected
+    // by the local snapshot/catalog/lifecycle-pin authority.
     let mut existing = LocalFileSystem::open_with_root_authentication_key(
         root,
         options.clone(),
         root_authentication_key,
     )?;
     let audit = existing.recovery_audit()?;
-    let base_found = audit
-        .valid_committed_roots
-        .iter()
-        .any(|r| RootIdentity::from_summary(r) == base_identity);
-    if !base_found {
-        return Err(FileSystemError::Unsupported {
-            operation: "incremental receive",
-            reason: "base snapshot not found in target filesystem",
-        });
-    }
+    let authorized_base = verify_incremental_base_root_authority(&existing, &audit, from_root)?;
+    let placement_verified_stable = incremental_receive_placement_verified_stable(
+        existing.placement_epoch,
+        export.placement_epoch,
+    )?;
     drop(existing);
 
-    // Apply incremental records to the target store.
+    // Prove base content first, then apply changed content and prove every
+    // incoming manifest content reference before publishing a new root slot.
     let mut store = LocalObjectStore::open_with_options(root, options.clone())?;
+    let base_root = root_commit_from_summary(&authorized_base);
+    let _base_state = load_state_from_transaction(&mut store, &base_root, root_authentication_key)?;
     for root_rec in &prepared.roots {
         for record in root_rec.records.values() {
             if matches!(
@@ -1216,6 +1473,7 @@ pub(crate) fn receive_incremental_changed_records(
             }
         }
     }
+    validate_incremental_target_content_objects(&store, &prepared)?;
 
     // Persist all roots (re-signing with the target's authentication key).
     let mut roots = prepared.roots.clone();
@@ -1274,12 +1532,12 @@ pub(crate) fn receive_incremental_changed_records(
         selected_generation: selected.generation,
         selected_transaction_id: selected.transaction_id,
         snapshot_catalog_entries,
-        stream_version: SEND_RECEIVE_STREAM_VERSION,
+        stream_version: prepared.stream_version,
         staging_validated_before_publish: true,
         destination_root_reauthentication: true,
         production_fsck_required: false,
         placement_epoch: export.placement_epoch,
-        placement_verified_stable: false,
+        placement_verified_stable,
     })
 }
 
@@ -1294,7 +1552,10 @@ pub fn verify_placement_stable(
     local_epoch: Option<u64>,
     report: &ChangedRecordImportReport,
 ) -> bool {
-    report.placement_epoch == local_epoch
+    matches!(
+        (local_epoch, report.placement_epoch),
+        (Some(local_epoch), Some(stream_epoch)) if local_epoch == stream_epoch
+    )
 }
 
 // ── Receive checkpoint: durable resume for interrupted streams ──────────────
@@ -1622,7 +1883,7 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
             selected_generation: selected.generation,
             selected_transaction_id: selected.transaction_id,
             snapshot_catalog_entries,
-            stream_version: SEND_RECEIVE_STREAM_VERSION,
+            stream_version: prepared.stream_version,
             staging_validated_before_publish: true,
             destination_root_reauthentication: true,
             production_fsck_required: false,
@@ -1640,8 +1901,7 @@ fn compute_export_identity_from_prepared(
 ) -> IntegrityDigest64 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(SEND_RECEIVE_CHANGED_RECORD_SPEC.as_bytes());
-    let version: u16 = SEND_RECEIVE_STREAM_VERSION;
-    hasher.update(&version.to_le_bytes());
+    hasher.update(&prepared.stream_version.to_le_bytes());
     let mut root_ids: Vec<RootIdentity> = prepared
         .roots
         .iter()
@@ -2575,7 +2835,39 @@ mod tests {
     }
 
     #[test]
-    fn verify_placement_stable_none_both_sides() {
+    fn incremental_receive_placement_match_reports_stable() {
+        let stable = incremental_receive_placement_verified_stable(Some(7), Some(7))
+            .expect("matching placement epochs should be stable");
+        assert!(stable);
+    }
+
+    #[test]
+    fn incremental_receive_placement_mismatch_refuses() {
+        let err = incremental_receive_placement_verified_stable(Some(7), Some(8))
+            .expect_err("mismatched placement epochs must fail closed");
+        assert!(
+            err.to_string()
+                .contains("stream placement epoch does not match target placement epoch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn incremental_receive_placement_absent_is_unknown() {
+        assert!(!incremental_receive_placement_verified_stable(None, None)
+            .expect("absent placement epochs should be reported as unknown"));
+        assert!(
+            !incremental_receive_placement_verified_stable(Some(7), None)
+                .expect("missing stream placement epoch should be reported as unknown")
+        );
+        assert!(
+            !incremental_receive_placement_verified_stable(None, Some(7))
+                .expect("missing target placement epoch should be reported as unknown")
+        );
+    }
+
+    #[test]
+    fn verify_placement_stable_none_is_unknown() {
         let report = crate::ChangedRecordImportReport {
             spec: crate::SEND_RECEIVE_CHANGED_RECORD_SPEC,
             target_root: std::path::PathBuf::from("/tmp/test"),
@@ -2592,9 +2884,8 @@ mod tests {
             placement_epoch: None,
             placement_verified_stable: false,
         };
-        // Neither side tracks placement: stable by definition.
-        assert!(verify_placement_stable(None, &report));
-        // But if receiver tracks placement and sender didn't, it's not stable.
+        // Missing placement evidence is unknown/unstable, not proof of stability.
+        assert!(!verify_placement_stable(None, &report));
         assert!(!verify_placement_stable(Some(1), &report));
     }
 }

@@ -2,11 +2,11 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType};
 use tidefs_local_object_store::CompressionAlgorithm;
-use tidefs_local_object_store::{checksum64, IntegrityDigest64};
+use tidefs_local_object_store::{checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey};
 use tidefs_recovery_loop::RecoveryPolicy;
 use tidefs_types_vfs_core::S_IFDIR;
 use tidefs_types_vfs_core::{LockRange, LockType};
@@ -5963,13 +5963,136 @@ fn incremental_send_receive_skips_unchanged_objects() {
     let decoded = ChangedRecordExport::decode(&encoded).expect("decode incremental stream");
     assert_eq!(decoded, incr_export);
 
-    // The incremental stream is self-contained: it can be decoded and
-    // its structural records carry enough information to reconstruct the
-    // filesystem state.  Full incremental receive (applying delta on top
-    // of an existing baseline) is a separate feature tracked at #790.
+    // The incremental stream can be decoded, but receive must still prove the
+    // target owns the exact protected base root and omitted content objects
+    // before publishing the new selected root.
 
     cleanup(&source_root);
     cleanup(&target_root);
+}
+
+struct IncrementalReceiveFixture {
+    source_root: PathBuf,
+    target_root: PathBuf,
+    target_key: RootAuthenticationKey,
+    incremental_export: ChangedRecordExport,
+    unchanged_data: Vec<u8>,
+    modified_data: Vec<u8>,
+    new_data: Vec<u8>,
+}
+
+fn make_incremental_receive_fixture(
+    name: &str,
+    retain_base_snapshot: bool,
+    placement_epoch: Option<u64>,
+) -> IncrementalReceiveFixture {
+    let source_root = temp_root(&format!("{name}-source"));
+    let target_root = temp_root(&format!("{name}-target"));
+    let source_key = RootAuthenticationKey::from_bytes32([0xcc_u8; ROOT_AUTHENTICATION_KEY_LEN]);
+    let target_key = RootAuthenticationKey::from_bytes32([0xdd_u8; ROOT_AUTHENTICATION_KEY_LEN]);
+
+    let mut source =
+        LocalFileSystem::open_with_root_authentication_key(&source_root, options(), source_key)
+            .expect("open source");
+    source.create_dir("/data", 0o755).expect("mkdir data");
+    let unchanged_data: Vec<u8> = vec![0x11; 8192];
+    source
+        .create_file("/data/unchanged.bin", 0o644)
+        .expect("create unchanged");
+    source
+        .write_file("/data/unchanged.bin", 0, &unchanged_data)
+        .expect("write unchanged");
+    let old_modified: Vec<u8> = vec![0x22; 4096];
+    source
+        .create_file("/data/modified.bin", 0o644)
+        .expect("create modified");
+    source
+        .write_file("/data/modified.bin", 0, &old_modified)
+        .expect("write old modified");
+    source.sync_all().expect("sync baseline");
+    let baseline_root = source
+        .selected_current_root_summary()
+        .expect("baseline root");
+    if retain_base_snapshot {
+        source
+            .create_snapshot("baseline")
+            .expect("baseline snapshot");
+    }
+    let baseline_export = source.export_changed_records().expect("baseline export");
+
+    LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
+        &target_root,
+        options(),
+        &baseline_export,
+        target_key,
+    )
+    .expect("receive baseline");
+
+    let modified_data: Vec<u8> = vec![0x33; 8192];
+    source
+        .replace_file("/data/modified.bin", &modified_data)
+        .expect("replace modified");
+    source
+        .create_file("/data/new.bin", 0o644)
+        .expect("create new");
+    let new_data: Vec<u8> = vec![0x44; 2048];
+    source
+        .write_file("/data/new.bin", 0, &new_data)
+        .expect("write new");
+    source.sync_all().expect("sync delta");
+    if let Some(epoch) = placement_epoch {
+        source.set_placement_epoch(epoch);
+    }
+    let incremental_export = source
+        .export_incremental_changed_records(&baseline_root)
+        .expect("incremental export");
+    drop(source);
+
+    IncrementalReceiveFixture {
+        source_root,
+        target_root,
+        target_key,
+        incremental_export,
+        unchanged_data,
+        modified_data,
+        new_data,
+    }
+}
+
+fn selected_root_for_test(root: &Path, key: RootAuthenticationKey) -> CommittedRootSummary {
+    let mut fs = LocalFileSystem::open_with_root_authentication_key(root, options(), key)
+        .expect("open target for selected root");
+    fs.selected_current_root_summary()
+        .expect("selected current root")
+}
+
+fn omitted_incremental_content_key(export: &ChangedRecordExport) -> ObjectKey {
+    for root in &export.roots {
+        let manifest_record = root
+            .records
+            .iter()
+            .find(|record| record.role == ChangedRecordObjectRole::TransactionManifest)
+            .expect("incremental root has a manifest record");
+        let manifest =
+            decode_transaction_manifest(&manifest_record.payload).expect("decode manifest");
+        for entry in &manifest.entries {
+            if !matches!(
+                entry.role,
+                TransactionManifestObjectRole::VersionedContent
+                    | TransactionManifestObjectRole::VersionedContentChunk
+            ) {
+                continue;
+            }
+            if root
+                .records
+                .iter()
+                .all(|record| record.object_key != entry.object_key)
+            {
+                return entry.object_key;
+            }
+        }
+    }
+    panic!("incremental export did not omit any content object");
 }
 
 /// End-to-end incremental receive: baseline exported to empty target,
@@ -5984,7 +6107,7 @@ fn incremental_send_receive_end_to_end() {
         LocalFileSystem::open_with_root_authentication_key(&source_root, options(), source_key)
             .expect("open source");
     source.create_dir("/data", 0o755).expect("mkdir data");
-    let unchanged_data: Vec<u8> = vec![0x11; 16384];
+    let unchanged_data: Vec<u8> = vec![0x11; 8192];
     source
         .create_file("/data/unchanged.bin", 0o644)
         .expect("create unchanged");
@@ -6064,13 +6187,19 @@ fn incremental_send_receive_end_to_end() {
     assert_eq!(incremental_export.stream_version, 2);
 
     // Phase 5: receive incremental into the target containing only the baseline.
-    LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+    let report = LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
         &target_root,
         options(),
         &incremental_export,
         target_key,
     )
     .expect("receive incremental");
+    assert_eq!(report.stream_version, incremental_export.stream_version);
+    assert_eq!(report.placement_epoch, None);
+    assert!(
+        !report.placement_verified_stable,
+        "absent placement epochs are reported as unknown/unstable"
+    );
 
     // Phase 6: verify target has the delta data.
     {
@@ -6102,6 +6231,258 @@ fn incremental_send_receive_end_to_end() {
 
     cleanup(&source_root);
     cleanup(&target_root);
+}
+
+#[test]
+fn incremental_receive_rejects_missing_from_root_without_selecting_new_root() {
+    let fixture = make_incremental_receive_fixture("incr-missing-from-root", true, None);
+    let before = selected_root_for_test(&fixture.target_root, fixture.target_key);
+    let mut export = fixture.incremental_export.clone();
+    export.from_root = None;
+    export.incremental = true;
+
+    let err = LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+        &fixture.target_root,
+        options(),
+        &export,
+        fixture.target_key,
+    )
+    .expect_err("missing from_root must fail");
+    assert!(
+        err.to_string()
+            .contains("incremental stream is missing from_root"),
+        "unexpected error: {err}"
+    );
+    let after = selected_root_for_test(&fixture.target_root, fixture.target_key);
+    assert_eq!(after, before);
+
+    cleanup(&fixture.source_root);
+    cleanup(&fixture.target_root);
+}
+
+#[test]
+fn incremental_receive_rejects_target_missing_base_root() {
+    let fixture = make_incremental_receive_fixture("incr-missing-base", true, None);
+    let other_root = temp_root("incr-missing-base-other-target");
+    {
+        let mut other = LocalFileSystem::open_with_root_authentication_key(
+            &other_root,
+            options(),
+            fixture.target_key,
+        )
+        .expect("open other target");
+        other
+            .create_file("/other.txt", 0o644)
+            .expect("create other");
+        other
+            .write_file("/other.txt", 0, b"other target")
+            .expect("write other");
+        other.sync_all().expect("sync other");
+    }
+    let before = selected_root_for_test(&other_root, fixture.target_key);
+
+    let err = LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+        &other_root,
+        options(),
+        &fixture.incremental_export,
+        fixture.target_key,
+    )
+    .expect_err("missing base must fail");
+    assert!(
+        err.to_string()
+            .contains("target recovery audit does not contain the incremental base root identity"),
+        "unexpected error: {err}"
+    );
+    let after = selected_root_for_test(&other_root, fixture.target_key);
+    assert_eq!(after, before);
+
+    cleanup(&fixture.source_root);
+    cleanup(&fixture.target_root);
+    cleanup(&other_root);
+}
+
+#[test]
+fn incremental_receive_rejects_loose_unprotected_base_root() {
+    let fixture = make_incremental_receive_fixture("incr-loose-base", false, None);
+    let before = selected_root_for_test(&fixture.target_root, fixture.target_key);
+
+    let err = LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+        &fixture.target_root,
+        options(),
+        &fixture.incremental_export,
+        fixture.target_key,
+    )
+    .expect_err("loose base root without snapshot authority must fail");
+    assert!(
+        err.to_string().contains(
+            "incremental base root is not protected by a data-retaining snapshot or clone"
+        ),
+        "unexpected error: {err}"
+    );
+    let after = selected_root_for_test(&fixture.target_root, fixture.target_key);
+    assert_eq!(after, before);
+
+    cleanup(&fixture.source_root);
+    cleanup(&fixture.target_root);
+}
+
+#[test]
+fn incremental_receive_rejects_divergent_base_root_identity() {
+    let fixture = make_incremental_receive_fixture("incr-divergent-base", true, None);
+    let before = selected_root_for_test(&fixture.target_root, fixture.target_key);
+    let mut export = fixture.incremental_export.clone();
+    let from_root = export
+        .from_root
+        .as_mut()
+        .expect("fixture incremental export has from_root");
+    from_root.superblock_checksum = IntegrityDigest64(from_root.superblock_checksum.get() ^ 1);
+
+    let err = LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+        &fixture.target_root,
+        options(),
+        &export,
+        fixture.target_key,
+    )
+    .expect_err("divergent from_root identity must fail");
+    assert!(
+        err.to_string()
+            .contains("incremental from_root is not present in stream roots"),
+        "unexpected error: {err}"
+    );
+    let after = selected_root_for_test(&fixture.target_root, fixture.target_key);
+    assert_eq!(after, before);
+
+    cleanup(&fixture.source_root);
+    cleanup(&fixture.target_root);
+}
+
+#[test]
+fn incremental_receive_rejects_missing_unchanged_content() {
+    let fixture = make_incremental_receive_fixture("incr-missing-unchanged", true, None);
+    let missing_key = omitted_incremental_content_key(&fixture.incremental_export);
+    {
+        let mut store = LocalObjectStore::open_with_options(&fixture.target_root, options())
+            .expect("open target store");
+        assert!(
+            store.delete(missing_key).expect("delete omitted content"),
+            "omitted content key should exist before deletion"
+        );
+        store.sync_all().expect("sync deletion");
+    }
+
+    let err = LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+        &fixture.target_root,
+        options(),
+        &fixture.incremental_export,
+        fixture.target_key,
+    )
+    .expect_err("missing omitted content must fail");
+    assert!(
+        err.to_string().contains("missing")
+            || err
+                .to_string()
+                .contains("content object required by incoming manifest"),
+        "unexpected error: {err}"
+    );
+
+    cleanup(&fixture.source_root);
+    cleanup(&fixture.target_root);
+}
+
+#[test]
+fn full_receive_rejects_incremental_stream_for_empty_target() {
+    let fixture = make_incremental_receive_fixture("incr-wrong-full-route", true, None);
+    let empty_target = temp_root("incr-wrong-full-route-empty");
+
+    let err =
+        LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
+            &empty_target,
+            options(),
+            &fixture.incremental_export,
+            fixture.target_key,
+        )
+        .expect_err("full receive must reject incremental stream");
+    assert!(
+        err.to_string()
+            .contains("incremental stream requires incremental receive into an existing target"),
+        "unexpected error: {err}"
+    );
+    assert!(!empty_target.exists());
+
+    cleanup(&fixture.source_root);
+    cleanup(&fixture.target_root);
+    cleanup(&empty_target);
+}
+
+#[test]
+fn incremental_receive_rejects_full_stream_for_existing_target() {
+    let fixture = make_incremental_receive_fixture("incr-wrong-incr-route", true, None);
+    let mut full_export = fixture.incremental_export.clone();
+    full_export.incremental = false;
+    full_export.from_root = None;
+
+    let err = LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+        &fixture.target_root,
+        options(),
+        &full_export,
+        fixture.target_key,
+    )
+    .expect_err("incremental receive must reject full stream");
+    assert!(
+        err.to_string()
+            .contains("stream is not an incremental export"),
+        "unexpected error: {err}"
+    );
+
+    cleanup(&fixture.source_root);
+    cleanup(&fixture.target_root);
+}
+
+#[test]
+fn incremental_receive_reports_unknown_placement_without_target_epoch() {
+    let fixture = make_incremental_receive_fixture("incr-placement-unknown", true, Some(42));
+
+    let report = LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+        &fixture.target_root,
+        options(),
+        &fixture.incremental_export,
+        fixture.target_key,
+    )
+    .expect("receive incremental with sender placement epoch");
+    assert_eq!(report.placement_epoch, Some(42));
+    assert!(
+        !report.placement_verified_stable,
+        "target without a placement epoch must report unknown/unstable"
+    );
+    assert!(!verify_placement_stable(None, &report));
+    assert!(!verify_placement_stable(Some(41), &report));
+    assert!(verify_placement_stable(Some(42), &report));
+
+    let target = LocalFileSystem::open_with_root_authentication_key(
+        &fixture.target_root,
+        options(),
+        fixture.target_key,
+    )
+    .expect("open target after placement receive");
+    assert_eq!(
+        target
+            .read_file("/data/unchanged.bin")
+            .expect("read unchanged"),
+        fixture.unchanged_data
+    );
+    assert_eq!(
+        target
+            .read_file("/data/modified.bin")
+            .expect("read modified"),
+        fixture.modified_data
+    );
+    assert_eq!(
+        target.read_file("/data/new.bin").expect("read new"),
+        fixture.new_data
+    );
+
+    cleanup(&fixture.source_root);
+    cleanup(&fixture.target_root);
 }
 
 /// Test chained incremental receives: baseline → delta1 → delta2.
