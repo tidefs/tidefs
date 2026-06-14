@@ -7440,6 +7440,16 @@ impl FuseVfsAdapter {
         self.invalidate_atime_caches_after_read(ino);
     }
 
+    fn finish_successful_writeback_open_atime(&self, ino: u64, open_flags: u32, ctx: &RequestCtx) {
+        if !self.writeback_cache_enabled {
+            return;
+        }
+        if !open_flags_allow_read(open_flags).unwrap_or(false) {
+            return;
+        }
+        self.finish_successful_read_atime(ino, ctx);
+    }
+
     fn invalidate_atime_caches_after_read(&self, ino: u64) {
         if self.read_only || self.timestamp_policy == TimestampPolicy::NoAtime {
             return;
@@ -8076,6 +8086,7 @@ impl FuseVfsAdapter {
         ));
         self.file_handles.lock().unwrap().inc_open_ref(ino);
         self.remember_writeback_inode(ino);
+        self.finish_successful_writeback_open_atime(ino, engine_open_flags, ctx);
         // FUSE reply flags already computed and stored by AdapterFileHandle::new
         // during allocate(). Read them back for the reply.
         self.mmap_coherency.register(ino, 0);
@@ -10814,6 +10825,200 @@ mod tests {
         assert_eq!(
             after_read.posix.ctime_ns, after_write.posix.ctime_ns,
             "automatic read atime updates must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn writeback_read_open_records_atime_without_ctime() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        fixture.adapter.timestamp_policy = TimestampPolicy::StrictAtime;
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"writeback-open-read-atime.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before read open")
+        };
+        assert_eq!(before.posix.atime_ns, 1);
+
+        std::thread::sleep(Duration::from_millis(1));
+        fixture
+            .adapter
+            .dispatch_open_entry(&ctx, inode.get(), libc::O_RDONLY as u32)
+            .expect("read-capable open");
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after read open")
+        };
+        assert!(
+            after.posix.atime_ns > before.posix.atime_ns,
+            "writeback-cache read-capable open must record read atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "writeback-cache open atime must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn writeback_write_only_open_does_not_record_atime() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        fixture.adapter.timestamp_policy = TimestampPolicy::StrictAtime;
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"writeback-open-writeonly-atime.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before write-only open")
+        };
+
+        std::thread::sleep(Duration::from_millis(1));
+        fixture
+            .adapter
+            .dispatch_open_entry(&ctx, inode.get(), libc::O_WRONLY as u32)
+            .expect("write-only open");
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after write-only open")
+        };
+        assert_eq!(
+            after.posix.atime_ns, before.posix.atime_ns,
+            "write-only open must not record read atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "write-only open must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn writeback_read_open_honors_noatime() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"writeback-open-noatime.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+        fixture.adapter.timestamp_policy = TimestampPolicy::NoAtime;
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before noatime read open")
+        };
+
+        std::thread::sleep(Duration::from_millis(1));
+        fixture
+            .adapter
+            .dispatch_open_entry(&ctx, inode.get(), libc::O_RDONLY as u32)
+            .expect("noatime read-capable open");
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after noatime read open")
+        };
+        assert_eq!(
+            after.posix.atime_ns, before.posix.atime_ns,
+            "noatime writeback open must not record atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "noatime writeback open must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn read_only_writeback_read_open_does_not_record_atime() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"writeback-open-readonly-atime.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+        fixture.adapter.timestamp_policy = TimestampPolicy::StrictAtime;
+        fixture.adapter.set_read_only();
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before read-only read open")
+        };
+
+        std::thread::sleep(Duration::from_millis(1));
+        fixture
+            .adapter
+            .dispatch_open_entry(&ctx, inode.get(), libc::O_RDONLY as u32)
+            .expect("read-only read-capable open");
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after read-only read open")
+        };
+        assert_eq!(
+            after.posix.atime_ns, before.posix.atime_ns,
+            "read-only writeback open must not record atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "read-only writeback open must not advance ctime"
         );
     }
 
