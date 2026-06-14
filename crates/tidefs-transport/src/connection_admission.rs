@@ -36,6 +36,11 @@
 //! [12..13)  reason       u8 discriminant
 //! ```
 
+use tidefs_types_transport_session::{
+    ClosureClass, DrainResultClass, TransportClosureReceipt, TransportClosureReceiptId,
+    TransportSessionId,
+};
+
 // ---------------------------------------------------------------------------
 // BLAKE3 domain constant
 // ---------------------------------------------------------------------------
@@ -108,6 +113,29 @@ pub enum AdmissionRejection {
 }
 
 impl AdmissionRejection {
+    #[must_use]
+    /// Static trigger label used by admission refusal close receipts.
+    pub const fn trigger_ref(self) -> &'static str {
+        match self {
+            Self::NotInRoster => "admission.transport_session_0.not_in_roster.a0",
+            Self::PeerSuspected => "admission.transport_session_0.peer_suspected.a1",
+            Self::PeerDrained => "admission.transport_session_0.peer_drained.a2",
+            Self::EpochMismatch => "admission.transport_session_0.epoch_mismatch.a3",
+        }
+    }
+
+    #[must_use]
+    /// Admission refusals are policy refusals, not clean drains.
+    pub const fn closure_class(self) -> ClosureClass {
+        ClosureClass::RefusedPolicy
+    }
+
+    #[must_use]
+    /// No session exists at admission refusal, so there is no clean drain.
+    pub const fn drain_result_class(self) -> DrainResultClass {
+        DrainResultClass::Force
+    }
+
     /// Discriminant for wire format encoding.
     pub fn discriminant(self) -> u8 {
         match self {
@@ -351,6 +379,8 @@ pub struct ConnectionAdmissionEvent {
     pub claimed_epoch: u64,
     /// Why the peer was rejected.
     pub reason: AdmissionRejection,
+    /// Typed no-session closure evidence for this admission refusal.
+    pub closure_receipt: TransportClosureReceipt,
 }
 
 impl ConnectionAdmissionEvent {
@@ -361,8 +391,52 @@ impl ConnectionAdmissionEvent {
             peer_id,
             claimed_epoch,
             reason,
+            closure_receipt: admission_closure_receipt(peer_id, claimed_epoch, reason),
         }
     }
+
+    #[must_use]
+    /// Closure class carried by this admission refusal receipt.
+    pub fn closure_class(&self) -> ClosureClass {
+        self.closure_receipt.closure_class
+    }
+
+    #[must_use]
+    /// Drain class carried by this admission refusal receipt.
+    pub fn drain_result_class(&self) -> DrainResultClass {
+        self.closure_receipt.drain_result_class
+    }
+}
+
+fn admission_closure_receipt(
+    peer_id: u64,
+    claimed_epoch: u64,
+    reason: AdmissionRejection,
+) -> TransportClosureReceipt {
+    let digest = admission_receipt_digest(peer_id, claimed_epoch, reason);
+    TransportClosureReceipt {
+        receipt_id: TransportClosureReceiptId::new(digest),
+        session_ref: TransportSessionId::ZERO,
+        closure_class: reason.closure_class(),
+        trigger_ref: reason.trigger_ref(),
+        last_seq_acked: 0,
+        drain_result_class: reason.drain_result_class(),
+        successor_session_ref: None,
+        preserved_artifact_refs: Vec::new(),
+        digest,
+    }
+}
+
+fn admission_receipt_digest(peer_id: u64, claimed_epoch: u64, reason: AdmissionRejection) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tidefs.transport.admission.close_receipt.v1");
+    hasher.update(&peer_id.to_le_bytes());
+    hasher.update(&claimed_epoch.to_le_bytes());
+    hasher.update(&[reason.discriminant()]);
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,6 +1193,17 @@ mod tests {
         assert_eq!(recorded[0].peer_id, 42);
         assert_eq!(recorded[0].claimed_epoch, 5);
         assert_eq!(recorded[0].reason, AdmissionRejection::NotInRoster);
+        assert_eq!(recorded[0].closure_class(), ClosureClass::RefusedPolicy);
+        assert_eq!(recorded[0].drain_result_class(), DrainResultClass::Force);
+        assert_eq!(
+            recorded[0].closure_receipt.session_ref,
+            TransportSessionId::ZERO
+        );
+        assert_eq!(recorded[0].closure_receipt.last_seq_acked, 0);
+        assert_eq!(
+            recorded[0].closure_receipt.trigger_ref,
+            AdmissionRejection::NotInRoster.trigger_ref()
+        );
     }
 
     #[test]
@@ -1160,6 +1245,10 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].peer_id, 42);
         assert_eq!(recorded[0].reason, AdmissionRejection::NotInRoster);
+        assert_eq!(
+            recorded[0].closure_receipt.closure_class,
+            ClosureClass::RefusedPolicy
+        );
     }
 
     #[test]

@@ -1216,6 +1216,33 @@ impl SessionCloseReason {
     pub fn is_rdma(&self) -> bool {
         matches!(self, Self::RdmaCarrierLost | Self::RdmaRegistrationFailure)
     }
+
+    #[must_use]
+    /// Return the authoritative closure class for this close reason.
+    pub const fn closure_class(self) -> ClosureClass {
+        match self {
+            Self::AuthFailed | Self::ProtocolVersionMismatch => ClosureClass::RefusedPolicy,
+            Self::LocalShutdown => ClosureClass::CleanDrain,
+            Self::PeerRemoved
+            | Self::TransportError
+            | Self::RdmaCarrierLost
+            | Self::RdmaRegistrationFailure => ClosureClass::ForcedClose,
+        }
+    }
+
+    #[must_use]
+    /// Return the default drain result class for this close reason.
+    pub const fn drain_result_class(self) -> DrainResultClass {
+        match self {
+            Self::LocalShutdown => DrainResultClass::Complete,
+            Self::AuthFailed
+            | Self::ProtocolVersionMismatch
+            | Self::PeerRemoved
+            | Self::TransportError
+            | Self::RdmaCarrierLost
+            | Self::RdmaRegistrationFailure => DrainResultClass::Force,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2790,6 +2817,38 @@ mod tests {
         assert!(!ClosureClass::ForcedClose.requires_escalation());
         assert!(!ClosureClass::ExpiredTimeout.requires_escalation());
         assert!(!ClosureClass::RefusedPolicy.requires_escalation());
+    }
+
+    #[test]
+    fn close_reasons_have_stable_receipt_classes() {
+        assert_eq!(
+            SessionCloseReason::AuthFailed.closure_class(),
+            ClosureClass::RefusedPolicy
+        );
+        assert_eq!(
+            SessionCloseReason::ProtocolVersionMismatch.closure_class(),
+            ClosureClass::RefusedPolicy
+        );
+        assert_eq!(
+            SessionCloseReason::LocalShutdown.closure_class(),
+            ClosureClass::CleanDrain
+        );
+        assert_eq!(
+            SessionCloseReason::PeerRemoved.closure_class(),
+            ClosureClass::ForcedClose
+        );
+        assert_eq!(
+            SessionCloseReason::TransportError.drain_result_class(),
+            DrainResultClass::Force
+        );
+        assert_eq!(
+            SessionCloseReason::RdmaCarrierLost.drain_result_class(),
+            DrainResultClass::Force
+        );
+        assert_eq!(
+            SessionCloseReason::RdmaRegistrationFailure.drain_result_class(),
+            DrainResultClass::Force
+        );
     }
 
     // --- Full life cycle: open -> bind -> attach -> flow -> drain -> close ---

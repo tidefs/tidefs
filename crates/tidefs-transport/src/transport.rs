@@ -31,7 +31,10 @@ use crate::tdma_gate::TdmaSendGate;
 use crate::types::{CohortMembership, FamilyVersion, HlcTimestamp, NodeIdentityPublic, SessionId};
 use crate::unreachable_peer::UnreachablePeerCallbackRef;
 use crate::SendGate;
-use tidefs_types_transport_session::EndpointFamily;
+use tidefs_types_transport_session::{
+    DrainResultClass, EndpointFamily, TransportClosureReceipt, TransportClosureReceiptId,
+    TransportSessionId,
+};
 use tracing;
 // ---------------------------------------------------------------------------
 // Connection: wraps the transport backend connection with metadata
@@ -302,6 +305,13 @@ pub struct Transport {
     /// [`set_session_drain_handle`](Self::set_session_drain_handle).
     pub session_drain_handles: BTreeMap<SessionId, Arc<crate::session_drain::SessionDrainHandle>>,
 
+    /// Authoritative close receipts keyed by session ID.
+    ///
+    /// This is a TFR-017 reduction: it makes transport lifecycle closure
+    /// evidence observable inside the runtime. It is not a placement,
+    /// rebuild, or distributed recovery receipt authority.
+    pub session_closure_receipts: BTreeMap<SessionId, TransportClosureReceipt>,
+
     /// Local node ID
     pub local_node_id: u64,
 
@@ -412,6 +422,7 @@ impl Transport {
             local_identity: None,
             shippers: BTreeMap::new(),
             session_drain_handles: BTreeMap::new(),
+            session_closure_receipts: BTreeMap::new(),
             local_node_id,
             attestation_key: None,
             attestation_identity: None,
@@ -687,6 +698,7 @@ impl Transport {
             local_identity: None,
             shippers: BTreeMap::new(),
             session_drain_handles: BTreeMap::new(),
+            session_closure_receipts: BTreeMap::new(),
             local_node_id,
             attestation_key: None,
             attestation_identity: None,
@@ -2488,6 +2500,86 @@ impl Transport {
         self.session_drain_handles.get(&session_id)
     }
 
+    /// Return the authoritative close receipt for a session, if one exists.
+    #[must_use]
+    pub fn session_closure_receipt(
+        &self,
+        session_id: SessionId,
+    ) -> Option<&TransportClosureReceipt> {
+        self.session_closure_receipts.get(&session_id)
+    }
+
+    /// Return all authoritative close receipts recorded by this transport.
+    #[must_use]
+    pub fn session_closure_receipts(&self) -> &BTreeMap<SessionId, TransportClosureReceipt> {
+        &self.session_closure_receipts
+    }
+
+    fn record_session_closure_receipt(
+        &mut self,
+        session_id: SessionId,
+        reason: SessionCloseReason,
+        last_seq_acked: u64,
+        drain_result_class: DrainResultClass,
+    ) -> &TransportClosureReceipt {
+        let receipt = Self::build_session_closure_receipt(
+            session_id,
+            reason,
+            last_seq_acked,
+            drain_result_class,
+        );
+        self.session_closure_receipts
+            .entry(session_id)
+            .or_insert(receipt)
+    }
+
+    fn build_session_closure_receipt(
+        session_id: SessionId,
+        reason: SessionCloseReason,
+        last_seq_acked: u64,
+        drain_result_class: DrainResultClass,
+    ) -> TransportClosureReceipt {
+        let digest = Self::session_closure_receipt_digest(
+            session_id,
+            reason,
+            last_seq_acked,
+            drain_result_class,
+        );
+        TransportClosureReceipt {
+            receipt_id: TransportClosureReceiptId::new(digest),
+            session_ref: TransportSessionId::new(session_id.0),
+            closure_class: reason.closure_class(),
+            trigger_ref: reason.trigger_ref(),
+            last_seq_acked,
+            drain_result_class,
+            successor_session_ref: None,
+            preserved_artifact_refs: Vec::new(),
+            digest,
+        }
+    }
+
+    fn session_closure_receipt_digest(
+        session_id: SessionId,
+        reason: SessionCloseReason,
+        last_seq_acked: u64,
+        drain_result_class: DrainResultClass,
+    ) -> u64 {
+        let model_reason = reason.to_type_model() as u32;
+        let closure_class = reason.closure_class() as u32;
+        let drain_result_class = drain_result_class as u32;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"tidefs.transport.session.close_receipt.v1");
+        hasher.update(&session_id.0.to_le_bytes());
+        hasher.update(&model_reason.to_le_bytes());
+        hasher.update(&closure_class.to_le_bytes());
+        hasher.update(&drain_result_class.to_le_bytes());
+        hasher.update(&last_seq_acked.to_le_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest.as_bytes()[..8]);
+        u64::from_le_bytes(bytes)
+    }
+
     /// Drain the per-session drain handle for a session being evicted.
     ///
     /// This resolves all pending [`DrainToken`](crate::session_drain::DrainToken)s
@@ -2547,6 +2639,7 @@ impl Transport {
         let session = self
             .sessions
             .get(&session_id)
+            .cloned()
             .ok_or(TransportError::SessionNotFound { session_id })?;
 
         {
@@ -2554,6 +2647,18 @@ impl Transport {
                 .lock()
                 .map_err(|e| TransportError::Generic(format!("session lock poisoned: {e}")))?;
             if s.is_closed() {
+                let reason = match &s.state {
+                    SessionState::Closed { reason } => *reason,
+                    _ => unreachable!("is_closed returned true for a non-closed state"),
+                };
+                let last_seq_acked = s.last_recv_seq().0;
+                drop(s);
+                self.record_session_closure_receipt(
+                    session_id,
+                    reason,
+                    last_seq_acked,
+                    reason.drain_result_class(),
+                );
                 return Ok(DrainOutcome::AlreadyClosed);
             }
         }
@@ -2623,15 +2728,30 @@ impl Transport {
         // Always remove from draining set on exit.
         self.draining_sessions.remove(&session_id);
 
-        // After a completed drain, close the session for controlled shutdown.
-        if outcome.is_completed() {
-            if let Err(e) = self.close_session(session_id, SessionCloseReason::LocalShutdown) {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "graceful drain completed but close_session failed; session may already be closed"
-                );
+        match outcome {
+            DrainOutcome::Completed { .. } => {
+                if let Err(e) = self.close_session(session_id, SessionCloseReason::LocalShutdown) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "graceful drain completed but close_session failed"
+                    );
+                }
             }
+            DrainOutcome::DeadlineExpired { .. } => {
+                if let Err(e) = self.close_session_with_drain_result(
+                    session_id,
+                    SessionCloseReason::TransportError,
+                    DrainResultClass::StalledTimeout,
+                ) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "graceful drain deadline expired but close_session failed"
+                    );
+                }
+            }
+            DrainOutcome::AlreadyClosed => {}
         }
 
         Ok(outcome)
@@ -2713,11 +2833,20 @@ impl Transport {
         Ok(handle)
     }
 
-    /// Close a session (peer removed from cluster).
+    /// Close a session and record its authoritative TFR-017 closure receipt.
     pub fn close_session(
         &mut self,
         session_id: SessionId,
         reason: SessionCloseReason,
+    ) -> Result<(), TransportError> {
+        self.close_session_with_drain_result(session_id, reason, reason.drain_result_class())
+    }
+
+    fn close_session_with_drain_result(
+        &mut self,
+        session_id: SessionId,
+        reason: SessionCloseReason,
+        drain_result_class: DrainResultClass,
     ) -> Result<(), TransportError> {
         // Drain pending tokens on eviction before touching session state.
         // Must happen first to avoid borrow conflicts with sessions.get().
@@ -2728,19 +2857,27 @@ impl Transport {
         let session = self
             .sessions
             .get(&session_id)
+            .cloned()
             .ok_or(TransportError::SessionNotFound { session_id })?;
 
         let mut session = session
             .lock()
             .map_err(|e| TransportError::Generic(format!("session lock poisoned: {e}")))?;
 
-        // Check if session is already closed; avoid double-close
         if session.is_closed() {
-            return Err(TransportError::SessionInWrongState {
+            let existing_reason = match &session.state {
+                SessionState::Closed { reason } => *reason,
+                _ => unreachable!("is_closed returned true for a non-closed state"),
+            };
+            let last_seq_acked = session.last_recv_seq().0;
+            drop(session);
+            self.record_session_closure_receipt(
                 session_id,
-                expected: "not closed",
-                actual: session.state.as_str(),
-            });
+                existing_reason,
+                last_seq_acked,
+                existing_reason.drain_result_class(),
+            );
+            return Ok(());
         }
 
         // RDMA carrier: if the backend is RDMA, log the degrade before closing.
@@ -2778,6 +2915,12 @@ impl Transport {
             .transition(SessionState::Closed { reason })
             .map_err(|e| TransportError::Generic(e.to_string()))?;
 
+        let peer_node = session.peer_node;
+        let last_seq_acked = session.last_recv_seq().0;
+        drop(session);
+
+        self.record_session_closure_receipt(session_id, reason, last_seq_acked, drain_result_class);
+
         // Consult the session reconnector on transport-level failures.
         // Transient failures (network blips, peer restart) should trigger
         // automatic reconnection with exponential backoff rather than
@@ -2788,7 +2931,7 @@ impl Transport {
                 SessionCloseReason::TransportError | SessionCloseReason::RdmaCarrierLost
             );
             if should_reconnect {
-                let member_id = tidefs_membership_epoch::MemberId::new(session.peer_node);
+                let member_id = tidefs_membership_epoch::MemberId::new(peer_node);
                 let action = reconnector.on_session_failed(member_id);
                 match action {
                     crate::session_reconnector::ReconnectAction::ReconnectAfter {
@@ -2798,7 +2941,7 @@ impl Transport {
                         tracing::info!(
                             "session {} (peer {}): scheduling reconnect attempt {} after {:?}",
                             session_id,
-                            session.peer_node,
+                            peer_node,
                             attempt,
                             delay
                         );
@@ -2809,14 +2952,13 @@ impl Transport {
                         tracing::warn!(
                             "session {} (peer {}): reconnection permanently failed: {}",
                             session_id,
-                            session.peer_node,
+                            peer_node,
                             fail_reason
                         );
                     }
                 }
             }
         }
-        drop(session); // release lock before accessing self.connect_lifecycles
 
         // Advance the connect lifecycle to Ready now that the session is
         // fully established and can carry messages.
@@ -3302,12 +3444,50 @@ mod tests {
     use super::*;
     use crate::session_cohort::NodeInfo;
     use crate::session_drain::{DrainOutcome, GracefulDrainConfig};
-    use tidefs_types_transport_session::CohortClass;
+    use tidefs_types_transport_session::{ClosureClass, CohortClass};
 
     use crate::ReconnectState;
     use std::net::TcpListener;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::thread;
+
+    fn make_established_session(sid: SessionId) -> Session {
+        let mut session = Session::new(
+            sid,
+            1,
+            2,
+            TransportAddr::Tcp("127.0.0.1:9001".parse().unwrap()),
+            EndpointFamily::LocalEmbed,
+            TransportBackendKind::Tcp,
+        );
+        for state in [
+            SessionState::Connecting {
+                started_at: HlcTimestamp::default(),
+            },
+            SessionState::Handshaking {
+                started_at: HlcTimestamp::default(),
+            },
+            SessionState::Bound {
+                since: HlcTimestamp::default(),
+            },
+            SessionState::CohortAttached {
+                since: HlcTimestamp::default(),
+            },
+            SessionState::Established {
+                since: HlcTimestamp::default(),
+            },
+        ] {
+            session.transition(state).unwrap();
+        }
+        session
+    }
+
+    fn insert_established_session(t: &mut Transport, sid: SessionId) {
+        t.sessions.insert(
+            sid,
+            Arc::new(std::sync::Mutex::new(make_established_session(sid))),
+        );
+    }
 
     #[test]
     fn test_transport_create() {
@@ -4373,6 +4553,12 @@ mod tests {
 
         let outcome = t.drain_session_gracefully(sid).unwrap();
         assert_eq!(outcome, DrainOutcome::AlreadyClosed);
+        let receipt = t
+            .session_closure_receipt(sid)
+            .expect("already-closed drain must preserve closure receipt evidence");
+        assert_eq!(receipt.closure_class, ClosureClass::CleanDrain);
+        assert_eq!(receipt.drain_result_class, DrainResultClass::Complete);
+        assert_eq!(receipt.last_seq_acked, 0);
     }
 
     // ---- graceful drain: empty queue returns completed ----
@@ -4426,6 +4612,11 @@ mod tests {
             }
         );
         assert!(!t.is_session_draining(sid));
+        let receipt = t
+            .session_closure_receipt(sid)
+            .expect("completed drain must record a close receipt");
+        assert_eq!(receipt.closure_class, ClosureClass::CleanDrain);
+        assert_eq!(receipt.drain_result_class, DrainResultClass::Complete);
         // Verify the session was closed by the completed drain.
         let s = t.sessions.get(&sid).unwrap().lock().unwrap();
         assert!(
@@ -4493,6 +4684,20 @@ mod tests {
             }
         );
         assert!(!t.is_session_draining(sid));
+        let receipt = t
+            .session_closure_receipt(sid)
+            .expect("deadline-expired drain must record a close receipt");
+        assert_eq!(receipt.closure_class, ClosureClass::ForcedClose);
+        assert_eq!(receipt.drain_result_class, DrainResultClass::StalledTimeout);
+        assert_eq!(
+            receipt.trigger_ref,
+            SessionCloseReason::TransportError.trigger_ref()
+        );
+        let s = t.sessions.get(&sid).unwrap().lock().unwrap();
+        assert!(
+            s.is_closed(),
+            "stalled drain should force-close the session"
+        );
     }
 
     // ---- graceful drain: completed drain closes session state ----
@@ -4542,6 +4747,116 @@ mod tests {
         assert!(
             s.is_closed(),
             "session should be in Closed state after completed drain"
+        );
+    }
+
+    #[test]
+    fn close_session_records_receipt_for_each_public_reason() {
+        let cases = [
+            (
+                SessionCloseReason::AuthFailed,
+                ClosureClass::RefusedPolicy,
+                DrainResultClass::Force,
+            ),
+            (
+                SessionCloseReason::ProtocolVersionMismatch,
+                ClosureClass::RefusedPolicy,
+                DrainResultClass::Force,
+            ),
+            (
+                SessionCloseReason::LocalShutdown,
+                ClosureClass::CleanDrain,
+                DrainResultClass::Complete,
+            ),
+            (
+                SessionCloseReason::PeerRemoved,
+                ClosureClass::ForcedClose,
+                DrainResultClass::Force,
+            ),
+            (
+                SessionCloseReason::TransportError,
+                ClosureClass::ForcedClose,
+                DrainResultClass::Force,
+            ),
+            (
+                SessionCloseReason::RdmaCarrierLost,
+                ClosureClass::ForcedClose,
+                DrainResultClass::Force,
+            ),
+            (
+                SessionCloseReason::RdmaRegistrationFailure,
+                ClosureClass::ForcedClose,
+                DrainResultClass::Force,
+            ),
+        ];
+
+        for (idx, (reason, closure_class, drain_result_class)) in cases.into_iter().enumerate() {
+            let mut t = Transport::new(1);
+            let sid = SessionId::new(idx as u64 + 1000);
+            insert_established_session(&mut t, sid);
+
+            t.close_session(sid, reason).unwrap();
+
+            let receipt = t
+                .session_closure_receipt(sid)
+                .expect("close_session must record a closure receipt");
+            assert_eq!(receipt.closure_class, closure_class);
+            assert_eq!(receipt.drain_result_class, drain_result_class);
+            assert_eq!(receipt.trigger_ref, reason.trigger_ref());
+            assert_eq!(receipt.last_seq_acked, 0);
+        }
+    }
+
+    #[test]
+    fn transport_error_close_receipt_records_last_acknowledged_sequence() {
+        let mut t = Transport::new(1);
+        let sid = SessionId::new(2000);
+        let mut session = make_established_session(sid);
+        for seq in 1..=3 {
+            assert_eq!(
+                session.accept_recv_seq(crate::session::MessageSequenceNumber(seq)),
+                crate::session::SeqReceiveOutcome::Accepted
+            );
+        }
+        t.sessions
+            .insert(sid, Arc::new(std::sync::Mutex::new(session)));
+
+        t.close_session(sid, SessionCloseReason::TransportError)
+            .unwrap();
+
+        let receipt = t
+            .session_closure_receipt(sid)
+            .expect("transport-error close must record a closure receipt");
+        assert_eq!(receipt.last_seq_acked, 3);
+        assert_eq!(receipt.closure_class, ClosureClass::ForcedClose);
+        assert_eq!(receipt.drain_result_class, DrainResultClass::Force);
+    }
+
+    #[test]
+    fn already_closed_close_keeps_observable_receipt() {
+        let mut t = Transport::new(1);
+        let sid = SessionId::new(2001);
+        insert_established_session(&mut t, sid);
+
+        t.close_session(sid, SessionCloseReason::LocalShutdown)
+            .unwrap();
+        let first_receipt = t
+            .session_closure_receipt(sid)
+            .expect("first close must record a closure receipt")
+            .clone();
+
+        t.close_session(sid, SessionCloseReason::TransportError)
+            .unwrap();
+
+        assert_eq!(t.session_closure_receipts().len(), 1);
+        let receipt = t
+            .session_closure_receipt(sid)
+            .expect("already-closed close must keep closure receipt evidence");
+        assert_eq!(receipt, &first_receipt);
+        assert_eq!(receipt.closure_class, ClosureClass::CleanDrain);
+        assert_eq!(
+            receipt.trigger_ref,
+            SessionCloseReason::LocalShutdown.trigger_ref()
         );
     }
 
