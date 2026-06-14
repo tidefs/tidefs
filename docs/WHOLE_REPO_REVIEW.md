@@ -557,8 +557,10 @@ ownership a product boundary, not a settled implementation detail.
 
 Mmap and pre-full-kernel writeback remain especially risky, but the current
 mounted-kernel path is narrower and more concrete than the older source-model
-claims. The live C shim admits `mmap(2)` through
-`tidefs_posix_vfs_file_mmap()` -> `generic_file_mmap()`. Linux filemap then
+claims. The live C shim admits engine-backed mounted-pool `mmap(2)` through
+`tidefs_posix_vfs_file_mmap()` -> `generic_file_mmap()` and refuses
+bootstrap/fixed-table files because they have no mmap writeback authority.
+Linux filemap then
 calls the registered C `address_space_operations`: `read_folio` reads through
 `tidefs_posix_vfs_engine_read`, `dirty_folio` records Linux dirty accounting,
 `writepages` copies dirty folio bytes into `tidefs_posix_vfs_engine_write`,
@@ -1090,9 +1092,10 @@ bridge can sleep from atomic MM paths. The Rust `address_space_ops.rs` and
 as the mounted C callback path.
 
 The practical result is not "mmap solved" or "writeback solved." The C shim
-admits mmap via the generic filemap path, but no custom VM operations bridge
-registers the Rust `KmodVfsVmOps` policy, and the registered C a_ops table
-still lacks direct Rust DirtyFolioTracker/page-authority cleanup. POSIX
+admits engine-backed mounted-pool mmap via the generic filemap path, but no
+custom VM operations bridge registers the Rust `KmodVfsVmOps` policy, and the
+registered C a_ops table still lacks direct Rust DirtyFolioTracker/
+page-authority cleanup. POSIX
 matrix, compliance, and xfstests documents must continue to distinguish the
 first-boot mounted mmap/writeback row from crash consistency, direct-I/O, FUSE
 writeback-cache, distributed coherency, and broad xfstests closure. These

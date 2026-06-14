@@ -25,9 +25,9 @@
 //!
 //! # Current validation role
 //!
-//! This module is the validation surface for mounted kernel mmap/writeback
-//! artifact rows. The live C shim currently admits mmap through
-//! `generic_file_mmap()` and relies on Linux filemap plus C
+//! This module is the validation surface for engine-backed mounted-kernel
+//! mmap/writeback artifact rows. The live C shim admits mounted-pool mmap
+//! through `generic_file_mmap()` and relies on Linux filemap plus C
 //! `address_space_operations` for read faults, dirtying, writeback, fsync,
 //! and unmap cleanup. The Rust `KmodVfsVmOps` type remains a source-model
 //! dispatch spine until a C `vm_operations_struct` bridge is registered; that
