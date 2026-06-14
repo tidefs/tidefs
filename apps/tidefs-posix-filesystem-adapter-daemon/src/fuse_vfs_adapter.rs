@@ -3765,6 +3765,21 @@ impl FuseVfsAdapter {
             Err(errno) => return Err(errno),
         }
 
+        let engine_lookup_attr = {
+            let e = self.engine.lock().unwrap();
+            e.lookup(InodeId::new(parent), name, ctx)
+        };
+        match engine_lookup_attr {
+            Ok(attr) if attr.inode_id.get() == ino => {
+                self.sync_namespace_attrs_local(ino, &attr);
+                self.cache_path_lookup(parent, name, &attr);
+                self.record_lookup_count(attr.inode_id.get());
+                return Ok(attr);
+            }
+            Ok(_) | Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) => {}
+            Err(errno) => return Err(errno),
+        }
+
         let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
         let attr = namespace_attrs_to_inode_attr(&ns_attrs);
         self.cache_path_lookup(parent, name, &attr);
@@ -33572,6 +33587,54 @@ mod tests {
     }
 
     #[test]
+    fn namespace_lookup_uses_engine_parent_lookup_when_direct_getattr_is_cold() {
+        let ctx = root_ctx();
+        let name = b"cold-lookup-ctime.txt";
+        let namespace = Arc::new(Namespace::new());
+        let ns_ino = namespace
+            .create_file(
+                1,
+                std::str::from_utf8(name).expect("test name is utf8"),
+                tidefs_namespace::InodeAttributes::new_file(0),
+            )
+            .expect("seed namespace entry");
+
+        let mut stale = namespace.get_attrs(ns_ino).expect("namespace attrs");
+        stale.atime = UNIX_EPOCH;
+        stale.mtime = UNIX_EPOCH;
+        stale.ctime = UNIX_EPOCH;
+        namespace
+            .update_attrs(ns_ino, stale)
+            .expect("make namespace timestamps stale");
+
+        let engine_attr = test_attr(ns_ino, 7);
+        let adapter = make_adapter(
+            AclMockEngine::new()
+                .with_root(1)
+                .with_getattr_result(Err(Errno::ESTALE))
+                .with_lookup_result(Ok(engine_attr)),
+        )
+        .with_namespace(Arc::clone(&namespace));
+
+        let looked_up = adapter
+            .dispatch_lookup(&ctx, 1, name)
+            .expect("lookup through engine parent/name fallback");
+        assert_eq!(looked_up.inode_id, engine_attr.inode_id);
+        assert_eq!(
+            looked_up.posix.ctime_ns, engine_attr.posix.ctime_ns,
+            "namespace lookup must return authoritative engine ctime"
+        );
+
+        let repaired = namespace
+            .get_attrs(engine_attr.inode_id.get())
+            .expect("namespace attrs repaired after lookup");
+        assert_eq!(
+            system_time_to_ns(repaired.ctime),
+            engine_attr.posix.ctime_ns
+        );
+    }
+
+    #[test]
     fn namespace_dispatch_symlink_and_readlink() {
         let (_ns, fixture) = namespace_fixture();
         let ctx = root_ctx();
@@ -34915,6 +34978,7 @@ mod tests {
     struct AclMockEngine {
         root_inode: Result<InodeId, Errno>,
         attr: Result<InodeAttr, Errno>,
+        lookup_result: Result<InodeAttr, Errno>,
         acl_xattr: Result<Vec<u8>, Errno>,
         open_result: Result<EngineFileHandle, Errno>,
         write_result: Result<u32, Errno>,
@@ -34928,6 +34992,7 @@ mod tests {
             Self {
                 root_inode: Err(Errno::ENOSYS),
                 attr: Err(Errno::ENOSYS),
+                lookup_result: Err(Errno::ENOSYS),
                 acl_xattr: Err(Errno::ENOSYS),
                 open_result: Err(Errno::ENOSYS),
                 write_result: Err(Errno::ENOSYS),
@@ -34970,6 +35035,16 @@ mod tests {
 
         fn with_attr(self, uid: u32, gid: u32, mode: u32) -> Self {
             self.with_attr_kind(uid, gid, mode, NodeKind::File)
+        }
+
+        fn with_getattr_result(mut self, result: Result<InodeAttr, Errno>) -> Self {
+            self.attr = result;
+            self
+        }
+
+        fn with_lookup_result(mut self, result: Result<InodeAttr, Errno>) -> Self {
+            self.lookup_result = result;
+            self
         }
 
         fn with_dir_attr(self, uid: u32, gid: u32, mode: u32) -> Self {
@@ -35053,7 +35128,7 @@ mod tests {
             name: &[u8],
             ctx: &RequestCtx,
         ) -> Result<InodeAttr, Errno> {
-            Err(Errno::ENOSYS)
+            self.lookup_result
         }
         fn getattr(
             &self,
