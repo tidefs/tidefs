@@ -4505,6 +4505,86 @@ mod tests {
         (VfsLocalFileSystem::new(fs), dir)
     }
 
+    #[test]
+    fn read_atime_after_reopen_persists_without_ctime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_key = RootAuthenticationKey::demo_key();
+        let file_name = b"reopen-read-atime.txt";
+        let inode_id;
+
+        {
+            let local_fs = LocalFileSystem::open_with_root_authentication_key(
+                dir.path(),
+                tidefs_local_object_store::StoreOptions::test_fast(),
+                root_key,
+            )
+            .expect("open local filesystem");
+            let mut engine = VfsLocalFileSystem::new(local_fs);
+            engine.set_timestamp_policy(TimestampPolicy::Strictatime);
+            let root = engine.get_root_inode(&ctx()).expect("root inode");
+            let (attr, fh) = engine
+                .create(root, file_name, 0o644, O_RDWR, &ctx())
+                .expect("create file");
+            inode_id = attr.inode_id;
+            engine
+                .write(&fh, 0, b"timestamp payload", &ctx())
+                .expect("write payload");
+            engine
+                .fs
+                .borrow_mut()
+                .commit_if_dirty()
+                .expect("commit created file");
+        }
+
+        let after_read;
+        {
+            let local_fs = LocalFileSystem::open_with_root_authentication_key(
+                dir.path(),
+                tidefs_local_object_store::StoreOptions::test_fast(),
+                root_key,
+            )
+            .expect("reopen local filesystem");
+            let mut engine = VfsLocalFileSystem::new(local_fs);
+            engine.set_timestamp_policy(TimestampPolicy::Strictatime);
+            let root = engine.get_root_inode(&ctx()).expect("root inode");
+            let before = engine.lookup(root, file_name, &ctx()).expect("lookup file");
+            assert_eq!(before.inode_id, inode_id);
+
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            engine
+                .record_read_access(inode_id, &ctx())
+                .expect("record read access");
+            after_read = engine
+                .getattr(inode_id, None, &ctx())
+                .expect("getattr after read access");
+            assert!(
+                after_read.posix.atime_ns > before.posix.atime_ns,
+                "strictatime read access must advance atime"
+            );
+            assert_eq!(
+                after_read.posix.ctime_ns, before.posix.ctime_ns,
+                "read access after reopen must not advance ctime"
+            );
+            engine
+                .fs
+                .borrow_mut()
+                .commit_if_dirty()
+                .expect("commit read atime");
+        }
+
+        let reopened = LocalFileSystem::open_with_root_authentication_key(
+            dir.path(),
+            tidefs_local_object_store::StoreOptions::test_fast(),
+            root_key,
+        )
+        .expect("reopen after read atime commit");
+        let persisted = reopened
+            .stat_attr("/reopen-read-atime.txt")
+            .expect("persisted file attr");
+        assert_eq!(persisted.posix.atime_ns, after_read.posix.atime_ns);
+        assert_eq!(persisted.posix.ctime_ns, after_read.posix.ctime_ns);
+    }
+
     fn live_dataset_admin(engine: &VfsLocalFileSystem, operation: &str, args: Value) -> Value {
         let request = json!({
             "command": "dataset",
