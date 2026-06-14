@@ -91,8 +91,8 @@
 //! - readdir (directory iteration) with dirent64 kernel-format packing -- K7-23
 //! - super_operations (fill_super, kill_sb, statfs) mount lifecycle dispatch
 //! - mount_lifecycle state machine with BLAKE3-verified superblock state integrity
-//! - address_space_operations dispatch spine with per-operation VfsEngine bridge
-//!   with writeback expansion, mmap vm_operations_struct, and page_mkwrite support
+//! - C address_space_operations callbacks for mounted read/writeback, plus Rust
+//!   source-model dispatch spines for future direct vm_ops/a_ops bridge work
 //! - sync_fs (per-superblock writeback flush, C shim + Rust bridge)
 //! - show_options (/proc/mounts display, C shim)
 //! - umount_begin (async unmount initiation, C shim)
@@ -209,9 +209,15 @@ pub struct KmodPosixVfs<E> {
     generation: u64,
     /// Kernel page-cache statistics tracker for parity validation (K7-06).
     pub page_cache: readahead::KmodPageCacheTracker,
-    /// Dirty-folio writeback tracker for address_space_operations.
+    /// Rust source-model dirty-folio tracker.
+    ///
+    /// The mounted C shim uses Linux dirty accounting and C `writepages`;
+    /// this tracker is not registered as mounted product callback state.
     pub dirty_folio_tracker: writeback::DirtyFolioTracker,
-    /// Page-cache ownership authority table for kernel/engine coherence.
+    /// Rust source-model page-cache ownership table.
+    ///
+    /// The mounted product path does not call this table from C
+    /// `vm_operations_struct` or `address_space_operations` callbacks.
     pub page_authority: page_authority::PageAuthorityTable,
     /// Bridge registration handle (None until kmod_init succeeds).
     pub registration: Option<bridge::KmodRegistration>,
@@ -262,8 +268,7 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
         &self.engine
     }
 
-    /// Construct an [`AddressSpaceOps`] dispatch spine for the kernel
-    /// `address_space_operations` vtable.
+    /// Construct a source-model [`AddressSpaceOps`] dispatch spine.
     ///
     /// Borrows the VfsEngine, page-cache tracker, dirty-folio tracker,
     /// and page-authority table mutably, returning an `AddressSpaceOps`
@@ -271,9 +276,9 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
     /// operations (`write_begin`, `write_end`, `dirty_folio`,
     /// `writepages`, `writepage`, `page_mkwrite`, `invalidate_folio`).
     /// The returned ops carry mutable borrows on `self.page_cache`,
-    /// `self.dirty_folio_tracker`, and `self.page_authority` for
-    /// per-operation statistics, writeback tracking, and page-cache
-    /// ownership arbitration respectively.
+    /// `self.dirty_folio_tracker`, and `self.page_authority` for source-model
+    /// per-operation statistics, writeback tracking, and page-cache ownership
+    /// arbitration respectively.
     ///
     /// # Kernel wiring
     ///
@@ -290,16 +295,15 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
     /// pointer to [`AddressSpaceOps`], but the live mounted path must not be
     /// documented as doing that until the bridge is registered.
     ///
-    /// This method is the userspace-model analogue: it returns the
-    /// dispatch spine that the kernel-side vtable would reference.
-    /// Callers in the kernel module use this during inode creation
-    /// to construct the ops that will be wired into the inode mapping.
+    /// This method returns the Rust source-model dispatch spine only. The
+    /// mounted C shim's registered vtable is the product authority until a
+    /// direct C-to-Rust a_ops bridge is added.
     ///
     /// # No-daemon boundary
     ///
-    /// All implemented aops operations resolve locally within kernel
-    /// authority through VfsEngine. See [`AddressSpaceOps`] for
-    /// per-operation daemon-boundary disclosure.
+    /// All modeled aops operations resolve locally through VfsEngine. See
+    /// [`AddressSpaceOps`] for per-operation daemon-boundary disclosure and
+    /// mounted-callback limits.
     pub fn address_space_ops(&mut self) -> crate::address_space_ops::AddressSpaceOps<'_, E> {
         crate::address_space_ops::AddressSpaceOps::new(
             &self.engine,

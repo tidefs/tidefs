@@ -729,16 +729,14 @@ Important 2026-06-01 findings:
   lookup retry.
   Remaining kernel/POSIX edge wiring is broader than those fixes. The C shim
   registers `generic_file_mmap()` and `address_space_operations` callbacks for
-  `read_folio`, `write_begin`, `write_end`, `dirty_folio`, and `writepages`,
-  but the Rust `address_space_ops.rs` and kmod README describe a separate
-  `DirtyFolioTracker`/`writeback_folios()`/`page_mkwrite` model, while
-  `VFS-OPS-GAP-ANALYSIS.md` still says mmap is refused and address-space
-  operations are out of scope in places. The live C writeback path copies
-  folio bytes directly through `tidefs_posix_vfs_engine_write()`;
-  `dirty_folio` deliberately avoids the engine from atomic MM paths; C
-  is still absent. POSIX docs also still list mmap as `NONE` and xfstests
-  coverage as only two passing generics. Each edge needs a reconciled code/doc
-  path.
+  `read_folio`, `write_begin`, `write_end`, `dirty_folio`, and `writepages`.
+  Issue #260 reconciles the prior Rust-source mismatch by documenting
+  `DirtyFolioTracker`/`writeback_folios()`/`page_mkwrite` as source-model only
+  and making the Rust direct mmap path fail closed. The live C writeback path
+  copies folio bytes directly through `tidefs_posix_vfs_engine_write()`;
+  `dirty_folio` deliberately avoids the engine from atomic MM paths. POSIX and
+  xfstests coverage remain separate TFR-018 work. Each edge still needs
+  runtime validation before broad closure.
 - `TFR-018`: the first direct kmod page-cache reconciliation slice is now
   source- and Kbuild-checked. Engine-backed `write_iter` sends buffered writes
   through `generic_file_write_iter()`, while direct writes now run Linux
@@ -897,6 +895,15 @@ Important 2026-06-01 findings:
   not close crash-consistent mmap, broad xfstests, direct-I/O, FUSE
   writeback-cache correctness, placement receipt correctness, or distributed
   mmap coherency.
+- `TFR-018`: issue #260 demotes the remaining Rust direct vm-ops bridge so it
+  is fail-closed instead of product-looking. `KmodPosixVfs::mmap()` now
+  returns `EOPNOTSUPP`, the Rust constructor is named
+  `source_model_vm_ops()`, and docs/validation keep `custom-rust-vm-ops` as an
+  explicit unsupported row. The only mounted first-boot mmap/writeback
+  authority remains the C `generic_file_mmap()` plus C
+  `address_space_operations` path from #258. TFR-008/TFR-018 stay open for
+  crash-consistent mmap, broad xfstests, direct-I/O, FUSE writeback-cache
+  correctness, placement receipt correctness, and distributed mmap coherency.
 - `TFR-018`: commit `822848b7` routes live inode writes through the active
   storage path when a mounted `KernelPoolCore` I/O context is available.
   `stage_live_inode_write()` now asks

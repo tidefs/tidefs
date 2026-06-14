@@ -29,10 +29,10 @@
 //! mmap/writeback artifact rows. The live C shim admits mounted-pool mmap
 //! through `generic_file_mmap()` and relies on Linux filemap plus C
 //! `address_space_operations` for read faults, dirtying, writeback, fsync,
-//! and unmap cleanup. The Rust `KmodVfsVmOps` type remains a source-model
-//! dispatch spine until a C `vm_operations_struct` bridge is registered; that
-//! unsupported state is reported as its own validation outcome rather than as
-//! a runtime pass.
+//! and unmap cleanup. The Rust `KmodVfsVmOps` type remains fail-closed
+//! source-model code until a C `vm_operations_struct` bridge is registered;
+//! that unsupported state is reported as its own validation outcome rather
+//! than as a runtime pass.
 
 use crate::runtime_artifact_source::RuntimeArtifactSource;
 use serde::{Deserialize, Serialize};
@@ -84,13 +84,13 @@ pub enum MmapFaultKind {
     Munmap,
     /// read(2) observes mmap writes after sync/writeback.
     PostSyncReadback,
-    /// Custom Rust vm_operations_struct bridge is not registered by the C shim.
+    /// Custom Rust vm_operations_struct bridge is fail-closed and not registered.
     CustomRustVmOps,
     /// MAP_PRIVATE read fault — filemap_fault resolves via VfsEngine::read.
     PrivateReadFault,
     /// MAP_SHARED read fault — filemap_fault resolves via VfsEngine::read.
     SharedReadFault,
-    /// Write fault — page_mkwrite transitions read-only page to writable,
+    /// Legacy source-model write fault — page_mkwrite transitions a page to writable,
     /// registers dirty range with DirtyFolioTracker for subsequent writepages flush.
     WriteFault,
     /// msync/fsync after mmap write — verifies dirty data reaches stable storage
@@ -150,7 +150,7 @@ pub enum ValidationOutcome {
     Skipped,
 }
 
-/// Mounted-kernel mmap rows required by the issue #258 QEMU artifact.
+/// Mounted-kernel mmap rows required by the #258/#260 QEMU artifact.
 pub const MOUNTED_MMAP_REQUIRED_ROWS: [MmapFaultKind; 9] = [
     MmapFaultKind::CreateAndWriteInitial,
     MmapFaultKind::MmapShared,
@@ -528,7 +528,7 @@ mod tests {
             MmapFaultKind::CustomRustVmOps,
             KmodMmapFaultTier::QemuFullStack,
             ValidationOutcome::Unsupported,
-            "custom Rust vm_ops bridge is not registered by the mounted C shim",
+            "custom Rust vm_ops bridge is fail-closed and not registered by the mounted C shim",
         );
 
         assert_eq!(row.kind, MmapFaultKind::CustomRustVmOps);

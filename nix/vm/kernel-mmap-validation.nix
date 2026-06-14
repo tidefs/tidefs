@@ -4,8 +4,8 @@
 # boots a QEMU VM, loads the module, mounts a TideFS filesystem through
 # the kernel module, and exercises the mmap path:
 #   - page-fault read (MAP_SHARED read fault populates page)
-#   - page-fault write (MAP_SHARED write fault marks dirty)
-#   - page_mkwrite (dirty-folio tracking)
+#   - page-fault write (MAP_SHARED generic-filemap write fault marks dirty)
+#   - dirty-folio/writepages accounting through the registered C a_ops table
 #   - msync MS_SYNC (durability flush)
 #   - munmap (dirty-page writeback and cleanup)
 #
@@ -44,7 +44,7 @@ let
  * Exercise on a TideFS kernel mount point:
  *  1. Create a file, write initial content via write(2).
  *  2. mmap the file MAP_SHARED, read via pointer (fault-read coherence).
- *  3. Write via pointer (fault-write + page_mkwrite dirty tracking).
+ *  3. Write via pointer (fault-write + Linux dirty-folio tracking).
  *  4. Read back via pointer (write-read coherence).
  *  5. msync MS_SYNC (durability flush).
  *  6. munmap (cleanup, dirty-page writeback).
@@ -504,8 +504,8 @@ else
     fi
 fi
 
-unsupported "custom-rust-vm-ops" "mounted C shim uses generic_file_mmap and C address_space_operations; Rust KmodVfsVmOps is source-model only until a C vm_ops bridge is registered"
-unsupported "crash-consistency" "issue #258 only proves first-boot mounted mmap/writeback behavior; TFR-008/TFR-018 crash consistency remains open"
+unsupported "custom-rust-vm-ops" "mounted C shim uses generic_file_mmap and C address_space_operations; Rust KmodVfsVmOps is fail-closed source-model code, not a registered C vm_ops bridge"
+unsupported "crash-consistency" "issues #258/#260 only prove first-boot mounted mmap/writeback behavior; TFR-008/TFR-018 crash consistency remains open"
 
 # ── Phase 4: Tear-down ───────────────────────────────────────────────
 echo ""
