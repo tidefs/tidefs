@@ -70,7 +70,6 @@ pub(crate) fn is_driver_mount_option(option: &MountOption) -> bool {
     !matches!(option, MountOption::WritebackCache)
 }
 
-#[cfg(any(test, not(feature = "libfuse")))]
 pub(crate) fn is_fusermount_mount_option(option: &MountOption) -> bool {
     is_driver_mount_option(option)
         && !matches!(
@@ -80,6 +79,112 @@ pub(crate) fn is_fusermount_mount_option(option: &MountOption) -> bool {
                 | MountOption::StrictAtime
                 | MountOption::NoAtime
         )
+}
+
+#[derive(PartialEq)]
+pub(crate) enum MountOptionGroup {
+    KernelOption,
+    KernelFlag,
+    Fusermount,
+}
+
+pub(crate) fn option_group(option: &MountOption) -> MountOptionGroup {
+    match option {
+        MountOption::FSName(_) => MountOptionGroup::Fusermount,
+        MountOption::Subtype(_) => MountOptionGroup::Fusermount,
+        MountOption::CUSTOM(_) => MountOptionGroup::KernelOption,
+        MountOption::AutoUnmount => MountOptionGroup::Fusermount,
+        MountOption::AllowOther => MountOptionGroup::KernelOption,
+        MountOption::Dev => MountOptionGroup::KernelFlag,
+        MountOption::NoDev => MountOptionGroup::KernelFlag,
+        MountOption::Suid => MountOptionGroup::KernelFlag,
+        MountOption::NoSuid => MountOptionGroup::KernelFlag,
+        MountOption::RO => MountOptionGroup::KernelFlag,
+        MountOption::RW => MountOptionGroup::KernelFlag,
+        MountOption::Exec => MountOptionGroup::KernelFlag,
+        MountOption::NoExec => MountOptionGroup::KernelFlag,
+        MountOption::Atime => MountOptionGroup::KernelFlag,
+        MountOption::Relatime => MountOptionGroup::KernelFlag,
+        MountOption::StrictAtime => MountOptionGroup::KernelFlag,
+        MountOption::NoAtime => MountOptionGroup::KernelFlag,
+        MountOption::DirSync => MountOptionGroup::KernelFlag,
+        MountOption::Sync => MountOptionGroup::KernelFlag,
+        MountOption::Async => MountOptionGroup::KernelFlag,
+        MountOption::AllowRoot => MountOptionGroup::KernelOption,
+        MountOption::DefaultPermissions => MountOptionGroup::KernelOption,
+        MountOption::WritebackCache => MountOptionGroup::Fusermount,
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn option_to_flag(option: &MountOption) -> libc::c_ulong {
+    match option {
+        MountOption::Dev => 0, // There is no option for dev. It's the absence of NoDev
+        MountOption::NoDev => libc::MS_NODEV,
+        MountOption::Suid => 0,
+        MountOption::NoSuid => libc::MS_NOSUID,
+        MountOption::RW => 0,
+        MountOption::RO => libc::MS_RDONLY,
+        MountOption::Exec => 0,
+        MountOption::NoExec => libc::MS_NOEXEC,
+        MountOption::Atime => libc::MS_STRICTATIME,
+        MountOption::Relatime => libc::MS_RELATIME,
+        MountOption::StrictAtime => libc::MS_STRICTATIME,
+        MountOption::NoAtime => libc::MS_NOATIME,
+        MountOption::Async => 0,
+        MountOption::Sync => libc::MS_SYNCHRONOUS,
+        MountOption::DirSync => libc::MS_DIRSYNC,
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn option_to_flag(option: &MountOption) -> libc::c_int {
+    match option {
+        MountOption::Dev => 0, // There is no option for dev. It's the absence of NoDev
+        MountOption::NoDev => libc::MNT_NODEV,
+        MountOption::Suid => 0,
+        MountOption::NoSuid => libc::MNT_NOSUID,
+        MountOption::RW => 0,
+        MountOption::RO => libc::MNT_RDONLY,
+        MountOption::Exec => 0,
+        MountOption::NoExec => libc::MNT_NOEXEC,
+        MountOption::Atime => 0,
+        MountOption::Relatime => 0,
+        MountOption::StrictAtime => 0,
+        MountOption::NoAtime => libc::MNT_NOATIME,
+        MountOption::Async => 0,
+        MountOption::Sync => libc::MNT_SYNCHRONOUS,
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn atime_remount_flags(options: &[MountOption]) -> Option<libc::c_ulong> {
+    let needs_remount = options.iter().any(|option| {
+        matches!(
+            option,
+            MountOption::Atime | MountOption::NoAtime | MountOption::StrictAtime
+        )
+    });
+    if !needs_remount {
+        return None;
+    }
+
+    let mut flags = libc::MS_REMOUNT;
+    if !options.contains(&MountOption::Dev) {
+        flags |= libc::MS_NODEV;
+    }
+    if !options.contains(&MountOption::Suid) {
+        flags |= libc::MS_NOSUID;
+    }
+    for flag in options
+        .iter()
+        .filter(|x| option_group(x) == MountOptionGroup::KernelFlag)
+    {
+        flags |= option_to_flag(flag);
+    }
+    Some(flags)
 }
 
 pub fn check_option_conflicts(options: &[MountOption]) -> Result<(), io::Error> {

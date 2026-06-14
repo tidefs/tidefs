@@ -19,11 +19,16 @@ pub mod mount_options;
 use fuse2_sys::fuse_args;
 #[cfg(any(test, not(feature = "libfuse")))]
 use std::fs::File;
-#[cfg(any(test, not(feature = "libfuse"), not(fuser_libfuse3)))]
+#[cfg(any(
+    test,
+    not(feature = "libfuse"),
+    not(fuser_libfuse3),
+    all(feature = "libfuse", target_os = "linux")
+))]
 use std::io;
 
 #[cfg(any(feature = "libfuse", test))]
-use mount_options::{is_driver_mount_option, MountOption};
+use mount_options::{is_fusermount_mount_option, MountOption};
 
 /// Helper function to provide options as a fuse_args struct
 /// (which contains an argc count and an argv pointer)
@@ -36,7 +41,7 @@ fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(options: &[MountOption], f: F) 
     use std::ffi::CString;
 
     let mut args = vec![CString::new("rust-fuse").unwrap()]; // hardcoded string, never contains NUL
-    for x in options.iter().filter(|x| is_driver_mount_option(x)) {
+    for x in options.iter().filter(|x| is_fusermount_mount_option(x)) {
         // "-o" is hardcoded, never contains NUL
         // Mount options with interior NUL bytes are rejected gracefully
         let opt_str = match CString::new(option_to_string(x)) {
@@ -53,13 +58,47 @@ fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(options: &[MountOption], f: F) 
     })
 }
 
+#[cfg(all(feature = "libfuse", target_os = "linux"))]
+fn apply_libfuse_atime_remount(mountpoint: &CStr, options: &[MountOption]) -> io::Result<()> {
+    let Some(flags) = mount_options::atime_remount_flags(options) else {
+        return Ok(());
+    };
+
+    // SAFETY: remounting uses a valid null-terminated mountpoint string.
+    // For MS_REMOUNT, Linux ignores the null source, filesystem type, and data
+    // pointers; flags are assembled from MS_* constants only.
+    let result = unsafe {
+        libc::mount(
+            std::ptr::null::<libc::c_char>(),
+            mountpoint.as_ptr(),
+            std::ptr::null::<libc::c_char>(),
+            flags,
+            std::ptr::null::<libc::c_void>(),
+        )
+    };
+    if result == -1 {
+        let err = io::Error::last_os_error();
+        Err(io::Error::new(
+            err.kind(),
+            format!("Error remounting FUSE atime policy at {mountpoint:?}: {err}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "libfuse", not(target_os = "linux")))]
+fn apply_libfuse_atime_remount(_mountpoint: &CStr, _options: &[MountOption]) -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(fuser_libfuse2)]
 pub use fuse2::Mount;
 #[cfg(fuser_libfuse3)]
 pub use fuse3::Mount;
 #[cfg(not(feature = "libfuse"))]
 pub use fuse_pure::Mount;
-#[cfg(not(fuser_libfuse3))]
+#[cfg(any(not(fuser_libfuse3), all(feature = "libfuse", target_os = "linux")))]
 use std::ffi::CStr;
 
 #[cfg(not(fuser_libfuse3))]
@@ -158,13 +197,14 @@ mod test {
     }
 
     #[test]
-    fn fuse_args_include_atime_policy_options() {
+    fn fuse_args_skip_atime_policy_options() {
         with_fuse_args(
             &[
                 MountOption::Atime,
                 MountOption::Relatime,
                 MountOption::StrictAtime,
                 MountOption::NoAtime,
+                MountOption::Dev,
                 MountOption::WritebackCache,
             ],
             |args| {
@@ -177,20 +217,7 @@ mod test {
                             .unwrap()
                     })
                     .collect();
-                assert_eq!(
-                    *v,
-                    [
-                        "rust-fuse",
-                        "-o",
-                        "atime",
-                        "-o",
-                        "relatime",
-                        "-o",
-                        "strictatime",
-                        "-o",
-                        "noatime",
-                    ]
-                );
+                assert_eq!(*v, ["rust-fuse", "-o", "dev"]);
             },
         );
     }

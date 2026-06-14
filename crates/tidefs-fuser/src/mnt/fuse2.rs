@@ -41,6 +41,11 @@ impl Mount {
                 // SAFETY: fd was just returned by fuse_mount_compat25 as a
                 // valid open file descriptor. Ownership is transferred to File.
                 let file = unsafe { File::from_raw_fd(fd) };
+                if let Err(err) = super::apply_libfuse_atime_remount(mountpoint.as_c_str(), options)
+                {
+                    let _ = super::libc_umount(mountpoint.as_c_str());
+                    return Err(err);
+                }
                 Ok((Arc::new(file), Mount { mountpoint }))
             }
         })
