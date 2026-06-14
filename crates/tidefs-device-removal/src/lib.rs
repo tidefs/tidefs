@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use tidefs_block_allocator::DeviceId;
 use tidefs_locator_table::ExtentId;
-use tidefs_pool_scan::{DeviceHealth, DeviceRemovalPlanner};
+use tidefs_pool_scan::{
+    DeviceHealth, DeviceRemovalPlanner, DeviceRemovalRefusal, DeviceRemovalRefusalClass,
+};
 
 pub mod locator_integration;
 
@@ -83,6 +85,21 @@ pub trait ObjectMover: std::fmt::Debug {
 /// committed checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvacuationCheckpoint {
+    /// Block-allocator device ID for the target being removed.
+    pub target_device_id: u32,
+
+    /// GUID of the target device being removed.
+    pub target_device_guid: [u8; 16],
+
+    /// Topology generation that this removal is expected to commit.
+    pub target_topology_generation: u64,
+
+    /// Digest binding the enumerated evacuation set identity.
+    pub evacuation_set_digest: [u8; 32],
+
+    /// Removal phase-chain digest observed when the checkpoint was created.
+    pub removal_chain_digest: [u8; 32],
+
     /// Index of the next object to evacuate (0-based into the
     /// enumerated object list).
     pub next_object_index: u64,
@@ -108,6 +125,11 @@ impl EvacuationCheckpoint {
     #[must_use]
     pub fn new(total_objects: u64, dest_device_id: u32) -> Self {
         Self {
+            target_device_id: 0,
+            target_device_guid: [0u8; 16],
+            target_topology_generation: 0,
+            evacuation_set_digest: [0u8; 32],
+            removal_chain_digest: [0u8; 32],
             next_object_index: 0,
             total_objects,
             objects_evacuated: 0,
@@ -258,6 +280,9 @@ pub struct DeviceRemovalState {
     /// Human-readable error message if the removal entered the Failed phase.
     pub error: Option<String>,
 
+    /// Typed refusal/failure evidence if the removal entered the Failed phase.
+    pub failure_evidence: Option<DeviceRemovalRefusal>,
+
     /// BLAKE3-256 chain digest linking this phase to the prior one.
     ///
     /// Updated at each phase transition via
@@ -291,6 +316,7 @@ impl DeviceRemovalState {
             bytes_evacuated: 0,
             target_topology_generation,
             error: None,
+            failure_evidence: None,
             chain_digest: [0u8; 32],
         }
     }
@@ -339,6 +365,13 @@ impl DeviceRemovalState {
         self.error = Some(error.into());
     }
 
+    /// Transition the state machine to Failed with typed durable evidence.
+    pub fn fail_with_evidence(&mut self, evidence: DeviceRemovalRefusal) {
+        self.phase = DeviceRemovalPhase::Failed;
+        self.error = Some(evidence.details.clone());
+        self.failure_evidence = Some(evidence);
+    }
+
     /// Record a successfully evacuated object.
     pub fn record_object_evacuated(&mut self, bytes: u64) {
         self.objects_evacuated = self.objects_evacuated.saturating_add(1);
@@ -355,13 +388,12 @@ impl DeviceRemovalState {
     pub fn objects_remaining(&self) -> u64 {
         self.total_objects_to_evacuate
             .saturating_sub(self.objects_evacuated)
-            .saturating_sub(self.objects_failed)
     }
 
-    /// Returns `true` if all objects have been evacuated (or failed).
+    /// Returns `true` if all live objects have been evacuated with no failures.
     #[must_use]
     pub fn is_evacuation_complete(&self) -> bool {
-        self.objects_remaining() == 0
+        self.objects_failed == 0 && self.objects_remaining() == 0
     }
 }
 
@@ -429,12 +461,39 @@ pub enum DeviceRemovalError {
         health: DeviceHealth,
     },
 
+    /// Removal was refused or failed with typed durable evidence.
+    #[error("device removal refused: {evidence}")]
+    RemovalRefused {
+        /// Typed refusal/failure evidence.
+        evidence: DeviceRemovalRefusal,
+    },
+
     /// Failed to persist removal state to pool metadata.
     #[error("failed to persist removal state: {reason}")]
     PersistFailed {
         /// Human-readable reason for the persistence failure.
         reason: String,
     },
+}
+
+impl DeviceRemovalError {
+    /// Return typed refusal evidence when this error carries it directly.
+    #[must_use]
+    pub const fn refusal_evidence(&self) -> Option<&DeviceRemovalRefusal> {
+        match self {
+            Self::RemovalRefused { evidence } => Some(evidence),
+            _ => None,
+        }
+    }
+
+    /// Return the stable refusal class when this error carries direct evidence.
+    #[must_use]
+    pub const fn refusal_class(&self) -> Option<DeviceRemovalRefusalClass> {
+        match self {
+            Self::RemovalRefused { evidence } => Some(evidence.class),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -506,27 +565,112 @@ impl DeviceRemovalDriver {
         surviving_device_ids: Vec<DeviceId>,
         object_count_on_device: u64,
     ) -> Result<Self, DeviceRemovalError> {
+        let expected_topology_generation = pool_config.topology_generation;
+        Self::prepare_with_expected_topology_generation(
+            alloc_fence,
+            target_device_path,
+            pool_config,
+            surviving_device_ids,
+            object_count_on_device,
+            expected_topology_generation,
+        )
+    }
+
+    /// Prepare a device removal operation against an expected topology
+    /// generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceRemovalError::RemovalRefused`] with typed evidence if
+    /// preflight rejects the target, topology, health, or redundancy state.
+    pub fn prepare_with_expected_topology_generation(
+        alloc_fence: Box<dyn AllocationFence>,
+        target_device_path: &Path,
+        pool_config: tidefs_pool_scan::PoolConfig,
+        surviving_device_ids: Vec<DeviceId>,
+        object_count_on_device: u64,
+        expected_topology_generation: u64,
+    ) -> Result<Self, DeviceRemovalError> {
+        if pool_config.topology_generation != expected_topology_generation {
+            return Err(DeviceRemovalError::RemovalRefused {
+                evidence: DeviceRemovalRefusal::new(
+                    DeviceRemovalRefusalClass::StaleTopologyGeneration,
+                    target_device_path.to_path_buf(),
+                    "pool topology generation changed before removal preflight",
+                )
+                .with_topology_generations(
+                    expected_topology_generation,
+                    pool_config.topology_generation,
+                ),
+            });
+        }
+
+        if !pool_config.redundancy_policy.is_well_formed() {
+            return Err(DeviceRemovalError::RemovalRefused {
+                evidence: DeviceRemovalRefusal::new(
+                    DeviceRemovalRefusalClass::DomainConstraintViolation,
+                    target_device_path.to_path_buf(),
+                    format!(
+                        "pool redundancy policy {} is not well formed",
+                        pool_config.redundancy_policy
+                    ),
+                ),
+            });
+        }
+
         // Validate target device exists in the pool.
         let leaves = DeviceRemovalPlanner::flatten_leaves(&pool_config.device_tree);
 
         let target_info = leaves
             .iter()
             .find(|leaf| leaf.device_path == target_device_path)
-            .ok_or_else(|| DeviceRemovalError::TargetDeviceNotFound {
-                path: target_device_path.to_path_buf(),
+            .ok_or_else(|| DeviceRemovalError::RemovalRefused {
+                evidence: DeviceRemovalRefusal::new(
+                    DeviceRemovalRefusalClass::TargetNotFound,
+                    target_device_path.to_path_buf(),
+                    "target device is not present in the pool topology",
+                ),
             })?;
 
         // Validate pool won't be emptied.
         if surviving_device_ids.is_empty() {
-            return Err(DeviceRemovalError::WouldEmptyPool);
+            return Err(DeviceRemovalError::RemovalRefused {
+                evidence: DeviceRemovalRefusal::new(
+                    DeviceRemovalRefusalClass::WouldEmptyPool,
+                    target_device_path.to_path_buf(),
+                    "removal would leave the pool with zero surviving devices",
+                )
+                .with_surviving_topology(0, 1),
+            });
         }
 
         // Validate device health permits removal.
         let target_health = find_device_health(&pool_config.device_tree, target_device_path)
             .unwrap_or(DeviceHealth::Online);
         if !target_health.is_operational() {
-            return Err(DeviceRemovalError::DeviceNotHealthy {
-                health: target_health,
+            return Err(DeviceRemovalError::RemovalRefused {
+                evidence: DeviceRemovalRefusal::new(
+                    DeviceRemovalRefusalClass::UnhealthyTarget,
+                    target_device_path.to_path_buf(),
+                    format!("target health is {target_health}"),
+                ),
+            });
+        }
+
+        let required_survivors = u32::from(pool_config.redundancy_policy.target_width());
+        if (surviving_device_ids.len() as u32) < required_survivors {
+            return Err(DeviceRemovalError::RemovalRefused {
+                evidence: DeviceRemovalRefusal::new(
+                    DeviceRemovalRefusalClass::InsufficientSurvivingTopology,
+                    target_device_path.to_path_buf(),
+                    format!(
+                        "removal would leave {} surviving device(s), but policy {} requires {}",
+                        surviving_device_ids.len(),
+                        pool_config.redundancy_policy,
+                        required_survivors
+                    ),
+                )
+                .with_surviving_topology(surviving_device_ids.len() as u32, required_survivors),
             });
         }
 
@@ -601,7 +745,8 @@ impl DeviceRemovalDriver {
         self.require_phase(DeviceRemovalPhase::Removing, "begin_evacuation")?;
         self.alloc_fence
             .fence_device(DeviceId(self.state.target_device_id));
-        self.state.advance_with_digest(b"begin_evacuation")
+        self.state
+            .advance_with_digest(&begin_evacuation_digest_data(&self.state))
     }
 
     /// Record a single object evacuation.
@@ -624,10 +769,15 @@ impl DeviceRemovalDriver {
     /// # Errors
     ///
     /// Returns an error if not in the Evacuating phase.
-    pub fn record_object_failed(&mut self, _object_id: ExtentId) -> Result<(), DeviceRemovalError> {
+    pub fn record_object_failed(&mut self, object_id: ExtentId) -> Result<(), DeviceRemovalError> {
         self.require_phase(DeviceRemovalPhase::Evacuating, "record_object_failed")?;
         self.state.record_object_failed();
-        Ok(())
+        let evidence = DeviceRemovalRefusal::new(
+            DeviceRemovalRefusalClass::EvacuationFailed,
+            self.state.target_device.clone(),
+            format!("evacuation failed for object {object_id}"),
+        );
+        Err(self.transition_to_failed(evidence))
     }
 
     /// Advance from Evacuating to Evacuated.
@@ -640,16 +790,30 @@ impl DeviceRemovalDriver {
     /// Returns an error if not all objects have been evacuated.
     pub fn mark_evacuated(&mut self) -> Result<(), DeviceRemovalError> {
         self.require_phase(DeviceRemovalPhase::Evacuating, "mark_evacuated")?;
-        if !self.state.is_evacuation_complete() {
-            return Err(DeviceRemovalError::InvalidTransition {
-                from: self.state.phase,
-                details: format!(
-                    "{} objects still pending evacuation",
+        if self.state.objects_failed > 0 {
+            let evidence = DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::EvacuationFailed,
+                self.state.target_device.clone(),
+                format!(
+                    "{} object(s) failed during evacuation",
+                    self.state.objects_failed
+                ),
+            );
+            return Err(self.transition_to_failed(evidence));
+        }
+        if self.state.objects_remaining() > 0 {
+            let evidence = DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::EvacuationIncomplete,
+                self.state.target_device.clone(),
+                format!(
+                    "{} live object(s) remain un-evacuated",
                     self.state.objects_remaining()
                 ),
-            });
+            );
+            return Err(self.transition_to_failed(evidence));
         }
-        self.state.advance_with_digest(b"mark_evacuated")
+        self.state
+            .advance_with_digest(&evacuation_success_digest_data(&self.state))
     }
 
     /// Advance from Evacuated to Vacated.
@@ -673,25 +837,34 @@ impl DeviceRemovalDriver {
             .iter()
             .any(|leaf| leaf.device_path == self.state.target_device);
         if target_still_present {
-            return Err(DeviceRemovalError::InvalidTransition {
-                from: self.state.phase,
-                details: "updated_pool_config still contains the target device".into(),
-            });
+            let evidence = DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::CommittedTopologyMismatch,
+                self.state.target_device.clone(),
+                "updated_pool_config still contains the target device",
+            );
+            return Err(self.transition_to_failed(evidence));
         }
 
         // Validate topology generation advanced.
         if updated_pool_config.topology_generation != self.state.target_topology_generation {
-            return Err(DeviceRemovalError::InvalidTransition {
-                from: self.state.phase,
-                details: format!(
+            let evidence = DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::CommittedTopologyMismatch,
+                self.state.target_device.clone(),
+                format!(
                     "topology generation mismatch: expected {}, got {}",
                     self.state.target_topology_generation, updated_pool_config.topology_generation,
                 ),
-            });
+            )
+            .with_topology_generations(
+                self.state.target_topology_generation,
+                updated_pool_config.topology_generation,
+            );
+            return Err(self.transition_to_failed(evidence));
         }
 
+        let digest_data = committed_topology_digest_data(&self.state, &updated_pool_config);
         self.pool_config_snapshot = updated_pool_config;
-        self.state.advance_with_digest(b"commit_vacated")
+        self.state.advance_with_digest(&digest_data)
     }
 
     /// Advance from Vacated to Removed.
@@ -705,14 +878,18 @@ impl DeviceRemovalDriver {
         self.require_phase(DeviceRemovalPhase::Vacated, "mark_removed")?;
         self.alloc_fence
             .unfence_device(DeviceId(self.state.target_device_id));
-        self.state.advance_with_digest(b"mark_removed")
+        self.state
+            .advance_with_digest(&removed_digest_data(&self.state))
     }
 
     /// Transition the removal to Failed.
     pub fn fail(&mut self, error: impl Into<String>) {
-        self.alloc_fence
-            .unfence_device(DeviceId(self.state.target_device_id));
-        self.state.fail(error);
+        let evidence = DeviceRemovalRefusal::new(
+            DeviceRemovalRefusalClass::DomainConstraintViolation,
+            self.state.target_device.clone(),
+            error.into(),
+        );
+        let _ = self.transition_to_failed(evidence);
     }
 
     // ── Evacuation orchestration ─────────────────────────────────
@@ -725,7 +902,7 @@ impl DeviceRemovalDriver {
     /// are moved before checkpointing.
     ///
     /// Returns the number of objects successfully evacuated in this
-    /// batch, plus any that failed (non-fatal).
+    /// batch. Any object failure fails the removal closed.
     ///
     /// # Errors
     ///
@@ -748,16 +925,18 @@ impl DeviceRemovalDriver {
         let batch: Vec<_> = all_objects.iter().take(max_batch_size).copied().collect();
 
         let mut evacuated = 0u64;
-        let mut failed = 0u64;
-
         for extent_id in &batch {
             // Read the object from the source device
             let data = match mover.read_object(*extent_id, DeviceId(self.state.target_device_id)) {
                 Ok(d) => d,
-                Err(_e) => {
+                Err(e) => {
                     self.state.record_object_failed();
-                    failed += 1;
-                    continue;
+                    let evidence = DeviceRemovalRefusal::new(
+                        DeviceRemovalRefusalClass::EvacuationFailed,
+                        self.state.target_device.clone(),
+                        format!("read failed for object {extent_id}: {e}"),
+                    );
+                    return Err(self.transition_to_failed(evidence));
                 }
             };
 
@@ -769,14 +948,19 @@ impl DeviceRemovalDriver {
                     self.state.record_object_evacuated(obj_len);
                     evacuated += 1;
                 }
-                Err(_e) => {
+                Err(e) => {
                     self.state.record_object_failed();
-                    failed += 1;
+                    let evidence = DeviceRemovalRefusal::new(
+                        DeviceRemovalRefusalClass::EvacuationFailed,
+                        self.state.target_device.clone(),
+                        format!("write failed for object {extent_id}: {e}"),
+                    );
+                    return Err(self.transition_to_failed(evidence));
                 }
             }
         }
 
-        Ok((evacuated, failed))
+        Ok((evacuated, 0))
     }
 
     /// Create a checkpoint from the current removal state.
@@ -786,6 +970,11 @@ impl DeviceRemovalDriver {
     #[must_use]
     pub fn create_checkpoint(&self, dest_device_id: DeviceId) -> EvacuationCheckpoint {
         EvacuationCheckpoint {
+            target_device_id: self.state.target_device_id,
+            target_device_guid: self.state.target_device_guid,
+            target_topology_generation: self.state.target_topology_generation,
+            evacuation_set_digest: evacuation_set_digest(&self.state),
+            removal_chain_digest: self.state.chain_digest,
             next_object_index: self.state.objects_evacuated + self.state.objects_failed,
             total_objects: self.state.total_objects_to_evacuate,
             objects_evacuated: self.state.objects_evacuated,
@@ -799,10 +988,38 @@ impl DeviceRemovalDriver {
     ///
     /// Used during recovery to restore progress from a persisted
     /// checkpoint.
-    pub fn apply_checkpoint(&mut self, cp: &EvacuationCheckpoint) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceRemovalError::RemovalRefused`] if the checkpoint
+    /// identity does not match this removal.
+    pub fn apply_checkpoint(
+        &mut self,
+        cp: &EvacuationCheckpoint,
+    ) -> Result<(), DeviceRemovalError> {
+        self.apply_checkpoint_for_destination(cp, DeviceId(cp.dest_device_id))
+    }
+
+    /// Apply a checkpoint while proving it belongs to an expected destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceRemovalError::RemovalRefused`] if the checkpoint was
+    /// created for a different target, destination, object count, topology
+    /// generation, or phase-chain digest.
+    pub fn apply_checkpoint_for_destination(
+        &mut self,
+        cp: &EvacuationCheckpoint,
+        expected_dest_device_id: DeviceId,
+    ) -> Result<(), DeviceRemovalError> {
+        self.require_phase(DeviceRemovalPhase::Evacuating, "apply_checkpoint")?;
+        if let Some(evidence) = self.checkpoint_replay_refusal(cp, expected_dest_device_id) {
+            return Err(self.transition_to_failed(evidence));
+        }
         self.state.objects_evacuated = cp.objects_evacuated;
         self.state.bytes_evacuated = cp.bytes_evacuated;
         self.state.objects_failed = cp.objects_failed;
+        Ok(())
     }
 
     // ── State persistence ────────────────────────────────────────
@@ -850,6 +1067,86 @@ impl DeviceRemovalDriver {
         }
         Ok(())
     }
+
+    fn checkpoint_replay_refusal(
+        &self,
+        cp: &EvacuationCheckpoint,
+        expected_dest_device_id: DeviceId,
+    ) -> Option<DeviceRemovalRefusal> {
+        let class = DeviceRemovalRefusalClass::CheckpointReplayRejected;
+        let target = self.state.target_device.clone();
+        let expected_set_digest = evacuation_set_digest(&self.state);
+        let expected_next_index = cp.objects_evacuated.saturating_add(cp.objects_failed);
+
+        let details = if cp.target_device_id != self.state.target_device_id {
+            Some(format!(
+                "checkpoint target device id {} does not match {}",
+                cp.target_device_id, self.state.target_device_id
+            ))
+        } else if cp.target_device_guid != self.state.target_device_guid {
+            Some("checkpoint target device guid does not match removal target".to_string())
+        } else if cp.dest_device_id != expected_dest_device_id.0 {
+            Some(format!(
+                "checkpoint destination device {} does not match expected {}",
+                cp.dest_device_id, expected_dest_device_id.0
+            ))
+        } else if !self
+            .surviving_device_ids
+            .iter()
+            .any(|device_id| device_id.0 == cp.dest_device_id)
+        {
+            Some(format!(
+                "checkpoint destination device {} is not a surviving device",
+                cp.dest_device_id
+            ))
+        } else if cp.total_objects != self.state.total_objects_to_evacuate {
+            Some(format!(
+                "checkpoint object count {} does not match removal object count {}",
+                cp.total_objects, self.state.total_objects_to_evacuate
+            ))
+        } else if cp.target_topology_generation != self.state.target_topology_generation {
+            Some(format!(
+                "checkpoint topology generation {} does not match {}",
+                cp.target_topology_generation, self.state.target_topology_generation
+            ))
+        } else if cp.evacuation_set_digest != expected_set_digest {
+            Some("checkpoint evacuation set digest does not match removal identity".to_string())
+        } else if cp.removal_chain_digest != self.state.chain_digest {
+            Some("checkpoint removal chain digest does not match current phase chain".to_string())
+        } else if cp.objects_failed > 0 {
+            Some(format!(
+                "checkpoint records {} failed object(s)",
+                cp.objects_failed
+            ))
+        } else if cp.next_object_index != expected_next_index {
+            Some(format!(
+                "checkpoint next object index {} does not equal processed object count {}",
+                cp.next_object_index, expected_next_index
+            ))
+        } else if cp.objects_evacuated > cp.total_objects {
+            Some(format!(
+                "checkpoint evacuated count {} exceeds object count {}",
+                cp.objects_evacuated, cp.total_objects
+            ))
+        } else {
+            None
+        };
+
+        details.map(|details| DeviceRemovalRefusal::new(class, target, details))
+    }
+
+    fn transition_to_failed(&mut self, evidence: DeviceRemovalRefusal) -> DeviceRemovalError {
+        self.alloc_fence
+            .unfence_device(DeviceId(self.state.target_device_id));
+        let digest_data = refusal_digest_data(&evidence);
+        self.state.chain_digest = compute_device_removal_chain_digest(
+            &self.state.chain_digest,
+            self.state.phase,
+            &digest_data,
+        );
+        self.state.fail_with_evidence(evidence.clone());
+        DeviceRemovalError::RemovalRefused { evidence }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -880,12 +1177,198 @@ pub fn compute_device_removal_chain_digest(
         &[DEVICE_REMOVAL_DOMAIN_DISCRIMINANT],
     );
     let mut hasher = blake3::Hasher::new_keyed(&key);
-    hasher.update(prior_digest);
-    hasher.update(current_phase.to_string().as_bytes());
-    if !commit_data.is_empty() {
-        hasher.update(commit_data);
+    append_hash_field(&mut hasher, b"prior-digest", prior_digest);
+    append_hash_field(&mut hasher, b"phase", current_phase.to_string().as_bytes());
+    append_hash_field(&mut hasher, b"removal-evidence", commit_data);
+    *hasher.finalize().as_bytes()
+}
+
+fn begin_evacuation_digest_data(state: &DeviceRemovalState) -> Vec<u8> {
+    let mut data = removal_state_digest_data(b"begin-evacuation", state);
+    append_u64_field(
+        &mut data,
+        b"planned-object-count",
+        state.total_objects_to_evacuate,
+    );
+    data
+}
+
+fn evacuation_success_digest_data(state: &DeviceRemovalState) -> Vec<u8> {
+    let mut data = removal_state_digest_data(b"evacuation-success", state);
+    let outcome = if state.total_objects_to_evacuate == 0 {
+        b"empty-evacuation-success".as_slice()
+    } else {
+        b"all-live-objects-evacuated".as_slice()
+    };
+    append_vec_field(&mut data, b"evacuation-outcome", outcome);
+    append_u64_field(&mut data, b"objects-evacuated", state.objects_evacuated);
+    append_u64_field(&mut data, b"objects-failed", state.objects_failed);
+    append_u64_field(&mut data, b"bytes-evacuated", state.bytes_evacuated);
+    data
+}
+
+fn committed_topology_digest_data(
+    state: &DeviceRemovalState,
+    updated_pool_config: &tidefs_pool_scan::PoolConfig,
+) -> Vec<u8> {
+    let mut data = removal_state_digest_data(b"committed-topology", state);
+    append_u64_field(
+        &mut data,
+        b"committed-topology-generation",
+        updated_pool_config.topology_generation,
+    );
+    append_u32_field(
+        &mut data,
+        b"committed-device-count",
+        updated_pool_config.device_count,
+    );
+    append_vec_field(
+        &mut data,
+        b"committed-topology-root",
+        &topology_root_digest(updated_pool_config),
+    );
+    data
+}
+
+fn removed_digest_data(state: &DeviceRemovalState) -> Vec<u8> {
+    let mut data = removal_state_digest_data(b"removed", state);
+    append_u64_field(&mut data, b"objects-evacuated", state.objects_evacuated);
+    append_u64_field(&mut data, b"bytes-evacuated", state.bytes_evacuated);
+    data
+}
+
+fn refusal_digest_data(evidence: &DeviceRemovalRefusal) -> Vec<u8> {
+    let mut data = Vec::new();
+    append_vec_field(&mut data, b"evidence-kind", b"removal-refusal");
+    append_vec_field(
+        &mut data,
+        b"failure-class",
+        evidence.class.to_string().as_bytes(),
+    );
+    append_vec_field(
+        &mut data,
+        b"target-device",
+        evidence.target_device.to_string_lossy().as_bytes(),
+    );
+    append_vec_field(&mut data, b"details", evidence.details.as_bytes());
+    if let Some(expected) = evidence.expected_topology_generation {
+        append_u64_field(&mut data, b"expected-topology-generation", expected);
+    }
+    if let Some(observed) = evidence.observed_topology_generation {
+        append_u64_field(&mut data, b"observed-topology-generation", observed);
+    }
+    if let Some(surviving) = evidence.surviving_devices {
+        append_u32_field(&mut data, b"surviving-devices", surviving);
+    }
+    if let Some(required) = evidence.required_surviving_devices {
+        append_u32_field(&mut data, b"required-surviving-devices", required);
+    }
+    data
+}
+
+fn removal_state_digest_data(tag: &[u8], state: &DeviceRemovalState) -> Vec<u8> {
+    let mut data = Vec::new();
+    append_vec_field(&mut data, b"evidence-kind", tag);
+    append_vec_field(
+        &mut data,
+        b"target-device",
+        state.target_device.to_string_lossy().as_bytes(),
+    );
+    append_u32_field(&mut data, b"target-device-id", state.target_device_id);
+    append_vec_field(&mut data, b"target-device-guid", &state.target_device_guid);
+    append_u32_field(&mut data, b"target-device-index", state.target_device_index);
+    append_u32_field(&mut data, b"device-count-before", state.device_count_before);
+    append_u64_field(
+        &mut data,
+        b"target-topology-generation",
+        state.target_topology_generation,
+    );
+    append_vec_field(&mut data, b"evacuation-set", &evacuation_set_digest(state));
+    data
+}
+
+fn evacuation_set_digest(state: &DeviceRemovalState) -> [u8; 32] {
+    let key = blake3::derive_key(
+        "TideFS DeviceRemoval Evacuation Set v1",
+        &[DEVICE_REMOVAL_DOMAIN_DISCRIMINANT],
+    );
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    append_hash_field(
+        &mut hasher,
+        b"target-device-id",
+        &state.target_device_id.to_le_bytes(),
+    );
+    append_hash_field(
+        &mut hasher,
+        b"target-device-guid",
+        &state.target_device_guid,
+    );
+    append_hash_field(
+        &mut hasher,
+        b"total-objects",
+        &state.total_objects_to_evacuate.to_le_bytes(),
+    );
+    append_hash_field(
+        &mut hasher,
+        b"target-topology-generation",
+        &state.target_topology_generation.to_le_bytes(),
+    );
+    *hasher.finalize().as_bytes()
+}
+
+fn topology_root_digest(config: &tidefs_pool_scan::PoolConfig) -> [u8; 32] {
+    let key = blake3::derive_key(
+        "TideFS DeviceRemoval Committed Topology Root v1",
+        &[DEVICE_REMOVAL_DOMAIN_DISCRIMINANT],
+    );
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    append_hash_field(
+        &mut hasher,
+        b"topology-generation",
+        &config.topology_generation.to_le_bytes(),
+    );
+    append_hash_field(
+        &mut hasher,
+        b"device-count",
+        &config.device_count.to_le_bytes(),
+    );
+    for leaf in DeviceRemovalPlanner::flatten_leaves(&config.device_tree) {
+        append_hash_field(
+            &mut hasher,
+            b"leaf-path",
+            leaf.device_path.to_string_lossy().as_bytes(),
+        );
+        append_hash_field(&mut hasher, b"leaf-guid", &leaf.device_guid);
+        append_hash_field(&mut hasher, b"leaf-index", &leaf.device_index.to_le_bytes());
+        append_hash_field(
+            &mut hasher,
+            b"leaf-capacity",
+            &leaf.capacity_bytes.to_le_bytes(),
+        );
     }
     *hasher.finalize().as_bytes()
+}
+
+fn append_vec_field(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    out.extend_from_slice(value);
+}
+
+fn append_u32_field(out: &mut Vec<u8>, name: &[u8], value: u32) {
+    append_vec_field(out, name, &value.to_le_bytes());
+}
+
+fn append_u64_field(out: &mut Vec<u8>, name: &[u8], value: u64) {
+    append_vec_field(out, name, &value.to_le_bytes());
+}
+
+fn append_hash_field(hasher: &mut blake3::Hasher, name: &[u8], value: &[u8]) {
+    hasher.update(&(name.len() as u64).to_le_bytes());
+    hasher.update(name);
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,6 +1522,53 @@ mod tests {
         }
     }
 
+    fn assert_refusal_class(
+        error: DeviceRemovalError,
+        expected: DeviceRemovalRefusalClass,
+    ) -> DeviceRemovalRefusal {
+        match error {
+            DeviceRemovalError::RemovalRefused { evidence } => {
+                assert_eq!(evidence.class, expected);
+                evidence
+            }
+            other => panic!("expected {expected} refusal, got {other:?}"),
+        }
+    }
+
+    fn make_evacuating_driver(total_objects: u64) -> DeviceRemovalDriver {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            total_objects,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver
+    }
+
+    fn assert_checkpoint_rejected(
+        mut driver: DeviceRemovalDriver,
+        checkpoint: &EvacuationCheckpoint,
+        expected_dest_device_id: DeviceId,
+    ) -> DeviceRemovalRefusal {
+        let err = driver
+            .apply_checkpoint_for_destination(checkpoint, expected_dest_device_id)
+            .unwrap_err();
+        let evidence =
+            assert_refusal_class(err, DeviceRemovalRefusalClass::CheckpointReplayRejected);
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+        assert_eq!(
+            driver.state().failure_evidence.as_ref().map(|e| e.class),
+            Some(DeviceRemovalRefusalClass::CheckpointReplayRejected)
+        );
+        evidence
+    }
+
     // ── Phase tests ─────────────────────────────────────────────────
 
     #[test]
@@ -1115,6 +1645,7 @@ mod tests {
         assert_eq!(state.objects_failed, 0);
         assert_eq!(state.bytes_evacuated, 0);
         assert!(state.error.is_none());
+        assert!(state.failure_evidence.is_none());
     }
 
     #[test]
@@ -1182,8 +1713,8 @@ mod tests {
             DeviceRemovalState::new(PathBuf::from("/dev/disk0"), 0, [0x01u8; 16], 0, 3, 2, 2);
         state.record_object_evacuated(100);
         state.record_object_failed();
-        assert_eq!(state.objects_remaining(), 0);
-        assert!(state.is_evacuation_complete());
+        assert_eq!(state.objects_remaining(), 1);
+        assert!(!state.is_evacuation_complete());
     }
 
     #[test]
@@ -1233,10 +1764,11 @@ mod tests {
             vec![DeviceId(0)],
             0,
         );
-        assert!(matches!(
+        let evidence = assert_refusal_class(
             result.unwrap_err(),
-            DeviceRemovalError::TargetDeviceNotFound { .. }
-        ));
+            DeviceRemovalRefusalClass::TargetNotFound,
+        );
+        assert_eq!(evidence.target_device, PathBuf::from("/dev/disk99"));
     }
 
     #[test]
@@ -1251,10 +1783,12 @@ mod tests {
             vec![],
             0,
         );
-        assert!(matches!(
+        let evidence = assert_refusal_class(
             result.unwrap_err(),
-            DeviceRemovalError::WouldEmptyPool
-        ));
+            DeviceRemovalRefusalClass::WouldEmptyPool,
+        );
+        assert_eq!(evidence.surviving_devices, Some(0));
+        assert_eq!(evidence.required_surviving_devices, Some(1));
     }
 
     #[test]
@@ -1276,10 +1810,79 @@ mod tests {
             vec![DeviceId(1)],
             0,
         );
-        assert!(matches!(
+        let evidence = assert_refusal_class(
             result.unwrap_err(),
-            DeviceRemovalError::DeviceNotHealthy { .. }
-        ));
+            DeviceRemovalRefusalClass::UnhealthyTarget,
+        );
+        assert_eq!(evidence.target_device, PathBuf::from("/dev/disk0"));
+    }
+
+    #[test]
+    fn driver_prepare_fails_on_insufficient_surviving_topology() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024, DeviceHealth::Online);
+        let leaf2 = make_leaf("/dev/disk2", 3, 2, 1024 * 1024 * 1024, DeviceHealth::Online);
+        let mut config = make_pool_config(vec![leaf0, leaf1, leaf2]);
+        config.redundancy_policy =
+            tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(2);
+
+        let result = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            0,
+        );
+        let evidence = assert_refusal_class(
+            result.unwrap_err(),
+            DeviceRemovalRefusalClass::InsufficientSurvivingTopology,
+        );
+        assert_eq!(evidence.surviving_devices, Some(1));
+        assert_eq!(evidence.required_surviving_devices, Some(2));
+    }
+
+    #[test]
+    fn driver_prepare_fails_on_bad_redundancy_policy() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024, DeviceHealth::Online);
+        let mut config = make_pool_config(vec![leaf0, leaf1]);
+        config.redundancy_policy =
+            tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(0);
+
+        let result = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            0,
+        );
+        assert_refusal_class(
+            result.unwrap_err(),
+            DeviceRemovalRefusalClass::DomainConstraintViolation,
+        );
+    }
+
+    #[test]
+    fn driver_prepare_fails_on_stale_topology_generation() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024 * 1024 * 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024 * 1024 * 1024, DeviceHealth::Online);
+        let mut config = make_pool_config(vec![leaf0, leaf1]);
+        config.topology_generation = 5;
+
+        let result = DeviceRemovalDriver::prepare_with_expected_topology_generation(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            0,
+            4,
+        );
+        let evidence = assert_refusal_class(
+            result.unwrap_err(),
+            DeviceRemovalRefusalClass::StaleTopologyGeneration,
+        );
+        assert_eq!(evidence.expected_topology_generation, Some(4));
+        assert_eq!(evidence.observed_topology_generation, Some(5));
     }
 
     #[test]
@@ -1353,11 +1956,15 @@ mod tests {
         // Only 1 of 3 evacuated
 
         let result = driver.mark_evacuated();
-        assert!(result.is_err());
-        assert!(matches!(
+        assert_refusal_class(
             result.unwrap_err(),
-            DeviceRemovalError::InvalidTransition { .. }
-        ));
+            DeviceRemovalRefusalClass::EvacuationIncomplete,
+        );
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+        assert_eq!(
+            driver.state().failure_evidence.as_ref().map(|e| e.class),
+            Some(DeviceRemovalRefusalClass::EvacuationIncomplete)
+        );
     }
 
     #[test]
@@ -1385,7 +1992,11 @@ mod tests {
         ]);
 
         let result = driver.commit_vacated(still_has_target);
-        assert!(result.is_err());
+        assert_refusal_class(
+            result.unwrap_err(),
+            DeviceRemovalRefusalClass::CommittedTopologyMismatch,
+        );
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
     }
 
     #[test]
@@ -1408,6 +2019,10 @@ mod tests {
         assert_eq!(
             driver.state().error.as_deref(),
             Some("I/O error during evacuation")
+        );
+        assert_eq!(
+            driver.state().failure_evidence.as_ref().map(|e| e.class),
+            Some(DeviceRemovalRefusalClass::DomainConstraintViolation)
         );
     }
 
@@ -1489,6 +2104,7 @@ mod tests {
             bytes_evacuated: 20480,
             target_topology_generation: 4,
             error: Some("transient I/O error".into()),
+            failure_evidence: None,
             chain_digest: [0xBBu8; 32],
         };
         let json = serde_json::to_string(&state).expect("serialize");
@@ -1522,6 +2138,13 @@ mod tests {
             },
             DeviceRemovalError::DeviceNotHealthy {
                 health: DeviceHealth::Faulted,
+            },
+            DeviceRemovalError::RemovalRefused {
+                evidence: DeviceRemovalRefusal::new(
+                    DeviceRemovalRefusalClass::WouldEmptyPool,
+                    PathBuf::from("/dev/disk0"),
+                    "removal would leave no data device",
+                ),
             },
             DeviceRemovalError::PersistFailed {
                 reason: "disk full".into(),
@@ -1563,6 +2186,11 @@ mod tests {
     #[test]
     fn checkpoint_remaining_decrements_correctly() {
         let cp = EvacuationCheckpoint {
+            target_device_id: 1,
+            target_device_guid: [0x11u8; 16],
+            target_topology_generation: 2,
+            evacuation_set_digest: [0x22u8; 32],
+            removal_chain_digest: [0x33u8; 32],
             next_object_index: 7,
             total_objects: 10,
             objects_evacuated: 6,
@@ -1577,6 +2205,11 @@ mod tests {
     #[test]
     fn checkpoint_serde_roundtrip() {
         let cp = EvacuationCheckpoint {
+            target_device_id: 7,
+            target_device_guid: [0x44u8; 16],
+            target_topology_generation: 9,
+            evacuation_set_digest: [0x55u8; 32],
+            removal_chain_digest: [0x66u8; 32],
             next_object_index: 42,
             total_objects: 100,
             objects_evacuated: 40,
@@ -1789,44 +2422,88 @@ mod tests {
         assert_eq!(cp.bytes_evacuated, 300);
         assert_eq!(cp.dest_device_id, 5);
         assert_eq!(cp.total_objects, 10);
+        assert_eq!(cp.target_device_id, 1);
+        assert_eq!(cp.target_device_guid, [2u8; 16]);
+        assert_eq!(cp.target_topology_generation, 2);
+        assert_eq!(
+            cp.evacuation_set_digest,
+            evacuation_set_digest(driver.state())
+        );
+        assert_eq!(cp.removal_chain_digest, driver.state().chain_digest);
     }
 
     #[test]
     fn apply_checkpoint_restores_state() {
-        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
-        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
-        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut source = make_evacuating_driver(100);
+        source.state.record_object_evacuated(400);
+        source.state.record_object_evacuated(600);
+        let cp = source.create_checkpoint(DeviceId(0));
 
-        let mut driver = DeviceRemovalDriver::prepare(
-            Box::new(NoopAllocationFence::new()),
-            Path::new("/dev/disk1"),
-            config,
-            vec![DeviceId(0)],
-            100,
-        )
-        .unwrap();
+        let mut recovered = make_evacuating_driver(100);
+        assert_eq!(recovered.state().objects_evacuated, 0);
+        assert_eq!(recovered.state().bytes_evacuated, 0);
+        assert_eq!(recovered.state().objects_failed, 0);
 
-        driver.begin_evacuation().unwrap();
+        recovered.apply_checkpoint(&cp).unwrap();
 
-        // Driver starts at 0.
-        assert_eq!(driver.state().objects_evacuated, 0);
-        assert_eq!(driver.state().bytes_evacuated, 0);
-        assert_eq!(driver.state().objects_failed, 0);
+        assert_eq!(recovered.state().objects_evacuated, 2);
+        assert_eq!(recovered.state().bytes_evacuated, 1000);
+        assert_eq!(recovered.state().objects_failed, 0);
+    }
 
-        // Apply a checkpoint from a previous run.
-        let cp = EvacuationCheckpoint {
-            next_object_index: 55,
-            total_objects: 100,
-            objects_evacuated: 50,
-            bytes_evacuated: 50000,
-            objects_failed: 5,
-            dest_device_id: 3,
-        };
-        driver.apply_checkpoint(&cp);
+    #[test]
+    fn apply_checkpoint_rejects_failed_progress() {
+        let mut source = make_evacuating_driver(100);
+        source.state.record_object_evacuated(100);
+        let mut cp = source.create_checkpoint(DeviceId(0));
+        cp.objects_failed = 5;
+        cp.next_object_index = cp.objects_evacuated + cp.objects_failed;
 
-        assert_eq!(driver.state().objects_evacuated, 50);
-        assert_eq!(driver.state().bytes_evacuated, 50000);
-        assert_eq!(driver.state().objects_failed, 5);
+        let evidence = assert_checkpoint_rejected(make_evacuating_driver(100), &cp, DeviceId(0));
+        assert!(evidence.details.contains("failed object"));
+    }
+
+    #[test]
+    fn checkpoint_replay_rejects_tampered_identity() {
+        let mut source = make_evacuating_driver(10);
+        source.state.record_object_evacuated(100);
+        let base = source.create_checkpoint(DeviceId(0));
+
+        let mut cp = base.clone();
+        cp.target_device_id = 99;
+        assert_checkpoint_rejected(make_evacuating_driver(10), &cp, DeviceId(0));
+
+        let mut cp = base.clone();
+        cp.target_device_guid = [0x99u8; 16];
+        assert_checkpoint_rejected(make_evacuating_driver(10), &cp, DeviceId(0));
+
+        let evidence = assert_checkpoint_rejected(make_evacuating_driver(10), &base, DeviceId(1));
+        assert!(evidence.details.contains("destination"));
+
+        let mut cp = base.clone();
+        cp.total_objects = 11;
+        assert_checkpoint_rejected(make_evacuating_driver(10), &cp, DeviceId(0));
+
+        let mut cp = base.clone();
+        cp.target_topology_generation += 1;
+        assert_checkpoint_rejected(make_evacuating_driver(10), &cp, DeviceId(0));
+
+        let mut cp = base.clone();
+        cp.evacuation_set_digest[0] ^= 0x01;
+        assert_checkpoint_rejected(make_evacuating_driver(10), &cp, DeviceId(0));
+
+        let mut cp = base.clone();
+        cp.removal_chain_digest[0] ^= 0x01;
+        assert_checkpoint_rejected(make_evacuating_driver(10), &cp, DeviceId(0));
+
+        let mut cp = base.clone();
+        cp.next_object_index += 1;
+        assert_checkpoint_rejected(make_evacuating_driver(10), &cp, DeviceId(0));
+
+        let mut cp = base;
+        cp.objects_evacuated = cp.total_objects + 1;
+        cp.next_object_index = cp.objects_evacuated;
+        assert_checkpoint_rejected(make_evacuating_driver(10), &cp, DeviceId(0));
     }
 
     #[test]
