@@ -77,6 +77,7 @@ manifests are fuzz harnesses:
 - `crates/tidefs-binary_schema-core/fuzz/Cargo.toml`
 - `crates/tidefs-local-filesystem/fuzz/Cargo.toml`
 - `crates/tidefs-local-object-store/fuzz/Cargo.toml`
+- `crates/tidefs-validation/fuzz/Cargo.toml`
 - `fuzz/Cargo.toml`
 
 Meanwhile `tidefs-types-control-plane-core`,
