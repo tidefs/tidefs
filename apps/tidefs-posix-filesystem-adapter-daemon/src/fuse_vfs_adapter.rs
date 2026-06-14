@@ -4571,7 +4571,7 @@ impl FuseVfsAdapter {
         fh: Option<u64>,
     ) -> Result<FuseAttrOut, Errno> {
         if is_fuse_read_atime_setattr(attr, fh) {
-            return self.dispatch_fuse_read_atime_setattr(ctx, unique, ino);
+            return self.dispatch_fuse_read_atime_setattr(ctx, unique, ino, attr);
         }
         self.dispatch_setattr(ctx, unique, ino, attr, fh)
     }
@@ -4581,12 +4581,13 @@ impl FuseVfsAdapter {
         ctx: &RequestCtx,
         unique: u64,
         ino: u64,
+        attr: &SetAttr,
     ) -> Result<FuseAttrOut, Errno> {
         if self.read_only || self.timestamp_policy == TimestampPolicy::NoAtime {
             return self.dispatch_getattr(ctx, ino, unique, None);
         }
 
-        let updated = match self.record_read_access_and_sync(ino, ctx) {
+        let updated = match self.record_fuse_read_atime_and_sync(ino, ctx, attr) {
             Ok(attr) => attr,
             Err(Errno::ENOENT | Errno::ESTALE) if self.namespace.is_some() => {
                 return self.dispatch_getattr(ctx, ino, unique, None);
@@ -4601,6 +4602,35 @@ impl FuseVfsAdapter {
             &updated.posix,
             updated.kind,
         ))
+    }
+
+    fn record_fuse_read_atime_and_sync(
+        &self,
+        ino: u64,
+        ctx: &RequestCtx,
+        attr: &SetAttr,
+    ) -> Result<InodeAttr, Errno> {
+        if attr.valid & FATTR_CTIME == 0 {
+            return self.record_read_access_and_sync(ino, ctx);
+        }
+
+        let inode_id = InodeId::new(ino);
+        let mut update = SetAttr::new();
+        if attr.valid & FATTR_ATIME != 0 {
+            update.valid |= FATTR_ATIME;
+            update.atime_ns = attr.atime_ns;
+        } else {
+            update.valid |= FATTR_ATIME_NOW;
+        }
+        update.valid |= FATTR_CTIME;
+        update.ctime_ns = attr.ctime_ns;
+
+        let updated = {
+            let e = self.engine.lock().unwrap();
+            e.setattr(inode_id, &update, None, ctx)?
+        };
+        self.sync_namespace_attrs_local(ino, &updated);
+        Ok(updated)
     }
 
     /// P5-02 classification for an incoming FUSE create request.
@@ -11397,6 +11427,63 @@ mod tests {
         assert_eq!(
             after.posix.ctime_ns, before.posix.ctime_ns,
             "automatic FUSE atime+ctime setattr must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn fuse_callback_specific_atime_ctime_uses_kernel_atime_without_ctime() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"fuse-specific-atime-ctime-setattr.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let base = 10_000_000_000;
+        let mut current = SetAttr::new();
+        current.valid = FATTR_ATIME | FATTR_MTIME | FATTR_CTIME;
+        current.atime_ns = base + 2_000_000_000;
+        current.mtime_ns = base;
+        current.ctime_ns = base;
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .setattr(inode, &current, None, &ctx)
+                .expect("seed relatime-noop timestamp state");
+        }
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before kernel atime")
+        };
+        assert_eq!(before.posix.atime_ns, current.atime_ns);
+        assert_eq!(before.posix.ctime_ns, current.ctime_ns);
+
+        let mut read_atime = SetAttr::new();
+        read_atime.valid = FATTR_ATIME | FATTR_CTIME;
+        read_atime.atime_ns = base + 3_000_000_000;
+        read_atime.ctime_ns = before.posix.ctime_ns;
+        fixture
+            .adapter
+            .dispatch_fuse_setattr(&ctx, 2, inode.get(), &read_atime, None)
+            .expect("automatic fuse specific atime setattr with preserved ctime");
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after kernel atime")
+        };
+        assert_eq!(
+            after.posix.atime_ns, read_atime.atime_ns,
+            "kernel-selected FUSE atime must be applied exactly"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "kernel-selected FUSE atime must preserve ctime"
         );
     }
 
