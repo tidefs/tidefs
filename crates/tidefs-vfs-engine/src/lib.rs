@@ -818,6 +818,16 @@ pub trait VfsEngine {
         ctx: &RequestCtx,
     ) -> Result<Vec<u8>, Errno>;
 
+    /// Record an automatic read access timestamp update for `inode`.
+    ///
+    /// Adapters use this when a successful read is served from an adapter-side
+    /// cache instead of calling [`VfsEngine::read`]. Implementations must apply
+    /// the same atime policy as `read` and must not treat the update as an
+    /// explicit setattr that advances ctime.
+    fn record_read_access(&self, _inode: InodeId, _ctx: &RequestCtx) -> Result<(), Errno> {
+        Ok(())
+    }
+
     /// Write `data` to `fh` at `offset`.
     ///
     /// Returns the number of bytes written (may be less than `data.len()`
