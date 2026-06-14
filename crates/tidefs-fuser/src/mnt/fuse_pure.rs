@@ -655,7 +655,10 @@ mod tests {
     }
 
     #[test]
-    fn fusermount_relatime_uses_kernel_default_without_remount() {
-        assert_eq!(atime_remount_flags(&[MountOption::Relatime]), None);
+    fn fusermount_relatime_remount_preserves_default_flags() {
+        assert_eq!(
+            atime_remount_flags(&[MountOption::Relatime]),
+            Some(libc::MS_REMOUNT | libc::MS_NODEV | libc::MS_NOSUID | libc::MS_RELATIME)
+        );
     }
 }

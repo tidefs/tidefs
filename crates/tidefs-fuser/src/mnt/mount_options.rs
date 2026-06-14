@@ -164,7 +164,10 @@ pub(crate) fn atime_remount_flags(options: &[MountOption]) -> Option<libc::c_ulo
     let needs_remount = options.iter().any(|option| {
         matches!(
             option,
-            MountOption::Atime | MountOption::NoAtime | MountOption::StrictAtime
+            MountOption::Atime
+                | MountOption::Relatime
+                | MountOption::NoAtime
+                | MountOption::StrictAtime
         )
     });
     if !needs_remount {
