@@ -540,6 +540,7 @@ impl<'a> MembershipOutboundDispatch<'a> {
         // Enqueue through the transport send pipeline.
         self.send_dispatcher
             .enqueue(peer_id, outbound)
+            .map(|_| ())
             .map_err(|e| Self::map_send_error(member_id, e))
     }
 
@@ -576,32 +577,34 @@ impl<'a> MembershipOutboundDispatch<'a> {
                 conn_id,
                 depth,
                 byte_depth,
+                ..
             } => OutboundDispatchError::Backpressure {
                 member_id,
                 peer_id: conn_id,
                 depth,
                 byte_depth,
             },
-            SendError::NoConnection { conn_id } => OutboundDispatchError::NoTransportQueue {
+            SendError::NoConnection { conn_id, .. } => OutboundDispatchError::NoTransportQueue {
                 member_id,
                 peer_id: conn_id,
             },
-            SendError::Shutdown { conn_id } => OutboundDispatchError::TransportShutdown {
+            SendError::Shutdown { conn_id, .. } => OutboundDispatchError::TransportShutdown {
                 member_id,
                 peer_id: conn_id,
             },
-            SendError::SendConcurrencyLimitExceeded { conn_id, max: _ } => {
-                OutboundDispatchError::Backpressure {
-                    member_id,
-                    peer_id: conn_id,
-                    depth: 0,
-                    byte_depth: 0,
-                }
-            }
+            SendError::SendConcurrencyLimitExceeded {
+                conn_id, max: _, ..
+            } => OutboundDispatchError::Backpressure {
+                member_id,
+                peer_id: conn_id,
+                depth: 0,
+                byte_depth: 0,
+            },
             SendError::SendQueueFull {
                 lane: _,
                 depth,
                 max_depth: _,
+                ..
             } => {
                 OutboundDispatchError::Backpressure {
                     member_id,
