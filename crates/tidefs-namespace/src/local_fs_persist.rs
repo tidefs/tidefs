@@ -61,6 +61,7 @@ impl PersistentInodeStore for LocalFilesystemInodeStore {
         let id = InodeId::new(inode);
         let existing = fs
             .get_inode_by_id(id)
+            .cloned()
             .ok_or(NamespaceError::InodeNotFound)?;
         if existing.is_file_like() && attrs.size != existing.size {
             return Err(NamespaceError::NotSupported);
@@ -72,6 +73,10 @@ impl PersistentInodeStore for LocalFilesystemInodeStore {
         record.size = attrs.size;
         record.nlink = attrs.nlink;
         record.rdev = attrs.rdev;
+        record.posix_time = posix_time_from_attrs(attrs, existing.posix_time.btime_ns);
+        if record == existing {
+            return Ok(());
+        }
         record.metadata_version = record.metadata_version.saturating_add(1);
         fs.update_inode_record(id, record)
             .map_err(|_| NamespaceError::InodeNotFound)
@@ -120,17 +125,21 @@ fn attrs_to_inode_record(
         size: attrs.size,
         data_version: 0,
         metadata_version: 0,
-        posix_time: PosixTimeRecord::new(
-            system_time_to_ns(attrs.atime),
-            system_time_to_ns(attrs.mtime),
-            system_time_to_ns(attrs.ctime),
-            system_time_to_ns(attrs.ctime),
-        ),
+        posix_time: posix_time_from_attrs(attrs, system_time_to_ns(attrs.ctime)),
         xattr_storage_kind: 0,
         xattrs: std::collections::BTreeMap::new(),
         dir_rev: 0,
         rdev: attrs.rdev,
     }
+}
+
+fn posix_time_from_attrs(attrs: &InodeAttributes, btime_ns: i64) -> PosixTimeRecord {
+    PosixTimeRecord::new(
+        system_time_to_ns(attrs.atime),
+        system_time_to_ns(attrs.mtime),
+        system_time_to_ns(attrs.ctime),
+        btime_ns,
+    )
 }
 
 fn inode_record_to_attrs(record: &tidefs_local_filesystem::InodeRecord) -> InodeAttributes {
@@ -556,6 +565,9 @@ mod integration_tests {
     fn test_attrs_dir() -> InodeAttributes {
         InodeAttributes::new_dir(0)
     }
+    fn fixed_time(secs: u64, nanos: u32) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
+    }
 
     fn test_fs(temp: &tempfile::TempDir) -> Arc<Mutex<LocalFileSystem>> {
         let root_key = tidefs_local_filesystem::RootAuthenticationKey::demo_key();
@@ -623,6 +635,105 @@ mod integration_tests {
         drop(dir_store);
         drop(inode_store);
         finish_bridge_conversion_test(fs);
+    }
+
+    #[test]
+    fn real_inode_store_update_attrs_preserves_posix_timestamps() {
+        let temp = tempfile::TempDir::with_prefix("tidefs-ns-times-").unwrap();
+        let fs = test_fs(&temp);
+        let inode_store = LocalFilesystemInodeStore::new(Arc::clone(&fs));
+        let mut attrs = InodeAttributes::new_file(0);
+        attrs.atime = fixed_time(10, 1);
+        attrs.mtime = fixed_time(20, 2);
+        attrs.ctime = fixed_time(30, 3);
+
+        let (ino, _) = inode_store.alloc_inode(&attrs).unwrap();
+        let original_btime_ns = {
+            let guard = fs.lock().unwrap();
+            guard
+                .get_inode_by_id(InodeId::new(ino))
+                .unwrap()
+                .posix_time
+                .btime_ns
+        };
+        let mut updated = inode_store.get_attrs(ino).unwrap();
+        updated.uid = 1000;
+        updated.atime = fixed_time(100, 10);
+        updated.mtime = fixed_time(200, 20);
+        updated.ctime = fixed_time(300, 30);
+
+        inode_store.update_attrs(ino, &updated).unwrap();
+
+        let stored = inode_store.get_attrs(ino).unwrap();
+        assert_eq!(stored.uid, 1000);
+        assert_eq!(stored.atime, updated.atime);
+        assert_eq!(stored.mtime, updated.mtime);
+        assert_eq!(stored.ctime, updated.ctime);
+
+        let record = fs
+            .lock()
+            .unwrap()
+            .get_inode_by_id(InodeId::new(ino))
+            .unwrap()
+            .clone();
+        assert_eq!(record.posix_time.atime_ns, system_time_to_ns(updated.atime));
+        assert_eq!(record.posix_time.mtime_ns, system_time_to_ns(updated.mtime));
+        assert_eq!(record.posix_time.ctime_ns, system_time_to_ns(updated.ctime));
+        assert_eq!(record.posix_time.btime_ns, original_btime_ns);
+
+        drop(inode_store);
+        finish_bridge_conversion_test(fs);
+    }
+
+    #[test]
+    fn real_inode_store_update_attrs_persists_posix_timestamps() {
+        let temp = tempfile::TempDir::with_prefix("tidefs-ns-times-reopen-").unwrap();
+        let root_key = tidefs_local_filesystem::RootAuthenticationKey::demo_key();
+        let fs = Arc::new(Mutex::new(
+            LocalFileSystem::open_with_root_authentication_key(
+                temp.path(),
+                tidefs_local_filesystem::human::local_filesystem::StoreOptions::test_fast(),
+                root_key,
+            )
+            .expect("open local filesystem"),
+        ));
+        let inode_store = Arc::new(LocalFilesystemInodeStore::new(Arc::clone(&fs)));
+        let dir_store = Arc::new(LocalFilesystemDirectoryStore::new(Arc::clone(&fs)));
+        let ns = Namespace::with_persistent_stores(
+            Some(inode_store as Arc<dyn PersistentInodeStore>),
+            Some(dir_store as Arc<dyn PersistentDirectoryStore>),
+        );
+        let mut attrs = InodeAttributes::new_file(0);
+        attrs.atime = fixed_time(11, 1);
+        attrs.mtime = fixed_time(22, 2);
+        attrs.ctime = fixed_time(33, 3);
+
+        let ino = ns.create_file(ROOT_INODE, "timed.txt", attrs).unwrap();
+        let mut updated = ns.get_attrs(ino).unwrap();
+        updated.gid = 1001;
+        updated.atime = fixed_time(111, 11);
+        updated.mtime = fixed_time(222, 22);
+        updated.ctime = fixed_time(333, 33);
+        ns.update_attrs(ino, updated.clone()).unwrap();
+        fs.lock().unwrap().commit_if_dirty().unwrap();
+
+        drop(ns);
+        drop(fs);
+
+        let reopened = LocalFileSystem::open_with_root_authentication_key(
+            temp.path(),
+            tidefs_local_filesystem::human::local_filesystem::StoreOptions::test_fast(),
+            root_key,
+        )
+        .expect("reopen local filesystem");
+        let record = reopened
+            .get_inode_by_id(InodeId::new(ino))
+            .expect("persisted inode");
+
+        assert_eq!(record.gid, 1001);
+        assert_eq!(record.posix_time.atime_ns, system_time_to_ns(updated.atime));
+        assert_eq!(record.posix_time.mtime_ns, system_time_to_ns(updated.mtime));
+        assert_eq!(record.posix_time.ctime_ns, system_time_to_ns(updated.ctime));
     }
 
     #[test]

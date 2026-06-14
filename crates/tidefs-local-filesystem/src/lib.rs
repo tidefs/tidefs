@@ -4838,14 +4838,18 @@ impl LocalFileSystem {
 
     /// Replace an existing inode record.
     pub fn update_inode_record(&mut self, id: InodeId, record: InodeRecord) -> Result<()> {
-        if self.state.inodes.contains_key(&id) {
-            Arc::make_mut(&mut self.state.inodes).insert(id, record);
-            Ok(())
-        } else {
-            Err(FileSystemError::NotFound {
+        let Some(existing) = self.state.inodes.get(&id) else {
+            return Err(FileSystemError::NotFound {
                 path: format!("inode:{}", id.0),
-            })
+            });
+        };
+        if existing == &record {
+            return Ok(());
         }
+        self.mark_inode_metadata_dirty(id);
+        Arc::make_mut(&mut self.state.inodes).insert(id, record);
+        self.inode_cache.borrow_mut().invalidate(id);
+        Ok(())
     }
 
     /// Insert an inode record at a specific ID (without allocating).
