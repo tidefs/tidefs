@@ -93,7 +93,7 @@ Important 2026-06-01 findings:
   depending on publication-pipeline, response-registry, or control-plane
   scaffold crates. Current metadata no longer reports direct scaffold
   dependencies from the POSIX daemon, POSIX core, schema codec, or `xtask`.
-  `check-workspace-policy` now reports 148 members and 531 internal dependency
+  `check-workspace-policy` now reports 148 members and 595 internal dependency
   edges, and reports `tidefs-types-publication-pipeline-core` and
   `tidefs-types-response-registry-core` as zero-consumer workspace crates to
   inspect before removal. This is not TFR-002 closure because the
@@ -118,11 +118,15 @@ Important 2026-06-01 findings:
   `docs/PUBLISHING_CHECKLIST.md`, and the live verification engine source now
   carries the `data_copy_2.verification_engine` component id required by the
   cluster gate.
-  `docs/ARCHITECTURE.md`, `docs/workspace-package-classification.md`, and
-  `crates/README.md` now carry explicit stale-authority warnings but still
-  need authority refresh before they can be treated as current package truth;
-  `apps/README.md` now only records the app roots currently present on disk and
-  flags open TFR authority limits.
+  `docs/workspace-package-classification.md` is now regenerated from current
+  Cargo metadata and manifest discovery as the package-role authority, and
+  `check-workspace-policy` validates its counts, package roots, excluded fuzz
+  roots, and scaffold-transitional dependency boundary. `crates/README.md` and
+  `apps/README.md` now defer to that authority instead of carrying competing
+  package tables. This reduces TFR-002/TFR-019 drift but does not close either
+  item: scaffold-transitional type crates still need issue-backed migration,
+  reclassification, or deletion, and broader imported docs still need
+  authority classification.
 - `TFR-004`: `LocalFileSystem` still has global inode and directory maps plus
   global `next_inode_id`; namespace and inode-table crates maintain separate
   inode allocation authorities. The fresh root dataset catalog path now uses
@@ -935,10 +939,10 @@ Important 2026-06-01 findings:
   `CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target` passes against the canonical
   `forgeadmin/tidefs` Forgejo slug without a local repo override. This is not
   documentation closure:
-  `docs/workspace-package-classification.md` still carries closed-gate
-  wording while current metadata reports 148 packages and 148 members, many
-  imported docs remain unclassified, and broader process authority still needs
-  deliberate completion.
+  `docs/workspace-package-classification.md` now records the current
+  148-package workspace plus five excluded fuzz package roots and is checked by
+  `check-workspace-policy`, but many imported docs remain unclassified and
+  broader process authority still needs deliberate completion.
   The doc set cannot be treated as release truth until every file is classified
   as current policy, current spec, historical input, or delete candidate.
 - `TFR-019`/`TFR-018`: the current xfstests harness authority slice repairs
