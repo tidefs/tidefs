@@ -444,7 +444,10 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         },
         fuser::MountOption::FSName(config.fs_name.clone()),
     ];
-    options.extend(config.mount_opts.to_fuse_mount_options());
+    options.extend(fuse_mount_options_for_mode(
+        &config.mount_opts,
+        config.read_only,
+    ));
     if config.writeback_cache {
         options.push(fuser::MountOption::WritebackCache);
     }
@@ -715,6 +718,17 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         .write_to_path(&msp_for_sig)
         .map_err(|e| format!("write clean mount-state: {e}"))?;
     Ok(())
+}
+
+fn fuse_mount_options_for_mode(
+    mount_opts: &MountOptions,
+    read_only: bool,
+) -> Vec<fuser::MountOption> {
+    let mut effective = mount_opts.clone();
+    if read_only {
+        effective.timestamp_policy = crate::mount_options::TimestampPolicy::NoAtime;
+    }
+    effective.to_fuse_mount_options()
 }
 
 /// Configuration for mount-vfs subcommand.
@@ -3918,6 +3932,45 @@ mod tests {
         let config = parse_mount_vfs_config(args).expect("parse mount config");
 
         assert!(config.mount_opts.sync);
+    }
+
+    #[test]
+    fn read_write_mount_preserves_kernel_atime_policy() {
+        let opts = MountOptions {
+            timestamp_policy: crate::mount_options::TimestampPolicy::StrictAtime,
+            suppress_dir_atime: false,
+            sync: false,
+            sync_guarantee: SyncGuarantee::Local,
+            allow_other: false,
+            dev: false,
+            intent_log_write: false,
+        };
+
+        assert_eq!(
+            fuse_mount_options_for_mode(&opts, false),
+            vec![fuser::MountOption::StrictAtime]
+        );
+    }
+
+    #[test]
+    fn read_only_mount_forces_kernel_noatime_policy() {
+        let opts = MountOptions {
+            timestamp_policy: crate::mount_options::TimestampPolicy::StrictAtime,
+            suppress_dir_atime: false,
+            sync: true,
+            sync_guarantee: SyncGuarantee::Local,
+            allow_other: true,
+            dev: true,
+            intent_log_write: false,
+        };
+
+        let mount_options = fuse_mount_options_for_mode(&opts, true);
+
+        assert!(mount_options.contains(&fuser::MountOption::NoAtime));
+        assert!(!mount_options.contains(&fuser::MountOption::StrictAtime));
+        assert!(mount_options.contains(&fuser::MountOption::Sync));
+        assert!(mount_options.contains(&fuser::MountOption::AllowOther));
+        assert!(mount_options.contains(&fuser::MountOption::Dev));
     }
 
     #[test]

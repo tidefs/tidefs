@@ -2864,6 +2864,16 @@ impl FuseVfsAdapter {
         }
     }
 
+    fn system_request_ctx() -> RequestCtx {
+        RequestCtx {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            umask: 0,
+            groups: vec![0],
+        }
+    }
+
     fn write_sync_datasync(&self, open_flags: u32) -> Option<bool> {
         if self.force_sync_writes {
             return Some(false);
@@ -7309,12 +7319,15 @@ impl FuseVfsAdapter {
         // Check whether the kernel wants to preserve cached data.
         // FOPEN_KEEP_CACHE means the adapter's read cache should NOT be
         // invalidated on close. Without it, evict stale cached data.
-        let keep_cache = {
+        let (keep_cache, release_read_open_flags) = {
             let fht = self.file_handles.lock().unwrap();
-            fht.handles
-                .get(&fh)
-                .map(|h| (h.fuse_open_flags & fuser::consts::FOPEN_KEEP_CACHE) != 0)
-                .unwrap_or(false)
+            match fht.handles.get(&fh) {
+                Some(handle) => (
+                    (handle.fuse_open_flags & fuser::consts::FOPEN_KEEP_CACHE) != 0,
+                    Some(handle.engine_handle.open_flags),
+                ),
+                None => (false, None),
+            }
         };
 
         let efh = match self.remove_file_handle(ino, fh, lock_owner.unwrap_or(0)) {
@@ -7417,6 +7430,13 @@ impl FuseVfsAdapter {
             let e = self.engine.lock().unwrap();
             e.release(efh)?;
         }
+        if let Some(open_flags) = release_read_open_flags {
+            // Kernel writeback-cache reads can be satisfied without a daemon
+            // READ. Reconcile automatic read atime again after close so cache
+            // invalidation is ordered after the kernel-served access.
+            let ctx = Self::system_request_ctx();
+            self.finish_successful_writeback_read_handle_atime(ino, open_flags, &ctx);
+        }
         self.writeback_cache.lock().unwrap().mark_clean(ino);
 
         // Drain the DirtyPageTracker for this inode after writeback so
@@ -7518,7 +7538,12 @@ impl FuseVfsAdapter {
         self.maybe_update_atime(ino, ctx);
     }
 
-    fn finish_successful_writeback_open_atime(&self, ino: u64, open_flags: u32, ctx: &RequestCtx) {
+    fn finish_successful_writeback_read_handle_atime(
+        &self,
+        ino: u64,
+        open_flags: u32,
+        ctx: &RequestCtx,
+    ) {
         if !self.writeback_cache_enabled {
             return;
         }
@@ -8164,7 +8189,7 @@ impl FuseVfsAdapter {
         ));
         self.file_handles.lock().unwrap().inc_open_ref(ino);
         self.remember_writeback_inode(ino);
-        self.finish_successful_writeback_open_atime(ino, engine_open_flags, ctx);
+        self.finish_successful_writeback_read_handle_atime(ino, engine_open_flags, ctx);
         // FUSE reply flags already computed and stored by AdapterFileHandle::new
         // during allocate(). Read them back for the reply.
         self.mmap_coherency.register(ino, 0);
@@ -11129,6 +11154,125 @@ mod tests {
         assert_eq!(
             after.posix.ctime_ns, before.posix.ctime_ns,
             "writeback-cache open atime must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn writeback_relatime_read_open_after_write_advances_atime_without_ctime() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        fixture.adapter.timestamp_policy = TimestampPolicy::RelativeAtime;
+        let ctx = root_ctx();
+        let payload = b"relatime writeback open atime";
+        let (inode, writer_adapter_fh, writer_engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"writeback-open-relatime-atime.txt",
+            libc::O_RDWR as u32,
+        );
+
+        std::thread::sleep(Duration::from_millis(1));
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&writer_engine_fh, 0, payload, &ctx)
+                .expect("write payload");
+        }
+        let released = fixture
+            .adapter
+            .remove_file_handle(inode.get(), writer_adapter_fh, 0)
+            .expect("remove writer adapter handle");
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.release(&released).expect("release writer handle");
+        }
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before read open")
+        };
+        assert!(
+            before.posix.atime_ns <= before.posix.mtime_ns
+                || before.posix.atime_ns <= before.posix.ctime_ns,
+            "fresh post-write inode should be eligible for the first relatime read: atime={}, mtime={}, ctime={}",
+            before.posix.atime_ns,
+            before.posix.mtime_ns,
+            before.posix.ctime_ns
+        );
+
+        std::thread::sleep(Duration::from_millis(1));
+        let read_open = fixture
+            .adapter
+            .dispatch_open_entry(&ctx, inode.get(), libc::O_RDONLY as u32)
+            .expect("read-capable open");
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after read open")
+        };
+        assert!(
+            after.posix.atime_ns > before.posix.atime_ns,
+            "first writeback-cache relatime read open after write must advance atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "relatime read-open atime must not advance ctime"
+        );
+
+        fixture
+            .adapter
+            .dispatch_release(inode.get(), read_open.adapter_fh, 0, None, false)
+            .expect("release read handle");
+    }
+
+    #[test]
+    fn writeback_read_release_records_atime_without_ctime() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        fixture.adapter.timestamp_policy = TimestampPolicy::StrictAtime;
+        let ctx = root_ctx();
+        let (inode, adapter_fh) = create_file_with_data_and_open(
+            &fixture,
+            b"writeback-release-read-atime.txt",
+            b"release-side read atime",
+            libc::O_RDONLY as u32,
+        );
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, inode.get(), &stale_atime, None)
+            .expect("force old atime");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before release")
+        };
+        assert_eq!(before.posix.atime_ns, 1);
+
+        std::thread::sleep(Duration::from_millis(1));
+        fixture
+            .adapter
+            .dispatch_release(inode.get(), adapter_fh, 0, None, false)
+            .expect("release read handle");
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after release")
+        };
+        assert!(
+            after.posix.atime_ns > before.posix.atime_ns,
+            "writeback-cache read release must reconcile read atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "release-side read atime must not advance ctime"
         );
     }
 
