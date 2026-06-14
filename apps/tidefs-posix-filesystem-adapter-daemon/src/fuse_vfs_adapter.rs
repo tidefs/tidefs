@@ -3046,21 +3046,21 @@ impl FuseVfsAdapter {
             .map(|_| ())
     }
 
-    /// Conditionally update atime on a parent directory after a
-    /// successful lookup, following the configured timestamp policy.
+    /// Conditionally update atime on a directory after a successful readdir.
     ///
-    /// This is read-access timestamp behavior, not explicit setattr behavior:
-    /// automatic directory atime must never advance ctime.
-    fn maybe_update_lookup_atime(&self, ctx: &RequestCtx, parent: u64) {
+    /// Pathname lookup is metadata resolution, not a directory-content read:
+    /// advancing directory atime there makes later read-only remount checks see
+    /// timestamp drift that happened before the remount. Directory atime belongs
+    /// to explicit directory reads, and automatic updates must never advance
+    /// ctime.
+    fn maybe_update_dir_read_atime(&self, ctx: &RequestCtx, ino: u64) {
         if self.suppress_dir_atime {
             return;
         }
 
-        self.maybe_update_atime(parent, ctx);
+        self.maybe_update_atime(ino, ctx);
     }
 
-    /// Conditionally update atime on a directory after a successful
-    /// lookup, following the configured timestamp policy.
     pub fn notifier_cell(&self) -> Arc<Mutex<Option<fuser::Notifier>>> {
         Arc::clone(&self.notifier)
     }
@@ -4337,7 +4337,6 @@ impl FuseVfsAdapter {
         };
         if let Some((ino, attr)) = cache_hit {
             self.record_lookup_count(ino);
-            self.maybe_update_lookup_atime(ctx, parent);
             return Ok(attr);
         }
 
@@ -4347,7 +4346,6 @@ impl FuseVfsAdapter {
         if let Some(ref ns) = self.namespace {
             match self.dispatch_lookup_via_namespace(ctx, ns, parent, name) {
                 Ok(attr) => {
-                    self.maybe_update_lookup_atime(ctx, parent);
                     return Ok(attr);
                 }
                 Err(Errno::ENOENT) | Err(Errno::EIO) | Err(Errno::ESTALE) => {} // fall through
@@ -4355,9 +4353,6 @@ impl FuseVfsAdapter {
             }
         }
 
-        // Scope the engine lock so maybe_update_lookup_atime (which also
-        // locks the engine) cannot self-deadlock.  Same pattern as the
-        // write-path fix in commit 07af1f9ae.
         let result = {
             let e = self.engine.lock().unwrap();
             e.lookup(InodeId::new(parent), name, ctx)
@@ -4368,7 +4363,6 @@ impl FuseVfsAdapter {
             let ino = attr.inode_id.get();
             self.record_lookup_count(ino);
             self.cache_path_lookup(parent, name, attr);
-            self.maybe_update_lookup_atime(ctx, parent);
         }
 
         // Cache negative results for the configured TTL.
@@ -7538,6 +7532,13 @@ impl FuseVfsAdapter {
         self.maybe_update_atime(ino, ctx);
     }
 
+    fn finish_successful_read_open_atime(&self, ino: u64, open_flags: u32, ctx: &RequestCtx) {
+        if !open_flags_allow_read(open_flags).unwrap_or(false) {
+            return;
+        }
+        self.finish_successful_read_atime(ino, ctx);
+    }
+
     fn finish_successful_writeback_read_handle_atime(
         &self,
         ino: u64,
@@ -7547,10 +7548,7 @@ impl FuseVfsAdapter {
         if !self.writeback_cache_enabled {
             return;
         }
-        if !open_flags_allow_read(open_flags).unwrap_or(false) {
-            return;
-        }
-        self.finish_successful_read_atime(ino, ctx);
+        self.finish_successful_read_open_atime(ino, open_flags, ctx);
     }
 
     fn invalidate_atime_caches_after_read(&self, ino: u64) {
@@ -7576,16 +7574,13 @@ impl FuseVfsAdapter {
         // surfaces, but must not reset or renumber engine pagination.
         let engine_error = match self.dispatch_readdir_via_engine(ctx, ino, fh, offset) {
             Ok(engine_entries) => {
-                if let Some(ref ns) = self.namespace {
-                    return self.merge_namespace_readdir_entries(
-                        ns,
-                        ino,
-                        fh,
-                        offset,
-                        engine_entries,
-                    );
-                }
-                return Ok(engine_entries);
+                let entries = if let Some(ref ns) = self.namespace {
+                    self.merge_namespace_readdir_entries(ns, ino, fh, offset, engine_entries)?
+                } else {
+                    engine_entries
+                };
+                self.maybe_update_dir_read_atime(ctx, ino);
+                return Ok(entries);
             }
             Err(errno @ (Errno::ENOENT | Errno::EBADF | Errno::EIO)) => errno,
             Err(e) => return Err(e),
@@ -7593,7 +7588,10 @@ impl FuseVfsAdapter {
         if let Some(ref ns) = self.namespace {
             let cookie = tidefs_dir_index::DirCookie(offset);
             match self.dispatch_readdir_via_namespace(ns, ino, fh, cookie) {
-                Ok(entries) => return Ok(entries),
+                Ok(entries) => {
+                    self.maybe_update_dir_read_atime(ctx, ino);
+                    return Ok(entries);
+                }
                 Err(Errno::ENOENT) | Err(Errno::EIO) => {} // fall through to engine error
                 Err(e) => return Err(e),
             }
@@ -8189,7 +8187,7 @@ impl FuseVfsAdapter {
         ));
         self.file_handles.lock().unwrap().inc_open_ref(ino);
         self.remember_writeback_inode(ino);
-        self.finish_successful_writeback_read_handle_atime(ino, engine_open_flags, ctx);
+        self.finish_successful_read_open_atime(ino, engine_open_flags, ctx);
         // FUSE reply flags already computed and stored by AdapterFileHandle::new
         // during allocate(). Read them back for the reply.
         self.mmap_coherency.register(ino, 0);
@@ -11019,8 +11017,8 @@ mod tests {
     }
 
     #[test]
-    fn namespace_lookup_dir_atime_uses_read_semantics_and_honors_nodiratime() {
-        let mut fixture = adapter_fixture_with_namespace();
+    fn lookup_does_not_advance_parent_dir_atime() {
+        let fixture = adapter_fixture_with_namespace();
         let ctx = root_ctx();
         let name = b"namespace-lookup-atime.txt";
         let (inode, _adapter_fh, _engine_fh) =
@@ -11065,58 +11063,171 @@ mod tests {
                 .getattr(InodeId::new(1), None, &ctx)
                 .expect("root attrs after namespace lookup")
         };
-        assert!(
-            after.posix.atime_ns > before.posix.atime_ns,
-            "directory lookup should record read atime"
+        assert_eq!(
+            after.posix.atime_ns, before.posix.atime_ns,
+            "pathname lookup must not record parent directory read atime"
         );
         assert_eq!(
             after.posix.ctime_ns, before.posix.ctime_ns,
-            "directory lookup atime must not advance ctime"
+            "pathname lookup must not advance parent directory ctime"
         );
-
-        fixture
-            .adapter
-            .dispatch_setattr(&ctx, 2, 1, &stale_atime, None)
-            .expect("force old root atime again");
-        fixture.adapter.suppress_dir_atime = true;
-        let suppressed_before = {
-            let engine = fixture.adapter.engine.lock().unwrap();
-            engine
-                .getattr(InodeId::new(1), None, &ctx)
-                .expect("root attrs before nodiratime lookup")
-        };
-        assert_eq!(suppressed_before.posix.atime_ns, 1);
 
         std::thread::sleep(Duration::from_millis(1));
         fixture
             .adapter
             .dispatch_lookup(&ctx, 1, name)
-            .expect("cached namespace lookup with nodiratime");
-        let suppressed_after = {
+            .expect("cached namespace lookup");
+        let cached_after = {
             let engine = fixture.adapter.engine.lock().unwrap();
             engine
                 .getattr(InodeId::new(1), None, &ctx)
-                .expect("root attrs after nodiratime lookup")
+                .expect("root attrs after cached namespace lookup")
         };
         assert_eq!(
-            suppressed_after.posix.atime_ns, suppressed_before.posix.atime_ns,
-            "nodiratime must suppress directory atime on lookup"
+            cached_after.posix.atime_ns, before.posix.atime_ns,
+            "cached pathname lookup must not record parent directory atime"
         );
         assert_eq!(
-            suppressed_after.posix.ctime_ns, suppressed_before.posix.ctime_ns,
-            "nodiratime lookup suppression must not advance ctime"
+            cached_after.posix.ctime_ns, before.posix.ctime_ns,
+            "cached pathname lookup must not advance parent directory ctime"
         );
     }
 
     #[test]
-    fn writeback_read_open_records_atime_without_ctime() {
-        let mut fixture = adapter_fixture_with_writeback_cache();
+    fn readdir_dir_atime_uses_read_semantics_and_honors_suppression() {
+        let mut fixture = adapter_fixture();
+        fixture.adapter.timestamp_policy = TimestampPolicy::StrictAtime;
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let _ = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"dir-read-atime-entry.txt",
+            libc::O_RDWR as u32,
+        );
+
+        let mut stale_atime = SetAttr::new();
+        stale_atime.valid = FATTR_ATIME;
+        stale_atime.atime_ns = 1;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, root.get(), &stale_atime, None)
+            .expect("force old root atime");
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(root, None, &ctx)
+                .expect("root attrs before readdir")
+        };
+        assert_eq!(before.posix.atime_ns, 1);
+
+        std::thread::sleep(Duration::from_millis(1));
+        let dh = fixture
+            .adapter
+            .dispatch_opendir(&ctx, root.get())
+            .expect("opendir root");
+        fixture
+            .adapter
+            .dispatch_readdir(&ctx, root.get(), dh.dh_id.get(), 0)
+            .expect("readdir root");
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(root, None, &ctx)
+                .expect("root attrs after readdir")
+        };
+        assert!(
+            after.posix.atime_ns > before.posix.atime_ns,
+            "directory reads must advance directory atime"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "directory read atime must not advance ctime"
+        );
+
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 2, root.get(), &stale_atime, None)
+            .expect("force old root atime again");
+        let suppressed_before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(root, None, &ctx)
+                .expect("root attrs before nodiratime readdir")
+        };
+        fixture.adapter.suppress_dir_atime = true;
+        let suppressed_after = {
+            let dh = fixture
+                .adapter
+                .dispatch_opendir(&ctx, root.get())
+                .expect("opendir root with nodiratime");
+            fixture
+                .adapter
+                .dispatch_readdir(&ctx, root.get(), dh.dh_id.get(), 0)
+                .expect("readdir root with nodiratime");
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(root, None, &ctx)
+                .expect("root attrs after nodiratime readdir")
+        };
+        assert_eq!(
+            suppressed_after.posix.atime_ns, suppressed_before.posix.atime_ns,
+            "nodiratime must suppress directory atime on readdir"
+        );
+        assert_eq!(
+            suppressed_after.posix.ctime_ns, suppressed_before.posix.ctime_ns,
+            "nodiratime readdir suppression must not advance ctime"
+        );
+
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 3, root.get(), &stale_atime, None)
+            .expect("force old root atime before read-only");
+        let read_only_before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(root, None, &ctx)
+                .expect("root attrs before read-only readdir")
+        };
+        fixture.adapter.suppress_dir_atime = false;
+        fixture.adapter.set_read_only();
+        std::thread::sleep(Duration::from_millis(1));
+        let read_only_after = {
+            let dh = fixture
+                .adapter
+                .dispatch_opendir(&ctx, root.get())
+                .expect("opendir root read-only");
+            fixture
+                .adapter
+                .dispatch_readdir(&ctx, root.get(), dh.dh_id.get(), 0)
+                .expect("readdir root read-only");
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(root, None, &ctx)
+                .expect("root attrs after read-only readdir")
+        };
+        assert_eq!(
+            read_only_after.posix.atime_ns, read_only_before.posix.atime_ns,
+            "read-only directory reads must not advance atime"
+        );
+        assert_eq!(
+            read_only_after.posix.ctime_ns, read_only_before.posix.ctime_ns,
+            "read-only directory reads must not advance ctime"
+        );
+    }
+
+    #[test]
+    fn read_open_records_atime_without_ctime() {
+        let mut fixture = adapter_fixture();
         fixture.adapter.timestamp_policy = TimestampPolicy::StrictAtime;
         let ctx = root_ctx();
         let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &ctx,
-            b"writeback-open-read-atime.txt",
+            b"open-read-atime.txt",
             libc::O_RDWR as u32,
         );
 
@@ -11149,24 +11260,24 @@ mod tests {
         };
         assert!(
             after.posix.atime_ns > before.posix.atime_ns,
-            "writeback-cache read-capable open must record read atime"
+            "read-capable open must record read atime"
         );
         assert_eq!(
             after.posix.ctime_ns, before.posix.ctime_ns,
-            "writeback-cache open atime must not advance ctime"
+            "read-open atime must not advance ctime"
         );
     }
 
     #[test]
-    fn writeback_relatime_read_open_after_write_advances_atime_without_ctime() {
-        let mut fixture = adapter_fixture_with_writeback_cache();
+    fn relatime_read_open_after_write_advances_atime_without_ctime() {
+        let mut fixture = adapter_fixture();
         fixture.adapter.timestamp_policy = TimestampPolicy::RelativeAtime;
         let ctx = root_ctx();
-        let payload = b"relatime writeback open atime";
+        let payload = b"relatime open atime";
         let (inode, writer_adapter_fh, writer_engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &ctx,
-            b"writeback-open-relatime-atime.txt",
+            b"open-relatime-atime.txt",
             libc::O_RDWR as u32,
         );
 
@@ -11214,7 +11325,7 @@ mod tests {
         };
         assert!(
             after.posix.atime_ns > before.posix.atime_ns,
-            "first writeback-cache relatime read open after write must advance atime"
+            "first relatime read open after write must advance atime"
         );
         assert_eq!(
             after.posix.ctime_ns, before.posix.ctime_ns,
@@ -11277,14 +11388,14 @@ mod tests {
     }
 
     #[test]
-    fn writeback_write_only_open_does_not_record_atime() {
-        let mut fixture = adapter_fixture_with_writeback_cache();
+    fn write_only_open_does_not_record_atime() {
+        let mut fixture = adapter_fixture();
         fixture.adapter.timestamp_policy = TimestampPolicy::StrictAtime;
         let ctx = root_ctx();
         let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &ctx,
-            b"writeback-open-writeonly-atime.txt",
+            b"open-writeonly-atime.txt",
             libc::O_RDWR as u32,
         );
 
@@ -11325,13 +11436,13 @@ mod tests {
     }
 
     #[test]
-    fn writeback_read_open_honors_noatime() {
-        let mut fixture = adapter_fixture_with_writeback_cache();
+    fn read_open_honors_noatime() {
+        let mut fixture = adapter_fixture();
         let ctx = root_ctx();
         let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &ctx,
-            b"writeback-open-noatime.txt",
+            b"open-noatime.txt",
             libc::O_RDWR as u32,
         );
 
@@ -11364,22 +11475,22 @@ mod tests {
         };
         assert_eq!(
             after.posix.atime_ns, before.posix.atime_ns,
-            "noatime writeback open must not record atime"
+            "noatime read open must not record atime"
         );
         assert_eq!(
             after.posix.ctime_ns, before.posix.ctime_ns,
-            "noatime writeback open must not advance ctime"
+            "noatime read open must not advance ctime"
         );
     }
 
     #[test]
-    fn read_only_writeback_read_open_does_not_record_atime() {
-        let mut fixture = adapter_fixture_with_writeback_cache();
+    fn read_only_read_open_does_not_record_atime() {
+        let mut fixture = adapter_fixture();
         let ctx = root_ctx();
         let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &ctx,
-            b"writeback-open-readonly-atime.txt",
+            b"open-readonly-atime.txt",
             libc::O_RDWR as u32,
         );
 
@@ -11413,11 +11524,11 @@ mod tests {
         };
         assert_eq!(
             after.posix.atime_ns, before.posix.atime_ns,
-            "read-only writeback open must not record atime"
+            "read-only read open must not record atime"
         );
         assert_eq!(
             after.posix.ctime_ns, before.posix.ctime_ns,
-            "read-only writeback open must not advance ctime"
+            "read-only read open must not advance ctime"
         );
     }
 
