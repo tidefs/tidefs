@@ -38,7 +38,7 @@ Important 2026-06-01 findings:
   surfaces; future cleanup should keep mounted/runtime/product and compact
   invariant tests, compress redundant branch tests, and remove or demote
   marker-only, stale-fixture, scaffold, and weakened-fixture claims.
-- `TFR-002`: Cargo metadata reports 148 packages and 148 workspace members.
+- `TFR-002`: Earlier package-authority cleanup reported 148 packages and 148 workspace members.
   Five manifests are outside root workspace metadata after the abandoned POSIX
   adapter split-shard crates, broken `tidefs-chaos` app root, and five
   excluded non-fuzz scaffold type crates were deleted. The deleted scaffold
@@ -59,46 +59,30 @@ Important 2026-06-01 findings:
   product/harness/archive split.
   The four deleted POSIX split shards had no active workspace users, were
   outside Cargo metadata, and were already classified as consolidated into the
-  adapter runtime; their removal is only one TFR-002 cleanup slice. Current
-  workspace members also retain direct dependencies
-  on scaffold type crates (`tidefs-types-control-plane-core`,
-  `tidefs-types-publication-pipeline-core`, and
-  `tidefs-types-response-registry-core`) from the POSIX adapter daemon,
-  standalone `tidefs-posix-filesystem-adapter-runtime` crate was deleted after
-  source review showed the daemon owns the live runtime module. Imported docs
+  adapter runtime; their removal is only one TFR-002 cleanup slice. Earlier
+  metadata still showed direct dependencies on scaffold type crates from the
+  POSIX adapter daemon; later cleanup removed those POSIX edges before issue
+  #276 deleted the remaining scaffold type roots themselves. The standalone
+  `tidefs-posix-filesystem-adapter-runtime` crate was deleted after source
+  review showed the daemon owns the live runtime module. Imported docs
   still
   reference deleted control-plane, policy-authority, observe, and
   remain coupled.
-- `TFR-002`: the root `members` array now explicitly lists the five packages
-  Cargo had been resolving implicitly through path dependencies:
-  `tidefs-device-removal`, `tidefs-posix-filesystem-adapter-reply`,
-  `tidefs-types-control-plane-core`,
+- `TFR-002`: issue #276 removed the last three `scaffold-transitional`
+  workspace members: `tidefs-types-control-plane-core`,
   `tidefs-types-publication-pipeline-core`, and
-  `tidefs-types-response-registry-core`. The explicit root list now matches
-  Cargo's 148 resolved workspace members, and `check-workspace-policy` now
-  reports the current member count after its member scanner was fixed to retain packages
-  whose package name differs from the directory name, such as vendored
-  `fuser`. This is not TFR-002 closure: current metadata still shows direct
-  surfaces into control-plane types. The
-  secret-key-policy edge has now been narrowed: `tidefs-types-secret-key-policy-core`
-  owns `SecretKeyPolicyId128`/`SecretKeyPolicyDigest32`, and
-  `tidefs-secret-key-policy-runtime` consumes those local types instead of
-  depending on `tidefs-types-control-plane-core`. Current metadata therefore
-  no longer reports secret-key policy crates as direct control-plane scaffold
-  consumers. The POSIX receipt-demo edge has now also been narrowed:
-  `tidefs-types-posix-filesystem-adapter-core` owns family-local id, digest,
-  request, journal, receipt, and witness-ref types; the POSIX schema codec and
-  format-golden path consume those POSIX-local types; and the daemon
-  `receipt-demo` feature uses local demo ticket/answer records instead of
-  depending on publication-pipeline, response-registry, or control-plane
-  scaffold crates. Current metadata no longer reports direct scaffold
-  dependencies from the POSIX daemon, POSIX core, schema codec, or `xtask`.
-  `check-workspace-policy` now reports 148 members and 595 internal dependency
-  edges, and reports `tidefs-types-publication-pipeline-core` and
-  `tidefs-types-response-registry-core` as zero-consumer workspace crates to
-  inspect before removal. This is not TFR-002 closure because the
-  publication/response type crates still directly depend on control-plane
-  edge, and imported package/docs authority still needs classification. The current
+  `tidefs-types-response-registry-core`. Reverse-dependency review found only
+  one stale optional `tidefs-validation` manifest edge to control-plane plus
+  scaffold-internal publication/response edges to control-plane. The live
+  control-plane, publication-pipeline, and response-registry record definitions
+  already reside in `tidefs-types-vfs-core`, so the stale crate roots were
+  deleted rather than reclassified. `docs/workspace-package-classification.md`
+  now records 145 workspace members, 150 classified roots, and zero
+  `scaffold-transitional` rows; `check-workspace-policy` treats any future
+  scaffold-transitional row as drift. This reduces TFR-002/TFR-019 package
+  authority debt but does not close either item because broader imported docs
+  still carry historical package assumptions that need classification.
+  The current
   `xtask` terminology, authority, and observe gates no longer require
   deleted or quarantined control-plane, policy-authority, observe, truth-view,
   `check-group terminology`, `check-terminology`, `check-human-api-aliases`,
@@ -121,12 +105,10 @@ Important 2026-06-01 findings:
   `docs/workspace-package-classification.md` is now regenerated from current
   Cargo metadata and manifest discovery as the package-role authority, and
   `check-workspace-policy` validates its counts, package roots, excluded fuzz
-  roots, and scaffold-transitional dependency boundary. `crates/README.md` and
+  roots, and retired scaffold-transitional boundary. `crates/README.md` and
   `apps/README.md` now defer to that authority instead of carrying competing
   package tables. This reduces TFR-002/TFR-019 drift but does not close either
-  item: scaffold-transitional type crates still need issue-backed migration,
-  reclassification, or deletion, and broader imported docs still need
-  authority classification.
+  item: broader imported docs still need authority classification.
 - `TFR-004`: `LocalFileSystem` still has global inode and directory maps plus
   global `next_inode_id`; namespace and inode-table crates maintain separate
   inode allocation authorities. The fresh root dataset catalog path now uses

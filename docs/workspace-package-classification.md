@@ -1,6 +1,6 @@
 # Workspace Package Classification
 
-Generated from current Cargo metadata and on-disk manifest discovery for issue #273 on 2026-06-14.
+Generated from current Cargo metadata and on-disk manifest discovery for issue #276 on 2026-06-15.
 This document is the package-role authority for TideFS workspace selection and TFR-002/TFR-019 reduction.
 It is enforced by `cargo run -p tidefs-xtask -- check-workspace-policy`.
 
@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 148 |
+| Workspace packages | 145 |
 | Explicitly excluded package roots | 5 |
-| Discovered package manifests | 153 |
-| Classified package roots | 153 |
+| Discovered package manifests | 150 |
+| Classified package roots | 150 |
 
 ## Role Semantics
 
@@ -25,7 +25,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `proof-harness` | Validation, deterministic harness, demo, oracle, or workload surface used to collect signal. |
 | `vendored-third-party` | Vendored upstream dependency carried in-tree with separate provenance. |
 | `standalone-fuzz` | Cargo-fuzz package intentionally excluded from the root workspace and checked as standalone harness material. |
-| `scaffold-transitional` | Current workspace member retained only as an issue-backed transitional surface under TFR-002. Product/operator/tooling packages must not grow dependencies on it. |
+| `scaffold-transitional` | Retired TFR-002 role for stale workspace scaffolding. No current package root is assigned this role; future scaffold recovery requires a prepared issue and current-role classification instead. |
 | `archive-delete-candidate` | Package root that should not stay active without an explicit issue. No current package root is assigned this role. |
 
 ## Role Counts
@@ -38,7 +38,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `proof-harness` | 7 |
 | `vendored-third-party` | 1 |
 | `standalone-fuzz` | 5 |
-| `scaffold-transitional` | 3 |
+| `scaffold-transitional` | 0 |
 | `archive-delete-candidate` | 0 |
 
 ## Package Role Authority
@@ -166,7 +166,6 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-two-node-harness` | `tidefs-two-node-harness` | `workspace-member` | `proof-harness` | planned authority surface for validation; follow-up issue required before it can support release claims. |
 | `crates/tidefs-types-cache-lattice-core` | `tidefs-types-cache-lattice-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-types-claim-ledger-core` | `tidefs-types-claim-ledger-core` | `workspace-member` | `policy-tooling` | current policy/tooling surface; not a production-readiness claim. |
-| `crates/tidefs-types-control-plane-core` | `tidefs-types-control-plane-core` | `workspace-member` | `scaffold-transitional` | TFR-002 follow-up issue required: migrate, reclassify, or delete this scaffold type surface before product claims. |
 | `crates/tidefs-types-dataset-feature-flags-core` | `tidefs-types-dataset-feature-flags-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-types-dataset-lifecycle-core` | `tidefs-types-dataset-lifecycle-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-types-deferred-cleanup-core` | `tidefs-types-deferred-cleanup-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -178,9 +177,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-types-polymorphic-xattr-core` | `tidefs-types-polymorphic-xattr-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-types-pool-label-core` | `tidefs-types-pool-label-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-types-posix-filesystem-adapter-core` | `tidefs-types-posix-filesystem-adapter-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-types-publication-pipeline-core` | `tidefs-types-publication-pipeline-core` | `workspace-member` | `scaffold-transitional` | TFR-002 follow-up issue required: migrate, reclassify, or delete this scaffold type surface before product claims. |
 | `crates/tidefs-types-reclaim-queue-core` | `tidefs-types-reclaim-queue-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-types-response-registry-core` | `tidefs-types-response-registry-core` | `workspace-member` | `scaffold-transitional` | TFR-002 follow-up issue required: migrate, reclassify, or delete this scaffold type surface before product claims. |
 | `crates/tidefs-types-secret-key-policy-core` | `tidefs-types-secret-key-policy-core` | `workspace-member` | `policy-tooling` | current policy/tooling surface; not a production-readiness claim. |
 | `crates/tidefs-types-space-accounting-core` | `tidefs-types-space-accounting-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-types-transport-session` | `tidefs-types-transport-session` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -224,9 +221,6 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `crates/tidefs-secret-key-policy-runtime` | `tidefs-secret-key-policy-runtime` | `policy-tooling` | planned authority surface for policy work; follow-up issue required before release claims. |
 | `crates/tidefs-snapshot-pruner` | `tidefs-snapshot-pruner` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-two-node-harness` | `tidefs-two-node-harness` | `proof-harness` | planned authority surface for validation; follow-up issue required before it can support release claims. |
-| `crates/tidefs-types-control-plane-core` | `tidefs-types-control-plane-core` | `scaffold-transitional` | TFR-002 follow-up issue required: migrate, reclassify, or delete this scaffold type surface before product claims. |
-| `crates/tidefs-types-publication-pipeline-core` | `tidefs-types-publication-pipeline-core` | `scaffold-transitional` | TFR-002 follow-up issue required: migrate, reclassify, or delete this scaffold type surface before product claims. |
-| `crates/tidefs-types-response-registry-core` | `tidefs-types-response-registry-core` | `scaffold-transitional` | TFR-002 follow-up issue required: migrate, reclassify, or delete this scaffold type surface before product claims. |
 | `crates/tidefs-vfs-rpc` | `tidefs-vfs-rpc` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `xtask/tidefs-xtask` | `tidefs-xtask` | `policy-tooling` | policy gate and developer tooling entrypoint; validates this classification authority. |
 
@@ -244,6 +238,6 @@ The root `workspace.exclude` list and the `workspace-excluded` rows above must m
 
 ## Boundary Rules Enforced By Xtask
 
-`check-workspace-policy` validates this document against Cargo metadata, discovered package manifests, and root `workspace.exclude`. It fails when a workspace member or excluded package root is missing from the table, when package names or counts drift, when excluded manifests diverge from root Cargo policy, or when product/operator/tooling packages depend on `scaffold-transitional` or `archive-delete-candidate` packages.
+`check-workspace-policy` validates this document against Cargo metadata, discovered package manifests, and root `workspace.exclude`. It fails when a workspace member or excluded package root is missing from the table, when package names or counts drift, when excluded manifests diverge from root Cargo policy, when any package root is classified as `scaffold-transitional` after issue #276, or when product/operator/tooling packages depend on `archive-delete-candidate` packages.
 
-The current scaffold-transitional set is limited to `tidefs-types-control-plane-core`, `tidefs-types-publication-pipeline-core`, and `tidefs-types-response-registry-core`. Keeping those packages classified does not close TFR-002; it makes their remaining follow-up visible and enforceable.
+Issue #276 audited the prior scaffold-transitional type roots. Cargo metadata showed only an optional `tidefs-validation` manifest edge to `tidefs-types-control-plane-core`, plus scaffold-internal edges from `tidefs-types-publication-pipeline-core` and `tidefs-types-response-registry-core` to that same crate. Documentation references were limited to this authority, `crates/README.md`, `docs/REVIEW_TODO_REGISTER.md`, stale review material in `docs/ARCHITECTURE.md`, and xtask policy/terminology fixtures. The live control-plane, publication-pipeline, and response-registry record definitions are already present in `tidefs-types-vfs-core`; the stale package roots were deleted rather than reclassified.

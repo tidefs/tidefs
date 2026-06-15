@@ -14,7 +14,7 @@ struct SourceSurface {
 
 const CURRENT_AUTHORITY_PUBLICATION_SURFACES: &[SourceSurface] = &[
     SourceSurface {
-        rel: "crates/tidefs-types-control-plane-core/src/lib.rs",
+        rel: "crates/tidefs-types-vfs-core/src/lib.rs",
         markers: &[
             "ControlPlaneRequestEnvelopeHead",
             "ControlPlaneRouteTerminalReceiptRecord",
@@ -24,7 +24,7 @@ const CURRENT_AUTHORITY_PUBLICATION_SURFACES: &[SourceSurface] = &[
         ],
     },
     SourceSurface {
-        rel: "crates/tidefs-types-publication-pipeline-core/src/lib.rs",
+        rel: "crates/tidefs-types-vfs-core/src/lib.rs",
         markers: &[
             "PublicationPipelineEmissionTicketRecord",
             "PublicationPipelineQueueClass",
@@ -34,7 +34,7 @@ const CURRENT_AUTHORITY_PUBLICATION_SURFACES: &[SourceSurface] = &[
         ],
     },
     SourceSurface {
-        rel: "crates/tidefs-types-response-registry-core/src/lib.rs",
+        rel: "crates/tidefs-types-vfs-core/src/lib.rs",
         markers: &[
             "ResponseRegistryVisibleAnswerRecord",
             "ResponseRegistryResponseIndexEntryRecord",
@@ -90,7 +90,7 @@ pub fn check_authority_publication_spine_current_workspace() -> Result<(), Autho
 
     if missing.is_empty() {
         println!(
-            "authority publication spine ok: current workspace control-plane, publication, response-registry, and POSIX wake surfaces are present"
+            "authority publication spine ok: current workspace VFS-core control-plane, publication, response-registry, and POSIX wake surfaces are present"
         );
         Ok(())
     } else {

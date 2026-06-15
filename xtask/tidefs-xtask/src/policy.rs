@@ -857,11 +857,7 @@ fn collect_member_entries(line: &str, out: &mut Vec<String>) {
 
 const PACKAGE_CLASSIFICATION_DOC: &str = "docs/workspace-package-classification.md";
 
-const SCAFFOLD_TRANSITIONAL_PACKAGES: &[&str] = &[
-    "tidefs-types-control-plane-core",
-    "tidefs-types-publication-pipeline-core",
-    "tidefs-types-response-registry-core",
-];
+const SCAFFOLD_TRANSITIONAL_PACKAGES: &[&str] = &[];
 
 fn check_package_classification_authority(
     root: &Path,
@@ -1399,7 +1395,7 @@ fn check_classification_role_boundary(
         && !SCAFFOLD_TRANSITIONAL_PACKAGES.contains(&row.package_name.as_str())
     {
         violations.push(format!(
-            "{PACKAGE_CLASSIFICATION_DOC} row `{}` is scaffold-transitional but is not in the TFR-002 scaffold type allowlist",
+            "{PACKAGE_CLASSIFICATION_DOC} row `{}` is scaffold-transitional, but issue #276 retired the TFR-002 scaffold type allowlist",
             row.package_name
         ));
     }
@@ -2455,8 +2451,8 @@ mod tests {
     #[test]
     fn name_classifiers_cover_current_workspace_families() {
         let (kind, family, class) = classify_member(
-            Path::new("crates/tidefs-types-control-plane-core/Cargo.toml"),
-            "tidefs-types-control-plane-core",
+            Path::new("crates/tidefs-types-vfs-core/Cargo.toml"),
+            "tidefs-types-vfs-core",
         );
         assert_eq!(kind, NodeKind::Library);
         assert_eq!(family, Family::Types);
@@ -2477,14 +2473,6 @@ mod tests {
         assert_eq!(kind, NodeKind::Library);
         assert_eq!(family, Family::PolicyAuthority);
         assert_eq!(class, CrateClass::Runtime);
-
-        let (kind, family, class) = classify_member(
-            Path::new("crates/tidefs-types-response-registry-core/Cargo.toml"),
-            "tidefs-types-response-registry-core",
-        );
-        assert_eq!(kind, NodeKind::Library);
-        assert_eq!(family, Family::Types);
-        assert_eq!(class, CrateClass::Types);
 
         let (kind, family, class) = classify_member(
             Path::new("crates/tidefs-local-object-store/Cargo.toml"),

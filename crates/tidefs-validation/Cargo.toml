@@ -69,7 +69,6 @@ fuse = [
     "dep:tidefs-permission",
     "dep:tidefs-xattr-storage",
     "dep:tidefs-types-polymorphic-xattr-core",
-    "dep:tidefs-types-control-plane-core",
     "dep:tidefs-types-posix-filesystem-adapter-core",
     "dep:tidefs-posix-filesystem-adapter-workers-io",
     "dep:tidefs-posix-filesystem-adapter-workers-locks",
@@ -121,7 +120,6 @@ tidefs-posix-acl = { path = "../tidefs-posix-acl", optional = true }
 tidefs-permission = { path = "../tidefs-permission", optional = true }
 tidefs-xattr-storage = { path = "../tidefs-xattr-storage", optional = true }
 tidefs-types-polymorphic-xattr-core = { path = "../tidefs-types-polymorphic-xattr-core", features = ["alloc"], optional = true }
-tidefs-types-control-plane-core = { path = "../tidefs-types-control-plane-core", optional = true }
 tidefs-types-posix-filesystem-adapter-core = { path = "../tidefs-types-posix-filesystem-adapter-core", optional = true }
 tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core", optional = true }
 tidefs-cluster = { path = "../tidefs-cluster", optional = true }
