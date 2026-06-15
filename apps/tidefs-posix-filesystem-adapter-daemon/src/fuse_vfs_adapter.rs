@@ -114,22 +114,14 @@ impl PermissionInodeAttr for VfsInodeAttrRef<'_> {
     }
 }
 
-/// Check POSIX sticky-bit permission for an unlink or rmdir operation.
-///
-/// When the parent directory has `S_ISVTX` set, only the file owner,
-/// directory owner, or root may delete entries. Returns `Ok(())` when
-/// allowed, `Err(EPERM)` when denied.
-fn check_sticky_unlink(
-    engine: &dyn VfsEngine,
-    parent: InodeId,
-    name: &[u8],
+fn check_sticky_unlink_with_attrs(
+    parent_attr: &InodeAttr,
+    child_attr: &InodeAttr,
     ctx: &RequestCtx,
 ) -> Result<(), Errno> {
-    let parent_attr = engine.getattr(parent, None, ctx)?;
-    let child_attr = engine.lookup(parent, name, ctx)?;
     let plan = tidefs_permission::plan_sticky_directory_delete(
-        &VfsInodeAttrRef(&parent_attr),
-        &VfsInodeAttrRef(&child_attr),
+        &VfsInodeAttrRef(parent_attr),
+        &VfsInodeAttrRef(child_attr),
         ctx.uid,
     );
     if plan.is_allowed() {
@@ -299,8 +291,20 @@ fn check_parent_write_execute(
     ctx: &RequestCtx,
 ) -> Result<(), Errno> {
     let parent_attr = engine.getattr(parent, None, ctx)?;
+    check_parent_write_execute_with_attr(engine, parent, &parent_attr, ctx)
+}
+
+fn check_parent_write_execute_with_attr(
+    engine: &dyn VfsEngine,
+    parent: InodeId,
+    parent_attr: &InodeAttr,
+    ctx: &RequestCtx,
+) -> Result<(), Errno> {
     if parent_attr.kind != NodeKind::Dir {
         return Err(Errno::ENOTDIR);
+    }
+    if ctx.uid == 0 {
+        return Ok(());
     }
     let acl: Option<Vec<PosixAclEntry>> =
         match engine.getxattr(parent, b"system.posix_acl_access", ctx) {
@@ -309,7 +313,7 @@ fn check_parent_write_execute(
             Err(_) => None,
         };
     plan_fuse_access_result(
-        Ok(parent_attr),
+        Ok(*parent_attr),
         ctx,
         ACCESS_WRITE | ACCESS_EXECUTE,
         acl.as_deref(),
@@ -3949,26 +3953,21 @@ impl FuseVfsAdapter {
     ) -> Result<(), Errno> {
         self.check_not_read_only()?;
         let e = self.engine.lock().unwrap();
-        check_parent_write_execute(&**e, InodeId::new(parent), ctx)?;
-        check_sticky_unlink(&**e, InodeId::new(parent), name, ctx)?;
+        let parent_id = InodeId::new(parent);
+        let parent_attr = e.getattr(parent_id, None, ctx)?;
+        check_parent_write_execute_with_attr(&**e, parent_id, &parent_attr, ctx)?;
+        let child_attr = e.lookup(parent_id, name, ctx)?;
+        check_sticky_unlink_with_attrs(&parent_attr, &child_attr, ctx)?;
         // POSIX: reject unlink if parent or child inode is immutable.
-        {
-            let parent_attr = e.getattr(InodeId::new(parent), None, ctx)?;
-            enforce_immutable_guard(parent_attr.flags.to_raw_flags())?;
-            if let Ok(child_attr) = e.lookup(InodeId::new(parent), name, ctx) {
-                enforce_immutable_guard(child_attr.flags.to_raw_flags())?;
-            }
-        }
+        enforce_immutable_guard(parent_attr.flags.to_raw_flags())?;
+        enforce_immutable_guard(child_attr.flags.to_raw_flags())?;
         // Capacity tracking for freed space is handled by the engine's
         // CapacityAuthority during unlink dispatch.
-        let child_inode_for_delete = e
-            .lookup(InodeId::new(parent), name, ctx)
-            .ok()
-            .map(|a| a.inode_id);
+        let child_inode_for_delete = child_attr.inode_id;
         let result = dispatch_unlink_batch(
             &**e as &dyn tidefs_vfs_engine::VfsEngine,
             &[UnlinkBatchRequest {
-                parent: InodeId::new(parent),
+                parent: parent_id,
                 name,
                 ctx: ctx.clone(),
             }],
@@ -3987,26 +3986,24 @@ impl FuseVfsAdapter {
         // still reference the inode, insert into the orphan index so
         // the last-close handler in dispatch_release can trigger
         // cleanup-engine reclamation (#5527, #5549).
-        if let Some(child_ino) = child_inode_for_delete {
-            let refcount = {
-                let fht = self.file_handles.lock().unwrap();
-                fht.open_ref_count(child_ino.get())
-            };
-            if refcount > 0 {
-                // The inode was unlinked while open: orphan it.
-                if let Ok(attrs) = e.getattr(child_ino, None, ctx) {
-                    if attrs.posix.nlink == 0 {
-                        let entry = OrphanEntry::new(
-                            child_ino.get(),
-                            attrs.generation.get(),
-                            0,
-                            OrphanEntryFlags::NONE,
-                        );
-                        self.orphan_index
-                            .lock()
-                            .unwrap()
-                            .insert(child_ino.get(), entry);
-                    }
+        let refcount = {
+            let fht = self.file_handles.lock().unwrap();
+            fht.open_ref_count(child_inode_for_delete.get())
+        };
+        if refcount > 0 {
+            // The inode was unlinked while open: orphan it.
+            if let Ok(attrs) = e.getattr(child_inode_for_delete, None, ctx) {
+                if attrs.posix.nlink == 0 {
+                    let entry = OrphanEntry::new(
+                        child_inode_for_delete.get(),
+                        attrs.generation.get(),
+                        0,
+                        OrphanEntryFlags::NONE,
+                    );
+                    self.orphan_index
+                        .lock()
+                        .unwrap()
+                        .insert(child_inode_for_delete.get(), entry);
                 }
             }
         }
@@ -4268,27 +4265,25 @@ impl FuseVfsAdapter {
     ) -> Result<(), Errno> {
         self.check_not_read_only()?;
         let e = self.engine.lock().unwrap();
-        check_parent_write_execute(&**e, InodeId::new(parent), ctx)?;
-        check_sticky_unlink(&**e, InodeId::new(parent), name, ctx)?;
+        let parent_id = InodeId::new(parent);
+        let parent_attr = e.getattr(parent_id, None, ctx)?;
+        check_parent_write_execute_with_attr(&**e, parent_id, &parent_attr, ctx)?;
+        let child_attr = e.lookup(parent_id, name, ctx)?;
+        check_sticky_unlink_with_attrs(&parent_attr, &child_attr, ctx)?;
 
         // POSIX: reject rmdir if parent or child inode is immutable.
-        {
-            let parent_attr = e.getattr(InodeId::new(parent), None, ctx)?;
-            enforce_immutable_guard(parent_attr.flags.to_raw_flags())?;
-            if let Ok(child_attr) = e.lookup(InodeId::new(parent), name, ctx) {
-                enforce_immutable_guard(child_attr.flags.to_raw_flags())?;
-            }
-        }
+        enforce_immutable_guard(parent_attr.flags.to_raw_flags())?;
+        enforce_immutable_guard(child_attr.flags.to_raw_flags())?;
         // Resolve the removed directory's inode before rmdir: needed both
         // for negative-cache invalidation.
-        let removed_attr = e.lookup(InodeId::new(parent), name, ctx).ok();
+        let removed_attr = child_attr;
         // Capacity tracking for freed space is handled by the engine's
         // CapacityAuthority during rmdir dispatch.
 
         let result = dispatch_rmdir_batch(
             &**e as &dyn tidefs_vfs_engine::VfsEngine,
             &[RmdirBatchRequest {
-                parent: InodeId::new(parent),
+                parent: parent_id,
                 name,
                 ctx: ctx.clone(),
             }],
@@ -4304,16 +4299,14 @@ impl FuseVfsAdapter {
         self.record_dentry_child_mutation(parent, name);
         // Invalidate all negative-cache entries scoped to the now-removed
         // directory, since lookups against it will return ENOTDIR from now on.
-        if let Some(ref attr) = removed_attr {
-            self.negative_cache
-                .lock()
-                .unwrap()
-                .invalidate_parent_dir(attr.inode_id.get());
-            self.path_lookup_cache
-                .lock()
-                .unwrap()
-                .invalidate_parent_dir(attr.inode_id.get());
-        }
+        self.negative_cache
+            .lock()
+            .unwrap()
+            .invalidate_parent_dir(removed_attr.inode_id.get());
+        self.path_lookup_cache
+            .lock()
+            .unwrap()
+            .invalidate_parent_dir(removed_attr.inode_id.get());
         Ok(())
     }
 

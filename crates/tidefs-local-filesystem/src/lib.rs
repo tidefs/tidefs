@@ -7757,9 +7757,7 @@ impl LocalFileSystem {
         let _inode_id = pre.target_inode_id;
 
         let entry = self
-            .directory(parent_id, path)?
-            .get(&name)
-            .cloned()
+            .dir_entry_by_inode(parent_id, &name, path)?
             .ok_or_else(|| FileSystemError::NotFound {
                 path: path.to_string(),
             })?;
@@ -7878,9 +7876,7 @@ impl LocalFileSystem {
         let path = path.as_ref();
         let (parent_id, name) = self.resolve_parent_and_name(path)?;
         let entry = self
-            .directory(parent_id, path)?
-            .get(&name)
-            .cloned()
+            .dir_entry_by_inode(parent_id, &name, path)?
             .ok_or_else(|| FileSystemError::NotFound {
                 path: path.to_string(),
             })?;
@@ -7890,7 +7886,12 @@ impl LocalFileSystem {
                 path: path.to_string(),
             });
         }
-        if !self.directory(entry.inode_id, path)?.is_empty() {
+        let child_is_empty = if let Some(directory) = self.state.directories.get(&entry.inode_id) {
+            directory.is_empty()
+        } else {
+            self.directory(entry.inode_id, path)?.is_empty()
+        };
+        if !child_is_empty {
             return Err(FileSystemError::DirectoryNotEmpty {
                 path: path.to_string(),
             });

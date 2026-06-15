@@ -12440,15 +12440,21 @@ mod tests {
         let engine = VfsLocalFileSystem::new(fs);
         let root = engine.get_root_inode(&ctx()).unwrap();
         let parent = engine.mkdir(root, b"permname", 0o755, &ctx()).unwrap();
+        let target = engine.mkdir(parent.inode_id, b"b", 0o755, &ctx()).unwrap();
         let stable = engine
             .mkdir(parent.inode_id, b"stable", 0o755, &ctx())
             .unwrap();
         let mut created = Vec::new();
 
-        for idx in 0..512 {
-            let name = format!("file-{idx:04}");
+        for idx in 0..1024u64 {
+            let mut value = idx;
+            let mut name = vec![b'a'; 6];
+            for byte in name.iter_mut().rev() {
+                *byte = b'a' + u8::try_from(value % 4).unwrap();
+                value /= 4;
+            }
             let (attr, fh) = engine
-                .create(parent.inode_id, name.as_bytes(), 0o644, 0, &ctx())
+                .create(target.inode_id, &name, 0o644, 0, &ctx())
                 .unwrap();
             engine.release(&fh).unwrap();
             created.push((attr.inode_id, name));
@@ -12460,15 +12466,14 @@ mod tests {
         );
 
         for (inode_id, name) in &created {
-            engine
-                .unlink(parent.inode_id, name.as_bytes(), &ctx())
-                .unwrap();
+            engine.unlink(target.inode_id, name, &ctx()).unwrap();
             assert_eq!(cached_path(&engine, *inode_id), None);
             assert_eq!(
                 cached_path(&engine, stable.inode_id).as_deref(),
                 Some("/permname/stable")
             );
         }
+        engine.rmdir(parent.inode_id, b"b", &ctx()).unwrap();
     }
 
     #[test]
