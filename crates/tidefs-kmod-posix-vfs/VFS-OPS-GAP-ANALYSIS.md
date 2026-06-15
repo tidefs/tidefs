@@ -229,6 +229,23 @@ Test counts by module:
 Standalone cargo/mock validation reports are retired from this count; use current
 `cargo test --workspace --locked` output for exact test totals.
 
+## 9.1 Kernel Environment Source Model
+
+Issue #291 adds `src/kernel_env_model.rs` as a kmod-local source-model seed
+for Linux VFS context tokens and teardown race exploration. The model records
+sleepable/non-sleepable context, RCU/pin or workqueue ownership, mmap and
+page-cache callback boundaries, and teardown-state assumptions for the modeled
+kernel-facing operations. Its deterministic workqueue harness explores bounded
+interleavings and checks that no modeled work item starts after final teardown.
+
+This source model is not mounted runtime evidence and is not a C shim callback
+registration surface. Unsupported mounted paths remain fail-closed through the
+live kmod shim and the source-model Rust vm-ops/page-cache helpers remain
+non-product unless a later issue wires and validates them through the mounted
+Linux 7.0 path. The claim `kmod.no_work_after_teardown.v1` remains planned
+until a PR records the required context-token model, teardown proof artifact,
+claims-gate review, and any required mounted-kernel validation artifacts.
+
 ---
 
 ## 10. Implementation Completeness Score

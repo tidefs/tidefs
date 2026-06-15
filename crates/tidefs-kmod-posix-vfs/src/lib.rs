@@ -130,6 +130,8 @@ pub mod file;
 pub mod flush;
 pub mod fsync;
 pub mod getattr;
+#[cfg(not(CONFIG_RUST))]
+pub mod kernel_env_model;
 pub mod inode;
 pub mod intent_replay;
 pub mod kernel_mount;
