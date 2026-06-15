@@ -164,11 +164,13 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 blockers = [
-  "GitHub issue #289 owns the uBLK qid/tag lifecycle model.",
+  "The qid/tag state model is bounded pure-model evidence, not uBLK daemon or block-volume runtime evidence.",
   "No focused runtime artifact proves exactly-once completion for qid/tag pairs.",
 ]
-generated_doc = "Planned uBLK qid/tag exactly-once completion claim. TideFS must keep this as model work until lifecycle and runtime artifacts cover the completion contract."
-evidence_artifacts = []
+generated_doc = "Planned uBLK qid/tag exactly-once completion claim. TideFS has bounded model evidence only; runtime artifacts must still cover the completion contract before product wording can strengthen."
+evidence_artifacts = [
+  { class = "qid-tag-state-model", path = "validation/artifacts/ublk/qid-tag-state-model.json" },
+]
 
 [[claims]]
 id = "kernel.teardown.no_work_after.v1"

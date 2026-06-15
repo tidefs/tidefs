@@ -1943,6 +1943,7 @@ fn classify_library_family(name: &str) -> Family {
     } else if name.starts_with("tidefs-test-")
         || name == "tidefs-model-core"
         || name == "tidefs-crash-oracle"
+        || name == "tidefs-env-ublk-model"
         || name == "tidefs-trace-oracle"
         || name == "tidefs-two-node-harness"
         || name == "tidefs-validation"
@@ -1954,7 +1955,10 @@ fn classify_library_family(name: &str) -> Family {
 }
 
 fn classify_library_class(name: &str) -> CrateClass {
-    if name == "tidefs-model-core" || name == "tidefs-crash-oracle" {
+    if name == "tidefs-model-core"
+        || name == "tidefs-crash-oracle"
+        || name == "tidefs-env-ublk-model"
+    {
         CrateClass::TestOrXtask
     } else if name.starts_with("tidefs-types-") {
         CrateClass::Types

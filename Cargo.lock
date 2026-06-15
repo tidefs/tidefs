@@ -2427,6 +2427,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-env-ublk-model"
+version = "0.421.0"
+dependencies = [
+ "tidefs-types-vfs-core",
+ "tidefs-ublk-abi",
+]
+
+[[package]]
 name = "tidefs-erasure-coded-store"
 version = "0.421.0"
 dependencies = [

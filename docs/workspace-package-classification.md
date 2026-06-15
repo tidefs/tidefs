@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 148 |
+| Workspace packages | 149 |
 | Explicitly excluded package roots | 5 |
-| Discovered package manifests | 153 |
-| Classified package roots | 153 |
+| Discovered package manifests | 154 |
+| Classified package roots | 154 |
 
 ## Role Semantics
 
@@ -35,7 +35,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `product-code` | 116 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
-| `proof-harness` | 9 |
+| `proof-harness` | 10 |
 | `vendored-third-party` | 1 |
 | `standalone-fuzz` | 5 |
 | `scaffold-transitional` | 0 |
@@ -90,6 +90,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-dir-index` | `tidefs-dir-index` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-durability-layout` | `tidefs-durability-layout` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-encryption` | `tidefs-encryption` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
+| `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `workspace-member` | `proof-harness` | bounded uBLK qid/tag state model evidence only; runtime block-volume claims remain blocked on focused artifacts. |
 | `crates/tidefs-erasure-coded-store` | `tidefs-erasure-coded-store` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-erasure-coding` | `tidefs-erasure-coding` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-extent-map` | `tidefs-extent-map` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -215,6 +216,7 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `crates/tidefs-compaction` | `tidefs-compaction` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-crash-oracle` | `tidefs-crash-oracle` | `proof-harness` | planned authority surface for model-only crash oracle validation; follow-up issue required before it can support runtime release claims. |
 | `crates/tidefs-data-cleaner` | `tidefs-data-cleaner` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `proof-harness` | bounded uBLK qid/tag state model evidence only; runtime block-volume claims remain blocked on focused artifacts. |
 | `crates/tidefs-erasure-coded-store` | `tidefs-erasure-coded-store` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-geometry-convert` | `tidefs-geometry-convert` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-kernel-cutover-runtime` | `tidefs-kernel-cutover-runtime` | `product-code` | planned authority surface; follow-up issue required before release claims. |
