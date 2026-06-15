@@ -4,8 +4,8 @@
 //!
 //! This crate models legal FUSE connection and request lifecycles at the
 //! adapter boundary. It translates semantic FUSE requests into the current
-//! TideFS request contract where that contract exists, uses `tidefs-model-core`
-//! for known contract gaps, and never calls storage mutation APIs directly.
+//! TideFS request contract and replays those envelopes through
+//! `tidefs-model-core` without calling storage mutation APIs directly.
 
 pub mod adapter_guard;
 
@@ -13,12 +13,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use tidefs_model_core::{
-    ContractModelContext, ModelFingerprint, ModelFs, ModelInvariantError, ModelPath, ModelRequest,
+    ContractModelContext, ContractNameBinding, ContractNameContext, ModelFingerprint, ModelFs,
+    ModelInvariantError, ModelPath,
 };
 use tidefs_types_vfs_core::{
     AdmissionIntent, BudgetIntent, CompletionDisposition, CompletionStatus, ContractEpoch, Errno,
     FenceIntent, FileHandleId, InodeId, RequestEnvelope, RequestId, RequestMetadata, RetryIntent,
-    TideCompletion, TideRequest, TraceId, VfsRequest, WorkClass,
+    TideCompletion, TideRequest, TraceId, VfsNameToken, VfsRequest, WorkClass,
 };
 
 /// FUSE capability names relevant to the adapter-boundary model.
@@ -272,14 +273,28 @@ pub enum AdapterContractRequest {
     Canonical {
         envelope: RequestEnvelope,
         write_bytes: Vec<u8>,
-    },
-    ModelGap {
-        request: ModelRequest,
+        name_bindings: Vec<AdapterNameBinding>,
     },
     UnsupportedCapability {
         capability: FuseCapability,
         classification: CapabilityClassification,
     },
+}
+
+/// Owned namespace binding carried with canonical adapter requests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdapterNameBinding {
+    pub token: VfsNameToken,
+    pub component: String,
+}
+
+impl AdapterNameBinding {
+    fn new(component: String) -> Self {
+        Self {
+            token: VfsNameToken::from_component_bytes(component.as_bytes()),
+            component,
+        }
+    }
 }
 
 impl AdapterContractRequest {
@@ -817,9 +832,23 @@ impl FuseEnvironmentModel {
 
     fn translate_request(&self, unique: u64, request: &FuseRequest) -> AdapterContractRequest {
         match request {
-            FuseRequest::Create { path } => AdapterContractRequest::ModelGap {
-                request: ModelRequest::Create { path: path.clone() },
-            },
+            FuseRequest::Create { path } => {
+                let (parent_id, binding) = self.create_parent_binding(path);
+                AdapterContractRequest::Canonical {
+                    envelope: envelope(
+                        unique,
+                        self.trace_seed,
+                        TideRequest::Vfs(VfsRequest::Create {
+                            parent_id,
+                            name: binding.token,
+                        }),
+                        WorkClass::Foreground,
+                        FenceIntent::Write,
+                    ),
+                    write_bytes: Vec::new(),
+                    name_bindings: vec![binding],
+                }
+            }
             FuseRequest::GetAttr { inode } => AdapterContractRequest::Canonical {
                 envelope: envelope(
                     unique,
@@ -829,6 +858,7 @@ impl FuseEnvironmentModel {
                     FenceIntent::Read,
                 ),
                 write_bytes: Vec::new(),
+                name_bindings: Vec::new(),
             },
             FuseRequest::Read {
                 inode,
@@ -849,6 +879,7 @@ impl FuseEnvironmentModel {
                     FenceIntent::Read,
                 ),
                 write_bytes: Vec::new(),
+                name_bindings: Vec::new(),
             },
             FuseRequest::Write {
                 inode,
@@ -870,6 +901,7 @@ impl FuseEnvironmentModel {
                     FenceIntent::Write,
                 ),
                 write_bytes: bytes.clone(),
+                name_bindings: Vec::new(),
             },
             FuseRequest::Flush { inode, file_handle }
             | FuseRequest::Fsync {
@@ -886,6 +918,7 @@ impl FuseEnvironmentModel {
                     FenceIntent::Write,
                 ),
                 write_bytes: Vec::new(),
+                name_bindings: Vec::new(),
             },
             FuseRequest::Open { .. } | FuseRequest::Release { .. } => {
                 unreachable!("adapter-only requests are handled before translation")
@@ -899,6 +932,16 @@ impl FuseEnvironmentModel {
         }
     }
 
+    fn create_parent_binding(&self, path: &ModelPath) -> (InodeId, AdapterNameBinding) {
+        match self.model.resolve_parent_inode(path) {
+            Ok((parent_id, component)) => (parent_id, AdapterNameBinding::new(component)),
+            Err(_) => {
+                let component = path.components().last().cloned().unwrap_or_default();
+                (InodeId::new(u64::MAX), AdapterNameBinding::new(component))
+            }
+        }
+    }
+
     fn execute_queued(
         &mut self,
         queued: &QueuedRequest,
@@ -907,17 +950,16 @@ impl FuseEnvironmentModel {
             AdapterContractRequest::Canonical {
                 envelope,
                 write_bytes,
+                name_bindings,
             } => {
-                let step = self.model.apply_contract(
+                let contract_bindings = contract_name_bindings(name_bindings);
+                let step = self.model.apply_contract_with_names(
                     envelope,
                     ContractModelContext {
                         write_bytes: write_bytes.as_slice(),
                     },
+                    ContractNameContext::new(&contract_bindings),
                 )?;
-                (step.completion, Some(step.fingerprint))
-            }
-            AdapterContractRequest::ModelGap { request } => {
-                let step = self.model.apply(request.clone())?;
                 (step.completion, Some(step.fingerprint))
             }
             AdapterContractRequest::UnsupportedCapability { classification, .. } => (
@@ -1129,6 +1171,13 @@ fn envelope(
     RequestEnvelope::new(metadata, request)
 }
 
+fn contract_name_bindings(bindings: &[AdapterNameBinding]) -> Vec<ContractNameBinding<'_>> {
+    bindings
+        .iter()
+        .map(|binding| ContractNameBinding::new(binding.token, binding.component.as_str()))
+        .collect()
+}
+
 fn request_id(unique: u64) -> RequestId {
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&unique.to_le_bytes());
@@ -1163,6 +1212,7 @@ fn synthetic_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_model_core::ROOT_INODE_ID;
 
     fn has_kind(trace: &[FuseModelStep], kind: FuseStepKind) -> bool {
         trace.iter().any(|step| step.kind == kind)
@@ -1213,20 +1263,65 @@ mod tests {
         assert!(canonical.count() >= 3);
 
         assert!(trace.iter().any(|step| {
-            matches!(
-                step.request,
-                Some(AdapterContractRequest::ModelGap {
-                    request: ModelRequest::Create { .. }
-                })
-            ) && step
-                .completion
-                .is_some_and(|completion| completion.status == CompletionStatus::Success)
+            let Some(AdapterContractRequest::Canonical {
+                envelope,
+                name_bindings,
+                ..
+            }) = &step.request
+            else {
+                return false;
+            };
+            let TideRequest::Vfs(VfsRequest::Create { parent_id, name }) = envelope.request else {
+                return false;
+            };
+            parent_id == ROOT_INODE_ID
+                && name_bindings.as_slice()
+                    == &[AdapterNameBinding {
+                        token: name,
+                        component: "file".to_string(),
+                    }]
+                && step
+                    .completion
+                    .is_some_and(|completion| completion.status == CompletionStatus::Success)
         }));
 
         assert!(trace.iter().any(|step| {
             matches!(step.request, Some(AdapterContractRequest::Canonical { .. }))
                 && step.completion.is_some()
         }));
+    }
+
+    #[test]
+    fn canonical_create_without_name_binding_fails_closed() {
+        let token = VfsNameToken::from_component_bytes(b"file");
+        let contract = AdapterContractRequest::Canonical {
+            envelope: envelope(
+                1,
+                0x290_f05e,
+                TideRequest::Vfs(VfsRequest::Create {
+                    parent_id: ROOT_INODE_ID,
+                    name: token,
+                }),
+                WorkClass::Foreground,
+                FenceIntent::Write,
+            ),
+            write_bytes: Vec::new(),
+            name_bindings: Vec::new(),
+        };
+        let queued = QueuedRequest {
+            unique: 1,
+            request: FuseRequest::Create {
+                path: path("/file"),
+            },
+            contract,
+            interrupted: false,
+        };
+        let mut model = FuseEnvironmentModel::new();
+
+        let (completion, fingerprint) = model.execute_queued(&queued).unwrap();
+
+        assert_eq!(completion.errno, Errno::EINVAL);
+        assert!(fingerprint.is_some());
     }
 
     #[test]

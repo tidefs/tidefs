@@ -7,8 +7,15 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tidefs_model_core::{ModelFs, ModelOutput, ModelPath, ModelRequest, ModelStep};
-use tidefs_types_vfs_core::{CompletionDisposition, CompletionStatus, Errno};
+use tidefs_model_core::{
+    ContractModelContext, ContractNameBinding, ContractNameContext, ModelFs, ModelOutput,
+    ModelPath, ModelRequest, ModelStep, ROOT_INODE_ID,
+};
+use tidefs_types_vfs_core::{
+    AdmissionIntent, BudgetIntent, CompletionDisposition, CompletionStatus, ContractEpoch, Errno,
+    FenceIntent, InodeId, RequestEnvelope, RequestId, RequestMetadata, RetryIntent, TideRequest,
+    TraceId, VfsNameToken, VfsRequest, WorkClass,
+};
 
 use crate::protocol::*;
 use crate::{get_string_arg, load_trace, TraceError, TraceRunner};
@@ -276,10 +283,167 @@ impl ModelTraceBackend {
             .live_mut()?
             .apply(request)
             .map_err(|err| TraceError::Assertion(format!("model invariant: {err}")))?;
-        let result = result_override.or_else(|| model_output_result(operation, &step.output));
-        let completion = BackendCompletion::from_model(&step, result);
-        let fingerprint = Some(step.fingerprint.to_hex());
-        Ok((completion, fingerprint))
+        Ok(model_step_result(operation, &step, result_override))
+    }
+
+    fn apply_contract_request(
+        &mut self,
+        operation: &TraceOperation,
+        envelope: RequestEnvelope,
+        name_bindings: &[ContractNameBinding<'_>],
+        result_override: Option<Value>,
+    ) -> Result<(BackendCompletion, Option<String>), TraceError> {
+        let step =
+            self.apply_contract_step(&envelope, ContractModelContext::empty(), name_bindings)?;
+        Ok(model_step_result(operation, &step, result_override))
+    }
+
+    fn apply_contract_step(
+        &mut self,
+        envelope: &RequestEnvelope,
+        context: ContractModelContext<'_>,
+        name_bindings: &[ContractNameBinding<'_>],
+    ) -> Result<ModelStep, TraceError> {
+        self.live_mut()?
+            .apply_contract_with_names(envelope, context, ContractNameContext::new(name_bindings))
+            .map_err(|err| TraceError::Assertion(format!("model invariant: {err}")))
+    }
+
+    fn apply_contract_mkdir_path(
+        &mut self,
+        operation: &TraceOperation,
+        operation_index: usize,
+        path: &ModelPath,
+        result_override: Option<Value>,
+    ) -> Result<(BackendCompletion, Option<String>), TraceError> {
+        let (parent_id, name) = self
+            .live()?
+            .resolve_parent_inode(path)
+            .map_err(model_errno_error)?;
+        self.apply_contract_mkdir_child(
+            operation,
+            operation_index,
+            parent_id,
+            &name,
+            result_override,
+        )
+    }
+
+    fn apply_contract_mkdir_child(
+        &mut self,
+        operation: &TraceOperation,
+        operation_index: usize,
+        parent_id: InodeId,
+        name: &str,
+        result_override: Option<Value>,
+    ) -> Result<(BackendCompletion, Option<String>), TraceError> {
+        let binding = name_binding(name);
+        let envelope = trace_contract_envelope(
+            operation_index,
+            TideRequest::Vfs(VfsRequest::Mkdir {
+                parent_id,
+                name: binding.token,
+            }),
+        );
+        self.apply_contract_request(operation, envelope, &[binding], result_override)
+    }
+
+    fn apply_contract_create_path(
+        &mut self,
+        operation: &TraceOperation,
+        operation_index: usize,
+        path: &ModelPath,
+        result_override: Option<Value>,
+    ) -> Result<(BackendCompletion, Option<String>), TraceError> {
+        let (parent_id, name) = self
+            .live()?
+            .resolve_parent_inode(path)
+            .map_err(model_errno_error)?;
+        let binding = name_binding(&name);
+        let envelope = trace_contract_envelope(
+            operation_index,
+            TideRequest::Vfs(VfsRequest::Create {
+                parent_id,
+                name: binding.token,
+            }),
+        );
+        self.apply_contract_request(operation, envelope, &[binding], result_override)
+    }
+
+    fn apply_contract_unlink_path(
+        &mut self,
+        operation: &TraceOperation,
+        operation_index: usize,
+        path: &ModelPath,
+        result_override: Option<Value>,
+    ) -> Result<(BackendCompletion, Option<String>), TraceError> {
+        let (parent_id, name) = self
+            .live()?
+            .resolve_parent_inode(path)
+            .map_err(model_errno_error)?;
+        let binding = name_binding(&name);
+        let envelope = trace_contract_envelope(
+            operation_index,
+            TideRequest::Vfs(VfsRequest::Unlink {
+                parent_id,
+                name: binding.token,
+            }),
+        );
+        self.apply_contract_request(operation, envelope, &[binding], result_override)
+    }
+
+    fn apply_contract_rename_paths(
+        &mut self,
+        operation: &TraceOperation,
+        operation_index: usize,
+        from: &ModelPath,
+        to: &ModelPath,
+        result_override: Option<Value>,
+    ) -> Result<(BackendCompletion, Option<String>), TraceError> {
+        let (old_parent_id, old_name) = self
+            .live()?
+            .resolve_parent_inode(from)
+            .map_err(model_errno_error)?;
+        let (new_parent_id, new_name) = self
+            .live()?
+            .resolve_parent_inode(to)
+            .map_err(model_errno_error)?;
+        let old_binding = name_binding(&old_name);
+        let new_binding = name_binding(&new_name);
+        let envelope = trace_contract_envelope(
+            operation_index,
+            TideRequest::Vfs(VfsRequest::Rename {
+                old_parent_id,
+                old_name: old_binding.token,
+                new_parent_id,
+                new_name: new_binding.token,
+            }),
+        );
+        self.apply_contract_request(
+            operation,
+            envelope,
+            &[old_binding, new_binding],
+            result_override,
+        )
+    }
+
+    fn apply_contract_truncate_path(
+        &mut self,
+        operation: &TraceOperation,
+        operation_index: usize,
+        path: &ModelPath,
+        size: u64,
+        result_override: Option<Value>,
+    ) -> Result<(BackendCompletion, Option<String>), TraceError> {
+        let inode_id = self
+            .live()?
+            .resolve_path_inode(path)
+            .map_err(model_errno_error)?;
+        let envelope = trace_contract_envelope(
+            operation_index,
+            TideRequest::Vfs(VfsRequest::Truncate { inode_id, size }),
+        );
+        self.apply_contract_request(operation, envelope, &[], result_override)
     }
 }
 
@@ -328,23 +492,23 @@ impl TraceBackend for ModelTraceBackend {
             }
             OP_CREATE_DATASET => {
                 let name = dataset_name(&operation.args)?;
-                self.apply_model_request(
+                self.apply_contract_mkdir_child(
                     operation,
-                    ModelRequest::Mkdir {
-                        path: model_path(&format!("/{name}"))?,
-                    },
+                    operation_index,
+                    ROOT_INODE_ID,
+                    &name,
                     None,
                 )?
             }
             OP_MKDIR => {
                 let path = dataset_relative_path(&operation.args, KEY_PATH)?;
-                self.apply_model_request(operation, ModelRequest::Mkdir { path }, None)?
+                self.apply_contract_mkdir_path(operation, operation_index, &path, None)?
             }
             OP_CREATE_FILE => {
                 let path = dataset_relative_path(&operation.args, KEY_PATH)?;
-                self.apply_model_request(operation, ModelRequest::Create { path }, None)?
+                self.apply_contract_create_path(operation, operation_index, &path, None)?
             }
-            OP_PUT => self.apply_put(operation)?,
+            OP_PUT => self.apply_put(operation_index, operation)?,
             OP_GET => self.apply_get(operation, None)?,
             OP_WRITE_RANGE => {
                 let path = dataset_relative_path(&operation.args, KEY_KEY)?;
@@ -379,12 +543,12 @@ impl TraceBackend for ModelTraceBackend {
             }
             OP_UNLINK => {
                 let path = dataset_relative_path(&operation.args, KEY_PATH)?;
-                self.apply_model_request(operation, ModelRequest::Unlink { path }, None)?
+                self.apply_contract_unlink_path(operation, operation_index, &path, None)?
             }
             OP_RENAME => {
                 let from = dataset_relative_path(&operation.args, KEY_SRC)?;
                 let to = dataset_relative_path(&operation.args, KEY_DST)?;
-                self.apply_model_request(operation, ModelRequest::Rename { from, to }, None)?
+                self.apply_contract_rename_paths(operation, operation_index, &from, &to, None)?
             }
             OP_LOOKUP => {
                 let path = dataset_relative_path(&operation.args, KEY_PATH)?;
@@ -472,21 +636,29 @@ impl TraceBackend for ModelTraceBackend {
 impl ModelTraceBackend {
     fn apply_put(
         &mut self,
+        operation_index: usize,
         operation: &TraceOperation,
     ) -> Result<(BackendCompletion, Option<String>), TraceError> {
         let path = dataset_relative_path(&operation.args, KEY_KEY)?;
-        ensure_model_parent_dirs(self.live_mut()?, &path)?;
+        self.ensure_model_parent_dirs(operation, operation_index, &path)?;
         if matches!(self.live()?.attr(&path), Err(Errno::ENOENT)) {
-            self.live_mut()?
-                .apply(ModelRequest::Create { path: path.clone() })
-                .map_err(|err| TraceError::Assertion(format!("model invariant: {err}")))?;
+            let (completion, _) =
+                self.apply_contract_create_path(operation, operation_index, &path, None)?;
+            if completion.errno != Errno::SUCCESS.name() {
+                return Err(TraceError::FileSystem(format!(
+                    "model create during put failed with {}",
+                    completion.errno
+                )));
+            }
         }
-        self.live_mut()?
-            .apply(ModelRequest::Truncate {
-                path: path.clone(),
-                size: 0,
-            })
-            .map_err(|err| TraceError::Assertion(format!("model invariant: {err}")))?;
+        let (completion, _) =
+            self.apply_contract_truncate_path(operation, operation_index, &path, 0, None)?;
+        if completion.errno != Errno::SUCCESS.name() {
+            return Err(TraceError::FileSystem(format!(
+                "model truncate during put failed with {}",
+                completion.errno
+            )));
+        }
         let bytes = decode_arg_b64(&operation.args, KEY_VALUE_B64)?;
         self.apply_model_request(
             operation,
@@ -497,6 +669,37 @@ impl ModelTraceBackend {
             },
             None,
         )
+    }
+
+    fn ensure_model_parent_dirs(
+        &mut self,
+        operation: &TraceOperation,
+        operation_index: usize,
+        path: &ModelPath,
+    ) -> Result<(), TraceError> {
+        let components = path.components();
+        if components.len() <= 1 {
+            return Ok(());
+        }
+        let mut parent = Vec::new();
+        for component in &components[..components.len() - 1] {
+            parent.push(component.clone());
+            let path =
+                ModelPath::from_components(parent.iter().map(String::as_str)).map_err(|errno| {
+                    TraceError::Protocol(format!("invalid parent path: {}", errno.name()))
+                })?;
+            if matches!(self.live()?.attr(&path), Err(Errno::ENOENT)) {
+                let (completion, _) =
+                    self.apply_contract_mkdir_path(operation, operation_index, &path, None)?;
+                if completion.errno != Errno::SUCCESS.name() {
+                    return Err(TraceError::FileSystem(format!(
+                        "model mkdir parent during put failed with {}",
+                        completion.errno
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn apply_get(
@@ -736,31 +939,57 @@ fn model_path(path: &str) -> Result<ModelPath, TraceError> {
     })
 }
 
+fn model_step_result(
+    operation: &TraceOperation,
+    step: &ModelStep,
+    result_override: Option<Value>,
+) -> (BackendCompletion, Option<String>) {
+    let result = result_override.or_else(|| model_output_result(operation, &step.output));
+    let completion = BackendCompletion::from_model(step, result);
+    let fingerprint = Some(step.fingerprint.to_hex());
+    (completion, fingerprint)
+}
+
+fn name_binding(component: &str) -> ContractNameBinding<'_> {
+    ContractNameBinding::new(
+        VfsNameToken::from_component_bytes(component.as_bytes()),
+        component,
+    )
+}
+
+fn trace_contract_envelope(operation_index: usize, request: TideRequest) -> RequestEnvelope {
+    let mut metadata = RequestMetadata::new(
+        trace_request_id(operation_index),
+        ContractEpoch::new(0x317),
+        trace_id(operation_index),
+    );
+    metadata.work_class = WorkClass::Foreground;
+    metadata.admission = AdmissionIntent::RequirePermit;
+    metadata.budget = BudgetIntent::Foreground;
+    metadata.fence = FenceIntent::Write;
+    metadata.retry = RetryIntent::None;
+    RequestEnvelope::new(metadata, request)
+}
+
+fn trace_request_id(operation_index: usize) -> RequestId {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&(operation_index as u64).to_le_bytes());
+    bytes[8..].copy_from_slice(b"tracevfs");
+    RequestId::new(bytes)
+}
+
+fn trace_id(operation_index: usize) -> TraceId {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&0x317_u64.to_le_bytes());
+    bytes[8..].copy_from_slice(&(operation_index as u64).to_le_bytes());
+    TraceId::new(bytes)
+}
+
 fn decode_arg_b64(args: &Value, key: &str) -> Result<Vec<u8>, TraceError> {
     let encoded = get_string_arg(args, key)?;
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(TraceError::Base64)
-}
-
-fn ensure_model_parent_dirs(fs: &mut ModelFs, path: &ModelPath) -> Result<(), TraceError> {
-    let components = path.components();
-    if components.len() <= 1 {
-        return Ok(());
-    }
-    let mut parent = Vec::new();
-    for component in &components[..components.len() - 1] {
-        parent.push(component.clone());
-        let path =
-            ModelPath::from_components(parent.iter().map(String::as_str)).map_err(|errno| {
-                TraceError::Protocol(format!("invalid parent path: {}", errno.name()))
-            })?;
-        if matches!(fs.attr(&path), Err(Errno::ENOENT)) {
-            fs.apply(ModelRequest::Mkdir { path })
-                .map_err(|err| TraceError::Assertion(format!("model invariant: {err}")))?;
-        }
-    }
-    Ok(())
 }
 
 fn model_output_result(operation: &TraceOperation, output: &ModelOutput) -> Option<Value> {
@@ -855,4 +1084,80 @@ fn model_kind_name(kind: tidefs_model_core::ModelNodeKind) -> &'static str {
 
 fn model_errno_error(errno: Errno) -> TraceError {
     TraceError::FileSystem(format!("model operation failed with {}", errno.name()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn model_backend_replays_namespace_trace_through_contract_envelopes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("namespace.jsonl");
+        crate::save_trace(
+            &path,
+            &[
+                json!({"op": OP_TRACE_META, "args": {"schema": POOL_TRACE_SCHEMA, "version": 1}}),
+                json!({"op": OP_CREATE_POOL, "args": {"device_count": 1, "device_size_bytes": 4194304}}),
+                json!({"op": OP_CREATE_DATASET, "args": {"name": "ds"}}),
+                json!({"op": OP_MKDIR, "args": {"dataset": "ds", "path": "dir"}}),
+                json!({"op": OP_CREATE_FILE, "args": {"dataset": "ds", "path": "dir/file"}}),
+                json!({"op": OP_RENAME, "args": {"dataset": "ds", "src": "dir/file", "dst": "dir/moved"}}),
+                json!({"op": OP_UNLINK, "args": {"dataset": "ds", "path": "dir/moved"}}),
+            ],
+        )
+        .unwrap();
+
+        let mut backend = ModelTraceBackend::new();
+        let events = run_trace_with_backend(&mut backend, &path).unwrap();
+
+        for op in [
+            OP_CREATE_DATASET,
+            OP_MKDIR,
+            OP_CREATE_FILE,
+            OP_RENAME,
+            OP_UNLINK,
+        ] {
+            let event = events
+                .iter()
+                .find(|event| event.operation.op == op)
+                .unwrap_or_else(|| panic!("missing {op}"));
+            assert_eq!(event.completion.status, "success");
+            assert_eq!(event.completion.errno, Errno::SUCCESS.name());
+            assert!(event.fingerprint.is_some());
+        }
+    }
+
+    #[test]
+    fn namespace_contract_replay_rejects_missing_or_wrong_name_binding() {
+        let token = VfsNameToken::from_component_bytes(b"file");
+        let envelope = trace_contract_envelope(
+            1,
+            TideRequest::Vfs(VfsRequest::Create {
+                parent_id: ROOT_INODE_ID,
+                name: token,
+            }),
+        );
+        let mut fs = ModelFs::new();
+
+        let missing = fs
+            .apply_contract_with_names(
+                &envelope,
+                ContractModelContext::empty(),
+                ContractNameContext::empty(),
+            )
+            .unwrap();
+        assert_eq!(missing.errno(), Errno::EINVAL);
+
+        let wrong_binding = ContractNameBinding::new(token, "other");
+        let wrong = fs
+            .apply_contract_with_names(
+                &envelope,
+                ContractModelContext::empty(),
+                ContractNameContext::new(&[wrong_binding]),
+            )
+            .unwrap();
+        assert_eq!(wrong.errno(), Errno::EINVAL);
+    }
 }
