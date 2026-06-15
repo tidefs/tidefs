@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use tidefs_trace_oracle::backend::compare_model_and_runtime_trace;
 use tidefs_trace_oracle::manifest::{load_manifest, print_results, verify_trace_corpus};
 
 /// Run the full check-trace-oracle gate.
@@ -15,7 +16,47 @@ use tidefs_trace_oracle::manifest::{load_manifest, print_results, verify_trace_c
 /// 3. Replays all pool traces through `verify_trace_corpus`.
 /// 4. Reports per-trace PASS/FAIL and exits non-zero on failure.
 pub fn check_trace_oracle_current_workspace() -> Result<(), String> {
+    check_trace_oracle_current_workspace_with_args(std::iter::empty())
+}
+
+pub fn check_trace_oracle_current_workspace_with_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<(), String> {
     let repo_root = find_repo_root()?;
+    if let Some(arg) = args.next() {
+        if arg != "--compare-trace" {
+            return Err(format!("unknown check-trace-oracle argument: {arg}"));
+        }
+        let trace = args
+            .next()
+            .ok_or_else(|| "--compare-trace requires a path".to_string())?;
+        if let Some(extra) = args.next() {
+            return Err(format!("unexpected check-trace-oracle argument: {extra}"));
+        }
+        let trace_path = if PathBuf::from(&trace).is_absolute() {
+            PathBuf::from(trace)
+        } else {
+            repo_root.join(trace)
+        };
+        let comparison = compare_model_and_runtime_trace(&trace_path)
+            .map_err(|e| format!("backend comparison failed: {e}"))?;
+        println!("trace: {}", trace_path.display());
+        println!(
+            "model final fingerprint: {}",
+            comparison.final_fingerprint("model").unwrap_or("(none)")
+        );
+        println!(
+            "local-runtime final fingerprint: {}",
+            comparison
+                .final_fingerprint("local_runtime")
+                .unwrap_or("(none)")
+        );
+        if let Some(first) = comparison.mismatches.first() {
+            return Err(first.to_string());
+        }
+        println!("model/local-runtime comparison: PASS");
+        return Ok(());
+    }
 
     // Step 1: run crate unit tests.
     let test_status = Command::new("cargo")

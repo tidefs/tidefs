@@ -7,6 +7,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::backend::{
+    verify_backend_expectations, BackendExpectation, BACKEND_EXPECTATIONS_VERSION,
+};
 use crate::{sha256_file, TraceError, TraceEvent, TraceRunner};
 
 /// Top-level manifest structure.
@@ -28,6 +31,10 @@ pub struct ManifestItem {
     pub schema: String,
     pub sha256: String,
     pub expected_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_expectations_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_expectations: Option<std::collections::BTreeMap<String, BackendExpectation>>,
 }
 
 /// Result of replaying one trace from the manifest.
@@ -135,6 +142,28 @@ pub fn verify_trace_corpus(
                     error: err_msg,
                     sha256_ok,
                 });
+                if passed {
+                    if let Some(expectations) = &item.backend_expectations {
+                        let version = item.backend_expectations_version.ok_or_else(|| {
+                            TraceError::Protocol(format!(
+                                "{} missing backend_expectations_version",
+                                item.id
+                            ))
+                        })?;
+                        if version != BACKEND_EXPECTATIONS_VERSION {
+                            return Err(TraceError::Protocol(format!(
+                                "{} has unsupported backend_expectations_version: {}",
+                                item.id, version
+                            )));
+                        }
+                        if let Err(err) = verify_backend_expectations(&trace_path, expectations) {
+                            if let Some(result) = results.last_mut() {
+                                result.passed = false;
+                                result.error = Some(format!("backend expectation error: {err}"));
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 results.push(TraceResult {
