@@ -126,6 +126,10 @@ enum Command {
         #[arg(long = "output", short = 'o', value_name = "DIR")]
         output_dir: Option<PathBuf>,
 
+        /// Print the source-qualified support bundle JSON to stdout
+        #[arg(long = "json")]
+        json: bool,
+
         /// Device paths to scan for pool information
         #[arg(long = "devices", value_name = "DEVICES", num_args = 1..)]
         devices: Vec<PathBuf>,
@@ -162,8 +166,9 @@ fn main() {
 
         Command::Diag {
             output_dir,
+            json,
             devices,
-        } => commands::diag::handle_diag(output_dir, &devices),
+        } => commands::diag::handle_diag(output_dir, &devices, json),
         Command::Cluster { cmd } => commands::cluster::handle_cluster(cmd),
         Command::Kernel { cmd } => commands::kernel::handle_kernel(cmd),
     }
@@ -1102,6 +1107,39 @@ mod tests {
         use clap::Parser;
         let args = Cli::try_parse_from(["tidefsctl", "kernel"]);
         assert!(args.is_err(), "kernel requires a subcommand");
+    }
+
+    // -- Diagnostic bundle CLI parse tests --------------------------------
+
+    #[test]
+    fn cli_parse_diag_json() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "diag", "--json"]);
+        assert!(args.is_ok(), "diag --json should parse");
+    }
+
+    #[test]
+    fn cli_parse_diag_devices_are_offline_input() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "diag",
+            "--json",
+            "--devices",
+            "/dev/sda",
+            "/dev/sdb",
+        ]);
+        assert!(args.is_ok(), "diag --devices should parse as offline input");
+    }
+
+    #[test]
+    fn cli_parse_diag_rejects_pool_name_path() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "diag", "tank", "--json"]);
+        assert!(
+            args.is_err(),
+            "diag does not expose a pool-name live-owner diagnostic path yet"
+        );
     }
 
     // -- Dataset CLI parse tests ------------------------------------------

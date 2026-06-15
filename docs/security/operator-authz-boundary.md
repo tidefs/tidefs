@@ -95,6 +95,21 @@ mutating mode only. `unguarded` rows are consciously excluded from privileged
 guarding until they mutate state or a future issue gives them a stronger
 authorization class.
 
+## Diagnostic Bundle Boundary
+
+`tidefsctl diag` is an unguarded, read-only operator diagnostic. Its support
+bundle is source-qualified evidence rather than authority. System, build, and
+environment facts are labeled `passive-host-probe`; command-surface facts are
+labeled `command-classification-registry`; explicit `--devices` facts are
+labeled `offline-device-scan`; future reachable owner facts must be labeled
+`live-owner`; and placeholders are labeled `unavailable`.
+
+The diagnostic path must not reopen cached imported-pool state behind the
+runtime owner. If explicit device labels show `ACTIVE` imported state, the
+bundle may report label-only evidence and `live_owner_required`, but committed
+roots, datasets, and claim-adjacent validation rows remain unavailable unless a
+reachable live-owner or validation artifact source is actually consulted.
+
 `mount` remains explicitly standalone/local: it constructs only standalone
 daemon mount authority and cannot assert cluster admission. `pool mount
 --cluster` is separate from P9-02 remote operator authorization; it is admitted

@@ -258,6 +258,27 @@ Errors should name the command path first, for example
 resource involved. Warnings must not hide pre-alpha limitations behind success
 language.
 
+=== Diagnostic Bundles
+
+`tidefsctl diag` collects a redacted, read-only support bundle. The bundle is
+operator evidence, not storage authority and not claim validation. Every major
+section carries a source label such as `passive-host-probe`,
+`command-classification-registry`, `offline-device-scan`, `live-owner`, or
+`unavailable`.
+
+Passive host probes cover system, build, and environment facts. The command
+surface section is generated from the command-classification registry. Explicit
+`--devices` input is an offline device scan source only: exported pool labels
+may produce exported/offline pool facts, while `ACTIVE` imported-pool labels are
+reported as label-only evidence that requires a live owner before deeper state
+is read. Dataset and validation/claim-adjacent sections are marked
+`unavailable` when no live-owner or validation-row source was consulted, rather
+than emitting zero-filled pass/fail taxonomies.
+
+`tidefsctl diag --json` prints the same source-qualified bundle to stdout. The
+default file-output mode also names the report source and maturity before
+printing the bundle path.
+
 === Help Text Rule
 
 Top-level help should answer two questions quickly:
