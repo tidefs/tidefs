@@ -3,6 +3,10 @@
 
 //! `schema_codec` VFS canon for error mapping and fixed-width encode/decode hooks.
 
+pub mod contract;
+
+pub use contract::*;
+
 use core::convert::TryFrom;
 use tidefs_types_vfs_core::{
     DirHandleId, EngineDirHandle, EngineFileHandle, FileHandleId, Generation, InodeId, NodeKind,

@@ -7,6 +7,10 @@
 //! records so the `environment_boundary` split between `core` and `alloc` stays explicit.
 extern crate alloc;
 
+pub mod contract;
+
+pub use contract::*;
+
 use core::convert::TryFrom;
 use core::fmt;
 
