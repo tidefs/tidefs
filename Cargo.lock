@@ -2790,6 +2790,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-model-core"
+version = "0.421.0"
+dependencies = [
+ "tidefs-types-vfs-core",
+]
+
+[[package]]
 name = "tidefs-namespace"
 version = "0.421.0"
 dependencies = [

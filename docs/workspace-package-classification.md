@@ -1,6 +1,6 @@
 # Workspace Package Classification
 
-Generated from current Cargo metadata and on-disk manifest discovery for issue #276 on 2026-06-15.
+Updated from current Cargo metadata and on-disk manifest discovery for issue #283 on 2026-06-15.
 This document is the package-role authority for TideFS workspace selection and TFR-002/TFR-019 reduction.
 It is enforced by `cargo run -p tidefs-xtask -- check-workspace-policy`.
 
@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 145 |
+| Workspace packages | 146 |
 | Explicitly excluded package roots | 5 |
-| Discovered package manifests | 150 |
-| Classified package roots | 150 |
+| Discovered package manifests | 151 |
+| Classified package roots | 151 |
 
 ## Role Semantics
 
@@ -35,7 +35,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `product-code` | 115 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
-| `proof-harness` | 7 |
+| `proof-harness` | 8 |
 | `vendored-third-party` | 1 |
 | `standalone-fuzz` | 5 |
 | `scaffold-transitional` | 0 |
@@ -116,6 +116,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-membership-epoch` | `tidefs-membership-epoch` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-membership-live` | `tidefs-membership-live` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-membership-types` | `tidefs-membership-types` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
+| `crates/tidefs-model-core` | `tidefs-model-core` | `workspace-member` | `proof-harness` | planned authority surface for trace and oracle validation; follow-up issue required before it can support release claims. |
 | `crates/tidefs-namespace` | `tidefs-namespace` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-node-drain` | `tidefs-node-drain` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-node-join` | `tidefs-node-join` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -215,6 +216,7 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `crates/tidefs-geometry-convert` | `tidefs-geometry-convert` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-kernel-cutover-runtime` | `tidefs-kernel-cutover-runtime` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-kmod-posix-vfs` | `tidefs-kmod-posix-vfs` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue required before release claims. |
+| `crates/tidefs-model-core` | `tidefs-model-core` | `proof-harness` | planned authority surface for trace and oracle validation; follow-up issue required before it can support release claims. |
 | `crates/tidefs-online-defrag` | `tidefs-online-defrag` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-posix-filesystem-adapter-reply` | `tidefs-posix-filesystem-adapter-reply` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue required before release claims. |
 | `crates/tidefs-posix-guarantee-verifier` | `tidefs-posix-guarantee-verifier` | `proof-harness` | planned authority surface for validation; follow-up issue required before it can support release claims. |
