@@ -135,7 +135,8 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
         // Rust source-model truncation coordination: when the file shrank,
         // clean up model dirty-writeback tracking and page-authority entries
         // beyond the new EOF. The mounted C truncate path uses Linux
-        // page-cache discard helpers for live folios.
+        // filemap write-and-wait, unmap, invalidate, and truncate_setsize
+        // helpers for live folios before/while applying the engine size.
         if (attr.valid & tidefs_kmod_bridge::kernel_types::FATTR_SIZE) != 0 {
             let new_size = attr.size;
             let page_threshold = crate::page_authority::page_index(new_size);

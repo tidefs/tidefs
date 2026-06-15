@@ -541,10 +541,13 @@ calls the registered C `address_space_operations`: `read_folio` reads through
 `writepages` copies dirty folio bytes into `tidefs_posix_vfs_engine_write`,
 and `fsync` drains `filemap_write_and_wait_range()` before
 `tidefs_posix_vfs_engine_fsync()`. Engine writeback errors and short writes
-re-dirty the folio for retry. Truncate and direct-write invalidation use the C
-`filemap_write_and_wait_range`, `unmap_mapping_range`,
-`invalidate_inode_pages2_range`, and `truncate_setsize()` helpers for the
-ranges Linux has discarded.
+re-dirty the folio for retry. Mounted truncate now takes the C mapping
+invalidate lock, waits dirty mapped or buffered folios with
+`filemap_write_and_wait_range()`, unmaps and invalidates the size-change
+range, calls the Rust engine `setattr` bridge, and then applies
+`truncate_setsize()` to the canonical size. Truncate-extend, direct-write,
+fallocate, and copy invalidation remain C-helper-owned mounted cleanup rather
+than Rust source-model page-authority claims.
 
 That first-boot mounted C/generic-filemap proof is not TFR-008 or TFR-018
 closure. The Rust `KmodVfsVmOps`, `DirtyFolioTracker`, and page-authority

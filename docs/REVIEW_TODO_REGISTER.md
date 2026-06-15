@@ -911,6 +911,21 @@ Important 2026-06-01 findings:
   `address_space_operations` path from #258. TFR-008/TFR-018 stay open for
   crash-consistent mmap, broad xfstests, direct-I/O, FUSE writeback-cache
   correctness, placement receipt correctness, and distributed mmap coherency.
+- `TFR-018`: issue #275 tightens the mounted C truncate/invalidation path
+  without registering `.invalidate_folio` or reopening the Rust vm-ops source
+  model. Engine-backed `setattr(ATTR_SIZE)` now takes the mapping invalidate
+  lock, waits dirty mapped or buffered folios in the size-change range with
+  `filemap_write_and_wait_range()`, unmaps and invalidates that range, then
+  calls the Rust engine `setattr` bridge and applies `truncate_setsize()` to
+  the canonical returned size. Truncate-extend uses the same C helper path over
+  the extension range so stale folios from before the size change cannot become
+  the authority for new zero-filled bytes. The kernel mmap validation artifact
+  now requires mounted rows for truncate-down discard, truncate-extend zero
+  reads, mapped dirty truncate-down with `msync`/`munmap`, remount readback,
+  and buffered overwrite after a prior mapping. This reduces the mounted
+  TFR-008/TFR-018 page-cache-invalidation gap, but does not close
+  crash-consistent mmap, broad xfstests, direct-I/O, FUSE writeback-cache
+  correctness, placement receipt correctness, or distributed mmap coherency.
 - `TFR-018`: commit `822848b7` routes live inode writes through the active
   storage path when a mounted `KernelPoolCore` I/O context is available.
   `stage_live_inode_write()` now asks

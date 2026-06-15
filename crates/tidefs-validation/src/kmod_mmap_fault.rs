@@ -22,6 +22,12 @@
 //! - **MsyncSync** — `msync(MS_SYNC)` drains dirty folios through writeback
 //! - **Munmap** — unmap cleanup leaves no silent dirty-state drop
 //! - **PostSyncReadback** — read(2) observes data after sync/writeback
+//! - **TruncateDownDiscard** — truncate-down discards cached bytes beyond EOF
+//! - **TruncateExtendZeroRead** — truncate-extend exposes zero-filled new bytes
+//! - **MappedDirtyTruncateDown** — mapped dirty discard followed by msync/munmap
+//! - **MappedDirtyTruncateRemount** — remount readback keeps truncated bytes absent
+//! - **BufferedOverwriteAfterMapping** — buffered write after mmap updates cache and engine
+//! - **BufferedOverwriteRemount** — remount readback matches the buffered overwrite
 //!
 //! # Current validation role
 //!
@@ -84,6 +90,18 @@ pub enum MmapFaultKind {
     Munmap,
     /// read(2) observes mmap writes after sync/writeback.
     PostSyncReadback,
+    /// Truncate-down waits/discards the page-cache range beyond the new EOF.
+    TruncateDownDiscard,
+    /// Truncate-extend preserves old bytes and reads zeroes from the extension.
+    TruncateExtendZeroRead,
+    /// Dirty mapped bytes beyond the new EOF stay absent after truncate/msync/munmap.
+    MappedDirtyTruncateDown,
+    /// Remount readback keeps the mapped-dirty truncated range absent.
+    MappedDirtyTruncateRemount,
+    /// Buffered overwrite after a prior mapping updates page cache and engine contents.
+    BufferedOverwriteAfterMapping,
+    /// Remount readback matches buffered overwrite state after a prior mapping.
+    BufferedOverwriteRemount,
     /// Custom Rust vm_operations_struct bridge is fail-closed and not registered.
     CustomRustVmOps,
     /// MAP_PRIVATE read fault — filemap_fault resolves via VfsEngine::read.
@@ -109,6 +127,16 @@ impl fmt::Display for MmapFaultKind {
             Self::MsyncSync => write!(f, "msync-sync"),
             Self::Munmap => write!(f, "munmap"),
             Self::PostSyncReadback => write!(f, "post-sync-readback"),
+            Self::TruncateDownDiscard => write!(f, "truncate-down-discard"),
+            Self::TruncateExtendZeroRead => write!(f, "truncate-extend-zero-read"),
+            Self::MappedDirtyTruncateDown => write!(f, "mapped-dirty-truncate-down"),
+            Self::MappedDirtyTruncateRemount => {
+                write!(f, "mapped-dirty-truncate-remount")
+            }
+            Self::BufferedOverwriteAfterMapping => {
+                write!(f, "buffered-overwrite-after-mapping")
+            }
+            Self::BufferedOverwriteRemount => write!(f, "buffered-overwrite-remount"),
             Self::CustomRustVmOps => write!(f, "custom-rust-vm-ops"),
             Self::PrivateReadFault => write!(f, "private-read-fault"),
             Self::SharedReadFault => write!(f, "shared-read-fault"),
@@ -150,8 +178,8 @@ pub enum ValidationOutcome {
     Skipped,
 }
 
-/// Mounted-kernel mmap rows required by the #258/#260 QEMU artifact.
-pub const MOUNTED_MMAP_REQUIRED_ROWS: [MmapFaultKind; 9] = [
+/// Mounted-kernel mmap rows required by the #258/#260/#275 QEMU artifact.
+pub const MOUNTED_MMAP_REQUIRED_ROWS: [MmapFaultKind; 15] = [
     MmapFaultKind::CreateAndWriteInitial,
     MmapFaultKind::MmapShared,
     MmapFaultKind::FaultReadShared,
@@ -160,6 +188,12 @@ pub const MOUNTED_MMAP_REQUIRED_ROWS: [MmapFaultKind; 9] = [
     MmapFaultKind::MsyncSync,
     MmapFaultKind::Munmap,
     MmapFaultKind::PostSyncReadback,
+    MmapFaultKind::TruncateDownDiscard,
+    MmapFaultKind::TruncateExtendZeroRead,
+    MmapFaultKind::MappedDirtyTruncateDown,
+    MmapFaultKind::MappedDirtyTruncateRemount,
+    MmapFaultKind::BufferedOverwriteAfterMapping,
+    MmapFaultKind::BufferedOverwriteRemount,
     MmapFaultKind::CustomRustVmOps,
 ];
 
@@ -371,6 +405,30 @@ mod tests {
             "post-sync-readback"
         );
         assert_eq!(
+            format!("{}", MmapFaultKind::TruncateDownDiscard),
+            "truncate-down-discard"
+        );
+        assert_eq!(
+            format!("{}", MmapFaultKind::TruncateExtendZeroRead),
+            "truncate-extend-zero-read"
+        );
+        assert_eq!(
+            format!("{}", MmapFaultKind::MappedDirtyTruncateDown),
+            "mapped-dirty-truncate-down"
+        );
+        assert_eq!(
+            format!("{}", MmapFaultKind::MappedDirtyTruncateRemount),
+            "mapped-dirty-truncate-remount"
+        );
+        assert_eq!(
+            format!("{}", MmapFaultKind::BufferedOverwriteAfterMapping),
+            "buffered-overwrite-after-mapping"
+        );
+        assert_eq!(
+            format!("{}", MmapFaultKind::BufferedOverwriteRemount),
+            "buffered-overwrite-remount"
+        );
+        assert_eq!(
             format!("{}", MmapFaultKind::CustomRustVmOps),
             "custom-rust-vm-ops"
         );
@@ -400,6 +458,12 @@ mod tests {
             MmapFaultKind::MsyncSync,
             MmapFaultKind::Munmap,
             MmapFaultKind::PostSyncReadback,
+            MmapFaultKind::TruncateDownDiscard,
+            MmapFaultKind::TruncateExtendZeroRead,
+            MmapFaultKind::MappedDirtyTruncateDown,
+            MmapFaultKind::MappedDirtyTruncateRemount,
+            MmapFaultKind::BufferedOverwriteAfterMapping,
+            MmapFaultKind::BufferedOverwriteRemount,
             MmapFaultKind::CustomRustVmOps,
             MmapFaultKind::PrivateReadFault,
             MmapFaultKind::SharedReadFault,
@@ -445,6 +509,30 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&MmapFaultKind::PostSyncReadback).unwrap(),
             "\"post-sync-readback\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::TruncateDownDiscard).unwrap(),
+            "\"truncate-down-discard\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::TruncateExtendZeroRead).unwrap(),
+            "\"truncate-extend-zero-read\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::MappedDirtyTruncateDown).unwrap(),
+            "\"mapped-dirty-truncate-down\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::MappedDirtyTruncateRemount).unwrap(),
+            "\"mapped-dirty-truncate-remount\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::BufferedOverwriteAfterMapping).unwrap(),
+            "\"buffered-overwrite-after-mapping\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MmapFaultKind::BufferedOverwriteRemount).unwrap(),
+            "\"buffered-overwrite-remount\""
         );
         assert_eq!(
             serde_json::to_string(&MmapFaultKind::CustomRustVmOps).unwrap(),
@@ -501,6 +589,12 @@ mod tests {
                 "msync-sync",
                 "munmap",
                 "post-sync-readback",
+                "truncate-down-discard",
+                "truncate-extend-zero-read",
+                "mapped-dirty-truncate-down",
+                "mapped-dirty-truncate-remount",
+                "buffered-overwrite-after-mapping",
+                "buffered-overwrite-remount",
                 "custom-rust-vm-ops",
             ]
         );

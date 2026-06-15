@@ -3782,6 +3782,29 @@ static int tidefs_posix_vfs_invalidate_pagecache_range(
 					     invalidate_end >> PAGE_SHIFT);
 }
 
+static int tidefs_posix_vfs_prepare_truncate_pagecache(
+	struct inode *inode,
+	loff_t old_size,
+	loff_t new_size)
+{
+	if (!inode || old_size < 0 || new_size < 0 || old_size == new_size)
+		return 0;
+
+	/*
+	 * Review debt TFR-018: the mounted product path does not register the
+	 * Rust source-model invalidate_folio/page-authority bridge. Truncate
+	 * therefore owns live cleanup here: wait for dirty mapped or buffered
+	 * folios in the size-change range, unmap them, and discard the page
+	 * cache before the engine-visible size changes.
+	 */
+	if (new_size < old_size)
+		return tidefs_posix_vfs_flush_invalidate_pagecache_range(
+			inode, new_size, old_size - new_size);
+
+	return tidefs_posix_vfs_flush_invalidate_pagecache_range(
+		inode, old_size, new_size - old_size);
+}
+
 static ssize_t tidefs_posix_vfs_file_direct_engine_write(
 	struct kiocb *iocb,
 	struct iov_iter *from)
@@ -4328,11 +4351,16 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 		unsigned int out_gid = 0;
 		unsigned long long out_size = 0;
 		unsigned long long out_blocks = 0;
+		bool size_update;
+		bool invalidate_locked = false;
+		loff_t old_size = 0;
 		int ret;
 
 		ret = setattr_prepare(idmap, dentry, iattr);
 		if (ret)
 			return ret;
+
+		size_update = (iattr->ia_valid & ATTR_SIZE) != 0;
 
 		/*
 		 * Translate Linux ATTR_* flags to TideFS FATTR_* bitmask.
@@ -4350,6 +4378,18 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 		if (valid == 0)
 			return 0;
 
+		if (size_update) {
+			old_size = i_size_read(inode);
+			if (iattr->ia_size != old_size) {
+				filemap_invalidate_lock(inode->i_mapping);
+				invalidate_locked = true;
+				ret = tidefs_posix_vfs_prepare_truncate_pagecache(
+					inode, old_size, iattr->ia_size);
+				if (ret)
+					goto out_invalidate_unlock;
+			}
+		}
+
 		ret = tidefs_posix_vfs_engine_setattr(
 			inode->i_ino,
 			valid,
@@ -4363,7 +4403,7 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 			&out_mode, &out_uid, &out_gid, &out_size, &out_blocks);
 
 		if (ret < 0)
-			return ret;
+			goto out_invalidate_unlock;
 
 		/* Apply canonical attributes returned by the engine.
 		 * Clear the bits we handled so simple_setattr skips them. */
@@ -4389,7 +4429,11 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 		 * set to "now" and any bits we did not clear). */
 		setattr_copy(idmap, inode, iattr);
 		mark_inode_dirty(inode);
-		return 0;
+		ret = 0;
+out_invalidate_unlock:
+		if (invalidate_locked)
+			filemap_invalidate_unlock(inode->i_mapping);
+		return ret;
 	}
 
 	/* Non-engine path: delegate to simple_setattr. */
@@ -5754,8 +5798,11 @@ static int tidefs_posix_vfs_read_folio(struct file *file, struct folio *folio)
  * Implemented: read_folio, write_begin, write_end, dirty_folio,
  * writepages.  `dirty_folio` records Linux dirty accounting only; writeback
  * copies the folio contents to the engine and re-dirties on engine failure for
- * retry. Remaining: readahead and C-to-Rust invalidate_folio/page-authority
- * bridge work under Review debt TFR-018.
+ * retry. `.invalidate_folio` remains unregistered: mounted truncate,
+ * fallocate, direct-write, and copy mutations own live cleanup through the C
+ * filemap write-and-wait, unmap, invalidate, and truncate_setsize helpers.
+ * Remaining: readahead and C-to-Rust invalidate_folio/page-authority bridge
+ * work under Review debt TFR-018.
  */
 static const struct address_space_operations tidefs_posix_vfs_aops = {
 	.write_begin = tidefs_posix_vfs_write_begin,
