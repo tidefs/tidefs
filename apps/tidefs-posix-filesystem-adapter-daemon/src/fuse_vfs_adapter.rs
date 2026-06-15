@@ -1311,6 +1311,9 @@ fn fuse_access_requested_from_mask(mask: i32) -> Result<u8, Errno> {
 /// - O_APPEND under kernel writeback-cache -> FOPEN_DIRECT_IO: keep append
 ///   offset authority in the daemon because the engine size is stale until
 ///   the kernel writes dirty cached pages back.
+/// - Clean read-only writeback-cache reopens under an active atime policy may
+///   add FOPEN_DIRECT_IO in the adapter helper below so reads cross the daemon
+///   and Linux FUSE invalidates atime before the following stat.
 /// - Kernel writeback-cache ordinary opens may add FOPEN_KEEP_CACHE in the
 ///   adapter helper below when preserving cached pages is safe for the active
 ///   timestamp policy.
@@ -2920,6 +2923,23 @@ impl FuseVfsAdapter {
         !self.active_read_atime_policy()
     }
 
+    fn writeback_open_should_force_direct_io_for_atime(
+        &self,
+        open_flags: u32,
+        existing_open_state: InodeOpenState,
+    ) -> bool {
+        if !self.active_read_atime_policy() {
+            return false;
+        }
+        if !open_flags_allow_read(open_flags).unwrap_or(false) {
+            return false;
+        }
+        if open_flags_allow_write(open_flags).unwrap_or(false) {
+            return false;
+        }
+        !existing_open_state.has_writable
+    }
+
     fn fuse_open_flags_for_existing_state(
         &self,
         open_flags: u32,
@@ -2930,6 +2950,12 @@ impl FuseVfsAdapter {
             reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
         }
         if self.writeback_cache_enabled && (open_flags & libc::O_APPEND as u32) != 0 {
+            reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
+        }
+        if self.writeback_cache_enabled
+            && (reply_flags & fuser::consts::FOPEN_DIRECT_IO) == 0
+            && self.writeback_open_should_force_direct_io_for_atime(open_flags, existing_open_state)
+        {
             reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
         }
         if self.writeback_cache_enabled
@@ -11029,10 +11055,15 @@ mod tests {
             .adapter
             .dispatch_open(&ctx, created.attr.inode_id.get(), libc::O_RDONLY as u32)
             .expect("open read-only handle");
+        assert_ne!(
+            read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
+            0,
+            "active-atime read opens after the writer closes must route reads through the daemon"
+        );
         assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
             0,
-            "active-atime read opens after the writer closes must enter the daemon read path"
+            "active-atime read opens after the writer closes must not preserve stale kernel pages"
         );
 
         let after_read_open = {
@@ -39619,7 +39650,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_active_atime_readonly_reopen_drops_kernel_page_cache() {
+    fn writeback_active_atime_readonly_reopen_uses_direct_io() {
         let mut fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let root = {
@@ -39646,15 +39677,15 @@ mod tests {
             .adapter
             .dispatch_open(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
             .expect("open read-only under active atime");
-        assert_eq!(
+        assert_ne!(
             read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
             0,
-            "active-atime read-only writeback opens must still use buffered I/O"
+            "active-atime read-only writeback opens must route reads through the daemon"
         );
         assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
             0,
-            "clean active-atime read-only reopens must invalidate page cache so reads reach the daemon"
+            "direct active-atime read-only reopens must not ask the kernel to keep cached pages"
         );
     }
 
@@ -39687,6 +39718,11 @@ mod tests {
             .adapter
             .dispatch_open(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
             .expect("open read-only under noatime");
+        assert_eq!(
+            read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
+            0,
+            "noatime read-only reopens do not need direct read observation"
+        );
         assert_ne!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
             0,
