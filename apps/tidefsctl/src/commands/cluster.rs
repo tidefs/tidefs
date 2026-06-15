@@ -21,8 +21,8 @@ use clap::Subcommand;
 
 use tidefs_cluster::{
     ClusterPlacementPolicy, ClusterPoolConfig, ClusterPoolMessage, ClusterPoolOrchestrator,
-    ClusterRedundancy, FailureDomain, HealState, LossEvent, NodeDevice, PlacementHealCoordinator,
-    PlacementMap, PoolTransport,
+    FailureDomain, HealState, LossEvent, NodeDevice, PlacementHealCoordinator, PlacementMap,
+    PoolTransport,
 };
 use tidefs_membership_epoch::HealthClass;
 use tidefs_transport::{NodeInfo, SessionId, Transport, TransportAddr};
@@ -891,6 +891,7 @@ fn hex_guid(bytes: &[u8; 16]) -> String {
 mod tests {
     use super::*;
     use clap::Parser;
+    use tidefs_cluster::ClusterRedundancy;
 
     #[derive(Debug, Parser)]
     struct TestClusterCli {

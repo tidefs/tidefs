@@ -1,5 +1,6 @@
 //! Local-only admission for privileged `tidefsctl` command handlers.
 
+#[cfg(test)]
 use crate::commands::classification::COMMAND_SURFACES;
 use tidefs_auth::local_only::{LocalOnlyError, LocalOnlyGuard};
 
@@ -11,6 +12,7 @@ pub(crate) enum CommandAdmission {
 }
 
 impl CommandAdmission {
+    #[cfg(test)]
     pub(crate) const fn requires_local_only(self) -> bool {
         matches!(self, Self::LocalOnly | Self::LocalOnlyWhenMutating)
     }
@@ -101,6 +103,7 @@ pub(crate) fn command_admission(command: &str) -> Option<CommandAdmission> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn command_surface_authority_table() -> String {
     let mut out = String::from("| Command | Class | Routing | Admission | Help | Summary |\n");
     out.push_str("|---|---|---|---|---|---|\n");
