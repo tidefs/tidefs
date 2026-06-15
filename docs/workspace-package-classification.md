@@ -1,6 +1,6 @@
 # Workspace Package Classification
 
-Updated from current Cargo metadata and on-disk manifest discovery for issue #283 on 2026-06-15.
+Updated from current Cargo metadata and on-disk manifest discovery for issue #286 on 2026-06-15.
 This document is the package-role authority for TideFS workspace selection and TFR-002/TFR-019 reduction.
 It is enforced by `cargo run -p tidefs-xtask -- check-workspace-policy`.
 
@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 146 |
+| Workspace packages | 147 |
 | Explicitly excluded package roots | 5 |
-| Discovered package manifests | 151 |
-| Classified package roots | 151 |
+| Discovered package manifests | 152 |
+| Classified package roots | 152 |
 
 ## Role Semantics
 
@@ -35,7 +35,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `product-code` | 115 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
-| `proof-harness` | 8 |
+| `proof-harness` | 9 |
 | `vendored-third-party` | 1 |
 | `standalone-fuzz` | 5 |
 | `scaffold-transitional` | 0 |
@@ -76,6 +76,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-cluster` | `tidefs-cluster` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-commit_group` | `tidefs-commit_group` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-compaction` | `tidefs-compaction` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-crash-oracle` | `tidefs-crash-oracle` | `workspace-member` | `proof-harness` | planned authority surface for model-only crash oracle validation; follow-up issue required before it can support runtime release claims. |
 | `crates/tidefs-compression` | `tidefs-compression` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-coordination-strategy` | `tidefs-coordination-strategy` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-data-cleaner` | `tidefs-data-cleaner` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
@@ -211,6 +212,7 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue required before release claims. |
 | `crates/tidefs-compaction` | `tidefs-compaction` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-crash-oracle` | `tidefs-crash-oracle` | `proof-harness` | planned authority surface for model-only crash oracle validation; follow-up issue required before it can support runtime release claims. |
 | `crates/tidefs-data-cleaner` | `tidefs-data-cleaner` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-erasure-coded-store` | `tidefs-erasure-coded-store` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-geometry-convert` | `tidefs-geometry-convert` | `product-code` | planned authority surface; follow-up issue required before release claims. |

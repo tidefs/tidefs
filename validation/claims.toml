@@ -11,11 +11,13 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 blockers = [
-  "GitHub issue #286 must land model-first write/fsync crash matrices.",
+  "GitHub issue #286 model-first evidence is bounded to the executable model, not local runtime crash injection.",
   "Runtime crash-oracle artifacts must be recorded before present-tense durability wording.",
 ]
 generated_doc = "Planned write/fsync crash-safety claim for local filesystem commits. TideFS must keep this as future capability wording until model and runtime crash-oracle evidence exists."
-evidence_artifacts = []
+evidence_artifacts = [
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json" },
+]
 
 [[claims]]
 id = "namespace.rename.atomicity.v1"
@@ -27,11 +29,49 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 blockers = [
-  "GitHub issue #286 must cover rename crash matrices.",
+  "GitHub issue #286 model-first evidence is bounded to the executable model, not local runtime crash injection.",
   "Runtime evidence for interrupted rename sequences is not recorded.",
 ]
 generated_doc = "Planned rename atomicity claim for local namespace operations. TideFS must keep rename wording aspirational until model and runtime crash evidence covers the claimed scope."
-evidence_artifacts = []
+evidence_artifacts = [
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json" },
+]
+
+[[claims]]
+id = "local.vfs.write_fsync_crash.v1"
+status = "blocked"
+scope = "local VFS write and fsync crash recovery"
+required_evidence_classes = [
+  "model-crash-matrix",
+  "runtime-crash-oracle",
+  "claims-gate-review",
+]
+blockers = [
+  "Model-only issue #286 evidence is not local runtime crash evidence.",
+  "Local runtime crash injection remains blocked until local-filesystem write-set conflicts clear.",
+]
+generated_doc = "Blocked local VFS write/fsync crash claim. TideFS must treat model-only crash matrices as planning evidence, not production runtime durability proof."
+evidence_artifacts = [
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json" },
+]
+
+[[claims]]
+id = "local.vfs.rename_atomic_crash.v1"
+status = "blocked"
+scope = "local VFS rename crash recovery"
+required_evidence_classes = [
+  "model-crash-matrix",
+  "runtime-namespace-crash-artifact",
+  "claims-gate-review",
+]
+blockers = [
+  "Model-only issue #286 evidence is not local runtime crash evidence.",
+  "Local runtime rename crash injection remains blocked until local-filesystem write-set conflicts clear.",
+]
+generated_doc = "Blocked local VFS rename crash claim. TideFS must keep rename crash-safety wording behind model and runtime evidence."
+evidence_artifacts = [
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json" },
+]
 
 [[claims]]
 id = "scheduler.dirty_debt.no_hidden.v1"
@@ -112,4 +152,3 @@ blockers = [
 ]
 generated_doc = "Planned kernel no-work-after-teardown claim. TideFS must keep this as future proof work until context-token and teardown race evidence exists."
 evidence_artifacts = []
-

@@ -2290,6 +2290,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-crash-oracle"
+version = "0.421.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tidefs-model-core",
+ "tidefs-types-vfs-core",
+]
+
+[[package]]
 name = "tidefs-data-cleaner"
 version = "0.421.0"
 dependencies = [

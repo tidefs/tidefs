@@ -1,0 +1,22 @@
+[package]
+name = "tidefs-crash-oracle"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "Model-first crash oracle for bounded TideFS persistence-boundary matrices"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tidefs-model-core = { path = "../tidefs-model-core" }
+tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tidefs-crash-oracle"
+path = "src/main.rs"

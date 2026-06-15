@@ -77,6 +77,7 @@ members = [
   "crates/tidefs-reclaim",
   "crates/tidefs-segment-cleaner",
   "crates/tidefs-trace-oracle",
+  "crates/tidefs-crash-oracle",
   "crates/tidefs-model-core",
   "crates/tidefs-clock-timing",
   "crates/tidefs-chunk-shipper",
