@@ -11,6 +11,7 @@ description = "Workspace summary xtask for tidefs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 ureq = { version = "3", default-features = false, features = ["json"] }
 tidefs-types-package-profile-catalog = { path = "../../crates/tidefs-types-package-profile-catalog" }
 tidefs-trace-oracle = { path = "../../crates/tidefs-trace-oracle" }
