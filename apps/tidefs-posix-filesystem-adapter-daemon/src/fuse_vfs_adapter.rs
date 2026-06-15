@@ -1311,9 +1311,6 @@ fn fuse_access_requested_from_mask(mask: i32) -> Result<u8, Errno> {
 /// - O_APPEND under kernel writeback-cache -> FOPEN_DIRECT_IO: keep append
 ///   offset authority in the daemon because the engine size is stale until
 ///   the kernel writes dirty cached pages back.
-/// - Clean read-only writeback-cache reopens under an active atime policy may
-///   add FOPEN_DIRECT_IO in the adapter helper below so reads cross the daemon
-///   and Linux FUSE invalidates atime before the following stat.
 /// - Kernel writeback-cache ordinary opens may add FOPEN_KEEP_CACHE in the
 ///   adapter helper below when preserving cached pages is safe for the active
 ///   timestamp policy.
@@ -2460,6 +2457,10 @@ pub struct FuseVfsAdapter {
     /// already reclaimed them; such requests are safe to acknowledge with a
     /// zero-TTL synthetic attr.
     writeback_seen_inodes: Mutex<HashSet<u64>>,
+    /// Relatime inodes with a successful write whose first later read must own
+    /// the automatic atime update even if writeback-cache timestamp ordering
+    /// left atime newer than the engine-visible mtime/ctime.
+    relatime_read_atime_pending: Mutex<HashSet<u64>>,
 
     /// Stable DatasetId for the mounted dataset, resolved through the catalog.
     /// Used for lifecycle gating, cache invalidation scope, and metrics.
@@ -2539,6 +2540,7 @@ impl FuseVfsAdapter {
             mmap_coherency,
             orphan_index: Mutex::new(OrphanIndex::new()),
             writeback_seen_inodes: Mutex::new(HashSet::new()),
+            relatime_read_atime_pending: Mutex::new(HashSet::new()),
             dataset_id: None,
             workload_observer: Arc::new(WorkloadObserver::new()),
             signature_cache: Arc::new(MaterializedSignatureCache::new()),
@@ -2906,6 +2908,20 @@ impl FuseVfsAdapter {
         !self.read_only && self.timestamp_policy != TimestampPolicy::NoAtime
     }
 
+    fn mark_relatime_read_atime_pending_after_write(&self, ino: u64) {
+        if self.read_only || self.timestamp_policy != TimestampPolicy::RelativeAtime {
+            return;
+        }
+        self.relatime_read_atime_pending.lock().unwrap().insert(ino);
+    }
+
+    fn take_relatime_read_atime_pending(&self, ino: u64) -> bool {
+        self.relatime_read_atime_pending
+            .lock()
+            .unwrap()
+            .remove(&ino)
+    }
+
     fn writeback_open_should_keep_cache(
         &self,
         open_flags: u32,
@@ -2923,23 +2939,6 @@ impl FuseVfsAdapter {
         !self.active_read_atime_policy()
     }
 
-    fn writeback_open_should_force_direct_io_for_atime(
-        &self,
-        open_flags: u32,
-        existing_open_state: InodeOpenState,
-    ) -> bool {
-        if !self.active_read_atime_policy() {
-            return false;
-        }
-        if !open_flags_allow_read(open_flags).unwrap_or(false) {
-            return false;
-        }
-        if open_flags_allow_write(open_flags).unwrap_or(false) {
-            return false;
-        }
-        !existing_open_state.has_writable
-    }
-
     fn fuse_open_flags_for_existing_state(
         &self,
         open_flags: u32,
@@ -2950,12 +2949,6 @@ impl FuseVfsAdapter {
             reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
         }
         if self.writeback_cache_enabled && (open_flags & libc::O_APPEND as u32) != 0 {
-            reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
-        }
-        if self.writeback_cache_enabled
-            && (reply_flags & fuser::consts::FOPEN_DIRECT_IO) == 0
-            && self.writeback_open_should_force_direct_io_for_atime(open_flags, existing_open_state)
-        {
             reply_flags |= fuser::consts::FOPEN_DIRECT_IO;
         }
         if self.writeback_cache_enabled
@@ -5831,6 +5824,9 @@ impl FuseVfsAdapter {
                 let e = self.engine.lock().unwrap();
                 let _ = e.release(&fallback);
             }
+            if written > 0 {
+                self.mark_relatime_read_atime_pending_after_write(ino);
+            }
             Ok(written)
         } else {
             let efh = resolved_efh.ok_or(Errno::EBADF)?;
@@ -5941,6 +5937,11 @@ impl FuseVfsAdapter {
             if !posix_direct_io && write_result.is_ok() {
                 if let Some(datasync) = sync_datasync {
                     self.dispatch_fsync_file(ctx, ino, fh, datasync)?;
+                }
+            }
+            if let Ok(written) = write_result.as_ref() {
+                if *written > 0 {
+                    self.mark_relatime_read_atime_pending_after_write(ino);
                 }
             }
             write_result
@@ -7576,11 +7577,30 @@ impl FuseVfsAdapter {
         Ok(updated)
     }
 
+    fn force_read_access_and_sync(&self, ino: u64, ctx: &RequestCtx) -> Result<InodeAttr, Errno> {
+        let inode_id = InodeId::new(ino);
+        let updated = {
+            let e = self.engine.lock().unwrap();
+            let current = e.getattr(inode_id, None, ctx)?;
+            let mut update = SetAttr::new();
+            update.valid = FATTR_ATIME_NOW | FATTR_CTIME;
+            update.ctime_ns = current.posix.ctime_ns;
+            e.setattr(inode_id, &update, None, ctx)?
+        };
+        self.sync_namespace_attrs_local(ino, &updated);
+        Ok(updated)
+    }
+
     fn maybe_update_atime(&self, ino: u64, ctx: &RequestCtx) {
         if self.read_only || self.timestamp_policy == TimestampPolicy::NoAtime {
             return;
         }
-        if self.record_read_access_and_sync(ino, ctx).is_ok() {
+        let result = if self.take_relatime_read_atime_pending(ino) {
+            self.force_read_access_and_sync(ino, ctx)
+        } else {
+            self.record_read_access_and_sync(ino, ctx)
+        };
+        if result.is_ok() {
             self.invalidate_atime_caches_after_read(ino);
         }
     }
@@ -11055,10 +11075,10 @@ mod tests {
             .adapter
             .dispatch_open(&ctx, created.attr.inode_id.get(), libc::O_RDONLY as u32)
             .expect("open read-only handle");
-        assert_ne!(
+        assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
             0,
-            "active-atime read opens after the writer closes must route reads through the daemon"
+            "active-atime read opens after the writer closes must keep buffered reads enabled"
         );
         assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
@@ -11091,6 +11111,132 @@ mod tests {
                 false,
             )
             .expect("release reader");
+    }
+
+    #[test]
+    fn pending_write_forces_relatime_read_open_atime_without_ctime() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let created = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"xfstests-generic-003-pending-atime.txt",
+                0o644,
+                libc::O_WRONLY as u32,
+            )
+            .expect("create write-only handle");
+
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                created.attr.inode_id.get(),
+                created.adapter_fh,
+                0,
+                b"aaa\n",
+                0,
+            )
+            .expect("write payload");
+        fixture
+            .adapter
+            .dispatch_release(
+                created.attr.inode_id.get(),
+                created.adapter_fh,
+                0,
+                None,
+                true,
+            )
+            .expect("release writer");
+
+        let after_write = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(created.attr.inode_id, None, &ctx)
+                .expect("getattr after write")
+        };
+        let synthetic_recent_atime = after_write.posix.ctime_ns.saturating_add(1);
+        let mut recent_atime = SetAttr::new();
+        recent_atime.valid = FATTR_ATIME | FATTR_CTIME;
+        recent_atime.atime_ns = synthetic_recent_atime;
+        recent_atime.ctime_ns = after_write.posix.ctime_ns;
+        fixture
+            .adapter
+            .dispatch_setattr(&ctx, 1, created.attr.inode_id.get(), &recent_atime, None)
+            .expect("seed atime newer than write timestamps");
+
+        let before_read = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(created.attr.inode_id, None, &ctx)
+                .expect("getattr before read")
+        };
+        assert!(
+            before_read.posix.atime_ns > before_read.posix.mtime_ns
+                && before_read.posix.atime_ns > before_read.posix.ctime_ns,
+            "test setup must make ordinary relatime suppress the read update"
+        );
+
+        std::thread::sleep(Duration::from_millis(1));
+        let read_open = fixture
+            .adapter
+            .dispatch_open(&ctx, created.attr.inode_id.get(), libc::O_RDONLY as u32)
+            .expect("open read-only handle");
+        let after_forced_read = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(created.attr.inode_id, None, &ctx)
+                .expect("getattr after forced read atime")
+        };
+        assert!(
+            after_forced_read.posix.atime_ns > before_read.posix.atime_ns,
+            "pending write must make the first later read own the relatime atime update"
+        );
+        assert_eq!(
+            after_forced_read.posix.ctime_ns, before_read.posix.ctime_ns,
+            "forced read-atime update must preserve ctime"
+        );
+        fixture
+            .adapter
+            .dispatch_release(
+                created.attr.inode_id.get(),
+                read_open.adapter_fh,
+                0,
+                None,
+                false,
+            )
+            .expect("release reader");
+
+        std::thread::sleep(Duration::from_millis(1));
+        let second_read_open = fixture
+            .adapter
+            .dispatch_open(&ctx, created.attr.inode_id.get(), libc::O_RDONLY as u32)
+            .expect("open read-only handle again");
+        let after_second_read_open = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(created.attr.inode_id, None, &ctx)
+                .expect("getattr after second read open")
+        };
+        assert_eq!(
+            after_second_read_open.posix.atime_ns, after_forced_read.posix.atime_ns,
+            "the pending marker must be consumed by the first read"
+        );
+        fixture
+            .adapter
+            .dispatch_release(
+                created.attr.inode_id.get(),
+                second_read_open.adapter_fh,
+                0,
+                None,
+                false,
+            )
+            .expect("release second reader");
     }
 
     #[test]
@@ -39650,7 +39796,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_active_atime_readonly_reopen_uses_direct_io() {
+    fn writeback_active_atime_readonly_reopen_drops_kernel_page_cache() {
         let mut fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let root = {
@@ -39677,15 +39823,15 @@ mod tests {
             .adapter
             .dispatch_open(&ctx, create.attr.inode_id.get(), libc::O_RDONLY as u32)
             .expect("open read-only under active atime");
-        assert_ne!(
+        assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
             0,
-            "active-atime read-only writeback opens must route reads through the daemon"
+            "active-atime read-only writeback opens must still use buffered I/O"
         );
         assert_eq!(
             read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
             0,
-            "direct active-atime read-only reopens must not ask the kernel to keep cached pages"
+            "clean active-atime read-only reopens must invalidate page cache so reads reach the daemon"
         );
     }
 
