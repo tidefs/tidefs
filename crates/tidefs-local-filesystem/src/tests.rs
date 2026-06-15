@@ -5725,6 +5725,73 @@ fn mounted_open_recovery_authority_raw_only_initializes_empty_pool() {
 }
 
 #[test]
+fn mounted_committed_root_repair_authority_routes_probe_audit_verifier_and_retention() {
+    let root = temp_root("mounted-committed-root-repair-authority");
+    let key = default_root_authentication_key().expect("auth key");
+    let generation = {
+        let mut fs = LocalFileSystem::open_with_root_authentication_key(&root, options(), key)
+            .expect("open fs");
+        fs.create_file("/stable.txt", DEFAULT_FILE_PERMISSIONS)
+            .expect("create file");
+        fs.write_file("/stable.txt", 0, b"stable committed root")
+            .expect("write file");
+        fs.sync_all().expect("sync committed root");
+        fs.stats().filesystem_generation
+    };
+
+    {
+        let mut store =
+            LocalFileSystem::default_pool(&root, &options(), None, None, None).expect("open pool");
+        let mut open_authority =
+            MountedOpenRecoveryAuthority::raw_only(&mut store, key, RecoveryPolicy::default());
+        assert_eq!(
+            open_authority.transform_ordering_boundary(),
+            MOUNTED_RECOVERY_TRANSFORM_ORDERING
+        );
+
+        let mut repair_authority = open_authority.committed_root_repair_authority();
+        assert_eq!(
+            repair_authority.transform_mode(),
+            MountedCommittedRootRepairTransformMode::MetadataRawOnlyNoDeviceTransforms
+        );
+        assert_eq!(
+            repair_authority.transform_ordering_boundary(),
+            MOUNTED_RECOVERY_TRANSFORM_ORDERING
+        );
+
+        let probe = repair_authority
+            .recovery_probe_report()
+            .expect("probe recovery through repair authority");
+        assert_eq!(probe.outcome, RecoveryProbeOutcome::SelectedCommittedRoot);
+        assert_eq!(probe.selected_generation, Some(generation));
+
+        let audit = repair_authority
+            .recovery_audit()
+            .expect("audit recovery through repair authority");
+        assert_eq!(
+            audit.selected_root.as_ref().map(|root| root.generation),
+            Some(generation)
+        );
+
+        let verifier = repair_authority
+            .online_verifier_report()
+            .expect("verify online through repair authority");
+        assert_eq!(verifier.outcome, OnlineVerifierOutcome::Clean);
+        assert!(verifier.passed());
+
+        let plan = repair_authority
+            .root_retention_plan(RootRetentionPolicy::safe_default())
+            .expect("plan root retention through repair authority");
+        assert!(plan
+            .protected_committed_roots
+            .iter()
+            .any(|root| root.generation == generation));
+    }
+
+    cleanup(&root);
+}
+
+#[test]
 fn mounted_open_recovery_authority_rejects_device_transforms() {
     let enc_config = EncryptionConfig {
         key: StoreEncryptionKey::generate(),
