@@ -3159,8 +3159,19 @@ impl VfsEngine for VfsLocalFileSystem {
         if let Some(file) = self.anonymous_tmpfiles.borrow().get(&inode) {
             return Ok(file.attr);
         }
-        let path = self.inode_path(inode)?;
-        self.fs.borrow().stat_attr(&path).map_err(|e| map_errno(&e))
+        if inode == ROOT_INODE_ID && self.dataset_root_path.is_some() {
+            let root_path = self.root_path();
+            let attr = self
+                .fs
+                .borrow()
+                .stat_attr(&root_path)
+                .map_err(|e| map_errno(&e))?;
+            self.path_cache
+                .borrow_mut()
+                .insert(attr.inode_id, root_path);
+            return Ok(attr);
+        }
+        self.getattr_by_ino(inode.get())
     }
 
     fn setattr(
@@ -11572,6 +11583,33 @@ mod tests {
                 .unwrap_err(),
             Errno::ENODATA
         );
+    }
+
+    #[test]
+    fn getattr_is_authoritative_by_inode_not_path_cache_alias() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (target, _target_fh) = engine
+            .create(root, b"getattr-target.txt", 0o640, 0, &ctx())
+            .unwrap();
+        let (wrong, wrong_fh) = engine
+            .create(root, b"getattr-wrong.txt", 0o600, 0, &ctx())
+            .unwrap();
+        engine
+            .write(&wrong_fh, 0, b"wrong inode bytes", &ctx())
+            .unwrap();
+
+        engine
+            .path_cache
+            .borrow_mut()
+            .insert(target.inode_id, "/getattr-wrong.txt".to_string());
+
+        let attr = engine.getattr(target.inode_id, None, &ctx()).unwrap();
+
+        assert_eq!(attr.inode_id, target.inode_id);
+        assert_eq!(attr.posix.mode & !S_IFMT, 0o640);
+        assert_eq!(attr.posix.size, 0);
+        assert_ne!(attr.inode_id, wrong.inode_id);
     }
 
     #[test]
