@@ -14,8 +14,17 @@ pub use contract::*;
 use core::convert::TryFrom;
 use core::fmt;
 
+/// Nanoseconds per POSIX second.
+///
+/// This constant belongs to POSIX wall-clock timestamp projection only. It is
+/// not a storage generation, transaction group, scrub identity, or format
+/// version conversion factor.
 pub const POSIX_NANOS_PER_SECOND: i64 = 1_000_000_000;
 
+/// Split POSIX nanoseconds since the UNIX epoch into `(seconds, nanoseconds)`.
+///
+/// Negative subsecond values are normalized to the POSIX timespec shape where
+/// the nanosecond component is always in `0..1_000_000_000`.
 #[must_use]
 pub const fn split_posix_time_ns(ns: i64) -> (i64, u32) {
     let mut sec = ns / POSIX_NANOS_PER_SECOND;
@@ -27,6 +36,10 @@ pub const fn split_posix_time_ns(ns: i64) -> (i64, u32) {
     (sec, nsec as u32)
 }
 
+/// Compose POSIX `(seconds, nanoseconds)` into nanoseconds since the UNIX epoch.
+///
+/// Nanoseconds outside the POSIX timespec range are clamped to
+/// `999_999_999`. Arithmetic saturates at the `i64` boundary.
 #[must_use]
 pub const fn compose_posix_time_ns(sec: i64, nsec: u32) -> i64 {
     let clamped_nsec = if nsec >= POSIX_NANOS_PER_SECOND as u32 {
@@ -36,6 +49,61 @@ pub const fn compose_posix_time_ns(sec: i64, nsec: u32) -> i64 {
     };
     sec.saturating_mul(POSIX_NANOS_PER_SECOND)
         .saturating_add(clamped_nsec)
+}
+
+/// POSIX wall-clock timestamp in nanoseconds since the UNIX epoch.
+///
+/// This is the named boundary for values projected into POSIX inode timestamp
+/// fields such as `atime_ns`, `mtime_ns`, `ctime_ns`, and `btime_ns`. It must
+/// not be used as, or derived into, [`Generation`], transaction groups,
+/// content object versions, scrub identities, or format-version numbers.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct PosixTimestampNs(pub i64);
+
+impl PosixTimestampNs {
+    /// POSIX timestamp at the UNIX epoch.
+    pub const UNIX_EPOCH: Self = Self(0);
+    /// Lowest representable POSIX timestamp boundary.
+    pub const MIN: Self = Self(i64::MIN);
+    /// Highest representable POSIX timestamp boundary.
+    pub const MAX: Self = Self(i64::MAX);
+
+    /// Construct from nanoseconds since the UNIX epoch.
+    #[must_use]
+    pub const fn from_unix_nanos(value: i64) -> Self {
+        Self(value)
+    }
+
+    /// Return nanoseconds since the UNIX epoch.
+    #[must_use]
+    pub const fn as_unix_nanos(self) -> i64 {
+        self.0
+    }
+
+    /// Split into POSIX `(seconds, nanoseconds)`.
+    #[must_use]
+    pub const fn split(self) -> (i64, u32) {
+        split_posix_time_ns(self.0)
+    }
+
+    /// Compose from POSIX `(seconds, nanoseconds)`.
+    #[must_use]
+    pub const fn from_split(sec: i64, nsec: u32) -> Self {
+        Self(compose_posix_time_ns(sec, nsec))
+    }
+}
+
+impl From<i64> for PosixTimestampNs {
+    fn from(value: i64) -> Self {
+        Self::from_unix_nanos(value)
+    }
+}
+
+impl From<PosixTimestampNs> for i64 {
+    fn from(value: PosixTimestampNs) -> Self {
+        value.as_unix_nanos()
+    }
 }
 
 #[repr(transparent)]
@@ -59,14 +127,52 @@ impl InodeId {
 pub struct Generation(pub u64);
 
 impl Generation {
+    /// Zero VFS inode generation.
+    pub const ZERO: Self = Self(0);
+    /// Highest representable VFS inode generation.
+    pub const MAX: Self = Self(u64::MAX);
+
+    /// Construct a VFS inode generation from its raw boundary value.
+    ///
+    /// A `Generation` is a VFS/file-handle identity token, not POSIX wall-clock
+    /// time and not a storage transaction/object/scrub/format authority.
     #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
+    /// Construct a VFS inode generation from its raw boundary value.
+    ///
+    /// This synonym exists to make authority conversions explicit at call
+    /// sites that would otherwise pass an unlabelled `u64`.
+    #[must_use]
+    pub const fn from_vfs_generation(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the raw VFS inode generation value.
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    /// Return the raw VFS inode generation value.
+    ///
+    /// This synonym exists to pair with [`Self::from_vfs_generation`] at
+    /// authority boundaries.
+    #[must_use]
+    pub const fn as_vfs_generation(self) -> u64 {
+        self.0
+    }
+
+    /// Return the next VFS inode generation, or `None` at the boundary.
+    #[must_use]
+    pub const fn checked_next(self) -> Option<Self> {
+        if self.0 == u64::MAX {
+            None
+        } else {
+            Some(Self(self.0 + 1))
+        }
     }
 }
 
@@ -827,8 +933,20 @@ pub struct SetAttr {
     pub uid: u32,
     pub gid: u32,
     pub size: u64,
+    /// POSIX atime projection in nanoseconds since the UNIX epoch.
+    ///
+    /// Prefer [`SetAttr::set_atime_timestamp`] and
+    /// [`SetAttr::atime_timestamp`] at authority boundaries.
     pub atime_ns: i64,
+    /// POSIX mtime projection in nanoseconds since the UNIX epoch.
+    ///
+    /// Prefer [`SetAttr::set_mtime_timestamp`] and
+    /// [`SetAttr::mtime_timestamp`] at authority boundaries.
     pub mtime_ns: i64,
+    /// POSIX ctime projection in nanoseconds since the UNIX epoch.
+    ///
+    /// Prefer [`SetAttr::set_ctime_timestamp`] and
+    /// [`SetAttr::ctime_timestamp`] at authority boundaries.
     pub ctime_ns: i64,
 }
 
@@ -849,6 +967,42 @@ impl SetAttr {
     #[must_use]
     pub const fn is_valid(&self, bit: u32) -> bool {
         self.valid & bit != 0
+    }
+
+    /// Return the atime POSIX timestamp value carried by this request.
+    #[must_use]
+    pub const fn atime_timestamp(&self) -> PosixTimestampNs {
+        PosixTimestampNs::from_unix_nanos(self.atime_ns)
+    }
+
+    /// Return the mtime POSIX timestamp value carried by this request.
+    #[must_use]
+    pub const fn mtime_timestamp(&self) -> PosixTimestampNs {
+        PosixTimestampNs::from_unix_nanos(self.mtime_ns)
+    }
+
+    /// Return the ctime POSIX timestamp value carried by this request.
+    #[must_use]
+    pub const fn ctime_timestamp(&self) -> PosixTimestampNs {
+        PosixTimestampNs::from_unix_nanos(self.ctime_ns)
+    }
+
+    /// Mark this request as an explicit POSIX atime update.
+    pub fn set_atime_timestamp(&mut self, timestamp: PosixTimestampNs) {
+        self.valid |= FATTR_ATIME;
+        self.atime_ns = timestamp.as_unix_nanos();
+    }
+
+    /// Mark this request as an explicit POSIX mtime update.
+    pub fn set_mtime_timestamp(&mut self, timestamp: PosixTimestampNs) {
+        self.valid |= FATTR_MTIME;
+        self.mtime_ns = timestamp.as_unix_nanos();
+    }
+
+    /// Mark this request as an explicit POSIX ctime update.
+    pub fn set_ctime_timestamp(&mut self, timestamp: PosixTimestampNs) {
+        self.valid |= FATTR_CTIME;
+        self.ctime_ns = timestamp.as_unix_nanos();
     }
 }
 
@@ -1324,9 +1478,21 @@ pub struct PosixAttrs {
     pub gid: u32,
     pub nlink: u32,
     pub rdev: u32,
+    /// POSIX atime projection in nanoseconds since the UNIX epoch.
+    ///
+    /// Prefer [`Self::atime_timestamp`] at authority boundaries.
     pub atime_ns: i64,
+    /// POSIX mtime projection in nanoseconds since the UNIX epoch.
+    ///
+    /// Prefer [`Self::mtime_timestamp`] at authority boundaries.
     pub mtime_ns: i64,
+    /// POSIX ctime projection in nanoseconds since the UNIX epoch.
+    ///
+    /// Prefer [`Self::ctime_timestamp`] at authority boundaries.
     pub ctime_ns: i64,
+    /// POSIX btime projection in nanoseconds since the UNIX epoch.
+    ///
+    /// Prefer [`Self::btime_timestamp`] at authority boundaries.
     pub btime_ns: i64,
     pub size: u64,
     pub blocks_512: u64,
@@ -1384,6 +1550,22 @@ impl PosixAttrs {
     #[must_use]
     pub const fn mode_perms(&self) -> u32 {
         self.mode & !S_IFMT
+    }
+    #[must_use]
+    pub const fn atime_timestamp(&self) -> PosixTimestampNs {
+        PosixTimestampNs::from_unix_nanos(self.atime_ns)
+    }
+    #[must_use]
+    pub const fn mtime_timestamp(&self) -> PosixTimestampNs {
+        PosixTimestampNs::from_unix_nanos(self.mtime_ns)
+    }
+    #[must_use]
+    pub const fn ctime_timestamp(&self) -> PosixTimestampNs {
+        PosixTimestampNs::from_unix_nanos(self.ctime_ns)
+    }
+    #[must_use]
+    pub const fn btime_timestamp(&self) -> PosixTimestampNs {
+        PosixTimestampNs::from_unix_nanos(self.btime_ns)
     }
 }
 
@@ -1443,6 +1625,10 @@ impl InodeFlags {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InodeAttr {
     pub inode_id: InodeId,
+    /// VFS inode generation token.
+    ///
+    /// This is not POSIX wall-clock time, storage object version,
+    /// transaction/replay generation, scrub identity, or a format version.
     pub generation: Generation,
     pub kind: NodeKind,
     pub posix: PosixAttrs,
@@ -7295,13 +7481,13 @@ pub mod vfs_engine {
     pub use super::{
         CreateFlags, DirEntry, DirEntryName, DirHandleId, EngineDirHandle, EngineFileHandle, Errno,
         FileHandleId, Generation, InodeAttr, InodeFlags, InodeId, LockSpec, LseekOffset,
-        NodeFacets, NodeKind, OpenFlags, PosixAttrs, RenameFlags, RequestCtx, SetAttr, StatFs,
-        FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_UNSHARE_RANGE, FALLOC_FL_ZERO_RANGE,
-        FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER,
-        FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, F_RDLCK, F_UNLCK, F_WRLCK,
-        RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, ROOT_INODE_ID, SEEK_CUR, SEEK_END,
-        SEEK_SET, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID,
-        S_ISUID, S_ISVTX, XATTR_CREATE, XATTR_REPLACE,
+        NodeFacets, NodeKind, OpenFlags, PosixAttrs, PosixTimestampNs, RenameFlags, RequestCtx,
+        SetAttr, StatFs, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_UNSHARE_RANGE,
+        FALLOC_FL_ZERO_RANGE, FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID,
+        FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, F_RDLCK,
+        F_UNLCK, F_WRLCK, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, ROOT_INODE_ID,
+        SEEK_CUR, SEEK_END, SEEK_SET, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
+        S_IFSOCK, S_ISGID, S_ISUID, S_ISVTX, XATTR_CREATE, XATTR_REPLACE,
     };
 }
 
@@ -7335,6 +7521,18 @@ mod tests {
     }
 
     #[test]
+    fn posix_timestamp_ns_wraps_split_compose_boundary() {
+        let ts = PosixTimestampNs::from_unix_nanos(-315_619_198_876_543_211);
+        let (sec, nsec) = ts.split();
+        assert_eq!((sec, nsec), (-315_619_199, 123_456_789));
+        assert_eq!(
+            PosixTimestampNs::from_split(sec, nsec),
+            PosixTimestampNs::from_unix_nanos(-315_619_198_876_543_211)
+        );
+        assert_eq!(i64::from(ts), -315_619_198_876_543_211);
+    }
+
+    #[test]
     fn node_kind_round_trips_through_u32() {
         let kind = NodeKind::Socket;
         let roundtrip = NodeKind::try_from(kind.as_u32()).expect("kind");
@@ -7351,6 +7549,36 @@ mod tests {
     fn generation_round_trips_through_u64() {
         let gen = Generation::new(42);
         assert_eq!(gen.get(), 42);
+        assert_eq!(Generation::from_vfs_generation(42).as_vfs_generation(), 42);
+    }
+
+    #[test]
+    fn generation_boundary_values_stay_vfs_identity() {
+        assert_eq!(Generation::ZERO.as_vfs_generation(), 0);
+        assert_eq!(Generation::MAX.as_vfs_generation(), u64::MAX);
+        assert_eq!(
+            Generation::from_vfs_generation(u64::MAX - 1).checked_next(),
+            Some(Generation::MAX)
+        );
+        assert_eq!(Generation::MAX.checked_next(), None);
+    }
+
+    #[test]
+    fn setattr_timestamp_helpers_mark_explicit_posix_updates() {
+        let mut set = SetAttr::new();
+        set.set_atime_timestamp(PosixTimestampNs::from_unix_nanos(-1));
+        set.set_mtime_timestamp(PosixTimestampNs::from_split(2, 3));
+        set.set_ctime_timestamp(PosixTimestampNs::UNIX_EPOCH);
+
+        assert!(set.is_valid(FATTR_ATIME));
+        assert!(set.is_valid(FATTR_MTIME));
+        assert!(set.is_valid(FATTR_CTIME));
+        assert_eq!(set.atime_timestamp(), PosixTimestampNs::from_unix_nanos(-1));
+        assert_eq!(
+            set.mtime_timestamp(),
+            PosixTimestampNs::from_unix_nanos(2_000_000_003)
+        );
+        assert_eq!(set.ctime_timestamp(), PosixTimestampNs::UNIX_EPOCH);
     }
 
     #[test]
