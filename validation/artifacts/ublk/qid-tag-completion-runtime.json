@@ -1,0 +1,195 @@
+{
+  "report_version": 1,
+  "generated_by": "tidefs-block-volume-adapter-daemon",
+  "claim_ids": [
+    "ublk.qid_tag.exactly_once_completion.v1"
+  ],
+  "evidence_class": "runtime-ublk-completion-artifact",
+  "evidence_scope": "bounded runtime uBLK daemon qid/tag completion lifecycle trace",
+  "scenario": "qemu-ublk-smoke",
+  "nr_hw_queues": 1,
+  "queue_depth": 2,
+  "max_completed_requests": 5,
+  "events": [
+    {
+      "sequence": 1,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 0,
+      "operation_kind": "fetch",
+      "lifecycle_state": "fetch_submitted",
+      "terminal_result": null,
+      "source": "initial_fetch_req_submit"
+    },
+    {
+      "sequence": 2,
+      "qid": 0,
+      "tag": 1,
+      "generation_token": 0,
+      "operation_kind": "fetch",
+      "lifecycle_state": "fetch_submitted",
+      "terminal_result": null,
+      "source": "initial_fetch_req_submit"
+    },
+    {
+      "sequence": 3,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 1,
+      "operation_kind": "read",
+      "lifecycle_state": "request_fetched",
+      "terminal_result": null,
+      "source": "fetch_req_cqe"
+    },
+    {
+      "sequence": 4,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 1,
+      "operation_kind": "read",
+      "lifecycle_state": "completion_submitted",
+      "terminal_result": 0,
+      "source": "daemon_commit_and_fetch_submit"
+    },
+    {
+      "sequence": 5,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 1,
+      "operation_kind": "read",
+      "lifecycle_state": "completion_cqe",
+      "terminal_result": 0,
+      "source": "commit_and_fetch_cqe"
+    },
+    {
+      "sequence": 6,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 2,
+      "operation_kind": "write",
+      "lifecycle_state": "request_reissued",
+      "terminal_result": null,
+      "source": "commit_and_fetch_cqe"
+    },
+    {
+      "sequence": 7,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 2,
+      "operation_kind": "write",
+      "lifecycle_state": "completion_submitted",
+      "terminal_result": 0,
+      "source": "daemon_commit_and_fetch_submit"
+    },
+    {
+      "sequence": 8,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 2,
+      "operation_kind": "write",
+      "lifecycle_state": "completion_cqe",
+      "terminal_result": 0,
+      "source": "commit_and_fetch_cqe"
+    },
+    {
+      "sequence": 9,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 3,
+      "operation_kind": "flush",
+      "lifecycle_state": "request_reissued",
+      "terminal_result": null,
+      "source": "commit_and_fetch_cqe"
+    },
+    {
+      "sequence": 10,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 3,
+      "operation_kind": "flush",
+      "lifecycle_state": "completion_submitted",
+      "terminal_result": 0,
+      "source": "daemon_commit_and_fetch_submit"
+    },
+    {
+      "sequence": 11,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 3,
+      "operation_kind": "flush",
+      "lifecycle_state": "completion_cqe",
+      "terminal_result": 0,
+      "source": "commit_and_fetch_cqe"
+    },
+    {
+      "sequence": 12,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 4,
+      "operation_kind": "discard",
+      "lifecycle_state": "request_reissued",
+      "terminal_result": null,
+      "source": "commit_and_fetch_cqe"
+    },
+    {
+      "sequence": 13,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 4,
+      "operation_kind": "discard",
+      "lifecycle_state": "completion_submitted",
+      "terminal_result": 0,
+      "source": "daemon_commit_and_fetch_submit"
+    },
+    {
+      "sequence": 14,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 4,
+      "operation_kind": "discard",
+      "lifecycle_state": "completion_cqe",
+      "terminal_result": 0,
+      "source": "commit_and_fetch_cqe"
+    },
+    {
+      "sequence": 15,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 5,
+      "operation_kind": "write_zeroes",
+      "lifecycle_state": "request_reissued",
+      "terminal_result": null,
+      "source": "commit_and_fetch_cqe"
+    },
+    {
+      "sequence": 16,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 5,
+      "operation_kind": "write_zeroes",
+      "lifecycle_state": "completion_submitted",
+      "terminal_result": 0,
+      "source": "daemon_commit_and_fetch_submit"
+    },
+    {
+      "sequence": 17,
+      "qid": 0,
+      "tag": 0,
+      "generation_token": 5,
+      "operation_kind": "release",
+      "lifecycle_state": "queue_released",
+      "terminal_result": null,
+      "source": "data_queue_release"
+    },
+    {
+      "sequence": 18,
+      "qid": 0,
+      "tag": 1,
+      "generation_token": 0,
+      "operation_kind": "release",
+      "lifecycle_state": "queue_released",
+      "terminal_result": null,
+      "source": "data_queue_release"
+    }
+  ]
+}

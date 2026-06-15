@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::storage_backend::BlockVolumeStorageBackend;
+use crate::ublk_completion::{UblkCompletionOperationKind, UblkCompletionTrace};
 use crate::ublk_io_uring::UblkIoUringDispatcher;
 use crate::LINUX_SECTOR_SIZE_BYTES;
 use tidefs_block_volume_adapter_core::{
@@ -137,6 +138,8 @@ fn run_ublk_data_queue_io_loop_impl(
     let mut inputs = UblkControlOpenInputs::read_host()?;
     let add_dev_input =
         UblkControlAddDevInput::from_nr_hw_queues_and_depth(nr_hw_queues, queue_depth);
+    let mut completion_trace =
+        UblkCompletionTrace::from_env(add_dev_input.nr_hw_queues, add_dev_input.queue_depth);
     #[allow(unused_assignments)]
     let mut start_dev_readiness = UblkControlStartDevReadiness::from_queue_geometry(
         add_dev_input.nr_hw_queues,
@@ -262,6 +265,11 @@ fn run_ublk_data_queue_io_loop_impl(
                                             &mut data_queue_runtime,
                                         )
                                     {
+                                        for qid in 0..add_dev_input.nr_hw_queues {
+                                            for tag in 0..add_dev_input.queue_depth {
+                                                completion_trace.record_fetch_submitted(qid, tag);
+                                            }
+                                        }
                                         start_dev_readiness = fetch_outcome.start_dev_readiness();
                                         if start_dev_readiness.all_fetches_ready() {
                                             // Submit START_DEV
@@ -358,8 +366,11 @@ fn run_ublk_data_queue_io_loop_impl(
                                                             break 'io_loop;
                                                         }
                                                     }
-                                                    let mut pending_fetch_tags: Vec<(u16, u16)> =
-                                                        Vec::new();
+                                                    let mut pending_fetch_tags: Vec<(
+                                                        u16,
+                                                        u16,
+                                                        bool,
+                                                    )> = Vec::new();
                                                     {
                                                         while let Some(cqe) = data_queue_runtime
                                                             .ring_mut()
@@ -367,28 +378,53 @@ fn run_ublk_data_queue_io_loop_impl(
                                                             .next()
                                                         {
                                                             io_loop_cqes_processed += 1;
-                                                            if cqe.result() < 0 {
-                                                                continue;
-                                                            }
                                                             let user_data = cqe.user_data();
                                                             if is_fetch_req_user_data(user_data) {
-                                                                pending_fetch_tags.push(
+                                                                let (q_id, tag) =
                                                                     decode_fetch_req_user_data(
                                                                         user_data,
-                                                                    ),
-                                                                );
+                                                                    );
+                                                                if cqe.result() < 0 {
+                                                                    completion_trace
+                                                                        .record_fetch_cqe_error(
+                                                                            q_id,
+                                                                            tag,
+                                                                            false,
+                                                                            cqe.result(),
+                                                                        );
+                                                                    continue;
+                                                                }
+                                                                pending_fetch_tags
+                                                                    .push((q_id, tag, false));
                                                             } else if is_commit_and_fetch_user_data(
                                                                 user_data,
                                                             ) {
-                                                                pending_fetch_tags.push(
+                                                                let (q_id, tag) =
                                                                     decode_commit_and_fetch_user_data(
                                                                         user_data,
-                                                                    ),
-                                                                );
+                                                                    );
+                                                                if cqe.result() < 0 {
+                                                                    completion_trace
+                                                                        .record_fetch_cqe_error(
+                                                                            q_id,
+                                                                            tag,
+                                                                            true,
+                                                                            cqe.result(),
+                                                                        );
+                                                                    continue;
+                                                                }
+                                                                completion_trace
+                                                                    .record_completion_cqe(
+                                                                        q_id, tag,
+                                                                    );
+                                                                pending_fetch_tags
+                                                                    .push((q_id, tag, true));
                                                             }
                                                         }
                                                     }
-                                                    for (q_id, tag) in pending_fetch_tags {
+                                                    for (q_id, tag, is_reissued_fetch) in
+                                                        pending_fetch_tags
+                                                    {
                                                         let result: i32;
                                                         if let Some(worker) =
                                                             data_workers.get_mut(usize::from(q_id))
@@ -398,6 +434,13 @@ fn run_ublk_data_queue_io_loop_impl(
                                                                     .io_desc_for_queue(q_id, tag)
                                                                     .copied()
                                                             {
+                                                                completion_trace
+                                                                    .record_request_fetched(
+                                                                        q_id,
+                                                                        tag,
+                                                                        UblkCompletionOperationKind::from_ublk_op(io_desc.op()),
+                                                                        is_reissued_fetch,
+                                                                    );
                                                                 let before_bytes_read =
                                                                     worker.bytes_read;
                                                                 let before_bytes_written =
@@ -562,9 +605,17 @@ fn run_ublk_data_queue_io_loop_impl(
                                                             readiness,
                                                         ) {
                                                             Ok(_) => {
+                                                                completion_trace
+                                                                    .record_completion_submitted(
+                                                                        q_id, tag, result,
+                                                                    );
                                                                 io_loop_commit_and_fetch_submitted += 1;
                                                             }
                                                             Err(_) => {
+                                                                completion_trace
+                                                                    .record_completion_submit_failed(
+                                                                        q_id, tag, result,
+                                                                    );
                                                                 break 'io_loop;
                                                             }
                                                         }
@@ -604,8 +655,11 @@ fn run_ublk_data_queue_io_loop_impl(
                                                                 break 'drain;
                                                             }
                                                         }
-                                                        let mut pending_tags: Vec<(u16, u16)> =
-                                                            Vec::new();
+                                                        let mut pending_tags: Vec<(
+                                                            u16,
+                                                            u16,
+                                                            bool,
+                                                        )> = Vec::new();
                                                         {
                                                             while let Some(cqe) = data_queue_runtime
                                                                 .ring_mut()
@@ -613,31 +667,56 @@ fn run_ublk_data_queue_io_loop_impl(
                                                                 .next()
                                                             {
                                                                 drain_cqes_processed += 1;
-                                                                if cqe.result() < 0 {
-                                                                    continue;
-                                                                }
                                                                 let user_data = cqe.user_data();
                                                                 if is_fetch_req_user_data(user_data)
                                                                 {
-                                                                    pending_tags.push(
+                                                                    let (q_id, tag) =
                                                                         decode_fetch_req_user_data(
                                                                             user_data,
-                                                                        ),
-                                                                    );
+                                                                        );
+                                                                    if cqe.result() < 0 {
+                                                                        completion_trace
+                                                                            .record_fetch_cqe_error(
+                                                                                q_id,
+                                                                                tag,
+                                                                                false,
+                                                                                cqe.result(),
+                                                                            );
+                                                                        continue;
+                                                                    }
+                                                                    pending_tags
+                                                                        .push((q_id, tag, false));
                                                                 } else if is_commit_and_fetch_user_data(user_data)
                                                                 {
-                                                                    pending_tags.push(
+                                                                    let (q_id, tag) =
                                                                         decode_commit_and_fetch_user_data(
                                                                             user_data,
-                                                                        ),
-                                                                    );
+                                                                        );
+                                                                    if cqe.result() < 0 {
+                                                                        completion_trace
+                                                                            .record_fetch_cqe_error(
+                                                                                q_id,
+                                                                                tag,
+                                                                                true,
+                                                                                cqe.result(),
+                                                                            );
+                                                                        continue;
+                                                                    }
+                                                                    completion_trace
+                                                                        .record_completion_cqe(
+                                                                            q_id, tag,
+                                                                        );
+                                                                    pending_tags
+                                                                        .push((q_id, tag, true));
                                                                 }
                                                             }
                                                         }
                                                         if pending_tags.is_empty() {
                                                             break 'drain;
                                                         }
-                                                        for (q_id, tag) in pending_tags {
+                                                        for (q_id, tag, is_reissued_fetch) in
+                                                            pending_tags
+                                                        {
                                                             let result: i32;
                                                             if let Some(ref mut worker) =
                                                                 data_workers
@@ -650,6 +729,13 @@ fn run_ublk_data_queue_io_loop_impl(
                                                                         )
                                                                         .copied()
                                                                 {
+                                                                    completion_trace
+                                                                        .record_request_fetched(
+                                                                            q_id,
+                                                                            tag,
+                                                                            UblkCompletionOperationKind::from_ublk_op(io_desc.op()),
+                                                                            is_reissued_fetch,
+                                                                        );
                                                                     let worker_result =
                                                                         if let Some(
                                                                             ref mut dispatcher,
@@ -753,11 +839,25 @@ fn run_ublk_data_queue_io_loop_impl(
                                                                 fetched_request_available: true,
                                                                 completion_result_ready: true,
                                                             };
-                                                            let _ = submit_runtime_commit_and_fetch_without_wait(
+                                                            match submit_runtime_commit_and_fetch_without_wait(
                                                                 &mut data_queue_runtime,
                                                                 commit_input,
                                                                 readiness,
-                                                            );
+                                                            ) {
+                                                                Ok(_) => {
+                                                                    completion_trace
+                                                                        .record_completion_submitted(
+                                                                            q_id, tag, result,
+                                                                        );
+                                                                }
+                                                                Err(_) => {
+                                                                    completion_trace
+                                                                        .record_completion_submit_failed(
+                                                                            q_id, tag, result,
+                                                                        );
+                                                                    break 'drain;
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                     // Final drain sweep via TargetResetGuard.
@@ -876,6 +976,11 @@ fn run_ublk_data_queue_io_loop_impl(
             }
         }
     }
+
+    completion_trace.record_releases();
+    completion_trace.write_if_enabled().map_err(|error| {
+        AppError::new(format!("write ublk completion runtime artifact: {error}"))
+    })?;
 
     Ok(UblkDataQueueIoLoopReport {
         start_dev_uring_cmd_completed,
