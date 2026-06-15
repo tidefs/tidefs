@@ -328,6 +328,17 @@ fn check_parent_write_execute_with_attr(
     )
 }
 
+fn check_parent_write_execute_mutation_preflight(
+    engine: &dyn VfsEngine,
+    parent: InodeId,
+    ctx: &RequestCtx,
+) -> Result<(), Errno> {
+    if ctx.uid == 0 {
+        return Ok(());
+    }
+    check_parent_write_execute(engine, parent, ctx)
+}
+
 /// Map a namespace `kind` field to a VFS [`NodeKind`].
 fn namespace_kind_to_node_kind(kind: u32) -> NodeKind {
     match kind {
@@ -3914,7 +3925,7 @@ impl FuseVfsAdapter {
     ) -> Result<InodeAttr, Errno> {
         self.check_not_read_only()?;
         let e = self.engine.lock().unwrap();
-        check_parent_write_execute(&**e, InodeId::new(parent), ctx)?;
+        check_parent_write_execute_mutation_preflight(&**e, InodeId::new(parent), ctx)?;
         let attr = dispatch_mkdir_batch(
             &**e as &dyn tidefs_vfs_engine::VfsEngine,
             &[MkdirBatchRequest {
@@ -5076,7 +5087,7 @@ impl FuseVfsAdapter {
             return Err(Errno::EINVAL);
         }
         let e = self.engine.lock().unwrap();
-        check_parent_write_execute(&**e, InodeId::new(parent), ctx)?;
+        check_parent_write_execute_mutation_preflight(&**e, InodeId::new(parent), ctx)?;
         let attr = e.mknod(InodeId::new(parent), name, mode, rdev, ctx)?;
         self.record_dentry_child_mutation(parent, name);
         Ok(attr)
@@ -5127,7 +5138,7 @@ impl FuseVfsAdapter {
         let engine_open_flags = Self::engine_open_flags(open_flags);
         // Capacity admission handled by engine CapacityAuthority during create dispatch.
         let e = self.engine.lock().unwrap();
-        check_parent_write_execute(&**e, InodeId::new(parent), ctx)?;
+        check_parent_write_execute_mutation_preflight(&**e, InodeId::new(parent), ctx)?;
         match dispatch_create_batch(
             &**e as &dyn tidefs_vfs_engine::VfsEngine,
             &[CreateBatchRequest {
@@ -24768,6 +24779,29 @@ mod tests {
             .dispatch_mkdir(&ctx, nonexistent_parent, b"orphan", 0o755);
         assert_eq!(result, Err(Errno::ENOENT));
     }
+
+    #[test]
+    fn root_mutation_preflight_defers_parent_resolution_to_engine() {
+        let fixture = adapter_fixture();
+        let engine = fixture.adapter.engine.lock().unwrap();
+        let missing_parent = InodeId::new(u64::MAX);
+
+        assert_eq!(
+            check_parent_write_execute_mutation_preflight(&**engine, missing_parent, &root_ctx()),
+            Ok(()),
+            "root creation preflight should not spend a getattr before the engine mutation"
+        );
+        let non_root_result = check_parent_write_execute_mutation_preflight(
+            &**engine,
+            missing_parent,
+            &access_ctx(1000, 1001, &[1001]),
+        );
+        assert!(
+            non_root_result.is_err(),
+            "non-root permission preflight still resolves the parent before mutation"
+        );
+    }
+
     #[test]
     fn vfs_adapter_dispatch_mkdir_public_api_parent_nlink_incremented() {
         let fixture = adapter_fixture();
