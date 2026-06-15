@@ -242,7 +242,7 @@ This source model is not mounted runtime evidence and is not a C shim callback
 registration surface. Unsupported mounted paths remain fail-closed through the
 live kmod shim and the source-model Rust vm-ops/page-cache helpers remain
 non-product unless a later issue wires and validates them through the mounted
-Linux 7.0 path. The claim `kmod.no_work_after_teardown.v1` remains planned
+Linux 7.0 path. The claim `kernel.teardown.no_work_after.v1` remains planned
 until a PR records the required context-token model, teardown proof artifact,
 claims-gate review, and any required mounted-kernel validation artifacts.
 
