@@ -845,6 +845,9 @@ impl ModelFs {
         }
 
         let existing_target = self.child(to_parent, &to_name);
+        if existing_target == Some(source) {
+            return self.getattr_inode(source);
+        }
         if let Some(target) = existing_target {
             let target_kind = self.node(target).kind;
             match (source_kind, target_kind) {
@@ -864,11 +867,6 @@ impl ModelFs {
         }
 
         self.node_mut(from_parent).children.remove(&from_name);
-
-        if existing_target == Some(source) {
-            self.drop_link(source);
-            return OperationOutcome::success(ModelOutput::None, 0, [0; 3]);
-        }
 
         if let Some(target) = existing_target {
             self.node_mut(to_parent).children.remove(&to_name);
@@ -1600,6 +1598,65 @@ mod tests {
             Errno::EINVAL
         );
 
+        fs.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn rename_between_hard_links_is_a_noop() {
+        let mut fs = ModelFs::new();
+        let created = apply(
+            &mut fs,
+            ModelRequest::Create {
+                path: path("/file"),
+            },
+        );
+        let inode_id = created.output.as_attr().unwrap().inode_id;
+        assert!(apply(
+            &mut fs,
+            ModelRequest::Write {
+                path: path("/file"),
+                offset: 0,
+                bytes: b"same".to_vec(),
+            },
+        )
+        .is_success());
+        assert!(apply(
+            &mut fs,
+            ModelRequest::Link {
+                from: path("/file"),
+                to: path("/alias"),
+            },
+        )
+        .is_success());
+
+        let before = fs.fingerprint();
+        let step = apply(
+            &mut fs,
+            ModelRequest::Rename {
+                from: path("/file"),
+                to: path("/alias"),
+            },
+        );
+
+        assert!(step.is_success());
+        assert_eq!(step.fingerprint, before);
+        assert_eq!(fs.attr(&path("/file")).unwrap().inode_id, inode_id);
+        assert_eq!(fs.attr(&path("/alias")).unwrap().inode_id, inode_id);
+        assert_eq!(fs.attr(&path("/file")).unwrap().nlink, 2);
+        assert_eq!(
+            apply(
+                &mut fs,
+                ModelRequest::Read {
+                    path: path("/alias"),
+                    offset: 0,
+                    length: 4,
+                },
+            )
+            .output
+            .as_bytes()
+            .unwrap(),
+            b"same"
+        );
         fs.check_invariants().unwrap();
     }
 
