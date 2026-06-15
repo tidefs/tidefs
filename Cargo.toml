@@ -37,6 +37,7 @@ members = [
   "crates/tidefs-membership-epoch",
   "crates/tidefs-membership-live",
   "crates/tidefs-partition-runtime",
+  "crates/tidefs-performance-contract",
   "crates/tidefs-membership-types",
   "crates/tidefs-two-node-harness",
   "crates/tidefs-node-join",
