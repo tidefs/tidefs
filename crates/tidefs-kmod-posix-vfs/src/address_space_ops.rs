@@ -43,7 +43,11 @@
 //! dirty folio bytes to the engine. The Rust [`DirtyFolioTracker`],
 //! [`PageAuthorityTable`], `writepage`, `page_mkwrite`, and
 //! `invalidate_folio` model paths remain unsupported for the mounted product
-//! path until a direct C bridge is registered and QEMU-proven.
+//! path until a direct C bridge is registered and QEMU-proven. Mounted
+//! truncate, truncate-extend, direct-write, fallocate, and copy cleanup is
+//! currently owned by C helpers in the shim: `filemap_write_and_wait_range`,
+//! `unmap_mapping_range`, `invalidate_inode_pages2_range`, and
+//! `truncate_setsize`.
 
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge;

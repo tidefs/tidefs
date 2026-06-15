@@ -8,6 +8,9 @@
 #   - dirty-folio/writepages accounting through the registered C a_ops table
 #   - msync MS_SYNC (durability flush)
 #   - munmap (dirty-page writeback and cleanup)
+#   - truncate-down and truncate-extend page-cache invalidation
+#   - mapped dirty truncate followed by msync, munmap, remount, and readback
+#   - buffered overwrite after a prior mapping plus remount readback
 #
 # A self-contained C test binary performs the mmap operations. It can produce
 # first-boot mounted-kernel mmap/page-fault/msync validation against a
@@ -49,6 +52,7 @@ let
  *  5. msync MS_SYNC (durability flush).
  *  6. munmap (cleanup, dirty-page writeback).
  *  7. Re-read via read(2) to verify post-sync visibility.
+ *  8. Truncate and overwrite rows for mounted C page-cache invalidation.
  *
  * Exit 0 on success, non-zero on failure with diagnostic on stderr.
  */
@@ -66,15 +70,340 @@ let
 #define TEST_BUF_SIZE (PAGE * 4)
 
 static char test_dir[4096];
+static int row_failures;
 
 static void die(const char *msg) {
     fprintf(stderr, "mmap-test: %s: %s\n", msg, strerror(errno));
     exit(1);
 }
 
+static void pass_row(const char *name) {
+    printf("PASS: %s\n", name);
+}
+
+static void fail_row(const char *name, const char *note) {
+    printf("FAIL: %s -- %s\n", name, note);
+    row_failures++;
+}
+
+static void unsupported_row(const char *name, const char *note) {
+    printf("UNSUPPORTED: %s -- %s\n", name, note);
+}
+
+static int write_byte_run(int fd, unsigned char value, size_t len, off_t offset) {
+    unsigned char buf[PAGE];
+    size_t done = 0;
+
+    memset(buf, value, sizeof(buf));
+    while (done < len) {
+        size_t chunk = len - done;
+        ssize_t n;
+
+        if (chunk > sizeof(buf))
+            chunk = sizeof(buf);
+        n = pwrite(fd, buf, chunk, offset + (off_t)done);
+        if (n != (ssize_t)chunk)
+            return 0;
+        done += chunk;
+    }
+    return 1;
+}
+
+static int verify_byte_run(int fd, off_t offset, size_t len, unsigned char value) {
+    unsigned char buf[PAGE];
+    size_t done = 0;
+
+    while (done < len) {
+        size_t chunk = len - done;
+        ssize_t n;
+
+        if (chunk > sizeof(buf))
+            chunk = sizeof(buf);
+        n = pread(fd, buf, chunk, offset + (off_t)done);
+        if (n != (ssize_t)chunk)
+            return 0;
+        for (size_t i = 0; i < chunk; i++) {
+            if (buf[i] != value)
+                return 0;
+        }
+        done += chunk;
+    }
+    return 1;
+}
+
+static int verify_size_and_eof(int fd, off_t size) {
+    struct stat st;
+    unsigned char byte = 0;
+
+    if (fstat(fd, &st) < 0)
+        return 0;
+    if (st.st_size != size)
+        return 0;
+    return pread(fd, &byte, 1, size) == 0;
+}
+
+static void test_truncate_down_discard(void) {
+    char path[8192];
+    int fd;
+    unsigned char *map;
+    volatile unsigned char touch;
+
+    snprintf(path, sizeof(path), "%s/truncate_down_discard", test_dir);
+    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { fail_row("truncate-down-discard", "open failed"); return; }
+    if (!write_byte_run(fd, 0x31, PAGE, 0) ||
+        !write_byte_run(fd, 0x5a, PAGE, PAGE)) {
+        close(fd);
+        fail_row("truncate-down-discard", "initial write failed");
+        return;
+    }
+    if (fsync(fd) < 0) {
+        close(fd);
+        fail_row("truncate-down-discard", "initial fsync failed");
+        return;
+    }
+
+    map = mmap(NULL, TEST_BUF_SIZE / 2, PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        fail_row("truncate-down-discard", "mmap failed");
+        return;
+    }
+    touch = map[PAGE];
+    (void)touch;
+    if (ftruncate(fd, PAGE) < 0) {
+        munmap(map, TEST_BUF_SIZE / 2);
+        close(fd);
+        fail_row("truncate-down-discard", "truncate-down failed");
+        return;
+    }
+    munmap(map, TEST_BUF_SIZE / 2);
+
+    if (verify_size_and_eof(fd, PAGE) &&
+        verify_byte_run(fd, 0, PAGE, 0x31))
+        pass_row("truncate-down-discard");
+    else
+        fail_row("truncate-down-discard", "discarded bytes visible after truncate");
+    close(fd);
+}
+
+static void test_truncate_extend_zero_read(void) {
+    char path[8192];
+    int fd;
+    unsigned char *map;
+    volatile unsigned char touch;
+
+    snprintf(path, sizeof(path), "%s/truncate_extend_zero", test_dir);
+    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { fail_row("truncate-extend-zero-read", "open failed"); return; }
+    if (!write_byte_run(fd, 0x11, PAGE, 0) ||
+        !write_byte_run(fd, 0x7e, PAGE, PAGE)) {
+        close(fd);
+        fail_row("truncate-extend-zero-read", "initial write failed");
+        return;
+    }
+    if (fsync(fd) < 0) {
+        close(fd);
+        fail_row("truncate-extend-zero-read", "initial fsync failed");
+        return;
+    }
+
+    map = mmap(NULL, TEST_BUF_SIZE / 2, PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        fail_row("truncate-extend-zero-read", "mmap failed");
+        return;
+    }
+    touch = map[PAGE];
+    (void)touch;
+    if (ftruncate(fd, PAGE) < 0) {
+        munmap(map, TEST_BUF_SIZE / 2);
+        close(fd);
+        fail_row("truncate-extend-zero-read", "truncate-down failed");
+        return;
+    }
+    if (munmap(map, TEST_BUF_SIZE / 2) < 0) {
+        close(fd);
+        fail_row("truncate-extend-zero-read", "munmap failed");
+        return;
+    }
+    if (ftruncate(fd, TEST_BUF_SIZE / 2) < 0) {
+        close(fd);
+        fail_row("truncate-extend-zero-read", "truncate-extend failed");
+        return;
+    }
+
+    if (verify_byte_run(fd, 0, PAGE, 0x11) &&
+        verify_byte_run(fd, PAGE, PAGE, 0x00))
+        pass_row("truncate-extend-zero-read");
+    else
+        fail_row("truncate-extend-zero-read", "extension returned stale bytes");
+    close(fd);
+}
+
+static void test_mapped_dirty_truncate_down(void) {
+    char path[8192];
+    int fd;
+    unsigned char *map;
+
+    snprintf(path, sizeof(path), "%s/mapped_dirty_truncate", test_dir);
+    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { fail_row("mapped-dirty-truncate-down", "open failed"); return; }
+    if (!write_byte_run(fd, 0x41, PAGE, 0) ||
+        !write_byte_run(fd, 0x42, PAGE, PAGE)) {
+        close(fd);
+        fail_row("mapped-dirty-truncate-down", "initial write failed");
+        return;
+    }
+    if (fsync(fd) < 0) {
+        close(fd);
+        fail_row("mapped-dirty-truncate-down", "initial fsync failed");
+        return;
+    }
+
+    map = mmap(NULL, TEST_BUF_SIZE / 2, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        fail_row("mapped-dirty-truncate-down", "mmap failed");
+        return;
+    }
+    memset(map + PAGE, 0x7d, PAGE);
+    if (ftruncate(fd, PAGE) < 0) {
+        munmap(map, TEST_BUF_SIZE / 2);
+        close(fd);
+        fail_row("mapped-dirty-truncate-down", "truncate-down failed");
+        return;
+    }
+    if (msync(map, TEST_BUF_SIZE / 2, MS_SYNC) < 0) {
+        char note[160];
+        snprintf(note, sizeof(note), "msync after truncate returned %s", strerror(errno));
+        munmap(map, TEST_BUF_SIZE / 2);
+        close(fd);
+        unsupported_row("mapped-dirty-truncate-down", note);
+        return;
+    }
+    if (munmap(map, TEST_BUF_SIZE / 2) < 0) {
+        close(fd);
+        fail_row("mapped-dirty-truncate-down", "munmap failed");
+        return;
+    }
+
+    if (verify_size_and_eof(fd, PAGE) &&
+        verify_byte_run(fd, 0, PAGE, 0x41))
+        pass_row("mapped-dirty-truncate-down");
+    else
+        fail_row("mapped-dirty-truncate-down", "truncated bytes visible before remount");
+    close(fd);
+}
+
+static void test_buffered_overwrite_after_mapping(void) {
+    char path[8192];
+    int fd;
+    unsigned char *map;
+    volatile unsigned char touch;
+
+    snprintf(path, sizeof(path), "%s/buffered_after_mapping", test_dir);
+    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { fail_row("buffered-overwrite-after-mapping", "open failed"); return; }
+    if (!write_byte_run(fd, 0x21, PAGE, 0)) {
+        close(fd);
+        fail_row("buffered-overwrite-after-mapping", "initial write failed");
+        return;
+    }
+    if (fsync(fd) < 0) {
+        close(fd);
+        fail_row("buffered-overwrite-after-mapping", "initial fsync failed");
+        return;
+    }
+
+    map = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        fail_row("buffered-overwrite-after-mapping", "mmap failed");
+        return;
+    }
+    touch = map[0];
+    (void)touch;
+
+    if (!write_byte_run(fd, 0x99, PAGE, 0)) {
+        munmap(map, PAGE);
+        close(fd);
+        fail_row("buffered-overwrite-after-mapping", "buffered overwrite failed");
+        return;
+    }
+    if (fsync(fd) < 0) {
+        munmap(map, PAGE);
+        close(fd);
+        fail_row("buffered-overwrite-after-mapping", "overwrite fsync failed");
+        return;
+    }
+
+    int ok = 1;
+    for (size_t i = 0; i < PAGE; i++) {
+        if (map[i] != 0x99) {
+            ok = 0;
+            break;
+        }
+    }
+    if (!verify_byte_run(fd, 0, PAGE, 0x99))
+        ok = 0;
+    munmap(map, PAGE);
+
+    if (ok)
+        pass_row("buffered-overwrite-after-mapping");
+    else
+        fail_row("buffered-overwrite-after-mapping", "mmap/readback diverged after buffered overwrite");
+    close(fd);
+}
+
+static int verify_remount_rows(void) {
+    char path[8192];
+    int fd;
+    int failures = 0;
+
+    snprintf(path, sizeof(path), "%s/mapped_dirty_truncate", test_dir);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fail_row("mapped-dirty-truncate-remount", "open failed after remount");
+        failures++;
+    } else {
+        if (verify_size_and_eof(fd, PAGE) &&
+            verify_byte_run(fd, 0, PAGE, 0x41))
+            pass_row("mapped-dirty-truncate-remount");
+        else {
+            fail_row("mapped-dirty-truncate-remount", "truncated bytes visible after remount");
+            failures++;
+        }
+        close(fd);
+    }
+
+    snprintf(path, sizeof(path), "%s/buffered_after_mapping", test_dir);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fail_row("buffered-overwrite-remount", "open failed after remount");
+        failures++;
+    } else {
+        if (verify_size_and_eof(fd, PAGE) &&
+            verify_byte_run(fd, 0, PAGE, 0x99))
+            pass_row("buffered-overwrite-remount");
+        else {
+            fail_row("buffered-overwrite-remount", "remount readback diverged");
+            failures++;
+        }
+        close(fd);
+    }
+
+    return failures == 0 ? 0 : 1;
+}
+
 int main(int argc, char *argv[]) {
+    if (argc == 3 && strcmp(argv[1], "--verify-remount") == 0) {
+        snprintf(test_dir, sizeof(test_dir), "%s", argv[2]);
+        return verify_remount_rows();
+    }
+
     if (argc < 2) {
-        fprintf(stderr, "Usage: tidefs-kmod-mmap-test <mount-point>\n");
+        fprintf(stderr, "Usage: tidefs-kmod-mmap-test [--verify-remount] <mount-point>\n");
         return 1;
     }
 
@@ -118,7 +447,7 @@ int main(int argc, char *argv[]) {
     if (read_ok)
         printf("PASS: fault-read-shared\n");
     else
-        printf("FAIL: fault-read-shared -- data mismatch\n");
+        fail_row("fault-read-shared", "data mismatch");
 
     /* ── 4. Fault-write: write via pointer ── */
     unsigned char pattern[PAGE];
@@ -152,7 +481,7 @@ int main(int argc, char *argv[]) {
     if (coh_ok)
         printf("PASS: write-read-coherence\n");
     else
-        printf("FAIL: write-read-coherence\n");
+        fail_row("write-read-coherence", "mapped readback mismatch");
 
     /* ── 6. msync MS_SYNC ── */
     if (msync(map + PAGE, PAGE * 2, MS_SYNC) < 0)
@@ -175,7 +504,7 @@ int main(int argc, char *argv[]) {
     for (size_t i = 0; i < PAGE; i++) {
         if (rbuf[i] != (unsigned char)(i & 0xFF)) {
             fprintf(stderr, "post-sync-readback: page0 mismatch at %zu\n", i);
-            printf("FAIL: post-sync-readback -- page0 corrupted\n");
+            fail_row("post-sync-readback", "page0 corrupted");
             goto done;
         }
     }
@@ -185,7 +514,7 @@ int main(int argc, char *argv[]) {
         if (rbuf[PAGE + i] != pattern[i]) {
             fprintf(stderr, "post-sync-readback: page1 mismatch at %zu: expected %02x got %02x\n",
                     i, pattern[i], rbuf[PAGE + i]);
-            printf("FAIL: post-sync-readback -- page1 not visible after sync\n");
+            fail_row("post-sync-readback", "page1 not visible after sync");
             goto done;
         }
     }
@@ -194,7 +523,7 @@ int main(int argc, char *argv[]) {
     for (size_t i = 0; i < PAGE; i++) {
         if (rbuf[PAGE * 2 + i] != (unsigned char)((PAGE * 2 + i) & 0xFF)) {
             fprintf(stderr, "post-sync-readback: page2 mismatch at %zu\n", i);
-            printf("FAIL: post-sync-readback -- page2 corrupted\n");
+            fail_row("post-sync-readback", "page2 corrupted");
             goto done;
         }
     }
@@ -204,16 +533,21 @@ int main(int argc, char *argv[]) {
         if (rbuf[PAGE * 3 + i] != pattern[i]) {
             fprintf(stderr, "post-sync-readback: page3 mismatch at %zu: expected %02x got %02x\n",
                     i, pattern[i], rbuf[PAGE * 3 + i]);
-            printf("FAIL: post-sync-readback -- page3 not visible after sync\n");
+            fail_row("post-sync-readback", "page3 not visible after sync");
             goto done;
         }
     }
 
     printf("PASS: post-sync-readback\n");
 
+    test_truncate_down_discard();
+    test_truncate_extend_zero_read();
+    test_mapped_dirty_truncate_down();
+    test_buffered_overwrite_after_mapping();
+
 done:
     close(fd);
-    return 0;
+    return row_failures == 0 ? 0 : 1;
 }
 CEOF
 
@@ -241,8 +575,9 @@ CEOF
 Usage: tidefs-kmod-mmap-validation [--timeout SECONDS] [--keep-tmp] [--module PATH] [--kernel PATH]
 
 Validate kmod-posix-vfs mmap operations (fault-read, fault-write,
-page_mkwrite, msync, munmap) in a reproducible Nix/QEMU Linux 7.0
-environment. Produces tier-classified validation for mmap behavior.
+page_mkwrite, msync, munmap, truncate invalidation, and remount
+readback) in a reproducible Nix/QEMU Linux 7.0 environment. Produces
+tier-classified validation for mmap behavior.
 
 Options:
   --timeout SECONDS    QEMU boot timeout (default: $TIMEOUT_SEC)
@@ -479,8 +814,8 @@ echo ""
 echo "--- Phase 3: Mmap workload ---"
 if [ "\$MOUNTED" -eq 1 ] && [ -x /bin/tidefs-kmod-mmap-test ]; then
     # Run the C test binary; capture structured output
-    /bin/tidefs-kmod-mmap-test "\$MNT" 2>/tmp/mmap.err
-    MMAP_RC=\$?
+    MMAP_RC=0
+    /bin/tidefs-kmod-mmap-test "\$MNT" 2>/tmp/mmap.err || MMAP_RC=\$?
 
     # Parse PASS/FAIL lines from the test binary output
     # (already printed to console by the binary itself)
@@ -501,6 +836,40 @@ else
     fi
     if [ ! -x /bin/tidefs-kmod-mmap-test ]; then
         blocked "mmap_workload" "test binary not found"
+    fi
+fi
+
+# ── Phase 3b: Remount readback for truncate/overwrite rows ───────────
+echo ""
+echo "--- Phase 3b: Remount readback ---"
+if [ "\$MOUNTED" -eq 1 ] && [ -x /bin/tidefs-kmod-mmap-test ]; then
+    sync
+    if umount "\$MNT" 2>/tmp/remount-umount.err; then
+        MOUNTED=0
+        if mount -t tidefs "\$POOL_DEV" "\$MNT" 2>/tmp/remount.err; then
+            pass "configured_pool_remount"
+            MOUNTED=1
+            REMOUNT_RC=0
+            /bin/tidefs-kmod-mmap-test --verify-remount "\$MNT" 2>/tmp/mmap-remount.err || REMOUNT_RC=\$?
+            echo "mmap_remount_readback_exit_code=\$REMOUNT_RC"
+            if [ "\$REMOUNT_RC" -eq 0 ]; then
+                echo "mmap_remount_readback_summary=ALL_PASSED"
+            else
+                echo "mmap_remount_readback_summary=FAILURES_DETECTED"
+                cat /tmp/mmap-remount.err
+            fi
+        else
+            fail "configured_pool_remount" "\$(cat /tmp/remount.err)"
+        fi
+    else
+        fail "configured_pool_remount" "\$(cat /tmp/remount-umount.err)"
+    fi
+else
+    if [ "\$MOUNTED" -ne 1 ]; then
+        blocked "configured_pool_remount" "filesystem not mounted"
+    fi
+    if [ ! -x /bin/tidefs-kmod-mmap-test ]; then
+        blocked "configured_pool_remount" "test binary not found"
     fi
 fi
 
@@ -600,7 +969,10 @@ INITSCRIPT
       missing_pool_member_rejected configured_pool_mount \
       create-and-write-initial mmap-shared fault-read-shared \
       fault-write-shared write-read-coherence msync-sync munmap \
-      post-sync-readback \
+      post-sync-readback truncate-down-discard \
+      truncate-extend-zero-read mapped-dirty-truncate-down \
+      configured_pool_remount mapped-dirty-truncate-remount \
+      buffered-overwrite-after-mapping buffered-overwrite-remount \
       unmount module_unload; do
       # Some ops are reported by C test binary directly (PASS:/FAIL:),
       # others by the init shell script.
