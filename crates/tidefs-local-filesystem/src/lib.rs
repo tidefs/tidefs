@@ -7752,19 +7752,35 @@ impl LocalFileSystem {
         // ── Namespace-level pre-check (reuse namespace module) ──────
         let pre =
             crate::namespace::unlink::pre_check(&self.state.inodes, &self.state.directories, path)?;
-        let parent_id = pre.parent_id;
-        let name = pre.name;
-        let _inode_id = pre.target_inode_id;
+        debug_assert_eq!(
+            pre.target_inode_id,
+            self.dir_entry_by_inode(pre.parent_id, &pre.name, path)?
+                .ok_or_else(|| FileSystemError::NotFound {
+                    path: path.to_string(),
+                })?
+                .inode_id
+        );
+        self.unlink_child_by_inode(pre.parent_id, &pre.name, path)
+    }
 
+    pub(crate) fn unlink_child_by_inode(
+        &mut self,
+        parent_id: InodeId,
+        name: &[u8],
+        path_for_error: &str,
+    ) -> Result<()> {
         let entry = self
-            .dir_entry_by_inode(parent_id, &name, path)?
+            .dir_entry_by_inode(parent_id, name, path_for_error)?
             .ok_or_else(|| FileSystemError::NotFound {
-                path: path.to_string(),
+                path: path_for_error.to_string(),
             })?;
         self.flush_file_write_buffer_for_entry(&entry)?;
         let record = self.inode(entry.inode_id)?.clone();
-        // pre_check already ensures target is not a directory.
-        debug_assert!(record.kind() != NodeKind::Dir);
+        if record.kind() == NodeKind::Dir {
+            return Err(FileSystemError::IsDirectory {
+                path: path_for_error.to_string(),
+            });
+        }
 
         let was_multilinked = record.nlink > 1;
 
@@ -7798,7 +7814,7 @@ impl LocalFileSystem {
         if !self.state.inodes.contains_key(&parent_id) {
             self.rollback_mutation_delta();
             return Err(FileSystemError::NotFound {
-                path: path.to_string(),
+                path: path_for_error.to_string(),
             });
         }
         let tick = self.bump_generation();
@@ -7807,8 +7823,8 @@ impl LocalFileSystem {
             let _frame = buf.append(
                 tidefs_intent_log::IntentLogRecord::Unlink {
                     parent: parent_id.get(),
-                    name: name.clone(),
-                    ino: _inode_id.get(),
+                    name: name.to_vec(),
+                    ino: entry.inode_id.get(),
                 },
                 0,
             );
@@ -7817,7 +7833,7 @@ impl LocalFileSystem {
         self.mark_inode_metadata_dirty(entry.inode_id);
         self.mark_dir_dirty(parent_id);
         self.mark_inode_metadata_dirty(parent_id);
-        if let Err(err) = self.remove_directory_entry(parent_id, &name, tick) {
+        if let Err(err) = self.remove_directory_entry(parent_id, name, tick) {
             self.rollback_mutation_delta();
             return Err(err);
         }
@@ -7872,28 +7888,38 @@ impl LocalFileSystem {
         }
         self.commit_mutation(())
     }
+
     pub fn remove_dir(&mut self, path: impl AsRef<str>) -> Result<()> {
         let path = path.as_ref();
         let (parent_id, name) = self.resolve_parent_and_name(path)?;
+        self.remove_dir_child_by_inode(parent_id, &name, path)
+    }
+
+    pub(crate) fn remove_dir_child_by_inode(
+        &mut self,
+        parent_id: InodeId,
+        name: &[u8],
+        path_for_error: &str,
+    ) -> Result<()> {
         let entry = self
-            .dir_entry_by_inode(parent_id, &name, path)?
+            .dir_entry_by_inode(parent_id, name, path_for_error)?
             .ok_or_else(|| FileSystemError::NotFound {
-                path: path.to_string(),
+                path: path_for_error.to_string(),
             })?;
         let record = self.inode(entry.inode_id)?.clone();
         if record.kind() != NodeKind::Dir {
             return Err(FileSystemError::NotDirectory {
-                path: path.to_string(),
+                path: path_for_error.to_string(),
             });
         }
         let child_is_empty = if let Some(directory) = self.state.directories.get(&entry.inode_id) {
             directory.is_empty()
         } else {
-            self.directory(entry.inode_id, path)?.is_empty()
+            self.directory(entry.inode_id, path_for_error)?.is_empty()
         };
         if !child_is_empty {
             return Err(FileSystemError::DirectoryNotEmpty {
-                path: path.to_string(),
+                path: path_for_error.to_string(),
             });
         }
 
@@ -7902,7 +7928,7 @@ impl LocalFileSystem {
             let _frame = buf.append(
                 tidefs_intent_log::IntentLogRecord::Rmdir {
                     parent: parent_id.get(),
-                    name: name.clone(),
+                    name: name.to_vec(),
                     ino: entry.inode_id.get(),
                 },
                 0, // txg_id assigned at drain time
@@ -7914,11 +7940,11 @@ impl LocalFileSystem {
         if !self.state.inodes.contains_key(&parent_id) {
             self.rollback_mutation_delta();
             return Err(FileSystemError::NotFound {
-                path: path.to_string(),
+                path: path_for_error.to_string(),
             });
         }
         let tick = self.bump_generation();
-        if let Err(err) = self.remove_directory_entry(parent_id, &name, tick) {
+        if let Err(err) = self.remove_directory_entry(parent_id, name, tick) {
             self.rollback_mutation_delta();
             return Err(err);
         }
@@ -12737,6 +12763,29 @@ mod orphan_index_integration_tests {
 
         assert!(matches!(
             fs.list_xattr("/d"),
+            Err(FileSystemError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn inode_resolved_unlink_and_rmdir_ignore_diagnostic_path() {
+        let (_root, mut fs) = make_test_fs("inode_resolved_remove").expect("open");
+        fs.create_dir("/parent", 0o755).expect("create parent");
+        fs.create_file("/parent/file", 0o644).expect("create file");
+        fs.create_dir("/parent/empty", 0o755).expect("create dir");
+        let parent = fs.stat("/parent").expect("stat parent").inode_id;
+
+        fs.unlink_child_by_inode(parent, b"file", "not-an-absolute-file-path")
+            .expect("unlink by parent inode");
+        fs.remove_dir_child_by_inode(parent, b"empty", "not-an-absolute-dir-path")
+            .expect("rmdir by parent inode");
+
+        assert!(matches!(
+            fs.stat("/parent/file"),
+            Err(FileSystemError::NotFound { .. })
+        ));
+        assert!(matches!(
+            fs.stat("/parent/empty"),
             Err(FileSystemError::NotFound { .. })
         ));
     }

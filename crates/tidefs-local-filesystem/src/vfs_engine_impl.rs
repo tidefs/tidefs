@@ -3675,13 +3675,13 @@ impl VfsEngine for VfsLocalFileSystem {
             } else {
                 self.fs
                     .borrow_mut()
-                    .unlink(&child_path)
+                    .unlink_child_by_inode(parent_record.inode_id, name, &child_path)
                     .map_err(|e| map_errno(&e))?;
             }
         } else {
             self.fs
                 .borrow_mut()
-                .unlink(&child_path)
+                .unlink_child_by_inode(parent_record.inode_id, name, &child_path)
                 .map_err(|e| map_errno(&e))?;
         }
         self.remove_cached_path_if_matches(record.inode_id, &child_path);
@@ -3707,7 +3707,7 @@ impl VfsEngine for VfsLocalFileSystem {
         }
         self.fs
             .borrow_mut()
-            .remove_dir(&child_path)
+            .remove_dir_child_by_inode(parent_record.inode_id, name, &child_path)
             .map_err(|e| map_errno(&e))?;
         self.remove_cached_path_if_matches(record.inode_id, &child_path);
         Ok(())
