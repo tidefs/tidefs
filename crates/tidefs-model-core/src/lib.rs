@@ -5,12 +5,11 @@
 //! compare observable filesystem semantics without depending on local runtime
 //! files.
 //!
-//! Contract request envelopes from `tidefs-types-vfs-core` are accepted for the
-//! VFS operations that currently exist in the contract seed: `GetAttr`, `Read`,
-//! `Write`, and `Sync`. Create, mkdir, rename, link, unlink, and truncate are
-//! represented by [`ModelRequest`]. That enum is a temporary internal model
-//! vocabulary for issue #283 until the canonical request contract grows those
-//! operations.
+//! Contract request envelopes from `tidefs-types-vfs-core` are accepted for
+//! the VFS operations in the canonical contract seed, including namespace
+//! mutation records that identify component operands through fixed-width
+//! `VfsNameToken` values. [`ModelRequest`] remains as a path-oriented helper
+//! for model tests and callers that have not moved to contract envelopes yet.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
@@ -19,7 +18,8 @@ use std::str::FromStr;
 
 use tidefs_types_vfs_core::{
     CompletionDisposition, CompletionStatus, ContractEpoch, Errno, InodeId, RequestEnvelope,
-    RequestId, TideCompletion, TideRequest, TraceId, VfsRequest, TIDE_CONTRACT_VERSION_V1,
+    RequestId, TideCompletion, TideRequest, TraceId, VfsNameToken, VfsRequest,
+    TIDE_CONTRACT_VERSION_V1,
 };
 
 pub const ROOT_INODE_ID: InodeId = InodeId(1);
@@ -233,6 +233,19 @@ pub enum ModelRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContractNameBinding<'a> {
+    pub token: VfsNameToken,
+    pub component: &'a str,
+}
+
+impl<'a> ContractNameBinding<'a> {
+    #[must_use]
+    pub const fn new(token: VfsNameToken, component: &'a str) -> Self {
+        Self { token, component }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContractModelContext<'a> {
     pub write_bytes: &'a [u8],
 }
@@ -242,9 +255,61 @@ impl<'a> ContractModelContext<'a> {
     pub const fn empty() -> Self {
         Self { write_bytes: &[] }
     }
+
+    #[must_use]
+    pub const fn with_write_bytes(write_bytes: &'a [u8]) -> Self {
+        Self { write_bytes }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContractNameContext<'a> {
+    pub bindings: &'a [ContractNameBinding<'a>],
+}
+
+impl<'a> ContractNameContext<'a> {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { bindings: &[] }
+    }
+
+    #[must_use]
+    pub const fn new(bindings: &'a [ContractNameBinding<'a>]) -> Self {
+        Self { bindings }
+    }
+
+    fn component_for(self, token: VfsNameToken) -> Result<&'a str, Errno> {
+        if token == VfsNameToken::NONE {
+            return Err(Errno::EINVAL);
+        }
+
+        let mut found = None;
+        for binding in self.bindings {
+            if binding.token != token {
+                continue;
+            }
+            validate_component(binding.component)?;
+            if VfsNameToken::from_component_bytes(binding.component.as_bytes()) != token {
+                return Err(Errno::EINVAL);
+            }
+            match found {
+                Some(existing) if existing != binding.component => return Err(Errno::EINVAL),
+                Some(_) => {}
+                None => found = Some(binding.component),
+            }
+        }
+
+        found.ok_or(Errno::EINVAL)
+    }
 }
 
 impl Default for ContractModelContext<'_> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl Default for ContractNameContext<'_> {
     fn default() -> Self {
         Self::empty()
     }
@@ -483,8 +548,8 @@ impl ModelFs {
         Ok(self.finish_step(None, outcome))
     }
 
-    /// Apply a canonical contract request envelope for the VFS subset that
-    /// exists today and check invariants after the step.
+    /// Apply a canonical contract request envelope for the model-supported VFS
+    /// operations and check invariants after the step.
     ///
     /// # Errors
     ///
@@ -495,6 +560,23 @@ impl ModelFs {
         &mut self,
         envelope: &RequestEnvelope,
         context: ContractModelContext<'_>,
+    ) -> Result<ModelStep, ModelInvariantError> {
+        self.apply_contract_with_names(envelope, context, ContractNameContext::empty())
+    }
+
+    /// Apply a canonical contract request envelope with namespace token
+    /// bindings for operations that need component material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelInvariantError`] only when the model's internal state is
+    /// inconsistent after the step. Unsupported or invalid contract operations
+    /// complete as normal model steps with stable errno classes.
+    pub fn apply_contract_with_names(
+        &mut self,
+        envelope: &RequestEnvelope,
+        context: ContractModelContext<'_>,
+        name_context: ContractNameContext<'_>,
     ) -> Result<ModelStep, ModelInvariantError> {
         let outcome = if envelope.version != TIDE_CONTRACT_VERSION_V1 {
             OperationOutcome::failed(Errno::EINVAL)
@@ -520,6 +602,51 @@ impl ModelFs {
                     }
                 }
                 TideRequest::Vfs(VfsRequest::Sync { inode_id, .. }) => self.fsync_inode(inode_id),
+                TideRequest::Vfs(VfsRequest::Create { parent_id, name }) => {
+                    match name_context.component_for(name) {
+                        Ok(name) => self.create_child(parent_id, name),
+                        Err(errno) => OperationOutcome::failed(errno),
+                    }
+                }
+                TideRequest::Vfs(VfsRequest::Mkdir { parent_id, name }) => {
+                    match name_context.component_for(name) {
+                        Ok(name) => self.mkdir_child(parent_id, name),
+                        Err(errno) => OperationOutcome::failed(errno),
+                    }
+                }
+                TideRequest::Vfs(VfsRequest::Rename {
+                    old_parent_id,
+                    old_name,
+                    new_parent_id,
+                    new_name,
+                }) => match (
+                    name_context.component_for(old_name),
+                    name_context.component_for(new_name),
+                ) {
+                    (Ok(old_name), Ok(new_name)) => {
+                        self.rename_child(old_parent_id, old_name, new_parent_id, new_name)
+                    }
+                    (Err(errno), _) | (_, Err(errno)) => OperationOutcome::failed(errno),
+                },
+                TideRequest::Vfs(VfsRequest::Link {
+                    source_inode_id,
+                    target_parent_id,
+                    target_name,
+                }) => match name_context.component_for(target_name) {
+                    Ok(target_name) => {
+                        self.link_inode(source_inode_id, target_parent_id, target_name)
+                    }
+                    Err(errno) => OperationOutcome::failed(errno),
+                },
+                TideRequest::Vfs(VfsRequest::Unlink { parent_id, name }) => {
+                    match name_context.component_for(name) {
+                        Ok(name) => self.unlink_child(parent_id, name),
+                        Err(errno) => OperationOutcome::failed(errno),
+                    }
+                }
+                TideRequest::Vfs(VfsRequest::Truncate { inode_id, size }) => {
+                    self.truncate_inode(inode_id, size)
+                }
                 TideRequest::Vfs(VfsRequest::Unsupported { .. })
                 | TideRequest::Block(_)
                 | TideRequest::Control(_)
@@ -750,14 +877,7 @@ impl ModelFs {
             Ok(parent) => parent,
             Err(errno) => return OperationOutcome::failed(errno),
         };
-        if self.child(parent, &name).is_some() {
-            return OperationOutcome::failed(Errno::EEXIST);
-        }
-
-        let inode_id = self.allocate_inode();
-        self.nodes.insert(inode_id, Node::file(inode_id));
-        self.node_mut(parent).children.insert(name, inode_id);
-        self.getattr_inode(inode_id)
+        self.create_child(parent, &name)
     }
 
     fn mkdir(&mut self, path: &ModelPath) -> OperationOutcome {
@@ -765,15 +885,7 @@ impl ModelFs {
             Ok(parent) => parent,
             Err(errno) => return OperationOutcome::failed(errno),
         };
-        if self.child(parent, &name).is_some() {
-            return OperationOutcome::failed(Errno::EEXIST);
-        }
-
-        let inode_id = self.allocate_inode();
-        self.nodes
-            .insert(inode_id, Node::dir(inode_id, Some(parent)));
-        self.node_mut(parent).children.insert(name, inode_id);
-        self.getattr_inode(inode_id)
+        self.mkdir_child(parent, &name)
     }
 
     fn link(&mut self, from: &ModelPath, to: &ModelPath) -> OperationOutcome {
@@ -781,21 +893,11 @@ impl ModelFs {
             Ok(source) => source,
             Err(errno) => return OperationOutcome::failed(errno),
         };
-        if self.node(source).kind == ModelNodeKind::Directory {
-            return OperationOutcome::failed(Errno::EPERM);
-        }
-
         let (parent, name) = match self.resolve_parent(to) {
             Ok(parent) => parent,
             Err(errno) => return OperationOutcome::failed(errno),
         };
-        if self.child(parent, &name).is_some() {
-            return OperationOutcome::failed(Errno::EEXIST);
-        }
-
-        self.node_mut(source).nlink = self.node(source).nlink.saturating_add(1);
-        self.node_mut(parent).children.insert(name, source);
-        self.getattr_inode(source)
+        self.link_inode(source, parent, &name)
     }
 
     fn unlink(&mut self, path: &ModelPath) -> OperationOutcome {
@@ -806,17 +908,7 @@ impl ModelFs {
             Ok(parent) => parent,
             Err(errno) => return OperationOutcome::failed(errno),
         };
-        let target = match self.child(parent, &name) {
-            Some(target) => target,
-            None => return OperationOutcome::failed(Errno::ENOENT),
-        };
-        if self.node(target).kind == ModelNodeKind::Directory {
-            return OperationOutcome::failed(Errno::EISDIR);
-        }
-
-        self.node_mut(parent).children.remove(&name);
-        self.drop_link(target);
-        OperationOutcome::success(ModelOutput::None, 0, [0; 3])
+        self.unlink_child(parent, &name)
     }
 
     fn rename(&mut self, from: &ModelPath, to: &ModelPath) -> OperationOutcome {
@@ -827,24 +919,159 @@ impl ModelFs {
             Ok(parent) => parent,
             Err(errno) => return OperationOutcome::failed(errno),
         };
-        let source = match self.child(from_parent, &from_name) {
-            Some(source) => source,
-            None => return OperationOutcome::failed(Errno::ENOENT),
-        };
         let (to_parent, to_name) = match self.resolve_parent(to) {
             Ok(parent) => parent,
             Err(errno) => return OperationOutcome::failed(errno),
         };
-        if from == to {
+        self.rename_child(from_parent, &from_name, to_parent, &to_name)
+    }
+
+    fn create_child(&mut self, parent_id: InodeId, name: &str) -> OperationOutcome {
+        if let Err(errno) = validate_component(name) {
+            return OperationOutcome::failed(errno);
+        }
+        match self.nodes.get(&parent_id) {
+            Some(parent) if parent.kind != ModelNodeKind::Directory => {
+                return OperationOutcome::failed(Errno::ENOTDIR);
+            }
+            Some(parent) if parent.children.contains_key(name) => {
+                return OperationOutcome::failed(Errno::EEXIST);
+            }
+            Some(_) => {}
+            None => return OperationOutcome::failed(Errno::ENOENT),
+        }
+
+        let inode_id = self.allocate_inode();
+        self.nodes.insert(inode_id, Node::file(inode_id));
+        self.node_mut(parent_id)
+            .children
+            .insert(name.to_string(), inode_id);
+        self.getattr_inode(inode_id)
+    }
+
+    fn mkdir_child(&mut self, parent_id: InodeId, name: &str) -> OperationOutcome {
+        if let Err(errno) = validate_component(name) {
+            return OperationOutcome::failed(errno);
+        }
+        match self.nodes.get(&parent_id) {
+            Some(parent) if parent.kind != ModelNodeKind::Directory => {
+                return OperationOutcome::failed(Errno::ENOTDIR);
+            }
+            Some(parent) if parent.children.contains_key(name) => {
+                return OperationOutcome::failed(Errno::EEXIST);
+            }
+            Some(_) => {}
+            None => return OperationOutcome::failed(Errno::ENOENT),
+        }
+
+        let inode_id = self.allocate_inode();
+        self.nodes
+            .insert(inode_id, Node::dir(inode_id, Some(parent_id)));
+        self.node_mut(parent_id)
+            .children
+            .insert(name.to_string(), inode_id);
+        self.getattr_inode(inode_id)
+    }
+
+    fn link_inode(
+        &mut self,
+        source_inode_id: InodeId,
+        target_parent_id: InodeId,
+        target_name: &str,
+    ) -> OperationOutcome {
+        if let Err(errno) = validate_component(target_name) {
+            return OperationOutcome::failed(errno);
+        }
+        match self.nodes.get(&source_inode_id) {
+            Some(source) if source.kind == ModelNodeKind::Directory => {
+                return OperationOutcome::failed(Errno::EPERM);
+            }
+            Some(_) => {}
+            None => return OperationOutcome::failed(Errno::ENOENT),
+        }
+        match self.nodes.get(&target_parent_id) {
+            Some(parent) if parent.kind != ModelNodeKind::Directory => {
+                return OperationOutcome::failed(Errno::ENOTDIR);
+            }
+            Some(parent) if parent.children.contains_key(target_name) => {
+                return OperationOutcome::failed(Errno::EEXIST);
+            }
+            Some(_) => {}
+            None => return OperationOutcome::failed(Errno::ENOENT),
+        }
+
+        let nlink = self.node(source_inode_id).nlink.saturating_add(1);
+        self.node_mut(source_inode_id).nlink = nlink;
+        self.node_mut(target_parent_id)
+            .children
+            .insert(target_name.to_string(), source_inode_id);
+        self.getattr_inode(source_inode_id)
+    }
+
+    fn unlink_child(&mut self, parent_id: InodeId, name: &str) -> OperationOutcome {
+        if let Err(errno) = validate_component(name) {
+            return OperationOutcome::failed(errno);
+        }
+        let target = match self.nodes.get(&parent_id) {
+            Some(parent) if parent.kind != ModelNodeKind::Directory => {
+                return OperationOutcome::failed(Errno::ENOTDIR);
+            }
+            Some(parent) => match parent.children.get(name) {
+                Some(target) => *target,
+                None => return OperationOutcome::failed(Errno::ENOENT),
+            },
+            None => return OperationOutcome::failed(Errno::ENOENT),
+        };
+        if self.node(target).kind == ModelNodeKind::Directory {
+            return OperationOutcome::failed(Errno::EISDIR);
+        }
+
+        self.node_mut(parent_id).children.remove(name);
+        self.drop_link(target);
+        OperationOutcome::success(ModelOutput::None, 0, [0; 3])
+    }
+
+    fn rename_child(
+        &mut self,
+        old_parent_id: InodeId,
+        old_name: &str,
+        new_parent_id: InodeId,
+        new_name: &str,
+    ) -> OperationOutcome {
+        if let Err(errno) = validate_component(old_name) {
+            return OperationOutcome::failed(errno);
+        }
+        if let Err(errno) = validate_component(new_name) {
+            return OperationOutcome::failed(errno);
+        }
+        let source = match self.nodes.get(&old_parent_id) {
+            Some(parent) if parent.kind != ModelNodeKind::Directory => {
+                return OperationOutcome::failed(Errno::ENOTDIR);
+            }
+            Some(parent) => match parent.children.get(old_name) {
+                Some(source) => *source,
+                None => return OperationOutcome::failed(Errno::ENOENT),
+            },
+            None => return OperationOutcome::failed(Errno::ENOENT),
+        };
+        match self.nodes.get(&new_parent_id) {
+            Some(parent) if parent.kind != ModelNodeKind::Directory => {
+                return OperationOutcome::failed(Errno::ENOTDIR);
+            }
+            Some(_) => {}
+            None => return OperationOutcome::failed(Errno::ENOENT),
+        }
+        if old_parent_id == new_parent_id && old_name == new_name {
             return self.getattr_inode(source);
         }
 
         let source_kind = self.node(source).kind;
-        if source_kind == ModelNodeKind::Directory && self.is_dir_descendant(to_parent, source) {
+        if source_kind == ModelNodeKind::Directory && self.is_dir_descendant(new_parent_id, source)
+        {
             return OperationOutcome::failed(Errno::EINVAL);
         }
 
-        let existing_target = self.child(to_parent, &to_name);
+        let existing_target = self.child(new_parent_id, new_name);
         if existing_target == Some(source) {
             return self.getattr_inode(source);
         }
@@ -866,16 +1093,18 @@ impl ModelFs {
             }
         }
 
-        self.node_mut(from_parent).children.remove(&from_name);
+        self.node_mut(old_parent_id).children.remove(old_name);
 
         if let Some(target) = existing_target {
-            self.node_mut(to_parent).children.remove(&to_name);
+            self.node_mut(new_parent_id).children.remove(new_name);
             self.drop_link(target);
         }
 
-        self.node_mut(to_parent).children.insert(to_name, source);
+        self.node_mut(new_parent_id)
+            .children
+            .insert(new_name.to_string(), source);
         if source_kind == ModelNodeKind::Directory {
-            self.node_mut(source).parent = Some(to_parent);
+            self.node_mut(source).parent = Some(new_parent_id);
         }
         self.getattr_inode(source)
     }
@@ -1286,6 +1515,14 @@ mod tests {
         )
     }
 
+    fn token(component: &str) -> VfsNameToken {
+        VfsNameToken::from_component_bytes(component.as_bytes())
+    }
+
+    fn binding(component: &'static str) -> ContractNameBinding<'static> {
+        ContractNameBinding::new(token(component), component)
+    }
+
     #[test]
     fn valid_trace_covers_namespace_content_and_sync_ops() {
         let mut fs = ModelFs::new();
@@ -1387,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn contract_envelope_subset_replays_against_inodes() {
+    fn contract_envelope_io_ops_replay_against_inodes() {
         let mut fs = ModelFs::new();
         let created = apply(
             &mut fs,
@@ -1404,12 +1641,7 @@ mod tests {
             length: 3,
         }));
         let step = fs
-            .apply_contract(
-                &write,
-                ContractModelContext {
-                    write_bytes: b"abc",
-                },
-            )
+            .apply_contract(&write, ContractModelContext::with_write_bytes(b"abc"))
             .unwrap();
         assert_eq!(step.completion.completed_bytes, 3);
         assert!(step.is_success());
@@ -1455,6 +1687,106 @@ mod tests {
                 .errno(),
             Errno::EOPNOTSUPP
         );
+    }
+
+    #[test]
+    fn contract_envelope_namespace_ops_replay_with_name_tokens() {
+        let mut fs = ModelFs::new();
+        let names = [
+            binding("dir"),
+            binding("file"),
+            binding("alias"),
+            binding("moved"),
+        ];
+        let name_context = ContractNameContext::new(&names);
+
+        let mkdir = envelope(TideRequest::Vfs(VfsRequest::Mkdir {
+            parent_id: ROOT_INODE_ID,
+            name: token("dir"),
+        }));
+        let mkdir_step = fs
+            .apply_contract_with_names(&mkdir, ContractModelContext::empty(), name_context)
+            .unwrap();
+        assert!(mkdir_step.is_success());
+        let dir_inode = mkdir_step.output.as_attr().unwrap().inode_id;
+
+        let create = envelope(TideRequest::Vfs(VfsRequest::Create {
+            parent_id: dir_inode,
+            name: token("file"),
+        }));
+        let create_step = fs
+            .apply_contract_with_names(&create, ContractModelContext::empty(), name_context)
+            .unwrap();
+        assert!(create_step.is_success());
+        let file_inode = create_step.output.as_attr().unwrap().inode_id;
+
+        let write = envelope(TideRequest::Vfs(VfsRequest::Write {
+            inode_id: file_inode,
+            file_handle_id: FileHandleId::new(11),
+            offset: 0,
+            length: 6,
+        }));
+        assert!(fs
+            .apply_contract_with_names(
+                &write,
+                ContractModelContext::with_write_bytes(b"abcdef"),
+                name_context,
+            )
+            .unwrap()
+            .is_success());
+
+        let link = envelope(TideRequest::Vfs(VfsRequest::Link {
+            source_inode_id: file_inode,
+            target_parent_id: dir_inode,
+            target_name: token("alias"),
+        }));
+        let link_step = fs
+            .apply_contract_with_names(&link, ContractModelContext::empty(), name_context)
+            .unwrap();
+        assert!(link_step.is_success());
+        assert_eq!(link_step.output.as_attr().unwrap().nlink, 2);
+
+        let truncate = envelope(TideRequest::Vfs(VfsRequest::Truncate {
+            inode_id: file_inode,
+            size: 3,
+        }));
+        assert!(fs
+            .apply_contract(&truncate, ContractModelContext::empty())
+            .unwrap()
+            .is_success());
+
+        let rename = envelope(TideRequest::Vfs(VfsRequest::Rename {
+            old_parent_id: dir_inode,
+            old_name: token("alias"),
+            new_parent_id: ROOT_INODE_ID,
+            new_name: token("moved"),
+        }));
+        assert!(fs
+            .apply_contract_with_names(&rename, ContractModelContext::empty(), name_context)
+            .unwrap()
+            .is_success());
+
+        let unlink = envelope(TideRequest::Vfs(VfsRequest::Unlink {
+            parent_id: dir_inode,
+            name: token("file"),
+        }));
+        assert!(fs
+            .apply_contract_with_names(&unlink, ContractModelContext::empty(), name_context)
+            .unwrap()
+            .is_success());
+
+        let read = envelope(TideRequest::Vfs(VfsRequest::Read {
+            inode_id: file_inode,
+            file_handle_id: FileHandleId::new(11),
+            offset: 0,
+            length: 8,
+        }));
+        let read_step = fs
+            .apply_contract(&read, ContractModelContext::empty())
+            .unwrap();
+        assert_eq!(read_step.output.as_bytes().unwrap(), b"abc");
+        assert_eq!(fs.attr(&path("/moved")).unwrap().nlink, 1);
+        fs.check_invariants().unwrap();
     }
 
     #[test]
@@ -1578,14 +1910,9 @@ mod tests {
             length: 4,
         }));
         assert_eq!(
-            fs.apply_contract(
-                &write,
-                ContractModelContext {
-                    write_bytes: b"abc",
-                },
-            )
-            .unwrap()
-            .errno(),
+            fs.apply_contract(&write, ContractModelContext::with_write_bytes(b"abc"),)
+                .unwrap()
+                .errno(),
             Errno::EINVAL
         );
 
