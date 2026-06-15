@@ -80,10 +80,13 @@ manifests are fuzz harnesses:
 - `crates/tidefs-validation/fuzz/Cargo.toml`
 - `fuzz/Cargo.toml`
 
-Meanwhile `tidefs-types-control-plane-core`,
+The last three scaffold-transitional workspace packages
+`tidefs-types-control-plane-core`,
 `tidefs-types-publication-pipeline-core`, and
-`tidefs-types-response-registry-core` are still workspace packages. This is not
-yet a clean product/harness/archive split.
+`tidefs-types-response-registry-core` were deleted by issue #276 after
+reverse-dependency review found only stale validation wiring and
+scaffold-internal edges. This removes the remaining scaffold-transitional role
+from current package authority, but it is not yet full TFR-002/TFR-019 closure.
 
 Spot checks against non-workspace packages confirm that Cargo cannot inspect
 them in isolation because each package still believes it belongs to the root
@@ -121,8 +124,8 @@ workspace surface is now the daemon runtime module plus `reply`, `workers-io`,
 
 A fresh sweep confirms this is broader than a member-count mismatch:
 
-- `cargo metadata --locked --no-deps` reports 148 packages, 148 workspace
-  members, and 148 default members, while `rg --files -g Cargo.toml` now finds
+- `cargo metadata --locked --no-deps` reports 145 packages, 145 workspace
+  members, and 145 default members, while `rg --files -g Cargo.toml` now finds
   the root manifest plus five nonmember fuzz harness manifests.
 - The root `fuzz/` manifest no longer depends on missing
   `crates/tidefs-schema-codec-outcome`, and its placeholder
@@ -133,29 +136,27 @@ A fresh sweep confirms this is broader than a member-count mismatch:
   `cargo check --manifest-path ... --locked`, which fixes the harness
   packaging leak but does not decide whether each fuzz root stays, moves, or is
   archived.
-- `docs/ARCHITECTURE.md` now marks the deleted scaffold type roots as deleted
-  rather than archived-on-disk roots, but the broader workspace authority split
-  remains open because other scaffold type crates still have live workspace
-  dependency edges and need issue-backed disposition.
+- `docs/ARCHITECTURE.md` is stale review material and still names earlier
+  scaffold type roots in historical package-family prose; the checked package
+  authority now lives in `docs/workspace-package-classification.md`.
 - `docs/workspace-package-classification.md` now records the current package
-  role authority for 148 workspace packages, five excluded fuzz package roots,
+  role authority for 145 workspace packages, five excluded fuzz package roots,
   app roots, `kmod`, `xtask`, and vendored `fuser`.
 - `xtask` policy validates that authority against Cargo metadata, manifest
-  discovery, and root `workspace.exclude`, and fails product/operator/tooling
-  dependencies on scaffold-transitional package roots.
+  discovery, and root `workspace.exclude`, and fails if a
+  scaffold-transitional row reappears after issue #276.
 - `apps/README.md` and `crates/README.md` now defer to the checked authority
   instead of carrying separate package-role tables.
 
 That reduces the package-authority split, but workspace authority remains a
-live product-boundary problem: scaffold-transitional type crates still exist in
-the workspace, and broader xtask/doc authority classification is not complete.
+live product-boundary problem until broader xtask/doc authority classification
+is complete.
 
-The current `workspace.exclude` quarantine still does not close the scaffold
-split. Current metadata shows the remaining hard control-plane type edges from
-publication-pipeline and response-registry type crates into
-`tidefs-types-control-plane-core`; proof-harness code may inspect that
-transitional surface, but product/operator/tooling packages must not grow new
-dependencies on it.
+The current `workspace.exclude` quarantine still does not close the broader
+scaffold split. Current metadata no longer shows publication-pipeline or
+response-registry type-crate edges into `tidefs-types-control-plane-core`
+because those stale package roots have been deleted; remaining work is imported
+doc and package-authority classification outside the retired scaffold role.
 
 The secret-key policy edge has been narrowed since the prior sweep:
 `tidefs-types-secret-key-policy-core` now owns local
@@ -169,9 +170,9 @@ The standalone `tidefs-posix-filesystem-adapter-runtime` crate was removed
 after current metadata showed no in-workspace reverse dependency and source
 review showed the daemon already owns the live runtime module at
 `apps/tidefs-posix-filesystem-adapter-daemon/src/runtime/mod.rs`. That removes
-one hard scaffold dependency chain but does not close TFR-002; remaining
-scaffold type crates still need separate migration, deletion, or explicit
-workspace-membership review.
+one hard scaffold dependency chain but does not close TFR-002; the final
+scaffold-transitional type crates were later deleted by issue #276, while
+broader workspace/doc authority cleanup remains open.
 
 The POSIX receipt-demo edge is now local to the POSIX family instead of pulling
 control/publication/response scaffold crates into the adapter. The POSIX core
@@ -224,9 +225,8 @@ and excluded fuzz package roots. `check-workspace-policy` validates that table
 against Cargo metadata, manifest discovery, and root `workspace.exclude`, and
 `crates/README.md` plus `apps/README.md` defer to it instead of carrying
 competing package inventories. This reduces the package-authority split but
-does not close TFR-002 or TFR-019: scaffold-transitional type crates still
-need issue-backed migration, reclassification, or deletion, and broader
-imported docs still need authority classification.
+does not close TFR-002 or TFR-019: the scaffold-transitional type roots are now
+deleted, while broader imported docs still need authority classification.
 
 ### TFR-004: Dataset And Inode Authority
 
@@ -1232,11 +1232,11 @@ Concrete current drift:
 - `docs/CLAIMS_GATE_POLICY.md` now says the gate scans current policy docs,
   preview docs, the review register, and the whole-repo review.
 - `docs/workspace-package-classification.md` now records the current
-  148-package workspace, five excluded fuzz package roots, and 153 classified
+  145-package workspace, five excluded fuzz package roots, and 150 classified
   package manifests. `check-workspace-policy` validates that package authority
   against Cargo metadata, manifest discovery, and root `workspace.exclude`;
-  remaining TFR-002 work is the issue-backed migration, reclassification, or
-  deletion of scaffold-transitional type surfaces.
+  issue #276 removed the remaining scaffold-transitional type surfaces, while
+  broader imported-doc authority work remains.
 - `apps/README.md` had listed deleted `tidefs-policy-authority-daemon` and
   `tidefs-control-plane-daemon` roots as current app roots. It now lists the
   roots currently present on disk and flags open TFR authority limits, but that

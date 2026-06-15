@@ -3539,10 +3539,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tidefs-types-control-plane-core"
-version = "0.421.0"
-
-[[package]]
 name = "tidefs-types-dataset-feature-flags-core"
 version = "0.421.0"
 
@@ -3605,24 +3601,10 @@ name = "tidefs-types-posix-filesystem-adapter-core"
 version = "0.421.0"
 
 [[package]]
-name = "tidefs-types-publication-pipeline-core"
-version = "0.421.0"
-dependencies = [
- "tidefs-types-control-plane-core",
-]
-
-[[package]]
 name = "tidefs-types-reclaim-queue-core"
 version = "0.421.0"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "tidefs-types-response-registry-core"
-version = "0.421.0"
-dependencies = [
- "tidefs-types-control-plane-core",
 ]
 
 [[package]]
@@ -3705,7 +3687,6 @@ dependencies = [
  "tidefs-transport",
  "tidefs-two-node-harness",
  "tidefs-types-cache-lattice-core",
- "tidefs-types-control-plane-core",
  "tidefs-types-extent-map-core",
  "tidefs-types-polymorphic-directory-index-core",
  "tidefs-types-polymorphic-xattr-core",

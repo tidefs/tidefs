@@ -107,12 +107,6 @@ members = [
   "crates/tidefs-xattr-storage",
   "crates/tidefs-types-polymorphic-xattr-core",
   "crates/tidefs-types-extent-map-core",
-  # Review debt TFR-002: Cargo already resolves these scaffold type crates as
-  # workspace members through path dependencies. Keep them explicit until their
-  # consumers are migrated and the crates can be removed or reclassified.
-  "crates/tidefs-types-control-plane-core",
-  "crates/tidefs-types-publication-pipeline-core",
-  "crates/tidefs-types-response-registry-core",
   "crates/tidefs-types-secret-key-policy-core",
   "crates/tidefs-types-space-accounting-core",
   "crates/tidefs-types-dataset-lifecycle-core",

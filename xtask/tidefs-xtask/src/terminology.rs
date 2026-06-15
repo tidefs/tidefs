@@ -116,7 +116,7 @@ pub struct HumanApiAliasEntry {
 
 pub const HUMAN_API_ALIASES: &[HumanApiAliasEntry] = &[
     HumanApiAliasEntry {
-        crate_path: "crates/tidefs-types-control-plane-core/src/lib.rs",
+        crate_path: "crates/tidefs-types-vfs-core/src/lib.rs",
         module_name: "control_plane",
         human_name: "Control Plane",
         stable_locator: "control_plane",
@@ -134,13 +134,13 @@ pub const HUMAN_API_ALIASES: &[HumanApiAliasEntry] = &[
         stable_locator: "posix_filesystem_adapter",
     },
     HumanApiAliasEntry {
-        crate_path: "crates/tidefs-types-publication-pipeline-core/src/lib.rs",
+        crate_path: "crates/tidefs-types-vfs-core/src/lib.rs",
         module_name: "publication_pipeline",
         human_name: "Publication Pipeline",
         stable_locator: "publication_pipeline",
     },
     HumanApiAliasEntry {
-        crate_path: "crates/tidefs-types-response-registry-core/src/lib.rs",
+        crate_path: "crates/tidefs-types-vfs-core/src/lib.rs",
         module_name: "response_registry",
         human_name: "Response Registry",
         stable_locator: "response_registry",
