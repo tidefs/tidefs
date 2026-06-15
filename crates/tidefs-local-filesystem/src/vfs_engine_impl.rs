@@ -52,9 +52,7 @@ use tidefs_encryption::key_hierarchy::{DatasetDEK, PoolWrappingKey, SALT_LEN};
 use tidefs_encryption::key_manager::{BorrowedKeyStore, KeyManager, KeyRotation};
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 
-// DirCursor-backed readdir with BLAKE3-verified entry iteration.
 use crate::{CopyFileRangeIntent, LocalFileSystem};
-use tidefs_dir_index::{DatasetDirPolicy, DirCursor, DirIndex};
 
 use tidefs_inode_table::{Ino, InodeTable};
 
@@ -4505,28 +4503,16 @@ impl VfsEngine for VfsLocalFileSystem {
         // Validate the inode still exists and is a directory.
         let inode_id = dh.inode_id;
         let path = self.inode_path(inode_id)?;
-        let entries = {
+        let batch_limit = 128usize;
+        let (entries, has_more) = {
             let fs = self.fs.borrow();
             let record = fs.stat(&path).map_err(|e| map_errno(&e))?;
             if !record.is_directory() {
                 return Err(Errno::ENOTDIR);
             }
-            // Use by-inode listing to avoid repeated path resolution.
-            fs.list_dir_by_inode(inode_id).map_err(|e| map_errno(&e))?
+            fs.list_dir_by_inode_window(inode_id, offset, batch_limit)
+                .map_err(|e| map_errno(&e))?
         };
-
-        // Build a DirIndex from the directory entries for
-        // BLAKE3-verified ordered iteration with DirCursor.
-        let mut dir_index = DirIndex::new(inode_id.get(), DatasetDirPolicy::DEFAULT);
-        for entry in &entries {
-            let kind_u32 = node_kind_to_dir_entry_kind(entry.kind());
-            let _ = dir_index.insert(
-                &entry.name,
-                entry.inode_id.get(),
-                entry.generation.get(),
-                kind_u32,
-            );
-        }
 
         // Fire-and-forget metadata prefetch: if an inode table is
         // configured, prime the cache for every inode returned.
@@ -4538,28 +4524,19 @@ impl VfsEngine for VfsLocalFileSystem {
             }
         }
 
-        // Create a bounded DirCursor window with BLAKE3 checksum verification.
-        // The shared dir-index cursor reserves offsets 0 and 1 for synthetic
-        // dots; the VFS engine API leaves dots to adapters, so translate to
-        // 1-based real-entry cookies at this boundary.
-        let batch_limit = 128usize;
-        let cursor_offset = offset.checked_add(2).unwrap_or(u64::MAX);
-        let (mut cursor, has_more) = DirCursor::new_window(&dir_index, cursor_offset, batch_limit)
-            .map_err(|_| Errno::EIO)?;
-
-        // Collect the bounded cursor window for this batch.
         let mut dir_entries: Vec<DirEntry> = Vec::with_capacity(batch_limit);
-        while let Some(entry) = cursor.next_entry() {
-            if entry.name.as_slice() == b"." || entry.name.as_slice() == b".." {
-                continue;
-            }
-            let kind = dir_entry_kind_to_node_kind(entry.entry_type);
+        for (index, entry) in entries.into_iter().enumerate() {
+            let cookie = offset
+                .checked_add(u64::try_from(index).map_err(|_| Errno::EOVERFLOW)?)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(Errno::EOVERFLOW)?;
+            let kind = entry.kind();
             dir_entries.push(DirEntry {
-                name: entry.name.clone(),
-                inode_id: InodeId::new(entry.inode_id),
+                name: entry.name,
+                inode_id: entry.inode_id,
                 kind,
-                generation: Generation::new(entry.generation),
-                cookie: entry.offset.saturating_sub(1),
+                generation: entry.generation,
+                cookie,
             });
         }
 
@@ -4785,38 +4762,6 @@ fn lock_range_from_spec(lock: &LockSpec) -> Result<LockRange, Errno> {
     };
     Ok(LockRange::new(lock.start, len, lock_type, 0, lock.pid))
 }
-// ── DirCursor conversion helpers ────────────────────────────────────
-
-/// Map a VfsEngine NodeKind to a DirIndex entry kind (u32).
-/// Uses 0=Dir, 1=File, 2=Symlink, 3=Fifo, 4=CharDev, 5=BlockDev, 6=Socket.
-/// Whiteout maps to 1 (File) as it is an internal sentinel.
-fn node_kind_to_dir_entry_kind(kind: NodeKind) -> u32 {
-    match kind {
-        NodeKind::Dir => 0,
-        NodeKind::File => 1,
-        NodeKind::Symlink => 2,
-        NodeKind::Fifo => 3,
-        NodeKind::CharDev => 4,
-        NodeKind::BlockDev => 5,
-        NodeKind::Socket => 6,
-        NodeKind::Whiteout => 1,
-    }
-}
-
-/// Map a DirIndex entry kind (u32) to a VfsEngine NodeKind.
-fn dir_entry_kind_to_node_kind(kind: u32) -> NodeKind {
-    match kind {
-        0 => NodeKind::Dir,
-        1 => NodeKind::File,
-        2 => NodeKind::Symlink,
-        3 => NodeKind::Fifo,
-        4 => NodeKind::CharDev,
-        5 => NodeKind::BlockDev,
-        6 => NodeKind::Socket,
-        _ => NodeKind::File,
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -11319,6 +11264,59 @@ mod tests {
         assert!(!has_more);
         assert_eq!(second[0].name, b"bulk_0128.txt");
         assert_eq!(second.last().unwrap().name, b"bulk_0139.txt");
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
+    fn readdir_permname_sized_directory_returns_all_entries_in_windows() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        for i in 0..4096u64 {
+            let mut value = i;
+            let mut name = vec![b'a'; 6];
+            for byte in name.iter_mut().rev() {
+                *byte = b'a' + u8::try_from(value % 4).unwrap();
+                value /= 4;
+            }
+            let entry = NamespaceEntry {
+                name: name.clone(),
+                inode_id: InodeId::new(30_000 + i),
+                generation: Generation::new(i + 1),
+                facets: NodeKind::File.to_facets(),
+                mode: S_IFREG | 0o644,
+            };
+            engine
+                .fs
+                .borrow_mut()
+                .insert_dir_entry(root, name, entry)
+                .unwrap();
+        }
+
+        let dh = engine.opendir(root, &ctx()).unwrap();
+        let mut offset = 0;
+        let mut seen = 0usize;
+        let mut pages = 0usize;
+        loop {
+            let (entries, has_more) = engine.readdir(&dh, offset, &ctx()).unwrap();
+            assert!(entries.len() <= 128);
+            pages += 1;
+            for entry in &entries {
+                seen += 1;
+                assert_eq!(entry.cookie, seen as u64);
+                assert_eq!(entry.name.len(), 6);
+            }
+            if let Some(last) = entries.last() {
+                offset = last.cookie;
+            } else {
+                assert!(!has_more);
+            }
+            if !has_more {
+                break;
+            }
+        }
+
+        assert_eq!(seen, 4096);
+        assert_eq!(pages, 32);
         engine.releasedir(&dh).unwrap();
     }
 
