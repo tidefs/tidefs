@@ -1,0 +1,114 @@
+{
+  "report_version": 1,
+  "generated_by": "tidefs-kmod-posix-vfs::kernel_env_model",
+  "claim_id": "kernel.teardown.no_work_after.v1",
+  "claim_ids": [
+    "kernel.teardown.no_work_after.v1"
+  ],
+  "evidence_class": "teardown-race-proof-artifact",
+  "model": {
+    "version": "kernel-env-model-v1",
+    "source_path": "crates/tidefs-kmod-posix-vfs/src/kernel_env_model.rs",
+    "model_kind": "bounded deterministic source model"
+  },
+  "runtime_boundary": "source model only; not mounted runtime evidence",
+  "bounds": {
+    "max_depth": 8,
+    "explored_prefixes": 2015539,
+    "schedule_semantics": "all prefixes over the action alphabet up to max_depth; invalid actions fail closed and preserve state for later prefix exploration",
+    "action_alphabet": [
+      "submit-writeback",
+      "submit-flush",
+      "begin-teardown",
+      "start-one",
+      "finish-one",
+      "complete-teardown"
+    ]
+  },
+  "covered_operation_classes": [
+    "setattr-truncate",
+    "dirty-folio",
+    "read-folio",
+    "write-begin-end",
+    "invalidate-range",
+    "mmap-fault",
+    "deferred-writeback",
+    "deferred-flush",
+    "umount-begin",
+    "put-super"
+  ],
+  "covered_context_axes": {
+    "sleep": [
+      "sleepable",
+      "non-sleepable"
+    ],
+    "lifetime": [
+      "callback-borrow",
+      "pinned-reference",
+      "rcu-read",
+      "workqueue-owned"
+    ],
+    "cache_boundary": [
+      "none",
+      "read-folio",
+      "dirty-folio",
+      "write-begin-end",
+      "writeback",
+      "invalidate",
+      "mmap-fault"
+    ],
+    "teardown": [
+      "live-only",
+      "drain-before-final-teardown",
+      "teardown-callback"
+    ]
+  },
+  "covered_workqueue_handoffs": [
+    {
+      "source": "setattr-truncate",
+      "work": "deferred-flush"
+    },
+    {
+      "source": "dirty-folio",
+      "work": "deferred-writeback"
+    },
+    {
+      "source": "write-begin-end",
+      "work": "deferred-writeback"
+    },
+    {
+      "source": "invalidate-range",
+      "work": "deferred-flush"
+    }
+  ],
+  "covered_transition_contracts": [
+    "work enqueue is accepted only while the queue is accepting",
+    "begin-teardown transitions accepting queues to draining and refuses duplicate teardown begins",
+    "queued work may start while draining but not after final teardown",
+    "work completion clears the single modeled running slot",
+    "final teardown is rejected while work is queued or running",
+    "final teardown transitions to torn-down and increments the owner generation token",
+    "teardown callbacks are rejected as sources for normal deferred work"
+  ],
+  "proof_counters": {
+    "completed_teardown_prefixes": 452952,
+    "refused_after_teardown_started": 542333,
+    "refused_enqueue_after_teardown_started": 476534,
+    "refused_start_after_final_teardown": 65799,
+    "blocked_final_teardown_with_inflight_work": 114310
+  },
+  "verdict": {
+    "passed": true,
+    "violation_count": 0,
+    "summary": "No explored schedule starts modeled work after final teardown; new work is refused once teardown begins, work starts are refused after final teardown, and final teardown cannot complete while modeled work is queued or running."
+  },
+  "live_contract_review": {
+    "source_paths": [
+      "crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_shim.c",
+      "crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_main.rs",
+      "crates/tidefs-kmod-posix-vfs/src/super_operations.rs",
+      "crates/tidefs-kmod-posix-vfs/src/mount_lifecycle.rs"
+    ],
+    "conclusion": "No separate mounted C-shim Linux workqueue was found in the reviewed teardown path. The mounted path keeps s_fs_info live through sync_fs and put_super, then calls the Rust engine kill_sb/teardown bridge; this artifact does not replace mounted-kernel runtime validation."
+  }
+}

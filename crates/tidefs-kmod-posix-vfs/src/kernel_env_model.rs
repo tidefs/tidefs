@@ -8,6 +8,15 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+/// Claim id covered by this source model.
+pub const KERNEL_TEARDOWN_CLAIM_ID: &str = "kernel.teardown.no_work_after.v1";
+
+/// Stable source-model version recorded by the durable proof artifact.
+pub const KERNEL_TEARDOWN_MODEL_VERSION: &str = "kernel-env-model-v1";
+
+/// Bounded schedule depth used by the checked-in claim evidence artifact.
+pub const KERNEL_TEARDOWN_PROOF_MAX_DEPTH: usize = 8;
+
 /// Whether a kernel callback or deferred work body may sleep.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SleepToken {
@@ -289,6 +298,34 @@ pub fn validate_modeled_kernel_operations() -> Result<(), ContextTokenError> {
     Ok(())
 }
 
+/// Kernel callbacks that may hand off to deferred work bodies in this model.
+pub const MODELED_WORKQUEUE_HANDOFFS: [WorkqueueHandoff; 4] = [
+    WorkqueueHandoff::new(
+        KernelOperation::required(KernelOperationKind::SetattrTruncate),
+        KernelOperation::required(KernelOperationKind::DeferredFlush),
+    ),
+    WorkqueueHandoff::new(
+        KernelOperation::required(KernelOperationKind::DirtyFolio),
+        KernelOperation::required(KernelOperationKind::DeferredWriteback),
+    ),
+    WorkqueueHandoff::new(
+        KernelOperation::required(KernelOperationKind::WriteBeginEnd),
+        KernelOperation::required(KernelOperationKind::DeferredWriteback),
+    ),
+    WorkqueueHandoff::new(
+        KernelOperation::required(KernelOperationKind::InvalidateRange),
+        KernelOperation::required(KernelOperationKind::DeferredFlush),
+    ),
+];
+
+/// Validate every modeled callback-to-workqueue handoff.
+pub fn validate_modeled_workqueue_handoffs() -> Result<(), WorkqueueHandoffError> {
+    for handoff in MODELED_WORKQUEUE_HANDOFFS {
+        handoff.validate()?;
+    }
+    Ok(())
+}
+
 /// A handoff from a kernel callback into deferred workqueue ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkqueueHandoff {
@@ -455,6 +492,12 @@ impl KernelWorkqueueModel {
     #[must_use]
     pub const fn state(&self) -> WorkqueueState {
         self.state
+    }
+
+    /// Current queue owner token. Final teardown invalidates this generation.
+    #[must_use]
+    pub const fn owner_token(&self) -> WorkqueueOwnerToken {
+        self.owner
     }
 
     /// Number of queued work items.
@@ -642,8 +685,14 @@ pub struct TeardownProofReport {
     pub explored_prefixes: u64,
     /// Number of prefixes that reached final teardown.
     pub completed_teardown_prefixes: u64,
-    /// Number of rejected submissions after teardown began.
+    /// Number of rejected submissions or starts after teardown began.
     pub refused_after_teardown_started: u64,
+    /// Number of rejected submissions after begin-teardown or final teardown.
+    pub refused_enqueue_after_teardown_started: u64,
+    /// Number of rejected work starts after final teardown.
+    pub refused_start_after_final_teardown: u64,
+    /// Number of final-teardown attempts blocked by queued or running work.
+    pub blocked_final_teardown_with_inflight_work: u64,
     /// Violations found by the proof harness.
     pub violations: Vec<TeardownViolation>,
 }
@@ -652,7 +701,11 @@ impl TeardownProofReport {
     /// True when no explored schedule starts work after final teardown.
     #[must_use]
     pub fn proves_no_work_after_teardown(&self) -> bool {
-        self.violations.is_empty() && self.completed_teardown_prefixes > 0
+        self.violations.is_empty()
+            && self.completed_teardown_prefixes > 0
+            && self.refused_enqueue_after_teardown_started > 0
+            && self.refused_start_after_final_teardown > 0
+            && self.blocked_final_teardown_with_inflight_work > 0
     }
 }
 
@@ -664,6 +717,9 @@ pub fn prove_no_work_after_teardown(max_depth: usize) -> TeardownProofReport {
         explored_prefixes: 0,
         completed_teardown_prefixes: 0,
         refused_after_teardown_started: 0,
+        refused_enqueue_after_teardown_started: 0,
+        refused_start_after_final_teardown: 0,
+        blocked_final_teardown_with_inflight_work: 0,
         violations: Vec::new(),
     };
 
@@ -702,6 +758,35 @@ fn explore_prefix(
     for action in MODEL_ACTIONS {
         let mut next_model = model.clone();
         let result = apply_action(&mut next_model, action);
+        if matches!(
+            (action, result),
+            (
+                ModelAction::SubmitWriteback | ModelAction::SubmitFlush,
+                Err(WorkqueueError::NotAccepting(
+                    WorkqueueState::Draining | WorkqueueState::TornDown
+                ))
+            )
+        ) {
+            report.refused_enqueue_after_teardown_started += 1;
+        }
+        if matches!(
+            (action, result),
+            (
+                ModelAction::StartOne,
+                Err(WorkqueueError::NotAccepting(WorkqueueState::TornDown))
+            )
+        ) {
+            report.refused_start_after_final_teardown += 1;
+        }
+        if matches!(
+            (action, result),
+            (
+                ModelAction::CompleteTeardown,
+                Err(WorkqueueError::InFlightWork)
+            )
+        ) {
+            report.blocked_final_teardown_with_inflight_work += 1;
+        }
         if matches!(
             result,
             Err(WorkqueueError::NotAccepting(
@@ -747,6 +832,7 @@ mod tests {
     #[test]
     fn kernel_env_model_operations_carry_explicit_context_tokens() {
         validate_modeled_kernel_operations().unwrap();
+        validate_modeled_workqueue_handoffs().unwrap();
 
         let mut saw_rcu = false;
         let mut saw_page_cache = false;
@@ -764,6 +850,24 @@ mod tests {
         assert!(saw_page_cache);
         assert!(saw_teardown_callback);
         assert!(saw_drain_work);
+    }
+
+    #[test]
+    fn kernel_env_model_teardown_callbacks_cannot_schedule_work() {
+        for source in [
+            KernelOperationKind::UmountBegin,
+            KernelOperationKind::PutSuper,
+        ] {
+            let handoff = WorkqueueHandoff::new(
+                KernelOperation::required(source),
+                KernelOperation::required(KernelOperationKind::DeferredFlush),
+            );
+
+            assert_eq!(
+                handoff.validate(),
+                Err(WorkqueueHandoffError::SourceIsTeardownCallback)
+            );
+        }
     }
 
     #[test]
@@ -814,8 +918,10 @@ mod tests {
         assert_eq!(model.complete_teardown(), Err(WorkqueueError::InFlightWork));
 
         model.finish_running().unwrap();
+        let generation_before_final = model.owner_token().generation;
         model.complete_teardown().unwrap();
         assert_eq!(model.state(), WorkqueueState::TornDown);
+        assert_eq!(model.owner_token().generation, generation_before_final + 1);
         assert_eq!(
             model.submit(KernelOperation::required(
                 KernelOperationKind::DeferredFlush
@@ -826,12 +932,80 @@ mod tests {
 
     #[test]
     fn kernel_env_model_deterministic_teardown_proves_no_work_after_teardown() {
-        let report = prove_no_work_after_teardown(6);
+        let report = prove_no_work_after_teardown(KERNEL_TEARDOWN_PROOF_MAX_DEPTH);
 
         assert!(report.proves_no_work_after_teardown());
         assert!(report.explored_prefixes > 1);
         assert!(report.completed_teardown_prefixes > 0);
         assert!(report.refused_after_teardown_started > 0);
+        assert!(report.refused_enqueue_after_teardown_started > 0);
+        assert!(report.refused_start_after_final_teardown > 0);
+        assert!(report.blocked_final_teardown_with_inflight_work > 0);
         assert_eq!(report.violations, vec![]);
+    }
+
+    #[test]
+    fn kernel_env_model_teardown_artifact_matches_report() {
+        let artifact: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../validation/artifacts/kernel/teardown-race-proof-artifact.json"
+        ))
+        .expect("teardown proof artifact parses as JSON");
+        let report = prove_no_work_after_teardown(KERNEL_TEARDOWN_PROOF_MAX_DEPTH);
+
+        assert_eq!(artifact["claim_id"], KERNEL_TEARDOWN_CLAIM_ID);
+        assert_eq!(artifact["evidence_class"], "teardown-race-proof-artifact");
+        assert_eq!(artifact["model"]["version"], KERNEL_TEARDOWN_MODEL_VERSION);
+        assert_eq!(
+            artifact["bounds"]["max_depth"].as_u64(),
+            Some(report.max_depth as u64)
+        );
+        assert_eq!(
+            artifact["bounds"]["explored_prefixes"].as_u64(),
+            Some(report.explored_prefixes)
+        );
+        assert_eq!(
+            artifact["proof_counters"]["completed_teardown_prefixes"].as_u64(),
+            Some(report.completed_teardown_prefixes)
+        );
+        assert_eq!(
+            artifact["proof_counters"]["refused_enqueue_after_teardown_started"].as_u64(),
+            Some(report.refused_enqueue_after_teardown_started)
+        );
+        assert_eq!(
+            artifact["proof_counters"]["refused_start_after_final_teardown"].as_u64(),
+            Some(report.refused_start_after_final_teardown)
+        );
+        assert_eq!(
+            artifact["proof_counters"]["blocked_final_teardown_with_inflight_work"].as_u64(),
+            Some(report.blocked_final_teardown_with_inflight_work)
+        );
+        assert_eq!(artifact["verdict"]["passed"], true);
+        assert_eq!(
+            artifact["verdict"]["violation_count"].as_u64(),
+            Some(report.violations.len() as u64)
+        );
+
+        let action_count = artifact["bounds"]["action_alphabet"]
+            .as_array()
+            .expect("artifact action alphabet is an array")
+            .len();
+        assert_eq!(action_count, MODEL_ACTIONS.len());
+
+        let operation_count = artifact["covered_operation_classes"]
+            .as_array()
+            .expect("artifact operation class list is an array")
+            .len();
+        assert_eq!(operation_count, MODELED_KERNEL_OPERATIONS.len());
+
+        let handoff_count = artifact["covered_workqueue_handoffs"]
+            .as_array()
+            .expect("artifact handoff list is an array")
+            .len();
+        assert_eq!(handoff_count, MODELED_WORKQUEUE_HANDOFFS.len());
+
+        assert_eq!(
+            artifact["runtime_boundary"],
+            "source model only; not mounted runtime evidence"
+        );
     }
 }

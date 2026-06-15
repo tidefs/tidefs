@@ -184,8 +184,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 blockers = [
-  "GitHub issue #291 owns kernel context tokens and teardown race proof harness work.",
-  "No artifact proves work cannot run after teardown.",
+  "The recorded teardown proof is bounded source-model evidence, not mounted Linux runtime evidence.",
+  "No claims-gate-review artifact is recorded for this claim.",
 ]
-generated_doc = "Planned kernel no-work-after-teardown claim. TideFS must keep this as future proof work until context-token and teardown race evidence exists."
-evidence_artifacts = []
+generated_doc = "Planned kernel no-work-after-teardown claim. TideFS has bounded source-model context-token and teardown race evidence, but it is not mounted runtime evidence and still lacks claims-gate review."
+evidence_artifacts = [
+  { class = "kernel-context-token-model", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json" },
+  { class = "teardown-race-proof-artifact", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json" },
+]
