@@ -177,6 +177,27 @@
             ];
           };
 
+          tidefsUblkCompletionRuntime = import ./nix/packages/tidefs.nix {
+            inherit (pkgs) lib pkg-config;
+            inherit (pkgs) fuse3 rdma-core;
+            rustPlatform = rustPlatform;
+            src = tidefsCtlSrc;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+            cargoBuildFlags = [
+              "-p" "tidefsctl"
+              "-p" "tidefs-block-volume-adapter-daemon"
+              "-p" "tidefs-xtask"
+              "--bins"
+            ];
+            workspaceBins = [
+              "tidefsctl"
+              "tidefs-block-volume-adapter-daemon"
+              "tidefs-xtask"
+            ];
+          };
+
           tidefsCtlRuntime = import ./nix/packages/tidefs.nix {
             inherit (pkgs) lib pkg-config;
             inherit (pkgs) fuse3 rdma-core;
@@ -3255,6 +3276,12 @@ EOF
             tidefsPackage = tidefsUblkRuntime;
           }).ublkPerfBaseline;
 
+          ublkCompletionArtifactValidation = (import ./nix/vm/ublk-completion-artifact-validation.nix {
+            inherit pkgs;
+            linuxKernel_7_0 = linuxKernel_7_0;
+            tidefsPackage = tidefsUblkCompletionRuntime;
+          }).ublkCompletionArtifactValidation;
+
           fuseFioBaselineValidation = (import ./nix/vm/fuse-fio-baseline-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
@@ -3447,7 +3474,16 @@ EOF
           qemu-smoke = qemuSourceApp "tidefs-qemu-smoke";
           fuse-vm-test = qemuSourceApp "tidefs-fuse-vm-test";
           fuse-fio-benchmark = qemuSourceApp "run-fuse-qemu-fio-baseline.sh";
-          qemu-ublk-smoke = qemuSourceApp "tidefs-qemu-ublk-smoke";
+          qemu-ublk-smoke = script "tidefs-qemu-ublk-smoke" [
+            pkgs.bash
+            pkgs.coreutils
+            pkgs.busybox
+            pkgs.cpio
+            pkgs.qemu
+            self.packages.${system}.ublkCompletionArtifactValidation
+          ] ''
+            exec ${self.packages.${system}.ublkCompletionArtifactValidation}/bin/tidefs-ublk-completion-artifact-validation "$@"
+          '';
           qemu-ublk-ext4-smoke = qemuSourceApp "tidefs-qemu-ublk-ext4-smoke";
           qemu-ublk-crash-consistency = qemuSourceApp "tidefs-qemu-ublk-crash-consistency";
 

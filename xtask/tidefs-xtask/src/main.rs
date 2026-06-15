@@ -738,6 +738,38 @@ fn main() {
                 process::exit(1);
             }
         }
+        Some("validate-ublk-completion-artifact") => {
+            let artifact_path = match args.next() {
+                Some(path) => path,
+                None => {
+                    eprintln!("validate-ublk-completion-artifact requires an artifact path");
+                    process::exit(2);
+                }
+            };
+            if let Some(extra) = args.next() {
+                eprintln!(
+                    "validate-ublk-completion-artifact accepts one path, got extra argument `{extra}`"
+                );
+                process::exit(2);
+            }
+            match tidefs_validation::ublk_completion_artifact::validate_ublk_completion_artifact_path(
+                &artifact_path,
+            ) {
+                Ok(summary) => {
+                    println!(
+                        "ublk completion artifact validated: events={} terminal_completions={} queues={} depth={}",
+                        summary.event_count,
+                        summary.terminal_completion_count,
+                        summary.nr_hw_queues,
+                        summary.queue_depth
+                    );
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    process::exit(1);
+                }
+            }
+        }
         Some("check-no-hidden-queues") => {
             if let Err(err) = no_hidden_queues::check_current_workspace() {
                 eprintln!("{err}");
@@ -1962,6 +1994,9 @@ fn print_help() {
     println!("  check-claims-gate       validate publish-facing capability claims");
     println!("  check-overclaims        alias for check-claims-gate");
     println!("  validate-claim <id>     validate a registered claim evidence set");
+    println!(
+        "  validate-ublk-completion-artifact <path> validate qid/tag runtime completion evidence"
+    );
     println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
     println!("  check-claim-gate        validate current worktree has a valid issue owner");
     println!("  check-worktree-claim    alias for check-claim-gate");

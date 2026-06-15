@@ -35,6 +35,7 @@ pub mod smoke;
 pub mod support_bundle;
 pub mod trace;
 pub mod two_node_harness_fuse_integrity;
+pub mod ublk_completion_artifact;
 pub mod ublk_discard_validation;
 pub mod validation_schema;
 pub mod validation_status;

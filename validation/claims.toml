@@ -165,11 +165,13 @@ required_evidence_classes = [
 ]
 blockers = [
   "The qid/tag state model is bounded pure-model evidence, not uBLK daemon or block-volume runtime evidence.",
-  "No focused runtime artifact proves exactly-once completion for qid/tag pairs.",
+  "The focused qemu-ublk-smoke runtime artifact is bounded evidence and still requires claims-gate review before product wording can strengthen.",
+  "No claims-gate-review artifact is recorded for this claim.",
 ]
-generated_doc = "Planned uBLK qid/tag exactly-once completion claim. TideFS has bounded model evidence only; runtime artifacts must still cover the completion contract before product wording can strengthen."
+generated_doc = "Planned uBLK qid/tag exactly-once completion claim. TideFS has bounded model evidence and a focused runtime completion artifact; claims-gate review is still required before product wording can strengthen."
 evidence_artifacts = [
   { class = "qid-tag-state-model", path = "validation/artifacts/ublk/qid-tag-state-model.json" },
+  { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json" },
 ]
 
 [[claims]]

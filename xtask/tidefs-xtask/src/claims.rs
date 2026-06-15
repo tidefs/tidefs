@@ -4,6 +4,9 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use tidefs_validation::ublk_completion_artifact::{
+    validate_ublk_completion_artifact_path, UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS,
+};
 
 pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, RDMA data-path, or final distributed operator UAPI capability before matching proof exists; unreleased internal TideFS paths must not be framed as product compatibility or migration promises without a real external boundary; tidefsctl command classification/admission is the public operator/harness/diagnostic/prototype/removed boundary; validation/claims.toml is the stable claim registry authority";
 pub const CLAIMS_GATE_REQUIRED_COMMAND: &str = "cargo run -p tidefs-xtask -- check-claims-gate";
@@ -621,6 +624,9 @@ fn check_claim_registry_docs(root: &Path, missing: &mut Vec<String>) {
     for err in validate_claim_registry(&registry) {
         missing.push(err);
     }
+    for err in validate_registered_runtime_ublk_artifacts(&root, &registry) {
+        missing.push(err);
+    }
 
     let expected = render_claim_registry_doc(&registry);
     let doc_path = root.join(CLAIM_REGISTRY_DOC_PATH);
@@ -751,6 +757,54 @@ fn validate_claim_registry(registry: &ClaimRegistry) -> Vec<String> {
     failures
 }
 
+fn validate_registered_runtime_ublk_artifacts(
+    root: &Path,
+    registry: &ClaimRegistry,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for claim in &registry.claims {
+        for artifact in &claim.evidence_artifacts {
+            if artifact.class != UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS {
+                continue;
+            }
+            failures.extend(validate_runtime_ublk_completion_artifact_content(
+                root, claim, artifact,
+            ));
+        }
+    }
+    failures
+}
+
+fn validate_runtime_ublk_completion_artifact_content(
+    root: &Path,
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let rel = Path::new(&artifact.path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        failures.push(format!(
+            "claim `{}` evidence artifact `{}` must be a workspace-relative path",
+            claim.id, artifact.path
+        ));
+        return failures;
+    }
+
+    let artifact_path = root.join(rel);
+    match validate_ublk_completion_artifact_path(&artifact_path) {
+        Ok(_) => {}
+        Err(error) => failures.push(format!(
+            "claim `{}` runtime uBLK completion artifact `{}` failed verifier: {error}",
+            claim.id, artifact.path
+        )),
+    }
+    failures
+}
+
 fn validate_claim_record(
     root: &Path,
     registry_modified: SystemTime,
@@ -827,6 +881,9 @@ fn validate_claim_record(
                     claim.id, artifact.path, artifact.class
                 ));
             }
+            failures.extend(validate_runtime_ublk_completion_artifact_content(
+                root, claim, artifact,
+            ));
         }
     }
     failures
