@@ -836,7 +836,7 @@ impl VfsLocalFileSystem {
         name: &[u8],
     ) -> std::result::Result<(InodeRecord, InodeRecord), Errno> {
         let fs = self.fs.borrow();
-        let parent_record = fs.inode(parent).map_err(|e| map_errno(&e))?;
+        let parent_record = self.parent_record_for_path(&fs, parent, parent_path)?;
         if !parent_record.is_directory() {
             return Err(Errno::ENOTDIR);
         }
@@ -846,6 +846,19 @@ impl VfsLocalFileSystem {
             .ok_or(Errno::ENOENT)?;
         let child_record = fs.inode(child.inode_id).map_err(|e| map_errno(&e))?;
         Ok((parent_record, child_record))
+    }
+
+    fn parent_record_for_path(
+        &self,
+        fs: &LocalFileSystem,
+        parent: InodeId,
+        parent_path: &str,
+    ) -> std::result::Result<InodeRecord, Errno> {
+        if parent == ROOT_INODE_ID && self.dataset_root_path.is_some() {
+            fs.stat(parent_path).map_err(|e| map_errno(&e))
+        } else {
+            fs.inode(parent).map_err(|e| map_errno(&e))
+        }
     }
 
     fn path_is_at_or_under(path: &str, prefix: &str) -> bool {
@@ -969,6 +982,14 @@ impl VfsLocalFileSystem {
         attr: &SetAttr,
         size_changed: bool,
     ) -> std::result::Result<(), Errno> {
+        if Self::metadata_setattr_is_noop(attr, size_changed) {
+            return Ok(());
+        }
+        let inode_id = fs.lookup(path).map_err(|e| map_errno(&e))?;
+        Self::apply_metadata_setattr_to_inode(fs, inode_id, attr, size_changed)
+    }
+
+    fn metadata_setattr_is_noop(attr: &SetAttr, size_changed: bool) -> bool {
         const METADATA_SETATTR_BITS: u32 = FATTR_MODE
             | FATTR_UID
             | FATTR_GID
@@ -977,12 +998,19 @@ impl VfsLocalFileSystem {
             | FATTR_CTIME
             | FATTR_ATIME_NOW
             | FATTR_MTIME_NOW;
+        attr.valid & METADATA_SETATTR_BITS == 0 && !size_changed
+    }
 
-        if attr.valid & METADATA_SETATTR_BITS == 0 && !size_changed {
+    fn apply_metadata_setattr_to_inode(
+        fs: &mut LocalFileSystem,
+        inode_id: InodeId,
+        attr: &SetAttr,
+        size_changed: bool,
+    ) -> std::result::Result<(), Errno> {
+        if Self::metadata_setattr_is_noop(attr, size_changed) {
             return Ok(());
         }
 
-        let inode_id = fs.lookup(path).map_err(|e| map_errno(&e))?;
         // Metadata-only setattr must not persist write-buffer-adjusted size;
         // content size/data_version change only when the buffer is flushed.
         let record = fs
@@ -3262,11 +3290,10 @@ impl VfsEngine for VfsLocalFileSystem {
         ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
         let parent_path = self.inode_path(parent)?;
-        let parent_record = self
-            .fs
-            .borrow()
-            .stat(&parent_path)
-            .map_err(|e| map_errno(&e))?;
+        let parent_record = {
+            let fs = self.fs.borrow();
+            self.parent_record_for_path(&fs, parent, &parent_path)?
+        };
         let parent_default_acl_entries = Self::parent_default_acl_entries(&parent_record);
         let child_permissions = Self::creation_permissions_for_parent(
             parent_default_acl_entries.as_ref(),
@@ -3293,12 +3320,13 @@ impl VfsEngine for VfsLocalFileSystem {
         }
         attr_update.uid = ctx.uid;
         attr_update.gid = child_gid;
-        Self::apply_metadata_setattr(&mut self.fs.borrow_mut(), &child_path, &attr_update, false)?;
-        let attr = self
-            .fs
-            .borrow()
-            .stat_attr(&child_path)
-            .map_err(|e| map_errno(&e))?;
+        let attr = {
+            let mut fs = self.fs.borrow_mut();
+            Self::apply_metadata_setattr_to_inode(&mut fs, record.inode_id, &attr_update, false)?;
+            fs.inode(record.inode_id)
+                .map(|record| record.to_inode_attr())
+                .map_err(|e| map_errno(&e))?
+        };
         self.path_cache
             .borrow_mut()
             .insert(record.inode_id, child_path);
@@ -3316,11 +3344,10 @@ impl VfsEngine for VfsLocalFileSystem {
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
 
-        let parent_record = self
-            .fs
-            .borrow()
-            .stat(&parent_path)
-            .map_err(|e| map_errno(&e))?;
+        let parent_record = {
+            let fs = self.fs.borrow();
+            self.parent_record_for_path(&fs, parent, &parent_path)?
+        };
         let parent_default_acl_entries = Self::parent_default_acl_entries(&parent_record);
         let child_permissions = Self::creation_permissions_for_parent(
             parent_default_acl_entries.as_ref(),
@@ -3407,11 +3434,10 @@ impl VfsEngine for VfsLocalFileSystem {
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
 
-        let parent_record = self
-            .fs
-            .borrow()
-            .stat(&parent_path)
-            .map_err(|e| map_errno(&e))?;
+        let parent_record = {
+            let fs = self.fs.borrow();
+            self.parent_record_for_path(&fs, parent, &parent_path)?
+        };
         let parent_default_acl_entries = Self::parent_default_acl_entries(&parent_record);
         let child_permissions = Self::creation_permissions_for_parent(
             parent_default_acl_entries.as_ref(),
@@ -3781,11 +3807,10 @@ impl VfsEngine for VfsLocalFileSystem {
         let child_path = build_child_path(&parent_path, name)?;
         let target_str = bytes_to_str(target)?;
 
-        let parent_record = self
-            .fs
-            .borrow()
-            .stat(&parent_path)
-            .map_err(|e| map_errno(&e))?;
+        let parent_record = {
+            let fs = self.fs.borrow();
+            self.parent_record_for_path(&fs, parent, &parent_path)?
+        };
         let child_mode = crate::constants::DEFAULT_SYMLINK_PERMISSIONS & !ctx.umask;
         let (child_mode, child_gid) = apply_setgid_inheritance_for_create(
             parent_record.mode,
@@ -3805,13 +3830,13 @@ impl VfsEngine for VfsLocalFileSystem {
         attr_update.mode = child_mode;
         attr_update.uid = ctx.uid;
         attr_update.gid = child_gid;
-        Self::apply_metadata_setattr(&mut self.fs.borrow_mut(), &child_path, &attr_update, false)?;
-
-        let attr = self
-            .fs
-            .borrow()
-            .stat_attr(&child_path)
-            .map_err(|e| map_errno(&e))?;
+        let attr = {
+            let mut fs = self.fs.borrow_mut();
+            Self::apply_metadata_setattr_to_inode(&mut fs, record.inode_id, &attr_update, false)?;
+            fs.inode(record.inode_id)
+                .map(|record| record.to_inode_attr())
+                .map_err(|e| map_errno(&e))?
+        };
         self.path_cache
             .borrow_mut()
             .insert(record.inode_id, child_path);

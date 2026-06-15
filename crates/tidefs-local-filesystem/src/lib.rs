@@ -5250,7 +5250,7 @@ impl LocalFileSystem {
     pub fn create_dir(&mut self, path: impl AsRef<str>, permissions: u32) -> Result<InodeRecord> {
         let path = path.as_ref();
         let (parent_id, name) = self.resolve_parent_and_name(path)?;
-        if self.directory(parent_id, path)?.contains_key(&name) {
+        if self.dir_entry_by_inode(parent_id, &name, path)?.is_some() {
             return Err(FileSystemError::AlreadyExists {
                 path: path.to_string(),
             });
@@ -8613,7 +8613,7 @@ impl LocalFileSystem {
             });
         }
         let (parent_id, name) = self.resolve_parent_and_name(path)?;
-        if self.directory(parent_id, path)?.contains_key(&name) {
+        if self.dir_entry_by_inode(parent_id, &name, path)?.is_some() {
             return Err(FileSystemError::AlreadyExists {
                 path: path.to_string(),
             });
