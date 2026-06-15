@@ -231,20 +231,31 @@ Standalone cargo/mock validation reports are retired from this count; use curren
 
 ## 9.1 Kernel Environment Source Model
 
-Issue #291 adds `src/kernel_env_model.rs` as a kmod-local source-model seed
-for Linux VFS context tokens and teardown race exploration. The model records
-sleepable/non-sleepable context, RCU/pin or workqueue ownership, mmap and
-page-cache callback boundaries, and teardown-state assumptions for the modeled
-kernel-facing operations. Its deterministic workqueue harness explores bounded
-interleavings and checks that no modeled work item starts after final teardown.
+`src/kernel_env_model.rs` is the kmod-local source model for Linux VFS context
+tokens and teardown race exploration. The model records sleepable/non-sleepable
+context, RCU/pin or workqueue ownership, mmap and page-cache callback
+boundaries, teardown-state assumptions, and the callback classes that may hand
+off to deferred workqueue bodies for the modeled kernel-facing operations. Its
+deterministic workqueue harness explores bounded interleavings for enqueue,
+work start, work completion, begin-teardown, final-teardown, and owner
+generation invalidation.
+
+The durable source-model artifact for `kernel.teardown.no_work_after.v1` is
+`validation/artifacts/kernel/teardown-race-proof-artifact.json`. It records
+the model version, depth-8 schedule bound, action alphabet, covered operation
+classes, callback-to-work handoffs, refusal counters, blocked final-teardown
+counters, and a passing verdict: no explored schedule starts modeled work after
+final teardown.
 
 This source model is not mounted runtime evidence and is not a C shim callback
 registration surface. Unsupported mounted paths remain fail-closed through the
 live kmod shim and the source-model Rust vm-ops/page-cache helpers remain
 non-product unless a later issue wires and validates them through the mounted
-Linux 7.0 path. The claim `kernel.teardown.no_work_after.v1` remains planned
-until a PR records the required context-token model, teardown proof artifact,
-claims-gate review, and any required mounted-kernel validation artifacts.
+Linux 7.0 path. The mounted C shim teardown review for this artifact found no
+separate mounted Linux workqueue in the reviewed path: `sync_fs`, `put_super`,
+and `kill_sb` keep `s_fs_info` live until the Rust engine teardown bridge runs.
+The claim `kernel.teardown.no_work_after.v1` remains planned until claims-gate
+review and any required mounted-kernel validation artifacts are recorded.
 
 ---
 
