@@ -1,0 +1,21 @@
+[package]
+name = "tidefs-performance-contract"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = "no_std admission, queue, and service-curve contracts for TideFS local performance correctness"
+
+[features]
+default = ["alloc"]
+alloc = []
+std = ["alloc"]
+serde = ["alloc", "dep:serde"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
+
+[lib]
+path = "src/lib.rs"

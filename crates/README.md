@@ -6,14 +6,14 @@ The current package-role authority is `docs/workspace-package-classification.md`
 
 ## Current Inventory
 
-- Workspace package roots under `crates/`: 137.
+- Workspace package roots under `crates/`: 138.
 - Excluded crate-local fuzz package roots under `crates/`: 4.
 - `crates/tidefs-fuser` is the vendored upstream `fuser` package and is tracked separately for provenance.
 - The remaining excluded crate-local package roots are standalone fuzz harnesses and must stay mirrored in root `workspace.exclude`.
 
 ## Role Groups
 
-- `product-code`: 115 crate roots. See the authority document for the full list and dispositions.
+- `product-code`: 116 crate roots. See the authority document for the full list and dispositions.
 - `adapter-operator`: 8 crate roots. See the authority document for the full list and dispositions.
 - `policy-tooling`: 7 crate roots. See the authority document for the full list and dispositions.
 - `proof-harness`: 6 crate roots. See the authority document for the full list and dispositions.

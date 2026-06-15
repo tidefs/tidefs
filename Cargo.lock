@@ -2907,6 +2907,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-performance-contract"
+version = "0.421.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "tidefs-permission"
 version = "0.421.0"
 dependencies = [
