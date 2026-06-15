@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 149 |
+| Workspace packages | 150 |
 | Explicitly excluded package roots | 5 |
-| Discovered package manifests | 154 |
-| Classified package roots | 154 |
+| Discovered package manifests | 155 |
+| Classified package roots | 155 |
 
 ## Role Semantics
 
@@ -32,7 +32,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Role | Count |
 | --- | ---: |
-| `product-code` | 116 |
+| `product-code` | 117 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
 | `proof-harness` | 10 |
@@ -123,6 +123,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-node-drain` | `tidefs-node-drain` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-node-join` | `tidefs-node-join` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-object-io` | `tidefs-object-io` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
+| `crates/tidefs-offload-core` | `tidefs-offload-core` | `workspace-member` | `product-code` | planned authority surface for non-authoritative offload descriptor, lease, CPU reference, and completion validation; not a GPU/FPGA production acceleration claim. |
 | `crates/tidefs-online-defrag` | `tidefs-online-defrag` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-orphan-index` | `tidefs-orphan-index` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-partition-runtime` | `tidefs-partition-runtime` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -222,6 +223,7 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `crates/tidefs-kernel-cutover-runtime` | `tidefs-kernel-cutover-runtime` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-kmod-posix-vfs` | `tidefs-kmod-posix-vfs` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue required before release claims. |
 | `crates/tidefs-model-core` | `tidefs-model-core` | `proof-harness` | planned authority surface for trace and oracle validation; follow-up issue required before it can support release claims. |
+| `crates/tidefs-offload-core` | `tidefs-offload-core` | `product-code` | planned authority surface for non-authoritative offload descriptor, lease, CPU reference, and completion validation; not a GPU/FPGA production acceleration claim. |
 | `crates/tidefs-online-defrag` | `tidefs-online-defrag` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-performance-contract` | `tidefs-performance-contract` | `product-code` | planned authority surface for performance admission and queue metadata; follow-up issue required before release claims. |
 | `crates/tidefs-posix-filesystem-adapter-reply` | `tidefs-posix-filesystem-adapter-reply` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue required before release claims. |

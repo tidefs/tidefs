@@ -1,0 +1,15 @@
+artifact_version = 1
+claim = "offload.ready.non_authoritative.v1"
+evidence_class = "cpu-reference-backend"
+source_crate = "crates/tidefs-offload-core"
+issue = 288
+
+validated_behaviors = [
+  "CpuReferenceBackend executes CRC32C checksum through the v1 descriptor and writes the 4-byte little-endian result.",
+  "CpuReferenceBackend executes one-shard XOR parity generation from fixed data-shard and shard-length descriptor parameters.",
+  "CpuReferenceBackend executes deterministic 64-bit scrub digest generation through the same descriptor and completion path.",
+]
+
+non_claims = [
+  "No GPU, FPGA, DMA, SIMD production backend, kernel path, RDMA path, or storage-runtime integration is validated by this artifact.",
+]

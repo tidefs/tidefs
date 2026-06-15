@@ -63,6 +63,7 @@ members = [
   "crates/tidefs-placement-runtime",
   "crates/tidefs-verification-engine",
   "crates/tidefs-flow-commit-coordinator",
+  "crates/tidefs-offload-core",
   "crates/tidefs-extent-map",
   "crates/tidefs-locator-table",
   "crates/tidefs-space-accounting",

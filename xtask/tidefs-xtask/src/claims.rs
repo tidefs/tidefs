@@ -881,9 +881,11 @@ fn validate_claim_record(
                     claim.id, artifact.path, artifact.class
                 ));
             }
-            failures.extend(validate_runtime_ublk_completion_artifact_content(
-                root, claim, artifact,
-            ));
+            if artifact.class == UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS {
+                failures.extend(validate_runtime_ublk_completion_artifact_content(
+                    root, claim, artifact,
+                ));
+            }
         }
     }
     failures
@@ -1383,8 +1385,8 @@ mod tests {
         let claim = registry
             .claims
             .iter()
-            .find(|claim| claim.id == "offload.ready.non_authoritative.v1")
-            .expect("offload claim registered");
+            .find(|claim| claim.id == "scrub.foreground_read.protected.v1")
+            .expect("planned scrub claim registered");
         let failures = validate_claim_record(
             std::path::Path::new("."),
             std::time::SystemTime::now(),
@@ -1395,7 +1397,7 @@ mod tests {
             .any(|failure| failure.contains("is planned")));
         assert!(failures
             .iter()
-            .any(|failure| failure.contains("NEXTGEN-007")));
+            .any(|failure| failure.contains("Scrub/read isolation authority")));
     }
 
     #[test]
