@@ -3523,6 +3523,12 @@ impl LocalFileSystem {
     /// keys via `content_chunk_object_key_for_version()`.
     fn record_reclaim_delta(&mut self, inode_id: InodeId, _freed_bytes: u64) {
         let record = self.state.inodes.get(&inode_id).cloned();
+        if record
+            .as_ref()
+            .is_some_and(|record| record.nlink == 0 && record.size == 0)
+        {
+            return;
+        }
         let dv = record.as_ref().map(|r| r.data_version);
         let chunk_reclaim_indexes = match record.as_ref().filter(|record| record.nlink == 0) {
             Some(record) => match read_content_layout_from_store(
@@ -5144,19 +5150,6 @@ impl LocalFileSystem {
         }
         let has_more = iter.next().is_some();
         Ok((entries, has_more))
-    }
-
-    pub(crate) fn write_empty_file_content(&mut self, record: &InodeRecord) -> Result<()> {
-        let mut dedup = self.dedup_index.borrow_mut();
-        write_chunked_content(
-            self.dedup_enabled,
-            self.store.raw_primary_store_mut(),
-            record,
-            &[],
-            &mut dedup,
-            self.quorum_store.as_mut(),
-            &self.content_compression_policy,
-        )
     }
 
     pub(crate) fn dir_entry_by_inode(
@@ -8761,21 +8754,24 @@ impl LocalFileSystem {
             });
         }
 
-        let result = {
-            let mut dedup = self.dedup_index.borrow_mut();
-            let mut pool_store = self.store.pool_store_mut();
-            write_chunked_content(
-                self.dedup_enabled,
-                &mut pool_store,
-                &record,
-                initial_content,
-                &mut dedup,
-                self.quorum_store.as_mut(),
-                &self.content_compression_policy,            )
-        };
-        if let Err(err) = result {
-            self.rollback_mutation_delta();
-            return Err(err);
+        if size > 0 || kind == NodeKind::Symlink {
+            let result = {
+                let mut dedup = self.dedup_index.borrow_mut();
+                let mut pool_store = self.store.pool_store_mut();
+                write_chunked_content(
+                    self.dedup_enabled,
+                    &mut pool_store,
+                    &record,
+                    initial_content,
+                    &mut dedup,
+                    self.quorum_store.as_mut(),
+                    &self.content_compression_policy,
+                )
+            };
+            if let Err(err) = result {
+                self.rollback_mutation_delta();
+                return Err(err);
+            }
         }
         // Accumulate space delta for new file creation: logical write of content bytes.
         if size > 0 {
@@ -11730,6 +11726,34 @@ mod orphan_index_integration_tests {
             -1,
             "inode tombstone delta should be -1"
         );
+    }
+
+    #[test]
+    fn empty_file_unlink_records_only_inode_tombstone_reclaim() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut fs = LocalFileSystem::open(root.path()).expect("open");
+        fs.create_file("/empty", 0o644).expect("create_file");
+        fs.do_commit().expect("commit");
+
+        assert_eq!(fs.reclaim_queue_depth(), 0);
+
+        fs.set_auto_commit(false);
+        fs.unlink("/empty").expect("unlink");
+
+        let q = fs.reclaim_queue.lock().unwrap();
+        assert_eq!(q.len(), 1);
+        let entries = q.entries();
+        assert!(
+            entries
+                .iter()
+                .all(|(_, entry)| entry.family != ReclaimQueueFamily::Extent),
+            "zero-length unlink should not enqueue content extent reclaim entries"
+        );
+        let tombstone_count = entries
+            .iter()
+            .filter(|(_, entry)| entry.family == ReclaimQueueFamily::InodeTombstone)
+            .count();
+        assert_eq!(tombstone_count, 1);
     }
 
     #[test]

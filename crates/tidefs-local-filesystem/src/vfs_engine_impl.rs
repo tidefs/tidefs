@@ -1278,11 +1278,6 @@ impl VfsLocalFileSystem {
             mode: new_mode,
         };
 
-        if let Err(err) = fs.write_empty_file_content(&record) {
-            fs.rollback_mutation_delta();
-            return Err(map_errno(&err));
-        }
-
         fs.mark_inode_metadata_dirty(inode_id);
         fs.mark_dir_dirty(parent_id);
         fs.mark_inode_metadata_dirty(parent_id);
@@ -6270,6 +6265,15 @@ mod tests {
             assert_eq!(fs.list_dir_by_inode(ROOT_INODE_ID).unwrap().len(), 512);
         }
 
+        engine.fs.borrow_mut().sync_all().unwrap();
+        let report =
+            crate::inspect_filesystem_content_objects(dir.path(), crate::StoreOptions::default())
+                .unwrap();
+        assert_eq!(report.file_like_inodes, 512);
+        assert_eq!(report.referenced_objects.len(), 0);
+        assert_eq!(report.missing_objects, 0);
+        assert_eq!(report.malformed_records, 0);
+
         let first_fh = first_fh.unwrap();
         assert_eq!(engine.read(&first_fh, 0, 1, &caller).unwrap(), b"");
         assert_eq!(engine.write(&first_fh, 0, b"x", &caller).unwrap(), 1);
@@ -6281,6 +6285,12 @@ mod tests {
         );
         assert_eq!(engine.read(&first_fh, 0, 1, &caller).unwrap(), b"x");
         engine.release(&first_fh).unwrap();
+        drop(engine);
+
+        let mut reopened = LocalFileSystem::open(dir.path()).unwrap();
+        assert_eq!(reopened.read_file("/perm-001").unwrap(), b"");
+        reopened.write_file("/perm-001", 0, b"y").unwrap();
+        assert_eq!(reopened.read_file("/perm-001").unwrap(), b"y");
     }
 
     #[test]
