@@ -57,7 +57,7 @@ Current `raw_primary_store()` and `raw_primary_store_mut()` matches:
 | Path | Current matches | Inventory note |
 |---|---:|---|
 | `crates/tidefs-local-object-store/src/pool/mod.rs` | 7 | Pool accessors and `PoolStore` escape hatches. This is the lower object-store authority, not a mounted-filesystem proof. |
-| `crates/tidefs-local-filesystem/src/lib.rs` | 64 | 63 mounted production matches plus one in-file test raw drain assertion. |
+| `crates/tidefs-local-filesystem/src/lib.rs` | 65 | 64 mounted production matches plus one in-file test raw drain assertion. |
 | `crates/tidefs-local-filesystem/src/crash_recovery.rs` | 21 | Crash-matrix validation helpers stage raw commit-boundary objects. |
 | `crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7 | One production key-scan path plus six unit-test assertions. |
 | `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` | 7 | Five live mounted VFS/admin paths plus two encryption-feature tests. |

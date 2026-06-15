@@ -5122,6 +5122,33 @@ impl LocalFileSystem {
             })
     }
 
+    pub(crate) fn write_empty_file_content(&mut self, record: &InodeRecord) -> Result<()> {
+        let mut dedup = self.dedup_index.borrow_mut();
+        write_chunked_content(
+            self.dedup_enabled,
+            self.store.raw_primary_store_mut(),
+            record,
+            &[],
+            &mut dedup,
+            self.quorum_store.as_mut(),
+            &self.content_compression_policy,
+        )
+    }
+
+    pub(crate) fn dir_entry_by_inode(
+        &self,
+        parent_id: InodeId,
+        name: &[u8],
+        path: &str,
+    ) -> Result<Option<NamespaceEntry>> {
+        validate_name(name)?;
+        if let Some(dir) = self.state.directories.get(&parent_id) {
+            return Ok(dir.get(name).cloned());
+        }
+        let directory = self.directory(parent_id, path)?;
+        Ok(directory.get(name).cloned())
+    }
+
     /// Find the parent directory that contains a real entry for `child_id`.
     pub fn parent_dir_for_inode(&self, child_id: InodeId) -> Option<InodeId> {
         if child_id == ROOT_INODE_ID {
