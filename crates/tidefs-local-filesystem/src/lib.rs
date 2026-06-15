@@ -5107,6 +5107,30 @@ impl LocalFileSystem {
             })
     }
 
+    /// List a bounded window of entries in a directory by inode ID.
+    pub fn list_dir_by_inode_window(
+        &self,
+        parent_id: InodeId,
+        offset: u64,
+        limit: usize,
+    ) -> Result<(Vec<NamespaceEntry>, bool)> {
+        let directory =
+            self.state
+                .directories
+                .get(&parent_id)
+                .ok_or(FileSystemError::NotFound {
+                    path: format!("dir-inode:{}", parent_id.0),
+                })?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        let mut iter = directory.values().skip(start);
+        let mut entries = Vec::with_capacity(limit.min(directory.len().saturating_sub(start)));
+        for entry in iter.by_ref().take(limit) {
+            entries.push(entry.clone());
+        }
+        let has_more = iter.next().is_some();
+        Ok((entries, has_more))
+    }
+
     pub(crate) fn write_empty_file_content(&mut self, record: &InodeRecord) -> Result<()> {
         let mut dedup = self.dedup_index.borrow_mut();
         write_chunked_content(
