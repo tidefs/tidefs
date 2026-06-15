@@ -2427,6 +2427,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-env-fuse-model"
+version = "0.421.0"
+dependencies = [
+ "tidefs-model-core",
+ "tidefs-types-vfs-core",
+]
+
+[[package]]
 name = "tidefs-env-ublk-model"
 version = "0.421.0"
 dependencies = [
