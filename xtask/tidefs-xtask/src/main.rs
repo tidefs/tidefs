@@ -6,6 +6,7 @@ mod authority;
 mod block;
 mod claims;
 mod cluster;
+mod contract_codecs;
 mod coverage;
 mod forgejo_work;
 mod format_golden;
@@ -70,6 +71,12 @@ fn main() {
         }
         Some("check-trace-oracle") => {
             if let Err(err) = trace_oracle::check_trace_oracle_current_workspace() {
+                eprintln!("{err}");
+                process::exit(1);
+            }
+        }
+        Some("check-contract-codecs") => {
+            if let Err(err) = contract_codecs::check_contract_codecs_current_workspace() {
                 eprintln!("{err}");
                 process::exit(1);
             }
@@ -1563,6 +1570,7 @@ fn print_summary() {
     }
     println!("policy_check_command=check-workspace-policy");
     println!("code_navigability_check_command=check-code-navigability");
+    println!("contract_codecs_check_command=check-contract-codecs");
     println!("terminology_command=terminology");
     println!("terminology_check_command=check-terminology");
     println!("human_readability_check_command=check-human-readability");
@@ -1777,6 +1785,7 @@ fn print_help() {
     println!(
         "  check-trace-oracle       validate trace oracle crate and replay golden trace corpus"
     );
+    println!("  check-contract-codecs    validate request contract codec golden vectors");
     println!(
         "  check-locator-table      validate V1 inline-hash locator table implementation markers"
     );
