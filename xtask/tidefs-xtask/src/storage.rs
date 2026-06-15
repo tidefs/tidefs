@@ -4249,7 +4249,7 @@ const MOUNTED_TRANSFORM_RAW_STORE_COUNTS: &[(&str, usize)] = &[
     ("crates/tidefs-local-filesystem/src/lib.rs", 64),
     ("crates/tidefs-local-filesystem/src/crash_recovery.rs", 21),
     ("crates/tidefs-local-filesystem/src/journal_cleaner.rs", 7),
-    ("crates/tidefs-local-filesystem/src/vfs_engine_impl.rs", 6),
+    ("crates/tidefs-local-filesystem/src/vfs_engine_impl.rs", 7),
 ];
 
 pub fn check_mounted_transform_authority_current_workspace() -> Result<(), StorageCheckError> {
@@ -4295,7 +4295,7 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
             "`crates/tidefs-local-filesystem/src/lib.rs` | 64",
             "`crates/tidefs-local-filesystem/src/crash_recovery.rs` | 21",
             "`crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7",
-            "`crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` | 6",
+            "`crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` | 7",
         ],
         &mut missing,
     );
