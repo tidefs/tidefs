@@ -1092,14 +1092,13 @@ impl VfsLocalFileSystem {
             ctx.gid,
         );
 
+        let parent_id = parent_record.inode_id;
+        let name = name.to_vec();
         let mut fs = self.fs.borrow_mut();
-        let (parent_id, name) = fs
-            .resolve_parent_and_name(&child_path)
-            .map_err(|e| map_errno(&e))?;
         if fs
-            .directory(parent_id, &child_path)
+            .dir_entry_by_inode(parent_id, &name, &parent_path)
             .map_err(|e| map_errno(&e))?
-            .contains_key(&name)
+            .is_some()
         {
             return Err(Errno::EEXIST);
         }
@@ -1170,6 +1169,141 @@ impl VfsLocalFileSystem {
                     .borrow_mut()
                     .insert(attr.inode_id, child_path.clone());
             })
+    }
+
+    fn create_empty_regular_file(
+        &self,
+        parent_id: InodeId,
+        parent_path: &str,
+        child_path: &str,
+        name: &[u8],
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        parent_default_acl_entries: Option<&tidefs_posix_acl::PosixAcl>,
+    ) -> std::result::Result<InodeRecord, Errno> {
+        let mut fs = self.fs.borrow_mut();
+        if fs
+            .dir_entry_by_inode(parent_id, name, parent_path)
+            .map_err(|e| map_errno(&e))?
+            .is_some()
+        {
+            return Err(Errno::EEXIST);
+        }
+
+        let inode_ancestors = fs.quota_ancestors_for_parent(parent_id);
+        let delta_bytes = crate::quota::allocation_grains_for_len(0);
+        let pool_free = fs.pool_free_bytes_for_quota();
+        let decision =
+            fs.state
+                .quota_table
+                .check_delta(&inode_ancestors, delta_bytes, 1, pool_free);
+        if decision.is_refusal() {
+            return Err(map_errno(&FileSystemError::from(decision)));
+        }
+
+        fs.ensure_inode_capacity_for_new_inode()
+            .map_err(|e| map_errno(&e))?;
+
+        fs.begin_mutation();
+        if !fs.state.inodes.contains_key(&parent_id) {
+            fs.rollback_mutation_delta();
+            return Err(Errno::ENOENT);
+        }
+        match fs.dir_entry_by_inode(parent_id, name, parent_path) {
+            Ok(Some(_)) => {
+                fs.rollback_mutation_delta();
+                return Err(Errno::EEXIST);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                fs.rollback_mutation_delta();
+                return Err(map_errno(&err));
+            }
+        }
+
+        let tick = fs.bump_generation();
+        let inode_id = fs.allocate_inode_id();
+        let generation = Generation::new(tick);
+        let mut new_mode = mode;
+        let mut xattrs = BTreeMap::new();
+        if let Some(acl_entries) = parent_default_acl_entries {
+            for (name, value) in
+                tidefs_posix_acl::default_acl_inheritance_for_parent(acl_entries, new_mode, false)
+            {
+                if name == Self::POSIX_ACL_ACCESS_XATTR {
+                    if let Ok(access_acl) = tidefs_posix_acl::decode_posix_acl_xattr(&value) {
+                        new_mode =
+                            tidefs_posix_acl::posix_mode_from_access_acl(&access_acl, new_mode);
+                    }
+                }
+                xattrs.insert(name.to_vec(), value);
+            }
+        }
+
+        let record = InodeRecord {
+            rdev: 0,
+            inode_id,
+            generation,
+            facets: NodeKind::File.to_facets(),
+            mode: new_mode,
+            uid,
+            gid,
+            nlink: 1,
+            size: 0,
+            data_version: tick,
+            metadata_version: tick,
+            posix_time: crate::types::PosixTimeRecord::now(),
+            xattrs,
+            dir_storage_kind: 0,
+            xattr_storage_kind: 0,
+            dir_rev: 0,
+        };
+
+        let name_vec = name.to_vec();
+        let _ = fs.intent_log_buffer.as_ref().map(|buf| {
+            let _frame = buf.append(
+                tidefs_intent_log::IntentLogRecord::Create {
+                    parent: parent_id.get(),
+                    name: name_vec.clone(),
+                    mode: new_mode,
+                    ino: inode_id.get(),
+                },
+                0,
+            );
+        });
+        let entry = NamespaceEntry {
+            name: name_vec.clone(),
+            inode_id,
+            generation,
+            facets: NodeKind::File.to_facets(),
+            mode: new_mode,
+        };
+
+        if let Err(err) = fs.write_empty_file_content(&record) {
+            fs.rollback_mutation_delta();
+            return Err(map_errno(&err));
+        }
+
+        fs.mark_inode_metadata_dirty(inode_id);
+        fs.mark_dir_dirty(parent_id);
+        fs.mark_inode_metadata_dirty(parent_id);
+        Arc::make_mut(&mut fs.state.inodes).insert(inode_id, record.clone());
+        fs.inode_cache.borrow_mut().invalidate(inode_id);
+        if let Err(err) = fs.insert_directory_entry(parent_id, name_vec, entry, tick) {
+            fs.rollback_mutation_delta();
+            return Err(map_errno(&err));
+        }
+        fs.update_parent_metadata_timestamps(parent_id, tick);
+
+        let record = fs.commit_mutation(record).map_err(|e| map_errno(&e))?;
+        fs.state
+            .quota_table
+            .apply_delta(&inode_ancestors, delta_bytes, 1);
+        self.path_cache
+            .borrow_mut()
+            .insert(record.inode_id, child_path.to_string());
+        Ok(record)
     }
 
     /// Return the configured sync guarantee for this dataset mount.
@@ -3169,9 +3303,23 @@ impl VfsEngine for VfsLocalFileSystem {
             S_IFREG | child_permissions,
             ctx.gid,
         );
-        let existing = self.fs.borrow().stat(&child_path);
+        let existing = {
+            let fs = self.fs.borrow();
+            fs.dir_entry_by_inode(parent_record.inode_id, name, &parent_path)
+                .and_then(|entry| {
+                    entry
+                        .map(|entry| {
+                            fs.get_inode_by_id(entry.inode_id).cloned().ok_or(
+                                FileSystemError::CorruptState {
+                                    reason: "directory entry references missing inode",
+                                },
+                            )
+                        })
+                        .transpose()
+                })
+        };
         match existing {
-            Ok(record) => {
+            Ok(Some(record)) => {
                 if flags & O_EXCL != 0 {
                     return Err(Errno::EEXIST);
                 }
@@ -3197,36 +3345,24 @@ impl VfsEngine for VfsLocalFileSystem {
                     .insert(record.inode_id, child_path);
                 return Ok((attr, fh));
             }
+            Ok(None) => {}
             Err(err) => {
-                if !matches!(err, FileSystemError::NotFound { .. }) {
-                    return Err(map_errno(&err));
-                }
+                return Err(map_errno(&err));
             }
         }
 
-        let record = self
-            .fs
-            .borrow_mut()
-            .create_file(&child_path, child_mode & 0o7777)
-            .map_err(|e| map_errno(&e))?;
-        let mut attr_update = SetAttr::new();
-        attr_update.valid = FATTR_UID | FATTR_GID;
-        if parent_default_acl_entries.is_none() {
-            attr_update.valid |= FATTR_MODE;
-            attr_update.mode = child_mode;
-        }
-        attr_update.uid = ctx.uid;
-        attr_update.gid = child_gid;
-        Self::apply_metadata_setattr(&mut self.fs.borrow_mut(), &child_path, &attr_update, false)?;
-        let attr = self
-            .fs
-            .borrow()
-            .stat_attr(&child_path)
-            .map_err(|e| map_errno(&e))?;
+        let record = self.create_empty_regular_file(
+            parent_record.inode_id,
+            &parent_path,
+            &child_path,
+            name,
+            child_mode,
+            ctx.uid,
+            child_gid,
+            parent_default_acl_entries.as_ref(),
+        )?;
+        let attr = record.to_inode_attr();
         let fh = self.register_file_handle(record.inode_id, flags, false)?;
-        self.path_cache
-            .borrow_mut()
-            .insert(record.inode_id, child_path);
         Ok((attr, fh))
     }
 
@@ -3259,38 +3395,30 @@ impl VfsEngine for VfsLocalFileSystem {
             ctx.gid,
         );
 
-        // Hold a single mutable borrow across existence check and creation
-        // to close the TOCTOU window between stat and create_file.
-        let mut fs = self.fs.borrow_mut();
-        if fs.stat(&child_path).is_ok() {
+        if self
+            .fs
+            .borrow()
+            .dir_entry_by_inode(parent_record.inode_id, name, &parent_path)
+            .map_err(|e| map_errno(&e))?
+            .is_some()
+        {
             return Err(Errno::EEXIST);
         }
 
-        let record = fs
-            .create_file(&child_path, child_mode & 0o7777)
-            .map_err(|e| map_errno(&e))?;
-        drop(fs);
-
-        let mut attr_update = SetAttr::new();
-        attr_update.valid = FATTR_UID | FATTR_GID;
-        if parent_default_acl_entries.is_none() {
-            attr_update.valid |= FATTR_MODE;
-            attr_update.mode = child_mode;
-        }
-        attr_update.uid = ctx.uid;
-        attr_update.gid = child_gid;
-        Self::apply_metadata_setattr(&mut self.fs.borrow_mut(), &child_path, &attr_update, false)?;
-        let attr = self
-            .fs
-            .borrow()
-            .stat_attr(&child_path)
-            .map_err(|e| map_errno(&e))?;
+        let record = self.create_empty_regular_file(
+            parent_record.inode_id,
+            &parent_path,
+            &child_path,
+            name,
+            child_mode,
+            ctx.uid,
+            child_gid,
+            parent_default_acl_entries.as_ref(),
+        )?;
+        let attr = record.to_inode_attr();
         // Preserve the caller's open flags so subsequent data-plane operations
         // validate against the same (inode, flags, fh_id) triple.
         let fh = self.register_file_handle(record.inode_id, flags, false)?;
-        self.path_cache
-            .borrow_mut()
-            .insert(record.inode_id, child_path);
         Ok((attr, fh))
     }
 
@@ -6152,6 +6280,62 @@ mod tests {
         assert_eq!(attr.posix.mode & 0o777, 0o640);
         assert_eq!(attr.posix.uid, 4242);
         assert_eq!(attr.posix.gid, 4343);
+    }
+
+    #[test]
+    fn create_burst_empty_files_stays_metadata_only_until_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut fs = LocalFileSystem::open(dir.path()).expect("open");
+        fs.set_auto_commit(false);
+        fs.set_commit_group_throughput_profile();
+        fs.set_max_uncommitted_mutations(16 * 1024);
+        let engine = VfsLocalFileSystem::new(fs);
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let caller = RequestCtx {
+            uid: 4242,
+            gid: 4343,
+            pid: 77,
+            umask: 0o077,
+            groups: vec![4343],
+        };
+
+        let mut first_fh = None;
+        for idx in 0..512 {
+            let name = format!("perm-{idx:03}");
+            let (attr, fh) = engine
+                .create(root, name.as_bytes(), 0o666, 0, &caller)
+                .unwrap();
+            if idx == 0 {
+                assert_eq!(attr.posix.mode & 0o777, 0o600);
+                assert_eq!(attr.posix.uid, caller.uid);
+                assert_eq!(attr.posix.gid, caller.gid);
+                first_fh = Some(fh);
+            } else {
+                engine.release(&fh).unwrap();
+            }
+        }
+
+        {
+            let fs = engine.fs.borrow();
+            assert_eq!(fs.uncommitted_mutation_count(), 512);
+            assert!(
+                fs.state.dirty_content.is_empty(),
+                "empty creates should not dirty file content"
+            );
+            assert_eq!(fs.list_dir_by_inode(ROOT_INODE_ID).unwrap().len(), 512);
+        }
+
+        let first_fh = first_fh.unwrap();
+        assert_eq!(engine.read(&first_fh, 0, 1, &caller).unwrap(), b"");
+        assert_eq!(engine.write(&first_fh, 0, b"x", &caller).unwrap(), 1);
+        assert_eq!(engine.read(&first_fh, 0, 1, &caller).unwrap(), b"x");
+        engine.unlink(root, b"perm-000", &caller).unwrap();
+        assert_eq!(
+            engine.lookup(root, b"perm-000", &caller),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(engine.read(&first_fh, 0, 1, &caller).unwrap(), b"x");
+        engine.release(&first_fh).unwrap();
     }
 
     #[test]
