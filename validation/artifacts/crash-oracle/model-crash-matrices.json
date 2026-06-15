@@ -1,0 +1,405 @@
+{
+  "report_version": 1,
+  "generated_by": "tidefs-crash-oracle-rust-v0.421.0",
+  "evidence_scope": "bounded model-only crash matrix; no local runtime crash injection",
+  "runtime_claim_boundary": "local runtime write/fsync and rename claims stay planned/blocked until runtime evidence exists",
+  "matrices": [
+    {
+      "id": "model.write_fsync_crash_matrix.v1",
+      "claim_ids": [
+        "storage.write_fsync.crash_safety.v1",
+        "local.vfs.write_fsync_crash.v1"
+      ],
+      "backend": "tidefs-model-core",
+      "description": "write/fsync matrix over model states at intent, data, inode, fsync, and recovery boundaries",
+      "cases": [
+        {
+          "id": "write.intent_append.old_file",
+          "operation": "write",
+          "boundary": "intent-append",
+          "classification": "lost-unfsynced",
+          "recovered_fingerprint": "acd5393de711b3ece771dd89d8e3d00b999509fe288e47ff8c45cfd2f6c700fc",
+          "acceptable_fingerprints": [
+            {
+              "label": "old-file",
+              "classification": "lost-unfsynced",
+              "fingerprint": "acd5393de711b3ece771dd89d8e3d00b999509fe288e47ff8c45cfd2f6c700fc"
+            },
+            {
+              "label": "new-file",
+              "classification": "valid",
+              "fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404"
+            }
+          ],
+          "recovered_state_diffs": [],
+          "minimized_trace": null
+        },
+        {
+          "id": "write.data_publish.new_file",
+          "operation": "write",
+          "boundary": "data-publish",
+          "classification": "valid",
+          "recovered_fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404",
+          "acceptable_fingerprints": [
+            {
+              "label": "old-file",
+              "classification": "lost-unfsynced",
+              "fingerprint": "acd5393de711b3ece771dd89d8e3d00b999509fe288e47ff8c45cfd2f6c700fc"
+            },
+            {
+              "label": "new-file",
+              "classification": "valid",
+              "fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404"
+            }
+          ],
+          "recovered_state_diffs": [],
+          "minimized_trace": null
+        },
+        {
+          "id": "write.extent_publish.new_file",
+          "operation": "write",
+          "boundary": "extent-publish",
+          "classification": "valid",
+          "recovered_fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404",
+          "acceptable_fingerprints": [
+            {
+              "label": "old-file",
+              "classification": "lost-unfsynced",
+              "fingerprint": "acd5393de711b3ece771dd89d8e3d00b999509fe288e47ff8c45cfd2f6c700fc"
+            },
+            {
+              "label": "new-file",
+              "classification": "valid",
+              "fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404"
+            }
+          ],
+          "recovered_state_diffs": [],
+          "minimized_trace": null
+        },
+        {
+          "id": "write.inode_publish.new_file",
+          "operation": "write",
+          "boundary": "inode-publish",
+          "classification": "valid",
+          "recovered_fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404",
+          "acceptable_fingerprints": [
+            {
+              "label": "old-file",
+              "classification": "lost-unfsynced",
+              "fingerprint": "acd5393de711b3ece771dd89d8e3d00b999509fe288e47ff8c45cfd2f6c700fc"
+            },
+            {
+              "label": "new-file",
+              "classification": "valid",
+              "fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404"
+            }
+          ],
+          "recovered_state_diffs": [],
+          "minimized_trace": null
+        },
+        {
+          "id": "fsync.fsync_commit.new_file",
+          "operation": "write+fsync",
+          "boundary": "fsync-commit",
+          "classification": "valid",
+          "recovered_fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404",
+          "acceptable_fingerprints": [
+            {
+              "label": "fsynced-new-file",
+              "classification": "valid",
+              "fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404"
+            }
+          ],
+          "recovered_state_diffs": [],
+          "minimized_trace": null
+        },
+        {
+          "id": "fsync.recovery_replay.new_file",
+          "operation": "write+fsync",
+          "boundary": "recovery-replay",
+          "classification": "valid",
+          "recovered_fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404",
+          "acceptable_fingerprints": [
+            {
+              "label": "fsynced-new-file",
+              "classification": "valid",
+              "fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404"
+            }
+          ],
+          "recovered_state_diffs": [],
+          "minimized_trace": null
+        },
+        {
+          "id": "fsync.root_publish.old_file_forbidden",
+          "operation": "write+fsync",
+          "boundary": "root-publish",
+          "classification": "forbidden",
+          "recovered_fingerprint": "acd5393de711b3ece771dd89d8e3d00b999509fe288e47ff8c45cfd2f6c700fc",
+          "acceptable_fingerprints": [
+            {
+              "label": "fsynced-new-file",
+              "classification": "valid",
+              "fingerprint": "0cf1e1919b92933a072e9aefdf3be6dd90d495b134f8c8e6282bc48797893404"
+            }
+          ],
+          "recovered_state_diffs": [
+            {
+              "path": "/file",
+              "field": "size",
+              "expected": "8",
+              "recovered": "3"
+            },
+            {
+              "path": "/file",
+              "field": "content-hex",
+              "expected": "6e65772d64617461",
+              "recovered": "6f6c64"
+            }
+          ],
+          "minimized_trace": {
+            "id": "write-fsync-old-file-forbidden",
+            "replay_hint": "cargo run -p tidefs-crash-oracle -- validation/artifacts/crash-oracle/model-crash-matrices.json",
+            "operations": [
+              {
+                "op": "create",
+                "path": "/file"
+              },
+              {
+                "op": "write",
+                "path": "/file",
+                "offset": 0,
+                "data_hex": "6f6c64"
+              },
+              {
+                "op": "fsync",
+                "path": "/file"
+              },
+              {
+                "op": "write",
+                "path": "/file",
+                "offset": 0,
+                "data_hex": "6e65772d64617461"
+              },
+              {
+                "op": "fsync",
+                "path": "/file"
+              },
+              {
+                "op": "crash_recover_at",
+                "boundary": "root-publish"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "model.rename_atomic_crash_matrix.v1",
+      "claim_ids": [
+        "namespace.rename.atomicity.v1",
+        "local.vfs.rename_atomic_crash.v1"
+      ],
+      "backend": "tidefs-model-core",
+      "description": "rename matrix over model namespace states at intent, root publication, and replay boundaries",
+      "cases": [
+        {
+          "id": "rename.intent_append.old_name",
+          "operation": "rename",
+          "boundary": "intent-append",
+          "classification": "lost-unfsynced",
+          "recovered_fingerprint": "c6491f96c663a236b9c5d52d68c50e416f53371b6768ea00c2a7efcfbedc75c9",
+          "acceptable_fingerprints": [
+            {
+              "label": "old-name",
+              "classification": "lost-unfsynced",
+              "fingerprint": "c6491f96c663a236b9c5d52d68c50e416f53371b6768ea00c2a7efcfbedc75c9"
+            },
+            {
+              "label": "new-name",
+              "classification": "valid",
+              "fingerprint": "765cd2c8ae662432bf5cd4c63e06e868978111dd3510f3600e51f67e3df85085"
+            }
+          ],
+          "recovered_state_diffs": [],
+          "minimized_trace": null
+        },
+        {
+          "id": "rename.root_publish.new_name",
+          "operation": "rename",
+          "boundary": "root-publish",
+          "classification": "valid",
+          "recovered_fingerprint": "765cd2c8ae662432bf5cd4c63e06e868978111dd3510f3600e51f67e3df85085",
+          "acceptable_fingerprints": [
+            {
+              "label": "old-name",
+              "classification": "lost-unfsynced",
+              "fingerprint": "c6491f96c663a236b9c5d52d68c50e416f53371b6768ea00c2a7efcfbedc75c9"
+            },
+            {
+              "label": "new-name",
+              "classification": "valid",
+              "fingerprint": "765cd2c8ae662432bf5cd4c63e06e868978111dd3510f3600e51f67e3df85085"
+            }
+          ],
+          "recovered_state_diffs": [],
+          "minimized_trace": null
+        },
+        {
+          "id": "rename.recovery_replay.new_name",
+          "operation": "rename",
+          "boundary": "recovery-replay",
+          "classification": "valid",
+          "recovered_fingerprint": "765cd2c8ae662432bf5cd4c63e06e868978111dd3510f3600e51f67e3df85085",
+          "acceptable_fingerprints": [
+            {
+              "label": "old-name",
+              "classification": "lost-unfsynced",
+              "fingerprint": "c6491f96c663a236b9c5d52d68c50e416f53371b6768ea00c2a7efcfbedc75c9"
+            },
+            {
+              "label": "new-name",
+              "classification": "valid",
+              "fingerprint": "765cd2c8ae662432bf5cd4c63e06e868978111dd3510f3600e51f67e3df85085"
+            }
+          ],
+          "recovered_state_diffs": [],
+          "minimized_trace": null
+        },
+        {
+          "id": "rename.recovery_replay.both_names_forbidden",
+          "operation": "rename",
+          "boundary": "recovery-replay",
+          "classification": "forbidden",
+          "recovered_fingerprint": "72152b831edb75527579431960b950de6abc7c4f5c4b32080c4d6c399d09db5a",
+          "acceptable_fingerprints": [
+            {
+              "label": "old-name",
+              "classification": "lost-unfsynced",
+              "fingerprint": "c6491f96c663a236b9c5d52d68c50e416f53371b6768ea00c2a7efcfbedc75c9"
+            },
+            {
+              "label": "new-name",
+              "classification": "valid",
+              "fingerprint": "765cd2c8ae662432bf5cd4c63e06e868978111dd3510f3600e51f67e3df85085"
+            }
+          ],
+          "recovered_state_diffs": [
+            {
+              "path": "/dir/source,/dir/dest",
+              "field": "atomic-name-set",
+              "expected": "exactly one name present",
+              "recovered": "both names present"
+            }
+          ],
+          "minimized_trace": {
+            "id": "rename-both-names-forbidden",
+            "replay_hint": "cargo run -p tidefs-crash-oracle -- validation/artifacts/crash-oracle/model-crash-matrices.json; recovered=both names present",
+            "operations": [
+              {
+                "op": "mkdir",
+                "path": "/dir"
+              },
+              {
+                "op": "create",
+                "path": "/dir/source"
+              },
+              {
+                "op": "write",
+                "path": "/dir/source",
+                "offset": 0,
+                "data_hex": "72656e616d652d64617461"
+              },
+              {
+                "op": "fsync",
+                "path": "/dir/source"
+              },
+              {
+                "op": "rename",
+                "path": "/dir/source",
+                "to": "/dir/dest"
+              },
+              {
+                "op": "crash_recover_at",
+                "boundary": "recovery-replay"
+              }
+            ]
+          }
+        },
+        {
+          "id": "rename.recovery_replay.neither_name_forbidden",
+          "operation": "rename",
+          "boundary": "recovery-replay",
+          "classification": "forbidden",
+          "recovered_fingerprint": "c2a11c9e57e309a8eb2327b9c6cb199863a8b810c3ef6c4bbac924f6666d29e7",
+          "acceptable_fingerprints": [
+            {
+              "label": "old-name",
+              "classification": "lost-unfsynced",
+              "fingerprint": "c6491f96c663a236b9c5d52d68c50e416f53371b6768ea00c2a7efcfbedc75c9"
+            },
+            {
+              "label": "new-name",
+              "classification": "valid",
+              "fingerprint": "765cd2c8ae662432bf5cd4c63e06e868978111dd3510f3600e51f67e3df85085"
+            }
+          ],
+          "recovered_state_diffs": [
+            {
+              "path": "/dir/source,/dir/dest",
+              "field": "atomic-name-set",
+              "expected": "exactly one name present",
+              "recovered": "neither name present"
+            }
+          ],
+          "minimized_trace": {
+            "id": "rename-neither-name-forbidden",
+            "replay_hint": "cargo run -p tidefs-crash-oracle -- validation/artifacts/crash-oracle/model-crash-matrices.json; recovered=neither name present",
+            "operations": [
+              {
+                "op": "mkdir",
+                "path": "/dir"
+              },
+              {
+                "op": "create",
+                "path": "/dir/source"
+              },
+              {
+                "op": "write",
+                "path": "/dir/source",
+                "offset": 0,
+                "data_hex": "72656e616d652d64617461"
+              },
+              {
+                "op": "fsync",
+                "path": "/dir/source"
+              },
+              {
+                "op": "rename",
+                "path": "/dir/source",
+                "to": "/dir/dest"
+              },
+              {
+                "op": "crash_recover_at",
+                "boundary": "recovery-replay"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "runtime_claims": [
+    {
+      "claim_id": "local.vfs.write_fsync_crash.v1",
+      "status": "blocked",
+      "classification": "unsupported-fail-closed",
+      "reason": "local runtime crash injection is intentionally outside the model-first slice"
+    },
+    {
+      "claim_id": "local.vfs.rename_atomic_crash.v1",
+      "status": "blocked",
+      "classification": "unsupported-fail-closed",
+      "reason": "local runtime rename crash evidence waits for runtime write-set clearance"
+    }
+  ]
+}
