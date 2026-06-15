@@ -90,6 +90,7 @@ members = [
   "crates/tidefs-cleanup-queue-core",
   "crates/tidefs-block-allocator",
   "crates/tidefs-block-volume-adapter-core",
+  "crates/tidefs-env-ublk-model",
   "crates/tidefs-block-volume-adapter-ublk-control-runtime",
   "crates/tidefs-ublk-abi",
   "crates/tidefs-local-object-store",

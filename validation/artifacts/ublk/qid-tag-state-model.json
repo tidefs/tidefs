@@ -1,0 +1,35 @@
+{
+  "report_version": 1,
+  "generated_by": "tidefs-env-ublk-model-rust-v0.421.0",
+  "claim_ids": [
+    "ublk.qid_tag.exactly_once_completion.v1"
+  ],
+  "evidence_class": "qid-tag-state-model",
+  "evidence_scope": "bounded pure uBLK qid/tag lifecycle model; no uBLK daemon, ioctl, or product block I/O runtime behavior",
+  "runtime_claim_boundary": "the runtime-ublk-completion-artifact class remains required before TideFS may strengthen this claim beyond model evidence",
+  "contract_boundary": "legal read, write, flush, and discard submissions refine into tidefs-types-vfs-core block RequestEnvelope records and terminal TideCompletion records",
+  "bounds": {
+    "queues": 2,
+    "tags_per_queue": 3,
+    "operations": [
+      "read",
+      "write",
+      "flush",
+      "discard"
+    ],
+    "terminal_events": [
+      "complete",
+      "abort",
+      "timeout",
+      "timeout-reissue-complete"
+    ]
+  },
+  "checked_invariants": [
+    "each qid/tag generation has at most one terminal TideFS completion",
+    "successful uBLK completion emits a matching TideCompletion for the current request token",
+    "abort emits one cancelled TideCompletion and rejects later uBLK completion commands",
+    "timeout emits one timed-out TideCompletion and stale completions after reissue fail closed",
+    "duplicate completion, stale generation, wrong qid, wrong tag, and completion after abort do not mutate the slot into a second terminal completion"
+  ],
+  "validation_hint": "cargo test -p tidefs-env-ublk-model --locked"
+}
