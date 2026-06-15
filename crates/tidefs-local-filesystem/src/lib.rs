@@ -378,8 +378,8 @@ use tidefs_extent_map::ExtentAllocator;
 use tidefs_local_object_store::{
     device_layout::DeviceMediaClass, CompressionConfig, CrashInjectionPoint, DeviceBacking,
     DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, EncryptionConfig, IntegrityDigest64,
-    IoClass, LocalObjectStore, ObjectKey, Pool, PoolConfig, PoolProperties, StoreEncryptionKey,
-    StoreError, StoreOptions,
+    IoClass, LocalObjectStore, ObjectKey, ObjectLocation, Pool, PoolConfig, PoolProperties,
+    StoreEncryptionKey, StoreError, StoreOptions,
 };
 use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
 use tidefs_quorum_write_runtime::{QuorumConfig, QuorumObjectStore};
@@ -485,7 +485,8 @@ pub fn audit_recovery_with_root_authentication_key(
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RecoveryAuditReport> {
     let mut store = LocalObjectStore::open_with_options(root, options)?;
-    audit_recovery_store(&mut store, root_authentication_key)
+    MountedCommittedRootRepairAuthority::raw_only(&mut store, root_authentication_key)
+        .recovery_audit()
 }
 
 pub fn verify_online(
@@ -504,7 +505,8 @@ pub fn verify_online_with_root_authentication_key(
     let Some(mut store) = LocalObjectStore::open_read_only_with_options(root, options)? else {
         return Ok(OnlineVerifierReport::empty());
     };
-    verify_online_store(&mut store, root_authentication_key)
+    MountedCommittedRootRepairAuthority::raw_only(&mut store, root_authentication_key)
+        .online_verifier_report()
 }
 pub fn fsck(root: impl AsRef<Path>, options: StoreOptions) -> Result<FsckReport> {
     fsck_with_root_authentication_key(root, options, default_root_authentication_key()?)
@@ -566,7 +568,8 @@ pub fn plan_root_retention_with_root_authentication_key(
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootRetentionPlan> {
     let mut store = LocalObjectStore::open_with_options(root, options)?;
-    plan_root_retention_store(&mut store, policy, root_authentication_key)
+    MountedCommittedRootRepairAuthority::raw_only(&mut store, root_authentication_key)
+        .root_retention_plan(policy)
 }
 
 pub fn run_crash_recovery_matrix(
@@ -1456,6 +1459,69 @@ pub(crate) enum MountedOpenRecoveryTransformMode {
     RawOnlyNoDeviceTransforms,
 }
 
+const MOUNTED_RECOVERY_TRANSFORM_ORDERING: &str =
+    "plaintext identity -> compression frame -> encryption frame -> checksum -> raw media bytes";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MountedCommittedRootRepairTransformMode {
+    MetadataRawOnlyNoDeviceTransforms,
+}
+
+pub(crate) struct MountedCommittedRootRepairAuthority<'a> {
+    store: &'a mut LocalObjectStore,
+    root_authentication_key: RootAuthenticationKey,
+    transform_mode: MountedCommittedRootRepairTransformMode,
+}
+
+impl<'a> MountedCommittedRootRepairAuthority<'a> {
+    fn raw_only(
+        store: &'a mut LocalObjectStore,
+        root_authentication_key: RootAuthenticationKey,
+    ) -> Self {
+        Self {
+            store,
+            root_authentication_key,
+            transform_mode:
+                MountedCommittedRootRepairTransformMode::MetadataRawOnlyNoDeviceTransforms,
+        }
+    }
+
+    fn transform_mode(&self) -> MountedCommittedRootRepairTransformMode {
+        self.transform_mode
+    }
+
+    fn transform_ordering_boundary(&self) -> &'static str {
+        MOUNTED_RECOVERY_TRANSFORM_ORDERING
+    }
+
+    fn recovery_probe_report(&mut self) -> Result<RecoveryProbeReport> {
+        recovery_probe_from_store(&mut *self.store, self.root_authentication_key)
+    }
+
+    fn recovery_audit(&mut self) -> Result<RecoveryAuditReport> {
+        audit_recovery_store(&mut *self.store, self.root_authentication_key)
+    }
+
+    fn online_verifier_report(&mut self) -> Result<OnlineVerifierReport> {
+        verify_online_store(&mut *self.store, self.root_authentication_key)
+    }
+
+    fn root_retention_plan(&mut self, policy: RootRetentionPolicy) -> Result<RootRetentionPlan> {
+        plan_root_retention_store(&mut *self.store, policy, self.root_authentication_key)
+    }
+
+    fn root_slot_locations_for_summary(
+        &self,
+        expected: &CommittedRootSummary,
+    ) -> Result<Vec<ObjectLocation>> {
+        root_slot_locations_for_summary(&*self.store, expected)
+    }
+
+    fn load_committed_root_state(&mut self, root: &RootCommitRecord) -> Result<FileSystemState> {
+        load_state_from_transaction(&mut *self.store, root, self.root_authentication_key)
+    }
+}
+
 pub(crate) struct MountedOpenRecoveryAuthority<'a> {
     store: &'a mut Pool,
     root_authentication_key: RootAuthenticationKey,
@@ -1494,12 +1560,65 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
         self.transform_mode
     }
 
+    fn transform_ordering_boundary(&self) -> &'static str {
+        MOUNTED_RECOVERY_TRANSFORM_ORDERING
+    }
+
     fn raw_recovery_store(&self) -> &LocalObjectStore {
         self.store.raw_primary_store()
     }
 
     fn raw_recovery_store_mut(&mut self) -> &mut LocalObjectStore {
         self.store.raw_primary_store_mut()
+    }
+
+    fn committed_root_repair_authority(&mut self) -> MountedCommittedRootRepairAuthority<'_> {
+        let root_authentication_key = self.root_authentication_key;
+        let authority = MountedCommittedRootRepairAuthority::raw_only(
+            self.raw_recovery_store_mut(),
+            root_authentication_key,
+        );
+        debug_assert_eq!(
+            authority.transform_mode(),
+            MountedCommittedRootRepairTransformMode::MetadataRawOnlyNoDeviceTransforms
+        );
+        debug_assert_eq!(
+            authority.transform_ordering_boundary(),
+            MOUNTED_RECOVERY_TRANSFORM_ORDERING
+        );
+        authority
+    }
+
+    fn recovery_probe_report(&mut self) -> Result<RecoveryProbeReport> {
+        self.committed_root_repair_authority()
+            .recovery_probe_report()
+    }
+
+    fn recovery_audit(&mut self) -> Result<RecoveryAuditReport> {
+        self.committed_root_repair_authority().recovery_audit()
+    }
+
+    fn online_verifier_report(&mut self) -> Result<OnlineVerifierReport> {
+        self.committed_root_repair_authority()
+            .online_verifier_report()
+    }
+
+    fn root_retention_plan(&mut self, policy: RootRetentionPolicy) -> Result<RootRetentionPlan> {
+        self.committed_root_repair_authority()
+            .root_retention_plan(policy)
+    }
+
+    fn root_slot_locations_for_summary(
+        &mut self,
+        expected: &CommittedRootSummary,
+    ) -> Result<Vec<ObjectLocation>> {
+        self.committed_root_repair_authority()
+            .root_slot_locations_for_summary(expected)
+    }
+
+    fn load_committed_root_state(&mut self, root: &RootCommitRecord) -> Result<FileSystemState> {
+        self.committed_root_repair_authority()
+            .load_committed_root_state(root)
     }
 
     fn load_or_initialize_state(&mut self) -> Result<FileSystemState> {
@@ -2701,6 +2820,10 @@ impl LocalFileSystem {
             open_recovery.transform_mode(),
             MountedOpenRecoveryTransformMode::RawOnlyNoDeviceTransforms
         );
+        debug_assert_eq!(
+            open_recovery.transform_ordering_boundary(),
+            MOUNTED_RECOVERY_TRANSFORM_ORDERING
+        );
         let mut state = open_recovery.load_or_initialize_state()?;
 
         // Load intent log for operational use (crash replay was already
@@ -3248,14 +3371,23 @@ impl LocalFileSystem {
         root_authentication_key: RootAuthenticationKey,
     ) -> Result<RecoveryProbeReport> {
         let mut store = Self::default_pool(root.as_ref(), &options, None, None, None)?;
-        recovery_probe_from_store(store.raw_primary_store_mut(), root_authentication_key)
+        let mut authority = MountedOpenRecoveryAuthority::raw_only(
+            &mut store,
+            root_authentication_key,
+            RecoveryPolicy::default(),
+        );
+        authority.recovery_probe_report()
     }
 
     pub fn recovery_probe_report(&mut self) -> Result<RecoveryProbeReport> {
-        recovery_probe_from_store(
-            self.store.raw_primary_store_mut(),
-            self.root_authentication_key,
-        )
+        let root_authentication_key = self.root_authentication_key;
+        let recovery_policy = self.recovery_policy;
+        let mut authority = MountedOpenRecoveryAuthority::raw_only(
+            &mut self.store,
+            root_authentication_key,
+            recovery_policy,
+        );
+        authority.recovery_probe_report()
     }
 
     pub fn root(&self) -> &Path {
@@ -3281,28 +3413,39 @@ impl LocalFileSystem {
     }
 
     pub fn recovery_audit(&mut self) -> Result<RecoveryAuditReport> {
-        audit_recovery_store(
-            self.store.raw_primary_store_mut(),
-            self.root_authentication_key,
-        )
+        let root_authentication_key = self.root_authentication_key;
+        let recovery_policy = self.recovery_policy;
+        let mut authority = MountedOpenRecoveryAuthority::raw_only(
+            &mut self.store,
+            root_authentication_key,
+            recovery_policy,
+        );
+        authority.recovery_audit()
     }
 
     pub fn online_verifier_report(&mut self) -> Result<OnlineVerifierReport> {
-        verify_online_store(
-            self.store.raw_primary_store_mut(),
-            self.root_authentication_key,
-        )
+        let root_authentication_key = self.root_authentication_key;
+        let recovery_policy = self.recovery_policy;
+        let mut authority = MountedOpenRecoveryAuthority::raw_only(
+            &mut self.store,
+            root_authentication_key,
+            recovery_policy,
+        );
+        authority.online_verifier_report()
     }
 
     pub fn root_retention_plan(
         &mut self,
         policy: RootRetentionPolicy,
     ) -> Result<RootRetentionPlan> {
-        plan_root_retention_store(
-            self.store.raw_primary_store_mut(),
-            policy,
-            self.root_authentication_key,
-        )
+        let root_authentication_key = self.root_authentication_key;
+        let recovery_policy = self.recovery_policy;
+        let mut authority = MountedOpenRecoveryAuthority::raw_only(
+            &mut self.store,
+            root_authentication_key,
+            recovery_policy,
+        );
+        authority.root_retention_plan(policy)
     }
 
     pub fn safe_root_retention_plan(&mut self) -> Result<RootRetentionPlan> {
@@ -3698,24 +3841,23 @@ impl LocalFileSystem {
             &plan.protected_object_keys,
             &plan.protected_root_slot_locations,
         )?;
-        let audit = audit_recovery_store(
-            self.store.raw_primary_store_mut(),
-            self.root_authentication_key,
-        )?;
+        let root_authentication_key = self.root_authentication_key;
+        let recovery_policy = self.recovery_policy;
+        let mut authority = MountedOpenRecoveryAuthority::raw_only(
+            &mut self.store,
+            root_authentication_key,
+            recovery_policy,
+        );
+        let audit = authority.recovery_audit()?;
         for expected in &expected_roots {
-            let locations =
-                root_slot_locations_for_summary(self.store.raw_primary_store(), expected)?;
+            let locations = authority.root_slot_locations_for_summary(expected)?;
             if locations.is_empty() {
                 return Err(FileSystemError::CorruptState {
                     reason: "safe reclamation lost a protected root-slot location",
                 });
             }
             let expected_root = root_commit_from_summary(expected);
-            let _ = load_state_from_transaction(
-                self.store.raw_primary_store_mut(),
-                &expected_root,
-                self.root_authentication_key,
-            )?;
+            let _ = authority.load_committed_root_state(&expected_root)?;
         }
         let selected_generation_after = audit.selected_root.as_ref().map(|root| root.generation);
         if audit.selected_root != selected_root_before {
@@ -10041,10 +10183,14 @@ impl LocalFileSystem {
     }
 
     fn selected_current_root_summary(&mut self) -> Result<CommittedRootSummary> {
-        let audit = audit_recovery_store(
-            self.store.raw_primary_store_mut(),
-            self.root_authentication_key,
-        )?;
+        let root_authentication_key = self.root_authentication_key;
+        let recovery_policy = self.recovery_policy;
+        let mut authority = MountedOpenRecoveryAuthority::raw_only(
+            &mut self.store,
+            root_authentication_key,
+            recovery_policy,
+        );
+        let audit = authority.recovery_audit()?;
         let selected = audit.selected_root.ok_or(FileSystemError::CorruptState {
             reason: "snapshot source requires a selected authenticated committed root",
         })?;
