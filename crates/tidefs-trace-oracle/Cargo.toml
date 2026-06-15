@@ -17,6 +17,7 @@ base64 = "0.22"
 tempfile = "3"
 tidefs-local-filesystem = { path = "../tidefs-local-filesystem" }
 tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tidefs-model-core = { path = "../tidefs-model-core" }
 tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
 
 [lib]

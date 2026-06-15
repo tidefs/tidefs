@@ -12,8 +12,10 @@
 use std::fs;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::backend::replay_command;
 use crate::protocol::*;
 use crate::{load_trace, save_trace, TraceError, TraceEvent};
 
@@ -33,6 +35,20 @@ pub struct MinimizeResult {
     pub original_op_count: usize,
     pub minimized_op_count: usize,
     pub output_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub manifest_entry: MinimizedManifestEntry,
+}
+
+/// Sidecar manifest entry emitted with each minimized trace.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinimizedManifestEntry {
+    pub id: String,
+    pub kind: String,
+    pub path: String,
+    pub original_trace_path: String,
+    pub original_op_count: usize,
+    pub minimized_op_count: usize,
+    pub replay_command: String,
 }
 
 /// Run full minimization (phases 1-3) on a failing trace.
@@ -80,11 +96,28 @@ where
     fs::create_dir_all(&ctx.output_dir)?;
     let output_path = ctx.output_dir.join(format!("{}.jsonl", ctx.trace_id));
     save_trace(&output_path, &output_ops)?;
+    let minimized_op_count = output_ops.len().saturating_sub(1);
+    let manifest_entry = MinimizedManifestEntry {
+        id: ctx.trace_id.clone(),
+        kind: "minimized_trace_reproducer".into(),
+        path: output_path.display().to_string(),
+        original_trace_path: ctx.trace_path.display().to_string(),
+        original_op_count: original_count,
+        minimized_op_count,
+        replay_command: replay_command(&output_path),
+    };
+    let manifest_path = ctx
+        .output_dir
+        .join(format!("{}.manifest.json", ctx.trace_id));
+    let manifest_json = serde_json::to_string_pretty(&manifest_entry)?;
+    fs::write(&manifest_path, format!("{manifest_json}\n"))?;
 
     Ok(MinimizeResult {
         original_op_count: original_count,
-        minimized_op_count: output_ops.len().saturating_sub(1), // Exclude meta.
+        minimized_op_count,
         output_path,
+        manifest_path,
+        manifest_entry,
     })
 }
 
@@ -433,5 +466,41 @@ mod tests {
             "args": { "device_size_bytes": "not-a-number" }
         });
         assert!(simplify_device_size(&op).is_none());
+    }
+
+    #[test]
+    fn minimize_writes_reproducer_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace_path = temp.path().join("failing.jsonl");
+        save_trace(
+            &trace_path,
+            &[
+                json!({"op": "trace_meta", "args": {"schema": "pool_trace_v1", "version": 1}}),
+                json!({"op": "create_pool", "args": {"device_size_bytes": 2097152}}),
+                json!({"op": "put", "args": {"value_b64": "YWJjZGVm"}}),
+            ],
+        )
+        .unwrap();
+        let ctx = MinimizerContext {
+            trace_id: "mini".into(),
+            trace_path,
+            output_dir: temp.path().join("out"),
+        };
+        let result = minimize_trace(&ctx, |ops| {
+            if ops.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(TraceError::Assertion("still failing".into()))
+            }
+        })
+        .unwrap();
+
+        assert!(result.output_path.exists());
+        assert!(result.manifest_path.exists());
+        assert_eq!(result.manifest_entry.original_op_count, 2);
+        assert!(result
+            .manifest_entry
+            .replay_command
+            .contains("check-trace-oracle --compare-trace"));
     }
 }

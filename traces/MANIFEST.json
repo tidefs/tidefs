@@ -36,6 +36,180 @@
       "path": "traces/golden/smoke_storm/cluster_trace.jsonl",
       "schema": "cluster_trace_v1",
       "sha256": "5b224d7f090a3cef09f475ca6aee9c7e32f6e23ddb0efe3db8cd0b053dc9f8f1"
+    },
+    {
+      "backend_expectations": {
+        "local_runtime": {
+          "expected_completions": [
+            {
+              "completion": {
+                "completed_bytes": 0,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "status": "success"
+              },
+              "op": "create_pool",
+              "operation_index": 1
+            },
+            {
+              "completion": {
+                "completed_bytes": 0,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "status": "success"
+              },
+              "op": "create_dataset",
+              "operation_index": 2
+            },
+            {
+              "completion": {
+                "completed_bytes": 0,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "status": "success"
+              },
+              "op": "create_file",
+              "operation_index": 3
+            },
+            {
+              "completion": {
+                "completed_bytes": 4,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "status": "success"
+              },
+              "op": "write_range",
+              "operation_index": 4
+            },
+            {
+              "completion": {
+                "completed_bytes": 2,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "result": {
+                  "value_b64": "YmM="
+                },
+                "status": "success"
+              },
+              "op": "get_range",
+              "operation_index": 5
+            },
+            {
+              "completion": {
+                "completed_bytes": 0,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "status": "success"
+              },
+              "op": "rename",
+              "operation_index": 6
+            },
+            {
+              "completion": {
+                "completed_bytes": 4,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "result": {
+                  "value_b64": "YWJjZA=="
+                },
+                "status": "success"
+              },
+              "op": "get",
+              "operation_index": 7
+            }
+          ],
+          "expected_fingerprint": "1b5ff6cab46a09b38b0270d739ed5abdcbf17cb631219ad729439cd9230d3222"
+        },
+        "model": {
+          "expected_completions": [
+            {
+              "completion": {
+                "completed_bytes": 0,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "status": "success"
+              },
+              "op": "create_pool",
+              "operation_index": 1
+            },
+            {
+              "completion": {
+                "completed_bytes": 0,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "status": "success"
+              },
+              "op": "create_dataset",
+              "operation_index": 2
+            },
+            {
+              "completion": {
+                "completed_bytes": 0,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "status": "success"
+              },
+              "op": "create_file",
+              "operation_index": 3
+            },
+            {
+              "completion": {
+                "completed_bytes": 4,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "status": "success"
+              },
+              "op": "write_range",
+              "operation_index": 4
+            },
+            {
+              "completion": {
+                "completed_bytes": 2,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "result": {
+                  "value_b64": "YmM="
+                },
+                "status": "success"
+              },
+              "op": "get_range",
+              "operation_index": 5
+            },
+            {
+              "completion": {
+                "completed_bytes": 0,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "status": "success"
+              },
+              "op": "rename",
+              "operation_index": 6
+            },
+            {
+              "completion": {
+                "completed_bytes": 4,
+                "disposition": "final",
+                "errno": "SUCCESS",
+                "result": {
+                  "value_b64": "YWJjZA=="
+                },
+                "status": "success"
+              },
+              "op": "get",
+              "operation_index": 7
+            }
+          ],
+          "expected_fingerprint": "57472c0e915ed47da807476b61edf1e5f91fc96076423ac5412b8e63ce04eb49"
+        }
+      },
+      "backend_expectations_version": 1,
+      "description": "model/local-runtime backend smoke trace over the shared JSONL runner",
+      "expected_fingerprint": "1b5ff6cab46a09b38b0270d739ed5abdcbf17cb631219ad729439cd9230d3222",
+      "id": "model_runtime_smoke_pool",
+      "kind": "pool",
+      "path": "traces/golden/model_runtime_smoke/pool_trace.jsonl",
+      "schema": "pool_trace_v1",
+      "sha256": "08725de02afb17eb482f925b1d6cb62d20e3c4c1dce80836c789d8bde20e85ec"
     }
   ],
   "manifest_version": 1

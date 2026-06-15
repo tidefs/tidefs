@@ -3459,6 +3459,7 @@ dependencies = [
  "tempfile",
  "tidefs-local-filesystem",
  "tidefs-local-object-store",
+ "tidefs-model-core",
  "tidefs-types-vfs-core",
 ]
 

@@ -1,0 +1,8 @@
+{"args":{"schema":"pool_trace_v1","version":1},"op":"trace_meta"}
+{"args":{"device_count":1,"device_size_bytes":4194304},"op":"create_pool"}
+{"args":{"name":"ds"},"op":"create_dataset"}
+{"args":{"dataset":"ds","path":"file"},"op":"create_file"}
+{"args":{"data_b64":"YWJjZA==","dataset":"ds","key":"file","offset":0},"op":"write_range"}
+{"args":{"dataset":"ds","key":"file","length":2,"offset":1},"expect":{"value_b64":"YmM="},"op":"get_range"}
+{"args":{"dataset":"ds","dst":"renamed","src":"file"},"op":"rename"}
+{"args":{"dataset":"ds","key":"renamed"},"expect":{"value_b64":"YWJjZA=="},"op":"get"}

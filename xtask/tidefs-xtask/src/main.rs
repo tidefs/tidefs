@@ -70,7 +70,15 @@ fn main() {
             }
         }
         Some("check-trace-oracle") => {
-            if let Err(err) = trace_oracle::check_trace_oracle_current_workspace() {
+            let trace_oracle_args: Vec<String> = args.collect();
+            let result = if trace_oracle_args.is_empty() {
+                trace_oracle::check_trace_oracle_current_workspace()
+            } else {
+                trace_oracle::check_trace_oracle_current_workspace_with_args(
+                    trace_oracle_args.into_iter(),
+                )
+            };
+            if let Err(err) = result {
                 eprintln!("{err}");
                 process::exit(1);
             }
@@ -1784,6 +1792,9 @@ fn print_help() {
     println!("  check-polymorphic-directory-index alias for check-polymorphic-dir-index");
     println!(
         "  check-trace-oracle       validate trace oracle crate and replay golden trace corpus"
+    );
+    println!(
+        "  check-trace-oracle --compare-trace <path> compare model/local-runtime backends for one trace"
     );
     println!("  check-contract-codecs    validate request contract codec golden vectors");
     println!(
