@@ -106,6 +106,39 @@ generated_doc = "Planned foreground-read protection claim for scrub and repair w
 evidence_artifacts = []
 
 [[claims]]
+id = "perf.local.no_unbounded_dirty_debt.v1"
+status = "blocked"
+scope = "local dirty write admission and budgeted queue accounting"
+required_evidence_classes = [
+  "admission-budget-model",
+  "no-hidden-queue-gate",
+  "queue-depth-runtime-artifact",
+  "claims-gate-review",
+]
+blockers = [
+  "GitHub issue #287 first slice records typed admission and no-hidden-queue metadata, not a runtime queue-depth artifact.",
+  "Local runtime write paths have not been wired through AdmissionPermit and BudgetedQueue.",
+]
+generated_doc = "Blocked local no-unbounded-dirty-debt claim. TideFS must keep this behind admission-budget model evidence, no-hidden-queue gate evidence, and runtime queue-depth artifacts."
+evidence_artifacts = []
+
+[[claims]]
+id = "perf.local.foreground_read_not_blocked_by_scrub.v1"
+status = "blocked"
+scope = "local foreground read service while scrub work is pending"
+required_evidence_classes = [
+  "scrub-read-isolation-model",
+  "runtime-scrub-read-artifact",
+  "claims-gate-review",
+]
+blockers = [
+  "GitHub issue #287 first slice records a deterministic oracle, not a mounted scrub/read runtime artifact.",
+  "Scrub runtime queues have not been wired through the typed service curve and admission metadata.",
+]
+generated_doc = "Blocked local foreground-read-not-blocked-by-scrub claim. TideFS must treat the oracle as model evidence only until runtime scrub/read artifacts cover the claimed path."
+evidence_artifacts = []
+
+[[claims]]
 id = "offload.ready.non_authoritative.v1"
 status = "planned"
 scope = "offload acceleration authority"

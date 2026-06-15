@@ -1,0 +1,22 @@
+schema_version = 1
+
+[[queue_roots]]
+id = "performance_contract.budgeted_queue"
+package = "tidefs-performance-contract"
+path = "crates/tidefs-performance-contract/src/lib.rs"
+symbol = "BudgetedQueue"
+work_class = "foreground-write"
+resource_domains = [
+  "dirty-bytes",
+  "dirty-operations",
+  "dirty-age",
+  "queue-slots",
+]
+admission = "AdmissionPermit"
+service_curve = "ServiceCurve"
+hard_caps = [
+  "dirty-bytes",
+  "dirty-operations",
+  "dirty-age",
+  "queue-slots",
+]

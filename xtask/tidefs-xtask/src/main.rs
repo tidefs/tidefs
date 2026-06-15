@@ -13,6 +13,7 @@ mod format_golden;
 mod hygiene;
 mod kernel_closure;
 mod kmod_guard;
+mod no_hidden_queues;
 mod observe;
 mod platform;
 mod policy;
@@ -733,6 +734,12 @@ fn main() {
                 process::exit(2);
             }
             if let Err(err) = claims::validate_claim_current_workspace(&claim_id) {
+                eprintln!("{err}");
+                process::exit(1);
+            }
+        }
+        Some("check-no-hidden-queues") => {
+            if let Err(err) = no_hidden_queues::check_current_workspace() {
                 eprintln!("{err}");
                 process::exit(1);
             }
@@ -1955,6 +1962,7 @@ fn print_help() {
     println!("  check-claims-gate       validate publish-facing capability claims");
     println!("  check-overclaims        alias for check-claims-gate");
     println!("  validate-claim <id>     validate a registered claim evidence set");
+    println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
     println!("  check-claim-gate        validate current worktree has a valid issue owner");
     println!("  check-worktree-claim    alias for check-claim-gate");
     println!("  check-stale-claims      scan Forgejo for stale codex:claimed issues");
