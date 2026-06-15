@@ -127,6 +127,8 @@ const REQUIRED_INITIAL_CLAIMS: &[&str] = &[
     "namespace.rename.atomicity.v1",
     "scheduler.dirty_debt.no_hidden.v1",
     "scrub.foreground_read.protected.v1",
+    "perf.local.no_unbounded_dirty_debt.v1",
+    "perf.local.foreground_read_not_blocked_by_scrub.v1",
     "offload.ready.non_authoritative.v1",
     "ublk.qid_tag.exactly_once_completion.v1",
     "kernel.teardown.no_work_after.v1",

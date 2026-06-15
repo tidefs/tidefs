@@ -597,7 +597,43 @@ pub enum AdmissionReason {
 }
 ```
 
-## 14. Open Questions
+## 14. Performance Correctness Contract Slice
+
+Issue #287 makes local performance a correctness contract before it becomes a
+throughput claim. The first implementation authority is
+`crates/tidefs-performance-contract`, a `no_std` crate whose core types define:
+
+- `WorkClass` and `ResourceDomain` labels for foreground, background, and
+  dirty-debt work;
+- `AdmissionPermit` as the must-use token that conserves dirty byte and
+  operation debt;
+- `BudgetedQueue` as the alloc-backed queue shape that cannot accept dirty
+  items without an admission permit;
+- `ServiceCurve` as the per-class service envelope used by deterministic
+  foreground-read/scrub oracle checks;
+- `WriteAdmissionConfig` and `WriteAdmissionState` as the hard local dirty
+  byte/op/age admission envelope.
+
+Dynamic tuning may lower or reshape soft limits, but it must not raise the hard
+dirty byte, dirty operation, dirty age, permit, or queue-slot caps. The contract
+is intentionally conservative: once the oldest dirty permit ages over the cap,
+new dirty admissions fail until dirty debt is released.
+
+Queue roots that enter implementation packages must be registered in
+`validation/performance/no-hidden-queues.toml` with work class, resource
+domains, admission token, service curve, and hard-cap metadata. The checked
+guard is:
+
+```text
+cargo run -p tidefs-xtask -- check-no-hidden-queues
+```
+
+The local claim ids `perf.local.no_unbounded_dirty_debt.v1` and
+`perf.local.foreground_read_not_blocked_by_scrub.v1` stay blocked in
+`validation/claims.toml` until runtime queue-depth and scrub/read artifacts
+cover the actual mounted paths.
+
+## 15. Open Questions
 
 1. **Should the governor run on its own thread or inline?**
    The admission path is hot (called from every cache insert and FUSE request).
@@ -627,7 +663,7 @@ pub enum AdmissionReason {
    per-node governor; cluster-wide coordination deferred to the distributed
    lock service (#1248) and cluster membership (#1209).
 
-## 15. References
+## 16. References
 
 - [#1237] This design spec
 - [#1226] Unified cache architecture (superseded/unified by this spec)
