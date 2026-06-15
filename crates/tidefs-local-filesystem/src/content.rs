@@ -1918,6 +1918,7 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
     source_record: &InodeRecord,
     dest_record: &InodeRecord,
     dedup_index: &mut DedupIndex,
+    compression_policy: &ContentCompressionPolicy,
 ) -> Result<()> {
     let source_layout =
         read_content_layout_from_store(store.raw_store(), source_inode_id, source_record, true)?;
@@ -1936,42 +1937,45 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
             )?;
         }
         ContentLayout::Chunked(ref manifest) => {
-            // For every chunk in the source manifest, store a dedup redirect
-            // at the destination's per-inode chunk key.  We read the raw
-            // encoded bytes from each source chunk key — these are *already*
-            // either a dedup redirect or actual chunk data stored at the
-            // canonical key from the original write path.
+            // For every chunk in the source manifest, store destination-owned
+            // content or a dedup redirect at the destination's per-inode chunk
+            // key.
             let mut dest_chunks: Vec<ContentChunkRef> = Vec::with_capacity(manifest.chunks.len());
 
             if !dedup_enabled {
-                // Dedup disabled: copy source chunk bytes directly to
-                // destination per-inode keys without fingerprint computation,
-                // canonical-object storage, or DedupIndex insertion.
+                // Dedup disabled: decode the source payload and re-encode it
+                // for the destination inode/version. The encoded chunk envelope
+                // carries inode identity, so copying source bytes verbatim
+                // would make committed-root validation reject the destination.
                 for src_chunk_ref in &manifest.chunks {
-                    let src_chunk_key = content_chunk_object_key_for_version(
-                        source_inode_id,
-                        src_chunk_ref.data_version,
-                        src_chunk_ref.chunk_index,
-                    );
-                    let src_encoded =
-                        store.raw_store()
-                            .get(src_chunk_key)?
-                            .ok_or(FileSystemError::CorruptState {
-                                reason: "reflink: source chunk object missing",
-                            })?;
+                    if src_chunk_ref.is_hole() {
+                        dest_chunks.push(ContentChunkRef::hole(
+                            src_chunk_ref.chunk_index,
+                            src_chunk_ref.len,
+                        ));
+                        continue;
+                    }
+                    let src_chunk =
+                        read_content_chunk_from_store(store.raw_store(), source_inode_id, src_chunk_ref)?;
                     let dest_chunk_key = content_chunk_object_key_for_version(
                         dest_record.inode_id,
                         dest_record.data_version,
                         src_chunk_ref.chunk_index,
                     );
-                    let chunk_receipt = store.put_with_receipt(dest_chunk_key, &src_encoded)?.1;
+                    let dest_encoded = encode_content_chunk(
+                        dest_record,
+                        src_chunk_ref.chunk_index,
+                        &src_chunk.bytes,
+                        compression_policy,
+                    );
+                    let chunk_receipt = store.put_with_receipt(dest_chunk_key, &dest_encoded)?.1;
                     dest_chunks.push(ContentChunkRef {
                         chunk_index: src_chunk_ref.chunk_index,
                         data_version: dest_record.data_version,
                         len: src_chunk_ref.len,
-                        checksum: checksum64(&src_encoded),
-                                placement_receipt_generation: chunk_receipt.generation,
-});
+                        checksum: checksum64(&dest_encoded),
+                        placement_receipt_generation: chunk_receipt.generation,
+                    });
                 }
                 let dest_manifest = ContentManifestObject {
                     inode_id: dest_record.inode_id,
@@ -1990,6 +1994,13 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
             // Dedup enabled: use content-addressed redirects as the clone
             // primitive.
             for src_chunk_ref in &manifest.chunks {
+                if src_chunk_ref.is_hole() {
+                    dest_chunks.push(ContentChunkRef::hole(
+                        src_chunk_ref.chunk_index,
+                        src_chunk_ref.len,
+                    ));
+                    continue;
+                }
                 let src_chunk_key = content_chunk_object_key_for_version(
                     source_inode_id,
                     src_chunk_ref.data_version,
