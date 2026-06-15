@@ -855,6 +855,16 @@ impl VfsLocalFileSystem {
             .retain(|_, path| !Self::path_is_at_or_under(path, root_path));
     }
 
+    fn remove_cached_path_if_matches(&self, inode_id: InodeId, removed_path: &str) {
+        let mut cache = self.path_cache.borrow_mut();
+        if cache
+            .get(&inode_id)
+            .is_some_and(|path| Self::path_is_at_or_under(path, removed_path))
+        {
+            cache.remove(&inode_id);
+        }
+    }
+
     fn rewrite_cached_path_subtree(&self, old_path: &str, new_path: &str) {
         for path in self.path_cache.borrow_mut().values_mut() {
             if let Some(updated) = Self::rewrite_path_prefix(path, old_path, new_path) {
@@ -3538,7 +3548,7 @@ impl VfsEngine for VfsLocalFileSystem {
                 .unlink(&child_path)
                 .map_err(|e| map_errno(&e))?;
         }
-        self.invalidate_cached_path_subtree(&child_path);
+        self.remove_cached_path_if_matches(record.inode_id, &child_path);
         Ok(())
     }
 
@@ -3572,7 +3582,7 @@ impl VfsEngine for VfsLocalFileSystem {
             .borrow_mut()
             .remove_dir(&child_path)
             .map_err(|e| map_errno(&e))?;
-        self.invalidate_cached_path_subtree(&child_path);
+        self.remove_cached_path_if_matches(record.inode_id, &child_path);
         Ok(())
     }
 
@@ -4508,11 +4518,10 @@ impl VfsEngine for VfsLocalFileSystem {
 
         // Validate the inode still exists and is a directory.
         let inode_id = dh.inode_id;
-        let path = self.inode_path(inode_id)?;
         let batch_limit = 128usize;
         let (entries, has_more) = {
             let fs = self.fs.borrow();
-            let record = fs.stat(&path).map_err(|e| map_errno(&e))?;
+            let record = fs.inode(inode_id).map_err(|e| map_errno(&e))?;
             if !record.is_directory() {
                 return Err(Errno::ENOTDIR);
             }
@@ -11183,6 +11192,30 @@ mod tests {
     }
 
     #[test]
+    fn readdir_open_handle_is_authoritative_by_inode_not_path_cache_alias() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let dir = engine.mkdir(root, b"dir", 0o755, &ctx()).unwrap();
+        let (_child, fh) = engine
+            .create(dir.inode_id, b"child.txt", 0o644, 0, &ctx())
+            .unwrap();
+        engine.release(&fh).unwrap();
+
+        let dh = engine.opendir(dir.inode_id, &ctx()).unwrap();
+        engine
+            .path_cache
+            .borrow_mut()
+            .insert(dir.inode_id, "/stale-dir-alias".to_string());
+
+        let (entries, has_more) = engine.readdir(&dh, 0, &ctx()).unwrap();
+
+        assert!(!has_more);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, b"child.txt");
+        engine.releasedir(&dh).unwrap();
+    }
+
+    #[test]
     fn readdir_offset_zero_returns_entries_with_sequential_cookies() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
@@ -12394,6 +12427,47 @@ mod tests {
                 Some("/stable/nested.txt")
             );
             assert_eq!(cached_path(&engine, removed_dir.inode_id), None);
+        }
+    }
+
+    #[test]
+    fn unlink_burst_prunes_removed_cached_paths() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mut fs = LocalFileSystem::open(td.path()).expect("open");
+        fs.set_auto_commit(false);
+        fs.set_commit_group_throughput_profile();
+        fs.set_max_uncommitted_mutations(16 * 1024);
+        let engine = VfsLocalFileSystem::new(fs);
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let parent = engine.mkdir(root, b"permname", 0o755, &ctx()).unwrap();
+        let stable = engine
+            .mkdir(parent.inode_id, b"stable", 0o755, &ctx())
+            .unwrap();
+        let mut created = Vec::new();
+
+        for idx in 0..512 {
+            let name = format!("file-{idx:04}");
+            let (attr, fh) = engine
+                .create(parent.inode_id, name.as_bytes(), 0o644, 0, &ctx())
+                .unwrap();
+            engine.release(&fh).unwrap();
+            created.push((attr.inode_id, name));
+        }
+
+        assert_eq!(
+            cached_path(&engine, stable.inode_id).as_deref(),
+            Some("/permname/stable")
+        );
+
+        for (inode_id, name) in &created {
+            engine
+                .unlink(parent.inode_id, name.as_bytes(), &ctx())
+                .unwrap();
+            assert_eq!(cached_path(&engine, *inode_id), None);
+            assert_eq!(
+                cached_path(&engine, stable.inode_id).as_deref(),
+                Some("/permname/stable")
+            );
         }
     }
 
