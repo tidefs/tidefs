@@ -829,6 +829,25 @@ impl VfsLocalFileSystem {
         cache.get(&inode_id).cloned().ok_or(Errno::ENOENT)
     }
 
+    fn parent_and_child_records(
+        &self,
+        parent: InodeId,
+        parent_path: &str,
+        name: &[u8],
+    ) -> std::result::Result<(InodeRecord, InodeRecord), Errno> {
+        let fs = self.fs.borrow();
+        let parent_record = fs.inode(parent).map_err(|e| map_errno(&e))?;
+        if !parent_record.is_directory() {
+            return Err(Errno::ENOTDIR);
+        }
+        let child = fs
+            .dir_entry_by_inode(parent_record.inode_id, name, parent_path)
+            .map_err(|e| map_errno(&e))?
+            .ok_or(Errno::ENOENT)?;
+        let child_record = fs.inode(child.inode_id).map_err(|e| map_errno(&e))?;
+        Ok((parent_record, child_record))
+    }
+
     fn path_is_at_or_under(path: &str, prefix: &str) -> bool {
         if path == prefix {
             return true;
@@ -3147,16 +3166,13 @@ impl VfsEngine for VfsLocalFileSystem {
 
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
-        self.fs
-            .borrow()
-            .stat_attr(&child_path)
-            .inspect(|attr| {
-                // Register child in path cache.
-                self.path_cache
-                    .borrow_mut()
-                    .insert(attr.inode_id, child_path.clone());
-            })
-            .map_err(|e| map_errno(&e))
+        let (_parent_record, child_record) =
+            self.parent_and_child_records(parent, &parent_path, name)?;
+        let attr = child_record.to_inode_attr();
+        self.path_cache
+            .borrow_mut()
+            .insert(attr.inode_id, child_path);
+        Ok(attr)
     }
 
     fn getattr(
@@ -3485,16 +3501,7 @@ impl VfsEngine for VfsLocalFileSystem {
     ) -> std::result::Result<(), Errno> {
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
-        let record = self
-            .fs
-            .borrow()
-            .stat(&child_path)
-            .map_err(|e| map_errno(&e))?;
-        let parent_record = self
-            .fs
-            .borrow()
-            .stat(&parent_path)
-            .map_err(|e| map_errno(&e))?;
+        let (parent_record, record) = self.parent_and_child_records(parent, &parent_path, name)?;
         if !sticky_dir_allows_unlink_or_rename(
             parent_record.mode,
             parent_record.uid,
@@ -3560,16 +3567,7 @@ impl VfsEngine for VfsLocalFileSystem {
     ) -> std::result::Result<(), Errno> {
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
-        let record = self
-            .fs
-            .borrow()
-            .stat(&child_path)
-            .map_err(|e| map_errno(&e))?;
-        let parent_record = self
-            .fs
-            .borrow()
-            .stat(&parent_path)
-            .map_err(|e| map_errno(&e))?;
+        let (parent_record, record) = self.parent_and_child_records(parent, &parent_path, name)?;
         if !sticky_dir_allows_unlink_or_rename(
             parent_record.mode,
             parent_record.uid,
@@ -12446,7 +12444,7 @@ mod tests {
             .unwrap();
         let mut created = Vec::new();
 
-        for idx in 0..1024u64 {
+        for idx in 0..4096u64 {
             let mut value = idx;
             let mut name = vec![b'a'; 6];
             for byte in name.iter_mut().rev() {
