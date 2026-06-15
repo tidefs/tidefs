@@ -5521,6 +5521,7 @@ impl LocalFileSystem {
                 &source_record,
                 &dest_record,
                 &mut dedup,
+                &self.content_compression_policy,
             )
         };
         if let Err(err) = result {
@@ -8802,6 +8803,7 @@ impl LocalFileSystem {
                 &source_record,
                 &dest_record,
                 &mut dedup,
+                &self.content_compression_policy,
             )
         };
         if let Err(err) = result {

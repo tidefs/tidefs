@@ -27,6 +27,7 @@ use tidefs_vfs_engine::{LseekDataRange, VfsEngine, VfsEngineStatFs};
 
 use crate::content::{
     content_chunk_start, read_content_chunk_from_store, read_content_layout_from_store,
+    reflink_chunked_content,
 };
 use crate::error::FileSystemError;
 use crate::fuse_getattr;
@@ -2788,6 +2789,127 @@ fn live_property_table(
 }
 
 impl VfsLocalFileSystem {
+    fn try_reflink_whole_file_copy(
+        &self,
+        source_fh: &EngineFileHandle,
+        offset_in: u64,
+        dest_fh: &EngineFileHandle,
+        offset_out: u64,
+        requested: u64,
+    ) -> std::result::Result<Option<u32>, Errno> {
+        if offset_in != 0 || offset_out != 0 || source_fh.inode_id == dest_fh.inode_id {
+            return Ok(None);
+        }
+
+        let mut fs = self.fs.borrow_mut();
+        let source_record = fs.inode(source_fh.inode_id).map_err(|e| map_errno(&e))?;
+        if source_record.kind() != NodeKind::File {
+            return Ok(None);
+        }
+        let dest_record = fs.inode(dest_fh.inode_id).map_err(|e| map_errno(&e))?;
+        if dest_record.kind() != NodeKind::File {
+            return Ok(None);
+        }
+
+        let source_size = fs.effective_file_size(source_fh.inode_id);
+        if source_size == 0 || source_size > requested {
+            return Ok(None);
+        }
+        if fs.effective_file_size(dest_fh.inode_id) != 0 {
+            return Ok(None);
+        }
+        if fs
+            .write_buffers
+            .get(&dest_fh.inode_id)
+            .is_some_and(|buffer| !buffer.is_empty())
+        {
+            return Ok(None);
+        }
+
+        if fs
+            .write_buffers
+            .get(&source_fh.inode_id)
+            .is_some_and(|buffer| !buffer.is_empty())
+        {
+            fs.flush_write_buffer(source_fh.inode_id)
+                .map_err(|e| map_errno(&e))?;
+        }
+        let source_record = fs
+            .inode(source_fh.inode_id)
+            .map_err(|e| map_errno(&e))?
+            .clone();
+        let source_size = source_record.size;
+        if source_size == 0 || source_size > requested {
+            return Ok(None);
+        }
+
+        let planned_tick = crate::allocation::next_generation_after(fs.state.generation);
+        let mut dest_record = fs
+            .inode(dest_fh.inode_id)
+            .map_err(|e| map_errno(&e))?
+            .clone();
+        dest_record.size = source_size;
+        dest_record.data_version = planned_tick;
+        dest_record.metadata_version = planned_tick;
+
+        let planned_entries =
+            crate::allocation::planned_chunk_allocation_entries_for_full_content(&dest_record)
+                .map_err(|e| map_errno(&e))?;
+        let allocation_bytes = crate::allocation::allocation_bytes(&planned_entries).unwrap_or(0);
+        let new_blocks = allocation_bytes / u64::from(crate::constants::content_chunk_size());
+        fs.ensure_obligation_capacity("staging_dirty", new_blocks, Some(dest_fh.inode_id))
+            .map_err(|e| map_errno(&e))?;
+        fs.ensure_content_capacity_with_planned_inode(Some(dest_fh.inode_id), planned_entries)
+            .map_err(|e| map_errno(&e))?;
+
+        fs.begin_mutation();
+        let tick = fs.bump_generation();
+        debug_assert_eq!(tick, planned_tick);
+        dest_record.data_version = tick;
+        dest_record.metadata_version = tick;
+        let result = {
+            let fs = &mut *fs;
+            let dedup_enabled = fs.dedup_enabled;
+            let compression_policy = fs.content_compression_policy.clone();
+            let store = fs.store.raw_primary_store_mut();
+            let mut dedup = fs.dedup_index.borrow_mut();
+            reflink_chunked_content(
+                dedup_enabled,
+                store,
+                source_fh.inode_id,
+                &source_record,
+                &dest_record,
+                &mut dedup,
+                &compression_policy,
+            )
+        };
+        if let Err(err) = result {
+            fs.rollback_mutation_delta();
+            return Err(map_errno(&err));
+        }
+        fs.mark_inode_metadata_dirty(dest_fh.inode_id);
+        Arc::make_mut(&mut fs.state.inodes).insert(dest_fh.inode_id, dest_record.clone());
+        fs.inode_cache.borrow_mut().invalidate(dest_fh.inode_id);
+        fs.mark_inode_content_dirty(dest_fh.inode_id);
+        fs.invalidate_hot_read_cache_for_inode(dest_fh.inode_id);
+        fs.commit_mutation(dest_record).map_err(|e| map_errno(&e))?;
+
+        let _ = fs.apply_timestamp_update(
+            source_fh.inode_id,
+            TimestampUpdate::Read,
+            self.timestamp_policy,
+        );
+        let _ = fs.apply_deferred_timestamp_update(
+            dest_fh.inode_id,
+            TimestampUpdate::Write,
+            self.timestamp_policy,
+        );
+
+        u32::try_from(source_size)
+            .map(Some)
+            .map_err(|_| Errno::EFBIG)
+    }
+
     fn read_impl(
         &self,
         fh: &EngineFileHandle,
@@ -4044,6 +4166,11 @@ impl VfsEngine for VfsLocalFileSystem {
                     }
                 }
                 return Ok(copied_u32);
+            }
+            if let Some(copied) = self
+                .try_reflink_whole_file_copy(source_fh, offset_in, dest_fh, offset_out, requested)?
+            {
+                return Ok(copied);
             }
         }
 
@@ -8077,6 +8204,55 @@ mod tests {
 
         assert_eq!(copied, 2);
         assert_eq!(engine.read(&dest_create, 0, 16, &ctx()).unwrap(), b"bc");
+    }
+
+    #[test]
+    fn copy_file_range_whole_file_to_empty_dest_flushes_buffered_source() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_source_attr, source_create) = engine
+            .create(root, b"generic001-source.bin", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let (_dest_attr, dest_create) = engine
+            .create(root, b"generic001-dest.bin", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let payload: Vec<u8> = (0..819_200).map(|idx| (idx % 251) as u8).collect();
+        engine.write(&source_create, 0, &payload, &ctx()).unwrap();
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(source_create.inode_id, 0, payload.len())
+                .is_some(),
+            "test setup should leave source data in the engine write buffer"
+        );
+
+        let copied = engine
+            .copy_file_range(
+                &source_create,
+                0,
+                &dest_create,
+                0,
+                payload.len() as u64,
+                &ctx(),
+            )
+            .unwrap();
+
+        assert_eq!(copied, payload.len() as u32);
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(source_create.inode_id, 0, payload.len())
+                .is_none(),
+            "whole-file copy should publish the source before reflinking"
+        );
+        assert_eq!(
+            engine
+                .read(&dest_create, 0, payload.len() as u32, &ctx())
+                .unwrap(),
+            payload
+        );
     }
 
     #[test]
