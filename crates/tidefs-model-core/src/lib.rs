@@ -795,6 +795,26 @@ impl ModelFs {
         self.attr_inode(inode_id)
     }
 
+    /// Resolve an absolute model path to the inode id used by canonical VFS
+    /// contract requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same stable errno classes as path-oriented model requests.
+    pub fn resolve_path_inode(&self, path: &ModelPath) -> Result<InodeId, Errno> {
+        self.resolve_path(path)
+    }
+
+    /// Resolve the parent inode and final component for an absolute model path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` for the root path and the same stable errno classes as
+    /// path-oriented namespace requests for missing or non-directory parents.
+    pub fn resolve_parent_inode(&self, path: &ModelPath) -> Result<(InodeId, String), Errno> {
+        self.resolve_parent(path)
+    }
+
     fn apply_model_inner(&mut self, request: ModelRequest) -> OperationOutcome {
         match request {
             ModelRequest::Create { path } => self.create(&path),
@@ -1787,6 +1807,18 @@ mod tests {
         assert_eq!(read_step.output.as_bytes().unwrap(), b"abc");
         assert_eq!(fs.attr(&path("/moved")).unwrap().nlink, 1);
         fs.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn path_resolution_helpers_expose_contract_inode_inputs() {
+        let mut fs = ModelFs::new();
+        assert!(apply(&mut fs, ModelRequest::Mkdir { path: path("/dir") }).is_success());
+        let dir_inode = fs.resolve_path_inode(&path("/dir")).unwrap();
+
+        let (parent_id, component) = fs.resolve_parent_inode(&path("/dir/file")).unwrap();
+        assert_eq!(parent_id, dir_inode);
+        assert_eq!(component, "file");
+        assert_eq!(fs.resolve_parent_inode(&path("/")), Err(Errno::EINVAL));
     }
 
     #[test]

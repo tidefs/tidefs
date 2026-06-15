@@ -12,8 +12,14 @@ use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tidefs_model_core::{ModelFs, ModelNodeKind, ModelOutput, ModelPath, ModelRequest};
-use tidefs_types_vfs_core::Errno;
+use tidefs_model_core::{
+    ContractModelContext, ContractNameBinding, ContractNameContext, ModelFs, ModelNodeKind,
+    ModelOutput, ModelPath, ModelRequest,
+};
+use tidefs_types_vfs_core::{
+    AdmissionIntent, BudgetIntent, ContractEpoch, Errno, FenceIntent, RequestEnvelope, RequestId,
+    RequestMetadata, RetryIntent, TideRequest, TraceId, VfsNameToken, VfsRequest, WorkClass,
+};
 
 pub const REPORT_VERSION: u64 = 1;
 pub const MODEL_BACKEND: &str = "tidefs-model-core";
@@ -416,33 +422,23 @@ fn write_fsync_matrix() -> Result<CrashMatrix, CrashOracleError> {
 fn rename_matrix() -> Result<CrashMatrix, CrashOracleError> {
     let baseline = model_with_file("/dir/source", b"rename-data")?;
     let mut after_rename = baseline.clone();
-    apply_success(
+    apply_contract_rename_success(
         &mut after_rename,
-        ModelRequest::Rename {
-            from: model_path("/dir/source")?,
-            to: model_path("/dir/dest")?,
-        },
+        "/dir/source",
+        "/dir/dest",
         "rename /dir/source /dir/dest",
     )?;
 
     let mut both_names = baseline.clone();
-    apply_success(
+    apply_contract_link_success(
         &mut both_names,
-        ModelRequest::Link {
-            from: model_path("/dir/source")?,
-            to: model_path("/dir/dest")?,
-        },
+        "/dir/source",
+        "/dir/dest",
         "link /dir/source /dir/dest",
     )?;
 
     let mut neither_name = baseline.clone();
-    apply_success(
-        &mut neither_name,
-        ModelRequest::Unlink {
-            path: model_path("/dir/source")?,
-        },
-        "unlink /dir/source",
-    )?;
+    apply_contract_unlink_success(&mut neither_name, "/dir/source", "unlink /dir/source")?;
 
     let acceptable_rename = vec![
         acceptable("old-name", CrashClassification::LostUnfsynced, &baseline),
@@ -576,22 +572,12 @@ fn model_with_file(path: &str, bytes: &[u8]) -> Result<ModelFs, CrashOracleError
                     errno,
                 })?;
             if matches!(fs.attr(&parent_path), Err(Errno::ENOENT)) {
-                apply_success(
-                    &mut fs,
-                    ModelRequest::Mkdir { path: parent_path },
-                    "mkdir parent",
-                )?;
+                apply_contract_mkdir_path_success(&mut fs, &parent_path, "mkdir parent")?;
             }
         }
     }
 
-    apply_success(
-        &mut fs,
-        ModelRequest::Create {
-            path: model_path.clone(),
-        },
-        "create file",
-    )?;
+    apply_contract_create_path_success(&mut fs, &model_path, "create file")?;
     apply_success(
         &mut fs,
         ModelRequest::Write {
@@ -607,6 +593,201 @@ fn model_with_file(path: &str, bytes: &[u8]) -> Result<ModelFs, CrashOracleError
         "fsync file",
     )?;
     Ok(fs)
+}
+
+fn apply_contract_mkdir_path_success(
+    fs: &mut ModelFs,
+    path: &ModelPath,
+    op: &str,
+) -> Result<(), CrashOracleError> {
+    let (parent_id, name) =
+        fs.resolve_parent_inode(path)
+            .map_err(|errno| CrashOracleError::ModelErrno {
+                op: op.to_string(),
+                errno,
+            })?;
+    let binding = name_binding(&name);
+    let envelope = contract_envelope(
+        op,
+        TideRequest::Vfs(VfsRequest::Mkdir {
+            parent_id,
+            name: binding.token,
+        }),
+    );
+    apply_contract_success(fs, &envelope, &[binding], op)
+}
+
+fn apply_contract_create_path_success(
+    fs: &mut ModelFs,
+    path: &ModelPath,
+    op: &str,
+) -> Result<(), CrashOracleError> {
+    let (parent_id, name) =
+        fs.resolve_parent_inode(path)
+            .map_err(|errno| CrashOracleError::ModelErrno {
+                op: op.to_string(),
+                errno,
+            })?;
+    let binding = name_binding(&name);
+    let envelope = contract_envelope(
+        op,
+        TideRequest::Vfs(VfsRequest::Create {
+            parent_id,
+            name: binding.token,
+        }),
+    );
+    apply_contract_success(fs, &envelope, &[binding], op)
+}
+
+fn apply_contract_rename_success(
+    fs: &mut ModelFs,
+    from: &str,
+    to: &str,
+    op: &str,
+) -> Result<(), CrashOracleError> {
+    let from = model_path(from)?;
+    let to = model_path(to)?;
+    let (old_parent_id, old_name) =
+        fs.resolve_parent_inode(&from)
+            .map_err(|errno| CrashOracleError::ModelErrno {
+                op: op.to_string(),
+                errno,
+            })?;
+    let (new_parent_id, new_name) =
+        fs.resolve_parent_inode(&to)
+            .map_err(|errno| CrashOracleError::ModelErrno {
+                op: op.to_string(),
+                errno,
+            })?;
+    let old_binding = name_binding(&old_name);
+    let new_binding = name_binding(&new_name);
+    let envelope = contract_envelope(
+        op,
+        TideRequest::Vfs(VfsRequest::Rename {
+            old_parent_id,
+            old_name: old_binding.token,
+            new_parent_id,
+            new_name: new_binding.token,
+        }),
+    );
+    apply_contract_success(fs, &envelope, &[old_binding, new_binding], op)
+}
+
+fn apply_contract_link_success(
+    fs: &mut ModelFs,
+    from: &str,
+    to: &str,
+    op: &str,
+) -> Result<(), CrashOracleError> {
+    let from = model_path(from)?;
+    let to = model_path(to)?;
+    let source_inode_id =
+        fs.resolve_path_inode(&from)
+            .map_err(|errno| CrashOracleError::ModelErrno {
+                op: op.to_string(),
+                errno,
+            })?;
+    let (target_parent_id, target_name) =
+        fs.resolve_parent_inode(&to)
+            .map_err(|errno| CrashOracleError::ModelErrno {
+                op: op.to_string(),
+                errno,
+            })?;
+    let binding = name_binding(&target_name);
+    let envelope = contract_envelope(
+        op,
+        TideRequest::Vfs(VfsRequest::Link {
+            source_inode_id,
+            target_parent_id,
+            target_name: binding.token,
+        }),
+    );
+    apply_contract_success(fs, &envelope, &[binding], op)
+}
+
+fn apply_contract_unlink_success(
+    fs: &mut ModelFs,
+    path: &str,
+    op: &str,
+) -> Result<(), CrashOracleError> {
+    let path = model_path(path)?;
+    let (parent_id, name) =
+        fs.resolve_parent_inode(&path)
+            .map_err(|errno| CrashOracleError::ModelErrno {
+                op: op.to_string(),
+                errno,
+            })?;
+    let binding = name_binding(&name);
+    let envelope = contract_envelope(
+        op,
+        TideRequest::Vfs(VfsRequest::Unlink {
+            parent_id,
+            name: binding.token,
+        }),
+    );
+    apply_contract_success(fs, &envelope, &[binding], op)
+}
+
+fn apply_contract_success(
+    fs: &mut ModelFs,
+    envelope: &RequestEnvelope,
+    name_bindings: &[ContractNameBinding<'_>],
+    op: &str,
+) -> Result<(), CrashOracleError> {
+    let step = fs
+        .apply_contract_with_names(
+            envelope,
+            ContractModelContext::empty(),
+            ContractNameContext::new(name_bindings),
+        )
+        .map_err(|err| CrashOracleError::ModelInvariant(err.to_string()))?;
+    if step.is_success() {
+        Ok(())
+    } else {
+        Err(CrashOracleError::ModelErrno {
+            op: op.to_string(),
+            errno: step.errno(),
+        })
+    }
+}
+
+fn name_binding(component: &str) -> ContractNameBinding<'_> {
+    ContractNameBinding::new(
+        VfsNameToken::from_component_bytes(component.as_bytes()),
+        component,
+    )
+}
+
+fn contract_envelope(op: &str, request: TideRequest) -> RequestEnvelope {
+    let mut metadata =
+        RequestMetadata::new(request_id(op), ContractEpoch::new(0x317), trace_id(op));
+    metadata.work_class = WorkClass::Foreground;
+    metadata.admission = AdmissionIntent::RequirePermit;
+    metadata.budget = BudgetIntent::Foreground;
+    metadata.fence = FenceIntent::Write;
+    metadata.retry = RetryIntent::None;
+    RequestEnvelope::new(metadata, request)
+}
+
+fn request_id(op: &str) -> RequestId {
+    let mut bytes = [0_u8; 16];
+    mix_label_bytes(&mut bytes, op.as_bytes());
+    bytes[15] ^= 0x31;
+    RequestId::new(bytes)
+}
+
+fn trace_id(op: &str) -> TraceId {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&0x317_u64.to_le_bytes());
+    mix_label_bytes(&mut bytes[8..], op.as_bytes());
+    TraceId::new(bytes)
+}
+
+fn mix_label_bytes(out: &mut [u8], label: &[u8]) {
+    let len = out.len();
+    for (index, byte) in label.iter().enumerate() {
+        out[index % len] ^= *byte;
+    }
 }
 
 fn apply_success(
@@ -926,6 +1107,39 @@ mod tests {
                 .iter()
                 .any(|op| op.op == "crash_recover_at"));
         }
+    }
+
+    #[test]
+    fn rename_claim_new_name_state_comes_from_contract_replay() {
+        let mut fs = model_with_file("/dir/source", b"rename-data").expect("baseline");
+        apply_contract_rename_success(
+            &mut fs,
+            "/dir/source",
+            "/dir/dest",
+            "rename /dir/source /dir/dest",
+        )
+        .expect("contract rename");
+        assert!(!observe_path(&fs, "/dir/source").unwrap().exists);
+        assert!(observe_path(&fs, "/dir/dest").unwrap().exists);
+
+        let report = run_model_crash_matrices().expect("crash matrices");
+        let rename_case = report
+            .matrices
+            .iter()
+            .find(|matrix| matrix.id == RENAME_MATRIX_ID)
+            .and_then(|matrix| {
+                matrix
+                    .cases
+                    .iter()
+                    .find(|case| case.id == "rename.root_publish.new_name")
+            })
+            .expect("rename root-publish case");
+
+        let expected = fs.fingerprint().to_hex();
+        assert_eq!(
+            rename_case.recovered_fingerprint.as_deref(),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
