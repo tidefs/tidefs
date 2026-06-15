@@ -5467,12 +5467,13 @@ impl LocalFileSystem {
         self.commit_mutation(updated)
     }
 
-    /// Create a zero-copy reflink clone of a regular file.
+    /// Create a reflink clone of a regular file.
     ///
-    /// Shares all content chunks with the source via content-addressed dedup
-    /// redirects — no data bytes are copied, read, or re-encoded.  This is the
-    /// storage-level primitive that powers `FICLONE` / `copy_file_range`
-    /// same-filesystem reflink and snapshot-clone writable forks.
+    /// With dedup enabled, shares content chunks with the source via
+    /// content-addressed redirects. With dedup disabled, re-encodes source
+    /// chunks for the destination inode/version. This is the storage-level
+    /// primitive that powers `FICLONE` / `copy_file_range` same-filesystem
+    /// reflink and snapshot-clone writable forks.
     ///
     /// The new file inherits the source's size, permissions, ownership, and
     /// extended attributes.  It is a fully independent inode with its own
@@ -8795,13 +8796,14 @@ impl LocalFileSystem {
         Ok(record)
     }
 
-    /// Reflink (zero-copy) content from a source inode to a destination inode.
+    /// Reflink content from a source inode to a destination inode.
     ///
-    /// Shares all content chunks via content-addressed dedup redirects — no
-    /// data bytes are copied, read, or re-encoded.  The destination inode's
-    /// size, data_version, and metadata_version are updated to reflect the new
-    /// content.  This is the inode-level primitive used by both path-level
-    /// `reflink_file` and the FUSE `copy_file_range` handler.
+    /// With dedup enabled, shares chunks via content-addressed redirects. With
+    /// dedup disabled, re-encodes source chunks for the destination
+    /// inode/version. The destination inode's size, data_version, and
+    /// metadata_version are updated to reflect the new content. This is the
+    /// inode-level primitive used by both path-level `reflink_file` and the
+    /// FUSE `copy_file_range` handler.
     pub fn reflink_inode_content(
         &mut self,
         source_inode_id: InodeId,

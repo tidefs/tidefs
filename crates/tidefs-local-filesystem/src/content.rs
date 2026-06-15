@@ -1904,10 +1904,12 @@ pub(crate) fn content_chunk_start(chunk_index: u64) -> Result<u64> {
 
 // ── Reflink (cross-file zero-copy clone via content-addressed dedup) ──
 
-/// Share all content chunks from `source_record` with `dest_record` by storing
-/// dedup redirects at the destination's per-inode chunk keys.  No data bytes
-/// are read, copied, or re-encoded — the destination's chunk entries point
-/// directly to the same canonical (fingerprint-addressed) chunks as the source.
+/// Clone all content chunks from `source_record` to `dest_record`.
+///
+/// With dedup enabled, the destination stores redirects to the same canonical
+/// chunks as the source. With dedup disabled, source chunks are decoded and
+/// re-encoded under the destination inode/version because chunk envelopes carry
+/// inode identity.
 ///
 /// This is the storage-level primitive that powers FICLONE/copy_file_range
 /// same-filesystem reflink and snapshot-clone writable forks.
