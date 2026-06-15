@@ -1226,6 +1226,122 @@ impl VfsLocalFileSystem {
             })
     }
 
+    fn create_empty_directory(
+        &self,
+        parent_id: InodeId,
+        parent_path: &str,
+        child_path: &str,
+        name: &[u8],
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        parent_default_acl_entries: Option<&tidefs_posix_acl::PosixAcl>,
+    ) -> std::result::Result<InodeRecord, Errno> {
+        let mut fs = self.fs.borrow_mut();
+        if fs
+            .dir_entry_by_inode(parent_id, name, parent_path)
+            .map_err(|e| map_errno(&e))?
+            .is_some()
+        {
+            return Err(Errno::EEXIST);
+        }
+        fs.ensure_inode_capacity_for_new_inode()
+            .map_err(|e| map_errno(&e))?;
+
+        fs.begin_mutation();
+        if !fs.state.inodes.contains_key(&parent_id) {
+            fs.rollback_mutation_delta();
+            return Err(Errno::ENOENT);
+        }
+        match fs.dir_entry_by_inode(parent_id, name, parent_path) {
+            Ok(Some(_)) => {
+                fs.rollback_mutation_delta();
+                return Err(Errno::EEXIST);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                fs.rollback_mutation_delta();
+                return Err(map_errno(&err));
+            }
+        }
+
+        let tick = fs.bump_generation();
+        let inode_id = fs.allocate_inode_id();
+        let generation = Generation::new(tick);
+        let mut new_mode = mode;
+        let mut xattrs = BTreeMap::new();
+        if let Some(acl_entries) = parent_default_acl_entries {
+            for (name, value) in
+                tidefs_posix_acl::default_acl_inheritance_for_parent(acl_entries, new_mode, true)
+            {
+                if name == Self::POSIX_ACL_ACCESS_XATTR {
+                    if let Ok(access_acl) = tidefs_posix_acl::decode_posix_acl_xattr(&value) {
+                        new_mode =
+                            tidefs_posix_acl::posix_mode_from_access_acl(&access_acl, new_mode);
+                    }
+                }
+                xattrs.insert(name.to_vec(), value);
+            }
+        }
+
+        let record = InodeRecord {
+            rdev: 0,
+            inode_id,
+            generation,
+            facets: NodeKind::Dir.to_facets(),
+            mode: new_mode,
+            uid,
+            gid,
+            nlink: 2,
+            size: 0,
+            data_version: tick,
+            metadata_version: tick,
+            posix_time: crate::types::PosixTimeRecord::now(),
+            xattrs,
+            dir_storage_kind: 0,
+            xattr_storage_kind: 0,
+            dir_rev: 0,
+        };
+
+        let name_vec = name.to_vec();
+        let _ = fs.intent_log_buffer.as_ref().map(|buf| {
+            let _frame = buf.append(
+                tidefs_intent_log::IntentLogRecord::Mkdir {
+                    parent: parent_id.get(),
+                    name: name_vec.clone(),
+                    mode: new_mode,
+                    ino: inode_id.get(),
+                },
+                0,
+            );
+        });
+        let entry = NamespaceEntry {
+            name: name_vec.clone(),
+            inode_id,
+            generation,
+            facets: NodeKind::Dir.to_facets(),
+            mode: new_mode,
+        };
+
+        fs.mark_inode_metadata_dirty(inode_id);
+        fs.mark_dir_dirty(parent_id);
+        fs.mark_inode_metadata_dirty(parent_id);
+        Arc::make_mut(&mut fs.state.inodes).insert(inode_id, record.clone());
+        fs.inode_cache.borrow_mut().invalidate(inode_id);
+        Arc::make_mut(&mut fs.state.directories).insert(inode_id, BTreeMap::new());
+        if let Err(err) = fs.insert_directory_entry(parent_id, name_vec, entry, tick) {
+            fs.rollback_mutation_delta();
+            return Err(map_errno(&err));
+        }
+        fs.update_parent_metadata_for_subdir_add(parent_id, tick);
+
+        let record = fs.commit_mutation(record).map_err(|e| map_errno(&e))?;
+        self.path_cache
+            .borrow_mut()
+            .insert(record.inode_id, child_path.to_string());
+        Ok(record)
+    }
+
     fn create_empty_regular_file(
         &self,
         parent_id: InodeId,
@@ -3307,30 +3423,17 @@ impl VfsEngine for VfsLocalFileSystem {
             ctx.gid,
         );
         let child_path = build_child_path(&parent_path, name)?;
-        let record = self
-            .fs
-            .borrow_mut()
-            .create_dir(&child_path, child_mode & 0o7777)
-            .map_err(|e| map_errno(&e))?;
-        let mut attr_update = SetAttr::new();
-        attr_update.valid = FATTR_UID | FATTR_GID;
-        if parent_default_acl_entries.is_none() {
-            attr_update.valid |= FATTR_MODE;
-            attr_update.mode = child_mode;
-        }
-        attr_update.uid = ctx.uid;
-        attr_update.gid = child_gid;
-        let attr = {
-            let mut fs = self.fs.borrow_mut();
-            Self::apply_metadata_setattr_to_inode(&mut fs, record.inode_id, &attr_update, false)?;
-            fs.inode(record.inode_id)
-                .map(|record| record.to_inode_attr())
-                .map_err(|e| map_errno(&e))?
-        };
-        self.path_cache
-            .borrow_mut()
-            .insert(record.inode_id, child_path);
-        Ok(attr)
+        let record = self.create_empty_directory(
+            parent_record.inode_id,
+            &parent_path,
+            &child_path,
+            name,
+            child_mode,
+            ctx.uid,
+            child_gid,
+            parent_default_acl_entries.as_ref(),
+        )?;
+        Ok(record.to_inode_attr())
     }
 
     fn create(
@@ -5480,6 +5583,33 @@ mod tests {
         assert_eq!(attr.posix.mode & 0o777, 0o755);
         assert_eq!(attr.posix.uid, 4242);
         assert_eq!(attr.posix.gid, 4343);
+    }
+
+    #[test]
+    fn mkdir_initial_record_uses_effective_metadata() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let caller = RequestCtx {
+            uid: 4242,
+            gid: 4343,
+            pid: 77,
+            umask: 0o022,
+            groups: vec![4343],
+        };
+
+        let attr = engine
+            .mkdir(root, b"single-commit-dir", 0o777, &caller)
+            .unwrap();
+        let fs = engine.fs.borrow();
+        let record = fs.inode(attr.inode_id).unwrap();
+
+        assert_eq!(record.kind(), NodeKind::Dir);
+        assert_eq!(record.mode & S_IFMT, S_IFDIR);
+        assert_eq!(record.mode & 0o777, 0o755);
+        assert_eq!(record.uid, 4242);
+        assert_eq!(record.gid, 4343);
+        assert_eq!(record.generation.get(), record.metadata_version);
+        assert_eq!(record.generation.get(), record.data_version);
     }
 
     #[test]
