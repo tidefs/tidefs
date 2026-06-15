@@ -36,11 +36,14 @@ pub(crate) fn content_allocation_entries_for_inode(
     inode: &InodeRecord,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
     let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
-    let bytes = store
-        .get(content_key)?
-        .ok_or(FileSystemError::CorruptState {
+    let Some(bytes) = store.get(content_key)? else {
+        if inode.size == 0 {
+            return Ok(BTreeMap::new());
+        }
+        return Err(FileSystemError::CorruptState {
             reason: "allocator expected a missing content object",
-        })?;
+        });
+    };
     let layout = decode_content_layout(&bytes)?;
     validate_content_layout(inode.inode_id, inode, &layout)?;
     content_allocation_entries_for_layout(inode.inode_id, &layout)

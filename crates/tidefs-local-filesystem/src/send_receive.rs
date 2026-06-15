@@ -1029,6 +1029,9 @@ pub(crate) fn transaction_manifest_entries_for_content_changed_records(
     let content_bytes = match records.get(&content_key) {
         Some(record) => record.payload.as_slice(),
         None => {
+            if inode.size == 0 {
+                return Ok(Vec::new());
+            }
             // Incremental streams omit unchanged content records.
             // Return an empty manifest entry set for this inode.
             if is_incremental {

@@ -122,13 +122,11 @@ pub(crate) fn ensure_versioned_content_object(
     inode: &InodeRecord,
     compression_policy: &ContentCompressionPolicy,
 ) -> Result<()> {
-    if store
-        .get(content_object_key_for_version(
-            inode.inode_id,
-            inode.data_version,
-        ))?
-        .is_some()
-    {
+    let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+    if store.get(content_key)?.is_some() {
+        return Ok(());
+    }
+    if inode.size == 0 {
         return Ok(());
     }
     let content = read_content_from_store(store, inode.inode_id, inode, true, None)?;
@@ -155,11 +153,14 @@ pub(crate) fn transaction_manifest_entries_for_content(
     verify_chunk_payloads: bool,
 ) -> Result<Vec<TransactionManifestEntry>> {
     let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
-    let content_bytes = store
-        .get(content_key)?
-        .ok_or(FileSystemError::CorruptState {
+    let Some(content_bytes) = store.get(content_key)? else {
+        if inode.size == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(FileSystemError::CorruptState {
             reason: "transaction manifest validation expected a missing content object",
-        })?;
+        });
+    };
     let layout = decode_content_layout(&content_bytes)?;
     validate_content_layout(inode.inode_id, inode, &layout)?;
 

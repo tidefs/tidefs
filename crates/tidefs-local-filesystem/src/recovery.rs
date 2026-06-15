@@ -396,6 +396,10 @@ pub fn online_verifier_content_counts(
     let mut checked_content_chunks = 0_u64;
     for inode in state.inodes.values() {
         if inode.is_file_like() {
+            let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+            if inode.size == 0 && !store.contains_key(content_key) {
+                continue;
+            }
             let layout = read_content_layout_from_store(store, inode.inode_id, inode, false)?;
             let _ = read_content_from_store(store, inode.inode_id, inode, false, None)?;
             checked_content_objects = checked_content_objects.saturating_add(1);
@@ -441,6 +445,9 @@ fn inspect_inode_content_objects(
     let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
     let content_bytes = store.get(content_key)?;
     let missing = content_bytes.is_none();
+    if missing && inode.size == 0 {
+        return Ok(());
+    }
     let zero_length_record = content_bytes
         .as_ref()
         .map(|bytes| bytes.is_empty())
@@ -766,10 +773,10 @@ pub(crate) fn object_keys_for_committed_root_summary(
             ));
         }
         if inode.is_file_like() {
-            keys.insert(content_object_key_for_version(
-                inode.inode_id,
-                inode.data_version,
-            ));
+            let key = content_object_key_for_version(inode.inode_id, inode.data_version);
+            if inode.size > 0 || store.contains_key(key) {
+                keys.insert(key);
+            }
         }
     }
     Ok(keys)
