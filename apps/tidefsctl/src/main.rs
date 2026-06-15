@@ -955,6 +955,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cli_parse_snapshot_receive_rejects_devices() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "snapshot",
+            "receive",
+            "mypool",
+            "--devices",
+            "/dev/sda",
+            "--input",
+            "/tmp/mypool.vfssend1",
+        ]);
+        assert!(
+            args.is_err(),
+            "snapshot receive must not accept offline devices"
+        );
+    }
+
+    #[test]
+    fn cli_help_snapshot_receive_is_live_owner_only() {
+        #[derive(clap::Parser)]
+        struct SnapshotHelpCli {
+            #[command(subcommand)]
+            cmd: commands::snapshot::SnapshotCommand,
+        }
+
+        let receive_help = SnapshotHelpCli::command()
+            .find_subcommand_mut("receive")
+            .map(|command| render_long_help(command.clone()))
+            .expect("snapshot receive help exists");
+
+        assert!(receive_help.contains("--input"));
+        assert!(receive_help.contains("POOL"));
+        assert!(!receive_help.contains("--devices"));
+        assert!(!receive_help.contains("--backing-dir"));
+    }
+
     // -- Device CLI parse tests -------------------------------------------
 
     #[test]

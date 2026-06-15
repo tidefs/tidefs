@@ -744,15 +744,6 @@ pub struct SnapshotReceiveArgs {
     )]
     pub backing_dir: Option<PathBuf>,
 
-    /// Block devices for offline/not-yet-imported snapshot receive routing
-    #[arg(
-        short = 'd',
-        long = "devices",
-        num_args = 1..,
-        conflicts_with = "backing_dir"
-    )]
-    pub devices: Option<Vec<PathBuf>>,
-
     /// Input path containing a changed-record stream from `snapshot send`
     #[arg(long = "input", short = 'i')]
     pub input: Option<PathBuf>,
@@ -1906,41 +1897,18 @@ fn handle_receive(args: SnapshotReceiveArgs) {
         process::exit(1);
     }
 
-    let live_args = serde_json::json!({
+    let live_args = snapshot_receive_live_args(&args);
+
+    super::live_owner::route_with_args("snapshot", "receive", &args.pool, live_args);
+}
+
+fn snapshot_receive_live_args(args: &SnapshotReceiveArgs) -> serde_json::Value {
+    serde_json::json!({
         "input": args.input.as_ref().map(|path| path.display().to_string()),
         "source_addr": args.source_addr.map(|addr| addr.to_string()),
         "node_id": args.node_id,
         "server_node_id": args.server_node_id,
-        "devices": args.devices.as_ref().map(|paths| {
-            paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-        }),
-    });
-
-    if let Some(devices) = args
-        .devices
-        .as_deref()
-        .filter(|devices| !devices.is_empty())
-    {
-        let config = scan_device_pool_config(&args.pool, devices, "receive");
-        super::live_owner::route_or_refuse_active_for_uuid_with_args(
-            "snapshot",
-            "receive",
-            &args.pool,
-            config.pool_uuid,
-            config.state == tidefs_types_pool_label_core::PoolState::Active,
-            live_args,
-        );
-        eprintln!(
-            "tidefsctl snapshot receive: offline device-backed receive for exported pools is not implemented; use a live owner for pool '{}'",
-            args.pool
-        );
-        process::exit(1);
-    }
-
-    super::live_owner::route_with_args("snapshot", "receive", &args.pool, live_args);
+    })
 }
 
 #[cfg(test)]
@@ -2073,7 +2041,6 @@ mod tests {
         let args = SnapshotReceiveArgs {
             pool: "mypool".into(),
             backing_dir: None,
-            devices: None,
             input: Some(PathBuf::from("/tmp/stream.vfssend1")),
             source_addr: None,
             node_id: None,
@@ -2083,6 +2050,32 @@ mod tests {
         assert_eq!(args.backing_dir, None);
         assert_eq!(args.input, Some(PathBuf::from("/tmp/stream.vfssend1")));
         assert!(args.source_addr.is_none());
+    }
+
+    #[test]
+    fn snapshot_receive_live_args_exclude_offline_media() {
+        let args = SnapshotReceiveArgs {
+            pool: "mypool".into(),
+            backing_dir: None,
+            input: Some(PathBuf::from("/tmp/stream.vfssend1")),
+            source_addr: "127.0.0.1:9000".parse().ok(),
+            node_id: Some(7),
+            server_node_id: Some(9),
+        };
+
+        let live_args = snapshot_receive_live_args(&args);
+        assert_eq!(
+            live_args.get("input").and_then(|value| value.as_str()),
+            Some("/tmp/stream.vfssend1")
+        );
+        assert_eq!(
+            live_args
+                .get("source_addr")
+                .and_then(|value| value.as_str()),
+            Some("127.0.0.1:9000")
+        );
+        assert!(!live_args.as_object().unwrap().contains_key("devices"));
+        assert!(!live_args.as_object().unwrap().contains_key("backing_dir"));
     }
 
     #[test]
