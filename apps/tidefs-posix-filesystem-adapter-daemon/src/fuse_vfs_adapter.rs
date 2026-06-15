@@ -246,6 +246,14 @@ fn request_groups_from_pid(pid: u32, primary_gid: u32) -> Vec<u32> {
     }
 }
 
+fn request_groups_for_ids(uid: u32, pid: u32, primary_gid: u32) -> Vec<u32> {
+    if uid == 0 {
+        vec![primary_gid]
+    } else {
+        request_groups_from_pid(pid, primary_gid)
+    }
+}
+
 fn apply_setattr_privilege_mode_rules(
     attr: &SetAttr,
     current: &InodeAttr,
@@ -2869,7 +2877,7 @@ impl FuseVfsAdapter {
             gid,
             pid: req.pid(),
             umask: 0o022,
-            groups: request_groups_from_pid(req.pid(), gid),
+            groups: request_groups_for_ids(req.uid(), req.pid(), gid),
         }
     }
 
@@ -19321,6 +19329,17 @@ mod tests {
         assert_eq!(
             request_groups_from_status_text("Name:\ttest\n", 99),
             vec![99]
+        );
+    }
+
+    #[test]
+    fn root_request_group_lookup_skips_proc_status() {
+        let groups = request_groups_for_ids(0, std::process::id(), 12345);
+
+        assert_eq!(
+            groups,
+            vec![12345],
+            "root permission checks bypass supplementary groups and must not parse /proc status"
         );
     }
 
