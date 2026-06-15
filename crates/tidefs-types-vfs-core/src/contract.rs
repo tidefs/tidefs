@@ -10,6 +10,9 @@ pub const TIDE_CONTRACT_VERSION_V1: ContractVersion = ContractVersion(1);
 
 pub type ContractPayloadWords = [u64; 5];
 
+const VFS_NAME_TOKEN_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const VFS_NAME_TOKEN_FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ContractVersion(pub u16);
@@ -159,6 +162,48 @@ impl OffloadObjectId {
     #[must_use]
     pub const fn raw(self) -> u64 {
         self.0
+    }
+}
+
+/// Fixed-width identifier for one namespace component in a VFS request record.
+///
+/// Namespace-mutating contract records identify names by a deterministic
+/// component token plus the parent inode carried in the same fixed-width
+/// payload. The token is not a host path, allocation address, wall-clock value,
+/// or process-local string index. Producers that have the component bytes
+/// should use [`Self::from_component_bytes`]; consumers that need the original
+/// component must resolve the token through their trace/model component table
+/// and reject ambiguous bindings.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct VfsNameToken(pub u64);
+
+impl VfsNameToken {
+    /// Reserved zero token for "no component bound" in contexts that need one.
+    pub const NONE: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Derive a token from one namespace component using FNV-1a-64 over the
+    /// component bytes with the byte length mixed into the final state.
+    #[must_use]
+    pub fn from_component_bytes(bytes: &[u8]) -> Self {
+        let mut hash = VFS_NAME_TOKEN_FNV_OFFSET;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(VFS_NAME_TOKEN_FNV_PRIME);
+        }
+        hash ^= bytes.len() as u64;
+        hash = hash.wrapping_mul(VFS_NAME_TOKEN_FNV_PRIME);
+        Self(hash)
     }
 }
 
@@ -398,6 +443,12 @@ pub enum VfsRequestOp {
     Read = 2,
     Write = 3,
     Sync = 4,
+    Create = 5,
+    Mkdir = 6,
+    Rename = 7,
+    Link = 8,
+    Unlink = 9,
+    Truncate = 10,
 }
 
 impl VfsRequestOp {
@@ -413,6 +464,12 @@ impl VfsRequestOp {
             2 => Some(Self::Read),
             3 => Some(Self::Write),
             4 => Some(Self::Sync),
+            5 => Some(Self::Create),
+            6 => Some(Self::Mkdir),
+            7 => Some(Self::Rename),
+            8 => Some(Self::Link),
+            9 => Some(Self::Unlink),
+            10 => Some(Self::Truncate),
             _ => None,
         }
     }
@@ -438,6 +495,33 @@ pub enum VfsRequest {
     Sync {
         inode_id: InodeId,
         file_handle_id: FileHandleId,
+    },
+    Create {
+        parent_id: InodeId,
+        name: VfsNameToken,
+    },
+    Mkdir {
+        parent_id: InodeId,
+        name: VfsNameToken,
+    },
+    Rename {
+        old_parent_id: InodeId,
+        old_name: VfsNameToken,
+        new_parent_id: InodeId,
+        new_name: VfsNameToken,
+    },
+    Link {
+        source_inode_id: InodeId,
+        target_parent_id: InodeId,
+        target_name: VfsNameToken,
+    },
+    Unlink {
+        parent_id: InodeId,
+        name: VfsNameToken,
+    },
+    Truncate {
+        inode_id: InodeId,
+        size: u64,
     },
     Unsupported {
         opcode: u16,
@@ -477,6 +561,37 @@ impl VfsRequest {
                 VfsRequestOp::Sync.as_u16(),
                 [inode_id.0, file_handle_id.0, 0, 0, 0],
             ),
+            Self::Create { parent_id, name } => (
+                VfsRequestOp::Create.as_u16(),
+                [parent_id.0, name.0, 0, 0, 0],
+            ),
+            Self::Mkdir { parent_id, name } => {
+                (VfsRequestOp::Mkdir.as_u16(), [parent_id.0, name.0, 0, 0, 0])
+            }
+            Self::Rename {
+                old_parent_id,
+                old_name,
+                new_parent_id,
+                new_name,
+            } => (
+                VfsRequestOp::Rename.as_u16(),
+                [old_parent_id.0, old_name.0, new_parent_id.0, new_name.0, 0],
+            ),
+            Self::Link {
+                source_inode_id,
+                target_parent_id,
+                target_name,
+            } => (
+                VfsRequestOp::Link.as_u16(),
+                [source_inode_id.0, target_parent_id.0, target_name.0, 0, 0],
+            ),
+            Self::Unlink { parent_id, name } => (
+                VfsRequestOp::Unlink.as_u16(),
+                [parent_id.0, name.0, 0, 0, 0],
+            ),
+            Self::Truncate { inode_id, size } => {
+                (VfsRequestOp::Truncate.as_u16(), [inode_id.0, size, 0, 0, 0])
+            }
             Self::Unsupported { opcode, words } => (opcode, words),
         }
     }
@@ -502,6 +617,33 @@ impl VfsRequest {
             Some(VfsRequestOp::Sync) => Self::Sync {
                 inode_id: InodeId(words[0]),
                 file_handle_id: FileHandleId(words[1]),
+            },
+            Some(VfsRequestOp::Create) => Self::Create {
+                parent_id: InodeId(words[0]),
+                name: VfsNameToken(words[1]),
+            },
+            Some(VfsRequestOp::Mkdir) => Self::Mkdir {
+                parent_id: InodeId(words[0]),
+                name: VfsNameToken(words[1]),
+            },
+            Some(VfsRequestOp::Rename) => Self::Rename {
+                old_parent_id: InodeId(words[0]),
+                old_name: VfsNameToken(words[1]),
+                new_parent_id: InodeId(words[2]),
+                new_name: VfsNameToken(words[3]),
+            },
+            Some(VfsRequestOp::Link) => Self::Link {
+                source_inode_id: InodeId(words[0]),
+                target_parent_id: InodeId(words[1]),
+                target_name: VfsNameToken(words[2]),
+            },
+            Some(VfsRequestOp::Unlink) => Self::Unlink {
+                parent_id: InodeId(words[0]),
+                name: VfsNameToken(words[1]),
+            },
+            Some(VfsRequestOp::Truncate) => Self::Truncate {
+                inode_id: InodeId(words[0]),
+                size: words[1],
             },
             None => Self::Unsupported { opcode, words },
         }
@@ -1016,6 +1158,79 @@ mod tests {
         let (opcode, words) = request.opcode_words();
         assert_eq!(opcode, VfsRequestOp::Read.as_u16());
         assert_eq!(VfsRequest::from_opcode_words(opcode, words), request);
+    }
+
+    #[test]
+    fn vfs_namespace_payloads_round_trip_wire_words() {
+        let old_name = VfsNameToken::from_component_bytes(b"old");
+        let new_name = VfsNameToken::from_component_bytes(b"new");
+        let create = VfsRequest::Create {
+            parent_id: InodeId::new(10),
+            name: old_name,
+        };
+        let mkdir = VfsRequest::Mkdir {
+            parent_id: InodeId::new(11),
+            name: old_name,
+        };
+        let rename = VfsRequest::Rename {
+            old_parent_id: InodeId::new(12),
+            old_name,
+            new_parent_id: InodeId::new(13),
+            new_name,
+        };
+        let link = VfsRequest::Link {
+            source_inode_id: InodeId::new(14),
+            target_parent_id: InodeId::new(15),
+            target_name: new_name,
+        };
+        let unlink = VfsRequest::Unlink {
+            parent_id: InodeId::new(16),
+            name: old_name,
+        };
+        let truncate = VfsRequest::Truncate {
+            inode_id: InodeId::new(17),
+            size: 4096,
+        };
+
+        let cases = [
+            (
+                create,
+                VfsRequestOp::Create.as_u16(),
+                [10, old_name.raw(), 0, 0, 0],
+            ),
+            (
+                mkdir,
+                VfsRequestOp::Mkdir.as_u16(),
+                [11, old_name.raw(), 0, 0, 0],
+            ),
+            (
+                rename,
+                VfsRequestOp::Rename.as_u16(),
+                [12, old_name.raw(), 13, new_name.raw(), 0],
+            ),
+            (
+                link,
+                VfsRequestOp::Link.as_u16(),
+                [14, 15, new_name.raw(), 0, 0],
+            ),
+            (
+                unlink,
+                VfsRequestOp::Unlink.as_u16(),
+                [16, old_name.raw(), 0, 0, 0],
+            ),
+            (
+                truncate,
+                VfsRequestOp::Truncate.as_u16(),
+                [17, 4096, 0, 0, 0],
+            ),
+        ];
+
+        for (request, expected_opcode, expected_words) in cases {
+            let (opcode, words) = request.opcode_words();
+            assert_eq!(opcode, expected_opcode);
+            assert_eq!(words, expected_words);
+            assert_eq!(VfsRequest::from_opcode_words(opcode, words), request);
+        }
     }
 
     #[test]

@@ -588,6 +588,7 @@ fn read_payload_words(bytes: &[u8], offset: usize) -> ContractPayloadWords {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_types_vfs_core::VfsNameToken;
 
     #[test]
     fn request_envelope_golden_vector_matches() {
@@ -706,6 +707,86 @@ mod tests {
             decoded.request,
             TideRequest::Vfs(VfsRequest::Unsupported { opcode: 99, .. })
         ));
+    }
+
+    #[test]
+    fn namespace_request_operations_round_trip_fixed_words() {
+        let old_name = VfsNameToken::from_component_bytes(b"old");
+        let new_name = VfsNameToken::from_component_bytes(b"new");
+        let cases = [
+            (
+                VfsRequest::Create {
+                    parent_id: InodeId::new(10),
+                    name: old_name,
+                },
+                5_u16,
+                [10, old_name.raw(), 0, 0, 0],
+            ),
+            (
+                VfsRequest::Mkdir {
+                    parent_id: InodeId::new(11),
+                    name: old_name,
+                },
+                6_u16,
+                [11, old_name.raw(), 0, 0, 0],
+            ),
+            (
+                VfsRequest::Rename {
+                    old_parent_id: InodeId::new(12),
+                    old_name,
+                    new_parent_id: InodeId::new(13),
+                    new_name,
+                },
+                7_u16,
+                [12, old_name.raw(), 13, new_name.raw(), 0],
+            ),
+            (
+                VfsRequest::Link {
+                    source_inode_id: InodeId::new(14),
+                    target_parent_id: InodeId::new(15),
+                    target_name: new_name,
+                },
+                8_u16,
+                [14, 15, new_name.raw(), 0, 0],
+            ),
+            (
+                VfsRequest::Unlink {
+                    parent_id: InodeId::new(16),
+                    name: old_name,
+                },
+                9_u16,
+                [16, old_name.raw(), 0, 0, 0],
+            ),
+            (
+                VfsRequest::Truncate {
+                    inode_id: InodeId::new(17),
+                    size: 4096,
+                },
+                10_u16,
+                [17, 4096, 0, 0, 0],
+            ),
+        ];
+
+        for (request, expected_opcode, expected_words) in cases {
+            let envelope = RequestEnvelope::new(
+                RequestMetadata::new(
+                    RequestId::new([3; 16]),
+                    ContractEpoch::new(9),
+                    TraceId::new([4; 16]),
+                ),
+                TideRequest::Vfs(request),
+            );
+            let mut buf = [0_u8; REQUEST_ENVELOPE_V1_ENCODED_LEN];
+            encode_request_envelope_v1_le(&envelope, &mut buf).expect("encode");
+
+            assert_eq!(read_u16_le(&buf, 4), 1);
+            assert_eq!(read_u16_le(&buf, 6), expected_opcode);
+            assert_eq!(read_payload_words(&buf, 80), expected_words);
+            assert_eq!(
+                decode_request_envelope_v1_le(&buf).expect("decode"),
+                envelope
+            );
+        }
     }
 
     #[test]
