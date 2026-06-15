@@ -360,6 +360,16 @@ impl WriteAdmissionState {
             return Err(AdmissionError::ZeroDirtyOperations);
         }
         self.check_dirty_age(now_tick)?;
+        let charge_age = now_tick.saturating_sub(charge.admitted_tick);
+        let age_cap = self.config.effective_max_dirty_age_ticks();
+        if charge_age > age_cap {
+            return Err(AdmissionError::DirtyAgeHardCap {
+                oldest_tick: charge.admitted_tick,
+                now_tick,
+                cap: self.config.hard_max_dirty_age_ticks,
+                effective_cap: age_cap,
+            });
+        }
 
         let max_bytes = self.config.effective_max_dirty_bytes();
         let max_ops = self.config.effective_max_dirty_ops();
@@ -708,8 +718,8 @@ pub mod oracle {
         let scrub_slots = scrub.queue_slots;
         let scrub_admitted = min_u32(config.scrub_units, scrub_slots);
         let scrub_deferred = config.scrub_units.saturating_sub(scrub_admitted);
-        let foreground_can_run = foreground.work_class as u8 == WorkClass::ForegroundRead as u8
-            && foreground.max_ops_per_tick > 0;
+        let foreground_can_run =
+            foreground.work_class == WorkClass::ForegroundRead && foreground.max_ops_per_tick > 0;
         let completed = if foreground_can_run {
             config.read_arrival_tick
         } else {
@@ -835,6 +845,31 @@ mod tests {
         ));
 
         state.release(permit).expect("release");
+    }
+
+    #[test]
+    fn stale_charge_cannot_bypass_dirty_age_cap() {
+        let config =
+            WriteAdmissionConfig::new(4096, 4, 4, 4).with_dynamic_tuning(DynamicAdmissionTuning {
+                max_dirty_bytes: 4096,
+                max_dirty_ops: 4,
+                max_dirty_age_ticks: 128,
+            });
+        let mut state = WriteAdmissionState::new(config);
+
+        let err = state
+            .try_admit_at(AdmissionCharge::dirty_write(512, 1, 10), 15)
+            .expect_err("stale charge is refused even without existing dirty debt");
+        assert!(matches!(
+            err,
+            AdmissionError::DirtyAgeHardCap {
+                oldest_tick: 10,
+                now_tick: 15,
+                cap: 4,
+                effective_cap: 4,
+            }
+        ));
+        assert_eq!(state.usage(), WriteAdmissionUsage::default());
     }
 
     #[test]
