@@ -80,6 +80,7 @@ members = [
   "crates/tidefs-trace-oracle",
   "crates/tidefs-crash-oracle",
   "crates/tidefs-model-core",
+  "crates/tidefs-env-fuse-model",
   "crates/tidefs-clock-timing",
   "crates/tidefs-chunk-shipper",
   "crates/tidefs-checksum-tree",
