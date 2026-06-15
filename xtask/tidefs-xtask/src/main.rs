@@ -720,6 +720,23 @@ fn main() {
                 process::exit(1);
             }
         }
+        Some("validate-claim") => {
+            let claim_id = match args.next() {
+                Some(claim_id) => claim_id,
+                None => {
+                    eprintln!("validate-claim requires a claim id");
+                    process::exit(2);
+                }
+            };
+            if let Some(extra) = args.next() {
+                eprintln!("validate-claim accepts one claim id, got extra argument `{extra}`");
+                process::exit(2);
+            }
+            if let Err(err) = claims::validate_claim_current_workspace(&claim_id) {
+                eprintln!("{err}");
+                process::exit(1);
+            }
+        }
         Some("check-claim-gate" | "check-worktree-claim") => {
             if let Err(err) = forgejo_work::check_claim_gate_current_workspace() {
                 eprintln!("{err}");
@@ -1666,6 +1683,7 @@ fn print_summary() {
     println!("hot_read_cache_check_command=check-hot-read-cache");
     println!("module_owners_check_command=check-module-owners");
     println!("claims_gate_check_command=check-claims-gate");
+    println!("claim_validate_command=validate-claim");
     println!("claim_gate_check_command=check-claim-gate");
     println!("stale_claims_check_command=check-stale-claims");
     println!("duplicate_claims_check_command=check-duplicate-claims");
@@ -1936,6 +1954,7 @@ fn print_help() {
     println!("  check-module-invariants alias for check-module-owners");
     println!("  check-claims-gate       validate publish-facing capability claims");
     println!("  check-overclaims        alias for check-claims-gate");
+    println!("  validate-claim <id>     validate a registered claim evidence set");
     println!("  check-claim-gate        validate current worktree has a valid issue owner");
     println!("  check-worktree-claim    alias for check-claim-gate");
     println!("  check-stale-claims      scan Forgejo for stale codex:claimed issues");

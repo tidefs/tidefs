@@ -1,0 +1,115 @@
+registry_version = 1
+generated_doc_path = "docs/CLAIM_REGISTRY.md"
+
+[[claims]]
+id = "storage.write_fsync.crash_safety.v1"
+status = "planned"
+scope = "local-filesystem write and fsync durability"
+required_evidence_classes = [
+  "model-crash-matrix",
+  "runtime-crash-oracle",
+  "claims-gate-review",
+]
+blockers = [
+  "GitHub issue #286 must land model-first write/fsync crash matrices.",
+  "Runtime crash-oracle artifacts must be recorded before present-tense durability wording.",
+]
+generated_doc = "Planned write/fsync crash-safety claim for local filesystem commits. TideFS must keep this as future capability wording until model and runtime crash-oracle evidence exists."
+evidence_artifacts = []
+
+[[claims]]
+id = "namespace.rename.atomicity.v1"
+status = "planned"
+scope = "local namespace rename operations"
+required_evidence_classes = [
+  "model-crash-matrix",
+  "runtime-namespace-crash-artifact",
+  "claims-gate-review",
+]
+blockers = [
+  "GitHub issue #286 must cover rename crash matrices.",
+  "Runtime evidence for interrupted rename sequences is not recorded.",
+]
+generated_doc = "Planned rename atomicity claim for local namespace operations. TideFS must keep rename wording aspirational until model and runtime crash evidence covers the claimed scope."
+evidence_artifacts = []
+
+[[claims]]
+id = "scheduler.dirty_debt.no_hidden.v1"
+status = "blocked"
+scope = "foreground and background dirty-work accounting"
+required_evidence_classes = [
+  "admission-budget-model",
+  "queue-depth-runtime-artifact",
+  "claims-gate-review",
+]
+blockers = [
+  "GitHub issue #287 owns performance-contract work classes and no-hidden-queue gates.",
+  "No runtime artifact proves dirty work cannot hide outside budgeted queues.",
+]
+generated_doc = "Blocked no-hidden-dirty-debt claim for foreground and background work accounting. TideFS must not claim hidden dirty work is eliminated until budgeted queue evidence exists."
+evidence_artifacts = []
+
+[[claims]]
+id = "scrub.foreground_read.protected.v1"
+status = "planned"
+scope = "foreground read protection from scrub and repair work"
+required_evidence_classes = [
+  "scrub-read-isolation-model",
+  "runtime-scrub-read-artifact",
+  "claims-gate-review",
+]
+blockers = [
+  "Scrub/read isolation authority is not proven by a focused runtime row.",
+  "Foreground read latency and correctness artifacts under scrub load are missing.",
+]
+generated_doc = "Planned foreground-read protection claim for scrub and repair work. TideFS must describe this as future proof work until isolation and runtime artifacts cover foreground reads."
+evidence_artifacts = []
+
+[[claims]]
+id = "offload.ready.non_authoritative.v1"
+status = "planned"
+scope = "offload acceleration authority"
+required_evidence_classes = [
+  "cpu-reference-backend",
+  "offload-equivalence-artifact",
+  "claims-gate-review",
+]
+blockers = [
+  "NEXTGEN-007 non-authoritative offload evidence is not present.",
+  "CPU/reference authority must remain the only product truth until equivalence artifacts exist.",
+]
+generated_doc = "Planned non-authoritative offload claim. TideFS must keep offload wording as helper-path acceleration until CPU/reference equivalence evidence exists."
+evidence_artifacts = []
+
+[[claims]]
+id = "ublk.qid_tag.exactly_once_completion.v1"
+status = "planned"
+scope = "uBLK qid/tag request lifecycle"
+required_evidence_classes = [
+  "qid-tag-state-model",
+  "runtime-ublk-completion-artifact",
+  "claims-gate-review",
+]
+blockers = [
+  "GitHub issue #289 owns the uBLK qid/tag lifecycle model.",
+  "No focused runtime artifact proves exactly-once completion for qid/tag pairs.",
+]
+generated_doc = "Planned uBLK qid/tag exactly-once completion claim. TideFS must keep this as model work until lifecycle and runtime artifacts cover the completion contract."
+evidence_artifacts = []
+
+[[claims]]
+id = "kernel.teardown.no_work_after.v1"
+status = "planned"
+scope = "kernel teardown and post-teardown work exclusion"
+required_evidence_classes = [
+  "kernel-context-token-model",
+  "teardown-race-proof-artifact",
+  "claims-gate-review",
+]
+blockers = [
+  "GitHub issue #291 owns kernel context tokens and teardown race proof harness work.",
+  "No artifact proves work cannot run after teardown.",
+]
+generated_doc = "Planned kernel no-work-after-teardown claim. TideFS must keep this as future proof work until context-token and teardown race evidence exists."
+evidence_artifacts = []
+

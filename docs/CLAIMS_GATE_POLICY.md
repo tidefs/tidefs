@@ -19,6 +19,21 @@ active work ownership. Foreground Codex work is coordinated through GitHub
 issues and pull requests in `tidefs/tidefs`; use the separate worktree/claim
 diagnostic commands when checking local worker ownership.
 
+## Claim Registry Authority
+
+Stable claim ids live in `validation/claims.toml`. That registry records the
+claim status, scope, required evidence classes, current blockers, and the text
+that may appear in generated claim documentation.
+
+The generated claim document is `docs/CLAIM_REGISTRY.md`. It is checked by
+`cargo run -p tidefs-xtask -- check-claims-gate`; manual edits to that document
+must fail unless they match the registry-derived output exactly.
+
+Use `cargo run -p tidefs-xtask -- validate-claim <id>` before treating a
+registered claim as validated evidence. Planned, blocked, and invalid claims
+fail closed; validated claims also fail closed when required evidence artifacts
+are missing or older than `validation/claims.toml`.
+
 ## Claims rule
 
 Current capability wording is blocked for these claim families unless the same
