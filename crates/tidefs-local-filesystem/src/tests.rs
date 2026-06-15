@@ -998,22 +998,34 @@ fn write_at_offset_zero_fills_gap() {
 fn zero_length_write_does_not_extend_or_allocate() {
     let root = temp_root("zero-length-write");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-    fs.create_file("/sparse.bin", 0o644).expect("create file");
+    let record = fs.create_file("/sparse.bin", 0o644).expect("create file");
     fs.write_file("/sparse.bin", 0, b"abc")
         .expect("write baseline");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush baseline");
     assert_eq!(
         fs.read_file("/sparse.bin").expect("cache baseline"),
         b"abc".to_vec()
     );
 
+    let intent_log = std::sync::Arc::new(tidefs_intent_log::IntentLogBuffer::new());
+    fs.set_intent_log_buffer(intent_log.clone());
     let generation_before = fs.stats().filesystem_generation;
     let record_before = fs.stat("/sparse.bin").expect("stat before");
     let allocator_before = fs.allocator_report().expect("allocator before");
+    let space_before = fs.space_counters();
+    let dirty_extent_maps_before = fs.state.dirty_extent_maps.clone();
+    let write_buffer_present_before = fs.write_buffers.contains_key(&record_before.inode_id);
+    let intent_seq_before = intent_log.current_seq();
     let cache_before = fs.hot_read_cache_report();
 
     let returned = fs
+        .write_file("/sparse.bin", record_before.size, b"")
+        .expect("zero-length write at eof");
+    assert_eq!(returned, record_before);
+    let returned = fs
         .write_file("/sparse.bin", content_chunk_size() as u64 * 4, b"")
-        .expect("zero-length write");
+        .expect("zero-length write beyond eof");
     assert_eq!(returned, record_before);
     assert_eq!(fs.stats().filesystem_generation, generation_before);
     assert_eq!(fs.stat("/sparse.bin").expect("stat after"), record_before);
@@ -1021,6 +1033,13 @@ fn zero_length_write_does_not_extend_or_allocate() {
         fs.allocator_report().expect("allocator after"),
         allocator_before
     );
+    assert_eq!(fs.space_counters(), space_before);
+    assert_eq!(fs.state.dirty_extent_maps, dirty_extent_maps_before);
+    assert_eq!(
+        fs.write_buffers.contains_key(&record_before.inode_id),
+        write_buffer_present_before
+    );
+    assert_eq!(intent_log.current_seq(), intent_seq_before);
     assert_eq!(
         fs.read_file("/sparse.bin").expect("read after no-op"),
         b"abc".to_vec()
@@ -1036,6 +1055,29 @@ fn zero_length_write_does_not_extend_or_allocate() {
         b"abc".to_vec()
     );
     assert_eq!(reopened.stat("/sparse.bin").expect("stat reopened").size, 3);
+    drop(reopened);
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
+fn write_file_non_empty_invalidates_hot_read_cache() {
+    let root = temp_root("write-file-invalidate-hot-read-cache");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.create_file("/hot.txt", 0o644).expect("create file");
+    fs.write_file("/hot.txt", 0, b"abc")
+        .expect("write baseline");
+    assert_eq!(fs.read_file("/hot.txt").expect("cache baseline"), b"abc");
+
+    let cache_before = fs.hot_read_cache_report();
+    assert_eq!(cache_before.resident_entries, 1);
+    fs.write_file("/hot.txt", 1, b"Z")
+        .expect("write non-empty patch");
+    let cache_after = fs.hot_read_cache_report();
+    assert_eq!(cache_after.resident_entries, 0);
+    assert!(cache_after.invalidations > cache_before.invalidations);
+    assert_eq!(fs.read_file("/hot.txt").expect("read patched"), b"aZc");
+    drop(fs);
     cleanup(&root);
 }
 
@@ -3921,9 +3963,11 @@ fn hot_read_cache_bypasses_oversized_content() {
 fn hot_read_cache_clears_on_snapshot_rollback() {
     let root = temp_root("hot-read-cache-rollback");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-    fs.create_file("/file.txt", 0o644).expect("create file");
+    let record = fs.create_file("/file.txt", 0o644).expect("create file");
     fs.write_file("/file.txt", 0, b"baseline")
         .expect("write baseline");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush baseline before snapshot");
     fs.create_snapshot("baseline").expect("snapshot baseline");
     assert_eq!(
         fs.read_file("/file.txt").expect("read baseline"),

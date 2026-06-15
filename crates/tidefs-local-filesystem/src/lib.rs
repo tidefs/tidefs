@@ -6415,6 +6415,7 @@ impl LocalFileSystem {
             handle.commit();
         }
         check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
+        self.invalidate_hot_read_cache_for_inode(inode_id);
 
         // Buffer the write — flush on threshold or explicit fsync.
         let may_flush_after_ingest = self
@@ -10319,25 +10320,6 @@ impl LocalFileSystem {
     }
 
     fn read_content(&self, inode_id: InodeId, record: &InodeRecord) -> Result<Vec<u8>> {
-        if let Some(wb) = self.write_buffers.get(&inode_id) {
-            let read_len_u64 = wb.max_offset().unwrap_or(0).max(record.size);
-            let read_len =
-                usize::try_from(read_len_u64).map_err(|_| FileSystemError::SizeOverflow {
-                    requested: read_len_u64,
-                })?;
-            if read_len > 0 {
-                if let Some(buffered) =
-                    self.read_with_write_buffer_overlay(inode_id, record, 0, read_len)?
-                {
-                    return Ok(buffered);
-                }
-            }
-        }
-        // Return EIO for inodes that have been marked corrupted by repair.
-        if self.state.corrupted_inodes.contains(&inode_id) {
-            return Err(FileSystemError::CorruptContent { inode_id });
-        }
-
         let role = HotReadCacheObjectRole::from_node_kind(record.kind()).ok_or(
             FileSystemError::NotFile {
                 path: format!("inode:{}", inode_id.get()),
@@ -10350,6 +10332,32 @@ impl LocalFileSystem {
             data_version: record.data_version,
             size: record.size,
         };
+        if let Some(wb) = self.write_buffers.get(&inode_id) {
+            let read_len_u64 = wb.max_offset().unwrap_or(0).max(record.size);
+            let read_len =
+                usize::try_from(read_len_u64).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: read_len_u64,
+                })?;
+            if read_len > 0 {
+                if let Some(buffered) =
+                    self.read_with_write_buffer_overlay(inode_id, record, 0, read_len)?
+                {
+                    let mut cache = self.hot_read_cache.borrow_mut();
+                    if let Some(cached) = cache.get(key) {
+                        if cached == buffered {
+                            return Ok(cached);
+                        }
+                    }
+                    cache.admit(key, &buffered);
+                    return Ok(buffered);
+                }
+            }
+        }
+        // Return EIO for inodes that have been marked corrupted by repair.
+        if self.state.corrupted_inodes.contains(&inode_id) {
+            return Err(FileSystemError::CorruptContent { inode_id });
+        }
+
         if let Some(bytes) = self.hot_read_cache.borrow_mut().get(key) {
             return Ok(bytes);
         }
