@@ -830,15 +830,55 @@ impl VfsLocalFileSystem {
         cache.get(&inode_id).cloned().ok_or(Errno::ENOENT)
     }
 
-    /// Invalidate path cache for a single inode.
-    fn invalidate_path(&self, inode_id: InodeId) {
-        self.path_cache.borrow_mut().remove(&inode_id);
+    fn path_is_at_or_under(path: &str, prefix: &str) -> bool {
+        if path == prefix {
+            return true;
+        }
+        path.strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
     }
 
-    /// Invalidate non-root path cache entries.
-    fn invalidate_all_paths(&self) {
-        let root_path = self.root_path();
-        self.path_cache.borrow_mut().retain(|_, p| *p == root_path);
+    fn rewrite_path_prefix(path: &str, old_prefix: &str, new_prefix: &str) -> Option<String> {
+        if path == old_prefix {
+            return Some(new_prefix.to_string());
+        }
+        let suffix = path.strip_prefix(old_prefix)?;
+        if suffix.starts_with('/') {
+            Some(format!("{new_prefix}{suffix}"))
+        } else {
+            None
+        }
+    }
+
+    fn invalidate_cached_path_subtree(&self, root_path: &str) {
+        self.path_cache
+            .borrow_mut()
+            .retain(|_, path| !Self::path_is_at_or_under(path, root_path));
+    }
+
+    fn rewrite_cached_path_subtree(&self, old_path: &str, new_path: &str) {
+        for path in self.path_cache.borrow_mut().values_mut() {
+            if let Some(updated) = Self::rewrite_path_prefix(path, old_path, new_path) {
+                *path = updated;
+            }
+        }
+    }
+
+    fn exchange_cached_path_subtrees(&self, old_path: &str, new_path: &str) {
+        let updates: Vec<_> = self
+            .path_cache
+            .borrow()
+            .iter()
+            .filter_map(|(inode_id, path)| {
+                Self::rewrite_path_prefix(path, old_path, new_path)
+                    .or_else(|| Self::rewrite_path_prefix(path, new_path, old_path))
+                    .map(|path| (*inode_id, path))
+            })
+            .collect();
+        let mut cache = self.path_cache.borrow_mut();
+        for (inode_id, path) in updates {
+            cache.insert(inode_id, path);
+        }
     }
 
     #[allow(dead_code)] // INTENT: VFS engine helpers for planned FUSE operation dispatch
@@ -3244,8 +3284,7 @@ impl VfsEngine for VfsLocalFileSystem {
                 .unlink(&child_path)
                 .map_err(|e| map_errno(&e))?;
         }
-        self.invalidate_path(record.inode_id);
-        self.invalidate_all_paths();
+        self.invalidate_cached_path_subtree(&child_path);
         Ok(())
     }
 
@@ -3279,8 +3318,7 @@ impl VfsEngine for VfsLocalFileSystem {
             .borrow_mut()
             .remove_dir(&child_path)
             .map_err(|e| map_errno(&e))?;
-        self.invalidate_path(record.inode_id);
-        self.invalidate_all_paths();
+        self.invalidate_cached_path_subtree(&child_path);
         Ok(())
     }
 
@@ -3323,12 +3361,12 @@ impl VfsEngine for VfsLocalFileSystem {
             .borrow()
             .stat(&old_path)
             .map_err(|e| map_errno(&e))?;
+        let target_record = self.fs.borrow().stat(&new_path).ok();
 
         // Sticky-bit check: when overwriting a target, the caller must
         // pass the sticky-bit gate on the target's parent directory.
         if renameat2_flags != RenameAt2Flags::EXCHANGE {
-            let new_target = self.fs.borrow().stat(&new_path);
-            if let Ok(target_record) = new_target {
+            if let Some(target_record) = target_record.as_ref() {
                 let new_parent_record = self
                     .fs
                     .borrow()
@@ -3350,10 +3388,27 @@ impl VfsEngine for VfsLocalFileSystem {
             .renameat2(&old_path, &new_path, renameat2_flags)
             .map_err(|e| map_errno(&e))?;
 
-        // Update cache: old inode now at new path.
-        self.invalidate_all_paths();
-        let mut cache = self.path_cache.borrow_mut();
-        cache.insert(old_record.inode_id, new_path);
+        if renameat2_flags == RenameAt2Flags::EXCHANGE {
+            if let Some(target_record) = target_record.as_ref() {
+                if target_record.inode_id != old_record.inode_id {
+                    self.exchange_cached_path_subtrees(&old_path, &new_path);
+                    let mut cache = self.path_cache.borrow_mut();
+                    cache.insert(old_record.inode_id, new_path);
+                    cache.insert(target_record.inode_id, old_path);
+                    return Ok(());
+                }
+            }
+        } else if target_record
+            .as_ref()
+            .is_some_and(|target| target.inode_id != old_record.inode_id)
+        {
+            self.invalidate_cached_path_subtree(&new_path);
+        }
+
+        self.rewrite_cached_path_subtree(&old_path, &new_path);
+        self.path_cache
+            .borrow_mut()
+            .insert(old_record.inode_id, new_path);
         Ok(())
     }
 
@@ -3445,7 +3500,7 @@ impl VfsEngine for VfsLocalFileSystem {
             .borrow_mut()
             .link_file(&target_path, &new_path)
             .map_err(|e| map_errno(&e))?;
-        self.invalidate_all_paths();
+        self.path_cache.borrow_mut().insert(target, new_path);
 
         self.fs
             .borrow()
@@ -4536,6 +4591,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let fs = LocalFileSystem::open(dir.path()).expect("open");
         (VfsLocalFileSystem::new(fs), dir)
+    }
+
+    fn cached_path(engine: &VfsLocalFileSystem, inode: InodeId) -> Option<String> {
+        engine.path_cache.borrow().get(&inode).cloned()
     }
 
     #[test]
@@ -11887,6 +11946,133 @@ mod tests {
 
         let path = engine.inode_path(attr.inode_id).unwrap();
         assert_eq!(path, "/newname");
+    }
+
+    #[test]
+    fn namespace_churn_preserves_unrelated_cached_paths() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let stable = engine.mkdir(root, b"stable", 0o755, &ctx()).unwrap();
+        let (nested, _nested_fh) = engine
+            .create(stable.inode_id, b"nested.txt", 0o644, 0, &ctx())
+            .unwrap();
+        assert_eq!(
+            engine.inode_path(nested.inode_id).unwrap(),
+            "/stable/nested.txt"
+        );
+
+        for idx in 0..16 {
+            let file_name = format!("churn-{idx}.txt");
+            let (created, _fh) = engine
+                .create(root, file_name.as_bytes(), 0o644, 0, &ctx())
+                .unwrap();
+            assert_eq!(
+                cached_path(&engine, nested.inode_id).as_deref(),
+                Some("/stable/nested.txt")
+            );
+
+            engine.unlink(root, file_name.as_bytes(), &ctx()).unwrap();
+            assert_eq!(
+                cached_path(&engine, nested.inode_id).as_deref(),
+                Some("/stable/nested.txt")
+            );
+            assert_eq!(cached_path(&engine, created.inode_id), None);
+
+            let dir_name = format!("churn-dir-{idx}");
+            let removed_dir = engine
+                .mkdir(root, dir_name.as_bytes(), 0o755, &ctx())
+                .unwrap();
+            engine.rmdir(root, dir_name.as_bytes(), &ctx()).unwrap();
+            assert_eq!(
+                cached_path(&engine, nested.inode_id).as_deref(),
+                Some("/stable/nested.txt")
+            );
+            assert_eq!(cached_path(&engine, removed_dir.inode_id), None);
+        }
+    }
+
+    #[test]
+    fn path_cache_rewrites_directory_descendants_on_rename() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let old_dir = engine.mkdir(root, b"old", 0o755, &ctx()).unwrap();
+        let child_dir = engine
+            .mkdir(old_dir.inode_id, b"child", 0o755, &ctx())
+            .unwrap();
+        let (leaf, _fh) = engine
+            .create(child_dir.inode_id, b"leaf.txt", 0o644, 0, &ctx())
+            .unwrap();
+        assert_eq!(
+            engine.inode_path(leaf.inode_id).unwrap(),
+            "/old/child/leaf.txt"
+        );
+
+        engine
+            .rename(root, b"old", root, b"new", 0, &ctx())
+            .unwrap();
+
+        assert_eq!(
+            cached_path(&engine, old_dir.inode_id).as_deref(),
+            Some("/new")
+        );
+        assert_eq!(
+            cached_path(&engine, child_dir.inode_id).as_deref(),
+            Some("/new/child")
+        );
+        assert_eq!(
+            cached_path(&engine, leaf.inode_id).as_deref(),
+            Some("/new/child/leaf.txt")
+        );
+        assert_eq!(
+            engine
+                .lookup(child_dir.inode_id, b"leaf.txt", &ctx())
+                .unwrap()
+                .inode_id,
+            leaf.inode_id
+        );
+    }
+
+    #[test]
+    fn path_cache_rewrites_directory_descendants_on_exchange() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let left_dir = engine.mkdir(root, b"left", 0o755, &ctx()).unwrap();
+        let right_dir = engine.mkdir(root, b"right", 0o755, &ctx()).unwrap();
+        let (left_child, _left_fh) = engine
+            .create(left_dir.inode_id, b"left-child.txt", 0o644, 0, &ctx())
+            .unwrap();
+        let (right_child, _right_fh) = engine
+            .create(right_dir.inode_id, b"right-child.txt", 0o644, 0, &ctx())
+            .unwrap();
+        assert_eq!(
+            engine.inode_path(left_child.inode_id).unwrap(),
+            "/left/left-child.txt"
+        );
+        assert_eq!(
+            engine.inode_path(right_child.inode_id).unwrap(),
+            "/right/right-child.txt"
+        );
+
+        engine
+            .rename(root, b"left", root, b"right", RENAME_EXCHANGE, &ctx())
+            .unwrap();
+
+        assert_eq!(
+            cached_path(&engine, left_dir.inode_id).as_deref(),
+            Some("/right")
+        );
+        assert_eq!(
+            cached_path(&engine, left_child.inode_id).as_deref(),
+            Some("/right/left-child.txt")
+        );
+        assert_eq!(
+            cached_path(&engine, right_dir.inode_id).as_deref(),
+            Some("/left")
+        );
+        assert_eq!(
+            cached_path(&engine, right_child.inode_id).as_deref(),
+            Some("/left/right-child.txt")
+        );
     }
 
     // ── ctime advancement on setattr (#3566) ──────────────────────────────────
