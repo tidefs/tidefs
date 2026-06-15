@@ -330,10 +330,11 @@ tidefsctl snapshot receive mypool --input /tmp/mypool.vfssend1
 ```
 
 For an imported pool, snapshot commands ask the live owner to operate on its
-mounted state. Owner-side receive, live network push, and live incremental
-send remain bounded follow-up paths; missing owner implementations fail closed
-instead of opening storage behind the owner. Directory object-store receive is
-not a pool media mode.
+mounted state. Snapshot receive is pool-name live-owner-only: it accepts stream
+input/source fields and never takes exported/offline devices or directory media
+handles as receive authority. Owner-side receive, live network push, and live
+incremental send remain bounded follow-up paths; missing owner implementations
+fail closed instead of opening storage behind the owner.
 
 The clone, bookmark, hold, release, and prune commands cover the current local
 snapshot lifecycle only. They do not claim distributed snapshot replication,

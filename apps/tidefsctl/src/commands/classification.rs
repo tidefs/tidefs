@@ -610,6 +610,15 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_receive_classification_is_live_owner_only() {
+        let surface = find_surface("snapshot receive").expect("snapshot receive classified");
+        assert_eq!(surface.routing, RoutingSemantics::LiveOwner);
+        assert!(surface.summary.contains("live owner"));
+        assert!(surface.summary.contains("offline receive is unsupported"));
+        assert!(!surface.summary.contains("explicit offline devices"));
+    }
+
+    #[test]
     fn removed_surfaces_are_classified_and_error_clearly() {
         for path in [
             "pool list",
