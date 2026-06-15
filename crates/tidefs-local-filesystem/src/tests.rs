@@ -3683,6 +3683,17 @@ fn retention_plan_protects_committed_roots_without_mutation_or_fsck() {
     assert!(plan.protects_fallback_roots_without_operator_repair());
     assert!(!plan.production_recovery_requires_operator_repair());
     assert!(!plan.mutates_storage());
+    drop(fs);
+
+    let path_plan = plan_root_retention(&root, options(), RootRetentionPolicy::safe_default())
+        .expect("plan root retention by root path");
+    assert_eq!(path_plan.policy, RootRetentionPolicy::safe_default());
+    assert!(!path_plan.protected_committed_roots.is_empty());
+    assert!(!path_plan.protected_object_keys.is_empty());
+    assert!(!path_plan.protected_root_slot_locations.is_empty());
+    assert!(path_plan.protects_fallback_roots_without_operator_repair());
+    assert!(!path_plan.production_recovery_requires_operator_repair());
+    assert!(!path_plan.mutates_storage());
     cleanup(&root);
 }
 
