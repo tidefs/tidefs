@@ -21,6 +21,7 @@ OpenZFS/Ceph-class claims.
 | TFR-017 | Transport/cluster authority | Cluster CLI, storage-node, send-buffer, epoch-fence, and orchestrator paths still expose staged or placeholder distributed behavior. | Define the transport authority, cross-replica comparison, dispatch, and backpressure semantics before multi-node claims. |
 | TFR-019 | Documentation authority drift | Imported docs still mix design intent, issue closeout records, maturity labels, and current-status claims. | Reclassify every doc as current policy, current spec, historical input, or delete candidate before relying on it. |
 | TFR-020 | Test signal authority | Unit, integration, harness, policy, and marker tests are widespread enough that test count can outgrow product confidence. | Apply `docs/TEST_SIGNAL_POLICY.md`: keep product/invariant signal, demote marker/stale/scaffold signal, and make fixtures match the claim being proved. |
+| TFR-021 | Nextgen verification contract authority | The verification/performance/offload plan needs one evidence chain instead of separate request-contract, model, trace, crash, performance, adapter, and offload systems. | Use `docs/NEXTGEN_VERIFICATION_CONTRACT_ROADMAP.md` as the planning authority; keep high-value claim ids blocked until issue-scoped evidence and claims-gate support exist. |
 
 ## Current Review Notes
 
@@ -38,6 +39,13 @@ Important 2026-06-01 findings:
   surfaces; future cleanup should keep mounted/runtime/product and compact
   invariant tests, compress redundant branch tests, and remove or demote
   marker-only, stale-fixture, scaffold, and weakened-fixture claims.
+- `TFR-021`: issue #281 adds
+  `docs/NEXTGEN_VERIFICATION_CONTRACT_ROADMAP.md` as the current planning
+  authority for the nextgen verification, performance, and offload chain. The
+  roadmap maps the architecture onto existing workspace anchors and records
+  planned-blocked claim ids only. It does not close crash safety, performance
+  isolation, kernel correctness, distributed correctness, accelerator
+  correctness, TFR-008, TFR-017, or TFR-018.
 - `TFR-002`: Earlier package-authority cleanup reported 148 packages and 148 workspace members.
   Five manifests are outside root workspace metadata after the abandoned POSIX
   adapter split-shard crates, broken `tidefs-chaos` app root, and five
