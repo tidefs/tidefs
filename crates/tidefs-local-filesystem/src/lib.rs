@@ -484,9 +484,13 @@ pub fn audit_recovery_with_root_authentication_key(
     options: StoreOptions,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RecoveryAuditReport> {
-    let mut store = LocalObjectStore::open_with_options(root, options)?;
-    MountedCommittedRootRepairAuthority::raw_only(&mut store, root_authentication_key)
-        .recovery_audit()
+    let mut store = LocalFileSystem::default_pool(root.as_ref(), &options, None, None, None)?;
+    let mut authority = MountedOpenRecoveryAuthority::raw_only(
+        &mut store,
+        root_authentication_key,
+        RecoveryPolicy::default(),
+    );
+    authority.recovery_audit()
 }
 
 pub fn verify_online(
@@ -502,11 +506,17 @@ pub fn verify_online_with_root_authentication_key(
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<OnlineVerifierReport> {
     options.repair_torn_tail = false;
-    let Some(mut store) = LocalObjectStore::open_read_only_with_options(root, options)? else {
+    let root = root.as_ref();
+    if !root.exists() {
         return Ok(OnlineVerifierReport::empty());
-    };
-    MountedCommittedRootRepairAuthority::raw_only(&mut store, root_authentication_key)
-        .online_verifier_report()
+    }
+    let mut store = LocalFileSystem::default_pool(root, &options, None, None, None)?;
+    let mut authority = MountedOpenRecoveryAuthority::raw_only(
+        &mut store,
+        root_authentication_key,
+        RecoveryPolicy::default(),
+    );
+    authority.online_verifier_report()
 }
 pub fn fsck(root: impl AsRef<Path>, options: StoreOptions) -> Result<FsckReport> {
     fsck_with_root_authentication_key(root, options, default_root_authentication_key()?)
@@ -567,9 +577,13 @@ pub fn plan_root_retention_with_root_authentication_key(
     policy: RootRetentionPolicy,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootRetentionPlan> {
-    let mut store = LocalObjectStore::open_with_options(root, options)?;
-    MountedCommittedRootRepairAuthority::raw_only(&mut store, root_authentication_key)
-        .root_retention_plan(policy)
+    let mut store = LocalFileSystem::default_pool(root.as_ref(), &options, None, None, None)?;
+    let mut authority = MountedOpenRecoveryAuthority::raw_only(
+        &mut store,
+        root_authentication_key,
+        RecoveryPolicy::default(),
+    );
+    authority.root_retention_plan(policy)
 }
 
 pub fn run_crash_recovery_matrix(
