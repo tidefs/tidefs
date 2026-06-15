@@ -881,9 +881,11 @@ fn validate_claim_record(
                     claim.id, artifact.path, artifact.class
                 ));
             }
-            failures.extend(validate_runtime_ublk_completion_artifact_content(
-                root, claim, artifact,
-            ));
+            if artifact.class == UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS {
+                failures.extend(validate_runtime_ublk_completion_artifact_content(
+                    root, claim, artifact,
+                ));
+            }
         }
     }
     failures

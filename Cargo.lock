@@ -2887,6 +2887,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-offload-core"
+version = "0.421.0"
+dependencies = [
+ "tidefs-types-vfs-core",
+]
+
+[[package]]
 name = "tidefs-online-defrag"
 version = "0.421.0"
 dependencies = [

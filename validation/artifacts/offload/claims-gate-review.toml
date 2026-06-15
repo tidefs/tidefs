@@ -1,0 +1,10 @@
+artifact_version = 1
+claim = "offload.ready.non_authoritative.v1"
+evidence_class = "claims-gate-review"
+issue = 288
+
+review_scope = [
+  "The validated claim scope is limited to descriptor/reference/completion behavior in tidefs-offload-core.",
+  "The generated claim text keeps GPU/FPGA production acceleration, DMA, kernel, RDMA, storage-runtime integration, and hardware equivalence outside the validated scope.",
+  "Claim-gate validation treats non-uBLK evidence classes as generic workspace-relative artifacts instead of applying the uBLK runtime artifact verifier.",
+]

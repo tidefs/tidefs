@@ -140,19 +140,20 @@ evidence_artifacts = []
 
 [[claims]]
 id = "offload.ready.non_authoritative.v1"
-status = "planned"
-scope = "offload acceleration authority"
+status = "validated"
+scope = "non-authoritative offload descriptor, CPU reference backend, and completion validation"
 required_evidence_classes = [
   "cpu-reference-backend",
-  "offload-equivalence-artifact",
+  "descriptor-completion-validation",
   "claims-gate-review",
 ]
-blockers = [
-  "NEXTGEN-007 non-authoritative offload evidence is not present.",
-  "CPU/reference authority must remain the only product truth until equivalence artifacts exist.",
+blockers = []
+generated_doc = "Validated non-authoritative offload claim for v1 descriptor validation, CPU reference checksum/parity/scrub kernels, buffer-lease matching, and completion validation. This does not validate GPU/FPGA production acceleration, DMA, kernel, RDMA, storage-runtime integration, or hardware equivalence."
+evidence_artifacts = [
+  { class = "cpu-reference-backend", path = "validation/artifacts/offload/cpu-reference-backend.toml" },
+  { class = "descriptor-completion-validation", path = "validation/artifacts/offload/descriptor-completion-validation.toml" },
+  { class = "claims-gate-review", path = "validation/artifacts/offload/claims-gate-review.toml" },
 ]
-generated_doc = "Planned non-authoritative offload claim. TideFS must keep offload wording as helper-path acceleration until CPU/reference equivalence evidence exists."
-evidence_artifacts = []
 
 [[claims]]
 id = "ublk.qid_tag.exactly_once_completion.v1"

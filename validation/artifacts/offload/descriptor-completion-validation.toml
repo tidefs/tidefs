@@ -1,0 +1,16 @@
+artifact_version = 1
+claim = "offload.ready.non_authoritative.v1"
+evidence_class = "descriptor-completion-validation"
+source_crate = "crates/tidefs-offload-core"
+issue = 288
+
+validated_behaviors = [
+  "OffloadDescV1 and OffloadCompletionV1 use exact fixed-width little-endian v1 codecs.",
+  "Descriptor decoding rejects wrong version, wrong encoded length, unknown kernel tags, unknown flags, invalid alignment, invalid length/parameter combinations, and non-zero reserved fields.",
+  "BufferLeaseV1 tokens bind descriptor and completion acceptance to lease id, lease generation, lengths, and alignment fields.",
+  "Completion validation rejects mismatched request id, epoch, descriptor id, kernel, lease id, lease generation, completed length, status, version, and reserved fields.",
+]
+
+non_claims = [
+  "The descriptor/completion contract is not a hardware equivalence artifact.",
+]
