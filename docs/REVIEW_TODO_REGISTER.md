@@ -230,6 +230,13 @@ Important 2026-06-01 findings:
   register-backed markers, but the item remains open until POSIX time,
   storage generation, replay, scrub, and format compatibility are designed as
   one contract.
+- `TFR-005`: issue #325 adds `docs/TIMESTAMP_GENERATION_AUTHORITY.md` and
+  shared VFS/inode-attribute helper boundaries for POSIX nanosecond timestamps
+  versus VFS inode `Generation`. This narrows the shared API contract and
+  proves setattr timestamp operations preserve `generation`, `subtree_rev`, and
+  `dir_rev`, but it does not close TFR-005. Local-filesystem inode record
+  projection, intent-log replay, scrub/repair identity, reclaim/content-key
+  identity, and send/receive runtime projections remain unresolved.
 - `TFR-006`: Transform authority is still split across mounted-content
   compression, object-store device compression/encryption, helper compression
   and encryption crates, and inline content-addressed dedup. The

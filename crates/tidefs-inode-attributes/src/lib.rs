@@ -16,9 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 pub use tidefs_types_vfs_core::{
-    InodeAttr, InodeFlags, InodeId, NodeKind, PosixAttrs, SetAttr, FATTR_ATIME, FATTR_ATIME_NOW,
-    FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID,
-    S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID, S_ISVTX,
+    InodeAttr, InodeFlags, InodeId, NodeKind, PosixAttrs, PosixTimestampNs, SetAttr, FATTR_ATIME,
+    FATTR_ATIME_NOW, FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE,
+    FATTR_UID, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID, S_ISVTX,
 };
 pub mod obj_xattr_store;
 pub mod posix_acl;
@@ -129,13 +129,13 @@ pub(crate) fn now_ns() -> i64 {
 // ---------------------------------------------------------------------------
 // Helper: setattr planning and logic (shared by all backends)
 // ---------------------------------------------------------------------------
-/// Timestamp update selected by a setattr timestamp plan.
+/// POSIX timestamp update selected by a setattr timestamp plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SetattrTimestampUpdate {
     /// Leave the timestamp unchanged.
     Unchanged,
     /// Set the timestamp to the provided nanoseconds since the UNIX epoch.
-    SetNs(i64),
+    SetNs(PosixTimestampNs),
 }
 impl SetattrTimestampUpdate {
     /// Return `true` when this update writes a timestamp.
@@ -150,7 +150,7 @@ pub enum PosixTimestampAction {
     /// Leave the timestamp unchanged.
     Keep,
     /// Set the timestamp to explicit nanoseconds since the UNIX epoch.
-    SetNs(i64),
+    SetNs(PosixTimestampNs),
     /// Set the timestamp to the caller-supplied current clock value.
     SetToNow,
 }
@@ -160,13 +160,15 @@ impl PosixTimestampAction {
     pub const fn writes_timestamp(self) -> bool {
         !matches!(self, Self::Keep)
     }
-    /// Resolve this POSIX action into a concrete storage timestamp update.
+    /// Resolve this POSIX action into a concrete POSIX timestamp update.
     #[must_use]
     pub const fn resolve(self, now_ns: i64) -> SetattrTimestampUpdate {
         match self {
             Self::Keep => SetattrTimestampUpdate::Unchanged,
             Self::SetNs(timestamp_ns) => SetattrTimestampUpdate::SetNs(timestamp_ns),
-            Self::SetToNow => SetattrTimestampUpdate::SetNs(now_ns),
+            Self::SetToNow => {
+                SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(now_ns))
+            }
         }
     }
 }
@@ -189,13 +191,13 @@ impl PosixUtimeTimestampPlan {
     pub const fn writes_any_timestamp(self) -> bool {
         self.atime.writes_timestamp() || self.mtime.writes_timestamp()
     }
-    /// Resolve this POSIX plan into the concrete storage timestamp plan.
+    /// Resolve this POSIX plan into the concrete POSIX timestamp plan.
     ///
     /// POSIX atime/mtime writes also advance ctime to the same resolved clock.
     #[must_use]
     pub const fn resolve(self, now_ns: i64) -> SetattrTimestampPlan {
         let ctime = if self.writes_any_timestamp() {
-            SetattrTimestampUpdate::SetNs(now_ns)
+            SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(now_ns))
         } else {
             SetattrTimestampUpdate::Unchanged
         };
@@ -237,13 +239,13 @@ impl SetattrTimestampPlan {
     /// Returns `true` when at least one timestamp write was accepted.
     pub fn apply_to(self, posix: &mut PosixAttrs) -> bool {
         if let SetattrTimestampUpdate::SetNs(atime_ns) = self.atime {
-            posix.atime_ns = atime_ns;
+            posix.atime_ns = atime_ns.as_unix_nanos();
         }
         if let SetattrTimestampUpdate::SetNs(mtime_ns) = self.mtime {
-            posix.mtime_ns = mtime_ns;
+            posix.mtime_ns = mtime_ns.as_unix_nanos();
         }
         if let SetattrTimestampUpdate::SetNs(ctime_ns) = self.ctime {
-            posix.ctime_ns = ctime_ns;
+            posix.ctime_ns = ctime_ns.as_unix_nanos();
         }
         self.writes_any_timestamp()
     }
@@ -265,6 +267,7 @@ pub fn apply_setattr_timestamps_to_posix(
     let mut timestamp_changed = false;
 
     if let SetattrTimestampUpdate::SetNs(atime_ns) = utime_plan.atime.resolve(now_ns) {
+        let atime_ns = atime_ns.as_unix_nanos();
         if posix.atime_ns != atime_ns {
             posix.atime_ns = atime_ns;
             changed = true;
@@ -272,6 +275,7 @@ pub fn apply_setattr_timestamps_to_posix(
         }
     }
     if let SetattrTimestampUpdate::SetNs(mtime_ns) = utime_plan.mtime.resolve(now_ns) {
+        let mtime_ns = mtime_ns.as_unix_nanos();
         if posix.mtime_ns != mtime_ns {
             posix.mtime_ns = mtime_ns;
             changed = true;
@@ -312,9 +316,9 @@ pub fn plan_setattr_timestamps(
     let mtime = utime_plan.mtime.resolve(now_ns);
     let has_timestamp_mutation = utime_plan.writes_any_timestamp() || set.is_valid(FATTR_CTIME);
     let ctime = if set.is_valid(FATTR_CTIME) {
-        SetattrTimestampUpdate::SetNs(set.ctime_ns)
+        SetattrTimestampUpdate::SetNs(set.ctime_timestamp())
     } else if advance_ctime || has_timestamp_mutation {
-        SetattrTimestampUpdate::SetNs(now_ns)
+        SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(now_ns))
     } else {
         SetattrTimestampUpdate::Unchanged
     };
@@ -333,14 +337,14 @@ pub fn plan_posix_utime_timestamps(set: &SetAttr) -> PosixUtimeTimestampPlan {
     let atime = if set.is_valid(FATTR_ATIME_NOW) {
         PosixTimestampAction::SetToNow
     } else if set.is_valid(FATTR_ATIME) {
-        PosixTimestampAction::SetNs(set.atime_ns)
+        PosixTimestampAction::SetNs(set.atime_timestamp())
     } else {
         PosixTimestampAction::Keep
     };
     let mtime = if set.is_valid(FATTR_MTIME_NOW) {
         PosixTimestampAction::SetToNow
     } else if set.is_valid(FATTR_MTIME) {
-        PosixTimestampAction::SetNs(set.mtime_ns)
+        PosixTimestampAction::SetNs(set.mtime_timestamp())
     } else {
         PosixTimestampAction::Keep
     };
@@ -1818,9 +1822,9 @@ mod tests {
         assert_eq!(
             plan,
             SetattrTimestampPlan {
-                atime: SetattrTimestampUpdate::SetNs(11),
-                mtime: SetattrTimestampUpdate::SetNs(22),
-                ctime: SetattrTimestampUpdate::SetNs(99),
+                atime: SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(11)),
+                mtime: SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(22)),
+                ctime: SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(99)),
             }
         );
     }
@@ -1834,9 +1838,9 @@ mod tests {
         assert_eq!(
             plan,
             SetattrTimestampPlan {
-                atime: SetattrTimestampUpdate::SetNs(1234),
-                mtime: SetattrTimestampUpdate::SetNs(1234),
-                ctime: SetattrTimestampUpdate::SetNs(1234),
+                atime: SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(1234)),
+                mtime: SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(1234)),
+                ctime: SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(1234)),
             }
         );
     }
@@ -1863,7 +1867,7 @@ mod tests {
             SetattrTimestampPlan {
                 atime: SetattrTimestampUpdate::Unchanged,
                 mtime: SetattrTimestampUpdate::Unchanged,
-                ctime: SetattrTimestampUpdate::SetNs(5678),
+                ctime: SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(5678)),
             }
         );
     }
@@ -1878,8 +1882,8 @@ mod tests {
             plan,
             SetattrTimestampPlan {
                 atime: SetattrTimestampUpdate::Unchanged,
-                mtime: SetattrTimestampUpdate::SetNs(22),
-                ctime: SetattrTimestampUpdate::SetNs(33),
+                mtime: SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(22)),
+                ctime: SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(33)),
             }
         );
     }
@@ -1888,8 +1892,8 @@ mod tests {
         let mut attrs = dummy_attrs(1);
         let original = attrs;
         let plan = PosixUtimeTimestampPlan::new(
-            PosixTimestampAction::SetNs(111),
-            PosixTimestampAction::SetNs(222),
+            PosixTimestampAction::SetNs(PosixTimestampNs::from_unix_nanos(111)),
+            PosixTimestampAction::SetNs(PosixTimestampNs::from_unix_nanos(222)),
         );
         assert!(plan.apply_to_inode(&mut attrs, 999));
         assert_eq!(attrs.posix.atime_ns, 111);
@@ -1902,8 +1906,11 @@ mod tests {
         assert_eq!(attrs.posix.size, original.posix.size);
         assert_eq!(attrs.posix.blocks_512, original.posix.blocks_512);
         assert_eq!(attrs.inode_id, original.inode_id);
+        assert_eq!(attrs.generation, original.generation);
         assert_eq!(attrs.kind, original.kind);
         assert_eq!(attrs.flags, original.flags);
+        assert_eq!(attrs.subtree_rev, original.subtree_rev);
+        assert_eq!(attrs.dir_rev, original.dir_rev);
     }
     #[test]
     fn posix_utime_plan_now_uses_supplied_clock_deterministically() {
@@ -1933,7 +1940,7 @@ mod tests {
         let mut attrs = dummy_attrs(1);
         let plan = PosixUtimeTimestampPlan::new(
             PosixTimestampAction::Keep,
-            PosixTimestampAction::SetNs(222),
+            PosixTimestampAction::SetNs(PosixTimestampNs::from_unix_nanos(222)),
         );
         assert!(plan.apply_to_inode(&mut attrs, 777));
         assert_eq!(attrs.posix.atime_ns, 1_000_000_000);
@@ -1951,7 +1958,7 @@ mod tests {
             plan,
             PosixUtimeTimestampPlan {
                 atime: PosixTimestampAction::SetToNow,
-                mtime: PosixTimestampAction::SetNs(22),
+                mtime: PosixTimestampAction::SetNs(PosixTimestampNs::from_unix_nanos(22)),
             }
         );
     }

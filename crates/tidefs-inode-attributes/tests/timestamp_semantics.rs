@@ -16,8 +16,9 @@ use tidefs_inode_attributes::{
     MemInodeAttributeStore, PosixTimestampAction, SetAttr, SetattrTimestampUpdate,
 };
 use tidefs_types_vfs_core::{
-    InodeAttr, InodeFlags, InodeId, NodeKind, PosixAttrs, FATTR_ATIME, FATTR_ATIME_NOW,
-    FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID, S_IFREG,
+    Generation, InodeAttr, InodeFlags, InodeId, NodeKind, PosixAttrs, PosixTimestampNs,
+    FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW,
+    FATTR_SIZE, FATTR_UID, S_IFREG,
 };
 
 // ---------------------------------------------------------------------------
@@ -27,7 +28,7 @@ use tidefs_types_vfs_core::{
 fn dummy_attrs(ino: u64) -> InodeAttr {
     InodeAttr {
         inode_id: InodeId(ino),
-        generation: tidefs_types_vfs_core::Generation(1),
+        generation: Generation(1),
         kind: NodeKind::File,
         posix: PosixAttrs::new(
             S_IFREG | 0o644,
@@ -47,6 +48,20 @@ fn dummy_attrs(ino: u64) -> InodeAttr {
         subtree_rev: 0,
         dir_rev: 0,
     }
+}
+
+fn attrs_with_revision_authorities(ino: u64) -> InodeAttr {
+    let mut attrs = dummy_attrs(ino);
+    attrs.generation = Generation::from_vfs_generation(u64::MAX - 7);
+    attrs.subtree_rev = 0x0123_4567_89AB_CDEF;
+    attrs.dir_rev = 0x0FED_CBA9_8765_4321;
+    attrs
+}
+
+fn assert_generation_revisions_unchanged(updated: &InodeAttr, original: &InodeAttr) {
+    assert_eq!(updated.generation, original.generation);
+    assert_eq!(updated.subtree_rev, original.subtree_rev);
+    assert_eq!(updated.dir_rev, original.dir_rev);
 }
 
 fn approx_now() -> i64 {
@@ -157,6 +172,57 @@ fn ctime_not_bumped_on_empty_setattr() {
     assert_eq!(updated.posix.ctime_ns, orig.posix.ctime_ns);
     assert_eq!(updated.posix.atime_ns, orig.posix.atime_ns);
     assert_eq!(updated.posix.mtime_ns, orig.posix.mtime_ns);
+}
+
+#[test]
+fn explicit_timestamp_setattr_preserves_generation_and_revisions() {
+    let store = MemInodeAttributeStore::new();
+    let original = attrs_with_revision_authorities(1);
+    store.insert(1, original);
+
+    let mut set = SetAttr::new();
+    set.set_atime_timestamp(PosixTimestampNs::from_unix_nanos(-1));
+    set.set_mtime_timestamp(PosixTimestampNs::from_split(10, 123_456_789));
+    set.set_ctime_timestamp(PosixTimestampNs::from_unix_nanos(77));
+
+    let updated = store.setattr(1, &set).unwrap();
+    assert_eq!(updated.posix.atime_ns, -1);
+    assert_eq!(updated.posix.mtime_ns, 10_123_456_789);
+    assert_eq!(updated.posix.ctime_ns, 77);
+    assert_generation_revisions_unchanged(&updated, &original);
+}
+
+#[test]
+fn now_timestamp_setattr_preserves_generation_and_revisions() {
+    let store = MemInodeAttributeStore::new();
+    let original = attrs_with_revision_authorities(1);
+    store.insert(1, original);
+
+    let before = approx_now();
+    let mut set = SetAttr::new();
+    set.valid = FATTR_ATIME_NOW | FATTR_MTIME_NOW;
+
+    let updated = store.setattr(1, &set).unwrap();
+    assert!(updated.posix.atime_ns >= before);
+    assert!(updated.posix.mtime_ns >= before);
+    assert!(updated.posix.ctime_ns >= before);
+    assert_generation_revisions_unchanged(&updated, &original);
+}
+
+#[test]
+fn invalid_noop_timestamp_payload_does_not_derive_generation_or_revisions() {
+    let store = MemInodeAttributeStore::new();
+    let original = attrs_with_revision_authorities(1);
+    store.insert(1, original);
+
+    let mut set = SetAttr::new();
+    set.atime_ns = i64::MAX;
+    set.mtime_ns = i64::MAX;
+    set.ctime_ns = i64::MAX;
+
+    let updated = store.setattr(1, &set).unwrap();
+    assert_eq!(updated, original);
+    assert_generation_revisions_unchanged(&updated, &original);
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +359,10 @@ fn posix_utime_plan_atime_now_mtime_explicit() {
 
     let plan = plan_posix_utime_timestamps(&set);
     assert_eq!(plan.atime, PosixTimestampAction::SetToNow);
-    assert_eq!(plan.mtime, PosixTimestampAction::SetNs(500));
+    assert_eq!(
+        plan.mtime,
+        PosixTimestampAction::SetNs(PosixTimestampNs::from_unix_nanos(500))
+    );
 }
 
 #[test]
@@ -328,7 +397,10 @@ fn timestamp_plan_without_timestamp_changes_is_noop() {
 fn timestamp_plan_with_metadata_change_advances_ctime() {
     let set = SetAttr::new();
     let plan = plan_setattr_timestamps(&set, 5678, true);
-    assert_eq!(plan.ctime, SetattrTimestampUpdate::SetNs(5678));
+    assert_eq!(
+        plan.ctime,
+        SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(5678))
+    );
 }
 
 #[test]
@@ -336,8 +408,14 @@ fn timestamp_plan_atime_now_resolves_to_clock() {
     let mut set = SetAttr::new();
     set.valid = FATTR_ATIME_NOW;
     let plan = plan_setattr_timestamps(&set, 42, false);
-    assert_eq!(plan.atime, SetattrTimestampUpdate::SetNs(42));
-    assert_eq!(plan.ctime, SetattrTimestampUpdate::SetNs(42)); // ctime advances with timestamp mutation
+    assert_eq!(
+        plan.atime,
+        SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(42))
+    );
+    assert_eq!(
+        plan.ctime,
+        SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(42))
+    ); // ctime advances with timestamp mutation
 }
 
 #[test]
@@ -348,8 +426,14 @@ fn timestamp_plan_explicit_ctime_overrides_auto() {
     set.ctime_ns = 20;
 
     let plan = plan_setattr_timestamps(&set, 999, true);
-    assert_eq!(plan.mtime, SetattrTimestampUpdate::SetNs(10));
-    assert_eq!(plan.ctime, SetattrTimestampUpdate::SetNs(20));
+    assert_eq!(
+        plan.mtime,
+        SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(10))
+    );
+    assert_eq!(
+        plan.ctime,
+        SetattrTimestampUpdate::SetNs(PosixTimestampNs::from_unix_nanos(20))
+    );
 }
 
 // ---------------------------------------------------------------------------
