@@ -86,6 +86,31 @@ impl CarrierPolicy {
             }
         }
     }
+
+    /// Check whether a runtime fallback from `configured` to `selected`
+    /// satisfies this policy.
+    ///
+    /// Unlike initial carrier selection, runtime fallback happens after an
+    /// RDMA session has already been admitted as RDMA evidence. Enforced
+    /// policy must fail closed before the session is demoted to TCP.
+    pub fn check_runtime_fallback(
+        self,
+        configured: TransportBackendKind,
+        selected: TransportBackendKind,
+        detail: &'static str,
+    ) -> Result<(), CarrierSelectionError> {
+        match self {
+            Self::Prefer => Ok(()),
+            Self::Enforce if configured.is_rdma() && !selected.is_rdma() => {
+                Err(CarrierSelectionError::CarrierPolicyViolation {
+                    configured: configured.preferred_carrier_name(),
+                    selected: selected.preferred_carrier_name(),
+                    detail,
+                })
+            }
+            Self::Enforce => self.check(configured, selected),
+        }
+    }
 }
 
 impl fmt::Display for CarrierPolicy {
@@ -93,6 +118,20 @@ impl fmt::Display for CarrierPolicy {
         match self {
             Self::Prefer => write!(f, "prefer"),
             Self::Enforce => write!(f, "enforce"),
+        }
+    }
+}
+
+impl core::str::FromStr for CarrierPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "prefer" => Ok(Self::Prefer),
+            "enforce" => Ok(Self::Enforce),
+            other => Err(format!(
+                "unknown carrier policy: {other}. valid values: prefer, enforce"
+            )),
         }
     }
 }
@@ -176,6 +215,13 @@ pub enum CarrierSelectionFallback {
         /// Why the fallback happened.
         reason: &'static str,
     },
+    /// Fallback was requested but refused by policy before demotion.
+    Refused {
+        /// The carrier that would have fallen back.
+        requested: &'static str,
+        /// Why the fallback would have happened.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for CarrierSelectionFallback {
@@ -184,6 +230,9 @@ impl fmt::Display for CarrierSelectionFallback {
             Self::Direct => write!(f, "direct"),
             Self::Fallback { requested, reason } => {
                 write!(f, "fallback from {requested}: {reason}")
+            }
+            Self::Refused { requested, reason } => {
+                write!(f, "fallback refused for {requested}: {reason}")
             }
         }
     }
@@ -470,6 +519,14 @@ impl CarrierDisclosure {
                     "rdma fallback to tcp: peer advertises RDMA but local does not support it",
                 )
             }
+            CarrierSelectionFallback::Refused { requested, reason } => {
+                let mismatch = Some(CapabilityMismatch {
+                    peer_advertised: requested,
+                    local_unsupported: false,
+                    detail: reason,
+                });
+                (mismatch, "rdma fallback refused: carrier policy")
+            }
         };
 
         Self {
@@ -494,6 +551,7 @@ impl CarrierDisclosure {
     pub fn from_runtime_fallback(
         configured_backend: TransportBackendKind,
         reason: &'static str,
+        policy: CarrierPolicy,
     ) -> Self {
         let requested = configured_backend.preferred_carrier_name();
         Self {
@@ -504,7 +562,27 @@ impl CarrierDisclosure {
             local_requested: requested,
             mismatch: None,
             rationale: "rdma runtime fallback to tcp: carrier degraded or lost",
-            policy: None,
+            policy: Some(policy),
+        }
+    }
+
+    /// Produce a disclosure for a runtime carrier fallback that was refused
+    /// before demoting an RDMA session to TCP.
+    pub fn from_runtime_fallback_refusal(
+        configured_backend: TransportBackendKind,
+        reason: &'static str,
+        policy: CarrierPolicy,
+    ) -> Self {
+        let requested = configured_backend.preferred_carrier_name();
+        Self {
+            selected_backend: configured_backend,
+            fallback: CarrierSelectionFallback::Refused { requested, reason },
+            local_backend: configured_backend,
+            peer_carriers: tidefs_membership_types::capabilities::TransportCarrier::NONE,
+            local_requested: requested,
+            mismatch: None,
+            rationale: "rdma runtime fallback refused: enforce carrier policy",
+            policy: Some(policy),
         }
     }
 }
@@ -525,6 +603,9 @@ impl fmt::Display for CarrierDisclosure {
             CarrierSelectionFallback::Direct => write!(f, " direct"),
             CarrierSelectionFallback::Fallback { requested, reason } => {
                 write!(f, " fallback from {requested}: {reason}")
+            }
+            CarrierSelectionFallback::Refused { requested, reason } => {
+                write!(f, " fallback refused for {requested}: {reason}")
             }
         }
     }
@@ -608,6 +689,32 @@ mod tests {
         let peer = TransportCarrier::TCP;
         let result = selector.select(peer).unwrap();
         assert_eq!(result.backend_kind, TransportBackendKind::Tcp);
+        assert!(matches!(result.fallback, CarrierSelectionFallback::Direct));
+    }
+
+    #[test]
+    fn enforce_initial_selection_rejects_rdma_claim_tcp_peer() {
+        let selector =
+            CarrierSelector::new(TransportBackendKind::Rdma).with_policy(CarrierPolicy::Enforce);
+        let err = selector.select(TransportCarrier::TCP).unwrap_err();
+        assert!(matches!(
+            err,
+            CarrierSelectionError::CarrierPolicyViolation {
+                configured: "rdma",
+                selected: "tcp",
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("RDMA was required"));
+    }
+
+    #[test]
+    fn enforce_initial_selection_accepts_rdma_peer() {
+        let selector =
+            CarrierSelector::new(TransportBackendKind::Rdma).with_policy(CarrierPolicy::Enforce);
+        let result = selector.select(TransportCarrier::RDMA).unwrap();
+        assert_eq!(result.backend_kind, TransportBackendKind::Rdma);
+        assert_eq!(result.policy_applied, Some(CarrierPolicy::Enforce));
         assert!(matches!(result.fallback, CarrierSelectionFallback::Direct));
     }
 
@@ -726,6 +833,56 @@ mod tests {
             reason: "no local RDMA device",
         };
         assert!(!format!("{f}").is_empty());
+        let f = CarrierSelectionFallback::Refused {
+            requested: "rdma",
+            reason: "carrier policy enforce",
+        };
+        let s = format!("{f}");
+        assert!(s.contains("refused"));
+    }
+
+    #[test]
+    fn carrier_policy_from_str_accepts_known_values() {
+        assert_eq!(
+            "prefer".parse::<CarrierPolicy>().unwrap(),
+            CarrierPolicy::Prefer
+        );
+        assert_eq!(
+            "enforce".parse::<CarrierPolicy>().unwrap(),
+            CarrierPolicy::Enforce
+        );
+    }
+
+    #[test]
+    fn carrier_policy_from_str_rejects_unknown_values() {
+        let err = "fallback".parse::<CarrierPolicy>().unwrap_err();
+        assert!(err.contains("unknown carrier policy"));
+    }
+
+    #[test]
+    fn enforce_runtime_fallback_refuses_rdma_to_tcp() {
+        let err = CarrierPolicy::Enforce
+            .check_runtime_fallback(
+                TransportBackendKind::Rdma,
+                TransportBackendKind::Tcp,
+                "enforce carrier policy: runtime RDMA fallback to TCP refused",
+            )
+            .unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("configured=rdma"));
+        assert!(s.contains("selected=tcp"));
+        assert!(s.contains("runtime RDMA fallback"));
+    }
+
+    #[test]
+    fn prefer_runtime_fallback_allows_rdma_to_tcp() {
+        CarrierPolicy::Prefer
+            .check_runtime_fallback(
+                TransportBackendKind::Rdma,
+                TransportBackendKind::Tcp,
+                "enforce carrier policy: runtime RDMA fallback to TCP refused",
+            )
+            .unwrap();
     }
 
     // ── Selector properties ───────────────────────────────────────
@@ -841,10 +998,12 @@ mod tests {
         let d = CarrierDisclosure::from_runtime_fallback(
             TransportBackendKind::Rdma,
             "permanent RDMA carrier loss",
+            CarrierPolicy::Prefer,
         );
         assert_eq!(d.selected_backend, TransportBackendKind::Tcp);
         assert_eq!(d.local_backend, TransportBackendKind::Rdma);
         assert_eq!(d.local_requested, "rdma");
+        assert_eq!(d.policy, Some(CarrierPolicy::Prefer));
         assert!(matches!(
             d.fallback,
             CarrierSelectionFallback::Fallback {
@@ -864,6 +1023,7 @@ mod tests {
         let d = CarrierDisclosure::from_runtime_fallback(
             TransportBackendKind::Rdma,
             "reconnect exhausted after 3 attempts",
+            CarrierPolicy::Prefer,
         );
         match d.fallback {
             CarrierSelectionFallback::Fallback { reason, .. } => {
@@ -871,5 +1031,29 @@ mod tests {
             }
             _ => panic!("expected fallback"),
         }
+    }
+
+    #[test]
+    fn disclosure_from_runtime_fallback_refusal_keeps_rdma_selected() {
+        let d = CarrierDisclosure::from_runtime_fallback_refusal(
+            TransportBackendKind::Rdma,
+            "reconnect exhausted",
+            CarrierPolicy::Enforce,
+        );
+        assert_eq!(d.selected_backend, TransportBackendKind::Rdma);
+        assert_eq!(d.local_backend, TransportBackendKind::Rdma);
+        assert_eq!(d.local_requested, "rdma");
+        assert_eq!(d.policy, Some(CarrierPolicy::Enforce));
+        assert!(matches!(
+            d.fallback,
+            CarrierSelectionFallback::Refused {
+                requested: "rdma",
+                reason: "reconnect exhausted",
+            }
+        ));
+        assert!(d.rationale.contains("refused"));
+        let s = format!("{d}");
+        assert!(s.contains("refused"));
+        assert!(s.contains("enforce"));
     }
 }

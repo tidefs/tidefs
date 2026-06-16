@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tidefs_auth::{self, verify_mutual_attestation, HelloMessage, HelloResponse, NodeKeyStore};
 
 use crate::backend::{ConnectionLike, TransportBackend, TransportBackendKind};
+use crate::carrier_selection::CarrierDisclosure;
 use crate::chunk_shipper::ChunkShipper;
 use crate::compression::CompressionConfig;
 use crate::connect_lifecycle::{
@@ -36,6 +37,13 @@ use tidefs_types_transport_session::{
     TransportSessionId,
 };
 use tracing;
+
+const RDMA_RUNTIME_FALLBACK_PERMANENT_LOSS: &str = "permanent RDMA carrier loss";
+const RDMA_RUNTIME_FALLBACK_RECONNECT_EXHAUSTED: &str = "reconnect exhausted";
+const RDMA_RUNTIME_FALLBACK_PERMANENT_LOSS_REFUSED: &str =
+    "enforce carrier policy: runtime RDMA fallback to TCP refused after permanent carrier loss";
+const RDMA_RUNTIME_FALLBACK_RECONNECT_EXHAUSTED_REFUSED: &str =
+    "enforce carrier policy: runtime RDMA fallback to TCP refused after reconnect exhaustion";
 // ---------------------------------------------------------------------------
 // Connection: wraps the transport backend connection with metadata
 // ---------------------------------------------------------------------------
@@ -762,6 +770,31 @@ impl Transport {
     pub fn with_carrier_policy(mut self, policy: crate::carrier_selection::CarrierPolicy) -> Self {
         self.carrier_policy = policy;
         self
+    }
+
+    fn check_runtime_rdma_fallback_policy(
+        &mut self,
+        session_id: SessionId,
+        peer_node: u64,
+        reason: &'static str,
+        refusal_detail: &'static str,
+    ) -> Result<(), TransportError> {
+        self.carrier_policy
+            .check_runtime_fallback(
+                TransportBackendKind::Rdma,
+                TransportBackendKind::Tcp,
+                refusal_detail,
+            )
+            .map_err(|e| {
+                let disclosure = CarrierDisclosure::from_runtime_fallback_refusal(
+                    TransportBackendKind::Rdma,
+                    reason,
+                    self.carrier_policy,
+                );
+                tracing::error!(peer = peer_node, session_id = %session_id, "{}", disclosure);
+                self.carrier_disclosures.insert(peer_node, disclosure);
+                TransportError::Generic(format!("session {session_id}: {e}"))
+            })
     }
 
     /// Configure this transport for Ed25519 mutual attestation.
@@ -3006,8 +3039,15 @@ impl Transport {
         // for the attempt >= 3 threshold).  This avoids useless RDMA
         // reconnect attempts while still providing a recovery path.
         if session.is_carrier_lost() && self.backend_kind.is_rdma() {
+            let peer_node = session.peer_node;
+            self.check_runtime_rdma_fallback_policy(
+                session_id,
+                peer_node,
+                RDMA_RUNTIME_FALLBACK_PERMANENT_LOSS,
+                RDMA_RUNTIME_FALLBACK_PERMANENT_LOSS_REFUSED,
+            )?;
             session
-                .handle_rdma_degraded("permanent RDMA carrier loss")
+                .handle_rdma_degraded(RDMA_RUNTIME_FALLBACK_PERMANENT_LOSS)
                 .map_err(|e| TransportError::Generic(e.to_string()))?;
             session.fallback_to_tcp();
 
@@ -3016,9 +3056,10 @@ impl Transport {
             // fallback has occurred (per NEXT-MN-018).
             {
                 let peer_node = session.peer_node;
-                let disclosure = crate::carrier_selection::CarrierDisclosure::from_runtime_fallback(
+                let disclosure = CarrierDisclosure::from_runtime_fallback(
                     TransportBackendKind::Rdma,
-                    "permanent RDMA carrier loss",
+                    RDMA_RUNTIME_FALLBACK_PERMANENT_LOSS,
+                    self.carrier_policy,
                 );
                 tracing::info!(peer = peer_node, "{}", disclosure);
                 self.carrier_disclosures.insert(peer_node, disclosure);
@@ -3082,8 +3123,15 @@ impl Transport {
         // a threshold, degrade the RDMA carrier and attempt TCP fallback
         // per OW-308. The session must be in Established state for degradation.
         if self.backend_kind.is_rdma() && session.reconnect.attempt >= 3 {
+            let peer_node = session.peer_node;
+            self.check_runtime_rdma_fallback_policy(
+                session_id,
+                peer_node,
+                RDMA_RUNTIME_FALLBACK_RECONNECT_EXHAUSTED,
+                RDMA_RUNTIME_FALLBACK_RECONNECT_EXHAUSTED_REFUSED,
+            )?;
             session
-                .handle_rdma_degraded("reconnect exhausted")
+                .handle_rdma_degraded(RDMA_RUNTIME_FALLBACK_RECONNECT_EXHAUSTED)
                 .map_err(|e| TransportError::Generic(e.to_string()))?;
             session.fallback_to_tcp();
 
@@ -3091,9 +3139,10 @@ impl Transport {
             // (per NEXT-MN-018).
             {
                 let peer_node = session.peer_node;
-                let disclosure = crate::carrier_selection::CarrierDisclosure::from_runtime_fallback(
+                let disclosure = CarrierDisclosure::from_runtime_fallback(
                     TransportBackendKind::Rdma,
-                    "reconnect exhausted",
+                    RDMA_RUNTIME_FALLBACK_RECONNECT_EXHAUSTED,
+                    self.carrier_policy,
                 );
                 tracing::info!(peer = peer_node, "{}", disclosure);
                 self.carrier_disclosures.insert(peer_node, disclosure);
@@ -3442,6 +3491,7 @@ struct HandshakeMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::carrier_selection::{CarrierPolicy, CarrierSelectionFallback};
     use crate::session_cohort::NodeInfo;
     use crate::session_drain::{DrainOutcome, GracefulDrainConfig};
     use tidefs_types_transport_session::{ClosureClass, CohortClass};
@@ -3451,14 +3501,17 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::thread;
 
-    fn make_established_session(sid: SessionId) -> Session {
+    fn make_established_session_with_backend(
+        sid: SessionId,
+        backend_kind: TransportBackendKind,
+    ) -> Session {
         let mut session = Session::new(
             sid,
             1,
             2,
             TransportAddr::Tcp("127.0.0.1:9001".parse().unwrap()),
             EndpointFamily::LocalEmbed,
-            TransportBackendKind::Tcp,
+            backend_kind,
         );
         for state in [
             SessionState::Connecting {
@@ -3482,10 +3535,23 @@ mod tests {
         session
     }
 
+    fn make_established_session(sid: SessionId) -> Session {
+        make_established_session_with_backend(sid, TransportBackendKind::Tcp)
+    }
+
     fn insert_established_session(t: &mut Transport, sid: SessionId) {
         t.sessions.insert(
             sid,
             Arc::new(std::sync::Mutex::new(make_established_session(sid))),
+        );
+    }
+
+    fn insert_established_rdma_session(t: &mut Transport, sid: SessionId) {
+        t.sessions.insert(
+            sid,
+            Arc::new(std::sync::Mutex::new(
+                make_established_session_with_backend(sid, TransportBackendKind::Rdma),
+            )),
         );
     }
 
@@ -3690,6 +3756,146 @@ mod tests {
         // Reset
         state.reset();
         assert_eq!(state.attempt, 0);
+    }
+
+    #[test]
+    fn rdma_permanent_carrier_loss_prefer_falls_back_to_tcp() {
+        let sid = SessionId::new(41);
+        let mut transport = Transport::new(1).with_carrier_policy(CarrierPolicy::Prefer);
+        transport.backend_kind = TransportBackendKind::Rdma;
+        insert_established_rdma_session(&mut transport, sid);
+        {
+            let session = transport.sessions.get(&sid).unwrap();
+            session.lock().unwrap().carrier_lost = true;
+        }
+
+        transport.reconnect(sid).expect("prefer should fall back");
+
+        let session = transport.sessions.get(&sid).unwrap().lock().unwrap();
+        assert_eq!(session.backend_kind, TransportBackendKind::Tcp);
+        assert!(!session.carrier_lost);
+        assert!(matches!(session.state, SessionState::Established { .. }));
+        drop(session);
+
+        let disclosure = transport
+            .carrier_disclosure(2)
+            .expect("runtime fallback disclosure");
+        assert_eq!(disclosure.selected_backend, TransportBackendKind::Tcp);
+        assert_eq!(disclosure.policy, Some(CarrierPolicy::Prefer));
+        assert!(matches!(
+            disclosure.fallback,
+            CarrierSelectionFallback::Fallback {
+                requested: "rdma",
+                reason: RDMA_RUNTIME_FALLBACK_PERMANENT_LOSS,
+            }
+        ));
+    }
+
+    #[test]
+    fn rdma_permanent_carrier_loss_enforce_fails_closed() {
+        let sid = SessionId::new(42);
+        let mut transport = Transport::new(1).with_carrier_policy(CarrierPolicy::Enforce);
+        transport.backend_kind = TransportBackendKind::Rdma;
+        insert_established_rdma_session(&mut transport, sid);
+        {
+            let session = transport.sessions.get(&sid).unwrap();
+            session.lock().unwrap().carrier_lost = true;
+        }
+
+        let err = transport
+            .reconnect(sid)
+            .expect_err("enforce must refuse TCP fallback");
+        let err = err.to_string();
+        assert!(err.contains("carrier policy violation"));
+        assert!(err.contains("runtime RDMA fallback to TCP refused"));
+
+        let session = transport.sessions.get(&sid).unwrap().lock().unwrap();
+        assert_eq!(session.backend_kind, TransportBackendKind::Rdma);
+        assert!(session.carrier_lost);
+        assert!(matches!(session.state, SessionState::Established { .. }));
+        drop(session);
+
+        let disclosure = transport
+            .carrier_disclosure(2)
+            .expect("runtime refusal disclosure");
+        assert_eq!(disclosure.selected_backend, TransportBackendKind::Rdma);
+        assert_eq!(disclosure.policy, Some(CarrierPolicy::Enforce));
+        assert!(matches!(
+            disclosure.fallback,
+            CarrierSelectionFallback::Refused {
+                requested: "rdma",
+                reason: RDMA_RUNTIME_FALLBACK_PERMANENT_LOSS,
+            }
+        ));
+    }
+
+    #[test]
+    fn rdma_reconnect_exhausted_prefer_falls_back_to_tcp() {
+        let sid = SessionId::new(43);
+        let mut transport = Transport::new(1).with_carrier_policy(CarrierPolicy::Prefer);
+        transport.backend_kind = TransportBackendKind::Rdma;
+        insert_established_rdma_session(&mut transport, sid);
+        {
+            let session = transport.sessions.get(&sid).unwrap();
+            session.lock().unwrap().reconnect.attempt = 2;
+        }
+
+        transport.reconnect(sid).expect("prefer should fall back");
+
+        let session = transport.sessions.get(&sid).unwrap().lock().unwrap();
+        assert_eq!(session.backend_kind, TransportBackendKind::Tcp);
+        assert!(matches!(session.state, SessionState::Established { .. }));
+        drop(session);
+
+        let disclosure = transport
+            .carrier_disclosure(2)
+            .expect("runtime fallback disclosure");
+        assert_eq!(disclosure.selected_backend, TransportBackendKind::Tcp);
+        assert_eq!(disclosure.policy, Some(CarrierPolicy::Prefer));
+        assert!(matches!(
+            disclosure.fallback,
+            CarrierSelectionFallback::Fallback {
+                requested: "rdma",
+                reason: RDMA_RUNTIME_FALLBACK_RECONNECT_EXHAUSTED,
+            }
+        ));
+    }
+
+    #[test]
+    fn rdma_reconnect_exhausted_enforce_fails_closed() {
+        let sid = SessionId::new(44);
+        let mut transport = Transport::new(1).with_carrier_policy(CarrierPolicy::Enforce);
+        transport.backend_kind = TransportBackendKind::Rdma;
+        insert_established_rdma_session(&mut transport, sid);
+        {
+            let session = transport.sessions.get(&sid).unwrap();
+            session.lock().unwrap().reconnect.attempt = 2;
+        }
+
+        let err = transport
+            .reconnect(sid)
+            .expect_err("enforce must refuse TCP fallback");
+        let err = err.to_string();
+        assert!(err.contains("carrier policy violation"));
+        assert!(err.contains("runtime RDMA fallback to TCP refused"));
+
+        let session = transport.sessions.get(&sid).unwrap().lock().unwrap();
+        assert_eq!(session.backend_kind, TransportBackendKind::Rdma);
+        assert!(matches!(session.state, SessionState::Established { .. }));
+        drop(session);
+
+        let disclosure = transport
+            .carrier_disclosure(2)
+            .expect("runtime refusal disclosure");
+        assert_eq!(disclosure.selected_backend, TransportBackendKind::Rdma);
+        assert_eq!(disclosure.policy, Some(CarrierPolicy::Enforce));
+        assert!(matches!(
+            disclosure.fallback,
+            CarrierSelectionFallback::Refused {
+                requested: "rdma",
+                reason: RDMA_RUNTIME_FALLBACK_RECONNECT_EXHAUSTED,
+            }
+        ));
     }
 
     #[test]

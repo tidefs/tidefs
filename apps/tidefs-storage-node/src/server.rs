@@ -70,6 +70,7 @@ use tidefs_replication_model::{
     FlowCommitClass, FlowCommitResult, FlowState, ObjectDigest, PlacementReceiptRef,
     ReceiptRedundancyPolicy, ReplicaMovementClass, ReplicatedReadPlan,
 };
+use tidefs_transport::carrier_selection::CarrierPolicy;
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
     send_replication_msg, send_segment_fetch_response, PlacementMap as TransportPlacementMap,
@@ -2400,10 +2401,10 @@ pub struct StorageNodeConfig {
     /// Use RDMA transport backend when available, falling back to TCP.
     /// When false (default), uses TCP transport.
     pub rdma: bool,
-    /// Carrier policy for fail-closed RDMA enforcement (#6672).
-    /// "prefer" (default) allows silent fallback to TCP; "enforce" fails
-    /// closed when an RDMA claim cannot be satisfied.
-    pub carrier_policy: Option<String>,
+    /// Carrier policy for fail-closed RDMA enforcement.
+    /// Prefer allows disclosed TCP fallback; Enforce fails closed when an
+    /// RDMA claim cannot be satisfied.
+    pub carrier_policy: Option<CarrierPolicy>,
     /// Optional path to a ready-marker file created after startup completes.
     pub ready_file: Option<std::path::PathBuf>,
     /// Drain timeout in seconds for graceful node-drain on shutdown.
@@ -3096,18 +3097,10 @@ impl StorageNode {
             Transport::new(config.node_id)
         };
         // Apply carrier policy from config (defaults to Prefer when unset).
-        match config.carrier_policy.as_deref() {
-            Some("enforce") => {
-                transport = transport.with_carrier_policy(
-                    tidefs_transport::carrier_selection::CarrierPolicy::Enforce,
-                );
-                eprintln!("[storage-node] carrier_policy=enforce: RDMA claim will fail closed on silent TCP fallback");
-            }
-            _ => {
-                transport = transport.with_carrier_policy(
-                    tidefs_transport::carrier_selection::CarrierPolicy::Prefer,
-                );
-            }
+        let carrier_policy = config.carrier_policy.unwrap_or(CarrierPolicy::Prefer);
+        transport = transport.with_carrier_policy(carrier_policy);
+        if carrier_policy == CarrierPolicy::Enforce {
+            eprintln!("[storage-node] carrier_policy=enforce: RDMA claim will fail closed on TCP fallback");
         }
         transport
             .configure_generated_attestation(true)

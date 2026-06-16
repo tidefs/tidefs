@@ -700,9 +700,14 @@ Important 2026-06-01 findings:
   because startup came from a config file. Commit `d7d31643` separately restores
   storage-node test-build hygiene after the existing `carrier_policy` field.
   TFR-017 remains open because the live store derives quorum from
-  `replication_factor` and opens remote replica sessions, but RDMA construction
-  falls back to TCP by default unless carrier policy is explicitly set to
-  `enforce`. Commit `6954336d` improves one no-quorum subcase:
+  `replication_factor` and opens remote replica sessions. The narrow
+  carrier-policy/runtime-fallback slice now checks policy before runtime
+  RDMA-to-TCP demotion: `prefer` keeps disclosed TCP recovery, while `enforce`
+  refuses both permanent RDMA carrier loss and reconnect-exhausted degradation
+  before the session becomes TCP evidence. This does not close the remaining
+  transport/cluster gaps: RDMA hardware validation, partition recovery,
+  cross-replica scrub/repair, and distributed transaction authority. Commit
+  `6954336d` improves one no-quorum subcase:
   `TransportReplicatedStore` now snapshots the previous primary payload before
   put/delete, restores the local primary on no-quorum failure, and sends
   best-effort compensating put/delete messages to replicas that acknowledged
