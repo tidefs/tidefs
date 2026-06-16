@@ -2489,6 +2489,7 @@ pub struct FuseVfsAdapter {
     forget_refcounts: Mutex<BTreeMap<u64, u64>>,
     /// Per-inode lookup frequency counter for reclaim hotness classification.
     lookup_counts: Mutex<BTreeMap<u64, u64>>,
+    removed_lookup_attrs: Mutex<BTreeMap<u64, InodeAttr>>,
     block_volume: Mutex<Option<Box<dyn BlockVolumeWriteTarget + Send>>>,
     /// Non-authoritative LRU read cache with byte-size limit.
     /// Checked before VFS engine reads; filled on miss.
@@ -2621,6 +2622,7 @@ impl FuseVfsAdapter {
             dirty_state: Mutex::new(BTreeMap::new()),
             forget_refcounts: Mutex::new(BTreeMap::new()),
             lookup_counts: Mutex::new(BTreeMap::new()),
+            removed_lookup_attrs: Mutex::new(BTreeMap::new()),
             namespace: None,
             block_volume: Mutex::new(None),
             page_cache: Mutex::new(ReadCache::new(256)),
@@ -4002,6 +4004,40 @@ impl FuseVfsAdapter {
         *counts.entry(ino).or_insert(0) = counts.get(&ino).unwrap_or(&0).saturating_add(1);
     }
 
+    fn has_forget_refcount(&self, ino: u64) -> bool {
+        self.forget_refcounts
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    }
+
+    fn remember_removed_lookup_attr(&self, attr: InodeAttr) {
+        let ino = attr.inode_id.get();
+        if ino == 1 || !self.has_forget_refcount(ino) {
+            return;
+        }
+        let mut removed_attr = attr;
+        removed_attr.posix.nlink = 0;
+        self.removed_lookup_attrs
+            .lock()
+            .unwrap()
+            .insert(ino, removed_attr);
+    }
+
+    fn removed_lookup_attr_out(&self, ino: u64) -> Option<FuseAttrOut> {
+        let attr = self
+            .removed_lookup_attrs
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .copied()?;
+        let out = crate::workers_meta::fuse_attr_out(ino, &attr.posix, attr.kind);
+        Some(fuse_attr_out_with_ttl(out, Duration::ZERO))
+    }
+
     pub fn dispatch_mkdir_entry(
         &self,
         ctx: &RequestCtx,
@@ -4079,6 +4115,7 @@ impl FuseVfsAdapter {
 
         // Capacity tracking for freed space is handled by the engine's
         // CapacityAuthority (record_free) during unlink dispatch.
+        self.remember_removed_lookup_attr(child_attr);
         self.record_dentry_child_mutation(parent, name);
 
         // When unlink succeeds and nlink reaches 0 but open handles
@@ -4388,6 +4425,7 @@ impl FuseVfsAdapter {
 
         // Capacity tracking for freed space is handled by the engine's
         // CapacityAuthority (record_free) during rmdir dispatch.
+        self.remember_removed_lookup_attr(removed_attr);
         self.record_dentry_child_mutation(parent, name);
         // Invalidate all negative-cache entries scoped to the now-removed
         // directory, since lookups against it will return ENOTDIR from now on.
@@ -4522,6 +4560,10 @@ impl FuseVfsAdapter {
     ) -> Result<FuseAttrOut, Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
 
+        if let Some(attr_out) = self.removed_lookup_attr_out(ino) {
+            return Ok(attr_out);
+        }
+
         // Check the short-lived getattr cache before acquiring engine lock.
         {
             let cache = self.getattr_cache.lock().unwrap();
@@ -4542,6 +4584,9 @@ impl FuseVfsAdapter {
         let inode_attr = match engine_attr {
             Ok(attr) => attr,
             Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) => {
+                if let Some(attr_out) = self.removed_lookup_attr_out(ino) {
+                    return Ok(attr_out);
+                }
                 if let Some(ref ns) = self.namespace {
                     return self.dispatch_getattr_via_namespace(ns, ino);
                 }
@@ -8667,16 +8712,26 @@ impl FuseVfsAdapter {
     /// Returns `true` if the count reached zero (reclaim-eligible),
     /// `false` otherwise.
     pub fn dispatch_forget(&self, ino: u64, nlookup: u64) -> bool {
-        let mut refs = self.forget_refcounts.lock().unwrap();
-        if let Some(count) = refs.get_mut(&ino) {
-            *count = count.saturating_sub(nlookup);
-            if *count == 0 {
-                self.writeback_cache.lock().unwrap().invalidate(ino);
-                refs.remove(&ino);
-                return true;
+        let reached_zero = {
+            let mut refs = self.forget_refcounts.lock().unwrap();
+            if let Some(count) = refs.get_mut(&ino) {
+                *count = count.saturating_sub(nlookup);
+                if *count == 0 {
+                    refs.remove(&ino);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
             }
+        };
+        if reached_zero {
+            self.writeback_cache.lock().unwrap().invalidate(ino);
+            self.removed_lookup_attrs.lock().unwrap().remove(&ino);
+            self.invalidate_inode_metadata_local(ino);
         }
-        false
+        reached_zero
     }
 
     /// Drain all deferred kernel reference counts during teardown.
@@ -8696,6 +8751,7 @@ impl FuseVfsAdapter {
         for ino in zero_inos {
             wb.invalidate(ino);
         }
+        self.removed_lookup_attrs.lock().unwrap().clear();
     }
 
     /// Return the per-inode lookup frequency count for `ino`.
@@ -25989,6 +26045,60 @@ mod tests {
         let engine = fixture.adapter.engine.lock().unwrap();
         let result = engine.lookup(root, b"to-remove", &ctx);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rmdir_preserves_lookup_referenced_getattr_until_forget() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let dir_attr = fixture
+            .adapter
+            .dispatch_mkdir(&ctx, root.get(), b"cwd-like-dir", 0o755)
+            .expect("create directory");
+        let ino = dir_attr.inode_id.get();
+
+        fixture.adapter.bump_forget_refcount(ino);
+        fixture
+            .adapter
+            .dispatch_rmdir(&ctx, root.get(), b"cwd-like-dir")
+            .expect("remove lookup-referenced directory");
+        assert_eq!(
+            fixture
+                .adapter
+                .removed_lookup_attrs
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .expect("removed attr remembered")
+                .posix
+                .nlink,
+            0
+        );
+
+        let attr = fixture
+            .adapter
+            .dispatch_getattr(&ctx, ino, 400, None)
+            .expect("removed lookup-referenced inode remains stat-able");
+        assert_eq!(attr.attr.ino, ino);
+        assert_eq!(attr.attr.mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(attr.attr.nlink, 2);
+
+        assert!(fixture.adapter.dispatch_forget(ino, 1));
+        assert!(!fixture
+            .adapter
+            .removed_lookup_attrs
+            .lock()
+            .unwrap()
+            .contains_key(&ino));
+        let err = fixture
+            .adapter
+            .dispatch_getattr(&ctx, ino, 401, None)
+            .expect_err("forgotten removed inode is stale");
+        assert_eq!(err, Errno::ESTALE);
     }
 
     #[test]
