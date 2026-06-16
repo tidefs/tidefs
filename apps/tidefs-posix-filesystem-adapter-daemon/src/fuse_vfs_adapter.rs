@@ -4115,7 +4115,9 @@ impl FuseVfsAdapter {
 
         // Capacity tracking for freed space is handled by the engine's
         // CapacityAuthority (record_free) during unlink dispatch.
-        self.remember_removed_lookup_attr(child_attr);
+        if child_attr.posix.nlink <= 1 {
+            self.remember_removed_lookup_attr(child_attr);
+        }
         self.record_dentry_child_mutation(parent, name);
 
         // When unlink succeeds and nlink reaches 0 but open handles
@@ -13909,6 +13911,61 @@ mod tests {
         );
         // Original name is gone
         assert!(engine.lookup(root, b"source.txt", &ctx).is_err());
+    }
+
+    #[test]
+    fn vfs_adapter_unlink_one_hardlink_keeps_lookup_referenced_nlink_live() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (root, source_inode, source_fh) = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let root = engine.get_root_inode(&ctx).expect("root inode");
+            let (source, source_fh) = engine
+                .create(root, b"source.txt", 0o644, libc::O_RDWR as u32, &ctx)
+                .expect("create source");
+            (root, source.inode_id, source_fh)
+        };
+
+        fixture
+            .adapter
+            .dispatch_link_entry(&ctx, source_inode.get(), root.get(), b"alias.txt")
+            .expect("link alias");
+        fixture.adapter.bump_forget_refcount(source_inode.get());
+
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.release(&source_fh).expect("release source handle");
+        }
+
+        fixture
+            .adapter
+            .dispatch_unlink_entry(&ctx, root.get(), b"source.txt")
+            .expect("unlink original");
+
+        assert!(
+            !fixture
+                .adapter
+                .removed_lookup_attrs
+                .lock()
+                .unwrap()
+                .contains_key(&source_inode.get()),
+            "unlinking one name of a hard-linked inode must not synthesize nlink=0"
+        );
+
+        let attr = fixture
+            .adapter
+            .dispatch_getattr(&ctx, source_inode.get(), 450, None)
+            .expect("still-linked lookup-referenced inode remains live");
+        assert_eq!(attr.attr.nlink, 1);
+
+        let engine = fixture.adapter.engine.lock().unwrap();
+        assert_eq!(
+            engine
+                .lookup(root, b"alias.txt", &ctx)
+                .expect("alias lookup")
+                .inode_id,
+            source_inode
+        );
     }
 
     #[test]
