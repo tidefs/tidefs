@@ -24,8 +24,9 @@ small follow-up commit tied to TFR-019.
 
 Use exactly one state when auditing a document:
 
-  rule that matches current source and repo policy.
+- Current policy: binding rule that matches current source and repo policy.
 - Current spec: design or implementation contract that matches current source
+  behavior and recorded evidence.
 - Historical input: useful design or audit material that must not be cited as
   current status.
 - Delete candidate: stale duplicate, obsolete closeout note, or scaffold text
@@ -34,11 +35,29 @@ Use exactly one state when auditing a document:
 ## Review Method
 
 Classify documents in focused commits. Do not mix doc classification with
+runtime implementation except for narrow claim-gate coverage updates required
+by the classification itself.
 
-Before promoting a document to current policy or current spec, check the
+Before promoting a document to current policy or current spec, check the live
+source behavior, `validation/claims.toml`, and the claims gate. If that review is
 too large for the current slice, leave the document as historical input and
 record the blocker in `docs/REVIEW_TODO_REGISTER.md` or
 `docs/WHOLE_REPO_REVIEW.md`.
+
+## Classified Authority Slices
+
+### Checksum and BLAKE3 Authority
+
+Classified for TFR-019 / GitHub issue #332 on 2026-06-16 after checking live
+source behavior, `validation/claims.toml`, and `xtask check-claims-gate`.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/BLAKE3_USAGE_POLICY.md` | Current policy | Binding only as a BLAKE3 placement and review policy. It is not implementation-status evidence and does not validate production end-to-end checksum, scrub self-heal, erasure-coded integrity, or tamper-proof root claims. Because this is promoted to current policy, it is scanned by the claims gate. |
+| `docs/CHECKSUM_ARCHITECTURE_DESIGN.md` | Historical input | Imported G3 design target and old closeout text. Current source has object-store integrity pieces, but `validation/claims.toml` has no validated production checksum, repair, erasure, or committed-root tamper-detection claim covering the full architecture. |
+| `docs/design/1683-checksum-architecture-g3-pillar-design-spec.md` | Historical input | Duplicate imported G3 design target with implementation deferred to wire-up issues. It must not be cited as current TideFS checksum status. |
+| `docs/design/end-to-end-checksum-architecture-g3-pillar.md` | Historical input | Imported canonical-design wording remains useful as target architecture, but its mandatory end-to-end, scrub, repair, erasure, and chain-of-trust claims exceed current claim-registry evidence. |
+| `docs/security/blake3-integrity-boundary.md` | Historical input | Imported release-train closeout note. It may inform review of residual BLAKE3 overfit, but its conformant-crate and closeout language is not current release authority. |
 
 ## Initial Open Queue
 

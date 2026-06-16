@@ -960,6 +960,16 @@ Important 2026-06-01 findings:
   broader process authority still needs deliberate completion.
   The doc set cannot be treated as release truth until every file is classified
   as current policy, current spec, historical input, or delete candidate.
+- `TFR-019`: The checksum/BLAKE3 authority slice for GitHub issue #332
+  classified `docs/BLAKE3_USAGE_POLICY.md` as current policy only for BLAKE3
+  placement and review. `docs/CHECKSUM_ARCHITECTURE_DESIGN.md`,
+  `docs/design/1683-checksum-architecture-g3-pillar-design-spec.md`,
+  `docs/design/end-to-end-checksum-architecture-g3-pillar.md`, and
+  `docs/security/blake3-integrity-boundary.md` are historical input, not current
+  production checksum, scrub self-heal, erasure-coded integrity, or tamper-proof
+  root authority. This reduces the checksum/BLAKE3 documentation drift under
+  TFR-019, but it does not close TFR-019 broadly and does not close any
+  storage-integrity implementation or claim-registry item.
 - `TFR-019`/`TFR-018`: the current xfstests harness authority slice repairs
   `xfstests-runner` as a diagnostic scoreboard wrapper, and sends output under
   runner help path no longer carries a bare `--per-test` command or duplicate
