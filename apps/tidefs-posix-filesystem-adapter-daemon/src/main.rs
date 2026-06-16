@@ -69,6 +69,7 @@ use tidefs_dataset_lifecycle::SyncGuarantee;
 use tidefs_inode_attributes::timestamp::TimestampPolicy as EngineTimestampPolicy;
 
 const MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
+const MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
 const MOUNT_VFS_TXG_COMMIT_INTERVAL_SECS: u64 = 30;
 
 /// RAII guard that removes a PID file on drop (clean shutdown).
@@ -369,7 +370,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     // syncfs, and destroy still force the durability barrier.
     lfs.set_auto_commit(false);
     lfs.set_commit_group_throughput_profile();
-    lfs.set_max_uncommitted_mutations(16 * 1024);
+    lfs.set_max_uncommitted_mutations(MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS);
 
     let writeback_tracker = std::sync::Arc::clone(lfs.writeback_range_tracker());
     let engine_timestamp_policy = if config.read_only {

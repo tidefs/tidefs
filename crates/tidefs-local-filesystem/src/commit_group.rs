@@ -248,10 +248,10 @@ impl CommitGroupConfig {
     /// High-throughput config for bulk workloads.
     pub fn throughput() -> Self {
         CommitGroupConfig {
-            commit_group_target_ops: 16384,
+            commit_group_target_ops: 64 * 1024,
             commit_group_target_bytes: 256 * 1024 * 1024, // 256 MiB
             commit_group_dirty_max_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB
-            commit_group_target_secs: 30.0,
+            commit_group_target_secs: 300.0,
             commit_group_quiesce_timeout_secs: 5.0,
         }
     }
@@ -1337,7 +1337,8 @@ mod tests {
         assert!(cons.commit_group_dirty_max_bytes < def.commit_group_dirty_max_bytes);
 
         let tp = CommitGroupConfig::throughput();
-        assert_eq!(tp.commit_group_target_ops, 16384);
+        assert_eq!(tp.commit_group_target_ops, 64 * 1024);
+        assert!(tp.commit_group_target_secs > def.commit_group_target_secs);
         assert!(tp.commit_group_dirty_max_bytes > def.commit_group_dirty_max_bytes);
     }
 
