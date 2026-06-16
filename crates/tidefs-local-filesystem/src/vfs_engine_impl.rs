@@ -64,6 +64,7 @@ const O_ACCMODE: u32 = 0o3;
 const O_EXCL: u32 = 0o200;
 const O_TRUNC: u32 = 0o1000;
 const O_APPEND: u32 = 0o2000;
+const COPY_FILE_RANGE_DIRECT_FALLBACK_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 fn open_flags_allow_read(flags: u32) -> bool {
     flags & O_ACCMODE != O_WRONLY
@@ -3089,6 +3090,56 @@ fn live_property_table(
 }
 
 impl VfsLocalFileSystem {
+    fn flush_copy_file_range_direct_segments(
+        &self,
+        dest_path: &str,
+        source_fh: &EngineFileHandle,
+        dest_fh: &EngineFileHandle,
+        segments: &mut Vec<(u64, Vec<u8>)>,
+        batch_bytes: &mut usize,
+        copied: u64,
+        requested: u64,
+    ) -> std::result::Result<bool, Errno> {
+        if segments.is_empty() {
+            return Ok(false);
+        }
+        let segment_count = segments.len();
+        let first_write_offset = segments
+            .first()
+            .map(|(offset, _)| *offset)
+            .unwrap_or_default();
+        let batch_len = *batch_bytes;
+        let batch = std::mem::take(segments);
+        *batch_bytes = 0;
+        match self
+            .fs
+            .borrow_mut()
+            .write_file_ranges_direct(dest_path, batch)
+        {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                let errno = map_errno(&err);
+                if vfs_op_diagnostics_enabled() {
+                    eprintln!(
+                        "tidefs-diagnostic: vfs copy_file_range direct batch write error src_ino={} src_fh={} dst_ino={} dst_fh={} first_write_offset={} batch_bytes={} segments={} copied={} requested={} errno={:?} err={:?}",
+                        source_fh.inode_id.get(),
+                        source_fh.fh_id.0,
+                        dest_fh.inode_id.get(),
+                        dest_fh.fh_id.0,
+                        first_write_offset,
+                        batch_len,
+                        segment_count,
+                        copied,
+                        requested,
+                        errno,
+                        err
+                    );
+                }
+                Err(errno)
+            }
+        }
+    }
+
     fn try_reflink_whole_file_copy(
         &self,
         source_fh: &EngineFileHandle,
@@ -4453,14 +4504,51 @@ impl VfsEngine for VfsLocalFileSystem {
         let mut copied = 0_u64;
         let mut source_was_read = false;
         let mut dest_was_direct_written = false;
+        let mut direct_segments = Vec::new();
+        let mut direct_batch_bytes = 0_usize;
         while copied < requested {
             let remaining = requested - copied;
-            let chunk_len = remaining.min(131072);
+            let chunk_len = remaining.min(131_072);
             let chunk_size = u32::try_from(chunk_len).map_err(|_| Errno::EFBIG)?;
             let read_offset = offset_in.checked_add(copied).ok_or(Errno::EINVAL)?;
             let chunk = match self.read_impl(source_fh, read_offset, chunk_size, ctx, false) {
                 Ok(chunk) => chunk,
                 Err(errno) => {
+                    if let Some(dest_path) = direct_dest_path.as_deref() {
+                        match self.flush_copy_file_range_direct_segments(
+                            dest_path,
+                            source_fh,
+                            dest_fh,
+                            &mut direct_segments,
+                            &mut direct_batch_bytes,
+                            copied,
+                            requested,
+                        ) {
+                            Ok(flushed) => {
+                                dest_was_direct_written |= flushed;
+                            }
+                            Err(write_errno) => {
+                                if source_was_read || dest_was_direct_written {
+                                    let mut fs = self.fs.borrow_mut();
+                                    if source_was_read {
+                                        let _ = fs.apply_deferred_timestamp_update(
+                                            source_fh.inode_id,
+                                            TimestampUpdate::Read,
+                                            self.timestamp_policy,
+                                        );
+                                    }
+                                    if dest_was_direct_written {
+                                        let _ = fs.apply_deferred_timestamp_update(
+                                            dest_fh.inode_id,
+                                            TimestampUpdate::Write,
+                                            self.timestamp_policy,
+                                        );
+                                    }
+                                }
+                                return Err(write_errno);
+                            }
+                        }
+                    }
                     if vfs_op_diagnostics_enabled() {
                         eprintln!(
                             "tidefs-diagnostic: vfs copy_file_range read error src_ino={} src_fh={} dst_ino={} dst_fh={} read_offset={} write_offset={} chunk_size={} copied={} requested={} errno={:?}",
@@ -4477,11 +4565,19 @@ impl VfsEngine for VfsLocalFileSystem {
                         );
                     }
                     if source_was_read {
-                        let _ = self.fs.borrow_mut().apply_deferred_timestamp_update(
+                        let mut fs = self.fs.borrow_mut();
+                        let _ = fs.apply_deferred_timestamp_update(
                             source_fh.inode_id,
                             TimestampUpdate::Read,
                             self.timestamp_policy,
                         );
+                        if dest_was_direct_written {
+                            let _ = fs.apply_deferred_timestamp_update(
+                                dest_fh.inode_id,
+                                TimestampUpdate::Write,
+                                self.timestamp_policy,
+                            );
+                        }
                     }
                     return Err(errno);
                 }
@@ -4491,56 +4587,51 @@ impl VfsEngine for VfsLocalFileSystem {
             }
             source_was_read = true;
             let write_offset = offset_out.checked_add(copied).ok_or(Errno::EINVAL)?;
-            let written = if let Some(dest_path) = direct_dest_path.as_deref() {
-                match self
-                    .fs
-                    .borrow_mut()
-                    .write_file_range_direct(dest_path, write_offset, &chunk)
-                {
-                    Ok(_) => {
-                        dest_was_direct_written = true;
-                        u32::try_from(chunk.len()).map_err(|_| Errno::EFBIG)?
-                    }
-                    Err(err) => {
-                        let errno = map_errno(&err);
-                        if vfs_op_diagnostics_enabled() {
-                            eprintln!(
-                                "tidefs-diagnostic: vfs copy_file_range direct write error src_ino={} src_fh={} dst_ino={} dst_fh={} read_offset={} write_offset={} chunk_len={} copied={} requested={} errno={:?} err={:?}",
-                                source_fh.inode_id.get(),
-                                source_fh.fh_id.0,
-                                dest_fh.inode_id.get(),
-                                dest_fh.fh_id.0,
-                                read_offset,
-                                write_offset,
-                                chunk.len(),
-                                copied,
-                                requested,
-                                errno,
-                                err
-                            );
+            if let Some(dest_path) = direct_dest_path.as_deref() {
+                let chunk_len = chunk.len();
+                let chunk_len_u64 = u64::try_from(chunk_len).map_err(|_| Errno::EFBIG)?;
+                direct_batch_bytes = direct_batch_bytes
+                    .checked_add(chunk_len)
+                    .ok_or(Errno::EFBIG)?;
+                direct_segments.push((write_offset, chunk));
+                copied = copied.checked_add(chunk_len_u64).ok_or(Errno::EFBIG)?;
+                if direct_batch_bytes >= COPY_FILE_RANGE_DIRECT_FALLBACK_BATCH_BYTES {
+                    match self.flush_copy_file_range_direct_segments(
+                        dest_path,
+                        source_fh,
+                        dest_fh,
+                        &mut direct_segments,
+                        &mut direct_batch_bytes,
+                        copied,
+                        requested,
+                    ) {
+                        Ok(flushed) => {
+                            dest_was_direct_written |= flushed;
                         }
-                        if source_was_read || dest_was_direct_written {
-                            let mut fs = self.fs.borrow_mut();
-                            if source_was_read {
-                                let _ = fs.apply_deferred_timestamp_update(
-                                    source_fh.inode_id,
-                                    TimestampUpdate::Read,
-                                    self.timestamp_policy,
-                                );
+                        Err(errno) => {
+                            if source_was_read || dest_was_direct_written {
+                                let mut fs = self.fs.borrow_mut();
+                                if source_was_read {
+                                    let _ = fs.apply_deferred_timestamp_update(
+                                        source_fh.inode_id,
+                                        TimestampUpdate::Read,
+                                        self.timestamp_policy,
+                                    );
+                                }
+                                if dest_was_direct_written {
+                                    let _ = fs.apply_deferred_timestamp_update(
+                                        dest_fh.inode_id,
+                                        TimestampUpdate::Write,
+                                        self.timestamp_policy,
+                                    );
+                                }
                             }
-                            if dest_was_direct_written {
-                                let _ = fs.apply_deferred_timestamp_update(
-                                    dest_fh.inode_id,
-                                    TimestampUpdate::Write,
-                                    self.timestamp_policy,
-                                );
-                            }
+                            return Err(errno);
                         }
-                        return Err(errno);
                     }
                 }
             } else {
-                match self.write(dest_fh, write_offset, &chunk, ctx) {
+                let written = match self.write(dest_fh, write_offset, &chunk, ctx) {
                     Ok(written) => written,
                     Err(errno) => {
                         if vfs_op_diagnostics_enabled() {
@@ -4565,11 +4656,47 @@ impl VfsEngine for VfsLocalFileSystem {
                         );
                         return Err(errno);
                     }
+                };
+                copied = copied.checked_add(u64::from(written)).ok_or(Errno::EFBIG)?;
+                if written == 0 || u64::from(written) < chunk.len() as u64 {
+                    break;
                 }
-            };
-            copied = copied.checked_add(u64::from(written)).ok_or(Errno::EFBIG)?;
-            if written == 0 || u64::from(written) < chunk.len() as u64 {
-                break;
+            }
+        }
+
+        if let Some(dest_path) = direct_dest_path.as_deref() {
+            match self.flush_copy_file_range_direct_segments(
+                dest_path,
+                source_fh,
+                dest_fh,
+                &mut direct_segments,
+                &mut direct_batch_bytes,
+                copied,
+                requested,
+            ) {
+                Ok(flushed) => {
+                    dest_was_direct_written |= flushed;
+                }
+                Err(errno) => {
+                    if source_was_read || dest_was_direct_written {
+                        let mut fs = self.fs.borrow_mut();
+                        if source_was_read {
+                            let _ = fs.apply_deferred_timestamp_update(
+                                source_fh.inode_id,
+                                TimestampUpdate::Read,
+                                self.timestamp_policy,
+                            );
+                        }
+                        if dest_was_direct_written {
+                            let _ = fs.apply_deferred_timestamp_update(
+                                dest_fh.inode_id,
+                                TimestampUpdate::Write,
+                                self.timestamp_policy,
+                            );
+                        }
+                    }
+                    return Err(errno);
+                }
             }
         }
 
@@ -8759,6 +8886,73 @@ mod tests {
                 .read(&dest_create, 384, outside_dirty.len() as u32, &ctx())
                 .unwrap(),
             outside_dirty
+        );
+    }
+
+    #[test]
+    fn copy_file_range_direct_fallback_batches_multichunk_writes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_source_attr, source_create) = engine
+            .create(root, b"copy-direct-batch-source.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let (_dest_attr, dest_create) = engine
+            .create(root, b"copy-direct-batch-dest.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let copy_len = crate::constants::FILESYSTEM_CONTENT_CHUNK_SIZE * 3 + 17;
+        let payload: Vec<u8> = (0..copy_len)
+            .map(|idx| 0x40_u8.wrapping_add((idx % 191) as u8))
+            .collect();
+        engine.write(&source_create, 0, &payload, &ctx()).unwrap();
+        engine
+            .fs
+            .borrow_mut()
+            .set_write_buffer_config(WriteBufferConfig {
+                flush_threshold_bytes: 64,
+                flush_threshold_age: std::time::Duration::from_secs(60),
+            });
+        let outside_offset = (copy_len + 4096) as u64;
+        let outside_dirty = vec![0x7c; 60];
+        engine
+            .write(&dest_create, outside_offset, &outside_dirty, &ctx())
+            .unwrap();
+        let before_version = engine
+            .fs
+            .borrow()
+            .stat("/copy-direct-batch-dest.txt")
+            .unwrap()
+            .data_version;
+
+        let copied = engine
+            .copy_file_range(&source_create, 0, &dest_create, 0, copy_len as u64, &ctx())
+            .unwrap();
+
+        assert_eq!(copied, copy_len as u32);
+        let after_version = engine
+            .fs
+            .borrow()
+            .stat("/copy-direct-batch-dest.txt")
+            .unwrap()
+            .data_version;
+        assert_eq!(
+            after_version,
+            before_version + 1,
+            "multi-chunk direct fallback should publish through one content mutation"
+        );
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(dest_create.inode_id, outside_offset, outside_dirty.len())
+                .as_deref(),
+            Some(outside_dirty.as_slice()),
+            "batched copy_file_range must not flush unrelated dirty destination bytes"
+        );
+        assert_eq!(
+            engine
+                .read(&dest_create, 0, copy_len as u32, &ctx())
+                .unwrap(),
+            payload
         );
     }
 
