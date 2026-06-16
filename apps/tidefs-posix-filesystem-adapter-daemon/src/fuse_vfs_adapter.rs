@@ -360,6 +360,56 @@ fn delete_child_attr_for_mutation_preflight(
     Ok(child_attr)
 }
 
+fn enforce_mutable_parent_dir(parent_attr: &InodeAttr) -> Result<(), Errno> {
+    if parent_attr.kind != NodeKind::Dir {
+        return Err(Errno::ENOTDIR);
+    }
+    enforce_immutable_guard(parent_attr.flags.to_raw_flags())
+}
+
+fn rename_parent_attr_for_mutation_preflight(
+    engine: &dyn VfsEngine,
+    parent: InodeId,
+    ctx: &RequestCtx,
+) -> Result<InodeAttr, Errno> {
+    match engine.getattr(parent, None, ctx) {
+        Ok(attr) => Ok(attr),
+        Err(Errno::EIO) => Err(Errno::ENOENT),
+        Err(errno) => Err(errno),
+    }
+}
+
+fn rename_mutation_preflight(
+    engine: &dyn VfsEngine,
+    old_parent: InodeId,
+    old_name: &[u8],
+    new_parent: InodeId,
+    new_name: &[u8],
+    ctx: &RequestCtx,
+) -> Result<(), Errno> {
+    if ctx.uid != 0 {
+        check_parent_write_execute(engine, old_parent, ctx)?;
+        check_parent_write_execute(engine, new_parent, ctx)?;
+        check_sticky_rename(engine, old_parent, old_name, new_parent, new_name, ctx)?;
+    }
+
+    let src_parent_attr = rename_parent_attr_for_mutation_preflight(engine, old_parent, ctx)?;
+    enforce_mutable_parent_dir(&src_parent_attr)?;
+    if new_parent != old_parent {
+        let dst_parent_attr = rename_parent_attr_for_mutation_preflight(engine, new_parent, ctx)?;
+        enforce_mutable_parent_dir(&dst_parent_attr)?;
+    }
+
+    let src_child = engine.lookup(old_parent, old_name, ctx)?;
+    enforce_immutable_guard(src_child.flags.to_raw_flags())?;
+    match engine.lookup(new_parent, new_name, ctx) {
+        Ok(dst_child) => enforce_immutable_guard(dst_child.flags.to_raw_flags())?,
+        Err(Errno::ENOENT) => {}
+        Err(errno) => return Err(errno),
+    }
+    Ok(())
+}
+
 /// Map a namespace `kind` field to a VFS [`NodeKind`].
 fn namespace_kind_to_node_kind(kind: u32) -> NodeKind {
     match kind {
@@ -3656,26 +3706,7 @@ impl FuseVfsAdapter {
         let engine: &dyn VfsEngine = &**e;
         let old_parent = InodeId::new(parent);
         let new_parent = InodeId::new(newparent);
-        check_parent_write_execute(engine, old_parent, ctx)?;
-        check_parent_write_execute(engine, new_parent, ctx)?;
-        check_sticky_rename(engine, old_parent, name, new_parent, newname, ctx)?;
-
-        // POSIX: reject rename if any involved inode (old parent, new parent,
-        // source victim, target victim) is immutable.
-        {
-            let src_parent_attr = engine.getattr(old_parent, None, ctx)?;
-            enforce_immutable_guard(src_parent_attr.flags.to_raw_flags())?;
-            if let Ok(src_child) = engine.lookup(old_parent, name, ctx) {
-                enforce_immutable_guard(src_child.flags.to_raw_flags())?;
-            }
-            if new_parent != old_parent {
-                let dst_parent_attr = engine.getattr(new_parent, None, ctx)?;
-                enforce_immutable_guard(dst_parent_attr.flags.to_raw_flags())?;
-            }
-            if let Ok(dst_child) = engine.lookup(new_parent, newname, ctx) {
-                enforce_immutable_guard(dst_child.flags.to_raw_flags())?;
-            }
-        }
+        rename_mutation_preflight(engine, old_parent, name, new_parent, newname, ctx)?;
         let result = self
             .rename_dispatch
             .dispatch_engine_with_flags(EngineRenameRequest {
@@ -24842,6 +24873,67 @@ mod tests {
             &**engine,
             parent,
             b"child.txt",
+            &access_ctx(1000, 1001, &[1001]),
+        );
+        assert_eq!(non_root_result.unwrap_err(), Errno::EACCES);
+    }
+
+    #[test]
+    fn root_rename_preflight_keeps_child_resolution_and_non_root_gate() {
+        let fixture = adapter_fixture();
+        let root_ctx = root_ctx();
+        let (parent, child) = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let root = engine.get_root_inode(&root_ctx).expect("root inode");
+            let parent = engine
+                .mkdir(root, b"rename-locked", 0o555, &root_ctx)
+                .expect("create unwritable parent");
+            let (child, _fh) = engine
+                .create(
+                    parent.inode_id,
+                    b"source.txt",
+                    0o644,
+                    libc::O_RDWR as u32,
+                    &root_ctx,
+                )
+                .expect("create source");
+            (parent.inode_id, child.inode_id)
+        };
+
+        let engine = fixture.adapter.engine.lock().unwrap();
+        rename_mutation_preflight(
+            &**engine,
+            parent,
+            b"source.txt",
+            parent,
+            b"dest.txt",
+            &root_ctx,
+        )
+        .expect("root rename preflight resolves source without permission scan");
+        assert_eq!(
+            rename_mutation_preflight(
+                &**engine,
+                parent,
+                b"missing.txt",
+                parent,
+                b"dest.txt",
+                &root_ctx,
+            )
+            .unwrap_err(),
+            Errno::ENOENT,
+            "root rename preflight still resolves the source child"
+        );
+        let resolved = engine
+            .lookup(parent, b"source.txt", &root_ctx)
+            .expect("source remains present");
+        assert_eq!(resolved.inode_id, child);
+
+        let non_root_result = rename_mutation_preflight(
+            &**engine,
+            parent,
+            b"source.txt",
+            parent,
+            b"dest.txt",
             &access_ctx(1000, 1001, &[1001]),
         );
         assert_eq!(non_root_result.unwrap_err(), Errno::EACCES);
