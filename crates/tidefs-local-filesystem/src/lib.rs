@@ -6447,8 +6447,7 @@ impl LocalFileSystem {
                     requested: base_len_u64,
                 })?;
             if base_len > 0 {
-                let base = read_content_range_from_store(
-                    self.store.raw_primary_store(),
+                let base = self.read_committed_content_range_cached(
                     inode_id,
                     &base_record,
                     offset,
@@ -10772,6 +10771,17 @@ impl LocalFileSystem {
         if self.state.corrupted_inodes.contains(&inode_id) {
             return Err(FileSystemError::CorruptContent { inode_id });
         }
+
+        self.read_committed_content_range_cached(inode_id, record, offset, length)
+    }
+
+    fn read_committed_content_range_cached(
+        &self,
+        inode_id: InodeId,
+        record: &InodeRecord,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
         if length == 0 || offset >= record.size {
             return Ok(Vec::new());
         }
@@ -10785,10 +10795,6 @@ impl LocalFileSystem {
             usize::try_from(clipped_len_u64).map_err(|_| FileSystemError::SizeOverflow {
                 requested: clipped_len_u64,
             })?;
-        if offset == 0 && length_u64 >= record.size {
-            return self.read_content(inode_id, record);
-        }
-
         let role = HotReadCacheObjectRole::from_node_kind(record.kind()).ok_or(
             FileSystemError::NotFile {
                 path: format!("inode:{}", inode_id.get()),
@@ -10819,6 +10825,13 @@ impl LocalFileSystem {
                 });
             }
             return Ok(bytes[start..end].to_vec());
+        }
+
+        if offset == 0 && length_u64 >= record.size {
+            let bytes =
+                read_content_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+            self.hot_read_cache.borrow_mut().admit(key, &bytes);
+            return Ok(bytes);
         }
 
         if let Some(layout) = self.content_layout_cache.borrow().get(&key).cloned() {
