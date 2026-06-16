@@ -6404,6 +6404,50 @@ impl FuseVfsAdapter {
         Ok(())
     }
 
+    fn reconcile_dirty_mirrors_after_engine_copy(
+        &self,
+        ctx: &RequestCtx,
+        ino: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), Errno> {
+        if length == 0 {
+            return Ok(());
+        }
+        let has_dirty_overlap = self.dirty_trackers_overlap_range(ino, offset, length)
+            || self.dirty_page_caches_overlap_range(ino, offset, length);
+        if !has_dirty_overlap {
+            return Ok(());
+        }
+
+        let engine = self.engine.lock().unwrap();
+        let read_fh = match engine.open(InodeId::new(ino), libc::O_RDONLY as u32, ctx) {
+            Ok(read_fh) => read_fh,
+            Err(errno) => {
+                let still_has_dirty_overlap = self
+                    .dirty_trackers_overlap_range(ino, offset, length)
+                    || self.dirty_page_caches_overlap_range(ino, offset, length);
+                return if still_has_dirty_overlap {
+                    Err(errno)
+                } else {
+                    Ok(())
+                };
+            }
+        };
+        let result = self.reconcile_dirty_mirrors_for_authoritative_range(
+            ino,
+            offset,
+            length,
+            AuthoritativeRangePayload::EngineRead {
+                engine: &**engine,
+                efh: &read_fh,
+                ctx,
+            },
+        );
+        let _ = engine.release(&read_fh);
+        result
+    }
+
     // ── Block-volume adapter extent resolution ───────────────────────────
     //
     // Resolve logical file offsets to physical block-volume ranges through
@@ -9967,42 +10011,12 @@ impl Filesystem for FuseVfsAdapter {
         match result {
             Ok(written) => {
                 if written > 0 {
-                    let reconcile_result = {
-                        let engine = self.engine.lock().unwrap();
-                        match engine.open(InodeId::new(copy_dest.0), libc::O_RDONLY as u32, &ctx) {
-                            Ok(read_fh) => {
-                                let result = self.reconcile_dirty_mirrors_for_authoritative_range(
-                                    copy_dest.0,
-                                    copy_dest.1,
-                                    u64::from(written),
-                                    AuthoritativeRangePayload::EngineRead {
-                                        engine: &**engine,
-                                        efh: &read_fh,
-                                        ctx: &ctx,
-                                    },
-                                );
-                                let _ = engine.release(&read_fh);
-                                result
-                            }
-                            Err(errno) => {
-                                let has_dirty_overlap = self.dirty_trackers_overlap_range(
-                                    copy_dest.0,
-                                    copy_dest.1,
-                                    u64::from(written),
-                                ) || self.dirty_page_caches_overlap_range(
-                                    copy_dest.0,
-                                    copy_dest.1,
-                                    u64::from(written),
-                                );
-                                if has_dirty_overlap {
-                                    Err(errno)
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                        }
-                    };
-                    if let Err(errno) = reconcile_result {
+                    if let Err(errno) = self.reconcile_dirty_mirrors_after_engine_copy(
+                        &ctx,
+                        copy_dest.0,
+                        copy_dest.1,
+                        u64::from(written),
+                    ) {
                         reply.reply_errno(errno);
                         return;
                     }
