@@ -372,6 +372,13 @@ Important 2026-06-01 findings:
   records live mmap coherency as deferred, kmod trait defaults allow mmap/fault
   and cache callbacks without a complete engine contract, and kmod
   address-space writeback still depends on mounted-kernel engine authority.
+- `TFR-008`: issue #329 makes crash claim evidence source-qualified at the
+  claims gate. The model crash matrix remains model-only evidence, runtime
+  crash evidence classes must not point at model-only artifacts, and a
+  claims-gate review artifact records why write/fsync and rename crash claims
+  remain planned or blocked until runtime crash evidence exists. This does not
+  close TFR-008 and does not claim production crash safety, mounted runtime
+  durability, or final recovery authority.
 - `TFR-009`: Kernel residency is still a tiered bring-up, not terminal; TideFS
   is not yet full-kernel. The kernel-resident architecture doc explicitly says the
   current mounted operation slice uses a small fixed in-kernel namespace/data
