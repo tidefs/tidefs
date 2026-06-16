@@ -57,7 +57,7 @@ Current `raw_primary_store()` and `raw_primary_store_mut()` matches:
 | Path | Current matches | Inventory note |
 |---|---:|---|
 | `crates/tidefs-local-object-store/src/pool/mod.rs` | 7 | Pool accessors and `PoolStore` escape hatches. This is the lower object-store authority, not a mounted-filesystem proof. |
-| `crates/tidefs-local-filesystem/src/lib.rs` | 64 | 63 mounted production matches plus one in-file test raw drain assertion. |
+| `crates/tidefs-local-filesystem/src/lib.rs` | 65 | 64 mounted production matches plus one in-file test raw drain assertion. |
 | `crates/tidefs-local-filesystem/src/crash_recovery.rs` | 21 | Crash-matrix validation helpers stage raw commit-boundary objects. |
 | `crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7 | One production key-scan path plus six unit-test assertions. |
 | `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` | 7 | Five live mounted VFS/admin paths plus two encryption-feature tests. |
@@ -78,7 +78,7 @@ branch can pass the guard.
 | File content reads, writes, sparse operations, reflink, copy-file-range, truncate, punch-hole, zero-range, read overlay | `create_file_like`, `replace_content`, `rewrite_content_*`, `read_content*`, `reflink_*`, `truncate_file`, `free_extent_range`, `punch_hole`, `zero_range`, and related helpers in `src/lib.rs` plus anonymous tmpfile reads and whole-file copy fast paths in `vfs_engine_impl.rs` | transform-aware for mounted content compression, plaintext dedup, and receipt-producing content writes; blocked for remaining device-level compression/encryption reads and raw paths | The main content-write population paths now route durable chunk writes through `PoolStoreMut::put_with_receipt`, but mounted content still has raw read, layout, reclaim, sparse, commit, recovery, and whole-file copy raw paths before device-level transforms can become a product claim. |
 | Snapshot export/import and send/receive | `rollback_to_snapshot`, `export_changed_records`, `export_incremental_changed_records` | blocked | Export/import currently serializes raw mounted records and is not yet one ordered transform contract. |
 | Intent log, fsync, commit, rollback | `sync_write_intent`, `flush_intent_log_if_needed`, `fsync_*`, `sync_*`, `fdatasync_inode`, `do_commit`, `rollback_mutation_delta`, `selected_current_root_summary` | blocked | Durability barriers and replay anchors still write and clear raw state/log objects. |
-| Directory/inode fallback reads | `inode`, `ensure_inode_loaded_for_write` | blocked | These paths recover inode and directory records directly from raw store keys. |
+| Directory/inode fallback reads | `inode`, `inode_record_only`, `ensure_inode_loaded_for_write` | blocked | These paths recover inode and directory records directly from raw store keys. |
 | Live dataset key administration | `live_dataset_seal_key`, `live_dataset_rotate_key` in `vfs_engine_impl.rs` | metadata/raw-only | These paths store sealed key records rather than file payloads, but the format still needs transform-authority review before it becomes a product encryption claim. |
 | Crash-matrix boundary staging | `src/crash_recovery.rs` | blocked validation fixture | This is not a mounted product write path, but it proves raw state construction is still required by validation. |
 | Placement, locator, rebuild, and default pool-media writes | #17, #18, #91 surfaces | later receipt/placement issue | This issue deliberately does not edit those write paths. |
