@@ -1182,6 +1182,51 @@ fn fully_buffered_range_read_skips_committed_content_lookup() {
 }
 
 #[test]
+fn dirty_overlay_range_reads_reuse_committed_layout_cache() {
+    let root = temp_root("dirty-overlay-layout-cache");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let record = fs.create_file("/hot.bin", 0o644).expect("create file");
+    let chunk = content_chunk_size() as usize;
+    let base_len = chunk * 3;
+    let mut base = Vec::with_capacity(base_len);
+    for index in 0..base_len {
+        base.push((index % 251) as u8);
+    }
+
+    fs.write_file("/hot.bin", 0, &base).expect("write baseline");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush baseline");
+    assert_eq!(fs.content_layout_cache_len_for_test(), 0);
+
+    let dirty_offset = chunk as u64 + 7;
+    fs.write_file("/hot.bin", dirty_offset, b"DIRTY")
+        .expect("buffer dirty overwrite");
+    assert!(fs.write_buffers.contains_key(&record.inode_id));
+
+    let read_offset = chunk as u64;
+    let mut expected = base[chunk..chunk + 64].to_vec();
+    expected[7..12].copy_from_slice(b"DIRTY");
+    assert_eq!(
+        fs.read_file_range("/hot.bin", read_offset, 64)
+            .expect("read partial dirty range"),
+        expected
+    );
+    assert_eq!(fs.content_layout_cache_len_for_test(), 1);
+
+    assert_eq!(
+        fs.read_file_range("/hot.bin", read_offset + 16, 64)
+            .expect("read committed range while dirty buffer exists"),
+        base[chunk + 16..chunk + 80].to_vec()
+    );
+    assert_eq!(fs.content_layout_cache_len_for_test(), 1);
+
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush dirty overwrite");
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
 fn write_file_non_empty_invalidates_hot_read_cache() {
     let root = temp_root("write-file-invalidate-hot-read-cache");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
