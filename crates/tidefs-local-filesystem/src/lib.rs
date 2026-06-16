@@ -6675,11 +6675,10 @@ impl LocalFileSystem {
         Ok(result)
     }
 
-    pub(crate) fn write_file_range_direct(
+    pub(crate) fn write_file_ranges_direct(
         &mut self,
         path: impl AsRef<str>,
-        offset: u64,
-        bytes: &[u8],
+        mut segments: Vec<(u64, Vec<u8>)>,
     ) -> Result<InodeRecord> {
         let path = path.as_ref();
         let parts = parse_absolute_path(path)?;
@@ -6697,22 +6696,34 @@ impl LocalFileSystem {
             });
         }
 
-        let bytes_len = u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
-            requested: u64::MAX,
-        })?;
-        if bytes_len == 0 {
+        segments.retain(|(_, bytes)| !bytes.is_empty());
+        if segments.is_empty() {
             return Ok(adjusted_record);
         }
-        let end = offset
-            .checked_add(bytes_len)
-            .ok_or(FileSystemError::SizeOverflow {
-                requested: u64::MAX,
-            })?;
-        let _end_len =
-            usize::try_from(end).map_err(|_| FileSystemError::SizeOverflow { requested: end })?;
 
         let effective_size = adjusted_record.size;
-        let new_size = effective_size.max(end);
+        let mut new_size = effective_size;
+        let mut total_bytes = 0_u64;
+        for (offset, bytes) in &segments {
+            let bytes_len =
+                u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            let end = offset
+                .checked_add(bytes_len)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            let _end_len = usize::try_from(end)
+                .map_err(|_| FileSystemError::SizeOverflow { requested: end })?;
+            total_bytes =
+                total_bytes
+                    .checked_add(bytes_len)
+                    .ok_or(FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    })?;
+            new_size = new_size.max(end);
+        }
         let old_grains = crate::quota::allocation_grains_for_len(effective_size);
         let new_grains = crate::quota::allocation_grains_for_len(new_size);
         let delta_bytes = new_grains.saturating_sub(old_grains);
@@ -6746,6 +6757,7 @@ impl LocalFileSystem {
         self.invalidate_hot_read_cache_for_inode(inode_id);
 
         let base_record = self.committed_inode_record(inode_id)?;
+        let patches = self.coalesced_write_buffer_patches(inode_id, &base_record, &segments)?;
         let was_auto_commit = self.auto_commit;
         let was_in_transaction = self.in_transaction;
         let was_max_uncommitted_mutations = self.max_uncommitted_mutations;
@@ -6754,8 +6766,37 @@ impl LocalFileSystem {
         self.auto_commit = false;
         self.in_transaction = true;
         self.max_uncommitted_mutations = u64::MAX;
-        let result =
-            self.rewrite_content_with_overlay(inode_id, base_record, offset, bytes, new_size, true);
+        let result = (|| match self.rewrite_content_with_patch_batch(
+            inode_id,
+            base_record.clone(),
+            &patches,
+            new_size,
+            true,
+        ) {
+            Ok(record) => Ok(record),
+            Err(FileSystemError::Unsupported { .. }) => {
+                let mut result = Ok(base_record);
+                for patch in &patches {
+                    let record = match self.committed_inode_record(inode_id) {
+                        Ok(record) => record,
+                        Err(err) => return Err(err),
+                    };
+                    result = self.rewrite_content_with_overlay(
+                        inode_id,
+                        record,
+                        patch.offset,
+                        &patch.bytes,
+                        new_size,
+                        true,
+                    );
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                result
+            }
+            Err(err) => Err(err),
+        })();
         self.max_uncommitted_mutations = was_max_uncommitted_mutations;
         self.in_transaction = was_in_transaction;
         self.auto_commit = was_auto_commit;
@@ -6769,26 +6810,40 @@ impl LocalFileSystem {
         }
         self.state
             .space_accounting
-            .accumulate_delta(SpaceDelta::new_write(bytes_len));
-        self.state.space_accounting.track_physical_write(bytes_len);
-        let _ = self
-            .extent_allocator
-            .allocate_extent(inode_id.0, offset, bytes_len, None);
-        let blake3_hash = blake3::hash(bytes);
-        let birth_txg = self.commit_group.current_commit_group().0;
-        let _ = self.extent_allocator.finalize_data_extent(
-            inode_id.0,
-            offset,
-            bytes_len,
-            *blake3_hash.as_bytes(),
-            birth_txg,
-        );
+            .accumulate_delta(SpaceDelta::new_write(total_bytes));
+        self.state
+            .space_accounting
+            .track_physical_write(total_bytes);
+        for (offset, bytes) in &segments {
+            let bytes_len =
+                u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            let _ = self
+                .extent_allocator
+                .allocate_extent(inode_id.0, *offset, bytes_len, None);
+            let blake3_hash = blake3::hash(bytes);
+            let birth_txg = self.commit_group.current_commit_group().0;
+            let _ = self.extent_allocator.finalize_data_extent(
+                inode_id.0,
+                *offset,
+                bytes_len,
+                *blake3_hash.as_bytes(),
+                birth_txg,
+            );
+        }
         self.state.dirty_extent_maps.insert(inode_id);
-        self.clear_write_buffer_range(inode_id, offset, bytes_len);
-        self.writeback_range_tracker
-            .lock()
-            .expect("locked")
-            .clear_range(inode_id, offset, bytes_len);
+        for (offset, bytes) in &segments {
+            let bytes_len =
+                u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            self.clear_write_buffer_range(inode_id, *offset, bytes_len);
+            self.writeback_range_tracker
+                .lock()
+                .expect("locked")
+                .clear_range(inode_id, *offset, bytes_len);
+        }
         Ok(self.adjust_for_write_buffer(inode_id, result))
     }
 
