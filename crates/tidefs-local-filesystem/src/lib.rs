@@ -6445,6 +6445,13 @@ impl LocalFileSystem {
         let read_len = usize::try_from(available).map_err(|_| FileSystemError::SizeOverflow {
             requested: available,
         })?;
+        if wb.contains_range(offset, available) {
+            return wb.read_overlap(offset, read_len).map(Some).ok_or(
+                FileSystemError::CorruptState {
+                    reason: "write buffer covered range without readable buffered bytes",
+                },
+            );
+        }
         let mut bytes = vec![0u8; read_len];
 
         let base_record = self.committed_record_for_buffered_read(inode_id, record);
