@@ -3012,6 +3012,7 @@ impl Transport {
         let session = self
             .sessions
             .get(&session_id)
+            .cloned()
             .ok_or(TransportError::SessionNotFound { session_id })?;
 
         let mut session = session
