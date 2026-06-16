@@ -8957,6 +8957,108 @@ mod tests {
     }
 
     #[test]
+    fn copy_file_range_direct_fallback_clears_batched_dest_ranges() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_source_attr, source_create) = engine
+            .create(
+                root,
+                b"copy-direct-batch-clear-source.txt",
+                0o644,
+                O_RDWR,
+                &ctx(),
+            )
+            .unwrap();
+        let (_dest_attr, dest_create) = engine
+            .create(
+                root,
+                b"copy-direct-batch-clear-dest.txt",
+                0o644,
+                O_RDWR,
+                &ctx(),
+            )
+            .unwrap();
+        let copy_len = crate::constants::FILESYSTEM_CONTENT_CHUNK_SIZE * 2 + 8192;
+        let payload: Vec<u8> = (0..copy_len)
+            .map(|idx| 0x20_u8.wrapping_add((idx % 173) as u8))
+            .collect();
+        engine.write(&source_create, 0, &payload, &ctx()).unwrap();
+        engine
+            .write(&dest_create, 0, &vec![0x11; copy_len + 16384], &ctx())
+            .unwrap();
+        engine
+            .fs
+            .borrow_mut()
+            .flush_write_buffer(dest_create.inode_id)
+            .unwrap();
+
+        let dirty_prefix = vec![0xa1; 4096];
+        let stale_overlap = vec![0xb2; copy_len - 8192];
+        let dirty_suffix = vec![0xc3; 4096];
+        engine
+            .write(&dest_create, 0, &dirty_prefix, &ctx())
+            .unwrap();
+        engine
+            .write(&dest_create, 4096, &stale_overlap, &ctx())
+            .unwrap();
+        engine
+            .write(
+                &dest_create,
+                (copy_len - 4096) as u64,
+                &dirty_suffix,
+                &ctx(),
+            )
+            .unwrap();
+
+        let copied = engine
+            .copy_file_range(
+                &source_create,
+                0,
+                &dest_create,
+                4096,
+                (copy_len - 8192) as u64,
+                &ctx(),
+            )
+            .unwrap();
+
+        assert_eq!(copied, (copy_len - 8192) as u32);
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(dest_create.inode_id, 0, dirty_prefix.len())
+                .as_deref(),
+            Some(dirty_prefix.as_slice()),
+            "dirty prefix outside the copied range should remain buffered"
+        );
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(dest_create.inode_id, 4096, stale_overlap.len())
+                .is_none(),
+            "batched direct copy must clear every overwritten dirty byte"
+        );
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(
+                    dest_create.inode_id,
+                    (copy_len - 4096) as u64,
+                    dirty_suffix.len()
+                )
+                .as_deref(),
+            Some(dirty_suffix.as_slice()),
+            "dirty suffix outside the copied range should remain buffered"
+        );
+        assert_eq!(
+            engine.read(&dest_create, 4096, copied, &ctx()).unwrap(),
+            payload[..copied as usize]
+        );
+    }
+
+    #[test]
     fn copy_file_range_direct_fallback_clears_overwritten_dest_buffered_writes() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
