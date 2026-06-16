@@ -170,6 +170,7 @@ impl std::error::Error for PageFlushError {}
 
 struct PageCacheInner {
     pages: HashMap<PageKey, Page>,
+    dirty_page_counts: HashMap<u64, usize>,
     /// Front = LRU (oldest), back = MRU (newest).
     lru_order: VecDeque<PageKey>,
     max_pages: usize,
@@ -184,6 +185,7 @@ impl PageCacheInner {
     fn new(max_pages: usize, page_size: usize) -> Self {
         Self {
             pages: HashMap::with_capacity(max_pages.min(1024)),
+            dirty_page_counts: HashMap::new(),
             lru_order: VecDeque::with_capacity(max_pages.min(1024)),
             max_pages,
             page_size,
@@ -206,6 +208,27 @@ impl PageCacheInner {
     fn unlink_lru(&mut self, key: &PageKey) {
         if let Some(pos) = self.lru_order.iter().position(|k| k == key) {
             self.lru_order.remove(pos);
+        }
+    }
+
+    fn dirty_page_count_for_inode(&self, inode: u64) -> usize {
+        self.dirty_page_counts.get(&inode).copied().unwrap_or(0)
+    }
+
+    fn increment_dirty_page_count(&mut self, inode: u64) {
+        *self.dirty_page_counts.entry(inode).or_insert(0) += 1;
+    }
+
+    fn decrement_dirty_page_count(&mut self, inode: u64) {
+        let mut remove_entry = false;
+        if let Some(count) = self.dirty_page_counts.get_mut(&inode) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                remove_entry = true;
+            }
+        }
+        if remove_entry {
+            self.dirty_page_counts.remove(&inode);
         }
     }
 
@@ -256,22 +279,32 @@ impl PageCacheInner {
 
     /// Mark a page dirty by key.  Returns false if the page does not exist.
     fn mark_dirty_inner(&mut self, key: &PageKey) -> bool {
-        if let Some(page) = self.pages.get_mut(key) {
+        let became_dirty = if let Some(page) = self.pages.get_mut(key) {
+            let became_dirty = !page.is_dirty();
             page.flags |= page_flags::DIRTY;
-            true
+            became_dirty
         } else {
-            false
+            return false;
+        };
+        if became_dirty {
+            self.increment_dirty_page_count(key.inode);
         }
+        true
     }
 
     /// Clear the dirty flag on a page.  Returns false if the page does not exist.
     fn clear_dirty_inner(&mut self, key: &PageKey) -> bool {
-        if let Some(page) = self.pages.get_mut(key) {
+        let was_dirty = if let Some(page) = self.pages.get_mut(key) {
+            let was_dirty = page.is_dirty();
             page.flags &= !page_flags::DIRTY;
-            true
+            was_dirty
         } else {
-            false
+            return false;
+        };
+        if was_dirty {
+            self.decrement_dirty_page_count(key.inode);
         }
+        true
     }
 
     /// Start writeback: pin the page and set the writeback flag.
@@ -291,16 +324,21 @@ impl PageCacheInner {
     /// Complete writeback: clear writeback flag; if successful, also clear dirty.
     /// Unpins regardless of success.  Returns false if the page does not exist.
     fn complete_writeback_inner(&mut self, key: &PageKey, success: bool) -> bool {
-        if let Some(page) = self.pages.get_mut(key) {
+        let cleared_dirty = if let Some(page) = self.pages.get_mut(key) {
             page.flags &= !page_flags::WRITEBACK;
             page.flags &= !page_flags::PINNED;
+            let cleared_dirty = success && page.is_dirty();
             if success {
                 page.flags &= !page_flags::DIRTY;
             }
-            true
+            cleared_dirty
         } else {
-            false
+            return false;
+        };
+        if cleared_dirty {
+            self.decrement_dirty_page_count(key.inode);
         }
+        true
     }
 
     /// Abort writeback: clear writeback flag and unpin, but preserve dirty.
@@ -317,6 +355,9 @@ impl PageCacheInner {
 
     /// Collect keys of all dirty pages.
     fn dirty_page_keys(&self) -> Vec<PageKey> {
+        if self.dirty_page_counts.is_empty() {
+            return Vec::new();
+        }
         self.pages
             .iter()
             .filter(|(_, p)| p.is_dirty())
@@ -326,6 +367,9 @@ impl PageCacheInner {
 
     /// Collect keys of all dirty pages for a given inode.
     fn dirty_page_keys_for_inode(&self, inode: u64) -> Vec<PageKey> {
+        if self.dirty_page_count_for_inode(inode) == 0 {
+            return Vec::new();
+        }
         self.pages
             .iter()
             .filter(|(k, p)| k.inode == inode && p.is_dirty())
@@ -336,6 +380,9 @@ impl PageCacheInner {
     /// Collect keys of all dirty pages for a given inode whose byte range
     /// [offset, offset + page_size) overlaps with [start, end).
     fn dirty_page_keys_in_range(&self, inode: u64, start: u64, end: u64) -> Vec<PageKey> {
+        if self.dirty_page_count_for_inode(inode) == 0 {
+            return Vec::new();
+        }
         let page_size = self.page_size as u64;
         self.pages
             .iter()
@@ -348,14 +395,21 @@ impl PageCacheInner {
 
     /// Clear dirty flag on all pages for a given inode. Returns count cleared.
     fn clear_dirty_for_inode(&mut self, inode: u64) -> usize {
-        self.pages
+        let dirty_count = self.dirty_page_count_for_inode(inode);
+        if dirty_count == 0 {
+            return 0;
+        }
+        let cleared = self
+            .pages
             .iter_mut()
             .filter(|(k, p)| k.inode == inode && p.is_dirty())
             .map(|(_, p)| {
                 p.flags &= !page_flags::DIRTY;
                 1
             })
-            .sum()
+            .sum();
+        self.dirty_page_counts.remove(&inode);
+        cleared
     }
 
     /// Invalidate (remove) clean, unpinned, non-writeback pages whose byte
@@ -487,16 +541,14 @@ impl<'a> PageHandle<'a> {
 
     /// Mark this page dirty.
     pub fn mark_dirty(&mut self) {
-        if let Some(page) = self.guard.pages.get_mut(&self.key) {
-            page.flags |= page_flags::DIRTY;
-        }
+        let key = self.key;
+        self.guard.mark_dirty_inner(&key);
     }
 
     /// Clear the dirty flag on this page.
     pub fn clear_dirty(&mut self) {
-        if let Some(page) = self.guard.pages.get_mut(&self.key) {
-            page.flags &= !page_flags::DIRTY;
-        }
+        let key = self.key;
+        self.guard.clear_dirty_inner(&key);
     }
 
     /// Start writeback on this page: pin and set writeback flag.
@@ -517,12 +569,8 @@ impl<'a> PageHandle<'a> {
     /// Complete writeback.  If `success`, the page is marked clean.
     /// The writeback flag and pin are cleared regardless.
     pub fn complete_writeback(&mut self, success: bool) {
-        if let Some(page) = self.guard.pages.get_mut(&self.key) {
-            page.flags &= !(page_flags::WRITEBACK | page_flags::PINNED);
-            if success {
-                page.flags &= !page_flags::DIRTY;
-            }
-        }
+        let key = self.key;
+        self.guard.complete_writeback_inner(&key, success);
     }
 
     /// Abort writeback: clear writeback flag and unpin, but leave the
@@ -623,12 +671,12 @@ impl PageCache {
     pub fn remove(&self, inode: u64, offset: u64) -> Option<Page> {
         let key = PageKey { inode, offset };
         let mut inner = self.inner.lock().unwrap();
-        if inner.pages.contains_key(&key) {
-            inner.unlink_lru(&key);
-            inner.pages.remove(&key)
-        } else {
-            None
+        let page = inner.pages.remove(&key)?;
+        inner.unlink_lru(&key);
+        if page.is_dirty() {
+            inner.decrement_dirty_page_count(inode);
         }
+        Some(page)
     }
 
     /// Remove all pages belonging to `inode` from the cache.
@@ -650,6 +698,7 @@ impl PageCache {
             inner.unlink_lru(key);
             inner.pages.remove(key);
         }
+        inner.dirty_page_counts.remove(&inode);
         count
     }
     // ── Eviction ────────────────────────────────────────────────────
@@ -1313,6 +1362,77 @@ mod tests {
         let dirty_keys = cache.dirty_pages();
         assert_eq!(dirty_keys.len(), 1);
         assert_eq!(dirty_keys[0].inode, 2);
+    }
+
+    #[test]
+    fn dirty_index_does_not_double_count_repeated_marks() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+
+        assert!(cache.mark_dirty(1, 0));
+        assert!(cache.mark_dirty(1, 0));
+
+        let keys = cache.dirty_pages_for_inode(1);
+        assert_eq!(
+            keys,
+            vec![PageKey {
+                inode: 1,
+                offset: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn dirty_index_tracks_handle_clear_and_writeback_success() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.insert(1, 4096).unwrap();
+
+        {
+            let mut page = cache.lookup(1, 0).unwrap();
+            page.mark_dirty();
+            page.clear_dirty();
+        }
+        assert!(cache.dirty_pages_for_inode(1).is_empty());
+
+        cache.mark_dirty(1, 0);
+        cache.mark_dirty(1, 4096);
+        {
+            let mut page = cache.lookup(1, 0).unwrap();
+            page.start_writeback();
+            page.complete_writeback(true);
+        }
+
+        assert_eq!(
+            cache.dirty_pages_for_inode(1),
+            vec![PageKey {
+                inode: 1,
+                offset: 4096
+            }]
+        );
+    }
+
+    #[test]
+    fn dirty_index_updates_when_dirty_pages_are_removed() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.insert(1, 4096).unwrap();
+        cache.mark_dirty(1, 0);
+        cache.mark_dirty(1, 4096);
+
+        let removed = cache.remove(1, 0).expect("remove dirty page");
+        assert!(removed.is_dirty());
+        assert_eq!(
+            cache.dirty_pages_for_inode(1),
+            vec![PageKey {
+                inode: 1,
+                offset: 4096
+            }]
+        );
+
+        assert_eq!(cache.remove_pages_for_inode(1), 1);
+        assert!(cache.dirty_pages_for_inode(1).is_empty());
+        assert!(cache.dirty_pages_in_range(1, 0, 8192).is_empty());
     }
 
     // ── dirty_pages_in_range ──────────────────────────────────────
