@@ -3016,10 +3016,18 @@ impl FuseVfsAdapter {
             .remove(&ino)
     }
 
+    fn has_relatime_read_atime_pending(&self, ino: u64) -> bool {
+        self.relatime_read_atime_pending
+            .lock()
+            .unwrap()
+            .contains(&ino)
+    }
+
     fn writeback_open_should_keep_cache(
         &self,
         open_flags: u32,
         existing_open_state: InodeOpenState,
+        relatime_read_atime_pending: bool,
     ) -> bool {
         if open_flags_allow_write(open_flags).unwrap_or(false) {
             return true;
@@ -3030,6 +3038,9 @@ impl FuseVfsAdapter {
         if existing_open_state.has_writable {
             return true;
         }
+        if self.writeback_cache_enabled && self.timestamp_policy == TimestampPolicy::RelativeAtime {
+            return !relatime_read_atime_pending;
+        }
         !self.active_read_atime_policy()
     }
 
@@ -3037,6 +3048,7 @@ impl FuseVfsAdapter {
         &self,
         open_flags: u32,
         existing_open_state: InodeOpenState,
+        relatime_read_atime_pending: bool,
     ) -> u32 {
         let mut reply_flags = fuse_open_reply_flags(open_flags);
         if self.force_direct_io {
@@ -3047,7 +3059,11 @@ impl FuseVfsAdapter {
         }
         if self.writeback_cache_enabled
             && (reply_flags & fuser::consts::FOPEN_DIRECT_IO) == 0
-            && self.writeback_open_should_keep_cache(open_flags, existing_open_state)
+            && self.writeback_open_should_keep_cache(
+                open_flags,
+                existing_open_state,
+                relatime_read_atime_pending,
+            )
         {
             reply_flags |= fuser::consts::FOPEN_KEEP_CACHE;
         }
@@ -3055,7 +3071,7 @@ impl FuseVfsAdapter {
     }
 
     fn fuse_open_flags_for_request(&self, open_flags: u32) -> u32 {
-        self.fuse_open_flags_for_existing_state(open_flags, InodeOpenState::default())
+        self.fuse_open_flags_for_existing_state(open_flags, InodeOpenState::default(), false)
     }
 
     fn invalidate_inode_metadata_local(&self, ino: u64) {
@@ -7839,7 +7855,14 @@ impl FuseVfsAdapter {
         if self.read_only || self.timestamp_policy == TimestampPolicy::NoAtime {
             return;
         }
-        let result = if self.take_relatime_read_atime_pending(ino) {
+        let force_relatime = self.take_relatime_read_atime_pending(ino);
+        if self.writeback_cache_enabled
+            && self.timestamp_policy == TimestampPolicy::RelativeAtime
+            && !force_relatime
+        {
+            return;
+        }
+        let result = if force_relatime {
             self.force_read_access_and_sync(ino, ctx)
         } else {
             self.record_read_access_and_sync(ino, ctx)
@@ -8498,8 +8521,11 @@ impl FuseVfsAdapter {
         let (adapter_fh, fuse_flags) = {
             let mut handles = self.file_handles.lock().unwrap();
             let existing_open_state = handles.inode_open_state(ino);
-            let fuse_flags =
-                self.fuse_open_flags_for_existing_state(engine_open_flags, existing_open_state);
+            let fuse_flags = self.fuse_open_flags_for_existing_state(
+                engine_open_flags,
+                existing_open_state,
+                self.has_relatime_read_atime_pending(ino),
+            );
             let adapter_fh = handles.allocate(ino, engine_open_flags, engine_fh);
             if let Some(handle) = handles.handles.get_mut(&adapter_fh) {
                 handle.fuse_open_flags = fuse_flags;
@@ -11790,6 +11816,74 @@ mod tests {
             after.posix.ctime_ns, before.posix.ctime_ns,
             "read-open atime must not advance ctime"
         );
+    }
+
+    #[test]
+    fn writeback_relatime_clean_read_open_defers_atime_and_keeps_cache() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, writer_adapter_fh, writer_engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"writeback-relatime-clean-read-open.txt",
+            libc::O_RDWR as u32,
+        );
+
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&writer_engine_fh, 0, b"clean writeback relatime", &ctx)
+                .expect("write payload directly through engine");
+        }
+        let released = fixture
+            .adapter
+            .remove_file_handle(inode.get(), writer_adapter_fh, 0)
+            .expect("remove writer adapter handle");
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.release(&released).expect("release writer handle");
+        }
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr before clean read open")
+        };
+
+        std::thread::sleep(Duration::from_millis(1));
+        let read_open = fixture
+            .adapter
+            .dispatch_open(&ctx, inode.get(), libc::O_RDONLY as u32)
+            .expect("open clean read-only handle");
+        assert_eq!(
+            read_open.open_flags & fuser::consts::FOPEN_DIRECT_IO,
+            0,
+            "clean writeback/relatime read opens should keep buffered reads enabled"
+        );
+        assert_ne!(
+            read_open.open_flags & fuser::consts::FOPEN_KEEP_CACHE,
+            0,
+            "clean writeback/relatime read opens can preserve kernel pages"
+        );
+
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, None, &ctx)
+                .expect("getattr after clean read open")
+        };
+        assert_eq!(
+            after.posix.atime_ns, before.posix.atime_ns,
+            "clean writeback/relatime read open should defer atime to the kernel"
+        );
+        assert_eq!(
+            after.posix.ctime_ns, before.posix.ctime_ns,
+            "deferred read-open atime must not advance ctime"
+        );
+        fixture
+            .adapter
+            .dispatch_release(inode.get(), read_open.adapter_fh, 0, None, false)
+            .expect("release reader");
     }
 
     #[test]
