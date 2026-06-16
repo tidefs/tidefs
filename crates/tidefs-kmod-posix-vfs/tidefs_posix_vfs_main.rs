@@ -878,16 +878,21 @@ impl KernelEngine {
         value: u64,
         quantum: u64,
     ) -> core::result::Result<u64, crate::tidefs_kmod_bridge::kernel_types::Errno> {
-        if quantum == 0 {
-            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL);
+        crate::live_data_allocator::align_up_to_quantum(value, quantum)
+            .map_err(Self::live_data_allocator_errno)
+    }
+
+    fn live_data_allocator_errno(
+        err: crate::live_data_allocator::LiveDataAllocatorError,
+    ) -> crate::tidefs_kmod_bridge::kernel_types::Errno {
+        match err {
+            crate::live_data_allocator::LiveDataAllocatorError::InvalidQuantum => {
+                crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL
+            }
+            crate::live_data_allocator::LiveDataAllocatorError::Overflow => {
+                crate::tidefs_kmod_bridge::kernel_types::Errno::EFBIG
+            }
         }
-        let rem = value % quantum;
-        if rem == 0 {
-            return Ok(value);
-        }
-        value
-            .checked_add(quantum - rem)
-            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::EFBIG)
     }
 
     fn align_down_to_live_block(value: u64) -> u64 {
@@ -1076,14 +1081,41 @@ impl KernelEngine {
         if entry.kind != LiveExtentEntry::DATA {
             return Ok(());
         }
-        let end = entry
-            .physical_start
-            .checked_add(entry.end.saturating_sub(entry.start))
-            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::EFBIG)?;
-        let aligned_end = Self::align_up_to_live_block(end)?;
+        let aligned_end = Self::live_data_allocator_tail_for_entry(entry)?;
         if aligned_end > self.next_live_data_offset.get() {
             self.next_live_data_offset.set(aligned_end);
         }
+        Ok(())
+    }
+
+    fn live_data_allocator_tail_for_entry(
+        entry: &LiveExtentEntry,
+    ) -> core::result::Result<u64, crate::tidefs_kmod_bridge::kernel_types::Errno> {
+        crate::live_data_allocator::reserved_extent_tail(
+            crate::live_data_allocator::LiveDataAllocatorExtent {
+                physical_start: entry.physical_start,
+                logical_len: entry.end.saturating_sub(entry.start),
+                physical_reserved_end: entry.physical_reserved_end,
+            },
+            LIVE_EXTENT_BLOCK_SIZE,
+        )
+        .map_err(Self::live_data_allocator_errno)
+    }
+
+    fn recompute_live_data_allocator_tail(
+        &self,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
+        let extents = self.live_extents.borrow();
+        let mut tail = 0u64;
+
+        for entry in extents.iter() {
+            if entry.kind != LiveExtentEntry::DATA {
+                continue;
+            }
+            tail = tail.max(Self::live_data_allocator_tail_for_entry(entry)?);
+        }
+
+        self.next_live_data_offset.set(tail);
         Ok(())
     }
 
@@ -1478,6 +1510,7 @@ impl KernelEngine {
         *self.live_extents.borrow_mut() = next;
         self.clear_live_extents_dirty(inode);
         self.invalidate_live_collapse_cursor(inode);
+        self.recompute_live_data_allocator_tail()?;
         Ok(())
     }
 
@@ -1657,6 +1690,7 @@ impl KernelEngine {
         drop(old);
         *self.live_extents.borrow_mut() = next;
         self.sort_live_extents_for_inode(inode)?;
+        self.recompute_live_data_allocator_tail()?;
         Ok(())
     }
 
@@ -1728,6 +1762,7 @@ impl KernelEngine {
         }
         drop(extents);
         self.sort_live_extents_for_inode(inode)?;
+        self.recompute_live_data_allocator_tail()?;
         Ok(())
     }
 
@@ -1757,6 +1792,7 @@ impl KernelEngine {
         drop(old);
         *self.live_extents.borrow_mut() = next;
         self.sort_live_extents_for_inode(inode)?;
+        self.recompute_live_data_allocator_tail()?;
         Ok(())
     }
 
@@ -2303,6 +2339,7 @@ impl KernelEngine {
         drop(old);
         *self.live_extents.borrow_mut() = next;
         self.sort_live_extents_for_inode(inode)?;
+        self.recompute_live_data_allocator_tail()?;
         Ok(Self::live_allocated_blocks_from_bytes(removed_bytes))
     }
 
@@ -2399,6 +2436,7 @@ impl KernelEngine {
         drop(old);
         *self.live_extents.borrow_mut() = next;
         self.sort_live_extents_for_inode(inode)?;
+        self.recompute_live_data_allocator_tail()?;
         Ok(())
     }
 
@@ -2451,19 +2489,25 @@ impl KernelEngine {
     }
 
     /// Remove an inode record by ino; returns true if found and removed.
-    fn remove_inode_record(&self, ino: u64) -> bool {
+    fn remove_inode_record(
+        &self,
+        ino: u64,
+    ) -> core::result::Result<bool, crate::tidefs_kmod_bridge::kernel_types::Errno> {
         let mut inodes = self.inodes.borrow_mut();
         if let Some(pos) = inodes.iter().position(|r| r.ino == ino) {
             inodes.remove(pos);
             drop(inodes);
-            self.remove_transient_inode_state(ino);
-            true
+            self.remove_transient_inode_state(ino)?;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
-    fn remove_transient_inode_state(&self, ino: u64) {
+    fn remove_transient_inode_state(
+        &self,
+        ino: u64,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
         self.write_buffer
             .borrow_mut()
             .retain(|entry| entry.inode.get() != ino);
@@ -2479,11 +2523,15 @@ impl KernelEngine {
         let inode = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(ino);
         self.clear_live_extents_dirty(inode);
         self.invalidate_live_collapse_cursor(inode);
+        self.recompute_live_data_allocator_tail()
     }
 
-    fn drop_unlinked_inode_if_closed(&self, ino: u64) {
+    fn drop_unlinked_inode_if_closed(
+        &self,
+        ino: u64,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
         if self.inode_open_count(ino) != 0 {
-            return;
+            return Ok(());
         }
         let should_drop = if let Some(idx) = self.find_inode(ino) {
             self.inodes.borrow()[idx].nlink == 0
@@ -2491,8 +2539,9 @@ impl KernelEngine {
             false
         };
         if should_drop {
-            self.remove_inode_record(ino);
+            self.remove_inode_record(ino)?;
         }
+        Ok(())
     }
 
     fn push_inode_record(
@@ -4736,7 +4785,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             inodes[parent_idx].nlink = inodes[parent_idx].nlink.saturating_add(1);
         }
         if let Err(e) = self.add_dir_entry(parent_ino, name, ino, InodeRecord::DIR) {
-            self.remove_inode_record(ino);
+            self.remove_inode_record(ino)?;
             if let Some(parent_idx) = self.find_inode(parent_ino) {
                 let mut inodes = self.inodes.borrow_mut();
                 inodes[parent_idx].nlink = inodes[parent_idx].nlink.saturating_sub(1);
@@ -4812,7 +4861,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         let gen = rec.generation;
         self.push_inode_record(rec)?;
         if let Err(e) = self.add_dir_entry(parent_ino, name, ino, InodeRecord::FILE) {
-            self.remove_inode_record(ino);
+            self.remove_inode_record(ino)?;
             return Err(e);
         }
         let entry = crate::intent_record::encode_create_intent(
@@ -4946,7 +4995,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             let mut inodes = self.inodes.borrow_mut();
             inodes[idx].nlink = inodes[idx].nlink.saturating_sub(1);
         }
-        self.drop_unlinked_inode_if_closed(child_ino);
+        self.drop_unlinked_inode_if_closed(child_ino)?;
         Ok(())
     }
     /// Engine-backed rmdir: remove an empty directory entry.
@@ -4977,7 +5026,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         // Remove the directory entry
         self.remove_dir_entry(parent_ino, name);
         // Remove the inode record and transient per-inode state.
-        self.remove_inode_record(child_ino);
+        self.remove_inode_record(child_ino)?;
         // Decrement parent nlink
         if let Some(idx) = self.find_inode(parent_ino) {
             let mut inodes = self.inodes.borrow_mut();
@@ -5100,7 +5149,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
                     inodes[idx].nlink = inodes[idx].nlink.saturating_sub(1);
                 }
             }
-            self.drop_unlinked_inode_if_closed(dst_ino);
+            self.drop_unlinked_inode_if_closed(dst_ino)?;
             if dst_is_dir {
                 if let Some(idx) = self.find_inode(new_p) {
                     let mut inodes = self.inodes.borrow_mut();
@@ -5227,7 +5276,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         };
         self.push_inode_record(rec_with_target)?;
         if let Err(e) = self.add_dir_entry(parent_ino, name, ino, InodeRecord::SYMLINK) {
-            self.remove_inode_record(ino);
+            self.remove_inode_record(ino)?;
             return Err(e);
         }
         let entry = crate::intent_record::encode_symlink_intent(
@@ -5337,7 +5386,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             }
         }
         if let Err(e) = self.add_dir_entry(parent_ino, name, ino, kind) {
-            self.remove_inode_record(ino);
+            self.remove_inode_record(ino)?;
             if kind == InodeRecord::DIR {
                 if let Some(parent_idx) = self.find_inode(parent_ino) {
                     let mut inodes = self.inodes.borrow_mut();
@@ -5449,7 +5498,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             // No more open handles: check if the inode was orphaned.
             if let Some(idx) = self.find_inode(ino) {
                 if self.inodes.borrow()[idx].nlink == 0 {
-                    self.remove_inode_record(ino);
+                    self.remove_inode_record(ino)?;
                 }
             }
         }
@@ -6068,7 +6117,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         if remaining == 0 {
             if let Some(idx) = self.find_inode(ino) {
                 if self.inodes.borrow()[idx].nlink == 0 {
-                    self.remove_inode_record(ino);
+                    self.remove_inode_record(ino)?;
                 }
             }
         }
@@ -8489,7 +8538,9 @@ pub extern "C" fn tidefs_posix_vfs_engine_sync_namespace(
                 .add_dir_entry(parent_ino, name_bytes, ino, kind)
                 .is_err()
             {
-                engine.remove_inode_record(ino);
+                if engine.remove_inode_record(ino).is_err() {
+                    return -12;
+                }
                 return -12;
             }
 
