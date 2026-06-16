@@ -3118,14 +3118,12 @@ impl FuseVfsAdapter {
         if written == 0 {
             return false;
         }
-        let _ = (
-            is_writeback_cached,
-            posix_direct_io,
-            write_flags,
-            old_size,
-            offset,
-        );
-        true
+        if !is_writeback_cached || posix_direct_io || (write_flags & FUSE_WRITE_KILL_PRIV) != 0 {
+            return true;
+        }
+        offset
+            .checked_add(u64::from(written))
+            .is_none_or(|end| end > old_size)
     }
 
     fn writeback_sparse_zero_write_is_noop(
@@ -39855,6 +39853,27 @@ mod tests {
         AdapterFixture { adapter, root }
     }
 
+    fn adapter_fixture_with_namespace_writeback_cache() -> AdapterFixture {
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-vfs-adapter-ns-wb-{}-{temp_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let local_fs = LocalFileSystem::open_with_root_authentication_key(
+            &root,
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open local filesystem");
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_namespace(Arc::new(Namespace::new()))
+            .with_writeback_cache_enabled();
+        AdapterFixture { adapter, root }
+    }
+
     fn adapter_fixture_with_writeback_cache_strict_atime() -> AdapterFixture {
         let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -40063,10 +40082,10 @@ mod tests {
     }
 
     #[test]
-    fn writeback_cached_writes_refresh_namespace_attrs() {
+    fn writeback_cached_overwrites_defer_namespace_attr_sync() {
         assert!(
-            FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 512),
-            "writeback-cache overwrites refresh the namespace mirror for getattr coherence"
+            !FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 512),
+            "writeback-cache overwrites can defer namespace mirror refresh to getattr or lookup"
         );
         assert!(
             FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 3840, 512),
@@ -40094,6 +40113,112 @@ mod tests {
         assert!(
             !FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 0),
             "zero-byte writes do not need namespace mirror sync"
+        );
+    }
+
+    #[test]
+    fn writeback_cached_overwrite_keeps_getattr_fresh_while_namespace_mirror_stale() {
+        let fixture = adapter_fixture_with_namespace_writeback_cache();
+        let ctx = root_ctx();
+        let ns = fixture.adapter.namespace_handle().expect("namespace");
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let name = b"wb-overwrite-deferred-namespace-attrs.txt";
+        let created = fixture
+            .adapter
+            .dispatch_create_entry(&ctx, root.get(), name, 0o644, libc::O_RDWR as u32)
+            .expect("create writeback-cache file");
+        let ino = created.attr.inode_id.get();
+        let ns_ino = ns
+            .create_file(
+                root.get(),
+                std::str::from_utf8(name).expect("test name is utf8"),
+                tidefs_namespace::InodeAttributes::new_file(ino),
+            )
+            .expect("seed namespace mirror");
+        assert_eq!(ns_ino, ino);
+
+        let seed = b"abcdefgh";
+        let written = fixture
+            .adapter
+            .dispatch_write(&ctx, ino, created.adapter_fh, 0, seed, FUSE_WRITE_CACHE)
+            .expect("seed write extends file");
+        assert_eq!(written, seed.len() as u32);
+
+        let mut stale = ns.get_attrs(ino).expect("namespace attrs");
+        stale.mtime = UNIX_EPOCH;
+        stale.ctime = UNIX_EPOCH;
+        ns.update_attrs(ino, stale)
+            .expect("make namespace timestamps stale");
+
+        std::thread::sleep(Duration::from_millis(1));
+        let overwrite = b"ZZ";
+        let written = fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                ino,
+                created.adapter_fh,
+                2,
+                overwrite,
+                FUSE_WRITE_CACHE,
+            )
+            .expect("writeback-cache overwrite");
+        assert_eq!(written, overwrite.len() as u32);
+
+        let ns_after_write = ns.get_attrs(ino).expect("namespace attrs after write");
+        assert_eq!(
+            system_time_to_ns(ns_after_write.mtime),
+            0,
+            "overwrite should not immediately refresh namespace mtime"
+        );
+        assert_eq!(
+            system_time_to_ns(ns_after_write.ctime),
+            0,
+            "overwrite should not immediately refresh namespace ctime"
+        );
+
+        let engine_after_write = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(InodeId::new(ino), None, &ctx)
+                .expect("engine getattr after overwrite")
+        };
+        assert!(
+            engine_after_write.posix.mtime_ns > 0,
+            "engine write path must still advance authoritative mtime"
+        );
+
+        let attr_out = fixture
+            .adapter
+            .dispatch_getattr(&ctx, ino, 40_099, Some(created.adapter_fh))
+            .expect("dispatch getattr after deferred namespace sync");
+        assert_eq!(attr_out.attr.size, seed.len() as u64);
+        assert_eq!(
+            attr_out.attr.mtime,
+            (engine_after_write.posix.mtime_ns / 1_000_000_000) as u64
+        );
+        assert_eq!(
+            attr_out.attr.mtimensec,
+            (engine_after_write.posix.mtime_ns % 1_000_000_000) as u32
+        );
+
+        let lookup = fixture
+            .adapter
+            .dispatch_lookup(&ctx, root.get(), name)
+            .expect("lookup repairs namespace attrs from engine");
+        assert_eq!(lookup.inode_id.get(), ino);
+
+        let ns_after_lookup = ns.get_attrs(ino).expect("namespace attrs after lookup");
+        assert_eq!(
+            system_time_to_ns(ns_after_lookup.mtime),
+            engine_after_write.posix.mtime_ns
+        );
+        assert_eq!(
+            system_time_to_ns(ns_after_lookup.ctime),
+            engine_after_write.posix.ctime_ns
         );
     }
 
