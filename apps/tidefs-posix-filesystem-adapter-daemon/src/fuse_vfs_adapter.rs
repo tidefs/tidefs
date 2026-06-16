@@ -5671,6 +5671,9 @@ impl FuseVfsAdapter {
             e.check_write_admission(data.len() as u64)?;
         }
 
+        let clean_writeback_write_through =
+            is_writeback_cached && !posix_direct_io && self.block_volume.lock().unwrap().is_none();
+
         // FUSE_WRITE_CACHE is still write-through to the engine.  The
         // asynchronous writeback authority is not complete enough to
         // acknowledge payload bytes that only live in daemon-side trackers.
@@ -5684,6 +5687,7 @@ impl FuseVfsAdapter {
                 mut fallback_to_release,
                 sparse_zero_noop,
                 post_write_attr,
+                clean_write_through_recorded,
             ) = {
                 let e = self.engine.lock().unwrap();
                 let fallback_open_flags = {
@@ -5734,52 +5738,73 @@ impl FuseVfsAdapter {
                     Err(errno)
                 } else {
                     match e.write(write_efh, effective_offset as u64, data, ctx) {
-                        Ok(written) => {
-                            if written > 0 {
-                                if posix_direct_io {
-                                    // Direct I/O bypasses the adapter page cache.
-                                    // The engine write is authoritative for
-                                    // read-after-write; flush/fsync/close publish
-                                    // it instead of forcing every O_DIRECT write
-                                    // through a committed-root cycle.
-                                    self.invalidate_caches_after_direct_write(ino);
-                                } else if !sparse_zero_noop {
-                                    self.mark_dirty_after_write(
-                                        &**e,
-                                        ctx,
-                                        write_efh,
-                                        ino,
-                                        effective_offset as u64,
-                                        written,
-                                        data,
-                                        write_flags,
-                                    );
+                        Ok(written) => match usize::try_from(written)
+                            .ok()
+                            .and_then(|written_len| data.get(..written_len))
+                        {
+                            Some(written_data) => {
+                                if written > 0 {
+                                    if posix_direct_io {
+                                        // Direct I/O bypasses the adapter page cache.
+                                        // The engine write is authoritative for
+                                        // read-after-write; flush/fsync/close publish
+                                        // it instead of forcing every O_DIRECT write
+                                        // through a committed-root cycle.
+                                        self.invalidate_caches_after_direct_write(ino);
+                                    } else if clean_writeback_write_through && !sparse_zero_noop {
+                                        self.record_clean_write_through_after_write(
+                                            &**e,
+                                            ctx,
+                                            write_efh,
+                                            ino,
+                                            effective_offset as u64,
+                                            written,
+                                            written_data,
+                                        );
+                                    } else if !sparse_zero_noop {
+                                        self.mark_dirty_after_write(
+                                            &**e,
+                                            ctx,
+                                            write_efh,
+                                            ino,
+                                            effective_offset as u64,
+                                            written,
+                                            written_data,
+                                            write_flags,
+                                        );
+                                    }
+                                    if post_write_attr.is_none()
+                                        && Self::write_requires_namespace_attr_sync(
+                                            is_writeback_cached,
+                                            posix_direct_io,
+                                            write_flags,
+                                            pre_write_size,
+                                            effective_offset as u64,
+                                            written,
+                                        )
+                                    {
+                                        post_write_attr =
+                                            e.getattr(InodeId::new(ino), Some(write_efh), ctx).ok();
+                                    }
                                 }
-                                if post_write_attr.is_none()
-                                    && Self::write_requires_namespace_attr_sync(
-                                        is_writeback_cached,
-                                        posix_direct_io,
-                                        write_flags,
-                                        pre_write_size,
-                                        effective_offset as u64,
-                                        written,
-                                    )
-                                {
-                                    post_write_attr =
-                                        e.getattr(InodeId::new(ino), Some(write_efh), ctx).ok();
-                                }
+                                Ok(written)
                             }
-                            Ok(written)
-                        }
+                            None => Err(Errno::EIO),
+                        },
                         Err(errno) => Err(errno),
                     }
                 };
+                let clean_write_through_recorded = matches!(
+                    &result,
+                    Ok(written) if *written > 0 && clean_writeback_write_through && !sparse_zero_noop
+                );
                 (
                     result,
                     sync_efh,
                     fallback_efh,
                     sparse_zero_noop,
                     post_write_attr,
+                    clean_write_through_recorded,
                 )
             };
             let written = match write_result {
@@ -5830,7 +5855,10 @@ impl FuseVfsAdapter {
                 // Direct I/O conflict guard: clear stale cached dirty ranges
                 // covered by this authoritative direct write, so later
                 // writeback cannot replay old page-cache bytes over it.
-                if posix_direct_io {
+                if clean_write_through_recorded {
+                    // The write-through helper already refreshed clean cache
+                    // mirrors and left dirty trackers empty.
+                } else if posix_direct_io {
                     if let Err(errno) = self.reconcile_dirty_mirrors_for_authoritative_range(
                         ino,
                         effective_offset as u64,
@@ -6184,6 +6212,122 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .accept_write(ino, offset, &data[..written as usize]);
+    }
+
+    fn record_clean_write_through_after_write(
+        &self,
+        engine: &(dyn VfsEngineStatFs + Send),
+        ctx: &RequestCtx,
+        efh: &EngineFileHandle,
+        ino: u64,
+        offset: u64,
+        written: u32,
+        written_data: &[u8],
+    ) {
+        if written == 0 {
+            return;
+        }
+
+        if let Ok(mut cache) = self.page_cache.lock() {
+            cache.invalidate(ino);
+        }
+        if let Some(ref rd) = self.fuse_read_dispatch {
+            rd.page_cache().remove_pages_for_inode(ino);
+        }
+        self.invalidate_inode_metadata_local(ino);
+
+        if let Some(ref wb_cache) = self.writeback_page_cache {
+            self.update_clean_write_through_page_cache(
+                wb_cache,
+                engine,
+                ctx,
+                efh,
+                ino,
+                offset,
+                written,
+                written_data,
+            );
+            if !Arc::ptr_eq(wb_cache, &self.write_page_cache) {
+                self.update_clean_write_through_page_cache(
+                    &self.write_page_cache,
+                    engine,
+                    ctx,
+                    efh,
+                    ino,
+                    offset,
+                    written,
+                    written_data,
+                );
+            }
+        } else {
+            self.update_clean_write_through_page_cache(
+                &self.write_page_cache,
+                engine,
+                ctx,
+                efh,
+                ino,
+                offset,
+                written,
+                written_data,
+            );
+        }
+
+        {
+            let mut wc = self.writeback_cache.lock().unwrap();
+            wc.insert(ino);
+            wc.mark_clean(ino);
+        }
+        self.txg_cycle.queue_write(ino, offset, written_data);
+    }
+
+    fn update_clean_write_through_page_cache(
+        &self,
+        cache: &PageCache,
+        engine: &(dyn VfsEngineStatFs + Send),
+        ctx: &RequestCtx,
+        efh: &EngineFileHandle,
+        ino: u64,
+        offset: u64,
+        written: u32,
+        data: &[u8],
+    ) {
+        let page_size = cache.page_size() as u64;
+        let start_off = offset;
+        let end_off = start_off.saturating_add(u64::from(written));
+        let mut off = (start_off / page_size) * page_size;
+        while off < end_off {
+            let page_was_absent = cache.lookup(ino, off).is_none();
+            let copy_start = start_off.max(off);
+            let copy_end = end_off.min(off.saturating_add(page_size));
+            let existing_page = if page_was_absent
+                && (copy_start != off || copy_end != off.saturating_add(page_size))
+            {
+                match u32::try_from(page_size) {
+                    Ok(read_size) => engine.read_for_cache_fill(efh, off, read_size, ctx).ok(),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            if page_was_absent {
+                let _ = cache.insert(ino, off);
+            }
+            if let Some(mut page) = cache.lookup(ino, off) {
+                if let Some(existing) = existing_page.as_deref() {
+                    let fill_len = existing.len().min(page.data_mut().len());
+                    page.data_mut()[..fill_len].copy_from_slice(&existing[..fill_len]);
+                }
+                if copy_start < copy_end {
+                    let src_start = (copy_start - start_off) as usize;
+                    let dst_start = (copy_start - off) as usize;
+                    let copy_len = (copy_end - copy_start) as usize;
+                    page.data_mut()[dst_start..dst_start + copy_len]
+                        .copy_from_slice(&data[src_start..src_start + copy_len]);
+                }
+                page.clear_dirty();
+            }
+            off = off.saturating_add(page_size);
+        }
     }
 
     fn reconcile_write_through_dirty_range_without_block_volume(
@@ -39847,6 +39991,29 @@ mod tests {
         let start = offset as usize;
         assert_eq!(&page.data()[start..start + payload.len()], payload);
         assert!(!page.is_dirty());
+
+        assert_eq!(
+            fixture
+                .adapter
+                .txg_cycle_cell()
+                .committed_count
+                .load(Ordering::Relaxed),
+            0,
+            "clean write-through writes must still stage a txg barrier"
+        );
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs after clean write-through write");
+        assert_eq!(
+            fixture
+                .adapter
+                .txg_cycle_cell()
+                .committed_count
+                .load(Ordering::Relaxed),
+            1,
+            "syncfs must commit the clean write-through txg descriptor"
+        );
     }
 
     #[test]
