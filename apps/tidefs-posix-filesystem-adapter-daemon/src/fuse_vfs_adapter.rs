@@ -3118,10 +3118,14 @@ impl FuseVfsAdapter {
         if written == 0 {
             return false;
         }
-        if posix_direct_io || !is_writeback_cached || (write_flags & FUSE_WRITE_KILL_PRIV) != 0 {
-            return true;
-        }
-        offset.saturating_add(u64::from(written)) > old_size
+        let _ = (
+            is_writeback_cached,
+            posix_direct_io,
+            write_flags,
+            old_size,
+            offset,
+        );
+        true
     }
 
     fn writeback_sparse_zero_write_is_noop(
@@ -39862,10 +39866,10 @@ mod tests {
     }
 
     #[test]
-    fn writeback_cached_writes_sync_namespace_attrs_only_when_needed() {
+    fn writeback_cached_writes_refresh_namespace_attrs() {
         assert!(
-            !FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 512),
-            "writeback-cache overwrites defer namespace mirror refresh to later engine getattr"
+            FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 1024, 512),
+            "writeback-cache overwrites refresh the namespace mirror for getattr coherence"
         );
         assert!(
             FuseVfsAdapter::write_requires_namespace_attr_sync(true, false, 0, 4096, 3840, 512),
