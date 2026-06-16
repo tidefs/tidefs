@@ -89,6 +89,7 @@ use super::server::{MembershipPeerConfig, StorageNodeConfig};
 use crate::authority_spine::RuntimeAuthority;
 use tidefs_membership_epoch::MemberClass;
 use tidefs_membership_live::BackendDisclosure;
+use tidefs_transport::carrier_selection::CarrierPolicy;
 
 fn parse_member_class_str(s: &str) -> Result<MemberClass, String> {
     match s {
@@ -110,6 +111,12 @@ impl TryFrom<JsonStorageNodeConfig> for StorageNodeConfig {
     type Error = String;
 
     fn try_from(j: JsonStorageNodeConfig) -> Result<Self, Self::Error> {
+        let carrier_policy = j
+            .carrier_policy
+            .as_deref()
+            .map(str::parse::<CarrierPolicy>)
+            .transpose()?;
+
         let member_class = j
             .member_class
             .as_deref()
@@ -185,7 +192,7 @@ impl TryFrom<JsonStorageNodeConfig> for StorageNodeConfig {
             membership_peers,
             replica_peers,
             rdma: j.rdma,
-            carrier_policy: j.carrier_policy,
+            carrier_policy,
             ready_file: j.ready_file,
             drain_timeout_secs: j.drain_timeout_secs,
             membership_checkpoint_dir: j.membership_checkpoint_dir,
@@ -339,6 +346,51 @@ mod tests {
         assert!(cfg.membership_peers.is_empty());
         assert!(cfg.replica_peers.is_empty());
         assert_eq!(cfg.drain_timeout_secs, 30);
+    }
+
+    #[test]
+    fn json_carrier_policy_prefer_propagates() {
+        let json = r#"{
+  "node_id": 42,
+  "bind": "127.0.0.1:8000",
+  "carrier_policy": "prefer"
+}"#;
+        let cfg = StorageNodeConfig::try_from(
+            serde_json::from_str::<JsonStorageNodeConfig>(json).expect("json"),
+        )
+        .expect("convert");
+        assert_eq!(cfg.carrier_policy, Some(CarrierPolicy::Prefer));
+    }
+
+    #[test]
+    fn json_carrier_policy_enforce_propagates() {
+        let json = r#"{
+  "node_id": 42,
+  "bind": "127.0.0.1:8000",
+  "rdma": true,
+  "carrier_policy": "enforce"
+}"#;
+        let cfg = StorageNodeConfig::try_from(
+            serde_json::from_str::<JsonStorageNodeConfig>(json).expect("json"),
+        )
+        .expect("convert");
+        assert!(cfg.rdma);
+        assert_eq!(cfg.carrier_policy, Some(CarrierPolicy::Enforce));
+    }
+
+    #[test]
+    fn json_unknown_carrier_policy_fails_closed() {
+        let json = r#"{
+  "node_id": 42,
+  "bind": "127.0.0.1:8000",
+  "carrier_policy": "fallback"
+}"#;
+        let result = StorageNodeConfig::try_from(
+            serde_json::from_str::<JsonStorageNodeConfig>(json).expect("json"),
+        );
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("unknown carrier policy"));
     }
 
     #[test]

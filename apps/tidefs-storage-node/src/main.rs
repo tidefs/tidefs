@@ -22,6 +22,7 @@ use tidefs_membership_live::BackendDisclosure;
 use tidefs_storage_node::authority_spine::RuntimeAuthority;
 use tidefs_storage_node::client;
 use tidefs_storage_node::server::{MembershipPeerConfig, StorageNode, StorageNodeConfig};
+use tidefs_transport::carrier_selection::CarrierPolicy;
 
 fn parse_socket_addr(s: &str) -> Result<SocketAddr, String> {
     s.parse().map_err(|e| format!("invalid address '{s}': {e}"))
@@ -59,6 +60,10 @@ fn parse_member_class(s: &str) -> Result<MemberClass, String> {
              data, data-only, shadow, shadow-only, quarantined"
         )),
     }
+}
+
+fn parse_carrier_policy(s: &str) -> Result<CarrierPolicy, String> {
+    s.parse()
 }
 
 // ── CLI definition ──
@@ -119,10 +124,10 @@ struct ServerArgs {
 
     #[arg(long = "rdma", default_value_t = false)]
     rdma: bool,
-    /// Carrier policy: "prefer" (default) allows TCP fallback; "enforce" fails
-    /// closed when an RDMA claim cannot be satisfied.
-    #[arg(long = "carrier-policy", default_value = "prefer")]
-    carrier_policy: String,
+    /// Carrier policy: "prefer" (default) allows disclosed TCP fallback; "enforce"
+    /// fails closed when an RDMA claim cannot be satisfied.
+    #[arg(long = "carrier-policy", value_parser = parse_carrier_policy, default_value = "prefer")]
+    carrier_policy: CarrierPolicy,
     #[arg(long = "config")]
     config_file: Option<PathBuf>,
 
@@ -819,6 +824,44 @@ mod tests {
     fn cli_parse_server_rdma_defaults_false() {
         let args = parse_server(&["--node-id", "1", "--bind", "127.0.0.1:9000"]);
         assert!(!args.rdma);
+    }
+
+    #[test]
+    fn cli_parse_server_carrier_policy_defaults_prefer() {
+        let args = parse_server(&["--node-id", "1", "--bind", "127.0.0.1:9000"]);
+        assert_eq!(args.carrier_policy, CarrierPolicy::Prefer);
+    }
+
+    #[test]
+    fn cli_parse_server_carrier_policy_enforce() {
+        let args = parse_server(&[
+            "--node-id",
+            "1",
+            "--bind",
+            "127.0.0.1:9000",
+            "--rdma",
+            "--carrier-policy",
+            "enforce",
+        ]);
+        assert!(args.rdma);
+        assert_eq!(args.carrier_policy, CarrierPolicy::Enforce);
+    }
+
+    #[test]
+    fn cli_parse_server_rejects_unknown_carrier_policy() {
+        let argv = make_argv(
+            "server",
+            &[
+                "--node-id",
+                "1",
+                "--bind",
+                "127.0.0.1:9000",
+                "--carrier-policy",
+                "fallback",
+            ],
+        );
+        let result = Cli::try_parse_from(argv);
+        assert!(result.is_err());
     }
 
     #[test]
