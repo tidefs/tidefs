@@ -331,6 +331,34 @@ impl WriteBuffer {
         false
     }
 
+    /// Return true when dirty buffered bytes cover the whole requested range.
+    pub fn contains_range(&self, read_offset: u64, read_len: u64) -> bool {
+        if read_len == 0 {
+            return true;
+        }
+        let Some(read_end) = read_offset.checked_add(read_len) else {
+            return false;
+        };
+        let start = self.first_segment_start_ending_after(read_offset);
+        let mut covered_until = read_offset;
+
+        for (&segment_offset, data) in self.segments.range(start..) {
+            if segment_offset > covered_until {
+                return false;
+            }
+            let seg_end = Self::segment_end(segment_offset, data);
+            if seg_end <= covered_until {
+                continue;
+            }
+            covered_until = seg_end;
+            if covered_until >= read_end {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Overlay dirty buffered bytes onto an existing read buffer.
     ///
     /// Returns `true` when at least one dirty segment intersected the requested
@@ -756,6 +784,22 @@ mod tests {
         wb.ingest(b"AA", 0);
         let result = wb.read_overlap(0, 5);
         assert_eq!(result, Some(b"AA\x00\x00\x00".to_vec()));
+    }
+
+    #[test]
+    fn contains_range_requires_full_dirty_coverage() {
+        let mut wb = WriteBuffer::new(test_config());
+        wb.ingest(b"abcdefghij", 0);
+        assert!(wb.contains_range(0, 10));
+        assert!(wb.contains_range(2, 5));
+        assert!(wb.contains_range(4, 0));
+        assert!(!wb.contains_range(0, 11));
+
+        wb.clear_range(4, 2);
+        assert!(wb.contains_range(0, 4));
+        assert!(wb.contains_range(6, 4));
+        assert!(!wb.contains_range(0, 10));
+        assert!(!wb.contains_range(3, 4));
     }
 
     #[test]

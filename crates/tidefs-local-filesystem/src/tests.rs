@@ -1132,6 +1132,56 @@ fn zero_length_write_does_not_extend_or_allocate() {
 }
 
 #[test]
+fn fully_buffered_range_read_skips_committed_content_lookup() {
+    let root = temp_root("fully-buffered-range-read");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let record = fs.create_file("/hot.txt", 0o644).expect("create file");
+    fs.write_file("/hot.txt", 0, b"base0123456789")
+        .expect("write baseline");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush baseline");
+
+    let committed = fs.stat("/hot.txt").expect("stat committed file");
+    let committed_key = content_object_key_for_version(committed.inode_id, committed.data_version);
+    let committed_bytes = fs
+        .store
+        .raw_primary_store()
+        .get(committed_key)
+        .expect("read committed content")
+        .expect("committed content exists");
+
+    fs.write_file("/hot.txt", 4, b"DIRTY")
+        .expect("buffer dirty overwrite");
+    assert!(fs.write_buffers.contains_key(&committed.inode_id));
+    assert!(fs
+        .store
+        .raw_primary_store_mut()
+        .delete(committed_key)
+        .expect("delete committed content"));
+    assert!(fs
+        .store
+        .raw_primary_store()
+        .get(committed_key)
+        .expect("read deleted committed content")
+        .is_none());
+
+    assert_eq!(
+        fs.read_file_range("/hot.txt", 4, 5)
+            .expect("read fully buffered span"),
+        b"DIRTY".to_vec()
+    );
+    fs.store
+        .raw_primary_store_mut()
+        .put(committed_key, &committed_bytes)
+        .expect("restore committed content");
+    fs.flush_write_buffer(committed.inode_id)
+        .expect("flush dirty overwrite");
+
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
 fn write_file_non_empty_invalidates_hot_read_cache() {
     let root = temp_root("write-file-invalidate-hot-read-cache");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
