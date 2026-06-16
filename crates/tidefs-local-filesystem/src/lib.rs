@@ -6675,6 +6675,123 @@ impl LocalFileSystem {
         Ok(result)
     }
 
+    pub(crate) fn write_file_range_direct(
+        &mut self,
+        path: impl AsRef<str>,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<InodeRecord> {
+        let path = path.as_ref();
+        let parts = parse_absolute_path(path)?;
+        let inode_id = self.resolve_parts(&parts, path)?;
+        let adjusted_record = self.inode(inode_id)?.clone();
+        if adjusted_record.kind() != NodeKind::File {
+            if adjusted_record.kind() == NodeKind::Dir {
+                return Err(FileSystemError::IsDirectory {
+                    path: path.to_string(),
+                });
+            }
+            return Err(FileSystemError::NotFile {
+                path: path.to_string(),
+                kind: adjusted_record.kind(),
+            });
+        }
+
+        let bytes_len = u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+        if bytes_len == 0 {
+            return Ok(adjusted_record);
+        }
+        let end = offset
+            .checked_add(bytes_len)
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+        let _end_len =
+            usize::try_from(end).map_err(|_| FileSystemError::SizeOverflow { requested: end })?;
+
+        let effective_size = adjusted_record.size;
+        let new_size = effective_size.max(end);
+        let old_grains = crate::quota::allocation_grains_for_len(effective_size);
+        let new_grains = crate::quota::allocation_grains_for_len(new_size);
+        let delta_bytes = new_grains.saturating_sub(old_grains);
+        if delta_bytes > 0 {
+            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
+            let pool_free = self.pool_free_bytes_for_quota();
+            let decision =
+                self.state
+                    .quota_table
+                    .check_delta(&inode_ancestors, delta_bytes, 0, pool_free);
+            if decision.is_refusal() {
+                return Err(FileSystemError::from(decision));
+            }
+        }
+
+        let admit_bytes = new_size.saturating_sub(effective_size);
+        if admit_bytes > 0 {
+            let handle = self.reserve_with_hierarchy(admit_bytes).map_err(|_e| {
+                FileSystemError::NoSpace {
+                    resource: LocalStorageResource::ContentBytes,
+                    requested: admit_bytes,
+                    available: self.capacity_authority.available_bytes(),
+                    capacity: self.capacity_authority.total_bytes(),
+                    allocated: self.capacity_authority.used_bytes(),
+                }
+            })?;
+            handle.commit();
+        }
+
+        check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
+        self.invalidate_hot_read_cache_for_inode(inode_id);
+
+        let base_record = self.committed_inode_record(inode_id)?;
+        let was_auto_commit = self.auto_commit;
+        let was_in_transaction = self.in_transaction;
+        let was_max_uncommitted_mutations = self.max_uncommitted_mutations;
+        // copy_file_range fallback writes should not force do_commit(), which
+        // flushes every inode's write buffer and defeats the direct path.
+        self.auto_commit = false;
+        self.in_transaction = true;
+        self.max_uncommitted_mutations = u64::MAX;
+        let result =
+            self.rewrite_content_with_overlay(inode_id, base_record, offset, bytes, new_size, true);
+        self.max_uncommitted_mutations = was_max_uncommitted_mutations;
+        self.in_transaction = was_in_transaction;
+        self.auto_commit = was_auto_commit;
+        let result = result?;
+
+        if delta_bytes > 0 {
+            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
+            self.state
+                .quota_table
+                .apply_delta(&inode_ancestors, delta_bytes, 0);
+        }
+        self.state
+            .space_accounting
+            .accumulate_delta(SpaceDelta::new_write(bytes_len));
+        self.state.space_accounting.track_physical_write(bytes_len);
+        let _ = self
+            .extent_allocator
+            .allocate_extent(inode_id.0, offset, bytes_len, None);
+        let blake3_hash = blake3::hash(bytes);
+        let birth_txg = self.commit_group.current_commit_group().0;
+        let _ = self.extent_allocator.finalize_data_extent(
+            inode_id.0,
+            offset,
+            bytes_len,
+            *blake3_hash.as_bytes(),
+            birth_txg,
+        );
+        self.state.dirty_extent_maps.insert(inode_id);
+        self.clear_write_buffer_range(inode_id, offset, bytes_len);
+        self.writeback_range_tracker
+            .lock()
+            .expect("locked")
+            .clear_range(inode_id, offset, bytes_len);
+        Ok(self.adjust_for_write_buffer(inode_id, result))
+    }
+
     pub fn fallocate_file(
         &mut self,
         path: impl AsRef<str>,
