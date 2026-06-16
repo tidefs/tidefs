@@ -1,28 +1,31 @@
 # Preview UAPI/ABI Boundary (OW-202)
 
-> TFR-019 authority note: this imported implementation note is review material,
-> the behavior below as needing reconciliation with current source,
-> `docs/REVIEW_TODO_REGISTER.md`, and `docs/WHOLE_REPO_REVIEW.md`.
+> TFR-019 authority note: this document is current spec only for the checked
+> preview command classification table and current non-release VFS codec hooks
+> named below. It is not a production Linux ioctl/statx/ublk ABI freeze and
+> not kernelspace-readiness evidence.
 
 This document describes historical tracker item 202 by documenting the
-vfs_boundary_mirror and preview UAPI/ABI surfaces. It is not a production
-Linux ioctl/statx/ublk ABI freeze and does not claim TideFS is kernelspace-ready.
+vfs_boundary_mirror terminology and preview UAPI/ABI surfaces. It is not a
+production Linux ioctl/statx/ublk ABI freeze and does not claim TideFS is
+kernelspace-ready.
 
 ## Purpose
 
-This document tracks the current preview VFS boundary mirror layout and the
-userspace-to-kernel data structures used during development. These are
+This document tracks the current preview VFS fixed-width codec hooks and the
+userspace-to-kernel classification surfaces used during development. These are
 implementation-tracked non-release surfaces.
 
 ## vfs_boundary_mirror
 
-The `vfs_boundary_mirror` records are fixed-size preview structures that map
-userspace VFS state (inode attributes, extent metadata, directory entries) to
-the kernel boundary. They exist so the kernel VFS module can consume
-committed-root state without a userspace daemon during the bootstrap path.
+The `vfs_boundary_mirror` name is the stable terminology for fixed-width VFS
+boundary records between owned engine values and ABI-safe scalar encodings.
+The current source surface is the `tidefs-schema-codec-vfs` crate, which owns
+the fixed-width VFS handle, inode id, generation, node-kind, and errno codec
+hooks used by adapters and kernel-facing paths during development.
 
-Layout tests live in `crates/tidefs-schema-codec-vfs-boundary/` and are
-exercised by `cargo test -p tidefs-schema-codec-vfs-boundary --all-targets`.
+Layout and round-trip tests live in `crates/tidefs-schema-codec-vfs/` and are
+exercised by `cargo test -p tidefs-schema-codec-vfs --all-targets`.
 
 ## Non-Claims
 

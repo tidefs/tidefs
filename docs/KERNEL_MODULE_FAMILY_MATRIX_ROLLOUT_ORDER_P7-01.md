@@ -1,6 +1,10 @@
 # kernel module family matrix and rollout order (P7-01) (v0.332)
 
-This document is the production-depth source-of-truth for **P7-01**.
+Authority note: this document is current spec for kernel-family rollout order,
+first-seam scope, and anti-regression constraints. It is not implementation
+status evidence, does not claim full-kernel acceptance, and does not replace
+issue-scoped QEMU, xfstests, crash-recovery, block-volume, or production
+readiness proof.
 
 It answers one concrete question:
 
@@ -382,7 +386,7 @@ Any runtime authority needed while the filesystem is mounted must either be
 implemented in the Linux 7.0 kernel-side stack (via the tracked product kmod
 families) or be proven unnecessary during operation. Mixed userspace/kernel
 deployments that still depend on FUSE, ublk, or any usermode daemon for
-normal operation have not achieved full-kernel acceptance and must not be
+normal operation have not achieved full-kernel acceptance and must not claim it.
 
 The predecessor K7 spine issues (#5289, #5290, #5291) established the
 family matrix, rollout order, first seam, and mixed-mode proof approach.
@@ -403,9 +407,9 @@ acceptance.
 9. **Mixed userspace/kernel and FUSE/ublk bring-up stages are bring-up scaffolding only; they do not constitute full-kernel acceptance.**
 10. **Before claiming full-kernel acceptance, the deployment must prove either `kmod.policy_authority.host.k0` residency or that no runtime authority remains in userspace for mounted operation.**
 
-## 12. Result
+## 12. Scope Result
 
-`P7-01` is closed when the repo can say, at production depth:
+For rollout-order planning, this document records:
 
 - which kernel product families exist,
 - what the shared but non-product kernel substrate is,
@@ -413,6 +417,7 @@ acceptance.
 - what the first legal seam is,
 - which families are explicitly not first and why,
 
-That condition is now met, and the K7-13 full-kernel residency invariant
-(section 9) closes the remaining ambiguity that predecessor K7 spine issues
-left open around mixed-mode versus final no-usermode acceptance.
+That condition is met as a current design constraint. Runtime implementation,
+full-kernel residency, daemonless storage parity, block-volume behavior,
+crash/replay proof, xfstests coverage, and production readiness remain separate
+issue-scoped work and must not be inferred from this classification.

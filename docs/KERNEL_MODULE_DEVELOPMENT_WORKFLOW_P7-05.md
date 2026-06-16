@@ -1,6 +1,11 @@
 # Linux 7.0 kernel source development workflow (P7-05)
 
-Maturity: **design-law** for Linux 7.0 kernel development.
+Maturity: **current policy** for Linux 7.0 kernel development workflow.
+
+Authority note: this is a development-loop and acceptance-workflow policy, not
+kernel runtime maturity evidence. It does not claim a production kernel module,
+full-kernel readiness, or a broader validation obligation for documentation-only
+slices.
 
 This document fixes the development loop for TideFS kernel work. The kernel
 delivery may be out-of-tree modules, in-tree Linux patches, or a combination of

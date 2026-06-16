@@ -1,7 +1,8 @@
 # kernel locking / RCU / pinning / workqueue model P7-03 (v0.319)
 
-This document is the source-of-truth for **P7-03** in the production design ledger.
-It is also the implementation-tracked non-release closeout for **OW-205**.
+Authority note: this document is current spec for the source-level kernel
+locking, RCU, pinning, and workqueue model. It is not runtime proof, not
+kernelspace-readiness evidence, and not a production full-kernel claim.
 
 It answers the production question that remained deliberately open after `P4-04`, `P5-03`, `P6-01`, and `P6-02`:
 
@@ -342,10 +343,11 @@ not claim that those later runtime campaigns have already passed.
 
 Every later executable test, KUnit-style harness, lockdep integration, QEMU
 kernel smoke, or fault campaign that claims OW-205 coverage must map failures
+to this matrix before claiming runtime coverage.
 
 ## 14. What this closes and what remains
 
-This pass closes the production-depth ambiguity around:
+This pass records the current source-level design rule around:
 - lock classes
 - RCU mirror usage
 - pin class law in-kernel

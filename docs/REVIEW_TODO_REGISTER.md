@@ -977,6 +977,18 @@ Important 2026-06-01 findings:
   root authority. This reduces the checksum/BLAKE3 documentation drift under
   TFR-019, but it does not close TFR-019 broadly and does not close any
   storage-integrity implementation or claim-registry item.
+- `TFR-011`/`TFR-019`: the kernel and preview UAPI authority slice for GitHub
+  issue #337 classifies the scoped kernel/UAPI documents in
+  `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`. The scanned preview UAPI doc is
+  current spec only for the checked tidefsctl command classification/admission
+  table and current non-release VFS codec hook description; the adjacent old
+  UAPI layout note is historical input because it points at the retired
+  `tidefs-schema-codec-vfs-boundary` crate path. Kernel-resident architecture,
+  workflow, rollout, and locking docs are current policy/spec only within their
+  stated development, target-architecture, rollout, and source-level model
+  scopes. This reduces TFR-011/TFR-019 drift but does not close full-kernel,
+  broader operator UAPI, kernel residency, storage authority, block-volume,
+  xfstests, crash-recovery, distributed, or documentation drift debt.
 - `TFR-019`/`TFR-018`: the current xfstests harness authority slice repairs
   `xfstests-runner` as a diagnostic scoreboard wrapper, and sends output under
   runner help path no longer carries a bare `--per-test` command or duplicate
