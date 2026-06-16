@@ -1487,6 +1487,60 @@ fn zero_writeback_over_sparse_holes_stays_sparse() {
 }
 
 #[test]
+fn zero_writeback_over_sparse_hole_ignores_unrelated_dirty_buffer() {
+    let (mut fs, root) = wb_open_temp("zero-writeback-sparse-hole-unrelated-dirty");
+    let chunk = content_chunk_size() as usize;
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: chunk * 8,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/sparse.bin", 0o644).expect("create");
+    let file_len = chunk * 4;
+    fs.truncate_file("/sparse.bin", file_len as u64)
+        .expect("sparse truncate");
+
+    let dirty_offset = (chunk * 3) as u64;
+    let dirty = vec![0x5a_u8; 4096];
+    fs.write_file("/sparse.bin", dirty_offset, &dirty)
+        .expect("stage unrelated dirty write");
+    assert!(
+        fs.read_from_write_buffer(record.inode_id, dirty_offset, dirty.len())
+            .is_some(),
+        "unrelated dirty payload should remain buffered"
+    );
+
+    let zeros = vec![0_u8; chunk];
+    fs.write_file("/sparse.bin", 0, &zeros)
+        .expect("zero writeback over sparse hole");
+    assert!(
+        fs.read_from_write_buffer(record.inode_id, 0, chunk)
+            .is_none(),
+        "zero writeback over a disjoint sparse hole should not stage bytes"
+    );
+    assert!(
+        fs.lookup_extents(record.inode_id.get(), 0, chunk as u64)
+            .is_empty(),
+        "zero writeback over a disjoint sparse hole should not allocate DATA extents"
+    );
+    assert_eq!(
+        fs.read_file_range("/sparse.bin", 0, chunk)
+            .expect("read sparse zero range"),
+        zeros
+    );
+    assert_eq!(
+        fs.read_file_range("/sparse.bin", dirty_offset, dirty.len())
+            .expect("read unrelated dirty range"),
+        dirty
+    );
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn sparse_range_reads_reuse_layout_without_whole_file_materialization() {
     let (mut fs, root) = wb_open_temp("sparse-range-layout-cache");
     let chunk = content_chunk_size() as usize;
