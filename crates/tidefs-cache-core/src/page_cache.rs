@@ -6,7 +6,7 @@
 //! concurrency is handled via an internal [`Mutex`] so the public
 //! API is `&self`-friendly.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::sync::Mutex;
 
@@ -170,7 +170,7 @@ impl std::error::Error for PageFlushError {}
 
 struct PageCacheInner {
     pages: HashMap<PageKey, Page>,
-    dirty_page_counts: HashMap<u64, usize>,
+    dirty_pages_by_inode: BTreeMap<u64, BTreeSet<u64>>,
     /// Front = LRU (oldest), back = MRU (newest).
     lru_order: VecDeque<PageKey>,
     max_pages: usize,
@@ -185,7 +185,7 @@ impl PageCacheInner {
     fn new(max_pages: usize, page_size: usize) -> Self {
         Self {
             pages: HashMap::with_capacity(max_pages.min(1024)),
-            dirty_page_counts: HashMap::new(),
+            dirty_pages_by_inode: BTreeMap::new(),
             lru_order: VecDeque::with_capacity(max_pages.min(1024)),
             max_pages,
             page_size,
@@ -212,23 +212,28 @@ impl PageCacheInner {
     }
 
     fn dirty_page_count_for_inode(&self, inode: u64) -> usize {
-        self.dirty_page_counts.get(&inode).copied().unwrap_or(0)
+        self.dirty_pages_by_inode
+            .get(&inode)
+            .map_or(0, |offsets| offsets.len())
     }
 
-    fn increment_dirty_page_count(&mut self, inode: u64) {
-        *self.dirty_page_counts.entry(inode).or_insert(0) += 1;
+    fn record_dirty_page(&mut self, key: PageKey) {
+        self.dirty_pages_by_inode
+            .entry(key.inode)
+            .or_default()
+            .insert(key.offset);
     }
 
-    fn decrement_dirty_page_count(&mut self, inode: u64) {
+    fn forget_dirty_page(&mut self, key: PageKey) {
         let mut remove_entry = false;
-        if let Some(count) = self.dirty_page_counts.get_mut(&inode) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
+        if let Some(offsets) = self.dirty_pages_by_inode.get_mut(&key.inode) {
+            offsets.remove(&key.offset);
+            if offsets.is_empty() {
                 remove_entry = true;
             }
         }
         if remove_entry {
-            self.dirty_page_counts.remove(&inode);
+            self.dirty_pages_by_inode.remove(&key.inode);
         }
     }
 
@@ -287,7 +292,7 @@ impl PageCacheInner {
             return false;
         };
         if became_dirty {
-            self.increment_dirty_page_count(key.inode);
+            self.record_dirty_page(*key);
         }
         true
     }
@@ -302,7 +307,7 @@ impl PageCacheInner {
             return false;
         };
         if was_dirty {
-            self.decrement_dirty_page_count(key.inode);
+            self.forget_dirty_page(*key);
         }
         true
     }
@@ -336,7 +341,7 @@ impl PageCacheInner {
             return false;
         };
         if cleared_dirty {
-            self.decrement_dirty_page_count(key.inode);
+            self.forget_dirty_page(*key);
         }
         true
     }
@@ -355,13 +360,20 @@ impl PageCacheInner {
 
     /// Collect keys of all dirty pages.
     fn dirty_page_keys(&self) -> Vec<PageKey> {
-        if self.dirty_page_counts.is_empty() {
-            return Vec::new();
-        }
-        self.pages
+        self.dirty_pages_by_inode
             .iter()
-            .filter(|(_, p)| p.is_dirty())
-            .map(|(k, _)| *k)
+            .flat_map(|(inode, offsets)| {
+                offsets.iter().filter_map(|offset| {
+                    let key = PageKey {
+                        inode: *inode,
+                        offset: *offset,
+                    };
+                    self.pages
+                        .get(&key)
+                        .is_some_and(Page::is_dirty)
+                        .then_some(key)
+                })
+            })
             .collect()
     }
 
@@ -370,10 +382,20 @@ impl PageCacheInner {
         if self.dirty_page_count_for_inode(inode) == 0 {
             return Vec::new();
         }
-        self.pages
-            .iter()
-            .filter(|(k, p)| k.inode == inode && p.is_dirty())
-            .map(|(k, _)| *k)
+        self.dirty_pages_by_inode
+            .get(&inode)
+            .into_iter()
+            .flat_map(|offsets| offsets.iter())
+            .filter_map(|offset| {
+                let key = PageKey {
+                    inode,
+                    offset: *offset,
+                };
+                self.pages
+                    .get(&key)
+                    .is_some_and(Page::is_dirty)
+                    .then_some(key)
+            })
             .collect()
     }
 
@@ -384,12 +406,19 @@ impl PageCacheInner {
             return Vec::new();
         }
         let page_size = self.page_size as u64;
-        self.pages
-            .iter()
-            .filter(|(k, p)| {
-                k.inode == inode && p.is_dirty() && k.offset < end && k.offset + page_size > start
+        let first_possible_offset = start.saturating_sub(page_size.saturating_sub(1));
+        self.dirty_pages_by_inode
+            .get(&inode)
+            .into_iter()
+            .flat_map(|offsets| offsets.range(first_possible_offset..end))
+            .filter_map(|offset| {
+                let key = PageKey {
+                    inode,
+                    offset: *offset,
+                };
+                let overlaps = key.offset < end && key.offset.saturating_add(page_size) > start;
+                (overlaps && self.pages.get(&key).is_some_and(Page::is_dirty)).then_some(key)
             })
-            .map(|(k, _)| *k)
             .collect()
     }
 
@@ -399,16 +428,17 @@ impl PageCacheInner {
         if dirty_count == 0 {
             return 0;
         }
-        let cleared = self
-            .pages
-            .iter_mut()
-            .filter(|(k, p)| k.inode == inode && p.is_dirty())
-            .map(|(_, p)| {
-                p.flags &= !page_flags::DIRTY;
-                1
+        let offsets = self.dirty_pages_by_inode.remove(&inode).unwrap_or_default();
+        let cleared = offsets
+            .into_iter()
+            .filter_map(|offset| {
+                let key = PageKey { inode, offset };
+                let page = self.pages.get_mut(&key)?;
+                let was_dirty = page.is_dirty();
+                page.flags &= !page_flags::DIRTY;
+                was_dirty.then_some(())
             })
-            .sum();
-        self.dirty_page_counts.remove(&inode);
+            .count();
         cleared
     }
 
@@ -674,7 +704,7 @@ impl PageCache {
         let page = inner.pages.remove(&key)?;
         inner.unlink_lru(&key);
         if page.is_dirty() {
-            inner.decrement_dirty_page_count(inode);
+            inner.forget_dirty_page(key);
         }
         Some(page)
     }
@@ -698,7 +728,7 @@ impl PageCache {
             inner.unlink_lru(key);
             inner.pages.remove(key);
         }
-        inner.dirty_page_counts.remove(&inode);
+        inner.dirty_pages_by_inode.remove(&inode);
         count
     }
     // ── Eviction ────────────────────────────────────────────────────
@@ -1494,6 +1524,34 @@ mod tests {
         let keys = cache.dirty_pages_in_range(1, 0, 4096);
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].inode, 1);
+    }
+
+    #[test]
+    fn dirty_pages_in_range_ignores_many_unrelated_dirty_inodes() {
+        let cache = new_cache(512);
+        for inode in 2..258 {
+            cache.insert(inode, 0).unwrap();
+            cache.mark_dirty(inode, 0);
+        }
+        for off in [0_u64, 4096, 8192, 12288] {
+            cache.insert(1, off).unwrap();
+            cache.mark_dirty(1, off);
+        }
+
+        let keys = cache.dirty_pages_in_range(1, 4096, 12288);
+        assert_eq!(
+            keys,
+            vec![
+                PageKey {
+                    inode: 1,
+                    offset: 4096
+                },
+                PageKey {
+                    inode: 1,
+                    offset: 8192
+                }
+            ]
+        );
     }
 
     // ── flush_dirty_range ───────────────────────────────────────────
