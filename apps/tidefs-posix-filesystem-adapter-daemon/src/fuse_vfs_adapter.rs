@@ -1196,7 +1196,35 @@ fn validate_vfs_copy_file_range_plan(
         return Err(Errno::EINVAL);
     }
 
+    if plan.len != 0 && (plan.offset_in != 0 || plan.offset_out != 0) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+
     Ok(plan)
+}
+
+fn validate_vfs_copy_file_range_fast_path(
+    engine: &(dyn VfsEngineStatFs + Send),
+    ctx: &RequestCtx,
+    plan: &FuseCopyFileRangePlan,
+    source_fh: &EngineFileHandle,
+    dest_fh: &EngineFileHandle,
+) -> Result<(), Errno> {
+    if plan.len == 0 {
+        return Ok(());
+    }
+
+    let source_attr = engine.getattr(InodeId::new(plan.ino_in), Some(source_fh), ctx)?;
+    let dest_attr = engine.getattr(InodeId::new(plan.ino_out), Some(dest_fh), ctx)?;
+    if source_attr.kind != NodeKind::File || dest_attr.kind != NodeKind::File {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if source_attr.posix.size == 0 || source_attr.posix.size > plan.len || dest_attr.posix.size != 0
+    {
+        return Err(Errno::EOPNOTSUPP);
+    }
+
+    Ok(())
 }
 
 fn plan_vfs_copy_file_range_dispatch(
@@ -10151,9 +10179,16 @@ impl Filesystem for FuseVfsAdapter {
         };
         let engine = self.engine.lock().unwrap();
         let result = match dispatch {
-            CopyDispatch::Registered(dispatch) => {
-                self.copy_file_range_with_engine(&**engine, &ctx, dispatch)
-            }
+            CopyDispatch::Registered(dispatch) => match validate_vfs_copy_file_range_fast_path(
+                &**engine,
+                &ctx,
+                &dispatch.plan,
+                &dispatch.source_fh,
+                &dispatch.dest_fh,
+            ) {
+                Ok(()) => self.copy_file_range_with_engine(&**engine, &ctx, dispatch),
+                Err(errno) => Err(errno),
+            },
             CopyDispatch::WritebackFallback(plan) => {
                 self.copy_file_range_with_writeback_fallback(&**engine, &ctx, plan)
             }
@@ -20343,18 +20378,18 @@ mod tests {
             &copy_file_range_request(CopyFileRangeFixture {
                 ino_in: 42,
                 fh_in: source,
-                offset_in: 128,
+                offset_in: 0,
                 ino_out: 43,
                 fh_out: dest,
-                offset_out: 256,
+                offset_out: 0,
                 len: 4096,
                 flags: 0,
             }),
         )
         .expect("copy dispatch plan");
 
-        assert_eq!(dispatch.plan.offset_in, 128);
-        assert_eq!(dispatch.plan.offset_out, 256);
+        assert_eq!(dispatch.plan.offset_in, 0);
+        assert_eq!(dispatch.plan.offset_out, 0);
         assert_eq!(dispatch.plan.len, 4096);
         assert_eq!(dispatch.source_fh.inode_id, InodeId::new(42));
         assert_eq!(dispatch.source_fh.fh_id, FileHandleId::new(11));
@@ -20446,6 +20481,22 @@ mod tests {
                 &copy_file_range_request(CopyFileRangeFixture {
                     ino_in: 42,
                     fh_in: read_only,
+                    offset_in: 128,
+                    ino_out: 43,
+                    fh_out: write_only,
+                    offset_out: 0,
+                    len: 1,
+                    flags: 0,
+                }),
+            ),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            plan_vfs_copy_file_range_dispatch(
+                &table,
+                &copy_file_range_request(CopyFileRangeFixture {
+                    ino_in: 42,
+                    fh_in: read_only,
                     offset_in: 0,
                     ino_out: 42,
                     fh_out: read_only,
@@ -20454,12 +20505,12 @@ mod tests {
                     flags: 0,
                 }),
             ),
-            Err(Errno::EBADF)
+            Err(Errno::EOPNOTSUPP)
         );
     }
 
     #[test]
-    fn copy_file_range_dispatch_rejects_same_inode_overlap_only() {
+    fn copy_file_range_dispatch_rejects_same_inode_overlap_and_nonzero_ranges() {
         let mut table = AdapterFileHandleTable::default();
         let source = table.allocate(
             42,
@@ -20485,11 +20536,8 @@ mod tests {
                     len: 128,
                     flags: 0,
                 }),
-            )
-            .expect("adjacent copy")
-            .plan
-            .offset_out,
-            128
+            ),
+            Err(Errno::EOPNOTSUPP)
         );
         assert_eq!(
             plan_vfs_copy_file_range_dispatch(
@@ -20506,6 +20554,128 @@ mod tests {
                 }),
             ),
             Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn copy_file_range_fast_path_allows_whole_source_into_empty_dest() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (source_inode, source_adapter_fh, source_engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"mounted-copy-source.bin",
+            libc::O_RDWR as u32,
+        );
+        let (dest_inode, dest_adapter_fh, dest_engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"mounted-copy-dest.bin",
+            libc::O_RDWR as u32,
+        );
+        let payload: Vec<u8> = (0..8192).map(|idx| (idx % 251) as u8).collect();
+
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                source_inode.get(),
+                source_adapter_fh,
+                0,
+                &payload,
+                FUSE_WRITE_CACHE,
+            )
+            .expect("write source bytes");
+
+        let plan = FuseCopyFileRangePlan {
+            unique: 77,
+            ino_in: source_inode.get(),
+            fh_in: source_adapter_fh,
+            offset_in: 0,
+            ino_out: dest_inode.get(),
+            fh_out: dest_adapter_fh,
+            offset_out: 0,
+            len: payload.len() as u64,
+        };
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan,
+            source_fh: source_engine_fh,
+            dest_fh: dest_engine_fh,
+        };
+
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            validate_vfs_copy_file_range_fast_path(
+                &**engine,
+                &ctx,
+                &dispatch.plan,
+                &dispatch.source_fh,
+                &dispatch.dest_fh,
+            )
+            .expect("whole-file copy is supported");
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("whole-file copy through adapter dispatch")
+        };
+
+        assert_eq!(copied, payload.len() as u32);
+        let engine = fixture.adapter.engine.lock().unwrap();
+        assert_eq!(
+            engine
+                .read(&dest_engine_fh, 0, payload.len() as u32, &ctx)
+                .unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn copy_file_range_fast_path_rejects_nonempty_destination() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (source_inode, source_adapter_fh, source_engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"mounted-copy-nonempty-source.bin",
+            libc::O_RDWR as u32,
+        );
+        let (dest_inode, dest_adapter_fh, dest_engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"mounted-copy-nonempty-dest.bin",
+            libc::O_RDWR as u32,
+        );
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, source_inode.get(), source_adapter_fh, 0, b"source", 0)
+            .expect("write source bytes");
+        fixture
+            .adapter
+            .dispatch_write(&ctx, dest_inode.get(), dest_adapter_fh, 0, b"dest", 0)
+            .expect("write dest bytes");
+
+        let plan = FuseCopyFileRangePlan {
+            unique: 78,
+            ino_in: source_inode.get(),
+            fh_in: source_adapter_fh,
+            offset_in: 0,
+            ino_out: dest_inode.get(),
+            fh_out: dest_adapter_fh,
+            offset_out: 0,
+            len: 6,
+        };
+
+        let engine = fixture.adapter.engine.lock().unwrap();
+        assert_eq!(
+            validate_vfs_copy_file_range_fast_path(
+                &**engine,
+                &ctx,
+                &plan,
+                &source_engine_fh,
+                &dest_engine_fh,
+            ),
+            Err(Errno::EOPNOTSUPP)
         );
     }
 
@@ -20562,29 +20732,40 @@ mod tests {
     fn writeback_copy_file_range_fallback_uses_live_open_authority() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
-        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+        let (source_inode, source_adapter_fh, _source_engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &ctx,
-            b"wb-copy-fallback.bin",
+            b"wb-copy-fallback-source.bin",
             libc::O_RDWR as u32,
         );
-        let ino = inode.get();
+        let (dest_inode, dest_adapter_fh, _dest_engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-copy-fallback-dest.bin",
+            libc::O_RDWR as u32,
+        );
         let source = b"copy me through the writeback fallback";
-        let dest_offset = 0x2000;
 
         fixture
             .adapter
-            .dispatch_write(&ctx, ino, adapter_fh, 0, source, FUSE_WRITE_CACHE)
+            .dispatch_write(
+                &ctx,
+                source_inode.get(),
+                source_adapter_fh,
+                0,
+                source,
+                FUSE_WRITE_CACHE,
+            )
             .expect("write source bytes");
 
         let request = FuseCopyFileRangeRequest::new(
             82,
-            ino,
-            adapter_fh + 10_000,
+            source_inode.get(),
+            source_adapter_fh + 10_000,
             0,
-            ino,
-            adapter_fh + 20_000,
-            dest_offset,
+            dest_inode.get(),
+            dest_adapter_fh + 20_000,
+            0,
             source.len() as u64,
             0,
         );
@@ -20611,9 +20792,9 @@ mod tests {
             .adapter
             .dispatch_read(
                 &ctx,
-                ino,
-                adapter_fh,
-                dest_offset,
+                dest_inode.get(),
+                dest_adapter_fh,
+                0,
                 source.len() as u32,
                 None,
             )
