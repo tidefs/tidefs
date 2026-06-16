@@ -1233,6 +1233,41 @@ fn multi_chunk_writeback_batch_updates_touched_chunks_once() {
 }
 
 #[test]
+fn writeback_batch_keeps_dirty_pieces_minimal() {
+    let (fs, root) = wb_open_temp("minimal-writeback-pieces");
+    let chunk = content_chunk_size() as u64;
+    let first = vec![0xa5_u8; 64];
+    let second = vec![0x5a_u8; 128];
+    let third = vec![0x3c_u8; 32];
+    let segments = vec![
+        (4096, first.clone()),
+        (8192, second.clone()),
+        (chunk + 256, third.clone()),
+    ];
+
+    let patches = fs
+        .coalesced_write_buffer_patches(&segments)
+        .expect("coalesce writeback patches");
+    assert_eq!(patches.len(), 3);
+    assert_eq!(patches[0].offset, 4096);
+    assert_eq!(patches[0].bytes, first);
+    assert_eq!(patches[1].offset, 8192);
+    assert_eq!(patches[1].bytes, second);
+    assert_eq!(patches[2].offset, chunk + 256);
+    assert_eq!(patches[2].bytes, third);
+
+    assert_eq!(
+        dirty_patch_batch_allocation_bytes(chunk * 2, &patches)
+            .expect("dirty patch batch accounting"),
+        chunk * 2,
+        "two dirty pieces in the first chunk must still account one rewritten chunk"
+    );
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn extending_writeback_batch_preserves_sparse_manifest_once() {
     let (mut fs, root) = wb_open_temp("extending-writeback-batch");
     let chunk = content_chunk_size() as usize;
