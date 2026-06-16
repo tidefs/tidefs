@@ -3995,6 +3995,31 @@ mod spacemap_integration {
         cleanup(&root);
     }
 
+    #[test]
+    fn clean_sync_all_does_not_rewrite_spacemap_checkpoint() {
+        let root = temp_dir();
+        {
+            let mut store = LocalObjectStore::open(root.join("pool")).unwrap();
+            store.put(ObjectKey::from_name(b"x"), b"y").unwrap();
+            store.rotate_segment().unwrap();
+            assert!(
+                store.free_map.dirty_segment_groups().is_empty(),
+                "rotate_segment should leave a clean spacemap checkpoint"
+            );
+
+            let tmp_path = root
+                .join("pool")
+                .join(crate::constants::STORE_DIR_NAME)
+                .join(format!("{}.tmp", crate::constants::SPACEMAP_BASE_FILE_NAME));
+            fs::create_dir(&tmp_path).unwrap();
+
+            store
+                .sync_all()
+                .expect("clean sync should not rewrite spacemap checkpoint");
+        }
+        cleanup(&root);
+    }
+
     // ------------------------------------------------------------------
     // SegmentIntegrityFooter tests
     // ------------------------------------------------------------------
