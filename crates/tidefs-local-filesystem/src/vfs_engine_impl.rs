@@ -3194,7 +3194,7 @@ impl VfsLocalFileSystem {
         fs.invalidate_hot_read_cache_for_inode(dest_fh.inode_id);
         fs.commit_mutation(dest_record).map_err(|e| map_errno(&e))?;
 
-        let _ = fs.apply_timestamp_update(
+        let _ = fs.apply_deferred_timestamp_update(
             source_fh.inode_id,
             TimestampUpdate::Read,
             self.timestamp_policy,
@@ -3262,7 +3262,7 @@ impl VfsLocalFileSystem {
             }
         };
         if record_access {
-            let _ = self.fs.borrow_mut().apply_timestamp_update(
+            let _ = self.fs.borrow_mut().apply_deferred_timestamp_update(
                 fh.inode_id,
                 TimestampUpdate::Read,
                 self.timestamp_policy,
@@ -4066,7 +4066,7 @@ impl VfsEngine for VfsLocalFileSystem {
     ) -> std::result::Result<(), Errno> {
         self.fs
             .borrow_mut()
-            .apply_timestamp_update(inode, TimestampUpdate::Read, self.timestamp_policy)
+            .apply_deferred_timestamp_update(inode, TimestampUpdate::Read, self.timestamp_policy)
             .map_err(|e| map_errno(&e))
     }
 
@@ -5016,6 +5016,85 @@ mod tests {
             .expect("persisted file attr");
         assert_eq!(persisted.posix.atime_ns, after_read.posix.atime_ns);
         assert_eq!(persisted.posix.ctime_ns, after_read.posix.ctime_ns);
+    }
+
+    #[test]
+    fn vfs_read_atime_is_visible_without_counting_deferred_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_key = RootAuthenticationKey::demo_key();
+        let file_name = b"deferred-read-atime.txt";
+
+        {
+            let local_fs = LocalFileSystem::open_with_root_authentication_key(
+                dir.path(),
+                tidefs_local_object_store::StoreOptions::test_fast(),
+                root_key,
+            )
+            .expect("open local filesystem");
+            let mut engine = VfsLocalFileSystem::new(local_fs);
+            engine.set_timestamp_policy(TimestampPolicy::Strictatime);
+            let root = engine.get_root_inode(&ctx()).expect("root inode");
+            let (_attr, fh) = engine
+                .create(root, file_name, 0o644, O_RDWR, &ctx())
+                .expect("create file");
+            engine.write(&fh, 0, b"timestamp payload", &ctx()).unwrap();
+            engine
+                .fs
+                .borrow_mut()
+                .commit_if_dirty()
+                .expect("commit setup");
+        }
+
+        let after_read;
+        {
+            let mut local_fs = LocalFileSystem::open_with_root_authentication_key(
+                dir.path(),
+                tidefs_local_object_store::StoreOptions::test_fast(),
+                root_key,
+            )
+            .expect("reopen local filesystem");
+            local_fs.set_auto_commit(false);
+            let mut engine = VfsLocalFileSystem::new(local_fs);
+            engine.set_timestamp_policy(TimestampPolicy::Strictatime);
+            let root = engine.get_root_inode(&ctx()).expect("root inode");
+            let before = engine.lookup(root, file_name, &ctx()).expect("lookup file");
+            let fh = engine
+                .open(before.inode_id, O_RDONLY, &ctx())
+                .expect("open read handle");
+            let before_mutations = engine.fs.borrow().uncommitted_mutation_count();
+
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            assert_eq!(engine.read(&fh, 0, 4, &ctx()).expect("read bytes"), b"time");
+            after_read = engine
+                .getattr(before.inode_id, None, &ctx())
+                .expect("getattr after read");
+
+            assert!(
+                after_read.posix.atime_ns > before.posix.atime_ns,
+                "strictatime read access must be visible through getattr"
+            );
+            assert_eq!(
+                engine.fs.borrow().uncommitted_mutation_count(),
+                before_mutations,
+                "read atime should ride the existing dirty-commit path"
+            );
+            engine
+                .fs
+                .borrow_mut()
+                .commit_if_dirty()
+                .expect("commit read atime");
+        }
+
+        let reopened = LocalFileSystem::open_with_root_authentication_key(
+            dir.path(),
+            tidefs_local_object_store::StoreOptions::test_fast(),
+            root_key,
+        )
+        .expect("reopen after read atime commit");
+        let persisted = reopened
+            .stat_attr("/deferred-read-atime.txt")
+            .expect("persisted file attr");
+        assert_eq!(persisted.posix.atime_ns, after_read.posix.atime_ns);
     }
 
     fn live_dataset_admin(engine: &VfsLocalFileSystem, operation: &str, args: Value) -> Value {
