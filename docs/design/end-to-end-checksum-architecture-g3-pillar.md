@@ -1,32 +1,36 @@
 **Issue**: [#1785](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1785)
-**Status**: design-spec
+**Status**: historical input
 **Lane**: storage-core (Layer 6: Data Services)
-**Maturity**: design-spec — Rust implementation deferred to wire-up issues
+**Maturity**: historical input — target design with Rust implementation deferred
+to wire-up issues
 **Originating issue**: #1559
 **Depends on**: #1223 (dataset feature flags), #1220 (on-media record format)
 **Interacts with**: #1285 (extent maps + locator tables), #1288 (scrub/repair), #787 (encryption), #905 (compression), #620 (observability), #1230 (crash injection), #110 (online verifier)
 
 # End-to-End Checksum Architecture (G3 Pillar)
 
-Maturity: **design-spec** for mandatory end-to-end checksum framing, read-time
-verification, corruption detection, and integrity-invariant enforcement across
-TideFS metadata and data paths.
+Maturity: **historical input** for mandatory end-to-end checksum framing,
+read-time verification, corruption detection, and integrity-invariant
+enforcement across TideFS metadata and data paths.
 
-This document is the **canonical design specification** for the G3 checksum
-architecture pillar.
+Authority classification: TFR-019 / GitHub issue #332 leaves this imported G3
+pillar document as historical target-design input. The current tree contains
+object-store integrity pieces, binary-schema checksum profiles, read-only scrub
+reporting, segment-chain helpers, and root-authentication helpers.
+`validation/claims.toml` does not validate production end-to-end checksum, scrub
+self-heal, erasure-coded repair, or tamper-proof committed-root claims. Use live
+source, `docs/BLAKE3_USAGE_POLICY.md`, and the claim registry for current
+authority.
 
 ## Abstract
 
-TideFS implements mandatory end-to-end checksums as a non-negotiable data
-integrity guarantee. Every record payload carries a BLAKE3-256 cryptographic
-digest domain-separated by record type; every read path verifies the digest
-before returning data; every mismatch triggers repair or explicit error
-reporting. A persistent SuspectLog tracks detected corruption, a
-SegmentIntegrityFooter forms a hash chain from root to segment, and a
-four-tier ChecksumProfile system stratifies integrity strength across framing,
-transport, metadata, and data. This document defines all data structures,
-algorithms, pipeline ordering, integration contracts, and the tradeoffs
-underlying the canonical G3 checksum architecture.
+This imported design proposed mandatory end-to-end checksums as a
+non-negotiable data-integrity target. Its target architecture has record payload
+BLAKE3-256 digests domain-separated by record type, read-path verification
+before returning data, explicit mismatch handling, persistent `SuspectLog`
+tracking, `SegmentIntegrityFooter` chaining, and a four-tier `ChecksumProfile`
+system. Those remain target-design statements unless current source behavior
+and claim-registry evidence cover the specific path.
 
 
 ## 1. Motivation and Scope
@@ -40,10 +44,10 @@ Ceph provides per-object checksums at the RADOS layer (crc32c default,
 optional xxhash64), but they are optional per-pool and silent corruption can
 persist when checksums are disabled.
 
-TideFS mandates **non-optional** end-to-end checksums at the framing layer.
-A checksum-verified read must never return corrupt data. Mismatch must
-trigger repair or explicit error reporting. Three axes define the
-architecture:
+The target design mandated **non-optional** end-to-end checksums at the framing
+layer. In that design, a checksum-verified read would not return corrupt data,
+and a mismatch would trigger repair or explicit error reporting. This is not a
+current production guarantee. Three axes define the target architecture:
 
 1. **What is checksummed.** Every record header, every data shard, and every
    aggregating structure (manifest, root record, intent log entry).
@@ -86,7 +90,7 @@ crates/tidefs-online-verifier/           → verify_online(), verify_online_with
 
 ### 3.1 Header Checksum: CRC32C (Per-Record Framing Sanity)
 
-Every record header carries a CRC32C (Castagnoli) over the fixed prefix
+The target record header carries a CRC32C (Castagnoli) over the fixed prefix
 fields (magic, record kind, format version, payload length). This is a
 **fast, local sanity check**, not an end-to-end data integrity guarantee.
 
@@ -117,9 +121,9 @@ the record type field causes the wrong decoder to be selected).
 
 ### 3.2 Payload Digest: BLAKE3-256 (Per-Record End-to-End)
 
-Every record payload carries a BLAKE3-256 digest over the payload bytes,
-domain-separated by record type. This is the **canonical end-to-end
-integrity guarantee**.
+Target record payloads carry a BLAKE3-256 digest over the payload bytes,
+domain-separated by record type. This is target design language, not proof that
+every current mounted read path enforces the guarantee.
 
 ```
 IntegrityTrailerV2 {
@@ -154,20 +158,20 @@ The context string follows the format
 
 ### 3.3 Shard-Level Digest (For EC)
 
-When a data extent is erasure-coded into k+m shards, each shard carries its
-own BLAKE3-256 digest. The shard digest covers:
+The target erasure-coded data extent carries a BLAKE3-256 digest per shard. The
+shard digest covers:
 
 - `shard_index` (which shard this is)
 - `shard_payload` (the encoded shard bytes)
 - `ec_k`, `ec_m` (the erasure-coding parameters)
 
-This is stored in the `IntegrityTrailerV2.shard_*` fields. The
-`LocatorTable` entry references all shard digests for reconstruction
+The design stores this in the `IntegrityTrailerV2.shard_*` fields and has the
+`LocatorTable` entry reference all shard digests for reconstruction
 verification.
 
 ### 3.4 Segment Integrity Footer
 
-Each object-store segment file carries a footer with:
+The target object-store segment file carries a footer with:
 
 ```
 SegmentIntegrityFooter {
@@ -185,14 +189,15 @@ SegmentIntegrityFooter {
 // Total: 192 bytes
 ```
 
-The `chain_digest` links each segment to its predecessor, forming a hash
-chain from the current segment back to the system area root. This is
-analogous to ZFS's root_record-to-block-tree chain of trust, but at segment
-granularity.
+The `chain_digest` links each segment to its predecessor, forming a hash chain
+from the current segment back to the system area root. This target design is
+analogous to ZFS's root_record-to-block-tree chain of trust, but current docs
+must not publish it as a tamper-proof committed-root guarantee without matching
+evidence.
 
 ### 3.5 Root Authentication
 
-The mount-time root-slot verification uses keyed BLAKE3-256:
+The target mount-time root-slot verification uses keyed BLAKE3-256:
 
 ```
 RootAuth {
@@ -203,47 +208,48 @@ RootAuth {
 }
 ```
 
-This is the top of the trust chain. The root authentication key is
-derived from the dataset's integrity key material, providing a binding
-between the physical segment chain and the logical root record.
+This is the target top of the trust chain. The root authentication key is
+derived from the dataset's integrity key material in the design, providing a
+binding between the physical segment chain and the logical root record.
 
 ## 4. Checksum Pipeline Ordering
 
-The canonical pipeline for data at rest is:
+The target pipeline for data at rest is:
 
 ```
 data → compress → encrypt → checksum → write
 ```
 
-Checksum is computed **after** both compression and encryption, ensuring
-the checksum covers the exact bytes stored on media. This prevents attacks
-that swap compressed representations or exploit gaps between encryption
-and integrity verification.
+The target checksum is computed **after** both compression and encryption,
+ensuring the checksum covers the exact bytes stored on media. This ordering is
+target design authority only until the corresponding mounted transform paths
+and claim evidence exist.
 
-On read, the pipeline reverses:
+In the target design, the read pipeline reverses:
 
 ```
 read → checksum-verify → decrypt → decompress → data
 ```
 
-Verification happens on ciphertext before decryption, catching on-media
-corruption at the earliest possible point.
+Verification happens on ciphertext before decryption in the design, catching
+on-media corruption at the earliest possible point.
 
 ## 5. Detection and Response
 
 ### 5.1 Read-Time Detection
 
-Every read path verifies:
+The target read path verifies:
 1. **CRC32C** on the record header (framing sanity)
 2. **BLAKE3-256** on the record payload (end-to-end integrity)
 3. **BLAKE3-256** on the full record (header + payload, for chaining)
 
-A mismatch at any level prevents data from being returned to the caller.
-In the FUSE adapter, this surfaces as `EIO` to the application.
+A mismatch at any level prevents data from being returned to the caller in the
+target design. Mounted FUSE `EIO` behavior remains a source-and-evidence
+question, not a claim made by this historical document.
 
 ### 5.2 SuspectLog
 
-Each segment maintains a persistent ring buffer of suspect records:
+The target segment maintains a persistent ring buffer of suspect records:
 
 ```
 SuspectLog {
@@ -263,14 +269,15 @@ SuspectEntry {
 }
 ```
 
-The SuspectLog is:
+The target `SuspectLog` is:
 - **Append-only**: new suspect entries are appended at `head`.
 - **Bounded**: when full, the oldest entry is overwritten.
 - **Per-segment**: each segment file has its own SuspectLog.
 
 ### 5.3 SuspectSet
 
-The in-memory `SuspectSet` aggregates suspect entries across all segments:
+The target in-memory `SuspectSet` aggregates suspect entries across all
+segments:
 
 ```
 SuspectSet {
@@ -285,14 +292,14 @@ SuspectStatus {
 }
 ```
 
-The SuspectSet drives:
+The target `SuspectSet` drives:
 - **Replica health transitions** in the LocatorTable
 - **Repair prioritization** in the repair planner
 - **Observability events** for operator visibility
 
 ### 5.4 Repair Flow
 
-On mismatch detection:
+The target mismatch flow is:
 1. Mark record as suspect in SuspectLog
 2. Query LocatorTable for healthy replicas
 3. If healthy replica exists: read from replica, verify its digest,
@@ -304,7 +311,7 @@ On mismatch detection:
 
 ## 6. Transport Integrity
 
-The transport layer provides independent per-message integrity:
+The target transport layer provides independent per-message integrity:
 
 ```
 FrameEnvelope {
@@ -318,16 +325,17 @@ frame type, payload length, stream id, sequence number), stored as LE
 bytes at `[60..64]`. The payload is verified with BLAKE3-256 domain-separated
 by the frame type.
 
-This is a separate integrity layer from the storage checksums. A transport
-CRC32C mismatch indicates a network corruption event; a storage BLAKE3-256
-mismatch indicates an on-media corruption event. The two layers are
-independent and complementary.
+This is a separate target integrity layer from the storage checksums. A
+transport CRC32C mismatch indicates a network corruption event; a storage
+BLAKE3-256 mismatch indicates an on-media corruption event. Current transport
+authenticity and duplicate-BLAKE3 boundaries remain governed by
+`docs/BLAKE3_USAGE_POLICY.md` and live source.
 
 ## 7. Algorithm Rationale
 
 ### 7.1 BLAKE3-256 as the Single Algorithm
 
-BLAKE3 was selected because it provides:
+BLAKE3 was selected for the target design because it provides:
 
 - **Cryptographic strength** (256-bit security against collision)
 - **Hardware acceleration** via SIMD (AVX2, AVX-512, NEON)
@@ -337,9 +345,9 @@ BLAKE3 was selected because it provides:
   dual-hash complexity)
 
 ZFS uses a pluggable checksum table (fletcher2, fletcher4, sha256, edonr,
-blake3 via OpenZFS 2.3+). TideFS simplifies by committing to a single
-algorithm. If BLAKE3 is ever broken, the dataset feature-flag system (#1223)
-allows migration to a successor.
+blake3 via OpenZFS 2.3+). The target TideFS design simplifies by committing to a
+single algorithm. If BLAKE3 is ever broken, algorithm migration needs current
+dataset feature-flag authority before it can be claimed.
 
 ### 7.2 CRC32C for Headers
 
@@ -353,90 +361,97 @@ is not a data-integrity checksum. The rationale:
 
 ## 8. ChecksumProfile System
 
-The `tidefs-binary_schema-core` crate defines four `ChecksumProfile` levels
-used across the binary schema system:
+The `tidefs-binary_schema-core` crate defines four `ChecksumProfile` levels for
+the binary schema system:
 
 | Profile | Description | Use |
 |---|---|---|
 | `None` | No checksum or digest | Development-only; not for production data |
 | `Crc32c` | CRC32C only | Transport headers, framing sanity |
 | `Blake3_256` | BLAKE3-256 only | Record payloads, metadata |
-| `Crc32cPlusBlake3_256` | CRC32C + BLAKE3-256 | Full production integrity |
+| `Crc32cPlusBlake3_256` | CRC32C + BLAKE3-256 | Strong payload integrity profile; not a production-readiness claim |
 
 The `tidefs-binary_schema-checksum` crate provides `seal_checksums()` and
 `verify_seal()` that operate generically over all four profiles, with
 domain-separated BLAKE3 key derivation via the `build_domain_context()`
 function.
 
-## 9. Integration Points
+## 9. Target Integration Points
 
 ### 9.1 With On-Media Format (#1220)
 
 - Record header CRC32C is defined in the format strategy
-- IntegrityTrailerV2 replaces the current 80-byte trailer
-- Segment integrity footer is a new segment-level structure
+- `IntegrityTrailerV2` replaces earlier trailer sketches in the target design
+- Segment integrity footer is a target segment-level structure
 
 ### 9.2 With Extent Maps (#1300) and Locator Tables (#1305)
 
-- ExtentMapEntry stores a `data_digest: [u8; 32]` (BLAKE3-256 of extent data)
-- LocatorTable stores per-shard digests for replica verification
-- Resolve-and-verify is a single logical operation in the read path
+- `ExtentMapEntry` stores a `data_digest: [u8; 32]` (BLAKE3-256 of extent data)
+  in the target design
+- `LocatorTable` stores per-shard digests for replica verification in the target
+  design
+- Resolve-and-verify is a single target logical operation in the read path
 
 ### 9.3 With Scrub/Repair (#1288)
 
-- Scrub walks all records and verifies all digests
-- Repair uses healthy replicas to reconstruct corrupt ones
-- SuspectLog is the persistent input to the repair planner (#1294)
+- Target scrub walks all records and verifies all digests
+- Target repair uses healthy replicas to reconstruct corrupt ones
+- `SuspectLog` is the target persistent input to the repair planner (#1294)
 
 ### 9.4 With Observability (#620)
 
-- `integrity:payload_mismatch` events carry locator_id, expected/actual
+- Target `integrity:payload_mismatch` events carry locator_id, expected/actual
   digests
-- `integrity:unrecoverable` events trigger operator alerts
-- `integrity:repair_success` events clear suspect entries
+- Target `integrity:unrecoverable` events trigger operator alerts
+- Target `integrity:repair_success` events clear suspect entries
 
 ### 9.5 With Crash Injection (#1230)
 
-- Injectors can corrupt: CRC32C, payload_digest, record_digest, shard_digest
-- Each corruption point maps to a specific detection path
-- Crash injection tests verify that every corruption is detected
+- Target injectors can corrupt: CRC32C, payload_digest, record_digest,
+  shard_digest
+- Each target corruption point maps to a specific detection path
+- Crash injection tests are required before publishing detection coverage
 
 ### 9.6 With Encryption (#787) and Compression (#905)
 
-- Checksum is computed **after** compression, **after** encryption
-- The pipeline is: data → compress → encrypt → checksum → write
-- This ensures the checksum covers the exact bytes stored on media
+- The target checksum is computed **after** compression, **after** encryption
+- The target pipeline is: data -> compress -> encrypt -> checksum -> write
+- This target ordering ensures the checksum covers the exact bytes stored on
+  media
 
 ### 9.7 With Online Verifier (#110)
 
-`tidefs-online-verifier` performs non-mutating verification at mount time:
-namespace invariants, and snapshot references. The verifier uses the
-segment hash chain as its trust anchor.
+In the target architecture, `tidefs-online-verifier` performs non-mutating
+verification at mount time: namespace invariants, and snapshot references. The
+verifier uses the segment hash chain as its trust anchor in the design.
 
 ## 10. ZFS / Ceph Comparative Analysis
 
-| Aspect | ZFS | Ceph (RADOS) | TideFS |
+This comparison is historical target-design material. It must not be cited as a
+current OpenZFS/Ceph-class integrity claim.
+
+| Aspect | ZFS | Ceph (RADOS) | Target TideFS design |
 |---|---|---|---|
 | Algorithm | Pluggable table | crc32c (default) / xxhash64 (optional) | BLAKE3-256 only, with migration path |
-| Mandatory? | Optional (`checksum=on\|off`) | Optional (per-pool) | **Mandatory, non-optional** |
+| Mandatory? | Optional (`checksum=on\|off`) | Optional (per-pool) | Target: mandatory, non-optional |
 | Location | In block pointer (128-256 bits) | Per-object attribute | Record trailer + segment footer |
-| Verification | Synchronous on read | Configurable | Synchronous on read + async scrub |
-| Silent corruption | Impossible with checksum=on | Possible when disabled | Impossible (always on) |
-| Self-healing | From mirror/parity_raid | From replica OSDs | From replica + EC parity |
+| Verification | Synchronous on read | Configurable | Target: synchronous on read + async scrub |
+| Silent corruption | Impossible with checksum=on | Possible when disabled | Target, not current validated claim |
+| Self-healing | From mirror/parity_raid | From replica OSDs | Target: from replica + EC parity |
 | Header integrity | Implicit in block pointer | N/A | Explicit CRC32C |
 | Domain separation | N/A | N/A | Per-record-type BLAKE3 context |
-| Chain of trust | RootRecord → block tree | N/A | Segment chain → system area → root auth |
-| Suspect tracking | Implicit (failed reads retry) | N/A | Explicit SuspectLog + SuspectSet |
-| Performance cost | 0.5–3% (sha256) | <1% (crc32c) | 0.5–3% (BLAKE3-256) |
+| Chain of trust | RootRecord -> block tree | N/A | Target: segment chain -> system area -> root auth |
+| Suspect tracking | Implicit (failed reads retry) | N/A | Target: explicit SuspectLog + SuspectSet |
+| Performance cost | 0.5-3% (sha256) | <1% (crc32c) | Target estimate: 0.5-3% (BLAKE3-256) |
 
-TideFS improves over both ZFS and Ceph by:
+The target design aimed to improve over both ZFS and Ceph by:
 
-- **Mandatory checksums** — no silent-corruption footgun
-- **Domain separation** — cross-type collision attacks prevented
-- **Explicit suspect tracking** — persistent SuspectLog enables repair
+- **Mandatory checksums** -- no silent-corruption footgun
+- **Domain separation** -- cross-type collision attacks prevented
+- **Explicit suspect tracking** -- persistent SuspectLog enables repair
   planning and operator visibility
-- **Segment-level hash chaining** — trust anchor beyond ZFS root_record
-- **Single algorithm** with formal migration path — no dual-hash complexity
+- **Segment-level hash chaining** -- trust anchor beyond ZFS root_record
+- **Single algorithm** with formal migration path -- no dual-hash complexity
 
 ## 11. Performance Budget
 
@@ -448,9 +463,9 @@ TideFS improves over both ZFS and Ceph by:
 | Segment chain verify (10K segments) | < 100 ms | Mount-time only |
 | SuspectLog entry append | < 10 µs | Ring buffer write |
 
-Overall throughput overhead of checksumming is estimated at 0.5–3% for
-data paths and negligible for metadata paths (under 0.1%), consistent
-with ZFS with edonr/sha256 checksums.
+Overall throughput overhead of the target checksum design was estimated at
+0.5-3% for data paths and negligible for metadata paths (under 0.1%),
+consistent with ZFS with edonr/sha256 checksums.
 
 ## 12. Tradeoffs and Design Decisions
 
@@ -461,12 +476,13 @@ with ZFS with edonr/sha256 checksums.
 **Rationale:** ZFS supports a pluggable checksum table (fletcher2/4,
 sha256, edonr, blake3), giving operators flexibility but introducing
 complexity in checksum negotiation, migration, and verification
-consistency. TideFS simplifies by committing to a single algorithm.
+consistency. The target TideFS design simplifies by committing to a single
+algorithm.
 
-**Migration path:** If BLAKE3 is ever broken, the dataset feature-flag
-system (#1223) allows per-dataset algorithm migration. The
-`IntegrityTrailerV2.digest_suite` field encodes the algorithm, so old
-and new digests coexist during migration.
+**Migration path:** If BLAKE3 is ever broken, algorithm migration needs current
+dataset feature-flag authority before it can be claimed. The
+`IntegrityTrailerV2.digest_suite` field is the target encoding hook for that
+kind of migration.
 
 ### 12.2 CRC32C for Headers vs BLAKE3 for Everything
 
@@ -490,7 +506,7 @@ content and the record type, preventing this attack.
 
 ### 12.4 SuspectLog as Ring Buffer vs Full Index
 
-**Decision:** SuspectLog is a persistent ring buffer per segment, not a
+**Decision:** Target `SuspectLog` is a persistent ring buffer per segment, not a
 full database index.
 
 **Rationale:** A full index of every suspect record across every segment
@@ -500,7 +516,7 @@ design bounds SuspectLog storage to O(segments × ring_capacity).
 
 ### 12.5 Segment Hash Chain vs Per-Segment Isolation
 
-**Decision:** Each segment footer includes a hash chain linking to the
+**Decision:** Target segment footers include a hash chain linking to the
 previous segment's footer digest.
 
 **Rationale:** Without a chain, a segment could be replaced wholesale
@@ -510,7 +526,8 @@ segment to every record, similar to ZFS's root_record→block-tree chain.
 
 ### 12.6 Checksum Before vs After Encryption
 
-**Decision:** Checksum is computed after encryption (ciphertext checksum).
+**Decision:** Target checksum is computed after encryption (ciphertext
+checksum).
 
 **Rationale:** If checksum covered plaintext, an attacker could corrupt
 ciphertext bytes and the corruption would only be detected after
@@ -518,11 +535,14 @@ decryption, wasting decryption work and potentially leaking information
 through error oracles. Ciphertext checksum catches corruption before
 decryption. This is consistent with ZFS's encrypted dataset behavior.
 
-## 13. Implementation Phases
+## 13. Historical Implementation Phases
+
+This imported phase list is not the current work queue and does not create
+compatibility promises for unreleased TideFS data.
 
 | Phase | Description | Status |
 |---|---|---|
-| 1 | `IntegrityTrailerV2` encoding/decoding. Extend 80-byte V3 trailer to 112-byte V2 with EC shard fields. Backward compatibility with V1/V3. | planned |
+| 1 | `IntegrityTrailerV2` encoding/decoding. Extend 80-byte V3 trailer to 112-byte V2 with EC shard fields. | planned |
 | 2 | Domain separation. Wire per-record-type BLAKE3 domain contexts into all record write paths. | partial — checksum crate ready |
 | 3 | Read-time verification. Add `verify_payload()` to every read path in local filesystem and object store. | planned |
 | 4 | `SuspectLog`. Implement persistent suspect tracking ring buffer. Wire into LocatorTable replica health transitions. | planned |
@@ -533,8 +553,7 @@ decryption. This is consistent with ZFS's encrypted dataset behavior.
 Phase details:
 
 **Phase 1:** IntegrityTrailerV2 encoding/decoding. Extend the current 80-byte
-trailer to the 112-byte V2 format with shard fields. Maintain backward
-compatibility: V1 trailers still verify.
+trailer to the 112-byte V2 format with shard fields.
 
 **Phase 2:** Domain separation. Add per-record-type BLAKE3 domain contexts.
 Wire into all record write paths (object-store `append_record`). The
@@ -558,11 +577,11 @@ the EC read path. Integrate with repair planner.
 **Phase 8:** Scrub integration. Wire the checksum architecture into the
 background scrub pipeline (#1288).
 
-## 14. Residual Risks
+## 14. Historical Residual Risks
 
-1. **BLAKE3 cryptanalysis**: If BLAKE3 is broken, the dataset feature-flag
-   system (#1223) provides migration. Risk window: detection-to-migration
-   latency.
+1. **BLAKE3 cryptanalysis**: If BLAKE3 is broken, the target dataset
+   feature-flag system was intended to provide migration. Risk window:
+   detection-to-migration latency.
 2. **Concurrent SuspectLog access**: Multiple scrub threads writing to the
    same segment's SuspectLog require careful synchronization. Mitigated by
    per-segment locking.
@@ -591,9 +610,9 @@ Required structural markers across the codebase:
 
 ## Appendix A: Checksum Pipeline Ordering
 
-The canonical pipeline is: **data → compress → encrypt → checksum → write**.
-This ensures the checksum covers exact on-media bytes, preventing attacks
-that swap compressed representations or exploit encryption gaps.
+The target pipeline is: **data -> compress -> encrypt -> checksum -> write**.
+This ensures the checksum covers exact on-media bytes in the design, preventing
+attacks that swap compressed representations or exploit encryption gaps.
 
 ## Appendix B: Domain Context Construction
 

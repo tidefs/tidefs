@@ -16,6 +16,7 @@ pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "apps/README.md",
     "crates/README.md",
     "docs/00_user_requirements.md",
+    "docs/BLAKE3_USAGE_POLICY.md",
     "docs/CLAIM_REGISTRY.md",
     "docs/CLAIMS_GATE_POLICY.md",
     "docs/GETTING_STARTED.md",
@@ -1330,6 +1331,7 @@ mod tests {
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"crates/README.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/REVIEW_TODO_REGISTER.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/UNRELEASED_AUTHORITY_POLICY.md"));
+        assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/BLAKE3_USAGE_POLICY.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/WHOLE_REPO_REVIEW.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/workspace-package-classification.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md"));

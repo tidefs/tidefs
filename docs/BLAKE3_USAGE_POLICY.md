@@ -1,9 +1,21 @@
 # BLAKE3 Usage Policy
 
-Maturity: **design-policy** — binding on all current and future TideFS code.
+Maturity: **current policy** — binding for BLAKE3 placement and review. Current
+implementation status remains governed by live source behavior,
+`validation/claims.toml`, and the claims gate.
 
 This document defines where BLAKE3-256 cryptographic hashing belongs in the
 TideFS codebase and where simpler integrity mechanisms must be used instead.
+It is not a production-readiness, end-to-end checksum, scrub self-heal,
+erasure-coded repair, or tamper-proof committed-root claim.
+
+Authority classification: TFR-019 / GitHub issue #332 promoted this file as
+current policy after checking live source and the claim registry. The current
+tree contains implemented BLAKE3 pieces such as binary-schema checksum profiles,
+local-object-store `IntegrityTrailerV2` digests, segment-chain verification
+helpers, read-only scrub reporting, and root-authentication helpers. The claim
+registry does not yet validate the broader production behavior described by the
+historical G3 checksum architecture docs.
 
 ## 1. Design Principle
 
@@ -22,7 +34,9 @@ rationale without adding security value.
 
 ## 2. Where BLAKE3 Belongs
 
-BLAKE3-256 is mandatory in these contexts:
+BLAKE3-256 is the required choice when TideFS implements or reviews these
+contexts. The lists below name current and planned surfaces for review; they do
+not prove every listed path has production-ready mounted behavior today.
 
 ### 2.1 Content Addressing
 
@@ -30,41 +44,47 @@ The object store uses BLAKE3-256 to derive storage keys from content. Two
 identical payloads must produce the same key. This requires cryptographic
 collision resistance.
 
-Crates: `tidefs-local-object-store`, `tidefs-send-stream`, `tidefs-receive-stream`
+Relevant surfaces: `tidefs-local-object-store`, `tidefs-send-stream`,
+`tidefs-receive-stream`.
 
 ### 2.2 Durable Integrity Trailers
 
-Every on-disk record that persists across mounts, reboots, or host failures
-carries a BLAKE3-256 payload digest in its integrity trailer. This is the
-end-to-end guarantee that silent corruption will be detected on read.
+Durable record formats that carry production integrity trailers use BLAKE3-256
+payload and record digests. The current local object-store implementation
+includes `IntegrityTrailerV2`; this policy does not by itself claim that every
+metadata and data path has mounted, production-validated read verification.
 
-Crates: `tidefs-local-object-store`, `tidefs-local-filesystem`,
+Relevant surfaces: `tidefs-local-object-store`, `tidefs-local-filesystem`,
 `tidefs-inode-table`, `tidefs-extent-map`, `tidefs-intent-log`,
-`tidefs-dataset-catalog`, `tidefs-space-accounting`
+`tidefs-dataset-catalog`, `tidefs-space-accounting`.
 
 ### 2.3 Committed-Root and Superblock Tamper Detection
 
-The committed-root anchor and superblock carry keyed BLAKE3-256 digests to
-detect tampering and provide crash-consistency guarantees across unclean
-shutdown.
+Committed-root and superblock designs that authenticate root state use keyed
+BLAKE3-256 digests. Current docs and code must not turn that design rule into a
+tamper-proof committed-root or crash-consistency product claim without matching
+claim-registry evidence.
 
-Crates: `tidefs-local-filesystem`, `tidefs-pool-scan`
+Relevant surfaces: `tidefs-local-filesystem`, `tidefs-pool-scan`.
 
 ### 2.4 Scrub Integrity Verification
 
-The background scrub engine uses BLAKE3-256 to verify on-disk object integrity
-against stored digests. This is the same end-to-end guarantee as SS2.2, applied
-asynchronously.
+Scrub and verification paths use stored integrity data to report mismatches.
+Where a scrub path verifies BLAKE3-256 production-integrity trailers, it must use
+the same domain-separated digest rules as the write/read path. This is not a
+scrub self-heal or repair guarantee.
 
-Crates: `tidefs-scrub-core`, `tidefs-compaction`
+Relevant surfaces: `apps/tidefs-scrub`, `tidefs-scrub-core`,
+`tidefs-compaction`.
 
 ### 2.5 Erasure-Coded Shard Verification
 
-Erasure-coded shards carry BLAKE3-256 integrity envelopes binding the object
-key, stripe index, shard index, and payload. Shards must be verified before
-decode to prevent corrupt shards from contaminating reconstruction.
+When erasure-coded shard storage is implemented, shards must carry BLAKE3-256
+integrity envelopes binding the object key, stripe index, shard index, and
+payload. This is a design requirement for EC work, not a current production EC
+integrity claim.
 
-Crates: `tidefs-erasure-coded-store`
+Relevant surfaces: `tidefs-erasure-coded-store`.
 
 ### 2.6 Transport Session Boundary Key Derivation and MAC
 
@@ -74,16 +94,18 @@ primitive for a raw carrier. If TLS, AEAD, HMAC, or another session envelope is
 already providing node-to-node authenticity and integrity, do not stack a
 second message-local BLAKE3 layer.
 
-Crates: `tidefs-transport` (`session/handshake.rs`, `reconnect.rs`, and any
-explicit transport-security consolidation work around `message_auth.rs`)
+Relevant surfaces: `tidefs-transport` (`session/handshake.rs`, `reconnect.rs`,
+and any explicit transport-security consolidation work around
+`message_auth.rs`).
 
 ### 2.7 Commit/Compaction/Rebuild Verification
 
-When compaction rewrites object segments, it verifies rewritten data against
-the original BLAKE3 digest. When rebuild reconstructs data from erasure-coded
-shards, it verifies the result. These are the same content-addressing guarantee.
+When compaction rewrites object segments or rebuild reconstructs data from
+erasure-coded shards, the implementation must verify rewritten or reconstructed
+data against the relevant BLAKE3 digest before publishing it. This policy does
+not claim that compaction or rebuild has production repair evidence today.
 
-Crates: `tidefs-compaction`, `tidefs-rebuild`
+Relevant surfaces: `tidefs-compaction`, `tidefs-rebuild`.
 
 
 ### 2.8 Transport Epoch Bridge State Integrity
@@ -170,9 +192,9 @@ Affected code:
   envelope dispatch
 - `tidefs-transport/src/compression.rs` — BLAKE3 for compressed frames
 
-**Fix**: Remove the duplicate BLAKE3 hash. The transport MAC already covers the
-payload. For compression frames, CRC32C on the compressed payload is sufficient
-to detect framing errors before decompression.
+**Fix**: Remove the duplicate BLAKE3 hash. The chosen transport/session
+integrity envelope covers the payload. For compression frames, CRC32C on the
+compressed payload is sufficient to detect framing errors before decompression.
 
 ### 3.5 Namespace In-Memory Hashing
 
