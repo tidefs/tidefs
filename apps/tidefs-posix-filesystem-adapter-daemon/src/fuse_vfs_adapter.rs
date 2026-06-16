@@ -3807,6 +3807,7 @@ impl FuseVfsAdapter {
         .into_iter()
         .next()
         .unwrap()?;
+        self.invalidate_inode_metadata_after_engine_write(attr.inode_id.get());
         self.record_dentry_child_mutation(newparent, newname);
         Ok(attr)
     }
@@ -4115,6 +4116,7 @@ impl FuseVfsAdapter {
 
         // Capacity tracking for freed space is handled by the engine's
         // CapacityAuthority (record_free) during unlink dispatch.
+        self.invalidate_inode_metadata_after_engine_write(child_inode_for_delete.get());
         if child_attr.posix.nlink <= 1 {
             self.remember_removed_lookup_attr(child_attr);
         }
@@ -13926,10 +13928,23 @@ mod tests {
             (root, source.inode_id, source_fh)
         };
 
+        let before_link = fixture
+            .adapter
+            .dispatch_getattr(&ctx, source_inode.get(), 448, None)
+            .expect("source getattr before link");
+        assert_eq!(before_link.attr.nlink, 1);
+
         fixture
             .adapter
             .dispatch_link_entry(&ctx, source_inode.get(), root.get(), b"alias.txt")
             .expect("link alias");
+
+        let after_link = fixture
+            .adapter
+            .dispatch_getattr(&ctx, source_inode.get(), 449, None)
+            .expect("source getattr after link");
+        assert_eq!(after_link.attr.nlink, 2);
+
         fixture.adapter.bump_forget_refcount(source_inode.get());
 
         {
