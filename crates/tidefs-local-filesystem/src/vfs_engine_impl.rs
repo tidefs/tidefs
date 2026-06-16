@@ -4227,13 +4227,13 @@ impl VfsEngine for VfsLocalFileSystem {
         if self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
             return Ok(());
         }
-        let path = self.inode_path(fh.inode_id)?;
         if datasync {
             self.fs
                 .borrow_mut()
-                .fsync_data_only_file(&path)
+                .fdatasync_inode(fh.inode_id, true)
                 .map_err(|e| map_errno(&e))?;
         } else {
+            let path = self.inode_path(fh.inode_id)?;
             self.fs
                 .borrow_mut()
                 .fsync_file(&path)
@@ -10908,6 +10908,26 @@ mod tests {
 
         engine.fsync(&fh, false, &ctx()).unwrap();
         engine.fsync(&fh, true, &ctx()).unwrap();
+    }
+
+    #[test]
+    fn fdatasync_file_handle_uses_inode_data_barrier() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_attr, fh) = engine
+            .create(root, b"fdatasync-inode.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+
+        engine.write(&fh, 0, b"data-only", &ctx()).unwrap();
+        let before = engine.fs.borrow().fsync_stats_snapshot();
+        engine.fsync(&fh, true, &ctx()).unwrap();
+        let after = engine.fs.borrow().fsync_stats_snapshot();
+
+        assert_eq!(after.fdatasync_count, before.fdatasync_count + 1);
+        assert_eq!(
+            after.fsync_do_commit_fallback_count,
+            before.fsync_do_commit_fallback_count
+        );
     }
 
     #[test]
