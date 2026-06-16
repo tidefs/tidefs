@@ -5359,6 +5359,7 @@ impl FuseVfsAdapter {
             resolved_engine_fh
         };
 
+        let mut adapter_must_record_read_access = false;
         let engine_data = if has_block_volume && !extents.is_empty() {
             // Check whether the requested range overlaps any dirty
             // (unflushed) ranges.  Dirty ranges must be served from
@@ -5400,6 +5401,7 @@ impl FuseVfsAdapter {
                             }
                         }
                     }
+                    adapter_must_record_read_access = true;
                     buf
                 } else {
                     let e = self.engine.lock().unwrap();
@@ -5411,7 +5413,12 @@ impl FuseVfsAdapter {
             }
         } else {
             let e = self.engine.lock().unwrap();
-            match e.read(&engine_fh, plan.offset, plan.size, ctx) {
+            let read_result = if writeback_write_only_cache_fill {
+                e.read_for_cache_fill(&engine_fh, plan.offset, plan.size, ctx)
+            } else {
+                e.read(&engine_fh, plan.offset, plan.size, ctx)
+            };
+            match read_result {
                 Ok(data) => data,
                 Err(errno) => {
                     drop(e);
@@ -5439,7 +5446,7 @@ impl FuseVfsAdapter {
         const READAHEAD_PAGES: u32 = 4;
         const PAGE_SIZE: u32 = 4096;
 
-        if !fuse_direct_io {
+        if !fuse_direct_io && !writeback_write_only_cache_fill {
             // ── PageCache population (issue #3574) ──────────────────
             //
             // If a FuseReadDispatch is configured, populate its
@@ -5498,7 +5505,7 @@ impl FuseVfsAdapter {
             let _ = e.release(&fallback);
         }
 
-        if !engine_data.is_empty() {
+        if adapter_must_record_read_access && !engine_data.is_empty() {
             self.finish_successful_read_atime(ino, ctx);
         }
 
@@ -39704,6 +39711,29 @@ mod tests {
         AdapterFixture { adapter, root }
     }
 
+    fn adapter_fixture_with_writeback_cache_strict_atime() -> AdapterFixture {
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-vfs-adapter-wb-atime-{}-{temp_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let local_fs = LocalFileSystem::open_with_root_authentication_key(
+            &root,
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open local filesystem");
+        let mut engine = VfsLocalFileSystem::new(local_fs);
+        engine
+            .set_timestamp_policy(tidefs_inode_attributes::timestamp::TimestampPolicy::Strictatime);
+        let mut adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_writeback_cache_enabled();
+        adapter.timestamp_policy = TimestampPolicy::StrictAtime;
+        AdapterFixture { adapter, root }
+    }
+
     fn adapter_fixture_with_writeback_cache_deferred_commit() -> AdapterFixture {
         let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -40171,6 +40201,50 @@ mod tests {
             .unwrap()
             .get(&ino)
             .is_none_or(|ranges| ranges.is_empty()));
+    }
+
+    #[test]
+    fn writeback_writeonly_cache_fill_read_does_not_update_atime() {
+        let fixture = adapter_fixture_with_writeback_cache_strict_atime();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-writeonly-cache-fill-atime.txt",
+            libc::O_WRONLY as u32,
+        );
+        let ino = inode.get();
+        let payload = b"writeback page-fill source";
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, payload, &ctx)
+                .expect("seed file through write-only handle");
+        }
+        let before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, Some(&engine_fh), &ctx)
+                .expect("getattr before cache fill")
+        };
+        std::thread::sleep(Duration::from_millis(2));
+
+        let read = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0, payload.len() as u32, None)
+            .expect("writeback cache-fill read through write-only handle");
+
+        assert_eq!(read, payload);
+        let after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, Some(&engine_fh), &ctx)
+                .expect("getattr after cache fill")
+        };
+        assert_eq!(
+            after.posix.atime_ns, before.posix.atime_ns,
+            "writeback cache-fill reads are internal and must not consume read atime"
+        );
     }
 
     #[test]
