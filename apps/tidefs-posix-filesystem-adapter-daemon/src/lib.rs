@@ -352,7 +352,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
-const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 16 * 1024;
+const MOUNT_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
 
 /// Resolve an encryption configuration from a sealed pool key envelope file.
 ///

@@ -5284,7 +5284,7 @@ impl LocalFileSystem {
         // child's xattrs can be populated atomically within the same commit_group.
         const ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
         let parent_default_acl_entries: Option<tidefs_posix_acl::PosixAcl> = self
-            .inode(parent_id)?
+            .inode_record_only(parent_id)?
             .xattrs
             .get(ACL_DEFAULT)
             .and_then(|raw| tidefs_posix_acl::decode_posix_acl_xattr(raw).ok());
@@ -8685,7 +8685,7 @@ impl LocalFileSystem {
         // --- POSIX ACL default inheritance (Phase 6) ---
         const ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
         let parent_default_acl_entries: Option<tidefs_posix_acl::PosixAcl> = self
-            .inode(parent_id)?
+            .inode_record_only(parent_id)?
             .xattrs
             .get(ACL_DEFAULT)
             .and_then(|raw| tidefs_posix_acl::decode_posix_acl_xattr(raw).ok());
@@ -10713,7 +10713,7 @@ impl LocalFileSystem {
         })?;
         validate_name(&name)?;
         let parent_id = self.resolve_parts(&parts, path)?;
-        let parent = self.inode(parent_id)?;
+        let parent = self.inode_record_only(parent_id)?;
         if !parent.is_directory() {
             return Err(FileSystemError::NotDirectory {
                 path: render_path(&parts),
@@ -10903,6 +10903,35 @@ impl LocalFileSystem {
             },
         );
         Ok(self.adjust_for_write_buffer(inode_id, record))
+    }
+
+    /// Return only inode metadata without admitting a directory listing into the
+    /// inode cache. Create-family parent checks need xattrs and type bits, not a
+    /// clone of every child in a hot directory.
+    fn inode_record_only(&self, inode_id: InodeId) -> Result<InodeRecord> {
+        if let Some(inode) = self.state.inodes.get(&inode_id) {
+            return Ok(self.adjust_for_write_buffer(inode_id, inode.clone()));
+        }
+        if !self.state.known_inode_ids.contains(&inode_id) && inode_id != ROOT_INODE_ID {
+            return Err(FileSystemError::CorruptState {
+                reason: "inode id is missing from the inode table",
+            });
+        }
+        let key = inode_object_key(inode_id);
+        let bytes =
+            self.store
+                .raw_primary_store()
+                .get(key)?
+                .ok_or(FileSystemError::CorruptState {
+                    reason: "known inode id references a missing inode object in store",
+                })?;
+        let inode = decode_inode(&bytes)?;
+        if inode.inode_id != inode_id {
+            return Err(FileSystemError::CorruptState {
+                reason: "inode object id does not match requested id",
+            });
+        }
+        Ok(self.adjust_for_write_buffer(inode_id, inode))
     }
 
     /// Adjust the inode size to account for buffered writes that

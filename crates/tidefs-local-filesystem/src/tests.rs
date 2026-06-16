@@ -1307,6 +1307,26 @@ fn metadata_mutations_count_once_toward_commit_group_target() {
 }
 
 #[test]
+fn create_family_parent_preflights_do_not_cache_directory_listing() {
+    let root = temp_root("create-parent-preflight-cache");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.set_auto_commit(false);
+    let cache_before = fs.inode_cache.borrow().report();
+
+    fs.create_dir("/dir-a", 0o755).expect("create first dir");
+    fs.create_dir("/dir-b", 0o755).expect("create second dir");
+    fs.create_file("/file-a", 0o644).expect("create file");
+
+    let cache_after = fs.inode_cache.borrow().report();
+    assert_eq!(cache_after.insertions, cache_before.insertions);
+    assert_eq!(cache_after.resident_entries, cache_before.resident_entries);
+    assert_eq!(fs.uncommitted_mutation_count(), 3);
+    fs.rollback_mutation_delta();
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
 fn truncate_rewrites_boundary_chunk_and_drops_tail_refs() {
     let root = temp_root("chunked-truncate");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
