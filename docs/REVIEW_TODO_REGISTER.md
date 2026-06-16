@@ -1179,14 +1179,22 @@ Important 2026-06-01 findings:
   and
   Rows after `generic/102` from the first shared `101-110` run and deferred
   `generic/128` through `generic/130` rows from the shared `121-130` run are
-  final buckets are 14 PASS rows (`generic/101`, `103`, `104`, `106`, `107`,
+  final buckets were 14 PASS rows (`generic/101`, `103`, `104`, `106`, `107`,
   `109`, `112`, `117`, `120`, `124`, `126`, `131`, `132`, `141`), 3 product
   FAIL rows (`generic/102`, `127`, `129`), 29 unsupported rows, and 4 skipped
   rows, with no deferred, harness-fail, or environment-refusal rows in the
-  accepted matrix. The product failures point at repeated clean remount/replay
+  accepted matrix. The product failures pointed at repeated clean remount/replay
   records `linux_ref: none` against `forgeadmin/linux:tidefs/linux-7.0`; no
-  Linux source patch is required for this classification issue. This
-  not as TFR-018 closure.
+  Linux source patch was required. Issue #335 / PR #336 narrowed this tranche
+  by fixing mounted-kernel live-data allocator tail reuse: issue-branch
+  `k7-vfs` dispatch
+  https://github.com/tidefs/tidefs/actions/runs/27624454132 passed
+  `generic/102`, `generic/127`, and `generic/129` with no product-fail,
+  harness-fail, environment-refusal, deferred, unsupported, or skipped rows,
+  and control dispatch https://github.com/tidefs/tidefs/actions/runs/27625310616
+  kept `generic/101` passing. Broader TFR-018 recovery, fsync/syncfs,
+  writeback, mmap, direct-I/O, no-daemon residency, and full xfstests coverage
+  remain open; this is not TFR-018 closure.
 - `TFR-018`: the #6591 Linux 7.0 mounted-kernel VFS xfstests tranche now has
   `tidefs_posix_vfs.ko` matching the generated NixOS VM kernel. The accepted
   matrix uses
