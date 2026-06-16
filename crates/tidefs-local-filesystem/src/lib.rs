@@ -671,14 +671,14 @@ struct MutationDelta {
 }
 
 #[derive(Debug)]
-struct CoalescedBufferedWritePatch {
+struct CoalescedBufferedWritePatch<'a> {
     offset: u64,
-    bytes: Vec<u8>,
+    bytes: &'a [u8],
 }
 
 fn dirty_patch_batch_allocation_bytes(
     new_size: u64,
-    patches: &[CoalescedBufferedWritePatch],
+    patches: &[CoalescedBufferedWritePatch<'_>],
 ) -> Result<u64> {
     if new_size == 0 || patches.is_empty() {
         return Ok(0);
@@ -5751,10 +5751,10 @@ impl LocalFileSystem {
 
     // ── Write-buffer management ───────────────────────────────
 
-    fn coalesced_write_buffer_patches(
+    fn coalesced_write_buffer_patches<'a>(
         &self,
-        segments: &[(u64, Vec<u8>)],
-    ) -> Result<Vec<CoalescedBufferedWritePatch>> {
+        segments: &'a [(u64, Vec<u8>)],
+    ) -> Result<Vec<CoalescedBufferedWritePatch<'a>>> {
         let mut patches = Vec::with_capacity(segments.len());
         for (offset, data) in segments {
             if data.is_empty() {
@@ -5762,7 +5762,7 @@ impl LocalFileSystem {
             }
             patches.push(CoalescedBufferedWritePatch {
                 offset: *offset,
-                bytes: data.clone(),
+                bytes: data.as_slice(),
             });
         }
         Ok(patches)
@@ -5857,7 +5857,7 @@ impl LocalFileSystem {
         &mut self,
         inode_id: InodeId,
         mut record: InodeRecord,
-        patches: &[CoalescedBufferedWritePatch],
+        patches: &[CoalescedBufferedWritePatch<'_>],
         new_size: u64,
         allow_holes: bool,
     ) -> Result<InodeRecord> {
@@ -6005,6 +6005,7 @@ impl LocalFileSystem {
                 true,
             ) {
                 Ok(_) => {
+                    drop(patches);
                     self.finalize_drained_write_segments(inode_id, segments);
                     return Ok(());
                 }
@@ -6042,7 +6043,7 @@ impl LocalFileSystem {
                 inode_id,
                 record,
                 patch.offset,
-                &patch.bytes,
+                patch.bytes,
                 new_size,
                 true,
             ) {
