@@ -1375,6 +1375,7 @@ pub struct LocalFileSystem {
     // INTENT: kept for planned architecture; callers in test modules or pending wiring into FUSE dispatch
     state_before_transaction: Option<FileSystemState>,
     mutation_delta: Option<MutationDelta>,
+    mutation_recorded_commit_group_write: bool,
     domain_registry: SpaceDomainRegistry,
     /// Runtime write-admission state with hard dirty-byte/op/age caps.
     /// Every dirty producer must acquire an [`AdmissionPermit`] before
@@ -3074,6 +3075,7 @@ impl LocalFileSystem {
             max_uncommitted_mutations: DEFAULT_MAX_UNCOMMITTED_MUTATIONS,
             in_transaction: false,
             mutation_delta: None,
+            mutation_recorded_commit_group_write: false,
             domain_registry: SpaceDomainRegistry::new(),
             state_before_transaction: None,
             write_admission: LocalWriteAdmission::new(Default::default()),
@@ -5975,7 +5977,8 @@ impl LocalFileSystem {
         if dirty_allocation_bytes > 0 {
             self.dirty_set
                 .record_data_write(inode_id, dirty_allocation_bytes);
-            let _accepted_by_commit_group = self.commit_group.record_write(dirty_allocation_bytes);
+            let _accepted_by_commit_group =
+                self.record_mutation_commit_group_write(dirty_allocation_bytes);
         }
         self.obligation_ledger.release_claims_for_inode(inode_id);
         if new_blocks > 0 {
@@ -9075,7 +9078,8 @@ impl LocalFileSystem {
         if dirty_allocation_bytes > 0 {
             self.dirty_set
                 .record_data_write(inode_id, dirty_allocation_bytes);
-            let _accepted_by_commit_group = self.commit_group.record_write(dirty_allocation_bytes);
+            let _accepted_by_commit_group =
+                self.record_mutation_commit_group_write(dirty_allocation_bytes);
         }
         // Release old claims and register new allocation claim per Rule 8
         // (space-as-claimed-capital: every allocation is an obligation)
@@ -9120,6 +9124,10 @@ impl LocalFileSystem {
     }
 
     fn commit_mutation<T>(&mut self, value: T) -> Result<T> {
+        if !self.mutation_recorded_commit_group_write {
+            let _accepted_by_commit_group = self.record_mutation_commit_group_write(0);
+        }
+
         if self.auto_commit {
             return self.force_commit(value);
         }
@@ -10206,7 +10214,6 @@ impl LocalFileSystem {
             });
         }
         self.dirty_set.record_metadata_op(inode_id);
-        let _accepted_by_commit_group = self.commit_group.record_write(0);
         self.state.dirty_inodes.insert(inode_id);
     }
 
@@ -10222,8 +10229,13 @@ impl LocalFileSystem {
             });
         }
         self.dirty_set.record_dir_op(inode_id);
-        let _accepted_by_commit_group = self.commit_group.record_write(0);
         self.state.dirty_dirs.insert(inode_id);
+    }
+
+    fn record_mutation_commit_group_write(&mut self, byte_delta: u64) -> bool {
+        let accepted = self.commit_group.record_write(byte_delta);
+        self.mutation_recorded_commit_group_write = true;
+        accepted
     }
     /// Bump parent directory nlink, mtime, and ctime when a subdirectory
     /// is created or moved in.  Directories start with nlink ≥ 2 (. and ..);
@@ -10314,6 +10326,7 @@ impl LocalFileSystem {
     }
 
     fn begin_mutation(&mut self) {
+        self.mutation_recorded_commit_group_write = false;
         if self.mutation_delta.is_none() {
             // Snapshot the dirty-page tracker for rollback.
             let old_dirty_pages = self

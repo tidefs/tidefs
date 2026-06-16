@@ -1274,6 +1274,39 @@ fn overlay_write_commits_when_padded_dirty_bytes_cross_target() {
 }
 
 #[test]
+fn metadata_mutations_count_once_toward_commit_group_target() {
+    let root = temp_root("metadata-mutations-count-once");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+    fs.commit_group.config.commit_group_target_ops = 3;
+    fs.commit_group.config.commit_group_target_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_dirty_max_bytes = u64::MAX;
+    fs.commit_group.config.commit_group_target_secs = 3600.0;
+    let start_commit_group = fs.commit_group.current_commit_group().0;
+
+    fs.create_dir("/a", 0o755).expect("create first dir");
+    assert_eq!(fs.commit_group.current_commit_group().0, start_commit_group);
+    assert_eq!(fs.commit_group.dirty_ops, 1);
+
+    fs.create_dir("/b", 0o755).expect("create second dir");
+    assert_eq!(fs.commit_group.current_commit_group().0, start_commit_group);
+    assert_eq!(fs.commit_group.dirty_ops, 2);
+
+    fs.create_dir("/c", 0o755).expect("create third dir");
+    assert!(
+        fs.commit_group.current_commit_group().0 > start_commit_group,
+        "third metadata mutation should reach the configured op target"
+    );
+    assert_eq!(fs.uncommitted_mutation_count(), 0);
+    assert_eq!(fs.commit_group.dirty_ops, 0);
+    assert!(fs.dirty_set.is_clean());
+    assert!(!fs.is_state_dirty());
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
 fn truncate_rewrites_boundary_chunk_and_drops_tail_refs() {
     let root = temp_root("chunked-truncate");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
