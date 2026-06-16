@@ -1196,14 +1196,10 @@ fn validate_vfs_copy_file_range_plan(
         return Err(Errno::EINVAL);
     }
 
-    if plan.len != 0 && (plan.offset_in != 0 || plan.offset_out != 0) {
-        return Err(Errno::EOPNOTSUPP);
-    }
-
     Ok(plan)
 }
 
-fn validate_vfs_copy_file_range_fast_path(
+fn validate_vfs_copy_file_range_engine_path(
     engine: &(dyn VfsEngineStatFs + Send),
     ctx: &RequestCtx,
     plan: &FuseCopyFileRangePlan,
@@ -1217,10 +1213,6 @@ fn validate_vfs_copy_file_range_fast_path(
     let source_attr = engine.getattr(InodeId::new(plan.ino_in), Some(source_fh), ctx)?;
     let dest_attr = engine.getattr(InodeId::new(plan.ino_out), Some(dest_fh), ctx)?;
     if source_attr.kind != NodeKind::File || dest_attr.kind != NodeKind::File {
-        return Err(Errno::EOPNOTSUPP);
-    }
-    if source_attr.posix.size == 0 || source_attr.posix.size > plan.len || dest_attr.posix.size != 0
-    {
         return Err(Errno::EOPNOTSUPP);
     }
 
@@ -10179,7 +10171,7 @@ impl Filesystem for FuseVfsAdapter {
         };
         let engine = self.engine.lock().unwrap();
         let result = match dispatch {
-            CopyDispatch::Registered(dispatch) => match validate_vfs_copy_file_range_fast_path(
+            CopyDispatch::Registered(dispatch) => match validate_vfs_copy_file_range_engine_path(
                 &**engine,
                 &ctx,
                 &dispatch.plan,
@@ -20378,18 +20370,18 @@ mod tests {
             &copy_file_range_request(CopyFileRangeFixture {
                 ino_in: 42,
                 fh_in: source,
-                offset_in: 0,
+                offset_in: 128,
                 ino_out: 43,
                 fh_out: dest,
-                offset_out: 0,
+                offset_out: 256,
                 len: 4096,
                 flags: 0,
             }),
         )
         .expect("copy dispatch plan");
 
-        assert_eq!(dispatch.plan.offset_in, 0);
-        assert_eq!(dispatch.plan.offset_out, 0);
+        assert_eq!(dispatch.plan.offset_in, 128);
+        assert_eq!(dispatch.plan.offset_out, 256);
         assert_eq!(dispatch.plan.len, 4096);
         assert_eq!(dispatch.source_fh.inode_id, InodeId::new(42));
         assert_eq!(dispatch.source_fh.fh_id, FileHandleId::new(11));
@@ -20475,42 +20467,10 @@ mod tests {
             ),
             Err(Errno::EBADF)
         );
-        assert_eq!(
-            plan_vfs_copy_file_range_dispatch(
-                &table,
-                &copy_file_range_request(CopyFileRangeFixture {
-                    ino_in: 42,
-                    fh_in: read_only,
-                    offset_in: 128,
-                    ino_out: 43,
-                    fh_out: write_only,
-                    offset_out: 0,
-                    len: 1,
-                    flags: 0,
-                }),
-            ),
-            Err(Errno::EOPNOTSUPP)
-        );
-        assert_eq!(
-            plan_vfs_copy_file_range_dispatch(
-                &table,
-                &copy_file_range_request(CopyFileRangeFixture {
-                    ino_in: 42,
-                    fh_in: read_only,
-                    offset_in: 0,
-                    ino_out: 42,
-                    fh_out: read_only,
-                    offset_out: 128,
-                    len: 1,
-                    flags: 0,
-                }),
-            ),
-            Err(Errno::EOPNOTSUPP)
-        );
     }
 
     #[test]
-    fn copy_file_range_dispatch_rejects_same_inode_overlap_and_nonzero_ranges() {
+    fn copy_file_range_dispatch_rejects_same_inode_overlap_but_allows_nonoverlap() {
         let mut table = AdapterFileHandleTable::default();
         let source = table.allocate(
             42,
@@ -20523,22 +20483,22 @@ mod tests {
             EngineFileHandle::new(InodeId::new(0), 0, FileHandleId::new(12), 0),
         );
 
-        assert_eq!(
-            plan_vfs_copy_file_range_dispatch(
-                &table,
-                &copy_file_range_request(CopyFileRangeFixture {
-                    ino_in: 42,
-                    fh_in: source,
-                    offset_in: 0,
-                    ino_out: 42,
-                    fh_out: dest,
-                    offset_out: 128,
-                    len: 128,
-                    flags: 0,
-                }),
-            ),
-            Err(Errno::EOPNOTSUPP)
-        );
+        let dispatch = plan_vfs_copy_file_range_dispatch(
+            &table,
+            &copy_file_range_request(CopyFileRangeFixture {
+                ino_in: 42,
+                fh_in: source,
+                offset_in: 0,
+                ino_out: 42,
+                fh_out: dest,
+                offset_out: 128,
+                len: 128,
+                flags: 0,
+            }),
+        )
+        .expect("same-inode non-overlapping copy dispatch");
+        assert_eq!(dispatch.plan.offset_in, 0);
+        assert_eq!(dispatch.plan.offset_out, 128);
         assert_eq!(
             plan_vfs_copy_file_range_dispatch(
                 &table,
@@ -20558,7 +20518,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_file_range_fast_path_allows_whole_source_into_empty_dest() {
+    fn copy_file_range_engine_path_allows_whole_source_into_empty_dest() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
         let (source_inode, source_adapter_fh, source_engine_fh) = create_adapter_file_handle(
@@ -20605,7 +20565,7 @@ mod tests {
 
         let copied = {
             let engine = fixture.adapter.engine.lock().unwrap();
-            validate_vfs_copy_file_range_fast_path(
+            validate_vfs_copy_file_range_engine_path(
                 &**engine,
                 &ctx,
                 &dispatch.plan,
@@ -20630,7 +20590,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_file_range_fast_path_rejects_nonempty_destination() {
+    fn copy_file_range_engine_path_allows_nonempty_destination() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
         let (source_inode, source_adapter_fh, source_engine_fh) = create_adapter_file_handle(
@@ -20665,17 +20625,34 @@ mod tests {
             offset_out: 0,
             len: 6,
         };
+        let dispatch = VfsCopyFileRangeDispatch {
+            plan,
+            source_fh: source_engine_fh,
+            dest_fh: dest_engine_fh,
+        };
 
-        let engine = fixture.adapter.engine.lock().unwrap();
-        assert_eq!(
-            validate_vfs_copy_file_range_fast_path(
+        let copied = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            validate_vfs_copy_file_range_engine_path(
                 &**engine,
                 &ctx,
-                &plan,
-                &source_engine_fh,
-                &dest_engine_fh,
-            ),
-            Err(Errno::EOPNOTSUPP)
+                &dispatch.plan,
+                &dispatch.source_fh,
+                &dispatch.dest_fh,
+            )
+            .expect("nonempty destination still uses engine path");
+            fixture
+                .adapter
+                .copy_file_range_with_engine(&**engine, &ctx, dispatch)
+                .expect("copy into nonempty destination")
+        };
+        assert_eq!(copied, 6);
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_read(&ctx, dest_inode.get(), dest_adapter_fh, 0, 6, None)
+                .expect("read copied destination"),
+            b"source"
         );
     }
 
