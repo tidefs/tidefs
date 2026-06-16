@@ -955,11 +955,28 @@ impl DirtyPageTracker {
     /// Return all dirty byte ranges for `inode`, ordered by offset.
     #[must_use]
     pub fn get_dirty_ranges(&self, inode: u64) -> Vec<DirtyRange> {
-        self.entries
+        self.inode_entries(inode)
             .iter()
-            .filter(|e| e.inode == inode)
             .map(|e| DirtyRange::new(e.inode, e.offset_start, e.offset_end))
             .collect()
+    }
+
+    /// Return true if `inode` has any tracked dirty byte ranges.
+    #[must_use]
+    pub fn has_dirty_ranges(&self, inode: u64) -> bool {
+        !self.inode_entries(inode).is_empty()
+    }
+
+    /// Return true if `inode` has a dirty range that overlaps
+    /// `[offset_start, offset_end)`.
+    #[must_use]
+    pub fn overlaps_range(&self, inode: u64, offset_start: u64, offset_end: u64) -> bool {
+        if offset_start >= offset_end {
+            return false;
+        }
+        self.inode_entries(inode)
+            .iter()
+            .any(|e| e.offset_start < offset_end && offset_start < e.offset_end)
     }
 
     /// Return all dirty byte ranges for `inode` with their boundary tokens,
@@ -969,9 +986,8 @@ impl DirtyPageTracker {
         &self,
         inode: u64,
     ) -> Vec<(DirtyRange, FsyncBoundaryToken)> {
-        self.entries
+        self.inode_entries(inode)
             .iter()
-            .filter(|e| e.inode == inode)
             .map(|e| {
                 (
                     DirtyRange::new(e.inode, e.offset_start, e.offset_end),
@@ -984,12 +1000,9 @@ impl DirtyPageTracker {
     /// Total dirty bytes for `inode` across all coalesced ranges.
     #[must_use]
     pub fn dirty_bytes(&self, inode: u64) -> u64 {
-        self.entries
-            .iter()
-            .filter(|e| e.inode == inode)
-            .fold(0_u64, |acc, e| {
-                acc.saturating_add(e.offset_end.saturating_sub(e.offset_start))
-            })
+        self.inode_entries(inode).iter().fold(0_u64, |acc, e| {
+            acc.saturating_add(e.offset_end.saturating_sub(e.offset_start))
+        })
     }
 
     /// Return every (inode, start, end) tuple currently tracked.
@@ -1010,9 +1023,8 @@ impl DirtyPageTracker {
         &self,
         inode: u64,
     ) -> Vec<(DirtyRange, u64, FsyncBoundaryToken)> {
-        self.entries
+        self.inode_entries(inode)
             .iter()
-            .filter(|e| e.inode == inode)
             .map(|e| {
                 (
                     DirtyRange::new(e.inode, e.offset_start, e.offset_end),
@@ -1070,9 +1082,8 @@ impl DirtyPageTracker {
         if offset_start >= offset_end {
             return None;
         }
-        self.entries
+        self.inode_entries(inode)
             .iter()
-            .filter(|e| e.inode == inode)
             .find(|e| {
                 // Overlap: entry_start < query_end AND query_start < entry_end
                 e.offset_start < offset_end && offset_start < e.offset_end
@@ -1112,10 +1123,24 @@ impl DirtyPageTracker {
         inode: u64,
         boundary_token: FsyncBoundaryToken,
     ) -> usize {
-        let before = self.entries.len();
-        self.entries
-            .retain(|e| !(e.inode == inode && e.boundary <= boundary_token));
-        before.saturating_sub(self.entries.len())
+        let (start, end) = self.inode_entry_bounds(inode);
+        if start == end {
+            return 0;
+        }
+
+        let mut cleared = 0usize;
+        let mut next = Vec::with_capacity(end.saturating_sub(start));
+        for entry in self.entries[start..end].iter().copied() {
+            if entry.boundary <= boundary_token {
+                cleared = cleared.saturating_add(1);
+            } else {
+                next.push(entry);
+            }
+        }
+        if cleared != 0 {
+            self.entries.splice(start..end, next);
+        }
+        cleared
     }
 
     /// Remove all dirty ranges across all inodes whose boundary token
@@ -1143,11 +1168,15 @@ impl DirtyPageTracker {
             return 0;
         }
 
+        let (start, end) = self.inode_entry_bounds(inode);
+        if start == end {
+            return 0;
+        }
+
         let mut cleared = 0usize;
-        let mut next = Vec::with_capacity(self.entries.len());
-        for entry in self.entries.drain(..) {
-            if entry.inode != inode || entry.offset_end <= offset || entry.offset_start >= clear_end
-            {
+        let mut next = Vec::with_capacity(end.saturating_sub(start).saturating_add(1));
+        for entry in self.entries[start..end].iter().copied() {
+            if entry.offset_end <= offset || entry.offset_start >= clear_end {
                 next.push(entry);
                 continue;
             }
@@ -1166,11 +1195,24 @@ impl DirtyPageTracker {
                 });
             }
         }
-        self.entries = next;
+        if cleared != 0 {
+            self.entries.splice(start..end, next);
+        }
         cleared
     }
 
     // ── internals ───────────────────────────────────────────────────────
+
+    fn inode_entry_bounds(&self, inode: u64) -> (usize, usize) {
+        let start = self.entries.partition_point(|e| e.inode < inode);
+        let end = start + self.entries[start..].partition_point(|e| e.inode == inode);
+        (start, end)
+    }
+
+    fn inode_entries(&self, inode: u64) -> &[DirtyPageEntry] {
+        let (start, end) = self.inode_entry_bounds(inode);
+        &self.entries[start..end]
+    }
 
     /// Insert a dirty-page entry and merge it with any adjacent or
     /// overlapping entry for the same inode.
@@ -1183,13 +1225,9 @@ impl DirtyPageTracker {
         dirtied_at_ms: u64,
     ) {
         // Find where this entry belongs in sorted order.
-        let mut insert_at = self.entries.len();
-        for (i, e) in self.entries.iter().enumerate() {
-            if e.inode > inode || (e.inode == inode && e.offset_start >= offset_start) {
-                insert_at = i;
-                break;
-            }
-        }
+        let mut insert_at = self.entries.partition_point(|e| {
+            e.inode < inode || (e.inode == inode && e.offset_start < offset_start)
+        });
 
         let mut merged = DirtyPageEntry {
             inode,
@@ -4895,6 +4933,23 @@ mod tests {
     }
 
     #[test]
+    fn dirty_range_predicates_stay_scoped_to_target_inode() {
+        let mut t = DirtyPageTracker::new();
+        for inode in 1..=128 {
+            t.mark_dirty(inode, 0, 4096).unwrap();
+        }
+        t.mark_dirty(77, 16384, 4096).unwrap();
+
+        assert!(t.has_dirty_ranges(77));
+        assert!(!t.has_dirty_ranges(999));
+        assert!(t.overlaps_range(77, 2048, 3072));
+        assert!(t.overlaps_range(77, 16 * 1024, 20 * 1024));
+        assert!(!t.overlaps_range(77, 8192, 12288));
+        assert!(!t.overlaps_range(78, 16 * 1024, 20 * 1024));
+        assert!(!t.overlaps_range(77, 4096, 4096));
+    }
+
+    #[test]
     fn take_boundary_returns_closed_token_and_increments() {
         let mut t = DirtyPageTracker::new();
         assert_eq!(t.current_boundary(), 1);
@@ -4989,6 +5044,7 @@ mod tests {
     #[test]
     fn clear_range_splits_dirty_range_without_touching_other_inodes() {
         let mut t = DirtyPageTracker::new();
+        t.mark_dirty(6, 0, 4096).unwrap();
         t.mark_dirty(7, 0, 16 * 1024).unwrap();
         t.mark_dirty(8, 0, 4096).unwrap();
 
@@ -4996,13 +5052,14 @@ mod tests {
 
         assert_eq!(cleared, 1);
         assert_eq!(
-            t.get_dirty_ranges(7),
+            t.all_dirty_ranges(),
             vec![
-                DirtyRange::new(7, 0, 4096),
-                DirtyRange::new(7, 8192, 16 * 1024),
+                (6, 0, 4096),
+                (7, 0, 4096),
+                (7, 8192, 16 * 1024),
+                (8, 0, 4096),
             ]
         );
-        assert_eq!(t.get_dirty_ranges(8), vec![DirtyRange::new(8, 0, 4096)]);
     }
 
     #[test]

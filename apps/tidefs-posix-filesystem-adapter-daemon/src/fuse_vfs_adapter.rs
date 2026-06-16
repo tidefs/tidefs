@@ -6460,9 +6460,7 @@ impl FuseVfsAdapter {
         let worker_overlap = worker_tracker
             .lock()
             .unwrap()
-            .get_dirty_ranges(ino)
-            .into_iter()
-            .any(|range| range.offset_start < end && offset < range.offset_end);
+            .overlaps_range(ino, offset, end);
         worker_overlap
     }
 
@@ -6501,11 +6499,7 @@ impl FuseVfsAdapter {
             }
         }
         let worker_tracker = self.write_dispatch.lock().unwrap().dirty_page_tracker_arc();
-        let worker_has_dirty_ranges = !worker_tracker
-            .lock()
-            .unwrap()
-            .get_dirty_ranges(ino)
-            .is_empty();
+        let worker_has_dirty_ranges = worker_tracker.lock().unwrap().has_dirty_ranges(ino);
         worker_has_dirty_ranges
     }
 
