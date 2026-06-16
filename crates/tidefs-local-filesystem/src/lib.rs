@@ -9951,9 +9951,13 @@ impl LocalFileSystem {
     pub fn fdatasync_inode(&mut self, inode_id: InodeId, datasync: bool) -> Result<()> {
         let started = Instant::now();
 
+        let had_dirty_buffer = self
+            .write_buffers
+            .get(&inode_id)
+            .is_some_and(|buffer| !buffer.is_empty());
         self.flush_write_buffer(inode_id)?;
 
-        if datasync && !self.state.dirty_content.contains(&inode_id) {
+        if datasync && !had_dirty_buffer && !self.state.dirty_content.contains(&inode_id) {
             return Ok(());
         }
 
