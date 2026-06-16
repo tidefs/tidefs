@@ -3422,11 +3422,15 @@ impl LocalObjectStore {
             .sync_all()
             .map_err(|source| io_error("sync_all", &path, source))?;
         sync_directory(&self.segments_dir)?;
-        // Write a full spacemap checkpoint on explicit sync (pool close / flush).
-        write_spacemap_checkpoint(&self.segments_dir, &self.free_map, false)?;
+        // Explicit sync only needs a spacemap checkpoint after allocation/free
+        // state changed since the last successful checkpoint.
+        let spacemap_dirty = !self.free_map.dirty_segment_groups().is_empty();
+        if spacemap_dirty {
+            write_spacemap_checkpoint(&self.segments_dir, &self.free_map, false)?;
+            self.free_map.clear_dirty_segment_groups();
+        }
         write_scrub_cursor(&self.segments_dir, &self.scrub_cursor)?;
         write_suspect_log(&self.segments_dir, &self.suspect_log)?;
-        self.free_map.clear_dirty_segment_groups();
 
         // Sync all replica stores to durable media.
         // Individual replica sync failures degrade but do not
