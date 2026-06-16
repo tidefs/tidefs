@@ -1,9 +1,11 @@
 # Kernel Resident Pool Engine Architecture
 
-This document is the implementation authority for the Linux 7.0 kernel-resident
-TideFS runtime. It connects the POSIX VFS module, block-volume module, imported
-physical block devices, transaction/replay state, and kernel execution contexts
-into one design.
+This document is the current target-architecture spec and evidence-tier map for
+the Linux 7.0 kernel-resident TideFS runtime. It connects the POSIX VFS module,
+block-volume module, imported physical block devices, transaction/replay state,
+and kernel execution contexts into one design. It is not proof that the full
+kernel runtime, daemonless storage parity, crash recovery, object/extent replay,
+block-volume export, xfstests coverage, or production readiness exists today.
 
 It consumes:
 
@@ -17,9 +19,12 @@ It consumes:
 
 ## Current Release Interpretation
 
-Read this document with `docs/REVIEW_TODO_REGISTER.md` and
+Read this document with `docs/GITHUB_CI.md`,
+`docs/REVIEW_TODO_REGISTER.md`, and `validation/claims.toml`. Current evidence
+is bounded:
 
 - `#6219` proved a Linux 7.0 block-kmod bring-up data path in QEMU. That is
+  not a full block-volume product claim.
 - `#6225` proved partial POSIX VFS default-mount behavior and committed-root
   namespace/data readback still uses a fixed bring-up table.
 - `#6252` is the current root gate for replacing that table with committed-root
@@ -32,8 +37,9 @@ can close this architecture.
 
 ## Core Decision
 
-TideFS kernel mode has one pool/engine core per imported pool. The POSIX VFS
-module and the block-volume module are front-ends over that core.
+In the target architecture, TideFS kernel mode has one pool/engine core per
+imported pool. The POSIX VFS module and the block-volume module are front-ends
+over that core.
 
 They are not separate stores, not separate transaction authorities, and not
 daemon-backed escape paths.
@@ -52,10 +58,11 @@ physical block devices
   -> block-volume front-end    (/dev/tidefsN exports)
 ```
 
-The kernel pool core is the only in-kernel authority for mounted filesystem
-state, exported block-volume state, writeback, recovery, placement, reserve,
-and admission. Userspace tools may configure and inspect through declared
-kernel UAPI. They may not be required as always-running support daemons.
+In that target architecture, the kernel pool core is the only in-kernel
+authority for mounted filesystem state, exported block-volume state, writeback,
+recovery, placement, reserve, and admission. Userspace tools may configure and
+inspect through declared kernel UAPI. They may not be required as
+always-running support daemons for any behavior claimed as full-kernel.
 
 ## Current Implementation Tier
 
@@ -84,9 +91,10 @@ is no longer bootstrap-only:
   skip VRBT/VCRP publication with an explicit warning;
 - this table is deliberately a bring-up mirror. It is not the final
   object/extent/intent-log engine, not page-cache/writeback, not xfstests, not
-  must replace table readback with object/extent state rebuilt from committed
-  roots plus replayable intent records, or record the exact primitive that
-  blocks that replacement.
+  crash/remount proof, not block-volume export proof, and not production
+  readiness. A later issue must replace table readback with object/extent state
+  rebuilt from committed roots plus replayable intent records, or record the
+  exact primitive that blocks that replacement.
 
 Workers must use an explicit pool member/authority for mounted kernel VFS
 behavior. Bootstrap-only results prove only missing-authority refusal; they

@@ -1,17 +1,19 @@
 # Preview UAPI/ABI Boundary (OW-202)
 
-> TFR-019 authority note: this imported implementation note is review material,
-> the behavior below as needing reconciliation with current source,
-> `docs/REVIEW_TODO_REGISTER.md`, and `docs/WHOLE_REPO_REVIEW.md`.
+> TFR-019 authority note: this imported tracker-era note is historical input.
+> The checked preview authority is
+> `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`; this file must not be cited as a
+> current Linux ioctl/statx/ublk ABI, kernel module ABI, or production freeze.
 
 This document describes historical tracker item 202 for the preview boundary.
-It freezes the source-visible layout contract for `vfs_boundary_mirror` records in
-`crates/tidefs-schema-codec-vfs-boundary`, not a production Linux kernel UAPI.
+It captured an old source-visible layout snapshot for `vfs_boundary_mirror`
+records in the retired `crates/tidefs-schema-codec-vfs-boundary` path. Current
+source uses `crates/tidefs-schema-codec-vfs` for fixed-width VFS codec hooks.
 
-## Frozen Preview Surface
+## Historical Preview Surface
 
-The current preview boundary is the fixed-size mirror layer between portable VFS
-engine values and ABI-safe scalar records:
+This historical preview boundary recorded a fixed-size mirror layer between
+portable VFS engine values and ABI-safe scalar records:
 
 | Mirror | Size | Align | Continuity rule |
 |---|---:|---:|---|
@@ -24,8 +26,9 @@ engine values and ABI-safe scalar records:
 | `InodeAttrMirror` | 120 | 8 | Carries inode id, generation, node-kind tag, POSIX attrs, flags, and revision counters. |
 | `StatFsMirror` | 72 | 8 | Carries allocator/statfs projection scalars. |
 
-These layout numbers are implementation-tracked non-release by compile-time size assertions and unit
-tests in `crates/tidefs-schema-codec-vfs-boundary/src/lib.rs`.
+These layout numbers are not current release authority. They remain useful only
+as review input when comparing old mirror-layout expectations with the current
+`tidefs-schema-codec-vfs` codec hooks.
 
 ## Continuity Rules
 
@@ -34,7 +37,7 @@ tests in `crates/tidefs-schema-codec-vfs-boundary/src/lib.rs`.
 - `InodeAttrMirror` rejects unknown `NodeKind` tags during conversion back to
   the VFS engine type.
 - Variable-sized values such as request groups, directory-entry names, path
-  bytes, xattr bytes, and symlink payloads remain outside this frozen preview
+  bytes, xattr bytes, and symlink payloads remain outside this historical
   surface.
 - Mirror records are non-authoritative projections. Local filesystem truth,
   committed roots, policy receipts, and response/refusal semantics remain owned
@@ -42,13 +45,13 @@ tests in `crates/tidefs-schema-codec-vfs-boundary/src/lib.rs`.
 
 
 
+Historical validation command from the imported note:
+
 ```sh
 cargo test -p tidefs-schema-codec-vfs-boundary --all-targets
 ```
 
-
-```sh
-```
+That package name is no longer present in the current workspace.
 
 
 
@@ -56,4 +59,6 @@ cargo test -p tidefs-schema-codec-vfs-boundary --all-targets
 
 This is not a production Linux ioctl/statx/ublk ABI freeze, not a kernel module
 contract, and not proof that TideFS is kernelspace-ready. Later production UAPI
-work must either preserve these preview layouts or create a new compatibility
+work must either deliberately preserve any relevant preview shape or create a
+new tracked compatibility plan with implementation proof and an explicit freeze
+decision.

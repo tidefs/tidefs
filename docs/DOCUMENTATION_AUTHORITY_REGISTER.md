@@ -59,6 +59,24 @@ source behavior, `validation/claims.toml`, and `xtask check-claims-gate`.
 | `docs/design/end-to-end-checksum-architecture-g3-pillar.md` | Historical input | Imported canonical-design wording remains useful as target architecture, but its mandatory end-to-end, scrub, repair, erasure, and chain-of-trust claims exceed current claim-registry evidence. |
 | `docs/security/blake3-integrity-boundary.md` | Historical input | Imported release-train closeout note. It may inform review of residual BLAKE3 overfit, but its conformant-crate and closeout language is not current release authority. |
 
+### Kernel And Preview UAPI Authority
+
+Classified for TFR-011 / TFR-019 / GitHub issue #337 on 2026-06-16 after
+checking live source behavior, `docs/GITHUB_CI.md`,
+`docs/REVIEW_TODO_REGISTER.md`, `validation/claims.toml`, and the current
+claims gate. This slice does not change the claims-gate scanned surface:
+`docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md` remains the only scanned document in
+this set.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md` | Current spec | Binding only for the checked tidefsctl command classification/admission table and the current non-release VFS fixed-width codec hook description. It is scanned by the claims gate and must keep explicit non-claim wording for production Linux ioctl/statx/ublk ABI freeze, kernel module ABI freeze, distributed operator UAPI finality, and kernelspace readiness. |
+| `docs/UAPI_ABI_BOUNDARY_OW202.md` | Historical input | Tracker-era duplicate with the retired `tidefs-schema-codec-vfs-boundary` crate path and old mirror-layout table. It may inform preview layout review, but it is not current UAPI/ABI authority and must not be cited as a production Linux ioctl/statx/ublk or kernel module ABI freeze. |
+| `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md` | Current spec | Target architecture and evidence-tier map for kernel-resident pool-engine work. Current implementation evidence is the narrow Linux 7.0 QEMU configured-pool smoke described in `docs/GITHUB_CI.md`; full-kernel, daemonless storage parity, xfstests, crash/replay, object/extent engine, block-volume export, and production-readiness claims remain outside this status. |
+| `docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md` | Current policy | Binding only as the Linux 7.0 kernel development workflow: external-module or Linux-branch ownership, out-of-repo build output, disposable QEMU guests, and Nix/QEMU acceptance gates. It is not runtime maturity evidence and does not require broad kernel validation for documentation-only slices. |
+| `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md` | Current spec | Binding only for kernel-family rollout order, first-seam scope, and anti-regression constraints. It does not prove current full-kernel residency, no-daemon parity, block-volume behavior, xfstests coverage, crash recovery, distributed behavior, or production readiness. |
+| `docs/KERNEL_LOCKING_RCU_PINNING_WORKQUEUE_MODEL_P7-03.md` | Current spec | Binding only for the source-level locking, RCU, pin, workqueue, and acceptance-row model that later kernel work must consume. It is not a kernel implementation gate and not runtime proof until issue-scoped Kbuild/QEMU/fault evidence maps to the rows. |
+
 ## Initial Open Queue
 
 The first mechanical pass found 87 imported documents with maturity labels or
