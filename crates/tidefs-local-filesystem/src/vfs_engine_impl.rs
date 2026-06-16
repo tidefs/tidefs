@@ -4442,9 +4442,17 @@ impl VfsEngine for VfsLocalFileSystem {
             }
         }
 
+        let direct_dest_path =
+            if dest_is_anonymous || (dst.enforce_access_mode && dst.open_flags & O_APPEND != 0) {
+                None
+            } else {
+                Some(self.inode_path(dest_fh.inode_id)?)
+            };
+
         // Perform the copy via the read/write path.
         let mut copied = 0_u64;
         let mut source_was_read = false;
+        let mut dest_was_direct_written = false;
         while copied < requested {
             let remaining = requested - copied;
             let chunk_len = remaining.min(131072);
@@ -4483,30 +4491,80 @@ impl VfsEngine for VfsLocalFileSystem {
             }
             source_was_read = true;
             let write_offset = offset_out.checked_add(copied).ok_or(Errno::EINVAL)?;
-            let written = match self.write(dest_fh, write_offset, &chunk, ctx) {
-                Ok(written) => written,
-                Err(errno) => {
-                    if vfs_op_diagnostics_enabled() {
-                        eprintln!(
-                            "tidefs-diagnostic: vfs copy_file_range write error src_ino={} src_fh={} dst_ino={} dst_fh={} read_offset={} write_offset={} chunk_len={} copied={} requested={} errno={:?}",
-                            source_fh.inode_id.get(),
-                            source_fh.fh_id.0,
-                            dest_fh.inode_id.get(),
-                            dest_fh.fh_id.0,
-                            read_offset,
-                            write_offset,
-                            chunk.len(),
-                            copied,
-                            requested,
-                            errno
-                        );
+            let written = if let Some(dest_path) = direct_dest_path.as_deref() {
+                match self
+                    .fs
+                    .borrow_mut()
+                    .write_file_range_direct(dest_path, write_offset, &chunk)
+                {
+                    Ok(_) => {
+                        dest_was_direct_written = true;
+                        u32::try_from(chunk.len()).map_err(|_| Errno::EFBIG)?
                     }
-                    let _ = self.fs.borrow_mut().apply_deferred_timestamp_update(
-                        source_fh.inode_id,
-                        TimestampUpdate::Read,
-                        self.timestamp_policy,
-                    );
-                    return Err(errno);
+                    Err(err) => {
+                        let errno = map_errno(&err);
+                        if vfs_op_diagnostics_enabled() {
+                            eprintln!(
+                                "tidefs-diagnostic: vfs copy_file_range direct write error src_ino={} src_fh={} dst_ino={} dst_fh={} read_offset={} write_offset={} chunk_len={} copied={} requested={} errno={:?} err={:?}",
+                                source_fh.inode_id.get(),
+                                source_fh.fh_id.0,
+                                dest_fh.inode_id.get(),
+                                dest_fh.fh_id.0,
+                                read_offset,
+                                write_offset,
+                                chunk.len(),
+                                copied,
+                                requested,
+                                errno,
+                                err
+                            );
+                        }
+                        if source_was_read || dest_was_direct_written {
+                            let mut fs = self.fs.borrow_mut();
+                            if source_was_read {
+                                let _ = fs.apply_deferred_timestamp_update(
+                                    source_fh.inode_id,
+                                    TimestampUpdate::Read,
+                                    self.timestamp_policy,
+                                );
+                            }
+                            if dest_was_direct_written {
+                                let _ = fs.apply_deferred_timestamp_update(
+                                    dest_fh.inode_id,
+                                    TimestampUpdate::Write,
+                                    self.timestamp_policy,
+                                );
+                            }
+                        }
+                        return Err(errno);
+                    }
+                }
+            } else {
+                match self.write(dest_fh, write_offset, &chunk, ctx) {
+                    Ok(written) => written,
+                    Err(errno) => {
+                        if vfs_op_diagnostics_enabled() {
+                            eprintln!(
+                                "tidefs-diagnostic: vfs copy_file_range write error src_ino={} src_fh={} dst_ino={} dst_fh={} read_offset={} write_offset={} chunk_len={} copied={} requested={} errno={:?}",
+                                source_fh.inode_id.get(),
+                                source_fh.fh_id.0,
+                                dest_fh.inode_id.get(),
+                                dest_fh.fh_id.0,
+                                read_offset,
+                                write_offset,
+                                chunk.len(),
+                                copied,
+                                requested,
+                                errno
+                            );
+                        }
+                        let _ = self.fs.borrow_mut().apply_deferred_timestamp_update(
+                            source_fh.inode_id,
+                            TimestampUpdate::Read,
+                            self.timestamp_policy,
+                        );
+                        return Err(errno);
+                    }
                 }
             };
             copied = copied.checked_add(u64::from(written)).ok_or(Errno::EFBIG)?;
@@ -4519,6 +4577,13 @@ impl VfsEngine for VfsLocalFileSystem {
             let _ = self.fs.borrow_mut().apply_deferred_timestamp_update(
                 source_fh.inode_id,
                 TimestampUpdate::Read,
+                self.timestamp_policy,
+            );
+        }
+        if dest_was_direct_written {
+            let _ = self.fs.borrow_mut().apply_deferred_timestamp_update(
+                dest_fh.inode_id,
+                TimestampUpdate::Write,
                 self.timestamp_policy,
             );
         }
@@ -4930,6 +4995,7 @@ fn lock_range_from_spec(lock: &LockSpec) -> Result<LockRange, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::write_buffer::WriteBufferConfig;
     use crate::RootAuthenticationKey;
     use std::path::PathBuf;
     use tidefs_space_accounting::{DatasetQuotaConfig, DatasetQuotaHierarchy};
@@ -8610,8 +8676,8 @@ mod tests {
         );
         assert_eq!(
             engine.fs.borrow().uncommitted_mutation_count(),
-            before_mutations,
-            "partial copy_file_range source atime should be deferred"
+            before_mutations + 1,
+            "partial copy_file_range should count the destination data rewrite only"
         );
         assert_eq!(
             engine.read(&dest_create, 0, 10, &ctx()).unwrap(),
@@ -8637,6 +8703,120 @@ mod tests {
 
         assert_eq!(copied, 2);
         assert_eq!(engine.read(&dest_create, 0, 16, &ctx()).unwrap(), b"bc");
+    }
+
+    #[test]
+    fn copy_file_range_direct_fallback_keeps_unrelated_dest_buffered_writes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_source_attr, source_create) = engine
+            .create(root, b"copy-direct-source.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let (_dest_attr, dest_create) = engine
+            .create(root, b"copy-direct-dest.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let source: Vec<u8> = (0..128).map(|idx| (idx + 1) as u8).collect();
+        let baseline = vec![0x11; 512];
+        engine.write(&source_create, 0, &source, &ctx()).unwrap();
+        engine.write(&dest_create, 0, &baseline, &ctx()).unwrap();
+        engine
+            .fs
+            .borrow_mut()
+            .flush_write_buffer(dest_create.inode_id)
+            .unwrap();
+        engine
+            .fs
+            .borrow_mut()
+            .set_write_buffer_config(WriteBufferConfig {
+                flush_threshold_bytes: 64,
+                flush_threshold_age: std::time::Duration::from_secs(60),
+            });
+        let outside_dirty = vec![0x5a; 60];
+        engine
+            .write(&dest_create, 384, &outside_dirty, &ctx())
+            .unwrap();
+
+        let copied = engine
+            .copy_file_range(&source_create, 8, &dest_create, 64, 16, &ctx())
+            .unwrap();
+
+        assert_eq!(copied, 16);
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(dest_create.inode_id, 384, outside_dirty.len())
+                .as_deref(),
+            Some(outside_dirty.as_slice()),
+            "copy_file_range must not flush unrelated dirty destination bytes"
+        );
+        assert_eq!(
+            engine.read(&dest_create, 64, 16, &ctx()).unwrap(),
+            source[8..24]
+        );
+        assert_eq!(
+            engine
+                .read(&dest_create, 384, outside_dirty.len() as u32, &ctx())
+                .unwrap(),
+            outside_dirty
+        );
+    }
+
+    #[test]
+    fn copy_file_range_direct_fallback_clears_overwritten_dest_buffered_writes() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_source_attr, source_create) = engine
+            .create(root, b"copy-direct-clear-source.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let (_dest_attr, dest_create) = engine
+            .create(root, b"copy-direct-clear-dest.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let source: Vec<u8> = (0..96).map(|idx| 0xa0_u8.wrapping_add(idx as u8)).collect();
+        engine.write(&source_create, 0, &source, &ctx()).unwrap();
+        engine.write(&dest_create, 0, &[0x33; 160], &ctx()).unwrap();
+        engine
+            .fs
+            .borrow_mut()
+            .flush_write_buffer(dest_create.inode_id)
+            .unwrap();
+        let stale = b"stale buffered bytes";
+        engine.write(&dest_create, 40, stale, &ctx()).unwrap();
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(dest_create.inode_id, 40, stale.len())
+                .as_deref(),
+            Some(stale.as_slice())
+        );
+
+        let copied = engine
+            .copy_file_range(
+                &source_create,
+                12,
+                &dest_create,
+                40,
+                stale.len() as u64,
+                &ctx(),
+            )
+            .unwrap();
+
+        assert_eq!(copied, stale.len() as u32);
+        assert!(
+            engine
+                .fs
+                .borrow()
+                .read_from_write_buffer(dest_create.inode_id, 40, stale.len())
+                .is_none(),
+            "overwritten destination bytes must not remain buffered"
+        );
+        assert_eq!(
+            engine
+                .read(&dest_create, 40, stale.len() as u32, &ctx())
+                .unwrap(),
+            source[12..12 + stale.len()]
+        );
     }
 
     #[test]
