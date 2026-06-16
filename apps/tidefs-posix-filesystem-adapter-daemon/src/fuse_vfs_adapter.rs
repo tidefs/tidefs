@@ -5752,6 +5752,9 @@ impl FuseVfsAdapter {
 
         let clean_writeback_write_through =
             is_writeback_cached && !posix_direct_io && self.block_volume.lock().unwrap().is_none();
+        let clean_plain_write_through = self.writeback_cache_enabled
+            && !posix_direct_io
+            && self.block_volume.lock().unwrap().is_none();
 
         // FUSE_WRITE_CACHE is still write-through to the engine.  The
         // asynchronous writeback authority is not complete enough to
@@ -6017,6 +6020,16 @@ impl FuseVfsAdapter {
                                     // it instead of forcing every O_DIRECT write
                                     // through a committed-root cycle.
                                     self.invalidate_caches_after_direct_write(ino);
+                                } else if clean_plain_write_through {
+                                    let written_len =
+                                        usize::try_from(written).map_err(|_| Errno::EIO)?;
+                                    let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
+                                    self.record_clean_write_through_after_write(
+                                        ino,
+                                        effective_offset as u64,
+                                        written,
+                                        written_data,
+                                    )?;
                                 } else {
                                     self.mark_dirty_after_write(
                                         &**e,
@@ -40512,6 +40525,114 @@ mod tests {
             1,
             "syncfs must commit the clean write-through txg descriptor"
         );
+    }
+
+    #[test]
+    fn writeback_cached_plain_write_through_reconciles_dirty_mirrors() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        fixture.adapter.writeback_range_tracker = Some(Arc::clone(&shared_tracker));
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-plain-write-through-clears-mirrors.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let page_size_u32 = u32::try_from(page_size).expect("page size fits u32");
+        let page_size_u64 = u64::try_from(page_size).expect("page size fits u64");
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert dirty mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("lookup dirty mirror");
+            page.data_mut().fill(0x33);
+            page.mark_dirty();
+        }
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, page_size_u32);
+        shared_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(inode, 0, page_size_u64);
+        worker_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, 0, page_size_u64)
+            .expect("seed worker dirty range");
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(ino);
+            cache.mark_dirty(ino, page_size_u64);
+        }
+
+        let payload = vec![0xCD; page_size];
+        let written = fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0, &payload, 0)
+            .expect("plain write on writeback-cache mount");
+        assert_eq!(written, payload.len() as u32);
+
+        assert!(fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_none_or(|ranges| ranges.is_empty()));
+        assert!(!shared_tracker.lock().unwrap().is_dirty(inode));
+        assert!(worker_tracker
+            .lock()
+            .unwrap()
+            .get_dirty_ranges(ino)
+            .is_empty());
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(false),
+            "plain write-through writes must not leave the inode reclaim cache dirty"
+        );
+        assert!(
+            fixture
+                .adapter
+                .write_page_cache
+                .dirty_pages_for_inode(ino)
+                .is_empty(),
+            "plain write-through writes must not leave dirty page mirrors"
+        );
+        let page = fixture
+            .adapter
+            .write_page_cache
+            .lookup(ino, 0)
+            .expect("dirty mirror remains resident");
+        assert_eq!(page.data(), payload.as_slice());
+        assert!(!page.is_dirty());
     }
 
     #[test]
