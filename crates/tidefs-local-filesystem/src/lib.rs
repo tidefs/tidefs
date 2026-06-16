@@ -671,22 +671,41 @@ struct MutationDelta {
 }
 
 #[derive(Debug)]
-struct BufferedChunkPatchPiece {
-    offset: u64,
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug)]
-struct BufferedChunkPatch {
-    start: u64,
-    end: u64,
-    pieces: Vec<BufferedChunkPatchPiece>,
-}
-
-#[derive(Debug)]
 struct CoalescedBufferedWritePatch {
     offset: u64,
     bytes: Vec<u8>,
+}
+
+fn dirty_patch_batch_allocation_bytes(
+    new_size: u64,
+    patches: &[CoalescedBufferedWritePatch],
+) -> Result<u64> {
+    if new_size == 0 || patches.is_empty() {
+        return Ok(0);
+    }
+
+    let mut touched_chunks = BTreeSet::new();
+    for patch in patches {
+        let Some((first_chunk, last_chunk)) =
+            overlay_chunk_index_bounds(new_size, patch.offset, patch.bytes.len())?
+        else {
+            continue;
+        };
+        for chunk_index in first_chunk..=last_chunk {
+            touched_chunks.insert(chunk_index);
+        }
+    }
+
+    let mut total = 0_u64;
+    for chunk_index in touched_chunks {
+        let chunk_len = u64::from(content_chunk_len(new_size, chunk_index)?);
+        total = total
+            .checked_add(crate::allocation::allocation_grains_for_len(chunk_len)?)
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+    }
+    Ok(total)
 }
 
 /// Captures old values of inodes, directories, and snapshots
@@ -5719,131 +5738,18 @@ impl LocalFileSystem {
 
     fn coalesced_write_buffer_patches(
         &self,
-        inode_id: InodeId,
-        base_record: &InodeRecord,
         segments: &[(u64, Vec<u8>)],
     ) -> Result<Vec<CoalescedBufferedWritePatch>> {
-        if let [(offset, data)] = segments {
-            return Ok(vec![CoalescedBufferedWritePatch {
-                offset: *offset,
-                bytes: data.clone(),
-            }]);
-        }
-
-        let chunk_size = content_chunk_size() as u64;
-        let mut chunks: BTreeMap<u64, BufferedChunkPatch> = BTreeMap::new();
-
+        let mut patches = Vec::with_capacity(segments.len());
         for (offset, data) in segments {
             if data.is_empty() {
                 continue;
             }
-            let data_len =
-                u64::try_from(data.len()).map_err(|_| FileSystemError::SizeOverflow {
-                    requested: u64::MAX,
-                })?;
-            let segment_end =
-                offset
-                    .checked_add(data_len)
-                    .ok_or(FileSystemError::SizeOverflow {
-                        requested: u64::MAX,
-                    })?;
-            let mut cursor = *offset;
-            let mut data_pos = 0usize;
-            while cursor < segment_end {
-                let chunk_index = cursor / chunk_size;
-                let next_chunk_start = (chunk_index + 1).checked_mul(chunk_size).ok_or(
-                    FileSystemError::SizeOverflow {
-                        requested: u64::MAX,
-                    },
-                )?;
-                let piece_end = segment_end.min(next_chunk_start);
-                let piece_len = usize::try_from(piece_end - cursor).map_err(|_| {
-                    FileSystemError::SizeOverflow {
-                        requested: piece_end - cursor,
-                    }
-                })?;
-                let data_end =
-                    data_pos
-                        .checked_add(piece_len)
-                        .ok_or(FileSystemError::SizeOverflow {
-                            requested: u64::MAX,
-                        })?;
-                let chunk = chunks
-                    .entry(chunk_index)
-                    .or_insert_with(|| BufferedChunkPatch {
-                        start: cursor,
-                        end: piece_end,
-                        pieces: Vec::new(),
-                    });
-                chunk.start = chunk.start.min(cursor);
-                chunk.end = chunk.end.max(piece_end);
-                chunk.pieces.push(BufferedChunkPatchPiece {
-                    offset: cursor,
-                    bytes: data[data_pos..data_end].to_vec(),
-                });
-                cursor = piece_end;
-                data_pos = data_end;
-            }
-        }
-
-        let mut patches = Vec::with_capacity(chunks.len());
-        for chunk in chunks.into_values() {
-            let overlay_len_u64 =
-                chunk
-                    .end
-                    .checked_sub(chunk.start)
-                    .ok_or(FileSystemError::SizeOverflow {
-                        requested: u64::MAX,
-                    })?;
-            let overlay_len =
-                usize::try_from(overlay_len_u64).map_err(|_| FileSystemError::SizeOverflow {
-                    requested: overlay_len_u64,
-                })?;
-            let mut overlay = vec![0_u8; overlay_len];
-
-            if chunk.start < base_record.size {
-                let base_len_u64 = base_record
-                    .size
-                    .saturating_sub(chunk.start)
-                    .min(overlay_len_u64);
-                let base_len =
-                    usize::try_from(base_len_u64).map_err(|_| FileSystemError::SizeOverflow {
-                        requested: base_len_u64,
-                    })?;
-                if base_len > 0 {
-                    let base = read_content_range_from_store(
-                        self.store.raw_primary_store(),
-                        inode_id,
-                        base_record,
-                        chunk.start,
-                        base_len,
-                        true,
-                        Some(&self.store),
-                    )?;
-                    overlay[..base.len()].copy_from_slice(&base);
-                }
-            }
-
-            for piece in chunk.pieces {
-                let dst = usize::try_from(piece.offset - chunk.start).map_err(|_| {
-                    FileSystemError::SizeOverflow {
-                        requested: piece.offset - chunk.start,
-                    }
-                })?;
-                let end =
-                    dst.checked_add(piece.bytes.len())
-                        .ok_or(FileSystemError::SizeOverflow {
-                            requested: u64::MAX,
-                        })?;
-                overlay[dst..end].copy_from_slice(&piece.bytes);
-            }
-
             patches.push(CoalescedBufferedWritePatch {
-                offset: chunk.start,
-                bytes: overlay,
+                offset: *offset,
+                bytes: data.clone(),
             });
         }
-
         Ok(patches)
     }
 
@@ -5918,12 +5824,7 @@ impl LocalFileSystem {
             &old_record,
         )?)?;
         let allocation_bytes = allocation_bytes(&planned_entries).unwrap_or(0);
-        let dirty_allocation_bytes = patches.iter().try_fold(0_u64, |sum, patch| {
-            let bytes = dirty_overlay_allocation_bytes(new_size, patch.offset, &patch.bytes)?;
-            sum.checked_add(bytes).ok_or(FileSystemError::SizeOverflow {
-                requested: u64::MAX,
-            })
-        })?;
+        let dirty_allocation_bytes = dirty_patch_batch_allocation_bytes(new_size, patches)?;
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
         if allocation_bytes > old_allocation_bytes {
             self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(inode_id))?;
@@ -6012,7 +5913,7 @@ impl LocalFileSystem {
             return Ok(());
         }
         let base_record = self.committed_inode_record(inode_id)?;
-        let patches = match self.coalesced_write_buffer_patches(inode_id, &base_record, &segments) {
+        let patches = match self.coalesced_write_buffer_patches(&segments) {
             Ok(patches) => patches,
             Err(err) => {
                 self.restore_drained_write_segments(inode_id, &segments);
@@ -6748,7 +6649,7 @@ impl LocalFileSystem {
         self.invalidate_hot_read_cache_for_inode(inode_id);
 
         let base_record = self.committed_inode_record(inode_id)?;
-        let patches = self.coalesced_write_buffer_patches(inode_id, &base_record, &segments)?;
+        let patches = self.coalesced_write_buffer_patches(&segments)?;
         let was_auto_commit = self.auto_commit;
         let was_in_transaction = self.in_transaction;
         let was_max_uncommitted_mutations = self.max_uncommitted_mutations;
