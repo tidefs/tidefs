@@ -71,6 +71,7 @@ use tidefs_inode_attributes::timestamp::TimestampPolicy as EngineTimestampPolicy
 const MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
 const MOUNT_VFS_TXG_COMMIT_INTERVAL_SECS: u64 = 30;
+const MOUNT_VFS_DEFAULT_BACKGROUND_SCRUB_INTERVAL_SECS: u64 = 0;
 
 /// RAII guard that removes a PID file on drop (clean shutdown).
 /// On SIGKILL the guard never runs, leaving the PID file as validation.
@@ -768,7 +769,7 @@ pub struct MountVfsConfig {
     /// complete naturally.  Default 0 means no extra drain wait.
     pub drain_timeout_secs: u64,
     /// Background segment integrity scrub interval in seconds.
-    /// 0 disables.  Default: 300 (5 minutes).
+    /// 0 disables.  Default: 0 (disabled).
     pub background_scrub_interval_secs: u64,
     /// Coherency profile for FUSE caching behaviour.
     /// Default: Writeback for TTL/invalidation only; kernel writeback remains
@@ -1012,7 +1013,8 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
         intent_log_write,
         writeback_cache_timeout: writeback_cache_timeout.unwrap_or(60),
         drain_timeout_secs: drain_timeout_secs.unwrap_or(0),
-        background_scrub_interval_secs: background_scrub_interval_secs.unwrap_or(300),
+        background_scrub_interval_secs: background_scrub_interval_secs
+            .unwrap_or(MOUNT_VFS_DEFAULT_BACKGROUND_SCRUB_INTERVAL_SECS),
         coherency_profile: cache_profile.unwrap_or_default(),
         compression,
         enable_dedup,
@@ -3692,7 +3694,7 @@ fn print_help() {
     println!("  mount-vfs --store <path> --mount <path> [--fs-name <name>] [--root-auth-key-hex <64 hex>] [--read-only] [--sync] [--writeback-cache] [--no-writeback-cache] [--content-capacity-bytes <bytes>] [--writeback-cache-timeout <seconds>] [--drain-timeout-secs <seconds>] [--background-scrub-interval <seconds>]");
     println!("    root auth key fallback env: {ROOT_AUTHENTICATION_ENV_VAR}");
     println!(
-        "    --background-scrub-interval  seconds between scrub cycles (0 disables, default 300)"
+        "    --background-scrub-interval  seconds between scrub cycles (0 disables, default 0)"
     );
     println!("    --writeback-cache            enable FUSE writeback-cache (opt-in, default: off)");
     println!(
@@ -3904,6 +3906,24 @@ mod tests {
             "writeback_cache must remain opt-in for the default qemu-smoke mount"
         );
         assert_eq!(config.fs_name, "tidefs-vfs");
+    }
+
+    #[test]
+    fn mount_vfs_config_disables_background_scrub_by_default() {
+        let config = parse_mount_vfs_config(required_mount_args()).expect("parse mount config");
+
+        assert_eq!(config.background_scrub_interval_secs, 0);
+    }
+
+    #[test]
+    fn mount_vfs_config_accepts_background_scrub_interval() {
+        let mut args = required_mount_args();
+        args.push("--background-scrub-interval".to_string());
+        args.push("300".to_string());
+
+        let config = parse_mount_vfs_config(args).expect("parse mount config");
+
+        assert_eq!(config.background_scrub_interval_secs, 300);
     }
 
     #[test]
