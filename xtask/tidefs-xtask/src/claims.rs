@@ -126,9 +126,41 @@ const COMMAND_AUTHORITY_TABLE_DOCS: &[&str] = &[
 pub const CLAIM_REGISTRY_PATH: &str = "validation/claims.toml";
 pub const CLAIM_REGISTRY_DOC_PATH: &str = "docs/CLAIM_REGISTRY.md";
 
+const MODEL_CRASH_MATRIX_EVIDENCE_CLASS: &str = "model-crash-matrix";
+const RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS: &str = "runtime-crash-oracle";
+const RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS: &str = "runtime-namespace-crash-artifact";
+const CLAIMS_GATE_REVIEW_EVIDENCE_CLASS: &str = "claims-gate-review";
+const CRASH_MODEL_MATRIX_PATH: &str = "validation/artifacts/crash-oracle/model-crash-matrices.json";
+const CRASH_CLAIMS_GATE_REVIEW_PATH: &str =
+    "validation/artifacts/crash-oracle/claims-gate-review.toml";
+const CRASH_MODEL_EVIDENCE_SOURCE: &str = "tidefs-crash-oracle";
+const CRASH_MODEL_EVIDENCE_SCOPE: &str = "model-only";
+const CRASH_MODEL_EVIDENCE_SCOPE_WORDING: &str =
+    "bounded model-only crash matrix; no local runtime crash injection";
+const CRASH_RUNTIME_CLAIM_BOUNDARY_WORDING: &str =
+    "local runtime write/fsync and rename claims stay planned/blocked until runtime evidence exists";
+const CRASH_MODEL_GENERATOR_PREFIX: &str = "tidefs-crash-oracle-rust-v";
+const CRASH_MODEL_BACKEND: &str = "tidefs-model-core";
+const CRASH_WRITE_FSYNC_MATRIX_ID: &str = "model.write_fsync_crash_matrix.v1";
+const CRASH_RENAME_MATRIX_ID: &str = "model.rename_atomic_crash_matrix.v1";
+const STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID: &str = "storage.write_fsync.crash_safety.v1";
+const NAMESPACE_RENAME_CRASH_CLAIM_ID: &str = "namespace.rename.atomicity.v1";
+const LOCAL_VFS_WRITE_FSYNC_CRASH_CLAIM_ID: &str = "local.vfs.write_fsync_crash.v1";
+const LOCAL_VFS_RENAME_CRASH_CLAIM_ID: &str = "local.vfs.rename_atomic_crash.v1";
+const CRASH_CLAIMS_GATE_REVIEW_SOURCE: &str = "claims-gate";
+const CRASH_CLAIMS_GATE_REVIEW_SCOPE: &str = "model-runtime-boundary-review";
+const CRASH_CLAIMS_GATE_REVIEW_ISSUE: u64 = 329;
+
+const CRASH_CLAIM_IDS: &[&str] = &[
+    STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
+    NAMESPACE_RENAME_CRASH_CLAIM_ID,
+    LOCAL_VFS_WRITE_FSYNC_CRASH_CLAIM_ID,
+    LOCAL_VFS_RENAME_CRASH_CLAIM_ID,
+];
+
 const REQUIRED_INITIAL_CLAIMS: &[&str] = &[
-    "storage.write_fsync.crash_safety.v1",
-    "namespace.rename.atomicity.v1",
+    STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
+    NAMESPACE_RENAME_CRASH_CLAIM_ID,
     "scheduler.dirty_debt.no_hidden.v1",
     "scrub.foreground_read.protected.v1",
     "perf.local.no_unbounded_dirty_debt.v1",
@@ -165,10 +197,14 @@ struct ClaimRecord {
     evidence_artifacts: Vec<ClaimEvidenceArtifact>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct ClaimEvidenceArtifact {
     class: String,
     path: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -193,6 +229,69 @@ impl ClaimStatus {
     const fn is_validated(self) -> bool {
         matches!(self, Self::Validated)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CrashOracleModelReport {
+    report_version: u64,
+    generated_by: String,
+    evidence_scope: String,
+    runtime_claim_boundary: String,
+    matrices: Vec<CrashOracleModelMatrix>,
+    runtime_claims: Vec<RuntimeCrashClaimStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrashOracleModelMatrix {
+    id: String,
+    claim_ids: Vec<String>,
+    backend: String,
+    cases: Vec<CrashOracleModelCase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrashOracleModelCase {
+    id: String,
+    classification: String,
+    recovered_state_diffs: Vec<serde_json::Value>,
+    minimized_trace: Option<CrashOracleModelTrace>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrashOracleModelTrace {
+    operations: Vec<CrashOracleModelTraceOp>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrashOracleModelTraceOp {
+    op: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeCrashClaimStatus {
+    claim_id: String,
+    status: String,
+    classification: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrashClaimsGateReviewArtifact {
+    artifact_version: u32,
+    evidence_class: String,
+    source: String,
+    scope: String,
+    issue: u64,
+    model_artifact: String,
+    model_evidence_class: String,
+    model_evidence_scope: String,
+    runtime_claim_boundary: String,
+    reviewed_claim_ids: Vec<String>,
+    missing_runtime_evidence_classes: Vec<String>,
+    runtime_evidence_status: String,
+    decision: String,
+    boundary_review: Vec<String>,
+    non_claims: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -614,7 +713,7 @@ pub fn validate_claim_current_workspace(id: &str) -> Result<(), ClaimValidationE
 }
 
 fn check_claim_registry_docs(root: &Path, missing: &mut Vec<String>) {
-    let (registry, _) = match load_claim_registry(root) {
+    let (registry, registry_modified) = match load_claim_registry(root) {
         Ok(registry) => registry,
         Err(err) => {
             missing.push(err);
@@ -626,6 +725,9 @@ fn check_claim_registry_docs(root: &Path, missing: &mut Vec<String>) {
         missing.push(err);
     }
     for err in validate_registered_runtime_ublk_artifacts(&root, &registry) {
+        missing.push(err);
+    }
+    for err in validate_registered_crash_artifacts(root, registry_modified, &registry) {
         missing.push(err);
     }
 
@@ -745,6 +847,7 @@ fn validate_claim_registry(registry: &ClaimRegistry) -> Vec<String> {
                 ));
             }
         }
+        validate_crash_claim_requirements(claim, &mut failures);
     }
 
     for required_id in REQUIRED_INITIAL_CLAIMS {
@@ -756,6 +859,40 @@ fn validate_claim_registry(registry: &ClaimRegistry) -> Vec<String> {
     }
 
     failures
+}
+
+fn validate_crash_claim_requirements(claim: &ClaimRecord, failures: &mut Vec<String>) {
+    if !is_crash_claim_id(&claim.id) {
+        return;
+    }
+
+    for class in [
+        MODEL_CRASH_MATRIX_EVIDENCE_CLASS,
+        CLAIMS_GATE_REVIEW_EVIDENCE_CLASS,
+    ] {
+        if !claim
+            .required_evidence_classes
+            .iter()
+            .any(|required| required == class)
+        {
+            failures.push(format!(
+                "crash claim `{}` must require evidence class `{class}`",
+                claim.id
+            ));
+        }
+    }
+
+    let runtime_class = required_crash_runtime_evidence_class(&claim.id);
+    if !claim
+        .required_evidence_classes
+        .iter()
+        .any(|required| required == runtime_class)
+    {
+        failures.push(format!(
+            "crash claim `{}` must require runtime evidence class `{runtime_class}`",
+            claim.id
+        ));
+    }
 }
 
 fn validate_registered_runtime_ublk_artifacts(
@@ -804,6 +941,606 @@ fn validate_runtime_ublk_completion_artifact_content(
         )),
     }
     failures
+}
+
+fn validate_registered_crash_artifacts(
+    root: &Path,
+    registry_modified: SystemTime,
+    registry: &ClaimRegistry,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    for claim in &registry.claims {
+        for artifact in &claim.evidence_artifacts {
+            failures.extend(validate_crash_evidence_artifact_content(
+                root, claim, artifact,
+            ));
+        }
+
+        if is_crash_claim_id(&claim.id) && claim.status.is_validated() {
+            failures.extend(validate_claim_record(root, registry_modified, claim));
+        }
+    }
+
+    failures.sort();
+    failures.dedup();
+    failures
+}
+
+fn validate_crash_evidence_artifact_content(
+    root: &Path,
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+) -> Vec<String> {
+    match artifact.class.as_str() {
+        MODEL_CRASH_MATRIX_EVIDENCE_CLASS => {
+            validate_model_crash_matrix_artifact_content(root, claim, artifact)
+        }
+        RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS | RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS => {
+            validate_runtime_crash_artifact_content(root, claim, artifact)
+        }
+        CLAIMS_GATE_REVIEW_EVIDENCE_CLASS if is_crash_claim_id(&claim.id) => {
+            validate_crash_claims_gate_review_artifact_content(root, claim, artifact)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn validate_model_crash_matrix_artifact_content(
+    root: &Path,
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+) -> Vec<String> {
+    let mut failures = validate_crash_artifact_source_scope(
+        claim,
+        artifact,
+        CRASH_MODEL_EVIDENCE_SOURCE,
+        CRASH_MODEL_EVIDENCE_SCOPE,
+    );
+
+    let rel = match workspace_relative_path(claim, artifact) {
+        Ok(rel) => rel,
+        Err(err) => {
+            failures.push(err);
+            return failures;
+        }
+    };
+    let artifact_path = root.join(&rel);
+    let text = match fs::read_to_string(&artifact_path) {
+        Ok(text) => text,
+        Err(err) => {
+            failures.push(format!(
+                "claim `{}` crash model artifact `{}` could not be read: {err}",
+                claim.id, artifact.path
+            ));
+            return failures;
+        }
+    };
+    let report: CrashOracleModelReport = match serde_json::from_str(&text) {
+        Ok(report) => report,
+        Err(err) => {
+            failures.push(format!(
+                "claim `{}` crash model artifact `{}` is malformed JSON: {err}",
+                claim.id, artifact.path
+            ));
+            return failures;
+        }
+    };
+
+    if report.report_version != 1 {
+        failures.push(format!(
+            "claim `{}` crash model artifact `{}` has report_version {}, expected 1",
+            claim.id, artifact.path, report.report_version
+        ));
+    }
+    if !report
+        .generated_by
+        .starts_with(CRASH_MODEL_GENERATOR_PREFIX)
+    {
+        failures.push(format!(
+            "claim `{}` crash model artifact `{}` has unexpected generator `{}`",
+            claim.id, artifact.path, report.generated_by
+        ));
+    }
+    if report.evidence_scope != CRASH_MODEL_EVIDENCE_SCOPE_WORDING {
+        failures.push(format!(
+            "claim `{}` crash model artifact `{}` must declare model-only evidence scope `{CRASH_MODEL_EVIDENCE_SCOPE_WORDING}`",
+            claim.id, artifact.path
+        ));
+    }
+    if report.runtime_claim_boundary != CRASH_RUNTIME_CLAIM_BOUNDARY_WORDING {
+        failures.push(format!(
+            "claim `{}` crash model artifact `{}` must preserve runtime boundary wording `{CRASH_RUNTIME_CLAIM_BOUNDARY_WORDING}`",
+            claim.id, artifact.path
+        ));
+    }
+
+    validate_expected_crash_matrix(
+        claim,
+        artifact,
+        &report,
+        CRASH_WRITE_FSYNC_MATRIX_ID,
+        &[
+            STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
+            LOCAL_VFS_WRITE_FSYNC_CRASH_CLAIM_ID,
+        ],
+        &mut failures,
+    );
+    validate_expected_crash_matrix(
+        claim,
+        artifact,
+        &report,
+        CRASH_RENAME_MATRIX_ID,
+        &[
+            NAMESPACE_RENAME_CRASH_CLAIM_ID,
+            LOCAL_VFS_RENAME_CRASH_CLAIM_ID,
+        ],
+        &mut failures,
+    );
+
+    if !report.matrices.iter().any(|matrix| {
+        matrix
+            .claim_ids
+            .iter()
+            .any(|claim_id| claim_id == &claim.id)
+    }) {
+        failures.push(format!(
+            "claim `{}` registers crash model artifact `{}` but no matrix names that claim id",
+            claim.id, artifact.path
+        ));
+    }
+
+    let forbidden_cases = report
+        .matrices
+        .iter()
+        .flat_map(|matrix| &matrix.cases)
+        .filter(|case| case.classification == "forbidden")
+        .collect::<Vec<_>>();
+    if forbidden_cases.is_empty() {
+        failures.push(format!(
+            "claim `{}` crash model artifact `{}` has no forbidden crash cases",
+            claim.id, artifact.path
+        ));
+    }
+    for case in forbidden_cases {
+        if case.recovered_state_diffs.is_empty() {
+            failures.push(format!(
+                "claim `{}` crash model artifact `{}` forbidden case `{}` has no recovered-state diff",
+                claim.id, artifact.path, case.id
+            ));
+        }
+        let has_crash_recovery_trace = case
+            .minimized_trace
+            .as_ref()
+            .map(|trace| {
+                trace
+                    .operations
+                    .iter()
+                    .any(|op| op.op == "crash_recover_at")
+            })
+            .unwrap_or(false);
+        if !has_crash_recovery_trace {
+            failures.push(format!(
+                "claim `{}` crash model artifact `{}` forbidden case `{}` has no minimized crash_recover_at trace",
+                claim.id, artifact.path, case.id
+            ));
+        }
+    }
+
+    for claim_id in [
+        LOCAL_VFS_WRITE_FSYNC_CRASH_CLAIM_ID,
+        LOCAL_VFS_RENAME_CRASH_CLAIM_ID,
+    ] {
+        let Some(runtime_claim) = report
+            .runtime_claims
+            .iter()
+            .find(|runtime_claim| runtime_claim.claim_id == claim_id)
+        else {
+            failures.push(format!(
+                "claim `{}` crash model artifact `{}` is missing runtime boundary status for `{claim_id}`",
+                claim.id, artifact.path
+            ));
+            continue;
+        };
+        if runtime_claim.status != "blocked"
+            || runtime_claim.classification != "unsupported-fail-closed"
+            || runtime_claim.reason.trim().is_empty()
+        {
+            failures.push(format!(
+                "claim `{}` crash model artifact `{}` runtime status for `{claim_id}` must be blocked unsupported-fail-closed with a reason",
+                claim.id, artifact.path
+            ));
+        }
+    }
+
+    failures
+}
+
+fn validate_expected_crash_matrix(
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+    report: &CrashOracleModelReport,
+    matrix_id: &str,
+    expected_claim_ids: &[&str],
+    failures: &mut Vec<String>,
+) {
+    let Some(matrix) = report.matrices.iter().find(|matrix| matrix.id == matrix_id) else {
+        failures.push(format!(
+            "claim `{}` crash model artifact `{}` is missing matrix `{matrix_id}`",
+            claim.id, artifact.path
+        ));
+        return;
+    };
+
+    if matrix.backend != CRASH_MODEL_BACKEND {
+        failures.push(format!(
+            "claim `{}` crash model artifact `{}` matrix `{matrix_id}` has backend `{}`, expected `{CRASH_MODEL_BACKEND}`",
+            claim.id, artifact.path, matrix.backend
+        ));
+    }
+    if !same_string_set(&matrix.claim_ids, expected_claim_ids) {
+        failures.push(format!(
+            "claim `{}` crash model artifact `{}` matrix `{matrix_id}` has claim ids {:?}, expected {:?}",
+            claim.id, artifact.path, matrix.claim_ids, expected_claim_ids
+        ));
+    }
+    if matrix.cases.is_empty() {
+        failures.push(format!(
+            "claim `{}` crash model artifact `{}` matrix `{matrix_id}` has no cases",
+            claim.id, artifact.path
+        ));
+    }
+}
+
+fn validate_runtime_crash_artifact_content(
+    root: &Path,
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+) -> Vec<String> {
+    let mut failures = validate_crash_artifact_has_source_scope(claim, artifact);
+    if artifact.path == CRASH_MODEL_MATRIX_PATH {
+        failures.push(format!(
+            "claim `{}` runtime crash evidence class `{}` must not point at model-only crash matrix `{CRASH_MODEL_MATRIX_PATH}`",
+            claim.id, artifact.class
+        ));
+    }
+    if artifact_source_or_scope_mentions_model_only(artifact) {
+        failures.push(format!(
+            "claim `{}` runtime crash evidence class `{}` is registered with model-only source/scope",
+            claim.id, artifact.class
+        ));
+    }
+    if !artifact_scope_contains_runtime(artifact) {
+        failures.push(format!(
+            "claim `{}` runtime crash evidence class `{}` must be source-qualified with runtime scope",
+            claim.id, artifact.class
+        ));
+    }
+
+    match artifact_declares_model_only_scope(root, claim, artifact) {
+        Ok(true) => failures.push(format!(
+            "claim `{}` runtime crash evidence class `{}` points at artifact `{}` whose declared scope is model-only",
+            claim.id, artifact.class, artifact.path
+        )),
+        Ok(false) => {}
+        Err(err) => failures.push(err),
+    }
+
+    failures
+}
+
+fn validate_crash_claims_gate_review_artifact_content(
+    root: &Path,
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+) -> Vec<String> {
+    let mut failures = validate_crash_artifact_source_scope(
+        claim,
+        artifact,
+        CRASH_CLAIMS_GATE_REVIEW_SOURCE,
+        CRASH_CLAIMS_GATE_REVIEW_SCOPE,
+    );
+    if artifact.path != CRASH_CLAIMS_GATE_REVIEW_PATH {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review must use `{CRASH_CLAIMS_GATE_REVIEW_PATH}`, found `{}`",
+            claim.id, artifact.path
+        ));
+    }
+
+    let rel = match workspace_relative_path(claim, artifact) {
+        Ok(rel) => rel,
+        Err(err) => {
+            failures.push(err);
+            return failures;
+        }
+    };
+    let artifact_path = root.join(&rel);
+    let text = match fs::read_to_string(&artifact_path) {
+        Ok(text) => text,
+        Err(err) => {
+            failures.push(format!(
+                "claim `{}` crash claims-gate review `{}` could not be read: {err}",
+                claim.id, artifact.path
+            ));
+            return failures;
+        }
+    };
+    let review: CrashClaimsGateReviewArtifact = match toml::from_str(&text) {
+        Ok(review) => review,
+        Err(err) => {
+            failures.push(format!(
+                "claim `{}` crash claims-gate review `{}` is malformed TOML: {err}",
+                claim.id, artifact.path
+            ));
+            return failures;
+        }
+    };
+
+    if review.artifact_version != 1 {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` has artifact_version {}, expected 1",
+            claim.id, artifact.path, review.artifact_version
+        ));
+    }
+    if review.evidence_class != CLAIMS_GATE_REVIEW_EVIDENCE_CLASS {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` must declare evidence_class `{CLAIMS_GATE_REVIEW_EVIDENCE_CLASS}`",
+            claim.id, artifact.path
+        ));
+    }
+    if review.source != CRASH_CLAIMS_GATE_REVIEW_SOURCE {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` must declare source `{CRASH_CLAIMS_GATE_REVIEW_SOURCE}`",
+            claim.id, artifact.path
+        ));
+    }
+    if review.scope != CRASH_CLAIMS_GATE_REVIEW_SCOPE {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` must declare scope `{CRASH_CLAIMS_GATE_REVIEW_SCOPE}`",
+            claim.id, artifact.path
+        ));
+    }
+    if review.issue != CRASH_CLAIMS_GATE_REVIEW_ISSUE {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` must name issue {CRASH_CLAIMS_GATE_REVIEW_ISSUE}",
+            claim.id, artifact.path
+        ));
+    }
+    if review.model_artifact != CRASH_MODEL_MATRIX_PATH
+        || review.model_evidence_class != MODEL_CRASH_MATRIX_EVIDENCE_CLASS
+        || review.model_evidence_scope != CRASH_MODEL_EVIDENCE_SCOPE_WORDING
+        || review.runtime_claim_boundary != CRASH_RUNTIME_CLAIM_BOUNDARY_WORDING
+    {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` must preserve the model/runtime evidence boundary",
+            claim.id, artifact.path
+        ));
+    }
+    if !same_string_set(&review.reviewed_claim_ids, CRASH_CLAIM_IDS) {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` must review exactly the crash claim ids {:?}",
+            claim.id, artifact.path, CRASH_CLAIM_IDS
+        ));
+    }
+    if !review.reviewed_claim_ids.iter().any(|id| id == &claim.id) {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` does not review this claim id",
+            claim.id, artifact.path
+        ));
+    }
+    if !same_string_set(
+        &review.missing_runtime_evidence_classes,
+        &[
+            RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS,
+            RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS,
+        ],
+    ) {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` must record both missing runtime crash evidence classes",
+            claim.id, artifact.path
+        ));
+    }
+
+    let boundary_text = review.boundary_review.join("\n").to_ascii_lowercase();
+    if !boundary_text.contains("model-only")
+        || !boundary_text.contains("runtime")
+        || !boundary_text.contains("evidence")
+    {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` must explicitly review the model/runtime evidence boundary",
+            claim.id, artifact.path
+        ));
+    }
+
+    let decision = review.decision.to_ascii_lowercase();
+    let runtime_status = review.runtime_evidence_status.to_ascii_lowercase();
+    if !decision.contains("fail-closed")
+        || !(decision.contains("planned") || decision.contains("blocked"))
+        || !runtime_status.contains("missing")
+    {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` must keep crash claims planned/blocked and fail-closed while runtime evidence is missing",
+            claim.id, artifact.path
+        ));
+    }
+
+    let non_claims = review.non_claims.join("\n").to_ascii_lowercase();
+    if !non_claims.contains("local runtime crash injection")
+        || !non_claims.contains("production crash safety")
+    {
+        failures.push(format!(
+            "claim `{}` crash claims-gate review `{}` must record crash-safety non-claims",
+            claim.id, artifact.path
+        ));
+    }
+
+    failures
+}
+
+fn validate_crash_artifact_source_scope(
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+    expected_source: &str,
+    expected_scope: &str,
+) -> Vec<String> {
+    let mut failures = validate_crash_artifact_has_source_scope(claim, artifact);
+    if artifact.source.as_deref() != Some(expected_source) {
+        failures.push(format!(
+            "claim `{}` evidence artifact `{}` for class `{}` must declare source `{expected_source}`",
+            claim.id, artifact.path, artifact.class
+        ));
+    }
+    if artifact.scope.as_deref() != Some(expected_scope) {
+        failures.push(format!(
+            "claim `{}` evidence artifact `{}` for class `{}` must declare scope `{expected_scope}`",
+            claim.id, artifact.path, artifact.class
+        ));
+    }
+    failures
+}
+
+fn validate_crash_artifact_has_source_scope(
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if artifact
+        .source
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        failures.push(format!(
+            "claim `{}` evidence artifact `{}` for class `{}` must declare source",
+            claim.id, artifact.path, artifact.class
+        ));
+    }
+    if artifact
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        failures.push(format!(
+            "claim `{}` evidence artifact `{}` for class `{}` must declare scope",
+            claim.id, artifact.path, artifact.class
+        ));
+    }
+    failures
+}
+
+fn artifact_declares_model_only_scope(
+    root: &Path,
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+) -> Result<bool, String> {
+    let rel = workspace_relative_path(claim, artifact)?;
+    let artifact_path = root.join(&rel);
+    let text = fs::read_to_string(&artifact_path).map_err(|err| {
+        format!(
+            "claim `{}` runtime crash evidence artifact `{}` could not be read for source/scope inspection: {err}",
+            claim.id, artifact.path
+        )
+    })?;
+
+    let declared_scopes = match rel.extension().and_then(|extension| extension.to_str()) {
+        Some("json") => {
+            let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|err| {
+                format!(
+                    "claim `{}` runtime crash evidence artifact `{}` has malformed JSON during source/scope inspection: {err}",
+                    claim.id, artifact.path
+                )
+            })?;
+            declared_source_scope_values_from_json(&value)
+        }
+        Some("toml") => {
+            let value = toml::from_str::<toml::Value>(&text).map_err(|err| {
+                format!(
+                    "claim `{}` runtime crash evidence artifact `{}` has malformed TOML during source/scope inspection: {err}",
+                    claim.id, artifact.path
+                )
+            })?;
+            declared_source_scope_values_from_toml(&value)
+        }
+        _ => Vec::new(),
+    };
+
+    Ok(declared_scopes
+        .iter()
+        .any(|value| value.to_ascii_lowercase().contains("model-only")))
+}
+
+fn declared_source_scope_values_from_json(value: &serde_json::Value) -> Vec<String> {
+    ["evidence_scope", "scope", "source", "evidence_source"]
+        .iter()
+        .filter_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn declared_source_scope_values_from_toml(value: &toml::Value) -> Vec<String> {
+    ["evidence_scope", "scope", "source", "evidence_source"]
+        .iter()
+        .filter_map(|key| value.get(key).and_then(toml::Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn workspace_relative_path(
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+) -> Result<PathBuf, String> {
+    let rel = Path::new(&artifact.path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "claim `{}` evidence artifact `{}` must be a workspace-relative path",
+            claim.id, artifact.path
+        ));
+    }
+    Ok(rel.to_path_buf())
+}
+
+fn artifact_source_or_scope_mentions_model_only(artifact: &ClaimEvidenceArtifact) -> bool {
+    [artifact.source.as_deref(), artifact.scope.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|value| value.to_ascii_lowercase().contains("model-only"))
+}
+
+fn artifact_scope_contains_runtime(artifact: &ClaimEvidenceArtifact) -> bool {
+    artifact
+        .scope
+        .as_deref()
+        .map(|scope| scope.to_ascii_lowercase().contains("runtime"))
+        .unwrap_or(false)
+}
+
+fn same_string_set(actual: &[String], expected: &[&str]) -> bool {
+    let actual = actual.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    actual == expected
+}
+
+fn is_crash_claim_id(id: &str) -> bool {
+    CRASH_CLAIM_IDS.contains(&id)
+}
+
+fn required_crash_runtime_evidence_class(claim_id: &str) -> &'static str {
+    match claim_id {
+        STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID | LOCAL_VFS_WRITE_FSYNC_CRASH_CLAIM_ID => {
+            RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS
+        }
+        NAMESPACE_RENAME_CRASH_CLAIM_ID | LOCAL_VFS_RENAME_CRASH_CLAIM_ID => {
+            RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS
+        }
+        _ => RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS,
+    }
 }
 
 fn validate_claim_record(
@@ -887,6 +1624,9 @@ fn validate_claim_record(
                     root, claim, artifact,
                 ));
             }
+            failures.extend(validate_crash_evidence_artifact_content(
+                root, claim, artifact,
+            ));
         }
     }
     failures
@@ -1267,15 +2007,23 @@ fn find_workspace_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::Duration;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
     use super::{
         claims_gate_rules, line_has_present_tense_overclaim, parse_claim_registry,
         parse_command_admissions, parse_command_surfaces, render_claim_registry_doc,
-        render_command_authority_table, validate_claim_record, ClaimEvidenceArtifact,
-        ClaimGateRuleTopic, ClaimRecord, ClaimStatus, APP_INDEX_LIMITATION_MARKERS,
-        CLAIMS_GATE_POLICY_SPEC, CLAIMS_GATE_REQUIRED_COMMAND, CLAIMS_GATE_SCANNED_DOCS,
-        CRATE_INDEX_LIMITATION_MARKERS, REQUIRED_INITIAL_CLAIMS,
+        render_command_authority_table, validate_claim_record,
+        validate_crash_claims_gate_review_artifact_content,
+        validate_model_crash_matrix_artifact_content, validate_registered_crash_artifacts,
+        validate_runtime_crash_artifact_content, ClaimEvidenceArtifact, ClaimGateRuleTopic,
+        ClaimRecord, ClaimStatus, APP_INDEX_LIMITATION_MARKERS, CLAIMS_GATE_POLICY_SPEC,
+        CLAIMS_GATE_REQUIRED_COMMAND, CLAIMS_GATE_REVIEW_EVIDENCE_CLASS, CLAIMS_GATE_SCANNED_DOCS,
+        CRASH_CLAIMS_GATE_REVIEW_PATH, CRASH_CLAIMS_GATE_REVIEW_SCOPE,
+        CRASH_CLAIMS_GATE_REVIEW_SOURCE, CRASH_CLAIM_IDS, CRASH_MODEL_EVIDENCE_SCOPE,
+        CRASH_MODEL_EVIDENCE_SOURCE, CRASH_MODEL_MATRIX_PATH, CRATE_INDEX_LIMITATION_MARKERS,
+        MODEL_CRASH_MATRIX_EVIDENCE_CLASS, REQUIRED_INITIAL_CLAIMS,
+        RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS, STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
     };
 
     #[test]
@@ -1429,8 +2177,139 @@ mod tests {
         claim.evidence_artifacts.push(ClaimEvidenceArtifact {
             class: "runtime-artifact".to_string(),
             path: "evidence.txt".to_string(),
+            ..Default::default()
         });
         let stale = validate_claim_record(temp.path(), registry_modified, &claim);
+        assert!(stale
+            .iter()
+            .any(|failure| failure.contains("stale evidence artifact")));
+    }
+
+    #[test]
+    fn claims_gate_accepts_current_crash_model_artifact_scope() {
+        let root = workspace_root();
+        let registry = parse_claim_registry(include_str!("../../../validation/claims.toml"))
+            .expect("claim registry parses");
+        let claim = registry
+            .claims
+            .iter()
+            .find(|claim| claim.id == STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID)
+            .expect("storage write/fsync claim registered");
+        let artifact = claim
+            .evidence_artifacts
+            .iter()
+            .find(|artifact| artifact.class == MODEL_CRASH_MATRIX_EVIDENCE_CLASS)
+            .expect("model crash matrix registered");
+
+        let failures = validate_model_crash_matrix_artifact_content(&root, claim, artifact);
+        assert!(failures.is_empty(), "{failures:#?}");
+
+        let registry_failures =
+            validate_registered_crash_artifacts(&root, SystemTime::UNIX_EPOCH, &registry);
+        assert!(registry_failures.is_empty(), "{registry_failures:#?}");
+    }
+
+    #[test]
+    fn runtime_crash_evidence_rejects_model_matrix_scope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_current_model_matrix(temp.path());
+        let claim = validated_crash_claim(
+            STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
+            vec![RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS.to_string()],
+            Vec::new(),
+        );
+        let artifact = crash_artifact(
+            RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS,
+            CRASH_MODEL_MATRIX_PATH,
+            CRASH_MODEL_EVIDENCE_SOURCE,
+            CRASH_MODEL_EVIDENCE_SCOPE,
+        );
+
+        let failures = validate_runtime_crash_artifact_content(temp.path(), &claim, &artifact);
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("must not point at model-only crash matrix")));
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("whose declared scope is model-only")));
+    }
+
+    #[test]
+    fn validated_crash_claim_requires_claims_gate_review_artifact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_current_model_matrix(temp.path());
+        write_runtime_crash_artifact(
+            temp.path(),
+            "validation/artifacts/crash-oracle/runtime.json",
+        );
+
+        let claim = validated_crash_claim(
+            STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
+            vec![
+                MODEL_CRASH_MATRIX_EVIDENCE_CLASS.to_string(),
+                RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS.to_string(),
+                CLAIMS_GATE_REVIEW_EVIDENCE_CLASS.to_string(),
+            ],
+            vec![
+                crash_artifact(
+                    MODEL_CRASH_MATRIX_EVIDENCE_CLASS,
+                    CRASH_MODEL_MATRIX_PATH,
+                    CRASH_MODEL_EVIDENCE_SOURCE,
+                    CRASH_MODEL_EVIDENCE_SCOPE,
+                ),
+                crash_artifact(
+                    RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS,
+                    "validation/artifacts/crash-oracle/runtime.json",
+                    "local-runtime-crash-oracle",
+                    "runtime-crash-injection",
+                ),
+            ],
+        );
+
+        let failures = validate_claim_record(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert!(failures
+            .iter()
+            .any(|failure| failure
+                .contains("missing evidence artifact for class `claims-gate-review`")));
+    }
+
+    #[test]
+    fn crash_review_artifact_rejects_malformed_or_stale_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_malformed_crash_review(temp.path());
+        let claim = validated_crash_claim(
+            STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
+            vec![CLAIMS_GATE_REVIEW_EVIDENCE_CLASS.to_string()],
+            Vec::new(),
+        );
+        let artifact = crash_artifact(
+            CLAIMS_GATE_REVIEW_EVIDENCE_CLASS,
+            CRASH_CLAIMS_GATE_REVIEW_PATH,
+            CRASH_CLAIMS_GATE_REVIEW_SOURCE,
+            CRASH_CLAIMS_GATE_REVIEW_SCOPE,
+        );
+
+        let malformed =
+            validate_crash_claims_gate_review_artifact_content(temp.path(), &claim, &artifact);
+        assert!(malformed
+            .iter()
+            .any(|failure| failure.contains("model/runtime evidence boundary")));
+
+        write_valid_crash_review(temp.path());
+        let artifact_path = temp.path().join(CRASH_CLAIMS_GATE_REVIEW_PATH);
+        let artifact_modified = fs::metadata(&artifact_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("review mtime");
+        let stale_claim = validated_crash_claim(
+            STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
+            vec![CLAIMS_GATE_REVIEW_EVIDENCE_CLASS.to_string()],
+            vec![artifact],
+        );
+        let stale = validate_claim_record(
+            temp.path(),
+            artifact_modified + Duration::from_secs(1),
+            &stale_claim,
+        );
         assert!(stale
             .iter()
             .any(|failure| failure.contains("stale evidence artifact")));
@@ -1566,6 +2445,101 @@ const UNGUARDED_COMMANDS: &[&str] = &["pool scan", "diag"];
             parse_command_surfaces(classification)?,
             parse_command_admissions(authz)?,
         )
+    }
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn crash_artifact(class: &str, path: &str, source: &str, scope: &str) -> ClaimEvidenceArtifact {
+        ClaimEvidenceArtifact {
+            class: class.to_string(),
+            path: path.to_string(),
+            source: Some(source.to_string()),
+            scope: Some(scope.to_string()),
+        }
+    }
+
+    fn validated_crash_claim(
+        id: &str,
+        required_evidence_classes: Vec<String>,
+        evidence_artifacts: Vec<ClaimEvidenceArtifact>,
+    ) -> ClaimRecord {
+        ClaimRecord {
+            id: id.to_string(),
+            status: ClaimStatus::Validated,
+            scope: "test crash scope".to_string(),
+            required_evidence_classes,
+            blockers: Vec::new(),
+            generated_doc: "Validated crash fixture claim.".to_string(),
+            evidence_artifacts,
+        }
+    }
+
+    fn write_current_model_matrix(root: &Path) {
+        write_artifact(
+            root,
+            CRASH_MODEL_MATRIX_PATH,
+            include_str!("../../../validation/artifacts/crash-oracle/model-crash-matrices.json"),
+        );
+    }
+
+    fn write_valid_crash_review(root: &Path) {
+        write_artifact(
+            root,
+            CRASH_CLAIMS_GATE_REVIEW_PATH,
+            include_str!("../../../validation/artifacts/crash-oracle/claims-gate-review.toml"),
+        );
+    }
+
+    fn write_runtime_crash_artifact(root: &Path, rel: &str) {
+        write_artifact(
+            root,
+            rel,
+            r#"{
+  "evidence_scope": "bounded local runtime crash injection artifact",
+  "source": "local-runtime-crash-oracle"
+}
+"#,
+        );
+    }
+
+    fn write_malformed_crash_review(root: &Path) {
+        let claim_ids = CRASH_CLAIM_IDS
+            .iter()
+            .map(|claim_id| format!("\"{claim_id}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write_artifact(
+            root,
+            CRASH_CLAIMS_GATE_REVIEW_PATH,
+            &format!(
+                r#"artifact_version = 1
+evidence_class = "claims-gate-review"
+source = "claims-gate"
+scope = "model-runtime-boundary-review"
+issue = 329
+model_artifact = "validation/artifacts/crash-oracle/model-crash-matrices.json"
+model_evidence_class = "model-crash-matrix"
+model_evidence_scope = "runtime proof"
+runtime_claim_boundary = "runtime proof exists"
+reviewed_claim_ids = [{claim_ids}]
+missing_runtime_evidence_classes = ["runtime-crash-oracle"]
+runtime_evidence_status = "complete"
+decision = "validated"
+boundary_review = ["runtime evidence is complete"]
+non_claims = ["none"]
+"#
+            ),
+        );
+    }
+
+    fn write_artifact(root: &Path, rel: &str, contents: &str) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create artifact parent");
+        }
+        fs::write(path, contents).expect("write artifact");
     }
 
     #[test]

@@ -66,6 +66,17 @@ Stronger wording requires all of the following:
 3. an updated current-status or review-register row;
 4. an updated claims gate rule that allows the specific stronger claim.
 
+## Crash Evidence Scope
+
+Crash-oracle model matrices are model-only evidence. A
+`runtime-crash-oracle` or `runtime-namespace-crash-artifact` evidence entry
+must point at runtime evidence whose declared source and scope are runtime,
+not model-only. Crash-safety and rename-crash claims must keep planned,
+blocked, or fail-closed wording until the registry records fresh model
+evidence, runtime evidence for the required runtime class, and a
+`claims-gate-review` artifact that reviews the model/runtime evidence
+boundary.
+
 ## Mounted Transform Authority
 
 The mounted local-filesystem compression/encryption claim is blocked behind
