@@ -5768,6 +5768,53 @@ impl LocalFileSystem {
         Ok(patches)
     }
 
+    fn coalesced_write_segment_ranges(
+        &self,
+        segments: &[(u64, Vec<u8>)],
+    ) -> Result<Vec<(u64, u64)>> {
+        let mut ranges = Vec::with_capacity(segments.len());
+        for (offset, data) in segments {
+            if data.is_empty() {
+                continue;
+            }
+            let len = u64::try_from(data.len()).map_err(|_| FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+            let end = offset
+                .checked_add(len)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            ranges.push((*offset, end));
+        }
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        ranges.sort_by_key(|(start, _)| *start);
+
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some((_, merged_end)) if start <= *merged_end => {
+                    *merged_end = (*merged_end).max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+
+        merged
+            .into_iter()
+            .map(|(start, end)| {
+                let len = end
+                    .checked_sub(start)
+                    .ok_or(FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    })?;
+                Ok((start, len))
+            })
+            .collect()
+    }
+
     fn restore_drained_write_segments(&mut self, inode_id: InodeId, segments: &[(u64, Vec<u8>)]) {
         self.snapshot_write_buffers_for_rollback();
         let wb = self
@@ -6297,10 +6344,19 @@ impl LocalFileSystem {
     }
 
     fn clear_write_buffer_range(&mut self, inode_id: InodeId, offset: u64, length: u64) {
+        self.clear_write_buffer_ranges(inode_id, &[(offset, length)]);
+    }
+
+    fn clear_write_buffer_ranges(&mut self, inode_id: InodeId, ranges: &[(u64, u64)]) {
+        if ranges.is_empty() || !self.write_buffers.contains_key(&inode_id) {
+            return;
+        }
         self.snapshot_write_buffers_for_rollback();
         let remove = match self.write_buffers.get_mut(&inode_id) {
             Some(wb) => {
-                wb.clear_range(offset, length);
+                for (offset, length) in ranges {
+                    wb.clear_range(*offset, *length);
+                }
                 wb.is_empty()
             }
             None => false,
@@ -6665,6 +6721,7 @@ impl LocalFileSystem {
 
         let base_record = self.committed_inode_record(inode_id)?;
         let patches = self.coalesced_write_buffer_patches(&segments)?;
+        let written_ranges = self.coalesced_write_segment_ranges(&segments)?;
         let was_auto_commit = self.auto_commit;
         let was_in_transaction = self.in_transaction;
         let was_max_uncommitted_mutations = self.max_uncommitted_mutations;
@@ -6740,16 +6797,12 @@ impl LocalFileSystem {
             );
         }
         self.state.dirty_extent_maps.insert(inode_id);
-        for (offset, bytes) in &segments {
-            let bytes_len =
-                u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
-                    requested: u64::MAX,
-                })?;
-            self.clear_write_buffer_range(inode_id, *offset, bytes_len);
-            self.writeback_range_tracker
-                .lock()
-                .expect("locked")
-                .clear_range(inode_id, *offset, bytes_len);
+        self.clear_write_buffer_ranges(inode_id, &written_ranges);
+        if !written_ranges.is_empty() {
+            let mut tracker = self.writeback_range_tracker.lock().expect("locked");
+            for (offset, length) in &written_ranges {
+                tracker.clear_range(inode_id, *offset, *length);
+            }
         }
         Ok(self.adjust_for_write_buffer(inode_id, result))
     }
