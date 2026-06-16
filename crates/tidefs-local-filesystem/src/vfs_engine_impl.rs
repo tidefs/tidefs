@@ -4420,7 +4420,7 @@ impl VfsEngine for VfsLocalFileSystem {
                         fs.punch_hole(&dest_path, offset_out, copied)
                             .map_err(|e| map_errno(&e))?;
                     }
-                    let _ = fs.apply_timestamp_update(
+                    let _ = fs.apply_deferred_timestamp_update(
                         source_fh.inode_id,
                         TimestampUpdate::Read,
                         self.timestamp_policy,
@@ -4444,12 +4444,13 @@ impl VfsEngine for VfsLocalFileSystem {
 
         // Perform the copy via the read/write path.
         let mut copied = 0_u64;
+        let mut source_was_read = false;
         while copied < requested {
             let remaining = requested - copied;
             let chunk_len = remaining.min(131072);
             let chunk_size = u32::try_from(chunk_len).map_err(|_| Errno::EFBIG)?;
             let read_offset = offset_in.checked_add(copied).ok_or(Errno::EINVAL)?;
-            let chunk = match self.read(source_fh, read_offset, chunk_size, ctx) {
+            let chunk = match self.read_impl(source_fh, read_offset, chunk_size, ctx, false) {
                 Ok(chunk) => chunk,
                 Err(errno) => {
                     if vfs_op_diagnostics_enabled() {
@@ -4467,12 +4468,20 @@ impl VfsEngine for VfsLocalFileSystem {
                             errno
                         );
                     }
+                    if source_was_read {
+                        let _ = self.fs.borrow_mut().apply_deferred_timestamp_update(
+                            source_fh.inode_id,
+                            TimestampUpdate::Read,
+                            self.timestamp_policy,
+                        );
+                    }
                     return Err(errno);
                 }
             };
             if chunk.is_empty() {
                 break;
             }
+            source_was_read = true;
             let write_offset = offset_out.checked_add(copied).ok_or(Errno::EINVAL)?;
             let written = match self.write(dest_fh, write_offset, &chunk, ctx) {
                 Ok(written) => written,
@@ -4492,6 +4501,11 @@ impl VfsEngine for VfsLocalFileSystem {
                             errno
                         );
                     }
+                    let _ = self.fs.borrow_mut().apply_deferred_timestamp_update(
+                        source_fh.inode_id,
+                        TimestampUpdate::Read,
+                        self.timestamp_policy,
+                    );
                     return Err(errno);
                 }
             };
@@ -4499,6 +4513,14 @@ impl VfsEngine for VfsLocalFileSystem {
             if written == 0 || u64::from(written) < chunk.len() as u64 {
                 break;
             }
+        }
+
+        if source_was_read {
+            let _ = self.fs.borrow_mut().apply_deferred_timestamp_update(
+                source_fh.inode_id,
+                TimestampUpdate::Read,
+                self.timestamp_policy,
+            );
         }
 
         u32::try_from(copied).map_err(|_| Errno::EFBIG)
@@ -8551,7 +8573,7 @@ mod tests {
 
     #[test]
     fn copy_file_range_copies_between_open_file_handles() {
-        let (engine, _td) = temp_fs();
+        let (mut engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (_source_attr, source_create) = engine
             .create(root, b"copy-source.txt", 0o644, O_RDWR, &ctx())
@@ -8565,12 +8587,32 @@ mod tests {
         engine
             .write(&dest_create, 0, b"abcdefghij", &ctx())
             .unwrap();
+        engine.set_timestamp_policy(TimestampPolicy::Strictatime);
+        engine.fs.borrow_mut().set_auto_commit(false);
+        let source_before = engine
+            .getattr(source_create.inode_id, None, &ctx())
+            .expect("source attr before copy");
+        let before_mutations = engine.fs.borrow().uncommitted_mutation_count();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
         // Copy between open file handles; write buffers serve read-your-writes.
         let copied = engine
             .copy_file_range(&source_create, 2, &dest_create, 3, 4, &ctx())
             .unwrap();
 
         assert_eq!(copied, 4);
+        let source_after = engine
+            .getattr(source_create.inode_id, None, &ctx())
+            .expect("source attr after copy");
+        assert!(
+            source_after.posix.atime_ns > source_before.posix.atime_ns,
+            "partial copy_file_range must record source read access"
+        );
+        assert_eq!(
+            engine.fs.borrow().uncommitted_mutation_count(),
+            before_mutations,
+            "partial copy_file_range source atime should be deferred"
+        );
         assert_eq!(
             engine.read(&dest_create, 0, 10, &ctx()).unwrap(),
             b"abc2345hij"
