@@ -6289,7 +6289,7 @@ impl LocalFileSystem {
         if self
             .write_buffers
             .get(&inode_id)
-            .is_some_and(|buffer| !buffer.is_empty())
+            .is_some_and(|buffer| buffer.overlaps_range(offset, write_len))
         {
             return Ok(false);
         }
