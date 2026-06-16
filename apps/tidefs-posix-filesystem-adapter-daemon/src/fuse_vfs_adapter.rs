@@ -6445,13 +6445,7 @@ impl FuseVfsAdapter {
             if tracker
                 .lock()
                 .unwrap()
-                .dirty_ranges(InodeId::new(ino))
-                .is_some_and(|ranges| {
-                    ranges.iter().any(|range| {
-                        let range_end = range.offset.saturating_add(range.length);
-                        range.offset < end && offset < range_end
-                    })
-                })
+                .overlaps_range(InodeId::new(ino), offset, length)
             {
                 return true;
             }
@@ -6472,14 +6466,12 @@ impl FuseVfsAdapter {
         if self
             .writeback_page_cache
             .as_ref()
-            .is_some_and(|cache| !cache.dirty_pages_in_range(ino, offset, end).is_empty())
+            .is_some_and(|cache| cache.has_dirty_pages_in_range(ino, offset, end))
         {
             return true;
         }
-        !self
-            .write_page_cache
-            .dirty_pages_in_range(ino, offset, end)
-            .is_empty()
+        self.write_page_cache
+            .has_dirty_pages_in_range(ino, offset, end)
     }
 
     fn inode_has_dirty_trackers(&self, ino: u64) -> bool {
@@ -6507,11 +6499,11 @@ impl FuseVfsAdapter {
         if self
             .writeback_page_cache
             .as_ref()
-            .is_some_and(|cache| !cache.dirty_pages_for_inode(ino).is_empty())
+            .is_some_and(|cache| cache.has_dirty_pages_for_inode(ino))
         {
             return true;
         }
-        !self.write_page_cache.dirty_pages_for_inode(ino).is_empty()
+        self.write_page_cache.has_dirty_pages_for_inode(ino)
     }
 
     fn reconcile_writeback_inode_cache_after_authoritative_range(&self, ino: u64) {
