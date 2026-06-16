@@ -399,6 +399,24 @@ impl PageCacheInner {
             .collect()
     }
 
+    /// Return true when `inode` has at least one dirty page.
+    fn has_dirty_pages_for_inode(&self, inode: u64) -> bool {
+        if self.dirty_page_count_for_inode(inode) == 0 {
+            return false;
+        }
+        self.dirty_pages_by_inode
+            .get(&inode)
+            .into_iter()
+            .flat_map(|offsets| offsets.iter())
+            .any(|offset| {
+                let key = PageKey {
+                    inode,
+                    offset: *offset,
+                };
+                self.pages.get(&key).is_some_and(Page::is_dirty)
+            })
+    }
+
     /// Collect keys of all dirty pages for a given inode whose byte range
     /// [offset, offset + page_size) overlaps with [start, end).
     fn dirty_page_keys_in_range(&self, inode: u64, start: u64, end: u64) -> Vec<PageKey> {
@@ -420,6 +438,28 @@ impl PageCacheInner {
                 (overlaps && self.pages.get(&key).is_some_and(Page::is_dirty)).then_some(key)
             })
             .collect()
+    }
+
+    /// Return true when `inode` has at least one dirty page whose byte range
+    /// [offset, offset + page_size) overlaps with [start, end).
+    fn has_dirty_pages_in_range(&self, inode: u64, start: u64, end: u64) -> bool {
+        if start >= end || self.dirty_page_count_for_inode(inode) == 0 {
+            return false;
+        }
+        let page_size = self.page_size as u64;
+        let first_possible_offset = start.saturating_sub(page_size.saturating_sub(1));
+        self.dirty_pages_by_inode
+            .get(&inode)
+            .into_iter()
+            .flat_map(|offsets| offsets.range(first_possible_offset..end))
+            .any(|offset| {
+                let key = PageKey {
+                    inode,
+                    offset: *offset,
+                };
+                let overlaps = key.offset < end && key.offset.saturating_add(page_size) > start;
+                overlaps && self.pages.get(&key).is_some_and(Page::is_dirty)
+            })
     }
 
     /// Clear dirty flag on all pages for a given inode. Returns count cleared.
@@ -815,6 +855,12 @@ impl PageCache {
         self.inner.lock().unwrap().dirty_page_keys_for_inode(inode)
     }
 
+    /// Return true when the given inode has at least one dirty page.
+    #[must_use]
+    pub fn has_dirty_pages_for_inode(&self, inode: u64) -> bool {
+        self.inner.lock().unwrap().has_dirty_pages_for_inode(inode)
+    }
+
     /// Return the keys of all dirty pages for a given inode whose byte
     /// range overlaps with `[start, end)`.
     ///
@@ -830,6 +876,20 @@ impl PageCache {
             .lock()
             .unwrap()
             .dirty_page_keys_in_range(inode, start, end)
+    }
+
+    /// Return true when the given inode has at least one dirty page whose
+    /// byte range overlaps with `[start, end)`.
+    ///
+    /// A page at offset `P` covers bytes `[P, P + page_size)`.  It
+    /// overlaps with `[start, end)` when `P < end` and
+    /// `P + page_size > start`.
+    #[must_use]
+    pub fn has_dirty_pages_in_range(&self, inode: u64, start: u64, end: u64) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .has_dirty_pages_in_range(inode, start, end)
     }
 
     /// Flush dirty pages in the byte range `[start, end)` for the given
@@ -1552,6 +1612,34 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn dirty_page_boolean_probes_match_inode_and_range_semantics() {
+        let cache = new_cache(512);
+        for inode in 2..258 {
+            cache.insert(inode, 0).unwrap();
+            cache.mark_dirty(inode, 0);
+        }
+        for off in [0_u64, 4096, 8192, 12288] {
+            cache.insert(1, off).unwrap();
+            cache.mark_dirty(1, off);
+        }
+
+        assert!(cache.has_dirty_pages_for_inode(1));
+        assert!(cache.has_dirty_pages_for_inode(257));
+        assert!(!cache.has_dirty_pages_for_inode(999));
+        assert!(!cache.has_dirty_pages_in_range(1, 16384, 16384));
+        assert!(!cache.has_dirty_pages_in_range(1, 16384, 20480));
+        assert!(!cache.has_dirty_pages_in_range(1, 0, 0));
+        assert!(cache.has_dirty_pages_in_range(1, 4096, 12288));
+        assert!(cache.has_dirty_pages_in_range(1, 1, 2));
+        assert!(!cache.has_dirty_pages_in_range(2, 4096, 12288));
+
+        cache.clear_dirty(1, 4096);
+        cache.clear_dirty(1, 8192);
+        assert!(!cache.has_dirty_pages_in_range(1, 4096, 12288));
+        assert!(cache.has_dirty_pages_for_inode(1));
     }
 
     // ── flush_dirty_range ───────────────────────────────────────────

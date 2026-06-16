@@ -189,6 +189,23 @@ impl DirtyPageTracker {
     pub fn dirty_ranges(&self, inode: InodeId) -> Option<&[DirtyRange]> {
         self.ranges.get(&inode).map(|v| v.as_slice())
     }
+
+    /// Check whether any dirty range for `inode` overlaps
+    /// `[offset, offset + length)`.
+    pub fn overlaps_range(&self, inode: InodeId, offset: u64, length: u64) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let end = offset.saturating_add(length);
+        let Some(ranges) = self.ranges.get(&inode) else {
+            return false;
+        };
+        let first_possible = ranges.partition_point(|range| range.end() <= offset);
+        ranges
+            .get(first_possible)
+            .is_some_and(|range| range.offset < end && offset < range.end())
+    }
+
     #[allow(dead_code)] // INTENT: dirty page tracker types for planned writeback scheduling
     /// Check whether `inode` has any dirty pages.
     pub fn is_dirty(&self, inode: InodeId) -> bool {
@@ -589,5 +606,24 @@ mod tests {
         assert!(!tracker.is_dirty(a));
         assert!(tracker.is_dirty(b));
         assert!(!tracker.ranges.contains_key(&a));
+    }
+
+    #[test]
+    fn overlaps_range_reports_target_inode_only() {
+        let mut tracker = DirtyPageTracker::new();
+        let a = id(40);
+        let b = id(41);
+        tracker.mark_dirty(a, 4096, 4096);
+        tracker.mark_dirty(a, 16384, 4096);
+        tracker.mark_dirty(b, 0, 4096);
+
+        assert!(!tracker.overlaps_range(a, 0, 4096));
+        assert!(tracker.overlaps_range(a, 4095, 2));
+        assert!(tracker.overlaps_range(a, 8191, 2));
+        assert!(!tracker.overlaps_range(a, 8192, 4096));
+        assert!(tracker.overlaps_range(a, 16384, 1));
+        assert!(!tracker.overlaps_range(a, 0, 0));
+        assert!(!tracker.overlaps_range(b, 4096, 4096));
+        assert!(!tracker.overlaps_range(id(999), 0, 4096));
     }
 }
