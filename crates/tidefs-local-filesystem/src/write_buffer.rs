@@ -110,6 +110,28 @@ impl WriteBuffer {
             return;
         }
 
+        if candidate_starts.len() == 1 {
+            let segment_start = candidate_starts[0];
+            if segment_start <= offset {
+                if let Some(data) = self.segments.get_mut(&segment_start) {
+                    let segment_end = Self::segment_end(segment_start, data);
+                    if offset <= segment_end {
+                        let dst = (offset - segment_start) as usize;
+                        let overlap_len = data.len().saturating_sub(dst).min(buf.len());
+                        if overlap_len > 0 {
+                            data[dst..dst + overlap_len].copy_from_slice(&buf[..overlap_len]);
+                        }
+                        if overlap_len < buf.len() {
+                            let tail = &buf[overlap_len..];
+                            data.extend_from_slice(tail);
+                            self.total_bytes = self.total_bytes.saturating_add(tail.len());
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
         let merged_len = (merged_end - merged_start) as usize;
         let mut merged = vec![0_u8; merged_len];
 
@@ -811,5 +833,38 @@ mod tests {
         assert!(wb.overlay_range(0, &mut base));
 
         assert_eq!(&base, b"abcddirtyjkl");
+    }
+
+    #[test]
+    fn sequential_full_page_writeback_extends_one_segment() {
+        let mut wb = WriteBuffer::new(WriteBufferConfig {
+            flush_threshold_bytes: 8 * 1024 * 1024,
+            flush_threshold_age: Duration::from_millis(50),
+        });
+        let page_size = 4096usize;
+        let page_count = 1536usize;
+
+        for page in 0..page_count {
+            let mut page_bytes = vec![0_u8; page_size];
+            page_bytes[..8].copy_from_slice(&(page as u64).to_le_bytes());
+            wb.ingest(&page_bytes, (page * page_size) as u64);
+        }
+
+        assert_eq!(wb.len(), page_count * page_size);
+        let drained = wb.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, 0);
+        assert_eq!(drained[0].1.len(), page_count * page_size);
+        for page in [0, 1, 511, 1024, 1535] {
+            let offset = page * page_size;
+            assert_eq!(
+                u64::from_le_bytes(
+                    drained[0].1[offset..offset + 8]
+                        .try_into()
+                        .expect("marker width"),
+                ),
+                page as u64
+            );
+        }
     }
 }
