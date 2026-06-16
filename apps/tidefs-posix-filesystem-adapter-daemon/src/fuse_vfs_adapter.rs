@@ -339,6 +339,27 @@ fn check_parent_write_execute_mutation_preflight(
     check_parent_write_execute(engine, parent, ctx)
 }
 
+fn delete_child_attr_for_mutation_preflight(
+    engine: &dyn VfsEngine,
+    parent: InodeId,
+    name: &[u8],
+    ctx: &RequestCtx,
+) -> Result<InodeAttr, Errno> {
+    if ctx.uid == 0 {
+        let child_attr = engine.lookup(parent, name, ctx)?;
+        enforce_immutable_guard(child_attr.flags.to_raw_flags())?;
+        return Ok(child_attr);
+    }
+
+    let parent_attr = engine.getattr(parent, None, ctx)?;
+    check_parent_write_execute_with_attr(engine, parent, &parent_attr, ctx)?;
+    let child_attr = engine.lookup(parent, name, ctx)?;
+    check_sticky_unlink_with_attrs(&parent_attr, &child_attr, ctx)?;
+    enforce_immutable_guard(parent_attr.flags.to_raw_flags())?;
+    enforce_immutable_guard(child_attr.flags.to_raw_flags())?;
+    Ok(child_attr)
+}
+
 /// Map a namespace `kind` field to a VFS [`NodeKind`].
 fn namespace_kind_to_node_kind(kind: u32) -> NodeKind {
     match kind {
@@ -3973,13 +3994,7 @@ impl FuseVfsAdapter {
         self.check_not_read_only()?;
         let e = self.engine.lock().unwrap();
         let parent_id = InodeId::new(parent);
-        let parent_attr = e.getattr(parent_id, None, ctx)?;
-        check_parent_write_execute_with_attr(&**e, parent_id, &parent_attr, ctx)?;
-        let child_attr = e.lookup(parent_id, name, ctx)?;
-        check_sticky_unlink_with_attrs(&parent_attr, &child_attr, ctx)?;
-        // POSIX: reject unlink if parent or child inode is immutable.
-        enforce_immutable_guard(parent_attr.flags.to_raw_flags())?;
-        enforce_immutable_guard(child_attr.flags.to_raw_flags())?;
+        let child_attr = delete_child_attr_for_mutation_preflight(&**e, parent_id, name, ctx)?;
         // Capacity tracking for freed space is handled by the engine's
         // CapacityAuthority during unlink dispatch.
         let child_inode_for_delete = child_attr.inode_id;
@@ -4285,14 +4300,7 @@ impl FuseVfsAdapter {
         self.check_not_read_only()?;
         let e = self.engine.lock().unwrap();
         let parent_id = InodeId::new(parent);
-        let parent_attr = e.getattr(parent_id, None, ctx)?;
-        check_parent_write_execute_with_attr(&**e, parent_id, &parent_attr, ctx)?;
-        let child_attr = e.lookup(parent_id, name, ctx)?;
-        check_sticky_unlink_with_attrs(&parent_attr, &child_attr, ctx)?;
-
-        // POSIX: reject rmdir if parent or child inode is immutable.
-        enforce_immutable_guard(parent_attr.flags.to_raw_flags())?;
-        enforce_immutable_guard(child_attr.flags.to_raw_flags())?;
+        let child_attr = delete_child_attr_for_mutation_preflight(&**e, parent_id, name, ctx)?;
         // Resolve the removed directory's inode before rmdir: needed both
         // for negative-cache invalidation.
         let removed_attr = child_attr;
@@ -24800,6 +24808,43 @@ mod tests {
             non_root_result.is_err(),
             "non-root permission preflight still resolves the parent before mutation"
         );
+    }
+
+    #[test]
+    fn root_delete_preflight_keeps_child_resolution_and_non_root_gate() {
+        let fixture = adapter_fixture();
+        let root_ctx = root_ctx();
+        let (parent, child) = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let root = engine.get_root_inode(&root_ctx).expect("root inode");
+            let parent = engine
+                .mkdir(root, b"locked", 0o555, &root_ctx)
+                .expect("create unwritable parent");
+            let (child, _fh) = engine
+                .create(
+                    parent.inode_id,
+                    b"child.txt",
+                    0o644,
+                    libc::O_RDWR as u32,
+                    &root_ctx,
+                )
+                .expect("create child");
+            (parent.inode_id, child.inode_id)
+        };
+
+        let engine = fixture.adapter.engine.lock().unwrap();
+        let root_child =
+            delete_child_attr_for_mutation_preflight(&**engine, parent, b"child.txt", &root_ctx)
+                .expect("root delete preflight resolves child");
+        assert_eq!(root_child.inode_id, child);
+
+        let non_root_result = delete_child_attr_for_mutation_preflight(
+            &**engine,
+            parent,
+            b"child.txt",
+            &access_ctx(1000, 1001, &[1001]),
+        );
+        assert_eq!(non_root_result.unwrap_err(), Errno::EACCES);
     }
 
     #[test]
