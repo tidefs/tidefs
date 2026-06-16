@@ -5767,14 +5767,11 @@ impl FuseVfsAdapter {
                                         self.invalidate_caches_after_direct_write(ino);
                                     } else if clean_writeback_write_through && !sparse_zero_noop {
                                         self.record_clean_write_through_after_write(
-                                            &**e,
-                                            ctx,
-                                            write_efh,
                                             ino,
                                             effective_offset as u64,
                                             written,
                                             written_data,
-                                        );
+                                        )?;
                                     } else if !sparse_zero_noop {
                                         self.mark_dirty_after_write(
                                             &**e,
@@ -6230,16 +6227,13 @@ impl FuseVfsAdapter {
 
     fn record_clean_write_through_after_write(
         &self,
-        engine: &(dyn VfsEngineStatFs + Send),
-        ctx: &RequestCtx,
-        efh: &EngineFileHandle,
         ino: u64,
         offset: u64,
         written: u32,
         written_data: &[u8],
-    ) {
+    ) -> Result<(), Errno> {
         if written == 0 {
-            return;
+            return Ok(());
         }
 
         if let Ok(mut cache) = self.page_cache.lock() {
@@ -6250,12 +6244,19 @@ impl FuseVfsAdapter {
         }
         self.invalidate_inode_metadata_local(ino);
 
-        if let Some(ref wb_cache) = self.writeback_page_cache {
+        let length = u64::from(written);
+        let has_dirty_overlap = self.dirty_trackers_overlap_range(ino, offset, length)
+            || self.dirty_page_caches_overlap_range(ino, offset, length);
+        if has_dirty_overlap {
+            self.reconcile_dirty_mirrors_for_authoritative_range(
+                ino,
+                offset,
+                length,
+                AuthoritativeRangePayload::Bytes(written_data),
+            )?;
+        } else if let Some(ref wb_cache) = self.writeback_page_cache {
             self.update_clean_write_through_page_cache(
                 wb_cache,
-                engine,
-                ctx,
-                efh,
                 ino,
                 offset,
                 written,
@@ -6264,9 +6265,6 @@ impl FuseVfsAdapter {
             if !Arc::ptr_eq(wb_cache, &self.write_page_cache) {
                 self.update_clean_write_through_page_cache(
                     &self.write_page_cache,
-                    engine,
-                    ctx,
-                    efh,
                     ino,
                     offset,
                     written,
@@ -6276,9 +6274,6 @@ impl FuseVfsAdapter {
         } else {
             self.update_clean_write_through_page_cache(
                 &self.write_page_cache,
-                engine,
-                ctx,
-                efh,
                 ino,
                 offset,
                 written,
@@ -6289,17 +6284,15 @@ impl FuseVfsAdapter {
         {
             let mut wc = self.writeback_cache.lock().unwrap();
             wc.insert(ino);
-            wc.mark_clean(ino);
         }
+        self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
         self.txg_cycle.queue_write(ino, offset, written_data);
+        Ok(())
     }
 
     fn update_clean_write_through_page_cache(
         &self,
         cache: &PageCache,
-        engine: &(dyn VfsEngineStatFs + Send),
-        ctx: &RequestCtx,
-        efh: &EngineFileHandle,
         ino: u64,
         offset: u64,
         written: u32,
@@ -6310,27 +6303,9 @@ impl FuseVfsAdapter {
         let end_off = start_off.saturating_add(u64::from(written));
         let mut off = (start_off / page_size) * page_size;
         while off < end_off {
-            let page_was_absent = cache.lookup(ino, off).is_none();
             let copy_start = start_off.max(off);
             let copy_end = end_off.min(off.saturating_add(page_size));
-            let existing_page = if page_was_absent
-                && (copy_start != off || copy_end != off.saturating_add(page_size))
-            {
-                match u32::try_from(page_size) {
-                    Ok(read_size) => engine.read_for_cache_fill(efh, off, read_size, ctx).ok(),
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
-            if page_was_absent {
-                let _ = cache.insert(ino, off);
-            }
             if let Some(mut page) = cache.lookup(ino, off) {
-                if let Some(existing) = existing_page.as_deref() {
-                    let fill_len = existing.len().min(page.data_mut().len());
-                    page.data_mut()[..fill_len].copy_from_slice(&existing[..fill_len]);
-                }
                 if copy_start < copy_end {
                     let src_start = (copy_start - start_off) as usize;
                     let dst_start = (copy_start - off) as usize;
@@ -40056,12 +40031,52 @@ mod tests {
             .lock()
             .unwrap()
             .dirty_page_tracker_arc();
-        let payload = b"dirty mirror";
-        let offset = 128;
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let page_size_u32 = u32::try_from(page_size).expect("page size fits u32");
+        let page_size_u64 = u64::try_from(page_size).expect("page size fits u64");
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert dirty mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("lookup dirty mirror");
+            page.data_mut().fill(0x55);
+            page.mark_dirty();
+        }
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, page_size_u32);
+        shared_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(inode, 0, page_size_u64);
+        worker_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, 0, page_size_u64)
+            .expect("seed worker dirty range");
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(ino);
+            cache.mark_dirty(ino, page_size_u64);
+        }
+
+        let payload = vec![0xAB; page_size];
+        let offset = 0;
 
         let written = fixture
             .adapter
-            .dispatch_write(&ctx, ino, adapter_fh, offset, payload, FUSE_WRITE_CACHE)
+            .dispatch_write(&ctx, ino, adapter_fh, offset, &payload, FUSE_WRITE_CACHE)
             .expect("writeback-cache write");
         assert_eq!(written, payload.len() as u32);
 
@@ -40100,9 +40115,8 @@ mod tests {
             .adapter
             .write_page_cache
             .lookup(ino, 0)
-            .expect("write-through mirror remains resident");
-        let start = offset as usize;
-        assert_eq!(&page.data()[start..start + payload.len()], payload);
+            .expect("dirty mirror remains resident");
+        assert_eq!(page.data(), payload.as_slice());
         assert!(!page.is_dirty());
 
         assert_eq!(
@@ -40130,7 +40144,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_cached_partial_page_preserves_authoritative_tails() {
+    fn writeback_cached_resident_partial_page_preserves_authoritative_tails() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
@@ -40150,7 +40164,20 @@ mod tests {
             .unwrap()
             .write(&engine_fh, 0, &seed, &ctx)
             .expect("seed authoritative engine page");
-        assert!(fixture.adapter.write_page_cache.lookup(ino, 0).is_none());
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert resident clean mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("lookup resident clean mirror");
+            page.data_mut().copy_from_slice(&seed);
+            page.clear_dirty();
+        }
 
         let offset = 1234i64;
         let payload = b"partial writeback payload";
@@ -40173,6 +40200,70 @@ mod tests {
             &seed[start + payload.len()..]
         );
         assert!(!page.is_dirty());
+    }
+
+    #[test]
+    fn writeback_cached_absent_partial_page_skips_clean_cache_fill() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-absent-partial-page.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let seed: Vec<u8> = (0..page_size)
+            .map(|index| 255_u8.wrapping_sub((index % 251) as u8))
+            .collect();
+
+        fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .write(&engine_fh, 0, &seed, &ctx)
+            .expect("seed authoritative engine page");
+        assert!(fixture.adapter.write_page_cache.lookup(ino, 0).is_none());
+
+        let offset = 1234i64;
+        let payload = b"partial clean write-through";
+        let written = fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, offset, payload, FUSE_WRITE_CACHE)
+            .expect("writeback-cache partial overwrite");
+        assert_eq!(written, payload.len() as u32);
+        assert!(
+            fixture.adapter.write_page_cache.lookup(ino, 0).is_none(),
+            "absent clean write-through pages should not be cache-filled"
+        );
+
+        let read_size = u32::try_from(page_size).expect("page size fits u32");
+        let engine_page = fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .read(&engine_fh, 0, read_size, &ctx)
+            .expect("read authoritative engine page");
+        let start = offset as usize;
+        assert_eq!(&engine_page[..start], &seed[..start]);
+        assert_eq!(&engine_page[start..start + payload.len()], payload);
+        assert_eq!(
+            &engine_page[start + payload.len()..page_size],
+            &seed[start + payload.len()..]
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(false),
+            "clean write-through writes remain clean without populating page cache"
+        );
     }
 
     #[test]
