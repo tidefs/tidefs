@@ -2553,15 +2553,39 @@ impl Pool {
         Ok(deleted)
     }
 
-    /// Drain receipt-authorized dead objects across the devices for an I/O class.
+    /// Drain receipt-authorized dead objects across the devices for an I/O class
+    /// using the last generation strictly below `stable_committed_txg`.
     ///
-    /// The stable boundary is caller-supplied so higher layers can tie source
-    /// reclamation to the replacement placement receipt that made the new
-    /// placement legal.
+    /// Prefer
+    /// [`Self::drain_receipt_bound_dead_objects_at_stable_generation`] when the
+    /// caller owns an explicit committed receipt-generation boundary.
     pub fn drain_receipt_bound_dead_objects_at_txg(
         &mut self,
         class: IoClass,
         stable_committed_txg: u64,
+        max_count: usize,
+    ) -> std::result::Result<
+        PoolReceiptBoundDeadObjectDrainStats,
+        crate::store::ReceiptBoundDeadObjectDrainError,
+    > {
+        self.drain_receipt_bound_dead_objects_at_stable_generation(
+            class,
+            stable_committed_txg,
+            stable_committed_txg.saturating_sub(1),
+            max_count,
+        )
+    }
+
+    /// Drain receipt-authorized dead objects across the devices for an I/O class.
+    ///
+    /// The stable boundaries are caller-supplied so higher layers can tie
+    /// source reclamation to the replacement placement receipt that made the
+    /// new placement legal.
+    pub fn drain_receipt_bound_dead_objects_at_stable_generation(
+        &mut self,
+        class: IoClass,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
         max_count: usize,
     ) -> std::result::Result<
         PoolReceiptBoundDeadObjectDrainStats,
@@ -2587,7 +2611,11 @@ impl Pool {
         for idx in self.usable_candidates(&indices) {
             let stats = self.devices[idx]
                 .store_mut()
-                .drain_receipt_bound_dead_objects_at_txg(stable_committed_txg, remaining)?;
+                .drain_receipt_bound_dead_objects_at_stable_generation(
+                    stable_committed_txg,
+                    stable_committed_generation,
+                    remaining,
+                )?;
             aggregate.devices_scanned += 1;
             aggregate.absorb_reclaim_stats(stats);
             remaining = remaining.saturating_sub(stats.entries_processed);
@@ -5000,7 +5028,11 @@ mod tests {
             .map(|idx| {
                 let stats = reopened.devices[*idx]
                     .store_mut()
-                    .drain_receipt_bound_dead_objects_at_txg(replacement.generation, 16)
+                    .drain_receipt_bound_dead_objects_at_stable_generation(
+                        replacement.generation.saturating_add(1),
+                        replacement.generation.saturating_sub(1),
+                        16,
+                    )
                     .expect("held drain");
                 assert_eq!(stats.entries_processed, 0);
                 stats.reclaim_queue_depth
@@ -5013,8 +5045,9 @@ mod tests {
             .map(|idx| {
                 reopened.devices[*idx]
                     .store_mut()
-                    .drain_receipt_bound_dead_objects_at_txg(
+                    .drain_receipt_bound_dead_objects_at_stable_generation(
                         replacement.generation.saturating_add(1),
+                        replacement.generation,
                         16,
                     )
                     .expect("stable drain")
@@ -5078,7 +5111,11 @@ mod tests {
             .map(|idx| {
                 let stats = reopened.devices[*idx]
                     .store_mut()
-                    .drain_receipt_bound_dead_objects_at_txg(replacement.generation, 16)
+                    .drain_receipt_bound_dead_objects_at_stable_generation(
+                        replacement.generation.saturating_add(1),
+                        replacement.generation.saturating_sub(1),
+                        16,
+                    )
                     .expect("held erasure drain");
                 assert_eq!(stats.entries_processed, 0);
                 stats.reclaim_queue_depth
@@ -5091,8 +5128,9 @@ mod tests {
             .map(|idx| {
                 reopened.devices[*idx]
                     .store_mut()
-                    .drain_receipt_bound_dead_objects_at_txg(
+                    .drain_receipt_bound_dead_objects_at_stable_generation(
                         replacement.generation.saturating_add(1),
+                        replacement.generation,
                         16,
                     )
                     .expect("stable erasure drain")
@@ -5138,7 +5176,7 @@ mod tests {
         for idx in old_target_indices {
             let stats = pool.devices[idx]
                 .store_mut()
-                .drain_receipt_bound_dead_objects_at_txg(u64::MAX, 16)
+                .drain_receipt_bound_dead_objects_at_stable_generation(u64::MAX, u64::MAX, 16)
                 .expect("delete drain");
             assert_eq!(stats.entries_processed, 0);
             assert_eq!(stats.reclaim_queue_depth, 0);

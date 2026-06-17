@@ -735,13 +735,15 @@ where
 ///
 /// This is the release-facing dead-object physical reclaim entry point: it
 /// selects candidates through
-/// [`DeadObjectReclaimQueue::dequeue_receipt_bound_batch`] so legacy,
-/// synthetic, malformed, under-width, ineligible, or not-yet-stable entries
-/// remain queued. The caller owns source-queue mutation and should acknowledge
-/// only the returned object ids after any queue persistence succeeds.
+/// [`DeadObjectReclaimQueue::dequeue_receipt_bound_batch_with_stable_generation`]
+/// so legacy, synthetic, malformed, under-width, ineligible, or
+/// generation-unstable entries remain queued. The caller owns source-queue
+/// mutation and should acknowledge only the returned object ids after any
+/// queue persistence succeeds.
 pub fn drain_receipt_bound_dead_objects<R, F>(
     queue: &DeadObjectReclaimQueue,
     stable_committed_txg: u64,
+    stable_committed_generation: u64,
     max_count: usize,
     resolver: &impl SegmentResolver<Error = R>,
     freer: &mut impl SegmentFreer<Error = F>,
@@ -765,7 +767,11 @@ where
         });
     }
 
-    let entries = queue.dequeue_receipt_bound_batch(limit, stable_committed_txg);
+    let entries = queue.dequeue_receipt_bound_batch_with_stable_generation(
+        limit,
+        stable_committed_txg,
+        stable_committed_generation,
+    );
     if entries.is_empty() {
         return Ok(ReceiptBoundDeadObjectDrain {
             stats,
@@ -919,6 +925,7 @@ impl ReclaimConsumerService {
         &mut self,
         queue: &DeadObjectReclaimQueue,
         stable_committed_txg: u64,
+        stable_committed_generation: u64,
         max_count: usize,
         resolver: &impl SegmentResolver<Error = R>,
         freer: &mut impl SegmentFreer<Error = F>,
@@ -930,6 +937,7 @@ impl ReclaimConsumerService {
         drain_receipt_bound_dead_objects(
             queue,
             stable_committed_txg,
+            stable_committed_generation,
             max_count,
             resolver,
             freer,
@@ -1673,6 +1681,26 @@ mod tests {
         )
     }
 
+    fn erasure_receipt_for(
+        key: ObjectKey,
+        generation: u64,
+        data_shards: u8,
+        parity_shards: u8,
+    ) -> tidefs_types_reclaim_queue_core::DeadObjectReplacementReceipt {
+        let mut digest = [0u8; 32];
+        digest[0] = key.0[0];
+        digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        tidefs_types_reclaim_queue_core::DeadObjectReplacementReceipt::erasure_coded(
+            key,
+            1,
+            generation,
+            data_shards,
+            parity_shards,
+            4096,
+            digest,
+        )
+    }
+
     fn dead_entry(
         id: u8,
         death_commit_group: u64,
@@ -1689,6 +1717,33 @@ mod tests {
         );
         match receipt_generation {
             Some(generation) => entry.with_replacement_receipt(receipt_for(key, generation)),
+            None => entry,
+        }
+    }
+
+    fn dead_erasure_entry(
+        id: u8,
+        death_commit_group: u64,
+        eligible: bool,
+        receipt_generation: Option<u64>,
+        data_shards: u8,
+        parity_shards: u8,
+    ) -> tidefs_types_reclaim_queue_core::DeadObjectEntry {
+        let key = obj_key(id);
+        let entry = tidefs_types_reclaim_queue_core::DeadObjectEntry::new(
+            key,
+            [id; 16],
+            death_commit_group,
+            eligible,
+            death_commit_group,
+        );
+        match receipt_generation {
+            Some(generation) => entry.with_replacement_receipt(erasure_receipt_for(
+                key,
+                generation,
+                data_shards,
+                parity_shards,
+            )),
             None => entry,
         }
     }
@@ -1937,6 +1992,7 @@ mod tests {
         let drain = drain_receipt_bound_dead_objects(
             &queue,
             6,
+            11,
             16,
             &resolver,
             &mut freer,
@@ -1961,20 +2017,22 @@ mod tests {
         queue.enqueue(dead_entry(2, 5, true, Some(0)));
         queue.enqueue(dead_entry(3, 7, true, Some(12)));
         queue.enqueue(dead_entry(4, 5, false, Some(13)));
+        queue.enqueue(dead_entry(5, 5, true, Some(12)));
 
         let mut resolver = MockResolver::new();
-        for id in 1..=4u8 {
+        for id in 1..=5u8 {
             resolver.set(id, 100);
         }
 
         let mut live_counts = SegmentLiveCounts::new();
-        live_counts.set_live_count(100, 4);
+        live_counts.set_live_count(100, 5);
         let mut freer = MockFreer::new();
         let config = ReclaimConsumerConfig::default();
 
         let drain = drain_receipt_bound_dead_objects(
             &queue,
             6,
+            11,
             16,
             &resolver,
             &mut freer,
@@ -1984,9 +2042,58 @@ mod tests {
         .expect("receipt-bound drain");
 
         assert!(drain.is_idle());
-        assert_eq!(drain.stats.reclaim_queue_depth, 4);
-        assert_eq!(live_counts.live_count(100), 4);
+        assert_eq!(drain.stats.reclaim_queue_depth, 5);
+        assert_eq!(live_counts.live_count(100), 5);
         assert!(freer.freed_segments().is_empty());
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_waits_for_stable_generation() {
+        let mut queue = DeadObjectReclaimQueue::new();
+        queue.enqueue(dead_entry(1, 4, true, Some(7)));
+
+        let mut resolver = MockResolver::new();
+        resolver.set(1, 100);
+
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.set_live_count(100, 1);
+        let mut freer = MockFreer::new();
+        let config = ReclaimConsumerConfig::default();
+
+        let held = drain_receipt_bound_dead_objects(
+            &queue,
+            6,
+            6,
+            16,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+        )
+        .expect("receipt-bound held drain");
+
+        assert!(held.is_idle());
+        assert_eq!(held.stats.reclaim_queue_depth, 1);
+        assert_eq!(live_counts.live_count(100), 1);
+        assert!(freer.freed_segments().is_empty());
+
+        let drained = drain_receipt_bound_dead_objects(
+            &queue,
+            6,
+            7,
+            16,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+        )
+        .expect("receipt-bound stable drain");
+
+        assert_eq!(drained.ack_object_ids, vec![obj_key(1)]);
+        assert_eq!(drained.stats.entries_processed, 1);
+        assert_eq!(drained.stats.segments_reclaimed, 1);
+        assert_eq!(freer.freed_segments(), vec![100]);
+        assert!(live_counts.is_dead(100));
     }
 
     #[test]
@@ -2012,6 +2119,7 @@ mod tests {
         let drain = drain_receipt_bound_dead_objects(
             &queue,
             6,
+            14,
             4,
             &resolver,
             &mut freer,
@@ -2043,13 +2151,119 @@ mod tests {
         let mut freer = MockFreer::new();
 
         let drain = service
-            .drain_receipt_bound_dead_objects(&queue, 6, 8, &resolver, &mut freer)
+            .drain_receipt_bound_dead_objects(&queue, 6, 18, 8, &resolver, &mut freer)
             .expect("service receipt-bound drain");
 
         assert_eq!(drain.ack_object_ids, vec![obj_key(8)]);
         assert_eq!(drain.stats.segments_reclaimed, 1);
         assert_eq!(freer.freed_segments(), vec![300]);
         assert!(service.live_counts().is_dead(300));
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_authorizes_erasure_receipts() {
+        let mut queue = DeadObjectReclaimQueue::new();
+        queue.enqueue(dead_erasure_entry(1, 4, true, Some(10), 3, 2));
+        queue.enqueue(dead_erasure_entry(2, 4, true, Some(11), 3, 2));
+        queue.enqueue(dead_entry(3, 4, true, None));
+
+        let mut resolver = MockResolver::new();
+        resolver.set(1, 100);
+        resolver.set(2, 100);
+        resolver.set(3, 100);
+
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.set_live_count(100, 3);
+        let mut freer = MockFreer::new();
+        let config = ReclaimConsumerConfig::default();
+
+        let drain = drain_receipt_bound_dead_objects(
+            &queue,
+            6,
+            11,
+            16,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+        )
+        .expect("receipt-bound erasure drain");
+
+        assert_eq!(drain.ack_object_ids, vec![obj_key(1), obj_key(2)]);
+        assert_eq!(drain.stats.entries_processed, 2);
+        assert_eq!(drain.stats.segments_reclaimed, 0);
+        assert!(!live_counts.is_dead(100));
+        assert_eq!(live_counts.live_count(100), 1);
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_frees_erasure_segment() {
+        let mut queue = DeadObjectReclaimQueue::new();
+        queue.enqueue(dead_erasure_entry(1, 4, true, Some(10), 2, 1));
+
+        let mut resolver = MockResolver::new();
+        resolver.set(1, 200);
+
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.set_live_count(200, 1);
+        let mut freer = MockFreer::new();
+        let config = ReclaimConsumerConfig::default();
+
+        let drain = drain_receipt_bound_dead_objects(
+            &queue,
+            6,
+            10,
+            16,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+        )
+        .expect("receipt-bound erasure segment drain");
+
+        assert_eq!(drain.ack_object_ids, vec![obj_key(1)]);
+        assert_eq!(drain.stats.segments_reclaimed, 1);
+        assert_eq!(drain.stats.blocks_freed, 1);
+        assert_eq!(freer.freed_segments(), vec![200]);
+        assert!(live_counts.is_dead(200));
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_mixed_replicated_and_erasure() {
+        let mut queue = DeadObjectReclaimQueue::new();
+        queue.enqueue(dead_entry(1, 4, true, Some(10)));
+        queue.enqueue(dead_erasure_entry(2, 4, true, Some(11), 2, 1));
+        queue.enqueue(dead_entry(3, 4, true, Some(12)));
+        queue.enqueue(dead_erasure_entry(4, 4, true, Some(13), 3, 2));
+
+        let mut resolver = MockResolver::new();
+        for id in 1..=4u8 {
+            resolver.set(id, 300);
+        }
+
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.set_live_count(300, 4);
+        let mut freer = MockFreer::new();
+        let config = ReclaimConsumerConfig::default();
+
+        let drain = drain_receipt_bound_dead_objects(
+            &queue,
+            6,
+            13,
+            16,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+        )
+        .expect("mixed receipt-bound drain");
+
+        assert_eq!(drain.ack_object_ids.len(), 4);
+        assert_eq!(drain.stats.entries_processed, 4);
+        assert_eq!(drain.stats.segments_reclaimed, 1);
+        assert_eq!(drain.stats.blocks_freed, 4);
+        assert_eq!(freer.freed_segments(), vec![300]);
+        assert!(live_counts.is_dead(300));
     }
 
     // -- SegmentLiveCounts tests --

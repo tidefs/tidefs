@@ -1408,9 +1408,8 @@ mod tests {
     #[test]
     fn erasure_coded_replacement_receipt_authorizes_reclaim() {
         let key = oid(42);
-        let receipt = DeadObjectReplacementReceipt::erasure_coded(
-            key, 7, 1, 4, 2, 8192, digest_for_key(key),
-        );
+        let receipt =
+            DeadObjectReplacementReceipt::erasure_coded(key, 7, 1, 4, 2, 8192, digest_for_key(key));
         assert!(!receipt.is_synthetic());
         assert!(receipt.authorizes_reclaim_for(key));
     }
@@ -1448,12 +1447,10 @@ mod tests {
     fn stable_generation_gating_rejects_zero_generation() {
         let mut q = DeadObjectReclaimQueue::new();
         let key = oid(30);
-        let receipt = DeadObjectReplacementReceipt::replicated(
-            key, 7, 0, 2, 4096, digest_for_key(key),
-        );
+        let receipt =
+            DeadObjectReplacementReceipt::replicated(key, 7, 0, 2, 4096, digest_for_key(key));
         q.enqueue(
-            DeadObjectEntry::new(key, [30; 16], 5, true, 5)
-                .with_replacement_receipt(receipt),
+            DeadObjectEntry::new(key, [30; 16], 5, true, 5).with_replacement_receipt(receipt),
         );
 
         // Synthetic receipt (gen 0): stable-generation batch rejects
@@ -1476,9 +1473,8 @@ mod tests {
         assert_eq!(q.receipt_bound_eligible_count(10), 0);
 
         // Rebake publishes replacement receipt
-        let receipt = DeadObjectReplacementReceipt::replicated(
-            key, 7, 1, 2, 4096, digest_for_key(key),
-        );
+        let receipt =
+            DeadObjectReplacementReceipt::replicated(key, 7, 1, 2, 4096, digest_for_key(key));
         assert!(q.publish_replacement_receipt(&key, receipt));
 
         // Now reclaimable
@@ -1489,30 +1485,25 @@ mod tests {
     fn rebake_publish_rejects_lower_generation() {
         let mut q = DeadObjectReclaimQueue::new();
         let key = oid(50);
-        let receipt_gen3 = DeadObjectReplacementReceipt::replicated(
-            key, 7, 3, 2, 4096, digest_for_key(key),
-        );
+        let receipt_gen3 =
+            DeadObjectReplacementReceipt::replicated(key, 7, 3, 2, 4096, digest_for_key(key));
         q.enqueue(
-            DeadObjectEntry::new(key, [50; 16], 5, true, 5)
-                .with_replacement_receipt(receipt_gen3),
+            DeadObjectEntry::new(key, [50; 16], 5, true, 5).with_replacement_receipt(receipt_gen3),
         );
 
         // Attempt to publish older generation: rejected
-        let receipt_gen2 = DeadObjectReplacementReceipt::replicated(
-            key, 7, 2, 2, 4096, digest_for_key(key),
-        );
+        let receipt_gen2 =
+            DeadObjectReplacementReceipt::replicated(key, 7, 2, 2, 4096, digest_for_key(key));
         assert!(!q.publish_replacement_receipt(&key, receipt_gen2));
 
         // Attempt to publish same generation: rejected
-        let receipt_gen3b = DeadObjectReplacementReceipt::replicated(
-            key, 7, 3, 2, 4096, digest_for_key(key),
-        );
+        let receipt_gen3b =
+            DeadObjectReplacementReceipt::replicated(key, 7, 3, 2, 4096, digest_for_key(key));
         assert!(!q.publish_replacement_receipt(&key, receipt_gen3b));
 
         // Publish higher generation: accepted
-        let receipt_gen4 = DeadObjectReplacementReceipt::replicated(
-            key, 7, 4, 2, 4096, digest_for_key(key),
-        );
+        let receipt_gen4 =
+            DeadObjectReplacementReceipt::replicated(key, 7, 4, 2, 4096, digest_for_key(key));
         assert!(q.publish_replacement_receipt(&key, receipt_gen4));
     }
 
@@ -1521,12 +1512,10 @@ mod tests {
         let mut q = DeadObjectReclaimQueue::new();
         let key = oid(60);
         // Dead object enqueued, receipt published at gen 8
-        let receipt = DeadObjectReplacementReceipt::erasure_coded(
-            key, 7, 8, 4, 2, 8192, digest_for_key(key),
-        );
+        let receipt =
+            DeadObjectReplacementReceipt::erasure_coded(key, 7, 8, 4, 2, 8192, digest_for_key(key));
         q.enqueue(
-            DeadObjectEntry::new(key, [60; 16], 5, true, 5)
-                .with_replacement_receipt(receipt),
+            DeadObjectEntry::new(key, [60; 16], 5, true, 5).with_replacement_receipt(receipt),
         );
 
         // stable_committed_generation = 7 (behind the receipt gen 8)
@@ -1550,21 +1539,20 @@ mod tests {
         let k1 = oid(70);
         let k2 = oid(71);
 
-        let r1 = DeadObjectReplacementReceipt::replicated(
-            k1, 7, 1, 3, 4096, digest_for_key(k1),
-        );
-        let r2 = DeadObjectReplacementReceipt::erasure_coded(
-            k2, 7, 2, 8, 3, 16384, digest_for_key(k2),
-        );
+        let r1 = DeadObjectReplacementReceipt::replicated(k1, 7, 1, 3, 4096, digest_for_key(k1));
+        let r2 =
+            DeadObjectReplacementReceipt::erasure_coded(k2, 7, 2, 8, 3, 16384, digest_for_key(k2));
 
         q.enqueue(DeadObjectEntry::new(k1, [70; 16], 5, true, 5).with_replacement_receipt(r1));
         q.enqueue(DeadObjectEntry::new(k2, [71; 16], 5, true, 5).with_replacement_receipt(r2));
 
         assert_eq!(q.receipt_bound_eligible_count(10), 2);
-        assert_eq!(q.receipt_bound_eligible_count_with_stable_generation(10, 5), 2);
+        assert_eq!(
+            q.receipt_bound_eligible_count_with_stable_generation(10, 5),
+            2
+        );
 
         let batch = q.dequeue_receipt_bound_batch_with_stable_generation(10, 10, 5);
         assert_eq!(batch.len(), 2);
     }
-
 }
