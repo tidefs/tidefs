@@ -101,6 +101,10 @@ pub struct SessionBindingManager {
     sessions: TransportSessionSet,
     /// Whether all sessions have been established (health != Unknown for all).
     pub is_established: bool,
+    /// The join session epoch binding that authorizes these sessions.
+    /// Set from the handshake; state transfer and promotion gates
+    /// require this to be present and valid.
+    pub session_epoch: Option<crate::JoinSessionEpoch>,
 }
 
 impl SessionBindingManager {
@@ -112,7 +116,51 @@ impl SessionBindingManager {
             bound_epoch,
             sessions: TransportSessionSet::new(),
             is_established: false,
+            session_epoch: None,
         }
+    }
+
+    /// Attach the join session epoch binding to this manager.
+    ///
+    /// This must be called after the handshake produces quorum evidence.
+    /// Session operations verify this binding before allowing state transfer.
+    pub fn set_session_epoch(&mut self, session: crate::JoinSessionEpoch) {
+        self.session_epoch = Some(session);
+    }
+
+    /// Whether session bindings can proceed: checks that the session
+    /// epoch is valid for the given member and current epoch.
+    #[must_use]
+    pub fn can_bind_sessions(
+        &self,
+        current_epoch: EpochId,
+    ) -> Result<(), crate::JoinError> {
+        let session = self
+            .session_epoch
+            .as_ref()
+            .ok_or_else(|| crate::JoinError::MissingEpochEvidence(
+                "no session epoch recorded".into(),
+            ))?;
+
+        let _ = session.is_valid_for(self.member_id, current_epoch).map_err(|status| match status {
+            crate::JoinStatus::WaitingForQuorum => crate::JoinError::QuorumNotReached {
+                epoch: session.epoch,
+                approvals: session.quorum_evidence.as_ref().map_or(0, |qe| qe.quorum_approvals),
+                threshold: session.quorum_evidence.as_ref().map_or(1, |qe| qe.quorum_threshold),
+            },
+            crate::JoinStatus::StaleEpoch { current_epoch, join_epoch } => crate::JoinError::StaleEpoch {
+                session_epoch: join_epoch,
+                current_epoch,
+                reason: "session binding blocked: stale epoch".into(),
+            },
+            crate::JoinStatus::IdentityMismatch { expected, actual } => crate::JoinError::IdentityMismatch {
+                session_member: expected,
+                caller_member: actual,
+            },
+            _ => crate::JoinError::PreflightDenied(format!("session binding blocked: {:?}", status)),
+        })?;
+
+        Ok(())
     }
 
     /// Add a session binding to a peer.

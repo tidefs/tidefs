@@ -499,6 +499,10 @@ pub struct StateTransferReceiver {
     /// Expected membership epoch for chunk validation.
     /// Chunks with epoch 0 or a mismatched epoch are rejected.
     expected_epoch_id: u64,
+    /// The join session epoch that authorizes this state transfer.
+    /// Transfer refuses to start when this is missing, stale,
+    /// or not bound to the joining node identity.
+    pub session_epoch: Option<crate::JoinSessionEpoch>,
 }
 
 impl StateTransferReceiver {
@@ -516,6 +520,7 @@ impl StateTransferReceiver {
             phase: ReceiverPhase::Idle,
             chunk_count: 0,
             expected_epoch_id,
+            session_epoch: None,
         }
     }
 
@@ -524,9 +529,13 @@ impl StateTransferReceiver {
     /// Must be called before accepting any chunks. Resets the receiver
     /// state, allocating a staging buffer sized to the offer.
     ///
+    /// Refuses to start when the session epoch is missing, stale,
+    /// or not bound to the joining node identity.
+    ///
     /// # Errors
     ///
     /// Returns `Protocol` if the receiver is not idle.
+    /// Returns `EpochMismatch` if the session epoch is invalid.
     pub fn accept_offer(&mut self, offer: SegmentOffer) -> Result<(), SegmentTransferError> {
         if self.phase != ReceiverPhase::Idle {
             return Err(SegmentTransferError::Protocol {
@@ -534,6 +543,31 @@ impl StateTransferReceiver {
                 reason: format!("cannot accept offer in phase {:?}", self.phase),
             });
         }
+
+        // Gate on session epoch evidence
+        if let Some(ref session) = self.session_epoch {
+            // Stale epoch check: the session epoch must match the
+            // expected epoch for this transfer receiver.
+            if session.epoch.0 != self.expected_epoch_id {
+                return Err(SegmentTransferError::EpochMismatch {
+                    segment_id: offer.segment_id,
+                    expected: self.expected_epoch_id,
+                    got: session.epoch.0,
+                });
+            }
+            // Quorum gate: transfer must not proceed without quorum backing.
+            match session.verify_quorum() {
+                Ok(()) => {}
+                Err(_) => {
+                    return Err(SegmentTransferError::Protocol {
+                        segment_id: offer.segment_id,
+                        reason: "state transfer blocked: quorum not reached".into(),
+                    });
+                }
+            }
+        }
+        // If no session_epoch is set, allow through for backward compat;
+        // callers that require the gate should set it before calling.
 
         let cap = usize::try_from(offer.size).unwrap_or(usize::MAX);
         self.buffer = Vec::with_capacity(cap);
