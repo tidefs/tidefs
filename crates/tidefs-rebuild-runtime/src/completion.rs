@@ -1121,6 +1121,32 @@ mod tests {
         assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
     }
 
+
+    #[test]
+    fn erasure_receipt_rejects_malformed_zero_data_shards() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+
+        let task = make_erasure_task(42, 10, 1, 0, 2);
+        let mut repaired = erasure_receipt_ref(42, 1, 0, 2);
+        repaired.receipt_generation = 2;
+        repaired.redundancy_policy = tidefs_replication_model::ReceiptRedundancyPolicy::Erasure {
+            data_shards: 0,
+            parity_shards: 2,
+        };
+
+        let err = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect_err("malformed erasure policy must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::MalformedReceiptPolicy { object_id: 42 }
+        );
+        assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
+    }
     #[test]
     fn rebuild_after_replacement_receipt_completes() {
         // Simulates rebuild after a device replacement: the replacement
