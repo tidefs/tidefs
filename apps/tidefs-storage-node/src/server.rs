@@ -25,14 +25,13 @@ use tidefs_durability_layout::DurabilityLayoutV1;
 use tidefs_local_filesystem::{self as vfs, ChangedRecordExport, RootAuthenticationKey};
 use tidefs_local_object_store::device_layout::DeviceMediaClass;
 use tidefs_local_object_store::pool::{
-    Pool, PoolConfig as ObjectPoolConfig, PoolProperties, PoolReceiptBoundDeadObjectDrainStats,
-    PoolRedundancyPolicy as ObjectPoolRedundancyPolicy,
-    PlacementReceipt,
+    PlacementReceipt, Pool, PoolConfig as ObjectPoolConfig, PoolProperties,
+    PoolReceiptBoundDeadObjectDrainStats, PoolRedundancyPolicy as ObjectPoolRedundancyPolicy,
 };
 use tidefs_local_object_store::{
-    StoredObject,
     DeviceBacking, DeviceClass as ObjectDeviceClass, DeviceConfig as ObjectDeviceConfig,
     DeviceIoClass as ObjectIoClass, DeviceKind as ObjectDeviceKind, ObjectKey, StoreOptions,
+    StoredObject,
 };
 use tidefs_membership_epoch::session_binding::{RosterSessionRegistry, SessionAcceptor};
 use tidefs_membership_epoch::EpochId;
@@ -1329,8 +1328,27 @@ fn validate_repair_receipt_for_name(
     payload: &[u8],
     placement_receipt_ref: PlacementReceiptRef,
 ) -> Result<(), String> {
-    let expected_key = tidefs_local_object_store::ObjectKey::from_name(name).as_bytes32();
-    validate_repair_receipt(expected_key, payload, placement_receipt_ref)
+    validate_receipt_for_name(
+        "repair",
+        "repair payload",
+        name,
+        payload,
+        placement_receipt_ref,
+    )
+}
+
+fn validate_transfer_receipt_for_name(
+    name: &[u8],
+    payload: &[u8],
+    placement_receipt_ref: PlacementReceiptRef,
+) -> Result<(), String> {
+    validate_receipt_for_name(
+        "receipt transfer",
+        "transferred payload",
+        name,
+        payload,
+        placement_receipt_ref,
+    )
 }
 
 fn validate_repair_receipt_for_object_key(
@@ -1338,7 +1356,14 @@ fn validate_repair_receipt_for_object_key(
     payload: &[u8],
     placement_receipt_ref: PlacementReceiptRef,
 ) -> Result<(), String> {
-    validate_repair_receipt(object_key.as_bytes32(), payload, placement_receipt_ref)
+    validate_receipt_payload_authority(
+        "repair",
+        "repair object key",
+        "repair payload",
+        object_key.as_bytes32(),
+        payload,
+        placement_receipt_ref,
+    )
 }
 
 fn exact_repair_object_key(key: &[u8]) -> Result<ObjectKey, String> {
@@ -1351,49 +1376,70 @@ fn exact_repair_object_key(key: &[u8]) -> Result<ObjectKey, String> {
     Ok(ObjectKey::from_bytes32(bytes))
 }
 
-fn validate_repair_receipt(
+fn validate_receipt_for_name(
+    action: &str,
+    payload_description: &str,
+    name: &[u8],
+    payload: &[u8],
+    placement_receipt_ref: PlacementReceiptRef,
+) -> Result<(), String> {
+    let expected_key = ObjectKey::from_name(name).as_bytes32();
+    validate_receipt_payload_authority(
+        action,
+        "object name",
+        payload_description,
+        expected_key,
+        payload,
+        placement_receipt_ref,
+    )
+}
+
+fn validate_receipt_payload_authority(
+    action: &str,
+    expected_key_description: &str,
+    payload_description: &str,
     expected_key: [u8; 32],
     payload: &[u8],
     placement_receipt_ref: PlacementReceiptRef,
 ) -> Result<(), String> {
     if placement_receipt_ref.is_synthetic() {
         return Err(format!(
-            "repair refused: placement receipt for object {} is synthetic",
-            placement_receipt_ref.object_id
+            "{action} refused: placement receipt for object {} is synthetic",
+            placement_receipt_ref.object_id,
         ));
     }
     if !placement_receipt_ref.redundancy_policy.is_well_formed() {
         return Err(format!(
-            "repair refused: placement receipt for object {} has malformed redundancy policy",
-            placement_receipt_ref.object_id
+            "{action} refused: placement receipt for object {} has malformed redundancy policy",
+            placement_receipt_ref.object_id,
         ));
     }
     let required_targets = placement_receipt_ref.redundancy_policy.target_width();
     if placement_receipt_ref.target_count < required_targets {
         return Err(format!(
-            "repair refused: placement receipt for object {} has {} targets, needs {}",
-            placement_receipt_ref.object_id, placement_receipt_ref.target_count, required_targets
+            "{action} refused: placement receipt for object {} has {} targets, needs {}",
+            placement_receipt_ref.object_id, placement_receipt_ref.target_count, required_targets,
         ));
     }
     if placement_receipt_ref.object_key != expected_key {
         return Err(format!(
-            "repair refused: placement receipt object key does not match repair key for object {}",
-            placement_receipt_ref.object_id
+            "{action} refused: placement receipt object key does not match {expected_key_description} for object {}",
+            placement_receipt_ref.object_id,
         ));
     }
     if placement_receipt_ref.payload_len != payload.len() as u64 {
         return Err(format!(
-            "repair refused: placement receipt payload length {} does not match repair payload length {} for object {}",
+            "{action} refused: placement receipt payload length {} does not match {payload_description} length {} for object {}",
             placement_receipt_ref.payload_len,
             payload.len(),
-            placement_receipt_ref.object_id
+            placement_receipt_ref.object_id,
         ));
     }
     let digest: [u8; 32] = blake3::hash(payload).into();
     if placement_receipt_ref.payload_digest != digest {
         return Err(format!(
-            "repair refused: placement receipt payload digest does not match repair payload for object {}",
-            placement_receipt_ref.object_id
+            "{action} refused: placement receipt payload digest does not match {payload_description} for object {}",
+            placement_receipt_ref.object_id,
         ));
     }
     Ok(())
@@ -3778,11 +3824,14 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     payload,
                     placement_receipt_ref,
                 } => {
-                    // Validate the caller's receipt before accepting payload bytes.
-                    if placement_receipt_ref.is_synthetic() {
+                    if let Err(e) = validate_transfer_receipt_for_name(
+                        name.as_bytes(),
+                        &payload,
+                        placement_receipt_ref,
+                    ) {
                         eprintln!(
-                            "[storage-node] session {}: rejecting synthetic receipt for {}",
-                            session_id, name
+                            "[storage-node] session {}: rejecting receipt-authorized put for {}: {}",
+                            session_id, name, e
                         );
                         ReplicationMessage::PutWithReceiptAck {
                             key_hash: name.clone(),
@@ -3796,31 +3845,25 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                                 .put_local(&name, payload)
                                 .map(|_| None)
                                 .map_err(|e| e.to_string()),
-                            StoreBackend::TransportBacked(ts) => ts
-                                .put_local(&name, payload)
-                                .map(|_| None),
+                            StoreBackend::TransportBacked(ts) => {
+                                ts.put_local(&name, payload).map(|_| None)
+                            }
                             StoreBackend::PoolBacked(pool) => {
                                 match pool_put_named_with_receipt(pool, &name, payload) {
-                                    Ok((_stored, receipt)) => {
-                                        match receipt.shared_receipt_ref() {
-                                            Ok(receipt_ref) => Ok(Some(receipt_ref)),
-                                            Err(e) => Err(format!(
-                                                "pool receipt projection: {e}"
-                                            )),
-                                        }
-                                    }
+                                    Ok((_stored, receipt)) => match receipt.shared_receipt_ref() {
+                                        Ok(receipt_ref) => Ok(Some(receipt_ref)),
+                                        Err(e) => Err(format!("pool receipt projection: {e}")),
+                                    },
                                     Err(e) => Err(e),
                                 }
                             }
                         };
                         match result {
-                            Ok(recorded_receipt_ref) => {
-                                ReplicationMessage::PutWithReceiptAck {
-                                    key_hash: name.clone(),
-                                    success: true,
-                                    recorded_receipt_ref,
-                                }
-                            }
+                            Ok(recorded_receipt_ref) => ReplicationMessage::PutWithReceiptAck {
+                                key_hash: name.clone(),
+                                success: true,
+                                recorded_receipt_ref,
+                            },
                             Err(_e) => ReplicationMessage::PutWithReceiptAck {
                                 key_hash: name.clone(),
                                 success: false,
@@ -6636,6 +6679,16 @@ mod cluster_pool_handler_tests {
         let mut receipt = receipt_ref(name, b"authoritative", 5);
         receipt.payload_digest = blake3::hash(b"different").into();
         let err = validate_repair_receipt_for_name(name, b"authoritative", receipt).unwrap_err();
+        assert!(err.contains("payload digest"));
+    }
+
+    #[test]
+    fn receipt_transfer_rejects_payload_digest_mismatch() {
+        let name = b"transfer-target";
+        let mut receipt = receipt_ref(name, b"authoritative", 6);
+        receipt.payload_digest = blake3::hash(b"different").into();
+        let err = validate_transfer_receipt_for_name(name, b"authoritative", receipt).unwrap_err();
+        assert!(err.contains("receipt transfer"));
         assert!(err.contains("payload digest"));
     }
 
