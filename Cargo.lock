@@ -2535,6 +2535,7 @@ version = "0.421.0"
 dependencies = [
  "proptest",
  "tidefs-types-dataset-lifecycle-core",
+ "tidefs-types-reclaim-queue-core",
 ]
 
 [[package]]
@@ -3228,6 +3229,7 @@ dependencies = [
 name = "tidefs-reclaim"
 version = "0.421.0"
 dependencies = [
+ "blake3",
  "tidefs-binary_schema-checksum",
  "tidefs-dedup",
  "tidefs-pool-allocator",
@@ -3463,6 +3465,7 @@ name = "tidefs-snapshot-pruner"
 version = "0.421.0"
 dependencies = [
  "blake3",
+ "tidefs-gc-pin-set",
  "tidefs-local-object-store",
 ]
 
