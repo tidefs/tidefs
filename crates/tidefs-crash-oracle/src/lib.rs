@@ -24,7 +24,11 @@ use tidefs_types_vfs_core::{
     RequestMetadata, RetryIntent, TideRequest, TraceId, VfsNameToken, VfsRequest, WorkClass,
 };
 
+
 pub mod runtime_report;
+
+#[cfg(feature = "intent-log-replay")]
+pub mod intent_log_replay_matrix;
 
 pub const REPORT_VERSION: u64 = 1;
 pub const MODEL_BACKEND: &str = "tidefs-model-core";
