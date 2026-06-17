@@ -399,6 +399,29 @@ impl LabelReader {
 // Convenience: validate pool membership across devices
 // ---------------------------------------------------------------------------
 
+/// Which pool member identity field was duplicated across devices.
+///
+/// Used by [`MembershipError::DuplicateMemberIdentity`] to distinguish
+/// duplicate device GUIDs from duplicate device indices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DuplicateIdentityKind {
+    /// Duplicate device GUID — two distinct physical devices claim the
+    /// same `device_guid`.
+    DeviceGuid,
+    /// Duplicate device index — two distinct physical devices claim the
+    /// same `device_index` within the pool topology.
+    DeviceIndex,
+}
+
+impl std::fmt::Display for DuplicateIdentityKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeviceGuid => f.write_str("device GUID"),
+            Self::DeviceIndex => f.write_str("device index"),
+        }
+    }
+}
+
 /// Error returned when pool membership validation fails.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MembershipError {
@@ -412,6 +435,21 @@ pub enum MembershipError {
         found: [u8; 16],
         /// Path of the device with the conflicting GUID.
         device_path: PathBuf,
+    },
+    /// Two or more distinct physical devices claim the same pool member
+    /// identity.  This is a hard import block: a pool must not assemble
+    /// topology from ambiguous members because duplicate identity can
+    /// hide stale replicas, wrong-device imports, or a split view of the
+    /// same physical media.
+    DuplicateMemberIdentity {
+        /// Which identity was duplicated.
+        kind: DuplicateIdentityKind,
+        /// Human-readable representation of the duplicate value (GUID hex
+        /// string for device GUID, decimal integer for device index).
+        identity_value: String,
+        /// Every observation of the duplicate identity, as
+        /// `(canonical_device_path, label_detail)` pairs.
+        observations: Vec<(PathBuf, String)>,
     },
     /// A device has a label that failed BLAKE3 checksum verification.
     CorruptedLabel {
@@ -435,6 +473,26 @@ impl std::fmt::Display for MembershipError {
                 hex_fmt(expected),
                 hex_fmt(found),
             ),
+            Self::DuplicateMemberIdentity {
+                kind,
+                identity_value,
+                observations,
+            } => {
+                write!(
+                    f,
+                    "duplicate {} identity \"{}\" observed on {} distinct device(s): ",
+                    kind,
+                    identity_value,
+                    observations.len()
+                )?;
+                for (i, (path, detail)) in observations.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "; ")?;
+                    }
+                    write!(f, "{} ({})", path.display(), detail)?;
+                }
+                Ok(())
+            }
             Self::CorruptedLabel {
                 device_path,
                 reason,
@@ -454,28 +512,62 @@ fn hex_fmt(bytes: &[u8; 16]) -> String {
 /// Validate that all scanned devices belong to the same pool.
 ///
 /// Reads labels from all devices in `config`, checks that each valid
-/// label shares the same `pool_guid`, and reports any corrupted labels.
+/// label shares the same `pool_guid`, rejects duplicate member
+/// identities (same `device_guid` or `device_index` on distinct
+/// physical devices), and reports any corrupted labels.
 ///
-/// Returns the common pool GUID on success.
+/// A repeated scan of the same canonical device path is tolerated
+/// (benign duplicate); two different paths with the same authority
+/// identity are treated as a hard import block.
+///
+/// Returns the common pool GUID on success.  Fails with
+/// [`MembershipError::DuplicateMemberIdentity`] when distinct
+/// physical devices claim the same member identity.
 pub fn validate_pool_membership(reader: &LabelReader) -> Result<[u8; 16], MembershipError> {
+    use std::collections::BTreeMap;
+
     let results = reader.scan_all();
 
     let mut pool_guid: Option<[u8; 16]> = None;
+    // Track observations of each device GUID / index for duplicate
+    // detection.  Keyed by identity value; each entry is a list of
+    // `(canonical_path, label_detail)` pairs.
+    let mut seen_guids: BTreeMap<[u8; 16], Vec<(PathBuf, String)>> = BTreeMap::new();
+    let mut seen_indices: BTreeMap<u32, Vec<(PathBuf, String)>> = BTreeMap::new();
 
     for (device_path, outcome) in &results {
         match outcome {
-            LabelReadOutcome::Valid(label) => match pool_guid {
-                None => pool_guid = Some(label.pool_guid),
-                Some(expected) => {
-                    if label.pool_guid != expected {
-                        return Err(MembershipError::PoolGuidMismatch {
-                            expected,
-                            found: label.pool_guid,
-                            device_path: device_path.clone(),
-                        });
+            LabelReadOutcome::Valid(label) => {
+                // Resolve a canonical filesystem path so that repeated
+                // scans of the same device node (e.g. /dev/sda vs
+                // /dev/disk/by-id/...) are not misclassified as
+                // duplicates.  Fall back to the raw path when
+                // canonicalization fails (e.g. test fixtures on
+                // synthetic filesystems).
+                let canonical = canonicalize_or_identity(device_path);
+
+                match pool_guid {
+                    None => pool_guid = Some(label.pool_guid),
+                    Some(expected) => {
+                        if label.pool_guid != expected {
+                            return Err(MembershipError::PoolGuidMismatch {
+                                expected,
+                                found: label.pool_guid,
+                                device_path: device_path.clone(),
+                            });
+                        }
                     }
                 }
-            },
+
+                seen_guids.entry(label.device_guid).or_default().push((
+                    canonical.clone(),
+                    format!("device_index={}", label.device_index),
+                ));
+                seen_indices.entry(label.device_index).or_default().push((
+                    canonical,
+                    format!("device_guid={}", hex_fmt(&label.device_guid)),
+                ));
+            }
             LabelReadOutcome::Corrupted { reason, .. } => {
                 return Err(MembershipError::CorruptedLabel {
                     device_path: device_path.clone(),
@@ -489,7 +581,46 @@ pub fn validate_pool_membership(reader: &LabelReader) -> Result<[u8; 16], Member
         }
     }
 
+    // Reject duplicate device GUIDs observed on distinct canonical paths.
+    for (guid, observations) in &seen_guids {
+        if distinct_canonical_paths(observations) {
+            return Err(MembershipError::DuplicateMemberIdentity {
+                kind: DuplicateIdentityKind::DeviceGuid,
+                identity_value: hex_fmt(guid),
+                observations: observations.clone(),
+            });
+        }
+    }
+
+    // Reject duplicate device indices observed on distinct canonical paths.
+    for (index, observations) in &seen_indices {
+        if distinct_canonical_paths(observations) {
+            return Err(MembershipError::DuplicateMemberIdentity {
+                kind: DuplicateIdentityKind::DeviceIndex,
+                identity_value: index.to_string(),
+                observations: observations.clone(),
+            });
+        }
+    }
+
     pool_guid.ok_or(MembershipError::NoValidLabels)
+}
+
+/// Resolve `path` to a canonical, absolute path.
+///
+/// Returns the raw `path` unchanged when canonicalization fails (e.g.
+/// synthetic test fixtures or missing device nodes).
+fn canonicalize_or_identity(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Returns `true` when `observations` refers to more than one distinct
+/// canonical device path (i.e. the same identity was seen on at least
+/// two different physical devices).
+fn distinct_canonical_paths(observations: &[(PathBuf, String)]) -> bool {
+    let paths: std::collections::BTreeSet<&PathBuf> =
+        observations.iter().map(|(p, _)| p).collect();
+    paths.len() > 1
 }
 
 // ---------------------------------------------------------------------------
@@ -847,10 +978,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let label_a = make_label("samepool");
         let label_b = {
-            // Same pool GUID, different device GUID.
+            // Same pool GUID, different device GUID, distinct device index.
             let pool_guid = [0xABu8; 16];
             let device_guid = [0xEFu8; 16];
-            let l = PoolLabelV1::new(pool_guid, device_guid, "samepool");
+            let mut l = PoolLabelV1::new(pool_guid, device_guid, "samepool");
+            l.device_index = 1;
             seal_label(l).unwrap()
         };
         let dev0 = write_label_file(&dir, "dev0", &label_a);
