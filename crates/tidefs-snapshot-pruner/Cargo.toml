@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 description = "Snapshot auto-pruner with per-dataset retention policies and age-based expiry"
 [dependencies]
+tidefs-gc-pin-set = { path = "../tidefs-gc-pin-set" }
 tidefs-local-object-store = { path = "../tidefs-local-object-store" }
 blake3 = "=1.5.5"
 [lib]

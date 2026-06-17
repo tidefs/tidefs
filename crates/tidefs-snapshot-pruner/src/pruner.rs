@@ -879,6 +879,7 @@ impl OriginIndex {
 // ---------------------------------------------------------------------------
 
 pub struct SnapshotPruner {
+    extent_pin_set: Option<tidefs_gc_pin_set::SnapshotExtentPinSet>,
     policy: SnapshotRetentionPolicy,
     stats: SnapshotPrunerStats,
     clone_index: CloneIndex,
@@ -895,6 +896,7 @@ impl SnapshotPruner {
             policy,
             stats: SnapshotPrunerStats::default(),
             clone_index: CloneIndex::default(),
+            extent_pin_set: None,
             origin_index: OriginIndex::default(),
         }
     }
@@ -906,6 +908,7 @@ impl SnapshotPruner {
             policy,
             stats: SnapshotPrunerStats::default(),
             clone_index: CloneIndex::load(store),
+            extent_pin_set: None,
             origin_index: OriginIndex::load(store),
         }
     }
@@ -1073,6 +1076,20 @@ impl SnapshotPruner {
     }
     pub fn stats(&self) -> SnapshotPrunerStats {
         self.stats.clone()
+    }
+
+    /// Attach a snapshot-extent pin set for reclaim gating.
+    ///
+    /// After a snapshot is destroyed, its extents must be released from
+    /// the pin set so that reclaim can free them. Call this before
+    /// [`prune_dataset`] to enable automatic pin release.
+    pub fn set_extent_pin_set(&mut self, pin_set: tidefs_gc_pin_set::SnapshotExtentPinSet) {
+        self.extent_pin_set = Some(pin_set);
+    }
+
+    /// Take the pin set back out (e.g. for persistence or to pass to reclaim).
+    pub fn take_extent_pin_set(&mut self) -> Option<tidefs_gc_pin_set::SnapshotExtentPinSet> {
+        self.extent_pin_set.take()
     }
 
     // -- Retention policy evaluation (auto-pruner) -----------------------
@@ -1523,7 +1540,6 @@ impl SnapshotPruner {
                     }
                 }
             }
-
             let action = if blocks.is_empty() {
                 result.delete_set.push(name.clone());
                 SnapshotPruneAction::Delete
@@ -1578,7 +1594,12 @@ impl SnapshotPruner {
 
         for name in delete_set {
             match store.destroy_snapshot(dataset_name, &name) {
-                Ok(Some(_)) => destroyed_names.push(name),
+                Ok(Some(_)) => {
+                    if let Some(ref mut pin_set) = self.extent_pin_set {
+                        pin_set.release_snapshot(&format!("{dataset_name}/{name}"));
+                    }
+                    destroyed_names.push(name);
+                }
                 Ok(None) => {}
                 Err(err) => {
                     result.store_failures = result.store_failures.saturating_add(1);
