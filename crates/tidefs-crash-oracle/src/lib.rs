@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! Model-first crash oracle for bounded TideFS persistence-boundary matrices.
+//! Crash oracle for bounded TideFS persistence-boundary matrices.
 //!
-//! This crate deliberately evaluates the pure `tidefs-model-core` state
-//! machine only. It records semantic crash boundaries and model recovery
-//! classifications, but it does not claim local runtime crash safety or
+//! The model-first path evaluates the pure `tidefs-model-core` state machine
+//! and records semantic crash boundaries with model recovery classifications.
+//!
+//! The `runtime_report` module adds a local runtime crash report schema and
+//! verifier that is distinct from the model-only crash matrix reports.  A
+//! passing schema verifier is necessary but not sufficient for establishing
 //! production durability.
 
 use std::fmt;
@@ -20,6 +23,8 @@ use tidefs_types_vfs_core::{
     AdmissionIntent, BudgetIntent, ContractEpoch, Errno, FenceIntent, RequestEnvelope, RequestId,
     RequestMetadata, RetryIntent, TideRequest, TraceId, VfsNameToken, VfsRequest, WorkClass,
 };
+
+pub mod runtime_report;
 
 pub const REPORT_VERSION: u64 = 1;
 pub const MODEL_BACKEND: &str = "tidefs-model-core";
