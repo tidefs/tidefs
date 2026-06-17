@@ -69,6 +69,21 @@ pub enum PlacementMapRefusalReason {
 pub enum ReplicationMessage {
     /// Store an object: key name + payload.
     Put { name: String, payload: Vec<u8> },
+    /// Store an object with durable placement receipt authority.
+    /// The receiver must validate the receipt before accepting the payload,
+    /// and must return its own pool-backed receipt in the acknowledgment.
+    PutWithReceipt {
+        name: String,
+        payload: Vec<u8>,
+        placement_receipt_ref: PlacementReceiptRef,
+    },
+    /// Acknowledgment for a receipt-authorized put.
+    PutWithReceiptAck {
+        key_hash: String,
+        success: bool,
+        /// Durable placement receipt recorded by the pool-backed receiver.
+        recorded_receipt_ref: Option<PlacementReceiptRef>,
+    },
     /// Acknowledgement with the stored ObjectKey hash and success flag.
     Ack { key_hash: String, success: bool },
     /// Request an object by name.
@@ -378,6 +393,41 @@ mod tests {
         let msg = ReplicationMessage::Put {
             name: "existing-key".into(),
             payload: b"existing-data".to_vec(),
+        };
+        let rt = bincode_roundtrip(&msg);
+        assert_eq!(rt, msg);
+    }
+
+    #[test]
+    fn put_with_receipt_bincode_roundtrip() {
+        let payload = b"receipt-put-payload".to_vec();
+        let msg = ReplicationMessage::PutWithReceipt {
+            name: "receipt-key".into(),
+            payload: payload.clone(),
+            placement_receipt_ref: receipt_ref("receipt-key", &payload, 42),
+        };
+        let rt = bincode_roundtrip(&msg);
+        assert_eq!(rt, msg);
+    }
+
+    #[test]
+    fn put_with_receipt_ack_success_bincode_roundtrip() {
+        let payload = b"ack-payload".to_vec();
+        let msg = ReplicationMessage::PutWithReceiptAck {
+            key_hash: "receipt-key".into(),
+            success: true,
+            recorded_receipt_ref: Some(receipt_ref("receipt-key", &payload, 43)),
+        };
+        let rt = bincode_roundtrip(&msg);
+        assert_eq!(rt, msg);
+    }
+
+    #[test]
+    fn put_with_receipt_ack_failure_bincode_roundtrip() {
+        let msg = ReplicationMessage::PutWithReceiptAck {
+            key_hash: "missing-key".into(),
+            success: false,
+            recorded_receipt_ref: None,
         };
         let rt = bincode_roundtrip(&msg);
         assert_eq!(rt, msg);

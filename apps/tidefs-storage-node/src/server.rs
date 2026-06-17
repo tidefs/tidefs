@@ -27,8 +27,10 @@ use tidefs_local_object_store::device_layout::DeviceMediaClass;
 use tidefs_local_object_store::pool::{
     Pool, PoolConfig as ObjectPoolConfig, PoolProperties, PoolReceiptBoundDeadObjectDrainStats,
     PoolRedundancyPolicy as ObjectPoolRedundancyPolicy,
+    PlacementReceipt,
 };
 use tidefs_local_object_store::{
+    StoredObject,
     DeviceBacking, DeviceClass as ObjectDeviceClass, DeviceConfig as ObjectDeviceConfig,
     DeviceIoClass as ObjectIoClass, DeviceKind as ObjectDeviceKind, ObjectKey, StoreOptions,
 };
@@ -1111,6 +1113,16 @@ fn pool_put_key(pool: &mut Pool, key: ObjectKey, payload: &[u8]) -> Result<(), S
     pool.put(ObjectIoClass::Data, key, payload)
         .map(|_| ())
         .map_err(|e| format!("pool key put: {e}"))
+}
+
+/// Pool-backed put that returns the durable placement receipt.
+fn pool_put_named_with_receipt(
+    pool: &mut Pool,
+    name: impl AsRef<[u8]>,
+    payload: &[u8],
+) -> Result<(StoredObject, PlacementReceipt), String> {
+    pool.put_with_receipt(ObjectIoClass::Data, pool_name_key(name), payload)
+        .map_err(|e| format!("pool put with receipt: {e}"))
 }
 
 fn pool_placement_receipt_ref_for_key(
@@ -3761,6 +3773,62 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                         },
                     }
                 }
+                ReplicationMessage::PutWithReceipt {
+                    name,
+                    payload,
+                    placement_receipt_ref,
+                } => {
+                    // Validate the caller's receipt before accepting payload bytes.
+                    if placement_receipt_ref.is_synthetic() {
+                        eprintln!(
+                            "[storage-node] session {}: rejecting synthetic receipt for {}",
+                            session_id, name
+                        );
+                        ReplicationMessage::PutWithReceiptAck {
+                            key_hash: name.clone(),
+                            success: false,
+                            recorded_receipt_ref: None,
+                        }
+                    } else {
+                        let mut s = ctx.store.lock().unwrap();
+                        let result = match &mut *s {
+                            StoreBackend::Local(rs) => rs
+                                .put_local(&name, payload)
+                                .map(|_| None)
+                                .map_err(|e| e.to_string()),
+                            StoreBackend::TransportBacked(ts) => ts
+                                .put_local(&name, payload)
+                                .map(|_| None),
+                            StoreBackend::PoolBacked(pool) => {
+                                match pool_put_named_with_receipt(pool, &name, payload) {
+                                    Ok((_stored, receipt)) => {
+                                        match receipt.shared_receipt_ref() {
+                                            Ok(receipt_ref) => Ok(Some(receipt_ref)),
+                                            Err(e) => Err(format!(
+                                                "pool receipt projection: {e}"
+                                            )),
+                                        }
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            }
+                        };
+                        match result {
+                            Ok(recorded_receipt_ref) => {
+                                ReplicationMessage::PutWithReceiptAck {
+                                    key_hash: name.clone(),
+                                    success: true,
+                                    recorded_receipt_ref,
+                                }
+                            }
+                            Err(_e) => ReplicationMessage::PutWithReceiptAck {
+                                key_hash: name.clone(),
+                                success: false,
+                                recorded_receipt_ref: None,
+                            },
+                        }
+                    }
+                }
                 ReplicationMessage::Get { name } => {
                     let mut s = ctx.store.lock().unwrap();
                     let result = match &mut *s {
@@ -5756,7 +5824,7 @@ mod cluster_pool_handler_tests {
     use tidefs_replicated_object_store::ReceiptRepairCompletionEvidence;
     use tidefs_replication_model::{
         FlowCommitClass, FlowCommitResult, FlowState, ReceiptRedundancyPolicy, ReplicaCopyRecord,
-        ReplicaPlacementReceipt, ReplicatedReceiptId, ReplicatedSubjectId,
+        ReplicaPlacementReceipt,
     };
 
     /// Minimum device size for pool creation: 2 * 256KB labels + 8KB offset + 256KB commit region.

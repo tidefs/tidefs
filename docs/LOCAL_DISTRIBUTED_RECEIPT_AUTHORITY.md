@@ -123,6 +123,28 @@ The local object-store tests cover:
 - projection from local receipts into `PlacementReceiptRef`;
 - receipt-bound reclaim gating for replicated and erasure rewrites.
 
+## Distributed Receipt Transfer Protocol
+
+The peer-replication wire protocol (`ReplicationMessage`) now carries
+receipt authority on the write path via `PutWithReceipt`:
+
+- `PutWithReceipt { name, payload, placement_receipt_ref }` — a peer sends
+  payload bytes with the durable placement receipt that authorized the source
+  write. The receiver validates that the receipt is non-synthetic and returns
+  its own receipt in the acknowledgment.
+- `PutWithReceiptAck { key_hash, success, recorded_receipt_ref }` — the
+  pool-backed receiver writes through `put_with_receipt` and returns its local
+  placement receipt reference in the acknowledgment. Transport-backed and
+  local stores accept the data but report `recorded_receipt_ref: None`.
+
+This complements the existing receipt-bearing protocol messages:
+
+- `SyncResponse { entries: Vec<SyncEntry> }` where each `SyncEntry` carries
+  an optional `placement_receipt_ref`;
+- `ReadPlanResponse { placement_receipt_ref: Option<PlacementReceiptRef> }`;
+- `RepairObject { placement_receipt_ref, authoritative_payload }` and
+  `RepairObjectAck { repaired_placement_receipt_ref }`.
+
 ## Remaining Issue #18 Acceptance Work
 
 The following work remains under issue #18 and the focused split issues:
