@@ -1586,6 +1586,314 @@ fn collect_stale_package_profile_name_violations(
     }
 }
 
+// ── Secret policy gate ──────────────────────────────────────────────────
+
+/// Classification for a detected forbidden GitHub secret surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretViolationClass {
+    /// `secrets.*` context expression in a GitHub Actions workflow.
+    SecretsContext,
+    /// Deploy-key reference (any spelling).
+    DeployKey,
+    /// Runner registration token reference.
+    RunnerToken,
+    /// Encrypted secret blob wording that suggests committing encrypted
+    /// material to the repository.
+    EncryptedBlob,
+}
+
+impl SecretViolationClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SecretsContext => "secrets-context",
+            Self::DeployKey => "deploy-key",
+            Self::RunnerToken => "runner-token",
+            Self::EncryptedBlob => "encrypted-blob",
+        }
+    }
+}
+
+impl std::fmt::Display for SecretViolationClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Relative paths scanned by the secret-policy gate.
+const SECRET_POLICY_SCAN_PATHS: &[&str] = &[
+    ".github/workflows/",
+    "docs/GITHUB_CI.md",
+    "AGENTS.md",
+];
+
+/// Per-line allowlist: (file_rel_path, line_substring).
+///
+/// These entries suppress false positives where a policy document or
+/// detection machinery mentions a forbidden surface for educational or
+/// enforcement purposes.
+const SECRET_POLICY_ALLOWLIST: &[(&str, &str)] = &[
+    // docs/GITHUB_CI.md explains the policy; its mentions are educational.
+    ("docs/GITHUB_CI.md", "Do not use GitHub deploy keys"),
+    ("docs/GITHUB_CI.md", "`secrets.*` workflow expressions"),
+    ("docs/GITHUB_CI.md", "Secrets such as runner registration tokens"),
+    ("docs/GITHUB_CI.md", "encrypted secret payloads"),
+    // AGENTS.md references the policy; not secret storage.
+    ("AGENTS.md", "`secrets.*`"),
+    ("AGENTS.md", "deploy keys"),
+    ("AGENTS.md", "runner registration tokens"),
+    ("AGENTS.md", "encrypted secret payloads"),
+    ("AGENTS.md", "encrypted secret blobs"),
+    // The secret-policy workflow uses `secrets` in a grep pattern to detect
+    // violations — it is the detector, not the violation.
+    (".github/workflows/secret-policy.yml", "secrets"),
+    (".github/workflows/secret-policy.yml", "secret-policy"),
+    // The nexus relay workflow references a host-local secret file.
+    (".github/workflows/tidefs-codex-nexus-relay.yml", "NEXUS_SECRET_FILE"),
+    (".github/workflows/tidefs-codex-nexus-relay.yml", "/etc/tidefs-codex-nexus/webhook-secret"),
+];
+
+// ── Pattern matchers (no regex dependency — simple substring matching) ──
+
+/// Returns the violation class if `line` contains a forbidden secret surface,
+/// and the match is not covered by the allowlist for `rel_path`.
+fn classify_secret_violation(rel_path: &str, line: &str) -> Option<SecretViolationClass> {
+    if is_secret_policy_allowed(rel_path, line) {
+        return None;
+    }
+
+    let lower = line.to_lowercase();
+
+    // 1. secrets.* context — the primary GitHub Actions secret surface.
+    if has_secrets_context(line) {
+        return Some(SecretViolationClass::SecretsContext);
+    }
+
+    // 2. Deploy key references.
+    if lower.contains("deploy_key")
+        || lower.contains("deploy-key")
+        || lower.contains("deploy key")
+    {
+        return Some(SecretViolationClass::DeployKey);
+    }
+
+    // 3. Runner registration token references.
+    if lower.contains("registration-token")
+        || lower.contains("registration_token")
+        || lower.contains("registration token")
+        || line.contains("RUNNER_TOKEN")
+    {
+        return Some(SecretViolationClass::RunnerToken);
+    }
+
+    // 4. Encrypted blob wording.
+    if lower.contains("encrypted secret")
+        || lower.contains("gpg --encrypt")
+        || lower.contains("gpg --decrypt")
+        || lower.contains("age --encrypt")
+        || lower.contains("age --decrypt")
+        || lower.contains("openssl enc")
+        || lower.contains("openssl rsautl")
+        || lower.contains("committed encrypted")
+        || line.contains("AGE-SECRET-KEY-1")
+    {
+        return Some(SecretViolationClass::EncryptedBlob);
+    }
+
+    None
+}
+
+/// Returns true when `line` uses a `secrets.*` GitHub Actions context
+/// expression (both `${{ secrets.X }}` and bare `secrets.X` forms).
+fn has_secrets_context(line: &str) -> bool {
+    // `${{ secrets.XXX }}` — the canonical expression form.
+    if line.contains("${{ secrets.") || line.contains("${{secrets.") {
+        return true;
+    }
+    // Bare `secrets.XXX` used in shell or script steps (without the
+    // expression braces).  Must be word-bounded to avoid matching
+    // e.g. `nosecrets.foo`.
+    if let Some(pos) = line.find("secrets.") {
+        // Check left boundary.
+        let left_ok = pos == 0 || {
+            let before = line.as_bytes()[pos - 1];
+            !before.is_ascii_alphanumeric() && before != b'_'
+        };
+        if left_ok {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_secret_policy_allowed(rel_path: &str, line: &str) -> bool {
+    for (allow_file, allow_substr) in SECRET_POLICY_ALLOWLIST {
+        if rel_path == *allow_file && line.contains(allow_substr) {
+            return true;
+        }
+    }
+    // Host-local secret file paths are allowed (secrets live on the runner,
+    // not in GitHub).
+    if is_host_local_secret_path(line) {
+        return true;
+    }
+    false
+}
+
+/// Returns true when `line` references a host-local secret file under
+/// `/etc`, `/root`, or `/var/lib` — paths that are clearly not stored in
+/// GitHub.
+fn is_host_local_secret_path(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    let mentions_secret = lower.contains("secret");
+    if !mentions_secret {
+        return false;
+    }
+    for prefix in &["/etc/", "/root/", "/var/lib/"] {
+        if line.contains(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build a safe, truncated snippet that does not leak secret values.
+fn safe_snippet(line: &str) -> String {
+    let trimmed = line.trim();
+    let capped: &str = if trimmed.len() > 120 {
+        &trimmed[..120]
+    } else {
+        trimmed
+    };
+    // Redact `${{ secrets.X }}` blocks so the report never includes
+    // secret names.
+    redact_secrets_expressions(capped)
+}
+
+fn redact_secrets_expressions(text: &str) -> String {
+    // Replace `${{ secrets.XXX }}` patterns with `${{ secrets.<redacted> }}`.
+    // Handles both `${{ secrets.X }}` and `${{secrets.X}}` spacing.
+    let mut result = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"${{") {
+            let rest = &bytes[i + 3..];
+            let rest_str = std::str::from_utf8(rest).unwrap_or("");
+            let trimmed = rest_str.trim_start();
+            if trimmed.starts_with("secrets.") {
+                // Find the closing `}}`.
+                if let Some(end) = rest_str.find("}}") {
+                    result.push_str("${{ secrets.<redacted> }}");
+                    i += 3 + end + 2; // skip past `}}`
+                    continue;
+                }
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
+// ── Public entry point ─────────────────────────────────────────────────
+
+pub fn check_secret_policy_current_workspace() -> Result<(), WorkspacePolicyError> {
+    let root = find_workspace_root().ok_or_else(|| WorkspacePolicyError {
+        violations: vec!["could not locate workspace root Cargo.toml".to_string()],
+    })?;
+
+    let mut violations = Vec::new();
+    let mut seen_any_file = false;
+
+    for rel_glob in SECRET_POLICY_SCAN_PATHS {
+        let target = root.join(rel_glob);
+        if !target.exists() {
+            continue;
+        }
+        if target.is_dir() {
+            let dir_entries = match std::fs::read_dir(&target) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    violations.push(format!(
+                        "cannot read secret-policy scan dir {}: {err}",
+                        target.display()
+                    ));
+                    continue;
+                }
+            };
+            for entry in dir_entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(err) => {
+                        violations.push(format!(
+                            "cannot read entry in {}: {err}",
+                            target.display()
+                        ));
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext != "yml" && ext != "yaml" {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                seen_any_file = true;
+                scan_file_for_secret_violations(&root, &rel, &mut violations);
+            }
+        } else if target.is_file() {
+            let rel = rel_glob.to_string();
+            seen_any_file = true;
+            scan_file_for_secret_violations(&root, &rel, &mut violations);
+        }
+    }
+
+    if !seen_any_file {
+        eprintln!(
+            "secret-policy: no scan targets found under {}",
+            root.display()
+        );
+    }
+
+    if violations.is_empty() {
+        println!("secret-policy ok");
+        Ok(())
+    } else {
+        Err(WorkspacePolicyError { violations })
+    }
+}
+
+fn scan_file_for_secret_violations(
+    root: &Path,
+    rel_path: &str,
+    violations: &mut Vec<String>,
+) {
+    let full_path = root.join(rel_path);
+    let text = match std::fs::read_to_string(&full_path) {
+        Ok(t) => t,
+        Err(err) => {
+            violations.push(format!("cannot read {rel_path}: {err}"));
+            return;
+        }
+    };
+
+    for (line_idx, line_text) in text.lines().enumerate() {
+        let line_no = line_idx + 1; // 1-based for human reports.
+        if let Some(class) = classify_secret_violation(rel_path, line_text) {
+            let snippet = safe_snippet(line_text);
+            violations.push(format!(
+                "{rel_path}:{line_no}: forbidden GitHub secret surface ({class}): {snippet}",
+            ));
+        }
+    }
+}
 fn find_workspace_root() -> Option<PathBuf> {
     let mut current = std::env::current_dir().ok()?;
     loop {
@@ -2759,5 +3067,167 @@ license = "GPL-2.0-only WITH Linux-syscall-note"
 "#;
 
         assert_eq!(manifest_package_license(text), None);
+    }
+
+    // ── Secret policy gate tests ───────────────────────────────────────
+
+    #[test]
+    fn secrets_context_expression_is_detected() {
+        let line = "          TOKEN: ${{ secrets.DEPLOY_TOKEN }}";
+        assert!(has_secrets_context(line));
+    }
+
+    #[test]
+    fn secrets_context_without_spaces_is_detected() {
+        let line = "          TOKEN: ${{secrets.DEPLOY_TOKEN}}";
+        assert!(has_secrets_context(line));
+    }
+
+    #[test]
+    fn bare_secrets_dot_is_detected() {
+        let line = "          run: echo \"$SECRET\" | secrets.REGISTRY_PASS";
+        assert!(has_secrets_context(line));
+    }
+
+    #[test]
+    fn non_secrets_word_is_not_flagged() {
+        let line = "          run: echo \"no secrets here\"";
+        assert!(!has_secrets_context(line));
+    }
+
+    #[test]
+    fn adjacent_word_nosecrets_is_not_flagged() {
+        let line = "          run: echo nosecrets.foo";
+        // "nosecrets." — the 'e' before 's' is alphanumeric, so not a hit.
+        assert!(!has_secrets_context(line));
+    }
+
+    #[test]
+    fn deploy_key_lowercase_is_detected() {
+        let line = "          deploy_key: ${{ secrets.SSH_KEY }}";
+        assert!(classify_secret_violation("test.yml", line).is_some());
+    }
+
+    #[test]
+    fn deploy_key_hyphenated_is_detected() {
+        let line = "          deploy-key: value";
+        assert!(classify_secret_violation("test.yml", line).is_some());
+    }
+
+    #[test]
+    fn deploy_key_with_space_is_detected() {
+        let line = "# Add a deploy key to the repository";
+        assert!(classify_secret_violation("test.yml", line).is_some());
+    }
+
+    #[test]
+    fn runner_registration_token_is_detected() {
+        let line = "          run: ./config.sh --token ${{ secrets.RUNNER_REGISTRATION_TOKEN }}";
+        assert!(classify_secret_violation("test.yml", line).is_some());
+    }
+
+    #[test]
+    fn runner_token_env_var_is_detected() {
+        let line = "          RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}";
+        assert!(classify_secret_violation("test.yml", line).is_some());
+    }
+
+    #[test]
+    fn encrypted_secret_wording_is_detected() {
+        let line = "          # Store the encrypted secret in the repo for recovery";
+        assert!(classify_secret_violation("test.yml", line).is_some());
+    }
+
+    #[test]
+    fn gpg_encrypt_command_is_detected() {
+        let line = "          run: gpg --encrypt --recipient ci@example.com secret.txt";
+        assert!(classify_secret_violation("test.yml", line).is_some());
+    }
+
+    #[test]
+    fn age_encrypt_command_is_detected() {
+        let line = "          run: age --encrypt -r age1... secret.txt";
+        assert!(classify_secret_violation("test.yml", line).is_some());
+    }
+
+    #[test]
+    fn age_secret_key_literal_is_detected() {
+        let line = "          AGE-SECRET-KEY-1: base64-encoded-key-material";
+        assert!(classify_secret_violation("test.yml", line).is_some());
+    }
+
+    #[test]
+    fn committed_encrypted_wording_is_detected() {
+        let line = "# A committed encrypted secret blob for disaster recovery";
+        assert!(classify_secret_violation("test.yml", line).is_some());
+    }
+
+    #[test]
+    fn public_secret_name_in_policy_doc_is_allowed() {
+        // docs/GITHUB_CI.md mentioning `secrets.*` is educational.
+        let line = "Do not use `secrets.*` workflow expressions";
+        assert!(classify_secret_violation("docs/GITHUB_CI.md", line).is_none());
+    }
+
+    #[test]
+    fn host_local_secret_file_path_is_allowed() {
+        let line = "          NEXUS_SECRET_FILE: /etc/tidefs-codex-nexus/webhook-secret";
+        assert!(classify_secret_violation("test.yml", line).is_none());
+    }
+
+    #[test]
+    fn host_local_secret_in_var_lib_is_allowed() {
+        let line = "          SECRET_FILE: /var/lib/tidefs/secrets/token";
+        assert!(classify_secret_violation("test.yml", line).is_none());
+    }
+
+    #[test]
+    fn redact_secrets_expression_masks_secret_name() {
+        let input = "run: echo ${{ secrets.MY_SECRET }}";
+        let output = redact_secrets_expressions(input);
+        assert!(!output.contains("MY_SECRET"));
+        assert!(output.contains("<redacted>"));
+    }
+
+    #[test]
+    fn redact_secrets_preserves_non_secret_text() {
+        let input = "run: echo \"hello\" && curl -H 'Auth: Bearer ${{ secrets.TOKEN }}'";
+        let output = redact_secrets_expressions(input);
+        assert!(output.contains("echo \"hello\""));
+        assert!(output.contains("curl"));
+        assert!(!output.contains("TOKEN"));
+    }
+
+    #[test]
+    fn safe_snippet_truncates_long_lines() {
+        let long_line = "          run: ".to_string() + &"x".repeat(200);
+        let snippet = safe_snippet(&long_line);
+        assert!(snippet.len() <= 120);
+    }
+
+    #[test]
+    fn secret_policy_workflow_self_is_allowlisted() {
+        // The secret-policy.yml grep pattern uses the word "secrets" to
+        // detect violations; that must not be a self-hit.
+        let line = "          pattern='secrets[[:space:]]*[.]'";
+        assert!(classify_secret_violation(
+            ".github/workflows/secret-policy.yml",
+            line
+        ).is_none());
+    }
+
+    #[test]
+    fn nexus_relay_secret_file_is_allowlisted() {
+        let line = "      NEXUS_SECRET_FILE: /etc/tidefs-codex-nexus/webhook-secret";
+        assert!(classify_secret_violation(
+            ".github/workflows/tidefs-codex-nexus-relay.yml",
+            line
+        ).is_none());
+    }
+
+    #[test]
+    fn clean_line_is_not_flagged() {
+        let line = "          run: cargo build --release";
+        assert!(classify_secret_violation("test.yml", line).is_none());
     }
 }

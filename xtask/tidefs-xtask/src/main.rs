@@ -1128,6 +1128,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        Some("check-secret-policy") => {
+            if let Err(err) = policy::check_secret_policy_current_workspace() {
+                eprintln!("{err}");
+                process::exit(1);
+            }
+        }
         Some("check-coverage-closure") => {
             if let Err(err) = coverage::check_coverage_closure_current_workspace() {
                 eprintln!("{err}");
@@ -2144,6 +2150,7 @@ fn print_help() {
     println!("  check-local-gc         alias for check-safe-local-reclamation");
     println!("  check-dead-crates      audit all crates for zero consumers (dead crates)");
     println!("  check-dead-crate-audit alias for check-dead-crates");
+    println!("  check-secret-policy    scan workflows and policy docs for forbidden GitHub secret surfaces");
     println!("  check-coverage-closure  audit coverage gaps: scan /root/ai/tmp/tidefs-validation/ receipts and print closure snapshot");
     println!("  check-kmod-blake3-guard  scan kmod-posix-vfs source/docs for BLAKE3 proof-marker regressions");
     println!("  check-dispatch-exists  check whether a FUSE callback method already exists in FuseVfsAdapter (exits 0 with line if found, 1 if missing)");
