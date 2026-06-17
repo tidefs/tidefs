@@ -42,6 +42,10 @@ pub enum DeviceRemovalRefusalClass {
     CheckpointReplayRejected,
     /// Committed topology root does not match the removal plan.
     CommittedTopologyMismatch,
+    /// Evacuation completion has not been durably recorded.
+    EvacuationCompletionNotDurable,
+    /// Durable evacuation completion evidence does not match the removal identity.
+    EvacuationCompletionMismatch,
 }
 
 impl core::fmt::Display for DeviceRemovalRefusalClass {
@@ -53,6 +57,8 @@ impl core::fmt::Display for DeviceRemovalRefusalClass {
             Self::InsufficientSurvivingTopology => f.write_str("insufficient-surviving-topology"),
             Self::DomainConstraintViolation => f.write_str("domain-constraint-violation"),
             Self::StaleTopologyGeneration => f.write_str("stale-topology-generation"),
+            Self::EvacuationCompletionNotDurable => f.write_str("evacuation-completion-not-durable"),
+            Self::EvacuationCompletionMismatch => f.write_str("evacuation-completion-mismatch"),
             Self::EvacuationFailed => f.write_str("evacuation-failed"),
             Self::EvacuationIncomplete => f.write_str("evacuation-incomplete"),
             Self::CheckpointReplayRejected => f.write_str("checkpoint-replay-rejected"),
