@@ -127,6 +127,17 @@ impl DatasetSpaceCountersV1 {
             .saturating_add(self.orphan_bytes)
     }
 
+    /// Total bytes consumed by this dataset for admission and statfs.
+    ///
+    /// Sums logical_used, reserved, orphan, and pinned_snapshot_bytes.
+    /// This is the unified authority consumption formula used by both
+    /// [`admission_check`] and [`SpaceAccounting::statfs`].
+    #[must_use]
+    pub const fn total_consumed_bytes(self) -> u64 {
+        self.logical_alloc_bytes()
+            .saturating_add(self.pinned_snapshot_bytes)
+    }
+
     /// Available logical bytes considering quota and slop.
     ///
     /// When `quota_bytes == 0` the caller must supply a physical-capacity
@@ -737,8 +748,8 @@ pub fn admission_check(
     phys_capacity_bytes: u64,
     needed_bytes: u64,
 ) -> AdmissionResult {
-    let current_alloc = counters.logical_alloc_bytes();
-    let projected = current_alloc.saturating_add(needed_bytes);
+    let current_consumed = counters.total_consumed_bytes();
+    let projected = current_consumed.saturating_add(needed_bytes);
 
     // Quota check.
     if counters.quota_bytes > 0 {
@@ -746,7 +757,7 @@ pub fn admission_check(
         if projected > ceiling {
             return AdmissionResult::QuotaExceeded {
                 quota_bytes: counters.quota_bytes,
-                current_alloc_bytes: current_alloc,
+                current_alloc_bytes: current_consumed,
                 needed_bytes,
             };
         }
@@ -755,7 +766,7 @@ pub fn admission_check(
     // Physical capacity check.
     if projected > phys_capacity_bytes {
         return AdmissionResult::PhysicalCapacityExceeded {
-            phys_avail_bytes: phys_capacity_bytes.saturating_sub(current_alloc),
+            phys_avail_bytes: phys_capacity_bytes.saturating_sub(current_consumed),
             needed_bytes,
         };
     }
@@ -922,33 +933,38 @@ pub fn apply_space_delta(
         apply_counter(counters.logical_used_bytes, delta.logical_used_delta);
     let projected_reserved = apply_counter(counters.reserved_bytes, delta.reserved_delta);
     let projected_orphan = apply_counter(counters.orphan_bytes, delta.orphan_delta);
+    let projected_pinned_snapshot =
+        apply_counter(counters.pinned_snapshot_bytes, delta.pinned_snapshot_delta);
     let projected_logical_alloc = projected_logical_used
         .saturating_add(projected_reserved)
         .saturating_add(projected_orphan);
+    let projected_total_consumed = projected_logical_alloc
+        .saturating_add(projected_pinned_snapshot);
 
     // Check quota ceiling (projected). Pure frees must be allowed even when
     // the current counters are already over a ceiling; otherwise cleanup cannot
     // recover an overcommitted dataset.
     let needed = delta.logical_used_delta.max(0) as u64
         + delta.reserved_delta.max(0) as u64
-        + delta.orphan_delta.max(0) as u64;
+        + delta.orphan_delta.max(0) as u64
+        + delta.pinned_snapshot_delta.max(0) as u64;
     if needed > 0 && counters.quota_bytes > 0 {
         let ceiling = counters.quota_bytes.saturating_sub(counters.slop_bytes);
-        if projected_logical_alloc > ceiling {
+        if projected_total_consumed > ceiling {
             return Err(SpaceAccountingError::QuotaExceeded {
                 quota_bytes: counters.quota_bytes,
                 requested_bytes: needed,
-                available_bytes: ceiling.saturating_sub(counters.logical_alloc_bytes()),
+                available_bytes: ceiling.saturating_sub(counters.total_consumed_bytes()),
             });
         }
     }
 
     // Physical capacity ceiling.
-    if needed > 0 && projected_logical_alloc > phys_capacity_bytes {
+    if needed > 0 && projected_total_consumed > phys_capacity_bytes {
         return Err(SpaceAccountingError::QuotaExceeded {
             quota_bytes: phys_capacity_bytes,
             requested_bytes: needed,
-            available_bytes: phys_capacity_bytes.saturating_sub(counters.logical_alloc_bytes()),
+            available_bytes: phys_capacity_bytes.saturating_sub(counters.total_consumed_bytes()),
         });
     }
 
