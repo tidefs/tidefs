@@ -207,12 +207,12 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
     /// result without marking pages dirty. Records readahead, prefetch,
     /// populate, and miss statistics for authoritative page-cache tracking.
     ///
-    /// Short reads, holes, EOF, and engine read errors are handled as
-    /// advisory prefetch outcomes: the page-cache tracker records the
-    /// outcome without exposing stale bytes or poisoning later demand
-    /// reads.  A subsequent `read_folio` call for the same range will
-    /// still resolve through engine authority and return the correct
-    /// bytes or error.
+    /// Empty reads, short reads, holes, EOF, and engine read errors are
+    /// handled as advisory prefetch outcomes: only a complete requested read
+    /// records a clean populate, and all other outcomes record a miss without
+    /// poisoning later demand reads.  A subsequent `read_folio` call for the
+    /// same range will still resolve through engine authority and return the
+    /// correct bytes or error.
     ///
     /// # Linux kernel signature
     /// `void (*readahead)(struct readahead_control *)`
@@ -234,14 +234,15 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
             PageOwnershipMode::Read,
         );
 
+        let requested = count as usize;
         match self.engine.read(fh, offset, count, ctx) {
             Ok(data) => {
-                if !data.is_empty() {
+                if requested > 0 && data.len() >= requested {
                     self.page_cache.record_populate();
                 } else {
-                    // EOF or hole: track as a miss for stats parity
-                    // with kernel behavior where an EOF read doesn't
-                    // populate a page.
+                    // EOF, hole, or short read: track as a miss for
+                    // stats parity with kernel behavior where advisory
+                    // readahead does not populate an uptodate folio.
                     self.page_cache.record_miss();
                 }
             }
@@ -802,7 +803,7 @@ mod tests {
             assert_eq!(fh.inode_id, InodeId::new(1));
             assert_eq!(off, 8192);
             assert_eq!(count, 16384);
-            Ok(b"prefetch-data".to_vec())
+            Ok(vec![0x42; count as usize])
         });
 
         let mut tracker = make_tracker();
@@ -858,7 +859,7 @@ mod tests {
     fn readahead_populates_clean_cache_and_records_populate() {
         let mut e = MockEngine::new();
         let fh = make_fh();
-        e.read_fn = Box::new(|_, _, _, _| Ok(b"prefetch-populated".to_vec()));
+        e.read_fn = Box::new(|_, _, count, _| Ok(vec![0x70; count as usize]));
 
         let mut tracker = make_tracker();
         let mut dt = make_dirty_tracker();
@@ -869,7 +870,7 @@ mod tests {
         let stats = aops.page_cache_stats();
         assert_eq!(stats.readahead_count, 1);
         assert_eq!(stats.prefetch, 1);
-        // Clean cache population: non-empty engine read records populate.
+        // Clean cache population: complete engine read records populate.
         assert_eq!(stats.populate, 1);
         assert_eq!(stats.miss, 0);
     }
@@ -982,15 +983,13 @@ mod tests {
     }
 
     #[test]
-    fn readahead_short_read_zerofills_remainder() {
+    fn readahead_short_read_records_miss_not_populate() {
         // Simulate a short engine read (fewer bytes than requested).
-        // The source model returns whatever the engine provides; the
-        // C shim handles zero-fill of the remainder.  Here we verify
-        // that a short read still records a populate (data was returned)
-        // and does not error out.
+        // The advisory readahead path must not treat a partial range as
+        // authoritative clean cache state.
         let mut e = MockEngine::new();
         let fh = make_fh();
-        // Return only 2048 bytes for a 4096-byte request.
+        // Return only two bytes for a 4096-byte request.
         e.read_fn = Box::new(|_, _, _, _| Ok(b"sh".to_vec())); // 2 bytes, simulating short
 
         let mut tracker = make_tracker();
@@ -1000,9 +999,9 @@ mod tests {
         aops.readahead(&fh, 0, 4096, &MockEngine::test_ctx());
 
         let stats = aops.page_cache_stats();
-        // Non-empty data returned: should record a populate.
-        assert_eq!(stats.populate, 1);
-        assert_eq!(stats.miss, 0);
+        // Short data returned: should record a miss, not populate.
+        assert_eq!(stats.populate, 0);
+        assert_eq!(stats.miss, 1);
     }
 
     // ── write_begin tests (blocker) ──────────────────────────────────
@@ -1490,7 +1489,7 @@ mod tests {
             if off < 4096 {
                 Ok(b"hot-data".to_vec())
             } else {
-                Ok(b"cold-data".to_vec())
+                Ok(vec![0x63; 4096])
             }
         });
 
