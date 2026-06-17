@@ -79,9 +79,12 @@ use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
 use tidefs_types_incremental_job_core::{
-    Checkpoint, IncrementalJob, JobError, JobId, JobKind, JobProgress, ServiceCheckpoint,
-    ServiceState, StepResult, WorkBudget,
+    Checkpoint, DispatchRecord, DispatchRecordId, IncrementalJob, JobError, JobId,
+    JobKind, JobProgress, SchedulerEpoch, ServiceCheckpoint, ServiceState, StepResult,
+    WorkBudget,
 };
+
+use tidefs_incremental_job_core::{DispatchStore, DispatchStoreError};
 
 // ---------------------------------------------------------------------------
 // ServicePriority — 5-stage priority for scheduling and budget allocation
@@ -774,6 +777,9 @@ pub struct BackgroundScheduler {
     cursors: [usize; 5],
     stats: SchedulerStats,
     preempt_flag: Option<Arc<AtomicBool>>,
+    dispatch_store: Option<Box<dyn DispatchStore>>,
+    epoch: SchedulerEpoch,
+    next_dispatch_id: DispatchRecordId,
 }
 
 impl core::fmt::Debug for BackgroundScheduler {
@@ -799,6 +805,9 @@ impl BackgroundScheduler {
             cursors: [0; 5],
             preempt_flag: None,
             stats: SchedulerStats::default(),
+            dispatch_store: None,
+            epoch: SchedulerEpoch::INITIAL,
+            next_dispatch_id: DispatchRecordId(0),
         }
     }
 
@@ -997,6 +1006,176 @@ impl BackgroundScheduler {
             Some(self.run_cycle())
         } else {
             None
+        }
+    }
+
+    // ── Durable dispatch support ──────────────────────────────────────
+
+    /// Create a scheduler with a [`DispatchStore`] for durable dispatch.
+    ///
+    /// The store persists dispatch records so jobs survive daemon restarts.
+    /// If the store already contains an epoch, the scheduler adopts it;
+    /// otherwise it persists [`SchedulerEpoch::INITIAL`].
+    #[must_use]
+    pub fn with_dispatch_store(
+        global_budget: ServiceBudget,
+        store: Box<dyn DispatchStore>,
+    ) -> Self {
+        let epoch = store
+            .load_epoch()
+            .ok()
+            .flatten()
+            .unwrap_or(SchedulerEpoch::INITIAL);
+        Self {
+            services: Vec::new(),
+            work_queue: crate::scheduling::WorkItemQueue::new_default(),
+            global_budget,
+            cursors: [0; 5],
+            preempt_flag: None,
+            stats: SchedulerStats::default(),
+            dispatch_store: Some(store),
+            epoch,
+            next_dispatch_id: DispatchRecordId(0),
+        }
+    }
+
+    /// Load resumable dispatch records from the store.
+    ///
+    /// Returns records that were `Pending` or `InProgress` at the time of
+    /// the last shutdown/crash. The caller should recreate jobs from these
+    /// records and re-register them.
+    pub fn load_resumable_records(
+        &self,
+    ) -> Result<Vec<DispatchRecord>, DispatchStoreError> {
+        match &self.dispatch_store {
+            Some(store) => store.load_resumable(),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Register a service and persist its dispatch record.
+    ///
+    /// Creates a [`DispatchRecord`] in `Pending` state, persists it, then
+    /// registers the service for scheduling. Returns the assigned
+    /// [`DispatchRecordId`].
+    ///
+    /// If a dispatch store is not configured (created via [`new`]), this
+    /// method behaves like [`register`] but still assigns a dispatch id.
+    pub fn register_dispatched(
+        &mut self,
+        service: Box<dyn BackgroundService>,
+        job_id: JobId,
+        job_kind: JobKind,
+    ) -> Result<DispatchRecordId, DispatchStoreError> {
+        let dispatch_id = self.next_dispatch_id;
+        self.next_dispatch_id = DispatchRecordId(dispatch_id.0 + 1);
+
+        let now_ms = crate_time_now_ms();
+        let mut record = DispatchRecord::new(job_id, job_kind, self.epoch, dispatch_id, now_ms);
+
+        if let Some(ref mut store) = self.dispatch_store {
+            store.store_record(&record)?;
+        }
+
+        record.mark_in_progress();
+
+        if let Some(ref mut store) = self.dispatch_store {
+            store.update_record(&record)?;
+        }
+
+        self.services.push(service);
+        Ok(dispatch_id)
+    }
+
+    /// Mark a dispatched service as completed.
+    ///
+    /// Updates the dispatch record to `Completed` state and persists it.
+    /// Returns an error if no dispatch store is configured.
+    pub fn mark_dispatched_completed(
+        &mut self,
+        dispatch_id: DispatchRecordId,
+    ) -> Result<(), DispatchStoreError> {
+        if let Some(ref mut store) = self.dispatch_store {
+            let mut record = store
+                .load_record(dispatch_id)?
+                .ok_or(DispatchStoreError::NotFound(
+                    dispatch_id,
+                ))?;
+            record.mark_completed();
+            store.update_record(&record)?;
+        }
+        Ok(())
+    }
+
+    /// Cancel a dispatched service.
+    ///
+    /// Updates the dispatch record to `Cancelled` state and persists it.
+    pub fn cancel_dispatched(
+        &mut self,
+        dispatch_id: DispatchRecordId,
+    ) -> Result<(), DispatchStoreError> {
+        if let Some(ref mut store) = self.dispatch_store {
+            let mut record = store
+                .load_record(dispatch_id)?
+                .ok_or(DispatchStoreError::NotFound(
+                    dispatch_id,
+                ))?;
+            record.mark_cancelled();
+            store.update_record(&record)?;
+        }
+        Ok(())
+    }
+
+    /// Update the checkpoint for a dispatched service.
+    pub fn update_dispatched_checkpoint(
+        &mut self,
+        dispatch_id: DispatchRecordId,
+        checkpoint: Checkpoint,
+    ) -> Result<(), DispatchStoreError> {
+        if let Some(ref mut store) = self.dispatch_store {
+            let mut record = store
+                .load_record(dispatch_id)?
+                .ok_or(DispatchStoreError::NotFound(
+                    dispatch_id,
+                ))?;
+            record.update_checkpoint(checkpoint);
+            store.update_record(&record)?;
+        }
+        Ok(())
+    }
+
+    /// Advance the scheduler epoch.
+    ///
+    /// Called on daemon restart. All dispatch records from the previous
+    /// epoch are considered stale; new dispatches use the new epoch.
+    pub fn advance_epoch(&mut self) -> Result<SchedulerEpoch, DispatchStoreError> {
+        let new_epoch = self.epoch.next();
+        self.epoch = new_epoch;
+        if let Some(ref mut store) = self.dispatch_store {
+            store.store_epoch(new_epoch)?;
+        }
+        Ok(new_epoch)
+    }
+
+    /// Return the current scheduler epoch.
+    #[must_use]
+    pub fn epoch(&self) -> SchedulerEpoch {
+        self.epoch
+    }
+
+    /// Check whether a dispatch with the given id has already been recorded
+    /// in the current epoch. Returns `true` if the dispatch would be a
+    /// duplicate.
+    pub fn is_duplicate_dispatch(
+        &self,
+        dispatch_id: DispatchRecordId,
+    ) -> Result<bool, DispatchStoreError> {
+        match &self.dispatch_store {
+            Some(store) => {
+                let existing = store.load_record(dispatch_id)?;
+                Ok(existing.is_some())
+            }
+            None => Ok(false),
         }
     }
 }

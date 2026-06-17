@@ -80,7 +80,8 @@
 extern crate alloc;
 
 use tidefs_types_incremental_job_core::{
-    Checkpoint, JobError, JobId, JobKind, StepResult, WorkBudget,
+    Checkpoint, DispatchRecord, DispatchRecordId, DispatchState, JobError, JobId,
+    JobKind, SchedulerEpoch, StepResult, WorkBudget,
 };
 
 // ---------------------------------------------------------------------------
@@ -623,6 +624,175 @@ impl CheckpointCodec for DefaultCheckpointCodec {
 }
 
 // ---------------------------------------------------------------------------
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+
+// ---------------------------------------------------------------------------
+// DispatchStoreError — errors from the dispatch persistence layer
+// ---------------------------------------------------------------------------
+
+/// Errors returned by [`DispatchStore`] operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DispatchStoreError {
+    /// I/O failure during read or write.
+    IoFailed(&'static str),
+    /// Record not found.
+    NotFound(DispatchRecordId),
+    /// Duplicate dispatch detected (same id already exists).
+    DuplicateDispatch(DispatchRecordId),
+    /// Record in unexpected state for the requested operation.
+    InvalidState {
+        dispatch_id: DispatchRecordId,
+        expected: &'static str,
+        actual: DispatchState,
+    },
+}
+
+impl core::fmt::Display for DispatchStoreError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DispatchStoreError::IoFailed(msg) => write!(f, "dispatch store I/O failed: {msg}"),
+            DispatchStoreError::NotFound(id) => write!(f, "dispatch record {id} not found"),
+            DispatchStoreError::DuplicateDispatch(id) => {
+                write!(f, "duplicate dispatch for record {id}")
+            }
+            DispatchStoreError::InvalidState {
+                dispatch_id,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "dispatch record {dispatch_id} in invalid state: expected {expected}, got {actual}"
+                )
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DispatchStore — persistence trait for dispatch records
+// ---------------------------------------------------------------------------
+
+/// Persistence layer for scheduler dispatch records.
+///
+/// The scheduler uses this trait to persist [`DispatchRecord`] entries
+/// before executing a job, update them as the job progresses, and mark
+/// them completed or cancelled. On restart, the scheduler replays
+/// pending and in-progress records to resume work.
+///
+/// Implementations must be crash-consistent: after `store_record` returns
+/// `Ok(())`, the record must survive a daemon crash.
+pub trait DispatchStore: Send {
+    /// Persist a new dispatch record.
+    ///
+    /// Must fail with [`DuplicateDispatch`](DispatchStoreError::DuplicateDispatch)
+    /// if a record with the same [`DispatchRecordId`] already exists.
+    fn store_record(&mut self, record: &DispatchRecord) -> Result<(), DispatchStoreError>;
+
+    /// Update an existing dispatch record (state change, checkpoint update).
+    ///
+    /// Must fail with [`NotFound`](DispatchStoreError::NotFound) if the
+    /// record does not exist.
+    fn update_record(&mut self, record: &DispatchRecord) -> Result<(), DispatchStoreError>;
+
+    /// Load all dispatch records whose state is `Pending` or `InProgress`.
+    fn load_resumable(&self) -> Result<Vec<DispatchRecord>, DispatchStoreError>;
+
+    /// Load a single dispatch record by id.
+    fn load_record(
+        &self,
+        dispatch_id: DispatchRecordId,
+    ) -> Result<Option<DispatchRecord>, DispatchStoreError>;
+
+    /// Load the persisted scheduler epoch.
+    ///
+    /// Returns `None` if no epoch has been persisted yet (first start).
+    fn load_epoch(&self) -> Result<Option<SchedulerEpoch>, DispatchStoreError>;
+
+    /// Persist the scheduler epoch.
+    fn store_epoch(&mut self, epoch: SchedulerEpoch) -> Result<(), DispatchStoreError>;
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryDispatchStore — for tests and single-node development
+// ---------------------------------------------------------------------------
+
+/// An in-memory [`DispatchStore`] backed by `Vec<DispatchRecord>`.
+///
+/// Useful for unit tests and single-node development. Not crash-consistent
+/// across daemon restarts; production must use an on-disk or distributed
+/// store.
+#[derive(Clone, Debug, Default)]
+pub struct InMemoryDispatchStore {
+    records: Vec<DispatchRecord>,
+    epoch: Option<SchedulerEpoch>,
+}
+
+impl InMemoryDispatchStore {
+    /// Create an empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            epoch: None,
+        }
+    }
+}
+
+impl DispatchStore for InMemoryDispatchStore {
+    fn store_record(&mut self, record: &DispatchRecord) -> Result<(), DispatchStoreError> {
+        // Check for duplicate
+        if self
+            .records
+            .iter()
+            .any(|r| r.dispatch_id == record.dispatch_id)
+        {
+            return Err(DispatchStoreError::DuplicateDispatch(record.dispatch_id));
+        }
+        self.records.push(record.clone());
+        Ok(())
+    }
+
+    fn update_record(&mut self, record: &DispatchRecord) -> Result<(), DispatchStoreError> {
+        let pos = self
+            .records
+            .iter()
+            .position(|r| r.dispatch_id == record.dispatch_id)
+            .ok_or(DispatchStoreError::NotFound(record.dispatch_id))?;
+        self.records[pos] = record.clone();
+        Ok(())
+    }
+
+    fn load_resumable(&self) -> Result<Vec<DispatchRecord>, DispatchStoreError> {
+        Ok(self
+            .records
+            .iter()
+            .filter(|r| r.can_resume())
+            .cloned()
+            .collect())
+    }
+
+    fn load_record(
+        &self,
+        dispatch_id: DispatchRecordId,
+    ) -> Result<Option<DispatchRecord>, DispatchStoreError> {
+        Ok(self
+            .records
+            .iter()
+            .find(|r| r.dispatch_id == dispatch_id)
+            .cloned())
+    }
+
+    fn load_epoch(&self) -> Result<Option<SchedulerEpoch>, DispatchStoreError> {
+        Ok(self.epoch)
+    }
+
+    fn store_epoch(&mut self, epoch: SchedulerEpoch) -> Result<(), DispatchStoreError> {
+        self.epoch = Some(epoch);
+        Ok(())
+    }
+}
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1041,5 +1211,152 @@ mod tests {
     #[test]
     fn checkpoint_header_size_is_sixteen() {
         assert_eq!(CHECKPOINT_HEADER_SIZE, 16);
+    }
+
+    // ── DispatchStore / InMemoryDispatchStore ──────────────────────────
+
+    #[test]
+    fn store_and_load_record() {
+        let mut store = InMemoryDispatchStore::new();
+        let rec = DispatchRecord::new(
+            JobId(1),
+            JobKind::Scrub,
+            SchedulerEpoch(0),
+            DispatchRecordId(10),
+            1000,
+        );
+        store.store_record(&rec).unwrap();
+        let loaded = store.load_record(DispatchRecordId(10)).unwrap();
+        assert_eq!(loaded, Some(rec));
+    }
+
+    #[test]
+    fn duplicate_dispatch_rejected() {
+        let mut store = InMemoryDispatchStore::new();
+        let rec = DispatchRecord::new(
+            JobId(2),
+            JobKind::DeferredCleanup,
+            SchedulerEpoch(1),
+            DispatchRecordId(5),
+            0,
+        );
+        store.store_record(&rec).unwrap();
+        let err = store.store_record(&rec).unwrap_err();
+        assert!(matches!(err, DispatchStoreError::DuplicateDispatch(DispatchRecordId(5))));
+    }
+
+    #[test]
+    fn load_resumable_filters_terminal() {
+        let mut store = InMemoryDispatchStore::new();
+        let pending = DispatchRecord::new(
+            JobId(1),
+            JobKind::Scrub,
+            SchedulerEpoch(0),
+            DispatchRecordId(1),
+            0,
+        );
+        store.store_record(&pending).unwrap();
+
+        let mut in_progress = DispatchRecord::new(
+            JobId(2),
+            JobKind::GCMark,
+            SchedulerEpoch(0),
+            DispatchRecordId(2),
+            0,
+        );
+        in_progress.mark_in_progress();
+        store.store_record(&in_progress).unwrap();
+
+        let mut completed = DispatchRecord::new(
+            JobId(3),
+            JobKind::BtreeCompaction,
+            SchedulerEpoch(0),
+            DispatchRecordId(3),
+            0,
+        );
+        completed.mark_completed();
+        store.store_record(&completed).unwrap();
+
+        let mut cancelled = DispatchRecord::new(
+            JobId(4),
+            JobKind::AdminJob,
+            SchedulerEpoch(0),
+            DispatchRecordId(4),
+            0,
+        );
+        cancelled.mark_cancelled();
+        store.store_record(&cancelled).unwrap();
+
+        let resumable = store.load_resumable().unwrap();
+        assert_eq!(resumable.len(), 2);
+        let ids: Vec<u64> = resumable.iter().map(|r| r.dispatch_id.0).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+        assert!(!ids.contains(&3));
+        assert!(!ids.contains(&4));
+    }
+
+    #[test]
+    fn update_record_modifies_state() {
+        let mut store = InMemoryDispatchStore::new();
+        let mut rec = DispatchRecord::new(
+            JobId(5),
+            JobKind::Rebake,
+            SchedulerEpoch(2),
+            DispatchRecordId(7),
+            0,
+        );
+        store.store_record(&rec).unwrap();
+
+        rec.mark_in_progress();
+        store.update_record(&rec).unwrap();
+        let loaded = store.load_record(DispatchRecordId(7)).unwrap().unwrap();
+        assert_eq!(loaded.state, DispatchState::InProgress);
+
+        rec.mark_completed();
+        store.update_record(&rec).unwrap();
+        let loaded = store.load_record(DispatchRecordId(7)).unwrap().unwrap();
+        assert_eq!(loaded.state, DispatchState::Completed);
+    }
+
+    #[test]
+    fn update_nonexistent_record_fails() {
+        let mut store = InMemoryDispatchStore::new();
+        let rec = DispatchRecord::new(
+            JobId(9),
+            JobKind::Scrub,
+            SchedulerEpoch(0),
+            DispatchRecordId(99),
+            0,
+        );
+        let err = store.update_record(&rec).unwrap_err();
+        assert!(matches!(err, DispatchStoreError::NotFound(DispatchRecordId(99))));
+    }
+
+    #[test]
+    fn epoch_persistence() {
+        let mut store = InMemoryDispatchStore::new();
+        assert!(store.load_epoch().unwrap().is_none());
+        store.store_epoch(SchedulerEpoch(3)).unwrap();
+        assert_eq!(store.load_epoch().unwrap(), Some(SchedulerEpoch(3)));
+        store.store_epoch(SchedulerEpoch(4)).unwrap();
+        assert_eq!(store.load_epoch().unwrap(), Some(SchedulerEpoch(4)));
+    }
+
+    #[test]
+    fn dispatch_store_error_display_nonempty() {
+        let errors = [
+            DispatchStoreError::IoFailed("disk full"),
+            DispatchStoreError::NotFound(DispatchRecordId(1)),
+            DispatchStoreError::DuplicateDispatch(DispatchRecordId(2)),
+            DispatchStoreError::InvalidState {
+                dispatch_id: DispatchRecordId(3),
+                expected: "Pending",
+                actual: DispatchState::Completed,
+            },
+        ];
+        for e in &errors {
+            assert!(!format!("{e}").is_empty());
+        }
     }
 }
