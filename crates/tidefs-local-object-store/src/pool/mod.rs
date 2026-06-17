@@ -7792,4 +7792,66 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+
+    #[test]
+    fn put_with_receipt_returns_placement_receipt() {
+        let root = temp_dir("put-with-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let options = test_options();
+        let config = multi_data_device_config(&root, 2);
+        let mut pool = Pool::create(config, PoolProperties::default(), &options).unwrap();
+
+        let key = ObjectKey::from_name(b"receipt-test");
+        let payload = b"placement receipt authority test";
+        let (stored, receipt) = pool
+            .put_with_receipt(IoClass::Data, key, payload)
+            .expect("put_with_receipt succeeds");
+
+        assert_eq!(stored.key, key);
+        assert_eq!(receipt.object_key, key);
+        assert!(!receipt.targets.is_empty());
+        assert!(receipt.generation > 0);
+
+        // Verify receipt is persisted and retrievable.
+        let loaded = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .expect("load succeeds")
+            .expect("receipt present");
+        assert_eq!(loaded.generation, receipt.generation);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repair_with_receipt_supersedes_original() {
+        let root = temp_dir("repair-with-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let options = test_options();
+        let config = multi_data_device_config(&root, 2);
+        let mut pool = Pool::create(config, PoolProperties::default(), &options).unwrap();
+
+        let key = ObjectKey::from_name(b"repair-test");
+        let original = b"original data";
+        let repaired = b"repaired data";
+
+        let (_stored, orig) = pool
+            .put_with_receipt(IoClass::Data, key, original)
+            .expect("original put");
+
+        let (_rep, repair) = pool
+            .repair_with_receipt(
+                IoClass::Data,
+                key,
+                repaired,
+                RepairSource::Replica { source_device_index: 0 },
+            )
+            .expect("repair succeeds");
+
+        assert!(repair.generation > orig.generation);
+        let read_back = pool.get(IoClass::Data, key).expect("get succeeds");
+        assert_eq!(read_back.as_deref(), Some(&repaired[..]));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
