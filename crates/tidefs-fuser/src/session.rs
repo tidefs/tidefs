@@ -149,7 +149,13 @@ impl<FS: Filesystem> Session<FS> {
                     // Dispatch request
                     Some(req) => req.dispatch(self),
                     // Quit loop on illegal request
-                    None => break,
+                    None => {
+                        eprintln!(
+                            "FUSE session run loop exiting: illegal/parse-failure request on mount {}",
+                            self.mountpoint.display()
+                        );
+                        break;
+                    },
                 },
                 Err(err) => match err.raw_os_error() {
                     // Operation interrupted. Accordingly to FUSE, this is safe to retry
@@ -159,7 +165,13 @@ impl<FS: Filesystem> Session<FS> {
                     // Explicitly try again
                     Some(EAGAIN) => continue,
                     // Filesystem was unmounted, quit the loop
-                    Some(ENODEV) => break,
+                    Some(ENODEV) => {
+                        eprintln!(
+                            "FUSE session run loop exiting: ENODEV (filesystem unmounted) on mount {}",
+                            self.mountpoint.display()
+                        );
+                        break;
+                    },
                     // Unhandled error
                     _ => return Err(err),
                 },
@@ -273,7 +285,7 @@ impl BackgroundSession {
     /// Unmount the filesystem and join the background thread.
     pub fn join(self) {
         let Self {
-            mountpoint: _,
+            mountpoint,
             guard,
             #[cfg(feature = "abi-7-11")]
                 sender: _,
@@ -281,9 +293,24 @@ impl BackgroundSession {
         } = self;
         drop(_mount);
         match guard.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("Background session terminated with error: {e}"),
-            Err(_) => warn!("Background session thread panicked"),
+            Ok(Ok(())) => {
+                eprintln!(
+                    "FUSE background session on {} exited normally (Ok)",
+                    mountpoint.display()
+                );
+            }
+            Ok(Err(e)) => {
+                eprintln!(
+                    "FUSE background session on {} exited with error: {e}",
+                    mountpoint.display()
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "FUSE background session on {} panicked",
+                    mountpoint.display()
+                );
+            }
         }
     }
 

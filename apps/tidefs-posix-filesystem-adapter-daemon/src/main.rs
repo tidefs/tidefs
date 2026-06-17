@@ -701,6 +701,13 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
             eprintln!(
                 "FUSE background session thread exited prematurely;                  shutting down to prevent hung mountpoint"
             );
+            // Diagnostic: if the session already finished, try to join and report the outcome.
+            // We cannot join() here because it consumes self, but we can inspect the guard.
+            tracing::error!(
+                target: "tidefs.fuse_session",
+                "FUSE background session thread finished prematurely on mount {}",
+                _session.mountpoint.display()
+            );
             shutdown_flag.store(true, Ordering::Relaxed);
         }
     }
