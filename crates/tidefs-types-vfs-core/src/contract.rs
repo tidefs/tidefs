@@ -1234,6 +1234,118 @@ mod tests {
     }
 
     #[test]
+    fn vfs_write_fsync_read_contract_shape_has_exact_words_and_completions() {
+        let name = VfsNameToken::new(0xa951_dd1b_f01a_508e);
+        let parent_id = InodeId::new(1);
+        let inode_id = InodeId::new(100);
+        let file_handle_id = FileHandleId::new(200);
+        let io_len = 4096_u64;
+
+        let requests = [
+            (
+                VfsRequest::Create { parent_id, name },
+                VfsRequestOp::Create.as_u16(),
+                [parent_id.get(), name.raw(), 0, 0, 0],
+            ),
+            (
+                VfsRequest::Write {
+                    inode_id,
+                    file_handle_id,
+                    offset: 0,
+                    length: io_len,
+                },
+                VfsRequestOp::Write.as_u16(),
+                [inode_id.get(), file_handle_id.get(), 0, io_len, 0],
+            ),
+            (
+                VfsRequest::Sync {
+                    inode_id,
+                    file_handle_id,
+                },
+                VfsRequestOp::Sync.as_u16(),
+                [inode_id.get(), file_handle_id.get(), 0, 0, 0],
+            ),
+            (
+                VfsRequest::Read {
+                    inode_id,
+                    file_handle_id,
+                    offset: 0,
+                    length: io_len,
+                },
+                VfsRequestOp::Read.as_u16(),
+                [inode_id.get(), file_handle_id.get(), 0, io_len, 0],
+            ),
+        ];
+
+        for (request, expected_opcode, expected_words) in requests {
+            let (opcode, words) = request.opcode_words();
+            assert_eq!(opcode, expected_opcode);
+            assert_eq!(words, expected_words);
+            assert_eq!(VfsRequest::from_opcode_words(opcode, words), request);
+        }
+
+        let request_id = RequestId::new([0x52; 16]);
+        let trace_id = TraceId::new([0x54; 16]);
+        let completions = [
+            TideCompletion {
+                version: TIDE_CONTRACT_VERSION_V1,
+                request_id,
+                trace_id,
+                epoch: ContractEpoch::new(528_001),
+                status: CompletionStatus::Success,
+                disposition: CompletionDisposition::Final,
+                errno: Errno::SUCCESS,
+                completed_bytes: 0,
+                result_words: [inode_id.get(), file_handle_id.get(), 0],
+                result_flags: 0,
+            },
+            TideCompletion {
+                version: TIDE_CONTRACT_VERSION_V1,
+                request_id,
+                trace_id,
+                epoch: ContractEpoch::new(528_002),
+                status: CompletionStatus::Success,
+                disposition: CompletionDisposition::Final,
+                errno: Errno::SUCCESS,
+                completed_bytes: io_len,
+                result_words: [io_len, 0, 0],
+                result_flags: 0,
+            },
+            TideCompletion {
+                version: TIDE_CONTRACT_VERSION_V1,
+                request_id,
+                trace_id,
+                epoch: ContractEpoch::new(528_003),
+                status: CompletionStatus::Success,
+                disposition: CompletionDisposition::Final,
+                errno: Errno::SUCCESS,
+                completed_bytes: 0,
+                result_words: [0, 0, 0],
+                result_flags: 0,
+            },
+            TideCompletion {
+                version: TIDE_CONTRACT_VERSION_V1,
+                request_id,
+                trace_id,
+                epoch: ContractEpoch::new(528_004),
+                status: CompletionStatus::Success,
+                disposition: CompletionDisposition::Final,
+                errno: Errno::SUCCESS,
+                completed_bytes: io_len,
+                result_words: [io_len, 0, 0],
+                result_flags: 0,
+            },
+        ];
+
+        for completion in completions {
+            assert_eq!(completion.version, TIDE_CONTRACT_VERSION_V1);
+            assert_eq!(completion.status, CompletionStatus::Success);
+            assert_eq!(completion.disposition, CompletionDisposition::Final);
+            assert_eq!(completion.errno, Errno::SUCCESS);
+        }
+    }
+
+    #[test]
     fn all_request_domains_keep_unknown_operations_explicit() {
         let words = [1, 2, 3, 4, 5];
         assert_eq!(
