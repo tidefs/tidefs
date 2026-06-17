@@ -3726,11 +3726,12 @@ impl LocalFileSystem {
     pub fn drain_local_reclaim_queue_into_store(&mut self) -> ReclaimDrainStats {
         const MAX_RECLAIM_PER_TICK: usize = 256;
 
-        // Receipt durability pre-check: collect keys whose placement receipt
-        // is not yet durable.  These are left in the queue for a future drain
-        // cycle.  We pre-compute the set before taking the mutable store borrow
-        // so the compiler can separate the immutable Pool access from the
-        // mutable store borrow below.
+        // Receipt durability pre-check: identify which batch keys have a
+        // durable placement receipt so that entries without durable receipts
+        // stay in the queue for a future drain cycle.  We pre-compute the
+        // durable set before taking the mutable store borrow so the compiler
+        // can separate the immutable Pool access from the mutable store
+        // borrow below.
 
         // Collect keys protected by active snapshots so reclaim does not
         // delete content objects that snapshot manifests still reference (#6451).
