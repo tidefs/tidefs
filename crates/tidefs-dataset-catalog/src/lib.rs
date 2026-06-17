@@ -1211,14 +1211,14 @@ impl DatasetCatalog {
         hasher.update(entry.dataset_id.as_bytes());
 
         while let Some(parent_id) = current_parent {
+            // Check for duplicate edge: same parent appears consecutively.
+            if visited.last() == Some(&parent_id) {
+                return Err(CatalogError::LineageDuplicateEdge);
+            }
+
             // Check for cycle: if we've seen this parent before, we have a cycle.
             if visited.contains(&parent_id) {
                 return Err(CatalogError::LineageCycle);
-            }
-
-            // Check for duplicate edge: two consecutive identical parents.
-            if visited.last() == Some(&parent_id) {
-                return Err(CatalogError::LineageDuplicateEdge);
             }
 
             // Find the parent entry by scanning for its DatasetId.
@@ -3990,17 +3990,18 @@ mod tests {
     // --- Direct cycle rejection -----------------------------------------------
 
     #[test]
-    fn publish_rejects_direct_cycle_self_parent() {
+    fn publish_rejects_direct_cycle_three_node_loop() {
         let mut cat = DatasetCatalog::new();
         make_filesystem(&mut cat, "pool", 0);
         make_filesystem(&mut cat, "pool/fs1", 1);
         make_snap(&mut cat, "pool/fs1@snap1", 10, did(1));
 
-        // Create cycle: snap2 -> snap3 -> snap2
+        // Create cycle: snap2 -> snap3 -> snap2 (triangular loop)
         make_snap(&mut cat, "pool/fs1@snap2", 11, did(10));
         make_snap(&mut cat, "pool/fs1@snap3", 12, did(11));
         cat.set_lineage_parent("pool/fs1@snap2", did(12)).unwrap();
 
+        // Publishing any node in the cycle should fail
         assert_eq!(
             cat.publish_root("pool/fs1@snap3"),
             Err(CatalogError::LineageCycle)
@@ -4179,10 +4180,10 @@ mod tests {
         // Make B point to itself
         cat.set_lineage_parent("pool/fs1@B", did(11)).unwrap();
 
-        // This should be caught as a cycle (B appears again)
+        // Self-loop is a duplicate edge
         assert_eq!(
             cat.publish_root("pool/fs1@B"),
-            Err(CatalogError::LineageCycle)
+            Err(CatalogError::LineageDuplicateEdge)
         );
     }
 
