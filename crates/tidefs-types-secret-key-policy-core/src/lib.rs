@@ -842,7 +842,7 @@ pub struct PolicyPublishBundleRecord {
     pub _reserved0: u64,
 }
 
-// ── PolicyActivationReceipt (128 bytes) ────────────────────────────────────
+// ── PolicyActivationReceipt (224 bytes) ────────────────────────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -857,6 +857,8 @@ pub struct PolicyActivationReceipt {
     pub anchor_set_proof_ref: SecretKeyPolicyId128,
     pub runbook_or_authz_receipt_ref: SecretKeyPolicyId128,
     pub activated_at_clock_ref: SecretKeyPolicyId128,
+    pub activation_lease_ref: SecretKeyPolicyId128,
+    pub activation_wrapping_key_ref: SecretKeyPolicyId128,
 }
 
 impl PolicyActivationReceipt {
@@ -869,6 +871,16 @@ impl PolicyActivationReceipt {
     pub fn rollback_predecessors(&self) -> &[SecretKeyPolicyId128] {
         let count = (self.rollback_eligible_predecessor_count as usize).min(4);
         &self.rollback_eligible_predecessors[..count]
+    }
+
+    #[must_use]
+    pub const fn has_activation_lease(self) -> bool {
+        !self.activation_lease_ref.is_zero()
+    }
+
+    #[must_use]
+    pub const fn has_activation_wrapping_key(self) -> bool {
+        !self.activation_wrapping_key_ref.is_zero()
     }
 }
 
@@ -883,7 +895,7 @@ const _: [(); 112] = [(); core::mem::size_of::<SecretRevocationReceipt>()];
 const _: [(); 72] = [(); core::mem::size_of::<SecretDisclosurePolicyRecord>()];
 const _: [(); 192] = [(); core::mem::size_of::<PolicyStoreManifestRecord>()];
 const _: [(); 136] = [(); core::mem::size_of::<PolicyPublishBundleRecord>()];
-const _: [(); 184] = [(); core::mem::size_of::<PolicyActivationReceipt>()];
+const _: [(); 216] = [(); core::mem::size_of::<PolicyActivationReceipt>()];
 
 // ── Human-aliases module ───────────────────────────────────────────────────
 

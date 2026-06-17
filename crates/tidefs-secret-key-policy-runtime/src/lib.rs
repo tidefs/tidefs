@@ -251,6 +251,18 @@ pub trait HandleStore {
     }
 }
 
+// ── LeaseClock trait ────────────────────────────────────────────────────────
+
+/// Clock interface for lease expiry checks during activation preflights.
+///
+/// Implementations bind to monotonic wall clocks, logical epochs, or
+/// mock/test clocks.
+pub trait LeaseClock {
+    /// Returns true when `deadline_ref` is in the past relative to the
+    /// clock's current reference point.
+    fn has_deadline_passed(&self, deadline_ref: SecretKeyPolicyId128) -> bool;
+}
+
 // ── Helper: deterministic id derivation from digests ───────────────────────
 
 fn make_id_from_digest_lo(digest: SecretKeyPolicyDigest32, offset: usize) -> SecretKeyPolicyId128 {
@@ -541,20 +553,75 @@ pub fn publish_policy_bundle(
 
 // ── Algorithm 6: activate_policy_revision_after_secret_handle_preflight ────
 
-pub fn activate_policy_revision_after_secret_handle_preflight(
+/// Activation preflight that consumes handle, lease, wrapping-key, and
+/// manifest references and returns a receipt tied to those identities.
+///
+/// # Preflight gates (fail-closed)
+///
+/// 1. Every required handle in the manifest must exist, be Active or
+///    RotatingDualValid, and not be revoked or quarantined.
+/// 2. The activation lease must exist and not be expired.
+/// 3. The wrapping key referenced by each handle's active envelope must exist.
+/// 4. The disclosure policy must permit activation (Audit surface check on each handle).
+/// 5. The manifest's continuity window must be open (non-zero start and end refs).
+/// 6. The seal provider must be reachable (tested via wrapping-key lineage probe).
+///
+/// # Errors
+///
+/// Returns distinct fail-closed errors for:
+///   - missing handles (`HandleNotFound`)
+///   - revoked handles (`HandleRevoked`)
+///   - quarantined handles (`HandleQuarantined`)
+///   - non-active handles (`HandleNotActive`)
+///   - expired lease (`LeaseExpired`)
+///   - missing lease (`LeaseNotFound`)
+///   - incompatible manifest (`ManifestIncompatible`)
+///   - provider unreachable (`SealProviderError`)
+///   - disclosure refused (`DisclosureRefused`)
+pub fn activate_policy_revision_after_secret_handle_preflight<S: SealProvider, C: LeaseClock>(
+    provider: &S,
+    clock: &C,
     store: &dyn HandleStore,
     manifest: &PolicyStoreManifestRecord,
     bundle: &PolicyPublishBundleRecord,
+    lease_id: SecretKeyPolicyId128,
+    disclosure_policy: &SecretDisclosurePolicyRecord,
     anchor_set_proof_ref: SecretKeyPolicyId128,
     runbook_or_authz_receipt_ref: SecretKeyPolicyId128,
     activated_at_clock_ref: SecretKeyPolicyId128,
     scope_selector: u32,
 ) -> Result<PolicyActivationReceipt, SecretKeyPolicyRuntimeError> {
+    // Gate 1: manifest continuity window must be open.
+    if manifest.continuity_window_start_ref.is_zero()
+        || manifest.continuity_window_end_ref.is_zero()
+    {
+        return Err(SecretKeyPolicyRuntimeError::ManifestIncompatible {
+            manifest_id: manifest.manifest_id,
+            reason: ManifestRefusalReason::ContinuityWindowClosed,
+        });
+    }
+
+    // Gate 2: activation lease must exist and not be expired.
+    let lease = store.lookup_lease(lease_id)?;
+    if clock.has_deadline_passed(lease.expiry_deadline_ref) {
+        return Err(SecretKeyPolicyRuntimeError::LeaseExpired { lease_id });
+    }
+
+    // Initial wrapping-key id accumulator (picked from first handle's
+    // envelope); all handles must agree on the same wrapping key.
+    let mut activation_wrapping_key_ref = SecretKeyPolicyId128::ZERO;
+    let mut first_handle = true;
+
+    // Gate 3-6: per-handle checks.
     for &handle_id in manifest.required_handles() {
         if handle_id.is_zero() {
             continue;
         }
+
+        // Gate 3: handle must exist.
         let handle = store.lookup_handle(handle_id)?;
+
+        // Gate 4: handle must be in a usable lifecycle state.
         let state = handle.lifecycle_state()?;
         match state {
             SecretLifecycleState::Active | SecretLifecycleState::RotatingDualValid => {}
@@ -571,8 +638,45 @@ pub fn activate_policy_revision_after_secret_handle_preflight(
                 });
             }
         }
+
+        // Gate 5: disclosure policy must permit activation.
+        validate_handle_disclosure(disclosure_policy, DisclosureSurfaceClass::Audit, &handle)?;
+
+        // Gate 6: wrapping key must exist for the handle's active envelope.
+        let envelope = store.lookup_envelope(handle.active_envelope_id)?;
+        let wrapping_key = store.lookup_wrapping_key(envelope.wrapping_key_id)?;
+
+        // All handles must reference the same wrapping key.
+        if first_handle {
+            activation_wrapping_key_ref = wrapping_key.wrapping_key_id;
+            first_handle = false;
+        } else if activation_wrapping_key_ref != wrapping_key.wrapping_key_id {
+            return Err(SecretKeyPolicyRuntimeError::EnvelopeWrappingMismatch {
+                envelope_id: envelope.envelope_id,
+                wrapping_key_id: wrapping_key.wrapping_key_id,
+            });
+        }
     }
 
+    if manifest.required_handles().is_empty()
+        || activation_wrapping_key_ref.is_zero()
+    {
+        return Err(SecretKeyPolicyRuntimeError::ManifestMissingHandles {
+            manifest_id: manifest.manifest_id,
+            missing_count: 1,
+        });
+    }
+
+    // Gate 7: seal provider must be reachable.
+    // Probe by verifying the wrapping key against itself (identity check).
+    let wrapping_key = store.lookup_wrapping_key(activation_wrapping_key_ref)?;
+    if !provider.verify_wrapping_key_lineage(&wrapping_key, &wrapping_key)? {
+        return Err(SecretKeyPolicyRuntimeError::SealProviderError {
+            reason: SealProviderErrorKind::ProviderUnreachable,
+        });
+    }
+
+    // Assemble activation receipt.
     let mut b = [0u8; 16];
     b[..4].copy_from_slice(&bundle.bundle_id.as_u128_le().to_le_bytes()[..4]);
     b[4..8].copy_from_slice(&manifest.manifest_id.as_u128_le().to_le_bytes()[..4]);
@@ -586,6 +690,8 @@ pub fn activate_policy_revision_after_secret_handle_preflight(
         bundle_id: bundle.bundle_id,
         replaced_active_revision_ref: SecretKeyPolicyId128::ZERO,
         scope_selector,
+        activation_lease_ref: lease_id,
+        activation_wrapping_key_ref,
         anchor_set_proof_ref,
         runbook_or_authz_receipt_ref,
         activated_at_clock_ref,
@@ -1101,6 +1207,8 @@ mod tests {
         envelopes: HashMap<u128, SecretEnvelopeRecord>,
         wrapping_keys: HashMap<u128, WrappingKeyRecord>,
         manifests: HashMap<u128, PolicyStoreManifestRecord>,
+        leases: HashMap<u128, SecretLeaseGrantRecord>,
+        activations: HashMap<u128, PolicyActivationReceipt>,
     }
 
     impl InMemoryHandleStore {
@@ -1110,6 +1218,8 @@ mod tests {
                 envelopes: HashMap::new(),
                 wrapping_keys: HashMap::new(),
                 manifests: HashMap::new(),
+                leases: HashMap::new(),
+                activations: HashMap::new(),
             }
         }
     }
@@ -1158,16 +1268,22 @@ mod tests {
             &self,
             activation_id: SecretKeyPolicyId128,
         ) -> Result<PolicyActivationReceipt, SecretKeyPolicyRuntimeError> {
-            Err(SecretKeyPolicyRuntimeError::ActivationPreflightFailed {
-                activation_id,
-                reason: ActivationRefusalReason::ManifestIncompatible,
-            })
+            self.activations
+                .get(&activation_id.as_u128_le())
+                .copied()
+                .ok_or(SecretKeyPolicyRuntimeError::ActivationPreflightFailed {
+                    activation_id,
+                    reason: ActivationRefusalReason::MissingHandles,
+                })
         }
         fn lookup_lease(
             &self,
             lease_id: SecretKeyPolicyId128,
         ) -> Result<SecretLeaseGrantRecord, SecretKeyPolicyRuntimeError> {
-            Err(SecretKeyPolicyRuntimeError::LeaseNotFound { lease_id })
+            self.leases
+                .get(&lease_id.as_u128_le())
+                .copied()
+                .ok_or(SecretKeyPolicyRuntimeError::LeaseNotFound { lease_id })
         }
         fn store_handle(
             &mut self,
@@ -1192,14 +1308,17 @@ mod tests {
         }
         fn store_activation(
             &mut self,
-            _activation: &PolicyActivationReceipt,
+            activation: &PolicyActivationReceipt,
         ) -> Result<(), SecretKeyPolicyRuntimeError> {
+            self.activations
+                .insert(activation.activation_id.as_u128_le(), *activation);
             Ok(())
         }
         fn store_lease(
             &mut self,
-            _lease: &SecretLeaseGrantRecord,
+            lease: &SecretLeaseGrantRecord,
         ) -> Result<(), SecretKeyPolicyRuntimeError> {
+            self.leases.insert(lease.lease_id.as_u128_le(), *lease);
             Ok(())
         }
         fn store_rotation_plan(
@@ -1220,13 +1339,30 @@ mod tests {
 
     struct MockSealProvider {
         wrapping_key_lineage_valid: bool,
+        /// When set, `verify_wrapping_key_lineage` returns this error
+        /// instead of the boolean flag.  Used to simulate
+        /// provider-unreachable, timeout, and other seal-provider
+        /// failures.
+        forced_error: Option<SealProviderErrorKind>,
     }
 
     impl MockSealProvider {
         fn new() -> Self {
             Self {
                 wrapping_key_lineage_valid: true,
+                forced_error: None,
             }
+        }
+
+        #[allow(dead_code)]
+        fn with_lineage(mut self, valid: bool) -> Self {
+            self.wrapping_key_lineage_valid = valid;
+            self
+        }
+
+        fn with_forced_error(mut self, err: SealProviderErrorKind) -> Self {
+            self.forced_error = Some(err);
+            self
         }
     }
 
@@ -1236,6 +1372,11 @@ mod tests {
             _envelope: &SecretEnvelopeRecord,
             _wrapping_key: &WrappingKeyRecord,
         ) -> Result<Vec<u8>, SecretKeyPolicyRuntimeError> {
+            if let Some(ref err) = self.forced_error {
+                return Err(SecretKeyPolicyRuntimeError::SealProviderError {
+                    reason: *err,
+                });
+            }
             Ok(b"mock-plaintext-material".to_vec())
         }
         fn seal_payload(
@@ -1243,12 +1384,22 @@ mod tests {
             _plaintext: &[u8],
             _wrapping_key: &WrappingKeyRecord,
         ) -> Result<SecretKeyPolicyDigest32, SecretKeyPolicyRuntimeError> {
+            if let Some(ref err) = self.forced_error {
+                return Err(SecretKeyPolicyRuntimeError::SealProviderError {
+                    reason: *err,
+                });
+            }
             Ok([0xAAu8; 32])
         }
         fn generate_secret_material(
             &self,
             _secret_class: SecretClass,
         ) -> Result<Vec<u8>, SecretKeyPolicyRuntimeError> {
+            if let Some(ref err) = self.forced_error {
+                return Err(SecretKeyPolicyRuntimeError::SealProviderError {
+                    reason: *err,
+                });
+            }
             Ok(vec![0x42u8; 32])
         }
         fn verify_wrapping_key_lineage(
@@ -1256,9 +1407,45 @@ mod tests {
             _parent: &WrappingKeyRecord,
             _child: &WrappingKeyRecord,
         ) -> Result<bool, SecretKeyPolicyRuntimeError> {
+            if let Some(ref err) = self.forced_error {
+                return Err(SecretKeyPolicyRuntimeError::SealProviderError {
+                    reason: *err,
+                });
+            }
             Ok(self.wrapping_key_lineage_valid)
         }
     }
+
+    // ── Test double: MockLeaseClock ───
+
+    struct MockLeaseClock {
+        /// When true, has_deadline_passed returns true for every input.
+        always_expired: bool,
+    }
+
+    impl MockLeaseClock {
+        fn new() -> Self {
+            Self {
+                always_expired: false,
+            }
+        }
+
+        fn with_always_expired(mut self, expired: bool) -> Self {
+            self.always_expired = expired;
+            self
+        }
+    }
+
+    impl LeaseClock for MockLeaseClock {
+        fn has_deadline_passed(&self, deadline_ref: SecretKeyPolicyId128) -> bool {
+            // A zero deadline is always considered expired (no valid deadline).
+            if deadline_ref.is_zero() {
+                return true;
+            }
+            self.always_expired
+        }
+    }
+
 
     // ── Algorithm 1 tests ───
 
@@ -1459,47 +1646,485 @@ mod tests {
 
     // ── Algorithm 6 tests ───
 
-    #[test]
-    fn activation_preflight_rejects_revoked_handle() {
+    fn make_activation_test_store(
+        handle_id: SecretKeyPolicyId128,
+        envelope_id: SecretKeyPolicyId128,
+        wk_id: SecretKeyPolicyId128,
+        lifecycle: SecretLifecycleState,
+    ) -> InMemoryHandleStore {
         let mut store = InMemoryHandleStore::new();
-        let h_id = SecretKeyPolicyId128::from_u128_le(0xBAD);
-        store.handles.insert(
-            0xBAD,
-            SecretHandleRecord {
-                handle_id: h_id,
-                secret_class: SecretClass::PolicySigner.as_u32(),
-                lifecycle_state: SecretLifecycleState::Revoked.as_u32(),
+
+        // Wrapping key
+        store.wrapping_keys.insert(
+            wk_id.as_u128_le(),
+            WrappingKeyRecord {
+                wrapping_key_id: wk_id,
+                wrapping_key_class: WrappingKeyClass::ClusterRoot.as_u32(),
+                wrapping_key_version: 1,
                 ..Default::default()
             },
         );
 
-        let manifest = PolicyStoreManifestRecord {
-            required_secret_handle_count: 1,
-            required_secret_handle_refs: [
-                h_id,
-                SecretKeyPolicyId128::ZERO,
-                SecretKeyPolicyId128::ZERO,
-                SecretKeyPolicyId128::ZERO,
-            ],
+        // Handle
+        store.handles.insert(
+            handle_id.as_u128_le(),
+            SecretHandleRecord {
+                handle_id,
+                secret_class: SecretClass::PolicySigner.as_u32(),
+                lifecycle_state: lifecycle.as_u32(),
+                active_envelope_version: 1,
+                active_envelope_id: envelope_id,
+                ..Default::default()
+            },
+        );
+
+        // Envelope
+        store.envelopes.insert(
+            envelope_id.as_u128_le(),
+            SecretEnvelopeRecord {
+                envelope_id,
+                handle_id,
+                envelope_version: 1,
+                wrapping_key_id: wk_id,
+                wrapping_key_version: 1,
+                ..Default::default()
+            },
+        );
+
+        store
+    }
+
+    fn make_activation_manifest(handle_ids: &[SecretKeyPolicyId128]) -> PolicyStoreManifestRecord {
+        let mut refs = [SecretKeyPolicyId128::ZERO; 4];
+        let count = handle_ids.len().min(4);
+        refs[..count].copy_from_slice(&handle_ids[..count]);
+        PolicyStoreManifestRecord {
+            required_secret_handle_count: count as u32,
+            required_secret_handle_refs: refs,
+            manifest_id: SecretKeyPolicyId128::from_u128_le(0x5000),
+            continuity_window_start_ref: SecretKeyPolicyId128::from_u128_le(0x1000),
+            continuity_window_end_ref: SecretKeyPolicyId128::from_u128_le(0x2000),
             ..Default::default()
-        };
+        }
+    }
+
+    fn make_activation_lease(
+        lease_id: SecretKeyPolicyId128,
+        handle_id: SecretKeyPolicyId128,
+        expiry_deadline: SecretKeyPolicyId128,
+    ) -> SecretLeaseGrantRecord {
+        SecretLeaseGrantRecord {
+            lease_id,
+            handle_id,
+            usage_class: LeaseUsageClass::SignOrPublish.as_u32(),
+            runtime_residency_class: StorageStratum::RuntimeMemoryLease.as_u32(),
+            expiry_deadline_ref: expiry_deadline,
+            ..Default::default()
+        }
+    }
+
+    /// Permissive disclosure policy: allows all surfaces with full field visibility.
+    fn make_permissive_disclosure() -> SecretDisclosurePolicyRecord {
+        SecretDisclosurePolicyRecord {
+            audit_visible: 1,
+            trace_visible: 1,
+            scenario_log_visible: 1,
+            visible_fields_mask: !0,
+            provider_class_reveal: 1,
+            narrative_export_visible: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn activation_preflight_succeeds_with_valid_inputs() {
+        let provider = MockSealProvider::new();
+        let clock = MockLeaseClock::new();
+        let h_id = SecretKeyPolicyId128::from_u128_le(0x100);
+        let e_id = SecretKeyPolicyId128::from_u128_le(0xE00);
+        let wk_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
+
+        let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Active);
+        store.leases.insert(
+            lease_id.as_u128_le(),
+            make_activation_lease(lease_id, h_id, expiry),
+        );
+
+        let manifest = make_activation_manifest(&[h_id]);
         let bundle = PolicyPublishBundleRecord::default();
+        let disclosure = make_permissive_disclosure();
 
         let result = activate_policy_revision_after_secret_handle_preflight(
+            &provider,
+            &clock,
             &store,
             &manifest,
             &bundle,
+            lease_id,
+            &disclosure,
             SecretKeyPolicyId128::from_u128_le(1),
             SecretKeyPolicyId128::from_u128_le(2),
             SecretKeyPolicyId128::from_u128_le(3),
             0,
         );
-        assert!(result.is_err());
+        assert!(result.is_ok(), "expected success, got {result:?}");
+        let receipt = result.unwrap();
+        assert_eq!(receipt.manifest_id, manifest.manifest_id);
+        assert_eq!(receipt.activation_lease_ref, lease_id);
+        assert_eq!(receipt.activation_wrapping_key_ref, wk_id);
+        assert!(receipt.has_activation_lease());
+        assert!(receipt.has_activation_wrapping_key());
+    }
+
+    #[test]
+    fn activation_preflight_rejects_missing_handle() {
+        let provider = MockSealProvider::new();
+        let clock = MockLeaseClock::new();
+        let store = InMemoryHandleStore::new();
+        let h_missing = SecretKeyPolicyId128::from_u128_le(0xDEAD);
+        let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
+
+        // Store has no handle; lease exists but handle doesn't.
+        let mut store = store;
+        store.leases.insert(
+            lease_id.as_u128_le(),
+            make_activation_lease(lease_id, h_missing, expiry),
+        );
+
+        let manifest = make_activation_manifest(&[h_missing]);
+        let bundle = PolicyPublishBundleRecord::default();
+        let disclosure = make_permissive_disclosure();
+
+        let result = activate_policy_revision_after_secret_handle_preflight(
+            &provider,
+            &clock,
+            &store,
+            &manifest,
+            &bundle,
+            lease_id,
+            &disclosure,
+            SecretKeyPolicyId128::from_u128_le(1),
+            SecretKeyPolicyId128::from_u128_le(2),
+            SecretKeyPolicyId128::from_u128_le(3),
+            0,
+        );
+        match result {
+            Err(SecretKeyPolicyRuntimeError::HandleNotFound { handle_id }) => {
+                assert_eq!(handle_id, h_missing);
+            }
+            other => panic!("expected HandleNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activation_preflight_rejects_expired_lease() {
+        let provider = MockSealProvider::new();
+        // Clock that always reports deadlines as passed.
+        let clock = MockLeaseClock::new().with_always_expired(true);
+        let h_id = SecretKeyPolicyId128::from_u128_le(0x100);
+        let e_id = SecretKeyPolicyId128::from_u128_le(0xE00);
+        let wk_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
+
+        let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Active);
+        store.leases.insert(
+            lease_id.as_u128_le(),
+            make_activation_lease(lease_id, h_id, expiry),
+        );
+
+        let manifest = make_activation_manifest(&[h_id]);
+        let bundle = PolicyPublishBundleRecord::default();
+        let disclosure = make_permissive_disclosure();
+
+        let result = activate_policy_revision_after_secret_handle_preflight(
+            &provider,
+            &clock,
+            &store,
+            &manifest,
+            &bundle,
+            lease_id,
+            &disclosure,
+            SecretKeyPolicyId128::from_u128_le(1),
+            SecretKeyPolicyId128::from_u128_le(2),
+            SecretKeyPolicyId128::from_u128_le(3),
+            0,
+        );
+        match result {
+            Err(SecretKeyPolicyRuntimeError::LeaseExpired { lease_id: lid }) => {
+                assert_eq!(lid, lease_id);
+            }
+            other => panic!("expected LeaseExpired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activation_preflight_rejects_revoked_handle() {
+        let provider = MockSealProvider::new();
+        let clock = MockLeaseClock::new();
+        let h_id = SecretKeyPolicyId128::from_u128_le(0xBAD);
+        let e_id = SecretKeyPolicyId128::from_u128_le(0xE00);
+        let wk_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
+
+        let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Revoked);
+        store.leases.insert(
+            lease_id.as_u128_le(),
+            make_activation_lease(lease_id, h_id, expiry),
+        );
+
+        let manifest = make_activation_manifest(&[h_id]);
+        let bundle = PolicyPublishBundleRecord::default();
+        let disclosure = make_permissive_disclosure();
+
+        let result = activate_policy_revision_after_secret_handle_preflight(
+            &provider,
+            &clock,
+            &store,
+            &manifest,
+            &bundle,
+            lease_id,
+            &disclosure,
+            SecretKeyPolicyId128::from_u128_le(1),
+            SecretKeyPolicyId128::from_u128_le(2),
+            SecretKeyPolicyId128::from_u128_le(3),
+            0,
+        );
         match result {
             Err(SecretKeyPolicyRuntimeError::HandleRevoked { handle_id }) => {
                 assert_eq!(handle_id, h_id);
             }
-            _ => panic!("expected HandleRevoked"),
+            _ => panic!("expected HandleRevoked, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn activation_preflight_rejects_quarantined_handle() {
+        let provider = MockSealProvider::new();
+        let clock = MockLeaseClock::new();
+        let h_id = SecretKeyPolicyId128::from_u128_le(0xBAD);
+        let e_id = SecretKeyPolicyId128::from_u128_le(0xE00);
+        let wk_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
+
+        let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Quarantined);
+        store.leases.insert(
+            lease_id.as_u128_le(),
+            make_activation_lease(lease_id, h_id, expiry),
+        );
+
+        let manifest = make_activation_manifest(&[h_id]);
+        let bundle = PolicyPublishBundleRecord::default();
+        let disclosure = make_permissive_disclosure();
+
+        let result = activate_policy_revision_after_secret_handle_preflight(
+            &provider,
+            &clock,
+            &store,
+            &manifest,
+            &bundle,
+            lease_id,
+            &disclosure,
+            SecretKeyPolicyId128::from_u128_le(1),
+            SecretKeyPolicyId128::from_u128_le(2),
+            SecretKeyPolicyId128::from_u128_le(3),
+            0,
+        );
+        match result {
+            Err(SecretKeyPolicyRuntimeError::HandleQuarantined { handle_id }) => {
+                assert_eq!(handle_id, h_id);
+            }
+            _ => panic!("expected HandleQuarantined, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn activation_preflight_rejects_disclosure_refusal() {
+        let provider = MockSealProvider::new();
+        let clock = MockLeaseClock::new();
+        let h_id = SecretKeyPolicyId128::from_u128_le(0x100);
+        let e_id = SecretKeyPolicyId128::from_u128_le(0xE00);
+        let wk_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
+
+        let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Active);
+        store.leases.insert(
+            lease_id.as_u128_le(),
+            make_activation_lease(lease_id, h_id, expiry),
+        );
+
+        let manifest = make_activation_manifest(&[h_id]);
+        let bundle = PolicyPublishBundleRecord::default();
+        // Disclosure policy with audit_visible = 0: refuse audit surface.
+        let disclosure = SecretDisclosurePolicyRecord::default();
+
+        let result = activate_policy_revision_after_secret_handle_preflight(
+            &provider,
+            &clock,
+            &store,
+            &manifest,
+            &bundle,
+            lease_id,
+            &disclosure,
+            SecretKeyPolicyId128::from_u128_le(1),
+            SecretKeyPolicyId128::from_u128_le(2),
+            SecretKeyPolicyId128::from_u128_le(3),
+            0,
+        );
+        match result {
+            Err(SecretKeyPolicyRuntimeError::DisclosureRefused { surface, reason: _ }) => {
+                assert_eq!(surface, DisclosureSurfaceClass::Audit);
+            }
+            other => panic!("expected DisclosureRefused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activation_preflight_rejects_provider_unreachable() {
+        let h_id = SecretKeyPolicyId128::from_u128_le(0x100);
+        let e_id = SecretKeyPolicyId128::from_u128_le(0xE00);
+        let wk_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
+
+        // Provider that always returns an unreachable error.
+        let provider = MockSealProvider::new()
+            .with_forced_error(SealProviderErrorKind::ProviderUnreachable);
+        let clock = MockLeaseClock::new();
+
+        let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Active);
+        store.leases.insert(
+            lease_id.as_u128_le(),
+            make_activation_lease(lease_id, h_id, expiry),
+        );
+
+        let manifest = make_activation_manifest(&[h_id]);
+        let bundle = PolicyPublishBundleRecord::default();
+        let disclosure = make_permissive_disclosure();
+
+        let result = activate_policy_revision_after_secret_handle_preflight(
+            &provider,
+            &clock,
+            &store,
+            &manifest,
+            &bundle,
+            lease_id,
+            &disclosure,
+            SecretKeyPolicyId128::from_u128_le(1),
+            SecretKeyPolicyId128::from_u128_le(2),
+            SecretKeyPolicyId128::from_u128_le(3),
+            0,
+        );
+        match result {
+            Err(SecretKeyPolicyRuntimeError::SealProviderError { reason }) => {
+                assert_eq!(reason, SealProviderErrorKind::ProviderUnreachable);
+            }
+            other => panic!("expected SealProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activation_preflight_rejects_manifest_missing_handles() {
+        let provider = MockSealProvider::new();
+        let clock = MockLeaseClock::new();
+        let store = InMemoryHandleStore::new();
+        let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
+
+        // Manifest with zero handles
+        let manifest = PolicyStoreManifestRecord {
+            required_secret_handle_count: 0,
+            required_secret_handle_refs: [SecretKeyPolicyId128::ZERO; 4],
+            manifest_id: SecretKeyPolicyId128::from_u128_le(0x5000),
+            continuity_window_start_ref: SecretKeyPolicyId128::from_u128_le(0x1000),
+            continuity_window_end_ref: SecretKeyPolicyId128::from_u128_le(0x2000),
+            ..Default::default()
+        };
+        let bundle = PolicyPublishBundleRecord::default();
+        let disclosure = make_permissive_disclosure();
+
+        let mut store = store;
+        store.leases.insert(
+            lease_id.as_u128_le(),
+            make_activation_lease(lease_id, SecretKeyPolicyId128::ZERO, expiry),
+        );
+
+        let result = activate_policy_revision_after_secret_handle_preflight(
+            &provider,
+            &clock,
+            &store,
+            &manifest,
+            &bundle,
+            lease_id,
+            &disclosure,
+            SecretKeyPolicyId128::from_u128_le(1),
+            SecretKeyPolicyId128::from_u128_le(2),
+            SecretKeyPolicyId128::from_u128_le(3),
+            0,
+        );
+        match result {
+            Err(SecretKeyPolicyRuntimeError::ManifestMissingHandles { manifest_id, .. }) => {
+                assert_eq!(manifest_id, manifest.manifest_id);
+            }
+            other => panic!("expected ManifestMissingHandles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activation_preflight_rejects_zero_continuity_window() {
+        let provider = MockSealProvider::new();
+        let clock = MockLeaseClock::new();
+        let h_id = SecretKeyPolicyId128::from_u128_le(0x100);
+        let e_id = SecretKeyPolicyId128::from_u128_le(0xE00);
+        let wk_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
+
+        let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Active);
+        store.leases.insert(
+            lease_id.as_u128_le(),
+            make_activation_lease(lease_id, h_id, expiry),
+        );
+
+        // Manifest with zero continuity_window_start_ref
+        let manifest = PolicyStoreManifestRecord {
+            required_secret_handle_count: 1,
+            required_secret_handle_refs: [h_id, SecretKeyPolicyId128::ZERO, SecretKeyPolicyId128::ZERO, SecretKeyPolicyId128::ZERO],
+            manifest_id: SecretKeyPolicyId128::from_u128_le(0x5000),
+            continuity_window_start_ref: SecretKeyPolicyId128::ZERO,
+            continuity_window_end_ref: SecretKeyPolicyId128::from_u128_le(0x2000),
+            ..Default::default()
+        };
+        let bundle = PolicyPublishBundleRecord::default();
+        let disclosure = make_permissive_disclosure();
+
+        let result = activate_policy_revision_after_secret_handle_preflight(
+            &provider,
+            &clock,
+            &store,
+            &manifest,
+            &bundle,
+            lease_id,
+            &disclosure,
+            SecretKeyPolicyId128::from_u128_le(1),
+            SecretKeyPolicyId128::from_u128_le(2),
+            SecretKeyPolicyId128::from_u128_le(3),
+            0,
+        );
+        match result {
+            Err(SecretKeyPolicyRuntimeError::ManifestIncompatible {
+                manifest_id,
+                reason: ManifestRefusalReason::ContinuityWindowClosed,
+            }) => {
+                assert_eq!(manifest_id, manifest.manifest_id);
+            }
+            other => panic!("expected ManifestIncompatible with ContinuityWindowClosed, got {other:?}"),
         }
     }
 
