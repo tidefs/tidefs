@@ -1,7 +1,7 @@
 # Local/Distributed Placement Receipt Authority
 
 Maturity: live implementation note for the local and distributed receipt APIs
-APIs that feed issue #18. This document is not a closure claim for the full
+that feed issue #18. This document is not a closure claim for the full
 local-filesystem, distributed transport, rebake, rebuild, and runtime
 validation surface.
 
