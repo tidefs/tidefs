@@ -39,6 +39,11 @@ Important 2026-06-01 findings:
   surfaces; future cleanup should keep mounted/runtime/product and compact
   invariant tests, compress redundant branch tests, and remove or demote
   marker-only, stale-fixture, scaffold, and weakened-fixture claims.
+- `TFR-020`: issue #500 adds `docs/TEST_SIGNAL_AUDIT.md`, classifying the
+  scoped `crates/*/tests/`, inline `crates/*/src/`, and `apps/*/tests/`
+  roots by product/invariant, harness/scaffold, and marker/stale signal. The
+  audit records per-package counts, high-confidence marker/delete candidates,
+  and claim-registry cross-references; it does not delete or refactor tests.
 - `TFR-021`: issue #281 adds
   `docs/NEXTGEN_VERIFICATION_CONTRACT_ROADMAP.md` as the current planning
   authority for the nextgen verification, performance, and offload chain. The
