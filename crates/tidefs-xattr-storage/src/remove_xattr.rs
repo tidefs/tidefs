@@ -2,12 +2,12 @@
 //!
 //! [`XattrRemoveStore`] provides persistent `remove_xattr` that:
 //!
-//! 1. Validates the namespace and name.
-//! 2. Reads the per-inode directory to check existence.
+//! 1. Validates the owner evidence, namespace, and name.
+//! 2. Reads the owner-versioned directory to check existence.
 //! 3. Records an [`IntentLogRecord::XattrRemove`] tombstone in the
 //!    intent-log buffer for crash-safe replay.
 //! 4. Deletes the xattr value blob from the local object store.
-//! 5. Removes the entry from the per-inode xattr directory.
+//! 5. Removes the entry from the owner-versioned xattr directory.
 //!
 //! Returns `Ok(true)` when the attribute existed and was removed,
 //! `Ok(false)` when it did not exist (idempotent no-op).
@@ -25,7 +25,7 @@ use tidefs_local_object_store::LocalObjectStore;
 
 use crate::persistent::{
     decode_dir, encode_dir, xattr_dir_key, xattr_full_name_bytes, xattr_value_key,
-    PersistentXattrError, MAX_XATTR_NAME_LEN,
+    PersistentXattrError, XattrOwner, MAX_XATTR_NAME_LEN,
 };
 use crate::xattr_record::XattrNamespace;
 
@@ -85,14 +85,14 @@ impl XattrRemoveStore {
         }
     }
 
-    /// Remove an extended attribute from `inode`.
+    /// Remove an extended attribute from `owner`.
     ///
     /// Returns `Ok(true)` when the attribute existed and was removed,
     /// `Ok(false)` when it did not exist (idempotent no-op).
     ///
     /// # Arguments
     ///
-    /// * `inode` — Inode number.
+    /// * `owner` — Inode number plus generation evidence.
     /// * `namespace` — Linux xattr namespace (`user`, `system`,
     ///   `security`, `trusted`).
     /// * `name` — Attribute name bytes (without namespace prefix).
@@ -104,12 +104,16 @@ impl XattrRemoveStore {
     /// storage error.
     pub fn remove_xattr(
         &self,
-        inode: u64,
+        owner: XattrOwner,
         namespace: &str,
         name: &[u8],
         txg_id: u64,
     ) -> Result<bool, PersistentXattrError> {
         // ── Validation ─────────────────────────────────────────────
+
+        if owner.inode == 0 || owner.generation == 0 {
+            return Err(PersistentXattrError::InvalidOwner);
+        }
 
         if namespace.is_empty() || namespace.contains(':') || namespace.len() > 64 {
             return Err(PersistentXattrError::InvalidNamespace);
@@ -130,7 +134,7 @@ impl XattrRemoveStore {
             .lock()
             .map_err(|e| PersistentXattrError::Internal(format!("lock poisoned: {e}")))?;
 
-        let mut dir = self.read_dir(&store, inode)?;
+        let mut dir = self.read_dir(&store, owner)?;
         let full_name = xattr_full_name_bytes(namespace, name);
 
         if !dir.remove(&full_name) {
@@ -140,7 +144,7 @@ impl XattrRemoveStore {
 
         // ── Delete value blob ─────────────────────────────────────
 
-        let value_key = xattr_value_key(inode, namespace, name);
+        let value_key = xattr_value_key(owner, namespace, name);
         store
             .delete_named(&value_key)
             .map_err(|e| PersistentXattrError::Internal(format!("object store delete: {e}")))?;
@@ -151,7 +155,7 @@ impl XattrRemoveStore {
         let intent_ns = to_intent_log_namespace(record_ns);
         let _frame = self.intent_log.append(
             IntentLogRecord::XattrRemove {
-                ino: inode,
+                ino: owner.inode,
                 namespace: intent_ns,
                 key_hash,
             },
@@ -160,7 +164,7 @@ impl XattrRemoveStore {
 
         // ── Update per-inode directory ─────────────────────────────
 
-        self.write_dir(&mut store, inode, &dir)?;
+        self.write_dir(&mut store, owner, &dir)?;
 
         Ok(true)
     }
@@ -172,9 +176,9 @@ impl XattrRemoveStore {
     fn read_dir(
         &self,
         store: &LocalObjectStore,
-        inode: u64,
+        owner: XattrOwner,
     ) -> Result<std::collections::BTreeSet<Vec<u8>>, PersistentXattrError> {
-        let dir_key = xattr_dir_key(inode);
+        let dir_key = xattr_dir_key(owner);
         let data = store
             .get_named(&dir_key)
             .map_err(|e| PersistentXattrError::Internal(format!("object store read: {e}")))?;
@@ -189,10 +193,10 @@ impl XattrRemoveStore {
     fn write_dir(
         &self,
         store: &mut LocalObjectStore,
-        inode: u64,
+        owner: XattrOwner,
         dir: &std::collections::BTreeSet<Vec<u8>>,
     ) -> Result<(), PersistentXattrError> {
-        let dir_key = xattr_dir_key(inode);
+        let dir_key = xattr_dir_key(owner);
         if dir.is_empty() {
             let _ = store
                 .delete_named(&dir_key)
@@ -238,21 +242,25 @@ mod tests {
         (xrs, dir)
     }
 
+    fn owner(inode: u64) -> XattrOwner {
+        XattrOwner::new(inode, 11)
+    }
+
     /// Helper: pre-populate an xattr entry so tests can remove it.
     fn put_xattr_entry(
         store: &Arc<Mutex<LocalObjectStore>>,
-        inode: u64,
+        owner: XattrOwner,
         namespace: &str,
         name: &[u8],
         value: &[u8],
     ) {
         let mut s = store.lock().unwrap();
         // Store the value blob
-        let value_key = xattr_value_key(inode, namespace, name);
+        let value_key = xattr_value_key(owner, namespace, name);
         s.put_named(&value_key, value).expect("put value");
 
         // Add to directory
-        let dir_key = xattr_dir_key(inode);
+        let dir_key = xattr_dir_key(owner);
         let existing = s.get_named(&dir_key).ok().flatten();
         let mut dir: BTreeSet<Vec<u8>> = match existing {
             Some(data) => decode_dir(&data).unwrap_or_default(),
@@ -270,10 +278,10 @@ mod tests {
     #[test]
     fn remove_existing_returns_true() {
         let (xrs, _dir) = make_store();
-        put_xattr_entry(&xrs.object_store, 1, "user", b"key", b"val");
+        put_xattr_entry(&xrs.object_store, owner(1), "user", b"key", b"val");
 
         let removed = xrs
-            .remove_xattr(1, "user", b"key", 1)
+            .remove_xattr(owner(1), "user", b"key", 1)
             .expect("remove_xattr");
         assert!(removed, "expected true for existing attribute");
     }
@@ -283,7 +291,7 @@ mod tests {
         let (xrs, _dir) = make_store();
         // No pre-populated entry.
         let removed = xrs
-            .remove_xattr(1, "user", b"missing", 1)
+            .remove_xattr(owner(1), "user", b"missing", 1)
             .expect("remove_xattr");
         assert!(!removed, "expected false for missing attribute");
     }
@@ -291,12 +299,12 @@ mod tests {
     #[test]
     fn remove_deletes_value_blob() {
         let (xrs, _dir) = make_store();
-        put_xattr_entry(&xrs.object_store, 1, "user", b"del", b"to-delete");
+        put_xattr_entry(&xrs.object_store, owner(1), "user", b"del", b"to-delete");
 
-        xrs.remove_xattr(1, "user", b"del", 1).unwrap();
+        xrs.remove_xattr(owner(1), "user", b"del", 1).unwrap();
 
         let s = xrs.object_store.lock().unwrap();
-        let value_key = xattr_value_key(1, "user", b"del");
+        let value_key = xattr_value_key(owner(1), "user", b"del");
         let blob = s.get_named(&value_key).ok().flatten();
         assert!(blob.is_none(), "value blob should be deleted");
     }
@@ -304,13 +312,13 @@ mod tests {
     #[test]
     fn remove_updates_directory() {
         let (xrs, _dir) = make_store();
-        put_xattr_entry(&xrs.object_store, 10, "user", b"a", b"1");
-        put_xattr_entry(&xrs.object_store, 10, "user", b"b", b"2");
+        put_xattr_entry(&xrs.object_store, owner(10), "user", b"a", b"1");
+        put_xattr_entry(&xrs.object_store, owner(10), "user", b"b", b"2");
 
-        xrs.remove_xattr(10, "user", b"a", 1).unwrap();
+        xrs.remove_xattr(owner(10), "user", b"a", 1).unwrap();
 
         let s = xrs.object_store.lock().unwrap();
-        let dir_key = xattr_dir_key(10);
+        let dir_key = xattr_dir_key(owner(10));
         let blob = s.get_named(&dir_key).unwrap().unwrap();
         let dir = decode_dir(&blob).unwrap();
         assert_eq!(dir.len(), 1);
@@ -321,12 +329,12 @@ mod tests {
     #[test]
     fn remove_last_entry_deletes_directory_object() {
         let (xrs, _dir) = make_store();
-        put_xattr_entry(&xrs.object_store, 5, "user", b"lonely", b"v");
+        put_xattr_entry(&xrs.object_store, owner(5), "user", b"lonely", b"v");
 
-        xrs.remove_xattr(5, "user", b"lonely", 1).unwrap();
+        xrs.remove_xattr(owner(5), "user", b"lonely", 1).unwrap();
 
         let s = xrs.object_store.lock().unwrap();
-        let dir_key = xattr_dir_key(5);
+        let dir_key = xattr_dir_key(owner(5));
         let data = s.get_named(&dir_key).ok().flatten();
         assert!(data.is_none(), "empty directory should be removed");
     }
@@ -334,9 +342,10 @@ mod tests {
     #[test]
     fn remove_records_intent_log_tombstone() {
         let (xrs, _dir) = make_store();
-        put_xattr_entry(&xrs.object_store, 42, "security", b"selinux", b"ctx");
+        put_xattr_entry(&xrs.object_store, owner(42), "security", b"selinux", b"ctx");
 
-        xrs.remove_xattr(42, "security", b"selinux", 7).unwrap();
+        xrs.remove_xattr(owner(42), "security", b"selinux", 7)
+            .unwrap();
 
         let frames = xrs.intent_log.drain_since(0);
         let remove_frames: Vec<_> = frames
@@ -364,7 +373,7 @@ mod tests {
     fn remove_missing_does_not_record_intent_log() {
         let (xrs, _dir) = make_store();
 
-        xrs.remove_xattr(99, "user", b"nope", 1).unwrap();
+        xrs.remove_xattr(owner(99), "user", b"nope", 1).unwrap();
 
         let frames = xrs.intent_log.drain_since(0);
         assert!(frames.is_empty(), "no intent-log for missing attr");
@@ -373,15 +382,15 @@ mod tests {
     #[test]
     fn remove_idempotent_twice() {
         let (xrs, _dir) = make_store();
-        put_xattr_entry(&xrs.object_store, 1, "user", b"twice", b"v");
+        put_xattr_entry(&xrs.object_store, owner(1), "user", b"twice", b"v");
 
         let first = xrs
-            .remove_xattr(1, "user", b"twice", 1)
+            .remove_xattr(owner(1), "user", b"twice", 1)
             .expect("first remove");
         assert!(first);
 
         let second = xrs
-            .remove_xattr(1, "user", b"twice", 2)
+            .remove_xattr(owner(1), "user", b"twice", 2)
             .expect("second remove");
         assert!(!second);
     }
@@ -389,24 +398,51 @@ mod tests {
     #[test]
     fn remove_independent_across_inodes() {
         let (xrs, _dir) = make_store();
-        put_xattr_entry(&xrs.object_store, 10, "user", b"shared", b"v10");
-        put_xattr_entry(&xrs.object_store, 20, "user", b"shared", b"v20");
+        put_xattr_entry(&xrs.object_store, owner(10), "user", b"shared", b"v10");
+        put_xattr_entry(&xrs.object_store, owner(20), "user", b"shared", b"v20");
 
-        let r10 = xrs.remove_xattr(10, "user", b"shared", 1).unwrap();
+        let r10 = xrs.remove_xattr(owner(10), "user", b"shared", 1).unwrap();
         assert!(r10);
 
         // 20 should still exist
         let s = xrs.object_store.lock().unwrap();
-        let value_key = xattr_value_key(20, "user", b"shared");
+        let value_key = xattr_value_key(owner(20), "user", b"shared");
         let blob = s.get_named(&value_key).unwrap().unwrap();
         assert_eq!(blob, b"v20");
+    }
+
+    #[test]
+    fn remove_generation_isolates_reused_inode_number() {
+        let (xrs, _dir) = make_store();
+        let old_owner = XattrOwner::new(6, 1);
+        let new_owner = XattrOwner::new(6, 2);
+
+        put_xattr_entry(&xrs.object_store, old_owner, "user", b"shared", b"old");
+        put_xattr_entry(&xrs.object_store, new_owner, "user", b"shared", b"new");
+
+        assert!(xrs
+            .remove_xattr(old_owner, "user", b"shared", 1)
+            .expect("remove old"));
+
+        let s = xrs.object_store.lock().unwrap();
+        assert!(s
+            .get_named(&xattr_value_key(old_owner, "user", b"shared"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            s.get_named(&xattr_value_key(new_owner, "user", b"shared"))
+                .unwrap(),
+            Some(b"new".to_vec())
+        );
+        assert!(s.get_named(&xattr_dir_key(old_owner)).unwrap().is_none());
+        assert!(s.get_named(&xattr_dir_key(new_owner)).unwrap().is_some());
     }
 
     #[test]
     fn validation_rejects_empty_name() {
         let (xrs, _dir) = make_store();
         assert_eq!(
-            xrs.remove_xattr(1, "user", b"", 1),
+            xrs.remove_xattr(owner(1), "user", b"", 1),
             Err(PersistentXattrError::InvalidName)
         );
     }
@@ -415,8 +451,21 @@ mod tests {
     fn validation_rejects_bad_namespace() {
         let (xrs, _dir) = make_store();
         assert_eq!(
-            xrs.remove_xattr(1, "custom", b"foo", 1),
+            xrs.remove_xattr(owner(1), "custom", b"foo", 1),
             Err(PersistentXattrError::InvalidNamespace)
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_owner() {
+        let (xrs, _dir) = make_store();
+        assert_eq!(
+            xrs.remove_xattr(XattrOwner::new(0, 1), "user", b"key", 1),
+            Err(PersistentXattrError::InvalidOwner)
+        );
+        assert_eq!(
+            xrs.remove_xattr(XattrOwner::new(1, 0), "user", b"key", 1),
+            Err(PersistentXattrError::InvalidOwner)
         );
     }
 }
