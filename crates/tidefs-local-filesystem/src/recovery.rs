@@ -2323,3 +2323,299 @@ mod cross_device_quorum_tests {
         assert_eq!(got2, file_data, "data intact after recovery+reopen");
     }
 }
+
+#[cfg(test)]
+mod receipt_validation_tests {
+    use super::*;
+    use crate::encoding::encode_content_chunk;
+    use crate::types::PosixTimeRecord;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tidefs_local_object_store::pool::Pool;
+    use tidefs_local_object_store::{
+        DeviceBacking, DeviceClass, DeviceConfig, DeviceKind, IntegrityDigest64, LocalObjectStore,
+        PoolConfig, PoolProperties, StoreOptions,
+    };
+    use tidefs_types_vfs_core::S_IFREG;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("tidefs-recovery-receipt-test-{ts}-{label}"))
+    }
+
+    fn cleanup(dir: &PathBuf) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn make_store(root: &PathBuf) -> LocalObjectStore {
+        let _ = std::fs::remove_dir_all(root);
+        LocalObjectStore::open(root).expect("open store")
+    }
+
+    fn single_data_device_config(root: &PathBuf) -> PoolConfig {
+        let data_dir = root.join("data");
+        PoolConfig {
+            name: "receipt-test-pool".into(),
+            root_path: root.to_path_buf(),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Single { path: data_dir },
+                encryption: None,
+                compression: None,
+            }],
+        }
+    }
+
+    fn make_pool(root: &PathBuf) -> Pool {
+        let _ = std::fs::remove_dir_all(root);
+        let config = single_data_device_config(root);
+        Pool::create(
+            config,
+            PoolProperties::default(),
+            &StoreOptions::test_fast(),
+        )
+        .expect("create test pool")
+    }
+
+    fn make_file_inode(inode_id: u64, data_version: u64, size: u64) -> InodeRecord {
+        InodeRecord {
+            rdev: 0,
+            inode_id: InodeId(inode_id),
+            generation: Generation(1),
+            facets: NodeKind::File.to_facets(),
+            mode: S_IFREG | DEFAULT_FILE_PERMISSIONS,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size,
+            data_version,
+            metadata_version: 1,
+            posix_time: PosixTimeRecord::now(),
+            xattrs: BTreeMap::new(),
+            dir_storage_kind: 0,
+            xattr_storage_kind: 0,
+            dir_rev: 0,
+        }
+    }
+
+    fn make_chunk_ref(
+        chunk_index: u64,
+        data_version: u64,
+        len: u32,
+        placement_receipt_generation: u64,
+    ) -> ContentChunkRef {
+        ContentChunkRef {
+            chunk_index,
+            data_version,
+            len,
+            checksum: IntegrityDigest64(0xCAFE),
+            placement_receipt_generation,
+        }
+    }
+
+    fn put_chunk_data(
+        store: &mut LocalObjectStore,
+        inode: &InodeRecord,
+        chunk_ref: &ContentChunkRef,
+    ) {
+        let key = content_chunk_object_key_for_version(
+            inode.inode_id,
+            chunk_ref.data_version,
+            chunk_ref.chunk_index,
+        );
+        let payload = b"test-chunk-payload-for-receipt-validation";
+        let encoded =
+            encode_content_chunk(inode, chunk_ref.chunk_index, payload, &Default::default());
+        store.put(key, &encoded).expect("put chunk data");
+        store.sync_all().expect("sync");
+    }
+
+    /// A chunk with zero placement_receipt_generation should have
+    /// missing_receipt = true but receipt_mismatch = false (no pool
+    /// validation is triggered).
+    #[test]
+    fn chunk_with_zero_receipt_generation_marks_missing_receipt() {
+        let root = temp_dir("zero-receipt-gen");
+        let mut store = make_store(&root);
+        let inode = make_file_inode(2, 1, 4096);
+        let chunk_ref = make_chunk_ref(0, 1, 4096, 0);
+        put_chunk_data(&mut store, &inode, &chunk_ref);
+        let mut report = FilesystemContentInspectionReport::empty();
+
+        inspect_chunk_object(&store, &inode, &chunk_ref, &mut report, None)
+            .expect("inspect_chunk_object success");
+
+        assert_eq!(report.referenced_objects.len(), 1);
+        let obj = &report.referenced_objects[0];
+        assert!(
+            obj.missing_receipt,
+            "chunk with zero receipt generation must have missing_receipt=true"
+        );
+        assert!(
+            !obj.receipt_mismatch,
+            "chunk with zero receipt generation must not have receipt_mismatch=true"
+        );
+        assert_eq!(report.receipt_mismatches, 0);
+        cleanup(&root);
+    }
+
+    /// A non-hole chunk with non-zero receipt generation and a matching
+    /// pool receipt should not be flagged.
+    #[test]
+    fn chunk_with_matching_pool_receipt_not_flagged() {
+        let store_root = temp_dir("matching-receipt-store");
+        let pool_root = temp_dir("matching-receipt-pool");
+        let mut store = make_store(&store_root);
+        let mut pool = make_pool(&pool_root);
+        let inode = make_file_inode(2, 1, 4096);
+
+        let chunk_key = content_chunk_object_key_for_version(inode.inode_id, 1, 0);
+        // Use put_with_receipt to get the pool-assigned generation, then
+        // build a chunk_ref that carries that exact generation.
+        let (_stored, receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, chunk_key, b"pool-chunk-data")
+            .expect("put_with_receipt in pool");
+        let gen = receipt.generation;
+
+        // Verify the pool can find its own receipt before inspection.
+        let pool_receipt = pool
+            .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+            .expect("placement_receipt_for_key ok")
+            .expect("pool must find its own receipt");
+        assert_eq!(
+            pool_receipt.generation,
+            gen,
+            "pool receipt gen {pool_gen} must match put_with_receipt return {gen}",
+            pool_gen = pool_receipt.generation
+        );
+
+        let chunk_ref = make_chunk_ref(0, 1, 4096, gen);
+        put_chunk_data(&mut store, &inode, &chunk_ref);
+
+        let mut report = FilesystemContentInspectionReport::empty();
+        inspect_chunk_object(&store, &inode, &chunk_ref, &mut report, Some(&pool))
+            .expect("inspect_chunk_object success");
+
+        assert_eq!(report.referenced_objects.len(), 1);
+        let obj = &report.referenced_objects[0];
+        assert!(
+            !obj.receipt_mismatch,
+            "matching receipt must not be flagged"
+        );
+        assert_eq!(report.receipt_mismatches, 0);
+        cleanup(&store_root);
+        cleanup(&pool_root);
+    }
+
+    /// A chunk with a non-zero receipt generation where the pool has no
+    /// receipt for the key should be flagged as a receipt mismatch.
+    #[test]
+    fn chunk_with_missing_pool_receipt_flagged() {
+        let store_root = temp_dir("missing-pool-receipt-store");
+        let pool_root = temp_dir("missing-pool-receipt-pool");
+        let mut store = make_store(&store_root);
+        let pool = make_pool(&pool_root);
+        let inode = make_file_inode(2, 1, 4096);
+        let chunk_ref = make_chunk_ref(0, 1, 4096, 5);
+        put_chunk_data(&mut store, &inode, &chunk_ref);
+
+        let mut report = FilesystemContentInspectionReport::empty();
+        inspect_chunk_object(&store, &inode, &chunk_ref, &mut report, Some(&pool))
+            .expect("inspect_chunk_object success");
+
+        assert_eq!(report.referenced_objects.len(), 1);
+        let obj = &report.referenced_objects[0];
+        assert!(
+            obj.receipt_mismatch,
+            "missing pool receipt must be flagged as mismatch"
+        );
+        assert_eq!(report.receipt_mismatches, 1);
+        cleanup(&store_root);
+        cleanup(&pool_root);
+    }
+
+    /// A chunk with no pool provided should never trigger receipt validation
+    /// and should therefore never set receipt_mismatch.
+    #[test]
+    fn chunk_without_pool_never_flags_mismatch() {
+        let root = temp_dir("no-pool-mismatch");
+        let mut store = make_store(&root);
+        let inode = make_file_inode(2, 1, 4096);
+        let chunk_ref = make_chunk_ref(0, 1, 4096, 5);
+        put_chunk_data(&mut store, &inode, &chunk_ref);
+        let mut report = FilesystemContentInspectionReport::empty();
+
+        inspect_chunk_object(&store, &inode, &chunk_ref, &mut report, None)
+            .expect("inspect_chunk_object success");
+
+        assert_eq!(report.referenced_objects.len(), 1);
+        let obj = &report.referenced_objects[0];
+        assert!(
+            !obj.receipt_mismatch,
+            "without pool no mismatch can be detected"
+        );
+        assert_eq!(report.receipt_mismatches, 0);
+        cleanup(&root);
+    }
+
+    /// Receipt validation state accumulates across multiple chunk inspections
+    /// with both matching and mismatching receipts.
+    #[test]
+    fn receipt_mismatch_counter_accumulates_across_chunks() {
+        let store_root = temp_dir("accum-mismatch-store");
+        let pool_root = temp_dir("accum-mismatch-pool");
+        let mut store = make_store(&store_root);
+        let mut pool = make_pool(&pool_root);
+        let inode = make_file_inode(2, 1, 3 * 4096);
+
+        // Chunk 0: match pool receipt generation -> no mismatch
+        let key0 = content_chunk_object_key_for_version(inode.inode_id, 1, 0);
+        let (_s0, r0) = pool
+            .put_with_receipt(DeviceIoClass::Data, key0, b"pool-chunk-0")
+            .expect("put chunk0");
+        let chunk0 = make_chunk_ref(0, 1, 4096, r0.generation);
+        put_chunk_data(&mut store, &inode, &chunk0);
+
+        // Chunk 1: receipt gen 7, pool has NO receipt for this key -> mismatch
+        let chunk1 = make_chunk_ref(1, 1, 4096, 7);
+        put_chunk_data(&mut store, &inode, &chunk1);
+
+        // Chunk 2: receipt gen mismatches pool gen -> mismatch
+        let key2 = content_chunk_object_key_for_version(inode.inode_id, 1, 2);
+        let (_s2, r2) = pool
+            .put_with_receipt(DeviceIoClass::Data, key2, b"pool-chunk-2")
+            .expect("put chunk2");
+        // Deliberately use a generation that differs from the pool receipt.
+        let mismatched_gen = r2.generation.saturating_add(1);
+        let chunk2 = make_chunk_ref(2, 1, 4096, mismatched_gen);
+        put_chunk_data(&mut store, &inode, &chunk2);
+
+        let mut report = FilesystemContentInspectionReport::empty();
+        inspect_chunk_object(&store, &inode, &chunk0, &mut report, Some(&pool)).expect("chunk0 ok");
+        inspect_chunk_object(&store, &inode, &chunk1, &mut report, Some(&pool)).expect("chunk1 ok");
+        inspect_chunk_object(&store, &inode, &chunk2, &mut report, Some(&pool)).expect("chunk2 ok");
+
+        assert_eq!(report.referenced_objects.len(), 3);
+        assert!(
+            !report.referenced_objects[0].receipt_mismatch,
+            "chunk0 matched"
+        );
+        assert!(
+            report.referenced_objects[1].receipt_mismatch,
+            "chunk1 missing pool receipt"
+        );
+        assert!(
+            report.referenced_objects[2].receipt_mismatch,
+            "chunk2 gen mismatch"
+        );
+        assert_eq!(report.receipt_mismatches, 2);
+        cleanup(&store_root);
+        cleanup(&pool_root);
+    }
+}
