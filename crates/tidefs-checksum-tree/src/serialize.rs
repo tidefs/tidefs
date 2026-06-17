@@ -16,6 +16,8 @@
 //!   node_count:  u32 (LE)
 //!   dk_present:  u8         (0 or 1)
 //!   domain_key:  [u8; 32]   (only if dk_present == 1)
+//!   lt_present:  u8         (0 or 1)
+//!   locator_token: [u8; 32] (only if lt_present == 1)
 //!
 //! Per-node record (repeated node_count times):
 //!   child_count: u16 (LE)
@@ -29,18 +31,21 @@
 
 use alloc::vec::Vec;
 
-use crate::{ChecksumTree, ChecksumTreeNode, Digest, DomainKey, DIGEST_SIZE};
+use crate::{ChecksumTree, ChecksumTreeNode, Digest, DomainKey, LocatorToken, DIGEST_SIZE};
 use tidefs_binary_schema_core::{U16Le, U32Le, U64Le};
 
 /// Magic bytes identifying this as a TideFS checksum tree blob.
 pub const TREE_MAGIC: [u8; 4] = [0x56, 0x42, 0x46, 0x53]; // "VBFS"
 
 /// Current binary format version.
-pub const TREE_VERSION: u8 = 0x01;
+pub const TREE_VERSION: u8 = 0x02;
 
 /// Minimum valid header size: magic (4) + version (1) + block_size (4) +
 /// block_count (8) + root_hash (32) + node_count (4) + dk_present (1).
-const MIN_HEADER_SIZE: usize = 4 + 1 + 4 + 8 + 32 + 4 + 1;
+/// Minimum valid header size: magic (4) + version (1) + block_size (4) +
+/// block_count (8) + root_hash (32) + node_count (4) + dk_present (1) +
+/// lt_present (1).
+const MIN_HEADER_SIZE: usize = 4 + 1 + 4 + 8 + 32 + 4 + 1 + 1;
 
 // ---------------------------------------------------------------------------
 // Encoding
@@ -64,7 +69,12 @@ pub fn encode_tree(tree: &ChecksumTree) -> Vec<u8> {
     } else {
         0
     };
-    let mut buf = Vec::with_capacity(MIN_HEADER_SIZE + dk_bytes + node_bytes);
+    let lt_bytes = if tree.locator_token.is_some() {
+        DIGEST_SIZE
+    } else {
+        0
+    };
+    let mut buf = Vec::with_capacity(MIN_HEADER_SIZE + dk_bytes + lt_bytes + node_bytes);
 
     // Magic
     buf.extend_from_slice(&TREE_MAGIC);
@@ -88,6 +98,14 @@ pub fn encode_tree(tree: &ChecksumTree) -> Vec<u8> {
     if let Some(ref dk) = tree.domain_key {
         buf.push(1u8);
         buf.extend_from_slice(dk.as_bytes());
+    } else {
+        buf.push(0u8);
+    }
+
+    // locator_token (optional)
+    if let Some(ref lt) = tree.locator_token {
+        buf.push(1u8);
+        buf.extend_from_slice(lt.as_bytes());
     } else {
         buf.push(0u8);
     }
@@ -131,6 +149,8 @@ pub enum DecodeError {
     TruncatedNodes,
     /// A node's child count exceeds [`crate::FANOUT`].
     FanoutExceeded { child_count: u16 },
+    /// The locator-token present flag is neither 0 nor 1.
+    BadLocatorTokenPresent { value: u8 },
 }
 
 impl core::fmt::Display for DecodeError {
@@ -153,6 +173,9 @@ impl core::fmt::Display for DecodeError {
                 "node child_count {child_count} exceeds FANOUT ({})",
                 crate::FANOUT
             ),
+            Self::BadLocatorTokenPresent { value } => {
+                write!(f, "bad locator-token-present flag: {value} (expected 0 or 1)")
+            }
         }
     }
 }
@@ -218,6 +241,27 @@ pub fn decode_tree(mut data: &[u8]) -> Result<ChecksumTree, DecodeError> {
         None
     };
 
+    // locator_token (optional, v2+)
+    if data.is_empty() {
+        return Err(DecodeError::TruncatedNodes);
+    }
+    let lt_present = data[0];
+    data = &data[1..];
+
+    let locator_token = if lt_present == 1 {
+        if data.len() < DIGEST_SIZE {
+            return Err(DecodeError::TruncatedNodes);
+        }
+        let mut token_bytes = [0u8; DIGEST_SIZE];
+        token_bytes.copy_from_slice(&data[..DIGEST_SIZE]);
+        data = &data[DIGEST_SIZE..];
+        Some(LocatorToken(token_bytes))
+    } else if lt_present == 0 {
+        None
+    } else {
+        return Err(DecodeError::BadLocatorTokenPresent { value: lt_present });
+    };
+
     // Nodes
     let mut nodes = Vec::with_capacity(node_count);
     for _ in 0..node_count {
@@ -232,6 +276,7 @@ pub fn decode_tree(mut data: &[u8]) -> Result<ChecksumTree, DecodeError> {
         block_size,
         root_hash,
         domain_key,
+        locator_token,
     })
 }
 
@@ -315,6 +360,7 @@ mod tests {
             block_size: DEFAULT_BLOCK_SIZE,
             root_hash: zero_digest(),
             domain_key: None,
+            locator_token: None,
         };
 
         let encoded = encode_tree(&tree);
@@ -434,6 +480,7 @@ mod tests {
             block_size: DEFAULT_BLOCK_SIZE,
             root_hash: zero_digest(),
             domain_key: None,
+            locator_token: None,
         };
         let mut encoded = encode_tree(&tree);
         // Corrupt version byte (byte at index 4)
@@ -497,6 +544,7 @@ mod tests {
             block_size: 512,
             root_hash: zero_digest(),
             domain_key: None,
+            locator_token: None,
         };
         let encoded = encode_tree(&tree);
         let decoded = decode_tree(&encoded).expect("decode empty tree");
