@@ -1,6 +1,6 @@
 // Snapshot auto-pruner: per-dataset retention policies, age-based expiry,
-// BLAKE3-verified integrity gating, and explicit snapshot deletion with
-// permission validation.
+// fail-closed pin-evidence planning, BLAKE3-verified integrity gating, and
+// explicit snapshot deletion with permission validation.
 //
 // # Retention Policies
 //
@@ -20,15 +20,25 @@
 // with `IntegrityFailure`. When no checksum exists, one is computed and
 // optionally stored via `store_snapshot_checksum`. This ensures corrupted
 // snapshots are never silently removed.
+//
+// # Fail-Closed Pin Evidence
+//
+// Retention pruning records a plan before deleting anything. Each candidate
+// needs current per-snapshot evidence for its snapshot root, clone-origin
+// protection, and deadlist pins. Missing or corrupt evidence blocks the
+// candidate and is reported separately from retention-policy keeps,
+// clone-origin protection, deadlist protection, and checksum failures.
 
 pub mod pruner;
 pub mod retention;
 
 // Re-export public API
 pub use pruner::{
-    snapshot_checksum_key, CloneIndex, OriginIndex, PruneResult, SnapshotInfo, SnapshotPruner,
-    SnapshotPrunerError, SnapshotPrunerStats, CLONE_INDEX_PREFIX, ORIGIN_INDEX_PREFIX,
-    SNAPSHOT_CHECKSUM_PREFIX,
+    snapshot_checksum_key, snapshot_pin_evidence_object_key, CloneIndex, CloneOriginPin,
+    CloneOriginPinKind, DeadlistPin, OriginIndex, PruneResult, SnapshotInfo, SnapshotPinEvidence,
+    SnapshotPinEvidenceIndex, SnapshotPruneAction, SnapshotPruneBlock, SnapshotPruneDecision,
+    SnapshotPruner, SnapshotPrunerError, SnapshotPrunerStats, SnapshotRootPin, CLONE_INDEX_PREFIX,
+    ORIGIN_INDEX_PREFIX, SNAPSHOT_CHECKSUM_PREFIX, SNAPSHOT_PIN_EVIDENCE_PREFIX,
 };
 pub use retention::SnapshotRetentionPolicy;
 // Tests
@@ -56,6 +66,48 @@ mod tests {
     }
     fn ns(td: &[String]) -> Vec<&str> {
         td.iter().map(|x| x.as_str()).collect()
+    }
+    fn record_empty_pin_evidence(
+        pruner: &SnapshotPruner,
+        store: &mut LocalObjectStore,
+        dataset_name: &str,
+        snapshot_names: &[&str],
+    ) {
+        for snapshot_name in snapshot_names {
+            pruner
+                .record_snapshot_pin_evidence(
+                    store,
+                    dataset_name,
+                    snapshot_name,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap();
+        }
+    }
+
+    fn store_incomplete_pin_evidence(
+        store: &mut LocalObjectStore,
+        dataset_name: &str,
+        snapshot_name: &str,
+        clone_origin_pins: Option<Vec<CloneOriginPin>>,
+        deadlist_pins: Option<Vec<DeadlistPin>>,
+    ) {
+        let entry = store
+            .list_snapshots(dataset_name)
+            .into_iter()
+            .find(|entry| entry.name == snapshot_name)
+            .unwrap();
+        let mut index = SnapshotPinEvidenceIndex::new();
+        index.insert(
+            format!("{dataset_name}/{snapshot_name}"),
+            SnapshotPinEvidence {
+                snapshot_root: SnapshotRootPin::from_snapshot_entry(&entry),
+                clone_origin_pins,
+                deadlist_pins,
+            },
+        );
+        index.save(store).unwrap();
     }
 
     // -- Retention policy tests (existing) --------------------------------
@@ -1262,12 +1314,24 @@ mod tests {
             keep_last: Some(2),
             ..Default::default()
         });
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        record_empty_pin_evidence(&pruner, &mut store, ds, &name_refs);
         let result = pruner.prune_dataset(&mut store, ds, SystemTime::now());
         // 5 snapshots, keep 2 latest => 3 candidates
         assert_eq!(result.candidates_evaluated, 3);
+        assert_eq!(result.retention_kept, 2);
         assert_eq!(result.destroyed, 3);
-        assert_eq!(result.skipped_clones, 0);
-        assert_eq!(result.skipped_origins, 0);
+        assert_eq!(result.clone_origin_protected, 0);
+        assert_eq!(result.deadlist_pin_protected, 0);
+        assert_eq!(result.missing_evidence_blocks, 0);
+        assert_eq!(
+            result.delete_set,
+            vec![
+                "snap-0".to_string(),
+                "snap-1".to_string(),
+                "snap-2".to_string()
+            ]
+        );
 
         // Only 2 latest remain
         let remaining = store.list_snapshots(ds);
@@ -1316,15 +1380,99 @@ mod tests {
         pruner
             .record_clone(&mut store, "test-ds/parent-snap", "test-ds/child-snap")
             .unwrap();
+        pruner
+            .record_snapshot_pin_evidence(
+                &mut store,
+                ds,
+                "parent-snap",
+                vec![CloneOriginPin::clone_snapshot("test-ds/child-snap")],
+                Vec::new(),
+            )
+            .unwrap();
+        pruner
+            .record_snapshot_pin_evidence(&mut store, ds, "child-snap", Vec::new(), Vec::new())
+            .unwrap();
 
         let result = pruner.prune_dataset(&mut store, ds, SystemTime::now());
 
         // Child-snap can be destroyed (no clones, no origins)
         // Parent-snap skipped because it has a clone
-        assert_eq!(result.skipped_clones, 1);
+        assert_eq!(result.clone_origin_protected, 1);
         assert_eq!(result.destroyed, 1);
+        assert_eq!(result.delete_set, vec!["child-snap".to_string()]);
+        let parent_decision = result
+            .decisions
+            .iter()
+            .find(|decision| decision.snapshot_name == "parent-snap")
+            .unwrap();
+        assert_eq!(
+            parent_decision.clone_origin_pins,
+            vec![CloneOriginPin::clone_snapshot("test-ds/child-snap")]
+        );
 
         // Only parent remains
+        let remaining = store.list_snapshots(ds);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "parent-snap");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_dataset_blocks_stale_empty_clone_origin_evidence() {
+        let dir = std::env::temp_dir().join("tidefs-pruner-stale-clone-evidence-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = LocalObjectStore::open(&dir).unwrap();
+        let ds = "test-ds";
+
+        store
+            .put(
+                tidefs_local_object_store::ObjectKey::from_name(b"obj1"),
+                b"data",
+            )
+            .unwrap();
+        store.create_snapshot(ds, "parent-snap").unwrap();
+        store
+            .put(
+                tidefs_local_object_store::ObjectKey::from_name(b"obj2"),
+                b"more",
+            )
+            .unwrap();
+        store.create_snapshot(ds, "child-snap").unwrap();
+
+        let mut pruner = SnapshotPruner::new(SnapshotRetentionPolicy {
+            keep_last: Some(0),
+            ..Default::default()
+        });
+        pruner
+            .record_clone(&mut store, "test-ds/parent-snap", "test-ds/child-snap")
+            .unwrap();
+        pruner
+            .record_snapshot_pin_evidence(&mut store, ds, "parent-snap", Vec::new(), Vec::new())
+            .unwrap();
+        pruner
+            .record_snapshot_pin_evidence(&mut store, ds, "child-snap", Vec::new(), Vec::new())
+            .unwrap();
+
+        let result = pruner.prune_dataset(&mut store, ds, SystemTime::now());
+
+        assert_eq!(result.clone_origin_protected, 1);
+        assert_eq!(result.corrupt_evidence_blocks, 1);
+        assert_eq!(result.destroyed, 1);
+        assert_eq!(result.delete_set, vec!["child-snap".to_string()]);
+        let parent_decision = result
+            .decisions
+            .iter()
+            .find(|decision| decision.snapshot_name == "parent-snap")
+            .unwrap();
+        assert_eq!(
+            parent_decision.clone_origin_pins,
+            vec![CloneOriginPin::clone_snapshot("test-ds/child-snap")]
+        );
+
         let remaining = store.list_snapshots(ds);
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].name, "parent-snap");
@@ -1369,16 +1517,220 @@ mod tests {
         pruner
             .record_origin(&mut store, "live-dataset", "test-ds/origin-snap")
             .unwrap();
+        pruner
+            .record_snapshot_pin_evidence(
+                &mut store,
+                ds,
+                "origin-snap",
+                vec![CloneOriginPin::live_dataset_origin("live-dataset")],
+                Vec::new(),
+            )
+            .unwrap();
+        pruner
+            .record_snapshot_pin_evidence(&mut store, ds, "normal-snap", Vec::new(), Vec::new())
+            .unwrap();
 
         let result = pruner.prune_dataset(&mut store, ds, SystemTime::now());
 
         // origin-snap skipped, normal-snap destroyed
-        assert_eq!(result.skipped_origins, 1);
+        assert_eq!(result.clone_origin_protected, 1);
         assert_eq!(result.destroyed, 1);
+        assert_eq!(result.delete_set, vec!["normal-snap".to_string()]);
 
         let remaining = store.list_snapshots(ds);
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].name, "origin-snap");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_dataset_blocks_deadlist_pin() {
+        let dir = std::env::temp_dir().join("tidefs-pruner-prune-deadlist-pin-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = LocalObjectStore::open(&dir).unwrap();
+        let ds = "test-ds";
+        store
+            .put(
+                tidefs_local_object_store::ObjectKey::from_name(b"obj"),
+                b"data",
+            )
+            .unwrap();
+        store.create_snapshot(ds, "pinned-snap").unwrap();
+
+        let mut pruner = SnapshotPruner::new(SnapshotRetentionPolicy {
+            keep_last: Some(0),
+            ..Default::default()
+        });
+        pruner
+            .record_snapshot_pin_evidence(
+                &mut store,
+                ds,
+                "pinned-snap",
+                Vec::new(),
+                vec![DeadlistPin::new("extent-42")],
+            )
+            .unwrap();
+
+        let result = pruner.prune_dataset(&mut store, ds, SystemTime::now());
+
+        assert_eq!(result.candidates_evaluated, 1);
+        assert_eq!(result.destroyed, 0);
+        assert_eq!(result.deadlist_pin_protected, 1);
+        assert!(result.delete_set.is_empty());
+        assert_eq!(store.list_snapshots(ds).len(), 1);
+        assert_eq!(
+            result.decisions[0].deadlist_pins,
+            vec![DeadlistPin::new("extent-42")]
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_dataset_blocks_missing_clone_origin_entry() {
+        let dir = std::env::temp_dir().join("tidefs-pruner-missing-clone-origin-evidence-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = LocalObjectStore::open(&dir).unwrap();
+        let ds = "test-ds";
+        store
+            .put(
+                tidefs_local_object_store::ObjectKey::from_name(b"obj"),
+                b"data",
+            )
+            .unwrap();
+        store.create_snapshot(ds, "snap").unwrap();
+
+        let mut pruner = SnapshotPruner::new(SnapshotRetentionPolicy {
+            keep_last: Some(0),
+            ..Default::default()
+        });
+        store_incomplete_pin_evidence(&mut store, ds, "snap", None, Some(Vec::new()));
+
+        let result = pruner.prune_dataset(&mut store, ds, SystemTime::now());
+
+        assert_eq!(result.candidates_evaluated, 1);
+        assert_eq!(result.missing_evidence_blocks, 1);
+        assert_eq!(result.destroyed, 0);
+        assert!(result.delete_set.is_empty());
+        assert_eq!(store.list_snapshots(ds).len(), 1);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_dataset_blocks_missing_deadlist_pin_entry() {
+        let dir = std::env::temp_dir().join("tidefs-pruner-missing-deadlist-evidence-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = LocalObjectStore::open(&dir).unwrap();
+        let ds = "test-ds";
+        store
+            .put(
+                tidefs_local_object_store::ObjectKey::from_name(b"obj"),
+                b"data",
+            )
+            .unwrap();
+        store.create_snapshot(ds, "snap").unwrap();
+
+        let mut pruner = SnapshotPruner::new(SnapshotRetentionPolicy {
+            keep_last: Some(0),
+            ..Default::default()
+        });
+        store_incomplete_pin_evidence(&mut store, ds, "snap", Some(Vec::new()), None);
+
+        let result = pruner.prune_dataset(&mut store, ds, SystemTime::now());
+
+        assert_eq!(result.candidates_evaluated, 1);
+        assert_eq!(result.missing_evidence_blocks, 1);
+        assert_eq!(result.destroyed, 0);
+        assert!(result.delete_set.is_empty());
+        assert_eq!(store.list_snapshots(ds).len(), 1);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_dataset_blocks_corrupt_pin_evidence() {
+        let dir = std::env::temp_dir().join("tidefs-pruner-corrupt-pin-evidence-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = LocalObjectStore::open(&dir).unwrap();
+        let ds = "test-ds";
+        store
+            .put(
+                tidefs_local_object_store::ObjectKey::from_name(b"obj"),
+                b"data",
+            )
+            .unwrap();
+        store.create_snapshot(ds, "snap").unwrap();
+        store
+            .put(snapshot_pin_evidence_object_key(), b"not-current-evidence")
+            .unwrap();
+
+        let mut pruner = SnapshotPruner::new(SnapshotRetentionPolicy {
+            keep_last: Some(0),
+            ..Default::default()
+        });
+        let result = pruner.prune_dataset(&mut store, ds, SystemTime::now());
+
+        assert_eq!(result.candidates_evaluated, 1);
+        assert_eq!(result.corrupt_evidence_blocks, 1);
+        assert_eq!(result.destroyed, 0);
+        assert!(result.delete_set.is_empty());
+        assert_eq!(store.list_snapshots(ds).len(), 1);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_dataset_blocks_corrupt_snapshot_checksum() {
+        let dir = std::env::temp_dir().join("tidefs-pruner-prune-corrupt-checksum-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = LocalObjectStore::open(&dir).unwrap();
+        let ds = "test-ds";
+        store
+            .put(
+                tidefs_local_object_store::ObjectKey::from_name(b"obj"),
+                b"data",
+            )
+            .unwrap();
+        store.create_snapshot(ds, "snap").unwrap();
+
+        let mut pruner = SnapshotPruner::new(SnapshotRetentionPolicy {
+            keep_last: Some(0),
+            ..Default::default()
+        });
+        pruner
+            .record_snapshot_pin_evidence(&mut store, ds, "snap", Vec::new(), Vec::new())
+            .unwrap();
+        pruner
+            .store_snapshot_checksum(&mut store, ds, "snap")
+            .unwrap();
+        store
+            .put(snapshot_checksum_key(ds, "snap"), &[0xAAu8; 32])
+            .unwrap();
+
+        let result = pruner.prune_dataset(&mut store, ds, SystemTime::now());
+
+        assert_eq!(result.candidates_evaluated, 1);
+        assert_eq!(result.integrity_failures, 1);
+        assert_eq!(result.destroyed, 0);
+        assert!(result.delete_set.is_empty());
+        assert_eq!(store.list_snapshots(ds).len(), 1);
 
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1411,6 +1763,7 @@ mod tests {
         let mut store = LocalObjectStore::open(&dir).unwrap();
         let ds = "test-ds";
 
+        let mut names = Vec::new();
         for i in 0u64..5 {
             store
                 .put(
@@ -1418,7 +1771,9 @@ mod tests {
                     b"data",
                 )
                 .unwrap();
-            store.create_snapshot(ds, &format!("snap-{i}")).unwrap();
+            let name = format!("snap-{i}");
+            store.create_snapshot(ds, &name).unwrap();
+            names.push(name);
             std::thread::sleep(Duration::from_millis(5));
         }
 
@@ -1426,6 +1781,8 @@ mod tests {
             keep_last: Some(2),
             ..Default::default()
         });
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        record_empty_pin_evidence(&pruner, &mut store, ds, &name_refs);
         let _ = pruner.prune_dataset(&mut store, ds, SystemTime::now());
 
         let stats = pruner.stats();
@@ -1485,9 +1842,19 @@ mod tests {
             keep_last: Some(1),
             ..Default::default()
         });
+        record_empty_pin_evidence(
+            &pruner,
+            &mut store,
+            ds,
+            &["oldest", "mid1", "mid2", "newest"],
+        );
         let result = pruner.prune_dataset(&mut store, ds, SystemTime::now());
         assert_eq!(result.candidates_evaluated, 3);
         assert_eq!(result.destroyed, 3);
+        assert_eq!(
+            result.delete_set,
+            vec!["oldest".to_string(), "mid1".to_string(), "mid2".to_string()]
+        );
 
         let remaining = store.list_snapshots(ds);
         assert_eq!(remaining.len(), 1);
@@ -1527,6 +1894,7 @@ mod tests {
             max_age_days: Some(0),
             ..Default::default()
         });
+        record_empty_pin_evidence(&pruner, &mut store, ds, &["snap-a", "snap-b", "snap-c"]);
         let result =
             pruner.prune_dataset(&mut store, ds, SystemTime::now() + Duration::from_secs(1));
         // All snapshots are older than 0 days from "now + 1s"
