@@ -1400,4 +1400,47 @@ mod tests {
             "pool integrity-check without pool should fail"
         );
     }
+
+    #[test]
+    fn cli_parse_cluster_status_default() {
+        use clap::Parser;
+        let args = super::Cli::try_parse_from(["tidefsctl", "cluster", "status", "mypool"]);
+        assert!(args.is_ok(), "cluster status with pool name should parse");
+    }
+
+    #[test]
+    fn cli_parse_cluster_status_json() {
+        use clap::Parser;
+        let args = super::Cli::try_parse_from(["tidefsctl", "cluster", "status", "mypool", "--json"]);
+        assert!(args.is_ok(), "cluster status --json should parse");
+    }
+
+    #[test]
+    fn cli_parse_cluster_status_rejects_no_pool() {
+        use clap::Parser;
+        let args = super::Cli::try_parse_from(["tidefsctl", "cluster", "status"]);
+        assert!(args.is_err(), "cluster status without pool name should fail");
+    }
+
+    #[test]
+    fn cli_parse_device_status_default() {
+        use clap::Parser;
+        let args = super::Cli::try_parse_from(["tidefsctl", "device", "status", "mypool"]);
+        assert!(args.is_ok(), "device status with pool name should parse");
+    }
+
+    #[test]
+    fn cli_parse_device_status_json() {
+        use clap::Parser;
+        let args = super::Cli::try_parse_from(["tidefsctl", "device", "status", "mypool", "--json"]);
+        assert!(args.is_ok(), "device status --json should parse");
+    }
+
+    #[test]
+    fn cli_parse_device_status_rejects_no_pool() {
+        use clap::Parser;
+        let args = super::Cli::try_parse_from(["tidefsctl", "device", "status"]);
+        assert!(args.is_err(), "device status without pool name should fail");
+    }
+
 }

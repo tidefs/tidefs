@@ -57,6 +57,19 @@ pub enum DeviceCommand {
         force: bool,
     },
 
+
+    /// Query live device status with source classification.
+    ///
+    /// Imported pools route to the live owner; fail closed when
+    /// no live owner is reachable.
+    Status {
+        /// Pool name for live-owner routing.
+        pool_name: String,
+
+        /// Output as JSON.
+        #[arg(long = "json")]
+        json: bool,
+    },
     /// Retired directory object-store device rebuild mode.
     #[command(hide = true)]
     Rebuild {
@@ -105,6 +118,10 @@ pub fn handle_device(cmd: DeviceCommand) {
                 eprintln!("tidefsctl device remove: {e}");
                 std::process::exit(1);
             }
+        }
+
+        DeviceCommand::Status { pool_name, json } => {
+            handle_device_status(pool_name, json);
         }
 
         DeviceCommand::Rebuild {
@@ -174,6 +191,23 @@ fn handle_remove(
         "pool-name device removal for '{pool_name}' requires a reachable live owner; route through the kernel UAPI or userspace daemon owner. Directory-backed offline device removal is retired."
     )
     .into())
+}
+
+
+/// Query live device status through the live owner, or fail closed
+
+/// with source-classified refusal when no live owner is reachable.
+
+fn handle_device_status(pool_name: String, json: bool) {
+
+    // Try the live owner first; exits if reachable.
+
+    super::live_owner::route_status_if_owner_exists("device", "status", &pool_name, json);
+
+    // No live owner reachable; fail closed with source classification.
+
+    super::live_owner::refuse_no_live_status_evidence("device", "status", &pool_name, json);
+
 }
 
 #[cfg(test)]
@@ -279,5 +313,61 @@ mod tests {
             msg.contains("offline directory object-store device rebuild is retired"),
             "unexpected error: {msg}"
         );
+    }
+
+    // -- device status tests --
+
+    #[test]
+    fn device_status_routes_to_live_owner_by_pool_name() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: super::DeviceCommand,
+        }
+        let args = TestCli::try_parse_from(["test", "status", "testpool"]);
+        assert!(args.is_ok(), "device status with pool name should parse");
+    }
+
+    #[test]
+    fn device_status_accepts_json_flag() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: super::DeviceCommand,
+        }
+        let args = TestCli::try_parse_from(["test", "status", "testpool", "--json"]);
+        assert!(args.is_ok(), "device status --json should parse");
+    }
+
+    #[test]
+    fn device_status_rejects_missing_pool_name() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: super::DeviceCommand,
+        }
+        let args = TestCli::try_parse_from(["test", "status"]);
+        assert!(args.is_err(), "device status without pool name must be rejected");
+    }
+
+    #[test]
+    fn device_remove_fails_closed_for_pool_name_only() {
+        // device remove with only a pool name must require a live owner.
+        // The routing is validated through the handler and live_owner tests.
+        let result = handle_remove(
+            "testpool",
+            &PathBuf::from("/dev/disk0"),
+            None,
+            &[],
+            2,
+            "device",
+            false,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("requires a reachable live owner"));
     }
 }

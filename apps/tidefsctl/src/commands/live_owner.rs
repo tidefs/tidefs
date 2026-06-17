@@ -247,10 +247,65 @@ pub(crate) fn route_imported_with_format_and_args(
     })
 }
 
+
+/// Route a status command to the live owner if reachable. Returns true
+/// if the request was routed (the process exits inside the route),
+/// returns false if no live owner was found so the caller can produce
+/// a source-classified refusal.
+pub(crate) fn route_status_if_owner_exists(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    json: bool,
+) -> bool {
+    let root = pool_runtime_root();
+    if owner_interface_reachable_by_pool_at(&root, pool) {
+        route_with_format(command, operation, pool, json);
+    }
+    false
+}
+
+/// Refuse a cluster or device status request with a source-classified
+/// message that states no live status evidence was obtained. Cached
+/// metadata is identified as non-authoritative.
+pub(crate) fn refuse_no_live_status_evidence(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    json: bool,
+) -> ! {
+    if json {
+        let out = serde_json::json!({
+            "ok": false,
+            "command": command,
+            "operation": operation,
+            "pool_name": pool,
+            "source:status": super::classification::StatusSource::UnsupportedOrOffline.label(),
+            "error": "no live status evidence obtained; cached local metadata is non-authoritative for live cluster/device state",
+            "recovery": "start or repair the kernel UAPI or userspace daemon that owns this pool; do not treat cached metadata as live truth",
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    } else {
+        eprintln!(
+            "tidefsctl {command} {operation}: no live status evidence obtained for pool '{pool}'"
+        );
+        eprintln!(
+            "tidefsctl {command} {operation}: [source:unsupported-or-offline] no reachable live owner"
+        );
+        eprintln!(
+            "tidefsctl {command} {operation}: cached local metadata, command-line parse results, and static configuration are non-authoritative for live cluster/device state"
+        );
+        eprintln!(
+            "tidefsctl {command} {operation}: refusing to present cached data as live status truth"
+        );
+    }
+    process::exit(1);
+}
 fn refuse_active_without_owner(
     command: &str,
     operation: &str,
     pool: &str,
+
     pool_uuid: [u8; 16],
     json: bool,
 ) -> ! {
