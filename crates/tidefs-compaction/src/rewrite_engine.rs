@@ -24,14 +24,14 @@ const COMPACTION_DOMAIN: &[u8] = b"TideFS compaction v1";
 
 /// The outcome of rewriting a single [`MergeGroup`].
 ///
-/// Captures which source segments were freed, which new target segment
-/// was created, how many objects were relocated, and the per-object
+/// Captures which source segments are release candidates, which new target
+/// segment was created, how many objects were relocated, and the per-object
 /// BLAKE3-verified relocation entries.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RewriteGroupOutcome {
     /// Index of the group within the plan (0-based).
     pub group_index: usize,
-    /// Source segments that were fully relocated and freed.
+    /// Source segments that were fully relocated and await verified release.
     pub freed_segments: Vec<u64>,
     /// New target segment id where live data was written.
     pub target_segment: u64,
@@ -44,7 +44,7 @@ pub struct RewriteGroupOutcome {
 }
 
 impl RewriteGroupOutcome {
-    /// Total source segments freed.
+    /// Total source segments pending verified release.
     #[must_use]
     pub fn segments_freed(&self) -> usize {
         self.freed_segments.len()
@@ -66,13 +66,13 @@ impl RewriteGroupOutcome {
 /// Contains per-group outcomes and a plan-level integrity hash
 /// computed over all group data in deterministic order using the
 /// "TideFS compaction v1" domain.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RewriteOutcome {
     /// Per-group rewrite outcomes in plan order.
     pub groups: Vec<RewriteGroupOutcome>,
     /// BLAKE3-256 hash sealing the full outcome.
     pub outcome_hash: [u8; 32],
-    /// Total source segments freed across all groups.
+    /// Total source segments pending verified release across all groups.
     pub total_segments_freed: usize,
     /// Total objects relocated across all groups.
     pub total_objects_relocated: u64,
@@ -153,7 +153,7 @@ pub struct RewriteEngine<S: CompactionStore> {
     pub total_bytes_relocated: u64,
     /// Cumulative objects relocated across all calls.
     pub total_objects_relocated: u64,
-    /// Cumulative source segments freed.
+    /// Cumulative source segments pending verified release.
     pub total_segments_freed: u64,
 }
 
@@ -188,7 +188,7 @@ impl<S: CompactionStore> RewriteEngine<S> {
     /// 1. Collect live object keys from all source segments.
     /// 2. Read each object with BLAKE3 verification.
     /// 3. Write objects contiguously to a new target segment.
-    /// 4. Free source segments and record the outcome.
+    /// 4. Record segments eligible for release after swap-manifest verification.
     ///
     /// Rate-limiting via `max_relocate_bytes_per_tick` stops
     /// per-group writes once the byte cap is reached; remaining
@@ -255,14 +255,12 @@ impl<S: CompactionStore> RewriteEngine<S> {
         }
 
         if all_keys.is_empty() {
-            // All segments are empty or errored — free them anyway.
-            let freed: Vec<u64> = group.source_segments.clone();
-            for &seg_id in &freed {
-                let _ = self.store.free_segment(seg_id);
-            }
+            // All segments are empty or errored; mark them eligible for freeing.
+            // Actual freeing is deferred to commit_outcome after verification.
+            let eligible: Vec<u64> = group.source_segments.clone();
             return RewriteGroupOutcome {
                 group_index,
-                freed_segments: freed,
+                freed_segments: eligible,
                 target_segment: 0,
                 objects_relocated: 0,
                 bytes_written: 0,
@@ -317,10 +315,10 @@ impl<S: CompactionStore> RewriteEngine<S> {
             }
         }
 
-        // Free source segments that had all their objects relocated.
-        // A segment is fully freed if we successfully processed all its
+        // Determine which source segments are eligible for freeing.
+        // A segment is eligible if we successfully processed all its
         // objects and none were skipped due to errors or rate-limiting.
-        let mut freed_segments: Vec<u64> = Vec::new();
+        let mut eligible_segments: Vec<u64> = Vec::new();
         for &seg_id in &group.source_segments {
             // Determine if this segment's objects were all processed.
             let keys_in_seg = all_keys.iter().filter(|(_, s)| *s == seg_id).count();
@@ -329,10 +327,8 @@ impl<S: CompactionStore> RewriteEngine<S> {
                 .filter(|e| e.source_segment == seg_id)
                 .count();
             if keys_in_seg > 0 && relocated_in_seg == keys_in_seg {
-                // All objects in this segment were successfully relocated.
-                if self.store.free_segment(seg_id).is_ok() {
-                    freed_segments.push(seg_id);
-                }
+                // All objects relocated; eligible for freeing after verification.
+                eligible_segments.push(seg_id);
             }
         }
 
@@ -340,7 +336,7 @@ impl<S: CompactionStore> RewriteEngine<S> {
 
         RewriteGroupOutcome {
             group_index,
-            freed_segments,
+            freed_segments: eligible_segments,
             target_segment,
             objects_relocated,
             bytes_written,
@@ -350,44 +346,60 @@ impl<S: CompactionStore> RewriteEngine<S> {
 
     /// Commit the outcome of a rewrite pass atomically via the store.
     ///
-    /// Builds a [`CompactionSwap`] from the outcome and calls
-    /// [`CompactionStore::commit_swap`].
+    /// Each group in the outcome is converted into a [`SwapManifest`],
+    /// verified against the stored target data via
+    /// [`verify_swap_manifest`], and only groups that pass verification
+    /// contribute their freed segments to the swap.  Source segments
+    /// in groups that fail verification are retained (fail-closed).
     ///
     /// # Errors
     ///
-    /// Returns an error if the swap commit fails.
+    /// Returns an error if the swap commit fails.  Verification
+    /// failures are recorded but do not cause this method to return
+    /// an error; the unverified segments are simply not freed.
     pub fn commit_outcome(&mut self, outcome: &RewriteOutcome) -> Result<(), CompactionError> {
         if outcome.is_empty {
             return Ok(());
         }
 
-        let freed_segments: Vec<u64> = outcome
-            .groups
-            .iter()
-            .flat_map(|g| g.freed_segments.iter().copied())
-            .collect();
+        let mut verified_freed: Vec<u64> = Vec::new();
+        let mut verified_registered: Vec<u64> = Vec::new();
+        let mut verified_entries: Vec<RelocationEntry> = Vec::new();
 
-        let registered_segments: Vec<u64> = outcome
-            .groups
-            .iter()
-            .filter(|g| g.target_segment != 0)
-            .map(|g| g.target_segment)
-            .collect();
+        for group in &outcome.groups {
+            // Skip groups with no work.
+            if group.freed_segments.is_empty() && group.target_segment == 0 {
+                continue;
+            }
 
-        let all_entries: Vec<RelocationEntry> = outcome
-            .groups
-            .iter()
-            .flat_map(|g| g.entries.iter().cloned())
-            .collect();
+            let manifest = SwapManifest::from_group_outcome(group);
 
-        if freed_segments.is_empty() && registered_segments.is_empty() {
+            // Empty manifests cannot release segments.
+            if manifest.is_empty() {
+                continue;
+            }
+
+            // Verify the manifest against stored target data.
+            let verification = crate::verification::verify_swap_manifest(&manifest, &self.store);
+
+            if verification.verified {
+                verified_freed.extend(group.freed_segments.iter().copied());
+                if group.target_segment != 0 {
+                    verified_registered.push(group.target_segment);
+                }
+                verified_entries.extend(group.entries.iter().cloned());
+            }
+            // Verification failures: source segments are NOT freed.
+        }
+
+        if verified_freed.is_empty() && verified_registered.is_empty() {
             return Ok(());
         }
 
         let swap = CompactionSwap {
-            freed_segments,
-            registered_segments,
-            entries: all_entries,
+            freed_segments: verified_freed,
+            registered_segments: verified_registered,
+            entries: verified_entries,
         };
 
         self.store.commit_swap(swap)
@@ -397,6 +409,123 @@ impl<S: CompactionStore> RewriteEngine<S> {
     #[must_use]
     pub fn into_store(self) -> S {
         self.store
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SwapManifest -- deterministic verified-swap manifest
+// ---------------------------------------------------------------------------
+
+/// A deterministic swap manifest produced by compaction rewrite.
+///
+/// Names source segments, target segment, relocation entries, byte
+/// counts, and the outcome hash.  A manifest must be verified against
+/// the stored target data before source segments become eligible for
+/// release.
+///
+/// Empty manifests are explicit and cannot be mistaken for a verified
+/// source-release manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwapManifest {
+    /// Source segments that are candidates for release.
+    pub source_segments: Vec<u64>,
+    /// The target segment holding the rewritten data (0 if no data written).
+    pub target_segment: u64,
+    /// Per-object relocation entries with BLAKE3-256 hashes.
+    pub relocation_entries: Vec<RelocationEntry>,
+    /// Total bytes written to the target segment.
+    pub total_bytes: u64,
+    /// BLAKE3-256 hash over the serialized manifest fields.
+    pub manifest_hash: [u8; 32],
+}
+
+impl SwapManifest {
+    /// Domain for swap-manifest BLAKE3 hashing.
+    const DOMAIN: &[u8] = b"TideFS compaction v1 swap-manifest";
+
+    /// Create a manifest from a single group''s rewrite outcome.
+    #[must_use]
+    pub fn from_group_outcome(outcome: &RewriteGroupOutcome) -> Self {
+        let hash = Self::compute_hash(
+            &outcome.freed_segments,
+            outcome.target_segment,
+            &outcome.entries,
+            outcome.bytes_written,
+        );
+        Self {
+            source_segments: outcome.freed_segments.clone(),
+            target_segment: outcome.target_segment,
+            relocation_entries: outcome.entries.clone(),
+            total_bytes: outcome.bytes_written,
+            manifest_hash: hash,
+        }
+    }
+
+    /// Create an explicit empty manifest.
+    ///
+    /// An empty manifest cannot release source segments and is
+    /// distinguishable from a verified source-release manifest.
+    #[must_use]
+    pub fn empty() -> Self {
+        let hash = Self::compute_hash(&[], 0, &[], 0);
+        Self {
+            source_segments: Vec::new(),
+            target_segment: 0,
+            relocation_entries: Vec::new(),
+            total_bytes: 0,
+            manifest_hash: hash,
+        }
+    }
+
+    /// Return `true` if this manifest represents no work.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.source_segments.is_empty()
+            && self.target_segment == 0
+            && self.relocation_entries.is_empty()
+            && self.total_bytes == 0
+    }
+
+    /// Verify the manifest's own hash against its fields.
+    #[must_use]
+    pub fn verify_self(&self) -> bool {
+        let recomputed = Self::compute_hash(
+            &self.source_segments,
+            self.target_segment,
+            &self.relocation_entries,
+            self.total_bytes,
+        );
+        recomputed == self.manifest_hash
+    }
+
+    /// Compute the deterministic BLAKE3-256 hash for a swap manifest.
+    ///
+    /// Domain: `"TideFS compaction v1 swap-manifest"`.
+    /// Field order: source_segments count + each id (LE u64),
+    ///   target_segment (LE u64), relocation_entries count + each entry,
+    ///   total_bytes (LE u64).
+    pub(crate) fn compute_hash(
+        source_segments: &[u64],
+        target_segment: u64,
+        entries: &[RelocationEntry],
+        total_bytes: u64,
+    ) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(Self::DOMAIN);
+        hasher.update(&(source_segments.len() as u32).to_le_bytes());
+        for &seg in source_segments {
+            hasher.update(&seg.to_le_bytes());
+        }
+        hasher.update(&target_segment.to_le_bytes());
+        hasher.update(&(entries.len() as u32).to_le_bytes());
+        for entry in entries {
+            hasher.update(&entry.source_segment.to_le_bytes());
+            hasher.update(&entry.object_key);
+            hasher.update(&entry.target_offset.to_le_bytes());
+            hasher.update(&entry.blake3_hash);
+        }
+        hasher.update(&total_bytes.to_le_bytes());
+        hasher.finalize().into()
     }
 }
 
@@ -861,8 +990,8 @@ mod tests {
         };
 
         let outcome = engine.execute_plan(&plan);
-        // Segment not found means no live_object_keys, so it's freed.
-        // Outcome is non-empty (one segment freed) but no relocations.
+        // Segment not found means no live_object_keys, so it becomes a
+        // release candidate. Outcome is non-empty but has no relocations.
         assert!(!outcome.is_empty);
         assert_eq!(outcome.total_objects_relocated, 0);
         assert!(outcome.verify());
@@ -1098,5 +1227,374 @@ mod tests {
         assert!(group.freed_segments.contains(&20));
         assert!(!group.freed_segments.contains(&10));
         assert!(outcome.verify());
+    }
+    // ------------------------------------------------------------------
+    // SwapManifest tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn swap_manifest_from_group_outcome() {
+        let entry = RelocationEntry {
+            source_segment: 10,
+            object_key: make_key(1),
+            target_offset: 0,
+            blake3_hash: [0xAAu8; 32],
+        };
+        let outcome = RewriteGroupOutcome {
+            group_index: 0,
+            freed_segments: vec![10, 20],
+            target_segment: 100,
+            objects_relocated: 1,
+            bytes_written: 64,
+            entries: vec![entry],
+        };
+
+        let manifest = SwapManifest::from_group_outcome(&outcome);
+        assert_eq!(manifest.source_segments, vec![10, 20]);
+        assert_eq!(manifest.target_segment, 100);
+        assert_eq!(manifest.relocation_entries.len(), 1);
+        assert_eq!(manifest.total_bytes, 64);
+        assert!(manifest.verify_self());
+        assert!(!manifest.is_empty());
+    }
+
+    #[test]
+    fn swap_manifest_empty_explicit() {
+        let manifest = SwapManifest::empty();
+        assert!(manifest.is_empty());
+        assert!(manifest.source_segments.is_empty());
+        assert_eq!(manifest.target_segment, 0);
+        assert!(manifest.relocation_entries.is_empty());
+        assert_eq!(manifest.total_bytes, 0);
+        assert!(manifest.verify_self());
+    }
+
+    #[test]
+    fn swap_manifest_verify_self_detects_tampering() {
+        let outcome = RewriteGroupOutcome {
+            group_index: 0,
+            freed_segments: vec![1],
+            target_segment: 100,
+            objects_relocated: 1,
+            bytes_written: 64,
+            entries: vec![RelocationEntry {
+                source_segment: 1,
+                object_key: make_key(1),
+                target_offset: 0,
+                blake3_hash: [0x11u8; 32],
+            }],
+        };
+        let mut manifest = SwapManifest::from_group_outcome(&outcome);
+        assert!(manifest.verify_self());
+
+        // Tamper with total_bytes without updating hash.
+        manifest.total_bytes = 999;
+        assert!(!manifest.verify_self());
+    }
+
+    #[test]
+    fn swap_manifest_hash_deterministic() {
+        let outcome = RewriteGroupOutcome {
+            group_index: 0,
+            freed_segments: vec![1, 2],
+            target_segment: 100,
+            objects_relocated: 3,
+            bytes_written: 192,
+            entries: vec![RelocationEntry {
+                source_segment: 1,
+                object_key: make_key(1),
+                target_offset: 0,
+                blake3_hash: [0xAAu8; 32],
+            }],
+        };
+        let m1 = SwapManifest::from_group_outcome(&outcome);
+        let m2 = SwapManifest::from_group_outcome(&outcome);
+        assert_eq!(m1.manifest_hash, m2.manifest_hash);
+        assert_eq!(m1, m2);
+    }
+
+    #[test]
+    fn swap_manifest_hash_differs_with_different_data() {
+        let o1 = RewriteGroupOutcome {
+            group_index: 0,
+            freed_segments: vec![1],
+            target_segment: 100,
+            objects_relocated: 1,
+            bytes_written: 64,
+            entries: vec![RelocationEntry {
+                source_segment: 1,
+                object_key: make_key(1),
+                target_offset: 0,
+                blake3_hash: [0xAAu8; 32],
+            }],
+        };
+        let o2 = RewriteGroupOutcome {
+            group_index: 0,
+            freed_segments: vec![2], // different segment
+            target_segment: 100,
+            objects_relocated: 1,
+            bytes_written: 64,
+            entries: vec![RelocationEntry {
+                source_segment: 2,
+                object_key: make_key(2),
+                target_offset: 0,
+                blake3_hash: [0xBBu8; 32],
+            }],
+        };
+        assert_ne!(
+            SwapManifest::from_group_outcome(&o1).manifest_hash,
+            SwapManifest::from_group_outcome(&o2).manifest_hash
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Verified swap manifest integration tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn commit_outcome_verified_swap_succeeds() {
+        let mut store = MockCompactionStore::new();
+        let k1 = make_key(1);
+        let k2 = make_key(2);
+        let d1 = vec![0xAAu8; 64];
+        let d2 = vec![0xBBu8; 128];
+
+        store.add_segment_with_objects(10, &[(k1, d1.clone()), (k2, d2.clone())]);
+
+        let mut engine = RewriteEngine::new(store, default_config());
+        let group = MergeGroup {
+            source_segments: vec![10],
+            total_live_bytes: 192,
+            total_dead_bytes: 0,
+            live_ratio: 1.0,
+            score: 0.0,
+        };
+        let plan = MergePlan {
+            groups: vec![group],
+            plan_hash: [0u8; 32],
+            total_source_segments: 1,
+            total_live_bytes: 192,
+            estimated_reclaimed_bytes: 0,
+        };
+
+        let outcome = engine.execute_plan(&plan);
+        assert!(!outcome.is_empty);
+        assert!(outcome.verify());
+        assert_eq!(outcome.total_segments_freed, 1);
+
+        // Commit: this should verify the manifest and free segment 10.
+        engine.commit_outcome(&outcome).unwrap();
+        let store = engine.into_store();
+        assert!(store.freed.contains(&10));
+    }
+
+    #[test]
+    fn commit_outcome_digest_mismatch_blocks_release() {
+        let mut store = MockCompactionStore::new();
+        let k1 = make_key(1);
+        let d1 = vec![0xAAu8; 64];
+
+        store.add_segment_with_objects(10, &[(k1, d1.clone())]);
+
+        let cfg = CompactionConfig::default();
+        let mut engine = RewriteEngine::new(store, cfg);
+
+        let group = MergeGroup {
+            source_segments: vec![10],
+            total_live_bytes: 64,
+            total_dead_bytes: 0,
+            live_ratio: 1.0,
+            score: 0.0,
+        };
+        let plan = MergePlan {
+            groups: vec![group],
+            plan_hash: [0u8; 32],
+            total_source_segments: 1,
+            total_live_bytes: 64,
+            estimated_reclaimed_bytes: 0,
+        };
+
+        let outcome = engine.execute_plan(&plan);
+        assert_eq!(outcome.total_segments_freed, 1);
+
+        // Tamper with the stored object data after execute but before commit.
+        // Overwrite the stored data so the digest won''t match.
+        engine.store.objects.insert(k1, vec![0xBBu8; 64]);
+
+        // Commit should NOT free segment 10 because digest mismatch.
+        engine.commit_outcome(&outcome).unwrap();
+        let store = engine.into_store();
+        assert!(
+            !store.freed.contains(&10),
+            "segment should NOT be freed after digest mismatch"
+        );
+    }
+
+    #[test]
+    fn commit_outcome_target_read_failure_blocks_release() {
+        let mut store = MockCompactionStore::new();
+        let k1 = make_key(1);
+        let d1 = vec![0xAAu8; 64];
+
+        store.add_segment_with_objects(10, &[(k1, d1.clone())]);
+
+        let cfg = CompactionConfig::default();
+        let mut engine = RewriteEngine::new(store, cfg);
+
+        let group = MergeGroup {
+            source_segments: vec![10],
+            total_live_bytes: 64,
+            total_dead_bytes: 0,
+            live_ratio: 1.0,
+            score: 0.0,
+        };
+        let plan = MergePlan {
+            groups: vec![group],
+            plan_hash: [0u8; 32],
+            total_source_segments: 1,
+            total_live_bytes: 64,
+            estimated_reclaimed_bytes: 0,
+        };
+
+        let outcome = engine.execute_plan(&plan);
+        assert_eq!(outcome.total_segments_freed, 1);
+
+        // Inject a read failure for k1 so target read fails.
+        engine.store.read_failures.insert(
+            k1,
+            CompactionError::ObjectReadFailed {
+                key: k1,
+                segment_id: 10,
+            },
+        );
+
+        // Commit should NOT free segment 10 because target read failed.
+        engine.commit_outcome(&outcome).unwrap();
+        let store = engine.into_store();
+        assert!(
+            !store.freed.contains(&10),
+            "segment should NOT be freed after read failure"
+        );
+    }
+
+    #[test]
+    fn commit_outcome_empty_outcome_no_release() {
+        let store = MockCompactionStore::new();
+        let cfg = CompactionConfig::default();
+        let mut engine = RewriteEngine::new(store, cfg);
+
+        let empty_outcome = RewriteOutcome::empty();
+        // Commit of empty outcome should succeed and not touch store.
+        engine.commit_outcome(&empty_outcome).unwrap();
+        let store = engine.into_store();
+        assert!(store.freed.is_empty());
+    }
+
+    #[test]
+    fn verify_swap_manifest_rejects_empty() {
+        let store = MockCompactionStore::new();
+        let empty_manifest = SwapManifest::empty();
+        let verification = crate::verification::verify_swap_manifest(&empty_manifest, &store);
+        assert!(!verification.verified);
+        assert_eq!(verification.errors.len(), 1);
+        assert!(matches!(
+            verification.errors[0],
+            crate::verification::SwapVerificationError::EmptyManifest
+        ));
+    }
+
+    #[test]
+    fn verify_swap_manifest_detects_digest_mismatch() {
+        let mut store = MockCompactionStore::new();
+        let k1 = make_key(1);
+
+        // Write object data to store.
+        store.objects.insert(k1, vec![0xCCu8; 64]);
+
+        // Build a manifest whose relocation entry has a different hash
+        // than the actual stored data.
+        let entry = RelocationEntry {
+            source_segment: 1,
+            object_key: k1,
+            target_offset: 0,
+            blake3_hash: [0xAAu8; 32], // wrong; actual hash of [0xCC; 64] differs
+        };
+        let hash = SwapManifest::compute_hash(&[1], 100, &[entry.clone()], 64);
+        let manifest = SwapManifest {
+            source_segments: vec![1],
+            target_segment: 100,
+            relocation_entries: vec![entry],
+            total_bytes: 64,
+            manifest_hash: hash,
+        };
+        assert!(manifest.verify_self());
+
+        // Verification should detect the digest mismatch.
+        let verification = crate::verification::verify_swap_manifest(&manifest, &store);
+        assert!(!verification.verified);
+        assert!(verification.errors.iter().any(|e| matches!(
+            e,
+            crate::verification::SwapVerificationError::DigestMismatch { .. }
+        )));
+    }
+
+    #[test]
+    fn verify_swap_manifest_target_read_failure() {
+        let mut store = MockCompactionStore::new();
+        let k1 = make_key(1);
+        store.add_segment_with_objects(1, &[(k1, vec![0xAAu8; 64])]);
+
+        // Build a valid manifest after writing.
+        let data = store.objects.get(&k1).cloned().unwrap();
+        let hash: [u8; 32] = blake3::hash(&data).into();
+
+        let entry = RelocationEntry {
+            source_segment: 1,
+            object_key: k1,
+            target_offset: 0,
+            blake3_hash: hash,
+        };
+        let manifest = SwapManifest {
+            source_segments: vec![1],
+            target_segment: 100,
+            relocation_entries: vec![entry.clone()],
+            total_bytes: 64,
+            manifest_hash: SwapManifest::compute_hash(&[1], 100, &[entry], 64),
+        };
+
+        // Inject a read failure.
+        store.read_failures.insert(
+            k1,
+            CompactionError::ObjectReadFailed {
+                key: k1,
+                segment_id: 1,
+            },
+        );
+
+        let verification = crate::verification::verify_swap_manifest(&manifest, &store);
+        assert!(!verification.verified);
+        assert!(verification.errors.iter().any(|e| matches!(
+            e,
+            crate::verification::SwapVerificationError::TargetReadFailed { .. }
+        )));
+    }
+
+    #[test]
+    fn verify_swap_manifest_missing_entry_triggers_entry_count_mismatch() {
+        let store = MockCompactionStore::new();
+        let manifest = SwapManifest {
+            source_segments: vec![1],
+            target_segment: 0,
+            relocation_entries: vec![], // no entries, but claims source segments
+            total_bytes: 0,
+            manifest_hash: SwapManifest::empty().manifest_hash,
+        };
+
+        let verification = crate::verification::verify_swap_manifest(&manifest, &store);
+        assert!(!verification.verified);
+        assert!(verification.errors.iter().any(|e| matches!(
+            e,
+            crate::verification::SwapVerificationError::MissingManifestData { .. }
+        )));
     }
 }
