@@ -755,7 +755,7 @@ impl Filesystem for SimpleFS {
             && file_type != libc::S_IFLNK as u32
             && file_type != libc::S_IFDIR as u32
         {
-            // TODO
+            // Review debt TFR-016
             warn!("mknod() implementation is incomplete. Only supports regular files, symlinks, and directories. Got {mode:o}");
             reply.error(libc::ENOSYS);
             return;
@@ -822,7 +822,7 @@ impl Filesystem for SimpleFS {
         entries.insert(name.as_bytes().to_vec(), (inode, attrs.kind));
         self.write_directory_content(parent, entries);
 
-        // TODO: implement flags
+        // Review debt TFR-016: implement flags
         reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
     }
 
@@ -1554,7 +1554,7 @@ impl Filesystem for SimpleFS {
 
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
         warn!("statfs() implementation is a stub");
-        // TODO: real implementation of this
+        // Review debt TFR-016: real implementation of this
         reply.statfs(
             10_000,
             10_000,
@@ -1764,7 +1764,7 @@ impl Filesystem for SimpleFS {
         entries.insert(name.as_bytes().to_vec(), (inode, attrs.kind));
         self.write_directory_content(parent, entries);
 
-        // TODO: implement flags
+        // Review debt TFR-016: implement flags
         reply.created(
             &Duration::new(0, 0),
             &attrs.into(),

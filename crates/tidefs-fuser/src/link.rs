@@ -232,7 +232,7 @@ pub fn plan_link_target(target_is_dir: bool, cross_fs: bool) -> Result<(), LinkE
     if cross_fs {
         return Err(LinkError::CrossFilesystemLink);
     }
-    // TODO(#5378): integrate tidefs-permission check_access for parent
+    // Review debt TFR-016 (also see TFR-004): integrate tidefs-permission check_access for parent
     // directory write permission once the PermissionChecker lands.
     Ok(())
 }

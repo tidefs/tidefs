@@ -4,7 +4,7 @@ use std::io::ErrorKind;
 
 /// Mount options accepted by the FUSE filesystem type
 /// See 'man mount.fuse' for details
-// TODO: add all options that 'man mount.fuse' documents and libfuse supports
+// Review debt TFR-016: add all options that 'man mount.fuse' documents and libfuse supports
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub enum MountOption {
     /// Set the name of the source in mtab
