@@ -9,7 +9,7 @@ use tidefs_types_vfs_core::{
     AdmissionIntent, BudgetIntent, CompletionDisposition, CompletionStatus, ContractEpoch,
     ContractPayloadWords, ContractVersion, DeadlineNs, DispositionIntent, Errno, FenceIntent,
     FileHandleId, InodeId, RequestEnvelope, RequestId, RequestMetadata, RetryIntent,
-    TideCompletion, TideRequest, TimeoutNs, TraceId, VfsRequest, WorkClass,
+    TideCompletion, TideRequest, TimeoutNs, TraceId, VfsNameToken, VfsRequest, WorkClass,
     TIDE_CONTRACT_VERSION_V1,
 };
 
@@ -69,6 +69,30 @@ pub enum ContractGoldenVector {
     TideCompletionV1,
     RequestReservedFailure,
     CompletionReservedFailure,
+    ContractVfsCreateRequestV1,
+    ContractVfsCreateCompletionV1,
+    ContractVfsWriteRequestV1,
+    ContractVfsWriteCompletionV1,
+    ContractVfsSyncRequestV1,
+    ContractVfsSyncCompletionV1,
+    ContractVfsReadRequestV1,
+    ContractVfsReadCompletionV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContractGoldenRecordKind {
+    RequestEnvelopeV1,
+    TideCompletionV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContractGoldenFixture {
+    pub manifest_name: &'static str,
+    pub file_name: &'static str,
+    pub operation: &'static str,
+    pub record_kind: ContractGoldenRecordKind,
+    pub encoded_len: usize,
+    pub bytes: &'static [u8],
 }
 
 pub const GOLDEN_REQUEST_ENVELOPE_V1: [u8; REQUEST_ENVELOPE_V1_ENCODED_LEN] =
@@ -77,66 +101,359 @@ pub const GOLDEN_REQUEST_ENVELOPE_V1: [u8; REQUEST_ENVELOPE_V1_ENCODED_LEN] =
 pub const GOLDEN_TIDE_COMPLETION_V1: [u8; TIDE_COMPLETION_V1_ENCODED_LEN] =
     build_golden_tide_completion_v1();
 
-const fn build_golden_request_envelope_v1() -> [u8; REQUEST_ENVELOPE_V1_ENCODED_LEN] {
+const CONTRACT_VFS_TRACE_ID: [u8; 16] = [
+    0x52, 0x43, 0x54, 0x52, 0x41, 0x43, 0x45, 0x2d, 0x57, 0x46, 0x52, 0x2d, 0x30, 0x35, 0x32, 0x38,
+];
+const CONTRACT_VFS_CREATE_REQUEST_ID: [u8; 16] = [
+    0x52, 0x45, 0x51, 0x2d, 0x57, 0x46, 0x52, 0x2d, 0x43, 0x52, 0x45, 0x41, 0x54, 0x45, 0x00, 0x01,
+];
+const CONTRACT_VFS_WRITE_REQUEST_ID: [u8; 16] = [
+    0x52, 0x45, 0x51, 0x2d, 0x57, 0x46, 0x52, 0x2d, 0x57, 0x52, 0x49, 0x54, 0x45, 0x00, 0x00, 0x02,
+];
+const CONTRACT_VFS_SYNC_REQUEST_ID: [u8; 16] = [
+    0x52, 0x45, 0x51, 0x2d, 0x57, 0x46, 0x52, 0x2d, 0x46, 0x53, 0x59, 0x4e, 0x43, 0x00, 0x00, 0x03,
+];
+const CONTRACT_VFS_READ_REQUEST_ID: [u8; 16] = [
+    0x52, 0x45, 0x51, 0x2d, 0x57, 0x46, 0x52, 0x2d, 0x52, 0x45, 0x41, 0x44, 0x00, 0x00, 0x00, 0x04,
+];
+
+const CONTRACT_VFS_PARENT_INODE_ID: u64 = 1;
+const CONTRACT_VFS_FILE_INODE_ID: u64 = 100;
+const CONTRACT_VFS_FILE_HANDLE_ID: u64 = 200;
+const CONTRACT_VFS_IO_LEN: u64 = 4096;
+const CONTRACT_VFS_NAME_TOKEN: u64 = 0xa951_dd1b_f01a_508e;
+const CONTRACT_VFS_CREATE_EPOCH: u64 = 528_001;
+const CONTRACT_VFS_WRITE_EPOCH: u64 = 528_002;
+const CONTRACT_VFS_SYNC_EPOCH: u64 = 528_003;
+const CONTRACT_VFS_READ_EPOCH: u64 = 528_004;
+
+pub const CONTRACT_VFS_CREATE_REQUEST_V1: [u8; REQUEST_ENVELOPE_V1_ENCODED_LEN] =
+    build_request_envelope_v1_bytes(
+        1,
+        5,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        CONTRACT_VFS_CREATE_REQUEST_ID,
+        CONTRACT_VFS_CREATE_EPOCH,
+        CONTRACT_VFS_TRACE_ID,
+        0,
+        0,
+        [
+            CONTRACT_VFS_PARENT_INODE_ID,
+            CONTRACT_VFS_NAME_TOKEN,
+            0,
+            0,
+            0,
+        ],
+    );
+pub const CONTRACT_VFS_CREATE_COMPLETION_V1: [u8; TIDE_COMPLETION_V1_ENCODED_LEN] =
+    build_tide_completion_v1_bytes(
+        0,
+        0,
+        0,
+        0,
+        CONTRACT_VFS_CREATE_REQUEST_ID,
+        CONTRACT_VFS_TRACE_ID,
+        CONTRACT_VFS_CREATE_EPOCH,
+        0,
+        [CONTRACT_VFS_FILE_INODE_ID, CONTRACT_VFS_FILE_HANDLE_ID, 0],
+    );
+pub const CONTRACT_VFS_WRITE_REQUEST_V1: [u8; REQUEST_ENVELOPE_V1_ENCODED_LEN] =
+    build_request_envelope_v1_bytes(
+        1,
+        3,
+        1,
+        1,
+        1,
+        2,
+        0,
+        0,
+        0,
+        CONTRACT_VFS_WRITE_REQUEST_ID,
+        CONTRACT_VFS_WRITE_EPOCH,
+        CONTRACT_VFS_TRACE_ID,
+        0,
+        0,
+        [
+            CONTRACT_VFS_FILE_INODE_ID,
+            CONTRACT_VFS_FILE_HANDLE_ID,
+            0,
+            CONTRACT_VFS_IO_LEN,
+            0,
+        ],
+    );
+pub const CONTRACT_VFS_WRITE_COMPLETION_V1: [u8; TIDE_COMPLETION_V1_ENCODED_LEN] =
+    build_tide_completion_v1_bytes(
+        0,
+        0,
+        0,
+        0,
+        CONTRACT_VFS_WRITE_REQUEST_ID,
+        CONTRACT_VFS_TRACE_ID,
+        CONTRACT_VFS_WRITE_EPOCH,
+        CONTRACT_VFS_IO_LEN,
+        [CONTRACT_VFS_IO_LEN, 0, 0],
+    );
+pub const CONTRACT_VFS_SYNC_REQUEST_V1: [u8; REQUEST_ENVELOPE_V1_ENCODED_LEN] =
+    build_request_envelope_v1_bytes(
+        1,
+        4,
+        1,
+        1,
+        1,
+        3,
+        0,
+        0,
+        0,
+        CONTRACT_VFS_SYNC_REQUEST_ID,
+        CONTRACT_VFS_SYNC_EPOCH,
+        CONTRACT_VFS_TRACE_ID,
+        0,
+        0,
+        [
+            CONTRACT_VFS_FILE_INODE_ID,
+            CONTRACT_VFS_FILE_HANDLE_ID,
+            0,
+            0,
+            0,
+        ],
+    );
+pub const CONTRACT_VFS_SYNC_COMPLETION_V1: [u8; TIDE_COMPLETION_V1_ENCODED_LEN] =
+    build_tide_completion_v1_bytes(
+        0,
+        0,
+        0,
+        0,
+        CONTRACT_VFS_SYNC_REQUEST_ID,
+        CONTRACT_VFS_TRACE_ID,
+        CONTRACT_VFS_SYNC_EPOCH,
+        0,
+        [0, 0, 0],
+    );
+pub const CONTRACT_VFS_READ_REQUEST_V1: [u8; REQUEST_ENVELOPE_V1_ENCODED_LEN] =
+    build_request_envelope_v1_bytes(
+        1,
+        2,
+        1,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0,
+        CONTRACT_VFS_READ_REQUEST_ID,
+        CONTRACT_VFS_READ_EPOCH,
+        CONTRACT_VFS_TRACE_ID,
+        0,
+        0,
+        [
+            CONTRACT_VFS_FILE_INODE_ID,
+            CONTRACT_VFS_FILE_HANDLE_ID,
+            0,
+            CONTRACT_VFS_IO_LEN,
+            0,
+        ],
+    );
+pub const CONTRACT_VFS_READ_COMPLETION_V1: [u8; TIDE_COMPLETION_V1_ENCODED_LEN] =
+    build_tide_completion_v1_bytes(
+        0,
+        0,
+        0,
+        0,
+        CONTRACT_VFS_READ_REQUEST_ID,
+        CONTRACT_VFS_TRACE_ID,
+        CONTRACT_VFS_READ_EPOCH,
+        CONTRACT_VFS_IO_LEN,
+        [CONTRACT_VFS_IO_LEN, 0, 0],
+    );
+
+pub static CONTRACT_VFS_WRITE_FSYNC_READ_V1_FIXTURES: [ContractGoldenFixture; 8] = [
+    ContractGoldenFixture {
+        manifest_name: "VfsContractWriteFsyncReadCreateRequestV1",
+        file_name: "request-contract-vfs-write-fsync-read-v1_create-request.bin",
+        operation: "create",
+        record_kind: ContractGoldenRecordKind::RequestEnvelopeV1,
+        encoded_len: REQUEST_ENVELOPE_V1_ENCODED_LEN,
+        bytes: &CONTRACT_VFS_CREATE_REQUEST_V1,
+    },
+    ContractGoldenFixture {
+        manifest_name: "VfsContractWriteFsyncReadCreateCompletionV1",
+        file_name: "request-contract-vfs-write-fsync-read-v1_create-completion.bin",
+        operation: "create",
+        record_kind: ContractGoldenRecordKind::TideCompletionV1,
+        encoded_len: TIDE_COMPLETION_V1_ENCODED_LEN,
+        bytes: &CONTRACT_VFS_CREATE_COMPLETION_V1,
+    },
+    ContractGoldenFixture {
+        manifest_name: "VfsContractWriteFsyncReadWriteRequestV1",
+        file_name: "request-contract-vfs-write-fsync-read-v1_write-request.bin",
+        operation: "write",
+        record_kind: ContractGoldenRecordKind::RequestEnvelopeV1,
+        encoded_len: REQUEST_ENVELOPE_V1_ENCODED_LEN,
+        bytes: &CONTRACT_VFS_WRITE_REQUEST_V1,
+    },
+    ContractGoldenFixture {
+        manifest_name: "VfsContractWriteFsyncReadWriteCompletionV1",
+        file_name: "request-contract-vfs-write-fsync-read-v1_write-completion.bin",
+        operation: "write",
+        record_kind: ContractGoldenRecordKind::TideCompletionV1,
+        encoded_len: TIDE_COMPLETION_V1_ENCODED_LEN,
+        bytes: &CONTRACT_VFS_WRITE_COMPLETION_V1,
+    },
+    ContractGoldenFixture {
+        manifest_name: "VfsContractWriteFsyncReadSyncRequestV1",
+        file_name: "request-contract-vfs-write-fsync-read-v1_sync-request.bin",
+        operation: "sync",
+        record_kind: ContractGoldenRecordKind::RequestEnvelopeV1,
+        encoded_len: REQUEST_ENVELOPE_V1_ENCODED_LEN,
+        bytes: &CONTRACT_VFS_SYNC_REQUEST_V1,
+    },
+    ContractGoldenFixture {
+        manifest_name: "VfsContractWriteFsyncReadSyncCompletionV1",
+        file_name: "request-contract-vfs-write-fsync-read-v1_sync-completion.bin",
+        operation: "sync",
+        record_kind: ContractGoldenRecordKind::TideCompletionV1,
+        encoded_len: TIDE_COMPLETION_V1_ENCODED_LEN,
+        bytes: &CONTRACT_VFS_SYNC_COMPLETION_V1,
+    },
+    ContractGoldenFixture {
+        manifest_name: "VfsContractWriteFsyncReadReadRequestV1",
+        file_name: "request-contract-vfs-write-fsync-read-v1_read-request.bin",
+        operation: "read",
+        record_kind: ContractGoldenRecordKind::RequestEnvelopeV1,
+        encoded_len: REQUEST_ENVELOPE_V1_ENCODED_LEN,
+        bytes: &CONTRACT_VFS_READ_REQUEST_V1,
+    },
+    ContractGoldenFixture {
+        manifest_name: "VfsContractWriteFsyncReadReadCompletionV1",
+        file_name: "request-contract-vfs-write-fsync-read-v1_read-completion.bin",
+        operation: "read",
+        record_kind: ContractGoldenRecordKind::TideCompletionV1,
+        encoded_len: TIDE_COMPLETION_V1_ENCODED_LEN,
+        bytes: &CONTRACT_VFS_READ_COMPLETION_V1,
+    },
+];
+
+#[must_use]
+pub fn contract_vfs_write_fsync_read_v1_fixtures() -> &'static [ContractGoldenFixture] {
+    &CONTRACT_VFS_WRITE_FSYNC_READ_V1_FIXTURES
+}
+
+const fn build_request_envelope_v1_bytes(
+    domain: u16,
+    opcode: u16,
+    work_class: u16,
+    admission: u16,
+    budget: u16,
+    fence: u16,
+    retry: u16,
+    disposition: u16,
+    payload_flags: u32,
+    request_id: [u8; 16],
+    epoch: u64,
+    trace_id: [u8; 16],
+    deadline: u64,
+    timeout: u64,
+    words: ContractPayloadWords,
+) -> [u8; REQUEST_ENVELOPE_V1_ENCODED_LEN] {
     let mut out = [0_u8; REQUEST_ENVELOPE_V1_ENCODED_LEN];
     const_write_u16(&mut out, 0, 1);
     const_write_u16(&mut out, 2, REQUEST_ENVELOPE_V1_ENCODED_LEN_U16);
-    const_write_u16(&mut out, 4, 1);
-    const_write_u16(&mut out, 6, 2);
-    const_write_u16(&mut out, 8, 1);
-    const_write_u16(&mut out, 10, 1);
-    const_write_u16(&mut out, 12, 1);
-    const_write_u16(&mut out, 14, 3);
-    const_write_u16(&mut out, 16, 1);
-    const_write_u16(&mut out, 18, 0);
-    const_write_u32(&mut out, 20, 0xA5A5_0001);
-    const_write_bytes(
-        &mut out,
-        24,
-        [
-            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-        ],
-    );
-    const_write_u64(&mut out, 40, 7);
-    const_write_bytes(
-        &mut out,
-        48,
-        [
-            32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
-        ],
-    );
-    const_write_u64(&mut out, 64, 1000);
-    const_write_u64(&mut out, 72, 250);
-    const_write_u64(&mut out, 80, 42);
-    const_write_u64(&mut out, 88, 9);
-    const_write_u64(&mut out, 96, 4096);
-    const_write_u64(&mut out, 104, 512);
+    const_write_u16(&mut out, 4, domain);
+    const_write_u16(&mut out, 6, opcode);
+    const_write_u16(&mut out, 8, work_class);
+    const_write_u16(&mut out, 10, admission);
+    const_write_u16(&mut out, 12, budget);
+    const_write_u16(&mut out, 14, fence);
+    const_write_u16(&mut out, 16, retry);
+    const_write_u16(&mut out, 18, disposition);
+    const_write_u32(&mut out, 20, payload_flags);
+    const_write_bytes(&mut out, 24, request_id);
+    const_write_u64(&mut out, 40, epoch);
+    const_write_bytes(&mut out, 48, trace_id);
+    const_write_u64(&mut out, 64, deadline);
+    const_write_u64(&mut out, 72, timeout);
+    const_write_u64(&mut out, 80, words[0]);
+    const_write_u64(&mut out, 88, words[1]);
+    const_write_u64(&mut out, 96, words[2]);
+    const_write_u64(&mut out, 104, words[3]);
+    const_write_u64(&mut out, 112, words[4]);
     out
 }
 
-const fn build_golden_tide_completion_v1() -> [u8; TIDE_COMPLETION_V1_ENCODED_LEN] {
+const fn build_tide_completion_v1_bytes(
+    status: u16,
+    disposition: u16,
+    errno: u16,
+    result_flags: u32,
+    request_id: [u8; 16],
+    trace_id: [u8; 16],
+    epoch: u64,
+    completed_bytes: u64,
+    result_words: [u64; 3],
+) -> [u8; TIDE_COMPLETION_V1_ENCODED_LEN] {
     let mut out = [0_u8; TIDE_COMPLETION_V1_ENCODED_LEN];
     const_write_u16(&mut out, 0, 1);
     const_write_u16(&mut out, 2, TIDE_COMPLETION_V1_ENCODED_LEN_U16);
-    const_write_u32(&mut out, 12, 0xAA);
-    const_write_bytes(
-        &mut out,
-        16,
+    const_write_u16(&mut out, 4, status);
+    const_write_u16(&mut out, 6, disposition);
+    const_write_u16(&mut out, 8, errno);
+    const_write_u32(&mut out, 12, result_flags);
+    const_write_bytes(&mut out, 16, request_id);
+    const_write_bytes(&mut out, 32, trace_id);
+    const_write_u64(&mut out, 48, epoch);
+    const_write_u64(&mut out, 56, completed_bytes);
+    const_write_u64(&mut out, 64, result_words[0]);
+    const_write_u64(&mut out, 72, result_words[1]);
+    const_write_u64(&mut out, 80, result_words[2]);
+    out
+}
+
+const fn build_golden_request_envelope_v1() -> [u8; REQUEST_ENVELOPE_V1_ENCODED_LEN] {
+    build_request_envelope_v1_bytes(
+        1,
+        2,
+        1,
+        1,
+        1,
+        3,
+        1,
+        0,
+        0xA5A5_0001,
         [
             16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
         ],
-    );
-    const_write_bytes(
-        &mut out,
-        32,
+        7,
         [
             32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
         ],
-    );
-    const_write_u64(&mut out, 48, 8);
-    const_write_u64(&mut out, 56, 512);
-    const_write_u64(&mut out, 64, 42);
-    out
+        1000,
+        250,
+        [42, 9, 4096, 512, 0],
+    )
+}
+
+const fn build_golden_tide_completion_v1() -> [u8; TIDE_COMPLETION_V1_ENCODED_LEN] {
+    build_tide_completion_v1_bytes(
+        0,
+        0,
+        0,
+        0xAA,
+        [
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        ],
+        [
+            32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+        ],
+        8,
+        512,
+        [42, 0, 0],
+    )
 }
 
 const fn const_write_u16<const N: usize>(out: &mut [u8; N], offset: usize, value: u16) {
@@ -222,6 +539,162 @@ pub const fn golden_tide_completion_v1() -> TideCompletion {
         completed_bytes: 512,
         result_words: [42, 0, 0],
         result_flags: 0xAA,
+    }
+}
+
+const fn contract_vfs_metadata(
+    request_id: [u8; 16],
+    epoch: u64,
+    fence: FenceIntent,
+) -> RequestMetadata {
+    RequestMetadata {
+        request_id: RequestId(request_id),
+        epoch: ContractEpoch(epoch),
+        trace_id: TraceId(CONTRACT_VFS_TRACE_ID),
+        work_class: WorkClass::Foreground,
+        admission: AdmissionIntent::RequirePermit,
+        budget: BudgetIntent::Foreground,
+        fence,
+        retry: RetryIntent::None,
+        disposition: DispositionIntent::CompleteOnce,
+        deadline: DeadlineNs::NONE,
+        timeout: TimeoutNs::NONE,
+    }
+}
+
+#[must_use]
+pub const fn contract_vfs_create_request_v1() -> RequestEnvelope {
+    RequestEnvelope {
+        version: TIDE_CONTRACT_VERSION_V1,
+        metadata: contract_vfs_metadata(
+            CONTRACT_VFS_CREATE_REQUEST_ID,
+            CONTRACT_VFS_CREATE_EPOCH,
+            FenceIntent::None,
+        ),
+        request: TideRequest::Vfs(VfsRequest::Create {
+            parent_id: InodeId(CONTRACT_VFS_PARENT_INODE_ID),
+            name: VfsNameToken(CONTRACT_VFS_NAME_TOKEN),
+        }),
+        payload_flags: 0,
+    }
+}
+
+#[must_use]
+pub const fn contract_vfs_create_completion_v1() -> TideCompletion {
+    TideCompletion {
+        version: TIDE_CONTRACT_VERSION_V1,
+        request_id: RequestId(CONTRACT_VFS_CREATE_REQUEST_ID),
+        trace_id: TraceId(CONTRACT_VFS_TRACE_ID),
+        epoch: ContractEpoch(CONTRACT_VFS_CREATE_EPOCH),
+        status: CompletionStatus::Success,
+        disposition: CompletionDisposition::Final,
+        errno: Errno::SUCCESS,
+        completed_bytes: 0,
+        result_words: [CONTRACT_VFS_FILE_INODE_ID, CONTRACT_VFS_FILE_HANDLE_ID, 0],
+        result_flags: 0,
+    }
+}
+
+#[must_use]
+pub const fn contract_vfs_write_request_v1() -> RequestEnvelope {
+    RequestEnvelope {
+        version: TIDE_CONTRACT_VERSION_V1,
+        metadata: contract_vfs_metadata(
+            CONTRACT_VFS_WRITE_REQUEST_ID,
+            CONTRACT_VFS_WRITE_EPOCH,
+            FenceIntent::Write,
+        ),
+        request: TideRequest::Vfs(VfsRequest::Write {
+            inode_id: InodeId(CONTRACT_VFS_FILE_INODE_ID),
+            file_handle_id: FileHandleId(CONTRACT_VFS_FILE_HANDLE_ID),
+            offset: 0,
+            length: CONTRACT_VFS_IO_LEN,
+        }),
+        payload_flags: 0,
+    }
+}
+
+#[must_use]
+pub const fn contract_vfs_write_completion_v1() -> TideCompletion {
+    TideCompletion {
+        version: TIDE_CONTRACT_VERSION_V1,
+        request_id: RequestId(CONTRACT_VFS_WRITE_REQUEST_ID),
+        trace_id: TraceId(CONTRACT_VFS_TRACE_ID),
+        epoch: ContractEpoch(CONTRACT_VFS_WRITE_EPOCH),
+        status: CompletionStatus::Success,
+        disposition: CompletionDisposition::Final,
+        errno: Errno::SUCCESS,
+        completed_bytes: CONTRACT_VFS_IO_LEN,
+        result_words: [CONTRACT_VFS_IO_LEN, 0, 0],
+        result_flags: 0,
+    }
+}
+
+#[must_use]
+pub const fn contract_vfs_sync_request_v1() -> RequestEnvelope {
+    RequestEnvelope {
+        version: TIDE_CONTRACT_VERSION_V1,
+        metadata: contract_vfs_metadata(
+            CONTRACT_VFS_SYNC_REQUEST_ID,
+            CONTRACT_VFS_SYNC_EPOCH,
+            FenceIntent::Epoch,
+        ),
+        request: TideRequest::Vfs(VfsRequest::Sync {
+            inode_id: InodeId(CONTRACT_VFS_FILE_INODE_ID),
+            file_handle_id: FileHandleId(CONTRACT_VFS_FILE_HANDLE_ID),
+        }),
+        payload_flags: 0,
+    }
+}
+
+#[must_use]
+pub const fn contract_vfs_sync_completion_v1() -> TideCompletion {
+    TideCompletion {
+        version: TIDE_CONTRACT_VERSION_V1,
+        request_id: RequestId(CONTRACT_VFS_SYNC_REQUEST_ID),
+        trace_id: TraceId(CONTRACT_VFS_TRACE_ID),
+        epoch: ContractEpoch(CONTRACT_VFS_SYNC_EPOCH),
+        status: CompletionStatus::Success,
+        disposition: CompletionDisposition::Final,
+        errno: Errno::SUCCESS,
+        completed_bytes: 0,
+        result_words: [0, 0, 0],
+        result_flags: 0,
+    }
+}
+
+#[must_use]
+pub const fn contract_vfs_read_request_v1() -> RequestEnvelope {
+    RequestEnvelope {
+        version: TIDE_CONTRACT_VERSION_V1,
+        metadata: contract_vfs_metadata(
+            CONTRACT_VFS_READ_REQUEST_ID,
+            CONTRACT_VFS_READ_EPOCH,
+            FenceIntent::Read,
+        ),
+        request: TideRequest::Vfs(VfsRequest::Read {
+            inode_id: InodeId(CONTRACT_VFS_FILE_INODE_ID),
+            file_handle_id: FileHandleId(CONTRACT_VFS_FILE_HANDLE_ID),
+            offset: 0,
+            length: CONTRACT_VFS_IO_LEN,
+        }),
+        payload_flags: 0,
+    }
+}
+
+#[must_use]
+pub const fn contract_vfs_read_completion_v1() -> TideCompletion {
+    TideCompletion {
+        version: TIDE_CONTRACT_VERSION_V1,
+        request_id: RequestId(CONTRACT_VFS_READ_REQUEST_ID),
+        trace_id: TraceId(CONTRACT_VFS_TRACE_ID),
+        epoch: ContractEpoch(CONTRACT_VFS_READ_EPOCH),
+        status: CompletionStatus::Success,
+        disposition: CompletionDisposition::Final,
+        errno: Errno::SUCCESS,
+        completed_bytes: CONTRACT_VFS_IO_LEN,
+        result_words: [CONTRACT_VFS_IO_LEN, 0, 0],
+        result_flags: 0,
     }
 }
 
@@ -375,6 +848,152 @@ pub fn decode_tide_completion_v1_le(bytes: &[u8]) -> Result<TideCompletion, Cont
     })
 }
 
+#[must_use]
+pub fn validate_contract_vfs_write_fsync_read_fixture(
+    file_name: &str,
+    bytes: &[u8],
+) -> Option<Result<(), ContractCodecError>> {
+    match file_name {
+        "request-contract-vfs-write-fsync-read-v1_create-request.bin" => {
+            Some(validate_request_fixture(
+                bytes,
+                contract_vfs_create_request_v1(),
+                &CONTRACT_VFS_CREATE_REQUEST_V1,
+                ContractGoldenVector::ContractVfsCreateRequestV1,
+            ))
+        }
+        "request-contract-vfs-write-fsync-read-v1_create-completion.bin" => {
+            Some(validate_completion_fixture(
+                bytes,
+                contract_vfs_create_completion_v1(),
+                &CONTRACT_VFS_CREATE_COMPLETION_V1,
+                ContractGoldenVector::ContractVfsCreateCompletionV1,
+            ))
+        }
+        "request-contract-vfs-write-fsync-read-v1_write-request.bin" => {
+            Some(validate_request_fixture(
+                bytes,
+                contract_vfs_write_request_v1(),
+                &CONTRACT_VFS_WRITE_REQUEST_V1,
+                ContractGoldenVector::ContractVfsWriteRequestV1,
+            ))
+        }
+        "request-contract-vfs-write-fsync-read-v1_write-completion.bin" => {
+            Some(validate_completion_fixture(
+                bytes,
+                contract_vfs_write_completion_v1(),
+                &CONTRACT_VFS_WRITE_COMPLETION_V1,
+                ContractGoldenVector::ContractVfsWriteCompletionV1,
+            ))
+        }
+        "request-contract-vfs-write-fsync-read-v1_sync-request.bin" => {
+            Some(validate_request_fixture(
+                bytes,
+                contract_vfs_sync_request_v1(),
+                &CONTRACT_VFS_SYNC_REQUEST_V1,
+                ContractGoldenVector::ContractVfsSyncRequestV1,
+            ))
+        }
+        "request-contract-vfs-write-fsync-read-v1_sync-completion.bin" => {
+            Some(validate_completion_fixture(
+                bytes,
+                contract_vfs_sync_completion_v1(),
+                &CONTRACT_VFS_SYNC_COMPLETION_V1,
+                ContractGoldenVector::ContractVfsSyncCompletionV1,
+            ))
+        }
+        "request-contract-vfs-write-fsync-read-v1_read-request.bin" => {
+            Some(validate_request_fixture(
+                bytes,
+                contract_vfs_read_request_v1(),
+                &CONTRACT_VFS_READ_REQUEST_V1,
+                ContractGoldenVector::ContractVfsReadRequestV1,
+            ))
+        }
+        "request-contract-vfs-write-fsync-read-v1_read-completion.bin" => {
+            Some(validate_completion_fixture(
+                bytes,
+                contract_vfs_read_completion_v1(),
+                &CONTRACT_VFS_READ_COMPLETION_V1,
+                ContractGoldenVector::ContractVfsReadCompletionV1,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn validate_request_fixture(
+    bytes: &[u8],
+    expected: RequestEnvelope,
+    expected_bytes: &[u8],
+    vector: ContractGoldenVector,
+) -> Result<(), ContractCodecError> {
+    expect_len(bytes.len(), REQUEST_ENVELOPE_V1_ENCODED_LEN)?;
+    if bytes != expected_bytes {
+        return Err(ContractCodecError::GoldenVectorMismatch { vector });
+    }
+
+    let mut encoded = [0_u8; REQUEST_ENVELOPE_V1_ENCODED_LEN];
+    encode_request_envelope_v1_le(&expected, &mut encoded)?;
+    if encoded != bytes {
+        return Err(ContractCodecError::GoldenVectorMismatch { vector });
+    }
+    if decode_request_envelope_v1_le(bytes)? != expected {
+        return Err(ContractCodecError::GoldenVectorMismatch { vector });
+    }
+
+    let mut corrupt = [0_u8; REQUEST_ENVELOPE_V1_ENCODED_LEN];
+    corrupt.copy_from_slice(bytes);
+    corrupt[120] = 1;
+    match decode_request_envelope_v1_le(&corrupt) {
+        Err(ContractCodecError::NonZeroReserved {
+            field: ContractReservedField::RequestEnvelopeTail,
+        }) => Ok(()),
+        _ => Err(ContractCodecError::GoldenVectorMismatch { vector }),
+    }
+}
+
+fn validate_completion_fixture(
+    bytes: &[u8],
+    expected: TideCompletion,
+    expected_bytes: &[u8],
+    vector: ContractGoldenVector,
+) -> Result<(), ContractCodecError> {
+    expect_len(bytes.len(), TIDE_COMPLETION_V1_ENCODED_LEN)?;
+    if bytes != expected_bytes {
+        return Err(ContractCodecError::GoldenVectorMismatch { vector });
+    }
+
+    let mut encoded = [0_u8; TIDE_COMPLETION_V1_ENCODED_LEN];
+    encode_tide_completion_v1_le(&expected, &mut encoded)?;
+    if encoded != bytes {
+        return Err(ContractCodecError::GoldenVectorMismatch { vector });
+    }
+    if decode_tide_completion_v1_le(bytes)? != expected {
+        return Err(ContractCodecError::GoldenVectorMismatch { vector });
+    }
+
+    let mut corrupt_header = [0_u8; TIDE_COMPLETION_V1_ENCODED_LEN];
+    corrupt_header.copy_from_slice(bytes);
+    corrupt_header[10] = 1;
+    match decode_tide_completion_v1_le(&corrupt_header) {
+        Err(ContractCodecError::NonZeroReserved {
+            field: ContractReservedField::CompletionHeader,
+        }) => {}
+        _ => return Err(ContractCodecError::GoldenVectorMismatch { vector }),
+    }
+
+    let mut corrupt_tail = [0_u8; TIDE_COMPLETION_V1_ENCODED_LEN];
+    corrupt_tail.copy_from_slice(bytes);
+    corrupt_tail[88] = 1;
+    match decode_tide_completion_v1_le(&corrupt_tail) {
+        Err(ContractCodecError::NonZeroReserved {
+            field: ContractReservedField::CompletionTail,
+        }) => Ok(()),
+        _ => Err(ContractCodecError::GoldenVectorMismatch { vector }),
+    }
+}
+
 /// Check the embedded v1 golden vectors and reserved-field rejection paths.
 ///
 /// # Errors
@@ -433,6 +1052,25 @@ pub fn contract_codec_self_check() -> Result<(), ContractCodecError> {
             return Err(ContractCodecError::GoldenVectorMismatch {
                 vector: ContractGoldenVector::CompletionReservedFailure,
             });
+        }
+    }
+
+    for fixture in contract_vfs_write_fsync_read_v1_fixtures() {
+        match validate_contract_vfs_write_fsync_read_fixture(fixture.file_name, fixture.bytes) {
+            Some(Ok(())) => {}
+            Some(Err(err)) => return Err(err),
+            None => {
+                return Err(ContractCodecError::GoldenVectorMismatch {
+                    vector: match fixture.record_kind {
+                        ContractGoldenRecordKind::RequestEnvelopeV1 => {
+                            ContractGoldenVector::RequestEnvelopeV1
+                        }
+                        ContractGoldenRecordKind::TideCompletionV1 => {
+                            ContractGoldenVector::TideCompletionV1
+                        }
+                    },
+                });
+            }
         }
     }
 
@@ -792,5 +1430,73 @@ mod tests {
     #[test]
     fn self_check_covers_golden_and_reserved_paths() {
         contract_codec_self_check().expect("self check");
+    }
+
+    #[test]
+    fn write_fsync_read_contract_fixtures_match_on_disk_vectors() {
+        let fixtures = [
+            (
+                "request-contract-vfs-write-fsync-read-v1_create-request.bin",
+                include_bytes!(
+                    "../../../validation/format-golden/request-contract-vfs-write-fsync-read-v1/request-contract-vfs-write-fsync-read-v1_create-request.bin"
+                )
+                .as_slice(),
+            ),
+            (
+                "request-contract-vfs-write-fsync-read-v1_create-completion.bin",
+                include_bytes!(
+                    "../../../validation/format-golden/request-contract-vfs-write-fsync-read-v1/request-contract-vfs-write-fsync-read-v1_create-completion.bin"
+                )
+                .as_slice(),
+            ),
+            (
+                "request-contract-vfs-write-fsync-read-v1_write-request.bin",
+                include_bytes!(
+                    "../../../validation/format-golden/request-contract-vfs-write-fsync-read-v1/request-contract-vfs-write-fsync-read-v1_write-request.bin"
+                )
+                .as_slice(),
+            ),
+            (
+                "request-contract-vfs-write-fsync-read-v1_write-completion.bin",
+                include_bytes!(
+                    "../../../validation/format-golden/request-contract-vfs-write-fsync-read-v1/request-contract-vfs-write-fsync-read-v1_write-completion.bin"
+                )
+                .as_slice(),
+            ),
+            (
+                "request-contract-vfs-write-fsync-read-v1_sync-request.bin",
+                include_bytes!(
+                    "../../../validation/format-golden/request-contract-vfs-write-fsync-read-v1/request-contract-vfs-write-fsync-read-v1_sync-request.bin"
+                )
+                .as_slice(),
+            ),
+            (
+                "request-contract-vfs-write-fsync-read-v1_sync-completion.bin",
+                include_bytes!(
+                    "../../../validation/format-golden/request-contract-vfs-write-fsync-read-v1/request-contract-vfs-write-fsync-read-v1_sync-completion.bin"
+                )
+                .as_slice(),
+            ),
+            (
+                "request-contract-vfs-write-fsync-read-v1_read-request.bin",
+                include_bytes!(
+                    "../../../validation/format-golden/request-contract-vfs-write-fsync-read-v1/request-contract-vfs-write-fsync-read-v1_read-request.bin"
+                )
+                .as_slice(),
+            ),
+            (
+                "request-contract-vfs-write-fsync-read-v1_read-completion.bin",
+                include_bytes!(
+                    "../../../validation/format-golden/request-contract-vfs-write-fsync-read-v1/request-contract-vfs-write-fsync-read-v1_read-completion.bin"
+                )
+                .as_slice(),
+            ),
+        ];
+
+        for (file_name, bytes) in fixtures {
+            validate_contract_vfs_write_fsync_read_fixture(file_name, bytes)
+                .expect("known fixture")
+                .expect("valid fixture");
+        }
     }
 }

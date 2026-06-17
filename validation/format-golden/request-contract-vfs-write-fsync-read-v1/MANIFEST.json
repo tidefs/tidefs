@@ -1,0 +1,310 @@
+{
+  "format_version": "v1",
+  "generator": "tidefs-request-contract-codec-golden v1",
+  "group": "request-contract-vfs-write-fsync-read-v1",
+  "description": "Contract/codec-only golden vectors for the canonical VFS create, write, sync/fsync, and read request/completion sequence.",
+  "evidence_scope": "contract-codec-only-not-mounted-runtime",
+  "runtime_claims": false,
+  "close_release_supported": false,
+  "close_release_note": "The current v1 VfsRequestOp contract has no Open, Close, or Release opcode; this corpus intentionally does not synthesize one.",
+  "entries": {
+    "VfsContractWriteFsyncReadCreateRequestV1": {
+      "group": "request-contract-vfs-write-fsync-read-v1",
+      "file": "request-contract-vfs-write-fsync-read-v1_create-request.bin",
+      "record": "request-envelope-v1",
+      "operation": "create",
+      "encoded_length": 128,
+      "sha256": "8a4008e245789adabdad1a01114369e284cbbfed0ce6f1d77b1ba282e06e20f3",
+      "runtime_evidence": false,
+      "description": "Contract/codec-only v1 VFS create request vector for write-fsync-read shape evidence; not mounted runtime evidence.",
+      "reserved_zero_fields": [
+        "request_envelope_tail:120..128"
+      ],
+      "canonical_field_values": {
+        "operation": "create",
+        "runtime_evidence": false,
+        "request_id_hex": "5245512d5746522d4352454154450001",
+        "trace_id_hex": "524354524143452d5746522d30353238",
+        "epoch": 528001,
+        "record": "request-envelope-v1",
+        "domain": "vfs",
+        "domain_tag": 1,
+        "opcode": 5,
+        "work_class": "Foreground",
+        "work_class_tag": 1,
+        "admission": "RequirePermit",
+        "admission_tag": 1,
+        "budget": "Foreground",
+        "budget_tag": 1,
+        "fence_tag": 0,
+        "payload_flags": 0,
+        "payload_words": [
+          1,
+          12200775977585496206,
+          0,
+          0,
+          0
+        ],
+        "component_name": "contract-write-fsync-read.dat",
+        "component_name_token_fnv1a64_len_mixed": 12200775977585496206
+      }
+    },
+    "VfsContractWriteFsyncReadCreateCompletionV1": {
+      "group": "request-contract-vfs-write-fsync-read-v1",
+      "file": "request-contract-vfs-write-fsync-read-v1_create-completion.bin",
+      "record": "tide-completion-v1",
+      "operation": "create",
+      "encoded_length": 96,
+      "sha256": "432ef9deffb68f2b5d877d1a9291d74f9d32ec30513087f0f2e7298eca8bfa88",
+      "runtime_evidence": false,
+      "description": "Contract/codec-only v1 VFS create completion vector for write-fsync-read shape evidence; not mounted runtime evidence.",
+      "reserved_zero_fields": [
+        "completion_header:10..12",
+        "completion_tail:88..96"
+      ],
+      "canonical_field_values": {
+        "operation": "create",
+        "runtime_evidence": false,
+        "request_id_hex": "5245512d5746522d4352454154450001",
+        "trace_id_hex": "524354524143452d5746522d30353238",
+        "epoch": 528001,
+        "record": "tide-completion-v1",
+        "status": "Success",
+        "status_tag": 0,
+        "disposition": "Final",
+        "disposition_tag": 0,
+        "errno": "SUCCESS",
+        "errno_raw": 0,
+        "completed_bytes": 0,
+        "result_words": [
+          100,
+          200,
+          0
+        ],
+        "result_flags": 0
+      }
+    },
+    "VfsContractWriteFsyncReadWriteRequestV1": {
+      "group": "request-contract-vfs-write-fsync-read-v1",
+      "file": "request-contract-vfs-write-fsync-read-v1_write-request.bin",
+      "record": "request-envelope-v1",
+      "operation": "write",
+      "encoded_length": 128,
+      "sha256": "4e0c9e3576cb3aa76b0a5d28e9b27e10877612c4d16e23c0b4fd806778c20dfd",
+      "runtime_evidence": false,
+      "description": "Contract/codec-only v1 VFS write request vector for write-fsync-read shape evidence; not mounted runtime evidence.",
+      "reserved_zero_fields": [
+        "request_envelope_tail:120..128"
+      ],
+      "canonical_field_values": {
+        "operation": "write",
+        "runtime_evidence": false,
+        "request_id_hex": "5245512d5746522d5752495445000002",
+        "trace_id_hex": "524354524143452d5746522d30353238",
+        "epoch": 528002,
+        "record": "request-envelope-v1",
+        "domain": "vfs",
+        "domain_tag": 1,
+        "opcode": 3,
+        "work_class": "Foreground",
+        "work_class_tag": 1,
+        "admission": "RequirePermit",
+        "admission_tag": 1,
+        "budget": "Foreground",
+        "budget_tag": 1,
+        "fence_tag": 2,
+        "payload_flags": 0,
+        "payload_words": [
+          100,
+          200,
+          0,
+          4096,
+          0
+        ]
+      }
+    },
+    "VfsContractWriteFsyncReadWriteCompletionV1": {
+      "group": "request-contract-vfs-write-fsync-read-v1",
+      "file": "request-contract-vfs-write-fsync-read-v1_write-completion.bin",
+      "record": "tide-completion-v1",
+      "operation": "write",
+      "encoded_length": 96,
+      "sha256": "b72f583e1df7282204c8c2236376b86ec0278c93c73d8c578be34809171026e6",
+      "runtime_evidence": false,
+      "description": "Contract/codec-only v1 VFS write completion vector for write-fsync-read shape evidence; not mounted runtime evidence.",
+      "reserved_zero_fields": [
+        "completion_header:10..12",
+        "completion_tail:88..96"
+      ],
+      "canonical_field_values": {
+        "operation": "write",
+        "runtime_evidence": false,
+        "request_id_hex": "5245512d5746522d5752495445000002",
+        "trace_id_hex": "524354524143452d5746522d30353238",
+        "epoch": 528002,
+        "record": "tide-completion-v1",
+        "status": "Success",
+        "status_tag": 0,
+        "disposition": "Final",
+        "disposition_tag": 0,
+        "errno": "SUCCESS",
+        "errno_raw": 0,
+        "completed_bytes": 4096,
+        "result_words": [
+          4096,
+          0,
+          0
+        ],
+        "result_flags": 0
+      }
+    },
+    "VfsContractWriteFsyncReadSyncRequestV1": {
+      "group": "request-contract-vfs-write-fsync-read-v1",
+      "file": "request-contract-vfs-write-fsync-read-v1_sync-request.bin",
+      "record": "request-envelope-v1",
+      "operation": "sync",
+      "encoded_length": 128,
+      "sha256": "ac02ad5e35d2c2369e5bbd796919daf106d117a021aaa675877b0cf357490117",
+      "runtime_evidence": false,
+      "description": "Contract/codec-only v1 VFS sync request vector for write-fsync-read shape evidence; not mounted runtime evidence.",
+      "reserved_zero_fields": [
+        "request_envelope_tail:120..128"
+      ],
+      "canonical_field_values": {
+        "operation": "sync",
+        "runtime_evidence": false,
+        "request_id_hex": "5245512d5746522d4653594e43000003",
+        "trace_id_hex": "524354524143452d5746522d30353238",
+        "epoch": 528003,
+        "record": "request-envelope-v1",
+        "domain": "vfs",
+        "domain_tag": 1,
+        "opcode": 4,
+        "work_class": "Foreground",
+        "work_class_tag": 1,
+        "admission": "RequirePermit",
+        "admission_tag": 1,
+        "budget": "Foreground",
+        "budget_tag": 1,
+        "fence_tag": 3,
+        "payload_flags": 0,
+        "payload_words": [
+          100,
+          200,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "VfsContractWriteFsyncReadSyncCompletionV1": {
+      "group": "request-contract-vfs-write-fsync-read-v1",
+      "file": "request-contract-vfs-write-fsync-read-v1_sync-completion.bin",
+      "record": "tide-completion-v1",
+      "operation": "sync",
+      "encoded_length": 96,
+      "sha256": "5b23c2a5b883dfa0ecc0838edfaea95c051fbf50cfc855ca36b976c25ff2002a",
+      "runtime_evidence": false,
+      "description": "Contract/codec-only v1 VFS sync completion vector for write-fsync-read shape evidence; not mounted runtime evidence.",
+      "reserved_zero_fields": [
+        "completion_header:10..12",
+        "completion_tail:88..96"
+      ],
+      "canonical_field_values": {
+        "operation": "sync",
+        "runtime_evidence": false,
+        "request_id_hex": "5245512d5746522d4653594e43000003",
+        "trace_id_hex": "524354524143452d5746522d30353238",
+        "epoch": 528003,
+        "record": "tide-completion-v1",
+        "status": "Success",
+        "status_tag": 0,
+        "disposition": "Final",
+        "disposition_tag": 0,
+        "errno": "SUCCESS",
+        "errno_raw": 0,
+        "completed_bytes": 0,
+        "result_words": [
+          0,
+          0,
+          0
+        ],
+        "result_flags": 0
+      }
+    },
+    "VfsContractWriteFsyncReadReadRequestV1": {
+      "group": "request-contract-vfs-write-fsync-read-v1",
+      "file": "request-contract-vfs-write-fsync-read-v1_read-request.bin",
+      "record": "request-envelope-v1",
+      "operation": "read",
+      "encoded_length": 128,
+      "sha256": "8cf3f92d6821ed0cdafe89025def2dcc1224c946acef1c81e2a1dd7b89fc69a3",
+      "runtime_evidence": false,
+      "description": "Contract/codec-only v1 VFS read request vector for write-fsync-read shape evidence; not mounted runtime evidence.",
+      "reserved_zero_fields": [
+        "request_envelope_tail:120..128"
+      ],
+      "canonical_field_values": {
+        "operation": "read",
+        "runtime_evidence": false,
+        "request_id_hex": "5245512d5746522d5245414400000004",
+        "trace_id_hex": "524354524143452d5746522d30353238",
+        "epoch": 528004,
+        "record": "request-envelope-v1",
+        "domain": "vfs",
+        "domain_tag": 1,
+        "opcode": 2,
+        "work_class": "Foreground",
+        "work_class_tag": 1,
+        "admission": "RequirePermit",
+        "admission_tag": 1,
+        "budget": "Foreground",
+        "budget_tag": 1,
+        "fence_tag": 1,
+        "payload_flags": 0,
+        "payload_words": [
+          100,
+          200,
+          0,
+          4096,
+          0
+        ]
+      }
+    },
+    "VfsContractWriteFsyncReadReadCompletionV1": {
+      "group": "request-contract-vfs-write-fsync-read-v1",
+      "file": "request-contract-vfs-write-fsync-read-v1_read-completion.bin",
+      "record": "tide-completion-v1",
+      "operation": "read",
+      "encoded_length": 96,
+      "sha256": "2040af73bb53403362f794663b0a6ce467951422e1676f43d22baf3661c7289a",
+      "runtime_evidence": false,
+      "description": "Contract/codec-only v1 VFS read completion vector for write-fsync-read shape evidence; not mounted runtime evidence.",
+      "reserved_zero_fields": [
+        "completion_header:10..12",
+        "completion_tail:88..96"
+      ],
+      "canonical_field_values": {
+        "operation": "read",
+        "runtime_evidence": false,
+        "request_id_hex": "5245512d5746522d5245414400000004",
+        "trace_id_hex": "524354524143452d5746522d30353238",
+        "epoch": 528004,
+        "record": "tide-completion-v1",
+        "status": "Success",
+        "status_tag": 0,
+        "disposition": "Final",
+        "disposition_tag": 0,
+        "errno": "SUCCESS",
+        "errno_raw": 0,
+        "completed_bytes": 4096,
+        "result_words": [
+          4096,
+          0,
+          0
+        ],
+        "result_flags": 0
+      }
+    }
+  }
+}
