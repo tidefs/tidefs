@@ -283,7 +283,7 @@ proptest! {
             size: payload.len() as u64,
             data_version,
             metadata_version: data_version,
-            posix_time: crate::types::PosixTimeRecord::synthetic(data_version as i64),
+            posix_time: crate::types::PosixTimeRecord::synthetic(1_i64),
             xattrs: Default::default(),
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
