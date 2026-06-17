@@ -1442,8 +1442,8 @@ pub(crate) fn replay_entry(
                     data_version: tick,
                     len: chunk_len,
                     checksum,
-                                placement_receipt_generation: 0,
-});
+                    placement_receipt_generation: 0,
+                });
             }
 
             let encoded_manifest = encode_content_manifest(&manifest);
@@ -1671,8 +1671,8 @@ impl ReplayBatcher {
                     data_version: tick,
                     len: chunk_len,
                     checksum,
-                                placement_receipt_generation: 0,
-});
+                    placement_receipt_generation: 0,
+                });
             }
 
             let encoded_manifest = encode_content_manifest(&manifest);
