@@ -1456,7 +1456,7 @@ pub struct LocalFileSystem {
     /// Deferred rewrite extent trims: (old_key, new_key) pairs where the
     /// old extent should be reclaimed once the replacement receipt is
     /// durable.  Processed by [`process_deferred_rewrite_trims`].
-    deferred_rewrite_trims: Vec<(tidefs_local_object_store::ObjectKey, tidefs_local_object_store::ObjectKey)>,
+    deferred_rewrite_trims: Vec<(ObjectKey, ObjectKey)>,
     total_reclaim_drains: u64,
     total_reclaim_entries_drained: u64,
     page_cache: RefCell<PageCache>,
@@ -1501,6 +1501,12 @@ pub struct LocalFileSystem {
     cleanup_engine: Option<CleanupEngine<Box<dyn JobExecutor + Send>>>,
     /// Current placement epoch for send/receive stream attribution.
     placement_epoch: Option<u64>,
+}
+
+#[derive(Default)]
+struct RewriteTrimPlan {
+    trimmable: Vec<ObjectKey>,
+    deferred: Vec<(ObjectKey, ObjectKey)>,
 }
 
 /// Configuration for authenticated filesystem open paths.
@@ -3889,26 +3895,28 @@ impl LocalFileSystem {
 
         ReclaimDrainStats { entries_drained }
     }
-    /// Record deferred extent trim pairs for a successful content rewrite.
+    /// Build a deferred extent trim plan for a content rewrite.
     ///
     /// For chunked layouts, compares old and new manifests to identify
-    /// replaced chunks and records (old_key, new_key) pairs that defer
+    /// replaced chunks and returns (old_key, new_key) pairs that defer
     /// reclaim until the replacement receipt is durable.  Retained chunks
-    /// are excluded; chunks past the new file size are queued directly for
+    /// are excluded; chunks past the new file size are returned directly for
     /// reclaim (no replacement to gate on).
     ///
-    /// For inline layouts, records (old_key, new_key) for the single
+    /// For inline layouts, returns (old_key, new_key) for the single
     /// content object.
-    fn record_deferred_rewrite_trims_for_layout(
-        &mut self,
+    fn rewrite_trim_plan_for_layout(
+        &self,
         inode_id: InodeId,
         old_layout: &ContentLayout,
         new_record: &InodeRecord,
-    ) -> Result<()> {
+    ) -> Result<RewriteTrimPlan> {
+        let mut plan = RewriteTrimPlan::default();
         match old_layout {
             ContentLayout::Chunked(ref old_manifest) => {
                 let new_layout = read_content_layout_from_store(
-                    self.store.raw_primary_store(), inode_id,
+                    self.store.raw_primary_store(),
+                    inode_id,
                     new_record,
                     false,
                 )?;
@@ -3921,11 +3929,8 @@ impl LocalFileSystem {
                             &new_manifest.chunks,
                             new_manifest.data_version,
                         );
-                    crate::allocation::queue_extent_keys_for_reclaim(
-                        &self.reclaim_queue,
-                        &trimmable,
-                    );
-                    self.deferred_rewrite_trims.extend(deferred);
+                    plan.trimmable = trimmable;
+                    plan.deferred = deferred;
                 }
             }
             ContentLayout::Inline(ref old_inline) => {
@@ -3936,16 +3941,17 @@ impl LocalFileSystem {
                         old_inline.data_version,
                         new_record.data_version,
                     );
-                crate::allocation::queue_extent_keys_for_reclaim(
-                    &self.reclaim_queue,
-                    &trimmable,
-                );
-                self.deferred_rewrite_trims.extend(deferred);
+                plan.trimmable = trimmable;
+                plan.deferred = deferred;
             }
         }
-        Ok(())
+        Ok(plan)
     }
 
+    fn apply_rewrite_trim_plan(&mut self, plan: RewriteTrimPlan) {
+        crate::allocation::queue_extent_keys_for_reclaim(&self.reclaim_queue, &plan.trimmable);
+        self.deferred_rewrite_trims.extend(plan.deferred);
+    }
 
     /// Process deferred rewrite extent trims, promoting old extent keys
     ///
@@ -3974,10 +3980,7 @@ impl LocalFileSystem {
         }
 
         if !promoted.is_empty() {
-            crate::allocation::queue_extent_keys_for_reclaim(
-                &self.reclaim_queue,
-                &promoted,
-            );
+            crate::allocation::queue_extent_keys_for_reclaim(&self.reclaim_queue, &promoted);
         }
 
         self.deferred_rewrite_trims = remaining;
@@ -9208,16 +9211,26 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
-        // Record deferred extent trims for old content objects replaced by
+        // Build deferred extent trims for old content objects replaced by
         // this write.  Each (old_key, new_key) pair defers reclaim of the
-        // old object until the replacement receipt is durable.
+        // old object until the replacement receipt is durable.  The plan is
+        // applied only after commit_mutation succeeds so rollback paths do
+        // not leave stale reclaim work for still-live extents.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
+        let rewrite_trim_plan = match read_content_layout_from_store(
+            self.store.raw_primary_store(),
+            inode_id,
+            &old_record,
+            true,
+        )
+        .and_then(|old_layout| self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record))
         {
-            let old_layout = read_content_layout_from_store(
-                self.store.raw_primary_store(), inode_id, &old_record, true)?;
-            self.record_deferred_rewrite_trims_for_layout(
-                inode_id, &old_layout, &record)?;
-        }
+            Ok(plan) => plan,
+            Err(err) => {
+                self.rollback_mutation_delta();
+                return Err(err);
+            }
+        };
 
         // Release old claims and register new allocation claim per Rule 8
         // (space-as-claimed-capital: every allocation is an obligation)
@@ -9258,7 +9271,9 @@ impl LocalFileSystem {
         self.inode_cache.borrow_mut().invalidate(inode_id);
         self.mark_inode_content_dirty(inode_id);
         self.invalidate_hot_read_cache_for_inode(inode_id);
-        self.commit_mutation(record)
+        let committed = self.commit_mutation(record)?;
+        self.apply_rewrite_trim_plan(rewrite_trim_plan);
+        Ok(committed)
     }
 
     fn rewrite_content_with_overlay(
@@ -9328,16 +9343,26 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
-        // Record deferred extent trims for old content objects replaced by
+        // Build deferred extent trims for old content objects replaced by
         // this overlay write.  Each (old_key, new_key) pair defers reclaim
-        // of the old object until the replacement receipt is durable.
+        // of the old object until the replacement receipt is durable.  The
+        // plan is applied only after commit_mutation succeeds so rollback
+        // paths do not leave stale reclaim work for still-live extents.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
+        let rewrite_trim_plan = match read_content_layout_from_store(
+            self.store.raw_primary_store(),
+            inode_id,
+            &old_record,
+            true,
+        )
+        .and_then(|old_layout| self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record))
         {
-            let old_layout = read_content_layout_from_store(
-                self.store.raw_primary_store(), inode_id, &old_record, true)?;
-            self.record_deferred_rewrite_trims_for_layout(
-                inode_id, &old_layout, &record)?;
-        }
+            Ok(plan) => plan,
+            Err(err) => {
+                self.rollback_mutation_delta();
+                return Err(err);
+            }
+        };
 
         if dirty_allocation_bytes > 0 {
             self.dirty_set
@@ -9384,7 +9409,9 @@ impl LocalFileSystem {
         self.inode_cache.borrow_mut().invalidate(inode_id);
         self.mark_inode_content_dirty(inode_id);
         self.invalidate_hot_read_cache_for_inode(inode_id);
-        self.commit_mutation(record)
+        let committed = self.commit_mutation(record)?;
+        self.apply_rewrite_trim_plan(rewrite_trim_plan);
+        Ok(committed)
     }
 
     fn commit_mutation<T>(&mut self, value: T) -> Result<T> {
