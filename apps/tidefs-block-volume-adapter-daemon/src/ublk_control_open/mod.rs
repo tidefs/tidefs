@@ -76,6 +76,7 @@ mod readonly_probe;
 mod resize_smoke;
 mod set_params;
 mod start_dev;
+mod started_export_admission;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
@@ -154,6 +155,8 @@ pub struct UblkDataQueueIoLoopReport {
     pub(crate) barrier_audit_failed_count: u64,
     /// Total barrier audit entries across all workers.
     pub(crate) barrier_audit_total_entries: u64,
+    pub(crate) started_export_admission_artifact_path: Option<PathBuf>,
+    pub(crate) started_export_admission_artifact_written: bool,
 }
 
 impl UblkDataQueueIoLoopReport {
@@ -226,6 +229,13 @@ impl UblkDataQueueIoLoopReport {
         if let Some(ref s) = self.data_queue_open_error_str {
             println!("data_queue_open.error={s}");
         }
+        println!(
+            "started_export_admission_artifact.written={}",
+            self.started_export_admission_artifact_written
+        );
+        if let Some(path) = &self.started_export_admission_artifact_path {
+            println!("started_export_admission_artifact.path={}", path.display());
+        }
     }
 }
 
@@ -251,6 +261,8 @@ pub(crate) use data_queue_open::evaluate_ublk_data_queue_open_boundary;
 pub(crate) use fetch_req_submission::evaluate_ublk_data_queue_fetch_req_submission_boundary;
 
 pub(crate) use commit_and_fetch::evaluate_ublk_data_queue_commit_and_fetch_boundary;
+
+pub(crate) use started_export_admission::UblkStartedExportAdmissionArtifact;
 
 pub use acceptance_harness::run_ublk_acceptance_harness;
 pub use add_del_dev::run_ublk_control_add_del_dev_boundary;

@@ -770,6 +770,41 @@ fn main() {
                 }
             }
         }
+        Some("validate-ublk-started-export-admission-artifact") => {
+            let artifact_path = match args.next() {
+                Some(path) => path,
+                None => {
+                    eprintln!(
+                        "validate-ublk-started-export-admission-artifact requires an artifact path"
+                    );
+                    process::exit(2);
+                }
+            };
+            if let Some(extra) = args.next() {
+                eprintln!(
+                    "validate-ublk-started-export-admission-artifact accepts one path, got extra argument `{extra}`"
+                );
+                process::exit(2);
+            }
+            match tidefs_validation::ublk_started_export_admission_artifact::validate_ublk_started_export_admission_artifact_path(
+                &artifact_path,
+            ) {
+                Ok(summary) => {
+                    println!(
+                        "ublk started-export admission artifact validated: claim_state={} start_dev_succeeded={} first_request_serviced={} bounded_no_request_observed={} cleanup_succeeded={}",
+                        summary.claim_state,
+                        summary.start_dev_succeeded,
+                        summary.first_request_serviced,
+                        summary.bounded_no_request_observed,
+                        summary.cleanup_succeeded
+                    );
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    process::exit(1);
+                }
+            }
+        }
         Some("check-no-hidden-queues") => {
             if let Err(err) = no_hidden_queues::check_current_workspace() {
                 eprintln!("{err}");
@@ -1996,6 +2031,9 @@ fn print_help() {
     println!("  validate-claim <id>     validate a registered claim evidence set");
     println!(
         "  validate-ublk-completion-artifact <path> validate qid/tag runtime completion evidence"
+    );
+    println!(
+        "  validate-ublk-started-export-admission-artifact <path> validate started uBLK export admission evidence"
     );
     println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
     println!("  check-claim-gate        validate current worktree has a valid issue owner");

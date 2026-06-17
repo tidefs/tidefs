@@ -177,6 +177,36 @@ fn run_ublk_data_queue_io_loop_impl(
     let mut set_params_errno: Option<i32> = None;
     let mut data_queue_open_errno: Option<i32> = None;
     let mut data_queue_open_error_str: Option<String> = None;
+    let mut feature_probe_attempted = false;
+    let mut feature_probe_completed = false;
+    let mut feature_mask = None;
+    let mut required_features_available = false;
+    let mut add_dev_attempted = false;
+    let mut add_dev_completed = false;
+    let mut add_dev_dev_id = None;
+    let mut set_params_attempted = false;
+    let mut set_params_completed = false;
+    let mut set_params_block_size_bytes = None;
+    let mut set_params_block_count = None;
+    let mut set_params_dev_sectors = None;
+    let mut data_queue_open_attempted = false;
+    let mut data_queue_opened = false;
+    let mut data_queue_path_for_artifact = None;
+    let mut data_queue_runtime_live_at_start = false;
+    let mut fetch_req_submission_attempted = false;
+    let mut fetch_req_submission_completed = false;
+    let mut fetch_req_required_commands = 0;
+    let mut fetch_req_submitted_commands = 0;
+    let mut fetch_req_first_qid = None;
+    let mut fetch_req_first_tag = None;
+    let mut fetch_req_last_qid = None;
+    let mut fetch_req_last_tag = None;
+    let mut start_dev_uring_cmd_attempted = false;
+    let mut start_dev_refusal_class = Some("host_not_admitted".to_string());
+    let mut start_dev_errno = None;
+    let mut stop_dev_attempted = false;
+    let mut del_dev_attempted = false;
+    let mut del_dev_errno = None;
 
     // ── Device ID tracking: supports reconnect to existing devices ──
     let mut resolved_dev_id: Option<u32> = None;
@@ -211,12 +241,27 @@ fn run_ublk_data_queue_io_loop_impl(
         match open_control_device_file(&inputs.control_path) {
             Ok(control_device) => {
                 inputs.control_open_result = Some(Ok(()));
+                feature_probe_attempted = true;
                 let current_probe_result = issue_get_features(control_device.as_fd());
+                match &current_probe_result {
+                    Ok(outcome) => {
+                        feature_probe_completed = true;
+                        feature_mask = Some(outcome.features.bits());
+                        required_features_available = outcome
+                            .features
+                            .contains(TIDEFS_UBLK_ADD_DEV_REQUIRED_FEATURES);
+                    }
+                    Err(error) => {
+                        io_loop_failure_class = UblkDataQueueIoLoopFailureClass::FeatureProbeFailed;
+                        start_dev_refusal_class = Some(error.as_str().to_string());
+                    }
+                }
                 if current_probe_result.as_ref().is_ok_and(|outcome| {
                     outcome
                         .features
                         .contains(TIDEFS_UBLK_ADD_DEV_REQUIRED_FEATURES)
                 }) {
+                    add_dev_attempted = !from_reconnect;
                     let current_add_dev_result = if from_reconnect {
                         // Already have dev_id from reconnect, skip ADD_DEV
                         Ok(tidefs_block_volume_adapter_ublk_control_runtime::UblkControlAddDevOutcome::from_dev_info(
@@ -232,20 +277,30 @@ fn run_ublk_data_queue_io_loop_impl(
                         issue_add_dev(control_device.as_fd(), add_dev_input)
                     };
                     if let Ok(add_outcome) = &current_add_dev_result {
+                        add_dev_completed = true;
+                        add_dev_dev_id = Some(add_outcome.dev_info.dev_id);
                         ublk_device_pair_created = true;
+                        let geometry = backend.geometry();
                         if let Ok(parameter_report) = build_ublk_parameter_spec_report_with_geometry(
-                            backend.geometry(),
+                            geometry,
                             nr_hw_queues,
                             queue_depth,
                         ) {
+                            set_params_block_size_bytes =
+                                u64::try_from(geometry.block_size_bytes).ok();
+                            set_params_block_count = u64::try_from(geometry.block_count).ok();
+                            set_params_dev_sectors =
+                                Some(parameter_report.params.basic.dev_sectors);
                             let set_params_input =
                                 UblkControlSetParamsInput::from_kernel_dev_id_and_params(
                                     add_outcome.dev_info.dev_id,
                                     parameter_report.params,
                                 );
+                            set_params_attempted = true;
                             let set_params_result =
                                 issue_set_params(control_device.as_fd(), set_params_input);
                             if set_params_result.is_ok() {
+                                set_params_completed = true;
                                 // Open data queue runtime
                                 let data_queue_input =
                                     UblkDataQueueRuntimeOpenInput::from_kernel_dev_id(
@@ -256,15 +311,39 @@ fn run_ublk_data_queue_io_loop_impl(
                                     );
                                 let data_queue_path =
                                     ublk_data_queue_device_path(data_queue_input.dev_id);
+                                data_queue_open_attempted = true;
+                                data_queue_path_for_artifact = Some(data_queue_path.clone());
                                 let data_queue_open_result =
                                     open_data_queue_runtime(&data_queue_path, data_queue_input);
                                 if let Ok(mut data_queue_runtime) = data_queue_open_result {
+                                    data_queue_opened = true;
                                     // Submit FETCH_REQs
-                                    if let Ok(fetch_outcome) =
+                                    fetch_req_submission_attempted = true;
+                                    fetch_req_required_commands =
+                                        u32::from(add_dev_input.nr_hw_queues)
+                                            * u32::from(add_dev_input.queue_depth);
+                                    let fetch_submission_result =
                                         submit_runtime_all_queues_fetch_reqs_without_wait(
                                             &mut data_queue_runtime,
-                                        )
-                                    {
+                                        );
+                                    if let Ok(fetch_outcome) = &fetch_submission_result {
+                                        fetch_req_submission_completed = true;
+                                        fetch_req_required_commands =
+                                            fetch_outcome.all_queues_required_fetch_commands;
+                                        fetch_req_submitted_commands =
+                                            fetch_outcome.submitted_fetch_commands;
+                                        data_queue_runtime_live_at_start =
+                                            fetch_outcome.data_queue_runtime_live;
+                                        if fetch_outcome.submitted_fetch_commands
+                                            >= fetch_outcome.all_queues_required_fetch_commands
+                                            && fetch_outcome.all_queues_required_fetch_commands > 0
+                                        {
+                                            fetch_req_first_qid = Some(0);
+                                            fetch_req_last_qid =
+                                                Some(add_dev_input.nr_hw_queues - 1);
+                                            fetch_req_first_tag = fetch_outcome.first_submitted_tag;
+                                            fetch_req_last_tag = fetch_outcome.last_submitted_tag;
+                                        }
                                         for qid in 0..add_dev_input.nr_hw_queues {
                                             for tag in 0..add_dev_input.queue_depth {
                                                 completion_trace.record_fetch_submitted(qid, tag);
@@ -280,6 +359,7 @@ fn run_ublk_data_queue_io_loop_impl(
                                                     add_outcome.dev_info.dev_id,
                                                     daemon_pid,
                                                 );
+                                            start_dev_uring_cmd_attempted = true;
                                             let sd_result = if from_reconnect {
                                                 let end_input = tidefs_block_volume_adapter_ublk_control_runtime::UblkControlEndUserRecoveryInput::from_kernel_dev_id(resolved_dev_id.unwrap_or(0));
                                                 match tidefs_block_volume_adapter_ublk_control_runtime::issue_end_user_recovery(control_device.as_fd(), end_input) {
@@ -301,6 +381,7 @@ fn run_ublk_data_queue_io_loop_impl(
                                             };
                                             if sd_result.is_ok() {
                                                 start_dev_uring_cmd_completed = true;
+                                                start_dev_refusal_class = None;
                                                 io_loop_failure_class =
                                                     UblkDataQueueIoLoopFailureClass::None;
                                                 // Live I/O loop: process CQEs and
@@ -351,7 +432,7 @@ fn run_ublk_data_queue_io_loop_impl(
                                                     }
                                                     iteration += 1;
                                                     io_loop_completed_iterations =
-                                                        u64::from(iteration) + 1;
+                                                        u64::from(iteration);
                                                     match submit_data_queue_and_wait(
                                                         &mut data_queue_runtime,
                                                         shutdown
@@ -908,14 +989,27 @@ fn run_ublk_data_queue_io_loop_impl(
                                                     }
                                                 }
                                             } else {
+                                                if let Err(error) = sd_result {
+                                                    start_dev_refusal_class =
+                                                        Some(error.as_str().to_string());
+                                                    start_dev_errno = error.errno();
+                                                }
                                                 io_loop_failure_class =
                                                     UblkDataQueueIoLoopFailureClass::StartDevFailed;
                                             }
                                         } else {
+                                            start_dev_refusal_class =
+                                                Some("data_queue_fetches_not_ready".to_string());
                                             io_loop_failure_class =
                                                 UblkDataQueueIoLoopFailureClass::StartDevFailed;
                                         }
                                     } else {
+                                        if let Err(error) = fetch_submission_result {
+                                            fetch_req_submitted_commands =
+                                                error.submitted_fetch_commands();
+                                            start_dev_refusal_class =
+                                                Some(error.as_str().to_string());
+                                        }
                                         io_loop_failure_class =
                                             UblkDataQueueIoLoopFailureClass::FetchReqSubmissionFailed;
                                     }
@@ -925,6 +1019,7 @@ fn run_ublk_data_queue_io_loop_impl(
                                     if let Err(ref e) = data_queue_open_result {
                                         data_queue_open_errno = e.errno();
                                         data_queue_open_error_str = Some(e.as_str().to_string());
+                                        start_dev_refusal_class = Some(e.as_str().to_string());
                                     }
                                 }
                             } else {
@@ -932,17 +1027,20 @@ fn run_ublk_data_queue_io_loop_impl(
                                     UblkDataQueueIoLoopFailureClass::SetParamsFailed;
                                 if let Err(ref e) = set_params_result {
                                     set_params_errno = e.errno();
+                                    start_dev_refusal_class = Some(e.as_str().to_string());
                                 }
                             }
                         } else {
                             io_loop_failure_class =
                                 UblkDataQueueIoLoopFailureClass::ParameterBuildFailed;
+                            start_dev_refusal_class = Some("parameter_build_failed".to_string());
                         }
 
                         // Cleanup: STOP_DEV then DEL_DEV after I/O loop or on error
                         let stop_input = UblkControlStopDevInput::from_kernel_dev_id(
                             add_outcome.dev_info.dev_id,
                         );
+                        stop_dev_attempted = true;
                         match issue_stop_dev(control_device.as_fd(), stop_input) {
                             Ok(_outcome) => {
                                 stop_dev_uring_cmd_completed = true;
@@ -960,19 +1058,26 @@ fn run_ublk_data_queue_io_loop_impl(
                         }
                         let del_input =
                             UblkControlDelDevInput::from_kernel_dev_id(add_outcome.dev_info.dev_id);
+                        del_dev_attempted = true;
                         let del_result = issue_del_dev(control_device.as_fd(), del_input);
                         ublk_device_pair_deleted = del_result.is_ok();
+                        if let Err(error) = del_result {
+                            del_dev_errno = error.errno();
+                        }
+                    } else if let Err(error) = &current_add_dev_result {
+                        io_loop_failure_class = UblkDataQueueIoLoopFailureClass::AddDevFailed;
+                        start_dev_refusal_class = Some(error.as_str().to_string());
                     }
-                } else {
+                } else if current_probe_result.is_ok() {
                     io_loop_failure_class =
                         UblkDataQueueIoLoopFailureClass::RequiredFeaturesMissing;
+                    start_dev_refusal_class = Some("required_features_missing".to_string());
                 }
             }
-            Err(_) => {
-                inputs.control_open_result = Some(Err(UblkControlOpenErrorClass::from_io_error(
-                    io::Error::from(io::ErrorKind::Other),
-                )));
+            Err(error_class) => {
+                inputs.control_open_result = Some(Err(error_class));
                 io_loop_failure_class = UblkDataQueueIoLoopFailureClass::ControlOpenFailed;
+                start_dev_refusal_class = Some("control_open_failed".to_string());
             }
         }
     }
@@ -981,6 +1086,118 @@ fn run_ublk_data_queue_io_loop_impl(
     completion_trace.write_if_enabled().map_err(|error| {
         AppError::new(format!("write ublk completion runtime artifact: {error}"))
     })?;
+    let open_report = evaluate_ublk_control_open_preflight(&inputs);
+    let fetch_req_all_queue_tag_slots_covered = fetch_req_submission_completed
+        && fetch_req_required_commands > 0
+        && fetch_req_submitted_commands == fetch_req_required_commands
+        && fetch_req_required_commands
+            == u32::from(add_dev_input.nr_hw_queues) * u32::from(add_dev_input.queue_depth)
+        && fetch_req_first_qid == Some(0)
+        && fetch_req_first_tag == Some(0)
+        && fetch_req_last_qid == Some(add_dev_input.nr_hw_queues.saturating_sub(1))
+        && fetch_req_last_tag == Some(add_dev_input.queue_depth.saturating_sub(1))
+        && data_queue_runtime_live_at_start;
+    let first_request_serviced = io_loop_commit_and_fetch_submitted > 0;
+    let bounded_no_request_observed = start_dev_uring_cmd_completed
+        && io_loop_attempted
+        && max_iterations.is_some()
+        && io_loop_commit_and_fetch_submitted == 0
+        && io_loop_errno.is_none();
+    let first_request_observation = if first_request_serviced {
+        "serviced_request"
+    } else if bounded_no_request_observed {
+        "bounded_no_request"
+    } else if start_dev_uring_cmd_completed {
+        "no_request_observation_missing"
+    } else if start_dev_uring_cmd_attempted {
+        "refused"
+    } else {
+        "not_started"
+    }
+    .to_string();
+    let start_dev_state = if start_dev_uring_cmd_completed {
+        "succeeded"
+    } else if start_dev_uring_cmd_attempted {
+        "refused"
+    } else {
+        "not_attempted"
+    }
+    .to_string();
+    let started_export_admission_artifact = UblkStartedExportAdmissionArtifact {
+        nr_hw_queues: add_dev_input.nr_hw_queues,
+        queue_depth: add_dev_input.queue_depth,
+        kernel_release: open_report.kernel_release,
+        host_preflight_admitted: open_report.admission_class
+            != UblkControlOpenAdmissionClass::Refused,
+        control_open_attempted: open_report.control_open_attempted,
+        control_opened: open_report.control_opened,
+        control_open_error_class: open_report
+            .control_open_error_class
+            .map(|error_class| error_class.as_str().to_string()),
+        feature_probe_attempted,
+        feature_probe_completed,
+        feature_mask,
+        required_features_available,
+        add_dev_attempted,
+        add_dev_completed,
+        add_dev_dev_id,
+        set_params_attempted,
+        set_params_completed,
+        set_params_block_size_bytes,
+        set_params_block_count,
+        set_params_dev_sectors,
+        set_params_errno,
+        data_queue_open_attempted,
+        data_queue_opened,
+        data_queue_path: data_queue_path_for_artifact,
+        data_queue_runtime_live_at_start,
+        data_queue_open_errno,
+        fetch_req_submission_attempted,
+        fetch_req_submission_completed,
+        fetch_req_required_commands,
+        fetch_req_submitted_commands,
+        fetch_req_all_queue_tag_slots_covered,
+        fetch_req_first_qid,
+        fetch_req_first_tag,
+        fetch_req_last_qid,
+        fetch_req_last_tag,
+        start_dev_attempted: start_dev_uring_cmd_attempted,
+        start_dev_succeeded: start_dev_uring_cmd_completed,
+        start_dev_state,
+        start_dev_refusal_class,
+        start_dev_errno,
+        service_loop_owned: start_dev_uring_cmd_completed
+            && data_queue_runtime_live_at_start
+            && fetch_req_all_queue_tag_slots_covered,
+        service_loop_attempted: io_loop_attempted,
+        service_loop_completed_iterations: io_loop_completed_iterations,
+        service_loop_cqes_processed: io_loop_cqes_processed,
+        first_request_observation,
+        first_request_serviced,
+        bounded_no_request_observed,
+        commit_and_fetch_submitted: io_loop_commit_and_fetch_submitted,
+        shutdown_graceful,
+        drain_cqes_processed,
+        drain_iterations,
+        drain_timed_out,
+        drain_hung_io_count,
+        final_flush_completed,
+        stop_dev_attempted,
+        stop_dev_succeeded: stop_dev_uring_cmd_completed,
+        del_dev_attempted,
+        del_dev_succeeded: ublk_device_pair_deleted,
+        del_dev_errno,
+        ..UblkStartedExportAdmissionArtifact::default()
+    };
+    let started_export_admission_artifact_path = started_export_admission_artifact
+        .write_if_enabled()
+        .map_err(|error| {
+            AppError::new(format!(
+                "write ublk started-export admission runtime artifact: {error}"
+            ))
+        })?;
+    let started_export_admission_artifact_written =
+        started_export_admission_artifact_path.is_some();
 
     Ok(UblkDataQueueIoLoopReport {
         start_dev_uring_cmd_completed,
@@ -1014,6 +1231,8 @@ fn run_ublk_data_queue_io_loop_impl(
         barrier_audit_fua_write_count,
         barrier_audit_failed_count,
         barrier_audit_total_entries,
+        started_export_admission_artifact_path,
+        started_export_admission_artifact_written,
     })
 }
 
@@ -1158,6 +1377,8 @@ mod tests {
             barrier_audit_fua_write_count: 0,
             barrier_audit_failed_count: 0,
             barrier_audit_total_entries: 0,
+            started_export_admission_artifact_path: None,
+            started_export_admission_artifact_written: false,
         };
         assert!(!report.shutdown_graceful);
         assert!(!report.drain_timed_out);
@@ -1198,6 +1419,8 @@ mod tests {
             barrier_audit_fua_write_count: 0,
             barrier_audit_failed_count: 0,
             barrier_audit_total_entries: 0,
+            started_export_admission_artifact_path: None,
+            started_export_admission_artifact_written: false,
         };
         assert!(report.shutdown_graceful);
         assert_eq!(report.drain_cqes_processed, 4);
@@ -1240,6 +1463,8 @@ mod tests {
             barrier_audit_fua_write_count: 0,
             barrier_audit_failed_count: 0,
             barrier_audit_total_entries: 0,
+            started_export_admission_artifact_path: None,
+            started_export_admission_artifact_written: false,
         };
         assert!(report.shutdown_graceful);
         assert!(report.drain_timed_out);

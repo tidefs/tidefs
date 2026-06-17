@@ -97,7 +97,9 @@ USAGE
     QEMU_OUT="$VALIDATION_DIR/qemu-stdout.log"
     QEMU_ERR="$VALIDATION_DIR/qemu-stderr.log"
     HOST_ARTIFACT="$VALIDATION_DIR/qid-tag-completion-runtime.json"
+    HOST_STARTED_EXPORT_ARTIFACT="$VALIDATION_DIR/started-export-admission-runtime.json"
     VERIFY_LOG="$VALIDATION_DIR/ublk-completion-verify.log"
+    STARTED_EXPORT_VERIFY_LOG="$VALIDATION_DIR/ublk-started-export-admission-verify.log"
     SUMMARY_JSON="$VALIDATION_DIR/qemu-ublk-completion.json"
 
     mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,etc,run/tidefs/import}
@@ -226,6 +228,7 @@ if [ ! -e /dev/ublk-control ]; then
 fi
 
 COMPLETION_ARTIFACT=/tmp/validation/ublk/qid-tag-completion-runtime.json
+STARTED_EXPORT_ARTIFACT=/tmp/validation/ublk/started-export-admission-runtime.json
 BACKING_FILE=/tmp/tidefs-ublk-completion.img
 DAEMON_LOG=/tmp/tidefs-ublk-daemon.log
 
@@ -234,6 +237,7 @@ rm -f "$BACKING_FILE"
 echo "--- Start ublk daemon ---"
 TIDEFS_UBLK_COMPLETION_ARTIFACT="$COMPLETION_ARTIFACT" \
 TIDEFS_UBLK_COMPLETION_ARTIFACT_MAX_COMPLETIONS=64 \
+TIDEFS_UBLK_STARTED_EXPORT_ARTIFACT="$STARTED_EXPORT_ARTIFACT" \
   tidefs-block-volume-adapter-daemon ublk-serve \
     --backing-file "$BACKING_FILE" \
     --create \
@@ -316,11 +320,21 @@ if [ ! -s "$COMPLETION_ARTIFACT" ]; then
     cat "$DAEMON_LOG" 2>&1 || true
     poweroff -f
 fi
+if [ ! -s "$STARTED_EXPORT_ARTIFACT" ]; then
+    echo "FAIL: started-export admission artifact missing"
+    echo "--- daemon log ---"
+    cat "$DAEMON_LOG" 2>&1 || true
+    poweroff -f
+fi
 
 echo "=== BEGIN UBLK COMPLETION ARTIFACT JSON ==="
 cat "$COMPLETION_ARTIFACT"
 echo "=== END UBLK COMPLETION ARTIFACT JSON ==="
 echo "PASS: completion artifact emitted"
+echo "=== BEGIN UBLK STARTED EXPORT ADMISSION ARTIFACT JSON ==="
+cat "$STARTED_EXPORT_ARTIFACT"
+echo "=== END UBLK STARTED EXPORT ADMISSION ARTIFACT JSON ==="
+echo "PASS: started-export admission artifact emitted"
 sync
 poweroff -f
 INITSCRIPT
@@ -358,6 +372,11 @@ INITSCRIPT
       /END UBLK COMPLETION ARTIFACT JSON/ { in_json = 0; next }
       in_json { print }
     ' "$QEMU_OUT" > "$HOST_ARTIFACT"
+    awk '
+      /BEGIN UBLK STARTED EXPORT ADMISSION ARTIFACT JSON/ { in_json = 1; next }
+      /END UBLK STARTED EXPORT ADMISSION ARTIFACT JSON/ { in_json = 0; next }
+      in_json { print }
+    ' "$QEMU_OUT" > "$HOST_STARTED_EXPORT_ARTIFACT"
 
     if [ "$QEMU_EXIT" -ne 0 ]; then
       echo "FAIL: QEMU exited with $QEMU_EXIT" >&2
@@ -367,25 +386,40 @@ INITSCRIPT
       echo "FAIL: no completion artifact was extracted from QEMU output" >&2
       exit 1
     fi
+    if [ ! -s "$HOST_STARTED_EXPORT_ARTIFACT" ]; then
+      echo "FAIL: no started-export admission artifact was extracted from QEMU output" >&2
+      exit 1
+    fi
 
     if "$XTASK" validate-ublk-completion-artifact "$HOST_ARTIFACT" > "$VERIFY_LOG" 2>&1; then
       cat "$VERIFY_LOG"
-      cat > "$SUMMARY_JSON" <<SUMMARY
-{
-  "test": "qemu-ublk-completion-artifact",
-  "version": 1,
-  "validation_tier": "Tier 3 QEMU guest ublk/block-volume runtime",
-  "qemu_exit_code": $QEMU_EXIT,
-  "artifact": "$HOST_ARTIFACT",
-  "verifier": "pass"
-}
-SUMMARY
-      echo "SUMMARY: qemu-ublk-completion-artifact PASS"
-      echo "artifact=$HOST_ARTIFACT"
-      echo "validation_dir=$VALIDATION_DIR"
     else
       cat "$VERIFY_LOG" >&2 || true
       echo "FAIL: completion artifact verifier rejected $HOST_ARTIFACT" >&2
+      exit 1
+    fi
+
+    if "$XTASK" validate-ublk-started-export-admission-artifact "$HOST_STARTED_EXPORT_ARTIFACT" > "$STARTED_EXPORT_VERIFY_LOG" 2>&1; then
+      cat "$STARTED_EXPORT_VERIFY_LOG"
+      cat > "$SUMMARY_JSON" <<SUMMARY
+{
+  "test": "qemu-ublk-completion-artifact",
+  "version": 2,
+  "validation_tier": "Tier 3 QEMU guest ublk/block-volume runtime",
+  "qemu_exit_code": $QEMU_EXIT,
+  "completion_artifact": "$HOST_ARTIFACT",
+  "started_export_admission_artifact": "$HOST_STARTED_EXPORT_ARTIFACT",
+  "completion_verifier": "pass",
+  "started_export_admission_verifier": "pass"
+}
+SUMMARY
+      echo "SUMMARY: qemu-ublk-completion-artifact PASS"
+      echo "completion_artifact=$HOST_ARTIFACT"
+      echo "started_export_admission_artifact=$HOST_STARTED_EXPORT_ARTIFACT"
+      echo "validation_dir=$VALIDATION_DIR"
+    else
+      cat "$STARTED_EXPORT_VERIFY_LOG" >&2 || true
+      echo "FAIL: started-export admission artifact verifier rejected $HOST_STARTED_EXPORT_ARTIFACT" >&2
       exit 1
     fi
   '';
