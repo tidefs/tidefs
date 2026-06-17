@@ -150,6 +150,54 @@ impl fmt::Display for SecretHandleLifecycle {
     }
 }
 
+
+// ── Dataset mount identity ─────────────────────────────────────────────────
+
+/// A committed dataset mount identity token.
+///
+/// Binds encryption key access to a specific dataset mount instance.
+/// When a dataset is unmounted and remounted, the mount generation
+/// increments, invalidating any key handles bound to the previous
+/// mount. This prevents decryption under a stale or foreign dataset
+/// identity.
+///
+/// The token is the pair `(dataset_id, mount_generation)` where
+/// `mount_generation` is a monotonically increasing counter assigned
+/// at each mount of the dataset. A key handle bound to
+/// `DatasetMountIdentity { dataset_id: "pool/ds1", mount_generation: 5 }`
+/// cannot be used after a remount that produces generation 6.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DatasetMountIdentity {
+    /// Dataset identifier (e.g., "pool/dataset").
+    pub dataset_id: String,
+    /// Monotonic mount generation for this dataset.
+    /// Incremented on each remount; resets to 0 only on pool create.
+    pub mount_generation: u64,
+}
+
+impl DatasetMountIdentity {
+    /// Create a new mount identity for a dataset at a given generation.
+    pub fn new(dataset_id: String, mount_generation: u64) -> Self {
+        Self {
+            dataset_id,
+            mount_generation,
+        }
+    }
+
+    /// Returns true when `other` matches this identity (same dataset
+    /// and same mount generation).
+    pub fn matches(&self, other: &Self) -> bool {
+        self.dataset_id == other.dataset_id
+            && self.mount_generation == other.mount_generation
+    }
+}
+
+impl std::fmt::Display for DatasetMountIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@gen{}", self.dataset_id, self.mount_generation)
+    }
+}
+
 // ── Handle record ─────────────────────────────────────────────────────────
 
 /// Durable record for a pool encryption secret handle.
@@ -167,6 +215,10 @@ pub struct PoolEncryptionSecretHandleRecord {
     pub lifecycle: SecretHandleLifecycle,
     /// Unix timestamp (seconds) when the handle was created.
     pub created_at: u64,
+    /// Committed dataset mount identity this handle is bound to.
+    ///
+    /// When `Some`, lease issuance requires a matching mount identity.
+    pub dataset_mount_identity: Option<DatasetMountIdentity>,
     /// Unix timestamp (seconds) when lifecycle last changed.
     pub state_changed_at: u64,
     /// Key generation counter (0 = original, increments on rotation).
@@ -185,6 +237,7 @@ impl PoolEncryptionSecretHandleRecord {
         sealed_envelope_sha256: [u8; 32],
         wrapping_key_generation: u32,
         created_at: u64,
+        dataset_mount_identity: Option<DatasetMountIdentity>,
     ) -> Self {
         Self {
             handle_id,
@@ -195,6 +248,7 @@ impl PoolEncryptionSecretHandleRecord {
             key_generation: 0,
             sealed_envelope_sha256,
             wrapping_key_generation,
+            dataset_mount_identity,
         }
     }
 
@@ -230,6 +284,8 @@ impl PoolEncryptionSecretHandleRecord {
 /// runtime access flows through a short-lived lease.
 pub struct PoolEncryptionKeyLease {
     handle_id: SecretHandleId,
+    /// The dataset mount identity bound to this lease, if any.
+    dataset_mount_identity: Option<DatasetMountIdentity>,
     key: StoreKey,
     expires_at: Instant,
     usage: LeaseUsageClass,
@@ -271,6 +327,7 @@ impl PoolEncryptionKeyLease {
         handle_id: SecretHandleId,
         key: StoreKey,
         duration: Duration,
+        dataset_mount_identity: Option<DatasetMountIdentity>,
         usage: LeaseUsageClass,
     ) -> Self {
         Self {
@@ -278,6 +335,7 @@ impl PoolEncryptionKeyLease {
             key,
             expires_at: Instant::now() + duration,
             usage,
+            dataset_mount_identity,
         }
     }
 
@@ -308,6 +366,11 @@ impl PoolEncryptionKeyLease {
         } else {
             None
         }
+    }
+
+    /// The dataset mount identity this lease is bound to, if any.
+    pub fn dataset_mount_identity(&self) -> Option<&DatasetMountIdentity> {
+        self.dataset_mount_identity.as_ref()
     }
 
     /// Consume the lease and return a copy of the [`StoreKey`] if still valid.
@@ -349,6 +412,7 @@ impl PoolEncryptionSecretHandle {
     /// before issuing leases to other consumers.
     pub fn mint(
         pool_name: String,
+        dataset_mount_identity: Option<DatasetMountIdentity>,
         wrapping_key: &PoolWrappingKey,
         now: u64,
     ) -> Result<(Self, StoreKey)> {
@@ -372,7 +436,7 @@ impl PoolEncryptionSecretHandle {
         hasher.update(envelope_bytes);
         let digest: [u8; 32] = hasher.finalize().into();
 
-        let record = PoolEncryptionSecretHandleRecord::new(handle_id, pool_name, digest, 0, now);
+        let record = PoolEncryptionSecretHandleRecord::new(handle_id, pool_name, digest, 0, now, dataset_mount_identity);
 
         Ok((Self { record, envelope }, store_key))
     }
@@ -388,12 +452,31 @@ impl PoolEncryptionSecretHandle {
     /// corruption).
     pub fn issue_lease(
         &self,
+        dataset_mount_identity: Option<&DatasetMountIdentity>,
         wrapping_key: &PoolWrappingKey,
         duration: Duration,
         usage: LeaseUsageClass,
     ) -> Result<PoolEncryptionKeyLease> {
         if self.record.lifecycle.blocks_lease() {
             return Err(EncryptionError::KeyDerivationRejected);
+        }
+
+        // Gate on dataset mount identity: if the handle was minted with a
+        // mount identity binding, the caller must present a matching identity.
+        // Fail closed when the mount identity does not match.
+        match (&self.record.dataset_mount_identity, dataset_mount_identity) {
+            (Some(required), Some(presented)) => {
+                if !required.matches(presented) {
+                    return Err(EncryptionError::KeyDerivationRejected);
+                }
+            }
+            (Some(_required), None) => {
+                // Handle requires a mount identity but none was provided.
+                return Err(EncryptionError::KeyDerivationRejected);
+            }
+            (None, Some(_)) | (None, None) => {
+                // Handle has no mount identity binding; proceed.
+            }
         }
 
         let actual_duration = duration.min(MAX_LEASE_DURATION);
@@ -415,6 +498,7 @@ impl PoolEncryptionSecretHandle {
             self.record.handle_id,
             store_key,
             actual_duration,
+            self.record.dataset_mount_identity.clone(),
             usage,
         ))
     }
@@ -460,7 +544,7 @@ mod tests {
     fn mint_handle_and_issue_lease_roundtrip() {
         let wk = dummy_wrapping_key();
         let (mut handle, original_key) =
-            PoolEncryptionSecretHandle::mint("test-pool".into(), &wk, now()).unwrap();
+            PoolEncryptionSecretHandle::mint("test-pool".into(), None, &wk, now()).unwrap();
 
         assert_eq!(
             handle.record.lifecycle,
@@ -472,7 +556,7 @@ mod tests {
         assert!(handle.can_mount());
 
         let lease = handle
-            .issue_lease(&wk, Duration::from_secs(60), LeaseUsageClass::PoolMount)
+            .issue_lease(None, &wk, Duration::from_secs(60), LeaseUsageClass::PoolMount)
             .unwrap();
         assert!(lease.is_valid());
         assert_eq!(lease.key_bytes().unwrap(), original_key.as_bytes());
@@ -482,12 +566,12 @@ mod tests {
     fn revoked_handle_blocks_lease() {
         let wk = dummy_wrapping_key();
         let (mut handle, _) =
-            PoolEncryptionSecretHandle::mint("test-pool".into(), &wk, now()).unwrap();
+            PoolEncryptionSecretHandle::mint("test-pool".into(), None, &wk, now()).unwrap();
         handle.activate(now());
         handle.revoke(now());
 
         assert!(handle.record.lifecycle.blocks_lease());
-        let result = handle.issue_lease(&wk, Duration::from_secs(60), LeaseUsageClass::PoolMount);
+        let result = handle.issue_lease(None, &wk, Duration::from_secs(60), LeaseUsageClass::PoolMount);
         assert!(result.is_err());
     }
 
@@ -498,10 +582,10 @@ mod tests {
         let wk2 = PoolWrappingKey::derive("different passphrase", &salt).unwrap();
 
         let (mut handle, _) =
-            PoolEncryptionSecretHandle::mint("test-pool".into(), &wk1, now()).unwrap();
+            PoolEncryptionSecretHandle::mint("test-pool".into(), None, &wk1, now()).unwrap();
         handle.activate(now());
 
-        let result = handle.issue_lease(&wk2, Duration::from_secs(60), LeaseUsageClass::PoolMount);
+        let result = handle.issue_lease(None, &wk2, Duration::from_secs(60), LeaseUsageClass::PoolMount);
         assert!(result.is_err());
     }
 
@@ -509,11 +593,11 @@ mod tests {
     fn lease_clamped_to_max_duration() {
         let wk = dummy_wrapping_key();
         let (mut handle, _) =
-            PoolEncryptionSecretHandle::mint("test-pool".into(), &wk, now()).unwrap();
+            PoolEncryptionSecretHandle::mint("test-pool".into(), None, &wk, now()).unwrap();
         handle.activate(now());
 
         let lease = handle
-            .issue_lease(&wk, Duration::from_secs(7200), LeaseUsageClass::PoolMount)
+            .issue_lease(None, &wk, Duration::from_secs(7200), LeaseUsageClass::PoolMount)
             .unwrap();
         assert!(lease.remaining() <= MAX_LEASE_DURATION);
     }
@@ -522,11 +606,11 @@ mod tests {
     fn lease_into_key_consumes() {
         let wk = dummy_wrapping_key();
         let (mut handle, original_key) =
-            PoolEncryptionSecretHandle::mint("test-pool".into(), &wk, now()).unwrap();
+            PoolEncryptionSecretHandle::mint("test-pool".into(), None, &wk, now()).unwrap();
         handle.activate(now());
 
         let lease = handle
-            .issue_lease(&wk, Duration::from_secs(60), LeaseUsageClass::PoolMount)
+            .issue_lease(None, &wk, Duration::from_secs(60), LeaseUsageClass::PoolMount)
             .unwrap();
         let consumed = lease.into_key().unwrap();
         assert_eq!(consumed.as_bytes(), original_key.as_bytes());
@@ -557,7 +641,7 @@ mod tests {
     fn lifecycle_transitions_track_state_changed_at() {
         let wk = dummy_wrapping_key();
         let (mut handle, _) =
-            PoolEncryptionSecretHandle::mint("test-pool".into(), &wk, 1_700_000_000).unwrap();
+            PoolEncryptionSecretHandle::mint("test-pool".into(), None, &wk, 1_700_000_000).unwrap();
         assert_eq!(handle.record.state_changed_at, 1_700_000_000);
 
         handle.activate(1_700_000_100);
@@ -570,7 +654,7 @@ mod tests {
     #[test]
     fn envelope_integrity_digest_is_stable() {
         let wk = dummy_wrapping_key();
-        let (handle, _) = PoolEncryptionSecretHandle::mint("test-pool".into(), &wk, now()).unwrap();
+        let (handle, _) = PoolEncryptionSecretHandle::mint("test-pool".into(), None, &wk, now()).unwrap();
 
         // Recompute and verify
         use sha2::{Digest, Sha256};
@@ -581,4 +665,258 @@ mod tests {
 
         assert_eq!(handle.record.sealed_envelope_sha256, digest);
     }
+
+
+    // ── Mount identity binding tests ───────────────────────────────────
+
+    #[test]
+    fn mount_identity_bound_to_correct_identity() {
+        let wk = dummy_wrapping_key();
+        let mount_id = DatasetMountIdentity::new("pool/ds1".into(), 5);
+
+        let (mut handle, original_key) =
+            PoolEncryptionSecretHandle::mint(
+                "test-pool".into(),
+                Some(mount_id.clone()),
+                &wk,
+                now(),
+            )
+            .unwrap();
+
+        assert!(handle.record.dataset_mount_identity.is_some());
+        assert_eq!(
+            handle.record.dataset_mount_identity.as_ref().unwrap(),
+            &mount_id
+        );
+
+        handle.activate(now());
+
+        // Lease with correct mount identity succeeds
+        let lease = handle
+            .issue_lease(Some(&mount_id), &wk, Duration::from_secs(60), LeaseUsageClass::PoolMount)
+            .unwrap();
+        assert!(lease.is_valid());
+        assert_eq!(lease.key_bytes().unwrap(), original_key.as_bytes());
+        assert_eq!(
+            lease.dataset_mount_identity().unwrap(),
+            &mount_id
+        );
+    }
+
+    #[test]
+    fn mount_identity_rejected_with_wrong_identity() {
+        let wk = dummy_wrapping_key();
+        let mount_id = DatasetMountIdentity::new("pool/ds1".into(), 5);
+        let wrong_id = DatasetMountIdentity::new("pool/ds1".into(), 6);
+        let foreign_id = DatasetMountIdentity::new("pool/ds2".into(), 5);
+
+        let (mut handle, _) =
+            PoolEncryptionSecretHandle::mint(
+                "test-pool".into(),
+                Some(mount_id),
+                &wk,
+                now(),
+            )
+            .unwrap();
+        handle.activate(now());
+
+        // Wrong mount generation
+        let result = handle.issue_lease(
+            Some(&wrong_id),
+            &wk,
+            Duration::from_secs(60),
+            LeaseUsageClass::PoolMount,
+        );
+        assert!(result.is_err());
+
+        // Foreign dataset
+        let result = handle.issue_lease(
+            Some(&foreign_id),
+            &wk,
+            Duration::from_secs(60),
+            LeaseUsageClass::PoolMount,
+        );
+        assert!(result.is_err());
+
+        // No mount identity provided when handle requires one
+        let result = handle.issue_lease(
+            None,
+            &wk,
+            Duration::from_secs(60),
+            LeaseUsageClass::PoolMount,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn encryption_roundtrip_with_mount_identity_gate() {
+        // Full encryption round-trip: mount-identity-bound key handle
+        // drives object encryption and decryption through the lease.
+        let wk = dummy_wrapping_key();
+        let mount_id = DatasetMountIdentity::new("pool/ds1".into(), 1);
+
+        let (mut handle, _store_key) =
+            PoolEncryptionSecretHandle::mint(
+                "test-pool".into(),
+                Some(mount_id.clone()),
+                &wk,
+                now(),
+            )
+            .unwrap();
+        handle.activate(now());
+
+        let lease = handle
+            .issue_lease(Some(&mount_id), &wk, Duration::from_secs(300), LeaseUsageClass::DatasetAccess)
+            .unwrap();
+
+        // Use the lease to derive object keys and encrypt/decrypt
+        let store_key = lease.into_key().unwrap();
+        let deriver = crate::ObjectKeyDeriver::new(store_key);
+
+        let obj_key_a = deriver.derive("tidefs-object-encryption-v1", b"obj-a");
+        let obj_key_b = deriver.derive("tidefs-object-encryption-v1", b"obj-b");
+
+        // Different objects get different keys
+        assert_ne!(obj_key_a.as_bytes(), obj_key_b.as_bytes());
+
+        // Same object with same master produces same key (deterministic)
+        let obj_key_a2 = deriver.derive("tidefs-object-encryption-v1", b"obj-a");
+        assert_eq!(obj_key_a.as_bytes(), obj_key_a2.as_bytes());
+
+        // Encrypt/decrypt round-trip using extent helpers
+        use crate::key_hierarchy::{
+            encrypt_extent, decrypt_extent, DatasetDEK, ExtentNonce,
+        };
+        let dek = DatasetDEK::from_bytes(obj_key_a.as_bytes());
+        let nonce = ExtentNonce::derive(1, 0, &dek);
+        let plaintext = b"mount-identity-gated encryption round-trip data";
+
+        let encrypted = encrypt_extent(plaintext, &dek, &nonce).unwrap();
+        let decrypted = decrypt_extent(&encrypted, &dek).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn key_rotation_across_remount() {
+        // After a remount, the mount generation increments.
+        // The old mount identity should be rejected; a new handle
+        // with the new mount identity must be minted.
+        let wk = dummy_wrapping_key();
+        let old_mount_id = DatasetMountIdentity::new("pool/ds1".into(), 3);
+        let new_mount_id = DatasetMountIdentity::new("pool/ds1".into(), 4);
+
+        // First mount: mint handle with generation 3
+        let (mut handle_old, key_old) =
+            PoolEncryptionSecretHandle::mint(
+                "test-pool".into(),
+                Some(old_mount_id.clone()),
+                &wk,
+                now(),
+            )
+            .unwrap();
+        handle_old.activate(now());
+
+        let lease_old = handle_old
+            .issue_lease(Some(&old_mount_id), &wk, Duration::from_secs(60), LeaseUsageClass::PoolMount)
+            .unwrap();
+        assert!(lease_old.is_valid());
+
+        // Remount: mount generation advances to 4
+        // The old handle must reject the new mount identity
+        let result = handle_old.issue_lease(
+            Some(&new_mount_id),
+            &wk,
+            Duration::from_secs(60),
+            LeaseUsageClass::PoolMount,
+        );
+        assert!(result.is_err());
+
+        // Old handle still works with old mount identity (until revoked)
+        let lease_old_again = handle_old
+            .issue_lease(Some(&old_mount_id), &wk, Duration::from_secs(60), LeaseUsageClass::PoolMount)
+            .unwrap();
+        assert!(lease_old_again.is_valid());
+
+        // New mount: mint a fresh handle with generation 4
+        let (mut handle_new, key_new) =
+            PoolEncryptionSecretHandle::mint(
+                "test-pool".into(),
+                Some(new_mount_id.clone()),
+                &wk,
+                now() + 100,
+            )
+            .unwrap();
+        handle_new.activate(now() + 100);
+
+        let lease_new = handle_new
+            .issue_lease(Some(&new_mount_id), &wk, Duration::from_secs(60), LeaseUsageClass::PoolMount)
+            .unwrap();
+        assert!(lease_new.is_valid());
+
+        // Keys differ across remount (new DEK generated)
+        assert_ne!(key_old.as_bytes(), key_new.as_bytes());
+
+        // New handle rejects the old (stale) mount identity
+        let result = handle_new.issue_lease(
+            Some(&old_mount_id),
+            &wk,
+            Duration::from_secs(60),
+            LeaseUsageClass::PoolMount,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unbound_handle_accepts_any_or_no_mount_identity() {
+        // A handle minted without a mount identity binding accepts
+        // leases regardless of whether a mount identity is presented.
+        let wk = dummy_wrapping_key();
+        let mount_id = DatasetMountIdentity::new("pool/ds1".into(), 1);
+
+        let (mut handle, _) =
+            PoolEncryptionSecretHandle::mint("test-pool".into(), None, &wk, now()).unwrap();
+        handle.activate(now());
+
+        // No mount identity: OK
+        let lease1 = handle
+            .issue_lease(None, &wk, Duration::from_secs(60), LeaseUsageClass::PoolMount)
+            .unwrap();
+        assert!(lease1.is_valid());
+        assert!(lease1.dataset_mount_identity().is_none());
+
+        // Some mount identity presented to unbound handle: OK
+        let lease2 = handle
+            .issue_lease(Some(&mount_id), &wk, Duration::from_secs(60), LeaseUsageClass::PoolMount)
+            .unwrap();
+        assert!(lease2.is_valid());
+    }
+
+    #[test]
+    fn mount_identity_display_format() {
+        let id = DatasetMountIdentity::new("pool/tank".into(), 42);
+        assert_eq!(format!("{id}"), "pool/tank@gen42");
+    }
+
+    #[test]
+    fn mount_identity_matches_same_identity() {
+        let a = DatasetMountIdentity::new("pool/ds".into(), 1);
+        let b = DatasetMountIdentity::new("pool/ds".into(), 1);
+        assert!(a.matches(&b));
+        assert!(b.matches(&a));
+    }
+
+    #[test]
+    fn mount_identity_rejects_different_generation() {
+        let a = DatasetMountIdentity::new("pool/ds".into(), 1);
+        let b = DatasetMountIdentity::new("pool/ds".into(), 2);
+        assert!(!a.matches(&b));
+    }
+
+    #[test]
+    fn mount_identity_rejects_different_dataset() {
+        let a = DatasetMountIdentity::new("pool/ds1".into(), 1);
+        let b = DatasetMountIdentity::new("pool/ds2".into(), 1);
+        assert!(!a.matches(&b));
+    }
+
 }
