@@ -11,6 +11,7 @@ description = "Offset-based read/write primitives bridging extent-map and object
 [dependencies]
 tidefs-types-extent-map-core = { path = "../tidefs-types-extent-map-core" }
 tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tidefs-frame = { path = "../tidefs-frame" }
 blake3 = "=1.5.5"
 
 [dev-dependencies]

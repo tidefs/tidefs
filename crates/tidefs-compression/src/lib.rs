@@ -92,8 +92,9 @@ pub use tidefs_frame::FRAME_HEADER_LEN;
 
 // Extent-level compression types and functions.
 pub use tidefs_frame::{
-    compress_extent, decompress_extent, CompressedExtentPayload, CompressionPolicy,
-    EXTENT_PAYLOAD_HEADER_LEN,
+    compress_extent, decompress_extent, decompress_extent_verified, CompressedExtentPayload,
+    CompressionPolicy, TransformVerification, EXTENT_PAYLOAD_HEADER_LEN,
+    TRANSFORM_VERIFICATION_LEN,
 };
 
 pub mod algorithm;
@@ -110,6 +111,12 @@ pub enum CompressionError {
     UnknownAlgorithm { byte: u8 },
     /// Decompression failed (corrupted compressed data).
     DecompressionFailed(String),
+    /// Stored transform header does not match the committed receipt.
+    TransformMismatch {
+        field: &'static str,
+        expected: u64,
+        observed: u64,
+    },
     /// Underlying store error.
     Store(StoreError),
 }
@@ -129,6 +136,9 @@ impl fmt::Display for CompressionError {
             Self::DecompressionFailed(reason) => {
                 write!(f, "decompression failed: {reason}")
             }
+            Self::TransformMismatch { field, expected, observed } => {
+                write!(f, "transform mismatch: {field} expected {expected}, observed {observed}")
+            }
             Self::Store(e) => write!(f, "store error: {e}"),
         }
     }
@@ -139,6 +149,17 @@ impl std::error::Error for CompressionError {}
 impl From<StoreError> for CompressionError {
     fn from(e: StoreError) -> Self {
         Self::Store(e)
+    }
+}
+
+impl From<tidefs_frame::FrameError> for CompressionError {
+    fn from(e: tidefs_frame::FrameError) -> Self {
+        match e {
+            tidefs_frame::FrameError::TransformMismatch { field, expected, observed } => {
+                Self::TransformMismatch { field, expected, observed }
+            }
+            other => Self::DecompressionFailed(format!("{other:?}")),
+        }
     }
 }
 
@@ -342,6 +363,28 @@ impl CompressedObjectStore {
         }
     }
 
+    /// Retrieve and decompress an extent payload, verifying the stored transform
+    /// header against the committed [`TransformVerification`] token.
+    ///
+    /// If the stored header does not match the token, the extent is rejected as
+    /// corrupt with [`CompressionError::TransformMismatch`].
+    pub fn get_extent_verified(
+        &self,
+        name: impl AsRef<[u8]>,
+        token: &TransformVerification,
+    ) -> Result<Option<Vec<u8>>> {
+        match self.inner.get_named(name)? {
+            Some(encoded) => {
+                let payload = CompressedExtentPayload::decode(&encoded)
+                    .ok_or(CompressionError::FrameTooShort { len: encoded.len() })?;
+                decompress_extent_verified(&payload, token)
+                    .map_err(CompressionError::from)
+                    .map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
     // ── Frame helpers ──────────────────────────────────────────────────
 
     /// Compress `payload` into a framed byte vector (delegates to tidefs-frame).
@@ -367,6 +410,9 @@ impl CompressedObjectStore {
             }
             tidefs_frame::FrameError::Lz4DecompressionFailed => {
                 CompressionError::DecompressionFailed("lz4 decompression failed".into())
+            }
+            tidefs_frame::FrameError::TransformMismatch { field, expected, observed } => {
+                CompressionError::TransformMismatch { field, expected, observed }
             }
         })
     }
@@ -1356,5 +1402,121 @@ mod tests {
         let store = CompressedObjectStore::new(inner, CompressionConfig::default());
         let result = store.get_extent("trunc");
         assert!(result.is_err());
+    }
+
+    // ── Verified extent get ──────────────────────────────────────────
+
+    #[test]
+    fn extent_put_get_verified_correct_receipt() {
+        let (_dir, inner) = temp_store();
+        let mut store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"AAAA".repeat(200);
+        let payload = store.put_extent("v1", &data, &policy).unwrap();
+        let token = payload.to_verification();
+
+        let result = store.get_extent_verified("v1", &token).unwrap().unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn extent_get_verified_rejects_wrong_algorithm() {
+        let (_dir, inner) = temp_store();
+        let mut store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"AAAA".repeat(200);
+        let payload = store.put_extent("v2", &data, &policy).unwrap();
+        let mut bad_token = payload.to_verification();
+        bad_token.algorithm = CompressionAlgorithm::Uncompressed;
+
+        let err = store.get_extent_verified("v2", &bad_token).unwrap_err();
+        assert!(matches!(err, CompressionError::TransformMismatch { .. }));
+    }
+
+    #[test]
+    fn extent_get_verified_rejects_wrong_uncompressed_len() {
+        let (_dir, inner) = temp_store();
+        let mut store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"AAAA".repeat(200);
+        let payload = store.put_extent("v3", &data, &policy).unwrap();
+        let mut bad_token = payload.to_verification();
+        bad_token.uncompressed_len = 42;
+
+        let err = store.get_extent_verified("v3", &bad_token).unwrap_err();
+        assert!(matches!(err, CompressionError::TransformMismatch { .. }));
+    }
+
+    #[test]
+    fn extent_get_verified_rejects_wrong_compressed_len() {
+        let (_dir, inner) = temp_store();
+        let mut store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"AAAA".repeat(200);
+        let payload = store.put_extent("v4", &data, &policy).unwrap();
+        let mut bad_token = payload.to_verification();
+        bad_token.compressed_len = 99999;
+
+        let err = store.get_extent_verified("v4", &bad_token).unwrap_err();
+        assert!(matches!(err, CompressionError::TransformMismatch { .. }));
+    }
+
+    #[test]
+    fn extent_get_verified_uncompressed_data() {
+        let (_dir, inner) = temp_store();
+        let mut store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let policy = CompressionPolicy::off();
+        let data = b"plain uncompressed content";
+        let payload = store.put_extent("v5", data, &policy).unwrap();
+        let token = payload.to_verification();
+        assert_eq!(token.algorithm, CompressionAlgorithm::Uncompressed);
+
+        let result = store.get_extent_verified("v5", &token).unwrap().unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn extent_get_verified_nonexistent() {
+        let (_dir, inner) = temp_store();
+        let store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let token = TransformVerification {
+            algorithm: CompressionAlgorithm::Zstd,
+            uncompressed_len: 100,
+            compressed_len: 0,
+        };
+        let result = store.get_extent_verified("no_such", &token).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extent_put_get_verified_multi_extent_file_simulation() {
+        let (_dir, inner) = temp_store();
+        let mut store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let policy = CompressionPolicy::zstd_default();
+
+        // Simulate a multi-extent file: 3 extents with different data
+        let extents: Vec<(&str, Vec<u8>)> = vec![
+            ("ext-a", b"AAAA".repeat(100)),
+            ("ext-b", b"BBBB".repeat(150)),
+            ("ext-c", b"CCCC".repeat(80)),
+        ];
+
+        let mut tokens = Vec::new();
+        for (name, data) in &extents {
+            let payload = store.put_extent(name, &data, &policy).unwrap();
+            tokens.push((name.to_string(), payload.to_verification()));
+        }
+
+        // Verify each extent with its token
+        for (i, (name, data)) in extents.iter().enumerate() {
+            let (_token_name, token) = &tokens[i];
+            let result = store.get_extent_verified(name, token).unwrap().unwrap();
+            assert_eq!(&result, data, "mismatch for extent {name}");
+        }
+
+        // Cross-verification: wrong token should fail
+        let wrong_token = &tokens[1].1; // token from ext-b
+        let err = store.get_extent_verified("ext-a", wrong_token).unwrap_err();
+        assert!(matches!(err, CompressionError::TransformMismatch { .. }));
     }
 }

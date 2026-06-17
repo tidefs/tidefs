@@ -96,6 +96,21 @@ pub enum FrameError {
     /// LZ4 decompression failed.
     #[error("decompression failed: LZ4 error")]
     Lz4DecompressionFailed,
+
+    /// Stored transform header does not match the committed receipt.
+    ///
+    /// The committed receipt records the expected compression algorithm,
+    /// uncompressed length, and compressed length; the stored payload's
+    /// transform header must match atomically or the extent is corrupt.
+    #[error("transform mismatch: {field} expected {expected}, observed {observed}")]
+    TransformMismatch {
+        /// Name of the mismatched field (algorithm, uncompressed_len, compressed_len).
+        field: &'static str,
+        /// Value recorded in the committed receipt.
+        expected: u64,
+        /// Value observed in the stored payload header.
+        observed: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, FrameError>;
@@ -314,6 +329,9 @@ fn make_uncompressed_frame(payload: &[u8]) -> Vec<u8> {
 /// algorithm byte (1) + uncompressed_len u64 LE (8) = 9 bytes.
 pub const EXTENT_PAYLOAD_HEADER_LEN: usize = 9;
 
+/// Size of a serialized [`TransformVerification`] token: algorithm (1) + uncompressed_len (8) + compressed_len (8) = 17 bytes.
+pub const TRANSFORM_VERIFICATION_LEN: usize = 17;
+
 /// Per-dataset compression policy.
 ///
 /// Distinct from [`CompressionConfig`]: the policy uses a ratio threshold
@@ -433,8 +451,77 @@ impl CompressedExtentPayload {
             compressed_data,
         })
     }
+
+    /// Produce a [`TransformVerification`] token from this payload.
+    ///
+    /// The token captures the compression algorithm, uncompressed length
+    /// (pre-size), and compressed data length (post-size) so a reader can
+    /// verify the stored transform header against the committed receipt.
+    pub fn to_verification(&self) -> TransformVerification {
+        TransformVerification {
+            algorithm: self.compression,
+            uncompressed_len: self.uncompressed_len,
+            compressed_len: self.compressed_data.len() as u64,
+        }
+    }
 }
 
+
+// ── Transform Verification ────────────────────────────────────────────────
+
+/// A verification token that captures the committed compression transform
+/// header for later cross-checking on read.
+///
+/// Produced during extent write ([`CompressedExtentPayload::to_verification`])
+/// and stored in the extent-map entry.  On read, the stored transform header
+/// is decoded from the raw payload and compared against this token; a mismatch
+/// is treated as corruption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransformVerification {
+    /// Compression algorithm applied.
+    pub algorithm: CompressionAlgorithm,
+    /// Logical (pre-compression) byte length.
+    pub uncompressed_len: u64,
+    /// Stored (post-compression) byte length, excluding the 9-byte header.
+    pub compressed_len: u64,
+}
+
+impl TransformVerification {
+    /// Verify a decoded [`CompressedExtentPayload`] against this token.
+    ///
+    /// Returns `Ok(())` when the payload's algorithm, uncompressed length,
+    /// and compressed data length all match the committed values.
+    /// Returns [`FrameError::TransformMismatch`] on any discrepancy.
+    pub fn verify(&self, payload: &CompressedExtentPayload) -> Result<()> {
+        if payload.compression != self.algorithm {
+            return Err(FrameError::TransformMismatch {
+                field: "algorithm",
+                expected: self.algorithm as u64,
+                observed: payload.compression as u64,
+            });
+        }
+        if payload.uncompressed_len != self.uncompressed_len {
+            return Err(FrameError::TransformMismatch {
+                field: "uncompressed_len",
+                expected: self.uncompressed_len,
+                observed: payload.uncompressed_len,
+            });
+        }
+        // compressed_len == 0 means "not stored in the receipt" — the
+        // content checksum already covers the compressed payload, so a
+        // length mismatch would be caught at the checksum layer.
+        if self.compressed_len != 0
+            && payload.compressed_data.len() as u64 != self.compressed_len
+        {
+            return Err(FrameError::TransformMismatch {
+                field: "compressed_len",
+                expected: self.compressed_len,
+                observed: payload.compressed_data.len() as u64,
+            });
+        }
+        Ok(())
+    }
+}
 /// Compress extent payload data according to a per-dataset policy.
 ///
 /// * If the policy algorithm is [`CompressionAlgorithm::Uncompressed`], the
@@ -490,6 +577,21 @@ pub fn compress_extent(data: &[u8], policy: &CompressionPolicy) -> CompressedExt
 ///
 /// Returns an error when a zstd payload is corrupt.  LZ4 is reserved in
 /// phase 1 and treated as identity.
+
+/// Decompress a [`CompressedExtentPayload`] after verifying its transform
+/// header against the committed [`TransformVerification`] token.
+///
+/// This is the verified read-path entry point: if the stored transform header
+/// does not match the committed receipt, the extent is rejected as corrupt
+/// before any decompression is attempted.
+pub fn decompress_extent_verified(
+    payload: &CompressedExtentPayload,
+    token: &TransformVerification,
+) -> Result<Vec<u8>> {
+    token.verify(payload)?;
+    decompress_extent(payload)
+}
+
 pub fn decompress_extent(payload: &CompressedExtentPayload) -> Result<Vec<u8>> {
     match payload.compression {
         CompressionAlgorithm::Uncompressed => Ok(payload.compressed_data.clone()),
@@ -988,6 +1090,92 @@ mod tests {
             compressed_data: b"not valid zstd".to_vec(),
         };
         let result = decompress_extent(&payload);
+        assert!(result.is_err());
+    }
+
+    // ── TransformVerification ────────────────────────────────────────
+
+    #[test]
+    fn transform_verification_matches_correct_payload() {
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"AAAA".repeat(200);
+        let payload = compress_extent(&data, &policy);
+        let token = payload.to_verification();
+        token.verify(&payload).unwrap();
+        let roundtrip = decompress_extent_verified(&payload, &token).unwrap();
+        assert_eq!(roundtrip, data);
+    }
+
+    #[test]
+    fn transform_verification_rejects_wrong_algorithm() {
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"AAAA".repeat(200);
+        let payload = compress_extent(&data, &policy);
+        let mut bad_token = payload.to_verification();
+        bad_token.algorithm = CompressionAlgorithm::Uncompressed;
+        let err = decompress_extent_verified(&payload, &bad_token).unwrap_err();
+        assert!(matches!(err, FrameError::TransformMismatch { field: "algorithm", .. }));
+    }
+
+    #[test]
+    fn transform_verification_rejects_wrong_uncompressed_len() {
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"AAAA".repeat(200);
+        let payload = compress_extent(&data, &policy);
+        let mut bad_token = payload.to_verification();
+        bad_token.uncompressed_len = 9999;
+        let err = decompress_extent_verified(&payload, &bad_token).unwrap_err();
+        assert!(matches!(err, FrameError::TransformMismatch { field: "uncompressed_len", .. }));
+    }
+
+    #[test]
+    fn transform_verification_rejects_wrong_compressed_len() {
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"AAAA".repeat(200);
+        let payload = compress_extent(&data, &policy);
+        let mut bad_token = payload.to_verification();
+        bad_token.compressed_len = 9999;
+        let err = decompress_extent_verified(&payload, &bad_token).unwrap_err();
+        assert!(matches!(err, FrameError::TransformMismatch { field: "compressed_len", .. }));
+    }
+
+    #[test]
+    fn transform_verification_skips_compressed_len_when_zero() {
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"AAAA".repeat(200);
+        let payload = compress_extent(&data, &policy);
+        let mut token = payload.to_verification();
+        token.compressed_len = 0;
+        // Should succeed because compressed_len=0 skips the check
+        decompress_extent_verified(&payload, &token).unwrap();
+    }
+
+    #[test]
+    fn transform_verification_uncompressed_data() {
+        let policy = CompressionPolicy::off();
+        let data: &[u8] = b"plain uncompressed";
+        let payload = compress_extent(&data, &policy);
+        let token = payload.to_verification();
+        assert_eq!(token.algorithm, CompressionAlgorithm::Uncompressed);
+        token.verify(&payload).unwrap();
+        let roundtrip = decompress_extent_verified(&payload, &token).unwrap();
+        assert_eq!(roundtrip, data);
+    }
+
+    #[test]
+    fn transform_verification_tampered_payload_rejected() {
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"AAAA".repeat(200);
+        let payload = compress_extent(&data, &policy);
+        let token = payload.to_verification();
+        // Tamper with the compressed data
+        let mut tampered = payload.clone();
+        if !tampered.compressed_data.is_empty() {
+            tampered.compressed_data[0] ^= 0xFF;
+        }
+        // Verification should still pass (header matches), but decompression fails
+        token.verify(&tampered).unwrap();
+        let result = decompress_extent(&tampered);
         assert!(result.is_err());
     }
 }
