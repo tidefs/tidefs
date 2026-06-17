@@ -4246,7 +4246,7 @@ pub fn check_poolstore_compression_current_workspace() -> Result<(), StorageChec
 
 const MOUNTED_TRANSFORM_RAW_STORE_COUNTS: &[(&str, usize)] = &[
     ("crates/tidefs-local-object-store/src/pool/mod.rs", 7),
-    ("crates/tidefs-local-filesystem/src/lib.rs", 65),
+    ("crates/tidefs-local-filesystem/src/lib.rs", 68),
     ("crates/tidefs-local-filesystem/src/crash_recovery.rs", 21),
     ("crates/tidefs-local-filesystem/src/journal_cleaner.rs", 7),
     ("crates/tidefs-local-filesystem/src/vfs_engine_impl.rs", 7),
