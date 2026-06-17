@@ -56,3 +56,17 @@ Each digest is computed with `blake3::Hasher::new_derive_key(DOMAIN)` where `DOM
 **executor_digest**: `[b"executor", state_digest, fence_manager_digest]`
 
 **step_chain_digest**: `[b"step-chain", step_ordinals...]`
+
+## Teardown Proof Review Receipt
+
+`teardown_proof_review_receipt()` exports the claims-gate review fields for
+`kernel.teardown.no_work_after.v1`: the covered teardown token states,
+forbidden post-teardown work cases, source proof artifact digest, validation
+tier, and claim id.
+
+The receipt is T4 source/model evidence only. It deliberately records
+`mounted_linux_runtime_evidence = false` and keeps the claim blocked until
+additional T5/T6 evidence exists:
+
+- T5 mounted-kernel teardown stress with Linux workqueue and callback activity tracing.
+- T6 mounted kernel I/O teardown and recovery rows across the filesystem runtime.

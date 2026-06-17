@@ -198,7 +198,7 @@ evidence_artifacts = []
 
 [[claims]]
 id = "kernel.teardown.no_work_after.v1"
-status = "planned"
+status = "blocked"
 scope = "kernel teardown and post-teardown work exclusion"
 required_evidence_classes = [
   "kernel-context-token-model",
@@ -206,11 +206,13 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 blockers = [
-  "The recorded teardown proof is bounded source-model evidence, not mounted Linux runtime evidence.",
-  "No claims-gate-review artifact is recorded for this claim.",
+  "The recorded teardown proof review is bounded source/model evidence, not mounted Linux runtime evidence.",
+  "T5 mounted-kernel teardown stress with Linux workqueue and callback activity tracing is missing.",
+  "T6 mounted kernel I/O teardown and recovery rows across the filesystem runtime are missing.",
 ]
-generated_doc = "Planned kernel no-work-after-teardown claim. TideFS has bounded source-model context-token and teardown race evidence, but it is not mounted runtime evidence and still lacks claims-gate review."
+generated_doc = "Blocked kernel no-work-after-teardown claim. TideFS has bounded source-model context-token and teardown race review evidence, but mounted Linux T5/T6 runtime evidence is still required before product wording can validate the claim."
 evidence_artifacts = [
   { class = "kernel-context-token-model", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json" },
   { class = "teardown-race-proof-artifact", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json" },
+  { class = "claims-gate-review", path = "validation/artifacts/kernel/teardown-no-work-after-claims-gate-review.toml", source = "tidefs-kernel-cutover-runtime", scope = "kernel-teardown-source-model-boundary-review" },
 ]
