@@ -6,6 +6,7 @@
 //! records qid/tag ownership, emits TideFS request-contract envelopes for legal
 //! uBLK I/O submissions, and emits exactly one terminal TideFS completion for
 //! each request token.
+pub mod started_export;
 
 use std::fmt;
 
