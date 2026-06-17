@@ -3812,9 +3812,21 @@ impl LocalFileSystem {
                 let _ = store.delete(local_key);
             }
             // Remove processed entries from the queue.
+            // Entries whose receipt is not yet durable are re-enqueued
+            // for a future drain cycle. Snapshot-protected entries are
+            // not re-enqueued; snapshot deletion regenerates them.
             let mut q = self.reclaim_queue.lock().unwrap();
-            for (object_key, _) in &batch {
+            for (object_key, delta) in &batch {
                 q.delete(object_key);
+                let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
+                if !receipt_durable_keys.contains(&local_key) && !protected_keys.contains(&local_key) {
+                    let entry = ReclaimQueueEntry::new(
+                        *object_key,
+                        *delta,
+                        QueueFamily::Extent,
+                    );
+                    q.insert(entry);
+                }
             }
             self.total_reclaim_drains += 1;
             self.total_reclaim_entries_drained += entries_drained as u64;
