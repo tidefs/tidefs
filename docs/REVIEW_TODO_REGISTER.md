@@ -122,6 +122,14 @@ Important 2026-06-01 findings:
   `apps/README.md` now defer to that authority instead of carrying competing
   package tables. This reduces TFR-002/TFR-019 drift but does not close either
   item: broader imported docs still need authority classification.
+- `TFR-002`: issue #513 adds retired-role enforcement for both
+  `scaffold-transitional` and `archive-delete-candidate` roles in
+  `check-workspace-policy`, regenerates the classification table from current
+  `cargo metadata` (152 workspace packages, 157 classified roots, zero
+  retired-role rows), and marks `archive-delete-candidate` as retired in the
+  role semantics. This hardens the TFR-002 workspace authority gate but does
+  not close the item: the broader import cleanup and remaining dead-crate
+  audit still need separate classification work.
 - `TFR-004`: `LocalFileSystem` still has global inode and directory maps plus
   global `next_inode_id`; namespace and inode-table crates maintain separate
   inode allocation authorities. The fresh root dataset catalog path now uses
