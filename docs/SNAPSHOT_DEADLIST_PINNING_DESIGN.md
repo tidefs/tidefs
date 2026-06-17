@@ -256,7 +256,20 @@ dataset (issue #1215). Extents pinned by a snapshot that has clones remain
 pinned until the clone is destroyed and the snapshot is subsequently destroyed
 via the two-phase move-or-free algorithm.
 
-### 5.3 Future: org.tidefs:clone_promote
+### 5.3 Pruner pin-evidence gate
+
+Retention pruning is fail-closed. Before a retention candidate enters the
+delete set, the pruner must read current-version per-snapshot pin evidence that
+matches the candidate's catalog root and contains explicit clone-origin and
+deadlist-pin fields. A missing evidence index, missing candidate entry, missing
+clone-origin field, missing deadlist-pin field, stale root evidence, corrupt
+pin-evidence payload, clone-origin evidence that disagrees with the current
+clone/origin indices, live clone/origin pin, or deadlist pin blocks the
+candidate and leaves it out of the delete set. The prune result reports these
+states separately from retention-policy keeps and snapshot checksum integrity
+failures.
+
+### 5.4 Future: org.tidefs:clone_promote
 
 A future ro_compat feature flag `org.tidefs:clone_promote` will allow promoting
 a clone to an independent dataset, at which point the clone's reference to

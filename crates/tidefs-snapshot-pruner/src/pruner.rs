@@ -16,6 +16,15 @@ pub const CLONE_INDEX_PREFIX: &str = "clone_index";
 pub const ORIGIN_INDEX_PREFIX: &str = "origin_index";
 /// Well-known object-key prefix for snapshot integrity checksums.
 pub const SNAPSHOT_CHECKSUM_PREFIX: &str = "snapshot_checksum";
+/// Well-known object-key prefix for fail-closed snapshot prune pin evidence.
+pub const SNAPSHOT_PIN_EVIDENCE_PREFIX: &str = "snapshot_pin_evidence";
+
+const PIN_EVIDENCE_MAGIC: &[u8; 4] = b"SPIN";
+const PIN_EVIDENCE_VERSION: u16 = 1;
+const EVIDENCE_FIELD_MISSING: u8 = 0;
+const EVIDENCE_FIELD_PRESENT: u8 = 1;
+const CLONE_ORIGIN_PIN_CLONE_SNAPSHOT: u8 = 0;
+const CLONE_ORIGIN_PIN_LIVE_DATASET: u8 = 1;
 
 // ---------------------------------------------------------------------------
 // SnapshotInfo / SnapshotPrunerStats
@@ -37,21 +46,178 @@ pub struct SnapshotPrunerStats {
     pub bytes_freed: u64,
 }
 
+/// The committed root captured by a snapshot catalog entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotRootPin {
+    pub txg_anchor: u64,
+    pub committed_root_txg: u64,
+    pub root_handle: u64,
+}
+
+impl SnapshotRootPin {
+    #[must_use]
+    pub fn from_snapshot_entry(entry: &tidefs_local_object_store::SnapshotEntry) -> Self {
+        Self {
+            txg_anchor: entry.txg_anchor.0,
+            committed_root_txg: entry.committed_root.commit_group_id.0,
+            root_handle: entry.committed_root.root_handle,
+        }
+    }
+
+    #[must_use]
+    pub fn matches_snapshot_entry(self, entry: &tidefs_local_object_store::SnapshotEntry) -> bool {
+        self == Self::from_snapshot_entry(entry)
+    }
+}
+
+/// A live clone or live dataset origin that protects a snapshot from pruning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CloneOriginPinKind {
+    CloneSnapshot,
+    LiveDatasetOrigin,
+}
+
+impl CloneOriginPinKind {
+    fn to_u8(&self) -> u8 {
+        match self {
+            CloneOriginPinKind::CloneSnapshot => CLONE_ORIGIN_PIN_CLONE_SNAPSHOT,
+            CloneOriginPinKind::LiveDatasetOrigin => CLONE_ORIGIN_PIN_LIVE_DATASET,
+        }
+    }
+
+    fn from_u8(raw: u8) -> Option<Self> {
+        match raw {
+            CLONE_ORIGIN_PIN_CLONE_SNAPSHOT => Some(CloneOriginPinKind::CloneSnapshot),
+            CLONE_ORIGIN_PIN_LIVE_DATASET => Some(CloneOriginPinKind::LiveDatasetOrigin),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloneOriginPin {
+    pub kind: CloneOriginPinKind,
+    pub id: String,
+}
+
+impl CloneOriginPin {
+    #[must_use]
+    pub fn clone_snapshot(id: impl Into<String>) -> Self {
+        Self {
+            kind: CloneOriginPinKind::CloneSnapshot,
+            id: id.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn live_dataset_origin(id: impl Into<String>) -> Self {
+        Self {
+            kind: CloneOriginPinKind::LiveDatasetOrigin,
+            id: id.into(),
+        }
+    }
+}
+
+/// A deadlist-protected object that blocks snapshot pruning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeadlistPin {
+    pub object_id: String,
+}
+
+impl DeadlistPin {
+    #[must_use]
+    pub fn new(object_id: impl Into<String>) -> Self {
+        Self {
+            object_id: object_id.into(),
+        }
+    }
+}
+
+/// Explicit pin evidence for one snapshot candidate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotPinEvidence {
+    pub snapshot_root: SnapshotRootPin,
+    pub clone_origin_pins: Option<Vec<CloneOriginPin>>,
+    pub deadlist_pins: Option<Vec<DeadlistPin>>,
+}
+
+impl SnapshotPinEvidence {
+    #[must_use]
+    pub fn complete(
+        snapshot_root: SnapshotRootPin,
+        clone_origin_pins: Vec<CloneOriginPin>,
+        deadlist_pins: Vec<DeadlistPin>,
+    ) -> Self {
+        Self {
+            snapshot_root,
+            clone_origin_pins: Some(clone_origin_pins),
+            deadlist_pins: Some(deadlist_pins),
+        }
+    }
+}
+
+/// Persisted per-snapshot evidence used by retention planning.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotPinEvidenceIndex {
+    entries: BTreeMap<String, SnapshotPinEvidence>,
+}
+
+/// One candidate's prune plan decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotPruneDecision {
+    pub snapshot_name: String,
+    pub snapshot_id: String,
+    pub snapshot_root: SnapshotRootPin,
+    pub action: SnapshotPruneAction,
+    pub clone_origin_pins: Vec<CloneOriginPin>,
+    pub deadlist_pins: Vec<DeadlistPin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotPruneAction {
+    RetainByPolicy,
+    Delete,
+    Blocked(Vec<SnapshotPruneBlock>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotPruneBlock {
+    IntegrityFailure(String),
+    CloneOriginProtection,
+    DeadlistPinProtection,
+    MissingEvidence(String),
+    CorruptEvidence(String),
+    StoreFailure(String),
+}
+
 /// Result of a single [`SnapshotPruner::prune_dataset`] invocation.
 ///
-/// Reports how many retention candidates were evaluated and how many
-/// were destroyed versus skipped due to clone-dependency or
-/// live-dataset-origin safety checks.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Includes the retention delete set, protected/blocked candidates, and the
+/// exact pin evidence seen while planning.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PruneResult {
     /// Number of retention-policy candidates evaluated.
     pub candidates_evaluated: u64,
+    /// Snapshots retained by policy before safety evidence was checked.
+    pub retention_kept: u64,
     /// Snapshots successfully destroyed.
     pub destroyed: u64,
-    /// Candidates skipped because they have held clone children.
-    pub skipped_clones: u64,
-    /// Candidates skipped because they are the origin of a live dataset.
-    pub skipped_origins: u64,
+    /// Candidates blocked by a corrupt snapshot checksum.
+    pub integrity_failures: u64,
+    /// Candidates protected by live clone or live-origin evidence.
+    pub clone_origin_protected: u64,
+    /// Candidates protected by deadlist pin evidence.
+    pub deadlist_pin_protected: u64,
+    /// Candidates blocked because required pin evidence is missing.
+    pub missing_evidence_blocks: u64,
+    /// Candidates blocked because persisted pin evidence is corrupt or stale.
+    pub corrupt_evidence_blocks: u64,
+    /// Candidates blocked by object-store failures while planning.
+    pub store_failures: u64,
+    /// Retention candidates eligible for deletion after evidence checks.
+    pub delete_set: Vec<String>,
+    /// Per-snapshot plan decisions, including retention keeps.
+    pub decisions: Vec<SnapshotPruneDecision>,
 }
 // ---------------------------------------------------------------------------
 // SnapshotPrunerError
@@ -68,6 +234,10 @@ pub enum SnapshotPrunerError {
     IsLiveDatasetOrigin,
     /// The snapshot failed BLAKE3 integrity verification before deletion.
     IntegrityFailure(String),
+    /// Required prune pin evidence was absent.
+    PinEvidenceMissing { reason: String },
+    /// Persisted prune pin evidence could not be trusted.
+    PinEvidenceCorrupt { reason: String },
     /// A retention policy constraint was violated.
     PolicyViolation(String),
     /// A store-level I/O or integrity error occurred.
@@ -84,6 +254,12 @@ impl fmt::Display for SnapshotPrunerError {
             }
             SnapshotPrunerError::IntegrityFailure(msg) => {
                 write!(f, "snapshot integrity failure: {msg}")
+            }
+            SnapshotPrunerError::PinEvidenceMissing { reason } => {
+                write!(f, "snapshot pin evidence missing: {reason}")
+            }
+            SnapshotPrunerError::PinEvidenceCorrupt { reason } => {
+                write!(f, "snapshot pin evidence corrupt: {reason}")
             }
             SnapshotPrunerError::PolicyViolation(msg) => {
                 write!(f, "policy violation: {msg}")
@@ -107,6 +283,237 @@ pub fn snapshot_checksum_key(
     tidefs_local_object_store::ObjectKey::from_name(
         format!("{SNAPSHOT_CHECKSUM_PREFIX}/{dataset_name}/{snapshot_name}").as_bytes(),
     )
+}
+
+/// Well-known object key for the snapshot prune pin-evidence singleton.
+pub fn snapshot_pin_evidence_object_key() -> tidefs_local_object_store::ObjectKey {
+    tidefs_local_object_store::ObjectKey::from_name(SNAPSHOT_PIN_EVIDENCE_PREFIX.as_bytes())
+}
+
+impl SnapshotPinEvidenceIndex {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn get(&self, snapshot_id: &str) -> Option<&SnapshotPinEvidence> {
+        self.entries.get(snapshot_id)
+    }
+
+    pub fn insert(
+        &mut self,
+        snapshot_id: impl Into<String>,
+        evidence: SnapshotPinEvidence,
+    ) -> Option<SnapshotPinEvidence> {
+        self.entries.insert(snapshot_id.into(), evidence)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(PIN_EVIDENCE_MAGIC);
+        buf.extend_from_slice(&PIN_EVIDENCE_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+
+        for (snapshot_id, evidence) in &self.entries {
+            write_string(&mut buf, snapshot_id);
+            buf.extend_from_slice(&evidence.snapshot_root.txg_anchor.to_le_bytes());
+            buf.extend_from_slice(&evidence.snapshot_root.committed_root_txg.to_le_bytes());
+            buf.extend_from_slice(&evidence.snapshot_root.root_handle.to_le_bytes());
+
+            match &evidence.clone_origin_pins {
+                Some(pins) => {
+                    buf.push(EVIDENCE_FIELD_PRESENT);
+                    buf.extend_from_slice(&(pins.len() as u32).to_le_bytes());
+                    for pin in pins {
+                        buf.push(pin.kind.to_u8());
+                        write_string(&mut buf, &pin.id);
+                    }
+                }
+                None => buf.push(EVIDENCE_FIELD_MISSING),
+            }
+
+            match &evidence.deadlist_pins {
+                Some(pins) => {
+                    buf.push(EVIDENCE_FIELD_PRESENT);
+                    buf.extend_from_slice(&(pins.len() as u32).to_le_bytes());
+                    for pin in pins {
+                        write_string(&mut buf, &pin.object_id);
+                    }
+                }
+                None => buf.push(EVIDENCE_FIELD_MISSING),
+            }
+        }
+
+        buf
+    }
+
+    #[must_use]
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        let mut off = 0usize;
+        if payload.len() < PIN_EVIDENCE_MAGIC.len() + 2 + 4 {
+            return None;
+        }
+        if &payload[..PIN_EVIDENCE_MAGIC.len()] != PIN_EVIDENCE_MAGIC {
+            return None;
+        }
+        off += PIN_EVIDENCE_MAGIC.len();
+        let version = read_u16(payload, &mut off)?;
+        if version != PIN_EVIDENCE_VERSION {
+            return None;
+        }
+        let count = read_u32(payload, &mut off)? as usize;
+        let mut entries = BTreeMap::new();
+
+        for _ in 0..count {
+            let snapshot_id = read_string(payload, &mut off)?;
+            let txg_anchor = read_u64(payload, &mut off)?;
+            let committed_root_txg = read_u64(payload, &mut off)?;
+            let root_handle = read_u64(payload, &mut off)?;
+            let snapshot_root = SnapshotRootPin {
+                txg_anchor,
+                committed_root_txg,
+                root_handle,
+            };
+
+            let clone_origin_pins = match read_u8(payload, &mut off)? {
+                EVIDENCE_FIELD_MISSING => None,
+                EVIDENCE_FIELD_PRESENT => {
+                    let pin_count = read_u32(payload, &mut off)? as usize;
+                    let mut pins = Vec::new();
+                    for _ in 0..pin_count {
+                        let kind = CloneOriginPinKind::from_u8(read_u8(payload, &mut off)?)?;
+                        let id = read_string(payload, &mut off)?;
+                        pins.push(CloneOriginPin { kind, id });
+                    }
+                    Some(pins)
+                }
+                _ => return None,
+            };
+
+            let deadlist_pins = match read_u8(payload, &mut off)? {
+                EVIDENCE_FIELD_MISSING => None,
+                EVIDENCE_FIELD_PRESENT => {
+                    let pin_count = read_u32(payload, &mut off)? as usize;
+                    let mut pins = Vec::new();
+                    for _ in 0..pin_count {
+                        pins.push(DeadlistPin::new(read_string(payload, &mut off)?));
+                    }
+                    Some(pins)
+                }
+                _ => return None,
+            };
+
+            entries.insert(
+                snapshot_id,
+                SnapshotPinEvidence {
+                    snapshot_root,
+                    clone_origin_pins,
+                    deadlist_pins,
+                },
+            );
+        }
+
+        if off != payload.len() {
+            return None;
+        }
+
+        Some(Self { entries })
+    }
+
+    pub fn load(store: &LocalObjectStore) -> Result<Option<Self>, SnapshotPrunerError> {
+        match store.get(snapshot_pin_evidence_object_key()) {
+            Ok(Some(payload)) => Self::decode(&payload).map(Some).ok_or_else(|| {
+                SnapshotPrunerError::PinEvidenceCorrupt {
+                    reason: "snapshot pin evidence payload does not match current format".into(),
+                }
+            }),
+            Ok(None) => Ok(None),
+            Err(e) => Err(SnapshotPrunerError::Store(format!("{e}"))),
+        }
+    }
+
+    pub fn save(&self, store: &mut LocalObjectStore) -> Result<(), SnapshotPrunerError> {
+        store
+            .put(snapshot_pin_evidence_object_key(), &self.encode())
+            .map(|_| ())
+            .map_err(|e| SnapshotPrunerError::Store(format!("{e}")))
+    }
+}
+
+fn write_string(buf: &mut Vec<u8>, value: &str) {
+    let bytes = value.as_bytes();
+    let len = u16::try_from(bytes.len()).expect("snapshot prune evidence string too long");
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn read_u8(payload: &[u8], off: &mut usize) -> Option<u8> {
+    let value = *payload.get(*off)?;
+    *off += 1;
+    Some(value)
+}
+
+fn read_u16(payload: &[u8], off: &mut usize) -> Option<u16> {
+    if payload.len() < *off + 2 {
+        return None;
+    }
+    let value = u16::from_le_bytes([payload[*off], payload[*off + 1]]);
+    *off += 2;
+    Some(value)
+}
+
+fn read_u32(payload: &[u8], off: &mut usize) -> Option<u32> {
+    if payload.len() < *off + 4 {
+        return None;
+    }
+    let value = u32::from_le_bytes([
+        payload[*off],
+        payload[*off + 1],
+        payload[*off + 2],
+        payload[*off + 3],
+    ]);
+    *off += 4;
+    Some(value)
+}
+
+fn read_u64(payload: &[u8], off: &mut usize) -> Option<u64> {
+    if payload.len() < *off + 8 {
+        return None;
+    }
+    let value = u64::from_le_bytes([
+        payload[*off],
+        payload[*off + 1],
+        payload[*off + 2],
+        payload[*off + 3],
+        payload[*off + 4],
+        payload[*off + 5],
+        payload[*off + 6],
+        payload[*off + 7],
+    ]);
+    *off += 8;
+    Some(value)
+}
+
+fn read_string(payload: &[u8], off: &mut usize) -> Option<String> {
+    let len = read_u16(payload, off)? as usize;
+    if payload.len() < *off + len {
+        return None;
+    }
+    let value = String::from_utf8(payload[*off..*off + len].to_vec()).ok()?;
+    *off += len;
+    Some(value)
 }
 
 /// Global index mapping parent snapshots to the set of clone snapshots
@@ -348,6 +755,20 @@ impl OriginIndex {
     /// Return the origin snapshot id for `dataset_name`, if any.
     pub fn origin_of(&self, dataset_name: &str) -> Option<&str> {
         self.origins.get(dataset_name).map(|s| s.as_str())
+    }
+
+    /// Iterate over live datasets that use `snapshot_id` as their origin.
+    pub fn live_datasets_for_origin<'a>(
+        &'a self,
+        snapshot_id: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.origins.iter().filter_map(move |(dataset, origin)| {
+            if origin == snapshot_id {
+                Some(dataset.as_str())
+            } else {
+                None
+            }
+        })
     }
 
     /// Number of origin entries.
@@ -599,6 +1020,50 @@ impl SnapshotPruner {
         self.clone_index = CloneIndex::load(store);
         self.origin_index = OriginIndex::load(store);
     }
+
+    fn live_clone_origin_pins(&self, snapshot_id: &str) -> Vec<CloneOriginPin> {
+        self.clone_index
+            .clones_of(snapshot_id)
+            .map(CloneOriginPin::clone_snapshot)
+            .chain(
+                self.origin_index
+                    .live_datasets_for_origin(snapshot_id)
+                    .map(CloneOriginPin::live_dataset_origin),
+            )
+            .collect()
+    }
+
+    /// Record complete fail-closed prune evidence for one snapshot.
+    ///
+    /// The snapshot root is read from the current snapshot catalog. Empty
+    /// `clone_origin_pins` or `deadlist_pins` are explicit negative evidence;
+    /// missing fields are represented only by constructing and saving
+    /// [`SnapshotPinEvidenceIndex`] directly.
+    pub fn record_snapshot_pin_evidence(
+        &self,
+        store: &mut LocalObjectStore,
+        dataset_name: &str,
+        snapshot_name: &str,
+        clone_origin_pins: Vec<CloneOriginPin>,
+        deadlist_pins: Vec<DeadlistPin>,
+    ) -> Result<(), SnapshotPrunerError> {
+        let snapshots = store.list_snapshots(dataset_name);
+        let entry = snapshots
+            .iter()
+            .find(|s| s.name == snapshot_name)
+            .ok_or(SnapshotPrunerError::SnapshotNotFound)?;
+        let snapshot_id = format!("{dataset_name}/{snapshot_name}");
+        let evidence = SnapshotPinEvidence::complete(
+            SnapshotRootPin::from_snapshot_entry(entry),
+            clone_origin_pins,
+            deadlist_pins,
+        );
+
+        let mut index = SnapshotPinEvidenceIndex::load(store)?.unwrap_or_default();
+        index.insert(snapshot_id, evidence);
+        index.save(store)
+    }
+
     pub fn policy(&self) -> &SnapshotRetentionPolicy {
         &self.policy
     }
@@ -893,21 +1358,18 @@ impl SnapshotPruner {
         Ok(entry)
     }
 
-    // -- Automated dataset prune (retention + safety) -------------------
+    // -- Automated dataset prune (retention + fail-closed safety) --------
 
-    /// Run a full retention-driven prune of a single dataset.
+    /// Plan a retention-driven prune without deleting snapshots.
     ///
-    /// Lists snapshots from the store, evaluates the retention policy,
-    /// filters candidates through clone-dependency and live-dataset-origin
-    /// safety checks, destroys eligible snapshots, and returns a
-    /// [] with per-category counts.
-    ///
-    /// Candidates that are clone parents or live dataset origins are
-    /// skipped (never destroyed). The pruner iterates candidates in
-    /// oldest-first order per the retention-evaluation output.
-    pub fn prune_dataset(
-        &mut self,
-        store: &mut LocalObjectStore,
+    /// Every retention candidate must have explicit per-snapshot pin evidence
+    /// before it can enter the delete set. Missing fields, stale/corrupt
+    /// evidence, clone-origin pins, deadlist pins, and checksum failures are
+    /// reported as blocked plan decisions.
+    #[must_use]
+    pub fn plan_dataset_prune(
+        &self,
+        store: &LocalObjectStore,
         dataset_name: &str,
         now: SystemTime,
     ) -> PruneResult {
@@ -931,47 +1393,259 @@ impl SnapshotPruner {
         // Evaluate retention: candidates are oldest-first
         let candidates = self.evaluate(&infos, now);
         let total_candidates = candidates.len() as u64;
+        let candidate_names: HashSet<&str> = candidates.iter().map(|s| s.as_str()).collect();
+        let evidence_index = SnapshotPinEvidenceIndex::load(store);
+        let mut result = PruneResult {
+            candidates_evaluated: total_candidates,
+            retention_kept: snapshots.len() as u64 - total_candidates,
+            ..Default::default()
+        };
 
-        let mut destroyed = 0u64;
-        let mut skipped_clones = 0u64;
-        let mut skipped_origins = 0u64;
+        for entry in snapshots
+            .iter()
+            .filter(|entry| !candidate_names.contains(entry.name.as_str()))
+        {
+            let snapshot_id = format!("{dataset_name}/{}", entry.name);
+            result.decisions.push(SnapshotPruneDecision {
+                snapshot_name: entry.name.clone(),
+                snapshot_id,
+                snapshot_root: SnapshotRootPin::from_snapshot_entry(entry),
+                action: SnapshotPruneAction::RetainByPolicy,
+                clone_origin_pins: Vec::new(),
+                deadlist_pins: Vec::new(),
+            });
+        }
 
         for name in &candidates {
+            let Some(entry) = snapshots.iter().find(|s| s.name == *name) else {
+                continue;
+            };
             let snapshot_id = format!("{dataset_name}/{name}");
-            if self.clone_index.has_clones(&snapshot_id) {
-                skipped_clones += 1;
-                continue;
+            let snapshot_root = SnapshotRootPin::from_snapshot_entry(entry);
+            let mut clone_origin_pins = Vec::new();
+            let mut deadlist_pins = Vec::new();
+            let mut blocks = Vec::new();
+            let current_clone_origin_pins = self.live_clone_origin_pins(&snapshot_id);
+            let current_clone_origin_pin_set =
+                clone_origin_pin_set(current_clone_origin_pins.as_slice());
+
+            match &evidence_index {
+                Ok(Some(index)) => match index.get(&snapshot_id) {
+                    Some(evidence) => {
+                        if !evidence.snapshot_root.matches_snapshot_entry(entry) {
+                            blocks.push(SnapshotPruneBlock::CorruptEvidence(format!(
+                                "snapshot root evidence for {snapshot_id} does not match catalog"
+                            )));
+                        }
+
+                        match &evidence.clone_origin_pins {
+                            Some(pins) => {
+                                clone_origin_pins = pins.clone();
+                                if clone_origin_pin_set(&clone_origin_pins)
+                                    != current_clone_origin_pin_set
+                                {
+                                    let protecting_pins = if current_clone_origin_pins.is_empty() {
+                                        clone_origin_pins.clone()
+                                    } else {
+                                        current_clone_origin_pins.clone()
+                                    };
+                                    if !protecting_pins.is_empty() {
+                                        clone_origin_pins = protecting_pins;
+                                        blocks.push(SnapshotPruneBlock::CloneOriginProtection);
+                                    }
+                                    blocks.push(SnapshotPruneBlock::CorruptEvidence(format!(
+                                        "clone-origin evidence for {snapshot_id} does not match current clone/origin index"
+                                    )));
+                                } else if !clone_origin_pins.is_empty() {
+                                    blocks.push(SnapshotPruneBlock::CloneOriginProtection);
+                                }
+                            }
+                            None => {
+                                if !current_clone_origin_pins.is_empty() {
+                                    clone_origin_pins = current_clone_origin_pins.clone();
+                                    blocks.push(SnapshotPruneBlock::CloneOriginProtection);
+                                }
+                                blocks.push(SnapshotPruneBlock::MissingEvidence(format!(
+                                    "clone-origin entry missing for {snapshot_id}"
+                                )));
+                            }
+                        }
+
+                        match &evidence.deadlist_pins {
+                            Some(pins) => {
+                                deadlist_pins = pins.clone();
+                                if !deadlist_pins.is_empty() {
+                                    blocks.push(SnapshotPruneBlock::DeadlistPinProtection);
+                                }
+                            }
+                            None => blocks.push(SnapshotPruneBlock::MissingEvidence(format!(
+                                "deadlist pin entry missing for {snapshot_id}"
+                            ))),
+                        }
+                    }
+                    None => {
+                        if !current_clone_origin_pins.is_empty() {
+                            clone_origin_pins = current_clone_origin_pins.clone();
+                            blocks.push(SnapshotPruneBlock::CloneOriginProtection);
+                        }
+                        blocks.push(SnapshotPruneBlock::MissingEvidence(format!(
+                            "snapshot pin evidence missing for {snapshot_id}"
+                        )));
+                    }
+                },
+                Ok(None) => {
+                    if !current_clone_origin_pins.is_empty() {
+                        clone_origin_pins = current_clone_origin_pins.clone();
+                        blocks.push(SnapshotPruneBlock::CloneOriginProtection);
+                    }
+                    blocks.push(SnapshotPruneBlock::MissingEvidence(
+                        "snapshot pin evidence index missing".into(),
+                    ));
+                }
+                Err(SnapshotPrunerError::PinEvidenceCorrupt { reason }) => {
+                    if !current_clone_origin_pins.is_empty() {
+                        clone_origin_pins = current_clone_origin_pins.clone();
+                        blocks.push(SnapshotPruneBlock::CloneOriginProtection);
+                    }
+                    blocks.push(SnapshotPruneBlock::CorruptEvidence(reason.clone()));
+                }
+                Err(err) => blocks.push(SnapshotPruneBlock::StoreFailure(err.to_string())),
             }
-            if self.origin_index.is_origin_of_live_dataset(&snapshot_id) {
-                skipped_origins += 1;
-                continue;
+
+            if blocks.is_empty() {
+                if let Err(err) = self.verify_snapshot_integrity(store, dataset_name, name) {
+                    match err {
+                        SnapshotPrunerError::IntegrityFailure(reason) => {
+                            blocks.push(SnapshotPruneBlock::IntegrityFailure(reason));
+                        }
+                        other => blocks.push(SnapshotPruneBlock::StoreFailure(other.to_string())),
+                    }
+                }
             }
-            // Safety checks passed; destroy. A failed destroy (e.g.
-            // concurrent removal) is best-effort — the snapshot stays.
-            if self.destroy_snapshot(store, dataset_name, name).is_ok() {
-                destroyed += 1;
+
+            let action = if blocks.is_empty() {
+                result.delete_set.push(name.clone());
+                SnapshotPruneAction::Delete
+            } else {
+                account_plan_blocks(&mut result, &blocks);
+                SnapshotPruneAction::Blocked(blocks)
+            };
+
+            result.decisions.push(SnapshotPruneDecision {
+                snapshot_name: name.clone(),
+                snapshot_id,
+                snapshot_root,
+                action,
+                clone_origin_pins,
+                deadlist_pins,
+            });
+        }
+
+        result
+    }
+
+    /// Run a full retention-driven prune of a single dataset.
+    ///
+    /// The delete set is first produced by [`Self::plan_dataset_prune`], so a
+    /// candidate with missing, corrupt, clone-origin, or deadlist-pin evidence
+    /// is never handed to the store deletion path.
+    pub fn prune_dataset(
+        &mut self,
+        store: &mut LocalObjectStore,
+        dataset_name: &str,
+        now: SystemTime,
+    ) -> PruneResult {
+        let snapshots = store.list_snapshots(dataset_name);
+        if snapshots.is_empty() {
+            return PruneResult::default();
+        }
+        let infos: Vec<SnapshotInfo> = snapshots
+            .iter()
+            .enumerate()
+            .map(|(i, e)| SnapshotInfo {
+                name: e.name.clone(),
+                created_at: e.created_at,
+                size_bytes: 0,
+                txg_anchor: e.txg_anchor.0,
+                ordinal: i as u64,
+            })
+            .collect();
+
+        let mut result = self.plan_dataset_prune(store, dataset_name, now);
+        let delete_set = result.delete_set.clone();
+        let mut destroyed_names = Vec::new();
+
+        for name in delete_set {
+            match store.destroy_snapshot(dataset_name, &name) {
+                Ok(Some(_)) => destroyed_names.push(name),
+                Ok(None) => {}
+                Err(err) => {
+                    result.store_failures = result.store_failures.saturating_add(1);
+                    if let Some(decision) = result
+                        .decisions
+                        .iter_mut()
+                        .find(|decision| decision.snapshot_name == name)
+                    {
+                        decision.action =
+                            SnapshotPruneAction::Blocked(vec![SnapshotPruneBlock::StoreFailure(
+                                format!("{err}"),
+                            )]);
+                    }
+                    result.delete_set.retain(|planned| planned != &name);
+                }
             }
         }
 
-        // Record dataset-level retained count (destroy_snapshot already
-        // recorded per-destroy stats via record_outcome).
-        self.stats.snapshots_retained = self
-            .stats
-            .snapshots_retained
-            .saturating_add(infos.len() as u64 - destroyed);
-        // datasets_processed was incremented per destroy; correct it.
-        if destroyed > 0 {
-            self.stats.datasets_processed =
-                self.stats.datasets_processed.saturating_sub(destroyed - 1);
-        }
+        result.destroyed = destroyed_names.len() as u64;
+        self.record_outcome(&infos, &destroyed_names);
 
-        PruneResult {
-            candidates_evaluated: total_candidates,
-            destroyed,
-            skipped_clones,
-            skipped_origins,
-        }
+        result
     }
 }
 
 // ---------------------------------------------------------------------------
+
+fn clone_origin_pin_set(pins: &[CloneOriginPin]) -> BTreeSet<(u8, String)> {
+    pins.iter()
+        .map(|pin| (pin.kind.to_u8(), pin.id.clone()))
+        .collect()
+}
+
+fn account_plan_blocks(result: &mut PruneResult, blocks: &[SnapshotPruneBlock]) {
+    if blocks
+        .iter()
+        .any(|block| matches!(block, SnapshotPruneBlock::IntegrityFailure(_)))
+    {
+        result.integrity_failures = result.integrity_failures.saturating_add(1);
+    }
+    if blocks
+        .iter()
+        .any(|block| matches!(block, SnapshotPruneBlock::CloneOriginProtection))
+    {
+        result.clone_origin_protected = result.clone_origin_protected.saturating_add(1);
+    }
+    if blocks
+        .iter()
+        .any(|block| matches!(block, SnapshotPruneBlock::DeadlistPinProtection))
+    {
+        result.deadlist_pin_protected = result.deadlist_pin_protected.saturating_add(1);
+    }
+    if blocks
+        .iter()
+        .any(|block| matches!(block, SnapshotPruneBlock::MissingEvidence(_)))
+    {
+        result.missing_evidence_blocks = result.missing_evidence_blocks.saturating_add(1);
+    }
+    if blocks
+        .iter()
+        .any(|block| matches!(block, SnapshotPruneBlock::CorruptEvidence(_)))
+    {
+        result.corrupt_evidence_blocks = result.corrupt_evidence_blocks.saturating_add(1);
+    }
+    if blocks
+        .iter()
+        .any(|block| matches!(block, SnapshotPruneBlock::StoreFailure(_)))
+    {
+        result.store_failures = result.store_failures.saturating_add(1);
+    }
+}
