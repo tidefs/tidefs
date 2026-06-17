@@ -79,6 +79,77 @@ fn block_device_pool_accepts_regular_file_dev_backing() {
     cleanup(&root);
 }
 
+#[test]
+fn default_open_uses_hidden_regular_file_dev_backing() {
+    let root = temp_root("default-hidden-file-dev");
+    let image = LocalFileSystem::default_development_device_path(&root);
+
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        fs.create_file("/round-trip.txt", DEFAULT_FILE_PERMISSIONS)
+            .expect("create file");
+        fs.write_file("/round-trip.txt", 0, b"default file-device media")
+            .expect("write file");
+        fs.fsync_file("/round-trip.txt").expect("fsync file");
+    }
+
+    assert!(
+        image.is_file(),
+        "default open should create hidden device image"
+    );
+    assert_eq!(
+        LocalFileSystem::byte_addressable_device_backing(&image).unwrap(),
+        DeviceBacking::RegularFileDev
+    );
+
+    let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        fs.read_file("/round-trip.txt").expect("read file"),
+        b"default file-device media"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn local_filesystem_round_trips_on_explicit_regular_file_dev() {
+    let root = temp_root("explicit-regular-file-dev");
+    fs::create_dir_all(&root).unwrap();
+    let image = root.join("pool.img");
+    let file = fs::File::create(&image).unwrap();
+    file.set_len(2 * 1024 * 1024).unwrap();
+    let metadata_dir = root.join("metadata");
+
+    {
+        let mut fs = LocalFileSystem::open_with_block_devices(
+            &metadata_dir,
+            std::slice::from_ref(&image),
+            options(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open explicit regular-file device");
+        fs.create_file("/dev-round-trip.txt", DEFAULT_FILE_PERMISSIONS)
+            .expect("create file");
+        fs.write_file("/dev-round-trip.txt", 0, b"explicit file-device media")
+            .expect("write file");
+        fs.fsync_file("/dev-round-trip.txt").expect("fsync file");
+    }
+
+    let fs = LocalFileSystem::open_with_block_devices(
+        &metadata_dir,
+        std::slice::from_ref(&image),
+        options(),
+        RootAuthenticationKey::demo_key(),
+    )
+    .expect("reopen explicit regular-file device");
+    assert_eq!(
+        fs.read_file("/dev-round-trip.txt").expect("read file"),
+        b"explicit file-device media"
+    );
+
+    cleanup(&root);
+}
+
 fn assert_record_has_wall_clock_posix_times(record: &InodeRecord, before_ns: i64, after_ns: i64) {
     let timestamps = [
         record.posix_time.atime_ns,
@@ -5735,8 +5806,8 @@ fn assert_transform_rejected(result: Result<LocalFileSystem>) {
 fn mounted_open_recovery_authority_raw_only_initializes_empty_pool() {
     let root = temp_root("mounted-open-recovery-authority");
     {
-        let mut store =
-            LocalFileSystem::default_pool(&root, &options(), None, None, None).expect("open pool");
+        let mut store = LocalFileSystem::default_development_pool(&root, &options(), None, None)
+            .expect("open pool");
         let mut authority = MountedOpenRecoveryAuthority::raw_only(
             &mut store,
             default_root_authentication_key().expect("auth key"),
@@ -5795,8 +5866,8 @@ fn mounted_committed_root_repair_authority_routes_probe_audit_verifier_and_reten
     };
 
     {
-        let mut store =
-            LocalFileSystem::default_pool(&root, &options(), None, None, None).expect("open pool");
+        let mut store = LocalFileSystem::default_development_pool(&root, &options(), None, None)
+            .expect("open pool");
         let mut open_authority =
             MountedOpenRecoveryAuthority::raw_only(&mut store, key, RecoveryPolicy::default());
         assert_eq!(

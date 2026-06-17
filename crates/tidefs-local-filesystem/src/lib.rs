@@ -224,7 +224,7 @@
 //!
 //! On `open`(LocalFileSystem::open), the recovery sequence is:
 //!
-//! 1. **Pool open**: `default_pool` opens the [`LocalObjectStore`] with
+//! 1. **Pool open**: `default_development_pool` opens the [`LocalObjectStore`] with
 //!    the requested device, encryption, and compression configuration.
 //! 2. **Root select**: `load_latest_committed_state` scans committed root
 //!    slots and selects the newest valid root. If no root exists,
@@ -484,7 +484,7 @@ pub fn audit_recovery_with_root_authentication_key(
     options: StoreOptions,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RecoveryAuditReport> {
-    let mut store = LocalFileSystem::default_pool(root.as_ref(), &options, None, None, None)?;
+    let mut store = LocalFileSystem::default_development_pool(root.as_ref(), &options, None, None)?;
     let mut authority = MountedOpenRecoveryAuthority::raw_only(
         &mut store,
         root_authentication_key,
@@ -510,7 +510,7 @@ pub fn verify_online_with_root_authentication_key(
     if !root.exists() {
         return Ok(OnlineVerifierReport::empty());
     }
-    let mut store = LocalFileSystem::default_pool(root, &options, None, None, None)?;
+    let mut store = LocalFileSystem::default_development_pool(root, &options, None, None)?;
     let mut authority = MountedOpenRecoveryAuthority::raw_only(
         &mut store,
         root_authentication_key,
@@ -577,7 +577,7 @@ pub fn plan_root_retention_with_root_authentication_key(
     policy: RootRetentionPolicy,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootRetentionPlan> {
-    let mut store = LocalFileSystem::default_pool(root.as_ref(), &options, None, None, None)?;
+    let mut store = LocalFileSystem::default_development_pool(root.as_ref(), &options, None, None)?;
     let mut authority = MountedOpenRecoveryAuthority::raw_only(
         &mut store,
         root_authentication_key,
@@ -698,6 +698,9 @@ struct CoalescedBufferedWritePatch {
 /// Review debt TFR-004: root identity must become dataset-scoped before
 /// dataset, snapshot, or mount identity can be treated as authoritative.
 const ROOT_DATASET_ID: [u8; 16] = [0u8; 16];
+const DEFAULT_DEVELOPMENT_DEVICE_DIR: &str = ".tidefs-devices";
+const DEFAULT_DEVELOPMENT_DEVICE_IMAGE: &str = "data0.img";
+pub const DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FileSystemState {
@@ -2397,51 +2400,77 @@ impl LocalFileSystem {
         self.background_scheduler = None;
     }
 
-    /// Create a default pool from a directory path, optionally with a
-    /// separate intent-log (LOG_DEVICE) device for sync-write acceleration.
-    fn default_pool(
+    /// Create the development default pool from a hidden regular-file device image.
+    fn default_development_pool(
         root: &std::path::Path,
         options: &StoreOptions,
         encryption: Option<EncryptionConfig>,
         compression: Option<CompressionConfig>,
-        log_device_device_path: Option<&std::path::Path>,
     ) -> Result<Pool> {
-        let mut devices = vec![DeviceConfig {
-            media_class: DeviceMediaClass::Ssd,
-            path: root.to_path_buf(),
-            backing: DeviceBacking::DirectoryObjectStoreCompat,
-            class: DeviceClass::Data,
-            kind: DeviceKind::Single {
+        let device_path = Self::ensure_default_development_device_image(root)?;
+        let devices = [device_path];
+        Self::block_device_pool(root, &devices, encryption, compression, options)
+    }
+
+    #[must_use]
+    pub fn default_development_device_path(root: impl AsRef<Path>) -> std::path::PathBuf {
+        root.as_ref()
+            .join(DEFAULT_DEVELOPMENT_DEVICE_DIR)
+            .join(DEFAULT_DEVELOPMENT_DEVICE_IMAGE)
+    }
+
+    fn ensure_default_development_device_image(
+        root: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        fs::create_dir_all(root).map_err(|source| {
+            FileSystemError::Store(StoreError::Io {
+                operation: "create_default_development_metadata_dir",
                 path: root.to_path_buf(),
-            },
-            encryption: encryption.clone(),
-            compression: compression.clone(),
-        }];
-        // When a dedicated log device path is provided, add an IntentLog
-        // device ahead of the data device so the ClassMap routes sync writes
-        // to the fast device first and falls back to data devices.
-        if let Some(log_device_path) = log_device_device_path {
-            devices.insert(
-                0,
-                DeviceConfig {
-                    media_class: DeviceMediaClass::Ssd,
-                    path: log_device_path.to_path_buf(),
-                    backing: DeviceBacking::DirectoryObjectStoreCompat,
-                    class: DeviceClass::IntentLog,
-                    kind: DeviceKind::LogDevice {
-                        path: log_device_path.to_path_buf(),
-                    },
-                    encryption: None,
-                    compression: None,
-                },
-            );
+                source,
+            })
+        })?;
+        let device_dir = root.join(DEFAULT_DEVELOPMENT_DEVICE_DIR);
+        fs::create_dir_all(&device_dir).map_err(|source| {
+            FileSystemError::Store(StoreError::Io {
+                operation: "create_default_development_device_dir",
+                path: device_dir.clone(),
+                source,
+            })
+        })?;
+        let device_path = root
+            .join(DEFAULT_DEVELOPMENT_DEVICE_DIR)
+            .join(DEFAULT_DEVELOPMENT_DEVICE_IMAGE);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&device_path)
+            .map_err(|source| {
+                FileSystemError::Store(StoreError::Io {
+                    operation: "open_default_development_device_image",
+                    path: device_path.clone(),
+                    source,
+                })
+            })?;
+        let len = file.metadata().map_err(|source| {
+            FileSystemError::Store(StoreError::Io {
+                operation: "metadata_default_development_device_image",
+                path: device_path.clone(),
+                source,
+            })
+        })?;
+        if len.len() < DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES {
+            file.set_len(DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES)
+                .map_err(|source| {
+                    FileSystemError::Store(StoreError::Io {
+                        operation: "size_default_development_device_image",
+                        path: device_path.clone(),
+                        source,
+                    })
+                })?;
         }
-        let config = PoolConfig {
-            name: "tidefs".into(),
-            root_path: root.to_path_buf(),
-            devices,
-        };
-        Ok(Pool::create(config, PoolProperties::default(), options)?)
+        Ok(device_path)
     }
 
     #[allow(dead_code)]
@@ -2501,14 +2530,14 @@ impl LocalFileSystem {
     ///
     /// The log device receives ZIL intent-log writes first, acknowledges
     /// them immediately after `fdatasync`, and defers the bulk data-device
-    /// writes to the next COMMIT_GROUP commit.  This bounds sync-write latency to
-    /// the speed of the fast device (e.g. NVMe SSD) without forcing all
+    /// writes to the next COMMIT_GROUP commit.  This bounds sync-write latency
+    /// to the speed of the fast device (e.g. NVMe SSD) without forcing all
     /// data writes through it.
     ///
     /// The `log_device_device_path` must point to a regular file or block
     /// device on a fast storage medium.  The pool label records the
-    /// log device class so the log device is re-attached on subsequent
-    /// imports.
+    /// data pool uses the same hidden regular-file development image as
+    /// [`LocalFileSystem::open`] unless explicit block devices are supplied.
     pub fn open_with_log_device(
         root: impl AsRef<Path>,
         log_device_device_path: impl AsRef<Path>,
@@ -2730,7 +2759,7 @@ impl LocalFileSystem {
         )
     }
 
-    /// Attempt to open a compatibility directory-store filesystem with encryption enabled.
+    /// Attempt to open a development default filesystem with encryption enabled.
     ///
     /// Currently fails closed until TFR-006 raw-store bypasses are removed or
     /// proven raw-only for mounted filesystem operation.
@@ -2808,13 +2837,7 @@ impl LocalFileSystem {
                 &options,
             )?
         } else {
-            Self::default_pool(
-                &root_path,
-                &options,
-                encryption,
-                compression,
-                log_device_device_path.as_deref(),
-            )?
+            Self::default_development_pool(&root_path, &options, encryption, compression)?
         };
         // Check locked-dataset condition: import an encrypted pool without
         // a key and refuse all I/O until the operator supplies one.
@@ -3384,7 +3407,7 @@ impl LocalFileSystem {
         options: StoreOptions,
         root_authentication_key: RootAuthenticationKey,
     ) -> Result<RecoveryProbeReport> {
-        let mut store = Self::default_pool(root.as_ref(), &options, None, None, None)?;
+        let mut store = Self::default_development_pool(root.as_ref(), &options, None, None)?;
         let mut authority = MountedOpenRecoveryAuthority::raw_only(
             &mut store,
             root_authentication_key,
