@@ -5793,9 +5793,10 @@ static int tidefs_posix_vfs_read_folio(struct file *file, struct folio *folio)
 /*
  * Engine-backed readahead for regular files.  Populates clean page-cache
  * folios from the engine for the range described by rac.  The folios are
- * populated and marked uptodate on success; on engine-read failure or
- * short read the folio is unlocked without marking it uptodate so the
- * kernel will fall back to a synchronous read_folio on demand.
+ * populated and marked uptodate after a complete in-file engine read.  Engine
+ * failures, allocation failures, and short in-file reads leave the folio
+ * non-uptodate so the kernel will fall back to synchronous read_folio on
+ * demand.  Folios wholly beyond EOF are zero-filled and marked uptodate.
  *
  * This is advisory: no mapping_set_error is recorded and dirty state is
  * never set.  Short reads, holes, EOF, and engine-read errors are handled
@@ -5827,6 +5828,11 @@ static void tidefs_posix_vfs_readahead(struct readahead_control *rac)
 		u64 fh_ino;
 
 		fh_ino = inode->i_ino;
+
+		if (fsize == 0) {
+			folio_unlock(folio);
+			continue;
+		}
 
 		/* Beyond EOF: zero-fill the folio and mark it uptodate.
 		 * This avoids leaving an unlocked, non-uptodate folio
@@ -5867,6 +5873,16 @@ static void tidefs_posix_vfs_readahead(struct readahead_control *rac)
 			continue;
 		}
 
+		if ((size_t)ret < read_len) {
+			kfree(kbuf);
+			/* Advisory short in-file read: leave the folio
+			 * non-uptodate so demand read_folio resolves the
+			 * range through engine authority later.
+			 */
+			folio_unlock(folio);
+			continue;
+		}
+
 		if (ret > 0) {
 			void *addr = kmap_local_folio(folio, 0);
 			size_t copy_len = min_t(size_t, (size_t)ret, read_len);
@@ -5874,15 +5890,10 @@ static void tidefs_posix_vfs_readahead(struct readahead_control *rac)
 			memcpy(addr, kbuf, copy_len);
 			kunmap_local(addr);
 
-			/* Zero-fill remainder for short reads
-			 * (holes within the engine range).
-			 */
+			/* Zero-fill folio bytes past the known file size. */
 			if (copy_len < fsize)
 				folio_zero_range(folio, copy_len,
 						 fsize - copy_len);
-		} else {
-			/* Zero-length engine read: hole. */
-			folio_zero_range(folio, 0, fsize);
 		}
 
 		kfree(kbuf);
