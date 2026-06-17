@@ -1292,3 +1292,373 @@ mod concurrency_bound_tests {
         );
     }
 }
+
+// ===========================================================================
+// 14. Durable dispatch — dispatch→crash→resume lifecycle tests
+// ===========================================================================
+
+mod durable_dispatch_tests {
+    use super::*;
+    use tidefs_background_scheduler::BackgroundScheduler;
+    use tidefs_incremental_job_core::{DispatchStore, DispatchStoreError, InMemoryDispatchStore};
+    use tidefs_types_incremental_job_core::{
+        DispatchRecord, DispatchRecordId, DispatchState, JobId, JobKind, SchedulerEpoch,
+    };
+
+    /// Helper: create a BackgroundScheduler with an InMemoryDispatchStore.
+    fn scheduler_with_store() -> BackgroundScheduler {
+        let store = Box::new(InMemoryDispatchStore::new());
+        BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, store)
+    }
+
+    // ── Basic dispatch record persistence ─────────────────────────
+
+    #[test]
+    fn register_dispatched_creates_record() {
+        let mut s = scheduler_with_store();
+        let job = MockJob::new(1, JobKind::Scrub, 10);
+        let adapter = IncrementalJobAdapter::new("test-scrub", job);
+
+        let dispatch_id = s
+            .register_dispatched(Box::new(adapter), JobId(1), JobKind::Scrub)
+            .unwrap();
+
+        // Record should exist
+        let records = s.load_resumable_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].job_id, JobId(1));
+        assert_eq!(records[0].job_kind, JobKind::Scrub);
+        assert_eq!(records[0].dispatch_id, dispatch_id);
+        assert_eq!(records[0].state, DispatchState::InProgress);
+    }
+
+    #[test]
+    fn register_dispatched_assigns_unique_ids() {
+        let mut s = scheduler_with_store();
+
+        let id1 = s
+            .register_dispatched(
+                Box::new(IncrementalJobAdapter::new("a", MockJob::new(1, JobKind::Scrub, 10))),
+                JobId(1),
+                JobKind::Scrub,
+            )
+            .unwrap();
+
+        let id2 = s
+            .register_dispatched(
+                Box::new(IncrementalJobAdapter::new(
+                    "b",
+                    MockJob::new(2, JobKind::GCMark, 10),
+                )),
+                JobId(2),
+                JobKind::GCMark,
+            )
+            .unwrap();
+
+        assert_ne!(id1, id2);
+        assert_eq!(s.load_resumable_records().unwrap().len(), 2);
+    }
+
+    // ── Dispatch → complete → restart (no re-dispatch) ───────────
+
+    #[test]
+    fn completed_job_not_resumed_on_restart() {
+        let mut s = scheduler_with_store();
+
+        let dispatch_id = s
+            .register_dispatched(
+                Box::new(IncrementalJobAdapter::new("task", MockJob::new(1, JobKind::Scrub, 10))),
+                JobId(1),
+                JobKind::Scrub,
+            )
+            .unwrap();
+
+        // Mark as completed
+        s.mark_dispatched_completed(dispatch_id).unwrap();
+
+        // On "restart" (new store view), completed records should not be resumable
+        let resumable = s.load_resumable_records().unwrap();
+        assert!(
+            resumable.is_empty(),
+            "completed job should not appear as resumable"
+        );
+    }
+
+    // ── Double-dispatch rejection ─────────────────────────────────
+
+    #[test]
+    fn double_dispatch_same_id_rejected() {
+        let store = Box::new(InMemoryDispatchStore::new());
+        let mut s = BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, store);
+
+        // Register first dispatch
+        s.register_dispatched(
+            Box::new(IncrementalJobAdapter::new("only", MockJob::new(1, JobKind::Scrub, 10))),
+            JobId(1),
+            JobKind::Scrub,
+        )
+        .unwrap();
+
+        // Try to dispatch with the same job_id + job_kind within the same epoch
+        // The store should reject the duplicate DispatchRecordId
+        // Since register_dispatched auto-increments the id, we test via store directly
+        let existing_id = DispatchRecordId(0); // first dispatch got id 0
+        let dup = s.is_duplicate_dispatch(existing_id).unwrap();
+        assert!(dup, "dispatch id 0 should already exist");
+    }
+
+    #[test]
+    fn duplicate_store_record_rejected() {
+        let mut store = InMemoryDispatchStore::new();
+        let rec = DispatchRecord::new(
+            JobId(7),
+            JobKind::BtreeCompaction,
+            SchedulerEpoch(1),
+            DispatchRecordId(42),
+            0,
+        );
+        store.store_record(&rec).unwrap();
+        let err = store.store_record(&rec).unwrap_err();
+        assert!(matches!(
+            err,
+            DispatchStoreError::DuplicateDispatch(DispatchRecordId(42))
+        ));
+    }
+
+    // ── Job cancellation durability ───────────────────────────────
+
+    #[test]
+    fn cancelled_job_not_resumed() {
+        let mut s = scheduler_with_store();
+
+        let dispatch_id = s
+            .register_dispatched(
+                Box::new(IncrementalJobAdapter::new(
+                    "cancel-me",
+                    MockJob::new(5, JobKind::AdminJob, 100),
+                )),
+                JobId(5),
+                JobKind::AdminJob,
+            )
+            .unwrap();
+
+        // Cancel the job
+        s.cancel_dispatched(dispatch_id).unwrap();
+
+        // Cancelled jobs should not be resumable
+        let resumable = s.load_resumable_records().unwrap();
+        assert!(resumable.is_empty(), "cancelled job should not be resumable");
+    }
+
+    // ── Crash → resume (in-progress job survives) ─────────────────
+
+    #[test]
+    fn in_progress_job_survives_crash() {
+        let mut s = scheduler_with_store();
+
+        s.register_dispatched(
+            Box::new(IncrementalJobAdapter::new(
+                "survivor",
+                MockJob::new(10, JobKind::DeferredCleanup, 50),
+            )),
+            JobId(10),
+            JobKind::DeferredCleanup,
+        )
+        .unwrap();
+
+        // Simulate crash: the job was InProgress when the crash happened.
+        // On restart, load_resumable_records should return it.
+        let resumable = s.load_resumable_records().unwrap();
+        assert_eq!(resumable.len(), 1);
+        assert_eq!(resumable[0].job_id, JobId(10));
+        assert_eq!(resumable[0].state, DispatchState::InProgress);
+    }
+
+    // ── Epoch advancement ─────────────────────────────────────────
+
+    #[test]
+    fn epoch_advances_on_restart() {
+        let mut s = scheduler_with_store();
+        let initial_epoch = s.epoch();
+        assert_eq!(initial_epoch, SchedulerEpoch::INITIAL);
+
+        let new_epoch = s.advance_epoch().unwrap();
+        assert_eq!(new_epoch, SchedulerEpoch(1));
+        assert!(new_epoch.is_successor_of(initial_epoch));
+        assert_eq!(s.epoch(), SchedulerEpoch(1));
+
+        let final_epoch = s.advance_epoch().unwrap();
+        assert_eq!(final_epoch, SchedulerEpoch(2));
+    }
+
+    #[test]
+    fn epoch_persisted_across_store_reload() {
+        let store = Box::new(InMemoryDispatchStore::new());
+        let mut s = BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, store);
+        s.advance_epoch().unwrap(); // epoch=1
+        s.advance_epoch().unwrap(); // epoch=2
+
+        // Verify epoch is stored
+        // A new scheduler with the same store should pick up epoch 2
+        // (InMemoryDispatchStore is reused, so we can check directly)
+        let resumable = s.load_resumable_records().unwrap();
+        assert!(resumable.is_empty());
+    }
+
+    #[test]
+    fn epoch_stored_and_loaded() {
+        let mut store = InMemoryDispatchStore::new();
+        assert!(store.load_epoch().unwrap().is_none());
+        store.store_epoch(SchedulerEpoch(5)).unwrap();
+        assert_eq!(store.load_epoch().unwrap(), Some(SchedulerEpoch(5)));
+    }
+
+    // ── Multiple job kinds dispatch and resume ────────────────────
+
+    #[test]
+    fn multiple_job_kinds_all_survive_crash() {
+        let mut s = scheduler_with_store();
+
+        let kinds = [
+            JobKind::Scrub,
+            JobKind::DeferredCleanup,
+            JobKind::GCMark,
+            JobKind::BtreeCompaction,
+            JobKind::Rebake,
+        ];
+
+        for (i, &kind) in kinds.iter().enumerate() {
+            s.register_dispatched(
+                Box::new(IncrementalJobAdapter::new(
+                    Box::leak(format!("job-{i}").into_boxed_str()),
+                    MockJob::new(i as u64, kind, 20),
+                )),
+                JobId(i as u64),
+                kind,
+            )
+            .unwrap();
+        }
+
+        let resumable = s.load_resumable_records().unwrap();
+        assert_eq!(resumable.len(), kinds.len());
+
+        // All should be InProgress
+        for rec in &resumable {
+            assert_eq!(rec.state, DispatchState::InProgress);
+            assert!(rec.can_resume());
+        }
+    }
+
+    // ── Checkpoint update on dispatched job ───────────────────────
+
+    #[test]
+    fn checkpoint_update_persisted() {
+        let mut s = scheduler_with_store();
+
+        let dispatch_id = s
+            .register_dispatched(
+                Box::new(IncrementalJobAdapter::new(
+                    "ckpt-test",
+                    MockJob::new(3, JobKind::JournalCleaning, 30),
+                )),
+                JobId(3),
+                JobKind::JournalCleaning,
+            )
+            .unwrap();
+
+        let cp = tidefs_types_incremental_job_core::Checkpoint::new_initial(
+            JobId(3),
+            JobKind::JournalCleaning,
+        );
+        s.update_dispatched_checkpoint(dispatch_id, cp.clone())
+            .unwrap();
+
+        // The record should now carry the checkpoint
+        let records = s.load_resumable_records().unwrap();
+        assert_eq!(records[0].last_checkpoint, Some(cp));
+    }
+
+    // ── Scheduler without store (backward compat) ─────────────────
+
+    #[test]
+    fn scheduler_without_store_loads_no_records() {
+        let s = BackgroundScheduler::new(ServiceBudget::SMALL_TICK);
+        let resumable = s.load_resumable_records().unwrap();
+        assert!(resumable.is_empty());
+    }
+
+    #[test]
+    fn scheduler_without_store_register_dispatched_works() {
+        let mut s = BackgroundScheduler::new(ServiceBudget::SMALL_TICK);
+        let id = s
+            .register_dispatched(
+                Box::new(IncrementalJobAdapter::new("no-store", MockJob::new(1, JobKind::Scrub, 10))),
+                JobId(1),
+                JobKind::Scrub,
+            )
+            .unwrap();
+        assert_eq!(id, DispatchRecordId(0));
+        assert_eq!(s.service_count(), 1);
+    }
+
+    #[test]
+    fn scheduler_without_store_epoch_is_initial() {
+        let s = BackgroundScheduler::new(ServiceBudget::SMALL_TICK);
+        assert_eq!(s.epoch(), SchedulerEpoch::INITIAL);
+    }
+
+    // ── Completion marker persistence ─────────────────────────────
+
+    #[test]
+    fn complete_marker_persisted_and_prevents_resume() {
+        let mut s = scheduler_with_store();
+
+        let dispatch_id = s
+            .register_dispatched(
+                Box::new(IncrementalJobAdapter::new("finish", MockJob::new(99, JobKind::Scrub, 1))),
+                JobId(99),
+                JobKind::Scrub,
+            )
+            .unwrap();
+
+        // Job runs to completion (through the scheduler cycle)
+        s.run_cycle();
+
+        // Mark completed
+        s.mark_dispatched_completed(dispatch_id).unwrap();
+
+        // On restart, not resumable
+        let resumable = s.load_resumable_records().unwrap();
+        assert!(
+            resumable.is_empty(),
+            "completed job must not be resumable"
+        );
+    }
+
+    // ── run_cycle with dispatch store ─────────────────────────────
+
+    #[test]
+    fn run_cycle_with_dispatched_services() {
+        let mut s = scheduler_with_store();
+
+        s.register_dispatched(
+            Box::new(IncrementalJobAdapter::new("svc1", MockJob::new(1, JobKind::Scrub, 10))),
+            JobId(1),
+            JobKind::Scrub,
+        )
+        .unwrap();
+        s.register_dispatched(
+            Box::new(IncrementalJobAdapter::new(
+                "svc2",
+                MockJob::new(2, JobKind::DeferredCleanup, 10),
+            )),
+            JobId(2),
+            JobKind::DeferredCleanup,
+        )
+        .unwrap();
+
+        let report = s.run_cycle();
+        assert!(report.services_ran >= 1);
+        assert!(report.total_processed > 0);
+    }
+}

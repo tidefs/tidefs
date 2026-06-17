@@ -827,6 +827,200 @@ impl core::fmt::Display for ServiceState {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// SchedulerEpoch — monotonic generation counter for dispatch ordering
+// ---------------------------------------------------------------------------
+
+/// Monotonic epoch counter that advances on each scheduler restart.
+///
+/// Used to detect and reject stale dispatch records from a previous
+/// scheduler lifetime. Every dispatch record carries the epoch in which
+/// it was created; the scheduler rejects dispatch for a record whose
+/// epoch differs from the current epoch unless the record is being
+/// replayed after a crash within the same epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SchedulerEpoch(pub u64);
+
+impl SchedulerEpoch {
+    /// The initial epoch value at pool creation or first scheduler start.
+    pub const INITIAL: Self = SchedulerEpoch(0);
+
+    /// Advance to the next epoch.
+    #[must_use]
+    pub fn next(self) -> Self {
+        SchedulerEpoch(self.0 + 1)
+    }
+
+    /// Returns true if this epoch is reached from `prev` by advancing.
+    #[must_use]
+    pub fn is_successor_of(self, prev: SchedulerEpoch) -> bool {
+        self.0 == prev.0 + 1
+    }
+}
+
+impl core::fmt::Display for SchedulerEpoch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "epoch-{}", self.0)
+    }
+}
+
+impl Default for SchedulerEpoch {
+    fn default() -> Self {
+        Self::INITIAL
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DispatchRecordId — unique identity for a single dispatch event
+// ---------------------------------------------------------------------------
+
+/// Unique identifier for a dispatch record.
+///
+/// Used to prevent duplicate dispatch: the scheduler stores this id
+/// and rejects any attempt to dispatch the same id within the same epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DispatchRecordId(pub u64);
+
+impl core::fmt::Display for DispatchRecordId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "dispatch-{}", self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DispatchState — lifecycle state of a dispatch record
+// ---------------------------------------------------------------------------
+
+/// State of a dispatched job tracked by the scheduler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DispatchState {
+    /// Record persisted, job not yet started.
+    Pending,
+    /// Job is actively executing.
+    InProgress,
+    /// Job completed successfully; completion marker persisted.
+    Completed,
+    /// Job was cancelled before completion.
+    Cancelled,
+}
+
+impl DispatchState {
+    /// True if this state represents a terminal condition.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, DispatchState::Completed | DispatchState::Cancelled)
+    }
+
+    /// True if the job may be resumed or re-queued.
+    #[must_use]
+    pub fn is_resumable(self) -> bool {
+        matches!(self, DispatchState::Pending | DispatchState::InProgress)
+    }
+}
+
+impl core::fmt::Display for DispatchState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DispatchState::Pending => write!(f, "pending"),
+            DispatchState::InProgress => write!(f, "in_progress"),
+            DispatchState::Completed => write!(f, "completed"),
+            DispatchState::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DispatchRecord — durable dispatch event for a scheduled job
+// ---------------------------------------------------------------------------
+
+/// Persistent record of a job dispatch event.
+///
+/// Written before a job begins execution and updated on completion,
+/// cancellation, or checkpoint advancement. On daemon restart, the
+/// scheduler replays pending and in-progress records to resume work.
+#[cfg(feature = "alloc")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DispatchRecord {
+    /// The job identity.
+    pub job_id: JobId,
+    /// The kind of job.
+    pub job_kind: JobKind,
+    /// Scheduler epoch when this record was created.
+    pub epoch: SchedulerEpoch,
+    /// Unique dispatch identity within this epoch.
+    pub dispatch_id: DispatchRecordId,
+    /// Current lifecycle state.
+    pub state: DispatchState,
+    /// Wall-clock timestamp when the record was created (ms since pool epoch).
+    pub created_at_ms: u64,
+    /// Last known checkpoint, if any step completed.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub last_checkpoint: Option<Checkpoint>,
+}
+
+#[cfg(feature = "alloc")]
+impl DispatchRecord {
+    /// Create a new dispatch record in `Pending` state.
+    #[must_use]
+    pub fn new(
+        job_id: JobId,
+        job_kind: JobKind,
+        epoch: SchedulerEpoch,
+        dispatch_id: DispatchRecordId,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            job_id,
+            job_kind,
+            epoch,
+            dispatch_id,
+            state: DispatchState::Pending,
+            created_at_ms: now_ms,
+            last_checkpoint: None,
+        }
+    }
+
+    /// Transition to `InProgress`.
+    pub fn mark_in_progress(&mut self) {
+        self.state = DispatchState::InProgress;
+    }
+
+    /// Transition to `Completed`.
+    pub fn mark_completed(&mut self) {
+        self.state = DispatchState::Completed;
+    }
+
+    /// Transition to `Cancelled`.
+    pub fn mark_cancelled(&mut self) {
+        self.state = DispatchState::Cancelled;
+    }
+
+    /// Update the last checkpoint after a step.
+    pub fn update_checkpoint(&mut self, cp: Checkpoint) {
+        self.last_checkpoint = Some(cp);
+    }
+
+    /// True if this record can be re-dispatched after restart.
+    #[must_use]
+    pub fn can_resume(&self) -> bool {
+        self.state.is_resumable()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl core::fmt::Display for DispatchRecord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "DispatchRecord({} {} epoch={} state={})",
+            self.job_id, self.job_kind, self.epoch, self.state
+        )
+    }
+}
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1857,5 +2051,145 @@ mod tests {
         let ck = Checkpoint::new_initial(JobId(11), JobKind::Rebake);
         let job = MockScanJob::resume(ck).unwrap();
         job.complete();
+    }
+
+    // ── Dispatch record types ─────────────────────────────────────────
+
+    #[test]
+    fn scheduler_epoch_advances_monotonically() {
+        let e0 = SchedulerEpoch::INITIAL;
+        assert_eq!(e0.0, 0);
+        let e1 = e0.next();
+        assert_eq!(e1.0, 1);
+        assert!(e1.is_successor_of(e0));
+        assert!(!e0.is_successor_of(e1));
+    }
+
+    #[test]
+    fn scheduler_epoch_default_is_initial() {
+        let e: SchedulerEpoch = Default::default();
+        assert_eq!(e, SchedulerEpoch::INITIAL);
+    }
+
+    #[test]
+    fn dispatch_record_id_equality() {
+        let a = DispatchRecordId(1);
+        let b = DispatchRecordId(1);
+        let c = DispatchRecordId(2);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn dispatch_state_terminal_and_resumable() {
+        assert!(!DispatchState::Pending.is_terminal());
+        assert!(DispatchState::Pending.is_resumable());
+        assert!(!DispatchState::InProgress.is_terminal());
+        assert!(DispatchState::InProgress.is_resumable());
+        assert!(DispatchState::Completed.is_terminal());
+        assert!(!DispatchState::Completed.is_resumable());
+        assert!(DispatchState::Cancelled.is_terminal());
+        assert!(!DispatchState::Cancelled.is_resumable());
+    }
+
+    #[test]
+    fn dispatch_record_new_is_pending() {
+        let rec = DispatchRecord::new(
+            JobId(42),
+            JobKind::Scrub,
+            SchedulerEpoch(1),
+            DispatchRecordId(100),
+            12345,
+        );
+        assert_eq!(rec.job_id, JobId(42));
+        assert_eq!(rec.job_kind, JobKind::Scrub);
+        assert_eq!(rec.epoch, SchedulerEpoch(1));
+        assert_eq!(rec.dispatch_id, DispatchRecordId(100));
+        assert_eq!(rec.state, DispatchState::Pending);
+        assert_eq!(rec.created_at_ms, 12345);
+        assert!(rec.last_checkpoint.is_none());
+        assert!(rec.can_resume());
+    }
+
+    #[test]
+    fn dispatch_record_lifecycle_transitions() {
+        let mut rec = DispatchRecord::new(
+            JobId(1),
+            JobKind::DeferredCleanup,
+            SchedulerEpoch(0),
+            DispatchRecordId(1),
+            0,
+        );
+        assert_eq!(rec.state, DispatchState::Pending);
+        rec.mark_in_progress();
+        assert_eq!(rec.state, DispatchState::InProgress);
+        assert!(rec.can_resume());
+        rec.mark_completed();
+        assert_eq!(rec.state, DispatchState::Completed);
+        assert!(!rec.can_resume());
+    }
+
+    #[test]
+    fn dispatch_record_cancellation() {
+        let mut rec = DispatchRecord::new(
+            JobId(2),
+            JobKind::GCMark,
+            SchedulerEpoch(3),
+            DispatchRecordId(7),
+            0,
+        );
+        rec.mark_in_progress();
+        rec.mark_cancelled();
+        assert_eq!(rec.state, DispatchState::Cancelled);
+        assert!(rec.state.is_terminal());
+        assert!(!rec.can_resume());
+    }
+
+    #[test]
+    fn dispatch_record_checkpoint_update() {
+        let mut rec = DispatchRecord::new(
+            JobId(3),
+            JobKind::BtreeCompaction,
+            SchedulerEpoch(1),
+            DispatchRecordId(5),
+            0,
+        );
+        let cp = Checkpoint::new_initial(JobId(3), JobKind::BtreeCompaction);
+        rec.update_checkpoint(cp.clone());
+        assert_eq!(rec.last_checkpoint, Some(cp));
+    }
+
+    #[test]
+    fn dispatch_record_display_nonempty() {
+        let rec = DispatchRecord::new(
+            JobId(1),
+            JobKind::Scrub,
+            SchedulerEpoch(0),
+            DispatchRecordId(1),
+            0,
+        );
+        assert!(!format!("{rec}").is_empty());
+    }
+
+    #[test]
+    fn dispatch_state_display_nonempty() {
+        for state in &[
+            DispatchState::Pending,
+            DispatchState::InProgress,
+            DispatchState::Completed,
+            DispatchState::Cancelled,
+        ] {
+            assert!(!format!("{state}").is_empty());
+        }
+    }
+
+    #[test]
+    fn dispatch_record_id_display_nonempty() {
+        assert!(!format!("{}", DispatchRecordId(0)).is_empty());
+    }
+
+    #[test]
+    fn scheduler_epoch_display_nonempty() {
+        assert!(!format!("{}", SchedulerEpoch::INITIAL).is_empty());
     }
 }
