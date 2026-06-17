@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 150 |
+| Workspace packages | 152 |
 | Explicitly excluded package roots | 5 |
-| Discovered package manifests | 155 |
-| Classified package roots | 155 |
+| Discovered package manifests | 157 |
+| Classified package roots | 157 |
 
 ## Role Semantics
 
@@ -26,7 +26,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `vendored-third-party` | Vendored upstream dependency carried in-tree with separate provenance. |
 | `standalone-fuzz` | Cargo-fuzz package intentionally excluded from the root workspace and checked as standalone harness material. |
 | `scaffold-transitional` | Retired TFR-002 role for stale workspace scaffolding. No current package root is assigned this role; future scaffold recovery requires a prepared issue and current-role classification instead. |
-| `archive-delete-candidate` | Package root that should not stay active without an explicit issue. No current package root is assigned this role. |
+| `archive-delete-candidate` | Retired TFR-002 role. No current package root is assigned this role; packages that need archival must use an explicit issue-backed plan instead. |
 
 ## Role Counts
 
@@ -35,7 +35,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `product-code` | 117 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
-| `proof-harness` | 10 |
+| `proof-harness` | 12 |
 | `vendored-third-party` | 1 |
 | `standalone-fuzz` | 5 |
 | `scaffold-transitional` | 0 |
@@ -87,10 +87,12 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-dedup` | `tidefs-dedup` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-derived-catalog` | `tidefs-derived-catalog` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-device-removal` | `tidefs-device-removal` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
+| `crates/tidefs-distributed-model-check` | `tidefs-distributed-model-check` | `workspace-member` | `proof-harness` | planned authority surface for deterministic distributed safety model checking; follow-up issue required before it can support release claims. |
 | `crates/tidefs-dir-index` | `tidefs-dir-index` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-durability-layout` | `tidefs-durability-layout` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-encryption` | `tidefs-encryption` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `workspace-member` | `proof-harness` | bounded uBLK qid/tag state model evidence only; runtime block-volume claims remain blocked on focused artifacts. |
+| `crates/tidefs-env-fuse-model` | `tidefs-env-fuse-model` | `workspace-member` | `proof-harness` | planned authority surface for FUSE lifecycle environment model evidence; follow-up issue required before it can support runtime release claims. |
+| `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `workspace-member` | `proof-harness` | planned authority surface for bounded uBLK qid/tag state model evidence; follow-up issue required before it can support runtime release claims. |
 | `crates/tidefs-erasure-coded-store` | `tidefs-erasure-coded-store` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-erasure-coding` | `tidefs-erasure-coding` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-extent-map` | `tidefs-extent-map` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -217,7 +219,9 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `crates/tidefs-compaction` | `tidefs-compaction` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-crash-oracle` | `tidefs-crash-oracle` | `proof-harness` | planned authority surface for model-only crash oracle validation; follow-up issue required before it can support runtime release claims. |
 | `crates/tidefs-data-cleaner` | `tidefs-data-cleaner` | `product-code` | planned authority surface; follow-up issue required before release claims. |
-| `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `proof-harness` | bounded uBLK qid/tag state model evidence only; runtime block-volume claims remain blocked on focused artifacts. |
+| `crates/tidefs-distributed-model-check` | `tidefs-distributed-model-check` | `proof-harness` | planned authority surface for deterministic distributed safety model checking; follow-up issue required before it can support release claims. |
+| `crates/tidefs-env-fuse-model` | `tidefs-env-fuse-model` | `proof-harness` | planned authority surface for FUSE lifecycle environment model evidence; follow-up issue required before it can support runtime release claims. |
+| `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `proof-harness` | planned authority surface for bounded uBLK qid/tag state model evidence; follow-up issue required before it can support runtime release claims. |
 | `crates/tidefs-erasure-coded-store` | `tidefs-erasure-coded-store` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-geometry-convert` | `tidefs-geometry-convert` | `product-code` | planned authority surface; follow-up issue required before release claims. |
 | `crates/tidefs-kernel-cutover-runtime` | `tidefs-kernel-cutover-runtime` | `product-code` | planned authority surface; follow-up issue required before release claims. |
@@ -248,6 +252,6 @@ The root `workspace.exclude` list and the `workspace-excluded` rows above must m
 
 ## Boundary Rules Enforced By Xtask
 
-`check-workspace-policy` validates this document against Cargo metadata, discovered package manifests, and root `workspace.exclude`. It fails when a workspace member or excluded package root is missing from the table, when package names or counts drift, when excluded manifests diverge from root Cargo policy, when any package root is classified as `scaffold-transitional` after issue #276, or when product/operator/tooling packages depend on `archive-delete-candidate` packages.
+`check-workspace-policy` validates this document against Cargo metadata, discovered package manifests, and root `workspace.exclude`. It fails when a workspace member or excluded package root is missing from the table, when package names or counts drift, when excluded manifests diverge from root Cargo policy, or when any package root is classified with the retired `scaffold-transitional` or `archive-delete-candidate` roles.
 
 Issue #276 audited the prior scaffold-transitional type roots. Cargo metadata showed only an optional `tidefs-validation` manifest edge to `tidefs-types-control-plane-core`, plus scaffold-internal edges from `tidefs-types-publication-pipeline-core` and `tidefs-types-response-registry-core` to that same crate. Documentation references were limited to this authority, `crates/README.md`, `docs/REVIEW_TODO_REGISTER.md`, stale review material in `docs/ARCHITECTURE.md`, and xtask policy/terminology fixtures. The live control-plane, publication-pipeline, and response-registry record definitions are already present in `tidefs-types-vfs-core`; the stale package roots were deleted rather than reclassified.
