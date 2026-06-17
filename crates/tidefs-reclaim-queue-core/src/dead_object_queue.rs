@@ -1909,3 +1909,192 @@ mod tests {
         assert_eq!(batch.len(), 2);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Orphan replay watermark gating tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::*;
+    use tidefs_types_orphan_index_core::OrphanReplayWatermark;
+
+    fn wm(pos: u64) -> OrphanReplayWatermark {
+        OrphanReplayWatermark { position: pos }
+    }
+
+    fn oid(byte: u8) -> ObjectKey {
+        let mut k = [0u8; 32];
+        k[0] = byte;
+        ObjectKey(k)
+    }
+
+    /// Create an entry whose inode_id (for watermark gating) is the
+    /// first byte of its object key. The watermark tests use u8 values
+    /// so inode_id and watermark positions stay within a small range.
+    fn entry_for_watermark(byte: u8) -> DeadObjectEntry {
+        DeadObjectEntry::new(oid(byte), [0u8; 16], 5, true, 5)
+    }
+
+    fn inode_of_u8(entry: &DeadObjectEntry) -> Option<u64> {
+        Some(u64::from(entry.object_id.0[0]))
+    }
+
+    // For dequeue tests we need reclaimable entries; death_commit_group=5
+    // means stable_committed_txg needs to be >= 5.
+    const STABLE_TXG: u64 = 10;
+
+    // -- check_orphan_watermark --
+
+    #[test]
+    fn watermark_none_blocks_all() {
+        let entry = entry_for_watermark(100);
+        let result = DeadObjectReclaimQueue::check_orphan_watermark(
+            Some(OrphanReplayWatermark::NONE),
+            &entry,
+            inode_of_u8,
+        );
+        assert_eq!(result, Err(OrphanWatermarkBlock::WatermarkNone));
+    }
+
+    #[test]
+    fn watermark_covers_inode_passes() {
+        let entry = entry_for_watermark(100);
+        let result = DeadObjectReclaimQueue::check_orphan_watermark(
+            Some(wm(100)),
+            &entry,
+            inode_of_u8,
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn watermark_covers_beyond_inode_passes() {
+        let entry = entry_for_watermark(50);
+        let result = DeadObjectReclaimQueue::check_orphan_watermark(
+            Some(wm(100)),
+            &entry,
+            inode_of_u8,
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn watermark_behind_inode_blocks() {
+        let entry = entry_for_watermark(100);
+        let result = DeadObjectReclaimQueue::check_orphan_watermark(
+            Some(wm(50)),
+            &entry,
+            inode_of_u8,
+        );
+        assert_eq!(
+            result,
+            Err(OrphanWatermarkBlock::WatermarkBehind {
+                inode_id: 100,
+                watermark_position: 50,
+            })
+        );
+    }
+
+    #[test]
+    fn watermark_none_option_skips_gate() {
+        let entry = entry_for_watermark(100);
+        let result = DeadObjectReclaimQueue::check_orphan_watermark(
+            None,
+            &entry,
+            inode_of_u8,
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn no_inode_mapping_blocks() {
+        let entry = entry_for_watermark(42);
+        let result = DeadObjectReclaimQueue::check_orphan_watermark(
+            Some(wm(100)),
+            &entry,
+            |_| None,
+        );
+        assert_eq!(result, Err(OrphanWatermarkBlock::NoInodeMapping));
+    }
+
+    // -- OrphanWatermarkBlock Display --
+
+    #[test]
+    fn orphan_watermark_block_display_covers_all_variants() {
+        let variants = [
+            OrphanWatermarkBlock::NoInodeMapping,
+            OrphanWatermarkBlock::WatermarkNone,
+            OrphanWatermarkBlock::WatermarkBehind {
+                inode_id: 42,
+                watermark_position: 10,
+            },
+        ];
+        for v in &variants {
+            let s = format!("{v}");
+            assert!(!s.is_empty(), "Display output empty for {v:?}");
+        }
+    }
+
+    // -- dequeue_batch_with_orphan_watermark --
+
+    #[test]
+    fn dequeue_watermark_passes_covered_entries() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_for_watermark(10));
+        q.enqueue(entry_for_watermark(20));
+        let batch = q.dequeue_batch_with_orphan_watermark(
+            10, STABLE_TXG, Some(wm(30)), inode_of_u8);
+        assert_eq!(batch.len(), 2);
+    }
+
+    #[test]
+    fn dequeue_watermark_blocks_behind_entries() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_for_watermark(10));
+        q.enqueue(entry_for_watermark(50));
+        let batch = q.dequeue_batch_with_orphan_watermark(
+            10, STABLE_TXG, Some(wm(30)), inode_of_u8);
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn dequeue_watermark_none_option_bypasses_gate() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_for_watermark(10));
+        q.enqueue(entry_for_watermark(20));
+        let batch = q.dequeue_batch_with_orphan_watermark(
+            10, STABLE_TXG, None, inode_of_u8);
+        assert_eq!(batch.len(), 2);
+    }
+
+    // -- orphan_watermark_blocked_count --
+
+    #[test]
+    fn watermark_blocked_count_none_option_returns_zero() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_for_watermark(10));
+        q.enqueue(entry_for_watermark(20));
+        let blocked = q.orphan_watermark_blocked_count(STABLE_TXG, None, inode_of_u8);
+        assert_eq!(blocked, 0);
+    }
+
+    #[test]
+    fn watermark_blocked_count_none_watermark_blocks_all_eligible() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_for_watermark(10));
+        q.enqueue(entry_for_watermark(20));
+        let blocked = q.orphan_watermark_blocked_count(
+            STABLE_TXG, Some(OrphanReplayWatermark::NONE), inode_of_u8);
+        assert_eq!(blocked, 2);
+    }
+
+    #[test]
+    fn watermark_blocked_count_partial_cover() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_for_watermark(10));
+        q.enqueue(entry_for_watermark(100));
+        let blocked = q.orphan_watermark_blocked_count(STABLE_TXG, Some(wm(50)), inode_of_u8);
+        assert_eq!(blocked, 1);
+    }
+}
