@@ -498,6 +498,38 @@ mod tests {
         repaired.receipt_generation = generation;
         repaired
     }
+    fn erasure_receipt_ref(subject: u64, generation: u64, data_shards: u8, parity_shards: u8) -> PlacementReceiptRef {
+        let mut object_key = [0xB5; 32];
+        object_key[..8].copy_from_slice(&subject.to_le_bytes());
+        let mut digest = [0x6A; 32];
+        digest[..8].copy_from_slice(&subject.to_le_bytes());
+        digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        PlacementReceiptRef::erasure(
+            subject,
+            object_key,
+            tidefs_membership_epoch::EpochId::new(7),
+            generation,
+            data_shards,
+            parity_shards,
+            4096,
+            digest,
+        )
+    }
+
+    fn make_erasure_task(subject: u64, member: u64, generation: u64, data_shards: u8, parity_shards: u8) -> BackfillTask {
+        let placement_receipt_ref = erasure_receipt_ref(subject, generation, data_shards, parity_shards);
+        BackfillTask::new(BackfillTaskInit {
+            subject_ref: ReplicatedSubjectId::new(subject),
+            placement_receipt_ref,
+            source_member: MemberId::new(1),
+            target_member: MemberId::new(member),
+            movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
+            payload_digest: receipt_digest_to_object_digest(placement_receipt_ref.payload_digest),
+            payload_len: placement_receipt_ref.payload_len,
+            created_at_ns: 0,
+            deadline_ns: 10_000,
+        })
+    }
 
     fn rebuilding_member(
         completion: &mut RebuildCompletion,
@@ -957,6 +989,99 @@ mod tests {
         );
         assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
     }
+
+    #[test]
+    fn receipt_verified_task_completion_accepts_erasure_repaired_receipt() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_erasure_task(42, 10, 1, 3, 2);
+        // Use repaired_receipt_for_task which preserves the digest; generation bump is fine
+        let repaired = repaired_receipt_for_task(&task, 2);
+
+        completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect("erasure repaired receipt must complete");
+
+        assert_eq!(
+            admission.status(member),
+            crate::admission::RebuildAdmissionStatus::Completed
+        );
+        let events = completion.drain_events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].fully_successful);
+    }
+
+    #[test]
+    fn receipt_verified_task_completion_rejects_erasure_under_width() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_erasure_task(42, 10, 1, 3, 2);
+        let mut repaired = repaired_receipt_for_task(&task, 2);
+        repaired.target_count = 4;
+
+        let err = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect_err("under-width erasure receipt must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::InsufficientReceiptTargets {
+                object_id: 42,
+                required: 5,
+                actual: 4,
+            }
+        );
+        assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
+    }
+
+    #[test]
+    fn receipt_verified_task_completion_rejects_erasure_malformed_policy() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+        let task = make_erasure_task(42, 10, 1, 0, 2);
+        let mut repaired = repaired_receipt_for_task(&task, 2);
+        repaired.redundancy_policy = tidefs_replication_model::ReceiptRedundancyPolicy::Erasure {
+            data_shards: 0,
+            parity_shards: 2,
+        };
+
+        let err = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect_err("malformed erasure policy must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::MalformedReceiptPolicy { object_id: 42 }
+        );
+        assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
+    }
+
+    #[test]
+    fn rebuild_after_replacement_accepts_higher_generation_repaired_receipt() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+
+        let task = make_task(42, 10, 1);
+        let repaired = repaired_receipt_for_task(&task, 3);
+
+        completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect("post-replacement rebuild must complete");
+
+        assert_eq!(
+            admission.status(member),
+            crate::admission::RebuildAdmissionStatus::Completed
+        );
+    }
+
 
     #[test]
     fn drain_events_clears_pending() {

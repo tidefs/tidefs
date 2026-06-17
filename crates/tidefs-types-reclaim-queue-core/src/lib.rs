@@ -779,6 +779,33 @@ impl DeadObjectReplacementReceipt {
         )
     }
 
+    /// Construct an erasure-coded dead-object replacement receipt.
+    #[must_use]
+    pub const fn erasure(
+        object_key: ObjectKey,
+        receipt_epoch: u64,
+        receipt_generation: u64,
+        data_shards: u8,
+        parity_shards: u8,
+        payload_len: u64,
+        payload_digest: [u8; 32],
+    ) -> Self {
+        let redundancy_policy = DeadObjectReceiptPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        };
+        let target_count = redundancy_policy.target_width();
+        Self::new(
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            target_count,
+        )
+    }
+
     /// True when this evidence is the legacy compatibility placeholder rather
     /// than a durable placement receipt.
     #[must_use]

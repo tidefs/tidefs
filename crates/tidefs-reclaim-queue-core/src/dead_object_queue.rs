@@ -587,6 +587,21 @@ mod tests {
     fn receipt(id: u8) -> DeadObjectReplacementReceipt {
         DeadObjectReplacementReceipt::replicated(oid(id), 7, 1, 2, 4096, digest(id))
     }
+    fn erasure_receipt(id: u8, data_shards: u8, parity_shards: u8) -> DeadObjectReplacementReceipt {
+        DeadObjectReplacementReceipt::erasure(oid(id), 7, 1, data_shards, parity_shards, 4096, digest(id))
+    }
+
+    fn entry_with_erasure_receipt(
+        id: u8,
+        death_commit_group: u64,
+        eligible: bool,
+        enqueued_at: u64,
+        data_shards: u8,
+        parity_shards: u8,
+    ) -> DeadObjectEntry {
+        entry(id, death_commit_group, eligible, enqueued_at)
+            .with_replacement_receipt(erasure_receipt(id, data_shards, parity_shards))
+    }
 
     fn placement_ref(
         key: ObjectKey,
@@ -795,6 +810,86 @@ mod tests {
         assert_eq!(batch[0].object_id, oid(3));
         assert_eq!(q.eligible_count(10), 1);
         assert_eq!(q.receipt_bound_eligible_count(10), 1);
+    }
+
+    #[test]
+    fn receipt_bound_dequeue_authorizes_erasure_receipts() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_with_erasure_receipt(1, 2, true, 1, 2, 1));
+        q.enqueue(entry_with_erasure_receipt(2, 2, true, 1, 3, 2));
+
+        let batch = q.dequeue_receipt_bound_batch(10, 10);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].object_id, oid(1));
+        assert_eq!(batch[1].object_id, oid(2));
+    }
+
+    #[test]
+    fn receipt_bound_dequeue_rejects_under_width_erasure_receipt() {
+        let mut q = DeadObjectReclaimQueue::new();
+        let under_width = DeadObjectReplacementReceipt::new(
+            oid(1), 7, 1,
+            tidefs_types_reclaim_queue_core::DeadObjectReceiptPolicy::Erasure {
+                data_shards: 3,
+                parity_shards: 2,
+            },
+            4096,
+            digest(1),
+            4,
+        );
+        q.enqueue(entry(1, 2, true, 1).with_replacement_receipt(under_width));
+
+        let batch = q.dequeue_receipt_bound_batch(10, 10);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn receipt_bound_dequeue_rejects_erasure_zero_data_shards() {
+        let mut q = DeadObjectReclaimQueue::new();
+        let malformed = DeadObjectReplacementReceipt::new(
+            oid(1), 7, 1,
+            tidefs_types_reclaim_queue_core::DeadObjectReceiptPolicy::Erasure {
+                data_shards: 0,
+                parity_shards: 2,
+            },
+            4096,
+            digest(1),
+            2,
+        );
+        q.enqueue(entry(1, 2, true, 1).with_replacement_receipt(malformed));
+
+        let batch = q.dequeue_receipt_bound_batch(10, 10);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn receipt_bound_dequeue_rejects_erasure_zero_parity_shards() {
+        let mut q = DeadObjectReclaimQueue::new();
+        let malformed = DeadObjectReplacementReceipt::new(
+            oid(1), 7, 1,
+            tidefs_types_reclaim_queue_core::DeadObjectReceiptPolicy::Erasure {
+                data_shards: 3,
+                parity_shards: 0,
+            },
+            4096,
+            digest(1),
+            3,
+        );
+        q.enqueue(entry(1, 2, true, 1).with_replacement_receipt(malformed));
+
+        let batch = q.dequeue_receipt_bound_batch(10, 10);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn receipt_bound_dequeue_mixed_replicated_and_erasure() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_with_receipt(1, 2, true, 1));
+        q.enqueue(entry_with_erasure_receipt(2, 2, true, 1, 2, 1));
+        q.enqueue(entry(3, 2, true, 1));
+
+        let batch = q.dequeue_receipt_bound_batch(10, 10);
+        assert_eq!(batch.len(), 2);
     }
 
     #[test]
