@@ -398,4 +398,88 @@ mod tests {
         assert!(!r.can_degrade());
         assert_eq!(r.replica_count(), 0);
     }
+
+    // ── Receipt-aware degraded read tests ───────────────────────────
+
+    #[test]
+    fn receipt_aware_candidate_fallback_after_loss() {
+        // Simulate a receipt-addressed replicated object (2 copies).
+        // When the local replica is lost, candidates fall back to
+        // the remaining healthy replica. The degraded read ordering
+        // is driven by candidate health, not replica store state.
+        let mut p = DegradedReadProtocol::new(Vec::new());
+        p.set_local_member(MemberId::new(1));
+
+        // Two replicas: local (node 1) and remote (node 2), both healthy
+        let health = vec![
+            (MemberId::new(1), CandidateHealthClass::Healthy, 0),
+            (MemberId::new(2), CandidateHealthClass::Healthy, 0),
+        ];
+        p.refresh_candidates(&health);
+
+        assert_eq!(p.candidate_count(), 2);
+
+        // Local candidate should be promoted to Local class
+        let by_class = p.candidates_by_class();
+        let locals = by_class.get(&CandidateHealthClass::Local).unwrap();
+        assert_eq!(locals.len(), 1);
+        assert_eq!(locals[0], MemberId::new(1));
+        let healthy = by_class.get(&CandidateHealthClass::Healthy).unwrap();
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0], MemberId::new(2));
+
+        // Simulate loss of the local replica (node 1 goes down)
+        let degraded_health = vec![
+            (MemberId::new(2), CandidateHealthClass::Healthy, 0),
+        ];
+        p.refresh_candidates(&degraded_health);
+
+        assert_eq!(p.candidate_count(), 1);
+        // The remaining candidate is on node 2, now the only healthy
+        let by_class = p.candidates_by_class();
+        assert!(by_class.get(&CandidateHealthClass::Local).is_none());
+        let remaining = by_class.get(&CandidateHealthClass::Healthy).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0], MemberId::new(2));
+
+        // After loss of all replicas, no candidates remain
+        let empty_health: Vec<(MemberId, CandidateHealthClass, u64)> = vec![];
+        p.refresh_candidates(&empty_health);
+        assert_eq!(p.candidate_count(), 0);
+        assert!(p.candidates_by_class().is_empty());
+    }
+
+    #[test]
+    fn receipt_aware_lagged_replica_fallback() {
+        // Verify that lagged-but-usable replicas are ordered after healthy ones.
+        let mut p = DegradedReadProtocol::new(Vec::new());
+        p.set_local_member(MemberId::new(10));
+
+        let health = vec![
+            (MemberId::new(10), CandidateHealthClass::LaggedButUsable, 500),
+            (MemberId::new(20), CandidateHealthClass::Healthy, 0),
+            (MemberId::new(30), CandidateHealthClass::LaggedButUsable, 100),
+        ];
+        p.refresh_candidates(&health);
+
+        assert_eq!(p.candidate_count(), 3);
+
+        let by_class = p.candidates_by_class();
+        // Local is always promoted to Local class regardless of input
+        assert_eq!(by_class.get(&CandidateHealthClass::Local).unwrap().len(), 1);
+        assert_eq!(by_class.get(&CandidateHealthClass::Healthy).unwrap().len(), 1);
+        assert_eq!(by_class.get(&CandidateHealthClass::LaggedButUsable).unwrap().len(), 1);
+
+        // Candidates should be ordered: Local first, then Healthy, then Lagged
+        let by_class = p.candidates_by_class();
+        let locals = by_class.get(&CandidateHealthClass::Local).unwrap();
+        let healthy = by_class.get(&CandidateHealthClass::Healthy).unwrap();
+        let lagged = by_class.get(&CandidateHealthClass::LaggedButUsable).unwrap();
+        assert_eq!(locals.len(), 1);
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(lagged.len(), 1);
+        assert_eq!(locals[0], MemberId::new(10));
+        assert_eq!(healthy[0], MemberId::new(20));
+        assert_eq!(lagged[0], MemberId::new(30));
+    }
 }
