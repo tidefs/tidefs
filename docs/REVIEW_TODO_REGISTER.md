@@ -1297,3 +1297,10 @@ Important 2026-06-01 findings:
   `linux_ref: none` against `forgeadmin/linux:tidefs/linux-7.0`; no Linux
   source patch is required for this classification issue. This classifies
   TFR-018 closure.
+- `TFR-018`: issue #383 wires the mounted C `readahead` callback into the
+  `address_space_operations` vtable via `tidefs_posix_vfs_readahead()` and
+  updates the Rust `AddressSpaceOps::readahead` source model to populate
+  clean page-cache state from the engine with authoritative readahead,
+  prefetch, populate, and miss counters. The readahead slice of TFR-018
+  is now closed; the C-to-Rust invalidate_folio/page-authority bridge
+  slice remains open.
