@@ -73,8 +73,17 @@ is final enough that ordinary TideFS work should not violate it.
 The nextgen program is already partially implemented. New work must reuse these
 anchors instead of creating parallel systems.
 
+Before adding any crate, trace format, artifact class, claim path, or harness,
+workers must rediscover the current workspace through
+`docs/workspace-package-classification.md`, root `Cargo.toml`, `crates/README.md`,
+live issue/PR state, and focused `rg --files` inspection. The uploaded guide's
+crate names describe desired authority roles. They are not permission to create
+duplicate packages when the repository already has an authority with a different
+name or a narrower scope.
+
 | Program area | Current TideFS authority | Status and finishing direction |
 | --- | --- | --- |
+| Workspace inventory | `docs/workspace-package-classification.md`, root `Cargo.toml`, `crates/README.md`, `xtask check-workspace-policy` | Use this before creating or deleting packages. Package role classification is navigation and policy evidence, not product proof. |
 | Integrated roadmap | `docs/NEXTGEN_VERIFICATION_CONTRACT_ROADMAP.md` from PR #299 | Keep as staging history. This document is the integrated program authority for issue #483. |
 | Request contract | `docs/REQUEST_CONTRACT.md`, `crates/tidefs-types-vfs-core`, `crates/tidefs-schema-codec-vfs` from PRs #300 and #315 | Reuse these instead of adding `tidefs-contract-core` or `tidefs-contract-codec` unless a future issue proves the split is needed. |
 | Contract codecs | `xtask check-contract-codecs`, fixed v1 request/completion codec, golden vectors, reserved-field rejection | Good seed for contract-shape validation. This is codec/tooling evidence, not runtime adapter proof. |
@@ -89,9 +98,19 @@ anchors instead of creating parallel systems.
 | uBLK environment model | `crates/tidefs-env-ublk-model`, `validation/artifacts/ublk/*` from PR #309 | Bounded qid/tag model evidence exists. Runtime artifacts and claims-gate review still gate stronger uBLK wording. |
 | FUSE environment model | `crates/tidefs-env-fuse-model` from PR #311 | Adapter lifecycle model seed. It does not replace mounted FUSE runtime validation. |
 | Kernel teardown model | `validation/artifacts/kernel/teardown-race-proof-artifact.json` from issue #291 | Bounded source-model evidence only. It is not mounted-kernel runtime proof. |
+| Kernel environment seed | `crates/tidefs-kmod-posix-vfs/src/kernel_env_model.rs` plus kernel validation rows | Reuse this as the current Linux/kernel VFS model seed. Do not create `tidefs-env-linux-vfs-model` just to match guide naming unless a focused issue proves a crate split is needed. |
 | Offload boundary | `crates/tidefs-offload-core`, `validation/artifacts/offload/*` from PR #324 | `offload.ready.non_authoritative.v1` is validated for descriptor, lease, completion, and CPU reference scope only. It is not GPU/FPGA/DMA/kernel/RDMA/storage-runtime evidence. |
 | Distributed model | `crates/tidefs-distributed-model-check` from PRs #365 and #374 | Reuses settled placement/receipt types. Runtime distributed claims remain separate claim-gated work. |
 | Verification engine | `crates/tidefs-verification-engine` | Existing object/replication verification machinery should be a consumer or artifact source, not a parallel claim authority. |
+| Claim ledger types | `crates/tidefs-types-claim-ledger-core`, `crates/tidefs-claim-ledger`, `crates/tidefs-reserve-ledger` | Reuse existing ledger/value types when evidence or receipt plumbing needs them. They do not replace `validation/claims.toml` or `validate-claim` as claim authority. |
+| Runtime/proof harnesses | `crates/tidefs-workload`, `crates/tidefs-two-node-harness`, `crates/tidefs-posix-guarantee-verifier`, demo apps, and `crates/tidefs-validation` smoke surfaces | Potential artifact producers and comparison consumers. Use them when they fit the issue; do not treat harness existence as release proof. |
+
+Guide target names that do not currently exist, such as
+`tidefs-property-catalog`, `tidefs-admission-governor`,
+`tidefs-service-model`, and `tidefs-proof-harness`, are role names until an
+issue proves a real package boundary is necessary. Prefer extending the
+existing request contract, model, validation, performance, workload, and
+environment-model surfaces first.
 
 ## What To Finish First
 
@@ -117,7 +136,10 @@ Current state: `local.vfs.write_fsync_crash.v1` is blocked because model-only
 crash evidence is not runtime crash evidence. That is useful. The next work
 should finish the missing runtime artifact path, not create another model-only
 crash matrix with a new name. Prepared follow-up issue #486 owns the first
-write/fsync/read/crash-recover evidence slice.
+write/fsync/read/crash-recover evidence slice. If that slice is too broad for
+one PR, split it into non-overlapping issues for trace/model replay, runtime
+crash artifact collection, dirty-queue evidence, and final claim-gate status
+instead of letting one broad ticket monopolize the lane.
 
 ## Evidence Classes
 
