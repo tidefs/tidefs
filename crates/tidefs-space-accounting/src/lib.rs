@@ -282,23 +282,20 @@ impl SpaceAccounting {
 
     // -- ENOSPC gating --
 
-    /// Check whether writing `requested` bytes would exceed the logical
-    /// quota capacity of this dataset.
+    /// Check whether `requested` bytes would be refused by the committed
+    /// capacity authority.
     ///
-    /// Mounted local-filesystem writes currently gate through
-    /// [`tidefs_local_filesystem::capacity_authority::CapacityAuthority::check_enospc`].
-    /// This method is retained for logical quota checks in crate-local tests
-    /// while allocator extents, obligations, reclaim, and persistence remain
-    /// separate TFR-007 closure areas.
-    ///
+    /// This is the unified ENOSPC gate: it uses
+    /// [`admission_check`](crate::admission_check) which checks quota
+    /// (minus slop), physical capacity, and all committed consumption
+    /// including reserved, orphan, and pinned-snapshot bytes.
     /// Returns `true` if the write should be refused with `ENOSPC`.
     #[must_use]
     pub fn check_enospc(&self, requested: u64) -> bool {
-        if self.counters.quota_bytes == 0 {
-            // No quota set: ENOSPC is driven by physical capacity only.
-            return false;
-        }
-        self.counters.logical_used_bytes.saturating_add(requested) > self.counters.quota_bytes
+        !matches!(
+            self.admission_check(requested),
+            AdmissionResult::Allowed
+        )
     }
 
     /// Check whether writing `requested` bytes would exceed the physical
@@ -333,44 +330,52 @@ impl SpaceAccounting {
 
     // -- Statfs derivation --
 
-    /// Derive statfs(2) fields from the current counters.
+    /// Derive statfs(2) fields from committed counters via the unified
+    /// capacity authority.
     ///
-    /// Mounted local-filesystem statfs currently derives through
-    /// [`tidefs_local_filesystem::capacity_authority::CapacityAuthority::derive_statfs`].
-    /// This method is retained for crate-local tests and SpaceBook fallback.
+    /// Uses [`total_consumed_bytes`] (logical_used + reserved + orphan +
+    /// pinned_snapshot) as the consumption baseline, matching
+    /// [`admission_check`] so that statfs never advertises bytes that
+    /// `check_enospc` would reject.
     ///
-    /// Uses `quota_bytes` and `logical_used_bytes` for block accounting,
-    /// and reserves 5% for root/metadata (matching ext4/XFS convention).
-    /// Snapshot-pinned bytes are excluded from free bytes.
+    /// Distinguishes operator-visible free space (`blocks_free` / `f_bfree`)
+    /// from allocation-admissible free space (`blocks_avail` / `f_bavail`):
+    /// the latter subtracts slop and is capped by physical pool free bytes.
     #[must_use]
     pub fn statfs(&self) -> StatfsResult {
-        // When quota is set (>0), use quota as the capacity ceiling.
-        // When quota is unlimited (0), fall back to pool physical capacity.
-        let capacity = if self.counters.quota_bytes > 0 {
-            self.counters.quota_bytes
+        let pool_cap = self.phys_capacity_bytes();
+        let counters = &self.counters;
+
+        // Effective capacity: quota minus slop when quota is set,
+        // otherwise physical pool capacity.
+        let capacity = if counters.quota_bytes > 0 {
+            counters.quota_bytes.saturating_sub(counters.slop_bytes)
         } else {
-            self.phys_capacity_bytes()
+            pool_cap
         };
-        Self::statfs_from_counters_with_capacity(&self.counters, capacity)
+
+        Self::statfs_from_counters_with_capacity(counters, capacity, pool_cap)
     }
 
     fn statfs_from_counters_with_capacity(
         counters: &DatasetSpaceCountersV1,
         capacity: u64,
+        pool_phys_capacity: u64,
     ) -> StatfsResult {
         let block_size = StatfsResult::DEFAULT_BLOCK_SIZE;
         let total_blocks = capacity / block_size;
 
-        // Free bytes = capacity - logical_used - snapshot_pinned.
-        let consumed = counters
-            .logical_used_bytes
-            .saturating_add(counters.pinned_snapshot_bytes);
+        // Total consumed bytes (same formula as admission_check).
+        let consumed = counters.total_consumed_bytes();
         let free_bytes = capacity.saturating_sub(consumed);
         let free_blocks = free_bytes / block_size;
 
-        // Reserved blocks: keep 5% for root/metadata (ext4/XFS convention).
-        let reserved_blocks = total_blocks / 20;
-        let avail_blocks = free_blocks.saturating_sub(reserved_blocks);
+        // Allocation-admissible free: operator-visible free minus slop,
+        // further capped by physical pool free bytes.
+        let avail_bytes = free_bytes
+            .saturating_sub(counters.slop_bytes)
+            .min(pool_phys_capacity.saturating_sub(consumed));
+        let avail_blocks = avail_bytes / block_size;
 
         // Inodes: tidefs does not have a fixed inode table; report as unlimited.
         let total_files = u64::MAX;
@@ -887,6 +892,7 @@ impl SpaceBook {
         Some(SpaceAccounting::statfs_from_counters_with_capacity(
             acct.counters(),
             effective_cap,
+            pool_cap,
         ))
     }
 
@@ -3511,8 +3517,9 @@ mod tests {
         let s = sa.statfs();
         assert_eq!(s.block_size, StatfsResult::DEFAULT_BLOCK_SIZE);
         assert_eq!(s.blocks, TEST_QUOTA_BYTES / 4096);
+        // With no consumption and no slop, free == avail.
         assert_eq!(s.blocks_free, s.blocks);
-        assert!(s.blocks_avail < s.blocks_free); // 5% reserve
+        assert_eq!(s.blocks_avail, s.blocks);
         assert_eq!(s.files, u64::MAX); // unlimited inodes
         assert_eq!(s.files_free, u64::MAX);
     }
@@ -5788,14 +5795,11 @@ mod tests {
         // With no quota set, capacity = phys_free_bytes = 500_000.
         // 500_000 / 4096 = 122 blocks.
         assert_eq!(statfs.blocks, 500_000 / 4096);
-        // Used = 4096, so free_bytes = 500_000 - 4096 = 495_904.
+        // Used = 4096, so consumed = 4096, free_bytes = 500_000 - 4096 = 495_904.
         // free_blocks = 495_904 / 4096 = 121.
         assert_eq!(statfs.blocks_free, 495_904 / 4096);
-        // avail = free - 5% reserved = 121 - 6 = 115.
-        assert_eq!(
-            statfs.blocks_avail,
-            (495_904 / 4096) - ((500_000 / 4096) / 20)
-        );
+        // avail = free_bytes min(pool_phys - consumed) = 495_904 (no slop).
+        assert_eq!(statfs.blocks_avail, 495_904 / 4096);
         // Inodes are unlimited when not tracked.
         assert_eq!(statfs.files, u64::MAX);
         assert_eq!(statfs.files_free, u64::MAX);
@@ -6444,5 +6448,281 @@ mod tests {
             before_pending
         );
         assert_eq!(book.dirty, before_dirty);
+    }
+
+    // ===================================================================
+    // TFR-007 unified authority tests
+    // ===================================================================
+
+    // -- Quota exhaustion: statfs/check_enospc consistency --
+
+    #[test]
+    fn statfs_reflects_quota_exhaustion() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        // Fill to within 1 byte of quota.
+        sa.commit_delta(SpaceDelta::new_write(TEST_QUOTA_BYTES - 1))
+            .unwrap();
+        let s = sa.statfs();
+        assert_eq!(s.blocks_free, 0); // 1 byte free -> 0 blocks
+        assert_eq!(s.blocks_avail, 0);
+        // check_enospc with 1 byte should still pass.
+        assert!(!sa.check_enospc(1));
+        // check_enospc with 2 bytes should fail.
+        assert!(sa.check_enospc(2));
+    }
+
+    #[test]
+    fn statfs_accounts_for_slop_in_quota_exhaustion() {
+        let mut counters = test_counters();
+        counters.slop_bytes = 500_000;
+        let sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
+        let s = sa.statfs();
+        // Capacity = quota - slop = 1_000_000_000 - 500_000.
+        let expected_capacity = TEST_QUOTA_BYTES - 500_000;
+        assert_eq!(s.blocks, expected_capacity / 4096);
+        assert_eq!(s.blocks_free, expected_capacity / 4096);
+        // avail subtracts slop.
+        assert_eq!(s.blocks_avail, (expected_capacity - 500_000) / 4096);
+    }
+
+    // -- Physical pool exhaustion --
+
+    #[test]
+    fn statfs_reflects_physical_pool_exhaustion() {
+        let mut sa = SpaceAccounting::new(
+            DatasetSpaceCountersV1 {
+                quota_bytes: 0, // no quota
+                ..test_counters()
+            },
+            SpaceDomainId::NONE,
+        );
+        // Tiny pool: 10 KB total, 4 KB free.
+        sa.update_pool_counters(test_pool(4_096, 10_000));
+        let s = sa.statfs();
+        // No quota, so capacity = phys_capacity = 4_096.
+        assert_eq!(s.blocks, 4_096 / 4096);
+        assert_eq!(s.blocks_free, 1);
+        assert_eq!(s.blocks_avail, 1);
+    }
+
+    #[test]
+    fn check_enospc_rejects_physical_exhaustion() {
+        let mut sa = SpaceAccounting::new(
+            DatasetSpaceCountersV1 {
+                quota_bytes: 0,
+                ..test_counters()
+            },
+            SpaceDomainId::NONE,
+        );
+        sa.update_pool_counters(test_pool(4_096, 10_000));
+        // 4 KB free, 1 byte write should pass.
+        assert!(!sa.check_enospc(1));
+        // Write beyond physical capacity should fail.
+        assert!(sa.check_enospc(4_097));
+    }
+
+    #[test]
+    fn statfs_avail_capped_by_physical_pool() {
+        let mut sa = SpaceAccounting::new(
+            DatasetSpaceCountersV1 {
+                quota_bytes: 0,
+                ..test_counters()
+            },
+            SpaceDomainId::NONE,
+        );
+        // Pool has 100 KB free, total 1 GB.
+        sa.update_pool_counters(test_pool(100_000, 1_000_000_000));
+        let s = sa.statfs();
+        // capacity = phys_capacity = 100_000.
+        assert_eq!(s.blocks, 100_000 / 4096);
+        assert_eq!(s.blocks_free, 100_000 / 4096);
+        // avail = free (no slop), capped by pool.
+        assert_eq!(s.blocks_avail, 100_000 / 4096);
+    }
+
+    // -- Orphan reservations --
+
+    #[test]
+    fn statfs_counts_orphan_bytes_as_consumed() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        sa.commit_delta(SpaceDelta::new_orphan_acquire(200_000))
+            .unwrap();
+        let s = sa.statfs();
+        let expected_free = (TEST_QUOTA_BYTES - 200_000) / 4096;
+        assert_eq!(s.blocks_free, expected_free);
+    }
+
+    #[test]
+    fn check_enospc_rejects_when_orphan_bytes_consume_quota() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        sa.commit_delta(SpaceDelta::new_orphan_acquire(TEST_QUOTA_BYTES - 1))
+            .unwrap();
+        // 1 byte remaining — admitted.
+        assert!(!sa.check_enospc(1));
+        // 2 bytes — rejected.
+        assert!(sa.check_enospc(2));
+    }
+
+    #[test]
+    fn statfs_orphan_release_frees_space() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        sa.commit_delta(SpaceDelta::new_orphan_acquire(200_000))
+            .unwrap();
+        sa.commit_delta(SpaceDelta::new_orphan_release(200_000))
+            .unwrap();
+        let s = sa.statfs();
+        assert_eq!(s.blocks_free, TEST_QUOTA_BYTES / 4096);
+    }
+
+    // -- Reserved bytes --
+
+    #[test]
+    fn statfs_counts_reserved_bytes_as_consumed() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        sa.commit_delta(SpaceDelta::new_reservation(300_000))
+            .unwrap();
+        let s = sa.statfs();
+        let expected_free = (TEST_QUOTA_BYTES - 300_000) / 4096;
+        assert_eq!(s.blocks_free, expected_free);
+    }
+
+    #[test]
+    fn check_enospc_rejects_when_reserved_bytes_consume_quota() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        sa.commit_delta(SpaceDelta::new_reservation(TEST_QUOTA_BYTES))
+            .unwrap();
+        assert!(sa.check_enospc(1));
+    }
+
+    // -- Snapshot-pinned bytes through unified authority --
+
+    #[test]
+    fn check_enospc_rejects_when_pinned_snapshot_consumes_quota() {
+        let mut counters = test_counters();
+        counters.pinned_snapshot_bytes = TEST_QUOTA_BYTES;
+        let sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
+        assert!(sa.check_enospc(1));
+    }
+
+    #[test]
+    fn statfs_and_check_enospc_agree_on_pinned_snapshot_bytes() {
+        let mut counters = test_counters();
+        // Use a block-aligned value so free_blocks * block_size == actual free.
+        counters.pinned_snapshot_bytes = 4096 * 100; // 409_600
+        let sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
+        let s = sa.statfs();
+        let free_blocks = s.blocks_free;
+        let free_bytes = free_blocks * 4096;
+        // check_enospc should admit writes up to free_bytes.
+        assert!(!sa.check_enospc(free_bytes));
+        // But refuse one block more.
+        assert!(sa.check_enospc(free_bytes + 4096));
+    }
+
+    // -- Pending-delta commit boundaries --
+
+    #[test]
+    fn statfs_excludes_pending_delta() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        sa.accumulate_delta(SpaceDelta::new_write(500_000_000));
+        // statfs should still show full free space (pending not committed).
+        let s = sa.statfs();
+        assert_eq!(s.blocks_free, TEST_QUOTA_BYTES / 4096);
+        assert!(sa.has_pending_delta());
+    }
+
+    #[test]
+    fn check_enospc_uses_committed_counters_only() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        // Accumulate a pending delta that would fill the quota.
+        sa.accumulate_delta(SpaceDelta::new_write(TEST_QUOTA_BYTES));
+        // check_enospc sees committed counters (still empty), so admits.
+        assert!(!sa.check_enospc(1));
+        // After committing the pending delta, admission is blocked.
+        sa.commit_pending(test_pool(TEST_QUOTA_BYTES * 2, TEST_QUOTA_BYTES * 2))
+            .unwrap();
+        assert!(sa.check_enospc(1));
+    }
+
+    #[test]
+    fn commit_pending_updates_statfs() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        sa.accumulate_delta(SpaceDelta::new_write(500_000_000));
+        assert_eq!(sa.statfs().blocks_free, TEST_QUOTA_BYTES / 4096);
+        sa.commit_pending(test_pool(TEST_QUOTA_BYTES * 2, TEST_QUOTA_BYTES * 2))
+            .unwrap();
+        assert_eq!(sa.statfs().blocks_free, 500_000_000 / 4096);
+        assert!(!sa.has_pending_delta());
+    }
+
+    // -- Slop bytes affect admission and statfs in lockstep --
+
+    #[test]
+    fn admission_rejects_when_slop_reduces_effective_capacity() {
+        let mut counters = test_counters();
+        counters.slop_bytes = 500_000;
+        let sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
+        // Effective capacity = 1_000_000_000 - 500_000.
+        // Used=0, so 999_500_000 available.
+        assert!(!sa.check_enospc(999_500_000));
+        assert!(sa.check_enospc(999_500_001));
+    }
+
+    // -- Combined consumption: reserved + orphan + pinned_snapshot --
+
+    #[test]
+    fn statfs_combines_all_counter_families() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        sa.commit_delta(SpaceDelta::new_write(100_000)).unwrap();
+        sa.commit_delta(SpaceDelta::new_reservation(200_000))
+            .unwrap();
+        sa.commit_delta(SpaceDelta::new_orphan_acquire(50_000))
+            .unwrap();
+        // Also set pinned_snapshot.
+        let snap = SnapshotSpaceRecord {
+            state: SnapshotState::Active,
+            deadlist_bytes: 30_000,
+            ..Default::default()
+        };
+        sa.update_snapshot_pinned(&[snap]);
+        let total_consumed = 100_000 + 200_000 + 50_000 + 30_000;
+        let expected_free = (TEST_QUOTA_BYTES - total_consumed) / 4096;
+        let s = sa.statfs();
+        assert_eq!(s.blocks_free, expected_free);
+    }
+
+    #[test]
+    fn check_enospc_combines_all_counter_families() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        sa.commit_delta(SpaceDelta::new_write(100_000)).unwrap();
+        sa.commit_delta(SpaceDelta::new_reservation(200_000))
+            .unwrap();
+        sa.commit_delta(SpaceDelta::new_orphan_acquire(50_000))
+            .unwrap();
+        sa.update_snapshot_pinned(&[SnapshotSpaceRecord {
+            state: SnapshotState::Active,
+            deadlist_bytes: 30_000,
+            ..Default::default()
+        }]);
+        let total_consumed = 100_000 + 200_000 + 50_000 + 30_000;
+        let avail = TEST_QUOTA_BYTES - total_consumed;
+        assert!(!sa.check_enospc(avail));
+        assert!(sa.check_enospc(avail + 1));
+    }
+
+    // -- Physical pool exhaustion with quota: quota takes precedence --
+
+    #[test]
+    fn statfs_quota_takes_precedence_over_physical_capacity() {
+        let mut sa = SpaceAccounting::new(test_counters(), SpaceDomainId::NONE);
+        // Quota is smaller than physical pool.
+        sa.update_pool_counters(test_pool(10_000_000, 10_000_000));
+        // capacity = min(quota, phys) = quota = 1_000_000_000.
+        let s = sa.statfs();
+        assert_eq!(s.blocks, TEST_QUOTA_BYTES / 4096);
+        // But avail is capped by physical.
+        // free_bytes = 1_000_000_000 - 0 = 1_000_000_000
+        // avail_bytes = free min(pool_phys - consumed) = 1_000_000_000 min(10_000_000) = 10_000_000
+        assert_eq!(s.blocks_avail, 10_000_000 / 4096);
     }
 }
