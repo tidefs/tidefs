@@ -2329,7 +2329,9 @@ impl LocalFileSystem {
     ///
     /// Called on fd close or process exit to clean up held locks.
     pub fn release_locks_by_pid(&self, pid: u32) {
-        self.lock_tracker.borrow_mut().release_by_pid(self.dataset_mount_id, pid);
+        self.lock_tracker
+            .borrow_mut()
+            .release_by_pid(self.dataset_mount_id, pid);
     }
 
     /// Get the number of inodes with active locks.
@@ -7306,6 +7308,11 @@ impl LocalFileSystem {
         } else {
             self.rewrite_content_with_overlay(inode_id, record, 0, &[], size, true)?
         };
+        let result = if size == 0 {
+            self.clear_xattrs_after_zero_truncate(inode_id, result, path)?
+        } else {
+            result
+        };
         self.truncate_write_buffer_for_inode(inode_id, size);
         // ── Intent-log: record truncate for crash recovery replay ──
         // Record the truncate after all extent and write-buffer mutations
@@ -8629,6 +8636,49 @@ impl LocalFileSystem {
         self.committed_inode_record(inode_id)
     }
 
+    fn ensure_xattr_owner_generation(
+        &self,
+        inode_id: InodeId,
+        expected_generation: Generation,
+        target: &str,
+    ) -> Result<()> {
+        match self.state.inodes.get(&inode_id) {
+            Some(current) if current.generation == expected_generation => Ok(()),
+            Some(_) => Err(FileSystemError::CorruptState {
+                reason: "xattr inode generation changed before mutation",
+            }),
+            None => Err(FileSystemError::NotFound {
+                path: target.to_string(),
+            }),
+        }
+    }
+
+    fn clear_xattrs_after_zero_truncate(
+        &mut self,
+        inode_id: InodeId,
+        mut record: InodeRecord,
+        target: &str,
+    ) -> Result<InodeRecord> {
+        if record.xattrs.is_empty() {
+            return Ok(record);
+        }
+
+        let owner_generation = record.generation;
+        self.begin_mutation();
+        if let Err(err) = self.ensure_xattr_owner_generation(inode_id, owner_generation, target) {
+            self.rollback_mutation_delta();
+            return Err(err);
+        }
+        let tick = self.bump_generation();
+        record.xattrs.clear();
+        record.posix_time.ctime_ns = Self::next_metadata_ctime_ns(record.posix_time.ctime_ns);
+        record.metadata_version = tick;
+        self.mark_inode_metadata_dirty(inode_id);
+        Arc::make_mut(&mut self.state.inodes).insert(inode_id, record.clone());
+        self.inode_cache.borrow_mut().invalidate(inode_id);
+        self.commit_mutation(record)
+    }
+
     fn set_xattr_by_inode_with_target(
         &mut self,
         inode_id: InodeId,
@@ -8688,26 +8738,11 @@ impl LocalFileSystem {
             }
         }
 
-        // Record intent-log entry for crash-safe xattr set
-        {
-            let namespace = Self::xattr_namespace_from_name(name);
-            let key_hash = blake3::hash(name);
-            let value_hash = blake3::hash(value);
-            let ino_u64 = inode_id.get();
-            let _ = self.intent_log_buffer.as_ref().map(|buf| {
-                let _frame = buf.append(
-                    tidefs_intent_log::IntentLogRecord::XattrSet {
-                        ino: ino_u64,
-                        namespace,
-                        key_hash: *key_hash.as_bytes(),
-                        value_hash: *value_hash.as_bytes(),
-                    },
-                    0, // txg_id assigned by TxgCoordinator at drain time
-                );
-            });
-        }
-
         self.begin_mutation(); // was: let previous_state = self.state.clone()
+        if let Err(err) = self.ensure_xattr_owner_generation(inode_id, record.generation, target) {
+            self.rollback_mutation_delta();
+            return Err(err);
+        }
         let tick = self.bump_generation();
         let mut updated = record;
         let n = name.to_vec();
@@ -8758,6 +8793,26 @@ impl LocalFileSystem {
         // Apply any mode sync computed during ACL validation
         if let Some(new_mode) = acl_mode_sync {
             updated.mode = new_mode;
+        }
+
+        // Record intent-log entry for crash-safe xattr set after all
+        // owner-generation and flag preconditions have passed.
+        {
+            let namespace = Self::xattr_namespace_from_name(name);
+            let key_hash = blake3::hash(name);
+            let value_hash = blake3::hash(value);
+            let ino_u64 = inode_id.get();
+            let _ = self.intent_log_buffer.as_ref().map(|buf| {
+                let _frame = buf.append(
+                    tidefs_intent_log::IntentLogRecord::XattrSet {
+                        ino: ino_u64,
+                        namespace,
+                        key_hash: *key_hash.as_bytes(),
+                        value_hash: *value_hash.as_bytes(),
+                    },
+                    0, // txg_id assigned by TxgCoordinator at drain time
+                );
+            });
         }
 
         updated.posix_time.ctime_ns = Self::next_metadata_ctime_ns(updated.posix_time.ctime_ns);
@@ -8859,7 +8914,16 @@ impl LocalFileSystem {
             });
         }
 
-        // Record intent-log entry for crash-safe xattr removal
+        self.begin_mutation(); // was: let previous_state = self.state.clone()
+        if let Err(err) = self.ensure_xattr_owner_generation(inode_id, record.generation, target) {
+            self.rollback_mutation_delta();
+            return Err(err);
+        }
+        let tick = self.bump_generation();
+        let mut updated = record;
+        updated.xattrs.remove(name);
+        // Record intent-log entry for crash-safe xattr removal after
+        // owner-generation preconditions have passed.
         {
             let namespace = Self::xattr_namespace_from_name(name);
             let key_hash = blake3::hash(name);
@@ -8875,11 +8939,6 @@ impl LocalFileSystem {
                 );
             });
         }
-
-        self.begin_mutation(); // was: let previous_state = self.state.clone()
-        let tick = self.bump_generation();
-        let mut updated = record;
-        updated.xattrs.remove(name);
         updated.posix_time.ctime_ns = Self::next_metadata_ctime_ns(updated.posix_time.ctime_ns);
         updated.metadata_version = tick;
         // Capture old record in mutation delta BEFORE replacing it
@@ -8905,6 +8964,10 @@ impl LocalFileSystem {
         }
 
         self.begin_mutation();
+        if let Err(err) = self.ensure_xattr_owner_generation(inode_id, record.generation, path) {
+            self.rollback_mutation_delta();
+            return Err(err);
+        }
         let tick = self.bump_generation();
         let mut updated = record;
         updated.xattrs.clear();
@@ -13159,6 +13222,202 @@ mod orphan_index_integration_tests {
         assert!(matches!(
             fs.list_xattr("/d"),
             Err(FileSystemError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn xattrs_cleared_after_truncate_to_zero() {
+        let (_root, mut fs) = make_test_fs("xra_truncate_zero").expect("open");
+        fs.create_file("/f", 0o644).expect("create");
+        fs.write_file("/f", 0, b"payload").expect("write");
+        fs.set_xattr("/f", b"user.truncated", b"old", 0).unwrap();
+
+        let truncated = fs.truncate_file("/f", 0).expect("truncate");
+
+        assert_eq!(truncated.size, 0);
+        assert!(fs.list_xattr("/f").unwrap().is_empty());
+        assert!(fs.get_xattr("/f", b"user.truncated").unwrap().is_none());
+        fs.set_xattr("/f", b"user.current", b"new", 0).unwrap();
+        assert_eq!(
+            fs.get_xattr("/f", b"user.current").unwrap(),
+            Some(b"new".to_vec())
+        );
+    }
+
+    #[test]
+    fn xattrs_survive_nonzero_truncate() {
+        let (_root, mut fs) = make_test_fs("xra_truncate_nonzero").expect("open");
+        fs.create_file("/f", 0o644).expect("create");
+        fs.write_file("/f", 0, b"payload").expect("write");
+        fs.set_xattr("/f", b"user.kept", b"value", 0).unwrap();
+
+        fs.truncate_file("/f", 4).expect("truncate");
+
+        assert_eq!(
+            fs.get_xattr("/f", b"user.kept").unwrap(),
+            Some(b"value".to_vec())
+        );
+    }
+
+    #[test]
+    fn xattrs_on_symlink_inode_roundtrip() {
+        let (_root, mut fs) = make_test_fs("xra_symlink").expect("open");
+        let link = fs.create_symlink("/link", b"target").expect("symlink");
+
+        fs.set_xattr_by_inode(link.inode_id, b"user.link", b"symlink", 0)
+            .unwrap();
+
+        assert_eq!(
+            fs.get_xattr_by_inode(link.inode_id, b"user.link").unwrap(),
+            Some(b"symlink".to_vec())
+        );
+        assert_eq!(
+            fs.list_xattr_by_inode(link.inode_id).unwrap(),
+            b"user.link\0"
+        );
+        fs.remove_xattr_by_inode(link.inode_id, b"user.link")
+            .unwrap();
+        assert!(fs
+            .get_xattr_by_inode(link.inode_id, b"user.link")
+            .unwrap()
+            .is_none());
+    }
+
+    fn insert_special_xattr_inode(
+        fs: &mut LocalFileSystem,
+        path_name: &[u8],
+        kind: NodeKind,
+        mode_type: u32,
+        permissions: u32,
+        rdev: u32,
+    ) -> InodeId {
+        let inode_id = fs.next_inode_id();
+        let generation = Generation::new(fs.generation().saturating_add(1).max(1));
+        let mode = mode_type | permissions;
+        let record = InodeRecord {
+            dir_storage_kind: 0,
+            inode_id,
+            generation,
+            facets: kind.to_facets(),
+            mode,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size: 0,
+            data_version: generation.get(),
+            metadata_version: generation.get(),
+            posix_time: crate::types::PosixTimeRecord::now(),
+            xattr_storage_kind: 0,
+            xattrs: std::collections::BTreeMap::new(),
+            dir_rev: 0,
+            rdev,
+        };
+        fs.insert_inode_at(inode_id, record);
+        fs.insert_dir_entry(
+            ROOT_INODE_ID,
+            path_name.to_vec(),
+            NamespaceEntry {
+                name: path_name.to_vec(),
+                inode_id,
+                generation,
+                facets: kind.to_facets(),
+                mode,
+            },
+        )
+        .expect("insert special node");
+        inode_id
+    }
+
+    #[test]
+    fn xattrs_on_device_inode_roundtrip() {
+        let (_root, mut fs) = make_test_fs("xra_device").expect("open");
+        let inode_id = insert_special_xattr_inode(
+            &mut fs,
+            b"null",
+            NodeKind::CharDev,
+            tidefs_types_vfs_core::S_IFCHR,
+            0o666,
+            0x0103,
+        );
+
+        assert_eq!(fs.stat("/null").unwrap().kind(), NodeKind::CharDev);
+        fs.set_xattr("/null", b"user.device", b"dev", 0).unwrap();
+
+        assert_eq!(
+            fs.get_xattr("/null", b"user.device").unwrap(),
+            Some(b"dev".to_vec())
+        );
+        assert_eq!(
+            fs.get_xattr_by_inode(inode_id, b"user.device").unwrap(),
+            Some(b"dev".to_vec())
+        );
+        fs.remove_xattr("/null", b"user.device").unwrap();
+        assert!(fs.get_xattr("/null", b"user.device").unwrap().is_none());
+    }
+
+    #[test]
+    fn xattrs_do_not_survive_manual_inode_number_reuse() {
+        let (_root, mut fs) = make_test_fs("xra_inode_reuse").expect("open");
+        let old = fs.create_file("/old", 0o644).expect("create old");
+        fs.set_xattr("/old", b"user.old", b"stale", 0).unwrap();
+        fs.unlink("/old").expect("unlink old");
+
+        let generation = Generation::new(fs.generation().saturating_add(1).max(1));
+        let record = InodeRecord {
+            dir_storage_kind: 0,
+            inode_id: old.inode_id,
+            generation,
+            facets: NodeKind::File.to_facets(),
+            mode: tidefs_types_vfs_core::S_IFREG | 0o644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size: 0,
+            data_version: generation.get(),
+            metadata_version: generation.get(),
+            posix_time: crate::types::PosixTimeRecord::now(),
+            xattr_storage_kind: 0,
+            xattrs: std::collections::BTreeMap::new(),
+            dir_rev: 0,
+            rdev: 0,
+        };
+        fs.insert_inode_at(old.inode_id, record);
+        fs.insert_dir_entry(
+            ROOT_INODE_ID,
+            b"new".to_vec(),
+            NamespaceEntry {
+                name: b"new".to_vec(),
+                inode_id: old.inode_id,
+                generation,
+                facets: NodeKind::File.to_facets(),
+                mode: tidefs_types_vfs_core::S_IFREG | 0o644,
+            },
+        )
+        .expect("insert reused inode");
+
+        assert!(fs.list_xattr("/new").unwrap().is_empty());
+        assert!(fs.get_xattr("/new", b"user.old").unwrap().is_none());
+        fs.set_xattr("/new", b"user.new", b"current", 0).unwrap();
+        assert_eq!(
+            fs.get_xattr("/new", b"user.new").unwrap(),
+            Some(b"current".to_vec())
+        );
+    }
+
+    #[test]
+    fn xattr_owner_generation_guard_rejects_stale_record() {
+        let (_root, mut fs) = make_test_fs("xra_generation_guard").expect("open");
+        let record = fs.create_file("/f", 0o644).expect("create");
+        let old_generation = record.generation;
+        Arc::make_mut(&mut fs.state.inodes)
+            .get_mut(&record.inode_id)
+            .expect("inode")
+            .generation = Generation::new(old_generation.get().saturating_add(1));
+
+        assert!(matches!(
+            fs.ensure_xattr_owner_generation(record.inode_id, old_generation, "/f"),
+            Err(FileSystemError::CorruptState { reason })
+                if reason.contains("xattr inode generation")
         ));
     }
 

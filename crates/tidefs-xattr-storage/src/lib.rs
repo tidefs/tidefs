@@ -2208,6 +2208,6 @@ pub mod persistent;
 pub use persistent::PersistentXattrStore;
 #[cfg(any(test, feature = "persistence"))]
 pub use persistent::{
-    PersistentXattrError, XATTR_CREATE as PERSISTENT_XATTR_CREATE,
+    PersistentXattrError, XattrOwner, XATTR_CREATE as PERSISTENT_XATTR_CREATE,
     XATTR_REPLACE as PERSISTENT_XATTR_REPLACE,
 };

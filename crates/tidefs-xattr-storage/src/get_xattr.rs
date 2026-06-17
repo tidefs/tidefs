@@ -3,7 +3,8 @@
 //! [`XattrGetStore`] provides persistent `get_xattr` that:
 //!
 //! 1. Looks up the sealed [`XattrRecord`] blob by its named key
-//!    (`__xattr:{inode}:{namespace}:{name}`) in the local object store.
+//!    (`__xattr:{inode}:{generation}:{namespace}:{name}`) in the local
+//!    object store.
 //! 2. Verifies the BLAKE3-256 domain-separated digest embedded in the
 //!    blob.
 //! 3. Returns the verified xattr value bytes.
@@ -20,8 +21,8 @@ use std::sync::{Arc, Mutex};
 
 use tidefs_local_object_store::LocalObjectStore;
 
-use crate::persistent::{xattr_value_key, PersistentXattrError, MAX_XATTR_NAME_LEN};
-use crate::xattr_record::XattrRecord;
+use crate::persistent::{xattr_value_key, PersistentXattrError, XattrOwner, MAX_XATTR_NAME_LEN};
+use crate::xattr_record::{XattrNamespace, XattrRecord};
 
 // ---------------------------------------------------------------------------
 // XattrGetStore
@@ -49,14 +50,14 @@ impl XattrGetStore {
         Self { object_store }
     }
 
-    /// Get the value of an extended attribute on `inode`.
+    /// Get the value of an extended attribute owned by `owner`.
     ///
     /// Returns `Ok(None)` when the attribute does not exist, or
     /// `Ok(Some(value))` with the BLAKE3-verified value bytes.
     ///
     /// # Arguments
     ///
-    /// * `inode` — Inode number.
+    /// * `owner` — Inode number plus generation evidence.
     /// * `namespace` — Linux xattr namespace (`user`, `system`,
     ///   `security`, `trusted`).
     /// * `name` — Attribute name bytes (without namespace prefix).
@@ -67,21 +68,28 @@ impl XattrGetStore {
     /// storage error, or BLAKE3 verification failure.
     pub fn get_xattr(
         &self,
-        inode: u64,
+        owner: XattrOwner,
         namespace: &str,
         name: &[u8],
     ) -> Result<Option<Vec<u8>>, PersistentXattrError> {
         // ── Validation ───────────────────────────────────────────
+
+        if owner.inode == 0 || owner.generation == 0 {
+            return Err(PersistentXattrError::InvalidOwner);
+        }
 
         // namespace
         if namespace.is_empty() || namespace.contains(':') || namespace.len() > 64 {
             return Err(PersistentXattrError::InvalidNamespace);
         }
         // Only accept well-known Linux xattr namespaces.
-        match namespace {
-            "user" | "system" | "security" | "trusted" => {}
+        let expected_namespace = match namespace {
+            "security" => XattrNamespace::Security,
+            "system" => XattrNamespace::System,
+            "trusted" => XattrNamespace::Trusted,
+            "user" => XattrNamespace::User,
             _ => return Err(PersistentXattrError::InvalidNamespace),
-        }
+        };
 
         // name
         if name.is_empty() || name.contains(&0) {
@@ -98,7 +106,7 @@ impl XattrGetStore {
             .lock()
             .map_err(|e| PersistentXattrError::Internal(format!("lock poisoned: {e}")))?;
 
-        let value_key = xattr_value_key(inode, namespace, name);
+        let value_key = xattr_value_key(owner, namespace, name);
 
         let blob = store
             .get_named(&value_key)
@@ -111,6 +119,15 @@ impl XattrGetStore {
                         "xattr record BLAKE3 verification failed: {e:?}"
                     ))
                 })?;
+                if record.inode != owner.inode
+                    || record.inode_generation != owner.generation
+                    || record.namespace != expected_namespace
+                    || record.name != name
+                {
+                    return Err(PersistentXattrError::Internal(
+                        "xattr record owner/key mismatch".to_string(),
+                    ));
+                }
                 Ok(Some(record.value))
             }
             None => Ok(None),
@@ -148,12 +165,28 @@ mod tests {
         (xgs, dir)
     }
 
+    fn owner(inode: u64) -> XattrOwner {
+        XattrOwner::new(inode, 11)
+    }
+
     /// Helper: write a sealed XattrRecord blob into the object store
     /// and add it to the per-inode directory, mimicking what
     /// [`XattrSetStore::set_xattr`] does.
     fn put_xattr_record(
         store: &Arc<Mutex<LocalObjectStore>>,
-        inode: u64,
+        owner: XattrOwner,
+        namespace: &str,
+        name: &[u8],
+        value: &[u8],
+        txg_id: u64,
+    ) {
+        put_xattr_record_with_record_owner(store, owner, owner, namespace, name, value, txg_id);
+    }
+
+    fn put_xattr_record_with_record_owner(
+        store: &Arc<Mutex<LocalObjectStore>>,
+        key_owner: XattrOwner,
+        record_owner: XattrOwner,
         namespace: &str,
         name: &[u8],
         value: &[u8],
@@ -166,16 +199,23 @@ mod tests {
             "user" => XattrNamespace::User,
             _ => panic!("bad namespace in test helper"),
         };
-        let record = XattrRecord::new(inode, ns, name.to_vec(), value.to_vec(), txg_id);
+        let record = XattrRecord::new(
+            record_owner.inode,
+            record_owner.generation,
+            ns,
+            name.to_vec(),
+            value.to_vec(),
+            txg_id,
+        );
         let blob = record.seal();
         let mut s = store.lock().unwrap();
 
         // Store by named key
-        let value_key = xattr_value_key(inode, namespace, name);
+        let value_key = xattr_value_key(key_owner, namespace, name);
         s.put_named(&value_key, &blob).expect("put_named");
 
         // Update per-inode directory
-        let dir_key = xattr_dir_key(inode);
+        let dir_key = xattr_dir_key(key_owner);
         let existing = s.get_named(&dir_key).ok().flatten();
         let mut dir: std::collections::BTreeSet<Vec<u8>> = match existing {
             Some(data) => crate::persistent::decode_dir(&data).unwrap_or_default(),
@@ -189,16 +229,20 @@ mod tests {
     #[test]
     fn get_returns_stored_value() {
         let (xgs, _dir) = make_store();
-        put_xattr_record(&xgs.object_store, 1, "user", b"comment", b"hello", 1);
+        put_xattr_record(&xgs.object_store, owner(1), "user", b"comment", b"hello", 1);
 
-        let val = xgs.get_xattr(1, "user", b"comment").expect("get_xattr");
+        let val = xgs
+            .get_xattr(owner(1), "user", b"comment")
+            .expect("get_xattr");
         assert_eq!(val, Some(b"hello".to_vec()));
     }
 
     #[test]
     fn get_missing_returns_none() {
         let (xgs, _dir) = make_store();
-        let val = xgs.get_xattr(1, "user", b"missing").expect("get_xattr");
+        let val = xgs
+            .get_xattr(owner(1), "user", b"missing")
+            .expect("get_xattr");
         assert_eq!(val, None);
     }
 
@@ -206,18 +250,22 @@ mod tests {
     fn get_with_binary_value() {
         let (xgs, _dir) = make_store();
         let bin_val = vec![0x00, 0xFF, 0x42, 0x99];
-        put_xattr_record(&xgs.object_store, 42, "user", b"binary", &bin_val, 1);
+        put_xattr_record(&xgs.object_store, owner(42), "user", b"binary", &bin_val, 1);
 
-        let val = xgs.get_xattr(42, "user", b"binary").expect("get_xattr");
+        let val = xgs
+            .get_xattr(owner(42), "user", b"binary")
+            .expect("get_xattr");
         assert_eq!(val, Some(bin_val));
     }
 
     #[test]
     fn get_empty_value() {
         let (xgs, _dir) = make_store();
-        put_xattr_record(&xgs.object_store, 1, "user", b"empty", b"", 1);
+        put_xattr_record(&xgs.object_store, owner(1), "user", b"empty", b"", 1);
 
-        let val = xgs.get_xattr(1, "user", b"empty").expect("get_xattr");
+        let val = xgs
+            .get_xattr(owner(1), "user", b"empty")
+            .expect("get_xattr");
         assert_eq!(val, Some(vec![]));
     }
 
@@ -226,16 +274,16 @@ mod tests {
         let (xgs, _dir) = make_store();
         // Write a proper record, then tamper it in-place.
         {
-            put_xattr_record(&xgs.object_store, 1, "user", b"tamper", b"val", 1);
+            put_xattr_record(&xgs.object_store, owner(1), "user", b"tamper", b"val", 1);
             let mut s = xgs.object_store.lock().unwrap();
-            let value_key = xattr_value_key(1, "user", b"tamper");
+            let value_key = xattr_value_key(owner(1), "user", b"tamper");
             let mut blob = s.get_named(&value_key).unwrap().unwrap();
             // Flip a byte in the value region.
             blob[30] ^= 0xFF;
             s.put_named(&value_key, &blob).expect("put tampered");
         }
 
-        let result = xgs.get_xattr(1, "user", b"tamper");
+        let result = xgs.get_xattr(owner(1), "user", b"tamper");
         match result {
             Err(PersistentXattrError::Internal(msg)) => {
                 assert!(
@@ -250,25 +298,32 @@ mod tests {
     #[test]
     fn get_all_four_namespaces() {
         let (xgs, _dir) = make_store();
-        put_xattr_record(&xgs.object_store, 1, "user", b"key", b"user-val", 1);
-        put_xattr_record(&xgs.object_store, 1, "system", b"key", b"sys-val", 1);
-        put_xattr_record(&xgs.object_store, 1, "security", b"key", b"sec-val", 1);
-        put_xattr_record(&xgs.object_store, 1, "trusted", b"key", b"tr-val", 1);
+        put_xattr_record(&xgs.object_store, owner(1), "user", b"key", b"user-val", 1);
+        put_xattr_record(&xgs.object_store, owner(1), "system", b"key", b"sys-val", 1);
+        put_xattr_record(
+            &xgs.object_store,
+            owner(1),
+            "security",
+            b"key",
+            b"sec-val",
+            1,
+        );
+        put_xattr_record(&xgs.object_store, owner(1), "trusted", b"key", b"tr-val", 1);
 
         assert_eq!(
-            xgs.get_xattr(1, "user", b"key").unwrap(),
+            xgs.get_xattr(owner(1), "user", b"key").unwrap(),
             Some(b"user-val".to_vec())
         );
         assert_eq!(
-            xgs.get_xattr(1, "system", b"key").unwrap(),
+            xgs.get_xattr(owner(1), "system", b"key").unwrap(),
             Some(b"sys-val".to_vec())
         );
         assert_eq!(
-            xgs.get_xattr(1, "security", b"key").unwrap(),
+            xgs.get_xattr(owner(1), "security", b"key").unwrap(),
             Some(b"sec-val".to_vec())
         );
         assert_eq!(
-            xgs.get_xattr(1, "trusted", b"key").unwrap(),
+            xgs.get_xattr(owner(1), "trusted", b"key").unwrap(),
             Some(b"tr-val".to_vec())
         );
     }
@@ -276,30 +331,77 @@ mod tests {
     #[test]
     fn get_multiple_inodes_independent() {
         let (xgs, _dir) = make_store();
-        put_xattr_record(&xgs.object_store, 10, "user", b"a", b"v10", 1);
-        put_xattr_record(&xgs.object_store, 20, "user", b"a", b"v20", 1);
+        put_xattr_record(&xgs.object_store, owner(10), "user", b"a", b"v10", 1);
+        put_xattr_record(&xgs.object_store, owner(20), "user", b"a", b"v20", 1);
 
         assert_eq!(
-            xgs.get_xattr(10, "user", b"a").unwrap(),
+            xgs.get_xattr(owner(10), "user", b"a").unwrap(),
             Some(b"v10".to_vec())
         );
         assert_eq!(
-            xgs.get_xattr(20, "user", b"a").unwrap(),
+            xgs.get_xattr(owner(20), "user", b"a").unwrap(),
             Some(b"v20".to_vec())
         );
         // Wrong inode should return None for the name
-        assert_eq!(xgs.get_xattr(10, "user", b"b").unwrap(), None);
+        assert_eq!(xgs.get_xattr(owner(10), "user", b"b").unwrap(), None);
+    }
+
+    #[test]
+    fn get_generation_isolates_reused_inode_number() {
+        let (xgs, _dir) = make_store();
+        let old_owner = XattrOwner::new(7, 1);
+        let new_owner = XattrOwner::new(7, 2);
+
+        put_xattr_record(&xgs.object_store, old_owner, "user", b"same", b"old", 1);
+        put_xattr_record(&xgs.object_store, new_owner, "user", b"same", b"new", 2);
+
+        assert_eq!(
+            xgs.get_xattr(new_owner, "user", b"same").unwrap(),
+            Some(b"new".to_vec())
+        );
+        assert_eq!(
+            xgs.get_xattr(old_owner, "user", b"same").unwrap(),
+            Some(b"old".to_vec())
+        );
+    }
+
+    #[test]
+    fn get_rejects_misfiled_record_generation() {
+        let (xgs, _dir) = make_store();
+        let stale_owner = XattrOwner::new(8, 1);
+        let current_owner = XattrOwner::new(8, 2);
+
+        put_xattr_record_with_record_owner(
+            &xgs.object_store,
+            current_owner,
+            stale_owner,
+            "user",
+            b"key",
+            b"stale",
+            1,
+        );
+
+        let result = xgs.get_xattr(current_owner, "user", b"key");
+        match result {
+            Err(PersistentXattrError::Internal(msg)) => {
+                assert!(
+                    msg.contains("owner/key mismatch"),
+                    "expected owner mismatch, got: {msg}"
+                );
+            }
+            other => panic!("expected owner mismatch error, got: {other:?}"),
+        }
     }
 
     #[test]
     fn validation_rejects_invalid_namespace() {
         let (xgs, _dir) = make_store();
         assert_eq!(
-            xgs.get_xattr(1, "custom", b"foo"),
+            xgs.get_xattr(owner(1), "custom", b"foo"),
             Err(PersistentXattrError::InvalidNamespace)
         );
         assert_eq!(
-            xgs.get_xattr(1, "", b"foo"),
+            xgs.get_xattr(owner(1), "", b"foo"),
             Err(PersistentXattrError::InvalidNamespace)
         );
     }
@@ -308,11 +410,11 @@ mod tests {
     fn validation_rejects_invalid_name() {
         let (xgs, _dir) = make_store();
         assert_eq!(
-            xgs.get_xattr(1, "user", b""),
+            xgs.get_xattr(owner(1), "user", b""),
             Err(PersistentXattrError::InvalidName)
         );
         assert_eq!(
-            xgs.get_xattr(1, "user", b"bad\0nul"),
+            xgs.get_xattr(owner(1), "user", b"bad\0nul"),
             Err(PersistentXattrError::InvalidName)
         );
     }
@@ -335,9 +437,9 @@ mod tests {
         let store = LocalObjectStore::open_with_options(&dir, opts).expect("open large store");
         let xgs = XattrGetStore::new(Arc::new(Mutex::new(store)));
         let big = vec![0xABu8; 8192];
-        put_xattr_record(&xgs.object_store, 1, "user", b"big", &big, 1);
+        put_xattr_record(&xgs.object_store, owner(1), "user", b"big", &big, 1);
         let val = xgs
-            .get_xattr(1, "user", b"big")
+            .get_xattr(owner(1), "user", b"big")
             .unwrap()
             .expect("value exists");
         assert_eq!(val, big);
@@ -346,15 +448,22 @@ mod tests {
     #[test]
     fn namespace_qualified_names_are_independent() {
         let (xgs, _dir) = make_store();
-        put_xattr_record(&xgs.object_store, 1, "user", b"key", b"user-v", 1);
-        put_xattr_record(&xgs.object_store, 1, "trusted", b"key", b"trusted-v", 1);
+        put_xattr_record(&xgs.object_store, owner(1), "user", b"key", b"user-v", 1);
+        put_xattr_record(
+            &xgs.object_store,
+            owner(1),
+            "trusted",
+            b"key",
+            b"trusted-v",
+            1,
+        );
 
         assert_eq!(
-            xgs.get_xattr(1, "user", b"key").unwrap(),
+            xgs.get_xattr(owner(1), "user", b"key").unwrap(),
             Some(b"user-v".to_vec())
         );
         assert_eq!(
-            xgs.get_xattr(1, "trusted", b"key").unwrap(),
+            xgs.get_xattr(owner(1), "trusted", b"key").unwrap(),
             Some(b"trusted-v".to_vec())
         );
     }

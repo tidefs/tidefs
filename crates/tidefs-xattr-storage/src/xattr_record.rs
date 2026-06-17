@@ -5,12 +5,13 @@
 //! creation transaction group, with a trailing BLAKE3-256 domain-separated
 //! digest for integrity verification.
 //!
-//! # Wire format (V1)
+//! # Wire format (V2)
 //!
 //! ```text
 //! [u8; 4]   magic           "XATR"
-//! u8        format_version  1
+//! u8        format_version  2
 //! u64 LE    inode
+//! u64 LE    inode_generation
 //! u8        namespace       1=security 2=system 3=trusted 4=user
 //! u16 LE    name_len
 //! [u8; NL]  name
@@ -39,19 +40,20 @@ use tidefs_binary_schema_core::{
 const XATTR_RECORD_MAGIC: [u8; 4] = [0x58, 0x41, 0x54, 0x52]; // "XATR"
 
 /// Current xattr value record format version.
-const XATTR_RECORD_FORMAT_VERSION: u8 = 1;
+const XATTR_RECORD_FORMAT_VERSION: u8 = 2;
 
 /// Schema type ID for xattr value records (201 = xattr value record).
 const XATTR_RECORD_TYPE_ID: SchemaTypeId = SchemaTypeId(201);
 
-/// Schema version for xattr value record format V1.
-const XATTR_RECORD_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
+/// Schema version for xattr value record format V2.
+const XATTR_RECORD_VERSION: SchemaVersion = SchemaVersion::new(2, 0);
 
-/// Minimum on-disk blob size: magic(4) + version(1) + inode(8) + ns(1)
-/// + name_len(2) + value_len(4) + txg(8) + digest(32) = 60.
+/// Minimum on-disk blob size: magic(4) + version(1) + inode(8)
+/// + inode_generation(8) + ns(1) + name_len(2) + value_len(4)
+/// + txg(8) + digest(32) = 68.
 ///
 /// This is the size of a record with a zero-length name and value.
-const XATTR_RECORD_MIN_BLOB_LEN: usize = 60;
+const XATTR_RECORD_MIN_BLOB_LEN: usize = 68;
 
 // ---------------------------------------------------------------------------
 // Namespace
@@ -109,6 +111,8 @@ impl XattrNamespace {
 pub struct XattrRecord {
     /// Inode number this xattr belongs to.
     pub inode: u64,
+    /// Inode generation/version this xattr belongs to.
+    pub inode_generation: u64,
     /// Xattr namespace.
     pub namespace: XattrNamespace,
     /// The attribute name (without namespace prefix), e.g. `selinux`
@@ -129,6 +133,7 @@ impl XattrRecord {
     #[must_use]
     pub fn new(
         inode: u64,
+        inode_generation: u64,
         namespace: XattrNamespace,
         name: Vec<u8>,
         value: Vec<u8>,
@@ -136,6 +141,7 @@ impl XattrRecord {
     ) -> Self {
         Self {
             inode,
+            inode_generation,
             namespace,
             name,
             value,
@@ -233,6 +239,11 @@ impl XattrRecord {
         let inode = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
+        // inode_generation (8 bytes)
+        ensure_len(data, pos, 8)?;
+        let inode_generation = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+
         // namespace (1 byte)
         ensure_len(data, pos, 1)?;
         let ns_byte = data[pos];
@@ -267,6 +278,7 @@ impl XattrRecord {
 
         Ok(Self {
             inode,
+            inode_generation,
             namespace,
             name,
             value,
@@ -284,6 +296,7 @@ impl XattrRecord {
             XATTR_RECORD_MAGIC.len()
                 + 1  // version
                 + 8  // inode
+                + 8  // inode_generation
                 + 1  // namespace
                 + U16Le::BYTES + self.name.len()
                 + U32Le::BYTES + self.value.len()
@@ -296,6 +309,9 @@ impl XattrRecord {
 
         // inode
         buf.extend_from_slice(&self.inode.to_le_bytes());
+
+        // inode_generation
+        buf.extend_from_slice(&self.inode_generation.to_le_bytes());
 
         // namespace
         buf.push(self.namespace.to_byte());
@@ -366,6 +382,7 @@ mod tests {
     fn make_record() -> XattrRecord {
         XattrRecord::new(
             42,
+            9,
             XattrNamespace::User,
             b"mykey".to_vec(),
             b"myval".to_vec(),
@@ -390,7 +407,7 @@ mod tests {
 
     #[test]
     fn empty_name_and_value_roundtrip() {
-        let rec = XattrRecord::new(1, XattrNamespace::Security, vec![], vec![], 0);
+        let rec = XattrRecord::new(1, 1, XattrNamespace::Security, vec![], vec![], 0);
         let blob = rec.seal();
         let verified = XattrRecord::verify(&blob).expect("verify empty");
         assert_eq!(verified, rec);
@@ -401,6 +418,7 @@ mod tests {
         let big = vec![0xABu8; 8192];
         let rec = XattrRecord::new(
             99,
+            3,
             XattrNamespace::System,
             b"large".to_vec(),
             big.clone(),
@@ -415,7 +433,7 @@ mod tests {
     #[test]
     fn binary_name_roundtrip() {
         let name = vec![0x00, 0xFF, 0x42, 0x99];
-        let rec = XattrRecord::new(10, XattrNamespace::User, name.clone(), b"v".to_vec(), 1);
+        let rec = XattrRecord::new(10, 4, XattrNamespace::User, name.clone(), b"v".to_vec(), 1);
         let blob = rec.seal();
         let verified = XattrRecord::verify(&blob).expect("verify binary name");
         assert_eq!(verified.name, name);
@@ -432,7 +450,7 @@ mod tests {
             (XattrNamespace::User, b"usr".to_vec(), b"uv".to_vec()),
         ];
         for (ns, name, value) in &namespaces {
-            let rec = XattrRecord::new(1, *ns, name.clone(), value.clone(), 0);
+            let rec = XattrRecord::new(1, 1, *ns, name.clone(), value.clone(), 0);
             let blob = rec.seal();
             let verified = XattrRecord::verify(&blob).expect("verify namespace");
             assert_eq!(verified.namespace, *ns);
@@ -453,29 +471,36 @@ mod tests {
 
     #[test]
     fn content_hash_differs_per_value() {
-        let r1 = XattrRecord::new(1, XattrNamespace::User, b"a".to_vec(), b"v1".to_vec(), 0);
-        let r2 = XattrRecord::new(1, XattrNamespace::User, b"a".to_vec(), b"v2".to_vec(), 0);
+        let r1 = XattrRecord::new(1, 1, XattrNamespace::User, b"a".to_vec(), b"v1".to_vec(), 0);
+        let r2 = XattrRecord::new(1, 1, XattrNamespace::User, b"a".to_vec(), b"v2".to_vec(), 0);
         assert_ne!(r1.content_hash(), r2.content_hash());
     }
 
     #[test]
     fn content_hash_differs_per_name() {
-        let r1 = XattrRecord::new(1, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 0);
-        let r2 = XattrRecord::new(1, XattrNamespace::User, b"b".to_vec(), b"v".to_vec(), 0);
+        let r1 = XattrRecord::new(1, 1, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 0);
+        let r2 = XattrRecord::new(1, 1, XattrNamespace::User, b"b".to_vec(), b"v".to_vec(), 0);
         assert_ne!(r1.content_hash(), r2.content_hash());
     }
 
     #[test]
     fn content_hash_differs_per_inode() {
-        let r1 = XattrRecord::new(1, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 0);
-        let r2 = XattrRecord::new(2, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 0);
+        let r1 = XattrRecord::new(1, 1, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 0);
+        let r2 = XattrRecord::new(2, 1, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 0);
+        assert_ne!(r1.content_hash(), r2.content_hash());
+    }
+
+    #[test]
+    fn content_hash_differs_per_inode_generation() {
+        let r1 = XattrRecord::new(1, 1, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 0);
+        let r2 = XattrRecord::new(1, 2, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 0);
         assert_ne!(r1.content_hash(), r2.content_hash());
     }
 
     #[test]
     fn content_hash_differs_per_txg() {
-        let r1 = XattrRecord::new(1, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 0);
-        let r2 = XattrRecord::new(1, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 1);
+        let r1 = XattrRecord::new(1, 1, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 0);
+        let r2 = XattrRecord::new(1, 1, XattrNamespace::User, b"a".to_vec(), b"v".to_vec(), 1);
         assert_ne!(r1.content_hash(), r2.content_hash());
     }
 
@@ -493,9 +518,10 @@ mod tests {
     fn tampered_value_rejected() {
         let rec = make_record();
         let mut blob = rec.seal();
-        // Flip a byte in the value region (after inode + ns + name_len + name + value_len).
-        // 4(magic) + 1(version) + 8(inode) + 1(ns) + 2(name_len) + 5(name) + 4(value_len) = 25
-        blob[25] ^= 0xFF;
+        // Flip a byte in the value region after inode-generation evidence.
+        // 4(magic) + 1(version) + 8(inode) + 8(generation) + 1(ns)
+        // + 2(name_len) + 5(name) + 4(value_len) = 33
+        blob[33] ^= 0xFF;
         assert_eq!(
             XattrRecord::verify(&blob),
             Err(XattrRecordError::DigestMismatch)
@@ -548,8 +574,8 @@ mod tests {
     fn bad_namespace_caught_by_digest() {
         let rec = make_record();
         let mut blob = rec.seal();
-        // Namespace byte is at offset 4(magic)+1(version)+8(inode) = 13
-        blob[13] = 99; // invalid namespace
+        // Namespace byte is at offset 4(magic)+1(version)+8(inode)+8(generation) = 21
+        blob[21] = 99; // invalid namespace
                        // Digest verification fires before structural decode; tampered data
                        // is always caught as DigestMismatch.
         assert_eq!(
@@ -565,7 +591,7 @@ mod tests {
         // when the digest is otherwise valid.
         let rec = make_record();
         let mut blob = rec.seal();
-        blob[13] = 99; // invalid namespace
+        blob[21] = 99; // invalid namespace
                        // Recompute digest over the now-modified header+payload.
         let content_end = blob.len() - 32;
         let new_digest = blake3_domain_digest(
@@ -592,8 +618,22 @@ mod tests {
 
     #[test]
     fn upsert_replacement_yields_different_blob() {
-        let r1 = XattrRecord::new(1, XattrNamespace::User, b"key".to_vec(), b"old".to_vec(), 1);
-        let r2 = XattrRecord::new(1, XattrNamespace::User, b"key".to_vec(), b"new".to_vec(), 2);
+        let r1 = XattrRecord::new(
+            1,
+            1,
+            XattrNamespace::User,
+            b"key".to_vec(),
+            b"old".to_vec(),
+            1,
+        );
+        let r2 = XattrRecord::new(
+            1,
+            1,
+            XattrNamespace::User,
+            b"key".to_vec(),
+            b"new".to_vec(),
+            2,
+        );
 
         let blob1 = r1.seal();
         let blob2 = r2.seal();
