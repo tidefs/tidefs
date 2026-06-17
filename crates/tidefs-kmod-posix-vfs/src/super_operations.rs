@@ -150,7 +150,12 @@ pub fn kill_sb<E: VfsEngine>(
     tracker: Option<&mut DirtyFolioTracker>,
 ) -> Result<(), Errno> {
     if let Some(tracker) = tracker {
-        let dirty_inodes: Vec<InodeId> = tracker.iter().map(|(ino, _)| ino).collect();
+        // Build inode list manually: KmodVec does not implement
+        // FromIterator, so collect() fails in the kernel build.
+        let mut dirty_inodes: Vec<InodeId> = Vec::new();
+        for (ino, _) in tracker.iter() {
+            dirty_inodes.push(ino);
+        }
         for inode in dirty_inodes {
             let ranges = tracker.drain_inode(inode);
             for range in &ranges {
