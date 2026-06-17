@@ -17,6 +17,8 @@ no_std / forbid(unsafe_code).
 [features]
 default = []
 alloc = []
+serde = ["dep:serde"]
 
 [dependencies]
 tidefs-posix-acl = { path = "../tidefs-posix-acl" }
+serde = { version = "1", features = ["derive"], optional = true }

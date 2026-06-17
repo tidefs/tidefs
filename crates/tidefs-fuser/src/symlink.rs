@@ -155,6 +155,7 @@ pub fn check_symlink_parent_permission(
     caller_uid: u32,
     caller_gid: u32,
     caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
 ) -> Result<(), SymlinkError> {
     crate::access::check_fuse_access(
         parent_mode,
@@ -164,6 +165,7 @@ pub fn check_symlink_parent_permission(
         caller_gid,
         caller_groups,
         crate::access::ACCESS_WRITE | crate::access::ACCESS_EXECUTE,
+        mount_identity,
     )
     .map_err(|_e| SymlinkError::PermissionDenied)
 }

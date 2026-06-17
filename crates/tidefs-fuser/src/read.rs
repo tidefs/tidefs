@@ -71,6 +71,7 @@ pub fn check_read_permission(
     caller_uid: u32,
     caller_gid: u32,
     caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
 ) -> Result<(), ReadError> {
     crate::access::check_fuse_access(
         mode,
@@ -80,6 +81,7 @@ pub fn check_read_permission(
         caller_gid,
         caller_groups,
         crate::access::ACCESS_READ,
+        mount_identity,
     )
     .map_err(|_e| ReadError::PermissionDenied)
 }
@@ -429,6 +431,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID_MOUNT: tidefs_permission::MountIdentity =
+        tidefs_permission::MountIdentity::new([0x41; 16], 1);
     use std::collections::HashMap;
     use std::convert::TryInto;
     use tidefs_object_io::{
@@ -1189,14 +1194,14 @@ mod tests {
     #[test]
     fn check_read_permission_root_bypass() {
         // Root (uid=0) always passes permission check regardless of mode bits.
-        let result = check_read_permission(0o000, 1000, 100, 0, 0, &[]);
+        let result = check_read_permission(0o000, 1000, 100, 0, 0, &[], &VALID_MOUNT);
         assert!(result.is_ok());
     }
 
     #[test]
     fn check_read_permission_owner_with_read_bit() {
         // Owner with read bit set passes.
-        let result = check_read_permission(0o400, 1000, 100, 1000, 100, &[]);
+        let result = check_read_permission(0o400, 1000, 100, 1000, 100, &[], &VALID_MOUNT);
         assert!(result.is_ok());
     }
 

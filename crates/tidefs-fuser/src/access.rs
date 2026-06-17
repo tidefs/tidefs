@@ -32,6 +32,7 @@
 //!     100,    // caller gid
 //!     &[],    // caller supplementary groups
 //!     access::ACCESS_READ | access::ACCESS_WRITE,
+//!     &mount_identity,
 //! );
 //! assert_eq!(result, Ok(()));
 //! ```
@@ -39,6 +40,7 @@
 use crate::errno;
 use libc::c_int;
 
+use tidefs_permission::MountIdentity;
 use tidefs_permission::{check_access, InodeAttr};
 pub use tidefs_permission::{
     ACCESS_EXECUTE, ACCESS_NONE, ACCESS_RDWR, ACCESS_READ, ACCESS_RWX, ACCESS_WRITE,
@@ -125,6 +127,8 @@ impl InodeAttr for AccessAttrView {
 /// - `requested` — access bits from [`fuse_access_requested_from_mask`]
 ///   or the re-exported [`ACCESS_READ`], [`ACCESS_WRITE`],
 ///   [`ACCESS_EXECUTE`], or [`ACCESS_NONE`] constants.
+/// - `mount_identity` — committed dataset mount identity for the current
+///   FUSE session.
 ///
 /// Returns `Ok(())` when all requested access bits are granted, or
 /// `Err(EACCES)` when denied.
@@ -136,7 +140,11 @@ pub fn check_fuse_access(
     caller_gid: u32,
     caller_groups: &[u32],
     requested: u8,
+    mount_identity: &MountIdentity,
 ) -> Result<(), c_int> {
+    if !mount_identity.is_valid() {
+        return Err(errno::EACCES);
+    }
     if requested == ACCESS_NONE {
         return Ok(());
     }
@@ -168,6 +176,7 @@ pub fn check_fuse_access(
         caller_gid,
         caller_groups,
         requested,
+        mount_identity,
     ) {
         Ok(())
     } else {
@@ -190,7 +199,11 @@ pub fn check_fuse_access_acl(
     caller_groups: &[u32],
     requested: u8,
     acl: Option<&[tidefs_permission::PosixAclEntry]>,
+    mount_identity: &MountIdentity,
 ) -> Result<(), c_int> {
+    if !mount_identity.is_valid() {
+        return Err(errno::EACCES);
+    }
     if requested == ACCESS_NONE {
         return Ok(());
     }
@@ -213,7 +226,15 @@ pub fn check_fuse_access_acl(
         uid: file_uid,
         gid: file_gid,
     };
-    if check_access(&view, acl, caller_uid, caller_gid, caller_groups, requested) {
+    if check_access(
+        &view,
+        acl,
+        caller_uid,
+        caller_gid,
+        caller_groups,
+        requested,
+        mount_identity,
+    ) {
         Ok(())
     } else {
         Err(errno::EACCES)
@@ -239,6 +260,7 @@ pub fn plan_fuse_access(
     caller_gid: u32,
     caller_groups: &[u32],
     mask: i32,
+    mount_identity: &MountIdentity,
 ) -> Result<(), c_int> {
     let requested = fuse_access_requested_from_mask(mask)?;
     check_fuse_access(
@@ -249,6 +271,7 @@ pub fn plan_fuse_access(
         caller_gid,
         caller_groups,
         requested,
+        mount_identity,
     )
 }
 
@@ -263,6 +286,7 @@ pub fn plan_fuse_access_acl(
     caller_groups: &[u32],
     mask: i32,
     acl: Option<&[tidefs_permission::PosixAclEntry]>,
+    mount_identity: &MountIdentity,
 ) -> Result<(), c_int> {
     let requested = fuse_access_requested_from_mask(mask)?;
     check_fuse_access_acl(
@@ -274,6 +298,7 @@ pub fn plan_fuse_access_acl(
         caller_groups,
         requested,
         acl,
+        mount_identity,
     )
 }
 
@@ -359,6 +384,7 @@ pub fn handle_access(
     caller_gid: u32,
     caller_groups: &[u32],
     read_only: bool,
+    mount_identity: &MountIdentity,
 ) -> Result<(), c_int> {
     let req = AccessRequest::new(mask);
     let validated_mask = validate_access_request(&req)?;
@@ -371,6 +397,7 @@ pub fn handle_access(
         caller_gid,
         caller_groups,
         validated_mask,
+        mount_identity,
     )
 }
 // ---------------------------------------------------------------------------
@@ -380,6 +407,9 @@ pub fn handle_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID_MOUNT: MountIdentity = MountIdentity::new([0x41; 16], 1);
+    const INVALID_MOUNT: MountIdentity = MountIdentity::new([0; 16], 1);
 
     // -- fuse_access_requested_from_mask --
 
@@ -437,19 +467,19 @@ mod tests {
     fn root_bypasses_no_permissions() {
         // File mode 000, not owned by root — root still gets through.
         assert_eq!(
-            check_fuse_access(0o000, 1000, 100, 0, 0, &[], ACCESS_READ),
+            check_fuse_access(0o000, 1000, 100, 0, 0, &[], ACCESS_READ, &VALID_MOUNT),
             Ok(())
         );
         assert_eq!(
-            check_fuse_access(0o000, 1000, 100, 0, 0, &[], ACCESS_WRITE),
+            check_fuse_access(0o000, 1000, 100, 0, 0, &[], ACCESS_WRITE, &VALID_MOUNT),
             Ok(())
         );
         assert_eq!(
-            check_fuse_access(0o000, 1000, 100, 0, 0, &[], ACCESS_EXECUTE),
+            check_fuse_access(0o000, 1000, 100, 0, 0, &[], ACCESS_EXECUTE, &VALID_MOUNT),
             Ok(())
         );
         assert_eq!(
-            check_fuse_access(0o000, 1000, 100, 0, 0, &[], ACCESS_RWX),
+            check_fuse_access(0o000, 1000, 100, 0, 0, &[], ACCESS_RWX, &VALID_MOUNT),
             Ok(())
         );
     }
@@ -459,7 +489,7 @@ mod tests {
     #[test]
     fn owner_read_on_readable_file() {
         assert_eq!(
-            check_fuse_access(0o400, 1000, 100, 1000, 100, &[], ACCESS_READ),
+            check_fuse_access(0o400, 1000, 100, 1000, 100, &[], ACCESS_READ, &VALID_MOUNT),
             Ok(())
         );
     }
@@ -467,7 +497,7 @@ mod tests {
     #[test]
     fn owner_write_denied_on_readonly_file() {
         assert_eq!(
-            check_fuse_access(0o400, 1000, 100, 1000, 100, &[], ACCESS_WRITE),
+            check_fuse_access(0o400, 1000, 100, 1000, 100, &[], ACCESS_WRITE, &VALID_MOUNT),
             Err(errno::EACCES)
         );
     }
@@ -475,7 +505,7 @@ mod tests {
     #[test]
     fn owner_rw_on_rw_file() {
         assert_eq!(
-            check_fuse_access(0o600, 1000, 100, 1000, 100, &[], ACCESS_RDWR),
+            check_fuse_access(0o600, 1000, 100, 1000, 100, &[], ACCESS_RDWR, &VALID_MOUNT),
             Ok(())
         );
     }
@@ -483,7 +513,16 @@ mod tests {
     #[test]
     fn owner_execute_on_executable_file() {
         assert_eq!(
-            check_fuse_access(0o500, 1000, 100, 1000, 100, &[], ACCESS_EXECUTE),
+            check_fuse_access(
+                0o500,
+                1000,
+                100,
+                1000,
+                100,
+                &[],
+                ACCESS_EXECUTE,
+                &VALID_MOUNT
+            ),
             Ok(())
         );
     }
@@ -495,7 +534,7 @@ mod tests {
         // File owner 1000, group 100, mode 0o040 (group read).
         // Caller 2000 is in group 100.
         assert_eq!(
-            check_fuse_access(0o040, 1000, 100, 2000, 100, &[], ACCESS_READ),
+            check_fuse_access(0o040, 1000, 100, 2000, 100, &[], ACCESS_READ, &VALID_MOUNT),
             Ok(())
         );
     }
@@ -503,7 +542,7 @@ mod tests {
     #[test]
     fn group_member_denied_write_on_group_readonly() {
         assert_eq!(
-            check_fuse_access(0o040, 1000, 100, 2000, 100, &[], ACCESS_WRITE),
+            check_fuse_access(0o040, 1000, 100, 2000, 100, &[], ACCESS_WRITE, &VALID_MOUNT),
             Err(errno::EACCES)
         );
     }
@@ -512,7 +551,16 @@ mod tests {
     fn supplementary_group_match_grants_access() {
         // Caller primary gid 200, but supplementary groups include 100.
         assert_eq!(
-            check_fuse_access(0o040, 1000, 100, 2000, 200, &[100], ACCESS_READ),
+            check_fuse_access(
+                0o040,
+                1000,
+                100,
+                2000,
+                200,
+                &[100],
+                ACCESS_READ,
+                &VALID_MOUNT
+            ),
             Ok(())
         );
     }
@@ -522,7 +570,7 @@ mod tests {
     #[test]
     fn other_read_on_world_readable_file() {
         assert_eq!(
-            check_fuse_access(0o004, 1000, 100, 2000, 200, &[], ACCESS_READ),
+            check_fuse_access(0o004, 1000, 100, 2000, 200, &[], ACCESS_READ, &VALID_MOUNT),
             Ok(())
         );
     }
@@ -530,7 +578,7 @@ mod tests {
     #[test]
     fn other_denied_on_world_unreadable_file() {
         assert_eq!(
-            check_fuse_access(0o000, 1000, 100, 2000, 200, &[], ACCESS_READ),
+            check_fuse_access(0o000, 1000, 100, 2000, 200, &[], ACCESS_READ, &VALID_MOUNT),
             Err(errno::EACCES)
         );
     }
@@ -541,8 +589,29 @@ mod tests {
     fn access_none_always_succeeds() {
         // Even mode 000 and non-owner: existence check always passes
         assert_eq!(
-            check_fuse_access(0o000, 1000, 100, 2000, 200, &[], ACCESS_NONE),
+            check_fuse_access(0o000, 1000, 100, 2000, 200, &[], ACCESS_NONE, &VALID_MOUNT),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn invalid_mount_identity_fails_closed_before_root_or_f_ok() {
+        assert_eq!(
+            check_fuse_access(0o777, 1000, 100, 0, 0, &[], ACCESS_READ, &INVALID_MOUNT),
+            Err(errno::EACCES)
+        );
+        assert_eq!(
+            check_fuse_access(
+                0o777,
+                1000,
+                100,
+                1000,
+                100,
+                &[],
+                ACCESS_NONE,
+                &INVALID_MOUNT
+            ),
+            Err(errno::EACCES)
         );
     }
 
@@ -551,7 +620,7 @@ mod tests {
     #[test]
     fn plan_fuse_access_f_ok_succeeds() {
         assert_eq!(
-            plan_fuse_access(0o600, 1000, 100, 1000, 100, &[], 0),
+            plan_fuse_access(0o600, 1000, 100, 1000, 100, &[], 0, &VALID_MOUNT),
             Ok(())
         );
     }
@@ -559,7 +628,16 @@ mod tests {
     #[test]
     fn plan_fuse_access_owner_rw() {
         assert_eq!(
-            plan_fuse_access(0o600, 1000, 100, 1000, 100, &[], libc::R_OK | libc::W_OK),
+            plan_fuse_access(
+                0o600,
+                1000,
+                100,
+                1000,
+                100,
+                &[],
+                libc::R_OK | libc::W_OK,
+                &VALID_MOUNT
+            ),
             Ok(())
         );
     }
@@ -567,7 +645,7 @@ mod tests {
     #[test]
     fn plan_fuse_access_other_denied() {
         assert_eq!(
-            plan_fuse_access(0o600, 1000, 100, 2000, 200, &[], libc::R_OK),
+            plan_fuse_access(0o600, 1000, 100, 2000, 200, &[], libc::R_OK, &VALID_MOUNT),
             Err(errno::EACCES)
         );
     }
@@ -575,7 +653,7 @@ mod tests {
     #[test]
     fn plan_fuse_access_invalid_mask_returns_einval() {
         assert_eq!(
-            plan_fuse_access(0o777, 1000, 100, 1000, 100, &[], 0x10),
+            plan_fuse_access(0o777, 1000, 100, 1000, 100, &[], 0x10, &VALID_MOUNT),
             Err(errno::EINVAL)
         );
     }
@@ -604,12 +682,32 @@ mod tests {
         ];
         // Owner (1000) is denied because ACL overrides mode bits
         assert_eq!(
-            check_fuse_access_acl(0o777, 1000, 100, 1000, 100, &[], ACCESS_READ, Some(&acl)),
+            check_fuse_access_acl(
+                0o777,
+                1000,
+                100,
+                1000,
+                100,
+                &[],
+                ACCESS_READ,
+                Some(&acl),
+                &VALID_MOUNT
+            ),
             Err(errno::EACCES)
         );
         // Root still bypasses
         assert_eq!(
-            check_fuse_access_acl(0o000, 1000, 100, 0, 0, &[], ACCESS_READ, Some(&acl)),
+            check_fuse_access_acl(
+                0o000,
+                1000,
+                100,
+                0,
+                0,
+                &[],
+                ACCESS_READ,
+                Some(&acl),
+                &VALID_MOUNT
+            ),
             Ok(())
         );
     }
@@ -617,11 +715,31 @@ mod tests {
     #[test]
     fn acl_none_falls_back_to_mode() {
         assert_eq!(
-            check_fuse_access_acl(0o400, 1000, 100, 1000, 100, &[], ACCESS_READ, None),
+            check_fuse_access_acl(
+                0o400,
+                1000,
+                100,
+                1000,
+                100,
+                &[],
+                ACCESS_READ,
+                None,
+                &VALID_MOUNT
+            ),
             Ok(())
         );
         assert_eq!(
-            check_fuse_access_acl(0o400, 1000, 100, 2000, 200, &[], ACCESS_READ, None),
+            check_fuse_access_acl(
+                0o400,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                ACCESS_READ,
+                None,
+                &VALID_MOUNT
+            ),
             Err(errno::EACCES)
         );
     }
@@ -631,7 +749,7 @@ mod tests {
     #[test]
     fn plan_fuse_access_acl_root_bypass() {
         assert_eq!(
-            plan_fuse_access_acl(0o000, 1000, 100, 0, 0, &[], libc::R_OK, None),
+            plan_fuse_access_acl(0o000, 1000, 100, 0, 0, &[], libc::R_OK, None, &VALID_MOUNT),
             Ok(())
         );
     }
@@ -639,7 +757,17 @@ mod tests {
     #[test]
     fn plan_fuse_access_acl_other_denied() {
         assert_eq!(
-            plan_fuse_access_acl(0o600, 1000, 100, 2000, 200, &[], libc::R_OK, None),
+            plan_fuse_access_acl(
+                0o600,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                libc::R_OK,
+                None,
+                &VALID_MOUNT
+            ),
             Err(errno::EACCES)
         );
     }
@@ -735,7 +863,7 @@ mod tests {
     #[test]
     fn handle_access_f_ok_success() {
         assert_eq!(
-            handle_access(0, 0o000, 1000, 100, 2000, 200, &[], false),
+            handle_access(0, 0o000, 1000, 100, 2000, 200, &[], false, &VALID_MOUNT),
             Ok(())
         );
     }
@@ -743,7 +871,17 @@ mod tests {
     #[test]
     fn handle_access_r_ok_on_readable_file() {
         assert_eq!(
-            handle_access(libc::R_OK, 0o400, 1000, 100, 1000, 100, &[], false),
+            handle_access(
+                libc::R_OK,
+                0o400,
+                1000,
+                100,
+                1000,
+                100,
+                &[],
+                false,
+                &VALID_MOUNT
+            ),
             Ok(())
         );
     }
@@ -751,7 +889,17 @@ mod tests {
     #[test]
     fn handle_access_w_ok_on_writable_file() {
         assert_eq!(
-            handle_access(libc::W_OK, 0o200, 1000, 100, 1000, 100, &[], false),
+            handle_access(
+                libc::W_OK,
+                0o200,
+                1000,
+                100,
+                1000,
+                100,
+                &[],
+                false,
+                &VALID_MOUNT
+            ),
             Ok(())
         );
     }
@@ -759,7 +907,17 @@ mod tests {
     #[test]
     fn handle_access_x_ok_on_executable_file() {
         assert_eq!(
-            handle_access(libc::X_OK, 0o100, 1000, 100, 1000, 100, &[], false),
+            handle_access(
+                libc::X_OK,
+                0o100,
+                1000,
+                100,
+                1000,
+                100,
+                &[],
+                false,
+                &VALID_MOUNT
+            ),
             Ok(())
         );
     }
@@ -768,7 +926,17 @@ mod tests {
     fn handle_access_root_bypass() {
         // uid 0 has full access even on mode 000
         assert_eq!(
-            handle_access(libc::R_OK | libc::W_OK, 0o000, 1000, 100, 0, 0, &[], false),
+            handle_access(
+                libc::R_OK | libc::W_OK,
+                0o000,
+                1000,
+                100,
+                0,
+                0,
+                &[],
+                false,
+                &VALID_MOUNT
+            ),
             Ok(())
         );
     }
@@ -779,7 +947,17 @@ mod tests {
     fn handle_access_permission_denied() {
         // Non-owner, non-group, non-other read on mode 600
         assert_eq!(
-            handle_access(libc::R_OK, 0o600, 1000, 100, 2000, 200, &[], false),
+            handle_access(
+                libc::R_OK,
+                0o600,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                false,
+                &VALID_MOUNT
+            ),
             Err(errno::EACCES)
         );
     }
@@ -787,7 +965,17 @@ mod tests {
     #[test]
     fn handle_access_read_only_rejects_write() {
         assert_eq!(
-            handle_access(libc::W_OK, 0o600, 1000, 100, 1000, 100, &[], true),
+            handle_access(
+                libc::W_OK,
+                0o600,
+                1000,
+                100,
+                1000,
+                100,
+                &[],
+                true,
+                &VALID_MOUNT
+            ),
             Err(errno::EROFS)
         );
     }
@@ -795,7 +983,17 @@ mod tests {
     #[test]
     fn handle_access_read_only_allows_read() {
         assert_eq!(
-            handle_access(libc::R_OK, 0o400, 1000, 100, 1000, 100, &[], true),
+            handle_access(
+                libc::R_OK,
+                0o400,
+                1000,
+                100,
+                1000,
+                100,
+                &[],
+                true,
+                &VALID_MOUNT
+            ),
             Ok(())
         );
     }
@@ -803,7 +1001,7 @@ mod tests {
     #[test]
     fn handle_access_bad_mask_einval() {
         assert_eq!(
-            handle_access(0x08, 0o777, 1000, 100, 1000, 100, &[], false),
+            handle_access(0x08, 0o777, 1000, 100, 1000, 100, &[], false, &VALID_MOUNT),
             Err(errno::EINVAL)
         );
     }
@@ -813,7 +1011,17 @@ mod tests {
         // EROFS takes priority over EINVAL when read-only and W_OK requested
         // with an otherwise-valid mask
         assert_eq!(
-            handle_access(libc::W_OK, 0o600, 1000, 100, 1000, 100, &[], true),
+            handle_access(
+                libc::W_OK,
+                0o600,
+                1000,
+                100,
+                1000,
+                100,
+                &[],
+                true,
+                &VALID_MOUNT
+            ),
             Err(errno::EROFS)
         );
     }

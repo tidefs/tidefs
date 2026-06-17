@@ -28,6 +28,7 @@
 //! ```
 
 use libc::c_int;
+
 use std::fmt;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -251,9 +252,16 @@ pub fn check_getattr_permission(
     uid: u32,
     gid: u32,
     groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
 ) -> Result<(), GetattrError> {
-    if tidefs_permission::check_mode_access(attrs, uid, gid, groups, tidefs_permission::ACCESS_READ)
-    {
+    if tidefs_permission::check_mode_access(
+        attrs,
+        uid,
+        gid,
+        groups,
+        tidefs_permission::ACCESS_READ,
+        mount_identity,
+    ) {
         Ok(())
     } else {
         Err(GetattrError::PermissionDenied)
@@ -363,15 +371,19 @@ pub fn handle_getattr(
     caller_uid: u32,
     caller_gid: u32,
     groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
 ) -> Result<GetattrPlan, GetattrError> {
     let plan = plan_getattr(ino, ino_exists)?;
-    check_getattr_permission(attrs, caller_uid, caller_gid, groups)?;
+    check_getattr_permission(attrs, caller_uid, caller_gid, groups, mount_identity)?;
     Ok(plan)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    const VALID_MOUNT: tidefs_permission::MountIdentity =
+        tidefs_permission::MountIdentity::new([0x41; 16], 1);
 
     // -- file_type_from_mode ------------------------------------------
 
@@ -898,7 +910,10 @@ mod tests {
             gid: 100,
             mode: 0o400,
         };
-        assert_eq!(check_getattr_permission(&ino, 1000, 100, &[]), Ok(()));
+        assert_eq!(
+            check_getattr_permission(&ino, 1000, 100, &[], &VALID_MOUNT),
+            Ok(())
+        );
     }
 
     #[test]
@@ -909,7 +924,7 @@ mod tests {
             mode: 0o000,
         };
         assert_eq!(
-            check_getattr_permission(&ino, 1000, 100, &[]),
+            check_getattr_permission(&ino, 1000, 100, &[], &VALID_MOUNT),
             Err(GetattrError::PermissionDenied)
         );
     }
@@ -921,7 +936,10 @@ mod tests {
             gid: 100,
             mode: 0o040,
         };
-        assert_eq!(check_getattr_permission(&ino, 2000, 100, &[]), Ok(()));
+        assert_eq!(
+            check_getattr_permission(&ino, 2000, 100, &[], &VALID_MOUNT),
+            Ok(())
+        );
     }
 
     #[test]
@@ -932,7 +950,7 @@ mod tests {
             mode: 0o040,
         };
         assert_eq!(
-            check_getattr_permission(&ino, 2000, 200, &[]),
+            check_getattr_permission(&ino, 2000, 200, &[], &VALID_MOUNT),
             Err(GetattrError::PermissionDenied)
         );
     }
@@ -944,7 +962,10 @@ mod tests {
             gid: 100,
             mode: 0o004,
         };
-        assert_eq!(check_getattr_permission(&ino, 2000, 200, &[]), Ok(()));
+        assert_eq!(
+            check_getattr_permission(&ino, 2000, 200, &[], &VALID_MOUNT),
+            Ok(())
+        );
     }
 
     #[test]
@@ -955,7 +976,7 @@ mod tests {
             mode: 0o000,
         };
         assert_eq!(
-            check_getattr_permission(&ino, 2000, 200, &[]),
+            check_getattr_permission(&ino, 2000, 200, &[], &VALID_MOUNT),
             Err(GetattrError::PermissionDenied)
         );
     }
@@ -967,7 +988,10 @@ mod tests {
             gid: 100,
             mode: 0o000,
         };
-        assert_eq!(check_getattr_permission(&ino, 0, 0, &[]), Ok(()));
+        assert_eq!(
+            check_getattr_permission(&ino, 0, 0, &[], &VALID_MOUNT),
+            Ok(())
+        );
     }
 
     #[test]
@@ -978,7 +1002,10 @@ mod tests {
             mode: 0o040,
         };
         // caller gid=200, but supp groups contain 100
-        assert_eq!(check_getattr_permission(&ino, 2000, 200, &[100]), Ok(()));
+        assert_eq!(
+            check_getattr_permission(&ino, 2000, 200, &[100], &VALID_MOUNT),
+            Ok(())
+        );
     }
 
     #[test]
@@ -989,7 +1016,7 @@ mod tests {
             mode: 0o040,
         };
         assert_eq!(
-            check_getattr_permission(&ino, 2000, 200, &[300, 400]),
+            check_getattr_permission(&ino, 2000, 200, &[300, 400], &VALID_MOUNT),
             Err(GetattrError::PermissionDenied)
         );
     }
@@ -1153,7 +1180,7 @@ mod tests {
             gid: 100,
             mode: 0o100644,
         };
-        let plan = handle_getattr(42, true, &attrs, 1000, 100, &[]).unwrap();
+        let plan = handle_getattr(42, true, &attrs, 1000, 100, &[], &VALID_MOUNT).unwrap();
         assert_eq!(plan.ino, 42);
     }
 
@@ -1165,7 +1192,7 @@ mod tests {
             mode: 0o100644,
         };
         assert_eq!(
-            handle_getattr(42, false, &attrs, 1000, 100, &[]),
+            handle_getattr(42, false, &attrs, 1000, 100, &[], &VALID_MOUNT),
             Err(GetattrError::InodeNotFound)
         );
     }
@@ -1178,7 +1205,7 @@ mod tests {
             mode: 0o000,
         };
         assert_eq!(
-            handle_getattr(42, true, &attrs, 2000, 200, &[]),
+            handle_getattr(42, true, &attrs, 2000, 200, &[], &VALID_MOUNT),
             Err(GetattrError::PermissionDenied)
         );
     }
@@ -1190,7 +1217,7 @@ mod tests {
             gid: 100,
             mode: 0o000,
         };
-        let plan = handle_getattr(42, true, &attrs, 0, 0, &[]).unwrap();
+        let plan = handle_getattr(42, true, &attrs, 0, 0, &[], &VALID_MOUNT).unwrap();
         assert_eq!(plan.ino, 42);
     }
 }

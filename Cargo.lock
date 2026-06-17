@@ -2969,6 +2969,7 @@ dependencies = [
 name = "tidefs-permission"
 version = "0.421.0"
 dependencies = [
+ "serde",
  "tidefs-posix-acl",
 ]
 

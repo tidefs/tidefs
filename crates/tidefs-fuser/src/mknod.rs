@@ -59,6 +59,7 @@ pub fn check_mknod_parent_permission(
     caller_uid: u32,
     caller_gid: u32,
     caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
 ) -> Result<(), c_int> {
     crate::access::check_fuse_access(
         parent_mode,
@@ -68,6 +69,7 @@ pub fn check_mknod_parent_permission(
         caller_gid,
         caller_groups,
         crate::access::ACCESS_WRITE | crate::access::ACCESS_EXECUTE,
+        mount_identity,
     )
 }
 
