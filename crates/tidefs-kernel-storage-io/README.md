@@ -101,6 +101,26 @@ through `KernelStorageIo`:
 - `PoolSuperblockError` enumerates failure modes: I/O error, device too
   small, bad magic, unsupported version, and corrupt (checksum mismatch).
 
+### Import evidence receipts
+
+`PoolSuperblockImportEvidence` records focused source/unit evidence for one
+member-device import decision. A receipt carries the observed primary and
+secondary label evidence, the candidate member id, the superblock generation
+(the label recovery `commit_group`), the verified label digest, the import
+decision, the validation tier, and the claim/issue references introduced for
+GitHub issue #537.
+
+The receipt constructor is fail-closed. It accepts import only when primary
+and secondary label copies are both present and agree on pool identity, member
+id, superblock generation, and label digest. Unknown evidence, a missing label
+copy, mixed labels, stale generations, or digest mismatch all produce rejected
+import decisions.
+
+These receipts are evidence metadata for `tidefs-kernel-storage-io` unit
+behavior. They are not a replacement for mounted kernel validation,
+multi-device runtime validation, pool import policy, recovery policy, or
+claim-status changes in `validation/claims.toml`.
+
 ### Integration
 
 The `tidefs-kmod-posix-vfs` mount path uses `PoolImportContext::scan_device_io`
