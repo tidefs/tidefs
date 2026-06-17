@@ -2675,6 +2675,7 @@ dependencies = [
  "tidefs-dataset-lifecycle",
  "tidefs-dataset-properties",
  "tidefs-dir-index",
+ "tidefs-durability-layout",
  "tidefs-encryption",
  "tidefs-erasure-coding",
  "tidefs-extent-map",

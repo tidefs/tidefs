@@ -24,6 +24,7 @@ tidefs-types-cache-lattice-core = { path = "../tidefs-types-cache-lattice-core" 
 tidefs-types-space-accounting-core = { path = "../tidefs-types-space-accounting-core" }
 tidefs-space-accounting = { path = "../tidefs-space-accounting" }
 tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tidefs-durability-layout = { path = "../tidefs-durability-layout" }
 tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core", features = ["alloc"] }
 tidefs-vfs-engine = { path = "../tidefs-vfs-engine" }
 tidefs-types-vfs-owned = { path = "../tidefs-types-vfs-owned" }

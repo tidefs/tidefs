@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::vec;
 
-use tidefs_local_object_store::{checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey};
+use tidefs_local_object_store::{checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey, StoredObject};
+use tidefs_local_object_store::pool::{PlacementReceipt, PoolStoreMut};
 use tidefs_types_vfs_core::InodeId;
 
 use crate::constants::*;
@@ -19,9 +20,119 @@ use crate::object_keys::{
 use crate::types::*;
 use crate::{ContentChunkObject, ContentChunkRef, ContentLayout, ContentManifestObject, Result};
 
-pub(crate) struct WriteChunkedContentOverlay<'a> {
+/// Trait abstracting content-store writes so that write functions can
+/// accept either a receipt-producing [`PoolStoreMut`] (VFS write path) or
+/// a raw [`LocalObjectStore`] (transaction serialisation path).
+pub(crate) trait ContentWriteStore {
+    fn put_with_receipt(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<(StoredObject, PlacementReceipt)>;
+
+    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject>;
+
+    fn contains_key(&self, key: ObjectKey) -> bool;
+
+    fn raw_store(&self) -> &LocalObjectStore;
+    fn raw_store_mut(&mut self) -> &mut LocalObjectStore;
+}
+
+impl<'a> ContentWriteStore for PoolStoreMut<'a> {
+    fn put_with_receipt(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<(StoredObject, PlacementReceipt)> {
+        Ok(PoolStoreMut::put_with_receipt(self, key, payload)?)
+    }
+    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        Ok(PoolStoreMut::put(self, key, payload)?)
+    }
+    fn contains_key(&self, key: ObjectKey) -> bool {
+        PoolStoreMut::raw_store(self).contains_key(key)
+    }
+    fn raw_store(&self) -> &LocalObjectStore {
+        PoolStoreMut::raw_store(self)
+    }
+    fn raw_store_mut(&mut self) -> &mut LocalObjectStore {
+        PoolStoreMut::raw_store_mut(self)
+    }
+}
+
+impl<'a> ContentWriteStore for &'a mut LocalObjectStore {
+    fn put_with_receipt(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<(StoredObject, PlacementReceipt)> {
+        let stored = LocalObjectStore::put(self, key, payload)?;
+        let receipt = PlacementReceipt {
+            object_key: key,
+            epoch: 0,
+            generation: 0,
+            policy: Default::default(),
+            failure_domain_level: tidefs_durability_layout::FailureDomainLevel::Device,
+            payload_len: payload.len() as u64,
+            shard_len: 0,
+            payload_digest: [0u8; 32],
+            targets: Vec::new(),
+            planner_replay_receipt: None,
+        };
+        Ok((stored, receipt))
+    }
+    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        Ok(LocalObjectStore::put(self, key, payload)?)
+    }
+    fn contains_key(&self, key: ObjectKey) -> bool {
+        LocalObjectStore::contains_key(self, key)
+    }
+    fn raw_store(&self) -> &LocalObjectStore {
+        self
+    }
+    fn raw_store_mut(&mut self) -> &mut LocalObjectStore {
+        self
+    }
+}
+
+impl ContentWriteStore for LocalObjectStore {
+    fn put_with_receipt(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<(StoredObject, PlacementReceipt)> {
+        let stored = LocalObjectStore::put(self, key, payload)?;
+        let receipt = PlacementReceipt {
+            object_key: key,
+            epoch: 0,
+            generation: 0,
+            policy: Default::default(),
+            failure_domain_level: tidefs_durability_layout::FailureDomainLevel::Device,
+            payload_len: payload.len() as u64,
+            shard_len: 0,
+            payload_digest: [0u8; 32],
+            targets: Vec::new(),
+            planner_replay_receipt: None,
+        };
+        Ok((stored, receipt))
+    }
+    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        Ok(LocalObjectStore::put(self, key, payload)?)
+    }
+    fn contains_key(&self, key: ObjectKey) -> bool {
+        LocalObjectStore::contains_key(self, key)
+    }
+    fn raw_store(&self) -> &LocalObjectStore {
+        self
+    }
+    fn raw_store_mut(&mut self) -> &mut LocalObjectStore {
+        self
+    }
+}
+
+pub(crate) struct WriteChunkedContentOverlay<'a, S: ContentWriteStore> {
     pub dedup_enabled: bool,
-    pub store: &'a mut LocalObjectStore,
+    pub store: &'a mut S,
     pub inode_id: InodeId,
     pub old_record: &'a InodeRecord,
     pub new_record: &'a InodeRecord,
@@ -31,7 +142,6 @@ pub(crate) struct WriteChunkedContentOverlay<'a> {
     pub dedup_index: &'a mut DedupIndex,
     pub quorum_store: Option<&'a mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     pub compression_policy: &'a ContentCompressionPolicy,
-    pub placement_receipt_generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -40,9 +150,9 @@ pub(crate) struct ContentOverlayPatch<'a> {
     pub bytes: &'a [u8],
 }
 
-pub(crate) struct WriteChunkedContentPatchBatch<'a> {
+pub(crate) struct WriteChunkedContentPatchBatch<'a, S: ContentWriteStore> {
     pub dedup_enabled: bool,
-    pub store: &'a mut LocalObjectStore,
+    pub store: &'a mut S,
     pub inode_id: InodeId,
     pub old_record: &'a InodeRecord,
     pub new_record: &'a InodeRecord,
@@ -51,11 +161,10 @@ pub(crate) struct WriteChunkedContentPatchBatch<'a> {
     pub dedup_index: &'a mut DedupIndex,
     pub quorum_store: Option<&'a mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     pub compression_policy: &'a ContentCompressionPolicy,
-    pub placement_receipt_generation: u64,
 }
 
-pub(crate) struct PunchHoleContent<'a> {
-    pub store: &'a mut LocalObjectStore,
+pub(crate) struct PunchHoleContent<'a, S: ContentWriteStore> {
+    pub store: &'a mut S,
     pub inode_id: InodeId,
     pub old_record: &'a InodeRecord,
     pub new_record: &'a InodeRecord,
@@ -63,7 +172,6 @@ pub(crate) struct PunchHoleContent<'a> {
     pub hole_length: u64,
     pub quorum_store: Option<&'a mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     pub compression_policy: &'a ContentCompressionPolicy,
-    pub placement_receipt_generation: u64,
 }
 
 pub(crate) fn read_content_from_store(
@@ -371,17 +479,15 @@ pub(crate) fn read_content_chunk_from_store(
     })
 }
 
-pub(crate) fn write_chunked_content(
+pub(crate) fn write_chunked_content<S: ContentWriteStore>(
     dedup_enabled: bool,
-    store: &mut LocalObjectStore,
+    store: &mut S,
     record: &InodeRecord,
     bytes: &[u8],
     dedup_index: &mut DedupIndex,
     mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     compression_policy: &ContentCompressionPolicy,
-    placement_receipt_generation: u64,
 ) -> Result<()> {
-    let _ = placement_receipt_generation;
     let actual_size = u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
         requested: u64::MAX,
     })?;
@@ -402,16 +508,16 @@ pub(crate) fn write_chunked_content(
                 // reclaimed it (#841 content-addressed dedup).
                 if store.contains_key(canonical_key) {
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canonical_key)
                 } else {
                     dedup_index.remove(&fingerprint);
                     let canon_key = crate::object_keys::content_dedup_object_key(&fingerprint);
                     let enc =
                         encode_content_chunk(record, chunk_index, chunk_bytes, compression_policy);
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             } else {
@@ -421,17 +527,17 @@ pub(crate) fn write_chunked_content(
                 if store.contains_key(canon_key) {
                     dedup_index.insert(fingerprint, canon_key);
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canon_key)
                 } else {
                     let enc =
                         encode_content_chunk(record, chunk_index, chunk_bytes, compression_policy);
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     if let Some(ref mut qs) = quorum_store {
                         let _ = qs.quorum_put(canon_key, &enc);
                     }
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             }
@@ -443,7 +549,7 @@ pub(crate) fn write_chunked_content(
         };
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
-        store.put(per_inode_key, &encoded)?;
+        let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?.1;
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -452,7 +558,7 @@ pub(crate) fn write_chunked_content(
             data_version: record.data_version,
             len: chunk_bytes.len() as u32,
             checksum,
-                    placement_receipt_generation: 0,
+                    placement_receipt_generation: chunk_receipt.generation,
 });
     }
     let manifest = ContentManifestObject {
@@ -462,16 +568,16 @@ pub(crate) fn write_chunked_content(
         chunk_size: content_chunk_size(),
         chunks,
     };
-    store.put(
+    let _ = store.put_with_receipt(
         content_object_key_for_version(record.inode_id, record.data_version),
         &encode_content_manifest(&manifest),
     )?;
     Ok(())
 }
 
-fn write_same_size_sparse_overlay(
+fn write_same_size_sparse_overlay<S: ContentWriteStore>(
     dedup_enabled: bool,
-    store: &mut LocalObjectStore,
+    store: &mut S,
     old_layout: &ContentLayout,
     old_manifest: &ContentManifestObject,
     old_record: &InodeRecord,
@@ -481,9 +587,7 @@ fn write_same_size_sparse_overlay(
     dedup_index: &mut DedupIndex,
     mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     compression_policy: &ContentCompressionPolicy,
-    placement_receipt_generation: u64,
 ) -> Result<()> {
-    let _ = placement_receipt_generation;
     let chunk_count = content_chunk_count(new_record.size)?;
     let mut chunks_by_index = BTreeMap::new();
     for old_ref in &old_manifest.chunks {
@@ -532,7 +636,7 @@ fn write_same_size_sparse_overlay(
 
         let mut chunk_bytes = vec![0_u8; chunk_len];
         copy_old_content_into_chunk(
-            store,
+        store.raw_store(),
             old_layout,
             old_record.size,
             chunk_index,
@@ -550,7 +654,7 @@ fn write_same_size_sparse_overlay(
             if let Some(canonical_key) = dedup_index.lookup(&fingerprint) {
                 if store.contains_key(canonical_key) {
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canonical_key)
                 } else {
                     dedup_index.remove(&fingerprint);
@@ -561,9 +665,9 @@ fn write_same_size_sparse_overlay(
                         &chunk_bytes,
                         compression_policy,
                     );
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             } else {
@@ -571,7 +675,7 @@ fn write_same_size_sparse_overlay(
                 if store.contains_key(canon_key) {
                     dedup_index.insert(fingerprint, canon_key);
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canon_key)
                 } else {
                     let enc = encode_content_chunk(
@@ -580,12 +684,12 @@ fn write_same_size_sparse_overlay(
                         &chunk_bytes,
                         compression_policy,
                     );
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     if let Some(ref mut qs) = quorum_store {
                         let _ = qs.quorum_put(canon_key, &enc);
                     }
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             }
@@ -594,7 +698,7 @@ fn write_same_size_sparse_overlay(
         };
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
-        store.put(per_inode_key, &encoded)?;
+        let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?.1;
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -605,7 +709,7 @@ fn write_same_size_sparse_overlay(
                 data_version: new_record.data_version,
                 len: chunk_bytes.len() as u32,
                 checksum,
-                        placement_receipt_generation: 0,
+                        placement_receipt_generation: chunk_receipt.generation,
 },
         );
     }
@@ -619,16 +723,16 @@ fn write_same_size_sparse_overlay(
     };
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
-    store.put(manifest_key, &manifest_encoded)?;
+    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
     Ok(())
 }
 
-fn write_same_size_sparse_patch_batch(
+fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
     dedup_enabled: bool,
-    store: &mut LocalObjectStore,
+    store: &mut S,
     old_layout: &ContentLayout,
     old_manifest: &ContentManifestObject,
     old_record: &InodeRecord,
@@ -637,9 +741,7 @@ fn write_same_size_sparse_patch_batch(
     dedup_index: &mut DedupIndex,
     mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     compression_policy: &ContentCompressionPolicy,
-    placement_receipt_generation: u64,
 ) -> Result<()> {
-    let _ = placement_receipt_generation;
     let chunk_count = content_chunk_count(new_record.size)?;
     let mut patches_by_chunk: BTreeMap<u64, Vec<ContentOverlayPatch<'_>>> = BTreeMap::new();
     for patch in patches {
@@ -681,7 +783,7 @@ fn write_same_size_sparse_patch_batch(
 
         let mut chunk_bytes = vec![0_u8; new_len as usize];
         copy_old_content_into_chunk(
-            store,
+        store.raw_store(),
             old_layout,
             old_record.size,
             old_ref.chunk_index,
@@ -697,7 +799,7 @@ fn write_same_size_sparse_patch_batch(
             if let Some(canonical_key) = dedup_index.lookup(&fingerprint) {
                 if store.contains_key(canonical_key) {
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canonical_key)
                 } else {
                     dedup_index.remove(&fingerprint);
@@ -708,9 +810,9 @@ fn write_same_size_sparse_patch_batch(
                         &chunk_bytes,
                         compression_policy,
                     );
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             } else {
@@ -718,7 +820,7 @@ fn write_same_size_sparse_patch_batch(
                 if store.contains_key(canon_key) {
                     dedup_index.insert(fingerprint, canon_key);
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canon_key)
                 } else {
                     let enc = encode_content_chunk(
@@ -727,12 +829,12 @@ fn write_same_size_sparse_patch_batch(
                         &chunk_bytes,
                         compression_policy,
                     );
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     if let Some(ref mut qs) = quorum_store {
                         let _ = qs.quorum_put(canon_key, &enc);
                     }
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             }
@@ -746,7 +848,7 @@ fn write_same_size_sparse_patch_batch(
         };
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
-        store.put(per_inode_key, &encoded)?;
+        let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?.1;
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -757,7 +859,7 @@ fn write_same_size_sparse_patch_batch(
                 data_version: new_record.data_version,
                 len: chunk_bytes.len() as u32,
                 checksum,
-                        placement_receipt_generation: 0,
+                        placement_receipt_generation: chunk_receipt.generation,
 },
         );
     }
@@ -785,7 +887,7 @@ fn write_same_size_sparse_patch_batch(
 
         let mut chunk_bytes = vec![0_u8; chunk_len];
         copy_old_content_into_chunk(
-            store,
+        store.raw_store(),
             old_layout,
             old_record.size,
             chunk_index,
@@ -808,7 +910,7 @@ fn write_same_size_sparse_patch_batch(
             if let Some(canonical_key) = dedup_index.lookup(&fingerprint) {
                 if store.contains_key(canonical_key) {
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canonical_key)
                 } else {
                     dedup_index.remove(&fingerprint);
@@ -819,9 +921,9 @@ fn write_same_size_sparse_patch_batch(
                         &chunk_bytes,
                         compression_policy,
                     );
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             } else {
@@ -829,7 +931,7 @@ fn write_same_size_sparse_patch_batch(
                 if store.contains_key(canon_key) {
                     dedup_index.insert(fingerprint, canon_key);
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canon_key)
                 } else {
                     let enc = encode_content_chunk(
@@ -838,12 +940,12 @@ fn write_same_size_sparse_patch_batch(
                         &chunk_bytes,
                         compression_policy,
                     );
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     if let Some(ref mut qs) = quorum_store {
                         let _ = qs.quorum_put(canon_key, &enc);
                     }
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             }
@@ -852,7 +954,7 @@ fn write_same_size_sparse_patch_batch(
         };
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
-        store.put(per_inode_key, &encoded)?;
+        let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?.1;
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -863,7 +965,7 @@ fn write_same_size_sparse_patch_batch(
                 data_version: new_record.data_version,
                 len: chunk_bytes.len() as u32,
                 checksum,
-                        placement_receipt_generation: 0,
+                        placement_receipt_generation: chunk_receipt.generation,
 },
         );
     }
@@ -877,24 +979,22 @@ fn write_same_size_sparse_patch_batch(
     };
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
-    store.put(manifest_key, &manifest_encoded)?;
+    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
     Ok(())
 }
 
-fn write_sparse_size_change(
+fn write_sparse_size_change<S: ContentWriteStore>(
     dedup_enabled: bool,
-    store: &mut LocalObjectStore,
+    store: &mut S,
     old_manifest: &ContentManifestObject,
     new_record: &InodeRecord,
     dedup_index: &mut DedupIndex,
     mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     compression_policy: &ContentCompressionPolicy,
-    placement_receipt_generation: u64,
 ) -> Result<()> {
-    let _ = placement_receipt_generation;
     let new_chunk_count = content_chunk_count(new_record.size)?;
     let max_retained_chunks = usize::try_from(new_chunk_count).unwrap_or(usize::MAX);
     let mut chunks = Vec::with_capacity(old_manifest.chunks.len().min(max_retained_chunks));
@@ -913,7 +1013,7 @@ fn write_sparse_size_change(
             continue;
         }
 
-        let old_chunk = read_content_chunk_from_store(store, new_record.inode_id, old_ref)?;
+        let old_chunk = read_content_chunk_from_store(store.raw_store(), new_record.inode_id, old_ref)?;
         let mut chunk_bytes = old_chunk.bytes.to_vec();
         chunk_bytes.resize(expected_len as usize, 0);
 
@@ -927,7 +1027,7 @@ fn write_sparse_size_change(
             if let Some(canonical_key) = dedup_index.lookup(&fingerprint) {
                 if store.contains_key(canonical_key) {
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canonical_key)
                 } else {
                     dedup_index.remove(&fingerprint);
@@ -938,9 +1038,9 @@ fn write_sparse_size_change(
                         &chunk_bytes,
                         compression_policy,
                     );
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             } else {
@@ -948,7 +1048,7 @@ fn write_sparse_size_change(
                 if store.contains_key(canon_key) {
                     dedup_index.insert(fingerprint, canon_key);
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canon_key)
                 } else {
                     let enc = encode_content_chunk(
@@ -957,12 +1057,12 @@ fn write_sparse_size_change(
                         &chunk_bytes,
                         compression_policy,
                     );
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     if let Some(ref mut qs) = quorum_store {
                         let _ = qs.quorum_put(canon_key, &enc);
                     }
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             }
@@ -976,7 +1076,7 @@ fn write_sparse_size_change(
         };
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
-        store.put(per_inode_key, &encoded)?;
+        let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?.1;
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -985,7 +1085,7 @@ fn write_sparse_size_change(
             data_version: new_record.data_version,
             len: expected_len,
             checksum,
-                    placement_receipt_generation: 0,
+                    placement_receipt_generation: chunk_receipt.generation,
 });
     }
 
@@ -998,15 +1098,15 @@ fn write_sparse_size_change(
     };
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
-    store.put(manifest_key, &manifest_encoded)?;
+    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
     Ok(())
 }
 
-pub(crate) fn write_chunked_content_with_overlay(
-    request: WriteChunkedContentOverlay<'_>,
+pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
+    request: WriteChunkedContentOverlay<'_, S>,
 ) -> Result<()> {
     let WriteChunkedContentOverlay {
         dedup_enabled,
@@ -1020,9 +1120,8 @@ pub(crate) fn write_chunked_content_with_overlay(
         dedup_index,
         mut quorum_store,
         compression_policy,
-        placement_receipt_generation,
     } = request;
-    let old_layout = read_content_layout_from_store(store, inode_id, old_record, true)?;
+    let old_layout = read_content_layout_from_store(store.raw_store(), inode_id, old_record, true)?;
     if allow_holes && overlay_bytes.is_empty() {
         if let ContentLayout::Chunked(ref old_manifest) = old_layout {
             return write_sparse_size_change(
@@ -1033,7 +1132,7 @@ pub(crate) fn write_chunked_content_with_overlay(
                 dedup_index,
                 quorum_store,
                 compression_policy,
-                placement_receipt_generation,
+
             );
         }
     }
@@ -1051,7 +1150,7 @@ pub(crate) fn write_chunked_content_with_overlay(
                 dedup_index,
                 quorum_store,
                 compression_policy,
-                placement_receipt_generation,
+
             );
         }
     }
@@ -1097,7 +1196,7 @@ pub(crate) fn write_chunked_content_with_overlay(
         let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
         let mut chunk_bytes = vec![0_u8; chunk_len];
         copy_old_content_into_chunk(
-            store,
+        store.raw_store(),
             &old_layout,
             old_record.size,
             chunk_index,
@@ -1134,7 +1233,7 @@ pub(crate) fn write_chunked_content_with_overlay(
             if let Some(canonical_key) = dedup_index.lookup(&fingerprint) {
                 if store.contains_key(canonical_key) {
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canonical_key)
                 } else {
                     dedup_index.remove(&fingerprint);
@@ -1145,9 +1244,9 @@ pub(crate) fn write_chunked_content_with_overlay(
                         &chunk_bytes,
                         compression_policy,
                     );
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             } else {
@@ -1155,7 +1254,7 @@ pub(crate) fn write_chunked_content_with_overlay(
                 if store.contains_key(canon_key) {
                     dedup_index.insert(fingerprint, canon_key);
                     dedup_index.record_dedup_hit(u64::from(content_chunk_size()));
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fingerprint);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fingerprint);
                     crate::encoding::encode_dedup_redirect(canon_key)
                 } else {
                     let enc = encode_content_chunk(
@@ -1164,12 +1263,12 @@ pub(crate) fn write_chunked_content_with_overlay(
                         &chunk_bytes,
                         compression_policy,
                     );
-                    store.put(canon_key, &enc)?;
+                    let _ = store.put_with_receipt(canon_key, &enc)?;
                     if let Some(ref mut qs) = quorum_store {
                         let _ = qs.quorum_put(canon_key, &enc);
                     }
                     dedup_index.insert(fingerprint, canon_key);
-                    crate::dedup_refcount::DedupRefCount::init(store, &fingerprint)?;
+                    crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fingerprint)?;
                     crate::encoding::encode_dedup_redirect(canon_key)
                 }
             }
@@ -1178,7 +1277,7 @@ pub(crate) fn write_chunked_content_with_overlay(
         };
         dedup_index.record_chunk_written();
         let checksum = checksum64(&encoded);
-        store.put(per_inode_key, &encoded)?;
+        let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?.1;
         if let Some(ref mut qs) = quorum_store {
             let _ = qs.quorum_put(per_inode_key, &encoded);
         }
@@ -1187,7 +1286,7 @@ pub(crate) fn write_chunked_content_with_overlay(
             data_version: new_record.data_version,
             len: chunk_bytes.len() as u32,
             checksum,
-                    placement_receipt_generation: 0,
+                    placement_receipt_generation: chunk_receipt.generation,
 });
     }
     let manifest = ContentManifestObject {
@@ -1199,15 +1298,15 @@ pub(crate) fn write_chunked_content_with_overlay(
     };
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
-    store.put(manifest_key, &manifest_encoded)?;
+    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
     Ok(())
 }
 
-pub(crate) fn write_chunked_content_with_patch_batch(
-    request: WriteChunkedContentPatchBatch<'_>,
+pub(crate) fn write_chunked_content_with_patch_batch<S: ContentWriteStore>(
+    request: WriteChunkedContentPatchBatch<'_, S>,
 ) -> Result<()> {
     let WriteChunkedContentPatchBatch {
         dedup_enabled,
@@ -1220,9 +1319,8 @@ pub(crate) fn write_chunked_content_with_patch_batch(
         dedup_index,
         quorum_store,
         compression_policy,
-        placement_receipt_generation,
     } = request;
-    let old_layout = read_content_layout_from_store(store, inode_id, old_record, true)?;
+    let old_layout = read_content_layout_from_store(store.raw_store(), inode_id, old_record, true)?;
     if allow_holes && old_record.size <= new_record.size {
         if let ContentLayout::Chunked(ref old_manifest) = old_layout {
             return write_same_size_sparse_patch_batch(
@@ -1236,7 +1334,7 @@ pub(crate) fn write_chunked_content_with_patch_batch(
                 dedup_index,
                 quorum_store,
                 compression_policy,
-                placement_receipt_generation,
+
             );
         }
     }
@@ -1246,7 +1344,7 @@ pub(crate) fn write_chunked_content_with_patch_batch(
     })
 }
 
-pub(crate) fn punch_hole_content(request: PunchHoleContent<'_>) -> Result<()> {
+pub(crate) fn punch_hole_content<S: ContentWriteStore>(request: PunchHoleContent<'_, S>) -> Result<()> {
     let PunchHoleContent {
         store,
         inode_id,
@@ -1256,10 +1354,8 @@ pub(crate) fn punch_hole_content(request: PunchHoleContent<'_>) -> Result<()> {
         hole_length,
         mut quorum_store,
         compression_policy,
-        placement_receipt_generation,
     } = request;
-    let _ = placement_receipt_generation;
-    let old_layout = read_content_layout_from_store(store, inode_id, old_record, true)?;
+    let old_layout = read_content_layout_from_store(store.raw_store(), inode_id, old_record, true)?;
 
     // Handle inline content: zero the hole range in-place and re-encode.
     if let ContentLayout::Inline(ref content) = old_layout {
@@ -1274,7 +1370,7 @@ pub(crate) fn punch_hole_content(request: PunchHoleContent<'_>) -> Result<()> {
         }
         let key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
         let encoded = encode_content(new_record, &bytes);
-        store.put(key, &encoded)?;
+        let _ = store.put_with_receipt(key, &encoded)?;
         return Ok(());
     }
 
@@ -1307,7 +1403,7 @@ pub(crate) fn punch_hole_content(request: PunchHoleContent<'_>) -> Result<()> {
         } else if !old_ref.is_hole() {
             // Chunk partially overlaps the hole: read the chunk, zero the
             // hole bytes, and write a modified chunk under the new data version.
-            let old_chunk = read_content_chunk_from_store(store, inode_id, old_ref)?;
+            let old_chunk = read_content_chunk_from_store(store.raw_store(), inode_id, old_ref)?;
             let mut modified = old_chunk.bytes.to_vec();
             let zero_start = hole_offset.saturating_sub(chunk_start);
             let zero_start_idx = usize::try_from(zero_start).unwrap_or(0);
@@ -1327,7 +1423,7 @@ pub(crate) fn punch_hole_content(request: PunchHoleContent<'_>) -> Result<()> {
                 new_record.data_version,
                 chunk_index,
             );
-            store.put(key, &encoded)?;
+            let chunk_receipt = store.put_with_receipt(key, &encoded)?.1;
             if let Some(ref mut qs) = quorum_store {
                 let _ = qs.quorum_put(key, &encoded);
             }
@@ -1336,7 +1432,7 @@ pub(crate) fn punch_hole_content(request: PunchHoleContent<'_>) -> Result<()> {
                 data_version: new_record.data_version,
                 len: modified.len() as u32,
                 checksum,
-                        placement_receipt_generation: 0,
+                        placement_receipt_generation: chunk_receipt.generation,
 });
         } else {
             // Existing sparse marker partially overlaps the hole. Keep the
@@ -1354,7 +1450,7 @@ pub(crate) fn punch_hole_content(request: PunchHoleContent<'_>) -> Result<()> {
     };
     let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
     let manifest_encoded = encode_content_manifest_sparse(&manifest);
-    store.put(manifest_key, &manifest_encoded)?;
+    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
     if let Some(ref mut qs) = quorum_store {
         let _ = qs.quorum_put(manifest_key, &manifest_encoded);
     }
@@ -1763,16 +1859,16 @@ pub(crate) fn content_chunk_start(chunk_index: u64) -> Result<u64> {
 ///
 /// This is the storage-level primitive that powers FICLONE/copy_file_range
 /// same-filesystem reflink and snapshot-clone writable forks.
-pub(crate) fn reflink_chunked_content(
+pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
     dedup_enabled: bool,
-    store: &mut LocalObjectStore,
+    store: &mut S,
     source_inode_id: InodeId,
     source_record: &InodeRecord,
     dest_record: &InodeRecord,
     dedup_index: &mut DedupIndex,
 ) -> Result<()> {
     let source_layout =
-        read_content_layout_from_store(store, source_inode_id, source_record, true)?;
+        read_content_layout_from_store(store.raw_store(), source_inode_id, source_record, true)?;
     match source_layout {
         ContentLayout::Inline(content) => {
             // Inline content cannot be shared at the chunk level; write the
@@ -1806,7 +1902,7 @@ pub(crate) fn reflink_chunked_content(
                         src_chunk_ref.chunk_index,
                     );
                     let src_encoded =
-                        store
+                        store.raw_store()
                             .get(src_chunk_key)?
                             .ok_or(FileSystemError::CorruptState {
                                 reason: "reflink: source chunk object missing",
@@ -1816,13 +1912,13 @@ pub(crate) fn reflink_chunked_content(
                         dest_record.data_version,
                         src_chunk_ref.chunk_index,
                     );
-                    store.put(dest_chunk_key, &src_encoded)?;
+                    let chunk_receipt = store.put_with_receipt(dest_chunk_key, &src_encoded)?.1;
                     dest_chunks.push(ContentChunkRef {
                         chunk_index: src_chunk_ref.chunk_index,
                         data_version: dest_record.data_version,
                         len: src_chunk_ref.len,
                         checksum: checksum64(&src_encoded),
-                                placement_receipt_generation: 0,
+                                placement_receipt_generation: chunk_receipt.generation,
 });
                 }
                 let dest_manifest = ContentManifestObject {
@@ -1848,7 +1944,7 @@ pub(crate) fn reflink_chunked_content(
                     src_chunk_ref.chunk_index,
                 );
                 let src_encoded =
-                    store
+                    store.raw_store()
                         .get(src_chunk_key)?
                         .ok_or(FileSystemError::CorruptState {
                             reason: "reflink: source chunk object missing",
@@ -1858,13 +1954,13 @@ pub(crate) fn reflink_chunked_content(
                     // Source already has a dedup redirect; chain to the same
                     // canonical key and add the fingerprint to the local index.
                     let ck = decode_dedup_redirect(&src_encoded)?;
-                    let canon_bytes = store.get(ck)?.ok_or(FileSystemError::CorruptState {
+                    let canon_bytes = store.raw_store().get(ck)?.ok_or(FileSystemError::CorruptState {
                         reason: "reflink: dedup redirect references missing canonical chunk",
                     })?;
                     let chunk = decode_content_chunk(&canon_bytes)?;
                     let fp = crate::encoding::compute_content_fingerprint(&chunk.bytes);
                     // Existing canonical: increment refcount for this new redirect.
-                    let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fp);
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fp);
                     (ck, fp)
                 } else {
                     // Source chunk is stored inline (no previous dedup).
@@ -1874,12 +1970,12 @@ pub(crate) fn reflink_chunked_content(
                     let fp = crate::encoding::compute_content_fingerprint(&chunk.bytes);
                     let ck = crate::object_keys::content_dedup_object_key(&fp);
                     // Only store the canonical chunk if it's not already there
-                    let canonical_existed = store.get(ck)?.is_some();
+                    let canonical_existed = store.raw_store().get(ck)?.is_some();
                     if !canonical_existed {
                         store.put(ck, &src_encoded)?;
-                        crate::dedup_refcount::DedupRefCount::init(store, &fp)?;
+                        crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fp)?;
                     } else {
-                        let _ = crate::dedup_refcount::DedupRefCount::increment(store, &fp);
+                        let _ = crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fp);
                     }
                     (ck, fp)
                 };
@@ -1895,7 +1991,7 @@ pub(crate) fn reflink_chunked_content(
                     src_chunk_ref.chunk_index,
                 );
                 let redirect = crate::encoding::encode_dedup_redirect(canonical_key);
-                store.put(dest_chunk_key, &redirect)?;
+                let chunk_receipt = store.put_with_receipt(dest_chunk_key, &redirect)?.1;
 
                 // The destination stores a dedup redirect at its per-inode
                 // key. The checksum must reflect the redirect bytes, not the
@@ -1906,7 +2002,7 @@ pub(crate) fn reflink_chunked_content(
                     data_version: dest_record.data_version,
                     len: src_chunk_ref.len,
                     checksum: checksum64(&redirect),
-                            placement_receipt_generation: 0,
+                            placement_receipt_generation: chunk_receipt.generation,
 });
             }
 
