@@ -11,6 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::thread;
 use std::time::Duration;
 use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions};
+use tidefs_membership_epoch::EpochId;
 use tidefs_replication_model::PlacementReceiptRef;
 use tidefs_transport::{NodeInfo, SessionCloseReason, SessionId, Transport, TransportError};
 
@@ -71,6 +72,18 @@ fn blocking_accept(transport: &mut Transport) -> SessionId {
 enum ReplicationMessage {
     /// Store an object: key name + payload.
     Put { name: String, payload: Vec<u8> },
+    /// Store an object with durable placement receipt authority.
+    PutWithReceipt {
+        name: String,
+        payload: Vec<u8>,
+        placement_receipt_ref: PlacementReceiptRef,
+    },
+    /// Acknowledgment for a receipt-authorized put.
+    PutWithReceiptAck {
+        key_hash: String,
+        success: bool,
+        recorded_receipt_ref: Option<PlacementReceiptRef>,
+    },
     /// Acknowledgement with the stored ObjectKey hash.
     Ack { key_hash: String, success: bool },
     /// Request an object by name.
@@ -98,6 +111,24 @@ impl SyncEntry {
             placement_receipt_ref: None,
         }
     }
+}
+
+/// Build a test PlacementReceiptRef for replicated (2-copy) placement.
+fn test_receipt_ref(name: &str, payload: &[u8], object_id: u64) -> PlacementReceiptRef {
+    let mut buf = [0u8; 32];
+    let name_bytes = name.as_bytes();
+    let len = name_bytes.len().min(32);
+    buf[..len].copy_from_slice(&name_bytes[..len]);
+    let digest = blake3::hash(payload);
+    PlacementReceiptRef::replicated(
+        object_id,
+        buf,
+        EpochId::new(1),
+        1,
+        2,
+        payload.len() as u64,
+        *digest.as_bytes(),
+    )
 }
 
 /// Send a structured replication message over a transport session.
@@ -785,4 +816,336 @@ fn replication_fails_on_closed_session() {
     server_handle.join().expect("server");
     drop(dir_a);
     drop(dir_b);
+}
+
+// ── Receipt transfer integration tests ─────────────────────────────────
+
+#[test]
+fn receipt_transfer_put_and_read() {
+    // Two nodes: Node 1 (server with store), Node 2 (client).
+    // Client sends PutWithReceipt; server stores and returns its
+    // pool-backed receipt in the ack.
+    let (mut node_a, addr_a) = listening_transport(1);
+    let (dir_a, mut store_a) = temp_store();
+    let mut node_b = Transport::new(2);
+
+    node_a.add_node(NodeInfo::new(2, vec![addr_a.clone()], 0));
+    node_b.add_node(NodeInfo::new(1, vec![addr_a], 0));
+
+    let server_handle = thread::spawn(move || {
+        let sid = blocking_accept(&mut node_a);
+        node_a.perform_handshake(sid).expect("handshake");
+
+        loop {
+            let msg = match recv_replication_msg(&mut node_a, sid) {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            match msg {
+                ReplicationMessage::PutWithReceipt { name, payload, placement_receipt_ref } => {
+                    // Store with receipt authority: record the receipt
+                    store_a.put_named(&name, &payload).ok();
+                    // Bump generation to simulate durable publication
+                    let recorded = PlacementReceiptRef::replicated(
+                        placement_receipt_ref.object_id,
+                        placement_receipt_ref.object_key,
+                        placement_receipt_ref.receipt_epoch,
+                        placement_receipt_ref.receipt_generation + 1,
+                        2,
+                        payload.len() as u64,
+                        placement_receipt_ref.payload_digest,
+                    );
+                    send_replication_msg(
+                        &mut node_a,
+                        sid,
+                        &ReplicationMessage::PutWithReceiptAck {
+                            key_hash: name.clone(),
+                            success: true,
+                            recorded_receipt_ref: Some(recorded),
+                        },
+                    )
+                    .expect("send put_with_receipt ack");
+                }
+                ReplicationMessage::Get { name } => {
+                    let key = ObjectKey::from_name(&name);
+                    let found = store_a.contains_key(key);
+                    let payload = if found {
+                        let loc = store_a.location_of(key).expect("location");
+                        store_a.get_at_location(loc).expect("get")
+                    } else {
+                        Vec::new()
+                    };
+                    send_replication_msg(
+                        &mut node_a,
+                        sid,
+                        &ReplicationMessage::GetResponse { found, payload },
+                    )
+                    .expect("send get_response");
+                }
+                _ => break,
+            }
+        }
+        node_a
+            .close_session(sid, SessionCloseReason::PeerRemoved)
+            .ok();
+    });
+
+    thread::sleep(Duration::from_millis(50));
+
+    let sid = node_b.connect(1).expect("connect");
+    node_b.perform_handshake(sid).expect("handshake");
+
+    // Create payload and receipt
+    let payload = b"receipt-transfer-payload-v1".to_vec();
+    let receipt = test_receipt_ref("receipt-obj-1", &payload, 100);
+
+    // Send PutWithReceipt
+    send_replication_msg(
+        &mut node_b,
+        sid,
+        &ReplicationMessage::PutWithReceipt {
+            name: "receipt-obj-1".to_string(),
+            payload: payload.clone(),
+            placement_receipt_ref: receipt.clone(),
+        },
+    )
+    .expect("send put_with_receipt");
+
+    // Receive ack with recorded receipt
+    let ack = recv_replication_msg(&mut node_b, sid).expect("recv ack");
+    match ack {
+        ReplicationMessage::PutWithReceiptAck { ref key_hash, success, ref recorded_receipt_ref } => {
+            assert!(success, "PutWithReceipt should succeed");
+            assert_eq!(key_hash, "receipt-obj-1");
+            let recorded = recorded_receipt_ref.as_ref().expect("should have recorded receipt");
+            assert_eq!(recorded.object_key, receipt.object_key);
+            assert_eq!(recorded.payload_digest, receipt.payload_digest);
+            assert_eq!(recorded.payload_len, receipt.payload_len);
+            // Generation should be bumped by server
+            assert!(recorded.receipt_generation > receipt.receipt_generation);
+        }
+        _ => panic!("Expected PutWithReceiptAck, got {:?}", ack),
+    }
+
+    // Read back the object using Get
+    send_replication_msg(
+        &mut node_b,
+        sid,
+        &ReplicationMessage::Get {
+            name: "receipt-obj-1".to_string(),
+        },
+    )
+    .expect("send get");
+
+    let response = recv_replication_msg(&mut node_b, sid).expect("recv get_response");
+    match response {
+        ReplicationMessage::GetResponse { found, payload: read_payload } => {
+            assert!(found, "Object should be readable after receipt transfer");
+            assert_eq!(read_payload, payload, "Payload should match");
+        }
+        _ => panic!("Expected GetResponse"),
+    }
+
+    node_b
+        .close_session(sid, SessionCloseReason::LocalShutdown)
+        .expect("close");
+    server_handle.join().expect("server");
+    drop(dir_a);
+}
+
+#[test]
+fn receipt_transfer_multiple_objects() {
+    // Transfer multiple objects with receipts; verify each is independently readable.
+    let (mut node_a, addr_a) = listening_transport(1);
+    let (dir_a, mut store_a) = temp_store();
+    let mut node_b = Transport::new(2);
+
+    node_a.add_node(NodeInfo::new(2, vec![addr_a.clone()], 0));
+    node_b.add_node(NodeInfo::new(1, vec![addr_a], 0));
+
+    let server_handle = thread::spawn(move || {
+        let sid = blocking_accept(&mut node_a);
+        node_a.perform_handshake(sid).expect("handshake");
+
+        loop {
+            let msg = match recv_replication_msg(&mut node_a, sid) {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            match msg {
+                ReplicationMessage::PutWithReceipt { name, payload, placement_receipt_ref } => {
+                    store_a.put_named(&name, &payload).ok();
+                    let recorded = PlacementReceiptRef::replicated(
+                        placement_receipt_ref.object_id,
+                        placement_receipt_ref.object_key,
+                        placement_receipt_ref.receipt_epoch,
+                        placement_receipt_ref.receipt_generation + 1,
+                        2,
+                        payload.len() as u64,
+                        placement_receipt_ref.payload_digest,
+                    );
+                    send_replication_msg(
+                        &mut node_a,
+                        sid,
+                        &ReplicationMessage::PutWithReceiptAck {
+                            key_hash: name.clone(),
+                            success: true,
+                            recorded_receipt_ref: Some(recorded),
+                        },
+                    )
+                    .expect("send ack");
+                }
+                _ => break,
+            }
+        }
+        node_a
+            .close_session(sid, SessionCloseReason::PeerRemoved)
+            .ok();
+    });
+
+    thread::sleep(Duration::from_millis(50));
+
+    let sid = node_b.connect(1).expect("connect");
+    node_b.perform_handshake(sid).expect("handshake");
+
+    let objects: Vec<(&str, Vec<u8>, u64)> = vec![
+        ("obj-a", b"payload-alpha".to_vec(), 1),
+        ("obj-b", b"payload-beta-bb".to_vec(), 2),
+        ("obj-c", b"payload-gamma-ccc".to_vec(), 3),
+    ];
+
+    let mut receipts = Vec::new();
+    for (name, payload, id) in &objects {
+        let receipt = test_receipt_ref(name, payload, *id);
+        send_replication_msg(
+            &mut node_b,
+            sid,
+            &ReplicationMessage::PutWithReceipt {
+                name: name.to_string(),
+                payload: payload.clone(),
+                placement_receipt_ref: receipt.clone(),
+            },
+        )
+        .expect("send put_with_receipt");
+
+        let ack = recv_replication_msg(&mut node_b, sid).expect("recv ack");
+        match ack {
+            ReplicationMessage::PutWithReceiptAck { success, recorded_receipt_ref, .. } => {
+                assert!(success);
+                assert!(recorded_receipt_ref.is_some());
+                receipts.push(recorded_receipt_ref.unwrap());
+            }
+            _ => panic!("Expected PutWithReceiptAck"),
+        }
+    }
+
+    assert_eq!(receipts.len(), objects.len());
+    // Each receipt should have generation > 0
+    for r in &receipts {
+        assert!(r.receipt_generation > 0, "receipt generation should be non-zero");
+    }
+    // Receipts should have the same object_key and payload_len as their originals
+    for ((_name, payload, _id), receipt) in objects.iter().zip(receipts.iter()) {
+        assert_eq!(receipt.payload_len, payload.len() as u64);
+    }
+
+    node_b
+        .close_session(sid, SessionCloseReason::LocalShutdown)
+        .expect("close");
+    server_handle.join().expect("server");
+    drop(dir_a);
+}
+
+#[test]
+fn receipt_transfer_rejects_mismatched_digest() {
+    // A PutWithReceipt whose payload does not match the receipt digest
+    // should be rejected by a validating receiver.
+    let (mut node_a, addr_a) = listening_transport(1);
+    let (dir_a, mut store_a) = temp_store();
+    let mut node_b = Transport::new(2);
+
+    node_a.add_node(NodeInfo::new(2, vec![addr_a.clone()], 0));
+    node_b.add_node(NodeInfo::new(1, vec![addr_a], 0));
+
+    let server_handle = thread::spawn(move || {
+        let sid = blocking_accept(&mut node_a);
+        node_a.perform_handshake(sid).expect("handshake");
+
+        loop {
+            let msg = match recv_replication_msg(&mut node_a, sid) {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            match msg {
+                ReplicationMessage::PutWithReceipt { name, payload, placement_receipt_ref } => {
+                    // Validate digest before storing
+                    let actual_digest = blake3::hash(&payload);
+                    let digest_ok = actual_digest.as_bytes() == &placement_receipt_ref.payload_digest;
+                    if digest_ok {
+                        store_a.put_named(&name, &payload).ok();
+                    }
+                    send_replication_msg(
+                        &mut node_a,
+                        sid,
+                        &ReplicationMessage::PutWithReceiptAck {
+                            key_hash: name,
+                            success: digest_ok,
+                            recorded_receipt_ref: None,
+                        },
+                    )
+                    .expect("send ack");
+                }
+                _ => break,
+            }
+        }
+        node_a
+            .close_session(sid, SessionCloseReason::PeerRemoved)
+            .ok();
+    });
+
+    thread::sleep(Duration::from_millis(50));
+
+    let sid = node_b.connect(1).expect("connect");
+    node_b.perform_handshake(sid).expect("handshake");
+
+    // Valid payload with correct receipt
+    let valid_payload = b"valid-data".to_vec();
+    let valid_receipt = test_receipt_ref("valid-key", &valid_payload, 1);
+    send_replication_msg(
+        &mut node_b,
+        sid,
+        &ReplicationMessage::PutWithReceipt {
+            name: "valid-key".to_string(),
+            payload: valid_payload.clone(),
+            placement_receipt_ref: valid_receipt,
+        },
+    )
+    .expect("send valid");
+    let ack = recv_replication_msg(&mut node_b, sid).expect("recv ack");
+    assert!(matches!(ack, ReplicationMessage::PutWithReceiptAck { success: true, .. }));
+
+    // Mismatched payload: receipt claims different digest
+    let wrong_payload = b"tampered-data".to_vec();
+    let stale_receipt = test_receipt_ref("bad-key", b"original-data", 2);
+    send_replication_msg(
+        &mut node_b,
+        sid,
+        &ReplicationMessage::PutWithReceipt {
+            name: "bad-key".to_string(),
+            payload: wrong_payload,
+            placement_receipt_ref: stale_receipt,
+        },
+    )
+    .expect("send bad");
+    let ack2 = recv_replication_msg(&mut node_b, sid).expect("recv ack2");
+    assert!(
+        matches!(ack2, ReplicationMessage::PutWithReceiptAck { success: false, .. }),
+        "Mismatched digest should be rejected"
+    );
+
+    node_b
+        .close_session(sid, SessionCloseReason::LocalShutdown)
+        .expect("close");
+    server_handle.join().expect("server");
+    drop(dir_a);
 }
