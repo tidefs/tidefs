@@ -35,6 +35,40 @@ pub const POOL_LABEL_SIZE: usize = 256 * 1024;
 /// Maximum pool name length in bytes (UTF-8).
 pub const POOL_NAME_MAX: usize = 255;
 
+/// Domain separation tag for label-agreement fingerprints used by
+/// membership-epoch promotion gates.
+pub const POOL_LABEL_AGREEMENT_FINGERPRINT_DOMAIN: &[u8] =
+    b"tidefs-pool-label-agreement-fingerprint-v1";
+
+/// BLAKE3-256 fingerprint of the committed label fields that must agree
+/// before a member can enter a membership epoch.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PoolLabelFingerprint(pub [u8; 32]);
+
+impl PoolLabelFingerprint {
+    /// The all-zero sentinel value.
+    pub const ZERO: Self = Self([0u8; 32]);
+
+    /// Borrow the raw fingerprint bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Return the raw fingerprint bytes.
+    #[must_use]
+    pub const fn into_inner(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl From<[u8; 32]> for PoolLabelFingerprint {
+    fn from(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PoolState
 // ---------------------------------------------------------------------------
@@ -775,6 +809,40 @@ pub fn verify_label_checksum(label: &PoolLabelV1) -> bool {
     buf[POOL_LABEL_V1_CHECKSUM_OFFSET..POOL_LABEL_V1_EXT_WIRE_SIZE] == label.checksum
 }
 
+/// Compute the committed label-agreement fingerprint for a valid pool label.
+#[must_use]
+pub fn compute_label_agreement_fingerprint(label: &PoolLabelV1) -> PoolLabelFingerprint {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(POOL_LABEL_AGREEMENT_FINGERPRINT_DOMAIN);
+    hasher.update(&label.magic);
+    hasher.update(&label.version.to_le_bytes());
+    hasher.update(&label.pool_guid);
+    hasher.update(&label.device_guid);
+    hasher.update(&label.pool_name_len.to_le_bytes());
+    hasher.update(&label.pool_name);
+    hasher.update(&[label.pool_state.to_u8()]);
+    hasher.update(&label.commit_group.to_le_bytes());
+    hasher.update(&label.label_commit_group.to_le_bytes());
+    hasher.update(&label.device_index.to_le_bytes());
+    hasher.update(&label.topology_generation.to_le_bytes());
+    hasher.update(&label.device_count.to_le_bytes());
+    hasher.update(&[label.device_class.to_u8()]);
+    hasher.update(&label.device_capacity_bytes.to_le_bytes());
+    hasher.update(&label.system_area_pointer.to_le_bytes());
+    hasher.update(&label.system_area_size.to_le_bytes());
+    hasher.update(&label.features_incompat.to_le_bytes());
+    hasher.update(&label.features_ro_compat.to_le_bytes());
+    hasher.update(&label.features_compat.to_le_bytes());
+    hasher.update(&[label.device_health]);
+    hasher.update(&label.device_read_errors.to_le_bytes());
+    hasher.update(&label.device_write_errors.to_le_bytes());
+    hasher.update(&label.device_checksum_errors.to_le_bytes());
+    let (kind, first, second, reserved) = label.redundancy_policy.to_wire();
+    hasher.update(&[kind, first, second, reserved]);
+    hasher.update(&label.checksum);
+    PoolLabelFingerprint(hasher.finalize().into())
+}
+
 impl PoolLabelV1 {
     /// Create a new label with default fields and zero checksum.
     /// Callers should populate fields then call [`seal_label`].
@@ -821,6 +889,12 @@ impl PoolLabelV1 {
         let len = self.pool_name_len as usize;
         let slice = &self.pool_name[..len.min(POOL_NAME_MAX)];
         core::str::from_utf8(slice).unwrap_or("")
+    }
+
+    /// Compute the committed label-agreement fingerprint for this label.
+    #[must_use]
+    pub fn agreement_fingerprint(&self) -> PoolLabelFingerprint {
+        compute_label_agreement_fingerprint(self)
     }
 
     /// Returns true when the pool uses per-object encryption.
@@ -1041,6 +1115,32 @@ mod tests {
 
         let result = decode_label(&buf);
         assert_eq!(result, Err(LabelError::ChecksumMismatch));
+    }
+
+    #[test]
+    fn agreement_fingerprint_is_stable_for_same_committed_label() {
+        let sealed = seal_label(make_label("agree")).unwrap();
+
+        assert_ne!(sealed.agreement_fingerprint(), PoolLabelFingerprint::ZERO);
+        assert_eq!(
+            sealed.agreement_fingerprint(),
+            compute_label_agreement_fingerprint(&sealed)
+        );
+    }
+
+    #[test]
+    fn agreement_fingerprint_changes_with_committed_label_evidence() {
+        let mut a = make_label("agree-change");
+        a.commit_group = 7;
+        a.label_commit_group = 7;
+        let a = seal_label(a).unwrap();
+
+        let mut b = make_label("agree-change");
+        b.commit_group = 8;
+        b.label_commit_group = 8;
+        let b = seal_label(b).unwrap();
+
+        assert_ne!(a.agreement_fingerprint(), b.agreement_fingerprint());
     }
 
     #[test]

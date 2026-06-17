@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use tidefs_types_pool_label_core::{PoolLabelV1, PoolState};
+use tidefs_types_pool_label_core::{PoolLabelFingerprint, PoolLabelV1, PoolState};
 
 use crate::committed_root::CommittedRoot;
 use crate::segment::SegmentTable;
@@ -28,6 +28,10 @@ pub struct DeviceScanInfo {
     pub label_valid: bool,
     /// Human-readable label status.
     pub label_status: String,
+    /// Committed label-agreement fingerprint for valid labels.
+    pub label_fingerprint: Option<PoolLabelFingerprint>,
+    /// Commit group recorded by the label write.
+    pub label_commit_group: Option<u64>,
     /// Segment count found on this device.
     pub segment_count: usize,
     /// Committed roots found on this device.
@@ -44,6 +48,8 @@ impl DeviceScanInfo {
             device_index: None,
             label_valid: false,
             label_status: String::new(),
+            label_fingerprint: None,
+            label_commit_group: None,
             segment_count: 0,
             committed_roots_found: 0,
         }
@@ -54,6 +60,8 @@ impl DeviceScanInfo {
         self.device_guid = Some(label.device_guid);
         self.device_index = Some(label.device_index);
         self.label_valid = true;
+        self.label_fingerprint = Some(label.agreement_fingerprint());
+        self.label_commit_group = Some(label.label_commit_group);
         self.label_status = format!(
             "pool='{}' state={} index={}",
             label.pool_name_str(),
@@ -142,6 +150,60 @@ impl PoolScanResult {
     /// Append a warning message.
     pub fn warn(&mut self, msg: impl Into<String>) {
         self.warnings.push(msg.into());
+    }
+
+    /// Export this scan as membership-epoch promotion evidence.
+    ///
+    /// `member_id_for_device` binds scan-local device evidence to the caller's
+    /// membership identity authority. Devices without a valid label fingerprint
+    /// or without a mapped member id are omitted from the evidence set.
+    #[must_use]
+    pub fn epoch_bound_scan_evidence<F>(
+        &self,
+        prior_epoch_id: u64,
+        proposed_epoch_id: u64,
+        mut member_id_for_device: F,
+    ) -> tidefs_membership_epoch::pool_scan_gate::PoolScanEvidence
+    where
+        F: FnMut(&DeviceScanInfo) -> Option<u64>,
+    {
+        let committed_txg = self.committed_txg();
+        let members = self.devices.iter().filter_map(|device| {
+            let label_fingerprint = device.label_fingerprint?;
+            if let Some(committed_txg) = committed_txg {
+                if device
+                    .label_commit_group
+                    .map_or(true, |label_txg| label_txg > committed_txg)
+                {
+                    return None;
+                }
+            }
+            let member_id = member_id_for_device(device)?;
+            Some(
+                tidefs_membership_epoch::pool_scan_gate::EpochMemberLabelFingerprint::new(
+                    member_id,
+                    label_fingerprint,
+                ),
+            )
+        });
+
+        let expected_member_count = self.device_count as usize;
+        if let Some(committed_txg) = committed_txg {
+            tidefs_membership_epoch::pool_scan_gate::PoolScanEvidence::committed(
+                prior_epoch_id,
+                proposed_epoch_id,
+                committed_txg,
+                expected_member_count,
+                members,
+            )
+        } else {
+            tidefs_membership_epoch::pool_scan_gate::PoolScanEvidence::pending(
+                prior_epoch_id,
+                proposed_epoch_id,
+                expected_member_count,
+                members,
+            )
+        }
     }
 }
 
@@ -265,7 +327,7 @@ mod tests {
     use std::io::{Seek, Write};
 
     use tidefs_types_pool_label_core::{
-        encode_label, seal_label, PoolLabelV1, POOL_LABEL_V1_EXT_WIRE_SIZE,
+        encode_label, seal_label, PoolLabelFingerprint, PoolLabelV1, POOL_LABEL_V1_EXT_WIRE_SIZE,
     };
 
     use crate::committed_root::write_committed_root_entry;
@@ -446,6 +508,90 @@ mod tests {
         assert_eq!(result.total_segment_count(), 3);
         assert!(result.has_committed_root());
         assert_eq!(result.committed_txg(), Some(55));
+    }
+
+    #[test]
+    fn committed_scan_exports_epoch_bound_label_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool_guid = [0x78u8; 16];
+
+        let seg_a = vec![SegmentDescriptor::new(
+            0,
+            0x100000,
+            0x200000,
+            SegmentState::Sealed,
+        )];
+        let sys_a = build_system_area(&seg_a, 0);
+
+        let seg_b = vec![SegmentDescriptor::new(
+            1,
+            0x300000,
+            0x200000,
+            SegmentState::Active,
+        )];
+        let mut sys_b = build_system_area(&seg_b, 1);
+        let root_offset_b = crate::segment::SYSTEM_AREA_HEADER_SIZE
+            + seg_b.len() * crate::segment::SEGMENT_TABLE_ENTRY_SIZE;
+        write_committed_root_entry(&mut sys_b, root_offset_b, 56, 999, 1, 0x300000);
+
+        let dev_a = write_labelled_device(
+            &dir,
+            LabelledDeviceSpec {
+                name: "devA",
+                pool_guid,
+                device_guid: [0x11u8; 16],
+                pool_name: "evidencepool",
+                device_index: 0,
+                device_count: 2,
+                sys_ptr: 4096,
+                sys_buf: Some(&sys_a),
+            },
+        );
+        let dev_b = write_labelled_device(
+            &dir,
+            LabelledDeviceSpec {
+                name: "devB",
+                pool_guid,
+                device_guid: [0x22u8; 16],
+                pool_name: "evidencepool",
+                device_index: 1,
+                device_count: 2,
+                sys_ptr: 4096,
+                sys_buf: Some(&sys_b),
+            },
+        );
+
+        let cfg = crate::label::PoolScanConfig::new(vec![dev_a, dev_b]);
+        let result = PoolScanner::scan(&cfg).unwrap();
+        let evidence =
+            result.epoch_bound_scan_evidence(4, 5, |device| device.device_index.map(u64::from));
+
+        assert!(evidence.committed);
+        assert_eq!(evidence.prior_epoch_id, 4);
+        assert_eq!(evidence.proposed_epoch_id, 5);
+        assert_eq!(evidence.committed_txg, Some(56));
+        assert_eq!(evidence.expected_member_count, 2);
+        assert_eq!(evidence.members.len(), 2);
+        assert_eq!(
+            evidence
+                .members
+                .iter()
+                .map(|entry| entry.member_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(evidence
+            .members
+            .iter()
+            .all(|entry| entry.label_fingerprint != PoolLabelFingerprint::ZERO));
+
+        let mut newer_label_result = result.clone();
+        newer_label_result.devices[1].label_commit_group = Some(57);
+        let incomplete = newer_label_result
+            .epoch_bound_scan_evidence(4, 5, |device| device.device_index.map(u64::from));
+        assert!(incomplete.committed);
+        assert_eq!(incomplete.expected_member_count, 2);
+        assert_eq!(incomplete.members.len(), 1);
     }
 
     #[test]
