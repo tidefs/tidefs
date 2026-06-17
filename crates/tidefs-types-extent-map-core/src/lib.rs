@@ -397,6 +397,41 @@ impl ExtentMapEntryV2 {
     pub fn set_base_complete(&mut self) {
         self.flags = (self.flags & !Self::FLAG_INGEST) | Self::FLAG_BASE_COMPLETE;
     }
+
+    // ── Transform verification ─────────────────────────────
+
+    /// Store a [`TransformVerification`] token in the reserved bytes.
+    ///
+    /// Uses reserved[0..1] for the algorithm byte and reserved[1..9]
+    /// for uncompressed_len (LE).  The remaining reserved bytes are
+    /// unchanged.
+    pub fn set_transform_verification(&mut self, algorithm: u8, uncompressed_len: u64) {
+        self.reserved[0] = algorithm;
+        self.reserved[1..9].copy_from_slice(&uncompressed_len.to_le_bytes());
+    }
+
+    /// Decode the [`TransformVerification`] token from reserved bytes.
+    ///
+    /// Returns `None` when the reserved bytes are all zero (no transform
+    /// verification was stored).
+    pub fn transform_verification(&self) -> Option<(u8, u64)> {
+        let algorithm = self.reserved[0];
+        let uncompressed_len = u64::from_le_bytes(self.reserved[1..9].try_into().unwrap());
+        if algorithm == 0 && uncompressed_len == 0 {
+            return None;
+        }
+        // Validate algorithm byte range.
+        if algorithm > 2 {
+            return None;
+        }
+        Some((algorithm, uncompressed_len))
+    }
+
+    /// True when this entry carries a transform verification token.
+    #[must_use]
+    pub fn has_transform_verification(&self) -> bool {
+        self.transform_verification().is_some()
+    }
 }
 
 impl fmt::Display for ExtentMapEntryV2 {
@@ -1191,5 +1226,77 @@ mod tests {
         let child = RecordsizeProperty::Inherit.resolve(Some(parent));
         let grandchild = RecordsizeProperty::Inherit.resolve(Some(child));
         assert_eq!(grandchild, RecordsizeProperty::Fixed(1_048_576));
+    }
+
+    // ── Transform verification ───────────────────────────────────────
+
+    #[test]
+    fn entry_set_and_get_transform_verification() {
+        let mut entry = ExtentMapEntryV2::new_data(0, 4096, LocatorId(1), [0xAB; 32], 1);
+        entry.set_transform_verification(0x01, 4096); // zstd, 4096 bytes
+        let (algo, len) = entry.transform_verification().unwrap();
+        assert_eq!(algo, 0x01);
+        assert_eq!(len, 4096);
+        assert!(entry.has_transform_verification());
+    }
+
+    #[test]
+    fn entry_transform_verification_defaults_to_none() {
+        let entry = ExtentMapEntryV2::new_data(0, 4096, LocatorId(1), [0xAB; 32], 1);
+        assert!(entry.transform_verification().is_none());
+        assert!(!entry.has_transform_verification());
+    }
+
+    #[test]
+    fn entry_transform_verification_rejects_invalid_algorithm() {
+        let mut entry = ExtentMapEntryV2::new_data(0, 4096, LocatorId(1), [0xAB; 32], 1);
+        entry.set_transform_verification(0xFF, 100);
+        assert!(entry.transform_verification().is_none());
+    }
+
+    #[test]
+    fn entry_transform_verification_zero_algorithm_and_len_is_none() {
+        let entry = ExtentMapEntryV2::new_data(0, 4096, LocatorId(1), [0xAB; 32], 1);
+        // Reserved bytes are all zero by default -> None
+        assert!(entry.transform_verification().is_none());
+    }
+
+    #[test]
+    fn entry_transform_verification_large_uncompressed_len() {
+        let mut entry = ExtentMapEntryV2::new_data(0, 4096, LocatorId(1), [0xAB; 32], 1);
+        let large_len = 1u64 << 40; // 1 TiB
+        entry.set_transform_verification(0x01, large_len);
+        let (_algo, len) = entry.transform_verification().unwrap();
+        assert_eq!(len, large_len);
+    }
+
+    #[test]
+    fn entry_transform_verification_roundtrip_through_reserved_bytes() {
+        let mut entry = ExtentMapEntryV2::new_data(0, 4096, LocatorId(1), [0xAB; 32], 1);
+        // Simulate what happens when reserved bytes are manually set
+        entry.reserved[0] = 0x02; // lz4
+        entry.reserved[1..9].copy_from_slice(&5000u64.to_le_bytes());
+        let (algo, len) = entry.transform_verification().unwrap();
+        assert_eq!(algo, 0x02);
+        assert_eq!(len, 5000);
+    }
+
+    #[test]
+    fn entry_set_transform_verification_preserves_unused_reserved() {
+        let mut entry = ExtentMapEntryV2::new_data(0, 4096, LocatorId(1), [0xAB; 32], 1);
+        // Set some data in the unused portion of reserved
+        entry.reserved[9] = 0xCC;
+        entry.reserved[10] = 0xDD;
+        entry.set_transform_verification(0x01, 2048);
+        assert_eq!(entry.reserved[9], 0xCC);
+        assert_eq!(entry.reserved[10], 0xDD);
+    }
+
+    #[test]
+    fn entry_pending_data_carries_transform_verification() {
+        let mut entry = ExtentMapEntryV2::new_pending_data(0, 8192, LocatorId(2));
+        assert!(!entry.has_transform_verification());
+        entry.set_transform_verification(0x01, 8192);
+        assert!(entry.has_transform_verification());
     }
 }

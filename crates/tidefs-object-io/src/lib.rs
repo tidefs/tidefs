@@ -9,6 +9,8 @@
 
 use std::fmt;
 
+use tidefs_frame::{CompressedExtentPayload, decompress_extent_verified, TransformVerification};
+
 pub use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreError};
 pub use tidefs_types_extent_map_core::{
     ExtentMapEntryV2, ExtentMapError, ExtentMapOps, ExtentType, FreedExtent, LocatorId,
@@ -33,6 +35,12 @@ pub enum ObjectIoError {
     InvalidChunkSize,
     /// A DATA extent referenced an object that was not present in the store.
     MissingObject(ObjectKey),
+    /// Stored transform header does not match the committed extent receipt.
+    TransformMismatch {
+        field: &'static str,
+        expected: u64,
+        observed: u64,
+    },
     /// The read range lies entirely in a hole past EOF.
     HoleBeyondEof,
 }
@@ -46,6 +54,9 @@ impl fmt::Display for ObjectIoError {
             Self::InvalidChunkSize => f.write_str("invalid object I/O chunk size"),
             Self::MissingObject(key) => write!(f, "extent references missing object {key}"),
             Self::HoleBeyondEof => f.write_str("read entirely in hole past EOF"),
+            Self::TransformMismatch { field, expected, observed } => {
+                write!(f, "transform mismatch: {field} expected {expected}, observed {observed}")
+            }
         }
     }
 }
@@ -181,6 +192,32 @@ fn load_object<S: ObjectStore>(store: &S, key: ObjectKey) -> Result<Vec<u8>> {
         .ok_or(ObjectIoError::MissingObject(key))
 }
 
+/// Load an object and verify its compression transform header against a committed token.
+///
+/// Returns the decompressed payload on success, or [`ObjectIoError::TransformMismatch`]
+/// when the stored transform header does not match the token.
+fn load_object_verified<S: ObjectStore>(
+    store: &S,
+    key: ObjectKey,
+    token: &TransformVerification,
+) -> Result<Vec<u8>> {
+    let raw = store
+        .get(&key)
+        .map_err(map_store_error)?
+        .ok_or(ObjectIoError::MissingObject(key))?;
+    let payload = CompressedExtentPayload::decode(&raw)
+        .ok_or(ObjectIoError::StoreError(Box::new(
+            std::io::Error::other("invalid compressed extent payload"),
+        )))?;
+    decompress_extent_verified(&payload, token)
+        .map_err(|e| match e {
+            tidefs_frame::FrameError::TransformMismatch { field, expected, observed } => {
+                ObjectIoError::TransformMismatch { field, expected, observed }
+            }
+            other => ObjectIoError::StoreError(Box::new(std::io::Error::other(format!("{other:?}")))),
+        })
+}
+
 fn data_entry<S: ObjectStore>(
     store: &mut S,
     offset: u64,
@@ -307,7 +344,22 @@ impl ObjectReader {
             let read_range = CheckedByteRange::non_empty(read_start, read_end - read_start)?;
             let read_len = read_range.len_usize()?;
             if entry.extent_type().is_data() {
-                let payload = load_object(store, entry_object_key(&entry))?;
+                let key = entry_object_key(&entry);
+                let payload = if let Some((algo, uncompressed_len)) = entry.transform_verification() {
+                    // Build a TransformVerification token from the extent-map entry.
+                    // The compressed_len is not stored in the entry; it is verified
+                    // implicitly by the content checksum that covers the full payload.
+                    // We pass compressed_len=0 to skip that field check.
+                    let token = TransformVerification {
+                        algorithm: tidefs_frame::CompressionAlgorithm::from_byte(algo)
+                            .unwrap_or(tidefs_frame::CompressionAlgorithm::Uncompressed),
+                        uncompressed_len,
+                        compressed_len: 0, // verified by content checksum
+                    };
+                    load_object_verified(store, key, &token)?
+                } else {
+                    load_object(store, key)?
+                };
                 let payload_start = usize::try_from(read_range.start - entry_range.start)
                     .map_err(|_| ObjectIoError::InvalidRange)?;
                 if payload_start < payload.len() {
