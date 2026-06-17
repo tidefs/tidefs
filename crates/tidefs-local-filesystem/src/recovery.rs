@@ -397,7 +397,7 @@ pub fn online_verifier_content_counts(
     for inode in state.inodes.values() {
         if inode.is_file_like() {
             let layout = read_content_layout_from_store(store, inode.inode_id, inode, false)?;
-            let _ = read_content_from_store(store, inode.inode_id, inode, false)?;
+            let _ = read_content_from_store(store, inode.inode_id, inode, false, None)?;
             checked_content_objects = checked_content_objects.saturating_add(1);
             if let ContentLayout::Chunked(manifest) = layout {
                 checked_content_chunks =
@@ -1837,6 +1837,7 @@ fn validate_loaded_state_incremental(
                     inode.inode_id,
                     inode,
                     allow_v0390_fixed_content,
+                    None,
                 )?;
             }
         }
@@ -1886,7 +1887,7 @@ pub(crate) fn validate_loaded_state(
     for inode in inodes.values() {
         if inode.is_file_like() {
             let _ =
-                read_content_from_store(store, inode.inode_id, inode, allow_v0390_fixed_content)?;
+                read_content_from_store(store, inode.inode_id, inode, allow_v0390_fixed_content, None)?;
         }
     }
     Ok(())
