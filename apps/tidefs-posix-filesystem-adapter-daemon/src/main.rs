@@ -546,6 +546,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
             libc::sigemptyset(&mut sigset);
             libc::sigaddset(&mut sigset, libc::SIGINT);
             libc::sigaddset(&mut sigset, libc::SIGTERM);
+            libc::sigaddset(&mut sigset, libc::SIGHUP);
             libc::pthread_sigmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
         }
         loop {

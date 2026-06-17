@@ -177,6 +177,12 @@ impl<FS: Filesystem> Session<FS> {
                             "FUSE session run loop exiting: ENODEV (filesystem unmounted) on mount {}",
                             self.mountpoint.display()
                         );
+                        // Diagnostic: read /proc/self/mountinfo to see if the
+                        // mountpoint is still listed.  A present entry means the
+                        // FUSE connection was aborted by the kernel while the
+                        // mount remained registered; a missing entry means an
+                        // external umount removed it.
+                        Self::diagnose_enodev(&self.mountpoint.to_string_lossy());
                         break;
                     }
                     // Unhandled error
@@ -191,6 +197,34 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
         Ok(())
+    }
+
+    /// Diagnostic helper: when the session loop exits with ENODEV, check
+    /// /proc/self/mountinfo to determine whether the mountpoint was externally
+    /// unmounted or the kernel aborted the FUSE connection while the mount
+    /// was still registered.
+    fn diagnose_enodev(mountpoint: &str) {
+        match std::fs::read_to_string("/proc/self/mountinfo") {
+            Ok(mountinfo) => {
+                let found = mountinfo
+                    .lines()
+                    .any(|line| line.split_whitespace().nth(4) == Some(mountpoint));
+                if found {
+                    eprintln!(
+                        "ENODEV diagnostic: mountpoint {} is still listed in /proc/self/mountinfo; kernel aborted FUSE connection",
+                        mountpoint
+                    );
+                } else {
+                    eprintln!(
+                        "ENODEV diagnostic: mountpoint {} is NOT in /proc/self/mountinfo; mount was externally unmounted",
+                        mountpoint
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("ENODEV diagnostic: could not read /proc/self/mountinfo: {e}");
+            }
+        }
     }
 
     /// Register a blocking operation and obtain an [`AbortHandle`].
