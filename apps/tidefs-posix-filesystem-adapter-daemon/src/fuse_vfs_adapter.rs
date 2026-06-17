@@ -1835,10 +1835,7 @@ fn emit_lookup_reply(reply: ReplyEntry, plan: LookupReplyPlan) {
             (Some(attr), None) => reply.entry(&ttl, &attr, generation),
             _ => reply.reply_errno(Errno::EIO),
         },
-        LookupOutcome::NotFound => match wire_entry {
-            Some(entry) if entry.negative => reply.negative(&lookup_entry_ttl(&entry)),
-            _ => reply.reply_errno(error.unwrap_or(Errno::ENOENT)),
-        },
+        LookupOutcome::NotFound => reply.reply_errno(error.unwrap_or(Errno::ENOENT)),
         LookupOutcome::Error { .. } => reply.reply_errno(error.unwrap_or(Errno::EIO)),
     }
 }
