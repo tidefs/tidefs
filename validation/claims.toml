@@ -111,7 +111,7 @@ evidence_artifacts = []
 
 [[claims]]
 id = "perf.local.no_unbounded_dirty_debt.v1"
-status = "planned"
+status = "blocked"
 scope = "local dirty write admission and budgeted queue accounting"
 required_evidence_classes = [
   "admission-budget-model",
@@ -122,7 +122,7 @@ required_evidence_classes = [
 blockers = [
   "GitHub issue #308 wired AdmissionPermit into local-filesystem write path and registered queue roots; a focused runtime queue-depth artifact must still be captured via CI.",
 ]
-generated_doc = "Planned local no-unbounded-dirty-debt claim. TideFS has wired admission into the local-filesystem runtime write path (issue #308). A runtime queue-depth artifact on a mounted path is still required before this claim can move to validated."
+generated_doc = "Blocked local no-unbounded-dirty-debt claim. TideFS has wired admission into the local-filesystem runtime write path (issue #308). A runtime queue-depth artifact on a mounted path is still required before this claim can move to validated."
 evidence_artifacts = []
 
 [[claims]]
