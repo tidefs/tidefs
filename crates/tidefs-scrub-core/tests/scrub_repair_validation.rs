@@ -9,6 +9,12 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use tidefs_local_object_store::SuspectEntry;
+use tidefs_replication_model::PlacementReceiptRef;
+use tidefs_scrub::repair_scheduling::{
+    RepairAdmission, RepairAdmissionInput, RepairEscalation, RepairEvidenceClass,
+    RepairEvidenceRejection, ScrubToRepairBridge,
+};
 use tidefs_scrub::scrub_repair::{BlockReconstructor, ScrubRepairEngine, ScrubRepairLedger};
 
 struct MockReconstructor {
@@ -76,6 +82,41 @@ fn make_data(size: usize, pattern: u8) -> Vec<u8> {
 
 fn hash_data(data: &[u8]) -> [u8; 32] {
     blake3::hash(data).into()
+}
+
+fn make_suspect_entry(locator_id: u64) -> SuspectEntry {
+    SuspectEntry {
+        entry_id: locator_id,
+        locator_id,
+        segment_id: 7,
+        offset: locator_id * 4096,
+        record_type: 1,
+        expected_hash: [0xAA; 32],
+        actual_hash: [0xBB; 32],
+        repair_attempts: 0,
+        last_repair_attempt: 0,
+        resolved: false,
+        commit_group: 3,
+        timestamp_secs: 10,
+    }
+}
+
+fn receipt_for_entry(entry: &SuspectEntry) -> PlacementReceiptRef {
+    let mut object_key = [0u8; 32];
+    object_key[..8].copy_from_slice(&entry.locator_id.to_le_bytes());
+    PlacementReceiptRef::replicated(
+        entry.locator_id,
+        object_key,
+        Default::default(),
+        entry.commit_group,
+        2,
+        4096,
+        entry.expected_hash,
+    )
+}
+
+fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
+    RepairAdmissionInput::with_receipt(entry, receipt_for_entry(&entry))
 }
 
 // 1. Single-block corruption repaired
@@ -247,4 +288,129 @@ fn repair_batch_mixed_outcomes() {
     assert_eq!(results, vec![true, true, false, true]);
     assert_eq!(engine.ledger().repair_count, 1);
     assert_eq!(engine.ledger().repair_failure_count, 1);
+}
+
+#[test]
+fn receipt_backed_repair_admission_records_evidence() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(700);
+    let receipt = receipt_for_entry(&entry);
+    let input = RepairAdmissionInput::with_receipt(entry, receipt);
+
+    let admissions = bridge.ingest_with_evidence(&[input], 2);
+
+    assert_eq!(
+        admissions,
+        vec![RepairAdmission::Admitted {
+            locator_id: 700,
+            evidence_class: RepairEvidenceClass::PlacementReceipt,
+        }]
+    );
+    let jobs = bridge.prioritized_jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].entry.locator_id, 700);
+    assert_eq!(
+        jobs[0].evidence.class,
+        RepairEvidenceClass::PlacementReceipt
+    );
+    assert_eq!(jobs[0].evidence.placement_receipt_ref, receipt);
+    assert_eq!(bridge.stats().entries_admitted_with_receipt, 1);
+    assert_eq!(bridge.stats().by_evidence_class[0], 1);
+}
+
+#[test]
+fn missing_receipt_repair_admission_blocks_queueing() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(701);
+
+    let admissions = bridge.ingest(&[entry], 2);
+
+    assert_eq!(
+        admissions,
+        vec![RepairAdmission::Blocked {
+            locator_id: 701,
+            reason: RepairEvidenceRejection::MissingReceipt,
+        }]
+    );
+    assert_eq!(bridge.pending_count(), 0);
+    assert_eq!(bridge.stats().entries_blocked_missing_receipt, 1);
+}
+
+#[test]
+fn stale_receipt_repair_admission_blocks_queueing() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(702);
+    let stale_receipt = receipt_for_entry(&make_suspect_entry(1702));
+    let input = RepairAdmissionInput::with_receipt(entry, stale_receipt);
+
+    let admissions = bridge.ingest_with_evidence(&[input], 2);
+
+    assert_eq!(
+        admissions,
+        vec![RepairAdmission::Blocked {
+            locator_id: 702,
+            reason: RepairEvidenceRejection::StaleReceipt,
+        }]
+    );
+    assert_eq!(bridge.pending_count(), 0);
+    assert_eq!(bridge.stats().entries_blocked_stale_receipt, 1);
+}
+
+#[test]
+fn stale_receipt_payload_digest_blocks_queueing() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(705);
+    let mut stale_receipt = receipt_for_entry(&entry);
+    stale_receipt.payload_digest = [0xEE; 32];
+    let input = RepairAdmissionInput::with_receipt(entry, stale_receipt);
+
+    let admissions = bridge.ingest_with_evidence(&[input], 2);
+
+    assert_eq!(
+        admissions,
+        vec![RepairAdmission::Blocked {
+            locator_id: 705,
+            reason: RepairEvidenceRejection::StaleReceipt,
+        }]
+    );
+    assert_eq!(bridge.pending_count(), 0);
+    assert_eq!(bridge.stats().entries_blocked_stale_receipt, 1);
+}
+
+#[test]
+fn degraded_read_escalates_with_receipt_evidence() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(703);
+    let input = input_with_receipt(entry).with_degraded_read();
+
+    bridge.ingest_with_evidence(&[input], 2);
+
+    let jobs = bridge.jobs_at_level(RepairEscalation::Immediate);
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].degraded_read_active);
+    assert_eq!(
+        jobs[0].evidence.class,
+        RepairEvidenceClass::PlacementReceipt
+    );
+}
+
+#[test]
+fn retry_escalation_preserves_receipt_evidence_identity() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(704);
+    let input = input_with_receipt(entry);
+
+    bridge.ingest_with_evidence(&[input], 2);
+    let original_evidence = bridge.prioritized_jobs()[0].evidence;
+
+    bridge.mark_failed(704);
+    bridge.mark_failed(704);
+
+    let jobs = bridge.jobs_at_level(RepairEscalation::Urgent);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].evidence, original_evidence);
+    assert_eq!(
+        jobs[0].evidence.placement_receipt_ref,
+        input.placement_receipt_ref.expect("receipt")
+    );
 }

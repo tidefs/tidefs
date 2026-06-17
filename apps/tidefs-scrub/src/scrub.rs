@@ -1064,6 +1064,8 @@ mod tests {
             observed_encoded_len: Some(0),
             missing: false,
             zero_length_record: true,
+            missing_receipt: false,
+            receipt_mismatch: false,
             malformed_reason: Some("decode failed".to_string()),
         });
 
@@ -1105,6 +1107,8 @@ mod tests {
             observed_encoded_len: Some(42),
             missing: false,
             zero_length_record: false,
+            missing_receipt: false,
+            receipt_mismatch: false,
             malformed_reason: None,
         });
 

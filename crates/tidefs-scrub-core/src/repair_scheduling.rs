@@ -38,6 +38,7 @@ use std::collections::HashSet;
 
 use tidefs_background_scheduler::ServicePriority;
 use tidefs_local_object_store::SuspectEntry;
+use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 use tidefs_types_incremental_job_core::JobKind;
 use tidefs_types_reclaim_queue_core::{QueueFamily, ReclaimQueueEntry};
 
@@ -185,6 +186,154 @@ impl core::fmt::Display for RepairEscalation {
 }
 
 // ---------------------------------------------------------------------------
+// RepairEvidence — placement authority required before scheduling repair
+// ---------------------------------------------------------------------------
+
+/// Evidence class used by repair scheduling admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairEvidenceClass {
+    /// A durable placement receipt identifies the object and source set.
+    PlacementReceipt = 0,
+}
+
+impl RepairEvidenceClass {
+    pub const LEVEL_COUNT: usize = 1;
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PlacementReceipt => "placement-receipt",
+        }
+    }
+}
+
+/// Reason a finding was not admitted into repair or rebake queues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairEvidenceRejection {
+    /// The finding has only a receiptless suspect record.
+    MissingReceipt,
+    /// The supplied receipt is synthetic, malformed, or for another object.
+    StaleReceipt,
+}
+
+impl RepairEvidenceRejection {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MissingReceipt => "missing-receipt",
+            Self::StaleReceipt => "stale-receipt",
+        }
+    }
+}
+
+/// Source-set identity derived from a placement receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepairSourceSet {
+    pub redundancy_policy: ReceiptRedundancyPolicy,
+    pub target_count: u16,
+}
+
+/// Repair evidence carried by an admitted repair job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepairEvidence {
+    pub class: RepairEvidenceClass,
+    pub locator_id: u64,
+    pub segment_id: u64,
+    pub offset: u64,
+    pub source_set: RepairSourceSet,
+    pub placement_receipt_ref: PlacementReceiptRef,
+}
+
+impl RepairEvidence {
+    /// Build repair evidence from a durable placement receipt.
+    pub fn from_placement_receipt(
+        entry: &SuspectEntry,
+        receipt: PlacementReceiptRef,
+    ) -> Result<Self, RepairEvidenceRejection> {
+        if receipt.is_synthetic()
+            || receipt.object_id != entry.locator_id
+            || (entry.expected_hash != [0; 32] && receipt.payload_digest != entry.expected_hash)
+            || !receipt.redundancy_policy.is_well_formed()
+            || receipt.target_count == 0
+            || receipt.target_count != receipt.redundancy_policy.target_width()
+        {
+            return Err(RepairEvidenceRejection::StaleReceipt);
+        }
+
+        Ok(Self {
+            class: RepairEvidenceClass::PlacementReceipt,
+            locator_id: entry.locator_id,
+            segment_id: entry.segment_id,
+            offset: entry.offset,
+            source_set: RepairSourceSet {
+                redundancy_policy: receipt.redundancy_policy,
+                target_count: receipt.target_count,
+            },
+            placement_receipt_ref: receipt,
+        })
+    }
+}
+
+/// Scrub finding plus the evidence needed to admit repair scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepairAdmissionInput {
+    pub entry: SuspectEntry,
+    pub placement_receipt_ref: Option<PlacementReceiptRef>,
+    pub degraded_read_active: bool,
+}
+
+impl RepairAdmissionInput {
+    #[must_use]
+    pub fn missing_receipt(entry: SuspectEntry) -> Self {
+        Self {
+            entry,
+            placement_receipt_ref: None,
+            degraded_read_active: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_receipt(entry: SuspectEntry, receipt: PlacementReceiptRef) -> Self {
+        Self {
+            entry,
+            placement_receipt_ref: Some(receipt),
+            degraded_read_active: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_degraded_read(mut self) -> Self {
+        self.degraded_read_active = true;
+        self
+    }
+}
+
+/// Admission result for one scrub finding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairAdmission {
+    Admitted {
+        locator_id: u64,
+        evidence_class: RepairEvidenceClass,
+    },
+    Blocked {
+        locator_id: u64,
+        reason: RepairEvidenceRejection,
+    },
+    Skipped {
+        locator_id: u64,
+        reason: RepairAdmissionSkip,
+    },
+}
+
+/// Idempotent skip reason for an already-known finding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairAdmissionSkip {
+    AlreadyRepaired,
+    AlreadyExhausted,
+    UpdatedExisting,
+}
+
+// ---------------------------------------------------------------------------
 // RepairJob — a prioritized repair task derived from a scrub finding
 // ---------------------------------------------------------------------------
 
@@ -193,6 +342,8 @@ impl core::fmt::Display for RepairEscalation {
 pub struct RepairJob {
     /// The suspect entry to repair.
     pub entry: SuspectEntry,
+    /// Durable evidence that admitted this repair job.
+    pub evidence: RepairEvidence,
     /// Current escalation level.
     pub escalation: RepairEscalation,
     /// Number of failed repair attempts so far.
@@ -209,17 +360,31 @@ pub struct RepairJob {
 }
 
 impl RepairJob {
-    /// Create a new repair job from a suspect entry.
+    /// Create a new repair job from a receipt-backed suspect entry.
     #[must_use]
-    pub fn new(entry: SuspectEntry, replicas_remaining: u32) -> Self {
-        let escalation = RepairEscalation::classify(&entry, 0, replicas_remaining, false);
+    pub fn new(entry: SuspectEntry, evidence: RepairEvidence, replicas_remaining: u32) -> Self {
+        Self::new_with_degraded_read(entry, evidence, replicas_remaining, false)
+    }
+
+    /// Create a new repair job and mark whether it came from an active
+    /// degraded-read signal.
+    #[must_use]
+    pub fn new_with_degraded_read(
+        entry: SuspectEntry,
+        evidence: RepairEvidence,
+        replicas_remaining: u32,
+        degraded_read_active: bool,
+    ) -> Self {
+        let escalation =
+            RepairEscalation::classify(&entry, 0, replicas_remaining, degraded_read_active);
         Self {
             entry,
+            evidence,
             escalation,
             failed_attempts: 0,
             max_attempts: 3,
             route_to_rebake: false,
-            degraded_read_active: false,
+            degraded_read_active,
             replicas_remaining,
         }
     }
@@ -305,6 +470,12 @@ pub struct RepairAuditEntry {
 pub struct BridgeStats {
     /// Total suspect entries ingested.
     pub entries_ingested: u64,
+    /// Entries admitted with receipt-backed evidence.
+    pub entries_admitted_with_receipt: u64,
+    /// Entries blocked because no placement receipt was supplied.
+    pub entries_blocked_missing_receipt: u64,
+    /// Entries blocked because the supplied receipt was stale or malformed.
+    pub entries_blocked_stale_receipt: u64,
     /// Entries dispatched to repair (mirror or EC).
     pub entries_dispatched_repair: u64,
     /// Entries routed to rebake (EC parity recomputation).
@@ -313,11 +484,20 @@ pub struct BridgeStats {
     pub entries_exhausted: u64,
     /// Entries by escalation level.
     pub by_escalation: [u64; RepairEscalation::LEVEL_COUNT],
+    /// Entries admitted by evidence class.
+    pub by_evidence_class: [u64; RepairEvidenceClass::LEVEL_COUNT],
     /// Failed dispatch attempts.
     pub dispatch_failures: u64,
     /// Number of idempotent no-ops (mark_repaired on absent, mark_failed on
     /// absent, ingest skip of already-repaired or exhausted entry).
     pub idempotent_noops: u64,
+}
+
+impl BridgeStats {
+    #[must_use]
+    pub const fn entries_blocked_by_evidence(&self) -> u64 {
+        self.entries_blocked_missing_receipt + self.entries_blocked_stale_receipt
+    }
 }
 
 impl ScrubToRepairBridge {
@@ -338,18 +518,37 @@ impl ScrubToRepairBridge {
     ///
     /// Entries already tracked are updated (e.g. escalated if this is a
     /// re-detection). New entries are classified and queued.
-    /// Ingest suspect entries from a scrub cycle.
-    ///
-    /// Entries already tracked are updated (e.g. escalated if this is a
-    /// re-detection). New entries are classified and queued.
     ///
     /// # Idempotence
     ///
     /// Entries whose locator_id is in the repaired set or exhausted set
     /// are silently skipped. This prevents re-creation of already-resolved
     /// work after crash recovery or repeated scrub cycles.
-    pub fn ingest(&mut self, entries: &[SuspectEntry], replicas_remaining: u32) {
-        for entry in entries {
+    pub fn ingest(
+        &mut self,
+        entries: &[SuspectEntry],
+        replicas_remaining: u32,
+    ) -> Vec<RepairAdmission> {
+        let inputs: Vec<_> = entries
+            .iter()
+            .copied()
+            .map(RepairAdmissionInput::missing_receipt)
+            .collect();
+        self.ingest_with_evidence(&inputs, replicas_remaining)
+    }
+
+    /// Ingest scrub findings with explicit receipt evidence.
+    ///
+    /// Findings without a durable placement receipt, or with a stale receipt,
+    /// are classified as blocked evidence and are not enqueued.
+    pub fn ingest_with_evidence(
+        &mut self,
+        inputs: &[RepairAdmissionInput],
+        replicas_remaining: u32,
+    ) -> Vec<RepairAdmission> {
+        let mut admissions = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let entry = input.entry;
             let locator_id = entry.locator_id;
 
             // Idempotence: skip already-repaired entries.
@@ -360,6 +559,10 @@ impl ScrubToRepairBridge {
                     operation: "ingest",
                     result: "skipped_already_repaired",
                     seq: self.audit_trace.len() as u64,
+                });
+                admissions.push(RepairAdmission::Skipped {
+                    locator_id,
+                    reason: RepairAdmissionSkip::AlreadyRepaired,
                 });
                 continue;
             }
@@ -373,8 +576,29 @@ impl ScrubToRepairBridge {
                     result: "skipped_already_exhausted",
                     seq: self.audit_trace.len() as u64,
                 });
+                admissions.push(RepairAdmission::Skipped {
+                    locator_id,
+                    reason: RepairAdmissionSkip::AlreadyExhausted,
+                });
                 continue;
             }
+
+            let evidence = match input.placement_receipt_ref {
+                Some(receipt) => match RepairEvidence::from_placement_receipt(&entry, receipt) {
+                    Ok(evidence) => evidence,
+                    Err(reason) => {
+                        self.record_evidence_block(locator_id, reason);
+                        admissions.push(RepairAdmission::Blocked { locator_id, reason });
+                        continue;
+                    }
+                },
+                None => {
+                    let reason = RepairEvidenceRejection::MissingReceipt;
+                    self.record_evidence_block(locator_id, reason);
+                    admissions.push(RepairAdmission::Blocked { locator_id, reason });
+                    continue;
+                }
+            };
 
             if let Some(job) = self.jobs.get_mut(&locator_id) {
                 // Re-detection: escalate if still present after prior repair attempt.
@@ -387,10 +611,21 @@ impl ScrubToRepairBridge {
                     result: "updated_existing",
                     seq: self.audit_trace.len() as u64,
                 });
+                admissions.push(RepairAdmission::Skipped {
+                    locator_id,
+                    reason: RepairAdmissionSkip::UpdatedExisting,
+                });
             } else {
-                let job = RepairJob::new(*entry, replicas_remaining);
+                let job = RepairJob::new_with_degraded_read(
+                    entry,
+                    evidence,
+                    replicas_remaining,
+                    input.degraded_read_active,
+                );
                 self.stats.entries_ingested += 1;
+                self.stats.entries_admitted_with_receipt += 1;
                 self.stats.by_escalation[job.escalation as usize] += 1;
+                self.stats.by_evidence_class[job.evidence.class as usize] += 1;
                 self.jobs.insert(locator_id, job);
                 self.insertion_order.push(locator_id);
                 self.audit_trace.push(RepairAuditEntry {
@@ -399,8 +634,30 @@ impl ScrubToRepairBridge {
                     result: "created_new",
                     seq: self.audit_trace.len() as u64,
                 });
+                admissions.push(RepairAdmission::Admitted {
+                    locator_id,
+                    evidence_class: evidence.class,
+                });
             }
         }
+        admissions
+    }
+
+    fn record_evidence_block(&mut self, locator_id: u64, reason: RepairEvidenceRejection) {
+        match reason {
+            RepairEvidenceRejection::MissingReceipt => {
+                self.stats.entries_blocked_missing_receipt += 1;
+            }
+            RepairEvidenceRejection::StaleReceipt => {
+                self.stats.entries_blocked_stale_receipt += 1;
+            }
+        }
+        self.audit_trace.push(RepairAuditEntry {
+            locator_id,
+            operation: "ingest",
+            result: reason.label(),
+            seq: self.audit_trace.len() as u64,
+        });
     }
 
     /// Return jobs sorted by escalation level (Immediate first, Background last),
@@ -576,6 +833,12 @@ pub struct RebakeSchedulingBridge {
     pending_rebake: Vec<ReclaimQueueEntry>,
     /// Total entries generated.
     entries_generated: u64,
+    /// Entries generated by evidence class.
+    entries_by_evidence_class: [u64; RepairEvidenceClass::LEVEL_COUNT],
+    /// Entries blocked because no placement receipt was supplied.
+    entries_blocked_missing_receipt: u64,
+    /// Entries blocked because the supplied receipt was stale or malformed.
+    entries_blocked_stale_receipt: u64,
     /// Set of (locator_id, segment_id, offset) tuples already generated.
     /// Prevents duplicate entries when generate_rebake_entries is called
     /// multiple times with the same suspect entries.
@@ -589,20 +852,13 @@ impl RebakeSchedulingBridge {
         Self {
             pending_rebake: Vec::new(),
             entries_generated: 0,
+            entries_by_evidence_class: [0; RepairEvidenceClass::LEVEL_COUNT],
+            entries_blocked_missing_receipt: 0,
+            entries_blocked_stale_receipt: 0,
             generated_entry_ids: std::collections::HashSet::new(),
         }
     }
 
-    /// Convert a set of suspect entries that require EC parity recomputation
-    /// into reclaim queue entries with `QueueFamily::Rebake`.
-    ///
-    /// Each suspect entry whose `record_type` indicates a payload mismatch
-    /// (record_type 1 or 3) in an erasure-coded stripe generates a rebake
-    /// entry. The `object_key` is derived from the locator_id and the delta
-    /// encodes the segment/offset for deterministic replay.
-    ///
-    /// Returns the vector of generated `ReclaimQueueEntry` values ready for
-    /// insertion into the reclaim queue B-tree.
     /// Convert a set of suspect entries that require EC parity recomputation
     /// into reclaim queue entries with `QueueFamily::Rebake`.
     ///
@@ -623,14 +879,45 @@ impl RebakeSchedulingBridge {
         &mut self,
         suspect_entries: &[SuspectEntry],
     ) -> Vec<ReclaimQueueEntry> {
+        let inputs: Vec<_> = suspect_entries
+            .iter()
+            .copied()
+            .map(RepairAdmissionInput::missing_receipt)
+            .collect();
+        self.generate_rebake_entries_with_evidence(&inputs)
+    }
+
+    /// Convert receipt-backed suspect entries into `Rebake` queue entries.
+    ///
+    /// Receiptless or stale-receipt findings are counted as blocked evidence
+    /// and are not enqueued.
+    pub fn generate_rebake_entries_with_evidence(
+        &mut self,
+        suspect_entries: &[RepairAdmissionInput],
+    ) -> Vec<ReclaimQueueEntry> {
         let mut entries = Vec::with_capacity(suspect_entries.len());
-        for suspect in suspect_entries {
+        for input in suspect_entries {
+            let suspect = &input.entry;
             // Only payload corruption (record_type 1) or truncated records (3)
             // that need EC rebake are routed here. Chain breaks (2) don't
             // need parity recomputation.
             if suspect.record_type != 1 && suspect.record_type != 3 {
                 continue;
             }
+
+            let evidence = match input.placement_receipt_ref {
+                Some(receipt) => match RepairEvidence::from_placement_receipt(suspect, receipt) {
+                    Ok(evidence) => evidence,
+                    Err(reason) => {
+                        self.record_evidence_block(reason);
+                        continue;
+                    }
+                },
+                None => {
+                    self.record_evidence_block(RepairEvidenceRejection::MissingReceipt);
+                    continue;
+                }
+            };
 
             // Idempotence: skip entries already generated.
             let entry_id = (suspect.locator_id, suspect.segment_id, suspect.offset);
@@ -645,12 +932,24 @@ impl RebakeSchedulingBridge {
                 -((suspect.segment_id as i64).wrapping_mul(1_000_000) + suspect.offset as i64);
 
             let entry = ReclaimQueueEntry::new(object_key, delta, QueueFamily::Rebake);
+            self.entries_by_evidence_class[evidence.class as usize] += 1;
             entries.push(entry);
         }
 
         self.entries_generated += entries.len() as u64;
         self.pending_rebake.extend(entries.clone());
         entries
+    }
+
+    fn record_evidence_block(&mut self, reason: RepairEvidenceRejection) {
+        match reason {
+            RepairEvidenceRejection::MissingReceipt => {
+                self.entries_blocked_missing_receipt += 1;
+            }
+            RepairEvidenceRejection::StaleReceipt => {
+                self.entries_blocked_stale_receipt += 1;
+            }
+        }
     }
 
     /// Drain all pending rebake entries, clearing internal state.
@@ -662,6 +961,21 @@ impl RebakeSchedulingBridge {
     #[must_use]
     pub fn entries_generated(&self) -> u64 {
         self.entries_generated
+    }
+
+    #[must_use]
+    pub fn entries_generated_by_evidence_class(&self) -> &[u64; RepairEvidenceClass::LEVEL_COUNT] {
+        &self.entries_by_evidence_class
+    }
+
+    #[must_use]
+    pub fn entries_blocked_missing_receipt(&self) -> u64 {
+        self.entries_blocked_missing_receipt
+    }
+
+    #[must_use]
+    pub fn entries_blocked_stale_receipt(&self) -> u64 {
+        self.entries_blocked_stale_receipt
     }
 
     /// Number of pending entries not yet drained.
@@ -712,6 +1026,7 @@ fn suspect_to_object_key(entry: &SuspectEntry) -> tidefs_types_reclaim_queue_cor
 mod tests {
     use super::*;
     use tidefs_local_object_store::SuspectEntry;
+    use tidefs_replication_model::PlacementReceiptRef;
 
     fn make_entry(locator_id: u64, record_type: u8) -> SuspectEntry {
         SuspectEntry {
@@ -728,6 +1043,52 @@ mod tests {
             commit_group: 1,
             timestamp_secs: 1,
         }
+    }
+
+    fn receipt_for_entry(entry: &SuspectEntry) -> PlacementReceiptRef {
+        let mut object_key = [0u8; 32];
+        object_key[..8].copy_from_slice(&entry.locator_id.to_le_bytes());
+        PlacementReceiptRef::replicated(
+            entry.locator_id,
+            object_key,
+            Default::default(),
+            entry.commit_group.max(1),
+            2,
+            4096,
+            entry.expected_hash,
+        )
+    }
+
+    fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
+        RepairAdmissionInput::with_receipt(entry, receipt_for_entry(&entry))
+    }
+
+    fn inputs_with_receipts(entries: &[SuspectEntry]) -> Vec<RepairAdmissionInput> {
+        entries.iter().copied().map(input_with_receipt).collect()
+    }
+
+    fn evidence_for_entry(entry: &SuspectEntry) -> RepairEvidence {
+        RepairEvidence::from_placement_receipt(entry, receipt_for_entry(entry))
+            .expect("test receipt should be admissible")
+    }
+
+    fn make_job(entry: SuspectEntry, replicas_remaining: u32) -> RepairJob {
+        RepairJob::new(entry, evidence_for_entry(&entry), replicas_remaining)
+    }
+
+    fn ingest_receipt_backed(
+        bridge: &mut ScrubToRepairBridge,
+        entries: &[SuspectEntry],
+        replicas_remaining: u32,
+    ) -> Vec<RepairAdmission> {
+        bridge.ingest_with_evidence(&inputs_with_receipts(entries), replicas_remaining)
+    }
+
+    fn generate_rebake_receipt_backed(
+        bridge: &mut RebakeSchedulingBridge,
+        entries: &[SuspectEntry],
+    ) -> Vec<ReclaimQueueEntry> {
+        bridge.generate_rebake_entries_with_evidence(&inputs_with_receipts(entries))
     }
 
     // ── RepairEscalation ──────────────────────────────────────────
@@ -869,7 +1230,7 @@ mod tests {
     #[test]
     fn repair_job_new_classifies_normal() {
         let entry = make_entry(10, 1);
-        let job = RepairJob::new(entry, 3);
+        let job = make_job(entry, 3);
         assert_eq!(job.escalation, RepairEscalation::Normal);
         assert_eq!(job.failed_attempts, 0);
         assert!(job.can_retry());
@@ -878,7 +1239,7 @@ mod tests {
     #[test]
     fn repair_job_record_failure_escalates() {
         let entry = make_entry(11, 1);
-        let mut job = RepairJob::new(entry, 3);
+        let mut job = make_job(entry, 3);
         job.record_failure();
         assert_eq!(job.failed_attempts, 1);
         assert_eq!(job.escalation, RepairEscalation::Normal);
@@ -897,7 +1258,7 @@ mod tests {
     #[test]
     fn repair_job_exhausted_after_max_attempts() {
         let entry = make_entry(12, 1);
-        let mut job = RepairJob::new(entry, 3);
+        let mut job = make_job(entry, 3);
         for _ in 0..3 {
             job.record_failure();
         }
@@ -907,7 +1268,7 @@ mod tests {
     #[test]
     fn repair_job_service_priority() {
         let entry = make_entry(13, 1);
-        let mut job = RepairJob::new(entry, 3);
+        let mut job = make_job(entry, 3);
         assert_eq!(job.service_priority(), ServicePriority::Throughput);
         job.record_failure(); // 1
         job.record_failure(); // 2 → Urgent
@@ -924,7 +1285,7 @@ mod tests {
             make_entry(2, 2), // chain break → Background
             make_entry(3, 1),
         ];
-        bridge.ingest(&entries, 3);
+        ingest_receipt_backed(&mut bridge, &entries, 3);
         assert_eq!(bridge.pending_count(), 3);
         assert_eq!(bridge.stats().entries_ingested, 3);
 
@@ -944,9 +1305,94 @@ mod tests {
     }
 
     #[test]
+    fn bridge_rejects_missing_receipt_evidence() {
+        let mut bridge = ScrubToRepairBridge::new();
+        let entry = make_entry(101, 1);
+
+        let admissions = bridge.ingest(&[entry], 3);
+
+        assert_eq!(
+            admissions,
+            vec![RepairAdmission::Blocked {
+                locator_id: 101,
+                reason: RepairEvidenceRejection::MissingReceipt,
+            }]
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.stats().entries_ingested, 0);
+        assert_eq!(bridge.stats().entries_blocked_missing_receipt, 1);
+        assert_eq!(bridge.stats().entries_blocked_by_evidence(), 1);
+    }
+
+    #[test]
+    fn bridge_rejects_stale_receipt_evidence() {
+        let mut bridge = ScrubToRepairBridge::new();
+        let entry = make_entry(102, 1);
+        let stale = receipt_for_entry(&make_entry(999, 1));
+        let input = RepairAdmissionInput::with_receipt(entry, stale);
+
+        let admissions = bridge.ingest_with_evidence(&[input], 3);
+
+        assert_eq!(
+            admissions,
+            vec![RepairAdmission::Blocked {
+                locator_id: 102,
+                reason: RepairEvidenceRejection::StaleReceipt,
+            }]
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.stats().entries_blocked_stale_receipt, 1);
+    }
+
+    #[test]
+    fn bridge_degraded_read_with_receipt_admits_immediate_job() {
+        let mut bridge = ScrubToRepairBridge::new();
+        let entry = make_entry(103, 1);
+        let input = input_with_receipt(entry).with_degraded_read();
+
+        let admissions = bridge.ingest_with_evidence(&[input], 3);
+
+        assert_eq!(
+            admissions,
+            vec![RepairAdmission::Admitted {
+                locator_id: 103,
+                evidence_class: RepairEvidenceClass::PlacementReceipt,
+            }]
+        );
+        let jobs = bridge.jobs_at_level(RepairEscalation::Immediate);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].evidence.class,
+            RepairEvidenceClass::PlacementReceipt
+        );
+        assert!(jobs[0].degraded_read_active);
+    }
+
+    #[test]
+    fn retry_escalation_preserves_receipt_evidence_identity() {
+        let mut bridge = ScrubToRepairBridge::new();
+        let entry = make_entry(104, 1);
+        let input = input_with_receipt(entry);
+
+        bridge.ingest_with_evidence(&[input], 3);
+        let original_evidence = bridge.prioritized_jobs()[0].evidence;
+
+        bridge.mark_failed(104);
+        bridge.mark_failed(104);
+
+        let jobs = bridge.jobs_at_level(RepairEscalation::Urgent);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].evidence, original_evidence);
+        assert_eq!(
+            jobs[0].evidence.placement_receipt_ref,
+            input.placement_receipt_ref.expect("receipt")
+        );
+    }
+
+    #[test]
     fn bridge_mark_repaired_removes_job() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(50, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(50, 1)], 3);
         assert_eq!(bridge.pending_count(), 1);
         bridge.mark_repaired(50);
         assert_eq!(bridge.pending_count(), 0);
@@ -956,7 +1402,7 @@ mod tests {
     #[test]
     fn bridge_mark_failed_escalates_and_may_exhaust() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(60, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(60, 1)], 3);
         // 2 failures → Urgent, still pending
         bridge.mark_failed(60);
         bridge.mark_failed(60);
@@ -970,7 +1416,8 @@ mod tests {
     #[test]
     fn bridge_jobs_at_level_filters() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(
+        ingest_receipt_backed(
+            &mut bridge,
             &[
                 make_entry(1, 1), // normal
                 make_entry(2, 2), // background
@@ -1002,9 +1449,20 @@ mod tests {
             make_entry(100, 1), // payload mismatch → rebake
             make_entry(200, 1), // payload mismatch → rebake
         ];
-        let generated = bridge.generate_rebake_entries(&entries);
+        let generated = generate_rebake_receipt_backed(&mut bridge, &entries);
         assert_eq!(generated.len(), 2);
         assert_eq!(bridge.entries_generated(), 2);
+    }
+
+    #[test]
+    fn rebake_rejects_receiptless_payload_corruption() {
+        let mut bridge = RebakeSchedulingBridge::new();
+        let generated = bridge.generate_rebake_entries(&[make_entry(301, 1)]);
+
+        assert!(generated.is_empty());
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.entries_generated(), 0);
+        assert_eq!(bridge.entries_blocked_missing_receipt(), 1);
     }
 
     #[test]
@@ -1015,14 +1473,14 @@ mod tests {
             make_entry(200, 2), // chain break → skipped
             make_entry(300, 3), // truncated → included
         ];
-        let generated = bridge.generate_rebake_entries(&entries);
+        let generated = generate_rebake_receipt_backed(&mut bridge, &entries);
         assert_eq!(generated.len(), 2);
     }
 
     #[test]
     fn rebake_drain_clears_pending() {
         let mut bridge = RebakeSchedulingBridge::new();
-        bridge.generate_rebake_entries(&[make_entry(100, 1)]);
+        generate_rebake_receipt_backed(&mut bridge, &[make_entry(100, 1)]);
         assert!(bridge.has_pending());
         let drained = bridge.drain_pending();
         assert_eq!(drained.len(), 1);
@@ -1032,14 +1490,14 @@ mod tests {
     #[test]
     fn rebake_entries_have_correct_family() {
         let mut bridge = RebakeSchedulingBridge::new();
-        let generated = bridge.generate_rebake_entries(&[make_entry(42, 1)]);
+        let generated = generate_rebake_receipt_backed(&mut bridge, &[make_entry(42, 1)]);
         assert_eq!(generated[0].family, QueueFamily::Rebake);
     }
 
     #[test]
     fn rebake_empty_input_produces_nothing() {
         let mut bridge = RebakeSchedulingBridge::new();
-        let generated = bridge.generate_rebake_entries(&[]);
+        let generated = generate_rebake_receipt_backed(&mut bridge, &[]);
         assert!(generated.is_empty());
         assert_eq!(bridge.entries_generated(), 0);
     }
@@ -1073,7 +1531,7 @@ mod tests {
             make_entry(20, 2), // chain break → background
             make_entry(30, 1), // payload corruption
         ];
-        bridge.ingest(&findings, 3);
+        ingest_receipt_backed(&mut bridge, &findings, 3);
 
         assert_eq!(bridge.pending_count(), 3);
         let stats = bridge.stats();
@@ -1092,7 +1550,7 @@ mod tests {
     #[test]
     fn failed_repair_escalates_in_bridge() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(100, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(100, 1)], 3);
 
         // Mark failed twice → Urgent.
         bridge.mark_failed(100);
@@ -1112,7 +1570,7 @@ mod tests {
     #[test]
     fn successful_repair_removes_job_from_bridge() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(200, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(200, 1)], 3);
         assert_eq!(bridge.pending_count(), 1);
 
         bridge.mark_repaired(200);
@@ -1125,9 +1583,9 @@ mod tests {
         let mut bridge = ScrubToRepairBridge::new();
 
         // Ingest 3 entries, one with degraded read active.
-        bridge.ingest(&[make_entry(1, 1)], 3); // Normal
-        bridge.ingest(&[make_entry(2, 1)], 3); // Normal
-        bridge.ingest(&[make_entry(3, 2)], 3); // Background (chain break)
+        ingest_receipt_backed(&mut bridge, &[make_entry(1, 1)], 3); // Normal
+        ingest_receipt_backed(&mut bridge, &[make_entry(2, 1)], 3); // Normal
+        ingest_receipt_backed(&mut bridge, &[make_entry(3, 2)], 3); // Background (chain break)
 
         // Manually mark entry 3 as degraded-read-active via escalation classify.
         // Ingest would auto-classify, so let's test directly.
@@ -1147,7 +1605,7 @@ mod tests {
             make_entry(4, 3), // truncated → included
         ];
 
-        let entries = rebake.generate_rebake_entries(&findings);
+        let entries = generate_rebake_receipt_backed(&mut rebake, &findings);
         assert_eq!(entries.len(), 3); // chain break skipped
 
         // All should have Rebake family.
@@ -1166,7 +1624,7 @@ mod tests {
     #[test]
     fn repair_job_escalation_monotonic() {
         let entry = make_entry(42, 1);
-        let mut job = RepairJob::new(entry, 3);
+        let mut job = make_job(entry, 3);
         assert_eq!(job.escalation, RepairEscalation::Normal);
 
         job.record_failure(); // 1 failure: still Normal (threshold is 2→Urgent, 3→Immediate)
@@ -1186,7 +1644,7 @@ mod tests {
         // Verify that the bridge can produce jobs compatible with the
         // rebuild planner's LossEventClass::CorruptionDetected priority.
         let entry = make_entry(500, 1);
-        let job = RepairJob::new(entry, 1); // 1 replica → Urgent
+        let job = make_job(entry, 1); // 1 replica → Urgent
         assert_eq!(job.escalation, RepairEscalation::Urgent);
         assert_eq!(job.service_priority(), ServicePriority::Critical);
         // Urgent jobs may_preempt, so rebuild can prioritize them.
@@ -1198,7 +1656,7 @@ mod tests {
     #[test]
     fn mark_repaired_twice_is_idempotent() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(1, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(1, 1)], 3);
         assert_eq!(bridge.pending_count(), 1);
         assert_eq!(bridge.stats().entries_ingested, 1);
 
@@ -1219,7 +1677,7 @@ mod tests {
     #[test]
     fn mark_failed_twice_is_idempotent() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(2, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(2, 1)], 3);
 
         // 3 failures exhausts the job (max_attempts=3).
         bridge.mark_failed(2);
@@ -1237,12 +1695,12 @@ mod tests {
     #[test]
     fn ingest_skips_already_repaired_entry() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(3, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(3, 1)], 3);
         bridge.mark_repaired(3);
         assert_eq!(bridge.pending_count(), 0);
 
         // Re-ingest same entry after repair: skipped.
-        bridge.ingest(&[make_entry(3, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(3, 1)], 3);
         assert_eq!(bridge.pending_count(), 0);
         assert_eq!(bridge.stats().entries_ingested, 1); // original only
         assert!(bridge.stats().idempotent_noops >= 1);
@@ -1251,14 +1709,14 @@ mod tests {
     #[test]
     fn ingest_skips_already_exhausted_entry() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(4, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(4, 1)], 3);
         for _ in 0..3 {
             bridge.mark_failed(4);
         }
         assert_eq!(bridge.pending_count(), 0);
 
         // Re-ingest same entry after exhaustion: skipped.
-        bridge.ingest(&[make_entry(4, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(4, 1)], 3);
         assert_eq!(bridge.pending_count(), 0);
         assert_eq!(bridge.stats().entries_ingested, 1); // original only
         assert!(bridge.stats().idempotent_noops >= 1);
@@ -1267,11 +1725,11 @@ mod tests {
     #[test]
     fn repeated_ingest_of_same_entry_escalates_not_duplicates() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(5, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(5, 1)], 3);
         assert_eq!(bridge.pending_count(), 1);
 
         // First re-ingest: failed_attempts == 0, so no escalation (idempotent).
-        bridge.ingest(&[make_entry(5, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(5, 1)], 3);
         assert_eq!(bridge.pending_count(), 1); // not duplicated
 
         // Mark failed once to set failed_attempts = 1.
@@ -1279,7 +1737,7 @@ mod tests {
         assert_eq!(bridge.pending_count(), 1); // still present, not exhausted
 
         // Re-ingest with failed_attempts > 0: escalates to failed_attempts=2 → Urgent.
-        bridge.ingest(&[make_entry(5, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(5, 1)], 3);
         let jobs = bridge.jobs_at_level(RepairEscalation::Urgent);
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].escalation, RepairEscalation::Urgent);
@@ -1288,7 +1746,7 @@ mod tests {
     #[test]
     fn audit_trace_records_mark_repaired_operations() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(6, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(6, 1)], 3);
         bridge.mark_repaired(6);
         bridge.mark_repaired(6); // no-op
 
@@ -1304,7 +1762,7 @@ mod tests {
     #[test]
     fn audit_trace_records_mark_failed_operations() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(7, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(7, 1)], 3);
 
         bridge.mark_failed(7); // escalated (1)
         bridge.mark_failed(7); // escalated (2)
@@ -1323,14 +1781,14 @@ mod tests {
     #[test]
     fn idempotent_stats_increment_on_duplicate_operations() {
         let mut bridge = ScrubToRepairBridge::new();
-        bridge.ingest(&[make_entry(8, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(8, 1)], 3);
         bridge.mark_repaired(8);
         bridge.mark_repaired(8); // no-op
         let noops_after_repaired = bridge.stats().idempotent_noops;
         assert_eq!(noops_after_repaired, 1);
 
         // Ingest another entry, exhaust it, then no-op.
-        bridge.ingest(&[make_entry(9, 1)], 3);
+        ingest_receipt_backed(&mut bridge, &[make_entry(9, 1)], 3);
         for _ in 0..3 {
             bridge.mark_failed(9);
         }
@@ -1345,12 +1803,12 @@ mod tests {
         let mut bridge = RebakeSchedulingBridge::new();
         let entries = vec![make_entry(100, 1), make_entry(200, 1)];
 
-        let first = bridge.generate_rebake_entries(&entries);
+        let first = generate_rebake_receipt_backed(&mut bridge, &entries);
         assert_eq!(first.len(), 2);
         assert_eq!(bridge.entries_generated(), 2);
 
         // Second call with same entries: no duplicates.
-        let second = bridge.generate_rebake_entries(&entries);
+        let second = generate_rebake_receipt_backed(&mut bridge, &entries);
         assert!(second.is_empty());
         assert_eq!(bridge.entries_generated(), 2); // not double-counted
     }
@@ -1361,12 +1819,12 @@ mod tests {
         let batch1 = vec![make_entry(100, 1), make_entry(200, 3)];
         let batch2 = vec![make_entry(100, 1), make_entry(300, 1)];
 
-        let first = bridge.generate_rebake_entries(&batch1);
+        let first = generate_rebake_receipt_backed(&mut bridge, &batch1);
         assert_eq!(first.len(), 2);
         assert_eq!(bridge.entries_generated(), 2);
 
         // batch2 overlaps on entry 100 → only entry 300 is new.
-        let second = bridge.generate_rebake_entries(&batch2);
+        let second = generate_rebake_receipt_backed(&mut bridge, &batch2);
         assert_eq!(second.len(), 1);
         assert_eq!(bridge.entries_generated(), 3);
     }
@@ -1378,24 +1836,24 @@ mod tests {
             make_entry(1, 2), // chain break → skipped
             make_entry(2, 1), // payload → included
         ];
-        let generated = bridge.generate_rebake_entries(&entries);
+        let generated = generate_rebake_receipt_backed(&mut bridge, &entries);
         assert_eq!(generated.len(), 1);
 
         // Second call: chain break still skipped, payload already generated → skipped.
-        let second = bridge.generate_rebake_entries(&entries);
+        let second = generate_rebake_receipt_backed(&mut bridge, &entries);
         assert!(second.is_empty());
     }
 
     #[test]
     fn rebake_drain_then_regenerate_emits_fresh_entries() {
         let mut bridge = RebakeSchedulingBridge::new();
-        bridge.generate_rebake_entries(&[make_entry(1, 1)]);
+        generate_rebake_receipt_backed(&mut bridge, &[make_entry(1, 1)]);
         let drained = bridge.drain_pending();
         assert_eq!(drained.len(), 1);
         assert!(!bridge.has_pending());
 
         // Re-generating same entry: no duplicates (idempotent).
-        let second = bridge.generate_rebake_entries(&[make_entry(1, 1)]);
+        let second = generate_rebake_receipt_backed(&mut bridge, &[make_entry(1, 1)]);
         assert!(second.is_empty());
     }
 }

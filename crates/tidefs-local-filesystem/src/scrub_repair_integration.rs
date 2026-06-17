@@ -100,9 +100,9 @@ pub fn run_scrub_repair_pass(report: &ScrubReport) -> ScrubRepairLedger {
 
 /// Result of the scrub-to-repair scheduling pipeline.
 ///
-/// Contains the populated [`ScrubToRepairBridge`] with prioritized repair
-/// jobs, the [`RebakeSchedulingBridge`] with EC parity recomputation
-/// entries, and the raw suspect entries for audit/replay.
+/// Contains the [`ScrubToRepairBridge`] admission state, the
+/// [`RebakeSchedulingBridge`] admission state, and the raw suspect entries
+/// for audit/replay.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct ScrubRepairSchedule {
@@ -119,13 +119,11 @@ pub struct ScrubRepairSchedule {
 /// scheduling bridge.
 ///
 /// Converts every [`ScrubViolation`] in the report into a [`SuspectEntry`],
-/// ingests them into a [`ScrubToRepairBridge`] with priority/escalation
-/// classification, and generates reclaim-queue rebake entries for payload-
-/// corruption findings that require EC parity recomputation.
-///
-/// In single-copy local-filesystem mode (`replicas_remaining == 0`), all
-/// payload corruption is immediately escalated to
-/// [`RepairEscalation::Immediate`] since no healthy replica exists.
+/// classifies them through a [`ScrubToRepairBridge`], and attempts rebake
+/// admission for payload-corruption findings that require EC parity
+/// recomputation. Current local-filesystem scrub reports do not carry
+/// placement receipts, so these findings are counted as blocked evidence
+/// rather than queued repair work.
 #[must_use]
 #[allow(dead_code)]
 pub fn run_scrub_repair_scheduling(report: &ScrubReport) -> ScrubRepairSchedule {
@@ -434,7 +432,7 @@ mod tests {
     // ── run_scrub_repair_scheduling tests ──────────────────────────
 
     #[test]
-    fn scheduling_bridge_populated_from_corrupt_report() {
+    fn scheduling_bridge_blocks_receiptless_corrupt_report() {
         let mut report = ScrubReport::empty();
         report.blocks_corrupt = 1;
         report.violations.push(ScrubViolation {
@@ -452,9 +450,10 @@ mod tests {
 
         let schedule = run_scrub_repair_scheduling(&report);
 
-        // Bridge has work from the corrupt violation.
-        assert!(schedule.bridge.has_work());
-        assert_eq!(schedule.bridge.pending_count(), 1);
+        // Receiptless scrub findings are blocked rather than scheduled.
+        assert!(!schedule.bridge.has_work());
+        assert_eq!(schedule.bridge.pending_count(), 0);
+        assert_eq!(schedule.bridge.stats().entries_blocked_missing_receipt, 1);
 
         // Suspect entries are populated.
         assert_eq!(schedule.suspect_entries.len(), 1);
@@ -464,6 +463,7 @@ mod tests {
 
         // Single-copy mode: no rebake entries.
         assert_eq!(schedule.rebake.entries_generated(), 0);
+        assert_eq!(schedule.rebake.entries_blocked_missing_receipt(), 1);
     }
 
     #[test]
@@ -477,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduling_bridge_prioritizes_immediate_in_single_copy() {
+    fn scheduling_bridge_blocks_receiptless_single_copy_findings() {
         let mut report = ScrubReport::empty();
         report.blocks_corrupt = 2;
         report.violations.push(ScrubViolation {
@@ -504,14 +504,9 @@ mod tests {
 
         let schedule = run_scrub_repair_scheduling(&report);
 
-        // In single-copy mode (replicas_remaining=0), both are Immediate.
-        let jobs = schedule.bridge.prioritized_jobs();
-        assert_eq!(jobs.len(), 2);
-
-        use tidefs_scrub::repair_scheduling::RepairEscalation;
-        assert!(jobs
-            .iter()
-            .all(|j| j.escalation == RepairEscalation::Immediate));
+        assert_eq!(schedule.bridge.prioritized_jobs().len(), 0);
+        assert_eq!(schedule.bridge.stats().entries_blocked_missing_receipt, 2);
+        assert_eq!(schedule.rebake.entries_blocked_missing_receipt(), 2);
     }
 
     // ── convert_violations_to_suspect_entries tests ─────────────────
@@ -603,8 +598,23 @@ mod tests {
             timestamp_secs: 0,
         };
 
-        use tidefs_scrub::repair_scheduling::RepairJob;
-        let job = RepairJob::new(suspect, 0);
+        use tidefs_replication_model::PlacementReceiptRef;
+        use tidefs_scrub::repair_scheduling::{RepairEvidence, RepairJob};
+
+        let mut object_key = [0u8; 32];
+        object_key[..8].copy_from_slice(&suspect.locator_id.to_le_bytes());
+        let receipt = PlacementReceiptRef::replicated(
+            suspect.locator_id,
+            object_key,
+            Default::default(),
+            suspect.commit_group.max(1),
+            2,
+            4096,
+            suspect.expected_hash,
+        );
+        let evidence = RepairEvidence::from_placement_receipt(&suspect, receipt)
+            .expect("test receipt should admit repair job");
+        let job = RepairJob::new(suspect, evidence, 0);
 
         let violation = repair_job_to_violation(&job);
         assert_eq!(violation.block_id.inode_id, 77);

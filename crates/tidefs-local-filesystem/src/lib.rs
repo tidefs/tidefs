@@ -89,8 +89,9 @@
 //!    `repair_cycle()` (scrub → schedule → dispatch) against the live
 //!    store, and clears the flag.
 //! 3. `repair_cycle()` delegates to `schedule_scrub_repairs()` +
-//!    `dispatch_scheduled_repairs()`, which classify violations into
-//!    prioritized repair jobs and apply them without an fsck model.
+//!    `dispatch_scheduled_repairs()`, which classify violations through
+//!    receipt-gated repair admission. Receiptless runtime scrub rows are
+//!    reported as blocked evidence rather than synthesized repair jobs.
 //!
 //! # Features
 //!
@@ -1445,9 +1446,9 @@ pub struct LocalFileSystem {
     /// saved after mutation.
     pool_properties: PropertySet,
     background_scheduler: Option<BackgroundSchedulerRuntime>,
-    /// Populated by `schedule_scrub_repairs()` with prioritized repair jobs
-    /// from the scrub-to-repair scheduling bridge. Consumed by
-    /// `dispatch_scheduled_repairs()` to apply repairs in priority order.
+    /// Populated by `schedule_scrub_repairs()` with receipt-gated repair
+    /// admission state. Consumed by `dispatch_scheduled_repairs()` to apply
+    /// admitted repairs in priority order when receipt evidence is present.
     scrub_repair_schedule: Option<crate::scrub_repair_integration::ScrubRepairSchedule>,
     /// Shared flag set by the background scrubber when corruption is detected
     /// on-disk.  Consumed by [`tick_background_services`] Duty 3 to trigger
@@ -4163,8 +4164,9 @@ impl LocalFileSystem {
     /// Run a full scrub-repair-re-scrub cycle on all inodes.
     ///
     /// Returns the repair log with actual outcomes applied.
-    /// On mount, this ensures any corruption detected by a previous
-    /// background scrub is healed before user I/O begins.
+    /// On mount, this classifies any corruption detected by a previous
+    /// background scrub and dispatches only receipt-backed repair work before
+    /// user I/O begins.
     pub fn repair_cycle(&mut self) -> Result<RepairLog> {
         use crate::crash_hooks::check_crash_hook;
         use tidefs_local_object_store::CrashInjectionPoint;
@@ -4184,12 +4186,12 @@ impl LocalFileSystem {
     /// Run a scrub pass and populate the repair scheduling bridge.
     ///
     /// Scrubs all inode content, records corruption validation into a BLAKE3-verified
-    /// [`ScrubRepairLedger`], and populates the [`ScrubToRepairBridge`] with
-    /// prioritized repair jobs via [`run_scrub_repair_scheduling`].
+    /// [`ScrubRepairLedger`], and classifies findings through receipt-gated
+    /// repair and rebake admission via [`run_scrub_repair_scheduling`].
     ///
-    /// The scheduling bridge classifies findings by escalation level (Immediate
-    /// for zero-replica corruption, Urgent/Normal/Background for multi-replica)
-    /// and generates rebake entries for EC parity recomputation.
+    /// Current runtime scrub rows do not carry placement receipts, so scheduling
+    /// records blocked evidence counters instead of claiming a dispatchable
+    /// repair source set.
     ///
     /// Returns the validation ledger. The scheduling bridge is stored on `self`
     /// and consumed by [`dispatch_scheduled_repairs`](Self::dispatch_scheduled_repairs).
@@ -4202,7 +4204,7 @@ impl LocalFileSystem {
         let report =
             crate::scrub::scrub_inodes_content(self.store.raw_primary_store(), &self.state.inodes)?;
 
-        // Populate the scheduling bridge with prioritized repair jobs.
+        // Populate the scheduling bridge with receipt-gated admission state.
         let schedule = crate::scrub_repair_integration::run_scrub_repair_scheduling(&report);
         self.scrub_repair_schedule = Some(schedule);
 
@@ -4249,15 +4251,32 @@ impl LocalFileSystem {
             None => return RepairLog::new(),
         };
 
-        if !schedule.bridge.has_work() {
+        let repair_blocked_missing = schedule.bridge.stats().entries_blocked_missing_receipt;
+        let repair_blocked_stale = schedule.bridge.stats().entries_blocked_stale_receipt;
+        let rebake_blocked_missing = schedule.rebake.entries_blocked_missing_receipt();
+        let rebake_blocked_stale = schedule.rebake.entries_blocked_stale_receipt();
+        let has_blocked_evidence = repair_blocked_missing != 0
+            || repair_blocked_stale != 0
+            || rebake_blocked_missing != 0
+            || rebake_blocked_stale != 0;
+
+        if !schedule.bridge.has_work() && !has_blocked_evidence {
             return RepairLog::new();
         }
 
         eprintln!(
-            "repair-dispatch: {} pending repair jobs, {} rebake entries",
+            "repair-dispatch: {} pending repair jobs, {} rebake entries, repair evidence blocked missing={} stale={}, rebake evidence blocked missing={} stale={}",
             schedule.bridge.pending_count(),
             schedule.rebake.entries_generated(),
+            repair_blocked_missing,
+            repair_blocked_stale,
+            rebake_blocked_missing,
+            rebake_blocked_stale,
         );
+
+        if !schedule.bridge.has_work() {
+            return RepairLog::new();
+        }
 
         check_crash_hook(CrashInjectionPoint::RepairBeforeWriteback);
 

@@ -246,9 +246,10 @@ impl ScrubService {
     /// prioritized repair dispatch.
     ///
     /// Entries remain in the durable log (with `repair_attempts` incremented)
-    /// so a crash after dispatch cannot lose corruption records. The bridge
-    /// deduplicates re-ingested entries by locator_id. Call this at the end
-    /// of a scrub cycle before the scheduler dispatches repair work.
+    /// so a crash after classification cannot lose corruption records. Raw
+    /// suspect-log entries do not carry placement receipts, so the bridge
+    /// classifies them as blocked evidence unless a caller uses a receipt-
+    /// bearing scheduling path.
     ///
     /// `replicas_remaining` is the number of healthy replicas known to exist
     /// for each entry's data (3 = multi-replica, 1 = single-copy, 0 = last-copy
@@ -257,9 +258,9 @@ impl ScrubService {
         &mut self,
         bridge: &mut repair_scheduling::ScrubToRepairBridge,
         replicas_remaining: u32,
-    ) {
+    ) -> Vec<repair_scheduling::RepairAdmission> {
         let entries = self.drain_suspect_log();
-        bridge.ingest(&entries, replicas_remaining);
+        bridge.ingest(&entries, replicas_remaining)
     }
 
     /// Persist the current suspect log to durable storage.
