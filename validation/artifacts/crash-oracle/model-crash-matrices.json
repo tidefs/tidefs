@@ -388,6 +388,88 @@
       ]
     }
   ],
+  "injection_matrices": [
+    {
+      "id": "local.vfs.crash_injection_matrix.v1",
+      "claim_ids": [
+        "local.vfs.write_fsync_crash.v1",
+        "storage.write_fsync.crash_safety.v1"
+      ],
+      "description": "Local VFS crash injection matrix for the write/fsync path. Defines crash injection              points, expected recovery outcomes, and evidence-class requirements for the vertical              write-fsync-read-recover slice.",
+      "injection_points": [
+        {
+          "id": "vfs.after_write.before_fsync",
+          "injection_point": "after-write-before-fsync",
+          "operation": "write",
+          "classification": "lost-unfsynced",
+          "expected_outcome": "Data written but not fsynced: after recovery, data may be absent                      (lost-unfsynced is allowed). Data must not be torn or partially present.",
+          "data_correct_required": false,
+          "data_absent_allowed": true,
+          "data_torn_forbidden": true,
+          "metadata_consistent_required": true,
+          "evidence_class": "T2",
+          "has_runtime_evidence": false,
+          "blocked_reason": "runtime crash evidence for local VFS write path requires issue #486                      write-fsync-read-recover vertical slice completion"
+        },
+        {
+          "id": "vfs.after_fsync.before_unmount",
+          "injection_point": "after-fsync-before-unmount",
+          "operation": "fsync",
+          "classification": "valid",
+          "expected_outcome": "Data fsynced before unmount: after recovery, data must be present,                      correct, and metadata must be consistent.",
+          "data_correct_required": true,
+          "data_absent_allowed": false,
+          "data_torn_forbidden": true,
+          "metadata_consistent_required": true,
+          "evidence_class": "T2",
+          "has_runtime_evidence": false,
+          "blocked_reason": "runtime crash evidence for local VFS fsync path requires issue #486                      write-fsync-read-recover vertical slice completion"
+        },
+        {
+          "id": "vfs.during_fsync",
+          "injection_point": "during-fsync",
+          "operation": "fsync",
+          "classification": "lost-unfsynced",
+          "expected_outcome": "Crash during fsync: after recovery, data must not be torn. Data may                      be either fully present (fsync completed before crash) or absent                      (fsync did not complete). Metadata must be consistent.",
+          "data_correct_required": false,
+          "data_absent_allowed": true,
+          "data_torn_forbidden": true,
+          "metadata_consistent_required": true,
+          "evidence_class": "T2",
+          "has_runtime_evidence": false,
+          "blocked_reason": "runtime crash evidence for during-fsync requires issue #486                      write-fsync-read-recover vertical slice completion"
+        },
+        {
+          "id": "vfs.during_directory_update",
+          "injection_point": "during-directory-update",
+          "operation": "mkdir",
+          "classification": "lost-unfsynced",
+          "expected_outcome": "Crash during directory update: after recovery, the directory entry                      may be absent (lost-unfsynced) but must not leave the directory in                      an inconsistent state (no dangling entries, no half-created entries).                      Metadata must be internally consistent.",
+          "data_correct_required": false,
+          "data_absent_allowed": true,
+          "data_torn_forbidden": true,
+          "metadata_consistent_required": true,
+          "evidence_class": "T2",
+          "has_runtime_evidence": false,
+          "blocked_reason": "runtime crash evidence for directory update paths requires issue #486                      and issue #495 (rename atomicity) clearance"
+        },
+        {
+          "id": "vfs.during_inode_attribute_update",
+          "injection_point": "during-inode-attribute-update",
+          "operation": "setattr",
+          "classification": "lost-unfsynced",
+          "expected_outcome": "Crash during inode attribute update: after recovery, the attribute                      update may be absent (lost-unfsynced) but the inode must not have                      torn attributes (e.g., half-updated mtime with stale size). Metadata                      must be internally consistent.",
+          "data_correct_required": false,
+          "data_absent_allowed": true,
+          "data_torn_forbidden": true,
+          "metadata_consistent_required": true,
+          "evidence_class": "T2",
+          "has_runtime_evidence": false,
+          "blocked_reason": "runtime crash evidence for attribute update paths requires issue #486                      write-fsync-read-recover vertical slice completion"
+        }
+      ]
+    }
+  ],
   "runtime_claims": [
     {
       "claim_id": "local.vfs.write_fsync_crash.v1",

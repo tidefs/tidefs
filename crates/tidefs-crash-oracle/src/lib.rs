@@ -32,6 +32,7 @@ pub const LOCAL_VFS_RENAME_CLAIM_ID: &str = "local.vfs.rename_atomic_crash.v1";
 pub const CACHE_DIRTY_CRASH_MATRIX_ID: &str = "cache.dirty_page_crash_matrix.v1";
 pub const CACHE_COHERENCY_CLAIM_ID: &str = "cache.coherency.crash_safety.v1";
 pub const CACHE_WRITEBACK_CRASH_CLAIM_ID: &str = "cache.writeback.crash_safety.v1";
+pub const LOCAL_VFS_INJECTION_MATRIX_ID: &str = "local.vfs.crash_injection_matrix.v1";
 const ISSUE_286_ARTIFACT_PATH: &str = "validation/artifacts/crash-oracle/model-crash-matrices.json";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -99,13 +100,50 @@ impl CrashClassification {
     }
 }
 
+/// Crash injection points on the local filesystem write/fsync path.
+///
+/// These describe where in the runtime VFS adapter path a crash can be
+/// injected. They are distinct from [`CrashBoundary`], which describes
+/// model-level state-transition boundaries.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CrashInjectionPoint {
+    /// Crash after write syscall returns but before fsync is issued
+    AfterWriteBeforeFsync,
+    /// Crash after fsync completes but before unmount
+    AfterFsyncBeforeUnmount,
+    /// Crash during fsync execution (data may be partially durable)
+    DuringFsync,
+    /// Crash during a directory update (mkdir, rmdir, rename, link, unlink)
+    DuringDirectoryUpdate,
+    /// Crash during an inode attribute update (chmod, chown, utimes, etc.)
+    DuringInodeAttributeUpdate,
+}
+
+impl CrashInjectionPoint {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AfterWriteBeforeFsync => "after-write-before-fsync",
+            Self::AfterFsyncBeforeUnmount => "after-fsync-before-unmount",
+            Self::DuringFsync => "during-fsync",
+            Self::DuringDirectoryUpdate => "during-directory-update",
+            Self::DuringInodeAttributeUpdate => "during-inode-attribute-update",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CrashOracleReport {
     pub report_version: u64,
     pub generated_by: String,
     pub evidence_scope: String,
     pub runtime_claim_boundary: String,
+    /// Model-level crash matrices (write/fsync, rename)
     pub matrices: Vec<CrashMatrix>,
+    /// Local VFS crash injection matrices (runtime injection point definitions)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub injection_matrices: Vec<CrashInjectionMatrix>,
     pub runtime_claims: Vec<RuntimeClaimStatus>,
 }
 
@@ -116,12 +154,28 @@ impl CrashOracleReport {
     }
 
     #[must_use]
+    pub fn injection_case_count(&self) -> usize {
+        self.injection_matrices
+            .iter()
+            .map(|matrix| matrix.injection_points.len())
+            .sum()
+    }
+
+    #[must_use]
     pub fn classification_count(&self, classification: CrashClassification) -> usize {
-        self.matrices
+        let model_count = self
+            .matrices
             .iter()
             .flat_map(|matrix| &matrix.cases)
             .filter(|case| case.classification == classification)
-            .count()
+            .count();
+        let injection_count = self
+            .injection_matrices
+            .iter()
+            .flat_map(|matrix| &matrix.injection_points)
+            .filter(|case| case.classification == classification)
+            .count();
+        model_count + injection_count
     }
 
     pub fn validate(&self) -> Result<(), CrashOracleError> {
@@ -148,6 +202,36 @@ impl CrashOracleReport {
             return Err(CrashOracleError::Report(format!(
                 "missing {RENAME_MATRIX_ID}"
             )));
+        }
+
+        // Validate injection matrices if present
+        for matrix in &self.injection_matrices {
+            if matrix.injection_points.is_empty() {
+                return Err(CrashOracleError::Report(format!(
+                    "injection matrix {} has no injection points",
+                    matrix.id
+                )));
+            }
+            let mut injection_ids = std::collections::BTreeSet::new();
+            for case in &matrix.injection_points {
+                if case.id.is_empty() {
+                    return Err(CrashOracleError::Report(
+                        "injection point with empty id".to_string(),
+                    ));
+                }
+                if !injection_ids.insert(case.id.as_str()) {
+                    return Err(CrashOracleError::Report(format!(
+                        "duplicate injection point id {} in matrix {}",
+                        case.id, matrix.id
+                    )));
+                }
+                if case.evidence_class.is_empty() {
+                    return Err(CrashOracleError::Report(format!(
+                        "injection point {} has empty evidence_class",
+                        case.id
+                    )));
+                }
+            }
         }
 
         for case in self.matrices.iter().flat_map(|matrix| &matrix.cases) {
@@ -237,6 +321,56 @@ pub struct CrashTraceOp {
     pub boundary: Option<CrashBoundary>,
 }
 
+/// A single crash injection point definition for the local VFS path.
+///
+/// Each injection point defines where on the local filesystem write/fsync
+/// path a crash can be injected and what the expected recovery outcome is.
+/// These are definition-only entries; they do not contain runtime evidence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CrashInjectionCase {
+    /// Unique identifier, e.g. "vfs.after_write.before_fsync"
+    pub id: String,
+    /// Where on the VFS path the crash is injected
+    pub injection_point: CrashInjectionPoint,
+    /// The operation targeted (write, fsync, mkdir, chmod, etc.)
+    pub operation: String,
+    /// Expected recovery classification
+    pub classification: CrashClassification,
+    /// Human-readable description of expected behavior on recovery
+    pub expected_outcome: String,
+    /// Whether data must be present and correct after recovery
+    pub data_correct_required: bool,
+    /// Whether data may be absent after recovery (allowed for pre-fsync crashes)
+    pub data_absent_allowed: bool,
+    /// Whether torn/partial data after recovery is forbidden
+    pub data_torn_forbidden: bool,
+    /// Whether filesystem metadata must be internally consistent after recovery
+    pub metadata_consistent_required: bool,
+    /// Evidence tier requirement: T0 (model/definition), T1 (harness), T2 (runtime)
+    pub evidence_class: String,
+    /// Whether this injection point currently has runtime evidence collected
+    #[serde(default)]
+    pub has_runtime_evidence: bool,
+    /// Reason if blocked from runtime evidence collection
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+/// A local VFS crash injection matrix.
+///
+/// Defines the set of crash injection points on the local filesystem
+/// write/fsync path, their expected recovery outcomes, and evidence-class
+/// requirements. This is a definition artifact: it does not contain runtime
+/// crash evidence. Each injection point has a unique identifier suitable
+/// for later runtime artifact binding.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CrashInjectionMatrix {
+    pub id: String,
+    pub claim_ids: Vec<String>,
+    pub description: String,
+    pub injection_points: Vec<CrashInjectionCase>,
+}
+
 #[derive(Debug)]
 pub enum CrashOracleError {
     Io(std::io::Error),
@@ -312,9 +446,8 @@ fn cache_dirty_page_matrix() -> Result<CrashMatrix, CrashOracleError> {
             CACHE_WRITEBACK_CRASH_CLAIM_ID.to_string(),
         ],
         backend: MODEL_BACKEND.to_string(),
-        description:
-            "cache dirty-page crash matrix across writeback lifecycle boundaries"
-                .to_string(),
+        description: "cache dirty-page crash matrix across writeback lifecycle boundaries"
+            .to_string(),
         cases: vec![
             crash_case(
                 "cache.page_dirty_mark",
@@ -322,9 +455,11 @@ fn cache_dirty_page_matrix() -> Result<CrashMatrix, CrashOracleError> {
                 CrashBoundary::PageDirtyMark,
                 CrashClassification::LostUnfsynced,
                 &baseline,
-                vec![
-                    acceptable("initial-data", CrashClassification::LostUnfsynced, &baseline),
-                ],
+                vec![acceptable(
+                    "initial-data",
+                    CrashClassification::LostUnfsynced,
+                    &baseline,
+                )],
                 vec![],
                 None,
             ),
@@ -334,9 +469,11 @@ fn cache_dirty_page_matrix() -> Result<CrashMatrix, CrashOracleError> {
                 CrashBoundary::PageWritebackStart,
                 CrashClassification::LostUnfsynced,
                 &baseline,
-                vec![
-                    acceptable("initial-data", CrashClassification::LostUnfsynced, &baseline),
-                ],
+                vec![acceptable(
+                    "initial-data",
+                    CrashClassification::LostUnfsynced,
+                    &baseline,
+                )],
                 vec![],
                 None,
             ),
@@ -346,9 +483,11 @@ fn cache_dirty_page_matrix() -> Result<CrashMatrix, CrashOracleError> {
                 CrashBoundary::PageWritebackComplete,
                 CrashClassification::Valid,
                 &after_fsync,
-                vec![
-                    acceptable("durable-data", CrashClassification::Valid, &after_fsync),
-                ],
+                vec![acceptable(
+                    "durable-data",
+                    CrashClassification::Valid,
+                    &after_fsync,
+                )],
                 vec![],
                 None,
             ),
@@ -358,9 +497,11 @@ fn cache_dirty_page_matrix() -> Result<CrashMatrix, CrashOracleError> {
                 CrashBoundary::CacheEvict,
                 CrashClassification::Valid,
                 &baseline,
-                vec![
-                    acceptable("initial-data", CrashClassification::Valid, &baseline),
-                ],
+                vec![acceptable(
+                    "initial-data",
+                    CrashClassification::Valid,
+                    &baseline,
+                )],
                 vec![],
                 None,
             ),
@@ -378,6 +519,7 @@ pub fn run_model_crash_matrices() -> Result<CrashOracleReport, CrashOracleError>
             "local runtime write/fsync and rename claims stay planned/blocked until runtime evidence exists"
                 .to_string(),
         matrices: vec![write_fsync_matrix()?, rename_matrix()?, cache_dirty_page_matrix()?],
+        injection_matrices: vec![define_local_vfs_crash_injection_matrix()],
         runtime_claims: vec![
             RuntimeClaimStatus {
                 claim_id: LOCAL_VFS_WRITE_FSYNC_CLAIM_ID.to_string(),
@@ -417,6 +559,129 @@ pub fn write_model_crash_report(path: &Path) -> Result<CrashOracleReport, CrashO
     let json = serde_json::to_string_pretty(&report)?;
     fs::write(path, format!("{json}\n"))?;
     Ok(report)
+}
+
+/// Define the local VFS crash injection matrix for the write/fsync path.
+///
+/// This matrix enumerates the crash injection points on the local filesystem
+/// write/fsync path, their expected recovery outcomes, and evidence-class
+/// requirements. Each injection point has a unique identifier suitable for
+/// binding to runtime crash artifacts in later slices (e.g., issue #486).
+///
+/// This is a definition artifact: it does not contain or require runtime
+/// crash evidence.
+pub fn define_local_vfs_crash_injection_matrix() -> CrashInjectionMatrix {
+    CrashInjectionMatrix {
+        id: LOCAL_VFS_INJECTION_MATRIX_ID.to_string(),
+        claim_ids: vec![
+            LOCAL_VFS_WRITE_FSYNC_CLAIM_ID.to_string(),
+            STORAGE_WRITE_FSYNC_CLAIM_ID.to_string(),
+        ],
+        description:
+            "Local VFS crash injection matrix for the write/fsync path. Defines crash injection              points, expected recovery outcomes, and evidence-class requirements for the vertical              write-fsync-read-recover slice."
+                .to_string(),
+        injection_points: vec![
+            // --- write path injection points ---
+            CrashInjectionCase {
+                id: "vfs.after_write.before_fsync".to_string(),
+                injection_point: CrashInjectionPoint::AfterWriteBeforeFsync,
+                operation: "write".to_string(),
+                classification: CrashClassification::LostUnfsynced,
+                expected_outcome:
+                    "Data written but not fsynced: after recovery, data may be absent                      (lost-unfsynced is allowed). Data must not be torn or partially present."
+                        .to_string(),
+                data_correct_required: false,
+                data_absent_allowed: true,
+                data_torn_forbidden: true,
+                metadata_consistent_required: true,
+                evidence_class: "T2".to_string(),
+                has_runtime_evidence: false,
+                blocked_reason: Some(
+                    "runtime crash evidence for local VFS write path requires issue #486                      write-fsync-read-recover vertical slice completion"
+                        .to_string(),
+                ),
+            },
+            // --- fsync path injection points ---
+            CrashInjectionCase {
+                id: "vfs.after_fsync.before_unmount".to_string(),
+                injection_point: CrashInjectionPoint::AfterFsyncBeforeUnmount,
+                operation: "fsync".to_string(),
+                classification: CrashClassification::Valid,
+                expected_outcome:
+                    "Data fsynced before unmount: after recovery, data must be present,                      correct, and metadata must be consistent."
+                        .to_string(),
+                data_correct_required: true,
+                data_absent_allowed: false,
+                data_torn_forbidden: true,
+                metadata_consistent_required: true,
+                evidence_class: "T2".to_string(),
+                has_runtime_evidence: false,
+                blocked_reason: Some(
+                    "runtime crash evidence for local VFS fsync path requires issue #486                      write-fsync-read-recover vertical slice completion"
+                        .to_string(),
+                ),
+            },
+            CrashInjectionCase {
+                id: "vfs.during_fsync".to_string(),
+                injection_point: CrashInjectionPoint::DuringFsync,
+                operation: "fsync".to_string(),
+                classification: CrashClassification::LostUnfsynced,
+                expected_outcome:
+                    "Crash during fsync: after recovery, data must not be torn. Data may                      be either fully present (fsync completed before crash) or absent                      (fsync did not complete). Metadata must be consistent."
+                        .to_string(),
+                data_correct_required: false,
+                data_absent_allowed: true,
+                data_torn_forbidden: true,
+                metadata_consistent_required: true,
+                evidence_class: "T2".to_string(),
+                has_runtime_evidence: false,
+                blocked_reason: Some(
+                    "runtime crash evidence for during-fsync requires issue #486                      write-fsync-read-recover vertical slice completion"
+                        .to_string(),
+                ),
+            },
+            // --- directory update injection point ---
+            CrashInjectionCase {
+                id: "vfs.during_directory_update".to_string(),
+                injection_point: CrashInjectionPoint::DuringDirectoryUpdate,
+                operation: "mkdir".to_string(),
+                classification: CrashClassification::LostUnfsynced,
+                expected_outcome:
+                    "Crash during directory update: after recovery, the directory entry                      may be absent (lost-unfsynced) but must not leave the directory in                      an inconsistent state (no dangling entries, no half-created entries).                      Metadata must be internally consistent."
+                        .to_string(),
+                data_correct_required: false,
+                data_absent_allowed: true,
+                data_torn_forbidden: true,
+                metadata_consistent_required: true,
+                evidence_class: "T2".to_string(),
+                has_runtime_evidence: false,
+                blocked_reason: Some(
+                    "runtime crash evidence for directory update paths requires issue #486                      and issue #495 (rename atomicity) clearance"
+                        .to_string(),
+                ),
+            },
+            // --- inode attribute update injection point ---
+            CrashInjectionCase {
+                id: "vfs.during_inode_attribute_update".to_string(),
+                injection_point: CrashInjectionPoint::DuringInodeAttributeUpdate,
+                operation: "setattr".to_string(),
+                classification: CrashClassification::LostUnfsynced,
+                expected_outcome:
+                    "Crash during inode attribute update: after recovery, the attribute                      update may be absent (lost-unfsynced) but the inode must not have                      torn attributes (e.g., half-updated mtime with stale size). Metadata                      must be internally consistent."
+                        .to_string(),
+                data_correct_required: false,
+                data_absent_allowed: true,
+                data_torn_forbidden: true,
+                metadata_consistent_required: true,
+                evidence_class: "T2".to_string(),
+                has_runtime_evidence: false,
+                blocked_reason: Some(
+                    "runtime crash evidence for attribute update paths requires issue #486                      write-fsync-read-recover vertical slice completion"
+                        .to_string(),
+                ),
+            },
+        ],
+    }
 }
 
 fn write_fsync_matrix() -> Result<CrashMatrix, CrashOracleError> {
@@ -1320,8 +1585,7 @@ mod tests {
     fn cache_crash_claim_is_recorded() {
         let report = run_model_crash_matrices().expect("crash matrices");
         assert!(report.runtime_claims.iter().any(|c| {
-            c.claim_id == CACHE_COHERENCY_CLAIM_ID
-                && c.status == "proof-in-progress"
+            c.claim_id == CACHE_COHERENCY_CLAIM_ID && c.status == "proof-in-progress"
         }));
     }
 
@@ -1332,5 +1596,225 @@ mod tests {
         let decoded: CrashOracleReport = serde_json::from_str(&json).expect("decode report");
         decoded.validate().expect("valid decoded report");
         assert_eq!(decoded, report);
+    }
+
+    // --- Injection matrix tests ---
+
+    #[test]
+    fn injection_matrix_has_all_required_injection_points() {
+        let matrix = define_local_vfs_crash_injection_matrix();
+        assert_eq!(matrix.id, LOCAL_VFS_INJECTION_MATRIX_ID);
+        assert!(!matrix.injection_points.is_empty());
+
+        let ids: Vec<&str> = matrix
+            .injection_points
+            .iter()
+            .map(|case| case.id.as_str())
+            .collect();
+
+        assert!(
+            ids.contains(&"vfs.after_write.before_fsync"),
+            "missing after-write-before-fsync"
+        );
+        assert!(
+            ids.contains(&"vfs.after_fsync.before_unmount"),
+            "missing after-fsync-before-unmount"
+        );
+        assert!(ids.contains(&"vfs.during_fsync"), "missing during-fsync");
+        assert!(
+            ids.contains(&"vfs.during_directory_update"),
+            "missing during-directory-update"
+        );
+        assert!(
+            ids.contains(&"vfs.during_inode_attribute_update"),
+            "missing during-inode-attribute-update"
+        );
+    }
+
+    #[test]
+    fn injection_matrix_every_case_has_unique_id() {
+        let matrix = define_local_vfs_crash_injection_matrix();
+        let mut seen = std::collections::HashSet::new();
+        for case in &matrix.injection_points {
+            assert!(
+                seen.insert(&case.id),
+                "duplicate injection point id: {}",
+                case.id
+            );
+        }
+    }
+
+    #[test]
+    fn injection_matrix_every_case_has_non_empty_fields() {
+        let matrix = define_local_vfs_crash_injection_matrix();
+        for case in &matrix.injection_points {
+            assert!(!case.id.is_empty(), "empty id");
+            assert!(!case.operation.is_empty(), "{}: empty operation", case.id);
+            assert!(
+                !case.expected_outcome.is_empty(),
+                "{}: empty expected_outcome",
+                case.id
+            );
+            assert!(
+                !case.evidence_class.is_empty(),
+                "{}: empty evidence_class",
+                case.id
+            );
+        }
+    }
+
+    #[test]
+    fn injection_matrix_pre_fsync_crashes_allow_data_absent() {
+        let matrix = define_local_vfs_crash_injection_matrix();
+        // Pre-fsync injection points must allow data to be absent
+        let pre_fsync: Vec<&CrashInjectionCase> = matrix
+            .injection_points
+            .iter()
+            .filter(|case| {
+                matches!(
+                    case.injection_point,
+                    CrashInjectionPoint::AfterWriteBeforeFsync
+                        | CrashInjectionPoint::DuringFsync
+                        | CrashInjectionPoint::DuringDirectoryUpdate
+                        | CrashInjectionPoint::DuringInodeAttributeUpdate
+                )
+            })
+            .collect();
+        assert!(!pre_fsync.is_empty());
+        for case in &pre_fsync {
+            assert!(
+                case.data_absent_allowed,
+                "{}: pre-fsync crash must allow data absent",
+                case.id
+            );
+            assert!(
+                !case.data_correct_required,
+                "{}: pre-fsync crash must not require data correct",
+                case.id
+            );
+        }
+    }
+
+    #[test]
+    fn injection_matrix_all_cases_forbid_torn_data() {
+        let matrix = define_local_vfs_crash_injection_matrix();
+        for case in &matrix.injection_points {
+            assert!(
+                case.data_torn_forbidden,
+                "{}: torn data must be forbidden",
+                case.id
+            );
+        }
+    }
+
+    #[test]
+    fn injection_matrix_all_cases_require_metadata_consistent() {
+        let matrix = define_local_vfs_crash_injection_matrix();
+        for case in &matrix.injection_points {
+            assert!(
+                case.metadata_consistent_required,
+                "{}: metadata must be consistent",
+                case.id
+            );
+        }
+    }
+
+    #[test]
+    fn injection_matrix_post_fsync_crash_requires_data_correct() {
+        let matrix = define_local_vfs_crash_injection_matrix();
+        let post_fsync = matrix
+            .injection_points
+            .iter()
+            .find(|case| case.id == "vfs.after_fsync.before_unmount")
+            .expect("missing after-fsync-before-unmount case");
+        assert!(post_fsync.data_correct_required);
+        assert!(!post_fsync.data_absent_allowed);
+        assert_eq!(post_fsync.classification, CrashClassification::Valid);
+    }
+
+    #[test]
+    fn injection_matrix_no_case_has_runtime_evidence() {
+        let matrix = define_local_vfs_crash_injection_matrix();
+        for case in &matrix.injection_points {
+            assert!(
+                !case.has_runtime_evidence,
+                "{}: must not claim runtime evidence in definition-only matrix",
+                case.id
+            );
+            assert!(
+                case.blocked_reason.is_some(),
+                "{}: must have a blocked reason",
+                case.id
+            );
+        }
+    }
+
+    #[test]
+    fn injection_matrix_round_trips_through_json() {
+        let matrix = define_local_vfs_crash_injection_matrix();
+        let json = serde_json::to_string_pretty(&matrix).expect("serialize");
+        let decoded: CrashInjectionMatrix = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, matrix);
+    }
+
+    #[test]
+    fn report_includes_injection_matrix_and_validates() {
+        let report = run_model_crash_matrices().expect("crash matrices");
+        assert_eq!(
+            report.injection_matrices.len(),
+            1,
+            "report must have one injection matrix"
+        );
+        let matrix = &report.injection_matrices[0];
+        assert_eq!(matrix.id, LOCAL_VFS_INJECTION_MATRIX_ID);
+        assert!(
+            report.injection_case_count() >= 5,
+            "must have at least 5 injection points"
+        );
+        report.validate().expect("report validates");
+    }
+
+    #[test]
+    fn report_validation_rejects_duplicate_injection_ids() {
+        let mut report = run_model_crash_matrices().expect("crash matrices");
+        let duplicate = report.injection_matrices[0].injection_points[0].clone();
+        report.injection_matrices[0]
+            .injection_points
+            .push(duplicate);
+
+        let err = report
+            .validate()
+            .expect_err("duplicate injection id must fail validation");
+        assert!(
+            err.to_string().contains("duplicate injection point id"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn injection_point_as_str_round_trips() {
+        for point in &[
+            CrashInjectionPoint::AfterWriteBeforeFsync,
+            CrashInjectionPoint::AfterFsyncBeforeUnmount,
+            CrashInjectionPoint::DuringFsync,
+            CrashInjectionPoint::DuringDirectoryUpdate,
+            CrashInjectionPoint::DuringInodeAttributeUpdate,
+        ] {
+            let s = point.as_str();
+            assert!(!s.is_empty());
+            // Verify each serialized name is kebab-case and not empty
+            assert!(s.chars().all(|c| c.is_ascii_lowercase() || c == '-'));
+        }
+    }
+
+    #[test]
+    fn injection_matrix_claim_ids_reference_existing_claims() {
+        let matrix = define_local_vfs_crash_injection_matrix();
+        assert!(matrix
+            .claim_ids
+            .contains(&LOCAL_VFS_WRITE_FSYNC_CLAIM_ID.to_string()));
+        assert!(matrix
+            .claim_ids
+            .contains(&STORAGE_WRITE_FSYNC_CLAIM_ID.to_string()));
     }
 }
