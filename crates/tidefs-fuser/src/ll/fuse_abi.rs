@@ -895,7 +895,7 @@ pub struct fuse_ioctl_in {
     pub fh: u64,
     pub flags: u32,
     pub cmd: u32,
-    pub arg: u64, // TODO: this is currently unused, but is defined as a void* in libfuse
+    pub arg: u64, // Review debt TFR-016: this is currently unused, but is defined as a void* in libfuse
     pub in_size: u32,
     pub out_size: u32,
 }

@@ -3,7 +3,7 @@
 //! A request represents information about a filesystem operation the kernel driver wants us to
 //! perform.
 //!
-//! TODO: This module is meant to go away soon in favor of `ll::Request`.
+//! Review debt TFR-016: This module is meant to go away soon in favor of `ll::Request`.
 
 use crate::abort::AbortHandle;
 use crate::ll::{fuse_abi as abi, Errno, Response};

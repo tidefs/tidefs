@@ -124,7 +124,7 @@ impl From<FileHandle> for u64 {
 
 /// A newtype for lock owners
 ///
-/// TODO: Document lock lifecycle and how and when to implement file locking.
+/// Review debt TFR-016: Document lock lifecycle and how and when to implement file locking.
 ///
 /// See [Read], [Write], [Release], [Flush], [GetLk], [SetLk], [SetLkW].
 ///
@@ -146,7 +146,7 @@ pub struct Lock {
     // Unfortunately this can't be a std::ops::Range because Range is not Copy:
     // https://github.com/rust-lang/rfcs/issues/2848
     pub range: (u64, u64),
-    // TODO: Make typ an enum
+    // Review debt TFR-016: Make typ an enum
     pub typ: i32,
     pub pid: u32,
 }
@@ -461,7 +461,7 @@ mod op {
             None
         }
 
-        // TODO: Why does *set*attr want to have an attr response?
+        // Review debt TFR-016: Why does *set*attr want to have an attr response?
     }
     impl<'a> Display for SetAttr<'a> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -725,7 +725,7 @@ mod op {
         /// the pid, uid, gid, and fh may not match the value that would have been sent if write caching
         /// is disabled
         ///
-        /// TODO: WriteFlags type or remove this
+        /// Review debt TFR-016: WriteFlags type or remove this
         pub fn write_flags(&self) -> u32 {
             self.arg.write_flags
         }
@@ -741,7 +741,7 @@ mod op {
             None
         }
         /// flags: these are the file flags, such as O_SYNC. Only supported with ABI >= 7.9
-        /// TODO: Make a Flags type specifying valid values
+        /// Review debt TFR-016: Make a Flags type specifying valid values
         pub fn flags(&self) -> i32 {
             #[cfg(feature = "abi-7-9")]
             return self.arg.flags;
@@ -779,7 +779,7 @@ mod op {
             FileHandle(self.arg.fh)
         }
         /// The same flags as for open.
-        /// TODO: Document what flags are valid, or remove this
+        /// Review debt TFR-016: Document what flags are valid, or remove this
         pub fn flags(&self) -> i32 {
             self.arg.flags
         }
@@ -829,7 +829,7 @@ mod op {
         pub fn value(&self) -> &'a [u8] {
             self.value
         }
-        // TODO: Document what are valid flags
+        // Review debt TFR-016: Document what are valid flags
         pub fn flags(&self) -> i32 {
             self.arg.flags
         }
@@ -1011,7 +1011,7 @@ mod op {
     /// directory stream operations in case the contents of the directory can change
     /// between [OpenDir] and [ReleaseDir].
     ///
-    /// TODO: Document how to implement "standard conforming directory stream operations"
+    /// Review debt TFR-016: Document how to implement "standard conforming directory stream operations"
     #[derive(Debug)]
     pub struct OpenDir<'a> {
         header: &'a fuse_in_header,
@@ -1072,7 +1072,7 @@ mod op {
                 None
             }
         }
-        /// TODO: Document what values this may take
+        /// Review debt TFR-016: Document what values this may take
         pub fn flags(&self) -> i32 {
             self.arg.flags
         }
@@ -1340,11 +1340,11 @@ mod op {
         pub fn file_handle(&self) -> FileHandle {
             FileHandle(self.arg.fh)
         }
-        /// TODO: What are valid values here?
+        /// Review debt TFR-016: What are valid values here?
         pub fn flags(&self) -> u32 {
             self.arg.flags
         }
-        /// TODO: What does this mean?
+        /// Review debt TFR-016: What does this mean?
         pub fn command(&self) -> u32 {
             self.arg.cmd
         }
@@ -1387,7 +1387,7 @@ mod op {
             self.arg.flags
         }
     }
-    /// BatchForget: TODO: merge with Forget
+    /// BatchForget: Review debt TFR-016: merge with Forget
     #[cfg(feature = "abi-7-16")]
     #[derive(Debug)]
     pub struct BatchForget<'a> {
@@ -1400,7 +1400,7 @@ mod op {
     impl_request!(BatchForget<'a>);
     #[cfg(feature = "abi-7-16")]
     impl<'a> BatchForget<'a> {
-        /// TODO: Don't return fuse_forget_one, this should be private
+        /// Review debt TFR-016: Don't return fuse_forget_one, this should be private
         pub fn nodes(&self) -> &'a [fuse_forget_one] {
             self.nodes
         }
@@ -1437,7 +1437,7 @@ mod op {
 
     /// Read directory.
     ///
-    /// TODO: Document when this is called rather than ReadDirectory
+    /// Review debt TFR-016: Document when this is called rather than ReadDirectory
     #[cfg(feature = "abi-7-21")]
     #[derive(Debug)]
     pub struct ReadDirPlus<'a> {
@@ -1462,7 +1462,7 @@ mod op {
 
     /// Rename a file.
     ///
-    /// TODO: Document the differences to [Rename] and [Exchange]
+    /// Review debt TFR-016: Document the differences to [Rename] and [Exchange]
     #[cfg(feature = "abi-7-23")]
     #[derive(Debug)]
     pub struct Rename2<'a> {
@@ -1493,7 +1493,7 @@ mod op {
         /// [libc::RENAME_WHITEOUT].  If you don't handle a particular flag
         /// reply with an EINVAL error.
         ///
-        /// TODO: Replace with enum/flags type
+        /// Review debt TFR-016: Replace with enum/flags type
         pub fn flags(&self) -> u32 {
             self.arg.flags
         }
@@ -1501,7 +1501,7 @@ mod op {
 
     /// Reposition read/write file offset
     ///
-    /// TODO: Document when you need to implement this.  Read and Write provide the offset anyway.
+    /// Review debt TFR-016: Document when you need to implement this.  Read and Write provide the offset anyway.
     #[cfg(feature = "abi-7-24")]
     #[derive(Debug)]
     pub struct Lseek<'a> {
@@ -1519,7 +1519,7 @@ mod op {
         pub fn offset(&self) -> i64 {
             self.arg.offset
         }
-        /// TODO: Make this return an enum
+        /// Review debt TFR-016: Make this return an enum
         pub fn whence(&self) -> i32 {
             self.arg.whence
         }
@@ -1587,7 +1587,7 @@ mod op {
         pub fn len(&self) -> u64 {
             self.arg.len
         }
-        // API TODO: Return a specific flags type
+        // API Review debt TFR-016: Return a specific flags type
         pub fn flags(&self) -> u64 {
             self.arg.flags
         }
@@ -1668,7 +1668,7 @@ mod op {
     }
     #[cfg(target_os = "macos")]
     impl_request!(GetXTimes<'a>);
-    // API TODO: Consider rename2(RENAME_EXCHANGE)
+    // API Review debt TFR-016: Consider rename2(RENAME_EXCHANGE)
     #[derive(Debug)]
     pub struct Exchange<'a> {
         header: &'a fuse_in_header,
@@ -1695,7 +1695,7 @@ mod op {
             self.arg.options
         }
     }
-    /// TODO: Document
+    /// Review debt TFR-016: Document
     fn system_time_from_time(secs: i64, nsecs: u32) -> SystemTime {
         let nsec = nsecs.min(999_999_999) as i64;
         let ns = secs.saturating_mul(1_000_000_000).saturating_add(nsec);
