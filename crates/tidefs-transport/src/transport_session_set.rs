@@ -35,6 +35,8 @@ pub struct SessionBinding {
     pub session_id: SessionId,
     /// Current health status of this binding.
     pub health: SessionHealth,
+    /// The membership epoch this binding was established at.
+    pub epoch: u64,
 }
 
 /// Maps node identities to active transport sessions, with basic health
@@ -98,6 +100,7 @@ impl TransportSessionSet {
             SessionBinding {
                 session_id,
                 health: SessionHealth::Unknown,
+                epoch: 0,
             },
         );
         self.session_to_node.insert(session_id, node_id);
@@ -199,6 +202,35 @@ impl TransportSessionSet {
     /// Return an iterator over (node_id, &SessionBinding) pairs.
     pub fn iter(&self) -> impl Iterator<Item = (u64, &SessionBinding)> {
         self.bindings.iter().map(|(k, v)| (*k, v))
+    }
+
+    /// Set the membership epoch for a session binding.
+    ///
+    /// Updated when the membership epoch advances and the
+    /// session is still active for this peer.
+    pub fn set_epoch(&mut self, session_id: SessionId, epoch: u64) {
+        if let Some(node_id) = self.session_to_node.get(&session_id) {
+            if let Some(binding) = self.bindings.get_mut(node_id) {
+                binding.epoch = epoch;
+            }
+        }
+    }
+
+    /// Get the membership epoch for a session binding.
+    ///
+    /// Returns `None` if the session ID is not bound to any node.
+    #[must_use]
+    pub fn get_epoch(&self, session_id: SessionId) -> Option<u64> {
+        let node_id = self.session_to_node.get(&session_id)?;
+        self.bindings.get(node_id).map(|b| b.epoch)
+    }
+
+    /// Get the membership epoch for a node binding.
+    ///
+    /// Returns `None` if the node has no binding.
+    #[must_use]
+    pub fn get_epoch_for_node(&self, node_id: u64) -> Option<u64> {
+        self.bindings.get(&node_id).map(|b| b.epoch)
     }
 }
 

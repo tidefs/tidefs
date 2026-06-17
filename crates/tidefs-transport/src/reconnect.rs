@@ -370,6 +370,8 @@ pub struct SessionResumeRequest {
     pub resume_token: [u8; 32],
     /// Last sequence number acknowledged before the disconnection.
     pub last_acknowledged_seq: MessageSequenceNumber,
+    /// The reconnecting peer's last-known membership epoch.
+    pub epoch: u64,
 }
 
 impl SessionResumeRequest {
@@ -380,12 +382,14 @@ impl SessionResumeRequest {
         session_id: u64,
         session_key: &[u8; 32],
         last_acknowledged_seq: MessageSequenceNumber,
+        epoch: u64,
     ) -> Self {
         let resume_token = compute_resume_token(session_key, session_id);
         Self {
             session_id,
             resume_token,
             last_acknowledged_seq,
+            epoch,
         }
     }
 
@@ -504,6 +508,26 @@ pub enum ReconnectError {
     /// The session has expired and cannot be resumed.
     #[error("session {session_id} expired, cannot resume")]
     SessionExpired { session_id: u64 },
+    /// The reconnecting peer's claimed epoch is behind the current
+    /// membership epoch. The peer must catch up before it can resume.
+    #[error("session {session_id} stale epoch: claimed {claimed_epoch} < current {current_epoch}")]
+    StaleEpoch {
+        session_id: u64,
+        claimed_epoch: u64,
+        current_epoch: u64,
+    },
+    /// The reconnecting peer has departed the cluster (drained or
+    /// failed) and is no longer a member.
+    #[error("session {session_id} peer {peer_id} has departed the cluster")]
+    PeerDeparted { session_id: u64, peer_id: u64 },
+    /// The reconnecting peer is not in the current membership roster.
+    #[error("session {session_id} peer {peer_id} is not in the current roster")]
+    NotInRoster { session_id: u64, peer_id: u64 },
+    /// The peer rejected the resume request because the reconnecting
+    /// peer's epoch is stale. This is a terminal error: the reconnecting
+    /// peer must obtain the current epoch before retrying.
+    #[error("session {session_id} resume rejected: peer reports stale epoch (claimed {claimed_epoch}, current {current_epoch})")]
+    ResumeStaleEpoch { session_id: u64, claimed_epoch: u64, current_epoch: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -551,12 +575,23 @@ pub struct ReconnectDriver {
     /// 32-byte session key used for resume token construction and
     /// response verification.
     pub session_key: [u8; 32],
+    /// The reconnecting peer's current membership epoch.
+    pub epoch: u64,
 }
 
 impl ReconnectDriver {
     /// Create a new reconnect driver in `Idle` phase.
+    ///
+    /// Uses epoch 0 by default; prefer [`with_epoch`](Self::with_epoch)
+    /// when the current membership epoch is known.
     #[must_use]
     pub fn new(session_id: u64, session_key: [u8; 32], config: ReconnectConfig) -> Self {
+        Self::with_epoch(session_id, session_key, config, 0)
+    }
+
+    /// Create a new reconnect driver with an explicit membership epoch.
+    #[must_use]
+    pub fn with_epoch(session_id: u64, session_key: [u8; 32], config: ReconnectConfig, epoch: u64) -> Self {
         let max_retries = config.max_retries;
         let policy = config.to_policy();
         let mut s = ReconnectState::with_policy(policy);
@@ -567,6 +602,7 @@ impl ReconnectDriver {
             state: s,
             session_id,
             session_key,
+            epoch,
         }
     }
 
@@ -678,7 +714,7 @@ impl ReconnectDriver {
         &self,
         last_acknowledged_seq: MessageSequenceNumber,
     ) -> SessionResumeRequest {
-        SessionResumeRequest::new(self.session_id, &self.session_key, last_acknowledged_seq)
+        SessionResumeRequest::new(self.session_id, &self.session_key, last_acknowledged_seq, self.epoch)
     }
 
     /// Verify a `SessionResumeResponse` digest against the stored key.
@@ -955,7 +991,7 @@ mod tests {
         let session_id = 42u64;
         let seq = MessageSequenceNumber(100);
 
-        let req = SessionResumeRequest::new(session_id, &session_key, seq);
+        let req = SessionResumeRequest::new(session_id, &session_key, seq, 0);
         assert_eq!(req.session_id, 42);
         assert_eq!(req.last_acknowledged_seq, MessageSequenceNumber(100));
 
@@ -967,14 +1003,14 @@ mod tests {
     fn resume_request_token_rejects_wrong_key() {
         let session_key = [0xabu8; 32];
         let wrong_key = [0xcd; 32];
-        let req = SessionResumeRequest::new(42, &session_key, MessageSequenceNumber(100));
+        let req = SessionResumeRequest::new(42, &session_key, MessageSequenceNumber(100), 0);
         assert!(!req.verify_token(&wrong_key));
     }
 
     #[test]
     fn resume_request_token_rejects_wrong_session_id() {
         let session_key = [0xabu8; 32];
-        let req = SessionResumeRequest::new(42, &session_key, MessageSequenceNumber(100));
+        let req = SessionResumeRequest::new(42, &session_key, MessageSequenceNumber(100), 0);
         // Manually alter the session_id without recomputing the token
         let mut tampered = req.clone();
         tampered.session_id = 99;
@@ -984,8 +1020,8 @@ mod tests {
     #[test]
     fn resume_request_token_different_per_session() {
         let key = [0x12; 32];
-        let req_a = SessionResumeRequest::new(1, &key, MessageSequenceNumber(0));
-        let req_b = SessionResumeRequest::new(2, &key, MessageSequenceNumber(0));
+        let req_a = SessionResumeRequest::new(1, &key, MessageSequenceNumber(0), 0);
+        let req_b = SessionResumeRequest::new(2, &key, MessageSequenceNumber(0), 0);
         // Different session ids should produce different tokens
         assert_ne!(req_a.resume_token, req_b.resume_token);
     }
@@ -994,8 +1030,8 @@ mod tests {
     fn resume_request_token_different_per_key() {
         let key_a = [0x11u8; 32];
         let key_b = [0x22u8; 32];
-        let req_a = SessionResumeRequest::new(1, &key_a, MessageSequenceNumber(0));
-        let req_b = SessionResumeRequest::new(1, &key_b, MessageSequenceNumber(0));
+        let req_a = SessionResumeRequest::new(1, &key_a, MessageSequenceNumber(0), 0);
+        let req_b = SessionResumeRequest::new(1, &key_b, MessageSequenceNumber(0), 0);
         assert_ne!(req_a.resume_token, req_b.resume_token);
     }
 

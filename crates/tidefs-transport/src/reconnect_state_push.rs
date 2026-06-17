@@ -136,6 +136,90 @@ impl ReconnectStatePushDispatcher {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ReconnectStatePushOutcome — validation result for incoming state push
+// ---------------------------------------------------------------------------
+
+/// Outcome of validating an incoming [`ReconnectStatePushMessage`] against
+/// the current membership state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconnectStatePushOutcome {
+    /// The state push is valid: the target peer is in the roster and
+    /// the epoch is current.
+    Accepted,
+    /// The target peer is not present in the push's own roster.
+    TargetNotInRoster {
+        target_peer_id: u64,
+    },
+    /// The state push's epoch is behind the current known epoch.
+    StaleEpoch {
+        push_epoch: u64,
+        current_epoch: u64,
+    },
+    /// The state push's target peer is not in the current roster
+    /// (peer has departed since the push was generated).
+    PeerDeparted {
+        target_peer_id: u64,
+    },
+}
+
+impl ReconnectStatePushOutcome {
+    /// Whether the state push was accepted.
+    #[must_use]
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+
+    /// Human-readable outcome label.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::TargetNotInRoster { .. } => "target_not_in_roster",
+            Self::StaleEpoch { .. } => "stale_epoch",
+            Self::PeerDeparted { .. } => "peer_departed",
+        }
+    }
+}
+
+impl ReconnectStatePushMessage {
+    /// Validate this state push against a current roster and epoch.
+    ///
+    /// Checks that:
+    /// 1. The target peer is in the push's own roster (internal consistency).
+    /// 2. The push's epoch is not behind the current epoch.
+    /// 3. The target peer is still in the current roster.
+    #[must_use]
+    pub fn validate(
+        &self,
+        current_roster: &[u64],
+        current_epoch: u64,
+    ) -> ReconnectStatePushOutcome {
+        // Internal consistency: target must be in the push's own roster
+        if !self.target_in_roster() {
+            return ReconnectStatePushOutcome::TargetNotInRoster {
+                target_peer_id: self.target_peer_id,
+            };
+        }
+        // Epoch check: push must not be behind
+        let push_epoch = self.roster.epoch.0;
+        if push_epoch < current_epoch {
+            return ReconnectStatePushOutcome::StaleEpoch {
+                push_epoch,
+                current_epoch,
+            };
+        }
+        // Membership check: target must still be in the current roster
+        if !current_roster.contains(&self.target_peer_id) {
+            return ReconnectStatePushOutcome::PeerDeparted {
+                target_peer_id: self.target_peer_id,
+            };
+        }
+        ReconnectStatePushOutcome::Accepted
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +332,87 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(h.calls.lock().unwrap().len(), 5);
+    }
+
+    // ------------------------------------------------------------------
+    // ReconnectStatePushOutcome validation tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn validate_accepts_current_peer() {
+        let r = mk(5, vec![1, 2, 3]);
+        let m = ReconnectStatePushMessage::new(0, r, 2, 5);
+        let outcome = m.validate(&[1, 2, 3], 5);
+        assert_eq!(outcome, ReconnectStatePushOutcome::Accepted);
+        assert!(outcome.is_accepted());
+    }
+
+    #[test]
+    fn validate_rejects_target_not_in_push_roster() {
+        let r = mk(3, vec![1, 2]);
+        let m = ReconnectStatePushMessage::new(0, r, 99, 3);
+        let outcome = m.validate(&[1, 2], 3);
+        assert_eq!(
+            outcome,
+            ReconnectStatePushOutcome::TargetNotInRoster { target_peer_id: 99 }
+        );
+        assert!(!outcome.is_accepted());
+    }
+
+    #[test]
+    fn validate_rejects_stale_epoch() {
+        let r = mk(2, vec![1, 2, 3]);
+        let m = ReconnectStatePushMessage::new(0, r, 2, 2);
+        let outcome = m.validate(&[1, 2, 3], 5);
+        assert_eq!(
+            outcome,
+            ReconnectStatePushOutcome::StaleEpoch {
+                push_epoch: 2,
+                current_epoch: 5,
+            }
+        );
+        assert!(!outcome.is_accepted());
+    }
+
+    #[test]
+    fn validate_rejects_departed_peer() {
+        let r = mk(4, vec![1, 2, 3]);
+        let m = ReconnectStatePushMessage::new(0, r, 3, 4);
+        // Peer 3 is in the push's roster but NOT in the current roster
+        let outcome = m.validate(&[1, 2], 4);
+        assert_eq!(
+            outcome,
+            ReconnectStatePushOutcome::PeerDeparted { target_peer_id: 3 }
+        );
+        assert!(!outcome.is_accepted());
+    }
+
+    #[test]
+    fn validate_target_not_in_roster_takes_precedence() {
+        // Target not in push's own roster should be caught first
+        let r = mk(1, vec![1, 2]);
+        let m = ReconnectStatePushMessage::new(0, r, 99, 1);
+        let outcome = m.validate(&[1, 2], 5);
+        assert_eq!(
+            outcome,
+            ReconnectStatePushOutcome::TargetNotInRoster { target_peer_id: 99 }
+        );
+    }
+
+    #[test]
+    fn validate_outcome_as_str() {
+        assert_eq!(ReconnectStatePushOutcome::Accepted.as_str(), "accepted");
+        assert_eq!(
+            ReconnectStatePushOutcome::TargetNotInRoster { target_peer_id: 1 }.as_str(),
+            "target_not_in_roster"
+        );
+        assert_eq!(
+            ReconnectStatePushOutcome::StaleEpoch { push_epoch: 1, current_epoch: 2 }.as_str(),
+            "stale_epoch"
+        );
+        assert_eq!(
+            ReconnectStatePushOutcome::PeerDeparted { target_peer_id: 1 }.as_str(),
+            "peer_departed"
+        );
     }
 }
