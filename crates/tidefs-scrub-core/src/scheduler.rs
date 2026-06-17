@@ -42,7 +42,10 @@ use std::sync::Arc;
 use tidefs_durability_layout::{DurabilityLayoutV1, DurabilityPolicy};
 use tidefs_local_object_store::SuspectEntry;
 
-use crate::repair_scheduling::{RepairEscalation, ScrubToRepairBridge};
+use crate::repair_scheduling::{
+    RepairAdmission, RepairAdmissionInput, RepairEscalation, RepairEvidenceRejection,
+    ScrubToRepairBridge,
+};
 
 // ---------------------------------------------------------------------------
 // DurabilityQuery — abstract layout consultation
@@ -188,6 +191,10 @@ pub struct RepairSchedulerStats {
     pub unsurvivable: u64,
     /// Entries dispatched for repair.
     pub dispatched: u64,
+    /// Entries blocked because no placement receipt was supplied.
+    pub blocked_missing_receipt: u64,
+    /// Entries blocked because the supplied receipt was stale or malformed.
+    pub blocked_stale_receipt: u64,
     /// Entries where policy is unknown (no layout available).
     pub unknown_policy: u64,
 }
@@ -256,9 +263,20 @@ impl<D: DurabilityQuery> RepairScheduler<D> {
     /// routed into the underlying [`ScrubToRepairBridge`] with the
     /// correct `replicas_remaining` count set.
     pub fn ingest_from_suspect_log(&mut self, entries: &[SuspectEntry]) {
-        for entry in entries {
+        let inputs: Vec<_> = entries
+            .iter()
+            .copied()
+            .map(RepairAdmissionInput::missing_receipt)
+            .collect();
+        self.ingest_with_evidence(&inputs);
+    }
+
+    /// Ingest suspect entries with explicit placement receipt evidence.
+    pub fn ingest_with_evidence(&mut self, inputs: &[RepairAdmissionInput]) {
+        for input in inputs {
+            let entry = input.entry;
             self.stats.entries_ingested += 1;
-            let health = self.assess_health(entry);
+            let health = self.assess_health(&entry);
 
             if health.is_unrecoverable() {
                 self.stats.unrecoverable += 1;
@@ -269,11 +287,10 @@ impl<D: DurabilityQuery> RepairScheduler<D> {
                 continue;
             }
 
-            self.bridge.ingest(
-                &[*entry],
-                health.healthy_replicas, // replicas_remaining
-            );
-            self.stats.dispatched += 1;
+            let admissions = self
+                .bridge
+                .ingest_with_evidence(&[*input], health.healthy_replicas);
+            self.record_admissions(&admissions);
         }
     }
 
@@ -281,9 +298,46 @@ impl<D: DurabilityQuery> RepairScheduler<D> {
     ///
     /// Use this when the caller already knows the exact replica state.
     pub fn ingest_with_replicas(&mut self, entries: &[SuspectEntry], replicas_remaining: u32) {
-        self.stats.entries_ingested += entries.len() as u64;
-        self.stats.dispatched += entries.len() as u64;
-        self.bridge.ingest(entries, replicas_remaining);
+        let inputs: Vec<_> = entries
+            .iter()
+            .copied()
+            .map(RepairAdmissionInput::missing_receipt)
+            .collect();
+        self.ingest_evidence_with_replicas(&inputs, replicas_remaining);
+    }
+
+    /// Ingest evidence-bearing suspect entries with an explicit replica count.
+    pub fn ingest_evidence_with_replicas(
+        &mut self,
+        inputs: &[RepairAdmissionInput],
+        replicas_remaining: u32,
+    ) {
+        self.stats.entries_ingested += inputs.len() as u64;
+        let admissions = self.bridge.ingest_with_evidence(inputs, replicas_remaining);
+        self.record_admissions(&admissions);
+    }
+
+    fn record_admissions(&mut self, admissions: &[RepairAdmission]) {
+        for admission in admissions {
+            match admission {
+                RepairAdmission::Admitted { .. } => {
+                    self.stats.dispatched += 1;
+                }
+                RepairAdmission::Blocked {
+                    reason: RepairEvidenceRejection::MissingReceipt,
+                    ..
+                } => {
+                    self.stats.blocked_missing_receipt += 1;
+                }
+                RepairAdmission::Blocked {
+                    reason: RepairEvidenceRejection::StaleReceipt,
+                    ..
+                } => {
+                    self.stats.blocked_stale_receipt += 1;
+                }
+                RepairAdmission::Skipped { .. } => {}
+            }
+        }
     }
 
     /// Return a reference to the underlying bridge for direct manipulation.
@@ -348,6 +402,7 @@ mod tests {
     use crate::repair_scheduling::ScrubToRepairBridge;
     use tidefs_durability_layout::DurabilityLayoutV1;
     use tidefs_local_object_store::SuspectEntry;
+    use tidefs_replication_model::PlacementReceiptRef;
 
     fn make_entry(locator_id: u64, repair_attempts: u32) -> SuspectEntry {
         SuspectEntry {
@@ -364,6 +419,28 @@ mod tests {
             commit_group: 1,
             timestamp_secs: 1,
         }
+    }
+
+    fn receipt_for_entry(entry: &SuspectEntry) -> PlacementReceiptRef {
+        let mut object_key = [0u8; 32];
+        object_key[..8].copy_from_slice(&entry.locator_id.to_le_bytes());
+        PlacementReceiptRef::replicated(
+            entry.locator_id,
+            object_key,
+            Default::default(),
+            entry.commit_group.max(1),
+            2,
+            4096,
+            entry.expected_hash,
+        )
+    }
+
+    fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
+        RepairAdmissionInput::with_receipt(entry, receipt_for_entry(&entry))
+    }
+
+    fn inputs_with_receipts(entries: &[SuspectEntry]) -> Vec<RepairAdmissionInput> {
+        entries.iter().copied().map(input_with_receipt).collect()
     }
 
     // ── LayoutDurabilityQuery tests ────────────────────────────
@@ -463,11 +540,23 @@ mod tests {
     fn scheduler_ingest_healthy_mirror_dispatches() {
         let (_q, mut scheduler) = make_scheduler();
         let entries = vec![make_entry(1, 0)];
-        scheduler.ingest_from_suspect_log(&entries);
+        scheduler.ingest_with_evidence(&inputs_with_receipts(&entries));
         assert_eq!(scheduler.stats().entries_ingested, 1);
         assert_eq!(scheduler.stats().dispatched, 1);
         assert_eq!(scheduler.stats().unrecoverable, 0);
         assert!(scheduler.bridge().has_work());
+    }
+
+    #[test]
+    fn scheduler_receiptless_ingest_blocks_repair_admission() {
+        let (_q, mut scheduler) = make_scheduler();
+        let entries = vec![make_entry(2, 0)];
+        scheduler.ingest_from_suspect_log(&entries);
+
+        assert_eq!(scheduler.stats().entries_ingested, 1);
+        assert_eq!(scheduler.stats().dispatched, 0);
+        assert_eq!(scheduler.stats().blocked_missing_receipt, 1);
+        assert_eq!(scheduler.bridge().pending_count(), 0);
     }
 
     #[test]
@@ -509,7 +598,7 @@ mod tests {
         // 3-way mirror: one corrupt but 2 healthy → dispatchable
         let (_q, mut scheduler) = make_scheduler();
         let entries = vec![make_entry(200, 0)];
-        scheduler.ingest_from_suspect_log(&entries);
+        scheduler.ingest_with_evidence(&inputs_with_receipts(&entries));
 
         assert_eq!(scheduler.stats().dispatched, 1);
         assert_eq!(scheduler.stats().unrecoverable, 0);
@@ -568,7 +657,7 @@ mod tests {
     fn scheduler_ingest_multiple_entries() {
         let (_q, mut scheduler) = make_scheduler();
         let entries: Vec<SuspectEntry> = (1..=10).map(|i| make_entry(i, 0)).collect();
-        scheduler.ingest_from_suspect_log(&entries);
+        scheduler.ingest_with_evidence(&inputs_with_receipts(&entries));
         assert_eq!(scheduler.stats().entries_ingested, 10);
         assert_eq!(scheduler.stats().dispatched, 10);
         assert_eq!(scheduler.bridge().pending_count(), 10);
@@ -578,7 +667,7 @@ mod tests {
     fn scheduler_ingest_with_replicas_direct() {
         let (_q, mut scheduler) = make_scheduler();
         let entries = vec![make_entry(500, 0)];
-        scheduler.ingest_with_replicas(&entries, 2);
+        scheduler.ingest_evidence_with_replicas(&inputs_with_receipts(&entries), 2);
         assert_eq!(scheduler.stats().entries_ingested, 1);
         assert_eq!(scheduler.stats().dispatched, 1);
     }
@@ -590,6 +679,8 @@ mod tests {
         assert_eq!(stats.unrecoverable, 0);
         assert_eq!(stats.unsurvivable, 0);
         assert_eq!(stats.dispatched, 0);
+        assert_eq!(stats.blocked_missing_receipt, 0);
+        assert_eq!(stats.blocked_stale_receipt, 0);
         assert_eq!(stats.unknown_policy, 0);
     }
 
@@ -647,7 +738,7 @@ mod tests {
         let mut scheduler = RepairScheduler::new(bridge, mock);
 
         let entries = vec![make_entry(1, 0)];
-        scheduler.ingest_from_suspect_log(&entries);
+        scheduler.ingest_with_evidence(&inputs_with_receipts(&entries));
 
         assert_eq!(scheduler.stats().dispatched, 1);
         assert_eq!(scheduler.stats().unrecoverable, 0);
