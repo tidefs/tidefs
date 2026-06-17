@@ -10,6 +10,11 @@ required_evidence_classes = [
   "runtime-crash-oracle",
   "claims-gate-review",
 ]
+evidence_requirements = [
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = ["#286"] },
+  { class = "runtime-crash-oracle", path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json", validation_tier = "mounted-userspace", blocking_issues = ["#493"] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
+]
 blockers = [
   "GitHub issue #286 model-first evidence is bounded to the executable model, not local runtime crash injection.",
   "Runtime crash-oracle artifacts must be recorded before present-tense durability wording.",
@@ -29,6 +34,11 @@ required_evidence_classes = [
   "runtime-namespace-crash-artifact",
   "claims-gate-review",
 ]
+evidence_requirements = [
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = ["#286"] },
+  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#495"] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
+]
 blockers = [
   "GitHub issue #286 model-first evidence is bounded to the executable model, not local runtime crash injection.",
   "Runtime evidence for interrupted rename sequences is not recorded.",
@@ -47,6 +57,11 @@ required_evidence_classes = [
   "model-crash-matrix",
   "runtime-crash-oracle",
   "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = ["#286"] },
+  { class = "runtime-crash-oracle", path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json", validation_tier = "mounted-userspace", blocking_issues = ["#493"] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
 ]
 blockers = [
   "Model-only issue #286 evidence is not local runtime crash evidence.",
@@ -68,6 +83,11 @@ required_evidence_classes = [
   "runtime-namespace-crash-artifact",
   "claims-gate-review",
 ]
+evidence_requirements = [
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = ["#286"] },
+  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#495"] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
+]
 blockers = [
   "Model-only issue #286 evidence is not local runtime crash evidence.",
   "Local runtime rename crash injection remains blocked until local-filesystem write-set conflicts clear.",
@@ -87,6 +107,11 @@ required_evidence_classes = [
   "queue-depth-runtime-artifact",
   "claims-gate-review",
 ]
+evidence_requirements = [
+  { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", validation_tier = "source-model", blocking_issues = ["#287"] },
+  { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#498"] },
+  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#287", "#498"] },
+]
 blockers = [
   "GitHub issue #287 owns performance-contract work classes and no-hidden-queue gates.",
   "No runtime artifact proves dirty work cannot hide outside budgeted queues.",
@@ -102,6 +127,11 @@ required_evidence_classes = [
   "scrub-read-isolation-model",
   "runtime-scrub-read-artifact",
   "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "scrub-read-isolation-model", path = "validation/artifacts/performance/scrub-read-isolation-model.toml", validation_tier = "source-model", blocking_issues = ["#287"] },
+  { class = "runtime-scrub-read-artifact", path = "validation/artifacts/performance/scrub-read-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#287"] },
+  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#287"] },
 ]
 blockers = [
   "Scrub/read isolation authority is not proven by a focused runtime row.",
@@ -120,6 +150,12 @@ required_evidence_classes = [
   "queue-depth-runtime-artifact",
   "claims-gate-review",
 ]
+evidence_requirements = [
+  { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", validation_tier = "source-model", blocking_issues = ["#308"] },
+  { class = "no-hidden-queue-gate", path = "validation/performance/no-hidden-queues.toml", validation_tier = "cargo-unit", blocking_issues = ["#308"] },
+  { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#498"] },
+  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#498"] },
+]
 blockers = [
   "GitHub issue #308 wired AdmissionPermit into local-filesystem write path and registered queue roots; a focused runtime queue-depth artifact must still be captured via CI.",
 ]
@@ -134,6 +170,11 @@ required_evidence_classes = [
   "scrub-read-isolation-model",
   "runtime-scrub-read-artifact",
   "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "scrub-read-isolation-model", path = "validation/artifacts/performance/scrub-read-isolation-model.toml", validation_tier = "source-model", blocking_issues = ["#287"] },
+  { class = "runtime-scrub-read-artifact", path = "validation/artifacts/performance/scrub-read-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#287"] },
+  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#287"] },
 ]
 blockers = [
   "GitHub issue #287 first slice records a deterministic oracle, not a mounted scrub/read runtime artifact.",
@@ -151,6 +192,11 @@ required_evidence_classes = [
   "descriptor-completion-validation",
   "claims-gate-review",
 ]
+evidence_requirements = [
+  { class = "cpu-reference-backend", path = "validation/artifacts/offload/cpu-reference-backend.toml", validation_tier = "cargo-unit", blocking_issues = [] },
+  { class = "descriptor-completion-validation", path = "validation/artifacts/offload/descriptor-completion-validation.toml", validation_tier = "cargo-unit", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/offload/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
+]
 blockers = []
 generated_doc = "Validated non-authoritative offload claim for v1 descriptor validation, CPU reference checksum/parity/scrub kernels, buffer-lease matching, and completion validation. This does not validate GPU/FPGA production acceleration, DMA, kernel, RDMA, storage-runtime integration, or hardware equivalence."
 evidence_artifacts = [
@@ -167,6 +213,11 @@ required_evidence_classes = [
   "qid-tag-state-model",
   "runtime-ublk-completion-artifact",
   "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "qid-tag-state-model", path = "validation/artifacts/ublk/qid-tag-state-model.json", validation_tier = "source-model", blocking_issues = ["#289", "#312"] },
+  { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json", validation_tier = "qemu-guest", blocking_issues = ["#312"] },
+  { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#312"] },
 ]
 blockers = [
   "The qid/tag state model is bounded pure-model evidence, not uBLK daemon or block-volume runtime evidence.",
@@ -189,6 +240,11 @@ required_evidence_classes = [
   "runtime-ublk-completion-artifact",
   "claims-gate-review",
 ]
+evidence_requirements = [
+  { class = "runtime-ublk-started-export-admission-artifact", path = "validation/artifacts/ublk/started-export-admission-runtime.json", validation_tier = "qemu-guest", blocking_issues = ["#341"] },
+  { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json", validation_tier = "qemu-guest", blocking_issues = ["#312", "#341"] },
+  { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#341"] },
+]
 blockers = [
   "The focused qemu-ublk-smoke started-export artifact is bounded service-loop evidence, not fio workload breadth, mkfs/mount acceptance, online resize acceptance, crash durability, or production block-device readiness.",
   "The started-export artifact must remain paired with the qid/tag completion artifact verifier before completion handling can be treated as runtime evidence.",
@@ -205,6 +261,11 @@ required_evidence_classes = [
   "kernel-context-token-model",
   "teardown-race-proof-artifact",
   "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "kernel-context-token-model", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json", validation_tier = "source-model", blocking_issues = ["#291"] },
+  { class = "teardown-race-proof-artifact", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json", validation_tier = "source-model", blocking_issues = ["#291"] },
+  { class = "claims-gate-review", path = "validation/artifacts/kernel/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#291"] },
 ]
 blockers = [
   "The recorded teardown proof review is bounded source/model evidence, not mounted Linux runtime evidence.",
