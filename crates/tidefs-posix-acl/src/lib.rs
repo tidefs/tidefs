@@ -215,8 +215,10 @@ pub enum PosixAclStructureError {
     InvalidTag,
     /// Permission bits exceed the allowed 0..7 range.
     InvalidPerm,
-    /// Non-id-bearing entries must use id 0.
+    /// Non-id-bearing entries must use id 0 or `ACL_UNDEFINED_ID`.
     InvalidSpecialEntryId,
+    /// A named user or named group entry used the undefined qualifier id.
+    InvalidQualifier,
     /// The required owner entry is missing.
     MissingUserObj,
     /// The required owning-group entry is missing.
@@ -258,6 +260,8 @@ pub enum AclError {
     InvalidTag,
     /// Permission bits exceed the allowed 0..7 range.
     InvalidPerm,
+    /// Entry qualifier does not match the tag.
+    InvalidQualifier,
     /// BLAKE3-256 hash verification failed: data was corrupted or tampered.
     ChecksumMismatch,
     /// Sealed ACL blob is too short to contain a BLAKE3-256 hash prefix.
@@ -267,6 +271,14 @@ pub enum AclError {
 // ---------------------------------------------------------------------------
 // Decode
 // ---------------------------------------------------------------------------
+
+fn special_acl_entry_id_is_valid(id: u32) -> bool {
+    id == 0 || id == ACL_UNDEFINED_ID
+}
+
+fn named_acl_entry_id_is_valid(id: u32) -> bool {
+    id != ACL_UNDEFINED_ID
+}
 
 /// Decode a Linux binary POSIX ACL xattr payload into a `PosixAcl`.
 ///
@@ -307,7 +319,16 @@ pub fn decode_posix_acl_xattr(data: &[u8]) -> Result<PosixAcl, AclError> {
         }
 
         match tag {
-            ACL_USER_OBJ | ACL_USER | ACL_GROUP_OBJ | ACL_GROUP | ACL_MASK | ACL_OTHER => {}
+            ACL_USER | ACL_GROUP if !named_acl_entry_id_is_valid(id) => {
+                return Err(AclError::InvalidQualifier);
+            }
+            ACL_USER | ACL_GROUP => {}
+            ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_MASK | ACL_OTHER
+                if !special_acl_entry_id_is_valid(id) =>
+            {
+                return Err(AclError::InvalidQualifier);
+            }
+            ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_MASK | ACL_OTHER => {}
             _ => return Err(AclError::InvalidTag),
         }
 
@@ -484,7 +505,7 @@ mod tests {
             PosixAclEntry {
                 tag: ACL_USER,
                 perm: 5,
-                id: 0xFFFFFFFF,
+                id: ACL_UNDEFINED_ID - 1,
             },
             PosixAclEntry {
                 tag: ACL_GROUP_OBJ,
@@ -578,6 +599,29 @@ mod tests {
         buf.extend_from_slice(&0x08u16.to_le_bytes()); // perm = 8
         buf.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(decode_posix_acl_xattr(&buf), Err(AclError::InvalidPerm));
+    }
+
+    #[test]
+    fn decode_invalid_qualifier() {
+        let named_without_qualifier = encode_posix_acl_xattr(&[PosixAclEntry {
+            tag: ACL_USER,
+            perm: 4,
+            id: ACL_UNDEFINED_ID,
+        }]);
+        assert_eq!(
+            decode_posix_acl_xattr(&named_without_qualifier),
+            Err(AclError::InvalidQualifier)
+        );
+
+        let special_with_qualifier = encode_posix_acl_xattr(&[PosixAclEntry {
+            tag: ACL_OTHER,
+            perm: 4,
+            id: 1000,
+        }]);
+        assert_eq!(
+            decode_posix_acl_xattr(&special_with_qualifier),
+            Err(AclError::InvalidQualifier)
+        );
     }
 
     #[test]
@@ -877,35 +921,39 @@ pub fn validate_posix_acl_access_structure(
             return Err(PosixAclStructureError::InvalidPerm);
         }
 
-        let special_id_is_valid = entry.id == 0 || entry.id == ACL_UNDEFINED_ID;
-
         match entry.tag {
             ACL_USER_OBJ => {
-                if !special_id_is_valid {
+                if !special_acl_entry_id_is_valid(entry.id) {
                     return Err(PosixAclStructureError::InvalidSpecialEntryId);
                 }
                 user_obj_count += 1;
             }
             ACL_USER => {
+                if !named_acl_entry_id_is_valid(entry.id) {
+                    return Err(PosixAclStructureError::InvalidQualifier);
+                }
                 has_named_entry = true;
             }
             ACL_GROUP_OBJ => {
-                if !special_id_is_valid {
+                if !special_acl_entry_id_is_valid(entry.id) {
                     return Err(PosixAclStructureError::InvalidSpecialEntryId);
                 }
                 group_obj_count += 1;
             }
             ACL_GROUP => {
+                if !named_acl_entry_id_is_valid(entry.id) {
+                    return Err(PosixAclStructureError::InvalidQualifier);
+                }
                 has_named_entry = true;
             }
             ACL_MASK => {
-                if !special_id_is_valid {
+                if !special_acl_entry_id_is_valid(entry.id) {
                     return Err(PosixAclStructureError::InvalidSpecialEntryId);
                 }
                 mask_count += 1;
             }
             ACL_OTHER => {
-                if !special_id_is_valid {
+                if !special_acl_entry_id_is_valid(entry.id) {
                     return Err(PosixAclStructureError::InvalidSpecialEntryId);
                 }
                 other_count += 1;
@@ -1273,6 +1321,10 @@ pub fn posix_mode_from_access_acl(acl: &[PosixAclEntry], old_mode: u32) -> u32 {
 
 /// Plan POSIX access ACL evaluation for a specific caller.
 ///
+/// This returns a caller-specific permission summary. For concrete access
+/// checks, use `decide_validated_posix_acl_access`, because POSIX group-class
+/// access is request-specific when multiple matching groups are present.
+///
 /// The algorithm follows the Linux kernel convention:
 ///
 /// 1. **Owner check.** If `caller_uid == file_uid`, return `USER_OBJ.perm`.
@@ -1282,7 +1334,7 @@ pub fn posix_mode_from_access_acl(acl: &[PosixAclEntry], old_mode: u32) -> u32 {
 ///    on `entry.id == caller_uid` returns `entry.perm & MASK.perm` (when
 ///    `MASK` is present) or `entry.perm` directly.
 ///
-/// 3. **Group class check.** If the caller's gid or any supplementary group
+/// 3. **Group class summary.** If the caller's gid or any supplementary group
 ///    matches `file_gid` or any named `GROUP` entry's id:
 ///    - Start with `GROUP_OBJ.perm` if matching the owning group.
 ///    - OR-in each matching named `GROUP.perm`.
@@ -1471,6 +1523,105 @@ impl AccessMask {
     }
 }
 
+/// Typed result of evaluating a POSIX access ACL for one caller and request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PosixAclAccessDecision {
+    /// Permission class and effective rwx bits selected by POSIX ACL rules.
+    pub plan: PosixAclPermissionPlan,
+    /// Requested rwx bits checked against the effective permission bits.
+    pub requested: AccessMask,
+    /// Whether the request is allowed by the POSIX ACL access algorithm.
+    pub allowed: bool,
+}
+
+impl PosixAclAccessDecision {
+    /// Return `true` when the evaluated permission bits satisfy the request.
+    #[must_use]
+    pub fn is_allowed(self) -> bool {
+        self.allowed
+    }
+}
+
+fn group_class_entry_allows(entry_perm: u16, mask_perm: Option<u8>, requested: AccessMask) -> bool {
+    let effective = (entry_perm & 0x7) as u8 & mask_perm.unwrap_or(0x7);
+    let requested = requested.bits();
+    (effective & requested) == requested
+}
+
+fn group_class_request_allowed(
+    acl: &[PosixAclEntry],
+    file_gid: u32,
+    caller_gid: u32,
+    caller_groups: &[u32],
+    mode_fallback: u32,
+    requested: AccessMask,
+) -> Option<bool> {
+    let mask_perm = find_entry(acl, ACL_MASK).map(|entry| (entry.perm & 0x7) as u8);
+    let mut matched_group_class = false;
+
+    if caller_gid == file_gid || caller_groups.contains(&file_gid) {
+        matched_group_class = true;
+        let group_obj_perm = find_entry(acl, ACL_GROUP_OBJ)
+            .map(|entry| entry.perm)
+            .unwrap_or(((mode_fallback >> 3) & 0x7) as u16);
+        if group_class_entry_allows(group_obj_perm, mask_perm, requested) {
+            return Some(true);
+        }
+    }
+
+    for entry in acl.iter().filter(|entry| entry.tag == ACL_GROUP) {
+        if caller_gid == entry.id || caller_groups.contains(&entry.id) {
+            matched_group_class = true;
+            if group_class_entry_allows(entry.perm, mask_perm, requested) {
+                return Some(true);
+            }
+        }
+    }
+
+    matched_group_class.then_some(false)
+}
+
+/// Validate and evaluate a POSIX access ACL for one caller and request.
+pub fn decide_validated_posix_acl_access(
+    acl: &[PosixAclEntry],
+    file_uid: u32,
+    file_gid: u32,
+    caller_uid: u32,
+    caller_gid: u32,
+    caller_groups: &[u32],
+    mode_fallback: u32,
+    requested: AccessMask,
+) -> Result<PosixAclAccessDecision, PosixAclStructureError> {
+    let plan = plan_validated_posix_acl_access_for_caller(
+        acl,
+        file_uid,
+        file_gid,
+        caller_uid,
+        caller_gid,
+        caller_groups,
+        mode_fallback,
+    )?;
+    let allowed = if plan.class == PosixAclPermissionClass::GroupClass {
+        group_class_request_allowed(
+            acl,
+            file_gid,
+            caller_gid,
+            caller_groups,
+            mode_fallback,
+            requested,
+        )
+        .unwrap_or(false)
+    } else {
+        let requested = requested.bits();
+        (plan.effective_perm & requested) == requested
+    };
+    Ok(PosixAclAccessDecision {
+        plan,
+        requested,
+        allowed,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // AclEvaluator
 // ---------------------------------------------------------------------------
@@ -1486,8 +1637,8 @@ impl AccessMask {
 /// 2. Else if a named `USER` entry matches `caller_uid`: use that entry,
 ///    limited by `MASK` when present.
 /// 3. Else if `caller_gid` or any supplementary group matches `GROUP_OBJ`
-///    or a named `GROUP` entry: OR together all matching group permissions,
-///    limited by `MASK` when present.
+///    or a named `GROUP` entry: allow only when one matching group-class
+///    entry contains the full request after `MASK` is applied.
 /// 4. Else: use `OTHER` entry (MASK not applied).
 pub struct AclEvaluator;
 
@@ -1515,10 +1666,26 @@ impl AclEvaluator {
         groups: &[u32],
         requested: AccessMask,
     ) -> bool {
-        let effective = posix_acl_perm_bits_for_caller(
-            acl, file_uid, file_gid, caller_uid, caller_gid, groups, 0,
-        );
-        (effective & requested.bits()) == requested.bits()
+        Self::access_decision(
+            acl, file_uid, file_gid, caller_uid, caller_gid, groups, requested,
+        )
+        .map(PosixAclAccessDecision::is_allowed)
+        .unwrap_or(false)
+    }
+
+    /// Validate the ACL structure and return the typed access decision.
+    pub fn access_decision(
+        acl: &PosixAcl,
+        file_uid: u32,
+        file_gid: u32,
+        caller_uid: u32,
+        caller_gid: u32,
+        groups: &[u32],
+        requested: AccessMask,
+    ) -> Result<PosixAclAccessDecision, PosixAclStructureError> {
+        decide_validated_posix_acl_access(
+            acl, file_uid, file_gid, caller_uid, caller_gid, groups, 0, requested,
+        )
     }
 
     /// Compute the effective file mode bits from an access ACL.
@@ -2229,6 +2396,42 @@ mod phase2_tests {
     }
 
     #[test]
+    fn validate_access_structure_rejects_invalid_named_qualifier() {
+        let acl = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_USER,
+                perm: 4,
+                id: ACL_UNDEFINED_ID,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 4,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_MASK,
+                perm: 4,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_OTHER,
+                perm: 0,
+                id: 0,
+            },
+        ];
+
+        assert_eq!(
+            validate_posix_acl_access_structure(&acl),
+            Err(PosixAclStructureError::InvalidQualifier)
+        );
+    }
+
+    #[test]
     fn validate_access_structure_requires_mask_for_named_entries() {
         let acl = vec![
             PosixAclEntry {
@@ -2701,6 +2904,129 @@ mod phase2_tests {
             plan_validated_posix_acl_access_for_caller(&acl, 1000, 100, 1001, 200, &[], 0),
             Err(PosixAclStructureError::MissingMaskForNamedEntries)
         );
+    }
+
+    #[test]
+    fn validated_access_decision_named_user_deny_precedes_group_grant() {
+        let acl = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_USER,
+                perm: 0,
+                id: 2000,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_MASK,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_OTHER,
+                perm: 7,
+                id: 0,
+            },
+        ];
+
+        let decision = decide_validated_posix_acl_access(
+            &acl,
+            1000,
+            100,
+            2000,
+            100,
+            &[100],
+            0,
+            AccessMask::new(AccessMask::READ),
+        )
+        .unwrap();
+        assert_eq!(decision.plan.class, PosixAclPermissionClass::NamedUser);
+        assert_eq!(decision.plan.effective_perm, 0);
+        assert!(!decision.is_allowed());
+    }
+
+    #[test]
+    fn validated_access_decision_group_class_does_not_union_distinct_groups() {
+        let acl = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 0,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: AccessMask::READ as u16,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP,
+                perm: AccessMask::WRITE as u16,
+                id: 300,
+            },
+            PosixAclEntry {
+                tag: ACL_MASK,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_OTHER,
+                perm: 0,
+                id: 0,
+            },
+        ];
+
+        let decision = decide_validated_posix_acl_access(
+            &acl,
+            1000,
+            500,
+            1001,
+            500,
+            &[300],
+            0,
+            AccessMask::new(AccessMask::READ | AccessMask::WRITE),
+        )
+        .unwrap();
+        assert_eq!(decision.plan.class, PosixAclPermissionClass::GroupClass);
+        assert_eq!(
+            decision.plan.effective_perm,
+            AccessMask::READ | AccessMask::WRITE
+        );
+        assert!(!decision.is_allowed());
+
+        assert!(AclEvaluator::check_access(
+            &acl,
+            1000,
+            500,
+            1001,
+            500,
+            &[300],
+            AccessMask::new(AccessMask::READ)
+        ));
+        assert!(AclEvaluator::check_access(
+            &acl,
+            1000,
+            500,
+            1001,
+            500,
+            &[300],
+            AccessMask::new(AccessMask::WRITE)
+        ));
+        assert!(!AclEvaluator::check_access(
+            &acl,
+            1000,
+            500,
+            1001,
+            500,
+            &[300],
+            AccessMask::new(AccessMask::READ | AccessMask::WRITE)
+        ));
     }
 
     // -- posix_acl_perm_bits_for_caller ------------------------------------
@@ -3460,6 +3786,70 @@ mod phase2_tests {
     }
 
     #[test]
+    fn default_acl_inheritance_two_levels_recalculates_access_masks() {
+        let root_default = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_USER,
+                perm: 6,
+                id: 1000,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_MASK,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_OTHER,
+                perm: 5,
+                id: 0,
+            },
+        ];
+
+        let child_plan = plan_posix_acl_default_inheritance(&root_default, 0o750, true).unwrap();
+        let child_access = child_plan.child_access_acl.as_ref().unwrap();
+        assert_eq!(
+            find_posix_acl_entry(child_access, ACL_MASK).unwrap().perm,
+            5
+        );
+        assert_eq!(
+            child_plan.child_default_acl.as_ref().unwrap(),
+            &root_default
+        );
+
+        let grandchild_plan = plan_posix_acl_default_inheritance(
+            child_plan.child_default_acl.as_ref().unwrap(),
+            0o640,
+            true,
+        )
+        .unwrap();
+        let grandchild_access = grandchild_plan.child_access_acl.as_ref().unwrap();
+        assert_eq!(
+            find_posix_acl_entry(grandchild_access, ACL_MASK)
+                .unwrap()
+                .perm,
+            4
+        );
+        assert_eq!(
+            find_posix_acl_entry(child_access, ACL_MASK).unwrap().perm,
+            5
+        );
+        assert_eq!(
+            grandchild_plan.child_default_acl.as_ref().unwrap(),
+            &root_default
+        );
+    }
+
+    #[test]
     fn default_acl_inheritance_file_gets_access_only() {
         let parent_default = minimal_access_acl_from_mode(0o750);
         let xattrs = default_acl_inheritance_for_parent(&parent_default, 0o640, false);
@@ -3692,6 +4082,11 @@ mod phase2_tests {
             PosixAclEntry {
                 tag: ACL_GROUP_OBJ,
                 perm: 0,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_MASK,
+                perm: 7,
                 id: 0,
             },
             PosixAclEntry {
