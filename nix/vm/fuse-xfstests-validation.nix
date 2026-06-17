@@ -74,6 +74,7 @@ let
     TMPDIR="''${TIDEFS_FUSE_XFSTESTS_TMPDIR:-/tmp/tidefs-fuse-xfstests-validation}"
     TIMEOUT_SEC="''${TIDEFS_FUSE_XFSTESTS_TIMEOUT:-1200}"
     PER_TEST_TIMEOUT_SEC="''${TIDEFS_FUSE_XFSTESTS_PER_TEST_TIMEOUT:-180}"
+    GENERIC_013_TIMEOUT_SEC="''${TIDEFS_FUSE_XFSTESTS_GENERIC_013_TIMEOUT:-900}"
     QEMU_MEMORY_MB="''${TIDEFS_FUSE_XFSTESTS_QEMU_MEMORY_MB:-2048}"
     STORE_IMAGE_MB="''${TIDEFS_FUSE_XFSTESTS_STORE_IMAGE_MB:-8192}"
     CRASHDUMP_MODE="''${TIDEFS_FUSE_XFSTESTS_CRASHDUMP:-0}"
@@ -104,6 +105,9 @@ Environment:
   TIDEFS_FUSE_XFSTESTS_STORE_IMAGE_MB  Guest /store disk image in MiB (default: $STORE_IMAGE_MB)
   TIDEFS_FUSE_XFSTESTS_PANIC_ON_WARN   Set guest panic-on-warning/lockup knobs (0/1)
   TIDEFS_FUSE_XFSTESTS_CRASHDUMP       Dump guest memory through QMP on panic/timeout (0/1)
+  TIDEFS_FUSE_XFSTESTS_GENERIC_013_TIMEOUT
+                                      Focused generic/013 stress timeout in seconds
+                                      (default: $GENERIC_013_TIMEOUT_SEC)
   TIDEFS_FUSE_XFSTESTS_CRASH_BIN       crash(8) binary for vmcore analysis (default: $CRASH_BIN)
   TIDEFS_FUSE_XFSTESTS_KERNEL_IMG      Override guest kernel bzImage
   TIDEFS_FUSE_XFSTESTS_KERNEL_VMLINUX  Override vmlinux for crash(8)
@@ -195,6 +199,7 @@ if false; then
     echo "  xfstests:  $XFSTESTS_BIN"
     echo "  Tests:     $TEST_LIST"
     echo "  Timeout:   ''${TIMEOUT_SEC}s"
+    echo "  Row timeout: ''${PER_TEST_TIMEOUT_SEC}s (generic/013: ''${GENERIC_013_TIMEOUT_SEC}s)"
     echo "  Memory:    $QEMU_MEMORY_MB MiB"
     echo "  Store img: $STORE_IMAGE_MB MiB"
     echo "  Panic warn:$PANIC_ON_WARN_MODE"
@@ -1036,6 +1041,14 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
     export RESULT_BASE="$RESULTS"
     export TIDEFS_XFSTESTS_TRACE=__XFSTESTS_TRACE__
     PER_TEST_TIMEOUT=__XFSTESTS_PER_TEST_TIMEOUT__
+    GENERIC_013_TIMEOUT=__XFSTESTS_GENERIC_013_TIMEOUT__
+    ACTIVE_TEST_TIMEOUT="$PER_TEST_TIMEOUT"
+    case "$PER_TEST_TIMEOUT" in
+        ""|*[!0-9]*) PER_TEST_TIMEOUT=180 ;;
+    esac
+    case "$GENERIC_013_TIMEOUT" in
+        ""|*[!0-9]*) GENERIC_013_TIMEOUT="$PER_TEST_TIMEOUT" ;;
+    esac
 
     cleanup_xfstests_test() {
         cleanup_tidefs_store() {
@@ -1052,24 +1065,45 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
                 fi
             }
         }
+        is_mounted_path() {
+            mounts_target="$1"
+            awk -v target="$mounts_target" '$2 == target { found = 1 } END { exit(found ? 0 : 1) }' /proc/mounts
+        }
+        unmount_path_bounded() {
+            unmount_target="$1"
+            [ -e "$unmount_target" ] || return 0
+            is_mounted_path "$unmount_target" || return 0
+            if timeout 10 umount "$unmount_target" 2>/tmp/tidefs-umount.err; then
+                return 0
+            fi
+            if timeout 10 umount -l "$unmount_target" 2>/tmp/tidefs-umount-lazy.err; then
+                return 0
+            fi
+            echo "cleanup: failed to unmount $unmount_target"
+            return 1
+        }
 
         echo "cleanup: stop xfstests helpers"
         pkill -f "xfstests-check" 2>/dev/null || true
         pkill -f "/tmp/xfstests\\." 2>/dev/null || true
         pkill -f "/tmp/xfstests\\..*/src/" 2>/dev/null || true
         pkill -f "/tmp/xfstests\\..*/ltp/" 2>/dev/null || true
+        pkill -f "fsstress" 2>/dev/null || true
+        killall fsstress 2>/dev/null || true
         sleep 1
+        pkill -9 -f "xfstests-check" 2>/dev/null || true
+        pkill -9 -f "/tmp/xfstests\\." 2>/dev/null || true
+        pkill -9 -f "/tmp/xfstests\\..*/src/" 2>/dev/null || true
+        pkill -9 -f "/tmp/xfstests\\..*/ltp/" 2>/dev/null || true
+        pkill -9 -f "fsstress" 2>/dev/null || true
+        killall -9 fsstress 2>/dev/null || true
         echo "cleanup: unmount nested test mounts"
         for nested_mnt in "$SCRATCH_MNT" "$TEST_DIR"; do
-            if mountpoint -q "$nested_mnt" 2>/dev/null; then
-                umount "$nested_mnt" 2>/dev/null || umount -l "$nested_mnt" 2>/dev/null || true
-            fi
+            unmount_path_bounded "$nested_mnt" || true
         done
         for nested_mnt in "$MNT"/xfstests-*; do
             [ -e "$nested_mnt" ] || continue
-            if mountpoint -q "$nested_mnt" 2>/dev/null; then
-                umount "$nested_mnt" 2>/dev/null || umount -l "$nested_mnt" 2>/dev/null || true
-            fi
+            unmount_path_bounded "$nested_mnt" || true
         done
         echo "cleanup: stop nested TideFS daemons"
         pkill -f "tidefs-posix-filesystem-adapter-daemon.*--mount $TEST_DIR" 2>/dev/null || true
@@ -1281,6 +1315,17 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         return "$?"
     }
 
+    xfstests_timeout_for() {
+        case "$1" in
+            generic/013)
+                echo "$GENERIC_013_TIMEOUT"
+                ;;
+            *)
+                echo "$PER_TEST_TIMEOUT"
+                ;;
+        esac
+    }
+
     run_xfstests_check_bounded() {
         bounded_test="$1"
         bounded_result_base="$2"
@@ -1289,7 +1334,7 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         check_pid=$!
         elapsed=0
         while kill -0 "$check_pid" 2>/dev/null; do
-            if [ "$elapsed" -ge "$PER_TEST_TIMEOUT" ]; then
+            if [ "$elapsed" -ge "$ACTIVE_TEST_TIMEOUT" ]; then
                 run_dump_xfstests_test_state_bounded "timeout-$bounded_test" "$bounded_test" "$bounded_result_base" "$bounded_test_log" || true
                 terminate_process_tree "$check_pid" TERM
                 sleep 2
@@ -1356,6 +1401,8 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         fi
         mkdir -p "$RESULT_BASE/$(dirname "$test")"
         TEST_LOG="$RESULT_BASE/''${test#*/}.log"
+        ACTIVE_TEST_TIMEOUT=$(xfstests_timeout_for "$test")
+        echo "xfstests timeout for $test: ''${ACTIVE_TEST_TIMEOUT}s"
         if run_xfstests_check_bounded "$test" "$RESULT_BASE" "$TEST_LOG"; then
             cat "$TEST_LOG"
             if grep -E "could not mount|test device.*not mounted" "$TEST_LOG" >/dev/null 2>&1; then
@@ -1377,10 +1424,10 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             RC=$?
             cat "$TEST_LOG" 2>/dev/null || true
             if [ "$RC" -eq 124 ]; then
-                fail "xfstests_$test" "test timed out after ''${PER_TEST_TIMEOUT}s"
+                fail "xfstests_$test" "test timed out after ''${ACTIVE_TEST_TIMEOUT}s"
             elif [ "$RC" -eq 143 ]; then
                 run_dump_xfstests_test_state_bounded "terminated-$test" "$test" "$RESULT_BASE" "$TEST_LOG" || true
-                fail "xfstests_$test" "test terminated after ''${PER_TEST_TIMEOUT}s window"
+                fail "xfstests_$test" "test terminated after ''${ACTIVE_TEST_TIMEOUT}s window"
             else
                 NOTRUN_DETAIL=""
                 for f in "$RESULT_BASE/$test.notrun" "$RESULT_BASE/''${test#*/}.notrun"; do
@@ -1455,13 +1502,13 @@ if [ "$MOUNTED" -eq 1 ]; then
     if ! run_cleanup_xfstests_test_bounded "phase4" "teardown" "$RESULTS" /dev/null; then
         fail "cleanup" "phase4 cleanup timed out"
     fi
-    umount "$MNT/xfstests-test" 2>/dev/null || true
-    umount "$MNT/xfstests-scratch" 2>/dev/null || true
+    timeout 10 umount "$MNT/xfstests-test" 2>/dev/null || timeout 10 umount -l "$MNT/xfstests-test" 2>/dev/null || true
+    timeout 10 umount "$MNT/xfstests-scratch" 2>/dev/null || timeout 10 umount -l "$MNT/xfstests-scratch" 2>/dev/null || true
     # Unmount the main mountpoint
-    if umount "$MNT" 2>/tmp/um.err; then
+    if timeout 20 umount "$MNT" 2>/tmp/um.err; then
         pass "unmount"
     else
-        fail "unmount" "$(cat /tmp/um.err)"
+        fail "unmount" "$(cat /tmp/um.err 2>/dev/null || echo "umount timed out")"
     fi
 else
     blocked "unmount" "filesystem not mounted"
@@ -1508,6 +1555,7 @@ INITSCRIPT
     sed -i "s|__ROOT_AUTH_KEY__|$ROOT_AUTH_KEY|g" "$RUN_DIR/init"
     sed -i "s|__XFSTESTS_TRACE__|$TRACE_XFSTESTS|g" "$RUN_DIR/init"
     sed -i "s|__XFSTESTS_PER_TEST_TIMEOUT__|$PER_TEST_TIMEOUT_SEC|g" "$RUN_DIR/init"
+    sed -i "s|__XFSTESTS_GENERIC_013_TIMEOUT__|$GENERIC_013_TIMEOUT_SEC|g" "$RUN_DIR/init"
     sed -i "s|__PANIC_ON_WARN_MODE__|$PANIC_ON_WARN_MODE|g" "$RUN_DIR/init"
 
     chmod +x "$RUN_DIR/init"
