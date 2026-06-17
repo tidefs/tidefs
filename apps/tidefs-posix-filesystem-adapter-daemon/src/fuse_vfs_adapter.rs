@@ -3273,19 +3273,6 @@ impl FuseVfsAdapter {
         Arc::clone(&self.mmap_coherency)
     }
 
-    /// Best-effort kernel dentry invalidation for `(parent, name)`.
-    ///
-    /// No-op when the notifier has not been installed yet.  Errors from the
-    /// kernel (including ENOENT, which is harmless for invalidation) are
-    /// silently discarded — invalidation is advisory.
-    fn try_inval_entry(&self, parent: u64, name: &[u8]) {
-        if let Ok(guard) = self.notifier.lock() {
-            if let Some(ref n) = *guard {
-                let _ = n.inval_entry(parent, std::ffi::OsStr::from_bytes(name));
-            }
-        }
-    }
-
     /// Best-effort kernel inode cache invalidation — whole inode.
     ///
     /// Instructs the kernel to drop cached data pages and attributes
@@ -8822,7 +8809,6 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .invalidate_child(parent, name);
-        self.try_inval_entry(parent, name);
     }
 
     fn record_dentry_rename(&self, parent: u64, name: &[u8], newparent: u64, newname: &[u8]) {
@@ -8846,8 +8832,6 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .invalidate_child(newparent, newname);
-        self.try_inval_entry(parent, name);
-        self.try_inval_entry(newparent, newname);
     }
     /// Collect xattr metadata from the engine for statx reply enrichment.
     fn collect_xattr_metadata(
