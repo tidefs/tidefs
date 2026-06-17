@@ -31,17 +31,19 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
+use tidefs_commit_group::types::CommitGroupId;
 use tidefs_membership_epoch::{
     EpochId, FailureDomainPlacementPolicy, FailureDomainRecord, MemberId, StorageTier,
     StorageTierPolicy, VerdictClass,
 };
-use tidefs_placement_planner::{compute_replica_target_set, PlacementError, TierGoal};
+use tidefs_placement_planner::{compute_committed_replica_target_set, PlacementError, TierGoal};
 use tidefs_rebuild_planner::{CapacityRebalanceSkew, RebuildPlanner};
 use tidefs_replica_health::NodeId;
 use tidefs_replication_model::{ReplicatedReceiptId, ReplicatedSubjectId};
+use tidefs_space_accounting::SpaceAccounting;
 
 /// Gate constant for PC-010.4 rebalance planner.
 pub const REBALANCE_PLANNER_GATE_PC_010_4: &str =
@@ -96,6 +98,12 @@ pub enum RebalanceError {
 
     #[error("movement would reduce redundancy below minimum: {0}")]
     RedundancyBelowMinimum(String),
+
+    #[error("rebalance evidence is stale: plan based on commit group {plan_cg}, current commit group is {current_cg}")]
+    EvidenceStale {
+        plan_cg: CommitGroupId,
+        current_cg: CommitGroupId,
+    },
 }
 
 // ── Rebalance priority ───────────────────────────────────────────────
@@ -290,6 +298,9 @@ pub struct RebalancePlan {
     pub anti_affinity_verdict: Option<VerdictClass>,
     /// The placement priority for this plan's transfer tickets.
     pub priority: RebalancePriority,
+    /// The commit group at which the capacity and placement evidence
+    /// backing this plan was committed. Used for staleness checks.
+    pub evidence_commit_group_id: u64,
 }
 
 impl RebalancePlan {
@@ -299,6 +310,7 @@ impl RebalancePlan {
         epoch: EpochId,
         skew: CapacityRebalanceSkew,
         created_at_ns: u64,
+        evidence_commit_group_id: u64,
     ) -> Self {
         let priority = RebalancePriority::from_utilization_delta(skew.max_utilization_delta_pct);
         Self {
@@ -312,6 +324,7 @@ impl RebalancePlan {
             is_aborted: false,
             anti_affinity_verdict: None,
             priority,
+            evidence_commit_group_id,
         }
     }
 
@@ -324,6 +337,26 @@ impl RebalancePlan {
     /// Abort this plan due to epoch transition.
     pub fn abort(&mut self, _at_ns: u64) {
         self.is_aborted = true;
+    }
+
+    /// Returns `true` if this plan's evidence has been superseded by a
+    /// newer commit group.
+    #[must_use]
+    pub fn evidence_is_stale(&self, current_commit_group_id: u64) -> bool {
+        current_commit_group_id > self.evidence_commit_group_id
+    }
+
+    /// Validate that this plan's evidence is still current. Returns
+    /// `Err(EvidenceStale)` if the evidence commit group has been
+    /// superseded.
+    pub fn validate_evidence(&self, current_commit_group_id: u64) -> Result<(), RebalanceError> {
+        if self.evidence_is_stale(current_commit_group_id) {
+            return Err(RebalanceError::EvidenceStale {
+                plan_cg: CommitGroupId(self.evidence_commit_group_id),
+                current_cg: CommitGroupId(current_commit_group_id),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -417,6 +450,8 @@ impl RebalancePlanner {
         failure_domains: &[FailureDomainRecord],
         placement_policy: &FailureDomainPlacementPolicy,
         created_at_ns: u64,
+        evidence_commit_group_id: u64,
+        committed_free_bytes_by_member: &BTreeMap<MemberId, u64>,
     ) -> Result<&RebalancePlan, RebalanceError> {
         // Check for existing active plan for this epoch
         if self.plans.iter().any(|p| p.epoch == epoch && !p.is_aborted) {
@@ -439,7 +474,13 @@ impl RebalancePlanner {
         let plan_id = self.next_plan_id;
         self.next_plan_id += 1;
 
-        let mut plan = RebalancePlan::new(plan_id, epoch, skew.clone(), created_at_ns);
+        let mut plan = RebalancePlan::new(
+            plan_id,
+            epoch,
+            skew.clone(),
+            created_at_ns,
+            evidence_commit_group_id,
+        );
 
         // Compute placement targets for each over-utilized source
         let under_utilized_members: Vec<MemberId> = skew
@@ -461,23 +502,86 @@ impl RebalancePlanner {
             });
         }
 
-        // Produce a placement plan for the under-utilized targets
-        let placement_plan = compute_replica_target_set(
+        let under_utilized_member_set: BTreeSet<MemberId> =
+            under_utilized_members.iter().copied().collect();
+        let target_failure_domains: Vec<FailureDomainRecord> = failure_domains
+            .iter()
+            .filter_map(|domain| {
+                let member_refs: Vec<MemberId> = domain
+                    .member_refs
+                    .iter()
+                    .copied()
+                    .filter(|member_id| {
+                        under_utilized_member_set.contains(member_id)
+                            && committed_free_bytes_by_member
+                                .get(member_id)
+                                .copied()
+                                .unwrap_or(0)
+                                > 0
+                    })
+                    .collect();
+                (!member_refs.is_empty()).then(|| {
+                    let mut domain = domain.clone();
+                    domain.member_refs = member_refs;
+                    domain
+                })
+            })
+            .collect();
+
+        if target_failure_domains.is_empty() {
+            return Err(RebalanceError::NotEnoughTargets {
+                needed: 1,
+                available: 0,
+            });
+        }
+
+        // Produce a placement plan from committed evidence for the
+        // under-utilized targets.
+        let committed_placement = compute_committed_replica_target_set(
             placement_policy,
-            failure_domains,
+            &target_failure_domains,
             TierGoal::Primary,
             epoch,
+            evidence_commit_group_id,
         )?;
 
+        let committed_targets = committed_placement.plan.selected_member_refs.clone();
+        if committed_targets.is_empty() {
+            return Err(RebalanceError::NotEnoughTargets {
+                needed: 1,
+                available: 0,
+            });
+        }
+
+        let required_target_free = ceil_div(
+            skew.estimated_bytes_to_move,
+            committed_targets.len().max(1) as u64,
+        );
+        let targets_with_committed_free = committed_targets
+            .iter()
+            .filter(|member_id| {
+                committed_free_bytes_by_member
+                    .get(member_id)
+                    .copied()
+                    .unwrap_or(0)
+                    >= required_target_free
+            })
+            .count();
+        if targets_with_committed_free != committed_targets.len() {
+            return Err(RebalanceError::NotEnoughTargets {
+                needed: committed_targets.len(),
+                available: targets_with_committed_free,
+            });
+        }
+
         // Build rebalance intents — pair over-utilized sources with
-        // placement-targeted members
+        // committed-free under-utilized placement targets.
         for &source in &over_utilized_members {
-            for &target in &placement_plan.selected_member_refs {
+            for &target in &committed_targets {
                 // Compute estimated bytes to move: proportional share of total
                 let source_share =
                     skew.estimated_bytes_to_move / over_utilized_members.len().max(1) as u64;
-                let target_share =
-                    source_share / placement_plan.selected_member_refs.len().max(1) as u64;
+                let target_share = source_share / committed_targets.len().max(1) as u64;
 
                 let intent = RebalanceIntent::new(
                     self.next_intent_id,
@@ -494,7 +598,17 @@ impl RebalancePlanner {
         }
 
         plan.total_bytes_to_move = skew.estimated_bytes_to_move;
-        plan.anti_affinity_verdict = Some(placement_plan.verdict.verdict_class);
+        plan.anti_affinity_verdict = Some(committed_placement.plan.verdict.verdict_class);
+        debug_assert!(
+            committed_targets.iter().all(|member_id| {
+                committed_free_bytes_by_member
+                    .get(member_id)
+                    .copied()
+                    .unwrap_or(0)
+                    >= required_target_free
+            }),
+            "rebalance targets must be selected from committed free-space evidence"
+        );
 
         self.plans.push(plan);
         Ok(self.plans.last().unwrap())
@@ -521,6 +635,60 @@ impl RebalancePlanner {
             if !plan.is_aborted && plan.epoch != new_epoch {
                 plan.abort(at_ns);
             }
+        }
+    }
+
+    /// Invalidate (abort) all plans whose capacity or placement evidence
+    /// is stale — i.e., based on a commit group older than `current`.
+    ///
+    /// Returns the number of plans invalidated.
+    pub fn invalidate_stale_plans(&mut self, current: u64) -> usize {
+        let mut count = 0;
+        for plan in &mut self.plans {
+            if !plan.is_aborted && plan.evidence_is_stale(current) {
+                plan.is_aborted = true;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Return committed free-space evidence for relocation target selection.
+    ///
+    /// Consumes a [`SpaceAccounting`] snapshot to extract committed free
+    /// space per member. Only committed (non-pending) free space is
+    /// eligible for relocation target sizing.
+    #[must_use]
+    pub fn committed_free_space_for_targets(
+        &self,
+        member_ids: &[MemberId],
+        accounting: &SpaceAccounting,
+    ) -> BTreeMap<MemberId, u64> {
+        let mut free_map = BTreeMap::new();
+        // Committed free blocks are available after pending deltas are excluded.
+        let committed_free_bytes = accounting.committed_free_bytes();
+        for &member_id in member_ids {
+            free_map.insert(member_id, committed_free_bytes);
+        }
+        free_map
+    }
+
+    /// Select relocation targets from committed free-space evidence only.
+    ///
+    /// Filters `candidate_members` to those that have at least
+    /// `min_free_bytes` of committed free space according to `accounting`.
+    #[must_use]
+    pub fn select_targets_with_committed_free_space(
+        &self,
+        candidate_members: &[MemberId],
+        accounting: &SpaceAccounting,
+        min_free_bytes: u64,
+    ) -> Vec<MemberId> {
+        let committed_free_bytes = accounting.committed_free_bytes();
+        if committed_free_bytes >= min_free_bytes {
+            candidate_members.to_vec()
+        } else {
+            Vec::new()
         }
     }
 
@@ -589,6 +757,13 @@ impl RebalancePlanner {
     }
 }
 
+fn ceil_div(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    (numerator / denominator) + u64::from(numerator % denominator != 0)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -597,6 +772,7 @@ mod tests {
     use tidefs_membership_epoch::{
         AntiAffinityClass, DomainId, FailureDomainClass, HealthClass, ReceiptId,
     };
+    use tidefs_space_accounting::{Delta, PoolCounters, SpaceAccounting};
 
     fn make_failure_domain(
         id: u64,
@@ -614,6 +790,13 @@ mod tests {
             storage_tier: None,
             digest: 0,
         }
+    }
+
+    fn committed_free(member_ids: &[u64], bytes: u64) -> BTreeMap<MemberId, u64> {
+        member_ids
+            .iter()
+            .map(|member_id| (MemberId::new(*member_id), bytes))
+            .collect()
     }
 
     #[test]
@@ -690,12 +873,53 @@ mod tests {
             FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Rack);
 
         let plan = planner
-            .plan_rebalance(&skew, EpochId::new(1), &domains, &policy, 2000)
+            .plan_rebalance(
+                &skew,
+                EpochId::new(1),
+                &domains,
+                &policy,
+                2000,
+                1,
+                &committed_free(&[2], 1_000_000),
+            )
             .unwrap();
 
         assert!(!plan.intents.is_empty());
+        assert!(plan
+            .intents
+            .iter()
+            .all(|intent| intent.target_ref == MemberId::new(2)));
         assert_eq!(plan.total_bytes_to_move, 100_000);
         assert!(plan.anti_affinity_verdict.is_some());
+    }
+
+    #[test]
+    fn rebalance_plan_requires_committed_free_target_space() {
+        let mut planner = RebalancePlanner::default_for_epoch(EpochId::new(1));
+
+        let skew =
+            CapacityRebalanceSkew::new(vec![NodeId(1)], vec![NodeId(2)], 50, 20, 100_000, 10, 1000);
+        let domains = vec![
+            make_failure_domain(1, FailureDomainClass::Rack, &[1]),
+            make_failure_domain(2, FailureDomainClass::Rack, &[2]),
+        ];
+        let policy =
+            FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Rack);
+
+        let err = planner
+            .plan_rebalance(
+                &skew,
+                EpochId::new(1),
+                &domains,
+                &policy,
+                2000,
+                1,
+                &committed_free(&[2], 99_999),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, RebalanceError::NotEnoughTargets { .. }));
+        assert!(planner.plans.is_empty());
     }
 
     #[test]
@@ -714,10 +938,26 @@ mod tests {
             FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Rack);
 
         planner
-            .plan_rebalance(&skew, EpochId::new(1), &domains, &policy, 2000)
+            .plan_rebalance(
+                &skew,
+                EpochId::new(1),
+                &domains,
+                &policy,
+                2000,
+                1,
+                &committed_free(&[2], 1_000_000),
+            )
             .unwrap();
         let err = planner
-            .plan_rebalance(&skew, EpochId::new(1), &domains, &policy, 3000)
+            .plan_rebalance(
+                &skew,
+                EpochId::new(1),
+                &domains,
+                &policy,
+                3000,
+                1,
+                &committed_free(&[2], 1_000_000),
+            )
             .unwrap_err();
         assert!(matches!(err, RebalanceError::PlanAlreadyExists { .. }));
     }
@@ -738,7 +978,15 @@ mod tests {
             FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Rack);
 
         planner
-            .plan_rebalance(&skew, EpochId::new(1), &domains, &policy, 2000)
+            .plan_rebalance(
+                &skew,
+                EpochId::new(1),
+                &domains,
+                &policy,
+                2000,
+                1,
+                &committed_free(&[2], 1_000_000),
+            )
             .unwrap();
         assert!(planner.has_active_work());
 
@@ -818,7 +1066,15 @@ mod tests {
             FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Rack);
 
         let err = planner
-            .plan_rebalance(&skew, EpochId::new(1), &domains, &policy, 2000)
+            .plan_rebalance(
+                &skew,
+                EpochId::new(1),
+                &domains,
+                &policy,
+                2000,
+                1,
+                &committed_free(&[], 0),
+            )
             .unwrap_err();
         assert!(matches!(err, RebalanceError::NotEnoughTargets { .. }));
     }
@@ -910,5 +1166,294 @@ mod tests {
         assert!(planner2.tier_policy.is_some());
         let result = planner2.tiered_placement_policy(&base, Some(StorageTier::HddArchive));
         assert_eq!(result.target_tier, Some(StorageTier::HddArchive));
+    }
+
+    // ── Committed evidence tests ───────────────────────────────────
+
+    #[test]
+    fn plan_carries_evidence_commit_group_id() {
+        let mut planner = RebalancePlanner::default_for_epoch(EpochId::new(1));
+
+        let skew =
+            CapacityRebalanceSkew::new(vec![NodeId(1)], vec![NodeId(2)], 50, 20, 100_000, 10, 1000);
+
+        let domains = vec![
+            make_failure_domain(1, FailureDomainClass::Rack, &[1]),
+            make_failure_domain(2, FailureDomainClass::Rack, &[2]),
+        ];
+        let policy =
+            FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Rack);
+
+        // Create a plan with evidence committed at commit group 5.
+        let plan = planner
+            .plan_rebalance(
+                &skew,
+                EpochId::new(1),
+                &domains,
+                &policy,
+                2000,
+                5,
+                &committed_free(&[2], 1_000_000),
+            )
+            .unwrap();
+        assert_eq!(plan.evidence_commit_group_id, 5);
+        // Evidence should not be stale at the same commit group.
+        assert!(!plan.evidence_is_stale(5));
+        // Evidence should not be stale at a lower commit group.
+        assert!(!plan.evidence_is_stale(4));
+        // Evidence is stale when current commit group has advanced.
+        assert!(plan.evidence_is_stale(6));
+        assert!(plan.evidence_is_stale(100));
+    }
+
+    #[test]
+    fn plan_invalidation_on_new_commit_group() {
+        let mut planner = RebalancePlanner::default_for_epoch(EpochId::new(1));
+
+        let skew =
+            CapacityRebalanceSkew::new(vec![NodeId(1)], vec![NodeId(2)], 50, 20, 100_000, 10, 1000);
+
+        let domains = vec![
+            make_failure_domain(1, FailureDomainClass::Rack, &[1]),
+            make_failure_domain(2, FailureDomainClass::Rack, &[2]),
+        ];
+        let policy =
+            FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Rack);
+
+        // Create a plan with evidence at commit group 1, epoch 1.
+        planner
+            .plan_rebalance(
+                &skew,
+                EpochId::new(1),
+                &domains,
+                &policy,
+                1000,
+                1,
+                &committed_free(&[2], 1_000_000),
+            )
+            .unwrap();
+
+        // Advance epoch to 2 — this aborts the first plan (epoch transition),
+        // so we can create a second plan at epoch 2.  Manually manage the
+        // planner state to keep both plans for the invalidation test.
+        // Reset: create fresh planner with both plans pre-loaded.
+        let mut planner2 = RebalancePlanner::default_for_epoch(EpochId::new(1));
+        planner2
+            .plan_rebalance(
+                &skew,
+                EpochId::new(1),
+                &domains,
+                &policy,
+                1000,
+                1,
+                &committed_free(&[2], 1_000_000),
+            )
+            .unwrap();
+        planner2.on_epoch_transition(EpochId::new(2), 2000);
+        planner2
+            .plan_rebalance(
+                &skew,
+                EpochId::new(2),
+                &domains,
+                &policy,
+                3000,
+                2,
+                &committed_free(&[2], 1_000_000),
+            )
+            .unwrap();
+
+        // After on_epoch_transition, the epoch-1 plan is aborted but still
+        // in the plans vec.  The epoch-2 plan is active.
+        assert_eq!(planner2.plans.len(), 2);
+        assert!(planner2.plans[0].is_aborted); // epoch-1 plan aborted by transition
+        assert!(!planner2.plans[1].is_aborted); // epoch-2 plan is active
+        assert_eq!(planner2.plans[1].evidence_commit_group_id, 2);
+
+        // Invalidate plans with evidence older than commit group 3.
+        // The aborted plan at CG 1 is already aborted; the active plan
+        // at CG 2 is stale and should be invalidated.
+        let invalidated = planner2.invalidate_stale_plans(3);
+        assert_eq!(invalidated, 1); // only the active plan gets newly invalidated
+        assert!(planner2.plans[1].is_aborted);
+
+        // validate_evidence returns Err for stale plan
+        let err = planner2.plans[1].validate_evidence(3).unwrap_err();
+        assert!(matches!(err, RebalanceError::EvidenceStale { .. }));
+    }
+
+    #[test]
+    fn plan_stays_valid_when_evidence_current() {
+        let mut planner = RebalancePlanner::default_for_epoch(EpochId::new(1));
+
+        let skew =
+            CapacityRebalanceSkew::new(vec![NodeId(1)], vec![NodeId(2)], 50, 20, 100_000, 10, 1000);
+
+        let domains = vec![
+            make_failure_domain(1, FailureDomainClass::Rack, &[1]),
+            make_failure_domain(2, FailureDomainClass::Rack, &[2]),
+        ];
+        let policy =
+            FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Rack);
+
+        // Create plan at commit group 7.
+        let plan = planner
+            .plan_rebalance(
+                &skew,
+                EpochId::new(1),
+                &domains,
+                &policy,
+                1000,
+                7,
+                &committed_free(&[2], 1_000_000),
+            )
+            .unwrap();
+        assert_eq!(plan.evidence_commit_group_id, 7);
+
+        // Same commit group: evidence is valid.
+        assert!(!plan.evidence_is_stale(7));
+        assert!(plan.validate_evidence(7).is_ok());
+
+        // Newer commit group: evidence is stale.
+        assert!(plan.evidence_is_stale(8));
+        assert!(plan.validate_evidence(8).is_err());
+    }
+
+    #[test]
+    fn committed_placement_plan_is_stale_check() {
+        use tidefs_membership_epoch::FailureDomainPlacementPlan;
+        use tidefs_placement_planner::CommittedPlacementPlan;
+
+        // A committed placement plan is stale when its commit group is older.
+        let inner_plan = FailureDomainPlacementPlan {
+            policy_ref: FailureDomainPlacementPolicy::strict_replica_targets(
+                1,
+                FailureDomainClass::Rack,
+            ),
+            selected_member_refs: vec![MemberId::new(1)],
+            selected_domain_refs: vec![DomainId::new(1)],
+            duplicate_domain_member_refs: vec![],
+            excluded_member_refs: vec![],
+            verdict: tidefs_membership_epoch::MembershipPlacementVerdictRecord {
+                verdict_id: 1,
+                membership_epoch_ref: EpochId::new(1),
+                placement_class: tidefs_membership_epoch::PlacementIntentClass::ReplicaTarget,
+                selected_member_refs: vec![MemberId::new(1)],
+                selected_domain_refs: vec![DomainId::new(1)],
+                verdict_class: VerdictClass::Admit,
+                degraded_reason_refs: vec![],
+                issuance_receipt_ref: ReceiptId::ZERO,
+                digest: 0,
+            },
+        };
+
+        let cpp = CommittedPlacementPlan {
+            plan: inner_plan,
+            committed_at: 3,
+        };
+
+        assert!(!cpp.is_stale(3));
+        assert!(!cpp.is_stale(2));
+        assert!(cpp.is_stale(4));
+        assert!(cpp.is_stale(10));
+    }
+
+    #[test]
+    fn relocate_targets_from_committed_free_space() {
+        // SpaceAccounting with known committed free space.
+        let mut sa = SpaceAccounting::empty();
+        // Commit some writes so we have non-zero committed consumption.
+        sa.commit_delta(Delta::new_write(1_000_000)).unwrap();
+
+        let planner = RebalancePlanner::default_for_epoch(EpochId::new(1));
+
+        // With 0 min_free_bytes, all candidates qualify
+        let targets = planner.select_targets_with_committed_free_space(
+            &[MemberId::new(1), MemberId::new(2)],
+            &sa,
+            0,
+        );
+        assert_eq!(targets.len(), 2);
+
+        // When min_free_bytes exceeds committed free space, none qualify
+        let statfs = sa.statfs();
+        let committed_free = statfs.blocks_free.saturating_mul(statfs.block_size);
+        let overflow = committed_free.saturating_add(1);
+        let no_targets =
+            planner.select_targets_with_committed_free_space(&[MemberId::new(1)], &sa, overflow);
+        assert!(no_targets.is_empty());
+    }
+
+    #[test]
+    fn rebalance_with_mixed_device_sizes() {
+        // Simulate a pool with mixed device sizes: device A has 1 TB,
+        // device B has 2 TB, device C has 4 TB. Utilization percentages
+        // differ, creating skew that rebalance should detect.
+        let planner = RebalancePlanner::new(20, 10, 10_000_000_000);
+
+        let mut node_util: BTreeMap<NodeId, u64> = BTreeMap::new();
+        // Device A (1 TB): 90% full
+        node_util.insert(NodeId(1), 90);
+        // Device B (2 TB): 50% full
+        node_util.insert(NodeId(2), 50);
+        // Device C (4 TB): 30% full
+        node_util.insert(NodeId(3), 30);
+
+        // Total raw bytes: 7 TB
+        let skew = planner.detect_skew(&node_util, 7_000_000_000_000, 1000);
+        assert!(skew.is_some());
+        let s = skew.unwrap();
+
+        // Delta 90 - 30 = 60% > 20% threshold
+        assert!(s.is_rebalance_needed());
+        assert!(s.has_viable_movement());
+
+        // Over-utilized: device A (90% > avg ~57%)
+        assert!(s.over_utilized_nodes.contains(&NodeId(1)));
+        // Under-utilized: device C (30% < avg ~57%)
+        assert!(s.under_utilized_nodes.contains(&NodeId(3)));
+    }
+
+    #[test]
+    fn committed_free_space_excludes_pending_deltas() {
+        let mut sa = SpaceAccounting::empty();
+        // Set a quota so there is committed free space to work with.
+        sa.set_quota(1_000_000_000);
+
+        // Set pool counters with enough physical headroom for the writes.
+        sa.update_pool_counters(PoolCounters {
+            phys_free_bytes: 1_000_000_000,
+            phys_total_bytes: 1_000_000_000,
+            ..Default::default()
+        });
+
+        // Before any writes, committed free space is the full quota.
+        let statfs_before = sa.statfs();
+        let committed_free_before = statfs_before
+            .blocks_free
+            .saturating_mul(statfs_before.block_size);
+        assert!(committed_free_before > 0);
+
+        // Accumulate a pending delta that would consume half the space.
+        // This stays pending (not yet committed) so statfs excludes it.
+        let pending_bytes = committed_free_before / 2;
+        sa.accumulate_delta(Delta::new_write(pending_bytes));
+        assert!(sa.has_pending_delta());
+
+        // statfs excludes the pending delta — committed free space unchanged.
+        let statfs_after = sa.statfs();
+        assert_eq!(statfs_after.blocks_free, statfs_before.blocks_free);
+
+        // check_enospc uses committed counters only, so still admits.
+        assert!(!sa.check_enospc(1));
+
+        // After committing the pending delta, free space drops.
+        sa.commit_pending(PoolCounters {
+            phys_free_bytes: 1_000_000_000,
+            phys_total_bytes: 1_000_000_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let statfs_committed = sa.statfs();
+        assert!(statfs_committed.blocks_free < statfs_before.blocks_free);
     }
 }

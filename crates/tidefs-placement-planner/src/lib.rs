@@ -85,6 +85,38 @@ pub struct MemberPlacementWeight {
 }
 
 // ---------------------------------------------------------------------------
+// CommittedPlacementPlan — placement plan bound to a commit group
+// ---------------------------------------------------------------------------
+
+/// A placement plan whose evidence is committed at a specific commit group.
+///
+/// Wraps [`FailureDomainPlacementPlan`] with the commit group id at which
+/// the placement receipts and failure-domain inventory were committed.
+/// This binding enables downstream consumers (e.g. the rebalance planner)
+/// to invalidate placement decisions when the underlying evidence is
+/// superseded by a newer commit group.
+///
+/// The `committed_at` field uses a raw `u64` to avoid a dependency cycle
+/// with `tidefs-commit_group`; callers in crates that already depend on
+/// `tidefs-commit_group` can convert with `CommitGroupId(committed_at)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedPlacementPlan {
+    /// The placement plan produced from committed evidence.
+    pub plan: FailureDomainPlacementPlan,
+    /// Commit group id at which the placement evidence was committed.
+    pub committed_at: u64,
+}
+
+impl CommittedPlacementPlan {
+    /// Returns `true` if the evidence backing this plan is stale relative
+    /// to a newer commit group.
+    #[must_use]
+    pub fn is_stale(&self, current_commit_group_id: u64) -> bool {
+        current_commit_group_id > self.committed_at
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core algorithm
 // ---------------------------------------------------------------------------
 
@@ -260,6 +292,53 @@ pub fn compute_replica_target_set(
         excluded_member_refs: excluded_members,
         verdict,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Committed variants — consume committed placement receipts
+// ---------------------------------------------------------------------------
+
+/// Compute replica targets from committed placement receipts, bound to a
+/// specific commit group.
+///
+/// Identical to [`compute_replica_target_set`] except the returned plan is
+/// wrapped in a [`CommittedPlacementPlan`] that records `committed_at` and
+/// supports staleness checks.
+pub fn compute_committed_replica_target_set(
+    policy: &FailureDomainPlacementPolicy,
+    failure_domains: &[FailureDomainRecord],
+    tier_goal: TierGoal,
+    epoch: EpochId,
+    committed_at: u64,
+) -> Result<CommittedPlacementPlan, PlacementError> {
+    let plan = compute_replica_target_set(policy, failure_domains, tier_goal, epoch)?;
+    Ok(CommittedPlacementPlan { plan, committed_at })
+}
+
+/// Compute keyed replica targets from committed placement receipts, bound
+/// to a specific commit group.
+///
+/// Identical to [`compute_keyed_replica_target_set`] except the returned plan
+/// is wrapped in a [`CommittedPlacementPlan`] that records `committed_at` and
+/// supports staleness checks.
+pub fn compute_committed_keyed_replica_target_set(
+    policy: &FailureDomainPlacementPolicy,
+    failure_domains: &[FailureDomainRecord],
+    tier_goal: TierGoal,
+    epoch: EpochId,
+    placement_key: u64,
+    member_weights: &[MemberPlacementWeight],
+    committed_at: u64,
+) -> Result<CommittedPlacementPlan, PlacementError> {
+    let plan = compute_keyed_replica_target_set(
+        policy,
+        failure_domains,
+        tier_goal,
+        epoch,
+        placement_key,
+        member_weights,
+    )?;
+    Ok(CommittedPlacementPlan { plan, committed_at })
 }
 
 /// Compute replica targets with placement-key-dependent weighted ordering.

@@ -3167,11 +3167,13 @@ version = "0.421.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
+ "tidefs-commit_group",
  "tidefs-membership-epoch",
  "tidefs-placement-planner",
  "tidefs-rebuild-planner",
  "tidefs-replica-health",
  "tidefs-replication-model",
+ "tidefs-space-accounting",
 ]
 
 [[package]]
