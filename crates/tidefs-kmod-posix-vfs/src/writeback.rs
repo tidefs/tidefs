@@ -162,6 +162,37 @@ impl DirtyFolioTracker {
         ranges
     }
 
+    /// Re-dirty the unwritten suffix of a previously drained range list.
+    ///
+    /// `current_index` names the range whose writeback failed or stopped
+    /// short. `bytes_written_in_current` is the committed prefix for that
+    /// range; all following ranges are restored in full.
+    pub fn redirty_unwritten(
+        &mut self,
+        inode: InodeId,
+        ranges: &[DirtyRange],
+        current_index: usize,
+        bytes_written_in_current: u64,
+    ) -> Result<(), Errno> {
+        for (idx, range) in ranges.iter().enumerate().skip(current_index) {
+            let written = if idx == current_index {
+                bytes_written_in_current.min(range.length as u64)
+            } else {
+                0
+            };
+            let remaining = (range.length as u64).saturating_sub(written);
+            if remaining == 0 {
+                continue;
+            }
+            self.try_add(
+                inode,
+                range.offset.saturating_add(written),
+                remaining as u32,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn clear_inode(&mut self, inode: InodeId) -> usize {
         let before = self.entries.len();
         self.entries.retain(|(ino, _)| *ino != inode);
@@ -394,6 +425,28 @@ mod tests {
         assert_eq!(t.drain_inode(ino(1)).len(), 2);
         assert_eq!(t.len(), 1);
     }
+
+    #[test]
+    fn redirty_unwritten_restores_tail_and_following_ranges() {
+        let mut t = DirtyFolioTracker::new(64);
+        let ranges = Vec::from([
+            DirtyRange::new(0, 4096),
+            DirtyRange::new(8192, 4096),
+            DirtyRange::new(16384, 4096),
+        ]);
+
+        t.redirty_unwritten(ino(1), &ranges, 1, 1024).unwrap();
+
+        let restored: Vec<_> = t.iter().collect();
+        assert_eq!(
+            restored,
+            Vec::from([
+                (ino(1), DirtyRange::new(9216, 3072)),
+                (ino(1), DirtyRange::new(16384, 4096)),
+            ])
+        );
+    }
+
     #[test]
     fn clear_count() {
         let mut t = DirtyFolioTracker::new(64);
