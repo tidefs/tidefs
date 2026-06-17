@@ -84,7 +84,7 @@ impl UblkAcceptanceHarnessReport {
             self.acceptance_status.is_acceptance_evidence()
         );
         if let Some(ref reason) = self.durability_block_reason {
-            println!("durability.block_reason={reason}");
+            println!("durability.block_reason={}", reason);
         }
         println!("host.kernel_release={}", self.host_kernel_release);
         println!("dev_id={}", self.dev_id);
