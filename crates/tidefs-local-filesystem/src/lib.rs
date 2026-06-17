@@ -10733,8 +10733,13 @@ impl LocalFileSystem {
         if let Some(bytes) = self.hot_read_cache.borrow_mut().get(key) {
             return Ok(bytes);
         }
-        let bytes =
-            read_content_from_store(self.store.raw_primary_store(), inode_id, record, true, Some(&self.store))?;
+        let bytes = read_content_from_store(
+            self.store.raw_primary_store(),
+            inode_id,
+            record,
+            true,
+            Some(&self.store),
+        )?;
         self.hot_read_cache.borrow_mut().admit(key, &bytes);
         Ok(bytes)
     }

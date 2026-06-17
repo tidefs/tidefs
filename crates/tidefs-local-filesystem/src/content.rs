@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::vec;
 
+use tidefs_local_object_store::pool::{PlacementReceipt, PoolStoreMut};
 use tidefs_local_object_store::DeviceIoClass;
 use tidefs_local_object_store::Pool;
-use tidefs_local_object_store::pool::{PlacementReceipt, PoolStoreMut};
 use tidefs_local_object_store::{
     checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey, StoredObject,
 };
@@ -189,7 +189,9 @@ pub(crate) fn read_content_from_store(
         read_content_layout_from_store(store, inode_id, record, allow_v0390_fixed_content)?;
     match &layout {
         ContentLayout::Inline(content) => Ok(content.bytes.clone()),
-        ContentLayout::Chunked(manifest) => read_chunked_content(store, manifest, record.size, pool),
+        ContentLayout::Chunked(manifest) => {
+            read_chunked_content(store, manifest, record.size, pool)
+        }
     }
 }
 
@@ -1112,7 +1114,6 @@ fn write_sparse_size_change<S: ContentWriteStore>(
             continue;
         }
 
-        let old_chunk = read_content_chunk_from_store(store.raw_store(), new_record.inode_id, old_ref, None)?;
         let old_chunk =
             read_content_chunk_from_store(store.raw_store(), new_record.inode_id, old_ref, None)?;
         let mut chunk_bytes = old_chunk.bytes.to_vec();
@@ -1527,7 +1528,8 @@ pub(crate) fn punch_hole_content<S: ContentWriteStore>(
         } else if !old_ref.is_hole() {
             // Chunk partially overlaps the hole: read the chunk, zero the
             // hole bytes, and write a modified chunk under the new data version.
-            let old_chunk = read_content_chunk_from_store(store.raw_store(), inode_id, old_ref, None)?;
+            let old_chunk =
+                read_content_chunk_from_store(store.raw_store(), inode_id, old_ref, None)?;
             let mut modified = old_chunk.bytes.to_vec();
             let zero_start = hole_offset.saturating_sub(chunk_start);
             let zero_start_idx = usize::try_from(zero_start).unwrap_or(0);
@@ -1812,7 +1814,8 @@ pub(crate) fn read_content_range_from_layout(
                         continue;
                     }
 
-                    let chunk = read_content_chunk_from_store(store, manifest.inode_id, chunk_ref, pool)?;
+                    let chunk =
+                        read_content_chunk_from_store(store, manifest.inode_id, chunk_ref, pool)?;
                     if in_chunk > chunk.bytes.len() {
                         return Err(FileSystemError::CorruptState {
                             reason: "content range starts beyond chunk length",
@@ -2252,13 +2255,8 @@ mod tests {
         let store = temp_store("hole-zeros");
         let hole_ref = ContentChunkRef::hole(0, 128);
 
-        let result = read_content_chunk_from_store(
-            &store,
-            InodeId::new(30),
-            &hole_ref,
-            None,
-        )
-        .expect("read hole chunk");
+        let result = read_content_chunk_from_store(&store, InodeId::new(30), &hole_ref, None)
+            .expect("read hole chunk");
         assert_eq!(result.bytes, vec![0u8; 128]);
     }
 }

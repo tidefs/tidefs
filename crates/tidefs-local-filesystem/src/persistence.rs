@@ -194,7 +194,8 @@ pub(crate) fn transaction_manifest_entries_for_content(
                         reason: "transaction manifest references a missing content chunk",
                     })?;
                 let is_dedup = crate::encoding::is_dedup_redirect(&stored_bytes);
-                let chunk = read_content_chunk_from_store(store, manifest.inode_id, chunk_ref, None)?;
+                let chunk =
+                    read_content_chunk_from_store(store, manifest.inode_id, chunk_ref, None)?;
                 if !is_dedup && chunk.chunk_index != chunk_ref.chunk_index {
                     return Err(FileSystemError::CorruptState {
                         reason: "content chunk does not match manifest",
