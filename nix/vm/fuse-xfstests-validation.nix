@@ -354,7 +354,7 @@ if false; then
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff \
                   reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync \
                   expr head tail cut kill ps test seq du dirname basename \
-                  readlink tr cmp diff od uname date mountpoint umount timeout sed mktemp chmod chown awk sort uniq xargs which tr ln tee hostname df pgrep pkill id killall logger; do
+                  readlink tr cmp diff setsid od uname date mountpoint umount timeout sed mktemp chmod chown awk sort uniq xargs which tr ln tee hostname df pgrep pkill id killall logger; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
     cat > "$RUN_DIR/etc/passwd" << 'PASSWD'
@@ -466,7 +466,7 @@ daemon_log="/tmp/tidefs-daemon-$log_tag.log"
     echo "tidefs-preview: daemon_log=$daemon_log"
 } > "$helper_log"
 mkdir -p "$store"
-/bin/tidefs-posix-filesystem-adapter-daemon mount-vfs     --store "$store" --mount "$mnt"     --fs-name "$dev"     --coherency "$daemon_coherency"     --writeback-cache     --content-capacity-bytes "$daemon_content_capacity_bytes"     --options "$daemon_opts"     $daemon_read_only     --root-auth-key-hex "$AUTH"     >"$daemon_log" 2>&1 &
+setsid /bin/tidefs-posix-filesystem-adapter-daemon mount-vfs     --store "$store" --mount "$mnt"     --fs-name "$dev"     --coherency "$daemon_coherency"     --writeback-cache     --content-capacity-bytes "$daemon_content_capacity_bytes"     --options "$daemon_opts"     $daemon_read_only     --root-auth-key-hex "$AUTH"     >"$daemon_log" 2>&1 &
 daemon_pid=$!
 echo "tidefs-preview: daemon_pid=$daemon_pid" >> "$helper_log"
 report_mount_failure() {
