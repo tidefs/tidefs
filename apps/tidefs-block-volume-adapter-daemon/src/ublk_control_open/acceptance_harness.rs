@@ -218,6 +218,162 @@ fn open_control_device_file(path: &std::path::Path) -> Result<std::fs::File, App
         .map_err(|e| AppError::new(format!("control device open: {e}")))
 }
 
+fn run_io_loop_iterations(
+    nr_hw_queues: u16,
+    queue_depth: u16,
+    data_queue_runtime: &mut tidefs_block_volume_adapter_ublk_control_runtime::UblkDataQueueRuntime,
+    image: &mut BlockVolumeFileImage,
+    max_iterations: u32,
+) -> (u64, u64) {
+    let mut iterations: u64 = 0;
+    let mut cqes_processed: u64 = 0;
+    let sectors_per_block = (image.geometry.block_size_bytes / 512) as u64;
+
+    for _ in 0..max_iterations {
+        match data_queue_runtime.ring_mut().submit_and_wait(1) {
+            Ok(_) => {}
+            Err(_e) => break,
+        }
+        iterations += 1;
+
+        let mut pending_fetch_tags: Vec<(u16, u16)> = Vec::new();
+        while let Some(cqe) = data_queue_runtime.ring_mut().completion().next() {
+            cqes_processed += 1;
+            if cqe.result() < 0 {
+                break;
+            }
+            let user_data = cqe.user_data();
+            if is_fetch_req_user_data(user_data) {
+                pending_fetch_tags.push(decode_fetch_req_user_data(user_data));
+            }
+        }
+
+        for (q_id, tag) in pending_fetch_tags {
+            let mut result: i32 = UBLK_IO_RES_OK;
+
+            if let Some(io_desc) = data_queue_runtime.io_desc(tag) {
+                let op = io_desc.op();
+                let fua = (io_desc.op_flags & UBLK_IO_F_FUA) != 0;
+
+                match op {
+                    UBLK_IO_OP_READ => {
+                        let sector_count = io_desc.count_or_zones as u64;
+                        if sector_count > 0 && sectors_per_block > 0 {
+                            let start_block = (io_desc.start_sector / sectors_per_block) as usize;
+                            let block_count = (sector_count / sectors_per_block) as usize;
+                            let range = BlockRangeRecord::new(start_block, block_count.max(1));
+                            match image.read_blocks(range) {
+                                Ok((plan, Some(payload))) => {
+                                    if plan.completion_class
+                                        == BlockVolumeCompletionClass::Completed
+                                    {
+                                        if data_queue_runtime
+                                            .write_data_at(0, tag, &payload)
+                                            .is_err()
+                                        {
+                                            result = -libc::EIO;
+                                        }
+                                    } else {
+                                        result = -libc::EIO;
+                                    }
+                                }
+                                _ => {
+                                    result = -libc::EIO;
+                                }
+                            }
+                        }
+                    }
+                    UBLK_IO_OP_WRITE => {
+                        let sector_count = io_desc.count_or_zones as u64;
+                        if sector_count > 0 && sectors_per_block > 0 {
+                            let start_block = (io_desc.start_sector / sectors_per_block) as usize;
+                            let block_count = (sector_count / sectors_per_block) as usize;
+                            let payload_len = block_count.max(1) * image.geometry.block_size_bytes;
+                            let mut write_buf = vec![0u8; payload_len];
+                            match data_queue_runtime.read_data_at(0, tag, &mut write_buf) {
+                                Ok(_) => {
+                                    match image.write_blocks(start_block, &write_buf[..payload_len])
+                                    {
+                                        Ok(plan) => {
+                                            if plan.completion_class
+                                                != BlockVolumeCompletionClass::Completed
+                                            {
+                                                result = -libc::EIO;
+                                            } else if fua {
+                                                let _ = image.flush();
+                                            }
+                                        }
+                                        Err(_) => {
+                                            result = -libc::EIO;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    result = -libc::EIO;
+                                }
+                            }
+                        }
+                    }
+                    UBLK_IO_OP_FLUSH => {
+                        let _ = image.flush();
+                    }
+                    UBLK_IO_OP_DISCARD => {
+                        let sector_count = io_desc.count_or_zones as u64;
+                        if sector_count > 0 && sectors_per_block > 0 {
+                            let start_block = (io_desc.start_sector / sectors_per_block) as usize;
+                            let block_count = (sector_count / sectors_per_block) as usize;
+                            let zeroes =
+                                vec![0u8; block_count.max(1) * image.geometry.block_size_bytes];
+                            if image.write_blocks(start_block, &zeroes).is_err() {
+                                result = -libc::EIO;
+                            }
+                        }
+                    }
+                    UBLK_IO_OP_WRITE_ZEROES => {
+                        let sector_count = io_desc.count_or_zones as u64;
+                        if sector_count > 0 && sectors_per_block > 0 {
+                            let start_block = (io_desc.start_sector / sectors_per_block) as usize;
+                            let block_count = (sector_count / sectors_per_block) as usize;
+                            let zeroes =
+                                vec![0u8; block_count.max(1) * image.geometry.block_size_bytes];
+                            if image.write_blocks(start_block, &zeroes).is_err() {
+                                result = -libc::EIO;
+                            }
+                        }
+                    }
+                    _ => {
+                        result = -libc::EIO;
+                    }
+                }
+
+                let _ = fua;
+            }
+
+            let commit_input = UblkDataQueueCommitAndFetchInput {
+                q_id,
+                tag,
+                nr_hw_queues,
+                queue_depth,
+                result,
+                addr_or_zone_append_lba: 0,
+            };
+            let readiness = UblkDataQueueCommitAndFetchReadiness {
+                data_queue_runtime_live: true,
+                fetched_request_available: true,
+                completion_result_ready: true,
+            };
+            let _ = submit_runtime_commit_and_fetch_without_wait(
+                data_queue_runtime,
+                commit_input,
+                readiness,
+            );
+        }
+    }
+
+    (iterations, cqes_processed)
+}
+
+
 /// OW for the ublk acceptance harness: gate PC-012.
 ///
 /// The harness:
