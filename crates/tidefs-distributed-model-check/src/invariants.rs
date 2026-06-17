@@ -49,7 +49,8 @@ pub fn no_conflicting_committed_writers(sys: &DistributedSystem) -> Vec<Distribu
                         violations.push(DistributedInvariantViolation::new(
                             "no_conflicting_committed_writers",
                             format!(
-                                "conflict: node {} committed write_id {} on object {} epoch {},                                  but node {} already committed write_id {} on same object/epoch",
+                                "conflict: node {} committed write_id {} on object {} epoch {}, \
+                                 but node {} already committed write_id {} on same object/epoch",
                                 write.writer_node_id, write.write_id,
                                 write.object_key, write.epoch,
                                 ow.writer_node_id, ow.write_id,
@@ -78,7 +79,8 @@ pub fn no_stale_epoch_commit(sys: &DistributedSystem) -> Vec<DistributedInvarian
                 violations.push(DistributedInvariantViolation::new(
                     "no_stale_epoch_commit",
                     format!(
-                        "node {} committed write_id {} on object {} at epoch {},                          but current epoch is {}",
+                        "node {} committed write_id {} on object {} at epoch {}, \
+                         but current epoch is {}",
                         node.node_id, write.write_id,
                         write.object_key, write.epoch,
                         node.current_epoch,
@@ -91,7 +93,8 @@ pub fn no_stale_epoch_commit(sys: &DistributedSystem) -> Vec<DistributedInvarian
                 violations.push(DistributedInvariantViolation::new(
                     "no_stale_epoch_commit",
                     format!(
-                        "node {} has committed quorum write_id {} on object {} at epoch {},                          but current epoch is {}",
+                        "node {} has committed quorum write_id {} on object {} at epoch {}, \
+                         but current epoch is {}",
                         node.node_id, qw.write_id,
                         qw.object_key, qw.epoch,
                         node.current_epoch,
@@ -116,7 +119,8 @@ pub fn no_false_quorum_success(sys: &DistributedSystem) -> Vec<DistributedInvari
                 violations.push(DistributedInvariantViolation::new(
                     "no_false_quorum_success",
                     format!(
-                        "node {} quorum write_id {} on object {} is committed but has                          {} acks (need >= {})",
+                        "node {} quorum write_id {} on object {} is committed but has \
+                         {} acks (need >= {})",
                         node.node_id, qw.write_id,
                         qw.object_key, qw.acks_received,
                         qw.quorum_size,
@@ -131,7 +135,8 @@ pub fn no_false_quorum_success(sys: &DistributedSystem) -> Vec<DistributedInvari
             violations.push(DistributedInvariantViolation::new(
                 "no_false_quorum_success",
                 format!(
-                    "quorum model write_id {} on object {} is committed but has                      {} acks (need >= {})",
+                    "quorum model write_id {} on object {} is committed but has \
+                     {} acks (need >= {})",
                     qw.write_id, qw.object_key,
                     qw.acks_received, qw.quorum_size,
                 ),
@@ -157,7 +162,8 @@ pub fn no_rebuild_before_receipt(sys: &DistributedSystem) -> Vec<DistributedInva
                 violations.push(DistributedInvariantViolation::new(
                     "no_rebuild_before_receipt",
                     format!(
-                        "rebuild on object {} at node {} epoch {} was allowed                          without a durable placement receipt",
+                        "rebuild on object {} at node {} epoch {} was allowed \
+                         without a durable placement receipt",
                         attempt.object_key, attempt.target_node, attempt.epoch,
                     ),
                 ));

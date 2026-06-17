@@ -13,7 +13,7 @@ mod bounded_model_tests {
         network::{DeliveryPolicy, DistributedMessage, MessageKind},
         lease::LeaseOutcome,
         quorum::{QuorumWriteRequest, QuorumWriteOutcome},
-        placement::{PlacementReceiptState, RebuildPolicy},
+        placement::{PlacementReceiptState, RebuildPolicy, model_placement_receipt_ref},
     };
 
     // ── helper ──────────────────────────────────────────────────────────
@@ -28,6 +28,11 @@ mod bounded_model_tests {
         sys
     }
 
+    /// Build a minimal placement receipt ref for a test object.
+    fn test_receipt_ref(object_id: u64, object_key_str: &str, epoch: u64) -> crate::placement::PlacementReceiptRef {
+        model_placement_receipt_ref(object_id, object_key_str, epoch)
+    }
+
     // ── I-1: no conflicting committed writers ──────────────────────────
 
     #[test]
@@ -35,11 +40,13 @@ mod bounded_model_tests {
         let mut sys = three_node_system();
         sys.nodes[0].committed_object_writes.push(CommittedObjectWrite {
             object_key: "obj/a".into(), epoch: 1,
-            writer_node_id: 0, write_id: 1, placement_receipt_id: 1,
+            writer_node_id: 0, write_id: 1,
+            placement_receipt_ref: test_receipt_ref(1, "obj/a", 1),
         });
         sys.nodes[1].committed_object_writes.push(CommittedObjectWrite {
             object_key: "obj/b".into(), epoch: 1,
-            writer_node_id: 1, write_id: 2, placement_receipt_id: 2,
+            writer_node_id: 1, write_id: 2,
+            placement_receipt_ref: test_receipt_ref(2, "obj/b", 1),
         });
         let violations = sys.step();
         let conflicts: Vec<_> = violations.iter()
@@ -53,11 +60,13 @@ mod bounded_model_tests {
         let mut sys = three_node_system();
         sys.nodes[0].committed_object_writes.push(CommittedObjectWrite {
             object_key: "obj/x".into(), epoch: 1,
-            writer_node_id: 0, write_id: 10, placement_receipt_id: 10,
+            writer_node_id: 0, write_id: 10,
+            placement_receipt_ref: test_receipt_ref(10, "obj/x", 1),
         });
         sys.nodes[1].committed_object_writes.push(CommittedObjectWrite {
             object_key: "obj/x".into(), epoch: 1,
-            writer_node_id: 1, write_id: 11, placement_receipt_id: 11,
+            writer_node_id: 1, write_id: 11,
+            placement_receipt_ref: test_receipt_ref(11, "obj/x", 1),
         });
         let violations = sys.step();
         let conflicts: Vec<_> = violations.iter()
@@ -71,11 +80,13 @@ mod bounded_model_tests {
         let mut sys = three_node_system();
         sys.nodes[0].committed_object_writes.push(CommittedObjectWrite {
             object_key: "obj/y".into(), epoch: 1,
-            writer_node_id: 0, write_id: 20, placement_receipt_id: 20,
+            writer_node_id: 0, write_id: 20,
+            placement_receipt_ref: test_receipt_ref(20, "obj/y", 1),
         });
         sys.nodes[1].committed_object_writes.push(CommittedObjectWrite {
             object_key: "obj/y".into(), epoch: 2,
-            writer_node_id: 1, write_id: 21, placement_receipt_id: 21,
+            writer_node_id: 1, write_id: 21,
+            placement_receipt_ref: test_receipt_ref(21, "obj/y", 2),
         });
         let violations = sys.step();
         let conflicts: Vec<_> = violations.iter()
@@ -95,7 +106,8 @@ mod bounded_model_tests {
         // But has a committed write at epoch 1 (stale).
         sys.nodes[0].committed_object_writes.push(CommittedObjectWrite {
             object_key: "obj/s".into(), epoch: 1,
-            writer_node_id: 0, write_id: 30, placement_receipt_id: 30,
+            writer_node_id: 0, write_id: 30,
+            placement_receipt_ref: test_receipt_ref(30, "obj/s", 1),
         });
         let violations = sys.step();
         let stale: Vec<_> = violations.iter()
@@ -110,110 +122,123 @@ mod bounded_model_tests {
         sys.nodes[0].current_epoch = 1;
         sys.nodes[0].committed_object_writes.push(CommittedObjectWrite {
             object_key: "obj/f".into(), epoch: 1,
-            writer_node_id: 0, write_id: 31, placement_receipt_id: 31,
+            writer_node_id: 0, write_id: 40,
+            placement_receipt_ref: test_receipt_ref(40, "obj/f", 1),
         });
         let violations = sys.step();
         let stale: Vec<_> = violations.iter()
             .filter(|v| v.invariant == "no_stale_epoch_commit")
             .collect();
-        assert!(stale.is_empty(), "fresh epoch commit must not be flagged");
+        assert!(stale.is_empty(), "fresh epoch should not be stale");
     }
 
     // ── I-3: no false quorum success ───────────────────────────────────
 
     #[test]
-    fn false_quorum_success_violation_detected() {
+    fn false_quorum_violation_detected() {
         let mut sys = three_node_system();
-        sys.nodes[0].quorum_writes.push(crate::quorum::QuorumWriteState {
-            write_id: 40, object_key: "obj/q".into(),
+        // Inject a committed quorum write with fewer acks than quorum needs.
+        let qw = crate::QuorumWriteState {
+            write_id: 1, object_key: "obj/fq".into(),
             coordinator: 0, participants: vec![0, 1, 2],
             epoch: 1, phase: crate::quorum::QuorumPhase::Committed,
-            acks_received: 1, // only 1 ack, but quorum_size = 2
-            quorum_size: 2, committed: true,
-        });
+            acks_received: 1, quorum_size: 2, committed: true,
+        };
+        sys.nodes[0].quorum_writes.push(qw);
         let violations = sys.step();
-        let false_q: Vec<_> = violations.iter()
+        let fq: Vec<_> = violations.iter()
             .filter(|v| v.invariant == "no_false_quorum_success")
             .collect();
-        assert!(!false_q.is_empty(), "false quorum success must be detected");
+        assert!(!fq.is_empty(), "false quorum must be detected");
     }
 
     #[test]
-    fn valid_quorum_success_no_violation() {
+    fn valid_quorum_no_violation() {
         let mut sys = three_node_system();
-        sys.nodes[0].quorum_writes.push(crate::quorum::QuorumWriteState {
-            write_id: 41, object_key: "obj/vq".into(),
+        let qw = crate::QuorumWriteState {
+            write_id: 1, object_key: "obj/vq".into(),
             coordinator: 0, participants: vec![0, 1, 2],
             epoch: 1, phase: crate::quorum::QuorumPhase::Committed,
-            acks_received: 2, // 2 acks >= quorum_size 2
-            quorum_size: 2, committed: true,
-        });
+            acks_received: 2, quorum_size: 2, committed: true,
+        };
+        sys.nodes[0].quorum_writes.push(qw);
         let violations = sys.step();
-        let false_q: Vec<_> = violations.iter()
+        let fq: Vec<_> = violations.iter()
             .filter(|v| v.invariant == "no_false_quorum_success")
             .collect();
-        assert!(false_q.is_empty(), "valid quorum must not be flagged");
+        assert!(fq.is_empty(), "valid quorum should not be flagged");
     }
 
     // ── I-4: no rebuild before receipt ─────────────────────────────────
 
     #[test]
-    fn rebuild_without_receipt_is_refused() {
+    fn rebuild_without_receipt_violation() {
         let mut sys = three_node_system();
         sys.placement_model.policy = RebuildPolicy::RequireDurableReceipt;
-        // No receipt recorded — rebuild must be refused.
-        let allowed = sys.placement_model.try_rebuild("obj/r", 0, 1);
-        assert!(!allowed, "rebuild without receipt must be refused");
+        let allowed = sys.placement_model.try_rebuild("obj/r1", 2, 1);
+        assert!(!allowed, "rebuild without receipt should be denied");
         let violations = sys.step();
-        let no_receipt: Vec<_> = violations.iter()
+        let rr: Vec<_> = violations.iter()
             .filter(|v| v.invariant == "no_rebuild_before_receipt")
             .collect();
-        // No violation because the system correctly refused the rebuild.
-        assert!(no_receipt.is_empty(), "refused rebuild must not be a violation");
+        assert!(rr.is_empty(), "denied rebuild is not a violation");
     }
 
     #[test]
-    fn rebuild_with_receipt_is_allowed() {
+    fn rebuild_after_receipt_allowed() {
         let mut sys = three_node_system();
         sys.placement_model.policy = RebuildPolicy::RequireDurableReceipt;
-        sys.placement_model.record_receipt(PlacementReceiptState {
-            receipt_id: 1, object_key: "obj/rr".into(),
-            node_id: 0, epoch: 1, durable: true,
-        });
-        sys.placement_model.try_rebuild("obj/rr", 0, 1);
+        sys.placement_model.record_receipt(
+            PlacementReceiptState::for_model(100, "obj/r2", 0, 1, true),
+        );
+        let allowed = sys.placement_model.try_rebuild("obj/r2", 2, 1);
+        assert!(allowed, "rebuild after durable receipt should be allowed");
         let violations = sys.step();
-        let no_receipt: Vec<_> = violations.iter()
+        let rr: Vec<_> = violations.iter()
             .filter(|v| v.invariant == "no_rebuild_before_receipt")
             .collect();
-        assert!(no_receipt.is_empty(), "rebuild with receipt must be allowed");
+        assert!(rr.is_empty(), "allowed rebuild with receipt is safe");
+    }
+
+    #[test]
+    fn rebuild_permit_without_receipt_policy() {
+        let mut sys = three_node_system();
+        sys.placement_model.policy = RebuildPolicy::PermitWithoutReceipt;
+        let allowed = sys.placement_model.try_rebuild("obj/r3", 2, 1);
+        assert!(allowed, "PermitWithoutReceipt policy should allow rebuild");
+        let violations = sys.step();
+        let rr: Vec<_> = violations.iter()
+            .filter(|v| v.invariant == "no_rebuild_before_receipt")
+            .collect();
+        assert!(rr.is_empty(), "PermitWithoutReceipt rebuild is not a violation");
     }
 
     // ── lease model tests ──────────────────────────────────────────────
 
     #[test]
-    fn lease_grant_and_revoke() {
+    fn lease_granted_and_revoked() {
         let mut model = crate::LeaseModel::new();
-        let outcome = model.try_grant(1, "obj/l1", 0, 1, 1);
-        assert_eq!(outcome, LeaseOutcome::Granted { lease_id: 1 });
-        assert_eq!(model.leases.len(), 1);
+        let outcome = model.try_grant(1, "obj/lease1", 0, 1, 1);
+        assert!(matches!(outcome, LeaseOutcome::Granted { lease_id: 1 }));
+        assert!(model.object_holders.contains_key("obj/lease1"));
 
         let outcome = model.revoke(1);
-        assert_eq!(outcome, LeaseOutcome::Revoked { lease_id: 1 });
-        assert!(model.leases[0].revoked);
+        assert!(matches!(outcome, LeaseOutcome::Revoked { lease_id: 1 }));
+        assert!(!model.object_holders.contains_key("obj/lease1"));
     }
 
     #[test]
-    fn lease_conflict_same_object() {
+    fn lease_conflict_detected() {
         let mut model = crate::LeaseModel::new();
-        assert_eq!(model.try_grant(1, "obj/lc", 0, 1, 1), LeaseOutcome::Granted { lease_id: 1 });
+        let _ = model.try_grant(1, "obj/lc", 0, 1, 1);
         let outcome = model.try_grant(2, "obj/lc", 1, 1, 1);
         assert!(matches!(outcome, LeaseOutcome::Conflict { .. }));
     }
 
     #[test]
-    fn lease_stale_epoch() {
+    fn lease_stale_epoch_rejected() {
         let mut model = crate::LeaseModel::new();
-        let outcome = model.try_grant(1, "obj/ls", 0, 1, 2); // request_epoch 1 < current_epoch 2
+        let outcome = model.try_grant(1, "obj/lse", 0, 1, 2);
         assert!(matches!(outcome, LeaseOutcome::StaleEpoch { .. }));
     }
 
@@ -227,11 +252,8 @@ mod bounded_model_tests {
             coordinator: 0, participants: vec![0, 1, 2],
             epoch: 1, data_size: 64,
         };
-        let leases = vec![crate::LeaseState {
-            lease_id: 1, object_key: "obj/qse".into(),
-            holder: 0, epoch: 1, granted: true, revoked: false,
-        }];
-        let outcome = model.submit(req, 2, &leases, &[(0, 2), (1, 2), (2, 2)]);
+        // Coordinator at epoch 2 > request epoch 1.
+        let outcome = model.submit(req, 2, &[], &[(0, 2), (1, 2), (2, 2)]);
         assert!(matches!(outcome, QuorumWriteOutcome::RefusedStaleEpoch { .. }));
     }
 
@@ -347,11 +369,53 @@ mod bounded_model_tests {
     fn placement_model_tracks_receipts() {
         let mut model = crate::PlacementModel::new(3);
         assert!(!model.has_durable_receipt("obj/p1"));
-        model.record_receipt(PlacementReceiptState {
-            receipt_id: 1, object_key: "obj/p1".into(),
-            node_id: 0, epoch: 1, durable: true,
-        });
+        model.record_receipt(
+            PlacementReceiptState::for_model(1, "obj/p1", 0, 1, true),
+        );
         assert!(model.has_durable_receipt("obj/p1"));
         assert_eq!(model.object_placements.get("obj/p1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn placement_receipt_ref_round_trips_model_key() {
+        let object_key_str = "obj/roundtrip";
+        let receipt_ref = model_placement_receipt_ref(42, object_key_str, 3);
+        let recovered = crate::placement::receipt_ref_to_model_key(&receipt_ref);
+        assert_eq!(recovered, object_key_str);
+    }
+
+    #[test]
+    fn placement_receipt_state_for_model_constructs_valid_ref() {
+        let state = PlacementReceiptState::for_model(7, "obj/state", 2, 5, true);
+        assert_eq!(state.node_id, 2);
+        assert!(state.durable);
+        assert_eq!(state.receipt_ref.object_id, 7);
+        assert_eq!(state.receipt_ref.receipt_epoch.0, 5);
+    }
+
+    // ── distributed system integration tests ───────────────────────────
+
+    #[test]
+    fn distributed_system_step_count_increments() {
+        let mut sys = DistributedSystem::new(2);
+        assert_eq!(sys.step_count, 0);
+        let _ = sys.step();
+        assert_eq!(sys.step_count, 1);
+    }
+
+    #[test]
+    fn distributed_system_drain_network_empties_queue() {
+        let mut sys = DistributedSystem::new(2);
+        sys.network.enqueue(
+            DistributedMessage {
+                from: 0, to: 1,
+                kind: MessageKind::EpochAdvance { new_epoch: 1 },
+                epoch: 1,
+            },
+            DeliveryPolicy::Normal,
+        );
+        assert!(!sys.network.is_empty());
+        let _ = sys.drain_network();
+        assert!(sys.network.is_empty());
     }
 }

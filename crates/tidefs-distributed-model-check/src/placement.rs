@@ -3,20 +3,47 @@
 //! Placement/receipt authority model for the distributed model checker.
 //!
 //! Tracks placement receipts and enforces that rebuild/reclaim operations
-//! require prior durable placement receipts.  This is a self-contained
-//! model that mirrors the TideFS placement protocol without depending on
-//! live runtime crates.
+//! require prior durable placement receipts.  Uses the settled receipt
+//! identity and locator types from `tidefs-replication-model` instead of
+//! inventing parallel types.
 
 use std::collections::BTreeMap;
+use tidefs_membership_epoch::EpochId;
+pub use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 
-/// Per-node placement receipt state.
+/// Per-node placement receipt state tracked by the model.
+///
+/// Wraps the real [`PlacementReceiptRef`] identity with model-level
+/// durability tracking.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementReceiptState {
-    pub receipt_id: u64,
-    pub object_key: String,
+    /// The settled receipt identity from `tidefs-replication-model`.
+    pub receipt_ref: PlacementReceiptRef,
+    /// Node that recorded this receipt.
     pub node_id: u64,
-    pub epoch: u64,
+    /// Whether the receipt has been durably recorded.
     pub durable: bool,
+}
+
+impl PlacementReceiptState {
+    /// Create a placement receipt state for a model-check scenario.
+    #[must_use]
+    pub fn for_model(
+        object_id: u64,
+        object_key_str: &str,
+        node_id: u64,
+        epoch: u64,
+        durable: bool,
+    ) -> Self {
+        let receipt_ref = model_placement_receipt_ref(object_id, object_key_str, epoch);
+        Self { receipt_ref, node_id, durable }
+    }
+
+    /// The epoch of this receipt.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.receipt_ref.receipt_epoch.0
+    }
 }
 
 /// Policy controlling when rebuild or reclaim is permitted.
@@ -31,9 +58,10 @@ pub enum RebuildPolicy {
 /// Placement model — tracks placement receipts and rebuild eligibility.
 #[derive(Clone, Debug)]
 pub struct PlacementModel {
-    /// All known placement receipts, keyed by receipt_id.
-    pub receipts: BTreeMap<u64, PlacementReceiptState>,
-    /// For each object, the set of nodes with a durable receipt.
+    /// All known placement receipt states, keyed by receipt ref identity.
+    pub receipts: BTreeMap<PlacementReceiptRef, PlacementReceiptState>,
+    /// For each object (by model object key string), the set of nodes
+    /// with a durable receipt.
     pub object_placements: BTreeMap<String, Vec<u64>>,
     /// Rebuild operations that have been attempted.
     pub rebuild_attempts: Vec<RebuildAttempt>,
@@ -63,18 +91,20 @@ impl PlacementModel {
     }
 
     /// Record a placement receipt as durable.
-    pub fn record_receipt(&mut self, receipt: PlacementReceiptState) {
+    pub fn record_receipt(&mut self, state: PlacementReceiptState) {
+        let object_key = object_key_from_receipt_ref(&state.receipt_ref);
         self.object_placements
-            .entry(receipt.object_key.clone())
+            .entry(object_key)
             .or_default()
-            .push(receipt.node_id);
-        self.receipts.insert(receipt.receipt_id, receipt);
+            .push(state.node_id);
+        self.receipts.insert(state.receipt_ref, state);
     }
 
     /// Check whether an object has a durable placement receipt.
     #[must_use]
     pub fn has_durable_receipt(&self, object_key: &str) -> bool {
-        self.object_placements.get(object_key)
+        self.object_placements
+            .get(object_key)
             .map(|nodes| !nodes.is_empty())
             .unwrap_or(false)
     }
@@ -100,4 +130,44 @@ impl PlacementModel {
         });
         allowed
     }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────
+
+/// Build a minimal [`PlacementReceiptRef`] for model-check scenarios.
+/// The model only exercises epoch and object identity; remaining fields
+/// are set to zero/default values that satisfy the type contract.
+#[must_use]
+pub fn model_placement_receipt_ref(
+    object_id: u64,
+    object_key_str: &str,
+    epoch: u64,
+) -> PlacementReceiptRef {
+    let mut key = [0u8; 32];
+    let bytes = object_key_str.as_bytes();
+    let len = bytes.len().min(32);
+    key[..len].copy_from_slice(&bytes[..len]);
+    PlacementReceiptRef::new(
+        object_id,
+        key,
+        EpochId::new(epoch),
+        0, // receipt_generation
+        ReceiptRedundancyPolicy::Replicated { copies: 1 },
+        0, // payload_len
+        [0u8; 32], // payload_digest
+        1, // target_count
+    )
+}
+
+/// Extract a model-level object key string from a receipt ref.
+fn object_key_from_receipt_ref(r: &PlacementReceiptRef) -> String {
+    // Find the first nul or take the whole 32 bytes as UTF-8 lossy.
+    let len = r.object_key.iter().position(|&b| b == 0).unwrap_or(32);
+    String::from_utf8_lossy(&r.object_key[..len]).into_owned()
+}
+
+/// Create a model object key string from a receipt ref, zero-padded.
+#[must_use]
+pub fn receipt_ref_to_model_key(r: &PlacementReceiptRef) -> String {
+    object_key_from_receipt_ref(r)
 }
