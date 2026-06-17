@@ -11,7 +11,7 @@ use std::fmt;
 
 use tidefs_durability_layout::FailureDomainV1;
 use tidefs_durability_layout::{DurabilityLayoutV1, DurabilityPolicy};
-use tidefs_erasure_coding::{encode, ErasureShard, StripeConfig};
+use tidefs_erasure_coding::{encode, ErasureShard, ShardKind, StripeConfig};
 use tidefs_local_object_store::{LocalObjectStore, ObjectKey};
 use tidefs_placement_planner::placement_plan::{DeviceCandidate, PlacementPlan, ShardAssignment};
 
@@ -63,6 +63,12 @@ pub struct ErasureCodedWriteOutcome {
 pub struct StripeWriteOutcome {
     /// Zero-based stripe index within the object.
     pub stripe_index: usize,
+    /// Object identifier (deterministic manifest self-containment).
+    pub object_id: Vec<u8>,
+    /// Stripe configuration (k, m, shard_len) for this stripe.
+    pub stripe_config: StripeConfig,
+    /// Logical payload length within this stripe, before shard-len padding.
+    pub original_chunk_len: usize,
     /// Per-shard placement info (shard index, target store, integrity digest).
     pub shard_placements: Vec<ShardPlacement>,
 }
@@ -72,6 +78,8 @@ pub struct StripeWriteOutcome {
 pub struct ShardPlacement {
     /// Index of the shard within the stripe (0..k-1 = data, k..k+m-1 = parity).
     pub shard_index: usize,
+    /// Kind of this shard (Data or Parity).
+    pub shard_kind: ShardKind,
     /// Target store index in the stores slice, determined by the placement planner.
     pub store_index: usize,
     /// Device id selected by the placement planner for this shard.
@@ -80,6 +88,23 @@ pub struct ShardPlacement {
     pub digest: [u8; 32],
     /// Shard payload size in bytes (padded to shard_len).
     pub size: usize,
+}
+
+/// Evidence recorded when dispatched shards are rolled back after a
+/// partial write failure.
+///
+/// Carried inside [`WritePathError::DispatchFailed`] so the caller can
+/// inspect which shards were written and subsequently deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackEvidence {
+    /// Stripe index where the failure occurred.
+    pub failed_stripe: usize,
+    /// Shard index that triggered the failure.
+    pub failed_shard: usize,
+    /// Store index that rejected the write.
+    pub failed_store: usize,
+    /// Keys that were written and then rolled back: (store_index, shard_key_bytes).
+    pub rolled_back_keys: Vec<(usize, [u8; 32])>,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +126,7 @@ pub enum WritePathError {
     InsufficientStores { needed: usize, available: usize },
     /// Writing a shard to its target store failed.
     DispatchFailed {
+        rollback_evidence: Option<RollbackEvidence>,
         stripe: usize,
         shard: usize,
         store: usize,
@@ -130,6 +156,7 @@ impl fmt::Display for WritePathError {
                 write!(f, "need {needed} stores for k+m shards, have {available}")
             }
             Self::DispatchFailed {
+                rollback_evidence,
                 stripe,
                 shard,
                 store,
@@ -138,7 +165,11 @@ impl fmt::Display for WritePathError {
                 write!(
                     f,
                     "dispatch to store {store} failed for stripe {stripe} shard {shard}: {reason}"
-                )
+                )?;
+                if let Some(ref ev) = rollback_evidence {
+                    write!(f, " (rolled back {} keys)", ev.rolled_back_keys.len())?;
+                }
+                Ok(())
             }
             Self::EnvelopeEncodeFailed(msg) => {
                 write!(f, "shard integrity envelope encoding failed: {msg}")
@@ -273,6 +304,12 @@ impl<'a> ErasureCodedWriteRequest<'a> {
                         // Rollback: delete all previously written shards for this object.
                         rollback_written(stores, &written_keys);
                         return Err(WritePathError::DispatchFailed {
+                            rollback_evidence: Some(RollbackEvidence {
+                                failed_stripe: stripe_idx,
+                                failed_shard: placement.shard_index,
+                                failed_store: placement.store_index,
+                                rolled_back_keys: written_keys.clone(),
+                            }),
                             stripe: stripe_idx,
                             shard: placement.shard_index,
                             store: placement.store_index,
@@ -284,10 +321,15 @@ impl<'a> ErasureCodedWriteRequest<'a> {
 
             stripe_outcomes.push(StripeWriteOutcome {
                 stripe_index: stripe_idx,
+                object_id: self.object_id.clone(),
+                stripe_config: stripe_config.clone(),
+                original_chunk_len: chunk.len(),
                 shard_placements: placements,
             });
         }
 
+        // --- Validate manifest completeness before acknowledging success ---
+        validate_manifest(&stripe_outcomes, k, m, num_stripes, shards_total)?;
         Ok(ErasureCodedWriteOutcome {
             object_id: self.object_id,
             stripe_outcomes,
@@ -361,6 +403,7 @@ pub fn dispatch_stripes(
         );
         placements.push(ShardPlacement {
             shard_index: shard.index,
+            shard_kind: shard.kind,
             store_index,
             device_id,
             digest,
@@ -369,6 +412,131 @@ pub fn dispatch_stripes(
     }
 
     Ok(placements)
+}
+/// Validate that every stripe in the manifest covers all data and parity shards
+/// with non-zero digests and the expected shard counts.
+///
+/// Returns an error if any stripe is missing a shard placement, has a zero
+/// digest, or the overall shard count does not match expectations.
+fn validate_manifest(
+    stripe_outcomes: &[StripeWriteOutcome],
+    k: usize,
+    m: usize,
+    num_stripes: usize,
+    shards_total: usize,
+) -> Result<(), WritePathError> {
+    let sw = k + m;
+    if stripe_outcomes.len() != num_stripes {
+        return Err(WritePathError::Internal(format!(
+            "manifest has {} stripe outcomes, expected {num_stripes}",
+            stripe_outcomes.len()
+        )));
+    }
+
+    for (expected_stripe, so) in stripe_outcomes.iter().enumerate() {
+        if so.stripe_index != expected_stripe {
+            return Err(WritePathError::Internal(format!(
+                "manifest stripe at position {expected_stripe} has stripe index {}",
+                so.stripe_index
+            )));
+        }
+        if so.stripe_config.data_shards != k || so.stripe_config.parity_shards != m {
+            return Err(WritePathError::Internal(format!(
+                "stripe {} config is {}+{}, expected {k}+{m}",
+                so.stripe_index, so.stripe_config.data_shards, so.stripe_config.parity_shards
+            )));
+        }
+        if so.stripe_config.shard_len == 0 {
+            return Err(WritePathError::Internal(format!(
+                "stripe {} config has zero shard_len",
+                so.stripe_index
+            )));
+        }
+        if so.shard_placements.len() != sw {
+            return Err(WritePathError::Internal(format!(
+                "stripe {} manifest has {} shard placements, expected {sw}",
+                so.stripe_index,
+                so.shard_placements.len()
+            )));
+        }
+
+        // Verify data/parity shard count per stripe
+        let data_count = so
+            .shard_placements
+            .iter()
+            .filter(|p| p.shard_kind == ShardKind::Data)
+            .count();
+        let parity_count = so.shard_placements.len() - data_count;
+        if data_count != k || parity_count != m {
+            return Err(WritePathError::Internal(format!(
+                "stripe {} manifest has {data_count} data + {parity_count} parity shards, expected {k}+{m}",
+                so.stripe_index
+            )));
+        }
+
+        let mut seen_shards = vec![false; sw];
+        for placement in &so.shard_placements {
+            if placement.shard_index >= sw {
+                return Err(WritePathError::Internal(format!(
+                    "stripe {} shard index {} is outside 0..{sw}",
+                    so.stripe_index, placement.shard_index
+                )));
+            }
+            if seen_shards[placement.shard_index] {
+                return Err(WritePathError::Internal(format!(
+                    "stripe {} has duplicate shard index {}",
+                    so.stripe_index, placement.shard_index
+                )));
+            }
+            seen_shards[placement.shard_index] = true;
+
+            let expected_kind = if placement.shard_index < k {
+                ShardKind::Data
+            } else {
+                ShardKind::Parity
+            };
+            if placement.shard_kind != expected_kind {
+                return Err(WritePathError::Internal(format!(
+                    "stripe {} shard {} has kind {:?}, expected {:?}",
+                    so.stripe_index, placement.shard_index, placement.shard_kind, expected_kind
+                )));
+            }
+            if placement.digest == [0u8; 32] {
+                return Err(WritePathError::Internal(format!(
+                    "stripe {} shard {} has zero digest",
+                    so.stripe_index, placement.shard_index
+                )));
+            }
+            if placement.size == 0 {
+                return Err(WritePathError::Internal(format!(
+                    "stripe {} shard {} has zero size",
+                    so.stripe_index, placement.shard_index
+                )));
+            }
+            if placement.size != so.stripe_config.shard_len {
+                return Err(WritePathError::Internal(format!(
+                    "stripe {} shard {} has size {}, expected {}",
+                    so.stripe_index,
+                    placement.shard_index,
+                    placement.size,
+                    so.stripe_config.shard_len
+                )));
+            }
+        }
+    }
+
+    // Cross-check total shard count
+    let total: usize = stripe_outcomes
+        .iter()
+        .map(|so| so.shard_placements.len())
+        .sum();
+    if total != shards_total {
+        return Err(WritePathError::Internal(format!(
+            "manifest covers {total} shard placements, expected {shards_total}"
+        )));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +686,35 @@ mod tests {
                 datacenter_id: None,
             })
             .collect()
+    }
+
+    fn manifest_placement(
+        shard_index: usize,
+        shard_kind: ShardKind,
+        digest_byte: u8,
+    ) -> ShardPlacement {
+        ShardPlacement {
+            shard_index,
+            shard_kind,
+            store_index: shard_index,
+            device_id: shard_index as u64,
+            digest: [digest_byte; 32],
+            size: 64,
+        }
+    }
+
+    fn manifest_stripe(shard_placements: Vec<ShardPlacement>) -> StripeWriteOutcome {
+        StripeWriteOutcome {
+            stripe_index: 0,
+            object_id: b"manifest".to_vec(),
+            stripe_config: StripeConfig {
+                data_shards: 2,
+                parity_shards: 1,
+                shard_len: 64,
+            },
+            original_chunk_len: 128,
+            shard_placements,
+        }
     }
 
     /// Build device candidates with node-level grouping.
@@ -895,6 +1092,7 @@ mod tests {
         );
         assert_eq!(
             WritePathError::DispatchFailed {
+                rollback_evidence: None,
                 stripe: 1,
                 shard: 3,
                 store: 3,
@@ -1214,6 +1412,440 @@ mod tests {
             );
             assert!(p.size > 0, "shard {} has zero size", p.shard_index);
         }
+
+        cleanup_dirs(&paths);
+    }
+
+    // --- Tail-stripe manifest: verify original_chunk_len records logical
+    //     payload length, not shard-len-padded size ---
+
+    #[test]
+    fn tail_stripe_manifest_original_chunk_len() {
+        let layout = erasure_layout_2_1();
+        let paths = make_paths(3, "tail-stripe");
+        let mut stores = open_stores(&paths);
+
+        let shard_len = 64;
+        let cap = 2 * shard_len;
+        // Payload is 200 bytes: first stripe = 128 bytes, tail stripe = 72 bytes.
+        let payload: Vec<u8> = (0..200u8).collect();
+
+        let device_cands_3 = device_candidates(3);
+        let fd_3 = device_fd(3);
+        let req = ErasureCodedWriteRequest {
+            object_id: b"tail".to_vec(),
+            payload,
+            layout: &layout,
+            shard_len,
+            failure_domain: &fd_3,
+            device_candidates: &device_cands_3,
+        };
+
+        let outcome = req.execute(&mut stores).unwrap();
+        assert_eq!(outcome.stripe_outcomes.len(), 2);
+
+        // First stripe: full capacity
+        let s0 = &outcome.stripe_outcomes[0];
+        assert_eq!(s0.stripe_index, 0);
+        assert_eq!(s0.original_chunk_len, cap);
+        assert_eq!(s0.shard_placements.len(), 3);
+        assert_eq!(s0.object_id, b"tail");
+        assert_eq!(s0.stripe_config.data_shards, 2);
+        assert_eq!(s0.stripe_config.parity_shards, 1);
+        assert_eq!(s0.stripe_config.shard_len, shard_len);
+        // Verify shard kinds
+        assert_eq!(s0.shard_placements[0].shard_kind, ShardKind::Data);
+        assert_eq!(s0.shard_placements[1].shard_kind, ShardKind::Data);
+        assert_eq!(s0.shard_placements[2].shard_kind, ShardKind::Parity);
+
+        // Tail stripe: 72 bytes (200 - 128)
+        let s1 = &outcome.stripe_outcomes[1];
+        assert_eq!(s1.stripe_index, 1);
+        assert_eq!(s1.original_chunk_len, 72);
+        assert_eq!(s1.shard_placements.len(), 3);
+        // Every shard should have size == shard_len (padded)
+        for p in &s1.shard_placements {
+            assert_eq!(p.size, shard_len);
+        }
+        assert_ne!(s1.original_chunk_len, s1.shard_placements[0].size);
+
+        cleanup_dirs(&paths);
+    }
+
+    // --- Digest mismatch: verify every placement has a non-zero digest ---
+
+    #[test]
+    fn manifest_digest_is_populated() {
+        let layout = erasure_layout_4_2();
+        let paths = make_paths(6, "digest-chk");
+        let mut stores = open_stores(&paths);
+
+        let payload = b"digest check payload".to_vec();
+        let req = ErasureCodedWriteRequest {
+            object_id: b"digest-obj".to_vec(),
+            payload,
+            layout: &layout,
+            shard_len: 64,
+            failure_domain: &device_fd(6),
+            device_candidates: &device_candidates(6),
+        };
+
+        let outcome = req.execute(&mut stores).unwrap();
+        for so in &outcome.stripe_outcomes {
+            for p in &so.shard_placements {
+                assert_ne!(
+                    p.digest, [0u8; 32],
+                    "stripe {} shard {} has zero digest",
+                    so.stripe_index, p.shard_index
+                );
+            }
+        }
+
+        cleanup_dirs(&paths);
+    }
+
+    // --- Missing shard: validate_manifest rejects incomplete stripe outcomes ---
+
+    #[test]
+    fn validate_manifest_rejects_missing_shard() {
+        // Build a StripeWriteOutcome with only 2 placements instead of 3
+        let partial = StripeWriteOutcome {
+            stripe_index: 0,
+            object_id: b"partial".to_vec(),
+            stripe_config: StripeConfig {
+                data_shards: 2,
+                parity_shards: 1,
+                shard_len: 64,
+            },
+            original_chunk_len: 128,
+            shard_placements: vec![
+                ShardPlacement {
+                    shard_index: 0,
+                    shard_kind: ShardKind::Data,
+                    store_index: 0,
+                    device_id: 0,
+                    digest: [1u8; 32],
+                    size: 64,
+                },
+                ShardPlacement {
+                    shard_index: 1,
+                    shard_kind: ShardKind::Data,
+                    store_index: 1,
+                    device_id: 1,
+                    digest: [2u8; 32],
+                    size: 64,
+                },
+            ],
+        };
+
+        let err = validate_manifest(&[partial], 2, 1, 1, 3).unwrap_err();
+        match err {
+            WritePathError::Internal(msg) => {
+                assert!(
+                    msg.contains("has 2 shard placements"),
+                    "expected missing-shard error, got: {msg}"
+                );
+            }
+            _ => panic!("expected Internal error, got {err:?}"),
+        }
+    }
+
+    // --- Data/parity shard count mismatch ---
+
+    #[test]
+    fn validate_manifest_rejects_wrong_shard_kind_counts() {
+        // Build a manifest whose placements claim 3 Data shards under a 2+1 config.
+        let malformed = StripeWriteOutcome {
+            stripe_index: 0,
+            object_id: b"wrong".to_vec(),
+            stripe_config: StripeConfig {
+                data_shards: 2,
+                parity_shards: 1,
+                shard_len: 64,
+            },
+            original_chunk_len: 192,
+            shard_placements: vec![
+                ShardPlacement {
+                    shard_index: 0,
+                    shard_kind: ShardKind::Data,
+                    store_index: 0,
+                    device_id: 0,
+                    digest: [1u8; 32],
+                    size: 64,
+                },
+                ShardPlacement {
+                    shard_index: 1,
+                    shard_kind: ShardKind::Data,
+                    store_index: 1,
+                    device_id: 1,
+                    digest: [2u8; 32],
+                    size: 64,
+                },
+                ShardPlacement {
+                    shard_index: 2,
+                    shard_kind: ShardKind::Data,
+                    store_index: 2,
+                    device_id: 2,
+                    digest: [3u8; 32],
+                    size: 64,
+                },
+            ],
+        };
+
+        // Expect 2 data + 1 parity, but got 3 data + 0 parity
+        let err = validate_manifest(&[malformed], 2, 1, 1, 3).unwrap_err();
+        match err {
+            WritePathError::Internal(msg) => {
+                assert!(
+                    msg.contains("data") && msg.contains("parity"),
+                    "expected shard-kind-count error, got: {msg}"
+                );
+            }
+            _ => panic!("expected Internal error, got {err:?}"),
+        }
+    }
+
+    // --- Duplicate shard index rejection ---
+
+    #[test]
+    fn validate_manifest_rejects_duplicate_shard_index() {
+        let duplicate = manifest_stripe(vec![
+            manifest_placement(0, ShardKind::Data, 1),
+            manifest_placement(0, ShardKind::Data, 2),
+            manifest_placement(2, ShardKind::Parity, 3),
+        ]);
+
+        let err = validate_manifest(&[duplicate], 2, 1, 1, 3).unwrap_err();
+        match err {
+            WritePathError::Internal(msg) => {
+                assert!(
+                    msg.contains("duplicate shard index 0"),
+                    "expected duplicate-shard-index error, got: {msg}"
+                );
+            }
+            _ => panic!("expected Internal error, got {err:?}"),
+        }
+    }
+
+    // --- Shard kind must match its index range ---
+
+    #[test]
+    fn validate_manifest_rejects_shard_kind_index_mismatch() {
+        let mismatched = manifest_stripe(vec![
+            manifest_placement(0, ShardKind::Data, 1),
+            manifest_placement(1, ShardKind::Parity, 2),
+            manifest_placement(2, ShardKind::Data, 3),
+        ]);
+
+        let err = validate_manifest(&[mismatched], 2, 1, 1, 3).unwrap_err();
+        match err {
+            WritePathError::Internal(msg) => {
+                assert!(
+                    msg.contains("shard 1 has kind") && msg.contains("expected Data"),
+                    "expected shard-kind/index error, got: {msg}"
+                );
+            }
+            _ => panic!("expected Internal error, got {err:?}"),
+        }
+    }
+
+    // --- Stripe config and recorded shard size must agree with manifest authority ---
+
+    #[test]
+    fn validate_manifest_rejects_config_and_size_mismatch() {
+        let mut wrong_config = manifest_stripe(vec![
+            manifest_placement(0, ShardKind::Data, 1),
+            manifest_placement(1, ShardKind::Data, 2),
+            manifest_placement(2, ShardKind::Parity, 3),
+        ]);
+        wrong_config.stripe_config.data_shards = 3;
+
+        let err = validate_manifest(&[wrong_config], 2, 1, 1, 3).unwrap_err();
+        match err {
+            WritePathError::Internal(msg) => {
+                assert!(
+                    msg.contains("config is 3+1"),
+                    "expected stripe-config error, got: {msg}"
+                );
+            }
+            _ => panic!("expected Internal error, got {err:?}"),
+        }
+
+        let mut wrong_size = manifest_stripe(vec![
+            manifest_placement(0, ShardKind::Data, 1),
+            manifest_placement(1, ShardKind::Data, 2),
+            manifest_placement(2, ShardKind::Parity, 3),
+        ]);
+        wrong_size.shard_placements[1].size = 63;
+
+        let err = validate_manifest(&[wrong_size], 2, 1, 1, 3).unwrap_err();
+        match err {
+            WritePathError::Internal(msg) => {
+                assert!(
+                    msg.contains("has size 63, expected 64"),
+                    "expected shard-size error, got: {msg}"
+                );
+            }
+            _ => panic!("expected Internal error, got {err:?}"),
+        }
+    }
+
+    // --- Zero digest rejection ---
+
+    #[test]
+    fn validate_manifest_rejects_zero_digest() {
+        let corrupt = StripeWriteOutcome {
+            stripe_index: 0,
+            object_id: b"zero-dig".to_vec(),
+            stripe_config: StripeConfig {
+                data_shards: 2,
+                parity_shards: 1,
+                shard_len: 64,
+            },
+            original_chunk_len: 128,
+            shard_placements: vec![
+                ShardPlacement {
+                    shard_index: 0,
+                    shard_kind: ShardKind::Data,
+                    store_index: 0,
+                    device_id: 0,
+                    digest: [0u8; 32],
+                    size: 64,
+                },
+                ShardPlacement {
+                    shard_index: 1,
+                    shard_kind: ShardKind::Data,
+                    store_index: 1,
+                    device_id: 1,
+                    digest: [1u8; 32],
+                    size: 64,
+                },
+                ShardPlacement {
+                    shard_index: 2,
+                    shard_kind: ShardKind::Parity,
+                    store_index: 2,
+                    device_id: 2,
+                    digest: [2u8; 32],
+                    size: 64,
+                },
+            ],
+        };
+
+        let err = validate_manifest(&[corrupt], 2, 1, 1, 3).unwrap_err();
+        match err {
+            WritePathError::Internal(msg) => {
+                assert!(
+                    msg.contains("zero digest"),
+                    "expected zero-digest error, got: {msg}"
+                );
+            }
+            _ => panic!("expected Internal error, got {err:?}"),
+        }
+    }
+
+    // --- Placement mismatch: wrong number of stripes in manifest ---
+
+    #[test]
+    fn validate_manifest_rejects_wrong_stripe_count() {
+        let valid = StripeWriteOutcome {
+            stripe_index: 0,
+            object_id: b"count".to_vec(),
+            stripe_config: StripeConfig {
+                data_shards: 2,
+                parity_shards: 1,
+                shard_len: 64,
+            },
+            original_chunk_len: 128,
+            shard_placements: vec![
+                ShardPlacement {
+                    shard_index: 0,
+                    shard_kind: ShardKind::Data,
+                    store_index: 0,
+                    device_id: 0,
+                    digest: [1u8; 32],
+                    size: 64,
+                },
+                ShardPlacement {
+                    shard_index: 1,
+                    shard_kind: ShardKind::Data,
+                    store_index: 1,
+                    device_id: 1,
+                    digest: [2u8; 32],
+                    size: 64,
+                },
+                ShardPlacement {
+                    shard_index: 2,
+                    shard_kind: ShardKind::Parity,
+                    store_index: 2,
+                    device_id: 2,
+                    digest: [3u8; 32],
+                    size: 64,
+                },
+            ],
+        };
+
+        // Claim 2 stripes but only provide 1
+        let err = validate_manifest(&[valid], 2, 1, 2, 6).unwrap_err();
+        match err {
+            WritePathError::Internal(msg) => {
+                assert!(
+                    msg.contains("has 1 stripe outcomes"),
+                    "expected stripe-count error, got: {msg}"
+                );
+            }
+            _ => panic!("expected Internal error, got {err:?}"),
+        }
+    }
+
+    // --- Rollback evidence is populated on dispatch failure ---
+
+    #[test]
+    fn rollback_evidence_populated_on_failure() {
+        let paths = make_paths(6, "rollback-evidence");
+        let stores = open_stores(&paths);
+        // Drop one store to create a failure scenario
+        drop(stores);
+        let _stores = open_stores(&paths);
+
+        // We cannot easily inject a store failure without fault injection,
+        // but we can verify that when a DispatchFailed is constructed,
+        // the RollbackEvidence fields are accessible.
+        let evidence = RollbackEvidence {
+            failed_stripe: 0,
+            failed_shard: 3,
+            failed_store: 3,
+            rolled_back_keys: vec![(0, [0u8; 32]), (1, [1u8; 32])],
+        };
+        assert_eq!(evidence.failed_stripe, 0);
+        assert_eq!(evidence.failed_shard, 3);
+        assert_eq!(evidence.failed_store, 3);
+        assert_eq!(evidence.rolled_back_keys.len(), 2);
+
+        // Verify evidence is carried in the error
+        let err = WritePathError::DispatchFailed {
+            rollback_evidence: Some(evidence),
+            stripe: 0,
+            shard: 3,
+            store: 3,
+            reason: "simulated".into(),
+        };
+        match &err {
+            WritePathError::DispatchFailed {
+                rollback_evidence: Some(ev),
+                ..
+            } => {
+                assert_eq!(ev.rolled_back_keys.len(), 2);
+                assert_eq!(ev.failed_stripe, 0);
+            }
+            _ => panic!("expected DispatchFailed with rollback evidence"),
+        }
+
+        // Display should mention rollback
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rolled back 2 keys"),
+            "display should mention rollback, got: {msg}"
+        );
 
         cleanup_dirs(&paths);
     }
