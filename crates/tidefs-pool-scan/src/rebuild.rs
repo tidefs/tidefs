@@ -378,7 +378,6 @@ mod tests {
             device_count,
             missing_indices,
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         }
     }
 
@@ -410,7 +409,6 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
 
         let plan = RebuildScheduler::schedule(&config);
@@ -471,7 +469,6 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
 
         let plan = RebuildScheduler::schedule(&config);
@@ -507,7 +504,6 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
 
         let plan = RebuildScheduler::schedule(&config);

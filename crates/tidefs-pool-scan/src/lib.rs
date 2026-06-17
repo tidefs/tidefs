@@ -1287,13 +1287,7 @@ pub struct PoolConfig {
     pub missing_indices: Vec<u32>,
     /// Indices of devices currently being removed (allocation-fenced).
     pub removing_device_indices: Vec<u32>,
-    /// Completed device evacuations with committed receipt evidence.
-    ///
-    /// Each entry records a device that was successfully evacuated and
-    /// removed.  Post-removal pool scans surface this evidence to confirm
-    /// that placement receipts were relocated before device retirement.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub completed_evacuations: Vec<CompletedEvacuation>,
+
 }
 /// A borrowed reference to a leaf device's immutable fields,
 /// returned by [`DeviceType::find_leaf`].
@@ -2207,7 +2201,6 @@ impl PoolAssembler {
             device_count: ref_count,
             missing_indices: missing,
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         })
     }
 }
@@ -3059,7 +3052,6 @@ mod tests {
             device_count: 1,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         }
     }
 
@@ -3104,7 +3096,6 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         }
     }
 
@@ -3201,7 +3192,6 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
 
         let (stats, trigger) =
@@ -3290,7 +3280,6 @@ mod tests {
             device_count: leaf_count,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
 
         let result = PoolAddVdev::add_vdev(device_path, DeviceRole::PoolDataMember, &mut config);
@@ -3399,7 +3388,6 @@ mod tests {
             device_count: 1,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
 
         // 1. Generate labels from the config.
@@ -3498,7 +3486,6 @@ mod tests {
             device_count: 3,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
 
         // Generate labels and write each to its corresponding device file.

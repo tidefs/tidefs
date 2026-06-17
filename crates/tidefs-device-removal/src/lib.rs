@@ -1134,6 +1134,19 @@ impl DeviceRemovalDriver {
         self.placement_receipt_checker = Some(checker);
     }
 
+    /// Record the committed evacuation receipt.
+    ///
+    /// Delegates to [`DeviceRemovalState::record_evacuation_receipt`].
+    /// Must be called after evacuation completes and the placement
+    /// receipt checker confirms no live extent references the device.
+    pub fn record_evacuation_receipt(
+        &mut self,
+        placement_receipt_refs: Vec<PlacementReceiptRef>,
+        receipt_id: u64,
+    ) {
+        self.state.record_evacuation_receipt(placement_receipt_refs, receipt_id);
+    }
+
     // ── Phase transitions ──────────────────────────────────────────
 
     /// Advance from Removing to Evacuating.
@@ -2434,6 +2447,7 @@ mod tests {
 
         // Evacuating -> Evacuated
         driver.mark_evacuated().unwrap();
+        driver.record_evacuation_receipt(vec![], 0);
         assert_eq!(driver.state().phase, DeviceRemovalPhase::Evacuated);
 
         // Evacuated -> Vacated
@@ -2501,6 +2515,7 @@ mod tests {
 
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
+        driver.record_evacuation_receipt(vec![], 0);
 
         // Pass a config that still has disk1
         let still_has_target = make_pool_config(vec![
@@ -3172,6 +3187,7 @@ mod tests {
         let d1 = driver.state().chain_digest;
         assert_ne!(d1, [0u8; 32]);
         driver.mark_evacuated().unwrap();
+        driver.record_evacuation_receipt(vec![], 0);
         let d2 = driver.state().chain_digest;
         assert_ne!(d2, d1);
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
@@ -3244,6 +3260,7 @@ mod tests {
         .unwrap();
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
+        driver.record_evacuation_receipt(vec![], 0);
 
         // Manually clear the completion generation to simulate
         // a state that was deserialized without it (pre-this-issue data).
@@ -3280,6 +3297,7 @@ mod tests {
         .unwrap();
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
+        driver.record_evacuation_receipt(vec![], 0);
 
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
         let mut updated = make_pool_config(vec![leaf0_after]);
@@ -3309,6 +3327,7 @@ mod tests {
             .record_object_evacuated(ExtentId::from(1u64), 100)
             .unwrap();
         driver.mark_evacuated().unwrap();
+        driver.record_evacuation_receipt(vec![], 0);
 
         // Tamper with the completion generation set digest.
         if let Some(ref mut completion) = driver.state.evacuation_completion_generation {
@@ -3346,6 +3365,7 @@ mod tests {
         .unwrap();
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
+        driver.record_evacuation_receipt(vec![], 0);
 
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
         let mut updated = make_pool_config(vec![leaf0_after]);
@@ -3392,6 +3412,7 @@ mod tests {
             .record_object_evacuated(ExtentId::from(1u64), 100)
             .unwrap();
         driver.mark_evacuated().unwrap();
+        driver.record_evacuation_receipt(vec![], 0);
         // Evacuated phase: not yet durable.
         assert_eq!(
             driver.status(),
@@ -3463,6 +3484,7 @@ mod tests {
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
         let mut updated = make_pool_config(vec![leaf0_after]);
         updated.topology_generation = 2;
+        resumed.record_evacuation_receipt(vec![], 0);
         resumed.commit_vacated(updated).unwrap();
         assert_eq!(resumed.state().phase, DeviceRemovalPhase::Vacated);
 
