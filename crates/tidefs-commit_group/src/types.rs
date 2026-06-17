@@ -41,6 +41,49 @@ impl fmt::Display for CommitGroupId {
     }
 }
 
+/// Allocation fence derived from a commit-group epoch.
+///
+/// Block allocators use this compact value to bind transient physical block
+/// reservations and pending frees to the commit-group epoch that owns their
+/// durability barrier. The fence is valid only when both the epoch number and
+/// commit-group id are non-zero.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CommitGroupEpochFence {
+    /// Monotonically increasing commit-group epoch number.
+    pub epoch_number: u64,
+    /// Commit-group id assigned to the fenced epoch.
+    pub commit_group_id: CommitGroupId,
+}
+
+impl CommitGroupEpochFence {
+    /// Nil / invalid epoch fence.
+    pub const NIL: Self = Self {
+        epoch_number: 0,
+        commit_group_id: CommitGroupId::NIL,
+    };
+
+    /// Create a new commit-group epoch fence.
+    #[must_use]
+    pub const fn new(epoch_number: u64, commit_group_id: CommitGroupId) -> Self {
+        Self {
+            epoch_number,
+            commit_group_id,
+        }
+    }
+
+    /// Returns true when the fence names a real commit-group epoch.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        self.epoch_number > 0 && self.commit_group_id.is_valid()
+    }
+}
+
+impl fmt::Display for CommitGroupEpochFence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@epoch-{}", self.commit_group_id, self.epoch_number)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DirtyRange — a single dirty byte range on an inode
 // ---------------------------------------------------------------------------
@@ -396,6 +439,20 @@ mod tests {
     fn commit_group_id_clone_is_equal() {
         let id = CommitGroupId(7);
         assert_eq!(id, id.clone());
+    }
+
+    #[test]
+    fn commit_group_epoch_fence_validity() {
+        assert!(!CommitGroupEpochFence::NIL.is_valid());
+        assert!(!CommitGroupEpochFence::new(0, CommitGroupId(1)).is_valid());
+        assert!(!CommitGroupEpochFence::new(1, CommitGroupId::NIL).is_valid());
+        assert!(CommitGroupEpochFence::new(2, CommitGroupId(3)).is_valid());
+    }
+
+    #[test]
+    fn commit_group_epoch_fence_display() {
+        let fence = CommitGroupEpochFence::new(4, CommitGroupId(9));
+        assert_eq!(fence.to_string(), "commit_group-9@epoch-4");
     }
 
     // ==================================================================

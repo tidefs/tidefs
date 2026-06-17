@@ -13,6 +13,7 @@ Pacing component that gates all write-path work.
 """
 
 [dependencies]
+tidefs-commit_group = { path = "../tidefs-commit_group", default-features = false }
 tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
 tidefs-spacemap-allocator = { path = "../tidefs-spacemap-allocator" }
 

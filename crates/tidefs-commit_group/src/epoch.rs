@@ -16,7 +16,7 @@
 //!
 //! A verifier can replay the chain from any known-good starting point.
 
-use crate::types::{CommitGroupError, CommitGroupId};
+use crate::types::{CommitGroupEpochFence, CommitGroupError, CommitGroupId};
 
 // ---------------------------------------------------------------------------
 // EpochState — the four epoch phases
@@ -77,6 +77,13 @@ pub struct CommitRecord {
     pub prior_epoch_hash: Option<[u8; 32]>,
     /// How many dirty objects were staged in this epoch.
     pub dirty_object_count: usize,
+}
+
+impl CommitRecord {
+    /// Allocation fence for the committed epoch described by this record.
+    pub fn allocation_fence(&self) -> CommitGroupEpochFence {
+        CommitGroupEpochFence::new(self.epoch_number, self.commit_group_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +151,11 @@ impl CommitGroupEpoch {
     /// The commit-group id assigned to this epoch.
     pub fn commit_group_id(&self) -> CommitGroupId {
         self.commit_group_id
+    }
+
+    /// Allocation fence for this epoch's block reservations.
+    pub fn allocation_fence(&self) -> CommitGroupEpochFence {
+        CommitGroupEpochFence::new(self.epoch_number, self.commit_group_id)
     }
 
     /// Current epoch state.
@@ -386,6 +398,13 @@ impl CommitGroupStateMachine {
     /// Reference to the currently open epoch, if any.
     pub fn current_epoch(&self) -> Option<&CommitGroupEpoch> {
         self.current_epoch.as_ref()
+    }
+
+    /// Allocation fence for the currently open epoch, if one exists.
+    pub fn current_epoch_fence(&self) -> Option<CommitGroupEpochFence> {
+        self.current_epoch
+            .as_ref()
+            .map(CommitGroupEpoch::allocation_fence)
     }
 
     /// Returns `true` if an epoch is currently open.
@@ -971,6 +990,36 @@ mod tests {
 
         assert!(r2.epoch_number > r1.epoch_number);
         assert!(r2.commit_group_id > r1.commit_group_id);
+    }
+
+    #[test]
+    fn epoch_allocation_fence_matches_epoch_identity() {
+        let epoch = CommitGroupEpoch::new(7, CommitGroupId(42), None);
+        assert_eq!(
+            epoch.allocation_fence(),
+            CommitGroupEpochFence::new(7, CommitGroupId(42))
+        );
+    }
+
+    #[test]
+    fn state_machine_exposes_current_epoch_fence() {
+        let mut sm = CommitGroupStateMachine::new(CommitGroupId(10), None);
+        assert!(sm.current_epoch_fence().is_none());
+
+        sm.begin_epoch().unwrap();
+        assert_eq!(
+            sm.current_epoch_fence(),
+            Some(CommitGroupEpochFence::new(1, CommitGroupId(10)))
+        );
+
+        sm.stage_dirty(1).unwrap();
+        sm.prepare().unwrap();
+        let record = sm.commit().unwrap();
+        assert_eq!(
+            record.allocation_fence(),
+            CommitGroupEpochFence::new(1, CommitGroupId(10))
+        );
+        assert!(sm.current_epoch_fence().is_none());
     }
 
     // ==================================================================

@@ -138,7 +138,7 @@ pub use txg::{TxGroupHandle, TxGroupLifecycle, TxGroupState, TX_GROUP_STATE_MAGI
 #[cfg(feature = "kernel-storage")]
 pub use txg_sequence::{TxgSequenceCounter, TxgSequenceError};
 pub use types::{
-    CommitGroupError, CommitGroupId, CommitGroupPhase, CommitGroupState, DirtyMetaFlags,
-    DirtyRange, RootPointer,
+    CommitGroupEpochFence, CommitGroupError, CommitGroupId, CommitGroupPhase, CommitGroupState,
+    DirtyMetaFlags, DirtyRange, RootPointer,
 };
 pub use writer::{CommitGroupWriter, CommittedRootBlock};
