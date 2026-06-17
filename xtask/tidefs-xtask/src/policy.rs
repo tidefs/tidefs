@@ -1717,7 +1717,12 @@ fn has_secrets_context(line: &str) -> bool {
             let before = line.as_bytes()[pos - 1];
             !before.is_ascii_alphanumeric() && before != b'_'
         };
-        if left_ok {
+        let after_dot = pos + "secrets.".len();
+        let right_ok = matches!(
+            line.as_bytes().get(after_dot),
+            Some(byte) if byte.is_ascii_alphanumeric() || *byte == b'_'
+        );
+        if left_ok && right_ok {
             return true;
         }
     }
@@ -3042,6 +3047,12 @@ license = "GPL-2.0-only WITH Linux-syscall-note"
     fn bare_secrets_dot_is_detected() {
         let line = "          run: echo \"$SECRET\" | secrets.REGISTRY_PASS";
         assert!(has_secrets_context(line));
+    }
+
+    #[test]
+    fn wildcard_secret_context_doc_pattern_is_not_bare_use() {
+        let line = "Do not use `secrets.*` workflow expressions";
+        assert!(!has_secrets_context(line));
     }
 
     #[test]
