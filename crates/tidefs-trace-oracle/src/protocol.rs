@@ -115,6 +115,7 @@ pub const KEY_DEVICE_COUNT: &str = "device_count";
 pub const KEY_DEVICE_SIZE_BYTES: &str = "device_size_bytes";
 pub const KEY_OFFSET: &str = "offset";
 pub const KEY_LENGTH: &str = "length";
+pub const KEY_DATASYNC: &str = "datasync";
 pub const KEY_SRC: &str = "src";
 pub const KEY_DST: &str = "dst";
 pub const KEY_START_AFTER: &str = "start_after";

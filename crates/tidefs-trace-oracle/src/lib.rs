@@ -529,12 +529,18 @@ impl TraceRunner {
             OP_FSYNC => {
                 let dataset = get_string_arg(args, KEY_DATASET)?;
                 let key = get_string_arg(args, KEY_KEY)?;
+                let datasync = args
+                    .get(KEY_DATASYNC)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let path = format!("/{dataset}/{key}");
-                let fs = self.fs()?;
-                // fsync is a durability flush that is a no-op in the
-                // local trace runner; we only verify the file exists.
-                let _ = fs.lookup(&path)
-                    .map_err(|e| TraceError::FileSystem(format!("fsync {path}: {e}")))?;
+                let fs = self.fs_mut()?;
+                let result = if datasync {
+                    fs.fsync_data_only_file(&path)
+                } else {
+                    fs.fsync_file(&path)
+                };
+                result.map_err(|e| TraceError::FileSystem(format!("fsync {path}: {e}")))?;
                 Ok(None)
             }
 
