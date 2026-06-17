@@ -2037,6 +2037,21 @@ mod tests {
         // ── Phase 4: NodeJoinProtocol phase promotion ──
         let mut protocol =
             crate::NodeJoinProtocol::new(MemberId::new(1), EpochId::new(10), 1, 5000);
+        // Provide committed evidence so phase_shadow gates pass
+        let session = crate::JoinSessionEpoch::new(commit_result.epoch, MemberId::new(1), 5000)
+            .with_pool_scan_evidence(crate::CommittedPoolScanEvidence {
+                committed_root: 0xBEEF, commit_group: 42, pool_id: commit_result.pool_id,
+                is_committed: true, member_id_present: true, joining_member_id: MemberId::new(1),
+                evidence_hash: [0xAAu8; 32],
+            })
+            .with_label_agreement(crate::LabelAgreementFingerprint {
+                fingerprint: [0xBBu8; 32], is_committed: true,
+            })
+            .with_placement_receipt(crate::PlacementReceiptEvidence {
+                intent_class: None, is_committed: true, placement_epoch: commit_result.epoch,
+                receipt_id: 1, receipt_hash: [0xCCu8; 32],
+            });
+        protocol.record_session_epoch(session);
         protocol
             .start_from_join_commit(&commit_result, 5000)
             .unwrap();

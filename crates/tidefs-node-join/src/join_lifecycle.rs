@@ -450,12 +450,23 @@ impl NodeJoin {
             )));
         }
 
-        // Record the session epoch binding from the join commit.
-        self.session_epoch = Some(crate::JoinSessionEpoch::new(
+        // Record the session epoch binding from the join commit,
+        // including any committed evidence.
+        let mut session = crate::JoinSessionEpoch::new(
             commit.epoch,
             self.member_id,
             at_ns,
-        ));
+        );
+        if let Some(ref ev) = commit.pool_scan_evidence {
+            session.pool_scan_evidence = Some(ev.clone());
+        }
+        if let Some(ref la) = commit.label_agreement {
+            session.label_agreement = Some(*la);
+        }
+        if let Some(ref pr) = commit.placement_receipt {
+            session.placement_receipt = Some(pr.clone());
+        }
+        self.session_epoch = Some(session);
 
         self.state = NodeJoinState::Bootstrapping;
         self.state_entered_at_ns = at_ns;
@@ -807,6 +818,9 @@ mod tests {
             committed_root: 0xDEAD,
             epoch: EpochId::new(5),
             pool_id: 7,
+            pool_scan_evidence: None,
+            label_agreement: None,
+            placement_receipt: None,
         };
 
         join.start_from_join_commit(&commit, MemberId::new(1), 2_000_000)
@@ -836,6 +850,9 @@ mod tests {
             committed_root: 0xBEEF,
             epoch: EpochId::new(5),
             pool_id: 7,
+            pool_scan_evidence: None,
+            label_agreement: None,
+            placement_receipt: None,
         };
 
         join.start_from_join_commit(&commit, MemberId::new(1), 2_000_000)
@@ -876,6 +893,9 @@ mod tests {
             committed_root: 0xBEEF,
             epoch: EpochId::new(5),
             pool_id: 7,
+            pool_scan_evidence: None,
+            label_agreement: None,
+            placement_receipt: None,
         };
 
         join.start_from_join_commit(&commit, MemberId::new(1), 2_000_000)
@@ -928,6 +948,9 @@ mod tests {
             committed_root: 0xBEEF,
             epoch: EpochId::new(5),
             pool_id: 7,
+            pool_scan_evidence: None,
+            label_agreement: None,
+            placement_receipt: None,
         };
 
         join.start_from_join_commit(&commit, MemberId::new(1), 2_000_000)
