@@ -10,12 +10,14 @@
 //! 1. Prober generates a random 32-byte nonce and sends it as a challenge
 //!    to the target replica.
 //! 2. Target computes `tag = BLAKE3::new_keyed(&shared_secret)
-//!    .update(&nonce).update(&device_id).update(&epoch).finalize()`
+//!    .update(&nonce).update(&device_id).update(&epoch)
+//!    .update(&receipt_id).finalize()` (receipt_id is optional)
 //!    and returns a `HealthAttestation` carrying the nonce, device_id,
-//!    epoch, tag, and a wall-clock timestamp.
+//!    epoch, optional receipt_id, tag, and a wall-clock timestamp.
 //! 3. Prober verifies the attestation by recomputing the tag with the
-//!    same inputs and comparing. Epoch staleness is checked by the
-//!    `HealthQuorum` aggregator (see `health_quorum.rs`).
+//!    same inputs and comparing. Epoch staleness and receipt evidence
+//!    quality are checked by the `HealthQuorum` aggregator
+//!    (see `health_quorum.rs`).
 //!
 //! # Security
 //!
@@ -27,6 +29,7 @@
 //!   rejected at aggregation time.
 
 use tidefs_membership_epoch::EpochId;
+use tidefs_replication_model::ReplicatedReceiptId;
 
 /// 32-byte shared secret for BLAKE3 keyed hashing.
 pub type SharedSecret = [u8; 32];
@@ -51,9 +54,11 @@ pub struct HealthAttestation {
     pub device_id: DeviceId,
     /// Membership epoch at attestation time.
     pub epoch: EpochId,
+    /// Optional receipt id for repair-source eligibility evidence.
+    pub receipt_id: Option<ReplicatedReceiptId>,
     /// Challenge nonce echoed back.
     pub nonce: Nonce,
-    /// BLAKE3 authentication tag = keyed_hash(nonce || device_id || epoch).
+    /// BLAKE3 authentication tag = keyed_hash(nonce || device_id || epoch || receipt_id).
     pub tag: AuthTag,
     /// Wall-clock timestamp (nanoseconds) when the attestation was produced.
     pub timestamp_ns: u64,
@@ -66,6 +71,9 @@ impl HealthAttestation {
         hasher.update(&self.nonce);
         hasher.update(&self.device_id.to_le_bytes());
         hasher.update(&self.epoch.0.to_le_bytes());
+        if let Some(rid) = &self.receipt_id {
+            hasher.update(&rid.0.to_le_bytes());
+        }
         *hasher.finalize().as_bytes()
     }
 }
@@ -95,27 +103,34 @@ impl HealthProbe {
         nonce
     }
 
-    /// Produce a `HealthAttestation` for the given device, epoch, and nonce.
+    /// Produce a `HealthAttestation` for the given device, epoch, nonce,
+    /// and optional receipt for repair-source eligibility.
     ///
     /// Computes `tag = BLAKE3::new_keyed(&secret)
     ///   .update(&nonce).update(&device_id.to_le_bytes())
-    ///   .update(&epoch.0.to_le_bytes()).finalize()`.
+    ///   .update(&epoch.0.to_le_bytes())
+    ///   .update(&receipt_id.to_le_bytes()) if present.finalize()`.
     pub fn attest(
         &self,
         device_id: DeviceId,
         epoch: EpochId,
         nonce: &Nonce,
         timestamp_ns: u64,
+        receipt_id: Option<ReplicatedReceiptId>,
     ) -> HealthAttestation {
         let mut hasher = blake3::Hasher::new_keyed(&self.secret);
         hasher.update(nonce);
         hasher.update(&device_id.to_le_bytes());
         hasher.update(&epoch.0.to_le_bytes());
+        if let Some(rid) = &receipt_id {
+            hasher.update(&rid.0.to_le_bytes());
+        }
         let tag = *hasher.finalize().as_bytes();
 
         HealthAttestation {
             device_id,
             epoch,
+            receipt_id,
             nonce: *nonce,
             tag,
             timestamp_ns,
@@ -142,9 +157,10 @@ impl HealthProbe {
         device_id: DeviceId,
         epoch: EpochId,
         timestamp_ns: u64,
+        receipt_id: Option<ReplicatedReceiptId>,
     ) -> Option<(Nonce, HealthAttestation)> {
         let nonce = self.generate_nonce();
-        let att = self.attest(device_id, epoch, &nonce, timestamp_ns);
+        let att = self.attest(device_id, epoch, &nonce, timestamp_ns, receipt_id);
         if self.verify(&att) {
             Some((nonce, att))
         } else {
@@ -153,15 +169,58 @@ impl HealthProbe {
     }
 }
 
-// ── Epoch-gated health sample ──────────────────────────────────────
+// ── Epoch-gated health sample with repair-source evidence ─────────
 
-/// A verified health sample carrying epoch information for
-/// staleness gating during quorum aggregation.
+/// Classification of probe evidence quality for repair-source eligibility.
+///
+/// Distinguishes between mere reachability and actionable repair evidence:
+/// a peer may be reachable but still ineligible as a repair source when
+/// its probe lacks a receipt, carries a stale timestamp, or is bound to
+/// an older placement epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ProbeEvidenceClass {
+    /// Fresh receipt evidence at current-or-newer epoch — eligible repair source.
+    FreshRepairEvidence,
+    /// Has a receipt but the probe timestamp is beyond the staleness threshold.
+    StaleEvidence,
+    /// Reachable but no receipt carried in the probe response.
+    MissingReceiptEvidence,
+    /// Has a receipt but the epoch is older than the current placement epoch.
+    OlderEpochEvidence,
+}
+
+impl ProbeEvidenceClass {
+    /// Whether this evidence class qualifies the peer as a repair source.
+    pub fn is_repair_eligible(&self) -> bool {
+        matches!(self, ProbeEvidenceClass::FreshRepairEvidence)
+    }
+
+    /// Human-readable label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ProbeEvidenceClass::FreshRepairEvidence => "fresh_repair_evidence",
+            ProbeEvidenceClass::StaleEvidence => "stale_evidence",
+            ProbeEvidenceClass::MissingReceiptEvidence => "missing_receipt_evidence",
+            ProbeEvidenceClass::OlderEpochEvidence => "older_epoch_evidence",
+        }
+    }
+}
+
+impl std::fmt::Display for ProbeEvidenceClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label())
+    }
+}
+
+/// A verified health sample carrying epoch and receipt information for
+/// staleness gating and repair-source eligibility during quorum aggregation.
 ///
 /// Constructed after `HealthProbe::verify` succeeds; the epoch
 /// is compared against the current membership epoch by the
 /// `HealthQuorum` aggregator so that attestations from ejected
-/// or stale members are rejected.
+/// or stale members are rejected. The optional `receipt_id` and
+/// evidence classification enable consumers to distinguish reachability
+/// from actionable repair-source eligibility.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HealthSample {
     pub device_id: DeviceId,
@@ -170,6 +229,9 @@ pub struct HealthSample {
     pub timestamp_ns: u64,
     /// Latency of the probe round-trip in nanoseconds, when available.
     pub latency_ns: Option<u64>,
+    /// Optional receipt identity carried from the attestation for
+    /// repair-source eligibility evidence.
+    pub receipt_id: Option<ReplicatedReceiptId>,
 }
 
 impl HealthSample {
@@ -185,6 +247,7 @@ impl HealthSample {
             healthy,
             timestamp_ns: attestation.timestamp_ns,
             latency_ns,
+            receipt_id: attestation.receipt_id,
         }
     }
 
@@ -192,6 +255,31 @@ impl HealthSample {
     /// Stale samples (epoch < current) are rejected.
     pub fn is_epoch_valid(&self, current_epoch: EpochId) -> bool {
         self.epoch.0 >= current_epoch.0
+    }
+
+    /// Classify the evidence quality of this probe sample for repair-source
+    /// eligibility.
+    ///
+    /// Returns `ProbeEvidenceClass::FreshRepairEvidence` only when all three
+    /// conditions hold: a receipt is present, the epoch is at least `current_epoch`,
+    /// and the sample timestamp is within `staleness_threshold_ns` of `now_ns`.
+    /// Otherwise returns the appropriate degraded classification.
+    pub fn classify_evidence(
+        &self,
+        current_epoch: EpochId,
+        now_ns: u64,
+        staleness_threshold_ns: u64,
+    ) -> ProbeEvidenceClass {
+        if self.receipt_id.is_none() {
+            return ProbeEvidenceClass::MissingReceiptEvidence;
+        }
+        if self.epoch.0 < current_epoch.0 {
+            return ProbeEvidenceClass::OlderEpochEvidence;
+        }
+        if now_ns.saturating_sub(self.timestamp_ns) > staleness_threshold_ns {
+            return ProbeEvidenceClass::StaleEvidence;
+        }
+        ProbeEvidenceClass::FreshRepairEvidence
     }
 }
 
@@ -215,7 +303,7 @@ mod tests {
     fn attest_and_verify_roundtrip() {
         let probe = test_probe();
         let nonce = probe.generate_nonce();
-        let att = probe.attest(1, EpochId::new(5), &nonce, 1000);
+        let att = probe.attest(1, EpochId::new(5), &nonce, 1000, None);
         assert!(probe.verify(&att));
     }
 
@@ -223,7 +311,7 @@ mod tests {
     fn tampered_device_id_fails_verification() {
         let probe = test_probe();
         let nonce = probe.generate_nonce();
-        let mut att = probe.attest(1, EpochId::new(5), &nonce, 1000);
+        let mut att = probe.attest(1, EpochId::new(5), &nonce, 1000, None);
         att.device_id = 2;
         assert!(!probe.verify(&att));
     }
@@ -232,7 +320,7 @@ mod tests {
     fn tampered_epoch_fails_verification() {
         let probe = test_probe();
         let nonce = probe.generate_nonce();
-        let mut att = probe.attest(1, EpochId::new(5), &nonce, 1000);
+        let mut att = probe.attest(1, EpochId::new(5), &nonce, 1000, None);
         att.epoch = EpochId::new(6);
         assert!(!probe.verify(&att));
     }
@@ -241,7 +329,7 @@ mod tests {
     fn tampered_nonce_fails_verification() {
         let probe = test_probe();
         let nonce = probe.generate_nonce();
-        let mut att = probe.attest(1, EpochId::new(5), &nonce, 1000);
+        let mut att = probe.attest(1, EpochId::new(5), &nonce, 1000, None);
         att.nonce[0] ^= 0xFF;
         assert!(!probe.verify(&att));
     }
@@ -250,7 +338,7 @@ mod tests {
     fn tampered_tag_fails_verification() {
         let probe = test_probe();
         let nonce = probe.generate_nonce();
-        let mut att = probe.attest(1, EpochId::new(5), &nonce, 1000);
+        let mut att = probe.attest(1, EpochId::new(5), &nonce, 1000, None);
         // Flip a byte in the tag
         att.tag[0] ^= 0xFF;
         assert!(!probe.verify(&att));
@@ -264,7 +352,7 @@ mod tests {
         let probe_b = HealthProbe::new(other_secret);
 
         let nonce = probe_a.generate_nonce();
-        let att = probe_a.attest(1, EpochId::new(5), &nonce, 1000);
+        let att = probe_a.attest(1, EpochId::new(5), &nonce, 1000, None);
         assert!(probe_a.verify(&att));
         assert!(!probe_b.verify(&att));
     }
@@ -272,7 +360,7 @@ mod tests {
     #[test]
     fn probe_roundtrip_succeeds() {
         let probe = test_probe();
-        let result = probe.probe_roundtrip(1, EpochId::new(5), 1000);
+        let result = probe.probe_roundtrip(1, EpochId::new(5), 1000, None);
         assert!(result.is_some());
         let (_nonce, att) = result.unwrap();
         assert_eq!(att.device_id, 1);
@@ -292,7 +380,7 @@ mod tests {
     fn health_sample_from_attestation() {
         let probe = test_probe();
         let nonce = probe.generate_nonce();
-        let att = probe.attest(42, EpochId::new(3), &nonce, 5000);
+        let att = probe.attest(42, EpochId::new(3), &nonce, 5000, None);
 
         let sample = HealthSample::from_attestation(&att, true, Some(100_000));
         assert_eq!(sample.device_id, 42);
@@ -306,7 +394,7 @@ mod tests {
     fn health_sample_unhealthy() {
         let probe = test_probe();
         let nonce = probe.generate_nonce();
-        let att = probe.attest(7, EpochId::new(1), &nonce, 3000);
+        let att = probe.attest(7, EpochId::new(1), &nonce, 3000, None);
 
         let sample = HealthSample::from_attestation(&att, false, None);
         assert!(!sample.healthy);
@@ -321,6 +409,7 @@ mod tests {
             healthy: true,
             timestamp_ns: 1000,
             latency_ns: None,
+            receipt_id: None,
         };
         assert!(sample.is_epoch_valid(EpochId::new(5)));
     }
@@ -333,6 +422,7 @@ mod tests {
             healthy: true,
             timestamp_ns: 1000,
             latency_ns: None,
+            receipt_id: None,
         };
         // Sample from a newer epoch is accepted (epoch has advanced)
         assert!(sample.is_epoch_valid(EpochId::new(5)));
@@ -346,6 +436,7 @@ mod tests {
             healthy: true,
             timestamp_ns: 1000,
             latency_ns: None,
+            receipt_id: None,
         };
         // Sample from an older epoch is stale
         assert!(!sample.is_epoch_valid(EpochId::new(5)));
@@ -359,7 +450,120 @@ mod tests {
             healthy: true,
             timestamp_ns: 1000,
             latency_ns: None,
+            receipt_id: None,
         };
         assert!(sample.is_epoch_valid(EpochId::new(10)));
+    }
+
+    // ── Evidence classification tests ─────────────────────────────
+
+    fn mk_sample(device_id: u64, epoch: u64, timestamp_ns: u64, receipt: Option<u64>) -> HealthSample {
+        HealthSample {
+            device_id,
+            epoch: EpochId::new(epoch),
+            healthy: true,
+            timestamp_ns,
+            latency_ns: Some(50_000),
+            receipt_id: receipt.map(ReplicatedReceiptId),
+        }
+    }
+
+    #[test]
+    fn classify_fresh_repair_evidence() {
+        let sample = mk_sample(1, 5, 1000, Some(42));
+        let cls = sample.classify_evidence(EpochId::new(5), 2000, 10_000_000_000);
+        assert_eq!(cls, ProbeEvidenceClass::FreshRepairEvidence);
+        assert!(cls.is_repair_eligible());
+    }
+
+    #[test]
+    fn classify_missing_receipt_evidence_not_eligible() {
+        let sample = mk_sample(1, 5, 1000, None);
+        let cls = sample.classify_evidence(EpochId::new(5), 2000, 10_000_000_000);
+        assert_eq!(cls, ProbeEvidenceClass::MissingReceiptEvidence);
+        assert!(!cls.is_repair_eligible());
+    }
+
+    #[test]
+    fn classify_older_epoch_evidence_not_eligible() {
+        let sample = mk_sample(1, 3, 1000, Some(42));
+        let cls = sample.classify_evidence(EpochId::new(5), 2000, 10_000_000_000);
+        assert_eq!(cls, ProbeEvidenceClass::OlderEpochEvidence);
+        assert!(!cls.is_repair_eligible());
+    }
+
+    #[test]
+    fn classify_stale_evidence_not_eligible() {
+        let sample = mk_sample(1, 5, 1000, Some(42));
+        let cls = sample.classify_evidence(EpochId::new(5), 11000, 5_000);
+        assert_eq!(cls, ProbeEvidenceClass::StaleEvidence);
+        assert!(!cls.is_repair_eligible());
+    }
+
+    #[test]
+    fn classify_recovery_from_stale_to_fresh() {
+        let sample = mk_sample(1, 5, 10000, Some(42));
+        let cls = sample.classify_evidence(EpochId::new(5), 10500, 5_000);
+        assert_eq!(cls, ProbeEvidenceClass::FreshRepairEvidence);
+        assert!(cls.is_repair_eligible());
+    }
+
+    #[test]
+    fn classify_epoch_newer_accepted() {
+        let sample = mk_sample(1, 7, 1000, Some(99));
+        let cls = sample.classify_evidence(EpochId::new(5), 2000, 10_000_000_000);
+        assert_eq!(cls, ProbeEvidenceClass::FreshRepairEvidence);
+    }
+
+    #[test]
+    fn classify_missing_receipt_trumps_epoch_check() {
+        let sample = HealthSample {
+            device_id: 1,
+            epoch: EpochId::new(5),
+            healthy: true,
+            timestamp_ns: 1000,
+            latency_ns: None,
+            receipt_id: None,
+        };
+        let cls = sample.classify_evidence(EpochId::new(5), 2000, 10_000_000_000);
+        assert_eq!(cls, ProbeEvidenceClass::MissingReceiptEvidence);
+    }
+
+    #[test]
+    fn evidence_class_labels() {
+        assert_eq!(ProbeEvidenceClass::FreshRepairEvidence.label(), "fresh_repair_evidence");
+        assert_eq!(ProbeEvidenceClass::StaleEvidence.label(), "stale_evidence");
+        assert_eq!(ProbeEvidenceClass::MissingReceiptEvidence.label(), "missing_receipt_evidence");
+        assert_eq!(ProbeEvidenceClass::OlderEpochEvidence.label(), "older_epoch_evidence");
+    }
+
+    #[test]
+    fn attestation_carries_receipt_id_roundtrip() {
+        let probe = test_probe();
+        let nonce = probe.generate_nonce();
+        let att = probe.attest(1, EpochId::new(5), &nonce, 1000, Some(ReplicatedReceiptId(123)));
+        assert_eq!(att.receipt_id, Some(ReplicatedReceiptId(123)));
+        assert!(probe.verify(&att));
+
+        let sample = HealthSample::from_attestation(&att, true, Some(50_000));
+        assert_eq!(sample.receipt_id, Some(ReplicatedReceiptId(123)));
+    }
+
+    #[test]
+    fn attestation_without_receipt_verifies() {
+        let probe = test_probe();
+        let nonce = probe.generate_nonce();
+        let att = probe.attest(1, EpochId::new(5), &nonce, 1000, None);
+        assert!(probe.verify(&att));
+        assert_eq!(att.receipt_id, None);
+    }
+
+    #[test]
+    fn receipt_included_in_auth_tag() {
+        let probe = test_probe();
+        let nonce = probe.generate_nonce();
+        let att_with = probe.attest(1, EpochId::new(5), &nonce, 1000, Some(ReplicatedReceiptId(42)));
+        let att_without = probe.attest(1, EpochId::new(5), &nonce, 1000, None);
+        assert_ne!(att_with.tag, att_without.tag);
     }
 }

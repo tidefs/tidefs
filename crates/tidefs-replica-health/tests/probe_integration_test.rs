@@ -1,4 +1,10 @@
 use std::collections::VecDeque;
+use tidefs_membership_epoch::EpochId;
+use tidefs_replication_model::ReplicatedReceiptId;
+use tidefs_replica_health::health_probe::{
+    HealthProbe, HealthSample, ProbeEvidenceClass,
+};
+use tidefs_replica_health::health_quorum::{HealthQuorum, QuorumHealthStatus};
 use tidefs_replica_health::probe::{
     ProbeConfig, ProbeResult, ReplicaLivenessState, ReplicaLivenessTracker,
 };
@@ -346,4 +352,126 @@ fn snapshot_quorum_write_calculation() {
     assert!(snap.can_quorum_write(3));
     assert!(!snap.can_quorum_write(4));
     assert!(snap.can_quorum_write(0));
+}
+
+// ── Evidence classification integration tests ──────────────────────
+
+#[test]
+fn evidence_class_from_attestation_with_receipt() {
+    let secret = [0xABu8; 32];
+    let probe = HealthProbe::new(secret);
+    let nonce = probe.generate_nonce();
+    let att = probe.attest(1, EpochId::new(5), &nonce, 1000, Some(ReplicatedReceiptId(7)));
+    assert!(probe.verify(&att));
+    assert_eq!(att.receipt_id, Some(ReplicatedReceiptId(7)));
+
+    let sample = HealthSample::from_attestation(&att, true, Some(50_000));
+    let cls = sample.classify_evidence(EpochId::new(5), 2000, 10_000_000_000);
+    assert_eq!(cls, ProbeEvidenceClass::FreshRepairEvidence);
+    assert!(cls.is_repair_eligible());
+}
+
+#[test]
+fn missing_receipt_attestation_is_not_repair_eligible() {
+    let secret = [0xABu8; 32];
+    let probe = HealthProbe::new(secret);
+    let nonce = probe.generate_nonce();
+    let att = probe.attest(1, EpochId::new(5), &nonce, 1000, None);
+    assert!(probe.verify(&att));
+
+    let sample = HealthSample::from_attestation(&att, true, Some(50_000));
+    let cls = sample.classify_evidence(EpochId::new(5), 2000, 10_000_000_000);
+    assert_eq!(cls, ProbeEvidenceClass::MissingReceiptEvidence);
+    assert!(!cls.is_repair_eligible());
+}
+
+#[test]
+fn older_epoch_attestation_rejected_as_repair_evidence() {
+    let secret = [0xABu8; 32];
+    let probe = HealthProbe::new(secret);
+    let nonce = probe.generate_nonce();
+    let att = probe.attest(1, EpochId::new(3), &nonce, 1000, Some(ReplicatedReceiptId(7)));
+    assert!(probe.verify(&att));
+
+    let sample = HealthSample::from_attestation(&att, true, Some(50_000));
+    let cls = sample.classify_evidence(EpochId::new(5), 2000, 10_000_000_000);
+    assert_eq!(cls, ProbeEvidenceClass::OlderEpochEvidence);
+    assert!(!cls.is_repair_eligible());
+}
+
+#[test]
+fn stale_timestamp_attestation_rejected_as_repair_evidence() {
+    let secret = [0xABu8; 32];
+    let probe = HealthProbe::new(secret);
+    let nonce = probe.generate_nonce();
+    let att = probe.attest(1, EpochId::new(5), &nonce, 1000, Some(ReplicatedReceiptId(7)));
+    assert!(probe.verify(&att));
+
+    let sample = HealthSample::from_attestation(&att, true, Some(50_000));
+    // now_ns = 20_000_000_000, staleness = 5_000_000_000 -> stale
+    let cls = sample.classify_evidence(EpochId::new(5), 20_000_000_000, 5_000_000_000);
+    assert_eq!(cls, ProbeEvidenceClass::StaleEvidence);
+    assert!(!cls.is_repair_eligible());
+}
+
+#[test]
+fn stale_to_fresh_evidence_recovery() {
+    let secret = [0xABu8; 32];
+    let probe = HealthProbe::new(secret);
+    let nonce = probe.generate_nonce();
+
+    // Old attestation (stale)
+    let att_stale = probe.attest(1, EpochId::new(5), &nonce, 1000, Some(ReplicatedReceiptId(7)));
+    let sample_stale = HealthSample::from_attestation(&att_stale, true, Some(50_000));
+    let cls_stale = sample_stale.classify_evidence(EpochId::new(5), 20_000_000_000, 5_000_000_000);
+    assert_eq!(cls_stale, ProbeEvidenceClass::StaleEvidence);
+
+    // Fresh attestation (new timestamp within threshold)
+    let nonce2 = probe.generate_nonce();
+    let att_fresh = probe.attest(1, EpochId::new(5), &nonce2, 19_000_000_000, Some(ReplicatedReceiptId(7)));
+    let sample_fresh = HealthSample::from_attestation(&att_fresh, true, Some(50_000));
+    let cls_fresh = sample_fresh.classify_evidence(EpochId::new(5), 20_000_000_000, 5_000_000_000);
+    assert_eq!(cls_fresh, ProbeEvidenceClass::FreshRepairEvidence);
+}
+
+#[test]
+fn quorum_evidence_counters_integration() {
+    let mut q = HealthQuorum::new();
+    let secret = [0xABu8; 32];
+    let probe = HealthProbe::new(secret);
+
+    // Fresh repair evidence: ts=2000, now=3000, threshold=2000 → diff=1000 <= 2000
+    let nonce1 = probe.generate_nonce();
+    let att1 = probe.attest(1, EpochId::new(5), &nonce1, 2000, Some(ReplicatedReceiptId(10)));
+    q.add_sample(HealthSample::from_attestation(&att1, true, Some(50_000)));
+
+    // Stale evidence: ts=100, now=3000, threshold=2000 → diff=2900 > 2000
+    let nonce2 = probe.generate_nonce();
+    let att2 = probe.attest(2, EpochId::new(5), &nonce2, 100, Some(ReplicatedReceiptId(20)));
+    q.add_sample(HealthSample::from_attestation(&att2, true, Some(50_000)));
+
+    // Missing receipt
+    let nonce3 = probe.generate_nonce();
+    let att3 = probe.attest(3, EpochId::new(5), &nonce3, 2000, None);
+    q.add_sample(HealthSample::from_attestation(&att3, true, Some(50_000)));
+
+    // Older epoch → missing evidence
+    let nonce4 = probe.generate_nonce();
+    let att4 = probe.attest(4, EpochId::new(3), &nonce4, 2000, Some(ReplicatedReceiptId(30)));
+    q.add_sample(HealthSample::from_attestation(&att4, true, Some(50_000)));
+
+    let result = q.compute(EpochId::new(5), 3000, 2000);
+    assert_eq!(result.reachable_count, 4);
+    assert_eq!(result.fresh_repair_evidence_count, 1);
+    assert_eq!(result.stale_evidence_count, 1);
+    assert_eq!(result.missing_evidence_count, 2);
+    assert_eq!(result.status, QuorumHealthStatus::Healthy);
+}
+
+#[test]
+fn evidence_class_labels_match_expectation() {
+    assert_eq!(ProbeEvidenceClass::FreshRepairEvidence.label(), "fresh_repair_evidence");
+    assert_eq!(ProbeEvidenceClass::StaleEvidence.label(), "stale_evidence");
+    assert_eq!(ProbeEvidenceClass::MissingReceiptEvidence.label(), "missing_receipt_evidence");
+    assert_eq!(ProbeEvidenceClass::OlderEpochEvidence.label(), "older_epoch_evidence");
 }

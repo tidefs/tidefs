@@ -33,7 +33,8 @@ pub mod tracker;
 
 // Re-exports from health_probe and health_quorum modules.
 pub use health_probe::{
-    AuthTag, HealthAttestation, HealthProbe, HealthSample, Nonce, SharedSecret,
+    AuthTag, HealthAttestation, HealthProbe, HealthSample, Nonce,
+    ProbeEvidenceClass, SharedSecret,
 };
 pub use health_quorum::{HealthQuorum, QuorumHealthResult, QuorumHealthStatus};
 
