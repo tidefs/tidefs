@@ -201,6 +201,18 @@ mod bounded_model_tests {
     }
 
     #[test]
+    fn nondurable_receipt_does_not_authorize_rebuild() {
+        let mut sys = three_node_system();
+        sys.placement_model.policy = RebuildPolicy::RequireDurableReceipt;
+        sys.placement_model.record_receipt(
+            PlacementReceiptState::for_model(101, "obj/r4", 0, 1, false),
+        );
+        assert!(!sys.placement_model.has_durable_receipt("obj/r4"));
+        let allowed = sys.placement_model.try_rebuild("obj/r4", 2, 1);
+        assert!(!allowed, "nondurable receipt should not authorize rebuild");
+    }
+
+    #[test]
     fn rebuild_permit_without_receipt_policy() {
         let mut sys = three_node_system();
         sys.placement_model.policy = RebuildPolicy::PermitWithoutReceipt;
