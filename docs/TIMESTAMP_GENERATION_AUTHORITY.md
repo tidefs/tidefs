@@ -1,29 +1,328 @@
 # Timestamp and Generation Authority
 
-Maturity: current guardrail for TFR-005 and GitHub issue #325.
+Maturity: design authority for TFR-005; produced under GitHub issue #499.
+Supersedes the guardrail version from issue #325.
 
-This document names the shared VFS and inode-attribute authority boundary for
-POSIX wall-clock timestamps, VFS inode generations, storage generations,
-content object versions, scrub identity, replay ordering, and format versions.
-It does not rewire mounted local-filesystem runtime behavior and does not close
-TFR-005.
+This document specifies one authority model for POSIX wall-clock timestamps,
+VFS inode generations, transaction group (txg / commit group) identifiers,
+content object versions, scrub identity, replay ordering, format versions, and
+the namespace revision counters `subtree_rev` / `dir_rev`. It names the owning
+crate for each concept, defines monotonicity and wraparound rules, maps
+cross-authority relationships, and records the on-disk format compatibility
+contract for version field changes.
 
-## Authority Terms
+This is a planning/design authority document. It does not claim production
+readiness and does not close TFR-005.
 
-| Authority | Current shared name | Value domain | Owns |
-|---|---|---|---|
-| POSIX wall-clock timestamp | `PosixTimestampNs`; raw ABI fields named `*_ns` | signed nanoseconds since the UNIX epoch | `atime_ns`, `mtime_ns`, `ctime_ns`, `btime_ns`, Linux `stat` timestamp projection, explicit and NOW-style `setattr` timestamp updates |
-| VFS inode generation | `Generation` | unsigned VFS inode/file-handle generation token | VFS identity freshness for inode attributes, directory entries, and file handles |
-| Transaction group / commit group / replay generation | storage runtime generation terms | storage ordering tokens | commit ordering, replay ordering, recovery selection, and storage mutation sequencing |
-| Storage object version | `data_version` or named storage version fields | storage object/content version token | object key material, content-manifest identity, and storage object lifetime |
-| Scrub identity | named scrub digest, block, or repair identity | integrity scan identity | the exact bytes, object, block, checksum, or repair row being checked |
-| Format version | named format/canon version fields | codec and schema version numbers | decode/encode compatibility, golden-format manifests, and format admission |
+## 1. Crate-to-Concept Ownership Matrix
 
-The domains may share machine scalar widths, but they are different
-authorities. A raw `i64` or `u64` is not enough evidence that a value belongs
-to a different authority.
+Each concept has exactly one defining crate. The defining crate owns the type,
+the construction/validation invariants, and the serialized representation.
+Callers that consume a concept must go through the defining crate's public API.
 
-## Allowed Projections
+| Concept                          | Defining crate                     | Primary type / constant                         |
+|----------------------------------|------------------------------------|--------------------------------------------------|
+| POSIX wall-clock timestamp       | `tidefs-types-vfs-core`            | `PosixTimestampNs`, `split_posix_time_ns`, `compose_posix_time_ns` |
+| POSIX timestamp record group     | `tidefs-local-filesystem`          | `PosixTimeRecord` (atime/mtime/ctime/btime_ns)   |
+| POSIX setattr timestamp planning | `tidefs-inode-attributes`          | `PosixTimestampAction`, `SetattrTimestampUpdate` |
+| VFS inode/file-handle generation | `tidefs-types-vfs-core`            | `Generation`                                     |
+| Transaction group identifier     | `tidefs-commit_group`              | `CommitGroupId`                                  |
+| Content object version           | `tidefs-local-filesystem`          | `data_version: u64` on `InodeRecord`             |
+| Metadata version                 | `tidefs-local-filesystem`          | `metadata_version: u64` on `InodeRecord`         |
+| Namespace subtree revision       | `tidefs-types-vfs-core`            | `InodeAttr::subtree_rev: u64`                    |
+| Namespace directory revision     | `tidefs-types-vfs-core`            | `InodeAttr::dir_rev: u64`                        |
+| Scrub block identity             | `tidefs-local-filesystem`          | `ScrubBlockId` (inode_id + data_version + kind)  |
+| On-disk format version           | `tidefs-local-filesystem`          | `FILESYSTEM_FORMAT_VERSION` (u16, currently 6)   |
+| Content dedup redirect version   | `tidefs-local-filesystem`          | `CONTENT_DEDUP_REDIRECT_FORMAT_VERSION` (u16, 1) |
+| Object store format manifest     | `tidefs-local-object-store`        | `LocalObjectStoreFormatManifest`                 |
+| Pool label version               | `tidefs-pool-import`               | label `version` field (u16, currently 1)         |
+| Committed-root version           | `tidefs-commit_group`              | version discriminant in root entry header (V1)   |
+| Dataset feature flags            | `tidefs-dataset-feature-flags`     | per-dataset B-trees, `org.tidefs:<name>` keys    |
+| Intent-log record version        | `tidefs-intent-log` / `tidefs-commit_group` | version discriminant in intent-log frame header |
+
+### 1.1 Ownership Rules
+
+- The defining crate publishes the canonical constructor, accessor, and
+  comparison functions. Other crates may use the type but must not invent
+  constructors that bypass the defining crate's invariants.
+- A raw `u64` or `i64` passed across crate boundaries is not authority. The
+  defining crate's named type or named accessor must appear at the boundary.
+- When a concept appears in multiple crates (e.g., `data_version` is both
+  serialized by `tidefs-local-filesystem` encoding and consumed by
+  `tidefs-scrub-core` scrub identity), the defining crate is the one that
+  owns the storage record and encoding format.
+
+## 2. Monotonicity, Wraparound, and Epoch Rules
+
+### 2.1 POSIX Wall-Clock Timestamps (`PosixTimestampNs`)
+
+- **Domain**: `i64`, nanoseconds since 1970-01-01T00:00:00Z (UNIX epoch).
+- **Monotonicity**: Not guaranteed. POSIX time can move backward (clock
+  adjustment, NTP step, suspend/resume). Callers must not rely on POSIX
+  timestamp ordering for correctness.
+- **Wraparound**: The `i64` range covers roughly +/-292 years from the epoch.
+  Wraparound is not a practical concern, but saturating helpers
+  (`compose_posix_time_ns`) clamp subsecond overflow defensively.
+- **Epoch**: UNIX epoch (1970-01-01T00:00:00Z). Negative values represent
+  pre-1970 timestamps.
+- **Authority boundary**: `current_posix_time_ns()` in
+  `tidefs-local-filesystem` samples `std::time::SystemTime::now()` and
+  saturates to `i64::MAX` on overflow. This is the single wall-clock source
+  for the local filesystem; all POSIX timestamp writes go through this or
+  through explicit caller-supplied values.
+
+### 2.2 VFS Inode Generation (`Generation`)
+
+- **Domain**: `u64`.
+- **Monotonicity**: Strictly monotonic per inode. Each inode mutation that
+  changes identity (content write, link/unlink, rename, attribute mutation
+  that affects filehandle validity) must advance `generation`.
+- **Wraparound**: `checked_next()` returns `None` at `u64::MAX`. In practice,
+  wraparound is not reached within the lifetime of a single mount.
+- **Epoch**: No epoch. `Generation::ZERO` (0) is the initial value for a
+  newly created inode. A generation of 0 means the inode has never been
+  mutated.
+- **Authority boundary**: `Generation::new()` and
+  `Generation::from_vfs_generation()` in `tidefs-types-vfs-core` are the
+  only valid constructors.
+
+### 2.3 Transaction Group Identifier (`CommitGroupId`)
+
+- **Domain**: `u64`.
+- **Monotonicity**: Strictly monotonic across a mount lifetime. Starts at 1
+  (`CommitGroupId::FIRST`) and increments by 1 per committed transaction
+  group.
+- **Wraparound**: `next()` saturates at `u64::MAX`. The nil value (0,
+  `CommitGroupId::NIL`) represents "no open commit group."
+- **Epoch**: Each mount starts a fresh txg sequence at 1. The txg counter is
+  not preserved across unmount/remount; recovery replays the journal to
+  determine the last committed txg and resumes from `last_txg + 1`.
+- **Persistence**: `CommitGroupId` is persisted in the commit_group journal
+  header, superblock, and committed-root entries for replay.
+- **Authority boundary**: `CommitGroupId` constructors and `next()` in
+  `tidefs-commit_group/src/types.rs`.
+
+### 2.4 Content Object Version (`data_version`)
+
+- **Domain**: `u64`.
+- **Monotonicity**: Monotonically increasing per inode. Each content write
+  that produces a new object allocates a fresh `data_version` (typically the
+  current txg tick). An inode with no content has `data_version == 0`.
+- **Wraparound**: `data_version` is bounded by `u64`. No explicit wraparound
+  guard exists; design expects `u64` range to exceed practical inode write
+  counts.
+- **Relationship to txg**: During normal operation, `data_version` advances
+  to the current `CommitGroupId` tick on content write. During crash
+  recovery, `data_version` is set to the recovery generation tick.
+- **Authority boundary**: Owned by `tidefs-local-filesystem`; encoded in
+  `InodeRecord`, `ContentManifest`, and `ContentChunk` serialization.
+  Consumed by object key generation (`content_object_key_for_version`) and
+  scrub identity (`ScrubBlockId.data_version`).
+
+### 2.5 Metadata Version (`metadata_version`)
+
+- **Domain**: `u64`.
+- **Monotonicity**: Monotonically increasing per inode. Advanced on metadata
+  mutations (setattr, link/unlink, rename, xattr changes) that do not
+  necessarily change content.
+- **Wraparound**: Same as `data_version` (bounded by `u64`).
+- **Current coupling (debt)**: `InodeRecord::to_inode_attr()` projects
+  `metadata_version` into both `subtree_rev` and `dir_rev`. This is a known
+  coupling tracked as a remaining TFR-005 runtime site (see section 9.1).
+- **Authority boundary**: Owned by `tidefs-local-filesystem`; serialized in
+  `InodeRecord`.
+
+### 2.6 Namespace Revision Counters (`subtree_rev`, `dir_rev`)
+
+- **Domain**: `u64` each.
+- **Monotonicity**: Both are monotonically increasing per inode.
+  `subtree_rev` advances on any attribute or content change; `dir_rev`
+  advances on directory entry mutations (create, unlink, rename within that
+  directory). Non-directory inodes keep `dir_rev == 0`.
+- **Wraparound**: Bounded by `u64`. Saturation at advance sites
+  (`.saturating_add(1).max(1)`).
+- **Epoch**: Initial value is 0 for new inodes.
+- **Authority boundary**: Defined in `tidefs-types-vfs-core` as fields on
+  `InodeAttr`. Currently projected from `metadata_version` in the local
+  filesystem's `InodeRecord::to_inode_attr()` — a coupling that needs its
+  own authority slice (see section 9.1).
+- **Ownership**: `tidefs-types-vfs-core` owns the field definitions.
+  `tidefs-local-filesystem` currently drives the values through
+  `metadata_version` projection and `update_anonymous_size`.
+
+### 2.7 Scrub Block Identity (`ScrubBlockId`)
+
+- **Domain**: `(inode_id: u64, data_version: u64, kind: ScrubBlockKind)`.
+- **Monotonicity**: Not applicable. Scrub identity is a snapshot key, not a
+  sequence.
+- **Authority boundary**: Owned by `tidefs-local-filesystem/src/scrub.rs`.
+  Constructed from the inode's current `data_version` at scrub time.
+
+### 2.8 Format Versions
+
+- **Domain**: `u16` per format family.
+- **Monotonicity**: Monotonically increasing across TideFS releases. A format
+  version is never decremented.
+- **Wraparound**: Bounded by `u16::MAX`. Not a practical concern within the
+  projected release cadence.
+- **Epoch**: V1 is the first public-release format surface. Pre-V1 and
+  pre-release internal versions (record versions 1-5 for the local
+  filesystem) are development inputs only, not format commitments.
+- **Authority boundary**: `FILESYSTEM_FORMAT_VERSION` (currently 6) in
+  `tidefs-local-filesystem/src/constants.rs`. Each format family has its own
+  version constant.
+
+## 3. Cross-Authority Relationship Map
+
+```
+POSIX wall clock (PosixTimestampNs, PosixTimeRecord)
+  │
+  │  PROJECTED INTO (via PosixTimeRecord)
+  ▼
+POSIX inode timestamps (atime_ns, mtime_ns, ctime_ns, btime_ns)
+  │
+  │  MUST NOT DERIVE (forbidden shortcut)
+  ▼
+┌─────────────────────────────────────────────────────┐
+│                                                     │
+│  Storage / ordering authorities (separate domains)  │
+│                                                     │
+│  CommitGroupId (txg)                                │
+│    │  -- drives -->  data_version (on write)        │
+│    │  -- drives -->  metadata_version (on mutate)   │
+│    │                                                │
+│  data_version                                       │
+│    │  -- keyed into -->  content object keys        │
+│    │  -- keyed into -->  ScrubBlockId               │
+│    │  -- serialized in -->  InodeRecord,            │
+│    │       ContentManifest, ContentChunk            │
+│    │                                                │
+│  metadata_version                                   │
+│    │  -- projected as -->  subtree_rev (debt)       │
+│    │  -- projected as -->  dir_rev (debt)           │
+│    │  -- serialized in -->  InodeRecord             │
+│    │                                                │
+│  Generation (VFS inode gen)                         │
+│    │  -- written alongside -->  data_version         │
+│    │       (both use same tick during recovery)     │
+│    │  -- serialized in -->  InodeRecord,            │
+│    │       DirEntry, InodeAttr                      │
+│    │                                                │
+│  FILESYSTEM_FORMAT_VERSION (u16, currently 6)       │
+│    │  -- gates -->  encode/decode of all records    │
+│    │  -- compared on -->  every record decode       │
+│    │                                                │
+└─────────────────────────────────────────────────────┘
+```
+
+### 3.1 Key Relationships
+
+**txg to data_version**: During normal writes, a new content object is stamped
+with the current `CommitGroupId` as its `data_version`. This ties the object
+to the transaction group that committed it, enabling replay ordering and
+recovery selection.
+
+**txg to metadata_version**: Metadata mutations (setattr, link, unlink,
+rename) advance `metadata_version` to the current `CommitGroupId` tick.
+
+**data_version to object keys**: Content object keys are derived from
+`(inode_id, data_version)`. The `data_version` component ensures that each
+content version has a distinct storage identity.
+
+**data_version to scrub identity**: `ScrubBlockId` uses `data_version` to
+identify which version of a content block is being checked.
+
+**metadata_version to subtree_rev / dir_rev (debt)**: Currently
+`InodeRecord::to_inode_attr()` sets both `subtree_rev` and `dir_rev` to
+`metadata_version`. This couples storage metadata versioning with VFS
+namespace revision semantics. A separate namespace-revision authority slice
+is needed to decouple these (see section 9.1).
+
+**Generation alongside data_version (during recovery)**: Crash recovery sets
+`generation`, `data_version`, and `metadata_version` to the same recovery
+tick. After recovery, normal write paths advance only `data_version` (for
+content) or `metadata_version` (for metadata), leaving `generation` at the
+last identity-changing value.
+
+**Format version to all records**: Every serialized record (inode, content
+manifest, content chunk, dedup redirect, changed-record export) carries
+`FILESYSTEM_FORMAT_VERSION` in its header. Decode refuses records with
+versions outside `FORMAT_COMPAT_WINDOW_MIN..=FILESYSTEM_FORMAT_VERSION`.
+
+## 4. On-Disk Format Compatibility Rules
+
+### 4.1 Format Version Families
+
+TideFS on-disk state is organized into independent format families, each with
+its own version. The policy document
+`docs/ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md` is the
+operator-facing compatibility contract. This section records the authority
+boundaries relevant to TFR-005.
+
+| Format family                    | Version field                | Current | Governing doc                                    |
+|----------------------------------|------------------------------|---------|--------------------------------------------------|
+| Local filesystem records         | `FILESYSTEM_FORMAT_VERSION`  | 6       | This document; `encoding.rs` constants           |
+| Local object store manifest      | `manifest_version`           | 1       | `LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`           |
+| Local object store records       | `record_format_version`      | 1-3     | `LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`           |
+| Pool labels                      | `version`                    | 1       | `POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`   |
+| Dataset feature flags            | per-dataset B-trees          | N/A     | `DATASET_FEATURE_FLAGS_DESIGN.md`                |
+| Committed roots / intent log     | version discriminant         | V1      | `TORN_COMMIT_RECOVERY_CONTRACT.md`               |
+| Content dedup redirects          | `CONTENT_DEDUP_REDIRECT_FORMAT_VERSION` | 1 | `encoding.rs` constants                        |
+
+### 4.2 Version Bump Rules
+
+A format version in the local filesystem family (`FILESYSTEM_FORMAT_VERSION`)
+is incremented when:
+
+- The serialized layout of `InodeRecord`, `ContentManifest`, `ContentChunk`,
+  or `ChangedRecordExport` changes (field additions, reordering, type width
+  changes).
+- A new required header field is added to the record framing.
+- The checksum or digest algorithm for record integrity changes.
+- A magic number or framing marker changes.
+
+A format version is **not** incremented for:
+
+- Adding an optional TLV extension field that older code can skip.
+- Changing in-memory-only structures.
+- Adding a feature gated behind a dataset feature flag.
+
+### 4.3 Decode Compatibility Window
+
+- **Current**: `FILESYSTEM_FORMAT_VERSION = 6`
+- **Compatibility window**: `FORMAT_COMPAT_WINDOW_MIN = 1` (all known
+  versions are accepted by the current decoder)
+- **Pre-release note**: Per `docs/UNRELEASED_AUTHORITY_POLICY.md`, version
+  < 5 inode records produce a clean decode error. This was enacted in issue
+  #330 to remove the `legacy_from_versions` shortcut. Pre-release format
+  artifacts are not product compatibility commitments.
+
+### 4.4 Refusal Behavior
+
+- An inode record with a version outside the compat window returns a decode
+  error. The store open path surfaces this as a `CorruptState` or format
+  error.
+- A committed-root entry with an unknown version discriminant is quarantined
+  (not replayed). The dataset is frozen at the last supported committed root.
+- A pool label with an unsupported version or unknown `features_incompat`
+  bits refuses import.
+- A dataset with an unknown `incompat` feature flag refuses open.
+
+### 4.5 Timestamp/Version Fields Under Format Change
+
+When `FILESYSTEM_FORMAT_VERSION` is incremented:
+
+- POSIX timestamp fields (`atime_ns`, `mtime_ns`, `ctime_ns`, `btime_ns`)
+  maintain their `i64` nanoseconds-since-epoch representation unless a
+  specific issue changes the POSIX timestamp ABI.
+- `data_version` and `metadata_version` maintain their `u64` domain. Their
+  semantics (monotonic, per-inode) are format-invariant.
+- `Generation` maintains its `u64` VFS inode generation semantics.
+- `subtree_rev` and `dir_rev` maintain their `u64` domain; decoupling them
+  from `metadata_version` (section 9.1) may change which field drives them
+  but not their serialized layout.
+
+## 5. Allowed Projections
 
 - A POSIX wall-clock timestamp may be projected through
   `PosixTimestampNs::from_unix_nanos`, `PosixTimestampNs::from_split`,
@@ -37,16 +336,18 @@ to a different authority.
 - `Generation::from_vfs_generation`, `Generation::new`,
   `Generation::as_vfs_generation`, and `Generation::checked_next` may be used
   at VFS inode/file-handle identity boundaries.
+- `CommitGroupId::next()` advances the txg counter; `CommitGroupId::FIRST`
+  starts a fresh mount sequence. The txg counter may be stamped into
+  `data_version` and `metadata_version` at commit time.
 - Storage commit/replay generation, object version, scrub identity, and format
   version may cross into POSIX or VFS inode APIs only through a named runtime
   projection documented by the owning storage issue or current policy.
 
-## Forbidden Shortcuts
+## 6. Forbidden Shortcuts
 
-- Do not derive `Generation`, transaction groups, commit groups, replay
-  generations, `data_version`, scrub identity, or format versions from
-  POSIX `atime_ns`, `mtime_ns`, `ctime_ns`, `btime_ns`, or the current wall
-  clock.
+- Do not derive `Generation`, `CommitGroupId`, `data_version`, scrub
+  identity, or format versions from POSIX `atime_ns`, `mtime_ns`, `ctime_ns`,
+  `btime_ns`, or the current wall clock.
 - Do not write POSIX timestamps into storage generation or object-version
   fields as a convenient ordering token.
 - Do not reconstruct POSIX timestamps from storage generations, content object
@@ -56,11 +357,13 @@ to a different authority.
   metadata-change timestamp projection, not a content manifest version.
 - Do not use format-version numbers as storage object generations or VFS inode
   generations.
+- Do not use `CommitGroupId` values as POSIX timestamps or VFS inode
+  generations.
 - Do not preserve pre-release timestamp/generation coupling as compatibility
   behavior unless a current issue names a real external ABI, protocol, or
   operator-owned data set under `docs/UNRELEASED_AUTHORITY_POLICY.md`.
 
-## Shared Code Contract
+## 7. Shared Code Contract
 
 `crates/tidefs-types-vfs-core` keeps `repr(C)` inode/setattr records layout
 stable for this slice. The raw POSIX fields remain named `*_ns`, but shared
@@ -75,13 +378,25 @@ callers should prefer the named helpers:
   `SetAttr::{atime,mtime,ctime}_timestamp` when reading raw timestamp fields at
   authority boundaries.
 - `Generation` helpers for VFS inode/file-handle identity.
+- `CommitGroupId` for transaction group ordering; `CommitGroupId::NIL`,
+  `CommitGroupId::FIRST`, and `CommitGroupId::next()` for lifecycle management.
 
 `crates/tidefs-inode-attributes` timestamp planning must mutate only POSIX
 timestamp fields unless the caller uses a separately named API that explicitly
 updates VFS generation or revision fields. POSIX timestamp plans must preserve
 `InodeAttr::generation`, `subtree_rev`, and `dir_rev`.
 
-## Issue #330: Local-Filesystem Runtime Projection (Partial)
+`crates/tidefs-commit_group` owns the txg counter lifecycle. Callers in
+`tidefs-local-filesystem` stamp `data_version` and `metadata_version` from
+the current `CommitGroupId` during commit, but the txg counter itself is
+driven by the commit_group subsystem.
+
+`crates/tidefs-local-filesystem/src/encoding.rs` is the single serialization
+authority for `InodeRecord`, `ContentManifest`, `ContentChunk`, and
+`ChangedRecordExport`. Every record encode/decode includes
+`FILESYSTEM_FORMAT_VERSION` as the first field after any framing magic.
+
+## 8. Issue #330: Local-Filesystem Runtime Projection (Partial)
 
 Issue #330 narrows TFR-005 for the local-filesystem / local content-object
 projection slice:
@@ -104,25 +419,66 @@ projection slice:
 - **Verified**: `InodeRecord::to_inode_attr` correctly projects `posix_time`
   fields into POSIX attributes and `data_version` / `metadata_version` into
   storage identity fields.  The encode path (`encode_inode`) always writes
-  explicit POSIX timestamps at format version 5.
+  explicit POSIX timestamps at format version 6.
 
-### Remaining TFR-005 Runtime Sites (after issue #330)
+## 9. Remaining TFR-005 Implementation Blockers
 
 These runtime projection sites still need owned issues, implementation, and
 validation before TFR-005 can close:
 
-- `InodeRecord::to_inode_attr()` uses `metadata_version` as both
-  `subtree_rev` and `dir_rev`.  These are VFS namespace revision counters,
-  not storage metadata versions; a separate namespace-revision authority is
-  needed.
-- Intent-log replay and commit-group recovery paths that rebuild content under
-  fresh generation ticks and store those ticks into inode metadata fields
-  (`data_version`, `metadata_version`).
-- Scrub and repair paths that must distinguish wall-clock time, object version,
-  checksum scope, and scrub row identity.
-- Send/receive export/import paths that serialize timestamp and storage
-  version fields through one current authority.
-- Content object reclaim and orphan cleanup paths that use `data_version` as
-  both a content identity token and a storage-ordering hint.
-- Format-golden and codec surfaces, if a later slice intentionally changes the
-  serialized ABI or golden-format shape.
+1. **`metadata_version` to `subtree_rev` / `dir_rev` coupling**.
+   `InodeRecord::to_inode_attr()` projects `metadata_version` into both VFS
+   namespace revision counters. `subtree_rev` and `dir_rev` are VFS namespace
+   concepts owned by `tidefs-types-vfs-core`; they must not be sourced from a
+   storage metadata version field. A separate namespace-revision authority
+   slice is needed to:
+   - Define `subtree_rev` and `dir_rev` increment rules independently of
+     `metadata_version`.
+   - Persist `dir_rev` per-directory in `InodeRecord` (currently always
+     decoded as 0 in the encode/decode path, then overwritten by
+     `to_inode_attr`).
+   - Remove the `metadata_version` to `{subtree_rev, dir_rev}` projection
+     from `InodeRecord::to_inode_attr()`.
+
+2. **Intent-log replay and commit-group recovery**.
+   Recovery paths (`crash_recovery.rs`, `txg_replay.rs`) rebuild content
+   under fresh generation ticks and store those ticks into `data_version`,
+   `metadata_version`, and `generation` simultaneously. After recovery,
+   `generation` may drift from `data_version`/`metadata_version` on subsequent
+   writes — this drift is intentional but must be explicitly specified as part
+   of the recovery contract.
+
+3. **Scrub and repair identity**.
+   `ScrubBlockId` uses `(inode_id, data_version)` as block identity. Scrub
+   must not confuse wall-clock time, content version, checksum scope, and
+   repair row identity. The scrub path already treats `data_version` as a
+   content-identity token; this is correct but should be explicitly documented
+   as the scrub-identity authority boundary.
+
+4. **Send/receive export/import**.
+   Send/receive serializes timestamp and storage version fields. The
+   export/import paths must project through one current authority — the
+   encoding format version in the changed-record export header — and must not
+   introduce a separate timestamp/version reconciliation pass.
+
+5. **Content object reclaim and orphan cleanup**.
+   `data_version` is used as both a content identity token (for object key
+   generation) and a storage-ordering hint (for reclaim liveness). These two
+   uses of `data_version` should be explicitly named and separated if they
+   diverge.
+
+6. **Format-golden and codec surfaces**.
+   If a later slice intentionally changes the serialized ABI (e.g.,
+   `FILESYSTEM_FORMAT_VERSION` bump from 6 to 7), the golden-format test
+   corpus and `tidefs-schema-codec-vfs` codec surfaces must be updated
+   atomically with the format version change.
+
+## 10. Non-Claim
+
+This document is a planning and design authority document. It does not:
+
+- Change on-disk format or runtime behavior.
+- Close TFR-005. The remaining blockers in section 9 must be resolved through
+  owned implementation issues.
+- Claim production readiness. Production claims are gated on closing TFR-005
+  and its descendant issues.
