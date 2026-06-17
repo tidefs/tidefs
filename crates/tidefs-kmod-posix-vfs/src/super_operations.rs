@@ -82,11 +82,15 @@
 use crate::tidefs_kmod_bridge;
 
 use crate::TideString as String;
+use crate::TideVec as Vec;
 
 use crate::address_space_ops::AddressSpaceOps;
 use crate::superblock::{mount_validate, MountError, MountResult};
+use crate::writeback::DirtyFolioTracker;
 use crate::KmodPosixVfs;
-use tidefs_kmod_bridge::kernel_types::{Errno, RequestCtx, StatFs};
+use tidefs_kmod_bridge::kernel_types::{
+    EngineFileHandle, Errno, FileHandleId, InodeId, RequestCtx, StatFs, WritebackRange,
+};
 use tidefs_kmod_bridge::kernel_types::{VfsEngine, VfsEngineStatFs};
 
 /// fill_super: Initialize the kernel VFS superblock from the backing device.
@@ -124,10 +128,13 @@ pub fn fill_super<E: VfsEngine + VfsEngineStatFs>(
 
 /// kill_sb: Teardown the kernel superblock with dirty-state flush.
 ///
-/// Called by the kernel VFS on unmount. Flushes all dirty data and metadata
-/// to stable storage via [`VfsEngine::syncfs`], completing the superblock
-/// teardown. The engine is responsible for releasing backing-device resources
-/// and marking the superblock clean.
+/// Called by the kernel VFS on unmount. When a
+/// [`DirtyFolioTracker`] is provided, drains all tracked dirty ranges
+/// through [`VfsEngine::writeback_folios`] before calling
+/// [`VfsEngine::syncfs`] to complete superblock teardown.  Writeback
+/// errors propagate to the caller and prevent a clean teardown from
+/// being reported.  The engine is responsible for releasing
+/// backing-device resources and marking the superblock clean.
 ///
 /// Unsupported `syncfs` is propagated for mounted filesystems so kernel
 /// teardown cannot report clean durability without pool authority.
@@ -137,7 +144,27 @@ pub fn fill_super<E: VfsEngine + VfsEngineStatFs>(
 /// The kernel VFS guarantees no new file operations will be admitted on
 /// this superblock.  After `kill_sb` returns, the kernel frees the
 /// superblock; this function must not retain references to it.
-pub fn kill_sb<E: VfsEngine>(engine: &E, ctx: &RequestCtx) -> Result<(), Errno> {
+pub fn kill_sb<E: VfsEngine>(
+    engine: &E,
+    ctx: &RequestCtx,
+    tracker: Option<&mut DirtyFolioTracker>,
+) -> Result<(), Errno> {
+    if let Some(tracker) = tracker {
+        let dirty_inodes: Vec<InodeId> = tracker.iter().map(|(ino, _)| ino).collect();
+        for inode in dirty_inodes {
+            let ranges = tracker.drain_inode(inode);
+            for range in &ranges {
+                let wb_range = WritebackRange::new(range.offset, range.length as u64);
+                let fh = EngineFileHandle::new(inode, 0, FileHandleId::default(), 0);
+                let outcome = engine.writeback_folios(inode, &fh, wb_range, ctx)?;
+                if !outcome.complete && outcome.bytes_written < wb_range.length {
+                    let tail_offset = range.offset + outcome.bytes_written;
+                    let tail_len = (wb_range.length - outcome.bytes_written) as u32;
+                    let _ = tracker.try_add(inode, tail_offset, tail_len);
+                }
+            }
+        }
+    }
     engine.syncfs(ctx)
 }
 
@@ -311,7 +338,7 @@ mod tests {
         let mut engine = MockEngine::new();
         engine.syncfs_fn = Box::new(|_| Ok(()));
 
-        assert_eq!(kill_sb(&engine, &MockEngine::test_ctx()), Ok(()));
+        assert_eq!(kill_sb(&engine, &MockEngine::test_ctx(), None), Ok(()));
     }
 
     #[test]
@@ -319,7 +346,7 @@ mod tests {
         let engine = MockEngine::new();
         // syncfs_fn defaults to ENOSYS
         assert_eq!(
-            kill_sb(&engine, &MockEngine::test_ctx()),
+            kill_sb(&engine, &MockEngine::test_ctx(), None),
             Err(Errno::ENOSYS)
         );
     }
@@ -329,7 +356,7 @@ mod tests {
         let mut engine = MockEngine::new();
         engine.syncfs_fn = Box::new(|_| Err(Errno::EIO));
 
-        assert_eq!(kill_sb(&engine, &MockEngine::test_ctx()), Err(Errno::EIO));
+        assert_eq!(kill_sb(&engine, &MockEngine::test_ctx(), None), Err(Errno::EIO));
     }
 
     // -- statfs tests --

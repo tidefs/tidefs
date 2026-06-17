@@ -370,7 +370,7 @@ mod tests {
                 for i in 0..ops_per_thread {
                     let parent = InodeId::new(1);
                     let name = format!("f-{t}-{i}");
-                    let guard = vfs.lock().unwrap();
+                    let mut guard = vfs.lock().unwrap();
                     let (_plan, state) = match guard.create(parent, name.as_bytes(), 0o644, 0, &ctx)
                     {
                         Ok(r) => r,
@@ -447,7 +447,7 @@ mod tests {
                 for i in 0..ops_per_thread {
                     let parent = InodeId::new(1);
                     let name = format!("mix-{t}-{i}");
-                    let guard = vfs.lock().unwrap();
+                    let mut guard = vfs.lock().unwrap();
                     let (plan, state) = match guard.create(parent, name.as_bytes(), 0o644, 0, &ctx)
                     {
                         Ok(r) => r,

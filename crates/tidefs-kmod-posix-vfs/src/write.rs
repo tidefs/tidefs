@@ -17,7 +17,7 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
     /// authority. The sync goes through [`VfsEngine::fsync`] and the
     /// txg commit barrier, ensuring the write is durable before returning.
     pub fn write(
-        &self,
+        &mut self,
         fh: &tidefs_kmod_bridge::kernel_types::EngineFileHandle,
         offset: u64,
         data: &[u8],

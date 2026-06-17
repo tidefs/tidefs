@@ -18,11 +18,10 @@ use crate::writeback::DirtyFolioTracker;
 use crate::{KmodPosixVfs, OpenFileState};
 use tidefs_kmod_bridge::kernel_types::VfsEngine;
 use tidefs_kmod_bridge::kernel_types::{
-    EngineDirHandle, EngineFileHandle, Errno, InodeId, RequestCtx,
+    EngineDirHandle, EngineFileHandle, Errno, InodeId, RequestCtx, WritebackRange,
 };
 
 /// Maximum byte range to writeback in one chunk during pre-fsync dirty-page flush.
-const FSYNC_WRITEBACK_CHUNK: u64 = 1_048_576; // 1 MiB
 
 // ---------------------------------------------------------------------------
 // FsyncCommit -- BLAKE3-verified fsync durability validation
@@ -97,19 +96,54 @@ impl FsyncCommit {
 // ---------------------------------------------------------------------------
 
 impl<E: VfsEngine> KmodPosixVfs<E> {
+    /// Drain dirty page-cache ranges for `inode` through
+    /// [`VfsEngine::writeback_folios`], removing committed ranges from
+    /// the dirty tracker.
+    ///
+    /// Returns the first writeback error encountered, or `Ok(())` when
+    /// all dirty ranges for the inode are drained successfully.  An
+    /// empty tracker is a clean no-op.
+    fn drain_writeback_for_inode(
+        &mut self,
+        fh: &EngineFileHandle,
+        ctx: &RequestCtx,
+    ) -> Result<(), Errno> {
+        let dirty_ranges = self.dirty_folio_tracker.drain_inode(fh.inode_id);
+        for range in &dirty_ranges {
+            let wb_range = WritebackRange::new(range.offset, range.length as u64);
+            let outcome = self
+                .engine
+                .writeback_folios(fh.inode_id, fh, wb_range, ctx)?;
+            // Re-dirty any tail that was not fully committed.
+            if !outcome.complete && outcome.bytes_written < wb_range.length {
+                let tail_offset = range.offset + outcome.bytes_written;
+                let tail_len = (wb_range.length - outcome.bytes_written) as u32;
+                let _ = self.dirty_folio_tracker.try_add(fh.inode_id, tail_offset, tail_len);
+            }
+        }
+        Ok(())
+    }
+
     /// Synchronize file data and metadata for `fh`.
+    ///
+    /// Drains dirty page-cache ranges through [`VfsEngine::writeback_folios`]
+    /// before calling the engine durability barrier.  Writeback errors
+    /// (EIO, ENOSPC) are surfaced to the caller and prevent the durability
+    /// barrier from executing.
     ///
     /// If `datasync` is true, only data and metadata needed to retrieve the
     /// data (size, mtime) must be flushed; other metadata may be skipped.
-    /// Delegates to VfsEngine::fsync.
+    /// Datasync keeps the narrower metadata contract while still refusing to
+    /// hide data-writeback failures.
     ///
     /// For commit validation, use [`fsync_range`] instead.
     pub fn fsync(
-        &self,
+        &mut self,
         fh: &EngineFileHandle,
         datasync: bool,
         ctx: &RequestCtx,
     ) -> Result<(), Errno> {
+        self.drain_writeback_for_inode(fh, ctx)?;
         self.engine.fsync(fh, datasync, ctx)?;
         self.commit_fs_barrier()
     }
@@ -117,18 +151,22 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
     /// Synchronize a byte range of `fh` and return a BLAKE3-verified
     /// [`FsyncCommit`] as durability validation.
     ///
+    /// Drains dirty page-cache ranges through [`VfsEngine::writeback_folios`]
+    /// before calling the engine durability barrier.  Writeback errors
+    /// prevent [`FsyncCommit`] publication for the affected inode.
+    ///
     /// This is the enhanced fsync path matching the Linux 7.0
     /// `file_operations::fsync(struct file *file, loff_t start,
-    /// loff_t end, int datasync)` signature. It delegates the
-    /// durability flush to [`VfsEngine::fsync`] and then produces a
-    /// domain-separated BLAKE3 commitment covering the inode,
-    /// transaction group, byte range, and datasync flag.
+    /// loff_t end, int datasync)` signature. It drains the dirty
+    /// range, delegates the durability flush to [`VfsEngine::fsync`],
+    /// and then produces a domain-separated BLAKE3 commitment covering
+    /// the inode, transaction group, byte range, and datasync flag.
     ///
     /// Use `range_start = 0, range_end = u64::MAX` for a full-file
     /// fsync (matching the Linux VFS convention of LLONG_MAX for EOF).
     /// Use [`fsync`] when commit validation is not required.
     pub fn fsync_range(
-        &self,
+        &mut self,
         fh: &EngineFileHandle,
         range_start: u64,
         range_end: u64,
@@ -136,6 +174,7 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
         ctx: &RequestCtx,
         committed_txg: u64,
     ) -> Result<FsyncCommit, Errno> {
+        self.drain_writeback_for_inode(fh, ctx)?;
         self.engine.fsync(fh, datasync, ctx)?;
         self.commit_fs_barrier()?;
         Ok(FsyncCommit::new(
@@ -167,15 +206,22 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
 
 /// Source-model bridge from kernel file_operations::fsync to VfsEngine::fsync.
 ///
-/// Resolves the OpenFileState (kernel file->private_data), flushes
-/// dirty source-model address_space ranges through the provided
-/// DirtyFolioTracker (when available), then calls VfsEngine::fsync to request
-/// a transaction-group commit barrier. The mounted C shim does not use this
-/// tracker for mmap dirties; it calls `filemap_write_and_wait_range()` and the
-/// registered C `writepages` callback before `tidefs_posix_vfs_engine_fsync()`.
+/// Resolves the OpenFileState (kernel file->private_data), drains dirty
+/// source-model address_space ranges through
+/// [`VfsEngine::writeback_folios`] (when a
+/// [`DirtyFolioTracker`] is provided), then calls [`VfsEngine::fsync`]
+/// to request a transaction-group commit barrier. Writeback errors
+/// (EIO, ENOSPC) are surfaced to the caller and prevent the engine
+/// fsync from executing.
+///
+/// The mounted C shim does not use this tracker for mmap dirties; it
+/// calls `filemap_write_and_wait_range()` and the registered C
+/// `writepages` callback before `tidefs_posix_vfs_engine_fsync()`.
 ///
 /// When datasync is true, only data and the metadata needed to retrieve
 /// it (size, mtime) must be flushed; other metadata may be skipped.
+/// Datasync still drains dirty writeback and refuses to hide
+/// data-writeback failures.
 ///
 /// start and end define the byte range to synchronize. When both are
 /// zero (start == 0 && end == 0), the kernel VFS signals a full-file
@@ -198,27 +244,26 @@ pub fn bridge_fsync<E: VfsEngine + ?Sized>(
     datasync: bool,
     ctx: &RequestCtx,
 ) -> Result<(), Errno> {
-    // Flush dirty address_space pages for this inode before the engine
-    // durability barrier, so all dirty data enters the intent-log pipeline.
+    // Drain dirty address_space pages for this inode through
+    // writeback_folios before the engine durability barrier, so all
+    // dirty data enters the intent-log pipeline.  Writeback errors
+    // surface to the caller and prevent the engine fsync.
     if let Some(tracker) = tracker {
         let dirty_ranges = tracker.drain_inode(session.inode);
         for range in &dirty_ranges {
-            let mut offset = range.offset;
-            let remaining = range.length as u64;
-            let mut written = 0u64;
-            while written < remaining {
-                let chunk = (remaining - written).min(FSYNC_WRITEBACK_CHUNK);
-                let chunk_size = u32::try_from(chunk).unwrap_or(u32::MAX);
-                let data = engine.read(&session.handle, offset, chunk_size, ctx)?;
-                if data.is_empty() {
-                    break;
-                }
-                let n = engine.write(&session.handle, offset, &data, ctx)?;
-                written += n as u64;
-                offset += n as u64;
-                if n == 0 {
-                    break;
-                }
+            let wb_range = WritebackRange::new(range.offset, range.length as u64);
+            let outcome = engine.writeback_folios(
+                session.inode,
+                &session.handle,
+                wb_range,
+                ctx,
+            )?;
+            // Re-dirty any tail that was not fully committed so the
+            // caller or a subsequent fsync can retry.
+            if !outcome.complete && outcome.bytes_written < wb_range.length {
+                let tail_offset = range.offset + outcome.bytes_written;
+                let tail_len = (wb_range.length - outcome.bytes_written) as u32;
+                let _ = tracker.try_add(session.inode, tail_offset, tail_len);
             }
         }
     }
@@ -286,8 +331,8 @@ mod tests {
             assert!(!datasync);
             Ok(())
         });
-        KmodPosixVfs::new(e)
-            .fsync(&fh, false, &MockEngine::test_ctx())
+        let mut kmod = KmodPosixVfs::new(e);
+        kmod.fsync(&fh, false, &MockEngine::test_ctx())
             .unwrap();
     }
 
@@ -301,8 +346,8 @@ mod tests {
             assert!(datasync);
             Ok(())
         });
-        KmodPosixVfs::new(e)
-            .fsync(&fh, true, &MockEngine::test_ctx())
+        let mut kmod = KmodPosixVfs::new(e);
+        kmod.fsync(&fh, true, &MockEngine::test_ctx())
             .unwrap();
     }
 
@@ -311,9 +356,9 @@ mod tests {
         let mut e = MockEngine::new();
         e.fsync_fn = Box::new(|_, _, _| Err(Errno::EIO));
         let fh = make_fh();
+        let mut kmod = KmodPosixVfs::new(e);
         assert_eq!(
-            KmodPosixVfs::new(e)
-                .fsync(&fh, false, &MockEngine::test_ctx())
+            kmod.fsync(&fh, false, &MockEngine::test_ctx())
                 .unwrap_err(),
             Errno::EIO,
         );
@@ -324,9 +369,9 @@ mod tests {
         let mut e = MockEngine::new();
         e.fsync_fn = Box::new(|_, _, _| Err(Errno::EBADF));
         let fh = make_fh();
+        let mut kmod = KmodPosixVfs::new(e);
         assert_eq!(
-            KmodPosixVfs::new(e)
-                .fsync(&fh, false, &MockEngine::test_ctx())
+            kmod.fsync(&fh, false, &MockEngine::test_ctx())
                 .unwrap_err(),
             Errno::EBADF,
         );
@@ -395,9 +440,9 @@ mod tests {
         let mut e = MockEngine::new();
         e.fsync_fn = Box::new(|_, _, _| Err(Errno::EROFS));
         let fh = make_fh();
+        let mut kmod = KmodPosixVfs::new(e);
         assert_eq!(
-            KmodPosixVfs::new(e)
-                .fsync(&fh, false, &MockEngine::test_ctx())
+            kmod.fsync(&fh, false, &MockEngine::test_ctx())
                 .unwrap_err(),
             Errno::EROFS,
         );
@@ -408,9 +453,9 @@ mod tests {
         let mut e = MockEngine::new();
         e.fsync_fn = Box::new(|_, _, _| Err(Errno::EROFS));
         let fh = make_fh();
+        let mut kmod = KmodPosixVfs::new(e);
         assert_eq!(
-            KmodPosixVfs::new(e)
-                .fsync_range(&fh, 0, u64::MAX, false, &MockEngine::test_ctx(), 0)
+            kmod.fsync_range(&fh, 0, u64::MAX, false, &MockEngine::test_ctx(), 0)
                 .unwrap_err(),
             Errno::EROFS,
         );
@@ -437,7 +482,7 @@ mod tests {
             Ok(())
         });
 
-        let kmod = KmodPosixVfs::new(e);
+        let mut kmod = KmodPosixVfs::new(e);
         let written = kmod.write(&fh, 0, data, &MockEngine::test_ctx()).unwrap();
         assert_eq!(written, data.len() as u32);
         kmod.fsync(&fh, false, &MockEngine::test_ctx()).unwrap();
@@ -460,7 +505,7 @@ mod tests {
             Ok(())
         });
 
-        let kmod = KmodPosixVfs::new(e);
+        let mut kmod = KmodPosixVfs::new(e);
         kmod.write(&fh, 0, b"payload", &MockEngine::test_ctx())
             .unwrap();
         let commit = kmod
