@@ -1,5 +1,7 @@
 # ublk daemon / queue topology P6-01 (v0.317)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the source-of-truth for **P6-01** in the production design ledger.
 
 It answers the production question that remained deliberately open after `P4-04` and `P5-03`:

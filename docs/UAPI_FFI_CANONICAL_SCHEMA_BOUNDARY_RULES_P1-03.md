@@ -1,5 +1,7 @@
 # UAPI / FFI / canonical-schema boundary rules (P1-03) (v0.357)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the source-of-truth for the production-depth UAPI / FFI /
 canonical-schema boundary rules for tidefs.
 

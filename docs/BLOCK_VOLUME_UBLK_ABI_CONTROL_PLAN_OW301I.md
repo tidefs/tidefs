@@ -1,5 +1,7 @@
 # Block Volume ublk ABI Control Plan OW-301I
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301I executable block-volume ublk ABI control-plan surface is implemented in

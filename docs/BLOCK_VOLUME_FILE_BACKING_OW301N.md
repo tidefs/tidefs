@@ -1,5 +1,7 @@
 # Block Volume File Backing OW-301N
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301N executable block-volume file-backed image surface is implemented in

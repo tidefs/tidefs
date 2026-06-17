@@ -1,5 +1,7 @@
 # Block Volume ublk Control uring_cmd Probe OW-301P
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301P executable read-only ublk control uring_cmd probe boundary is implemented in

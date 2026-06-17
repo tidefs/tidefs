@@ -1,5 +1,7 @@
 # Block Volume ublk Control Open OW-301O
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301O executable ublk control-device open boundary is implemented in

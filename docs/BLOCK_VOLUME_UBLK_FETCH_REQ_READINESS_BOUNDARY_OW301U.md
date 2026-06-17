@@ -1,5 +1,7 @@
 # Block Volume ublk FETCH_REQ Readiness Boundary OW-301U
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301U guarded ublk data-queue FETCH_REQ readiness boundary is implemented in

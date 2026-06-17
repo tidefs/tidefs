@@ -1,5 +1,7 @@
 # POSIX subset notes (OW-104/OW-106/OW-107/OW-102/OW-014/OW-015/OW-108/OW-109)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 > TFR-019 authority note: this imported implementation note is review material,
 > the behavior below as needing reconciliation with current source,
 > `docs/REVIEW_TODO_REGISTER.md`, and `docs/WHOLE_REPO_REVIEW.md`.

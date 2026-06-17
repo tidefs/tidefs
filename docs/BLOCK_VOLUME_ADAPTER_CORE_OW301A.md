@@ -1,5 +1,7 @@
 # Block Volume Adapter Core OW-301A
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301A executable block-volume adapter core slice is implemented in

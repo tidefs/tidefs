@@ -1,5 +1,7 @@
 # linux 7.0 baseline contract / supported subsystems (P0-01) (v0.357)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the source-of-truth for the production-depth Linux 7.0
 baseline contract and supported-subsystem law for tidefs.
 

@@ -1,5 +1,7 @@
 # Block Volume Adapter Host Preflight OW-301H
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301H executable block-volume adapter host preflight surface is implemented in

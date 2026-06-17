@@ -1,5 +1,7 @@
 # TideFS Architecture
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Layer Model
 
 TideFS is organized as a stack of library crates. Each layer builds on the one

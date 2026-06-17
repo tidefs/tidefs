@@ -1,5 +1,7 @@
 # operator manual - dynamic tuning and real-time observability (v0.422)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This manual explains the operator-facing behavior of tidefs' workload-reactive design.
 
 It answers the practical question:

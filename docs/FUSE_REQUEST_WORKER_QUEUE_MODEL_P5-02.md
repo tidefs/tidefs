@@ -1,5 +1,7 @@
 # fuse request worker and queue model (v0.314)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document settles `P5-02` at production depth.
 
 It is the source-of-truth for the live userspace **posix_filesystem_adapter** runtime on Linux 7.0:

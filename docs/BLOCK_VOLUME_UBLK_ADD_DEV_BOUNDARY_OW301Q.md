@@ -1,5 +1,7 @@
 # Block Volume ublk ADD_DEV Boundary OW-301Q
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301Q executable ublk ADD_DEV control uring_cmd boundary is implemented in

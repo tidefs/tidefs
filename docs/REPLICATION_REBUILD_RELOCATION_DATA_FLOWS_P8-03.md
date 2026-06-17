@@ -1,5 +1,7 @@
 # replication / rebuild / relocation data flows P8-03 (v0.320)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the source-of-truth for **P8-03** in the production design ledger.
 
 It answers the production question that remained deliberately open after `P2-02`, `P4-02`, `P4-03`, `P4-04`, `P5-02`, `P5-03`, `P6-01`, `P6-02`, and `P7-03`:

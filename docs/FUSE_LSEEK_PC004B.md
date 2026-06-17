@@ -1,5 +1,7 @@
 # FUSE lseek preview surface (PC-004B)
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This issue is a child of PC-004. It narrows one FUSE mount-surface gap without
 claiming that the parent POSIX-complete FUSE gate is closed.
 

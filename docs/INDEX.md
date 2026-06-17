@@ -22,11 +22,11 @@ Book:
 - `docs/book/tidefs-book.adoc`
 - `docs/book/chapters/05-book-plan.adoc`
 
-The remaining documents are imported design/reference material. They need
-ongoing audit against the review register before they can be treated as current
-status.
+The remaining documents are design/reference material. Their authority state is
+scoped by `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`; a path appearing below is
+not automatically current status.
 
-Key current design and policy areas:
+Key design, policy, and reference areas:
 
 - `docs/ARCHITECTURE.md`
 - `docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`

@@ -1,5 +1,7 @@
 # Block Volume Dispatch Execution OW-301C
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301C executable block-volume dispatch execution slice is implemented in

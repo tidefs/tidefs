@@ -1,5 +1,7 @@
 # export fencing / resize / failover runtime P6-03 (v0.322)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the source-of-truth for **P6-03** in the production design ledger.
 
 It answers the production question that remained deliberately open after `P6-01`, `P6-02`, `P7-03`, `P8-03`, and `P2-03`:

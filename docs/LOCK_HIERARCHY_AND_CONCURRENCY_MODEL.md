@@ -1,5 +1,7 @@
 # Lock Hierarchy and Deterministic Concurrency Model
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the source-of-truth for the tidefs lock hierarchy, optimistic
 by which the storage engine, FUSE adapter, ublk surface, and future cluster VFS
 RPC acquire and release locks without deadlock.

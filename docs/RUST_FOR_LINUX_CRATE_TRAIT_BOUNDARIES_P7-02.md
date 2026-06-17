@@ -1,5 +1,7 @@
 # Rust-for-Linux crate and trait boundaries (P7-02) (v0.338)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the production-depth source-of-truth for **P7-02**.
 
 It answers one concrete question:

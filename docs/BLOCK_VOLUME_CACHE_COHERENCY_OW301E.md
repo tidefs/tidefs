@@ -1,5 +1,7 @@
 # Block Volume Cache Coherency OW-301E
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301E executable block-volume cache coherency slice is implemented in

@@ -1,5 +1,7 @@
 # std / no_std / kernel / userspace boundary rules (P1-02) (v0.362)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the source-of-truth for the production-depth std / `no_std` /
 kernel / userspace boundary rules for tidefs.
 

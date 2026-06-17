@@ -1,5 +1,7 @@
 # Block Volume ublk COMMIT_AND_FETCH_REQ Boundary OW-301X
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301X guarded ublk COMMIT_AND_FETCH_REQ boundary is implemented in

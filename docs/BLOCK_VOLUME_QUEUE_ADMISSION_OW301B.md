@@ -1,5 +1,7 @@
 # Block Volume Queue Admission OW-301B
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301B executable block-volume queue admission slice is implemented in
