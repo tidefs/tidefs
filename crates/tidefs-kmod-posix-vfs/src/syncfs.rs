@@ -28,11 +28,12 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
         // Drain all tracked dirty inodes through writeback before the
         // engine-level sync barrier.  Collect inode list first so we
         // can iterate without borrow conflicts.
-        let dirty_inodes: Vec<InodeId> = self
-            .dirty_folio_tracker
-            .iter()
-            .map(|(ino, _)| ino)
-            .collect();
+        // Build inode list manually: KmodVec does not implement
+        // FromIterator, so collect() fails in the kernel build.
+        let mut dirty_inodes: Vec<InodeId> = Vec::new();
+        for (ino, _) in self.dirty_folio_tracker.iter() {
+            dirty_inodes.push(ino);
+        }
         for inode in dirty_inodes {
             let ranges = self.dirty_folio_tracker.drain_inode(inode);
             for range in &ranges {
