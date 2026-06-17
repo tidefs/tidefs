@@ -81,22 +81,48 @@ timestamp fields unless the caller uses a separately named API that explicitly
 updates VFS generation or revision fields. POSIX timestamp plans must preserve
 `InodeAttr::generation`, `subtree_rev`, and `dir_rev`.
 
-## Remaining TFR-005 Runtime Work
+## Issue #330: Local-Filesystem Runtime Projection (Partial)
 
-TFR-005 remains open after this shared-boundary slice. The following runtime
-projection sites still need owned issues, implementation, and validation before
-the register item can close:
+Issue #330 narrows TFR-005 for the local-filesystem / local content-object
+projection slice:
 
-- local-filesystem inode record projection between POSIX `*_ns` fields and
-  persisted `metadata_version` / `data_version` fields;
-- content object keys, content manifests, reclaim identity, and object lifetime
-  paths that still use `data_version` as both timestamp-like metadata and
-  storage version identity;
-- intent-log replay and commit-group recovery paths that rebuild content under
-  fresh generation ticks and store those ticks into inode metadata fields;
-- scrub and repair paths that must distinguish wall-clock time, object version,
-  checksum scope, and scrub row identity;
-- send/receive export/import paths that serialize timestamp and storage
-  version fields through one current authority;
-- format-golden and codec surfaces if a later slice intentionally changes the
+- **Removed**: `PosixTimeRecord::from_generation` and
+  `PosixTimeRecord::legacy_from_versions`.  These methods projected storage
+  generations and object versions back into POSIX timestamp fields, violating
+  the authority boundary.
+- **Added**: `PosixTimeRecord::synthetic(now_ns: i64)` as the named authority
+  boundary for synthetic inodes and test fixtures.  The `now_ns` argument must
+  be a POSIX wall-clock timestamp (typically `current_posix_time_ns()`), never
+  a storage version, generation, or object key.
+- **Removed**: The encoding format version < 5 decode path that used
+  `legacy_from_versions` to fabricate POSIX timestamps from storage fields.
+  Version < 5 inode records now produce a clean decode error per
+  `docs/UNRELEASED_AUTHORITY_POLICY.md`.
+- **Fixed**: `update_anonymous_size` in the VFS engine no longer derives a
+  synthetic version counter from `mtime_ns`.  It uses wall-clock time for
+  POSIX timestamp advancement and a separate counter for `subtree_rev`.
+- **Verified**: `InodeRecord::to_inode_attr` correctly projects `posix_time`
+  fields into POSIX attributes and `data_version` / `metadata_version` into
+  storage identity fields.  The encode path (`encode_inode`) always writes
+  explicit POSIX timestamps at format version 5.
+
+### Remaining TFR-005 Runtime Sites (after issue #330)
+
+These runtime projection sites still need owned issues, implementation, and
+validation before TFR-005 can close:
+
+- `InodeRecord::to_inode_attr()` uses `metadata_version` as both
+  `subtree_rev` and `dir_rev`.  These are VFS namespace revision counters,
+  not storage metadata versions; a separate namespace-revision authority is
+  needed.
+- Intent-log replay and commit-group recovery paths that rebuild content under
+  fresh generation ticks and store those ticks into inode metadata fields
+  (`data_version`, `metadata_version`).
+- Scrub and repair paths that must distinguish wall-clock time, object version,
+  checksum scope, and scrub row identity.
+- Send/receive export/import paths that serialize timestamp and storage
+  version fields through one current authority.
+- Content object reclaim and orphan cleanup paths that use `data_version` as
+  both a content identity token and a storage-ordering hint.
+- Format-golden and codec surfaces, if a later slice intentionally changes the
   serialized ABI or golden-format shape.

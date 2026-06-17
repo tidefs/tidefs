@@ -38,7 +38,7 @@ pub(crate) fn initial_state() -> FileSystemState {
         size: 0,
         data_version: 1,
         metadata_version: 1,
-        posix_time: PosixTimeRecord::from_generation(1),
+        posix_time: PosixTimeRecord::now(),
         xattrs: BTreeMap::new(),
         dir_storage_kind: 0,
         xattr_storage_kind: 0,

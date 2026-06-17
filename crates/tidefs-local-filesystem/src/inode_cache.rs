@@ -545,7 +545,7 @@ mod tests {
                 size: 4096,
                 data_version: 1,
                 metadata_version: 1,
-                posix_time: crate::types::PosixTimeRecord::from_generation(1),
+                posix_time: crate::types::PosixTimeRecord::now(),
                 xattrs: BTreeMap::new(),
                 dir_storage_kind: 0,
                 xattr_storage_kind: 0,

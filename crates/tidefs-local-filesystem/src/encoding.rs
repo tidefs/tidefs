@@ -810,16 +810,21 @@ pub(crate) fn decode_inode(bytes: &[u8]) -> Result<InodeRecord> {
     let data_version = decoder.read_u64()?;
     let metadata_version = decoder.read_u64()?;
     let rdev = if version >= 4 { decoder.read_u32()? } else { 0 };
-    let posix_time = if version >= 5 {
-        PosixTimeRecord::new(
-            decoder.read_i64()?,
-            decoder.read_i64()?,
-            decoder.read_i64()?,
-            decoder.read_i64()?,
-        )
-    } else {
-        PosixTimeRecord::legacy_from_versions(data_version, metadata_version, generation.get())
-    };
+    // Versions before 5 did not store explicit POSIX timestamps and
+    // attempted to derive them from storage versions/generations.  That
+    // authority shortcut has been removed; reject the old format.
+    if version < 5 {
+        return Err(FileSystemError::Decode {
+            object: "local filesystem inode",
+            reason: "format version below 5 lacks explicit POSIX timestamps; re-create with current format",
+        });
+    }
+    let posix_time = PosixTimeRecord::new(
+        decoder.read_i64()?,
+        decoder.read_i64()?,
+        decoder.read_i64()?,
+        decoder.read_i64()?,
+    );
     let xattrs = match xattr_storage_kind {
         0 => {
             // Try new bundle format first (magic XATB), fall back to old count-based format

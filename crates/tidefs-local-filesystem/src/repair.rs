@@ -165,7 +165,7 @@ mod tests {
             size,
             data_version: 3,
             metadata_version: 3,
-            posix_time: crate::types::PosixTimeRecord::from_generation(3),
+            posix_time: crate::types::PosixTimeRecord::now(),
             xattrs: Default::default(),
             dir_storage_kind: 0,
             xattr_storage_kind: 0,

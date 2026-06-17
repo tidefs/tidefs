@@ -206,7 +206,7 @@ fn stage_probe_file_state(
         size: bytes.len() as u64,
         data_version: tick,
         metadata_version: tick,
-        posix_time: crate::types::PosixTimeRecord::from_generation(tick),
+        posix_time: crate::types::PosixTimeRecord::synthetic(tick as i64),
         xattrs: BTreeMap::new(),
         dir_storage_kind: 0,
         xattr_storage_kind: 0,
@@ -2885,7 +2885,7 @@ fn uncommitted_transaction_objects_are_ignored_on_reopen() {
         size: 0,
         data_version: tick,
         metadata_version: tick,
-        posix_time: crate::types::PosixTimeRecord::from_generation(tick),
+        posix_time: crate::types::PosixTimeRecord::synthetic(tick as i64),
         xattrs: BTreeMap::new(),
         dir_storage_kind: 0,
         xattr_storage_kind: 0,
@@ -3731,7 +3731,7 @@ fn unreachable_inode_committed_root_is_skipped_before_mount_without_fsck() {
             size: 0,
             data_version: bad_generation,
             metadata_version: bad_generation,
-            posix_time: crate::types::PosixTimeRecord::from_generation(bad_generation),
+            posix_time: crate::types::PosixTimeRecord::synthetic(bad_generation as i64),
             xattrs: BTreeMap::new(),
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
@@ -9879,4 +9879,334 @@ fn feature_flag_mount_gate_known_features_succeeds() {
     let name = FeatureName::from_str(FEATURE_COMPRESSION_ZSTD).unwrap();
     assert!(fs.feature_flags().is_enabled(&name));
     cleanup(&root);
+}
+
+// ── Issue #330: POSIX timestamp / storage version authority separation ──
+
+use tidefs_inode_attributes::InodeAttributeStore;
+
+#[test]
+fn posix_time_record_synthetic_preserves_wall_clock_value() {
+    // synthetic(now_ns) must store the supplied wall-clock value, not derive
+    // it from any storage version, generation, or object key.
+    let now_ns = crate::types::current_posix_time_ns();
+    let synthetic = crate::types::PosixTimeRecord::synthetic(now_ns);
+    assert_eq!(synthetic.atime_ns, now_ns);
+    assert_eq!(synthetic.mtime_ns, now_ns);
+    assert_eq!(synthetic.ctime_ns, now_ns);
+    assert_eq!(synthetic.btime_ns, now_ns);
+}
+
+#[test]
+fn posix_time_record_now_uses_wall_clock() {
+    // now() must produce wall-clock timestamps, not storage-derived values.
+    let before_ns = crate::types::current_posix_time_ns();
+    let now = crate::types::PosixTimeRecord::now();
+    let after_ns = crate::types::current_posix_time_ns();
+    for ts in [now.atime_ns, now.mtime_ns, now.ctime_ns, now.btime_ns] {
+        assert!(ts >= before_ns, "timestamp {ts} before clock snapshot {before_ns}");
+        assert!(ts <= after_ns, "timestamp {ts} after clock snapshot {after_ns}");
+    }
+}
+
+#[test]
+fn encode_decode_round_trip_preserves_separate_authorities() {
+    // Encode an InodeRecord with distinct POSIX timestamps and storage
+    // versions, decode it, and verify the authorities stay separate.
+    let inode_id = tidefs_types_vfs_core::InodeId::new(42);
+    let generation = tidefs_types_vfs_core::Generation::new(7);
+    let posix_time = crate::types::PosixTimeRecord::new(
+        1_700_000_000_000_000_000, // atime
+        1_700_000_000_100_000_000, // mtime
+        1_700_000_000_200_000_000, // ctime
+        1_690_000_000_000_000_000, // btime
+    );
+    let data_version: u64 = 999;
+    let metadata_version: u64 = 1001;
+
+    let record = InodeRecord {
+        dir_storage_kind: 0,
+        inode_id,
+        generation,
+        facets: tidefs_types_vfs_core::NodeKind::File.to_facets(),
+        mode: 0o644 | tidefs_types_vfs_core::S_IFREG as u32,
+        uid: 1000,
+        gid: 1000,
+        nlink: 1,
+        size: 1024,
+        data_version,
+        metadata_version,
+        posix_time,
+        xattr_storage_kind: 0,
+        xattrs: BTreeMap::new(),
+        dir_rev: 0,
+        rdev: 0,
+    };
+
+    let encoded = crate::encoding::encode_inode(&record);
+    let decoded = crate::encoding::decode_inode(&encoded).expect("decode round-trip");
+
+    // POSIX timestamps must survive the round-trip exactly.
+    assert_eq!(decoded.posix_time.atime_ns, posix_time.atime_ns);
+    assert_eq!(decoded.posix_time.mtime_ns, posix_time.mtime_ns);
+    assert_eq!(decoded.posix_time.ctime_ns, posix_time.ctime_ns);
+    assert_eq!(decoded.posix_time.btime_ns, posix_time.btime_ns);
+
+    // Storage versions must survive the round-trip exactly.
+    assert_eq!(decoded.data_version, data_version);
+    assert_eq!(decoded.metadata_version, metadata_version);
+
+    // POSIX timestamps must not be contaminated by storage versions.
+    assert_ne!(decoded.posix_time.atime_ns, data_version as i64);
+    assert_ne!(decoded.posix_time.mtime_ns, data_version as i64);
+    assert_ne!(decoded.posix_time.ctime_ns, metadata_version as i64);
+    assert_ne!(decoded.posix_time.btime_ns, generation.get() as i64);
+}
+
+#[test]
+fn decode_format_below_5_is_rejected() {
+    // Version < 5 inode records no longer fabricate POSIX timestamps from
+    // storage fields; they must produce a clean decode error.
+    let mut bytes = Vec::new();
+    // INODE_MAGIC (8 bytes)
+    bytes.extend_from_slice(&crate::types::INODE_MAGIC);
+    // Format version 4 (below the current minimum for explicit POSIX times).
+    bytes.extend_from_slice(&4u16.to_le_bytes());
+    // xattr_storage_kind (u16)
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    // inode_id (u64)
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    // generation (u64)
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    // kind (u32) — must be a valid NodeKind (File=2)
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    // mode (u32), uid (u32), gid (u32), nlink (u32), dir_storage_raw (u32),
+    // size (u64), data_version (u64), metadata_version (u64) = 52 bytes of zeros
+    bytes.extend_from_slice(&[0u8; 52]);
+
+    let result = crate::encoding::decode_inode(&bytes);
+    match result {
+        Err(FileSystemError::Decode { reason, .. }) => {
+            assert!(
+                reason.contains("below 5") || reason.contains("POSIX"),
+                "expected version-rejection reason, got: {reason}"
+            );
+        }
+        other => panic!("expected Decode error for format version 4, got {other:?}"),
+    }
+}
+
+#[test]
+fn to_inode_attr_projects_authorities_separately() {
+    // InodeRecord::to_inode_attr() must project posix_time fields into
+    // POSIX attributes and data_version/metadata_version into storage
+    // identity fields without cross-contamination.
+    let posix_time = crate::types::PosixTimeRecord::new(
+        1_700_000_000_000_000_000,
+        1_700_000_000_100_000_000,
+        1_700_000_000_200_000_000,
+        1_690_000_000_000_000_000,
+    );
+    let record = InodeRecord {
+        dir_storage_kind: 0,
+        inode_id: tidefs_types_vfs_core::InodeId::new(10),
+        generation: tidefs_types_vfs_core::Generation::new(3),
+        facets: tidefs_types_vfs_core::NodeKind::File.to_facets(),
+        mode: 0o644 | tidefs_types_vfs_core::S_IFREG as u32,
+        uid: 0,
+        gid: 0,
+        nlink: 1,
+        size: 512,
+        data_version: 77,
+        metadata_version: 88,
+        posix_time,
+        xattr_storage_kind: 0,
+        xattrs: BTreeMap::new(),
+        dir_rev: 0,
+        rdev: 0,
+    };
+
+    let attr = record.to_inode_attr();
+
+    // POSIX timestamps must project into POSIX fields exactly.
+    assert_eq!(attr.posix.atime_ns, posix_time.atime_ns);
+    assert_eq!(attr.posix.mtime_ns, posix_time.mtime_ns);
+    assert_eq!(attr.posix.ctime_ns, posix_time.ctime_ns);
+    assert_eq!(attr.posix.btime_ns, posix_time.btime_ns);
+
+    // VFS generation must project from the Generation field, not timestamps.
+    assert_eq!(attr.generation.get(), record.generation.get());
+    assert_ne!(attr.generation.get() as i64, posix_time.atime_ns);
+
+    // Storage versions must not leak into POSIX timestamp fields.
+    assert_ne!(attr.posix.atime_ns, record.metadata_version as i64);
+    assert_ne!(attr.posix.mtime_ns, record.metadata_version as i64);
+    assert_ne!(attr.posix.ctime_ns, record.data_version as i64);
+    assert_ne!(attr.posix.btime_ns, record.data_version as i64);
+}
+
+#[test]
+fn no_op_setattr_preserves_storage_version_identity() {
+    // A setattr that changes no fields must not alter POSIX timestamps
+    // or VFS generation.  No-op paths prove that POSIX time and storage
+    // version authorities do not leak into each other through the
+    // attribute mutation machinery.
+    let store = tidefs_inode_attributes::MemInodeAttributeStore::new();
+    let ino: u64 = 1;
+
+    let initial = tidefs_types_vfs_core::InodeAttr {
+        inode_id: tidefs_types_vfs_core::InodeId::new(ino),
+        generation: tidefs_types_vfs_core::Generation::new(1),
+        kind: tidefs_types_vfs_core::NodeKind::File,
+        posix: tidefs_types_vfs_core::PosixAttrs {
+            mode: 0o644 | tidefs_types_vfs_core::S_IFREG as u32,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            rdev: 0,
+            atime_ns: 1_700_000_000_000_000_000,
+            mtime_ns: 1_700_000_000_000_000_000,
+            ctime_ns: 1_700_000_000_000_000_000,
+            btime_ns: 1_700_000_000_000_000_000,
+            size: 0,
+            blocks_512: 0,
+            blksize: 4096,
+        },
+        flags: tidefs_types_vfs_core::InodeFlags::default(),
+        subtree_rev: 1,
+        dir_rev: 0,
+    };
+    store.insert(ino, initial);
+
+    let before = store.getattr(ino).expect("getattr before no-op");
+
+    // Apply a setattr with no valid bits — pure no-op.
+    let noop = tidefs_types_vfs_core::SetAttr::default();
+    let after = store.setattr(ino, &noop).expect("no-op setattr");
+
+    // All timestamps must be unchanged for a true no-op.
+    assert_eq!(after.posix.atime_ns, before.posix.atime_ns);
+    assert_eq!(after.posix.mtime_ns, before.posix.mtime_ns);
+    assert_eq!(after.posix.ctime_ns, before.posix.ctime_ns);
+    assert_eq!(after.posix.btime_ns, before.posix.btime_ns);
+
+    // Generation must be unchanged.
+    assert_eq!(after.generation.get(), before.generation.get());
+}
+
+#[test]
+fn explicit_timestamp_update_preserves_storage_version_identity() {
+    // An explicit atime setattr via FATTR_ATIME must update the POSIX
+    // timestamp without altering VFS generation or revision counters.
+    let store = tidefs_inode_attributes::MemInodeAttributeStore::new();
+    let ino: u64 = 2;
+
+    let initial = tidefs_types_vfs_core::InodeAttr {
+        inode_id: tidefs_types_vfs_core::InodeId::new(ino),
+        generation: tidefs_types_vfs_core::Generation::new(5),
+        kind: tidefs_types_vfs_core::NodeKind::File,
+        posix: tidefs_types_vfs_core::PosixAttrs {
+            mode: 0o644 | tidefs_types_vfs_core::S_IFREG as u32,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            rdev: 0,
+            atime_ns: 1_700_000_000_000_000_000,
+            mtime_ns: 1_700_000_000_000_000_000,
+            ctime_ns: 1_700_000_000_000_000_000,
+            btime_ns: 1_700_000_000_000_000_000,
+            size: 0,
+            blocks_512: 0,
+            blksize: 4096,
+        },
+        flags: tidefs_types_vfs_core::InodeFlags::default(),
+        subtree_rev: 1,
+        dir_rev: 0,
+    };
+    store.insert(ino, initial);
+
+    let before = store.getattr(ino).expect("getattr before timestamp set");
+
+    let mut set = tidefs_types_vfs_core::SetAttr::default();
+    set.valid |= tidefs_types_vfs_core::FATTR_ATIME;
+    let new_atime_ns: i64 = 1_710_000_000_000_000_000;
+    set.atime_ns = new_atime_ns;
+
+    let after = store.setattr(ino, &set).expect("explicit atime setattr");
+
+    // atime must reflect the explicit value.
+    assert_eq!(after.posix.atime_ns, new_atime_ns);
+    // ctime advances because a metadata field changed.
+    assert!(after.posix.ctime_ns >= before.posix.ctime_ns);
+
+    // Generation must not be altered by a pure timestamp update.
+    assert_eq!(after.generation.get(), before.generation.get());
+}
+
+#[test]
+fn now_style_timestamp_update_uses_wall_clock() {
+    // A FATTR_MTIME_NOW setattr must update mtime to a wall-clock value,
+    // not derive it from any storage version or generation.
+    let store = tidefs_inode_attributes::MemInodeAttributeStore::new();
+    let ino: u64 = 3;
+
+    let past_stamp: i64 = 1_600_000_000_000_000_000;
+    let initial = tidefs_types_vfs_core::InodeAttr {
+        inode_id: tidefs_types_vfs_core::InodeId::new(ino),
+        generation: tidefs_types_vfs_core::Generation::new(10),
+        kind: tidefs_types_vfs_core::NodeKind::File,
+        posix: tidefs_types_vfs_core::PosixAttrs {
+            mode: 0o644 | tidefs_types_vfs_core::S_IFREG as u32,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            rdev: 0,
+            atime_ns: past_stamp,
+            mtime_ns: past_stamp,
+            ctime_ns: past_stamp,
+            btime_ns: past_stamp,
+            size: 0,
+            blocks_512: 0,
+            blksize: 4096,
+        },
+        flags: tidefs_types_vfs_core::InodeFlags::default(),
+        subtree_rev: 1,
+        dir_rev: 0,
+    };
+    store.insert(ino, initial);
+
+    let before_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+
+    let mut set = tidefs_types_vfs_core::SetAttr::default();
+    set.valid |= tidefs_types_vfs_core::FATTR_MTIME_NOW;
+
+    let after = store.setattr(ino, &set).expect("mtime NOW setattr");
+
+    let after_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+
+    // mtime must be set to a current wall-clock value.
+    assert!(
+        after.posix.mtime_ns >= before_ns,
+        "mtime_ns {} before clock snapshot {}",
+        after.posix.mtime_ns,
+        before_ns
+    );
+    assert!(
+        after.posix.mtime_ns <= after_ns,
+        "mtime_ns {} after clock snapshot {}",
+        after.posix.mtime_ns,
+        after_ns
+    );
+
+    // ctime advances because mtime changed.
+    assert!(after.posix.ctime_ns >= before_ns);
+
+    // Generation must not be altered by a NOW-style timestamp update.
+    assert_eq!(after.generation.get(), initial.generation.get());
 }

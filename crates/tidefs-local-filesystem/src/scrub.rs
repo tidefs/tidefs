@@ -460,7 +460,7 @@ mod tests {
             size: 11,
             data_version: 3,
             metadata_version: 3,
-            posix_time: crate::types::PosixTimeRecord::from_generation(3),
+            posix_time: crate::types::PosixTimeRecord::now(),
             xattr_storage_kind: 0,
             xattrs: BTreeMap::new(),
             dir_rev: 0,
