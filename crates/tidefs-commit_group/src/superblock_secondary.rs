@@ -231,72 +231,175 @@ pub fn write_superblock_secondary<S: CommitGroupStore>(
 /// Error returned when superblock read fails even after secondary fallback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SuperblockReadError {
-    /// The primary copy was corrupt. Contains the corruption detail message.
+    /// The primary committed-root block is corrupt (BLAKE3 mismatch or malformed).
     PrimaryCorrupt(String),
     /// Both primary and secondary copies are corrupt or missing.
     BothCorrupt(String),
-    /// The secondary copy has a sequence number lower than the last known.
-    SequenceRegression {
+    /// Secondary superblock magic does not match expected "VSBS".
+    SecondaryMagicInvalid,
+    /// Secondary superblock version is not supported.
+    SecondaryVersionUnsupported(u32),
+    /// Secondary superblock copy index is invalid (expected 1).
+    SecondaryCopyIndexInvalid(u8),
+    /// Secondary superblock BLAKE3 checksum does not match content.
+    SecondaryChecksumMismatch,
+    /// Secondary superblock content region is truncated or too short.
+    SecondaryContentTruncated,
+    /// Secondary payload could not be decoded as a valid committed-root block.
+    SecondaryPayloadCorrupt(String),
+    /// Secondary sequence number is older than the last-known recovery floor.
+    SequenceRollback {
         /// The last known-good sequence number.
         last_known: u64,
         /// The sequence number found in the secondary header.
         found: u64,
     },
+    /// Primary and secondary copies are both valid but carry different committed-root blocks.
+    AmbiguousRoot {
+        /// The commit-group id from the primary root block.
+        primary_id: crate::types::CommitGroupId,
+        /// The commit-group id from the secondary root block.
+        secondary_id: crate::types::CommitGroupId,
+    },
 }
 
-/// Attempt to read a committed-root block, falling back to the secondary
-/// copy if the primary is corrupt or missing.
+impl std::fmt::Display for SuperblockReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrimaryCorrupt(msg) => write!(f, "primary superblock corrupt: {msg}"),
+            Self::BothCorrupt(msg) => write!(f, "both superblock copies corrupt: {msg}"),
+            Self::SecondaryMagicInvalid => write!(f, "secondary superblock: invalid magic"),
+            Self::SecondaryVersionUnsupported(v) => {
+                write!(f, "secondary superblock: unsupported version {v}")
+            }
+            Self::SecondaryCopyIndexInvalid(idx) => {
+                write!(f, "secondary superblock: invalid copy index {idx}")
+            }
+            Self::SecondaryChecksumMismatch => {
+                write!(f, "secondary superblock: BLAKE3 checksum mismatch")
+            }
+            Self::SecondaryContentTruncated => {
+                write!(f, "secondary superblock: content truncated")
+            }
+            Self::SecondaryPayloadCorrupt(msg) => {
+                write!(f, "secondary superblock: payload corrupt: {msg}")
+            }
+            Self::SequenceRollback { last_known, found } => {
+                write!(
+                    f,
+                    "secondary superblock: sequence rollback detected (last_known={last_known}, found={found})"
+                )
+            }
+            Self::AmbiguousRoot {
+                primary_id,
+                secondary_id,
+            } => {
+                write!(
+                    f,
+                    "superblock divergence: primary root={primary_id}, secondary root={secondary_id}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SuperblockReadError {}
+
+/// Recover a committed-root block, comparing primary and secondary copies
+/// for coherence before accepting a root.
 ///
 /// # Algorithm
 ///
-/// 1. Try the primary copy via `CommitGroupWriter::read_root_block`.
-/// 2. If the primary succeeds, return it immediately.
-/// 3. If the primary is corrupt or missing, attempt the secondary copy.
-///    a. Parse and verify the [`SuperblockSecondaryHeader`].
-///    b. Extract and checksum-verify the superblock content.
-///    c. Validate sequence >= `last_known_sequence`.
-///    d. Parse the content as a `CommittedRootBlock` and verify its hash.
+/// 1. Read the primary copy via `CommitGroupWriter::read_root_block`.
+/// 2. Read and fully validate the secondary copy (magic, version, copy index,
+///    checksum, sequence floor, payload integrity).
+/// 3. Compare the two copies:
+///    a. If the primary is valid and the secondary is either absent or
+///       invalid, accept the primary.
+///    b. If the primary is valid and the secondary is also valid, compare
+///       the committed-root payloads. Matching payloads accept the primary;
+///       divergent payloads produce an [`AmbiguousRoot`][SuperblockReadError::AmbiguousRoot] error.
+///    c. If the primary is corrupt or missing and the secondary is valid
+///       (checksum OK, sequence >= floor), accept the secondary.
+///    d. If both copies are missing, return `Ok(None)`.
+///    e. If the primary is corrupt and the secondary is missing or corrupt,
+///       return a [`BothCorrupt`][SuperblockReadError::BothCorrupt] error.
+///
+/// Secondary validation failures are returned as distinct error variants
+/// ([`SecondaryMagicInvalid`][SuperblockReadError::SecondaryMagicInvalid],
+/// [`SecondaryVersionUnsupported`][SuperblockReadError::SecondaryVersionUnsupported],
+/// [`SecondaryCopyIndexInvalid`][SuperblockReadError::SecondaryCopyIndexInvalid],
+/// [`SecondaryChecksumMismatch`][SuperblockReadError::SecondaryChecksumMismatch],
+/// [`SecondaryContentTruncated`][SuperblockReadError::SecondaryContentTruncated],
+/// [`SecondaryPayloadCorrupt`][SuperblockReadError::SecondaryPayloadCorrupt],
+/// [`SequenceRollback`][SuperblockReadError::SequenceRollback]).
 ///
 /// # Returns
 ///
 /// - `Ok(Some(block))` if a valid block was recovered.
 /// - `Ok(None)` if neither copy exists.
 /// - `Err(SuperblockReadError)` if recovery fails.
+///
+/// # Ambiguity safety
+///
+/// When both primary and secondary copies are individually valid but contain
+/// different committed-root blocks, the function fails with
+/// [`AmbiguousRoot`][SuperblockReadError::AmbiguousRoot] rather than silently
+/// picking one. This protects against torn writes that leave both copies
+/// intact but divergent.
 pub fn read_superblock_with_fallback<S: CommitGroupStore>(
     store: &S,
     commit_group_id: CommitGroupId,
     last_known_sequence: u64,
 ) -> Result<Option<CommittedRootBlock>, SuperblockReadError> {
-    // Step 1: Try primary.
-    let primary_result = crate::writer::CommitGroupWriter::read_root_block(store, commit_group_id);
-
-    match primary_result {
-        Ok(Some(block)) => Ok(Some(block)),
-        Ok(None) => {
-            // Primary missing -- try secondary.
-            match read_secondary_copy(store, commit_group_id, last_known_sequence) {
-                Ok(Some(block)) => Ok(Some(block)),
-                Ok(None) => Ok(None),
-                Err(secondary_err) => Err(secondary_err),
-            }
-        }
-        Err(e) => {
-            // Primary corrupt -- try secondary.
-            match read_secondary_copy(store, commit_group_id, last_known_sequence) {
-                Ok(Some(block)) => Ok(Some(block)),
-                Ok(None) => Err(SuperblockReadError::BothCorrupt(format!(
-                    "primary corrupt: {e}; secondary missing"
-                ))),
-                Err(secondary_err) => Err(SuperblockReadError::BothCorrupt(format!(
-                    "primary corrupt: {e}; secondary: {secondary_err:?}"
-                ))),
-            }
-        }
-    }
+    recover_committed_root(store, commit_group_id, last_known_sequence)
 }
 
-/// Internal: read and verify the secondary copy from the store.
-fn read_secondary_copy<S: CommitGroupStore>(
+/// Parse and validate a secondary superblock header with granular errors.
+///
+/// Checks magic, version, and copy index independently, returning a distinct
+/// [`SuperblockReadError`] variant for each failure mode.
+fn parse_secondary_header(raw: &[u8]) -> Result<SuperblockSecondaryHeader, SuperblockReadError> {
+    if raw.len() < SECONDARY_HEADER_SIZE {
+        return Err(SuperblockReadError::SecondaryContentTruncated);
+    }
+
+    // Validate magic.
+    if &raw[0..4] != SECONDARY_MAGIC {
+        return Err(SuperblockReadError::SecondaryMagicInvalid);
+    }
+
+    // Validate version.
+    let version = u32::from_le_bytes(raw[4..8].try_into().unwrap());
+    if version != SECONDARY_VERSION {
+        return Err(SuperblockReadError::SecondaryVersionUnsupported(version));
+    }
+
+    // Validate copy index.
+    let copy_index = raw[COPY_INDEX_OFFSET];
+    if copy_index != COPY_INDEX_VALUE {
+        return Err(SuperblockReadError::SecondaryCopyIndexInvalid(copy_index));
+    }
+
+    let checksum = {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&raw[CHECKSUM_OFFSET..CHECKSUM_OFFSET + CHECKSUM_LEN]);
+        arr
+    };
+
+    let sequence = u64::from_le_bytes(raw[SEQUENCE_OFFSET..SEQUENCE_OFFSET + 8].try_into().unwrap());
+
+    Ok(SuperblockSecondaryHeader {
+        checksum,
+        sequence,
+        copy_index,
+    })
+}
+
+/// Full secondary copy validation: parse header, extract content,
+/// verify checksum, validate sequence floor, and decode the
+/// committed-root block payload.
+fn read_secondary_copy_validated<S: CommitGroupStore>(
     store: &S,
     commit_group_id: CommitGroupId,
     last_known_sequence: u64,
@@ -311,44 +414,115 @@ fn read_secondary_copy<S: CommitGroupStore>(
         None => return Ok(None),
     };
 
-    // Parse header.
-    let header = SuperblockSecondaryHeader::from_bytes(&raw).ok_or_else(|| {
-        SuperblockReadError::PrimaryCorrupt("secondary header: invalid magic or version".into())
-    })?;
+    // Parse and validate header (magic, version, copy index).
+    let header = parse_secondary_header(&raw)?;
 
-    // Extract content.
-    let content = SuperblockSecondaryHeader::content_bytes(&raw).ok_or_else(|| {
-        SuperblockReadError::PrimaryCorrupt("secondary: content too short".into())
-    })?;
+    // Extract content region.
+    let content = SuperblockSecondaryHeader::content_bytes(&raw)
+        .ok_or(SuperblockReadError::SecondaryContentTruncated)?;
 
     // Verify header checksum over content.
     if !header.verify(content) {
-        return Err(SuperblockReadError::PrimaryCorrupt(
-            "secondary: BLAKE3 checksum mismatch".into(),
-        ));
+        return Err(SuperblockReadError::SecondaryChecksumMismatch);
     }
 
-    // Validate sequence number.
+    // Validate sequence number against recovery floor.
     if header.sequence < last_known_sequence {
-        return Err(SuperblockReadError::SequenceRegression {
+        return Err(SuperblockReadError::SequenceRollback {
             last_known: last_known_sequence,
             found: header.sequence,
         });
     }
 
-    // Parse root block from content.
+    // Decode content as a CommittedRootBlock.
     let block = CommittedRootBlock::from_bytes(content).ok_or_else(|| {
-        SuperblockReadError::PrimaryCorrupt("secondary: invalid root block magic".into())
+        SuperblockReadError::SecondaryPayloadCorrupt(
+            "invalid root block magic or version".into(),
+        )
     })?;
 
-    // Verify root block's own BLAKE3 hash.
+    // Verify root block's own BLAKE3 integrity.
     if !crate::writer::CommitGroupWriter::verify_root_block(&block) {
-        return Err(SuperblockReadError::PrimaryCorrupt(
-            "secondary: root block BLAKE3 verification failed".into(),
+        return Err(SuperblockReadError::SecondaryPayloadCorrupt(
+            "root block BLAKE3 verification failed".into(),
         ));
     }
 
     Ok(Some(block))
+}
+
+/// Compare two committed-root blocks for equality.
+///
+/// Two blocks are equivalent when their serialized byte representations
+/// match.  We compare the full on-wire form so that any field-level
+/// divergence (including reserved-zero regions) is treated as a
+/// mismatch.
+fn root_blocks_equivalent(a: &CommittedRootBlock, b: &CommittedRootBlock) -> bool {
+    a.to_bytes() == b.to_bytes()
+}
+
+/// Recover the committed-root block for `commit_group_id` by reading
+/// both the primary and secondary copies and cross-validating them.
+///
+/// This is the authoritative recovery entry-point.  See
+/// [`read_superblock_with_fallback`] for the public-facing alias.
+fn recover_committed_root<S: CommitGroupStore>(
+    store: &S,
+    commit_group_id: CommitGroupId,
+    last_known_sequence: u64,
+) -> Result<Option<CommittedRootBlock>, SuperblockReadError> {
+    // Read primary copy.
+    let primary_result = crate::writer::CommitGroupWriter::read_root_block(store, commit_group_id);
+
+    // Read and fully validate secondary copy (if present).
+    let secondary_result =
+        read_secondary_copy_validated(store, commit_group_id, last_known_sequence);
+
+    match (primary_result, secondary_result) {
+        // --- Primary valid ---------------------------------------------------
+        (Ok(Some(primary)), Ok(Some(secondary))) => {
+            // Both copies are individually valid.  They must agree.
+            if root_blocks_equivalent(&primary, &secondary) {
+                Ok(Some(primary))
+            } else {
+                Err(SuperblockReadError::AmbiguousRoot {
+                    primary_id: primary.commit_group_id,
+                    secondary_id: secondary.commit_group_id,
+                })
+            }
+        }
+        (Ok(Some(primary)), Ok(None)) | (Ok(Some(primary)), Err(_)) => {
+            // Primary valid; secondary missing or invalid is acceptable.
+            Ok(Some(primary))
+        }
+
+        // --- Primary missing or corrupt --------------------------------------
+        (Ok(None), Ok(Some(secondary))) => {
+            // Primary missing, secondary valid.
+            Ok(Some(secondary))
+        }
+        (Err(primary_err), Ok(Some(secondary))) => {
+            // Primary corrupt, secondary valid.
+            let _ = primary_err; // secondary is the recovery path
+            Ok(Some(secondary))
+        }
+
+        // --- Neither copy is usable ------------------------------------------
+        (Ok(None), Ok(None)) => Ok(None),
+        // When primary is missing and secondary has a specific failure,
+        // propagate the secondary error directly so callers can match on it.
+        (Ok(None), Err(secondary_err)) => Err(secondary_err),
+        (Err(primary_err), Ok(None)) => {
+            Err(SuperblockReadError::BothCorrupt(format!(
+                "primary corrupt: {primary_err}; secondary missing"
+            )))
+        }
+        (Err(primary_err), Err(secondary_err)) => {
+            Err(SuperblockReadError::BothCorrupt(format!(
+                "primary corrupt: {primary_err}; secondary: {secondary_err}"
+            )))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -589,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn sequence_regression_rejects_secondary() {
+    fn sequence_rollback_rejects_secondary() {
         let mut store = TestStore::new();
         let block = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 30, 40);
         let sealed = CommitGroupWriter::seal_root_block(block);
@@ -600,11 +774,11 @@ mod tests {
         // last_known_sequence=10 -> secondary should be rejected.
         let result = read_superblock_with_fallback(&store, CommitGroupId(1), 10);
         match result {
-            Err(SuperblockReadError::SequenceRegression { last_known, found }) => {
+            Err(SuperblockReadError::SequenceRollback { last_known, found }) => {
                 assert_eq!(last_known, 10);
                 assert_eq!(found, 5);
             }
-            other => panic!("expected SequenceRegression, got {other:?}"),
+            other => panic!("expected SequenceRollback, got {other:?}"),
         }
     }
 
@@ -771,4 +945,299 @@ mod tests {
         let result = read_superblock_with_fallback(&store, CommitGroupId(1), 0);
         assert!(matches!(result, Err(SuperblockReadError::BothCorrupt(_))));
     }
+    // ------------------------------------------------------------------
+    // Ambiguous root (primary/secondary disagreement) tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ambiguous_root_when_both_valid_but_disagree() {
+        let mut store = TestStore::new();
+        // Primary carries one root.
+        let block_primary = CommittedRootBlock::new(CommitGroupId(1), 100, 200, 300, 400);
+        let sealed_primary = CommitGroupWriter::seal_root_block(block_primary);
+        write_primary(&mut store, &sealed_primary);
+
+        // Secondary carries a different root (different namespace_root).
+        let block_secondary = CommittedRootBlock::new(CommitGroupId(1), 999, 200, 300, 400);
+        let sealed_secondary = CommitGroupWriter::seal_root_block(block_secondary);
+        write_superblock_secondary(&mut store, &sealed_secondary, 1).unwrap();
+
+        let result = read_superblock_with_fallback(&store, CommitGroupId(1), 0);
+        match result {
+            Err(SuperblockReadError::AmbiguousRoot {
+                primary_id,
+                secondary_id,
+            }) => {
+                assert_eq!(primary_id, CommitGroupId(1));
+                assert_eq!(secondary_id, CommitGroupId(1));
+            }
+            other => panic!("expected AmbiguousRoot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_ambiguity_when_both_copies_agree() {
+        let mut store = TestStore::new();
+        let block = CommittedRootBlock::new(CommitGroupId(1), 42, 43, 44, 45);
+        let sealed = CommitGroupWriter::seal_root_block(block);
+        write_primary(&mut store, &sealed);
+        write_superblock_secondary(&mut store, &sealed, 1).unwrap();
+
+        let result = read_superblock_with_fallback(&store, CommitGroupId(1), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.namespace_root, 42);
+        assert_eq!(result.inode_table_root, 43);
+    }
+
+    // ------------------------------------------------------------------
+    // Secondary-specific error variant tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn secondary_magic_invalid_error() {
+        let mut store = TestStore::new();
+        let block = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 30, 40);
+        let sealed = CommitGroupWriter::seal_root_block(block);
+
+        // Tamper primary so we take the secondary-check path.
+        let mut tampered = sealed.to_bytes();
+        tampered[16] ^= 0xFF;
+        let primary_key = primary_key_name(CommitGroupId(1));
+        store.put_named(&primary_key, &tampered).unwrap();
+
+        // Write secondary, then corrupt its magic.
+        write_superblock_secondary(&mut store, &sealed, 1).unwrap();
+        let sec_key = secondary_key_name(CommitGroupId(1));
+        let mut stored = store.data.get(&sec_key).unwrap().clone();
+        stored[0] = 0x00; // break magic
+        store.data.insert(sec_key, stored);
+
+        let result = read_superblock_with_fallback(&store, CommitGroupId(1), 0);
+        assert!(matches!(result, Err(SuperblockReadError::BothCorrupt(_))));
+        // The secondary error itself is SecondaryMagicInvalid, but it gets wrapped
+        // as BothCorrupt when primary is also corrupt.  To test the variant
+        // directly we call the inner validator.
+    }
+
+    #[test]
+    fn secondary_magic_invalid_direct() {
+        let mut store = TestStore::new();
+        let block = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 30, 40);
+        let sealed = CommitGroupWriter::seal_root_block(block);
+
+        write_superblock_secondary(&mut store, &sealed, 1).unwrap();
+        let sec_key = secondary_key_name(CommitGroupId(1));
+        let mut stored = store.data.get(&sec_key).unwrap().clone();
+        stored[0] = 0x00; // break magic
+        store.data.insert(sec_key, stored);
+
+        // Direct call to the inner validator.
+        let result = read_secondary_copy_validated(&store, CommitGroupId(1), 0);
+        assert!(matches!(result, Err(SuperblockReadError::SecondaryMagicInvalid)));
+    }
+
+    #[test]
+    fn secondary_version_unsupported_direct() {
+        let header = SuperblockSecondaryHeader::new(1);
+        let mut bytes = header.to_bytes();
+        // Set version to 99 (unsupported).
+        bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
+
+        let result = parse_secondary_header(&bytes);
+        assert!(matches!(
+            result,
+            Err(SuperblockReadError::SecondaryVersionUnsupported(99))
+        ));
+    }
+
+    #[test]
+    fn secondary_copy_index_invalid_direct() {
+        let header = SuperblockSecondaryHeader::new(1);
+        let mut bytes = header.to_bytes();
+        bytes[COPY_INDEX_OFFSET] = 99; // invalid copy index
+
+        let result = parse_secondary_header(&bytes);
+        assert!(matches!(
+            result,
+            Err(SuperblockReadError::SecondaryCopyIndexInvalid(99))
+        ));
+    }
+
+    #[test]
+    fn secondary_checksum_mismatch_direct() {
+        let mut store = TestStore::new();
+        let block = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 30, 40);
+        let sealed = CommitGroupWriter::seal_root_block(block);
+
+        write_superblock_secondary(&mut store, &sealed, 1).unwrap();
+        let sec_key = secondary_key_name(CommitGroupId(1));
+        let mut stored = store.data.get(&sec_key).unwrap().clone();
+        // Flip a byte in the content region (after header) to break checksum.
+        stored[CONTENT_OFFSET + 5] ^= 0xFF;
+        store.data.insert(sec_key, stored);
+
+        let result = read_secondary_copy_validated(&store, CommitGroupId(1), 0);
+        assert!(matches!(
+            result,
+            Err(SuperblockReadError::SecondaryChecksumMismatch)
+        ));
+    }
+
+    #[test]
+    fn secondary_content_truncated_direct() {
+        let result = parse_secondary_header(&[0u8; 32]);
+        assert!(matches!(
+            result,
+            Err(SuperblockReadError::SecondaryContentTruncated)
+        ));
+    }
+
+    #[test]
+    fn secondary_payload_corrupt_direct() {
+        // Build a secondary manually: valid header + valid checksum, but
+        // content whose VRBT magic is wrong (so payload parsing fails after
+        // checksum passes).
+        let valid_content = [0xABu8; 88]; // wrong magic, not a real VRBT block
+        let mut header = SuperblockSecondaryHeader::new(1);
+        header.seal(&valid_content);
+
+        let hdr_bytes = header.to_bytes();
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&hdr_bytes);
+        combined.extend_from_slice(&valid_content);
+
+        let mut store = TestStore::new();
+        let sec_key = secondary_key_name(CommitGroupId(1));
+        store.data.insert(sec_key, combined);
+
+        let result = read_secondary_copy_validated(&store, CommitGroupId(1), 0);
+        assert!(matches!(
+            result,
+            Err(SuperblockReadError::SecondaryPayloadCorrupt(_))
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // Primary-valid / secondary-invalid: primary still accepted
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn primary_valid_secondary_bad_magic_still_returns_primary() {
+        let mut store = TestStore::new();
+        let block = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 30, 40);
+        let sealed = CommitGroupWriter::seal_root_block(block.clone());
+        write_primary(&mut store, &sealed);
+
+        // Write secondary with bad magic.
+        write_superblock_secondary(&mut store, &sealed, 1).unwrap();
+        let sec_key = secondary_key_name(CommitGroupId(1));
+        let mut stored = store.data.get(&sec_key).unwrap().clone();
+        stored[0] = 0x00; // break magic
+        store.data.insert(sec_key, stored);
+
+        let result = read_superblock_with_fallback(&store, CommitGroupId(1), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.namespace_root, 10);
+        assert!(CommitGroupWriter::verify_root_block(&result));
+    }
+
+    #[test]
+    fn primary_valid_secondary_checksum_mismatch_still_returns_primary() {
+        let mut store = TestStore::new();
+        let block = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 30, 40);
+        let sealed = CommitGroupWriter::seal_root_block(block.clone());
+        write_primary(&mut store, &sealed);
+
+        write_superblock_secondary(&mut store, &sealed, 1).unwrap();
+        let sec_key = secondary_key_name(CommitGroupId(1));
+        let mut stored = store.data.get(&sec_key).unwrap().clone();
+        stored[CONTENT_OFFSET + 3] ^= 0xFF; // break checksum
+        store.data.insert(sec_key, stored);
+
+        let result = read_superblock_with_fallback(&store, CommitGroupId(1), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.namespace_root, 10);
+    }
+
+    // ------------------------------------------------------------------
+    // Sequence rollback (distinct testable error)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sequence_rollback_distinct_error() {
+        let mut store = TestStore::new();
+        let block = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 30, 40);
+        let sealed = CommitGroupWriter::seal_root_block(block);
+
+        write_superblock_secondary(&mut store, &sealed, 5).unwrap();
+
+        // last_known_sequence=10 -> secondary should be rejected with SequenceRollback.
+        let result = read_superblock_with_fallback(&store, CommitGroupId(1), 10);
+        match result {
+            Err(SuperblockReadError::SequenceRollback { last_known, found }) => {
+                assert_eq!(last_known, 10);
+                assert_eq!(found, 5);
+            }
+            other => panic!("expected SequenceRollback, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Primary-only (no secondary at all) -> still works
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn primary_only_no_secondary_returns_primary() {
+        let mut store = TestStore::new();
+        let block = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 30, 40);
+        let sealed = CommitGroupWriter::seal_root_block(block);
+        write_primary(&mut store, &sealed);
+
+        // No secondary written at all.
+        let result = read_superblock_with_fallback(&store, CommitGroupId(1), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.namespace_root, 10);
+        assert!(CommitGroupWriter::verify_root_block(&result));
+    }
+
+    // ------------------------------------------------------------------
+    // Display / Error trait
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn superblock_read_error_display() {
+        let e = SuperblockReadError::SecondaryMagicInvalid;
+        let msg = format!("{e}");
+        assert!(msg.contains("invalid magic"));
+
+        let e = SuperblockReadError::SecondaryVersionUnsupported(99);
+        let msg = format!("{e}");
+        assert!(msg.contains("99"));
+
+        let e = SuperblockReadError::SecondaryCopyIndexInvalid(7);
+        let msg = format!("{e}");
+        assert!(msg.contains("7"));
+
+        let e = SuperblockReadError::SequenceRollback {
+            last_known: 10,
+            found: 3,
+        };
+        let msg = format!("{e}");
+        assert!(msg.contains("10"));
+        assert!(msg.contains("3"));
+
+        let e = SuperblockReadError::AmbiguousRoot {
+            primary_id: CommitGroupId(1),
+            secondary_id: CommitGroupId(2),
+        };
+        let msg = format!("{e}");
+        // CommitGroupId Display format is "commit_group-N".
+        assert!(msg.contains("primary root=commit_group-1"));
+        assert!(msg.contains("secondary root=commit_group-2"));
+    }
+
 }

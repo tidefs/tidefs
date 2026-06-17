@@ -131,7 +131,7 @@ impl CommitGroupReader {
             commit_group_id,
             last_known_sequence,
         )
-        .map_err(|e| format!("superblock read failed: {e:?}"))
+        .map_err(|e| format!("superblock read failed: {e}"))
     }
 }
 
