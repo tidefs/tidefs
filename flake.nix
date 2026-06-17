@@ -313,7 +313,7 @@
               # then read it back for complete diagnostics.
               smoke_rc = machine.execute(
                   "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141 "
-                  "sh -c 'tidefs-posix-filesystem-adapter-daemon smoke-mount --profile quick 2>&1 | tee /tmp/smoke-mount-output.txt'",
+                  "sh -c 'mkdir -p /tmp/tidefs-validation/performance && tidefs-posix-filesystem-adapter-daemon smoke-mount --profile quick --queue-depth-artifact /tmp/tidefs-validation/performance/queue-depth-runtime.json 2>&1 | tee /tmp/smoke-mount-output.txt'",
                   timeout=300
               )
               smoke_status = "pass" if smoke_rc[0] == 0 else "product-fail"
@@ -348,6 +348,19 @@
                   smoke_failed = 1
               validation["smoke_mount_passed"] = smoke_passed
               validation["smoke_mount_failed"] = smoke_failed
+              queue_artifact_rc = machine.execute(
+                  "cat /tmp/tidefs-validation/performance/queue-depth-runtime.json",
+                  timeout=30
+              )
+              if queue_artifact_rc[0] == 0:
+                  record("queue_depth_runtime_artifact", "pass", queue_artifact_rc[1].strip()[:4000])
+                  validation["queue_depth_runtime_artifact"] = json.loads(queue_artifact_rc[1])
+              else:
+                  record(
+                      "queue_depth_runtime_artifact",
+                      "product-fail",
+                      "missing /tmp/tidefs-validation/performance/queue-depth-runtime.json",
+                  )
               # Record dmesg for kernel-side FUSE diagnostics.
               # When the daemon exits during CREATE, the kernel may log
               # FUSE connection errors that help identify the root cause.
@@ -401,6 +414,7 @@
             };
             testScript = ''
               import json
+              import os
               import re
 
               validation = {
@@ -452,7 +466,7 @@
 
               smoke_rc, smoke_out = machine.execute(
                   "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141 "
-                  "tidefs-posix-filesystem-adapter-daemon smoke-mount 2>&1",
+                  "sh -c 'mkdir -p /tmp/tidefs-validation/performance && tidefs-posix-filesystem-adapter-daemon smoke-mount --profile quick --queue-depth-artifact /tmp/tidefs-validation/performance/queue-depth-runtime.json 2>&1'",
                   timeout=600
               )
 
@@ -483,6 +497,19 @@
               validation["skipped"] = sum(1 for r in validation["results"] if r["status"] == "skip")
               validation["smoke_mount_passed"] = smoke_passed
               validation["smoke_mount_failed"] = smoke_failed
+              queue_artifact_rc, queue_artifact_out = machine.execute(
+                  "cat /tmp/tidefs-validation/performance/queue-depth-runtime.json",
+                  timeout=30
+              )
+              if queue_artifact_rc == 0:
+                  record("queue_depth_runtime_artifact", "pass", queue_artifact_out.strip()[:4000])
+                  validation["queue_depth_runtime_artifact"] = json.loads(queue_artifact_out)
+              else:
+                  record(
+                      "queue_depth_runtime_artifact",
+                      "product-fail",
+                      "missing /tmp/tidefs-validation/performance/queue-depth-runtime.json",
+                  )
 
               # Write validation artifact
               os.makedirs("/tmp/tidefs-validation", exist_ok=True)

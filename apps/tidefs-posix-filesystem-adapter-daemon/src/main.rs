@@ -91,6 +91,12 @@ enum SmokeMountProfile {
     Quick,
 }
 
+#[derive(Debug)]
+struct SmokeMountConfig {
+    profile: SmokeMountProfile,
+    queue_depth_artifact: Option<PathBuf>,
+}
+
 impl SmokeMountProfile {
     fn from_name(name: &str) -> Result<Self, String> {
         match name {
@@ -103,8 +109,9 @@ impl SmokeMountProfile {
     }
 }
 
-fn parse_smoke_mount_profile(args: Vec<String>) -> Result<SmokeMountProfile, String> {
+fn parse_smoke_mount_config(args: Vec<String>) -> Result<SmokeMountConfig, String> {
     let mut profile = SmokeMountProfile::Full;
+    let mut queue_depth_artifact = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -120,9 +127,21 @@ fn parse_smoke_mount_profile(args: Vec<String>) -> Result<SmokeMountProfile, Str
                 let value = arg.strip_prefix("--profile=").expect("prefix checked");
                 profile = SmokeMountProfile::from_name(value)?;
             }
+            "--queue-depth-artifact" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--queue-depth-artifact requires a path".to_string())?;
+                queue_depth_artifact = Some(PathBuf::from(value));
+            }
+            _ if arg.starts_with("--queue-depth-artifact=") => {
+                let value = arg
+                    .strip_prefix("--queue-depth-artifact=")
+                    .expect("prefix checked");
+                queue_depth_artifact = Some(PathBuf::from(value));
+            }
             "--help" | "-h" => {
                 return Err(
-                    "usage: smoke-mount [--profile full|quick] [--quick] [--full]".to_string(),
+                    "usage: smoke-mount [--profile full|quick] [--quick] [--full] [--queue-depth-artifact <path>]".to_string(),
                 );
             }
             other => {
@@ -132,7 +151,10 @@ fn parse_smoke_mount_profile(args: Vec<String>) -> Result<SmokeMountProfile, Str
             }
         }
     }
-    Ok(profile)
+    Ok(SmokeMountConfig {
+        profile,
+        queue_depth_artifact,
+    })
 }
 
 fn main() {
@@ -176,8 +198,8 @@ fn run() -> Result<(), String> {
             mount_vfs(config).map_err(|err| format!("FUSE VFS mount failed: {err}"))
         }
         Some("smoke-mount") => {
-            let profile = parse_smoke_mount_profile(args.collect())?;
-            run_smoke_mount(profile)
+            let config = parse_smoke_mount_config(args.collect())?;
+            run_smoke_mount(config)
         }
         Some("scrub-repair-smoke") => run_scrub_repair_smoke(),
 
@@ -457,6 +479,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     let ns_handle = adapter
         .namespace_handle()
         .expect("namespace must be attached");
+    let queue_depth_engine = adapter.engine_handle();
     let bg_scheduler = adapter.background_scheduler_handle();
     let txg_cycle = adapter.txg_cycle_cell();
     let notifier_cell = adapter.notifier_cell();
@@ -706,6 +729,15 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     // triggers adapter.destroy() which flushes writeback data via shutdown().
     _session.join();
 
+    if let Some(path) = &config.queue_depth_artifact {
+        write_queue_depth_runtime_artifact(
+            &queue_depth_engine,
+            path,
+            "fuse-smoke-mount-quick",
+            "fuse",
+        )?;
+    }
+
     // ── Persistent namespace flush ────────────────────────────────────
     {
         let mut ns_store = tidefs_local_object_store::LocalObjectStore::open(&config.store_root)
@@ -719,6 +751,68 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     MountState::Clean
         .write_to_path(&msp_for_sig)
         .map_err(|e| format!("write clean mount-state: {e}"))?;
+    Ok(())
+}
+
+fn write_queue_depth_runtime_artifact(
+    engine: &crate::live_owner::LiveOwnerEngine,
+    path: &Path,
+    workload: &str,
+    mount_adapter: &str,
+) -> Result<(), String> {
+    let request = serde_json::json!({
+        "command": "performance",
+        "operation": "admission-snapshot",
+        "pool": "root",
+        "json": true,
+        "args": {
+            "workload": workload,
+            "mount_adapter": mount_adapter,
+            "artifact_path": path.display().to_string()
+        }
+    });
+    let request_bytes = serde_json::to_vec(&request)
+        .map_err(|err| format!("encode queue-depth artifact request: {err}"))?;
+    let response_bytes = {
+        let engine = engine
+            .lock()
+            .map_err(|_| "queue-depth artifact engine lock poisoned".to_string())?;
+        engine
+            .live_pool_admin_request(&request_bytes)
+            .map_err(|err| format!("queue-depth artifact request failed: {err:?}"))?
+    };
+    let response: serde_json::Value = serde_json::from_slice(&response_bytes)
+        .map_err(|err| format!("decode queue-depth artifact response: {err}"))?;
+    if !response
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        let message = response
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown error");
+        return Err(format!("queue-depth artifact response failed: {message}"));
+    }
+    let artifact = response
+        .get("json")
+        .ok_or("queue-depth artifact response did not include json payload")?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "create queue-depth artifact dir {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(artifact)
+        .map_err(|err| format!("encode queue-depth artifact JSON: {err}"))?;
+    std::fs::write(path, bytes)
+        .map_err(|err| format!("write queue-depth artifact {}: {err}", path.display()))?;
+    eprintln!("queue_depth_runtime_artifact={}", path.display());
     Ok(())
 }
 
@@ -797,6 +891,8 @@ pub struct MountVfsConfig {
     /// integrity-trailer computation, so it tests error-path behavior
     /// rather than scrub detection.  Default: None (off).
     pub fault_inject_corruption: Option<f64>,
+    /// Optional JSON artifact path for mounted queue-depth evidence.
+    pub queue_depth_artifact: Option<PathBuf>,
 }
 
 fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
@@ -820,6 +916,7 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
     let mut enable_reclaim = false;
     let mut enable_repair_writeback = false;
     let mut fault_inject_corruption: Option<f64> = None;
+    let mut queue_depth_artifact = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -991,6 +1088,18 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
                 }
                 fault_inject_corruption = Some(prob);
             }
+            "--queue-depth-artifact" => {
+                let val = iter
+                    .next()
+                    .ok_or("--queue-depth-artifact requires a path argument")?;
+                queue_depth_artifact = Some(PathBuf::from(val));
+            }
+            _ if arg.starts_with("--queue-depth-artifact=") => {
+                let value = arg
+                    .strip_prefix("--queue-depth-artifact=")
+                    .expect("prefix checked");
+                queue_depth_artifact = Some(PathBuf::from(value));
+            }
             other => return Err(format!("unknown mount-vfs argument `{other}`")),
         }
     }
@@ -1022,6 +1131,7 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
         enable_repair_writeback,
         snapshot_name,
         fault_inject_corruption,
+        queue_depth_artifact,
     })
 }
 
@@ -1168,7 +1278,7 @@ fn run_xfstests_harness(config: &xfstests_harness::XfstestsConfig) -> Result<(),
 /// Phase 5: remount after hard kill -> verify data integrity
 /// Phase 6: final cleanup
 #[allow(unsafe_code)]
-fn run_smoke_mount(profile: SmokeMountProfile) -> Result<(), String> {
+fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     use std::fs;
     use std::io::Write;
     use std::process::Command;
@@ -1190,7 +1300,7 @@ fn run_smoke_mount(profile: SmokeMountProfile) -> Result<(), String> {
     let mut passed = 0_u32;
     let mut failed = 0_u32;
 
-    eprintln!("=== smoke-mount profile: {profile:?} ===");
+    eprintln!("=== smoke-mount profile: {:?} ===", config.profile);
 
     macro_rules! smoke_test {
         ($name:expr, $body:block) => {
@@ -1213,12 +1323,14 @@ fn run_smoke_mount(profile: SmokeMountProfile) -> Result<(), String> {
         exe: &std::path::Path,
         store_root: &str,
         mountpoint: &str,
+        queue_depth_artifact: Option<&std::path::Path>,
     ) -> Result<std::process::Child, String> {
         use std::process::{Command, Stdio};
         use std::thread;
         use std::time::Duration;
 
-        let mut child = Command::new(exe)
+        let mut command = Command::new(exe);
+        command
             .arg("mount-vfs")
             .arg("--store")
             .arg(store_root)
@@ -1229,9 +1341,11 @@ fn run_smoke_mount(profile: SmokeMountProfile) -> Result<(), String> {
                 "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX",
                 "4141414141414141414141414141414141414141414141414141414141414141",
             )
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("spawn daemon: {e}"))?;
+            .stderr(Stdio::inherit());
+        if let Some(path) = queue_depth_artifact {
+            command.arg("--queue-depth-artifact").arg(path);
+        }
+        let mut child = command.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
 
         let mut mounted = false;
         for _ in 0..60 {
@@ -1296,7 +1410,12 @@ fn run_smoke_mount(profile: SmokeMountProfile) -> Result<(), String> {
             if umount_result.is_err() || umount_result.unwrap().code() != Some(0) {
                 let _ = Command::new("umount").arg(mountpoint).status();
             }
-            thread::sleep(Duration::from_secs(1));
+            for _ in 0..100 {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => return,
+                    Ok(None) => thread::sleep(Duration::from_millis(100)),
+                }
+            }
             let _ = child.kill();
         } else {
             // Hard kill: SIGKILL to simulate crash without clean unmount.
@@ -1384,7 +1503,12 @@ fn run_smoke_mount(profile: SmokeMountProfile) -> Result<(), String> {
     // ═══════════════════════════════════════════════════════════════════
     eprintln!("=== Phase 1: first mount and data creation ===");
 
-    let mut child = spawn_and_mount(&exe, store_root, mountpoint)?;
+    let mut child = spawn_and_mount(
+        &exe,
+        store_root,
+        mountpoint,
+        config.queue_depth_artifact.as_deref(),
+    )?;
 
     // FUSE responsiveness probe.
     eprintln!("  INFO  probing FUSE responsiveness...");
@@ -1565,7 +1689,7 @@ fn run_smoke_mount(profile: SmokeMountProfile) -> Result<(), String> {
         Ok(())
     });
 
-    if profile == SmokeMountProfile::Quick {
+    if config.profile == SmokeMountProfile::Quick {
         eprintln!("=== Quick profile: clean teardown after core mount checks ===");
         teardown_daemon(&mut child, mountpoint, false);
 
@@ -3691,7 +3815,7 @@ fn run_scrub_repair_smoke() -> Result<(), String> {
 
 fn print_help() {
     println!("tidefs-posix-filesystem-adapter-daemon");
-    println!("  mount-vfs --store <path> --mount <path> [--fs-name <name>] [--root-auth-key-hex <64 hex>] [--read-only] [--sync] [--writeback-cache] [--no-writeback-cache] [--content-capacity-bytes <bytes>] [--writeback-cache-timeout <seconds>] [--drain-timeout-secs <seconds>] [--background-scrub-interval <seconds>]");
+    println!("  mount-vfs --store <path> --mount <path> [--fs-name <name>] [--root-auth-key-hex <64 hex>] [--read-only] [--sync] [--writeback-cache] [--no-writeback-cache] [--content-capacity-bytes <bytes>] [--writeback-cache-timeout <seconds>] [--drain-timeout-secs <seconds>] [--background-scrub-interval <seconds>] [--queue-depth-artifact <path>]");
     println!("    root auth key fallback env: {ROOT_AUTHENTICATION_ENV_VAR}");
     println!(
         "    --background-scrub-interval  seconds between scrub cycles (0 disables, default 0)"
@@ -3702,7 +3826,7 @@ fn print_help() {
     );
     println!("    --no-writeback-cache         disable FUSE writeback-cache (default)");
     println!("  mount           (alias for mount-vfs)");
-    println!("  smoke-mount [--profile full|quick]");
+    println!("  smoke-mount [--profile full|quick] [--queue-depth-artifact <path>]");
     println!("    run a self-contained FUSE mount smoke test; quick stops after core mounted I/O and teardown");
     println!("  score-posix --out <dir>");
     println!(

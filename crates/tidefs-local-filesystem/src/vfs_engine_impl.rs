@@ -1536,12 +1536,94 @@ impl VfsLocalFileSystem {
             ("pool", "set") => self.live_pool_set(args),
             ("pool", "list-props") => self.live_pool_list_props(args),
             ("pool", "integrity-check") => self.live_pool_integrity_check(pool, args, wants_json),
+            ("performance", "admission-snapshot") => {
+                self.live_performance_admission_snapshot(pool, args)
+            }
             ("device", "remove") => self.live_device_remove(args, wants_json),
             _ => live_admin_error(
                 1,
                 format!("live engine does not implement tidefsctl {command} {operation}"),
             ),
         })
+    }
+
+    fn live_performance_admission_snapshot(&self, pool: &str, args: &Value) -> Vec<u8> {
+        let workload = live_admin_arg(args, "workload").unwrap_or("fuse-smoke-mount-quick");
+        let mount_adapter = live_admin_arg(args, "mount_adapter").unwrap_or("fuse");
+        let artifact_path = live_admin_arg(args, "artifact_path").ok();
+        let mut fs = self.fs.borrow_mut();
+        let config = fs.admission_config();
+        let snapshot = fs.take_admission_snapshot().as_evidence_record();
+
+        live_admin_ok_json(json!({
+            "schema_version": 1,
+            "evidence_class": "queue-depth-runtime-artifact",
+            "evidence_scope": "bounded mounted FUSE runtime dirty-write admission queue-depth snapshot",
+            "source": "tidefs-posix-filesystem-adapter-daemon smoke-mount",
+            "claim_ids": [
+                "perf.local.no_unbounded_dirty_debt.v1"
+            ],
+            "runtime_claim_boundary": "runtime queue-depth evidence only; claim validation still requires the no-hidden queue gate, admission budget model, and claims-gate review before status can move from blocked",
+            "pool": pool,
+            "mount_adapter": mount_adapter,
+            "workload": workload,
+            "artifact_path": artifact_path,
+            "no_hidden_queue_gate": {
+                "registry_path": "validation/performance/no-hidden-queues.toml",
+                "command": "cargo run -p tidefs-xtask -- check-no-hidden-queues",
+                "registered_queue_roots": [
+                    "performance_contract.budgeted_queue",
+                    "local_fs.write_admission",
+                    "local_fs.write_buffers",
+                    "local_fs.dirty_set",
+                    "local_fs.dirty_page_tracker",
+                    "local_fs.page_cache_lru"
+                ]
+            },
+            "admission": {
+                "peak_dirty_bytes": snapshot.peak_dirty_bytes,
+                "peak_dirty_ops": snapshot.peak_dirty_ops,
+                "peak_outstanding_permits": snapshot.peak_outstanding_permits,
+                "current_dirty_bytes": snapshot.current_dirty_bytes,
+                "current_dirty_ops": snapshot.current_dirty_ops,
+                "current_outstanding_permits": snapshot.current_outstanding_permits,
+                "current_tick": snapshot.current_tick
+            },
+            "invariant_checks": {
+                "peak_dirty_bytes_within_effective_cap": snapshot.peak_dirty_bytes <= config.effective_max_dirty_bytes(),
+                "peak_dirty_ops_within_effective_cap": snapshot.peak_dirty_ops <= config.effective_max_dirty_ops(),
+                "peak_outstanding_permits_within_hard_cap": snapshot.peak_outstanding_permits <= config.hard_max_permits,
+                "current_dirty_bytes_within_effective_cap": snapshot.current_dirty_bytes <= config.effective_max_dirty_bytes(),
+                "current_dirty_ops_within_effective_cap": snapshot.current_dirty_ops <= config.effective_max_dirty_ops(),
+                "current_outstanding_permits_within_hard_cap": snapshot.current_outstanding_permits <= config.hard_max_permits
+            },
+            "hard_caps": {
+                "dirty_bytes": config.hard_max_dirty_bytes,
+                "dirty_ops": config.hard_max_dirty_ops,
+                "dirty_age_ticks": config.hard_max_dirty_age_ticks,
+                "permits": config.hard_max_permits
+            },
+            "effective_caps": {
+                "dirty_bytes": config.effective_max_dirty_bytes(),
+                "dirty_ops": config.effective_max_dirty_ops(),
+                "dirty_age_ticks": config.effective_max_dirty_age_ticks(),
+                "permits": config.hard_max_permits
+            },
+            "determinism": {
+                "workload": "fixed smoke-mount quick workload",
+                "admission_state": "single mounted local filesystem with default hard caps",
+                "tolerance": {
+                    "peak_dirty_bytes": 0,
+                    "peak_dirty_ops": 0,
+                    "peak_outstanding_permits": 0
+                }
+            },
+            "non_claims": [
+                "does not validate crash recovery",
+                "does not validate scrub/read isolation",
+                "does not move perf.local.no_unbounded_dirty_debt.v1 out of blocked status"
+            ]
+        }))
     }
 
     fn live_dataset_create(&self, pool: &str, args: &Value) -> Vec<u8> {

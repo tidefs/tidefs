@@ -6584,6 +6584,11 @@ impl LocalFileSystem {
         self.write_admission.take_peak_snapshot()
     }
 
+    /// Return the current write-admission hard and effective caps.
+    pub fn admission_config(&self) -> tidefs_performance_contract::WriteAdmissionConfig {
+        self.write_admission.config()
+    }
+
     pub fn write_file(
         &mut self,
         path: impl AsRef<str>,
