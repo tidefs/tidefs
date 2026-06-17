@@ -292,10 +292,7 @@ impl SpaceAccounting {
     /// Returns `true` if the write should be refused with `ENOSPC`.
     #[must_use]
     pub fn check_enospc(&self, requested: u64) -> bool {
-        !matches!(
-            self.admission_check(requested),
-            AdmissionResult::Allowed
-        )
+        !matches!(self.admission_check(requested), AdmissionResult::Allowed)
     }
 
     /// Check whether writing `requested` bytes would exceed the physical
@@ -390,6 +387,19 @@ impl SpaceAccounting {
             files_free: free_files,
             name_max: StatfsResult::DEFAULT_NAME_MAX,
         }
+    }
+
+    /// Return committed free bytes — the space available for new
+    /// allocations based on committed counters only, excluding any
+    /// pending (uncommitted) deltas.
+    ///
+    /// This is the authoritative value for relocation target selection
+    /// and other capacity-sensitive planning that must not depend on
+    /// uncommitted state.
+    #[must_use]
+    pub fn committed_free_bytes(&self) -> u64 {
+        let statfs = self.statfs();
+        statfs.blocks_free.saturating_mul(statfs.block_size)
     }
 
     /// Derive domain-level aggregated counters for clone-family statfs.

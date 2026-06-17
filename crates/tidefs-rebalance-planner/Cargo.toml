@@ -16,6 +16,8 @@ tidefs-replication-model = { path = "../tidefs-replication-model" }
 tidefs-rebuild-planner = { path = "../tidefs-rebuild-planner" }
 tidefs-placement-planner = { path = "../tidefs-placement-planner" }
 tidefs-replica-health = { path = "../tidefs-replica-health" }
+tidefs-commit_group = { path = "../tidefs-commit_group" }
+tidefs-space-accounting = { path = "../tidefs-space-accounting" }
 
 [lib]
 path = "src/lib.rs"

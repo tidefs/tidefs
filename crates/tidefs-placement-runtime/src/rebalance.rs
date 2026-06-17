@@ -71,9 +71,18 @@ impl RebalanceIntegration {
         failure_domains: &[FailureDomainRecord],
         policy: &FailureDomainPlacementPolicy,
         now_ms: u64,
+        evidence_commit_group_id: u64,
+        committed_free_bytes_by_member: &BTreeMap<MemberId, u64>,
     ) -> Result<&Vec<RebalanceIntent>, RebalanceError> {
-        self.planner
-            .plan_rebalance(skew, epoch, failure_domains, policy, now_ms)?;
+        self.planner.plan_rebalance(
+            skew,
+            epoch,
+            failure_domains,
+            policy,
+            now_ms,
+            evidence_commit_group_id,
+            committed_free_bytes_by_member,
+        )?;
         // Return the intents from the newly-created plan
         Ok(&self.planner.plans.last().unwrap().intents)
     }
@@ -141,7 +150,10 @@ pub fn member_utilization_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_membership_epoch::{DomainId, FailureDomainVector, HealthClass, MemberClass};
+    use tidefs_membership_epoch::{
+        AntiAffinityClass, DomainId, FailureDomainClass, FailureDomainRecord, FailureDomainVector,
+        HealthClass, MemberClass, ReceiptId,
+    };
 
     fn make_member(id: u64, class: MemberClass, health: HealthClass) -> ClusterMemberRecord {
         ClusterMemberRecord {
@@ -158,6 +170,20 @@ mod tests {
                 region: DomainId::ZERO,
             },
             log_frontier: 0,
+            digest: 0,
+        }
+    }
+
+    fn make_failure_domain(id: u64, member_id: u64) -> FailureDomainRecord {
+        FailureDomainRecord {
+            failure_domain_id: DomainId::new(id),
+            failure_domain_class_ref: FailureDomainClass::Rack,
+            member_refs: vec![MemberId::new(member_id)],
+            health_class: HealthClass::Healthy,
+            separation_policy_ref: AntiAffinityClass::Strict,
+            parent_domain_ref: DomainId::ZERO,
+            availability_receipt_ref: ReceiptId::ZERO,
+            storage_tier: None,
             digest: 0,
         }
     }
@@ -185,6 +211,32 @@ mod tests {
         let mut ri = RebalanceIntegration::new(EpochId::new(1));
         ri.on_epoch_transition(EpochId::new(2), 1000);
         assert_eq!(ri.epoch, EpochId::new(2));
+    }
+
+    #[test]
+    fn plan_records_committed_evidence_commit_group() {
+        let mut ri = RebalanceIntegration::new(EpochId::new(1));
+        let skew =
+            CapacityRebalanceSkew::new(vec![NodeId(1)], vec![NodeId(2)], 50, 20, 100_000, 10, 1000);
+        let domains = vec![make_failure_domain(1, 1), make_failure_domain(2, 2)];
+        let policy =
+            FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Rack);
+        let committed_free = BTreeMap::from([(MemberId::new(2), 1_000_000)]);
+
+        let intents = ri
+            .plan(
+                &skew,
+                EpochId::new(1),
+                &domains,
+                &policy,
+                2000,
+                42,
+                &committed_free,
+            )
+            .expect("rebalance plan");
+
+        assert!(!intents.is_empty());
+        assert_eq!(ri.planner.plans[0].evidence_commit_group_id, 42);
     }
 
     #[test]

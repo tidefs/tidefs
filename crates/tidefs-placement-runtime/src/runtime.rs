@@ -119,6 +119,7 @@ impl PlacementRuntime {
         policy: FailureDomainPlacementPolicy,
         subjects: &[ReplicatedSubjectId],
         _receipt_registry: &[ReplicaPlacementReceipt],
+        evidence_commit_group_id: u64,
     ) -> PlacementCycle {
         let now = now_millis();
         let cycle_id = if let Some(ref current) = self.current_cycle {
@@ -244,6 +245,17 @@ impl PlacementRuntime {
             let util_snapshot =
                 crate::rebalance::member_utilization_snapshot(members, &member_used);
             let total_capacity: u64 = members.iter().map(|_m| 1_000_000_000u64).sum();
+            let committed_free_bytes_by_member: BTreeMap<MemberId, u64> = members
+                .iter()
+                .map(|member| {
+                    let committed_free_bytes = self
+                        .budget_tracker
+                        .get_budget(member.member_id)
+                        .map(|budget| budget.total_bytes.saturating_sub(budget.used_bytes))
+                        .unwrap_or(0);
+                    (member.member_id, committed_free_bytes)
+                })
+                .collect();
             if let Some(skew) = self
                 .rebalance
                 .detect_skew(&util_snapshot, total_capacity, now)
@@ -257,6 +269,8 @@ impl PlacementRuntime {
                         &self.planner.failure_domains,
                         &policy,
                         now,
+                        evidence_commit_group_id,
+                        &committed_free_bytes_by_member,
                     )
                     .is_ok()
                 {
@@ -598,8 +612,16 @@ impl PlacementRuntime {
         subjects: &[ReplicatedSubjectId],
         byte_cost: u64,
         receipts: &[ReplicaPlacementReceipt],
+        evidence_commit_group_id: u64,
     ) -> Result<PlacementCycle, PlacementRuntimeError> {
-        let _ = self.evaluate(config, members, policy, subjects, &[]);
+        let _ = self.evaluate(
+            config,
+            members,
+            policy,
+            subjects,
+            &[],
+            evidence_commit_group_id,
+        );
 
         let gaps = {
             let cycle = self
@@ -633,9 +655,17 @@ impl PlacementRuntime {
         members: &[ClusterMemberRecord],
         policy: FailureDomainPlacementPolicy,
         subjects: &[ReplicatedSubjectId],
+        evidence_commit_group_id: u64,
     ) -> PlacementCycle {
         self.refresh_domains(members);
-        self.evaluate(config, members, policy, subjects, &[])
+        self.evaluate(
+            config,
+            members,
+            policy,
+            subjects,
+            &[],
+            evidence_commit_group_id,
+        )
     }
 
     pub fn advance_epoch(&mut self, new_epoch: EpochId) {
@@ -1030,7 +1060,7 @@ mod tests {
         };
         let policy =
             FailureDomainPlacementPolicy::strict_replica_targets(3, FailureDomainClass::Node);
-        let cycle = rt.evaluate(&config, &[], policy, &[], &[]);
+        let cycle = rt.evaluate(&config, &[], policy, &[], &[], 1);
         assert!(cycle.under_replicated.is_empty());
         assert!(cycle.over_replicated.is_empty());
         assert!(cycle.verdicts.is_empty());
@@ -1055,8 +1085,8 @@ mod tests {
         let policy =
             FailureDomainPlacementPolicy::strict_replica_targets(1, FailureDomainClass::Node);
         let subjects = vec![ReplicatedSubjectId::new(1)];
-        let c1 = rt.evaluate(&config, &[member], policy, &subjects, &[]);
-        let c2 = rt.evaluate(&config, &[member], policy, &subjects, &[]);
+        let c1 = rt.evaluate(&config, &[member], policy, &subjects, &[], 7);
+        let c2 = rt.evaluate(&config, &[member], policy, &subjects, &[], 7);
         assert_eq!(
             c1.cycle_id, c2.cycle_id,
             "second evaluate should return same cycle"
