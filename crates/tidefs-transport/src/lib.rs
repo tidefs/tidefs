@@ -404,7 +404,7 @@ pub use reconnect::{
     SessionResumeRequest, SessionResumeResponse,
 };
 pub use reconnect_state_push::{
-    ReconnectStatePushDispatcher, ReconnectStatePushHandler, ReconnectStatePushMessage,
+    ReconnectStatePushDispatcher, ReconnectStatePushHandler, ReconnectStatePushMessage, ReconnectStatePushOutcome,
 };
 pub use replication::{
     recv_replication_msg, send_replication_msg, PlacementMapRefusalReason, ReplicationMessage,
@@ -479,7 +479,7 @@ pub use delivery_confirmation::{
 };
 pub use dispatch::{DecodedMessage, MessageDispatch};
 pub use epoch_bridge::{EpochEventBridge, PeerStateDelta, TransportEpochSubscriber};
-pub use epoch_fence::{EpochFence, EpochFenceRuntime, EpochTransition, FenceOutcome, FenceSummary};
+pub use epoch_fence::{check_reconnect_admission, EpochFence, EpochFenceRuntime, EpochTransition, FenceOutcome, FenceSummary, ReconnectAdmission};
 pub use listener::{TransportConnection, TransportListener};
 pub use listener_overload::{
     AcceptRateLimiter, ConnectionRejectedEvent, ConnectionRejectedReason, ListenerOverloadConfig,

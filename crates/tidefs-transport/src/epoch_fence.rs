@@ -441,6 +441,113 @@ impl EpochFenceRuntime {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// ReconnectAdmission — epoch-gated reconnect admission decision
+// ---------------------------------------------------------------------------
+
+/// Outcome of gating a reconnect attempt against the current membership
+/// roster and epoch.
+///
+/// The accepting side calls [`check_reconnect_admission`] before accepting
+/// a [`SessionResumeRequest`](crate::reconnect::SessionResumeRequest) to
+/// ensure the reconnecting peer is still a member at the current epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconnectAdmission {
+    /// The peer is a current member and its claimed epoch is acceptable.
+    Admitted,
+    /// The peer is in the roster but its claimed epoch is behind the
+    /// current epoch; the peer must catch up before data-path traffic
+    /// can resume.
+    StaleEpoch {
+        /// The reconnecting peer's claimed epoch.
+        claimed_epoch: u64,
+        /// The current membership epoch.
+        current_epoch: u64,
+    },
+    /// The peer was a member but has since departed (drained or failed).
+    PeerDeparted {
+        /// The departed peer's node identifier.
+        peer_id: u64,
+    },
+    /// The peer is not present in the current membership roster.
+    NotInRoster {
+        /// The unknown peer's node identifier.
+        peer_id: u64,
+    },
+}
+
+impl ReconnectAdmission {
+    /// Whether the reconnect is admitted.
+    #[must_use]
+    pub fn is_admitted(&self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+
+    /// Human-readable outcome label for operator visibility.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::StaleEpoch { .. } => "stale_epoch",
+            Self::PeerDeparted { .. } => "peer_departed",
+            Self::NotInRoster { .. } => "not_in_roster",
+        }
+    }
+}
+
+impl core::fmt::Display for ReconnectAdmission {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Admitted => f.write_str("reconnect admitted"),
+            Self::StaleEpoch { claimed_epoch, current_epoch } => {
+                write!(f, "reconnect stale epoch: claimed {claimed_epoch} < current {current_epoch}")
+            }
+            Self::PeerDeparted { peer_id } => {
+                write!(f, "reconnect rejected: peer {peer_id} has departed")
+            }
+            Self::NotInRoster { peer_id } => {
+                write!(f, "reconnect rejected: peer {peer_id} not in roster")
+            }
+        }
+    }
+}
+
+/// Check whether a reconnect attempt should be admitted.
+///
+/// Validates that:
+/// 1. The reconnecting peer is present in the current roster (via `roster`).
+/// 2. The peer's claimed epoch is not behind the current epoch.
+///
+/// The `roster` is a sorted set of current member node IDs. The
+/// `current_epoch` is the epoch of that member set. The `claimed_epoch`
+/// is what the reconnecting peer declared in its resume request.
+///
+/// # Operator visibility
+///
+/// The returned [`ReconnectAdmission`] distinguishes stale epoch,
+/// departed peer, and not-in-roster outcomes so operators can
+/// differentiate transient catch-up from permanent exclusion.
+#[must_use]
+pub fn check_reconnect_admission(
+    roster: &BTreeSet<u64>,
+    current_epoch: u64,
+    peer_id: u64,
+    claimed_epoch: u64,
+) -> ReconnectAdmission {
+    // Gate 1: is the peer in the roster?
+    if !roster.contains(&peer_id) {
+        return ReconnectAdmission::NotInRoster { peer_id };
+    }
+    // Gate 2: is the claimed epoch acceptable?
+    if claimed_epoch < current_epoch {
+        return ReconnectAdmission::StaleEpoch {
+            claimed_epoch,
+            current_epoch,
+        };
+    }
+    ReconnectAdmission::Admitted
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -889,5 +996,93 @@ mod tests {
         // Second transition: peer 20 drained (peer 30 already Draining)
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes.iter().all(|o| o.is_success()));
+    }
+
+    // ------------------------------------------------------------------
+    // ReconnectAdmission tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn reconnect_admitted_when_peer_in_roster_and_epoch_current() {
+        let roster: BTreeSet<u64> = [1, 2, 3].into();
+        let result = check_reconnect_admission(&roster, 5, 2, 5);
+        assert_eq!(result, ReconnectAdmission::Admitted);
+        assert!(result.is_admitted());
+    }
+
+    #[test]
+    fn reconnect_admitted_when_claimed_epoch_ahead() {
+        let roster: BTreeSet<u64> = [10, 20].into();
+        let result = check_reconnect_admission(&roster, 3, 10, 7);
+        assert_eq!(result, ReconnectAdmission::Admitted);
+    }
+
+    #[test]
+    fn reconnect_stale_epoch_when_claimed_behind() {
+        let roster: BTreeSet<u64> = [1, 2, 3].into();
+        let result = check_reconnect_admission(&roster, 10, 2, 5);
+        assert_eq!(
+            result,
+            ReconnectAdmission::StaleEpoch {
+                claimed_epoch: 5,
+                current_epoch: 10,
+            }
+        );
+        assert!(!result.is_admitted());
+        assert_eq!(result.as_str(), "stale_epoch");
+    }
+
+    #[test]
+    fn reconnect_not_in_roster_when_peer_unknown() {
+        let roster: BTreeSet<u64> = [1, 2].into();
+        let result = check_reconnect_admission(&roster, 1, 99, 1);
+        assert_eq!(
+            result,
+            ReconnectAdmission::NotInRoster { peer_id: 99 }
+        );
+        assert!(!result.is_admitted());
+        assert_eq!(result.as_str(), "not_in_roster");
+    }
+
+    #[test]
+    fn reconnect_not_in_roster_takes_precedence_over_stale_epoch() {
+        // Peer not in roster should be rejected even if epoch is also stale
+        let roster: BTreeSet<u64> = [1, 2].into();
+        let result = check_reconnect_admission(&roster, 10, 99, 1);
+        assert_eq!(
+            result,
+            ReconnectAdmission::NotInRoster { peer_id: 99 }
+        );
+    }
+
+    #[test]
+    fn reconnect_admission_display_format() {
+        let admitted = ReconnectAdmission::Admitted;
+        assert_eq!(format!("{admitted}"), "reconnect admitted");
+
+        let stale = ReconnectAdmission::StaleEpoch {
+            claimed_epoch: 3,
+            current_epoch: 7,
+        };
+        let s = format!("{stale}");
+        assert!(s.contains("stale epoch"));
+        assert!(s.contains("3"));
+        assert!(s.contains("7"));
+
+        let departed = ReconnectAdmission::PeerDeparted { peer_id: 5 };
+        assert!(format!("{departed}").contains("departed"));
+
+        let not_in = ReconnectAdmission::NotInRoster { peer_id: 42 };
+        assert!(format!("{not_in}").contains("not in roster"));
+    }
+
+    #[test]
+    fn reconnect_admission_empty_roster_rejects_all() {
+        let roster: BTreeSet<u64> = BTreeSet::new();
+        let result = check_reconnect_admission(&roster, 1, 1, 1);
+        assert_eq!(
+            result,
+            ReconnectAdmission::NotInRoster { peer_id: 1 }
+        );
     }
 }

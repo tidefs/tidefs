@@ -535,3 +535,105 @@ fn send_seq_continues_across_multiple_reconnect_cycles() {
     session.on_send(0, MessagePriority::Data);
     assert_eq!(session.last_sent_seq(), MessageSequenceNumber(7));
 }
+
+// ---------------------------------------------------------------------------
+// Epoch-gated reconnect admission tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_resume_request_carries_epoch() {
+    use tidefs_transport::reconnect::SessionResumeRequest;
+    let key = [0xAAu8; 32];
+    let req = SessionResumeRequest::new(42, &key, MessageSequenceNumber(7), 5);
+    assert_eq!(req.epoch, 5);
+    assert!(req.verify_token(&key));
+}
+
+#[test]
+fn reconnect_driver_with_epoch_builds_request_with_epoch() {
+    use tidefs_transport::reconnect::{ReconnectConfig, ReconnectDriver};
+
+    let config = ReconnectConfig::default();
+    let driver = ReconnectDriver::with_epoch(1, [0xBBu8; 32], config, 3);
+    let req = driver.build_resume_request(MessageSequenceNumber(0));
+    assert_eq!(req.epoch, 3);
+}
+
+#[test]
+fn reconnect_driver_new_defaults_to_epoch_zero() {
+    use tidefs_transport::reconnect::{ReconnectConfig, ReconnectDriver};
+
+    let config = ReconnectConfig::default();
+    let driver = ReconnectDriver::new(1, [0xCCu8; 32], config);
+    assert_eq!(driver.epoch, 0);
+    let req = driver.build_resume_request(MessageSequenceNumber(0));
+    assert_eq!(req.epoch, 0);
+}
+
+#[test]
+fn check_reconnect_admission_current_epoch() {
+    use std::collections::BTreeSet;
+    use tidefs_transport::epoch_fence::{check_reconnect_admission, ReconnectAdmission};
+
+    let roster: BTreeSet<u64> = [1, 2, 3].into();
+    // Peer 2 at epoch 5, current epoch is 5
+    let result = check_reconnect_admission(&roster, 5, 2, 5);
+    assert_eq!(result, ReconnectAdmission::Admitted);
+}
+
+#[test]
+fn check_reconnect_admission_stale_epoch() {
+    use std::collections::BTreeSet;
+    use tidefs_transport::epoch_fence::{check_reconnect_admission, ReconnectAdmission};
+
+    let roster: BTreeSet<u64> = [1, 2, 3].into();
+    // Peer 2 at epoch 3, current epoch is 5 — stale
+    let result = check_reconnect_admission(&roster, 5, 2, 3);
+    assert_eq!(
+        result,
+        ReconnectAdmission::StaleEpoch {
+            claimed_epoch: 3,
+            current_epoch: 5,
+        }
+    );
+}
+
+#[test]
+fn check_reconnect_admission_departed_peer() {
+    use std::collections::BTreeSet;
+    use tidefs_transport::epoch_fence::{check_reconnect_admission, ReconnectAdmission};
+
+    let roster: BTreeSet<u64> = [1, 2].into();
+    // Peer 3 not in roster — departed or never joined
+    let result = check_reconnect_admission(&roster, 5, 3, 5);
+    assert_eq!(result, ReconnectAdmission::NotInRoster { peer_id: 3 });
+}
+
+#[test]
+fn check_reconnect_admission_epoch_advance_while_reconnect_in_flight() {
+    use std::collections::BTreeSet;
+    use tidefs_transport::epoch_fence::{check_reconnect_admission, ReconnectAdmission};
+
+    // Simulate: peer 1 starts reconnect at epoch 2, but membership
+    // advances to epoch 4 while reconnect is in flight.
+    let roster: BTreeSet<u64> = [1, 2, 3].into();
+    let result = check_reconnect_admission(&roster, 4, 1, 2);
+    assert_eq!(
+        result,
+        ReconnectAdmission::StaleEpoch {
+            claimed_epoch: 2,
+            current_epoch: 4,
+        }
+    );
+}
+
+#[test]
+fn reconnect_admission_peer_departed_during_reconnect() {
+    use std::collections::BTreeSet;
+    use tidefs_transport::epoch_fence::{check_reconnect_admission, ReconnectAdmission};
+
+    // Peer 1 was in roster at epoch 2, but has been removed by epoch 4.
+    let roster: BTreeSet<u64> = [2, 3].into();
+    let result = check_reconnect_admission(&roster, 4, 1, 2);
+    assert_eq!(result, ReconnectAdmission::NotInRoster { peer_id: 1 });
+}

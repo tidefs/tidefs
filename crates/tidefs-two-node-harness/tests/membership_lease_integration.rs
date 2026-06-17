@@ -419,3 +419,48 @@ fn authority_replay_deterministic() {
     assert_eq!(l1, l2);
     assert_eq!(c1, c2);
 }
+
+// ── Reconnect epoch gating integration with membership lease ─────────
+
+#[test]
+fn reconnect_admission_rejects_stale_epoch_after_lease_advances() {
+    use std::collections::BTreeSet;
+    use tidefs_transport::epoch_fence::{check_reconnect_admission, ReconnectAdmission};
+
+    // Simulate: a peer held a lease at epoch 1, then membership advanced
+    // to epoch 3. A reconnect from epoch 1 should be rejected as stale.
+    let roster: BTreeSet<u64> = [1, 2, 3].into();
+    let result = check_reconnect_admission(&roster, 3, 1, 1);
+    assert_eq!(
+        result,
+        ReconnectAdmission::StaleEpoch {
+            claimed_epoch: 1,
+            current_epoch: 3,
+        }
+    );
+}
+
+#[test]
+fn reconnect_admission_rejects_departed_peer_after_lease_release() {
+    use std::collections::BTreeSet;
+    use tidefs_transport::epoch_fence::{check_reconnect_admission, ReconnectAdmission};
+
+    // Simulate: peer 4 released its lease and departed. The roster
+    // no longer includes peer 4. A reconnect from peer 4 should be
+    // rejected as not-in-roster.
+    let roster: BTreeSet<u64> = [1, 2, 3].into();
+    let result = check_reconnect_admission(&roster, 5, 4, 5);
+    assert_eq!(result, ReconnectAdmission::NotInRoster { peer_id: 4 });
+}
+
+#[test]
+fn reconnect_admission_accepts_current_epoch_after_lease_renewal() {
+    use std::collections::BTreeSet;
+    use tidefs_transport::epoch_fence::{check_reconnect_admission, ReconnectAdmission};
+
+    // Peer 2 renewed its lease. Current roster includes peer 2 at epoch 7.
+    // A reconnect from peer 2 at epoch 7 should be admitted.
+    let roster: BTreeSet<u64> = [1, 2, 3].into();
+    let result = check_reconnect_admission(&roster, 7, 2, 7);
+    assert_eq!(result, ReconnectAdmission::Admitted);
+}
