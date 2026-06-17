@@ -37,6 +37,7 @@ pub mod trace;
 pub mod two_node_harness_fuse_integrity;
 pub mod ublk_completion_artifact;
 pub mod ublk_discard_validation;
+pub mod ublk_started_export_admission_artifact;
 pub mod validation_schema;
 pub mod validation_status;
 pub mod workers_ns;

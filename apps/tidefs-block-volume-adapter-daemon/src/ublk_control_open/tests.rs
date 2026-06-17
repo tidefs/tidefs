@@ -5272,6 +5272,8 @@ fn io_loop_report_holds_image_backed_io_validation() {
         barrier_audit_fua_write_count: 0,
         barrier_audit_failed_count: 0,
         barrier_audit_total_entries: 0,
+        started_export_admission_artifact_path: None,
+        started_export_admission_artifact_written: false,
     };
 
     // Assert image-backed IO validation is carried in the report
@@ -5324,6 +5326,8 @@ fn io_loop_report_image_validation_defaults_to_zero() {
         barrier_audit_fua_write_count: 0,
         barrier_audit_failed_count: 0,
         barrier_audit_total_entries: 0,
+        started_export_admission_artifact_path: None,
+        started_export_admission_artifact_written: false,
     };
 
     assert_eq!(report.image_bytes_read, 0);
@@ -5369,6 +5373,8 @@ fn io_loop_report_print_includes_image_validation() {
         barrier_audit_fua_write_count: 0,
         barrier_audit_failed_count: 0,
         barrier_audit_total_entries: 0,
+        started_export_admission_artifact_path: None,
+        started_export_admission_artifact_written: false,
     };
 
     // print() should not panic with image validation fields
