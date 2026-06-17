@@ -24,7 +24,7 @@ use tidefs_btree::{BPlusTree, BTreeError};
 use tidefs_commit_group::store::CommitGroupStore;
 use tidefs_types_orphan_index_core::{
     OrphanCursor, OrphanKey, OrphanRecoveryBudget, OrphanRecoveryOutcome, OrphanRecoveryStats,
-    ORPHAN_INDEX_SPEC,
+    OrphanReplayWatermark, ORPHAN_INDEX_SPEC,
 };
 
 // ---------------------------------------------------------------------------
@@ -245,6 +245,11 @@ pub struct OrphanIndex {
     /// Removes pending the current TXG commit. Tracked so abort_pending
     /// can restore the removed entries.
     pending_removes: BTreeSet<OrphanKey>,
+    /// Durably committed replay watermark. Advanced after each successful
+    /// TXG commit to record the furthest inode_id whose orphan state has
+    /// been replayed. Reclaim gates compare against this watermark before
+    /// releasing dead objects or freed extents.
+    watermark: OrphanReplayWatermark,
 }
 
 impl OrphanIndex {
@@ -258,6 +263,7 @@ impl OrphanIndex {
             pending_inserts: BTreeMap::new(),
             pending_removes: BTreeSet::new(),
             dirty: false,
+            watermark: OrphanReplayWatermark::NONE,
         }
     }
 
@@ -451,7 +457,7 @@ impl OrphanIndex {
 
     /// Encode the entire index as an append-only log buffer.
     ///
-    /// Format: `[u32 LE entry_count][entries...]`
+    /// Format: `[u32 LE entry_count][u64 LE watermark_position][entries...]`
     /// Each entry record: `[u8; 24 encoded_entry][u8; 32 BLAKE3 checksum]`
     ///
     /// The log is designed to be written atomically via the object store.
@@ -459,9 +465,11 @@ impl OrphanIndex {
     #[must_use]
     pub fn encode_log(&self) -> Vec<u8> {
         let entries: Vec<OrphanEntry> = self.iter().collect();
-        let mut buf = Vec::with_capacity(4 + entries.len() * LOG_RECORD_SIZE);
+        // Format: 4-byte count | 8-byte watermark position | entries...
+        let mut buf = Vec::with_capacity(12 + entries.len() * LOG_RECORD_SIZE);
         let count: u32 = entries.len() as u32;
         buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&self.watermark.position.to_le_bytes());
         for entry in entries {
             let enc = entry.encode();
             buf.extend_from_slice(&enc);
@@ -487,13 +495,16 @@ impl OrphanIndex {
     /// entry record is incomplete. Incomplete entries at the tail of
     /// the log (crash during append) are treated as truncation.
     pub fn recover_from_log(data: &[u8]) -> Result<(Self, Vec<u64>), LogRecoverError> {
-        if data.len() < 4 {
+        // Header: 4-byte count + 8-byte watermark position = 12 bytes
+        if data.len() < 12 {
             return Err(LogRecoverError::TruncatedHeader);
         }
         let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let wm_pos = u64::from_le_bytes(data[4..12].try_into().unwrap());
         let mut idx = Self::new();
+        idx.watermark = OrphanReplayWatermark { position: wm_pos };
         let mut corrupted = Vec::new();
-        let mut offset: usize = 4;
+        let mut offset: usize = 12;
 
         for _ in 0..count {
             if offset + LOG_RECORD_SIZE > data.len() {
@@ -532,6 +543,34 @@ impl OrphanIndex {
     /// Clear the dirty flag after successful persistence.
     pub fn clear_dirty(&mut self) {
         self.dirty = false;
+    }
+
+    /// Return the durably committed replay watermark.
+    ///
+    /// Reclaim gates compare object/extent inode_id against this watermark
+    /// before releasing storage.  When the watermark is [`OrphanReplayWatermark::NONE`],
+    /// no orphan state has been durably replayed and reclaim blocks everything.
+    #[must_use]
+    pub fn durable_watermark(&self) -> OrphanReplayWatermark {
+        self.watermark
+    }
+
+    /// Advance the durably committed replay watermark past `position`.
+    ///
+    /// The watermark is monotonic: it never moves backwards.  Call this
+    /// after a TXG commit has durably recorded that orphan state up to
+    /// `position` has been replayed.
+    pub fn advance_watermark(&mut self, position: u64) {
+        self.watermark = self.watermark.advance_past(position);
+        self.dirty = true;
+    }
+
+    /// Set the watermark from an [`OrphanCursor`].
+    ///
+    /// Convenience wrapper for [`advance_watermark`](Self::advance_watermark)
+    /// when the caller already has a cursor from recovery scanning.
+    pub fn set_watermark_from_cursor(&mut self, cursor: OrphanCursor) {
+        self.advance_watermark(cursor.position);
     }
 
     /// Insert an inode entry into the orphan index within the current TXG.
@@ -741,7 +780,7 @@ impl Default for OrphanIndex {
 /// Errors that can occur during orphan log recovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LogRecoverError {
-    /// The log buffer is too short to contain the 4-byte entry-count header.
+    /// The log buffer is too short to contain the 12-byte count/watermark header.
     TruncatedHeader,
 }
 
@@ -1007,9 +1046,10 @@ mod tests {
     fn encode_log_empty() {
         let idx = OrphanIndex::new();
         let log = idx.encode_log();
-        // Just the 4-byte count (0)
-        assert_eq!(log.len(), 4);
+        // 4-byte count (0) + 8-byte watermark position = 12 bytes
+        assert_eq!(log.len(), 12);
         assert_eq!(&log[0..4], &0u32.to_le_bytes());
+        assert_eq!(&log[4..12], &0u64.to_le_bytes());
     }
 
     #[test]
@@ -1017,9 +1057,67 @@ mod tests {
         let mut idx = OrphanIndex::new();
         idx.insert(42, make_entry(42));
         let log = idx.encode_log();
-        assert_eq!(log.len(), 4 + LOG_RECORD_SIZE);
+        assert_eq!(log.len(), 12 + LOG_RECORD_SIZE);
         // Count
         assert_eq!(u32::from_le_bytes(log[0..4].try_into().unwrap()), 1);
+        // Watermark at position 0 (NONE)
+        assert_eq!(u64::from_le_bytes(log[4..12].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn durable_watermark_starts_at_none() {
+        let idx = OrphanIndex::new();
+        assert_eq!(idx.durable_watermark(), OrphanReplayWatermark::NONE);
+    }
+
+    #[test]
+    fn advance_watermark_is_monotonic_and_marks_dirty() {
+        let mut idx = OrphanIndex::new();
+        idx.clear_dirty();
+
+        idx.advance_watermark(42);
+        assert_eq!(idx.durable_watermark().position, 42);
+        assert!(idx.is_dirty());
+
+        idx.advance_watermark(10);
+        assert_eq!(idx.durable_watermark().position, 42);
+    }
+
+    #[test]
+    fn set_watermark_from_cursor_advances_position() {
+        let mut idx = OrphanIndex::new();
+        idx.set_watermark_from_cursor(OrphanCursor { position: 77 });
+        assert_eq!(idx.durable_watermark().position, 77);
+    }
+
+    #[test]
+    fn encode_log_persists_watermark_position() {
+        let mut idx = OrphanIndex::new();
+        idx.insert(42, make_entry(42));
+        idx.advance_watermark(42);
+
+        let log = idx.encode_log();
+        let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
+        assert!(corrupted.is_empty());
+        assert!(recovered.contains(42));
+        assert_eq!(recovered.durable_watermark().position, 42);
+    }
+
+    #[test]
+    fn truncated_tail_recovery_preserves_watermark_header() {
+        let mut idx = OrphanIndex::new();
+        idx.insert(1, make_entry(1));
+        idx.insert(2, make_entry(2));
+        idx.advance_watermark(1);
+
+        let mut log = idx.encode_log();
+        log.truncate(12 + LOG_RECORD_SIZE + 1);
+
+        let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
+        assert!(corrupted.is_empty());
+        assert!(recovered.contains(1));
+        assert!(!recovered.contains(2));
+        assert_eq!(recovered.durable_watermark().position, 1);
     }
 
     #[test]
@@ -1283,7 +1381,7 @@ mod tests {
 
     #[test]
     fn recover_empty_log() {
-        let log = 0u32.to_le_bytes().to_vec();
+        let log = OrphanIndex::new().encode_log();
         let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
         assert!(corrupted.is_empty());
         assert!(recovered.is_empty());
@@ -1291,7 +1389,7 @@ mod tests {
 
     #[test]
     fn recover_truncated_header() {
-        let log = vec![0u8, 1, 2]; // < 4 bytes
+        let log = vec![0u8, 1, 2]; // < 12 bytes (header is 12 bytes)
         let err = OrphanIndex::recover_from_log(&log).unwrap_err();
         assert_eq!(err, LogRecoverError::TruncatedHeader);
     }
@@ -1304,7 +1402,7 @@ mod tests {
         idx.insert(2, make_entry(2));
         let mut log = idx.encode_log();
         // Truncate halfway through the second entry
-        let new_len = 4 + LOG_RECORD_SIZE + 10; // header + first full entry + 10 bytes of second
+        let new_len = 12 + LOG_RECORD_SIZE + 10; // header(12) + first full entry + 10 bytes of second
         log.truncate(new_len);
 
         let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
@@ -1323,9 +1421,8 @@ mod tests {
         idx.insert(3, make_entry(3));
         let mut log = idx.encode_log();
 
-        // Corrupt the checksum of the second entry (bytes 56-87, which is
-        // offset 4 + 56..4 + 112 = 60..116)
-        let second_csum_start = 4 + LOG_RECORD_SIZE + ENTRY_ENCODED_SIZE;
+        // Corrupt the checksum of the second entry after the 12-byte header.
+        let second_csum_start = 12 + LOG_RECORD_SIZE + ENTRY_ENCODED_SIZE;
         log[second_csum_start] ^= 0xFF;
 
         let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
@@ -1345,7 +1442,7 @@ mod tests {
 
         // Corrupt the generation field of the first entry (offset 8-15 in entry bytes)
         // This preserves the inode_id so the corrupted vector reports the correct ID.
-        let entry_data_start = 4; // after count header
+        let entry_data_start = 12; // after count (4) + watermark (8) header
         log[entry_data_start + 10] ^= 0xFF; // flip a byte in generation field
 
         let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
@@ -1517,7 +1614,7 @@ mod tests {
         }
         let full_log = idx.encode_log();
         // Keep header + 3.5 entries
-        let partial_len = 4 + 3 * LOG_RECORD_SIZE + LOG_RECORD_SIZE / 2;
+        let partial_len = 12 + 3 * LOG_RECORD_SIZE + LOG_RECORD_SIZE / 2;
         let partial = &full_log[..partial_len.min(full_log.len())];
 
         let (recovered, corrupted) = OrphanIndex::recover_from_log(partial).unwrap();
@@ -1937,7 +2034,7 @@ mod tests {
         idx.insert_crash_safe(3, make_entry(3));
 
         let mut encoded = idx.encode_log();
-        let csum_start = 4 + super::LOG_RECORD_SIZE + super::ENTRY_ENCODED_SIZE;
+        let csum_start = 12 + super::LOG_RECORD_SIZE + super::ENTRY_ENCODED_SIZE;
         if csum_start < encoded.len() {
             encoded[csum_start] ^= 0xFF;
         }

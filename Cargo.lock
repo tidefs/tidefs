@@ -3226,6 +3226,7 @@ dependencies = [
  "tidefs-binary_schema-core",
  "tidefs-btree",
  "tidefs-replication-model",
+ "tidefs-types-orphan-index-core",
  "tidefs-types-pool-label-core",
  "tidefs-types-reclaim-queue-core",
 ]

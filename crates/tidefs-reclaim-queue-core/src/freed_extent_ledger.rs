@@ -22,6 +22,7 @@ use core::fmt;
 
 use tidefs_binary_schema_checksum::blake3_domain_digest;
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
+use tidefs_types_orphan_index_core::OrphanReplayWatermark;
 
 // ---------------------------------------------------------------------------
 // FreedExtent
@@ -44,12 +45,18 @@ pub struct FreedExtent {
     pub blake3_hash: [u8; 32],
     /// Transaction group at which this free became durable.
     pub freed_at_txg: u64,
+    /// Inode ID that owned this extent before it was freed.
+    /// `None` for extents not associated with a specific inode
+    /// (e.g. metadata extents).  Used by the orphan replay watermark
+    /// gate to delay reclaim until orphan recovery has been committed.
+    pub inode_id: Option<u64>,
 }
 
 impl FreedExtent {
     /// Serialized size in bytes: 8 (device_id) + 8 (physical_offset)
-    /// + 8 (length) + 32 (blake3_hash) + 8 (freed_at_txg).
-    pub const ENCODED_SIZE: usize = 64;
+    /// + 8 (length) + 32 (blake3_hash) + 8 (freed_at_txg)
+    /// + 8 (optional inode_id sentinel).
+    pub const ENCODED_SIZE: usize = 72;
 
     /// Create a new freed extent.
     #[must_use]
@@ -66,6 +73,27 @@ impl FreedExtent {
             length,
             blake3_hash,
             freed_at_txg,
+            inode_id: None,
+        }
+    }
+
+    /// Create a freed extent with an associated inode ID.
+    #[must_use]
+    pub const fn with_inode(
+        device_id: u64,
+        physical_offset: u64,
+        length: u64,
+        blake3_hash: [u8; 32],
+        freed_at_txg: u64,
+        inode_id: u64,
+    ) -> Self {
+        Self {
+            device_id,
+            physical_offset,
+            length,
+            blake3_hash,
+            freed_at_txg,
+            inode_id: Some(inode_id),
         }
     }
 
@@ -85,6 +113,12 @@ impl FreedExtent {
         buf[16..24].copy_from_slice(&self.length.to_le_bytes());
         buf[24..56].copy_from_slice(&self.blake3_hash);
         buf[56..64].copy_from_slice(&self.freed_at_txg.to_le_bytes());
+        // inode_id: 8 bytes, 0xFFFF_FFFF_FFFF_FFFF = None sentinel
+        let inode_bytes = match self.inode_id {
+            Some(id) => id.to_le_bytes(),
+            None => u64::MAX.to_le_bytes(),
+        };
+        buf[64..72].copy_from_slice(&inode_bytes);
         buf
     }
 
@@ -97,12 +131,19 @@ impl FreedExtent {
         let mut blake3_hash = [0u8; 32];
         blake3_hash.copy_from_slice(&buf[24..56]);
         let freed_at_txg = u64::from_le_bytes(buf[56..64].try_into().unwrap());
+        let inode_raw = u64::from_le_bytes(buf[64..72].try_into().unwrap());
+        let inode_id = if inode_raw == u64::MAX {
+            None
+        } else {
+            Some(inode_raw)
+        };
         Self {
             device_id,
             physical_offset,
             length,
             blake3_hash,
             freed_at_txg,
+            inode_id,
         }
     }
 
@@ -115,11 +156,18 @@ impl FreedExtent {
 
 impl fmt::Display for FreedExtent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "FreedExtent(dev={} off={} len={} txg={})",
-            self.device_id, self.physical_offset, self.length, self.freed_at_txg
-        )
+        match self.inode_id {
+            Some(inode) => write!(
+                f,
+                "FreedExtent(dev={} off={} len={} txg={} inode={})",
+                self.device_id, self.physical_offset, self.length, self.freed_at_txg, inode
+            ),
+            None => write!(
+                f,
+                "FreedExtent(dev={} off={} len={} txg={})",
+                self.device_id, self.physical_offset, self.length, self.freed_at_txg
+            ),
+        }
     }
 }
 
@@ -243,14 +291,90 @@ impl ReclaimQueueLedger {
     /// Pop up to `max_count` freed extents from the front of the queue
     /// in FIFO order.
     ///
-    /// If `max_count` is larger than `self.len()`, all entries are
-    /// returned.
+    /// If `max_count` is larger than `self.len()`, all entries are returned.
+    #[must_use]
     pub fn dequeue_batch(&mut self, max_count: usize) -> Vec<FreedExtent> {
         if max_count == 0 || self.is_empty() {
             return Vec::new();
         }
         let count = max_count.min(self.entries.len());
         self.entries.drain(..count).collect()
+    }
+
+    /// Dequeue up to `max_count` freed extents, skipping any blocked by
+    /// the orphan replay watermark.
+    ///
+    /// When `watermark` is `Some(w)`, extents whose `inode_id` is `Some(id)`
+    /// and `id > w.position` are held back until the watermark advances past
+    /// them.  Extents with `inode_id == None` (no inode association) are
+    /// held back when a watermark is active — a conservative gate that errs
+    /// on the side of not reclaiming extents that might belong to an
+    /// unrecovered orphan.
+    ///
+    /// When `watermark` is `None`, the gate is skipped entirely and this
+    /// method behaves identically to [`Self::dequeue_batch`].
+    #[must_use]
+    pub fn dequeue_batch_with_orphan_watermark(
+        &mut self,
+        max_count: usize,
+        watermark: Option<OrphanReplayWatermark>,
+    ) -> Vec<FreedExtent> {
+        if max_count == 0 || self.entries.is_empty() {
+            return Vec::new();
+        }
+        let wm = match watermark {
+            Some(w) if !w.is_none() => w,
+            Some(_) => return Vec::new(), // NONE watermark blocks everything
+            None => return self.dequeue_batch(max_count),
+        };
+        // Drain all entries, separate passing from blocked, re-enqueue blocked
+        let all: Vec<FreedExtent> = self.entries.drain(..).collect();
+        let mut passed = Vec::with_capacity(max_count);
+        let mut blocked = Vec::new();
+        for extent in all {
+            if passed.len() >= max_count {
+                blocked.push(extent);
+                continue;
+            }
+            let ok = match extent.inode_id {
+                Some(inode_id) => wm.covers(inode_id),
+                None => false, // conservative: block when no inode association
+            };
+            if ok {
+                passed.push(extent);
+            } else {
+                blocked.push(extent);
+            }
+        }
+        for extent in blocked {
+            self.entries.push_back(extent);
+        }
+        passed
+    }
+
+    /// Count freed extents that are blocked by the orphan replay watermark.
+    ///
+    /// Operator-visible reporting calls this to distinguish "reclaim waiting
+    /// for orphan replay" from other conditions.
+    #[must_use]
+    pub fn orphan_watermark_blocked_count(
+        &self,
+        watermark: Option<OrphanReplayWatermark>,
+    ) -> usize {
+        let wm = match watermark {
+            Some(w) => w,
+            None => return 0,
+        };
+        if wm.is_none() {
+            return self.entries.len();
+        }
+        self.entries
+            .iter()
+            .filter(|e| match e.inode_id {
+                Some(inode_id) => !wm.covers(inode_id),
+                None => true, // conservative: block when no inode association
+            })
+            .count()
     }
 
     /// Peek at up to `max_count` extents from the front without removing
@@ -328,7 +452,7 @@ impl ReclaimQueueLedger {
     /// - 4 bytes: magic `FRLG`
     /// - 4 bytes: format version (u32)
     /// - 4 bytes: entry count (u32)
-    /// - N * 64 bytes: per-entry encoded records
+    /// - N * 72 bytes: per-entry encoded records
     /// - 32 bytes: BLAKE3 domain-separated digest over all preceding bytes
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -511,6 +635,23 @@ mod tests {
         )
     }
 
+    fn fe_inode(seed: u8, inode_id: u64) -> FreedExtent {
+        let mut hash = [0u8; 32];
+        hash[0] = seed;
+        FreedExtent::with_inode(
+            seed as u64,
+            (seed as u64) * 4096,
+            (seed as u64) * 1024,
+            hash,
+            (seed as u64) * 100,
+            inode_id,
+        )
+    }
+
+    const fn wm(position: u64) -> OrphanReplayWatermark {
+        OrphanReplayWatermark { position }
+    }
+
     // -- FreedExtent encode/decode --
 
     #[test]
@@ -519,6 +660,31 @@ mod tests {
         let encoded = e.encode();
         let decoded = FreedExtent::decode(&encoded);
         assert_eq!(decoded, e);
+    }
+
+    #[test]
+    fn freed_extent_with_inode_roundtrip() {
+        let e = fe_inode(42, 77);
+        let encoded = e.encode();
+        let decoded = FreedExtent::decode(&encoded);
+        assert_eq!(decoded, e);
+        assert_eq!(decoded.inode_id, Some(77));
+    }
+
+    #[test]
+    fn freed_extent_without_inode_roundtrip() {
+        let e = fe(5);
+        let encoded = e.encode();
+        let decoded = FreedExtent::decode(&encoded);
+        assert_eq!(decoded.inode_id, None);
+    }
+
+    #[test]
+    fn freed_extent_with_inode_preserves_near_max_inode() {
+        let e = fe_inode(6, u64::MAX - 1);
+        let encoded = e.encode();
+        let decoded = FreedExtent::decode(&encoded);
+        assert_eq!(decoded.inode_id, Some(u64::MAX - 1));
     }
 
     #[test]
@@ -539,9 +705,9 @@ mod tests {
 
     #[test]
     fn freed_extent_encoded_size() {
-        assert_eq!(FreedExtent::ENCODED_SIZE, 64);
+        assert_eq!(FreedExtent::ENCODED_SIZE, 72);
         let e = fe(1);
-        assert_eq!(e.encode().len(), 64);
+        assert_eq!(e.encode().len(), 72);
     }
 
     #[test]
@@ -658,6 +824,73 @@ mod tests {
     }
 
     #[test]
+    fn dequeue_with_orphan_watermark_skips_gate_when_absent() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe(2));
+
+        let batch = l.dequeue_batch_with_orphan_watermark(10, None);
+        assert_eq!(batch.len(), 2);
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn dequeue_with_orphan_watermark_none_blocks_all() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 20));
+
+        let batch = l.dequeue_batch_with_orphan_watermark(10, Some(OrphanReplayWatermark::NONE));
+        assert!(batch.is_empty());
+        assert_eq!(l.len(), 2);
+    }
+
+    #[test]
+    fn dequeue_with_orphan_watermark_returns_only_covered_extents() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 100));
+        l.enqueue(fe(3));
+
+        let batch = l.dequeue_batch_with_orphan_watermark(10, Some(wm(50)));
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].inode_id, Some(10));
+        assert_eq!(l.len(), 2);
+
+        let remaining: Vec<Option<u64>> = l.iter().map(|e| e.inode_id).collect();
+        assert_eq!(remaining, vec![Some(100), None]);
+    }
+
+    #[test]
+    fn dequeue_with_orphan_watermark_respects_max_count() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 20));
+        l.enqueue(fe_inode(3, 30));
+
+        let batch = l.dequeue_batch_with_orphan_watermark(2, Some(wm(100)));
+        assert_eq!(batch.len(), 2);
+        assert_eq!(l.len(), 1);
+        assert_eq!(l.iter().next().unwrap().inode_id, Some(30));
+    }
+
+    #[test]
+    fn orphan_watermark_blocked_count_classifies_blocked_extents() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 100));
+        l.enqueue(fe(3));
+
+        assert_eq!(l.orphan_watermark_blocked_count(None), 0);
+        assert_eq!(
+            l.orphan_watermark_blocked_count(Some(OrphanReplayWatermark::NONE)),
+            3
+        );
+        assert_eq!(l.orphan_watermark_blocked_count(Some(wm(50))), 2);
+        assert_eq!(l.orphan_watermark_blocked_count(Some(wm(100))), 1);
+    }
+
+    #[test]
     fn peek_batch_does_not_remove() {
         let mut l = ReclaimQueueLedger::with_defaults();
         l.enqueue(fe(1));
@@ -731,6 +964,20 @@ mod tests {
     }
 
     #[test]
+    fn encode_decode_preserves_inode_ids() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 42));
+        l.enqueue(fe(2));
+        l.enqueue(fe_inode(3, 99));
+
+        let bytes = l.encode();
+        let decoded =
+            ReclaimQueueLedger::decode(&bytes, ReclaimQueueLedgerConfig::default()).unwrap();
+        let inode_ids: Vec<Option<u64>> = decoded.iter().map(|e| e.inode_id).collect();
+        assert_eq!(inode_ids, vec![Some(42), None, Some(99)]);
+    }
+
+    #[test]
     fn encode_decode_many_entries() {
         let mut l = ReclaimQueueLedger::with_defaults();
         for i in 0..100u8 {
@@ -790,7 +1037,7 @@ mod tests {
         for i in 0..n {
             l.enqueue(fe(i as u8));
         }
-        assert_eq!(l.encoded_len(), 12 + n * 64 + 32);
+        assert_eq!(l.encoded_len(), 12 + n * 72 + 32);
     }
 
     // -- Replay (crash recovery) --

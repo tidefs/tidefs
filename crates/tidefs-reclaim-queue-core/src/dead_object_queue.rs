@@ -19,6 +19,7 @@ use core::fmt;
 use tidefs_binary_schema_checksum::blake3_domain_digest;
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
 use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
+use tidefs_types_orphan_index_core::OrphanReplayWatermark;
 use tidefs_types_reclaim_queue_core::{
     DeadObjectEntry, DeadObjectReceiptPolicy, DeadObjectReplacementReceipt, ObjectKey,
 };
@@ -168,6 +169,41 @@ pub struct DeadObjectReclaimQueue {
     entries: BTreeMapAlloc<ObjectKey, DeadObjectEntry>,
 }
 
+/// Reason a dead-object entry is blocked by the orphan replay watermark.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrphanWatermarkBlock {
+    /// Entry carries no inode_id mapping; cannot be cleared by watermark.
+    NoInodeMapping,
+    /// OrphanReplayWatermark is NONE (no durably committed orphan state).
+    WatermarkNone,
+    /// The entry's inode_id is above the watermark position (orphan
+    /// recovery has not yet advanced past this inode).
+    WatermarkBehind {
+        inode_id: u64,
+        watermark_position: u64,
+    },
+}
+
+impl fmt::Display for OrphanWatermarkBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoInodeMapping => {
+                f.write_str("dead-object entry lacks inode mapping for watermark gate")
+            }
+            Self::WatermarkNone => {
+                f.write_str("orphan replay watermark is NONE — blocking all reclaim")
+            }
+            Self::WatermarkBehind {
+                inode_id,
+                watermark_position,
+            } => write!(
+                f,
+                "orphan watermark behind: inode_id={inode_id} watermark={watermark_position}"
+            ),
+        }
+    }
+}
+
 impl DeadObjectReclaimQueue {
     /// Create an empty dead-object reclaim queue.
     #[must_use]
@@ -288,6 +324,154 @@ impl DeadObjectReclaimQueue {
             .take(max_count)
             .copied()
             .collect()
+    }
+
+    /// Check whether a single entry is blocked by the orphan replay watermark.
+    ///
+    /// `inode_of` maps a `DeadObjectEntry` to an optional inode_id.  When the
+    /// watermark is NONE, all entries are blocked.  When the watermark does
+    /// not cover the entry's inode_id, the entry is blocked.
+    #[must_use]
+    pub fn check_orphan_watermark(
+        watermark: Option<OrphanReplayWatermark>,
+        entry: &DeadObjectEntry,
+        inode_of: impl Fn(&DeadObjectEntry) -> Option<u64>,
+    ) -> Result<(), OrphanWatermarkBlock> {
+        let wm = match watermark {
+            Some(w) => w,
+            None => return Ok(()), // no watermark → no blocking
+        };
+        if wm.is_none() {
+            return Err(OrphanWatermarkBlock::WatermarkNone);
+        }
+        let inode_id = match inode_of(entry) {
+            Some(id) => id,
+            None => return Err(OrphanWatermarkBlock::NoInodeMapping),
+        };
+        if wm.covers(inode_id) {
+            Ok(())
+        } else {
+            Err(OrphanWatermarkBlock::WatermarkBehind {
+                inode_id,
+                watermark_position: wm.position,
+            })
+        }
+    }
+
+    /// Dequeue up to `max_count` entries gated by txg, eligibility, and the
+    /// orphan replay watermark.
+    ///
+    /// Entries whose inode_id (extracted by `inode_of`) is not covered by the
+    /// watermark are held back.  When `watermark` is `None`, the watermark
+    /// gate is skipped entirely (backward-compatible behaviour).
+    #[must_use]
+    pub fn dequeue_batch_with_orphan_watermark(
+        &self,
+        max_count: usize,
+        stable_committed_txg: u64,
+        watermark: Option<OrphanReplayWatermark>,
+        inode_of: impl Fn(&DeadObjectEntry) -> Option<u64>,
+    ) -> Vec<DeadObjectEntry> {
+        if max_count == 0 || self.is_empty() {
+            return Vec::new();
+        }
+        let wm = watermark;
+        self.entries
+            .values()
+            .filter(|e| {
+                e.is_reclaimable(stable_committed_txg)
+                    && Self::check_orphan_watermark(wm, e, &inode_of).is_ok()
+            })
+            .take(max_count)
+            .copied()
+            .collect()
+    }
+
+    /// Dequeue up to `max_count` receipt-bound entries gated by txg,
+    /// eligibility, replacement receipt, and the orphan replay watermark.
+    #[must_use]
+    pub fn dequeue_receipt_bound_batch_with_orphan_watermark(
+        &self,
+        max_count: usize,
+        stable_committed_txg: u64,
+        watermark: Option<OrphanReplayWatermark>,
+        inode_of: impl Fn(&DeadObjectEntry) -> Option<u64>,
+    ) -> Vec<DeadObjectEntry> {
+        if max_count == 0 || self.is_empty() {
+            return Vec::new();
+        }
+        let wm = watermark;
+        self.entries
+            .values()
+            .filter(|e| {
+                e.is_receipt_bound_reclaimable(stable_committed_txg)
+                    && Self::check_orphan_watermark(wm, e, &inode_of).is_ok()
+            })
+            .take(max_count)
+            .copied()
+            .collect()
+    }
+
+    /// Dequeue up to `max_count` entries gated by txg, eligibility,
+    /// replacement receipt evidence, generation stability, and the orphan
+    /// replay watermark.
+    #[must_use]
+    pub fn dequeue_receipt_bound_batch_with_stable_generation_and_orphan_watermark(
+        &self,
+        max_count: usize,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+        watermark: Option<OrphanReplayWatermark>,
+        inode_of: impl Fn(&DeadObjectEntry) -> Option<u64>,
+    ) -> Vec<DeadObjectEntry> {
+        if max_count == 0 || self.is_empty() {
+            return Vec::new();
+        }
+        let wm = watermark;
+        self.entries
+            .values()
+            .filter(|e| {
+                e.is_receipt_bound_reclaimable_with_stable_generation(
+                    stable_committed_txg,
+                    stable_committed_generation,
+                ) && Self::check_orphan_watermark(wm, e, &inode_of).is_ok()
+            })
+            .take(max_count)
+            .copied()
+            .collect()
+    }
+
+    /// Count entries that are eligible for txg-gated reclaim but blocked by
+    /// the orphan replay watermark.  Returns the count of entries that pass
+    /// the txg/eligibility gate but fail the watermark check.
+    ///
+    /// Operator-visible reporting can call this to distinguish "reclaim
+    /// waiting for orphan replay" from other blocking conditions.
+    #[must_use]
+    pub fn orphan_watermark_blocked_count(
+        &self,
+        stable_committed_txg: u64,
+        watermark: Option<OrphanReplayWatermark>,
+        inode_of: impl Fn(&DeadObjectEntry) -> Option<u64>,
+    ) -> usize {
+        if watermark.is_none() {
+            return 0;
+        }
+        let wm = watermark.unwrap();
+        if wm.is_none() {
+            return self
+                .entries
+                .values()
+                .filter(|e| e.is_reclaimable(stable_committed_txg))
+                .count();
+        }
+        self.entries
+            .values()
+            .filter(|e| {
+                e.is_reclaimable(stable_committed_txg)
+                    && Self::check_orphan_watermark(Some(wm), e, &inode_of).is_err()
+            })
+            .count()
     }
 
     /// Publish a replacement/base placement receipt for a dead-object entry
@@ -692,6 +876,14 @@ mod tests {
         entry(id, death_commit_group, eligible, enqueued_at).with_replacement_receipt(receipt(id))
     }
 
+    const fn wm(position: u64) -> OrphanReplayWatermark {
+        OrphanReplayWatermark { position }
+    }
+
+    fn inode_from_object_byte(entry: &DeadObjectEntry) -> Option<u64> {
+        Some(u64::from(entry.object_id.0[0]))
+    }
+
     fn encode_v1_entry(entry: DeadObjectEntry) -> [u8; DeadObjectEntry::ENCODED_SIZE_V1] {
         let mut buf = [0u8; DeadObjectEntry::ENCODED_SIZE_V1];
         buf[0..32].copy_from_slice(&entry.object_id.0);
@@ -805,6 +997,167 @@ mod tests {
         let mut q = DeadObjectReclaimQueue::new();
         q.enqueue(entry(1, 5, true, 0));
         assert!(q.dequeue_batch(0, 100).is_empty());
+    }
+
+    // -- orphan replay watermark gate --
+
+    #[test]
+    fn check_orphan_watermark_skips_gate_when_absent() {
+        let entry = entry(10, 5, true, 0);
+        assert_eq!(
+            DeadObjectReclaimQueue::check_orphan_watermark(None, &entry, inode_from_object_byte),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn check_orphan_watermark_classifies_block_reasons() {
+        let entry = entry(40, 5, true, 0);
+
+        assert_eq!(
+            DeadObjectReclaimQueue::check_orphan_watermark(
+                Some(OrphanReplayWatermark::NONE),
+                &entry,
+                inode_from_object_byte
+            ),
+            Err(OrphanWatermarkBlock::WatermarkNone)
+        );
+        assert_eq!(
+            DeadObjectReclaimQueue::check_orphan_watermark(Some(wm(100)), &entry, |_| None),
+            Err(OrphanWatermarkBlock::NoInodeMapping)
+        );
+        assert_eq!(
+            DeadObjectReclaimQueue::check_orphan_watermark(
+                Some(wm(10)),
+                &entry,
+                inode_from_object_byte
+            ),
+            Err(OrphanWatermarkBlock::WatermarkBehind {
+                inode_id: 40,
+                watermark_position: 10,
+            })
+        );
+        assert_eq!(
+            DeadObjectReclaimQueue::check_orphan_watermark(
+                Some(wm(40)),
+                &entry,
+                inode_from_object_byte
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn orphan_watermark_block_display_covers_all_variants() {
+        let variants = [
+            OrphanWatermarkBlock::NoInodeMapping,
+            OrphanWatermarkBlock::WatermarkNone,
+            OrphanWatermarkBlock::WatermarkBehind {
+                inode_id: 42,
+                watermark_position: 10,
+            },
+        ];
+
+        for variant in variants {
+            assert!(!variant.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn dequeue_batch_with_orphan_watermark_filters_uncovered_entries() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(10, 5, true, 0));
+        q.enqueue(entry(50, 5, true, 0));
+        q.enqueue(entry(80, 5, true, 0));
+
+        let batch =
+            q.dequeue_batch_with_orphan_watermark(10, 10, Some(wm(50)), inode_from_object_byte);
+        let ids: Vec<u8> = batch.iter().map(|e| e.object_id.0[0]).collect();
+        assert_eq!(ids, vec![10, 50]);
+    }
+
+    #[test]
+    fn dequeue_batch_with_orphan_watermark_blocks_none_watermark() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(10, 5, true, 0));
+
+        let batch = q.dequeue_batch_with_orphan_watermark(
+            10,
+            10,
+            Some(OrphanReplayWatermark::NONE),
+            inode_from_object_byte,
+        );
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn receipt_bound_dequeue_with_orphan_watermark_keeps_both_gates() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_with_receipt(10, 5, true, 0));
+        q.enqueue(entry_with_receipt(70, 5, true, 0));
+        q.enqueue(entry(20, 5, true, 0));
+
+        let batch = q.dequeue_receipt_bound_batch_with_orphan_watermark(
+            10,
+            10,
+            Some(wm(50)),
+            inode_from_object_byte,
+        );
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].object_id, oid(10));
+    }
+
+    #[test]
+    fn stable_generation_dequeue_with_orphan_watermark_keeps_all_gates() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_with_receipt(10, 5, true, 0));
+        q.enqueue(entry_with_receipt(40, 5, true, 0));
+        q.enqueue(entry_with_receipt(80, 5, true, 0));
+
+        let batch = q.dequeue_receipt_bound_batch_with_stable_generation_and_orphan_watermark(
+            10,
+            10,
+            6,
+            Some(wm(40)),
+            inode_from_object_byte,
+        );
+        let ids: Vec<u8> = batch.iter().map(|e| e.object_id.0[0]).collect();
+        assert_eq!(ids, vec![10, 40]);
+
+        let blocked_by_generation = q
+            .dequeue_receipt_bound_batch_with_stable_generation_and_orphan_watermark(
+                10,
+                10,
+                0,
+                Some(wm(100)),
+                inode_from_object_byte,
+            );
+        assert!(blocked_by_generation.is_empty());
+    }
+
+    #[test]
+    fn orphan_watermark_blocked_count_reports_only_txg_eligible_blocks() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry(10, 5, true, 0));
+        q.enqueue(entry(70, 5, true, 0));
+        q.enqueue(entry(90, 50, true, 0));
+
+        assert_eq!(
+            q.orphan_watermark_blocked_count(10, None, inode_from_object_byte),
+            0
+        );
+        assert_eq!(
+            q.orphan_watermark_blocked_count(
+                10,
+                Some(OrphanReplayWatermark::NONE),
+                inode_from_object_byte
+            ),
+            2
+        );
+        assert_eq!(
+            q.orphan_watermark_blocked_count(10, Some(wm(50)), inode_from_object_byte),
+            1
+        );
     }
 
     #[test]

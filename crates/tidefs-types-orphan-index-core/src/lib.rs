@@ -224,6 +224,87 @@ impl fmt::Display for OrphanCursor {
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// OrphanReplayWatermark — durable cursor for reclaim gating
+// ---------------------------------------------------------------------------
+
+/// A durable watermark representing the furthest inode_id whose orphan state
+/// has been replayed and committed.
+///
+/// Reclaim (dead-object queue and freed-extent ledger) compares against this
+/// watermark before releasing objects or extents.  When the watermark covers a
+/// given inode_id, orphan recovery for that inode has been durably committed
+/// and it is safe to reclaim its associated storage.  When the watermark is
+/// below the inode_id, reclaim must wait — the orphan entry may not yet have
+/// been replayed after a crash.
+///
+/// Design spec §5.3: durable cursor persisted with orphan index commit_group;
+/// reclaim gates compare inode_id against the committed watermark position.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct OrphanReplayWatermark {
+    /// The highest inode_id whose orphan state has been durably committed.
+    /// Position 0 means no orphans have been replayed yet (the "start"
+    /// sentinel, matching OrphanCursor::START).
+    pub position: u64,
+}
+
+impl OrphanReplayWatermark {
+    /// Watermark at the start of recovery (position 0, meaning "no orphans
+    /// replayed yet").  Reclaim with this watermark blocks all releases.
+    pub const NONE: Self = OrphanReplayWatermark { position: 0 };
+
+    /// Build a watermark from an OrphanCursor.
+    #[must_use]
+    pub const fn from_cursor(cursor: OrphanCursor) -> Self {
+        OrphanReplayWatermark {
+            position: cursor.position,
+        }
+    }
+
+    /// Returns true when the watermark is at the start sentinel.
+    #[must_use]
+    pub const fn is_none(self) -> bool {
+        self.position == 0
+    }
+
+    /// Returns true when the watermark has been advanced past (or equal to)
+    /// the given inode_id, meaning orphan recovery for that inode has been
+    /// durably committed and reclaim may proceed.
+    #[must_use]
+    pub const fn covers(self, inode_id: u64) -> bool {
+        self.position >= inode_id
+    }
+
+    /// Advance the watermark to at least position, returning a new watermark.
+    ///
+    /// Never moves backwards — the watermark is monotonic.
+    #[must_use]
+    pub const fn advance_past(self, position: u64) -> Self {
+        OrphanReplayWatermark {
+            position: if position > self.position {
+                position
+            } else {
+                self.position
+            },
+        }
+    }
+
+    /// Convert this watermark back into an OrphanCursor.
+    #[must_use]
+    pub const fn to_cursor(self) -> OrphanCursor {
+        OrphanCursor {
+            position: self.position,
+        }
+    }
+}
+
+impl fmt::Display for OrphanReplayWatermark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "watermark:inode:{}", self.position)
+    }
+}
+
 // OrphanRecoveryStats — per-batch recovery statistics
 // ---------------------------------------------------------------------------
 
@@ -1265,6 +1346,85 @@ mod tests {
         );
         let o = outcome.clone();
         assert!(!o.made_progress());
+    }
+
+    // ── OrphanReplayWatermark ─────────────────────────────────────────
+
+    #[test]
+    fn orphan_replay_watermark_none() {
+        let w = OrphanReplayWatermark::NONE;
+        assert!(w.is_none());
+        assert_eq!(w.position, 0);
+        assert!(!w.covers(1));
+        assert!(w.covers(0));
+    }
+
+    #[test]
+    fn orphan_replay_watermark_from_cursor() {
+        let c = OrphanCursor { position: 42 };
+        let w = OrphanReplayWatermark::from_cursor(c);
+        assert!(!w.is_none());
+        assert_eq!(w.position, 42);
+        assert!(w.covers(42));
+        assert!(w.covers(10));
+        assert!(!w.covers(100));
+    }
+
+    #[test]
+    fn orphan_replay_watermark_default_is_none() {
+        assert_eq!(
+            OrphanReplayWatermark::default(),
+            OrphanReplayWatermark::NONE
+        );
+    }
+
+    #[test]
+    fn orphan_replay_watermark_advance_past() {
+        let w = OrphanReplayWatermark { position: 10 };
+        let w2 = w.advance_past(5);
+        assert_eq!(w2.position, 10); // no backward movement
+        let w3 = w.advance_past(20);
+        assert_eq!(w3.position, 20);
+        let w4 = w.advance_past(10);
+        assert_eq!(w4.position, 10); // equal does not advance
+    }
+
+    #[test]
+    fn orphan_replay_watermark_to_cursor_roundtrip() {
+        let c = OrphanCursor { position: 77 };
+        let w = OrphanReplayWatermark::from_cursor(c);
+        let c2 = w.to_cursor();
+        assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn orphan_replay_watermark_display() {
+        assert_eq!(
+            format!("{}", OrphanReplayWatermark::NONE),
+            "watermark:inode:0"
+        );
+        assert_eq!(
+            format!("{}", OrphanReplayWatermark { position: 100 }),
+            "watermark:inode:100"
+        );
+    }
+
+    #[test]
+    fn orphan_replay_watermark_covers_boundary() {
+        let w = OrphanReplayWatermark { position: 7 };
+        assert!(w.covers(7));
+        assert!(w.covers(6));
+        assert!(!w.covers(8));
+    }
+
+    #[test]
+    fn orphan_replay_watermark_none_covers_nothing() {
+        let w = OrphanReplayWatermark::NONE;
+        // Position 0 covers inode 0 (sentinel, never a real orphan)
+        assert!(w.covers(0));
+        // But does NOT cover real orphan inodes (1+)
+        assert!(!w.covers(1));
+        assert!(!w.covers(u64::MAX));
     }
 
     // ── OrphanIndexRoot ───────────────────────────────────────────────

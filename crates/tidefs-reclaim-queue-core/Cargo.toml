@@ -18,6 +18,7 @@ tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
 tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
 tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core" }
 tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-types-orphan-index-core = { path = "../tidefs-types-orphan-index-core" }
 blake3 = "1"
 
 [dev-dependencies]
