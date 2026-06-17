@@ -8,17 +8,21 @@
 use std::path::PathBuf;
 use std::process;
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use tidefs_cluster::dataset_catalog::CatalogDelta;
 use tidefs_cluster::pool_lease_client::ClusterLeaseClient;
 use tidefs_cluster::pool_protocol::CatalogQueryType;
-use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType, SyncGuarantee};
-use tidefs_dataset_properties;
+use tidefs_dataset_lifecycle::{
+    DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
+};
+use tidefs_dataset_properties::{self, PropertyKey, PropertySet, PropertyValue};
 use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy, RootAuthenticationKey};
 use tidefs_local_object_store::StoreOptions;
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 
 use bincode;
+
+use crate::parser::{self, DatasetTarget, PropertyAssignment};
 
 /// Sub-subcommands for `tidefsctl dataset`.
 #[derive(Subcommand, Debug)]
@@ -49,22 +53,109 @@ pub enum DatasetCommand {
     /// List all registry properties for a dataset with effective values and sources
     ListProps(DatasetListPropsArgs),
 }
-/// `dataset create <pool> <name> [--parent <parent>] [--devices <dev>...]`
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DatasetTypeArg {
+    Filesystem,
+    Volume,
+    Snapshot,
+}
+
+impl DatasetTypeArg {
+    fn to_dataset_type(self) -> DatasetType {
+        match self {
+            Self::Filesystem => DatasetType::Filesystem,
+            Self::Volume => DatasetType::Volume,
+            Self::Snapshot => DatasetType::Snapshot,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Filesystem => "filesystem",
+            Self::Volume => "volume",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
+impl std::fmt::Display for DatasetTypeArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DatasetListRow {
+    pool: String,
+    path: String,
+    dataset_type: DatasetType,
+    used_bytes: Option<u64>,
+    available_bytes: Option<u64>,
+    mountpoint: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DestroyAdmission {
+    child_count: usize,
+    snapshot_count: usize,
+    live_mount: bool,
+}
+
+impl DestroyAdmission {
+    fn has_hazards(&self) -> bool {
+        self.child_count > 0 || self.snapshot_count > 0 || self.live_mount
+    }
+
+    fn hazards(&self) -> Vec<String> {
+        let mut hazards = Vec::new();
+        if self.child_count > 0 {
+            hazards.push(format!("{} child dataset(s)", self.child_count));
+        }
+        if self.snapshot_count > 0 {
+            hazards.push(format!("{} snapshot(s)", self.snapshot_count));
+        }
+        if self.live_mount {
+            hazards.push("a live mount".to_string());
+        }
+        hazards
+    }
+}
+
+/// `dataset create <pool>/<name> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetCreateArgs {
-    /// Pool name (imported-pool identity; routed through the live owner)
-    pub pool: String,
-
-    /// Dataset name to create
-    pub name: String,
+    /// Dataset target in <pool>/<name> form
+    pub target: String,
 
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
 
-    /// Parent dataset name (default: "root")
-    #[arg(long = "parent", default_value = "root")]
-    pub parent: String,
+    /// Mountpoint metadata to pass to the live owner
+    #[arg(long = "mountpoint", value_name = "PATH")]
+    pub mountpoint: Option<PathBuf>,
+
+    /// Dataset type to create
+    #[arg(long = "type", value_enum, default_value_t = DatasetTypeArg::Filesystem)]
+    pub dataset_type: DatasetTypeArg,
+
+    /// Initial dataset property in key=value form
+    #[arg(long = "property", value_name = "KEY=VALUE")]
+    pub properties: Vec<String>,
+
+    /// Canonical dataset feature flag to request at creation
+    #[arg(
+        long = "feature",
+        alias = "feature-flag",
+        value_name = "FEATURE",
+        value_delimiter = ','
+    )]
+    pub features: Vec<String>,
+
+    /// Emit machine-parseable JSON
+    #[arg(long = "json")]
+    pub json: bool,
 
     /// Route this operation through cluster authority instead of local pool.
     /// Requires --cluster-node-addr and --cluster-node-id.
@@ -86,15 +177,24 @@ pub struct DatasetCreateArgs {
     #[arg(long = "sync", default_value = "local")]
     pub sync: String,
 }
-/// `dataset list <pool> [--devices <dev>...]`
+/// `dataset list [-p <pool>] [-t <type>] [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetListArgs {
-    /// Pool name (imported-pool identity; routed through the live owner)
-    pub pool: String,
+    /// Pool name filter (imported-pool identity; routed through the live owner)
+    #[arg(short = 'p', long = "pool", value_name = "POOL")]
+    pub pool: Option<String>,
 
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
+
+    /// Dataset type filter
+    #[arg(short = 't', long = "type", value_enum)]
+    pub dataset_type: Option<DatasetTypeArg>,
+
+    /// Emit machine-parseable JSON
+    #[arg(long = "json")]
+    pub json: bool,
 
     /// Route this operation through cluster authority instead of local pool.
     /// Requires --cluster-node-addr and --cluster-node-id.
@@ -142,18 +242,23 @@ pub struct DatasetRenameArgs {
     #[arg(long = "cluster-node-id")]
     pub cluster_node_id: Option<u64>,
 }
-/// `dataset destroy <pool> <name> [--devices <dev>...]`
+/// `dataset destroy <pool>/<name> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetDestroyArgs {
-    /// Pool name (imported-pool identity; routed through the live owner)
-    pub pool: String,
-
-    /// Dataset name to destroy
-    pub name: String,
+    /// Dataset target in <pool>/<name> form
+    pub target: String,
 
     /// Block devices for offline/not-yet-imported catalog access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
+
+    /// Required when the dataset has children, snapshots, or a live mount
+    #[arg(long = "force")]
+    pub force: bool,
+
+    /// Emit machine-parseable JSON
+    #[arg(long = "json")]
+    pub json: bool,
 
     /// Route this operation through cluster authority instead of local pool.
     /// Requires --cluster-node-addr and --cluster-node-id.
@@ -259,14 +364,11 @@ pub struct DatasetUpgradeArgs {
     pub devices: Option<Vec<PathBuf>>,
 }
 
-/// `dataset get <pool> <name> <property> [--devices <dev>...]`
+/// `dataset get <pool>/<name> <property> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetGetArgs {
-    /// Pool name (imported-pool identity; routed through the live owner)
-    pub pool: String,
-
-    /// Dataset name to query
-    pub name: String,
+    /// Dataset target in <pool>/<name> form
+    pub target: String,
 
     /// Property name (e.g. "access.readonly", "layout.recordsize")
     pub property: String,
@@ -274,16 +376,17 @@ pub struct DatasetGetArgs {
     /// Block devices for offline/not-yet-imported property access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
+
+    /// Emit machine-parseable JSON
+    #[arg(long = "json")]
+    pub json: bool,
 }
 
-/// `dataset set <pool> <name> <property>=<value> [--devices <dev>...]`
+/// `dataset set <pool>/<name> <property>=<value> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct DatasetSetArgs {
-    /// Pool name (imported-pool identity; routed through the live owner)
-    pub pool: String,
-
-    /// Dataset name to configure
-    pub name: String,
+    /// Dataset target in <pool>/<name> form
+    pub target: String,
 
     /// Property assignment in key=value form (e.g. "access.readonly=on")
     pub assignment: String,
@@ -291,6 +394,10 @@ pub struct DatasetSetArgs {
     /// Block devices for offline/not-yet-imported property access
     #[arg(short = 'd', long = "devices", num_args = 1..)]
     pub devices: Option<Vec<PathBuf>>,
+
+    /// Emit machine-parseable JSON
+    #[arg(long = "json")]
+    pub json: bool,
 }
 /// `dataset list-props <pool> <name> [--devices <dev>...]`
 #[derive(Args, Debug)]
@@ -331,12 +438,14 @@ fn open_filesystem(
     devices: Option<&[PathBuf]>,
     operation: &str,
     recovery_policy: RecoveryPolicy,
+    json: bool,
 ) -> LocalFileSystem {
     open_filesystem_with_live_args(
         pool,
         devices,
         operation,
         recovery_policy,
+        json,
         serde_json::Value::Null,
     )
 }
@@ -346,16 +455,18 @@ fn open_filesystem_with_live_args(
     devices: Option<&[PathBuf]>,
     operation: &str,
     recovery_policy: RecoveryPolicy,
+    json: bool,
     live_args: serde_json::Value,
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
-        super::live_owner::route_or_refuse_active_for_uuid_with_args(
+        super::live_owner::route_or_refuse_active_for_uuid_with_format_and_args(
             "dataset",
             operation,
             pool,
             config.pool_uuid,
             config.state == tidefs_types_pool_label_core::PoolState::Active,
+            json,
             live_args,
         );
 
@@ -382,7 +493,7 @@ fn open_filesystem_with_live_args(
         };
     }
 
-    super::live_owner::route_with_args("dataset", operation, pool, live_args)
+    super::live_owner::route_with_format_and_args("dataset", operation, pool, json, live_args)
 }
 
 fn scan_device_pool_config(
@@ -507,16 +618,346 @@ fn submit_cluster_delta(
     }
 }
 
+fn exit_dataset_error(operation: &str, message: impl Into<String>, json: bool) -> ! {
+    let message = message.into();
+    if json {
+        let out = serde_json::json!({
+            "ok": false,
+            "operation": operation,
+            "error": message,
+        });
+        print_json_or_exit(out);
+    } else {
+        eprintln!("tidefsctl dataset {operation}: {message}");
+    }
+    process::exit(1);
+}
+
+fn print_json_or_exit(value: serde_json::Value) {
+    match serde_json::to_string_pretty(&value) {
+        Ok(text) => println!("{text}"),
+        Err(err) => {
+            eprintln!("tidefsctl dataset: failed to encode JSON output: {err}");
+            process::exit(1);
+        }
+    }
+}
+
+fn parse_target_or_exit(raw: &str, operation: &str, json: bool) -> DatasetTarget {
+    parser::parse_dataset_target(raw).unwrap_or_else(|err| exit_dataset_error(operation, err, json))
+}
+
+fn parse_pool_or_exit(raw: &str, operation: &str, json: bool) -> String {
+    parser::parse_pool_name(raw).unwrap_or_else(|err| exit_dataset_error(operation, err, json))
+}
+
+fn parse_property_key_or_exit(raw: &str, operation: &str, json: bool) -> String {
+    parser::parse_property_key(raw).unwrap_or_else(|err| exit_dataset_error(operation, err, json))
+}
+
+fn parse_property_assignment_or_exit(raw: &str, operation: &str, json: bool) -> PropertyAssignment {
+    parser::parse_property_assignment(raw)
+        .unwrap_or_else(|err| exit_dataset_error(operation, err, json))
+}
+
+fn parse_property_assignments_or_exit(
+    raw_values: &[String],
+    operation: &str,
+    json: bool,
+) -> Vec<PropertyAssignment> {
+    let mut assignments = Vec::with_capacity(raw_values.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for raw in raw_values {
+        let assignment = parse_property_assignment_or_exit(raw, operation, json);
+        if !seen.insert(assignment.key.clone()) {
+            exit_dataset_error(
+                operation,
+                format!("duplicate dataset property key: {}", assignment.key),
+                json,
+            );
+        }
+        assignments.push(assignment);
+    }
+    assignments
+}
+
+fn parse_feature_names_or_exit(raw_values: &[String], operation: &str, json: bool) -> Vec<String> {
+    let mut features = Vec::with_capacity(raw_values.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for raw in raw_values {
+        let feature = parser::parse_dataset_feature_name(raw)
+            .unwrap_or_else(|err| exit_dataset_error(operation, err, json));
+        if !seen.insert(feature.clone()) {
+            exit_dataset_error(
+                operation,
+                format!("duplicate dataset feature flag: {feature}"),
+                json,
+            );
+        }
+        features.push(feature);
+    }
+    features
+}
+
+fn parse_sync_or_exit(raw: &str, operation: &str, json: bool) -> SyncGuarantee {
+    match raw {
+        "local" => SyncGuarantee::Local,
+        "remote-copy" => SyncGuarantee::RemoteCopy,
+        "full-redundancy" => SyncGuarantee::FullRedundancy,
+        other => exit_dataset_error(
+            operation,
+            format!(
+                "invalid --sync value {other}; expected local, remote-copy, or full-redundancy"
+            ),
+            json,
+        ),
+    }
+}
+
+fn create_parent_and_leaf(path: &str) -> (String, &str) {
+    let (parent, leaf) = parser::dataset_parent_and_leaf(path);
+    (parent.unwrap_or("root").to_string(), leaf)
+}
+
+fn property_set_from_assignments(assignments: &[PropertyAssignment]) -> PropertySet {
+    let mut properties = PropertySet::new();
+    for assignment in assignments {
+        if assignment.clear {
+            continue;
+        }
+        properties.set_local(PropertyKey::new(&assignment.key), assignment.value.clone());
+    }
+    properties
+}
+
+fn property_assignments_json(assignments: &[PropertyAssignment]) -> Vec<serde_json::Value> {
+    assignments
+        .iter()
+        .map(|assignment| {
+            serde_json::json!({
+                "key": assignment.key.as_str(),
+                "value": property_value_json(&assignment.value),
+                "display_value": assignment.value.to_string(),
+                "raw_value": assignment.raw_value.as_str(),
+                "clear": assignment.clear,
+            })
+        })
+        .collect()
+}
+
+fn property_value_json(value: &PropertyValue) -> serde_json::Value {
+    match value {
+        PropertyValue::None => serde_json::Value::Null,
+        PropertyValue::U64(value) => serde_json::json!(value),
+        PropertyValue::I64(value) => serde_json::json!(value),
+        PropertyValue::String(value) => serde_json::json!(value),
+        PropertyValue::Bool(value) => serde_json::json!(value),
+        PropertyValue::EnumVariant(value) => serde_json::json!(value),
+        PropertyValue::Bytes(value) => serde_json::json!(value),
+        PropertyValue::Size(value) => serde_json::json!(value),
+    }
+}
+
+fn normalized_assignment(assignment: &PropertyAssignment) -> String {
+    if assignment.clear {
+        format!("{}=-", assignment.key)
+    } else {
+        format!("{}={}", assignment.key, assignment.value)
+    }
+}
+
+fn dataset_type_matches(dataset_type: DatasetType, filter: Option<DatasetTypeArg>) -> bool {
+    filter
+        .map(|filter| dataset_type == filter.to_dataset_type())
+        .unwrap_or(true)
+}
+
+fn dataset_rows_from_catalog(
+    pool: &str,
+    catalog: &DatasetCatalog,
+    filter: Option<DatasetTypeArg>,
+    available_bytes: Option<u64>,
+) -> Vec<DatasetListRow> {
+    catalog
+        .list_all()
+        .into_iter()
+        .filter(|(_, _, dataset_type, _, _, _)| dataset_type_matches(*dataset_type, filter))
+        .map(|(path, _, dataset_type, _, _, _)| DatasetListRow {
+            pool: pool.to_string(),
+            path,
+            dataset_type,
+            used_bytes: None,
+            available_bytes,
+            mountpoint: None,
+        })
+        .collect()
+}
+
+fn print_dataset_rows(pool: Option<&str>, rows: &[DatasetListRow], json: bool) {
+    if json {
+        print_json_or_exit(serde_json::json!({
+            "ok": true,
+            "pool": pool,
+            "datasets": dataset_rows_json(rows),
+        }));
+        return;
+    }
+
+    println!(
+        "{:<40} {:<12} {:>14} {:>14} {}",
+        "NAME", "TYPE", "USED", "AVAILABLE", "MOUNTPOINT"
+    );
+    for row in rows {
+        println!(
+            "{:<40} {:<12} {:>14} {:>14} {}",
+            format!("{}/{}", row.pool, row.path),
+            row.dataset_type,
+            optional_bytes(row.used_bytes),
+            optional_bytes(row.available_bytes),
+            row.mountpoint.as_deref().unwrap_or("-")
+        );
+    }
+}
+
+fn dataset_rows_json(rows: &[DatasetListRow]) -> Vec<serde_json::Value> {
+    rows.iter()
+        .map(|row| {
+            serde_json::json!({
+                "pool": row.pool.as_str(),
+                "name": format!("{}/{}", row.pool, row.path),
+                "path": row.path.as_str(),
+                "type": row.dataset_type.to_string(),
+                "used": row.used_bytes,
+                "available": row.available_bytes,
+                "mountpoint": row.mountpoint.as_deref(),
+            })
+        })
+        .collect()
+}
+
+fn optional_bytes(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn bytes_from_blocks(blocks: u64, block_size: u32) -> u64 {
+    blocks.saturating_mul(u64::from(block_size))
+}
+
+fn list_pool_from_args(args: &DatasetListArgs) -> Option<String> {
+    if let Some(pool) = args.pool.as_deref() {
+        return Some(parse_pool_or_exit(pool, "list", args.json));
+    }
+    let devices = args
+        .devices
+        .as_deref()
+        .filter(|devices| !devices.is_empty())?;
+    let entries = match tidefs_pool_scan::scan_labels(devices) {
+        Ok(entries) => entries,
+        Err(err) => exit_dataset_error("list", format!("pool label scan failed: {err}"), args.json),
+    };
+    let config = match tidefs_pool_scan::PoolAssembler::assemble(&entries, None) {
+        Ok(config) => config,
+        Err(err) => exit_dataset_error("list", format!("pool assembly failed: {err}"), args.json),
+    };
+    Some(config.pool_name)
+}
+
+fn require_create_admission(
+    catalog: &DatasetCatalog,
+    path: &str,
+    parent: &str,
+) -> Result<(), String> {
+    if !catalog.contains(parent) {
+        return Err(format!(
+            "parent dataset '{parent}' does not exist in the catalog"
+        ));
+    }
+    if catalog.contains(path) {
+        return Err(format!("dataset '{path}' already exists in the catalog"));
+    }
+    Ok(())
+}
+
+fn destroy_admission_from_catalog(
+    catalog: &DatasetCatalog,
+    path: &str,
+    snapshot_count: usize,
+    mounted_dataset_id: [u8; 16],
+) -> Result<DestroyAdmission, String> {
+    let children = catalog
+        .list_children(path)
+        .map_err(|err| format!("catalog error listing children of '{path}': {err}"))?;
+    let live_mount = catalog
+        .lookup(path)
+        .map(|dataset_id| *dataset_id.as_bytes() == mounted_dataset_id)
+        .unwrap_or(false);
+    Ok(DestroyAdmission {
+        child_count: children.len(),
+        snapshot_count,
+        live_mount,
+    })
+}
+
+fn require_destroy_admission(
+    path: &str,
+    admission: &DestroyAdmission,
+    force: bool,
+) -> Result<(), String> {
+    if !admission.has_hazards() || force {
+        return Ok(());
+    }
+    Err(format!(
+        "dataset '{path}' has {}; retry with --force to destroy it",
+        admission.hazards().join(", ")
+    ))
+}
+
+fn destroy_catalog_subtree(catalog: &mut DatasetCatalog, path: &str) -> Result<usize, String> {
+    let prefix = format!("{path}/");
+    let mut descendants: Vec<String> = catalog
+        .list_all()
+        .into_iter()
+        .map(|(entry_path, _, _, _, _, _)| entry_path)
+        .filter(|entry_path| entry_path.starts_with(&prefix))
+        .collect();
+    descendants.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| right.cmp(left)));
+    let mut destroyed = 0;
+    for descendant in descendants {
+        catalog
+            .destroy(&descendant)
+            .map_err(|err| format!("catalog error destroying '{descendant}': {err}"))?;
+        destroyed += 1;
+    }
+    catalog
+        .destroy(path)
+        .map_err(|err| format!("catalog error destroying '{path}': {err}"))?;
+    Ok(destroyed + 1)
+}
+
 fn handle_create(args: DatasetCreateArgs) {
     let _guard = super::authz::require_local_only("dataset create");
 
+    let target = parse_target_or_exit(&args.target, "create", args.json);
     let devices_ref = args.devices.as_deref();
-    let name = &args.name;
-    let parent = &args.parent;
+    let full_path = target.dataset.clone();
+    let (parent, leaf) = create_parent_and_leaf(&full_path);
+    let sync_guarantee = parse_sync_or_exit(&args.sync, "create", args.json);
+    let properties = parse_property_assignments_or_exit(&args.properties, "create", args.json);
+    let features = parse_feature_names_or_exit(&args.features, "create", args.json);
+    let dataset_type = args.dataset_type.to_dataset_type();
+    let mountpoint = args
+        .mountpoint
+        .as_ref()
+        .map(|path| path.display().to_string());
 
-    if name == "root" {
-        eprintln!("tidefsctl dataset create: 'root' dataset cannot be re-created; it is created automatically with the pool");
-        process::exit(1);
+    if full_path == "root" {
+        exit_dataset_error(
+            "create",
+            "'root' dataset cannot be re-created; it is created automatically with the pool",
+            args.json,
+        );
     }
 
     // ── Cluster-authoritative path ─────────────────────────────────
@@ -526,108 +967,119 @@ fn handle_create(args: DatasetCreateArgs) {
         let devs = require_devices_for_cluster(devices_ref.map(|d| d), "create");
         let pool_guid = resolve_cluster_pool_guid(devs, "create");
 
-        let full_path = if parent == "root" {
-            name.clone()
-        } else {
-            format!("{parent}/{name}")
-        };
         let dataset_id = dataset_id_from_name(&full_path);
         let delta = CatalogDelta::Create {
             path: full_path.clone(),
             dataset_id_bytes: dataset_id.as_bytes().to_vec(),
-            dataset_type_u8: DatasetType::Filesystem.to_u8(),
+            dataset_type_u8: dataset_type.to_u8(),
             creation_txg: 1,
-            properties: vec![],
+            properties: property_set_from_assignments(&properties).to_key_value_blob(),
             flags_u16: DatasetFlags::default_create().bits(),
         };
 
         let catalog_version = submit_cluster_delta(node_addr, node_id, pool_guid, &delta, "create");
 
-        println!(
-            "dataset '{full_path}' created in clustered pool '{}' (catalog_version={catalog_version})",
-            args.pool
-        );
-        println!("  id={}  parent='{parent}'", format_dataset_id(&dataset_id));
+        if args.json {
+            print_json_or_exit(serde_json::json!({
+                "ok": true,
+                "operation": "create",
+                "pool": target.pool,
+                "dataset": full_path,
+                "id": dataset_id.to_string(),
+                "type": dataset_type.to_string(),
+                "parent": parent,
+                "mountpoint": mountpoint,
+                "properties": property_assignments_json(&properties),
+                "features": features,
+                "catalog_version": catalog_version,
+            }));
+        } else {
+            println!(
+                "dataset '{full_path}' created in clustered pool '{}' (catalog_version={catalog_version})",
+                target.pool
+            );
+            println!("  id={}  parent='{parent}'", format_dataset_id(&dataset_id));
+        }
         return;
     }
 
     let mut fs = open_filesystem_with_live_args(
-        &args.pool,
+        &target.pool,
         devices_ref,
         "create",
         RecoveryPolicy::default(),
+        args.json,
         serde_json::json!({
-            "name": &args.name,
-            "parent": &args.parent,
+            "target": &args.target,
+            "name": leaf,
+            "parent": parent,
+            "type": args.dataset_type.label(),
+            "mountpoint": mountpoint.as_deref(),
+            "properties": property_assignments_json(&properties),
+            "features": &features,
             "sync": &args.sync,
         }),
     );
 
-    // Check parent exists in the catalog
-    if !fs.dataset_catalog().contains(parent) {
-        eprintln!(
-            "tidefsctl dataset create: parent dataset '{parent}' does not exist in the catalog"
-        );
-        process::exit(1);
-    }
-
-    // Build full path for hierarchical catalog entry
-    let full_path = if parent == "root" {
-        name.clone()
-    } else {
-        format!("{parent}/{name}")
-    };
-
-    // Check the full path does not already exist
-    if fs.dataset_catalog().contains(&full_path) {
-        eprintln!("tidefsctl dataset create: dataset '{full_path}' already exists in the catalog");
-        process::exit(1);
+    if let Err(err) = require_create_admission(fs.dataset_catalog(), &full_path, &parent) {
+        exit_dataset_error("create", err, args.json);
     }
 
     let dataset_id = dataset_id_from_name(&full_path);
+    let property_set = property_set_from_assignments(&properties);
 
-    let sync_guarantee = match args.sync.as_str() {
-        "local" => SyncGuarantee::Local,
-        "remote-copy" => SyncGuarantee::RemoteCopy,
-        "full-redundancy" => SyncGuarantee::FullRedundancy,
-        other => {
-            eprintln!("tidefsctl dataset create: invalid --sync value {other}; expected local, remote-copy, or full-redundancy");
-            process::exit(1);
-        }
-    };
-
-    match fs.dataset_catalog_mut().create(
+    if let Err(err) = fs.dataset_catalog_mut().create(
         &full_path,
         dataset_id,
-        DatasetType::Filesystem,
+        dataset_type,
         1,
-        vec![],
+        property_set.to_key_value_blob(),
         DatasetFlags::default_create(),
         sync_guarantee,
     ) {
-        Ok(()) => {
-            println!("dataset '{full_path}' created in pool '{}'", args.pool);
-        }
-        Err(err) => {
-            eprintln!("tidefsctl dataset create: catalog error creating '{full_path}': {err}");
-            process::exit(1);
-        }
+        exit_dataset_error(
+            "create",
+            format!("catalog error creating '{full_path}': {err}"),
+            args.json,
+        );
     }
 
     if let Err(err) = fs.persist_dataset_catalog() {
-        eprintln!("tidefsctl dataset create: failed to persist catalog: {err}");
-        process::exit(1);
+        exit_dataset_error(
+            "create",
+            format!("failed to persist catalog: {err}"),
+            args.json,
+        );
     }
 
-    println!("  id={}  parent='{parent}'", format_dataset_id(&dataset_id));
+    if args.json {
+        print_json_or_exit(serde_json::json!({
+            "ok": true,
+            "operation": "create",
+            "pool": target.pool,
+            "dataset": full_path,
+            "id": dataset_id.to_string(),
+            "type": dataset_type.to_string(),
+            "parent": parent,
+            "mountpoint": mountpoint,
+            "properties": property_assignments_json(&properties),
+            "features": features,
+        }));
+    } else {
+        println!("dataset '{full_path}' created in pool '{}'", target.pool);
+        println!("  id={}  parent='{parent}'", format_dataset_id(&dataset_id));
+    }
 }
 fn handle_list(args: DatasetListArgs) {
+    let pool = list_pool_from_args(&args);
+
     // ── Cluster-authoritative path ─────────────────────────────────
     if args.cluster {
         let (node_addr, node_id) =
             validate_cluster_args(&args.cluster_node_addr, args.cluster_node_id, "list");
         let devs = require_devices_for_cluster(args.devices.as_deref(), "list");
         let pool_guid = resolve_cluster_pool_guid(devs, "list");
+        let pool_name = pool.unwrap_or_else(|| "<devices>".to_string());
 
         match ClusterLeaseClient::query_catalog(
             node_addr,
@@ -642,33 +1094,36 @@ fn handle_list(args: DatasetListArgs) {
                     eprintln!("tidefsctl dataset list: cluster query failed: {err}");
                     process::exit(1);
                 }
-                if resp.entries.is_empty() {
-                    println!("pool '{}' has no datasets", args.pool);
+                let mut rows: Vec<_> = resp
+                    .entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let dataset_type = DatasetType::from_u8(entry.dataset_type_u8)?;
+                        if !dataset_type_matches(dataset_type, args.dataset_type) {
+                            return None;
+                        }
+                        Some(DatasetListRow {
+                            pool: pool_name.clone(),
+                            path: entry.path.clone(),
+                            dataset_type,
+                            used_bytes: None,
+                            available_bytes: None,
+                            mountpoint: None,
+                        })
+                    })
+                    .collect();
+                rows.sort_by(|left, right| left.path.cmp(&right.path));
+                if args.json {
+                    let mut out = serde_json::json!({
+                        "ok": true,
+                        "pool": pool_name,
+                        "catalog_version": resp.catalog_version,
+                        "datasets": [],
+                    });
+                    out["datasets"] = serde_json::Value::Array(dataset_rows_json(&rows));
+                    print_json_or_exit(out);
                 } else {
-                    let mut sorted: Vec<_> = resp.entries.iter().collect();
-                    sorted.sort_by(|a, b| a.path.cmp(&b.path));
-                    println!(
-                        "pool '{}' datasets (catalog_version={}):",
-                        args.pool, resp.catalog_version
-                    );
-                    for entry in &sorted {
-                        let id_str: String = entry
-                            .dataset_id_bytes
-                            .iter()
-                            .take(4)
-                            .map(|b| format!("{b:02x}"))
-                            .collect();
-                        let lc = match entry.lifecycle_state_u8 {
-                            0 => "Active",
-                            1 => "Destroying",
-                            2 => "Destroyed",
-                            _ => "???",
-                        };
-                        println!(
-                            "  dataset '{}' id={} type={} state={lc}",
-                            entry.path, id_str, entry.dataset_type_u8
-                        );
-                    }
+                    print_dataset_rows(Some(&pool_name), &rows, false);
                 }
                 return;
             }
@@ -679,35 +1134,29 @@ fn handle_list(args: DatasetListArgs) {
         }
     }
 
-    let devices_ref = args.devices.as_deref();
-    let fs = open_filesystem(&args.pool, devices_ref, "list", RecoveryPolicy::ReadOnly);
-    let catalog = fs.dataset_catalog();
-
-    let entries = catalog.entries();
-    if entries.is_empty() {
-        println!("pool '{}' has no datasets", args.pool);
+    let Some(pool) = pool else {
+        print_dataset_rows(None, &[], args.json);
         return;
-    }
+    };
 
-    let mut sorted: Vec<_> = entries.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-
-    println!("pool '{}' datasets:", args.pool);
-    for (path, id) in &sorted {
-        // Format type if available, otherwise show "---" for entries without lifecycle state
-        let sg = match catalog.sync_guarantee(path) {
-            Ok(g) => g.to_string(),
-            Err(_) => "---".to_string(),
-        };
-        let lc = match catalog.lifecycle_state(path) {
-            Ok(state) => format!("{state:?}"),
-            Err(_) => "---".to_string(),
-        };
-        println!(
-            "  dataset '{path}' id={} sync={sg} state={lc}",
-            format_dataset_id(id)
-        );
-    }
+    let devices_ref = args.devices.as_deref();
+    let mut fs = open_filesystem_with_live_args(
+        &pool,
+        devices_ref,
+        "list",
+        RecoveryPolicy::ReadOnly,
+        args.json,
+        serde_json::json!({
+            "type": args.dataset_type.map(|dataset_type| dataset_type.label()),
+        }),
+    );
+    let available_bytes = match fs.statfs() {
+        Ok(stats) => Some(bytes_from_blocks(stats.bavail, stats.bsize)),
+        Err(_) => None,
+    };
+    let catalog = fs.dataset_catalog();
+    let rows = dataset_rows_from_catalog(&pool, catalog, args.dataset_type, available_bytes);
+    print_dataset_rows(Some(&pool), &rows, args.json);
 }
 fn handle_rename(args: DatasetRenameArgs) {
     let _guard = super::authz::require_local_only("dataset rename");
@@ -751,6 +1200,7 @@ fn handle_rename(args: DatasetRenameArgs) {
         devices_ref,
         "rename",
         RecoveryPolicy::default(),
+        false,
         serde_json::json!({
             "old_name": &args.old_name,
             "new_name": &args.new_name,
@@ -799,6 +1249,7 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
         devices_ref,
         "set-strategy",
         RecoveryPolicy::default(),
+        false,
         serde_json::json!({
             "name": &args.name,
             "enable": &args.enable,
@@ -975,6 +1426,7 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
         devices_ref,
         "upgrade",
         RecoveryPolicy::default(),
+        false,
         serde_json::json!({
             "name": &args.name,
         }),
@@ -1113,151 +1565,153 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
 }
 
 fn handle_get(args: DatasetGetArgs) {
+    let target = parse_target_or_exit(&args.target, "get", args.json);
+    let property = parse_property_key_or_exit(&args.property, "get", args.json);
     let fs = open_filesystem_with_live_args(
-        &args.pool,
+        &target.pool,
         args.devices.as_deref(),
         "get",
         RecoveryPolicy::ReadOnly,
+        args.json,
         serde_json::json!({
-            "name": &args.name,
-            "property": &args.property,
+            "target": &args.target,
+            "name": &target.dataset,
+            "property": &property,
         }),
     );
 
-    let path = args.name.as_str();
+    let path = target.dataset.as_str();
     // Resolve properties with full parent-chain inheritance.
     let effective = match fs.dataset_catalog().get_properties_with_inheritance(&path) {
         Ok(props) => props,
         Err(e) => {
-            eprintln!(
-                "tidefsctl dataset get: cannot read properties for '{}': {e}",
-                &args.name
+            exit_dataset_error(
+                "get",
+                format!("cannot read properties for '{}': {e}", target.dataset),
+                args.json,
             );
-            process::exit(1);
         }
     };
 
-    let registry = tidefs_dataset_properties::build_registry();
-    let key = tidefs_dataset_properties::PropertyKey::new(&args.property);
-
-    // Verify the property is known.
-    if tidefs_dataset_properties::lookup_property(&registry, &key).is_none() {
-        eprintln!(
-            "tidefsctl dataset get: unknown property '{}'",
-            &args.property
-        );
-        process::exit(1);
-    }
+    let key = PropertyKey::new(&property);
 
     // Show the effective value with source.
     match effective.get(&key) {
         Some(entry) => {
-            println!("property:  {}", &args.property);
-            println!("value:     {}", entry.value);
-            println!("source:    {}", entry.source);
+            if args.json {
+                print_json_or_exit(serde_json::json!({
+                    "ok": true,
+                    "operation": "get",
+                    "pool": target.pool,
+                    "dataset": target.dataset,
+                    "property": property,
+                    "value": property_value_json(&entry.value),
+                    "display_value": entry.value.to_string(),
+                    "source": entry.source.to_string(),
+                }));
+            } else {
+                println!("property:  {property}");
+                println!("value:     {}", entry.value);
+                println!("source:    {}", entry.source);
+            }
         }
         None => {
-            // Should not happen since get_properties_with_inheritance fills all registry keys.
-            eprintln!(
-                "tidefsctl dataset get: internal error resolving '{}'",
-                &args.property
+            exit_dataset_error(
+                "get",
+                format!("internal error resolving '{property}'"),
+                args.json,
             );
-            process::exit(1);
         }
     }
 }
 fn handle_set(args: DatasetSetArgs) {
     let _guard = super::authz::require_local_only("dataset set");
 
+    let target = parse_target_or_exit(&args.target, "set", args.json);
+    let assignment = parse_property_assignment_or_exit(&args.assignment, "set", args.json);
+    let live_assignment = normalized_assignment(&assignment);
     let mut fs = open_filesystem_with_live_args(
-        &args.pool,
+        &target.pool,
         args.devices.as_deref(),
         "set",
         RecoveryPolicy::RepairWriteback,
+        args.json,
         serde_json::json!({
-            "name": &args.name,
-            "assignment": &args.assignment,
+            "target": &args.target,
+            "name": &target.dataset,
+            "property": &assignment.key,
+            "assignment": live_assignment,
+            "value": property_value_json(&assignment.value),
+            "display_value": assignment.value.to_string(),
+            "clear": assignment.clear,
         }),
     );
 
-    // Parse the assignment: key=value
-    let (prop_name, prop_val_str) = match args.assignment.split_once('=') {
-        Some((k, v)) => (k.trim(), v.trim()),
-        None => {
-            eprintln!(
-                "tidefsctl dataset set: invalid assignment '{}' (expected key=value)",
-                &args.assignment
-            );
-            process::exit(1);
-        }
-    };
-
-    if prop_name.is_empty() {
-        eprintln!("tidefsctl dataset set: property name must not be empty");
-        process::exit(1);
-    }
-
     let registry = tidefs_dataset_properties::build_registry();
-    let key = tidefs_dataset_properties::PropertyKey::new(prop_name);
+    let key = PropertyKey::new(&assignment.key);
 
     let def = match tidefs_dataset_properties::lookup_property(&registry, &key) {
         Some(def) => def,
-        None => {
-            eprintln!("tidefsctl dataset set: unknown property '{}'", prop_name);
-            process::exit(1);
-        }
-    };
-
-    // Check if the user is clearing the override (value="-" or empty).
-    let is_clear = prop_val_str.is_empty() || prop_val_str == "-";
-
-    let value = if is_clear {
-        tidefs_dataset_properties::PropertyValue::None
-    } else {
-        tidefs_dataset_properties::PropertySet::parse_value_from_str(prop_val_str)
+        None => exit_dataset_error(
+            "set",
+            format!("unsupported dataset property key: {}", assignment.key),
+            args.json,
+        ),
     };
 
     // Validate the proposed value against the registry.
-    let path = args.name.as_str();
+    let path = target.dataset.as_str();
     let existing_props = fs
         .dataset_catalog()
         .get_properties(&path)
         .unwrap_or_default();
 
-    if let Err(verr) = tidefs_dataset_properties::validate_set(&key, &value, def, &existing_props) {
-        eprintln!("tidefsctl dataset set: validation failed: {verr}");
-        process::exit(1);
+    if let Err(verr) =
+        tidefs_dataset_properties::validate_set(&key, &assignment.value, def, &existing_props)
+    {
+        exit_dataset_error("set", format!("validation failed: {verr}"), args.json);
     }
 
     // Apply the change: clear or set.
     let mut props = existing_props;
-    if is_clear {
+    if assignment.clear {
         props.remove_local_override(&key);
     } else {
-        props.set_local(key.clone(), value.clone());
+        props.set_local(key.clone(), assignment.value.clone());
     }
 
     match fs.dataset_catalog_mut().set_properties(&path, &props) {
         Ok(()) => {
             if let Err(e) = fs.persist_dataset_catalog() {
-                eprintln!("tidefsctl dataset set: property set but catalog persist failed: {e}");
-                process::exit(1);
-            }
-            if is_clear {
-                println!(
-                    "cleared '{}' (now using default/inherited value)",
-                    prop_name
+                exit_dataset_error(
+                    "set",
+                    format!("property set but catalog persist failed: {e}"),
+                    args.json,
                 );
+            }
+            if args.json {
+                print_json_or_exit(serde_json::json!({
+                    "ok": true,
+                    "operation": "set",
+                    "pool": target.pool,
+                    "dataset": target.dataset,
+                    "property": assignment.key,
+                    "value": property_value_json(&assignment.value),
+                    "display_value": assignment.value.to_string(),
+                    "clear": assignment.clear,
+                }));
+            } else if assignment.clear {
+                println!("cleared '{}' (now using default/inherited value)", key);
             } else {
-                println!("{} = {}", prop_name, value);
+                println!("{} = {}", key, assignment.value);
             }
         }
         Err(e) => {
-            eprintln!(
-                "tidefsctl dataset set: cannot write properties for '{}': {e}",
-                &args.name
+            exit_dataset_error(
+                "set",
+                format!("cannot write properties for '{}': {e}", target.dataset),
+                args.json,
             );
-            process::exit(1);
         }
     }
 }
@@ -1268,6 +1722,7 @@ fn handle_list_props(args: DatasetListPropsArgs) {
         args.devices.as_deref(),
         "list-props",
         RecoveryPolicy::ReadOnly,
+        false,
         serde_json::json!({
             "name": &args.name,
             "family": args.family.as_deref(),
@@ -1353,11 +1808,11 @@ fn handle_list_props(args: DatasetListPropsArgs) {
 fn handle_destroy(args: DatasetDestroyArgs) {
     let _guard = super::authz::require_local_only("dataset destroy");
 
-    let name = &args.name;
+    let target = parse_target_or_exit(&args.target, "destroy", args.json);
+    let name = target.dataset.clone();
 
     if name == "root" {
-        eprintln!("tidefsctl dataset destroy: 'root' dataset cannot be destroyed");
-        process::exit(1);
+        exit_dataset_error("destroy", "'root' dataset cannot be destroyed", args.json);
     }
 
     // ── Cluster-authoritative path ─────────────────────────────────
@@ -1372,61 +1827,85 @@ fn handle_destroy(args: DatasetDestroyArgs) {
         let catalog_version =
             submit_cluster_delta(node_addr, node_id, pool_guid, &delta, "destroy");
 
-        println!(
-            "dataset '{name}' destroyed in clustered pool '{}' (catalog_version={catalog_version})",
-            args.pool
-        );
+        if args.json {
+            print_json_or_exit(serde_json::json!({
+                "ok": true,
+                "operation": "destroy",
+                "pool": target.pool,
+                "dataset": name,
+                "force": args.force,
+                "catalog_version": catalog_version,
+            }));
+        } else {
+            println!(
+                "dataset '{name}' destroyed in clustered pool '{}' (catalog_version={catalog_version})",
+                target.pool
+            );
+        }
         return;
     }
 
     let devices_ref = args.devices.as_deref();
     let mut fs = open_filesystem_with_live_args(
-        &args.pool,
+        &target.pool,
         devices_ref,
         "destroy",
         RecoveryPolicy::default(),
+        args.json,
         serde_json::json!({
-            "name": &args.name,
+            "target": &args.target,
+            "name": &name,
+            "force": args.force,
         }),
     );
 
     // Check dataset exists
-    if !fs.dataset_catalog().contains(name) {
-        eprintln!("tidefsctl dataset destroy: dataset '{name}' does not exist in the catalog");
-        process::exit(1);
-    }
-
-    // Check for children
-    let children = match fs.dataset_catalog().list_children(name) {
-        Ok(c) => c,
-        Err(err) => {
-            eprintln!(
-                "tidefsctl dataset destroy: catalog error listing children of '{name}': {err}"
-            );
-            process::exit(1);
-        }
-    };
-    if !children.is_empty() {
-        eprintln!(
-            "tidefsctl dataset destroy: dataset '{name}' has {} child(ren) and cannot be destroyed",
-            children.len()
+    if !fs.dataset_catalog().contains(&name) {
+        exit_dataset_error(
+            "destroy",
+            format!("dataset '{name}' does not exist in the catalog"),
+            args.json,
         );
-        process::exit(1);
     }
 
-    match fs.dataset_catalog_mut().destroy(name) {
-        Ok(()) => {
-            println!("dataset '{name}' destroyed");
-        }
-        Err(err) => {
-            eprintln!("tidefsctl dataset destroy: catalog error destroying '{name}': {err}");
-            process::exit(1);
-        }
+    let admission = destroy_admission_from_catalog(
+        fs.dataset_catalog(),
+        &name,
+        fs.list_snapshots().len(),
+        fs.mounted_dataset_id(),
+    )
+    .unwrap_or_else(|err| exit_dataset_error("destroy", err, args.json));
+    if let Err(err) = require_destroy_admission(&name, &admission, args.force) {
+        exit_dataset_error("destroy", err, args.json);
     }
+
+    let destroyed_entries = destroy_catalog_subtree(fs.dataset_catalog_mut(), &name)
+        .unwrap_or_else(|err| exit_dataset_error("destroy", err, args.json));
 
     if let Err(err) = fs.persist_dataset_catalog() {
-        eprintln!("tidefsctl dataset destroy: failed to persist catalog: {err}");
-        process::exit(1);
+        exit_dataset_error(
+            "destroy",
+            format!("failed to persist catalog: {err}"),
+            args.json,
+        );
+    }
+
+    if args.json {
+        print_json_or_exit(serde_json::json!({
+            "ok": true,
+            "operation": "destroy",
+            "pool": target.pool,
+            "dataset": name,
+            "force": args.force,
+            "destroyed_entries": destroyed_entries,
+            "admission": {
+                "children": admission.child_count,
+                "snapshots": admission.snapshot_count,
+                "live_mount": admission.live_mount,
+            },
+        }));
+    } else {
+        println!("dataset '{name}' destroyed");
     }
 }
 
@@ -1637,6 +2116,113 @@ fn hex_to_salt(hex: &str) -> Result<[u8; tidefs_encryption::key_hierarchy::SALT_
         salt[i] = byte;
     }
     Ok(salt)
+}
+
+#[cfg(test)]
+mod dataset_lifecycle_command_tests {
+    use super::*;
+
+    fn create_entry(catalog: &mut DatasetCatalog, path: &str, dataset_type: DatasetType) {
+        catalog
+            .create(
+                path,
+                dataset_id_from_name(path),
+                dataset_type,
+                1,
+                PropertySet::new().to_key_value_blob(),
+                DatasetFlags::default_create(),
+                SyncGuarantee::Local,
+            )
+            .unwrap();
+    }
+
+    fn catalog_with(paths: &[(&str, DatasetType)]) -> DatasetCatalog {
+        let mut catalog = DatasetCatalog::new();
+        create_entry(&mut catalog, "root", DatasetType::Filesystem);
+        for (path, dataset_type) in paths {
+            create_entry(&mut catalog, path, *dataset_type);
+        }
+        catalog
+    }
+
+    #[test]
+    fn create_admission_accepts_new_dataset_and_rejects_duplicate() {
+        let catalog = catalog_with(&[("data", DatasetType::Filesystem)]);
+
+        assert!(require_create_admission(&catalog, "logs", "root").is_ok());
+        let duplicate = require_create_admission(&catalog, "data", "root").unwrap_err();
+        assert!(duplicate.contains("already exists"));
+    }
+
+    #[test]
+    fn create_admission_rejects_missing_parent() {
+        let catalog = catalog_with(&[]);
+
+        let err = require_create_admission(&catalog, "missing/child", "missing").unwrap_err();
+        assert!(err.contains("parent dataset 'missing'"));
+    }
+
+    #[test]
+    fn list_rows_filter_by_type_and_keep_json_columns() {
+        let catalog = catalog_with(&[
+            ("data", DatasetType::Filesystem),
+            ("vol", DatasetType::Volume),
+        ]);
+
+        let rows =
+            dataset_rows_from_catalog("tank", &catalog, Some(DatasetTypeArg::Volume), Some(4096));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "vol");
+
+        let json = dataset_rows_json(&rows);
+        assert_eq!(json[0]["pool"], "tank");
+        assert_eq!(json[0]["name"], "tank/vol");
+        assert_eq!(json[0]["type"], "volume");
+        assert_eq!(json[0]["used"], serde_json::Value::Null);
+        assert_eq!(json[0]["available"], serde_json::json!(4096));
+        assert_eq!(json[0]["mountpoint"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn destroy_admission_requires_force_for_children_snapshots_or_live_mount() {
+        let catalog = catalog_with(&[
+            ("data", DatasetType::Filesystem),
+            ("data/child", DatasetType::Filesystem),
+        ]);
+        let mounted_dataset_id = *dataset_id_from_name("data").as_bytes();
+
+        let admission =
+            destroy_admission_from_catalog(&catalog, "data", 1, mounted_dataset_id).unwrap();
+        assert!(admission.has_hazards());
+        let err = require_destroy_admission("data", &admission, false).unwrap_err();
+        assert!(err.contains("--force"));
+        assert!(require_destroy_admission("data", &admission, true).is_ok());
+    }
+
+    #[test]
+    fn forced_destroy_removes_descendants_before_parent() {
+        let mut catalog = catalog_with(&[
+            ("data", DatasetType::Filesystem),
+            ("data/child", DatasetType::Filesystem),
+            ("data/child/grand", DatasetType::Filesystem),
+        ]);
+
+        let destroyed = destroy_catalog_subtree(&mut catalog, "data").unwrap();
+        assert_eq!(destroyed, 3);
+        assert!(!catalog.contains("data"));
+        assert!(!catalog.contains("data/child"));
+        assert!(catalog.contains("root"));
+    }
+
+    #[test]
+    fn property_assignment_parser_covers_set_get_admission() {
+        let assignment = parse_property_assignment_or_exit("layout.recordsize=128K", "set", true);
+        assert_eq!(assignment.key, "layout.recordsize");
+        assert_eq!(assignment.value, PropertyValue::Size(131_072));
+
+        assert!(parser::parse_property_key("access.readonly").is_ok());
+        assert!(parser::parse_property_key("unknown.property").is_err());
+    }
 }
 
 #[cfg(test)]

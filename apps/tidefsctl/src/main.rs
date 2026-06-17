@@ -18,6 +18,7 @@
 //! imported. Do not make pool-name usability by reopening runtime metadata
 //! behind the live owner.
 mod commands;
+mod parser;
 
 use std::path::PathBuf;
 use std::process;
@@ -1183,22 +1184,53 @@ mod tests {
     // -- Dataset CLI parse tests ------------------------------------------
 
     #[test]
-    fn cli_parse_dataset_create_positional_pool() {
+    fn cli_parse_dataset_create_target_with_options() {
         use clap::Parser;
-        let args = Cli::try_parse_from(["tidefsctl", "dataset", "create", "mypool", "data"]);
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "dataset",
+            "create",
+            "tank/data",
+            "--mountpoint",
+            "/srv/data",
+            "--property",
+            "access.readonly=on",
+            "--feature",
+            "org.tidefs:compression_zstd",
+            "--json",
+        ]);
         assert!(
             args.is_ok(),
-            "dataset create with positional pool should parse"
+            "dataset create with target, mountpoint, properties, features, and json should parse"
         );
     }
 
     #[test]
-    fn cli_parse_dataset_list_positional_pool() {
+    fn cli_parse_dataset_create_rejects_legacy_pool_name_shape() {
         use clap::Parser;
-        let args = Cli::try_parse_from(["tidefsctl", "dataset", "list", "mypool"]);
+        let args = Cli::try_parse_from(["tidefsctl", "dataset", "create", "mypool", "data"]);
+        assert!(
+            args.is_err(),
+            "dataset create no longer accepts separate pool and name positionals"
+        );
+    }
+
+    #[test]
+    fn cli_parse_dataset_list_filters() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "dataset",
+            "list",
+            "--pool",
+            "mypool",
+            "--type",
+            "filesystem",
+            "--json",
+        ]);
         assert!(
             args.is_ok(),
-            "dataset list with positional pool should parse"
+            "dataset list with pool/type filters and json should parse"
         );
     }
 
@@ -1221,10 +1253,44 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_dataset_rejects_pool_flag() {
+    fn cli_parse_dataset_destroy_target_force_json() {
         use clap::Parser;
-        let args = Cli::try_parse_from(["tidefsctl", "dataset", "list", "--pool", "mypool"]);
-        assert!(args.is_err(), "dataset list --pool should not parse");
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "dataset",
+            "destroy",
+            "tank/data",
+            "--force",
+            "--json",
+        ]);
+        assert!(
+            args.is_ok(),
+            "dataset destroy target with force and json should parse"
+        );
+    }
+
+    #[test]
+    fn cli_parse_dataset_get_set_targets() {
+        use clap::Parser;
+        let get = Cli::try_parse_from([
+            "tidefsctl",
+            "dataset",
+            "get",
+            "tank/data",
+            "access.readonly",
+            "--json",
+        ]);
+        assert!(get.is_ok(), "dataset get target property should parse");
+
+        let set = Cli::try_parse_from([
+            "tidefsctl",
+            "dataset",
+            "set",
+            "tank/data",
+            "access.readonly=off",
+            "--json",
+        ]);
+        assert!(set.is_ok(), "dataset set target assignment should parse");
     }
 
     // ── Pool mount CLI parse tests ─────────────────────────────────
