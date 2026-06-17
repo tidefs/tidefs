@@ -24,7 +24,7 @@ use tidefs_intent_log::{
 
 mod committed_root;
 pub mod create;
-use committed_root::{recover_committed_root_from_file, CommittedRoot};
+use committed_root::{recover_committed_root_from_file, CommittedRoot, CommittedRootError};
 #[cfg(test)]
 use tidefs_encryption::StoreKey;
 
@@ -115,9 +115,9 @@ pub enum ImportError {
         /// Pool UUID.
         pool_uuid: [u8; 16],
     },
-    /// Feature flags in the superblock require a newer software version.
+    /// Feature flags in the label require a newer or different importer.
     IncompatibleFeatures {
-        /// Bitmask of unsupported incompat features.
+        /// Bitmask of unsupported feature bits.
         unsupported: u64,
     },
     /// The intent log could not be replayed.
@@ -191,7 +191,7 @@ impl std::fmt::Display for ImportError {
             Self::IncompatibleFeatures { unsupported } => {
                 write!(
                     f,
-                    "incompatible feature flags 0x{unsupported:016x} require a newer version"
+                    "unsupported feature flags 0x{unsupported:016x} require a different importer"
                 )
             }
             Self::IntentLogReplay { msg } => {
@@ -274,6 +274,50 @@ pub struct ImportedPool {
 }
 
 // ---------------------------------------------------------------------------
+// LabelAgreementReport — bounded member-label authority evidence
+// ---------------------------------------------------------------------------
+
+/// Bounded label-agreement evidence gathered before replay or mount readiness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LabelAgreementReport {
+    /// One entry per candidate member device supplied for import.
+    members: Vec<LabelAgreementMember>,
+}
+
+/// Import-critical authority read from one candidate member label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LabelAgreementMember {
+    /// Device path the evidence was read from.
+    device_path: PathBuf,
+    /// Pool UUID recorded in the label.
+    pool_uuid: [u8; 16],
+    /// Member UUID recorded in the label.
+    member_uuid: [u8; 16],
+    /// Device index recorded in the label.
+    device_index: u32,
+    /// Topology generation recorded in the label.
+    topology_generation: u64,
+    /// Pool member count recorded in the label.
+    device_count: u32,
+    /// Committed txg recorded in the label.
+    committed_txg: u64,
+    /// Authenticated committed-root evidence recovered from the member.
+    committed_root: Option<CommittedRoot>,
+    /// Pool-wide redundancy policy recorded in the label.
+    redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy,
+    /// Device class recorded in the label.
+    device_class: tidefs_types_pool_label_core::DeviceClass,
+    /// Incompatible feature flags recorded in the label.
+    features_incompat: u64,
+    /// Read-only-compatible feature flags recorded in the label.
+    features_ro_compat: u64,
+    /// Compatible feature flags recorded in the label.
+    features_compat: u64,
+    /// Pool state recorded in the label.
+    pool_state: tidefs_types_pool_label_core::PoolState,
+}
+
+// ---------------------------------------------------------------------------
 // pool_import — public entry point
 // ---------------------------------------------------------------------------
 
@@ -293,6 +337,9 @@ pub fn pool_import(
     encryption_key: Option<tidefs_encryption::StoreKey>,
     min_epoch: Option<u64>,
 ) -> Result<ImportedPool, ImportError> {
+    let label_agreement = build_label_agreement_report_for_paths(device_paths, min_epoch)?;
+    verify_label_agreement(&label_agreement)?;
+
     let entries = tidefs_pool_scan::scan_labels(device_paths)
         .map_err(|e| ImportError::Assembly { msg: e.to_string() })?;
     let config = tidefs_pool_scan::PoolAssembler::assemble(&entries, None)
@@ -604,6 +651,421 @@ impl DeviceHandle {
     }
 }
 
+const SUPPORTED_INCOMPAT_FEATURES: u64 = tidefs_types_pool_label_core::features::POOL_LABEL_V1
+    | tidefs_types_pool_label_core::features::ENCRYPTION_INCOMPAT;
+const SUPPORTED_RO_COMPAT_FEATURES: u64 = 0;
+const SUPPORTED_COMPAT_FEATURES: u64 = tidefs_types_pool_label_core::features::DEVICE_CLASS_AWARE
+    | tidefs_types_pool_label_core::features::SPARE_POLICY_SUPPORTED
+    | tidefs_types_pool_label_core::features::DEVICE_HEALTH_STATE
+    | tidefs_types_pool_label_core::features::CLUSTER_POOL_COMPAT
+    | tidefs_types_pool_label_core::features::POOL_REDUNDANCY_POLICY;
+
+fn build_label_agreement_report_for_paths(
+    device_paths: &[PathBuf],
+    min_epoch: Option<u64>,
+) -> Result<LabelAgreementReport, ImportError> {
+    let mut members = Vec::with_capacity(device_paths.len());
+
+    for device_path in device_paths {
+        let mut file = File::open(device_path).map_err(|e| ImportError::DeviceOpen {
+            device_path: device_path.clone(),
+            msg: e.to_string(),
+        })?;
+        let label = read_member_label_from_file(&mut file, device_path)?;
+        let committed_root = recover_member_committed_root(&mut file, device_path, min_epoch)?;
+        members.push(label_agreement_member(
+            device_path.clone(),
+            label,
+            committed_root,
+        ));
+    }
+
+    Ok(LabelAgreementReport { members })
+}
+
+fn build_label_agreement_report_for_devices(
+    devices: &mut [DeviceHandle],
+    min_epoch: Option<u64>,
+) -> Result<LabelAgreementReport, ImportError> {
+    let mut members = Vec::with_capacity(devices.len());
+
+    for device in devices {
+        let label_buf = device.read_label_bytes()?;
+        let label = tidefs_types_pool_label_core::decode_label(&label_buf).map_err(|e| {
+            ImportError::Io {
+                device_path: Some(device.device_path.clone()),
+                msg: format!("decode label: {e}"),
+            }
+        })?;
+        let committed_root =
+            recover_member_committed_root(&mut device.file, &device.device_path, min_epoch)?;
+        members.push(label_agreement_member(
+            device.device_path.clone(),
+            label,
+            committed_root,
+        ));
+    }
+
+    Ok(LabelAgreementReport { members })
+}
+
+fn read_member_label_from_file(
+    file: &mut File,
+    device_path: &Path,
+) -> Result<tidefs_types_pool_label_core::PoolLabelV1, ImportError> {
+    let mut label_buf = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
+    file.seek(SeekFrom::Start(0)).map_err(|e| ImportError::Io {
+        device_path: Some(device_path.to_path_buf()),
+        msg: format!("seek to label 0: {e}"),
+    })?;
+    file.read_exact(&mut label_buf)
+        .map_err(|e| ImportError::Io {
+            device_path: Some(device_path.to_path_buf()),
+            msg: format!("read label 0: {e}"),
+        })?;
+    tidefs_types_pool_label_core::decode_label(&label_buf).map_err(|e| ImportError::Io {
+        device_path: Some(device_path.to_path_buf()),
+        msg: format!("decode label: {e}"),
+    })
+}
+
+fn recover_member_committed_root(
+    file: &mut File,
+    device_path: &Path,
+    min_epoch: Option<u64>,
+) -> Result<Option<CommittedRoot>, ImportError> {
+    recover_committed_root_from_file(file, min_epoch).map_err(|err| match err {
+        CommittedRootError::StaleRoot {
+            recovered_epoch,
+            min_epoch,
+        } => ImportError::StaleRoot {
+            recovered_epoch,
+            min_epoch,
+        },
+        err => ImportError::CommittedRootRecovery {
+            msg: format!(
+                "commit-record recovery failed on {}: {err}",
+                device_path.display()
+            ),
+        },
+    })
+}
+
+fn label_agreement_member(
+    device_path: PathBuf,
+    label: tidefs_types_pool_label_core::PoolLabelV1,
+    committed_root: Option<CommittedRoot>,
+) -> LabelAgreementMember {
+    LabelAgreementMember {
+        device_path,
+        pool_uuid: label.pool_guid,
+        member_uuid: label.device_guid,
+        device_index: label.device_index,
+        topology_generation: label.topology_generation,
+        device_count: label.device_count,
+        committed_txg: label.commit_group,
+        committed_root,
+        redundancy_policy: label.redundancy_policy,
+        device_class: label.device_class,
+        features_incompat: label.features_incompat,
+        features_ro_compat: label.features_ro_compat,
+        features_compat: label.features_compat,
+        pool_state: label.pool_state,
+    }
+}
+
+fn verify_label_agreement(report: &LabelAgreementReport) -> Result<(), ImportError> {
+    if report.members.is_empty() {
+        return Err(ImportError::Io {
+            device_path: None,
+            msg: "no candidate member labels supplied for import".to_string(),
+        });
+    }
+
+    for member in &report.members {
+        let unsupported = member.features_incompat & !SUPPORTED_INCOMPAT_FEATURES;
+        if unsupported != 0 {
+            return Err(ImportError::IncompatibleFeatures { unsupported });
+        }
+
+        let unsupported = member.features_ro_compat & !SUPPORTED_RO_COMPAT_FEATURES;
+        if unsupported != 0 {
+            return Err(ImportError::IncompatibleFeatures { unsupported });
+        }
+
+        let unsupported = member.features_compat & !SUPPORTED_COMPAT_FEATURES;
+        if unsupported != 0 {
+            return Err(ImportError::IncompatibleFeatures { unsupported });
+        }
+    }
+
+    ensure_pool_uuids_agree(report)?;
+    ensure_topology_generations_agree(report)?;
+    ensure_device_counts_agree(report)?;
+    ensure_pool_states_agree(report)?;
+    ensure_committed_roots_agree(report)?;
+    ensure_redundancy_policies_agree(report)?;
+    ensure_device_classes_agree(report)?;
+    ensure_feature_flags_agree(report)?;
+
+    Ok(())
+}
+
+fn ensure_pool_uuids_agree(report: &LabelAgreementReport) -> Result<(), ImportError> {
+    let first = report.members[0].pool_uuid;
+    if report
+        .members
+        .iter()
+        .any(|member| member.pool_uuid != first)
+    {
+        return Err(ImportError::SuperblockDisagreement {
+            field: "pool_uuid".to_string(),
+            values: report
+                .members
+                .iter()
+                .map(|member| hex_uuid(&member.pool_uuid))
+                .collect(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_topology_generations_agree(report: &LabelAgreementReport) -> Result<(), ImportError> {
+    let first = report.members[0].topology_generation;
+    if report
+        .members
+        .iter()
+        .any(|member| member.topology_generation != first)
+    {
+        return Err(ImportError::SuperblockDisagreement {
+            field: "topology_generation".to_string(),
+            values: report
+                .members
+                .iter()
+                .map(|member| member.topology_generation.to_string())
+                .collect(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_device_counts_agree(report: &LabelAgreementReport) -> Result<(), ImportError> {
+    let first = report.members[0].device_count;
+    if report
+        .members
+        .iter()
+        .any(|member| member.device_count != first)
+    {
+        return Err(ImportError::SuperblockDisagreement {
+            field: "device_count".to_string(),
+            values: report
+                .members
+                .iter()
+                .map(|member| member.device_count.to_string())
+                .collect(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_pool_states_agree(report: &LabelAgreementReport) -> Result<(), ImportError> {
+    let first = report.members[0].pool_state;
+    if report
+        .members
+        .iter()
+        .any(|member| member.pool_state != first)
+    {
+        return Err(ImportError::SuperblockDisagreement {
+            field: "pool_state".to_string(),
+            values: report
+                .members
+                .iter()
+                .map(|member| member.pool_state.to_string())
+                .collect(),
+        });
+    }
+    if !first.is_importable() {
+        return Err(ImportError::BadPoolState {
+            state: first.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_committed_roots_agree(report: &LabelAgreementReport) -> Result<(), ImportError> {
+    let first_txg = report.members[0].committed_txg;
+    if report
+        .members
+        .iter()
+        .any(|member| member.committed_txg != first_txg)
+    {
+        let min = report
+            .members
+            .iter()
+            .map(|member| member.committed_txg)
+            .min()
+            .unwrap_or(0);
+        let max = report
+            .members
+            .iter()
+            .map(|member| member.committed_txg)
+            .max()
+            .unwrap_or(0);
+        if min < max {
+            return Err(ImportError::StaleRoot {
+                recovered_epoch: min,
+                min_epoch: max,
+            });
+        }
+        return Err(ImportError::SuperblockDisagreement {
+            field: "committed_txg".to_string(),
+            values: report
+                .members
+                .iter()
+                .map(|member| member.committed_txg.to_string())
+                .collect(),
+        });
+    }
+
+    let any_missing_required = report
+        .members
+        .iter()
+        .any(|member| member.committed_txg > 0 && member.committed_root.is_none());
+    if any_missing_required {
+        return Err(ImportError::CommittedRootNotFound);
+    }
+
+    let first_root = &report.members[0].committed_root;
+    if report
+        .members
+        .iter()
+        .any(|member| &member.committed_root != first_root)
+    {
+        let mut epochs: Vec<u64> = report
+            .members
+            .iter()
+            .filter_map(|member| member.committed_root.as_ref().map(|root| root.epoch_number))
+            .collect();
+        epochs.sort_unstable();
+        if let (Some(min), Some(max)) = (epochs.first(), epochs.last()) {
+            if min < max {
+                return Err(ImportError::StaleRoot {
+                    recovered_epoch: *min,
+                    min_epoch: *max,
+                });
+            }
+        }
+        return Err(ImportError::SuperblockDisagreement {
+            field: "committed_root".to_string(),
+            values: report.members.iter().map(committed_root_value).collect(),
+        });
+    }
+
+    for member in &report.members {
+        if let Some(root) = &member.committed_root {
+            if root.epoch_number != member.committed_txg {
+                return Err(ImportError::SuperblockDisagreement {
+                    field: "committed_root".to_string(),
+                    values: report.members.iter().map(committed_root_value).collect(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_redundancy_policies_agree(report: &LabelAgreementReport) -> Result<(), ImportError> {
+    let first = report.members[0].redundancy_policy;
+    if report
+        .members
+        .iter()
+        .any(|member| member.redundancy_policy != first)
+    {
+        return Err(ImportError::SuperblockDisagreement {
+            field: "redundancy_policy".to_string(),
+            values: report
+                .members
+                .iter()
+                .map(|member| member.redundancy_policy.to_string())
+                .collect(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_device_classes_agree(report: &LabelAgreementReport) -> Result<(), ImportError> {
+    let first = report.members[0].device_class;
+    if report
+        .members
+        .iter()
+        .any(|member| member.device_class != first)
+    {
+        return Err(ImportError::SuperblockDisagreement {
+            field: "device_class".to_string(),
+            values: report
+                .members
+                .iter()
+                .map(|member| member.device_class.to_string())
+                .collect(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_feature_flags_agree(report: &LabelAgreementReport) -> Result<(), ImportError> {
+    let first = &report.members[0];
+    if report.members.iter().any(|member| {
+        member.features_incompat != first.features_incompat
+            || member.features_ro_compat != first.features_ro_compat
+            || member.features_compat != first.features_compat
+    }) {
+        return Err(ImportError::SuperblockDisagreement {
+            field: "feature_flags".to_string(),
+            values: report
+                .members
+                .iter()
+                .map(|member| {
+                    format!(
+                        "incompat=0x{:016x},ro=0x{:016x},compat=0x{:016x}",
+                        member.features_incompat, member.features_ro_compat, member.features_compat
+                    )
+                })
+                .collect(),
+        });
+    }
+    Ok(())
+}
+
+fn committed_root_value(member: &LabelAgreementMember) -> String {
+    match &member.committed_root {
+        Some(root) => format!(
+            "{}:member={} index={} txg={} root_epoch={} root_hash={}",
+            member.device_path.display(),
+            hex_uuid(&member.member_uuid),
+            member.device_index,
+            member.committed_txg,
+            root.epoch_number,
+            hex_digest_prefix(&root.commitment_hash),
+        ),
+        None => format!(
+            "{}:member={} index={} txg={} root=none",
+            member.device_path.display(),
+            hex_uuid(&member.member_uuid),
+            member.device_index,
+            member.committed_txg
+        ),
+    }
+}
+
+fn hex_digest_prefix(digest: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(16);
+    for b in &digest[..8] {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 // ---------------------------------------------------------------------------
 // PoolImport — the main import driver
 // ---------------------------------------------------------------------------
@@ -844,137 +1306,26 @@ impl PoolImport {
             });
         }
 
-        // Read labels from all devices and collect superblock fields.
-        let mut pool_uuids: Vec<[u8; 16]> = Vec::new();
-        let mut pool_states: Vec<tidefs_types_pool_label_core::PoolState> = Vec::new();
-        let mut topology_generations: Vec<u64> = Vec::new();
-        let mut device_counts: Vec<u32> = Vec::new();
-        let mut redundancy_policies: Vec<tidefs_types_pool_label_core::PoolRedundancyPolicy> =
-            Vec::new();
-        let mut commit_groups: Vec<u64> = Vec::new();
-        let mut incompat_flags: Vec<u64> = Vec::new();
+        let report = build_label_agreement_report_for_devices(&mut self.devices, self.min_epoch)?;
+        verify_label_agreement(&report)?;
+        let first = &report.members[0];
 
-        for device in &mut self.devices {
-            let buf = device.read_label_bytes()?;
-            match tidefs_types_pool_label_core::decode_label(&buf) {
-                Ok(label) => {
-                    pool_uuids.push(label.pool_guid);
-                    pool_states.push(label.pool_state);
-                    topology_generations.push(label.topology_generation);
-                    device_counts.push(label.device_count);
-                    redundancy_policies.push(label.redundancy_policy);
-                    commit_groups.push(label.commit_group);
-                    incompat_flags.push(label.features_incompat);
-                }
-                Err(_) => {
-                    // Label read failed — skip for now.  The pool
-                    // assembler already validated labels during scan.
-                    // We proceed with what we have.
-                }
-            }
-        }
-
-        if pool_uuids.is_empty() {
-            return Err(ImportError::Io {
-                device_path: None,
-                msg: "no valid labels read from any device".to_string(),
-            });
-        }
-
-        // Cross-validate fields.
-
-        // All pool_uuids must match.
-        let first_uuid = pool_uuids[0];
-        for uuid in &pool_uuids {
-            if *uuid != first_uuid {
-                return Err(ImportError::SuperblockDisagreement {
-                    field: "pool_uuid".to_string(),
-                    values: pool_uuids.iter().map(hex_uuid).collect(),
-                });
-            }
-        }
-
-        // All pool states must match.
-        let first_state = pool_states[0];
-        for state in &pool_states {
-            if *state != first_state {
-                return Err(ImportError::SuperblockDisagreement {
-                    field: "pool_state".to_string(),
-                    values: pool_states.iter().map(|s| format!("{s}")).collect(),
-                });
-            }
-        }
-
-        // Topology generations must match.
-        let first_gen = topology_generations[0];
-        for gen in &topology_generations {
-            if *gen != first_gen {
-                return Err(ImportError::SuperblockDisagreement {
-                    field: "topology_generation".to_string(),
-                    values: topology_generations.iter().map(|g| g.to_string()).collect(),
-                });
-            }
-        }
-
-        // Device counts must match.
-        let first_count = device_counts[0];
-        for count in &device_counts {
-            if *count != first_count {
-                return Err(ImportError::SuperblockDisagreement {
-                    field: "device_count".to_string(),
-                    values: device_counts.iter().map(|c| c.to_string()).collect(),
-                });
-            }
-        }
-
-        // Pool-wide redundancy policy must agree across every member label.
-        // It is allocation policy identity, not a fixed vdev topology.
-        let first_policy = redundancy_policies[0];
-        for policy in &redundancy_policies {
-            if *policy != first_policy {
-                return Err(ImportError::SuperblockDisagreement {
-                    field: "redundancy_policy".to_string(),
-                    values: redundancy_policies
-                        .iter()
-                        .map(|policy| policy.to_string())
-                        .collect(),
-                });
-            }
-        }
-        if first_policy != self.pool_config.redundancy_policy {
+        if first.redundancy_policy != self.pool_config.redundancy_policy {
             return Err(ImportError::SuperblockDisagreement {
                 field: "redundancy_policy".to_string(),
                 values: vec![
                     format!("config={}", self.pool_config.redundancy_policy),
-                    format!("label={first_policy}"),
+                    format!("label={}", first.redundancy_policy),
                 ],
             });
         }
 
-        // Check for incompatible feature flags: only reject flags that are
-        // NOT in the known incompat set.  POOL_LABEL_V1 (0x01) is set by
-        // pool create and is supported by this version.
-        const KNOWN_INCOMPAT: u64 = tidefs_types_pool_label_core::features::POOL_LABEL_V1
-            | tidefs_types_pool_label_core::features::ENCRYPTION_INCOMPAT
-            | tidefs_types_pool_label_core::features::CLUSTER_POOL_INCOMPAT;
-        for flags in &incompat_flags {
-            let unknown = *flags & !KNOWN_INCOMPAT;
-            if unknown != 0 {
-                return Err(ImportError::IncompatibleFeatures {
-                    unsupported: unknown,
-                });
-            }
-        }
-
-        // Select the recovery commit_group: maximum across all labels.
-        let recovery_commit_group = commit_groups.iter().copied().max().unwrap_or(0);
-
         self.stats.superblock_verified = true;
 
         // Detect encrypted pool from label feature flags.
-        self.stats.encrypted = incompat_flags
-            .iter()
-            .any(|f| (*f & tidefs_types_pool_label_core::features::ENCRYPTION_INCOMPAT) != 0);
+        self.stats.encrypted = (first.features_incompat
+            & tidefs_types_pool_label_core::features::ENCRYPTION_INCOMPAT)
+            != 0;
 
         // Validate encryption key against label flags.
         if self.stats.encrypted && self.encryption_key.is_none() {
@@ -996,7 +1347,7 @@ impl PoolImport {
         });
 
         // Store the recovery commit_group for intent log replay.
-        self.recovery_commit_group = recovery_commit_group;
+        self.recovery_commit_group = first.committed_txg;
 
         Ok(())
     }
@@ -1011,49 +1362,15 @@ impl PoolImport {
     /// For read-only import, the committed root is still recovered
     /// (verification is cheap and provides confidence in pool integrity).
     fn recover_committed_root(&mut self) -> Result<(), ImportError> {
-        let mut best: Option<CommittedRoot> = None;
+        let report = build_label_agreement_report_for_devices(&mut self.devices, self.min_epoch)?;
+        verify_label_agreement(&report)?;
+        let root = report.members[0].committed_root.clone();
 
-        for device in &mut self.devices {
-            match recover_committed_root_from_file(&mut device.file, self.min_epoch) {
-                Ok(Some(root)) => match &best {
-                    Some(b) if root.epoch_number > b.epoch_number => {
-                        best = Some(root);
-                    }
-                    None => {
-                        best = Some(root);
-                    }
-                    _ => {}
-                },
-                Ok(None) => {
-                    // No commit records on this device -- skip.
-                }
-                Err(e) => {
-                    // Preserve the structured StaleRoot error for split-brain detection.
-                    if let crate::committed_root::CommittedRootError::StaleRoot {
-                        recovered_epoch,
-                        min_epoch,
-                    } = e
-                    {
-                        return Err(ImportError::StaleRoot {
-                            recovered_epoch,
-                            min_epoch,
-                        });
-                    }
-                    return Err(ImportError::CommittedRootRecovery {
-                        msg: format!(
-                            "commit-record recovery failed on {}: {e}",
-                            device.device_path.display()
-                        ),
-                    });
-                }
-            }
-        }
-
-        if best.is_none() && self.recovery_commit_group > 0 {
+        if root.is_none() && self.recovery_commit_group > 0 {
             return Err(ImportError::CommittedRootNotFound);
         }
 
-        self.recovered_root = best;
+        self.recovered_root = root;
         Ok(())
     }
 
@@ -1664,17 +1981,19 @@ mod tests {
 
     /// Write a valid TideFS pool label at the start of a file.
     fn write_test_label(file: &mut File, pool_name: &str) {
-        let label = PoolLabelV1::new([0xAAu8; 16], [0x01u8; 16], pool_name);
-        let sealed = seal_label(label).unwrap();
-        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
-        encode_label(&sealed, &mut buf).unwrap();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(&buf).unwrap();
-        // Pad to POOL_LABEL_SIZE so read_label_bytes works.
-        let padding =
-            vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE - POOL_LABEL_V1_EXT_WIRE_SIZE];
-        file.write_all(&padding).unwrap();
-        file.flush().unwrap();
+        write_test_label_with_authority(
+            file,
+            [0xAAu8; 16],
+            [0x01u8; 16],
+            pool_name,
+            0,
+            1,
+            PoolState::Active,
+            PoolRedundancyPolicy::replicated(1),
+            DeviceClass::Hdd,
+            0,
+            0,
+        );
     }
 
     fn write_test_label_for_device(
@@ -1708,11 +2027,44 @@ mod tests {
         state: PoolState,
         redundancy_policy: PoolRedundancyPolicy,
     ) {
+        write_test_label_with_authority(
+            file,
+            pool_guid,
+            device_guid,
+            pool_name,
+            device_index,
+            device_count,
+            state,
+            redundancy_policy,
+            DeviceClass::Hdd,
+            0,
+            0,
+        );
+    }
+
+    fn write_test_label_with_authority(
+        file: &mut File,
+        pool_guid: [u8; 16],
+        device_guid: [u8; 16],
+        pool_name: &str,
+        device_index: u32,
+        device_count: u32,
+        state: PoolState,
+        redundancy_policy: PoolRedundancyPolicy,
+        device_class: DeviceClass,
+        features_incompat: u64,
+        committed_txg: u64,
+    ) {
         let mut label = PoolLabelV1::new(pool_guid, device_guid, pool_name);
         label.pool_state = state;
         label.device_index = device_index;
         label.device_count = device_count;
+        label.topology_generation = 1;
         label.redundancy_policy = redundancy_policy;
+        label.device_class = device_class;
+        label.features_incompat = features_incompat;
+        label.commit_group = committed_txg;
+        label.label_commit_group = committed_txg;
         let sealed = seal_label(label).unwrap();
         let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         encode_label(&sealed, &mut buf).unwrap();
@@ -1722,6 +2074,42 @@ mod tests {
             vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE - POOL_LABEL_V1_EXT_WIRE_SIZE];
         file.write_all(&padding).unwrap();
         file.flush().unwrap();
+    }
+
+    fn write_committed_root_chain(file: &mut File, latest_epoch: u64) {
+        let mut records = Vec::with_capacity(latest_epoch as usize);
+        let mut prior_hash = None;
+        for epoch in 1..=latest_epoch {
+            let dirty_id = epoch * 11;
+            let commit_hash = tidefs_commit_group::seal_commit_hash(
+                epoch,
+                tidefs_commit_group::CommitGroupId(epoch),
+                prior_hash,
+                &[dirty_id],
+            );
+            records.push(crate::committed_root::ParsedCommitRecord {
+                epoch_number: epoch,
+                commit_group_id: epoch,
+                commit_hash,
+                prior_epoch_hash: prior_hash,
+                dirty_object_ids: vec![dirty_id],
+            });
+            prior_hash = Some(commit_hash);
+        }
+        let encoded = crate::committed_root::encode_commit_record_region(&records);
+        file.seek(SeekFrom::Start(
+            crate::committed_root::COMMIT_RECORD_REGION_OFFSET,
+        ))
+        .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.flush().unwrap();
+    }
+
+    fn read_label_state(path: &Path) -> PoolState {
+        let mut handle = DeviceHandle::open_ro(path, 0).unwrap();
+        let label = tidefs_types_pool_label_core::decode_label(&handle.read_label_bytes().unwrap())
+            .unwrap();
+        label.pool_state
     }
 
     // -- open_devices tests --
@@ -2055,6 +2443,297 @@ mod tests {
         assert_eq!(result.config.device_count, 1);
         assert!(result.stats.superblock_verified);
         assert!(!result.stats.read_only);
+    }
+
+    #[test]
+    fn pool_import_label_agreement_accepts_clean_multi_device_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = dir.path().join("device0");
+        let dev1 = dir.path().join("device1");
+        for path in [&dev0, &dev1] {
+            let f = File::create(path).unwrap();
+            f.set_len(2 * 1024 * 1024).unwrap();
+        }
+
+        let config = crate::create::PoolCreateConfig {
+            pool_name: "clean_multi".into(),
+            pool_guid: Some([0xC1u8; 16]),
+            redundancy: crate::create::RedundancyPolicy::replicated(2),
+            encryption_key: None,
+            clustered: false,
+        };
+        crate::create::PoolCreator::create_pool(&[dev0.clone(), dev1.clone()], &config).unwrap();
+
+        let imported =
+            pool_import(&[dev0, dev1], &dir.path().join("locks"), false, None, None).unwrap();
+        assert_eq!(imported.config.device_count, 2);
+        assert_eq!(imported.stats.committed_root_epoch, Some(1));
+        assert!(imported.stats.superblock_verified);
+    }
+
+    #[test]
+    fn pool_import_label_agreement_rejects_mixed_pool_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = dir.path().join("device0");
+        let dev1 = dir.path().join("device1");
+        {
+            let mut f = File::create(&dev0).unwrap();
+            write_test_label_with_authority(
+                &mut f,
+                [0xA0u8; 16],
+                [0x10u8; 16],
+                "mixed_uuid",
+                0,
+                2,
+                PoolState::Exported,
+                PoolRedundancyPolicy::replicated(1),
+                DeviceClass::Hdd,
+                0,
+                0,
+            );
+        }
+        {
+            let mut f = File::create(&dev1).unwrap();
+            write_test_label_with_authority(
+                &mut f,
+                [0xB0u8; 16],
+                [0x11u8; 16],
+                "mixed_uuid",
+                1,
+                2,
+                PoolState::Exported,
+                PoolRedundancyPolicy::replicated(1),
+                DeviceClass::Hdd,
+                0,
+                0,
+            );
+        }
+
+        match pool_import(
+            &[dev0.clone(), dev1.clone()],
+            &dir.path().join("locks"),
+            false,
+            None,
+            None,
+        )
+        .unwrap_err()
+        {
+            ImportError::SuperblockDisagreement { field, values } => {
+                assert_eq!(field, "pool_uuid");
+                assert_eq!(values.len(), 2);
+            }
+            err => panic!("expected pool_uuid disagreement, got {err}"),
+        }
+        assert_eq!(read_label_state(&dev0), PoolState::Exported);
+        assert_eq!(read_label_state(&dev1), PoolState::Exported);
+    }
+
+    #[test]
+    fn pool_import_label_agreement_rejects_stale_committed_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = dir.path().join("device0");
+        let dev1 = dir.path().join("device1");
+        {
+            let mut f = File::create(&dev0).unwrap();
+            write_test_label_with_authority(
+                &mut f,
+                [0xA1u8; 16],
+                [0x20u8; 16],
+                "stale_root",
+                0,
+                2,
+                PoolState::Exported,
+                PoolRedundancyPolicy::replicated(1),
+                DeviceClass::Hdd,
+                0,
+                2,
+            );
+            write_committed_root_chain(&mut f, 2);
+        }
+        {
+            let mut f = File::create(&dev1).unwrap();
+            write_test_label_with_authority(
+                &mut f,
+                [0xA1u8; 16],
+                [0x21u8; 16],
+                "stale_root",
+                1,
+                2,
+                PoolState::Exported,
+                PoolRedundancyPolicy::replicated(1),
+                DeviceClass::Hdd,
+                0,
+                1,
+            );
+            write_committed_root_chain(&mut f, 1);
+        }
+
+        match pool_import(&[dev0, dev1], &dir.path().join("locks"), false, None, None).unwrap_err()
+        {
+            ImportError::StaleRoot {
+                recovered_epoch,
+                min_epoch,
+            } => {
+                assert_eq!(recovered_epoch, 1);
+                assert_eq!(min_epoch, 2);
+            }
+            err => panic!("expected stale committed-root evidence, got {err}"),
+        }
+    }
+
+    #[test]
+    fn pool_import_label_agreement_rejects_redundancy_policy_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = dir.path().join("device0");
+        let dev1 = dir.path().join("device1");
+        {
+            let mut f = File::create(&dev0).unwrap();
+            write_test_label_with_authority(
+                &mut f,
+                [0xA2u8; 16],
+                [0x30u8; 16],
+                "bad_policy",
+                0,
+                2,
+                PoolState::Exported,
+                PoolRedundancyPolicy::replicated(2),
+                DeviceClass::Hdd,
+                0,
+                0,
+            );
+        }
+        {
+            let mut f = File::create(&dev1).unwrap();
+            write_test_label_with_authority(
+                &mut f,
+                [0xA2u8; 16],
+                [0x31u8; 16],
+                "bad_policy",
+                1,
+                2,
+                PoolState::Exported,
+                PoolRedundancyPolicy::erasure(1, 1),
+                DeviceClass::Hdd,
+                0,
+                0,
+            );
+        }
+
+        match pool_import(&[dev0, dev1], &dir.path().join("locks"), false, None, None).unwrap_err()
+        {
+            ImportError::SuperblockDisagreement { field, values } => {
+                assert_eq!(field, "redundancy_policy");
+                assert!(values.contains(&"replicated=2".to_string()));
+                assert!(values.contains(&"erasure=1+1".to_string()));
+            }
+            err => panic!("expected redundancy-policy disagreement, got {err}"),
+        }
+    }
+
+    #[test]
+    fn pool_import_label_agreement_rejects_device_class_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev0 = dir.path().join("device0");
+        let dev1 = dir.path().join("device1");
+        {
+            let mut f = File::create(&dev0).unwrap();
+            write_test_label_with_authority(
+                &mut f,
+                [0xA3u8; 16],
+                [0x40u8; 16],
+                "bad_class",
+                0,
+                2,
+                PoolState::Exported,
+                PoolRedundancyPolicy::replicated(1),
+                DeviceClass::Hdd,
+                0,
+                0,
+            );
+        }
+        {
+            let mut f = File::create(&dev1).unwrap();
+            write_test_label_with_authority(
+                &mut f,
+                [0xA3u8; 16],
+                [0x41u8; 16],
+                "bad_class",
+                1,
+                2,
+                PoolState::Exported,
+                PoolRedundancyPolicy::replicated(1),
+                DeviceClass::Ssd,
+                0,
+                0,
+            );
+        }
+
+        match pool_import(&[dev0, dev1], &dir.path().join("locks"), false, None, None).unwrap_err()
+        {
+            ImportError::SuperblockDisagreement { field, values } => {
+                assert_eq!(field, "device_class");
+                assert!(values.contains(&"HDD".to_string()));
+                assert!(values.contains(&"SSD".to_string()));
+            }
+            err => panic!("expected device-class disagreement, got {err}"),
+        }
+    }
+
+    #[test]
+    fn pool_import_label_agreement_rejects_destroyed_pool_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("device0");
+        {
+            let mut f = File::create(&dev_path).unwrap();
+            write_test_label_with_authority(
+                &mut f,
+                [0xA4u8; 16],
+                [0x50u8; 16],
+                "destroyed",
+                0,
+                1,
+                PoolState::Destroyed,
+                PoolRedundancyPolicy::replicated(1),
+                DeviceClass::Hdd,
+                0,
+                0,
+            );
+        }
+
+        match pool_import(&[dev_path], &dir.path().join("locks"), false, None, None).unwrap_err() {
+            ImportError::BadPoolState { state } => assert_eq!(state, "DESTROYED"),
+            err => panic!("expected destroyed pool-state rejection, got {err}"),
+        }
+    }
+
+    #[test]
+    fn pool_import_label_agreement_rejects_unsupported_feature_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("device0");
+        let unsupported = 1u64 << 63;
+        {
+            let mut f = File::create(&dev_path).unwrap();
+            write_test_label_with_authority(
+                &mut f,
+                [0xA5u8; 16],
+                [0x60u8; 16],
+                "bad_feature",
+                0,
+                1,
+                PoolState::Exported,
+                PoolRedundancyPolicy::replicated(1),
+                DeviceClass::Hdd,
+                unsupported,
+                0,
+            );
+        }
+
+        match pool_import(&[dev_path], &dir.path().join("locks"), false, None, None).unwrap_err() {
+            ImportError::IncompatibleFeatures { unsupported: found } => {
+                assert_eq!(found, unsupported);
+            }
+            err => panic!("expected unsupported feature rejection, got {err}"),
+        }
     }
 
     #[test]
