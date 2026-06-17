@@ -210,6 +210,15 @@
       "path": "traces/golden/model_runtime_smoke/pool_trace.jsonl",
       "schema": "pool_trace_v1",
       "sha256": "08725de02afb17eb482f925b1d6cb62d20e3c4c1dce80836c789d8bde20e85ec"
+    },
+    {
+      "description": "write-fsync-read vertical slice: create, write, fsync, read-back, remove (model-only harness)",
+      "expected_fingerprint": "f7c1ec1a4ca55ba4474f38363f9d11b319e2285a117323e59e28836b4a6755ae",
+      "id": "write_fsync_read_model",
+      "kind": "pool",
+      "path": "traces/write-fsync-read.trace",
+      "schema": "pool_trace_v1",
+      "sha256": "bebec92d2dd6c8c126259e2599a3e3cb0d62fa3e344b384172158c6e871aa038"
     }
   ],
   "manifest_version": 1

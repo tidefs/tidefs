@@ -526,6 +526,18 @@ impl TraceRunner {
                 Ok(Some(serde_json::json!({KEY_VALUE_B64: value_b64})))
             }
 
+            OP_FSYNC => {
+                let dataset = get_string_arg(args, KEY_DATASET)?;
+                let key = get_string_arg(args, KEY_KEY)?;
+                let path = format!("/{dataset}/{key}");
+                let fs = self.fs()?;
+                // fsync is a durability flush that is a no-op in the
+                // local trace runner; we only verify the file exists.
+                let _ = fs.lookup(&path)
+                    .map_err(|e| TraceError::FileSystem(format!("fsync {path}: {e}")))?;
+                Ok(None)
+            }
+
             OP_CREATE_SNAPSHOT => {
                 let name = get_string_arg(args, KEY_NAME)?;
                 let fs = self.fs_mut()?;
