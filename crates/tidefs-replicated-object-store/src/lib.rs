@@ -1225,6 +1225,86 @@ fn validate_read_plan_response_receipt(
     Ok(())
 }
 
+fn validate_put_named_receipt_authority(
+    key: tidefs_local_object_store::ObjectKey,
+    payload: &[u8],
+    receipt: PlacementReceiptRef,
+) -> Result<(), String> {
+    if receipt.is_synthetic() {
+        return Err("put-with-receipt authority is synthetic (generation zero)".into());
+    }
+    if !receipt.redundancy_policy.is_well_formed() {
+        return Err("put-with-receipt authority has malformed redundancy policy".into());
+    }
+    let required_targets = receipt.redundancy_policy.target_width();
+    if receipt.target_count < required_targets {
+        return Err(format!(
+            "put-with-receipt authority is under-width: targets={} required={required_targets}",
+            receipt.target_count
+        ));
+    }
+    if receipt.object_key != *key.as_bytes() {
+        return Err(format!(
+            "put-with-receipt authority object-key mismatch for object {}",
+            receipt.object_id
+        ));
+    }
+    if receipt.payload_len != payload.len() as u64 {
+        return Err(format!(
+            "put-with-receipt authority length mismatch for object {}: receipt={} actual={}",
+            receipt.object_id,
+            receipt.payload_len,
+            payload.len()
+        ));
+    }
+    let actual_digest: [u8; 32] = blake3::hash(payload).into();
+    if receipt.payload_digest != actual_digest {
+        return Err(format!(
+            "put-with-receipt authority digest mismatch for object {}",
+            receipt.object_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recorded_put_receipt_authority(
+    expected: PlacementReceiptRef,
+    recorded: PlacementReceiptRef,
+) -> Result<(), String> {
+    if recorded.is_synthetic() {
+        return Err(format!(
+            "recorded put-with-receipt authority for object {} is synthetic",
+            expected.object_id
+        ));
+    }
+    if !recorded.redundancy_policy.is_well_formed() {
+        return Err(format!(
+            "recorded put-with-receipt authority for object {} has malformed redundancy policy",
+            expected.object_id
+        ));
+    }
+    if recorded.object_id != expected.object_id
+        || recorded.object_key != expected.object_key
+        || recorded.receipt_epoch != expected.receipt_epoch
+        || recorded.redundancy_policy != expected.redundancy_policy
+        || recorded.target_count != expected.target_count
+        || recorded.payload_len != expected.payload_len
+        || recorded.payload_digest != expected.payload_digest
+    {
+        return Err(format!(
+            "recorded put-with-receipt authority for object {} does not match the requested authority",
+            expected.object_id
+        ));
+    }
+    if recorded.receipt_generation < expected.receipt_generation {
+        return Err(format!(
+            "recorded put-with-receipt authority for object {} has stale generation {} below requested {}",
+            expected.object_id, recorded.receipt_generation, expected.receipt_generation
+        ));
+    }
+    Ok(())
+}
+
 fn required_planned_read_receipt(
     plan: &ReplicatedReadPlan,
     result: &TransportPlannedReadResult,
@@ -1901,6 +1981,186 @@ impl TransportReplicatedStore {
                 }
                 Err(e) => {
                     tracing::warn!("replica node {}: send put failed: {e}", replica.node_id);
+                }
+            }
+        }
+
+        let quorum_reached = acks >= self.config.write_quorum;
+        let fully_committed = quorum_reached && acks >= self.config.total_replicas;
+
+        if fully_committed {
+            self.stats.bytes_written += payload.len() as u64;
+            self.stats.object_count += 1;
+            self.stats.committed_writes += 1;
+        } else if quorum_reached {
+            self.stats.bytes_written += payload.len() as u64;
+            self.stats.object_count += 1;
+            self.stats.degraded_writes += 1;
+        } else {
+            drop(target_replicas);
+            self.restore_primary_after_failed_mutation(&name, key, previous_payload.as_deref());
+            Self::restore_acked_replicas_after_failed_mutation(
+                &mut self.transport,
+                &name_str,
+                previous_payload.as_deref(),
+                &acked_replicas,
+            );
+            self.stats.failed_writes += 1;
+        }
+
+        Ok(TransportReplicatedPutResult {
+            key,
+            acks,
+            total_targets,
+            quorum_size: self.config.write_quorum,
+            quorum_reached,
+            fully_committed,
+        })
+    }
+
+    /// Put an object identified by `name` into the replicated store with
+    /// durable placement receipt authority.
+    ///
+    /// The object is written to the local primary store first, then the
+    /// receipt-bearing write is fanned out to all connected remote replicas
+    /// over the Control session using the `PutWithReceipt` protocol. Each
+    /// replica validates the receipt before accepting the payload and returns
+    /// its own pool-backed receipt in the acknowledgment.
+    ///
+    /// Use this method when a pool-backed primary has produced a
+    /// `PlacementReceiptRef` and the caller wants replicas to record the
+    /// same receipt authority rather than synthesizing new placements.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the primary write fails.
+    pub fn put_named_with_receipt(
+        &mut self,
+        name: impl AsRef<[u8]>,
+        payload: &[u8],
+        placement_receipt_ref: PlacementReceiptRef,
+    ) -> Result<TransportReplicatedPutResult, String> {
+        use tidefs_local_object_store::ObjectKey;
+
+        let name_str = String::from_utf8_lossy(name.as_ref()).to_string();
+        let key = ObjectKey::from_name(&name);
+        validate_put_named_receipt_authority(key, payload, placement_receipt_ref)?;
+        let previous_payload = self
+            .primary
+            .get(key)
+            .map_err(|e| format!("primary pre-write read failed: {e}"))?;
+
+        // Write to local primary first
+        self.primary
+            .put_named(&name, payload)
+            .map_err(|e| format!("primary write failed: {e}"))?;
+
+        // Select which replicas to target. When placement is configured,
+        // only write to the placed replica set; otherwise fan out to all.
+        let target_replicas: Vec<&TransportReplica> = if let Some(ref placement) = self.placement {
+            let node_ids: Vec<u64> = self.replicas.iter().map(|r| r.node_id).collect();
+            match placement.resolve_write_targets(key.as_bytes(), &node_ids) {
+                Ok(targets) => self
+                    .replicas
+                    .iter()
+                    .filter(|r| targets.iter().any(|t| t.node_id == r.node_id))
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        "placement resolve failed for put_with_receipt: {e}; falling back to all replicas"
+                    );
+                    self.replicas.iter().collect()
+                }
+            }
+        } else {
+            self.replicas.iter().collect()
+        };
+
+        let total_targets = 1 + target_replicas.len();
+        let mut acks: usize = 1; // primary counts
+        let mut acked_replicas: Vec<(u64, SessionId)> = Vec::new();
+
+        // Fan out to targeted replicas over Control (e1) session using
+        // PutWithReceipt to carry durable placement authority.
+        for replica in &target_replicas {
+            let msg = ReplicationMessage::PutWithReceipt {
+                name: name_str.clone(),
+                payload: payload.to_vec(),
+                placement_receipt_ref,
+            };
+
+            match send_replication_msg(&mut self.transport, replica.control_session_id, &msg) {
+                Ok(()) => {
+                    match Self::recv_replication_ack_bounded(
+                        &mut self.transport,
+                        replica.control_session_id,
+                    ) {
+                        Ok(ReplicationMessage::PutWithReceiptAck {
+                            success: true,
+                            recorded_receipt_ref: Some(recorded_receipt_ref),
+                            ..
+                        }) => {
+                            match validate_recorded_put_receipt_authority(
+                                placement_receipt_ref,
+                                recorded_receipt_ref,
+                            ) {
+                                Ok(()) => {
+                                    acks += 1;
+                                    acked_replicas
+                                        .push((replica.node_id, replica.control_session_id));
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "replica node {}: PutWithReceipt ack receipt invalid: {error}",
+                                        replica.node_id
+                                    );
+                                }
+                            }
+                        }
+                        Ok(ReplicationMessage::PutWithReceiptAck {
+                            success: true,
+                            recorded_receipt_ref: None,
+                            ..
+                        }) => {
+                            tracing::warn!(
+                                "replica node {}: PutWithReceipt ack omitted recorded receipt",
+                                replica.node_id
+                            );
+                        }
+                        Ok(ReplicationMessage::PutWithReceiptAck { success: false, .. }) => {
+                            tracing::warn!(
+                                "replica node {}: receipt-authorized write rejected",
+                                replica.node_id
+                            );
+                        }
+                        Ok(other) => {
+                            tracing::warn!(
+                                "replica node {}: unexpected response to PutWithReceipt: {other:?}",
+                                replica.node_id
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "replica node {}: PutWithReceipt ack recv failed: {e}",
+                                replica.node_id
+                            );
+                            if let Err(close_err) = self.transport.close_session(
+                                replica.control_session_id,
+                                SessionCloseReason::TransportError,
+                            ) {
+                                tracing::warn!(
+                                    "replica node {}: close failed session after PutWithReceipt ack error: {close_err}",
+                                    replica.node_id
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "replica node {}: send PutWithReceipt failed: {e}",
+                        replica.node_id
+                    );
                 }
             }
         }
@@ -6909,6 +7169,320 @@ mod tests {
             assert_eq!(decoded.payload, payload);
             assert_eq!(decoded.object_id, 1);
             assert_eq!(decoded.segment_offset, 0);
+        }
+
+        // ── put_named_with_receipt tests ────────────────────────────
+
+        #[test]
+        fn put_named_with_receipt_no_replicas_stores_locally() {
+            // Primary-only store: the receipt-authorized write should succeed
+            // with no fan-out needed. Quorum of 1 is met by the local write.
+            let tmp = tempfile::TempDir::with_prefix("rep-obj-pnwr-").unwrap();
+            let mut store = TransportReplicatedStore::open(
+                tmp.path(),
+                1u64,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let payload = b"receipt-authorized write";
+            let key = tidefs_local_object_store::ObjectKey::from_name("receipt-test");
+            let receipt = placement_receipt_ref(42, &key, payload, 1);
+
+            let result = store
+                .put_named_with_receipt("receipt-test", payload, receipt)
+                .expect("put_named_with_receipt should succeed");
+
+            assert!(result.quorum_reached);
+            assert!(result.fully_committed);
+            assert_eq!(result.acks, 1);
+            assert_eq!(result.total_targets, 1);
+
+            // Verify data was stored locally
+            let read_back = store
+                .get_local("receipt-test")
+                .expect("get_local should succeed")
+                .expect("object should exist");
+            assert_eq!(read_back, payload);
+        }
+
+        #[test]
+        fn put_named_with_receipt_rejects_synthetic_receipt_without_write() {
+            let tmp = tempfile::TempDir::with_prefix("rep-obj-pnwr-synth-").unwrap();
+            let mut store = TransportReplicatedStore::open(
+                tmp.path(),
+                1u64,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let err = store
+                .put_named_with_receipt(
+                    "synthetic-receipt",
+                    b"payload",
+                    PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(1)),
+                )
+                .unwrap_err();
+            assert!(err.contains("synthetic"));
+            assert!(
+                store
+                    .get_local("synthetic-receipt")
+                    .expect("get_local should succeed")
+                    .is_none(),
+                "invalid receipt must not write primary data"
+            );
+        }
+
+        #[test]
+        fn put_named_with_receipt_two_node_sends_put_with_receipt_message() {
+            // Set up a primary and a replica store, connect them, spawn a
+            // replica handler that processes PutWithReceipt and returns
+            // a PutWithReceiptAck with success=true.
+            use std::sync::mpsc;
+            use tidefs_transport::recv_replication_msg;
+
+            let tmp_primary = tempfile::TempDir::with_prefix("rep-obj-pnwr-pri-").unwrap();
+            let tmp_replica = tempfile::TempDir::with_prefix("rep-obj-pnwr-rep-").unwrap();
+
+            let mut primary = TransportReplicatedStore::open(
+                tmp_primary.path(),
+                1u64,
+                TransportReplicatedStoreConfig {
+                    write_quorum: 2,
+                    total_replicas: 2,
+                    ..TransportReplicatedStoreConfig::default()
+                },
+            )
+            .unwrap();
+
+            let mut replica = TransportReplicatedStore::open(
+                tmp_replica.path(),
+                2u64,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let (_client_sid, server_sid) = connect_replica_pair(&mut primary, &mut replica, 2);
+
+            let payload = b"two-node receipt write";
+            let key = tidefs_local_object_store::ObjectKey::from_name("two-node-receipt");
+            let receipt = placement_receipt_ref(100, &key, payload, 3);
+
+            // Spawn a thread to handle the replica side: receive the
+            // PutWithReceipt, store the payload, and reply with success.
+            let payload_clone = payload.to_vec();
+            let receipt_clone = receipt;
+            let (tx, rx) = mpsc::channel();
+            let replica_handle = std::thread::spawn(move || {
+                let mut replica = replica;
+                let msg = recv_replication_msg(&mut replica.transport, server_sid)
+                    .expect("replica should receive message");
+                let ReplicationMessage::PutWithReceipt {
+                    name,
+                    payload: received_payload,
+                    placement_receipt_ref: received_receipt,
+                } = msg
+                else {
+                    let resp = ReplicationMessage::PutWithReceiptAck {
+                        key_hash: "unexpected".into(),
+                        success: false,
+                        recorded_receipt_ref: None,
+                    };
+                    let _ = send_replication_msg(&mut replica.transport, server_sid, &resp);
+                    tx.send(false).unwrap();
+                    return;
+                };
+                assert_eq!(name, "two-node-receipt");
+                assert_eq!(received_payload, payload_clone);
+                assert_eq!(received_receipt.object_id, receipt_clone.object_id);
+
+                // Store the payload locally
+                replica
+                    .put_local(&name, &received_payload)
+                    .expect("replica put_local should succeed");
+
+                let resp = ReplicationMessage::PutWithReceiptAck {
+                    key_hash: name.clone(),
+                    success: true,
+                    recorded_receipt_ref: Some(received_receipt),
+                };
+                send_replication_msg(&mut replica.transport, server_sid, &resp)
+                    .expect("replica should send ack");
+                tx.send(true).unwrap();
+            });
+
+            let result = primary
+                .put_named_with_receipt("two-node-receipt", payload, receipt)
+                .expect("put_named_with_receipt should succeed");
+
+            assert!(result.quorum_reached);
+            assert!(result.fully_committed);
+            assert_eq!(result.acks, 2);
+            assert_eq!(result.total_targets, 2);
+
+            replica_handle.join().unwrap();
+            assert!(
+                rx.recv().unwrap(),
+                "replica should have processed successfully"
+            );
+
+            // Verify data is on the primary
+            let primary_data = primary
+                .get_local("two-node-receipt")
+                .expect("primary get_local")
+                .expect("primary should have data");
+            assert_eq!(primary_data, payload);
+        }
+
+        #[test]
+        fn put_named_with_receipt_replica_rejects_bad_receipt() {
+            // When the replica rejects the receipt (success=false), quorum
+            // should not include that replica and the result should reflect it.
+            use std::sync::mpsc;
+            use tidefs_transport::recv_replication_msg;
+
+            let tmp_primary = tempfile::TempDir::with_prefix("rep-obj-pnwr-bad-").unwrap();
+            let tmp_replica = tempfile::TempDir::with_prefix("rep-obj-pnwr-bad-r-").unwrap();
+
+            let mut primary = TransportReplicatedStore::open(
+                tmp_primary.path(),
+                1u64,
+                TransportReplicatedStoreConfig {
+                    write_quorum: 2,
+                    total_replicas: 2,
+                    ..TransportReplicatedStoreConfig::default()
+                },
+            )
+            .unwrap();
+
+            let mut replica = TransportReplicatedStore::open(
+                tmp_replica.path(),
+                2u64,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let (_client_sid, server_sid) = connect_replica_pair(&mut primary, &mut replica, 2);
+
+            let payload = b"bad receipt write";
+            let key = tidefs_local_object_store::ObjectKey::from_name("bad-receipt");
+            let receipt = placement_receipt_ref(200, &key, payload, 7);
+
+            // Spawn replica that rejects
+            let (tx, rx) = mpsc::channel();
+            let replica_handle = std::thread::spawn(move || {
+                let mut replica = replica;
+                let msg = recv_replication_msg(&mut replica.transport, server_sid)
+                    .expect("replica should receive message");
+                assert!(
+                    matches!(msg, ReplicationMessage::PutWithReceipt { .. }),
+                    "expected PutWithReceipt"
+                );
+                // Reject the write
+                let resp = ReplicationMessage::PutWithReceiptAck {
+                    key_hash: "bad-receipt".into(),
+                    success: false,
+                    recorded_receipt_ref: None,
+                };
+                send_replication_msg(&mut replica.transport, server_sid, &resp)
+                    .expect("replica should send rejection ack");
+                tx.send(()).unwrap();
+            });
+
+            // Quorum is 2 but only primary counts; replica rejects.
+            let result = primary
+                .put_named_with_receipt("bad-receipt", payload, receipt)
+                .expect("put_named_with_receipt should not panic");
+
+            assert!(!result.quorum_reached, "quorum should not be reached");
+            assert!(!result.fully_committed);
+            assert_eq!(result.acks, 1); // only primary
+            assert_eq!(result.total_targets, 2);
+
+            replica_handle.join().unwrap();
+            rx.recv().unwrap();
+
+            // Primary data should have been rolled back (no quorum)
+            assert!(
+                primary
+                    .get_local("bad-receipt")
+                    .expect("primary get_local should succeed")
+                    .is_none(),
+                "no-quorum receipt write must roll back the primary"
+            );
+        }
+
+        #[test]
+        fn put_named_with_receipt_success_ack_requires_recorded_receipt() {
+            use std::sync::mpsc;
+            use tidefs_transport::recv_replication_msg;
+
+            let tmp_primary = tempfile::TempDir::with_prefix("rep-obj-pnwr-missing-").unwrap();
+            let tmp_replica = tempfile::TempDir::with_prefix("rep-obj-pnwr-missing-r-").unwrap();
+
+            let mut primary = TransportReplicatedStore::open(
+                tmp_primary.path(),
+                1u64,
+                TransportReplicatedStoreConfig {
+                    write_quorum: 2,
+                    total_replicas: 2,
+                    ..TransportReplicatedStoreConfig::default()
+                },
+            )
+            .unwrap();
+
+            let mut replica = TransportReplicatedStore::open(
+                tmp_replica.path(),
+                2u64,
+                TransportReplicatedStoreConfig::default(),
+            )
+            .unwrap();
+
+            let (_client_sid, server_sid) = connect_replica_pair(&mut primary, &mut replica, 2);
+
+            let payload = b"missing recorded receipt";
+            let key = tidefs_local_object_store::ObjectKey::from_name("missing-receipt");
+            let receipt = placement_receipt_ref(201, &key, payload, 9);
+
+            let (tx, rx) = mpsc::channel();
+            let replica_handle = std::thread::spawn(move || {
+                let mut replica = replica;
+                let msg = recv_replication_msg(&mut replica.transport, server_sid)
+                    .expect("replica should receive message");
+                assert!(
+                    matches!(msg, ReplicationMessage::PutWithReceipt { .. }),
+                    "expected PutWithReceipt"
+                );
+                let resp = ReplicationMessage::PutWithReceiptAck {
+                    key_hash: "missing-receipt".into(),
+                    success: true,
+                    recorded_receipt_ref: None,
+                };
+                send_replication_msg(&mut replica.transport, server_sid, &resp)
+                    .expect("replica should send receiptless ack");
+                tx.send(()).unwrap();
+            });
+
+            let result = primary
+                .put_named_with_receipt("missing-receipt", payload, receipt)
+                .expect("receiptless success ack should not panic");
+
+            assert!(
+                !result.quorum_reached,
+                "receiptless ack must not reach quorum"
+            );
+            assert_eq!(result.acks, 1);
+
+            replica_handle.join().unwrap();
+            rx.recv().unwrap();
+
+            assert!(
+                primary
+                    .get_local("missing-receipt")
+                    .expect("primary get_local should succeed")
+                    .is_none(),
+                "receiptless success ack must roll back the primary"
+            );
         }
     }
 
