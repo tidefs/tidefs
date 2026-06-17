@@ -857,8 +857,6 @@ fn collect_member_entries(line: &str, out: &mut Vec<String>) {
 
 const PACKAGE_CLASSIFICATION_DOC: &str = "docs/workspace-package-classification.md";
 
-const SCAFFOLD_TRANSITIONAL_PACKAGES: &[&str] = &[];
-
 fn check_package_classification_authority(
     root: &Path,
     members: &[Member],
@@ -1358,10 +1356,7 @@ fn check_classification_role_boundary(
     violations: &mut Vec<String>,
 ) {
     if row.status == ClassificationStatus::WorkspaceExcluded
-        && !matches!(
-            row.role,
-            PackageRole::StandaloneFuzz | PackageRole::ArchiveDeleteCandidate
-        )
+        && !matches!(row.role, PackageRole::StandaloneFuzz)
     {
         violations.push(format!(
             "{PACKAGE_CLASSIFICATION_DOC} row `{}` is workspace-excluded but role is `{}`",
@@ -1391,12 +1386,14 @@ fn check_classification_role_boundary(
             row.package_root
         ));
     }
-    if row.role == PackageRole::ScaffoldTransitional
-        && !SCAFFOLD_TRANSITIONAL_PACKAGES.contains(&row.package_name.as_str())
-    {
+    if matches!(
+        row.role,
+        PackageRole::ScaffoldTransitional | PackageRole::ArchiveDeleteCandidate
+    ) {
         violations.push(format!(
-            "{PACKAGE_CLASSIFICATION_DOC} row `{}` is scaffold-transitional, but issue #276 retired the TFR-002 scaffold type allowlist",
-            row.package_name
+            "{PACKAGE_CLASSIFICATION_DOC} row `{}` has retired role `{}`; no current package may use a retired role",
+            row.package_root,
+            row.role.as_str()
         ));
     }
     if row.package_root.starts_with("apps/")
@@ -2206,6 +2203,7 @@ fn classify_library_family(name: &str) -> Family {
         || name == "tidefs-online-verifier"
         || name.starts_with("tidefs-orphan-")
         || name.starts_with("tidefs-placement-")
+        || name.starts_with("tidefs-performance-contract")
         || name.starts_with("tidefs-pool-allocator")
         || name.starts_with("tidefs-posix-acl")
         || name.starts_with("tidefs-posix-semantics")
@@ -2251,6 +2249,7 @@ fn classify_library_family(name: &str) -> Family {
         || name.starts_with("tidefs-lock-")
         || name.starts_with("tidefs-namespace")
         || name.starts_with("tidefs-node-")
+        || name.starts_with("tidefs-offload-")
         || name.starts_with("tidefs-object-")
         || name.starts_with("tidefs-online-")
         || name.starts_with("tidefs-partition-")
@@ -2278,6 +2277,8 @@ fn classify_library_family(name: &str) -> Family {
     } else if name.starts_with("tidefs-test-")
         || name == "tidefs-model-core"
         || name == "tidefs-crash-oracle"
+        || name == "tidefs-distributed-model-check"
+        || name == "tidefs-env-fuse-model"
         || name == "tidefs-env-ublk-model"
         || name == "tidefs-trace-oracle"
         || name == "tidefs-two-node-harness"
@@ -2292,6 +2293,8 @@ fn classify_library_family(name: &str) -> Family {
 fn classify_library_class(name: &str) -> CrateClass {
     if name == "tidefs-model-core"
         || name == "tidefs-crash-oracle"
+        || name == "tidefs-distributed-model-check"
+        || name == "tidefs-env-fuse-model"
         || name == "tidefs-env-ublk-model"
     {
         CrateClass::TestOrXtask
@@ -2889,6 +2892,37 @@ mod tests {
         assert_eq!(rows[1].package_root, "fuzz");
         assert_eq!(rows[1].status, ClassificationStatus::WorkspaceExcluded);
         assert_eq!(rows[1].role, PackageRole::StandaloneFuzz);
+    }
+
+    #[test]
+    fn current_workspace_policy_authority_is_current() {
+        check_current_workspace().expect("workspace policy authority is current");
+    }
+
+    #[test]
+    fn retired_package_roles_are_rejected() {
+        let mut violations = Vec::new();
+        for role in [
+            PackageRole::ScaffoldTransitional,
+            PackageRole::ArchiveDeleteCandidate,
+        ] {
+            let row = PackageClassificationRow {
+                package_root: format!("crates/{}", role.as_str()),
+                package_name: role.as_str().to_string(),
+                status: ClassificationStatus::WorkspaceMember,
+                role,
+                disposition: "retired role fixture".to_string(),
+            };
+            check_classification_role_boundary(&row, &mut violations);
+        }
+
+        assert_eq!(violations.len(), 2);
+        assert!(violations
+            .iter()
+            .any(|violation| violation.contains("retired role `scaffold-transitional`")));
+        assert!(violations
+            .iter()
+            .any(|violation| violation.contains("retired role `archive-delete-candidate`")));
     }
 
     #[test]
