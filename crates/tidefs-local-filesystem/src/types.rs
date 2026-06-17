@@ -1658,6 +1658,9 @@ pub struct FilesystemContentObjectRef {
     pub malformed_reason: Option<String>,
     /// True when a non-hole chunk lacks a placement receipt generation.
     pub missing_receipt: bool,
+    /// True when a non-zero receipt generation does not match the pool's
+    /// current receipt set during verification.
+    pub receipt_mismatch: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1670,6 +1673,9 @@ pub struct FilesystemContentInspectionReport {
     pub size_mismatches: u64,
     /// Count of non-hole chunk objects lacking placement receipt authority.
     pub missing_receipts: u64,
+    /// Count of chunk objects whose stored receipt generation does not
+    /// match the pool's current receipt set.
+    pub receipt_mismatches: u64,
     pub malformed_records: u64,
     pub mutating_repair_attempted: bool,
 }
@@ -1684,6 +1690,7 @@ impl FilesystemContentInspectionReport {
             zero_length_records: 0,
             size_mismatches: 0,
             missing_receipts: 0,
+            receipt_mismatches: 0,
             malformed_records: 0,
             mutating_repair_attempted: false,
         }
@@ -1706,6 +1713,9 @@ impl FilesystemContentInspectionReport {
         }
         if reference.missing_receipt {
             self.missing_receipts = self.missing_receipts.saturating_add(1);
+        }
+        if reference.receipt_mismatch {
+            self.receipt_mismatches = self.receipt_mismatches.saturating_add(1);
         }
         if reference.malformed_reason.is_some() {
             self.malformed_records = self.malformed_records.saturating_add(1);

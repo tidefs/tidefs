@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tidefs_local_object_store::{
-    checksum64, CrashInjectionPoint, LocalObjectStore, ObjectKey, ObjectLocation,
+    checksum64, pool::Pool, CrashInjectionPoint, DeviceIoClass, LocalObjectStore, ObjectKey,
+    ObjectLocation,
 };
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
 
@@ -410,6 +411,7 @@ pub fn online_verifier_content_counts(
 pub fn inspect_filesystem_content_objects_store(
     store: &mut LocalObjectStore,
     root_authentication_key: RootAuthenticationKey,
+    pool: Option<&Pool>,
 ) -> Result<FilesystemContentInspectionReport> {
     let audit = audit_recovery_store(store, root_authentication_key)?;
     let mut report = FilesystemContentInspectionReport::empty();
@@ -425,7 +427,7 @@ pub fn inspect_filesystem_content_objects_store(
             continue;
         }
         report.file_like_inodes = report.file_like_inodes.saturating_add(1);
-        inspect_inode_content_objects(store, inode, &mut report)?;
+        inspect_inode_content_objects(store, inode, &mut report, pool)?;
     }
     Ok(report)
 }
@@ -434,6 +436,7 @@ fn inspect_inode_content_objects(
     store: &LocalObjectStore,
     inode: &InodeRecord,
     report: &mut FilesystemContentInspectionReport,
+    pool: Option<&Pool>,
 ) -> Result<()> {
     let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
     let content_bytes = store.get(content_key)?;
@@ -455,6 +458,7 @@ fn inspect_inode_content_objects(
             missing,
             zero_length_record,
             missing_receipt: false,
+            receipt_mismatch: false,
             malformed_reason: None,
         });
         return Ok(());
@@ -474,6 +478,7 @@ fn inspect_inode_content_objects(
                 missing,
                 zero_length_record,
                 missing_receipt: false,
+                receipt_mismatch: false,
                 malformed_reason: None,
             });
         }
@@ -490,13 +495,14 @@ fn inspect_inode_content_objects(
                 missing,
                 zero_length_record,
                 missing_receipt: false,
+                receipt_mismatch: false,
                 malformed_reason: None,
             });
             for chunk_ref in &manifest.chunks {
                 if chunk_ref.is_hole() {
                     continue;
                 }
-                inspect_chunk_object(store, inode, chunk_ref, report)?;
+                inspect_chunk_object(store, inode, chunk_ref, report, pool)?;
             }
         }
         Err(err) => {
@@ -512,6 +518,7 @@ fn inspect_inode_content_objects(
                 missing,
                 zero_length_record,
                 missing_receipt: false,
+                receipt_mismatch: false,
                 malformed_reason: Some(err.to_string()),
             });
         }
@@ -524,6 +531,7 @@ fn inspect_chunk_object(
     inode: &InodeRecord,
     chunk_ref: &ContentChunkRef,
     report: &mut FilesystemContentInspectionReport,
+    pool: Option<&Pool>,
 ) -> Result<()> {
     let key = content_chunk_object_key_for_version(
         inode.inode_id,
@@ -559,8 +567,32 @@ fn inspect_chunk_object(
         missing,
         zero_length_record,
         missing_receipt: !chunk_ref.is_hole() && chunk_ref.placement_receipt_generation == 0,
+        receipt_mismatch: false,
         malformed_reason,
     });
+
+    // Validate stored receipt generation against pool when pool is available.
+    if let Some(pool) = pool {
+        if !chunk_ref.is_hole() && chunk_ref.placement_receipt_generation != 0 {
+            let pool_receipt = pool
+                .placement_receipt_for_key(DeviceIoClass::Data, key)
+                .unwrap_or(None);
+            let mismatch = match pool_receipt {
+                Some(receipt) => receipt.generation != chunk_ref.placement_receipt_generation,
+                None => true,
+            };
+            if mismatch {
+                // Flag the reference we just pushed.
+                if let Some(last) = report.referenced_objects.last_mut() {
+                    if !last.receipt_mismatch {
+                        last.receipt_mismatch = true;
+                        report.receipt_mismatches = report.receipt_mismatches.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

@@ -558,7 +558,7 @@ pub fn inspect_filesystem_content_objects_with_root_authentication_key(
     let Some(mut store) = LocalObjectStore::open_read_only_with_options(root, options)? else {
         return Ok(FilesystemContentInspectionReport::empty());
     };
-    inspect_filesystem_content_objects_store(&mut store, root_authentication_key)
+    inspect_filesystem_content_objects_store(&mut store, root_authentication_key, None)
 }
 
 pub fn plan_root_retention(
