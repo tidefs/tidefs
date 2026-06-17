@@ -7942,4 +7942,242 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // -- pool-wide placement: all eligible devices used --------------------
+
+    #[test]
+    fn pool_wide_placement_uses_all_eligible_devices_over_many_allocations() {
+        let root = temp_dir("pool-wide-device-usage");
+        let _ = std::fs::remove_dir_all(&root);
+        let device_count: usize = 8;
+        let config = multi_data_device_config(&root, device_count);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let mut used_devices = std::collections::BTreeSet::new();
+        for i in 0..1024u64 {
+            let key = ObjectKey::from_name(format!("usage-{i}").as_bytes());
+            pool.put(IoClass::Data, key, format!("payload-{i}").as_bytes())
+                .unwrap();
+            let receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("receipt must persist");
+            assert_eq!(
+                receipt.targets.len(),
+                2,
+                "replicated(2) must place exactly 2 targets per allocation"
+            );
+            for target in &receipt.targets {
+                used_devices.insert(target.device_index);
+            }
+            if used_devices.len() == device_count {
+                break;
+            }
+        }
+
+        assert_eq!(
+            used_devices.len(),
+            device_count,
+            "pool-wide placement must use all {} eligible devices, used {:?}",
+            device_count,
+            used_devices
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_wide_placement_erasure_uses_all_eligible_devices() {
+        let root = temp_dir("pool-wide-erasure-usage");
+        let _ = std::fs::remove_dir_all(&root);
+        let device_count: usize = 10;
+        let config = multi_data_device_config(&root, device_count);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(4, 2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let mut used_devices = std::collections::BTreeSet::new();
+        for i in 0..2048u64 {
+            let key = ObjectKey::from_name(format!("erasure-usage-{i}").as_bytes());
+            pool.put(IoClass::Data, key, format!("payload-{i}").as_bytes())
+                .unwrap();
+            let receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("receipt must persist");
+            assert_eq!(
+                receipt.targets.len(),
+                6,
+                "erasure(4,2) must place exactly 6 targets per allocation"
+            );
+            for target in &receipt.targets {
+                used_devices.insert(target.device_index);
+            }
+            if used_devices.len() == device_count {
+                break;
+            }
+        }
+
+        assert_eq!(
+            used_devices.len(),
+            device_count,
+            "pool-wide erasure placement must use all {} devices, used {:?}",
+            device_count,
+            used_devices
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -- pool-wide placement: no fixed vdev subset owns all stripes ---------
+
+    #[test]
+    fn pool_wide_placement_no_fixed_device_subset_owns_all_stripes() {
+        let root = temp_dir("no-fixed-vdev-subset");
+        let _ = std::fs::remove_dir_all(&root);
+        let device_count: usize = 8;
+        let config = multi_data_device_config(&root, device_count);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(3),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        // Track per-device allocation counts.
+        let mut device_alloc_count: Vec<u64> = vec![0; device_count];
+        let total_allocations: usize = 512;
+
+        for i in 0..total_allocations {
+            let key = ObjectKey::from_name(format!("stripe-{i}").as_bytes());
+            pool.put(IoClass::Data, key, format!("payload-{i}").as_bytes())
+                .unwrap();
+            let receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("receipt must persist");
+            for target in &receipt.targets {
+                let idx = target.device_index as usize;
+                device_alloc_count[idx] = device_alloc_count[idx].saturating_add(1);
+            }
+        }
+
+        // Every device must have received at least some allocations.
+        let min_allocations = device_alloc_count.iter().min().copied().unwrap_or(0);
+        assert!(
+            min_allocations > 0,
+            "no device should be left with zero allocations: {:?}",
+            device_alloc_count
+        );
+
+        // No single device should dominate -- each device gets a roughly fair share.
+        let max_allocations = device_alloc_count.iter().max().copied().unwrap_or(0);
+        let expected_avg = (total_allocations * 3) as u64 / device_count as u64;
+        // Allow generous headroom; the point is to detect fixed-subset
+        // behaviour where 1-2 devices get everything.
+        let cap = expected_avg.saturating_mul(4).max(10);
+        assert!(
+            max_allocations <= cap,
+            "no device should dominate: max {} vs expected-avg {}, counts {:?}",
+            max_allocations,
+            expected_avg,
+            device_alloc_count
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -- pool-wide placement: redundancy determines target width ------------
+
+    #[test]
+    fn redundancy_policy_determines_placement_target_width() {
+        let root = temp_dir("redundancy-target-width");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Replicated(1) --> 1 target
+        {
+            let config = multi_data_device_config(&root.join("rep1"), 4);
+            let props = PoolProperties {
+                redundancy_policy: PoolRedundancyPolicy::replicated(1),
+                ..PoolProperties::default()
+            };
+            let mut pool = Pool::create(config, props, &test_options()).unwrap();
+            set_deterministic_device_guids(&mut pool);
+            let key = ObjectKey::from_name(b"rep1-obj");
+            pool.put(IoClass::Data, key, b"a").unwrap();
+            let receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("receipt");
+            assert_eq!(receipt.targets.len(), 1);
+            let _ = std::fs::remove_dir_all(&root.join("rep1"));
+        }
+
+        // Replicated(3) --> 3 targets
+        {
+            let config = multi_data_device_config(&root.join("rep3"), 5);
+            let props = PoolProperties {
+                redundancy_policy: PoolRedundancyPolicy::replicated(3),
+                ..PoolProperties::default()
+            };
+            let mut pool = Pool::create(config, props, &test_options()).unwrap();
+            set_deterministic_device_guids(&mut pool);
+            let key = ObjectKey::from_name(b"rep3-obj");
+            pool.put(IoClass::Data, key, b"abc").unwrap();
+            let receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("receipt");
+            assert_eq!(receipt.targets.len(), 3);
+            let _ = std::fs::remove_dir_all(&root.join("rep3"));
+        }
+
+        // Erasure(2,1) --> 3 targets (2 data + 1 parity)
+        {
+            let config = multi_data_device_config(&root.join("ec21"), 5);
+            let props = PoolProperties {
+                redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+                ..PoolProperties::default()
+            };
+            let mut pool = Pool::create(config, props, &test_options()).unwrap();
+            set_deterministic_device_guids(&mut pool);
+            let key = ObjectKey::from_name(b"ec21-obj");
+            pool.put(IoClass::Data, key, b"erasure data").unwrap();
+            let receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("receipt");
+            assert_eq!(receipt.targets.len(), 3);
+            let _ = std::fs::remove_dir_all(&root.join("ec21"));
+        }
+
+        // Erasure(4,2) --> 6 targets (4 data + 2 parity)
+        {
+            let config = multi_data_device_config(&root.join("ec42"), 8);
+            let props = PoolProperties {
+                redundancy_policy: PoolRedundancyPolicy::erasure(4, 2),
+                ..PoolProperties::default()
+            };
+            let mut pool = Pool::create(config, props, &test_options()).unwrap();
+            set_deterministic_device_guids(&mut pool);
+            let key = ObjectKey::from_name(b"ec42-obj");
+            pool.put(IoClass::Data, key, b"four data shards payload").unwrap();
+            let receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("receipt");
+            assert_eq!(receipt.targets.len(), 6);
+            let _ = std::fs::remove_dir_all(&root.join("ec42"));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
