@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tidefs_checksum_tree::Digest;
 use tidefs_local_object_store::{ObjectKey, SuspectEntry};
+use tidefs_replication_model::PlacementReceiptRef;
 
 // ---------------------------------------------------------------------------
 // ScrubFanoutRequest — sent to a peer for authoritative verification
@@ -31,6 +32,9 @@ pub struct ScrubFanoutRequest {
     pub request_seq: u64,
     pub return_data_on_match: bool,
     pub timestamp_secs: u64,
+    /// Durable placement receipt that authorises the object being verified.
+    /// Carries the receipt identity so peers can validate placement authority.
+    pub placement_receipt_ref: Option<PlacementReceiptRef>,
 }
 
 impl ScrubFanoutRequest {
@@ -57,8 +61,42 @@ impl ScrubFanoutRequest {
             expected_digest,
             request_seq,
             return_data_on_match,
+            placement_receipt_ref: None,
             timestamp_secs: current_timestamp_secs(),
         }
+    }
+
+    /// Create a fanout request that carries receipt authority.
+    #[must_use]
+    pub fn new_with_receipt(
+        suspect: SuspectEntry,
+        object_key: ObjectKey,
+        expected_digest: Digest,
+        request_seq: u64,
+        return_data_on_match: bool,
+        placement_receipt_ref: PlacementReceiptRef,
+    ) -> Self {
+        Self {
+            suspect,
+            object_key,
+            expected_digest,
+            request_seq,
+            return_data_on_match,
+            placement_receipt_ref: Some(placement_receipt_ref),
+            timestamp_secs: current_timestamp_secs(),
+        }
+    }
+
+    /// Whether this request carries receipt authority.
+    #[must_use]
+    pub fn has_receipt_ref(&self) -> bool {
+        self.placement_receipt_ref.is_some()
+    }
+
+    /// The placement receipt ref carried by this request, if any.
+    #[must_use]
+    pub fn receipt_ref(&self) -> Option<&PlacementReceiptRef> {
+        self.placement_receipt_ref.as_ref()
     }
 }
 
@@ -458,6 +496,70 @@ impl ScrubFanoutCoordinator {
         for &peer_id in &reachable {
             let request =
                 ScrubFanoutRequest::new(*suspect, object_key, expected_digest, self.next_seq, true);
+            self.pending_requests.push((peer_id, request));
+            self.next_seq += 1;
+            count += 1;
+        }
+
+        self.trackers.insert(locator_id, tracker);
+        count
+    }
+
+    /// Fan out a suspect entry with receipt authority for multi-node verification.
+    ///
+    /// Like [`fanout`] but carries the durable placement receipt so peers can
+    /// verify the placement authority of the object under scrub. The receipt
+    /// identifies which members are authoritative for this object; the fanout
+    /// uses the reachable subset of those members rather than all known peers.
+    ///
+    /// Returns the number of requests queued.
+    pub fn fanout_with_receipt(
+        &mut self,
+        suspect: &SuspectEntry,
+        object_key: ObjectKey,
+        expected_digest: Digest,
+        max_peers: usize,
+        placement_receipt_ref: PlacementReceiptRef,
+    ) -> usize {
+        let locator_id = suspect.locator_id;
+        if self.trackers.contains_key(&locator_id) {
+            return 0;
+        }
+
+        let reachable: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, &r)| r)
+            .map(|(&id, _)| id)
+            .take(max_peers)
+            .collect();
+
+        if reachable.is_empty() {
+            return 0;
+        }
+
+        let mut count = 0;
+        let tracker = FanoutTracker::new(
+            ScrubFanoutRequest::new_with_receipt(
+                *suspect,
+                object_key,
+                expected_digest,
+                self.next_seq,
+                true,
+                placement_receipt_ref,
+            ),
+            reachable.clone(),
+        );
+
+        for &peer_id in &reachable {
+            let request = ScrubFanoutRequest::new_with_receipt(
+                *suspect,
+                object_key,
+                expected_digest,
+                self.next_seq,
+                true,
+                placement_receipt_ref,
+            );
             self.pending_requests.push((peer_id, request));
             self.next_seq += 1;
             count += 1;
