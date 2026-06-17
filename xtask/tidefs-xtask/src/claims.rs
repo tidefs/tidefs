@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -15,6 +15,7 @@ use tidefs_validation::ublk_started_export_admission_artifact::{
     validate_ublk_started_export_admission_artifact_path,
     UBLK_STARTED_EXPORT_ADMISSION_ARTIFACT_EVIDENCE_CLASS,
 };
+use tidefs_validation::validation_schema::ValidationTier;
 
 pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, RDMA data-path, or final distributed operator UAPI capability before matching proof exists; unreleased internal TideFS paths must not be framed as product compatibility or migration promises without a real external boundary; tidefsctl command classification/admission is the public operator/harness/diagnostic/prototype/removed boundary; validation/claims.toml is the stable claim registry authority";
 pub const CLAIMS_GATE_REQUIRED_COMMAND: &str = "cargo run -p tidefs-xtask -- check-claims-gate";
@@ -199,10 +200,21 @@ struct ClaimRecord {
     status: ClaimStatus,
     scope: String,
     required_evidence_classes: Vec<String>,
+    #[serde(default)]
+    evidence_requirements: Vec<ClaimEvidenceRequirement>,
     blockers: Vec<String>,
     generated_doc: String,
     #[serde(default)]
     evidence_artifacts: Vec<ClaimEvidenceArtifact>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ClaimEvidenceRequirement {
+    class: String,
+    path: String,
+    validation_tier: ValidationTier,
+    #[serde(default)]
+    blocking_issues: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -237,6 +249,73 @@ impl ClaimStatus {
     const fn is_validated(self) -> bool {
         matches!(self, Self::Validated)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaimValidationFormat {
+    Summary,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ClaimReceiptStatus {
+    Pass,
+    Blocked,
+    Fail,
+}
+
+impl ClaimReceiptStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Blocked => "BLOCKED",
+            Self::Fail => "FAIL",
+        }
+    }
+
+    const fn is_pass(self) -> bool {
+        matches!(self, Self::Pass)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum EvidenceClassStatus {
+    Present,
+    Missing,
+    Stale,
+}
+
+impl EvidenceClassStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "PRESENT",
+            Self::Missing => "MISSING",
+            Self::Stale => "STALE",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ClaimValidationReceipt {
+    claim_id: String,
+    status: ClaimReceiptStatus,
+    registry_status: String,
+    scope: String,
+    required_evidence: Vec<ClaimEvidenceClassReceipt>,
+    blockers: Vec<String>,
+    generated_doc: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ClaimEvidenceClassReceipt {
+    class: String,
+    status: EvidenceClassStatus,
+    artifact_path: String,
+    validation_tier: String,
+    blocking_issues: Vec<String>,
+    details: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -699,7 +778,10 @@ fn check_source_bound_claim_rules(missing: &mut Vec<String>) {
     }
 }
 
-pub fn validate_claim_current_workspace(id: &str) -> Result<(), ClaimValidationError> {
+pub fn validate_claim_current_workspace(
+    id: &str,
+    format: ClaimValidationFormat,
+) -> Result<bool, ClaimValidationError> {
     let root = find_workspace_root().ok_or_else(|| ClaimValidationError {
         failures: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
@@ -725,17 +807,308 @@ pub fn validate_claim_current_workspace(id: &str) -> Result<(), ClaimValidationE
     }
 
     let claim = claim.expect("claim presence checked above");
-    let failures = validate_claim_record(&root, registry_modified, claim);
-    if failures.is_empty() {
-        println!(
-            "PASS: claim `{}` validated with {} fresh evidence artifact(s)",
-            claim.id,
-            claim.evidence_artifacts.len()
-        );
-        Ok(())
-    } else {
-        Err(ClaimValidationError { failures })
+    let receipt = build_claim_validation_receipt(&root, registry_modified, claim);
+    render_claim_validation_receipt(&receipt, format).map_err(|failure| ClaimValidationError {
+        failures: vec![failure],
+    })?;
+    Ok(receipt.status.is_pass())
+}
+
+fn render_claim_validation_receipt(
+    receipt: &ClaimValidationReceipt,
+    format: ClaimValidationFormat,
+) -> Result<(), String> {
+    match format {
+        ClaimValidationFormat::Summary => {
+            print!("{}", render_claim_validation_summary(receipt));
+            Ok(())
+        }
+        ClaimValidationFormat::Json => {
+            let text = serde_json::to_string_pretty(receipt)
+                .map_err(|err| format!("serialize claim validation receipt: {err}"))?;
+            println!("{text}");
+            Ok(())
+        }
     }
+}
+
+fn render_claim_validation_summary(receipt: &ClaimValidationReceipt) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("claim_id: {}\n", receipt.claim_id));
+    out.push_str(&format!("status: {}\n", receipt.status.as_str()));
+    out.push_str(&format!("registry_status: {}\n", receipt.registry_status));
+    out.push_str(&format!("scope: {}\n", receipt.scope));
+    out.push_str("required_evidence:\n");
+    for evidence in &receipt.required_evidence {
+        out.push_str(&format!("  - class: {}\n", evidence.class));
+        out.push_str(&format!("    status: {}\n", evidence.status.as_str()));
+        out.push_str(&format!("    artifact_path: {}\n", evidence.artifact_path));
+        out.push_str(&format!(
+            "    validation_tier: {}\n",
+            evidence.validation_tier
+        ));
+        let issues = if evidence.blocking_issues.is_empty() {
+            "-".to_string()
+        } else {
+            evidence.blocking_issues.join(", ")
+        };
+        out.push_str(&format!("    blocking_issues: {issues}\n"));
+        if !evidence.details.is_empty() {
+            out.push_str("    details:\n");
+            for detail in &evidence.details {
+                out.push_str(&format!("      - {detail}\n"));
+            }
+        }
+    }
+    if !receipt.blockers.is_empty() {
+        out.push_str("blockers:\n");
+        for blocker in &receipt.blockers {
+            out.push_str(&format!("  - {blocker}\n"));
+        }
+    }
+    out.push_str(&format!("generated_doc: {}\n", receipt.generated_doc));
+    out
+}
+
+fn build_claim_validation_receipt(
+    root: &Path,
+    registry_modified: SystemTime,
+    claim: &ClaimRecord,
+) -> ClaimValidationReceipt {
+    let enforce_freshness = claim.status.is_validated();
+    let required_evidence = claim
+        .required_evidence_classes
+        .iter()
+        .map(|class| {
+            build_claim_evidence_class_receipt(
+                root,
+                registry_modified,
+                claim,
+                class,
+                enforce_freshness,
+            )
+        })
+        .collect::<Vec<_>>();
+    let has_evidence_gap = required_evidence
+        .iter()
+        .any(|evidence| evidence.status != EvidenceClassStatus::Present);
+    let status = match claim.status {
+        ClaimStatus::Validated if !has_evidence_gap => ClaimReceiptStatus::Pass,
+        ClaimStatus::Validated => ClaimReceiptStatus::Fail,
+        ClaimStatus::Invalid => ClaimReceiptStatus::Fail,
+        ClaimStatus::Planned | ClaimStatus::Blocked => ClaimReceiptStatus::Blocked,
+    };
+
+    ClaimValidationReceipt {
+        claim_id: claim.id.clone(),
+        status,
+        registry_status: claim.status.as_str().to_string(),
+        scope: claim.scope.clone(),
+        required_evidence,
+        blockers: claim.blockers.clone(),
+        generated_doc: claim.generated_doc.clone(),
+    }
+}
+
+fn build_claim_evidence_class_receipt(
+    root: &Path,
+    registry_modified: SystemTime,
+    claim: &ClaimRecord,
+    class: &str,
+    enforce_freshness: bool,
+) -> ClaimEvidenceClassReceipt {
+    let requirement = claim
+        .evidence_requirements
+        .iter()
+        .find(|requirement| requirement.class == class);
+    let matching = claim
+        .evidence_artifacts
+        .iter()
+        .filter(|artifact| artifact.class == class)
+        .collect::<Vec<_>>();
+    let artifact_path = requirement
+        .map(|requirement| requirement.path.clone())
+        .or_else(|| matching.first().map(|artifact| artifact.path.clone()))
+        .unwrap_or_default();
+    let validation_tier = requirement
+        .map(|requirement| requirement.validation_tier.label().to_string())
+        .unwrap_or_else(|| inferred_validation_tier(class).label().to_string());
+    let blocking_issues = requirement
+        .map(|requirement| requirement.blocking_issues.clone())
+        .unwrap_or_else(|| issue_refs_from_blockers(&claim.blockers));
+
+    if matching.is_empty() {
+        return ClaimEvidenceClassReceipt {
+            class: class.to_string(),
+            status: EvidenceClassStatus::Missing,
+            artifact_path,
+            validation_tier,
+            blocking_issues,
+            details: vec![format!(
+                "no evidence_artifacts entry registers class `{class}` for claim `{}`",
+                claim.id
+            )],
+        };
+    }
+
+    let mut details = Vec::new();
+    let mut saw_missing = false;
+    let mut saw_stale = false;
+    for artifact in matching {
+        let artifact_details = validate_evidence_artifact_for_receipt(
+            root,
+            registry_modified,
+            claim,
+            artifact,
+            enforce_freshness,
+        );
+        match artifact_details.status {
+            EvidenceClassStatus::Present => {}
+            EvidenceClassStatus::Missing => saw_missing = true,
+            EvidenceClassStatus::Stale => saw_stale = true,
+        }
+        details.extend(artifact_details.details);
+    }
+
+    let status = if saw_stale {
+        EvidenceClassStatus::Stale
+    } else if saw_missing {
+        EvidenceClassStatus::Missing
+    } else {
+        EvidenceClassStatus::Present
+    };
+
+    ClaimEvidenceClassReceipt {
+        class: class.to_string(),
+        status,
+        artifact_path,
+        validation_tier,
+        blocking_issues,
+        details,
+    }
+}
+
+struct EvidenceArtifactReceiptDetails {
+    status: EvidenceClassStatus,
+    details: Vec<String>,
+}
+
+fn validate_evidence_artifact_for_receipt(
+    root: &Path,
+    registry_modified: SystemTime,
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+    enforce_freshness: bool,
+) -> EvidenceArtifactReceiptDetails {
+    let rel = Path::new(&artifact.path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return EvidenceArtifactReceiptDetails {
+            status: EvidenceClassStatus::Missing,
+            details: vec![format!(
+                "claim `{}` evidence artifact `{}` must be a workspace-relative path",
+                claim.id, artifact.path
+            )],
+        };
+    }
+
+    let artifact_path = root.join(rel);
+    let metadata = match fs::metadata(&artifact_path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            return EvidenceArtifactReceiptDetails {
+                status: EvidenceClassStatus::Missing,
+                details: vec![format!(
+                    "claim `{}` missing evidence artifact `{}` for class `{}`: {err}",
+                    claim.id, artifact.path, artifact.class
+                )],
+            };
+        }
+    };
+
+    let mut details = Vec::new();
+    if enforce_freshness {
+        match metadata.modified() {
+            Ok(modified) if modified < registry_modified => details.push(format!(
+                "claim `{}` has stale evidence artifact `{}` for class `{}`; artifact is older than `{CLAIM_REGISTRY_PATH}`",
+                claim.id, artifact.path, artifact.class
+            )),
+            Ok(_) => {}
+            Err(err) => details.push(format!(
+                "claim `{}` could not read mtime for evidence artifact `{}`: {err}",
+                claim.id, artifact.path
+            )),
+        }
+    }
+
+    details.extend(validate_claim_evidence_artifact_content(
+        root, claim, artifact,
+    ));
+    let status = if details.is_empty() {
+        EvidenceClassStatus::Present
+    } else {
+        EvidenceClassStatus::Stale
+    };
+    EvidenceArtifactReceiptDetails { status, details }
+}
+
+fn validate_claim_evidence_artifact_content(
+    root: &Path,
+    claim: &ClaimRecord,
+    artifact: &ClaimEvidenceArtifact,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if artifact.class == UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS {
+        failures.extend(validate_runtime_ublk_completion_artifact_content(
+            root, claim, artifact,
+        ));
+    }
+    if artifact.class == UBLK_STARTED_EXPORT_ADMISSION_ARTIFACT_EVIDENCE_CLASS {
+        failures.extend(
+            validate_runtime_ublk_started_export_admission_artifact_content(root, claim, artifact),
+        );
+    }
+    failures.extend(validate_crash_evidence_artifact_content(
+        root, claim, artifact,
+    ));
+    failures
+}
+
+fn inferred_validation_tier(class: &str) -> ValidationTier {
+    if class.contains("runtime") {
+        ValidationTier::MountedUserspace
+    } else if class.contains("gate") || class.contains("review") {
+        ValidationTier::SourceModel
+    } else {
+        ValidationTier::CargoUnit
+    }
+}
+
+fn issue_refs_from_blockers(blockers: &[String]) -> Vec<String> {
+    let mut refs = BTreeSet::new();
+    for blocker in blockers {
+        let bytes = blocker.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if bytes[index] == b'#' {
+                let start = index;
+                index += 1;
+                let digits_start = index;
+                while index < bytes.len() && bytes[index].is_ascii_digit() {
+                    index += 1;
+                }
+                if index > digits_start {
+                    refs.insert(blocker[start..index].to_string());
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+    refs.into_iter().collect()
 }
 
 fn check_claim_registry_docs(root: &Path, missing: &mut Vec<String>) {
@@ -827,6 +1200,50 @@ fn validate_claim_registry(registry: &ClaimRegistry) -> Vec<String> {
             if !required_classes.insert(class) {
                 failures.push(format!(
                     "claim `{}` repeats evidence class `{class}`",
+                    claim.id
+                ));
+            }
+        }
+        let mut requirement_classes = BTreeSet::new();
+        for requirement in &claim.evidence_requirements {
+            if requirement.class.trim().is_empty() || requirement.path.trim().is_empty() {
+                failures.push(format!(
+                    "claim `{}` has an evidence requirement with empty class or path",
+                    claim.id
+                ));
+            }
+            if !requirement_classes.insert(requirement.class.as_str()) {
+                failures.push(format!(
+                    "claim `{}` repeats evidence requirement for class `{}`",
+                    claim.id, requirement.class
+                ));
+            }
+            if !claim
+                .required_evidence_classes
+                .iter()
+                .any(|class| class == &requirement.class)
+            {
+                failures.push(format!(
+                    "claim `{}` evidence requirement class `{}` is not required by the claim",
+                    claim.id, requirement.class
+                ));
+            }
+            let rel = Path::new(&requirement.path);
+            if rel.is_absolute()
+                || rel
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                failures.push(format!(
+                    "claim `{}` evidence requirement path `{}` must be workspace-relative",
+                    claim.id, requirement.path
+                ));
+            }
+        }
+        for class in &claim.required_evidence_classes {
+            if !requirement_classes.contains(class.as_str()) {
+                failures.push(format!(
+                    "claim `{}` required evidence class `{class}` has no evidence_requirements metadata",
                     claim.id
                 ));
             }
@@ -2139,19 +2556,21 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        claims_gate_rules, line_has_present_tense_overclaim, parse_claim_registry,
-        parse_command_admissions, parse_command_surfaces, render_claim_registry_doc,
-        render_command_authority_table, validate_claim_record,
-        validate_crash_claims_gate_review_artifact_content,
+        build_claim_validation_receipt, claims_gate_rules, line_has_present_tense_overclaim,
+        parse_claim_registry, parse_command_admissions, parse_command_surfaces,
+        render_claim_registry_doc, render_claim_validation_summary, render_command_authority_table,
+        validate_claim_record, validate_crash_claims_gate_review_artifact_content,
         validate_model_crash_matrix_artifact_content, validate_registered_crash_artifacts,
         validate_runtime_crash_artifact_content, ClaimEvidenceArtifact, ClaimGateRuleTopic,
-        ClaimRecord, ClaimStatus, APP_INDEX_LIMITATION_MARKERS, CLAIMS_GATE_POLICY_SPEC,
-        CLAIMS_GATE_REQUIRED_COMMAND, CLAIMS_GATE_REVIEW_EVIDENCE_CLASS, CLAIMS_GATE_SCANNED_DOCS,
-        CRASH_CLAIMS_GATE_REVIEW_PATH, CRASH_CLAIMS_GATE_REVIEW_SCOPE,
-        CRASH_CLAIMS_GATE_REVIEW_SOURCE, CRASH_CLAIM_IDS, CRASH_MODEL_EVIDENCE_SCOPE,
-        CRASH_MODEL_EVIDENCE_SOURCE, CRASH_MODEL_MATRIX_PATH, CRATE_INDEX_LIMITATION_MARKERS,
+        ClaimReceiptStatus, ClaimRecord, ClaimStatus, EvidenceClassStatus,
+        APP_INDEX_LIMITATION_MARKERS, CLAIMS_GATE_POLICY_SPEC, CLAIMS_GATE_REQUIRED_COMMAND,
+        CLAIMS_GATE_REVIEW_EVIDENCE_CLASS, CLAIMS_GATE_SCANNED_DOCS, CRASH_CLAIMS_GATE_REVIEW_PATH,
+        CRASH_CLAIMS_GATE_REVIEW_SCOPE, CRASH_CLAIMS_GATE_REVIEW_SOURCE, CRASH_CLAIM_IDS,
+        CRASH_MODEL_EVIDENCE_SCOPE, CRASH_MODEL_EVIDENCE_SOURCE, CRASH_MODEL_MATRIX_PATH,
+        CRATE_INDEX_LIMITATION_MARKERS, LOCAL_VFS_RENAME_CRASH_CLAIM_ID,
         MODEL_CRASH_MATRIX_EVIDENCE_CLASS, REQUIRED_INITIAL_CLAIMS,
-        RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS, STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
+        RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS,
+        RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS, STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
     };
 
     #[test]
@@ -2257,6 +2676,77 @@ mod tests {
     }
 
     #[test]
+    fn validate_claim_receipt_names_missing_runtime_evidence() {
+        let root = workspace_root();
+        let registry = parse_claim_registry(include_str!("../../../validation/claims.toml"))
+            .expect("claim registry parses");
+        let claim = registry
+            .claims
+            .iter()
+            .find(|claim| claim.id == LOCAL_VFS_RENAME_CRASH_CLAIM_ID)
+            .expect("local VFS rename atomic crash claim registered");
+
+        let receipt = build_claim_validation_receipt(&root, SystemTime::UNIX_EPOCH, claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Blocked);
+
+        let runtime = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS)
+            .expect("runtime crash evidence receipt");
+        assert_eq!(runtime.status, EvidenceClassStatus::Missing);
+        assert_eq!(
+            runtime.artifact_path,
+            "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json"
+        );
+        assert_eq!(runtime.validation_tier, "mounted-userspace");
+        assert_eq!(runtime.blocking_issues, vec!["#495".to_string()]);
+        assert!(runtime.details.iter().any(|detail| detail
+            .contains("no evidence_artifacts entry registers class `runtime-namespace-crash-artifact`")));
+
+        let model = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == MODEL_CRASH_MATRIX_EVIDENCE_CLASS)
+            .expect("model crash matrix receipt");
+        assert_eq!(model.status, EvidenceClassStatus::Present);
+
+        let summary = render_claim_validation_summary(&receipt);
+        assert!(summary.contains("status: BLOCKED"));
+        assert!(summary.contains("class: runtime-namespace-crash-artifact"));
+        assert!(summary.contains("blocking_issues: #495"));
+    }
+
+    #[test]
+    fn validate_claim_json_receipt_is_parseable() {
+        let root = workspace_root();
+        let registry = parse_claim_registry(include_str!("../../../validation/claims.toml"))
+            .expect("claim registry parses");
+        let claim = registry
+            .claims
+            .iter()
+            .find(|claim| claim.id == LOCAL_VFS_RENAME_CRASH_CLAIM_ID)
+            .expect("local VFS rename atomic crash claim registered");
+
+        let receipt = build_claim_validation_receipt(&root, SystemTime::UNIX_EPOCH, claim);
+        let json = serde_json::to_value(&receipt).expect("receipt serializes to JSON");
+        assert_eq!(json["claim_id"], LOCAL_VFS_RENAME_CRASH_CLAIM_ID);
+        assert_eq!(json["status"], "BLOCKED");
+        let runtime = json["required_evidence"]
+            .as_array()
+            .expect("required evidence array")
+            .iter()
+            .find(|entry| entry["class"] == RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS)
+            .expect("runtime crash evidence entry");
+        assert_eq!(runtime["status"], "MISSING");
+        assert_eq!(runtime["validation_tier"], "mounted-userspace");
+        assert_eq!(
+            runtime["artifact_path"],
+            "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json"
+        );
+    }
+
+    #[test]
     fn validate_claim_fails_closed_for_planned_status() {
         let registry = parse_claim_registry(include_str!("../../../validation/claims.toml"))
             .expect("claim registry parses");
@@ -2293,6 +2783,7 @@ mod tests {
             status: ClaimStatus::Validated,
             scope: "test scope".to_string(),
             required_evidence_classes: vec!["runtime-artifact".to_string()],
+            evidence_requirements: Vec::new(),
             blockers: Vec::new(),
             generated_doc: "Validated fixture claim.".to_string(),
             evidence_artifacts: Vec::new(),
@@ -2598,6 +3089,7 @@ const UNGUARDED_COMMANDS: &[&str] = &["pool scan", "diag"];
             status: ClaimStatus::Validated,
             scope: "test crash scope".to_string(),
             required_evidence_classes,
+            evidence_requirements: Vec::new(),
             blockers: Vec::new(),
             generated_doc: "Validated crash fixture claim.".to_string(),
             evidence_artifacts,
