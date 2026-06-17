@@ -1027,7 +1027,12 @@ mod tests {
 
     // ── erasure-coded receipt tests for #346 ──────────────────────────
 
-    fn erasure_receipt_ref(subject: u64, generation: u64, data_shards: u8, parity_shards: u8) -> PlacementReceiptRef {
+    fn erasure_receipt_ref(
+        subject: u64,
+        generation: u64,
+        data_shards: u8,
+        parity_shards: u8,
+    ) -> PlacementReceiptRef {
         let mut object_key = [0xA5; 32];
         object_key[..8].copy_from_slice(&subject.to_le_bytes());
         let mut digest = [0x5A; 32];
@@ -1045,8 +1050,15 @@ mod tests {
         )
     }
 
-    fn make_erasure_task(subject: u64, member: u64, generation: u64, data_shards: u8, parity_shards: u8) -> BackfillTask {
-        let placement_receipt_ref = erasure_receipt_ref(subject, generation, data_shards, parity_shards);
+    fn make_erasure_task(
+        subject: u64,
+        member: u64,
+        generation: u64,
+        data_shards: u8,
+        parity_shards: u8,
+    ) -> BackfillTask {
+        let placement_receipt_ref =
+            erasure_receipt_ref(subject, generation, data_shards, parity_shards);
         BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(subject),
             placement_receipt_ref,
@@ -1133,8 +1145,13 @@ mod tests {
 
         let records = completion.verified_receipt_completions();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].source_placement_receipt_ref.receipt_generation, 1);
-        assert_eq!(records[0].repaired_placement_receipt_ref.receipt_generation, 5);
+        assert_eq!(
+            records[0].source_placement_receipt_ref.receipt_generation,
+            1
+        );
+        assert_eq!(
+            records[0].repaired_placement_receipt_ref.receipt_generation,
+            5
+        );
     }
-
 }

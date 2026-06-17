@@ -2241,21 +2241,26 @@ impl LocalObjectStore {
         Ok(inserted)
     }
 
-    /// Drain receipt-authorized dead objects at a caller-supplied stable
-    /// committed transaction group.
+    /// Drain receipt-authorized dead objects at caller-supplied stable
+    /// committed transaction and receipt-generation boundaries.
     ///
     /// Selected entries pass through `ReclaimConsumerService` before this method
     /// acknowledges them in the persisted dead-object queue. Completed stats are
     /// returned only after the acknowledged queue state reaches `sync_all()`.
-    pub fn drain_receipt_bound_dead_objects_at_txg(
+    pub fn drain_receipt_bound_dead_objects_at_stable_generation(
         &mut self,
         stable_committed_txg: u64,
+        stable_committed_generation: u64,
         max_count: usize,
     ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
     {
-        self.ensure_writable("drain_receipt_bound_dead_objects_at_txg")?;
+        self.ensure_writable("drain_receipt_bound_dead_objects_at_stable_generation")?;
 
-        let plan = self.receipt_bound_dead_object_drain_plan(stable_committed_txg, max_count);
+        let plan = self.receipt_bound_dead_object_drain_plan(
+            stable_committed_txg,
+            stable_committed_generation,
+            max_count,
+        );
         if plan.current_segment_would_be_reclaimed(self.current_segment_id) {
             self.rotate_segment()?;
         }
@@ -2268,6 +2273,7 @@ impl LocalObjectStore {
         let drain_result = reclaim_consumer.drain_receipt_bound_dead_objects(
             &queue_snapshot,
             stable_committed_txg,
+            stable_committed_generation,
             max_count,
             &plan.resolver,
             self,
@@ -2305,12 +2311,17 @@ impl LocalObjectStore {
     fn receipt_bound_dead_object_drain_plan(
         &self,
         stable_committed_txg: u64,
+        stable_committed_generation: u64,
         max_count: usize,
     ) -> ReceiptBoundDeadObjectDrainPlan {
         let limit = max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
         let entries = self
             .dead_object_reclaim_queue
-            .dequeue_receipt_bound_batch(limit, stable_committed_txg);
+            .dequeue_receipt_bound_batch_with_stable_generation(
+                limit,
+                stable_committed_txg,
+                stable_committed_generation,
+            );
         let mut resolver = DeadObjectDrainSegmentResolver::default();
         let mut segment_refdrops: std::collections::HashMap<u64, u64> =
             std::collections::HashMap::new();
@@ -7085,7 +7096,7 @@ mod reclaim_queue_production_tests {
             .expect("enqueue receipt-bound dead object"));
 
         let stats = store
-            .drain_receipt_bound_dead_objects_at_txg(1, 16)
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
             .expect("receipt-bound drain");
 
         assert_eq!(stats.entries_processed, 1);
@@ -7133,7 +7144,7 @@ mod reclaim_queue_production_tests {
             .expect("enqueue receipt-bound overwritten object"));
 
         let stats = store
-            .drain_receipt_bound_dead_objects_at_txg(6, 16)
+            .drain_receipt_bound_dead_objects_at_stable_generation(6, 1, 16)
             .expect("receipt-bound drain");
 
         assert_eq!(stats.entries_processed, 1);
@@ -7159,6 +7170,7 @@ mod reclaim_queue_production_tests {
         let under_width_key = dead_object_key(0x64);
         let ineligible_key = dead_object_key(0x65);
         let not_stable_key = dead_object_key(0x66);
+        let future_generation_key = dead_object_key(0x67);
         let mut digest = [0u8; 32];
 
         store.dead_object_reclaim_queue.enqueue(
@@ -7226,26 +7238,29 @@ mod reclaim_queue_production_tests {
         store
             .dead_object_reclaim_queue
             .enqueue(dead_object_entry_for_key(not_stable_key, 10, true, 1));
+        store
+            .dead_object_reclaim_queue
+            .enqueue(dead_object_entry_for_key(future_generation_key, 5, true, 2));
         store.dead_object_reclaim_queue_dirty = true;
         store.sync_all().expect("sync queued unauthorized entries");
 
         let stats = store
-            .drain_receipt_bound_dead_objects_at_txg(6, 16)
+            .drain_receipt_bound_dead_objects_at_stable_generation(6, 1, 16)
             .expect("unauthorized drain should be idle");
 
         assert_eq!(stats.entries_processed, 0);
         assert_eq!(stats.segments_reclaimed, 0);
-        assert_eq!(stats.reclaim_queue_depth, 6);
-        assert_eq!(store.dead_object_reclaim_queue.len(), 6);
+        assert_eq!(stats.reclaim_queue_depth, 7);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 7);
         drop(store);
 
         let reopened = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
             .expect("reopen store");
-        assert_eq!(reopened.dead_object_reclaim_queue.len(), 6);
+        assert_eq!(reopened.dead_object_reclaim_queue.len(), 7);
         assert_eq!(
             reopened
                 .dead_object_reclaim_queue
-                .receipt_bound_eligible_count(6),
+                .receipt_bound_eligible_count_with_stable_generation(6, 1),
             0
         );
     }
