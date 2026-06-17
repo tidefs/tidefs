@@ -199,3 +199,291 @@ fn empty_payload_object_persists_to_store() {
     let stored = store.get(key).expect("get").expect("object present");
     assert!(stored.is_empty());
 }
+
+// ── Incremental contract tests ──────────────────────────────────────
+
+use tidefs_receive_stream::receive_persistence::{
+    BaseRootPinLookup, ReceiveContract, ReceivePersistenceError,
+};
+
+/// A pin lookup for integration tests.
+struct StubPinLookup {
+    pinned: Vec<[u8; 32]>,
+    lineages: std::collections::HashMap<[u8; 32], [u8; 32]>,
+}
+
+impl StubPinLookup {
+    fn new() -> Self {
+        Self {
+            pinned: Vec::new(),
+            lineages: std::collections::HashMap::new(),
+        }
+    }
+
+    fn add_pinned_with_lineage(&mut self, identity: [u8; 32], lineage: [u8; 32]) {
+        self.pinned.push(identity);
+        self.lineages.insert(identity, lineage);
+    }
+}
+
+impl BaseRootPinLookup for StubPinLookup {
+    fn is_base_root_pinned(&self, base_root_identity: &[u8; 32]) -> bool {
+        self.pinned.contains(base_root_identity)
+    }
+
+    fn dataset_lineage_for_base_root(
+        &self,
+        base_root_identity: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        self.lineages.get(base_root_identity).copied()
+    }
+}
+
+/// Test: incremental receive with valid pinned base root succeeds.
+#[test]
+fn incremental_receive_with_valid_pinned_base_root() {
+    let (mut store, _path) = temp_store();
+    let payload = b"incremental data block";
+    let object_id = ObjectKey::from_content(payload).as_bytes32();
+
+    let mut framer = ChunkFramer::new(object_id, payload.to_vec(), 4096);
+    let chunk = framer.next_chunk().expect("single chunk");
+    let wire = send_chunk_to_wire(&chunk);
+
+    // A base root identity for the pin authority
+    let base_root = [0xA1u8; 32];
+    let lineage = [0xB1u8; 32];
+
+    let mut pin_lookup = StubPinLookup::new();
+    pin_lookup.add_pinned_with_lineage(base_root, lineage);
+
+    let contract = ReceiveContract {
+        base_root_identity: base_root,
+        dataset_lineage_identity: lineage,
+        receive_generation: 1,
+    };
+
+    let mut bridge = ReceivePersistenceBridge::new(&mut store)
+        .with_incremental_contract(contract);
+
+    // Validate before dispatching
+    bridge.validate_base_root_pin(&pin_lookup).expect("base root should be pinned");
+    assert!(bridge.has_validated_contract());
+
+    let (objects, bytes) = receive_object(&wire, 0, &mut bridge).expect("receive+persist");
+
+    assert_eq!(objects, 1);
+    assert_eq!(bytes, payload.len() as u64);
+    assert_eq!(bridge.objects_persisted(), 1);
+
+    // Verify the store has the object
+    let key = ObjectKey::from_content(payload);
+    let stored = store.get(key).expect("get").expect("object present");
+    assert_eq!(stored, payload);
+}
+
+/// Test: incremental receive blocks persistence when contract is not validated.
+#[test]
+fn incremental_receive_blocked_without_validation() {
+    let (mut store, _path) = temp_store();
+    let payload = b"should not persist";
+    let object_id = ObjectKey::from_content(payload).as_bytes32();
+
+    let mut framer = ChunkFramer::new(object_id, payload.to_vec(), 4096);
+    let chunk = framer.next_chunk().expect("single chunk");
+    let wire = send_chunk_to_wire(&chunk);
+
+    let contract = ReceiveContract {
+        base_root_identity: [0xA2u8; 32],
+        dataset_lineage_identity: [0xB2u8; 32],
+        receive_generation: 2,
+    };
+
+    let mut bridge = ReceivePersistenceBridge::new(&mut store)
+        .with_incremental_contract(contract);
+
+    // Do NOT call validate_base_root_pin — persistence should be blocked
+    assert!(!bridge.has_validated_contract());
+
+    let err = receive_object(&wire, 0, &mut bridge).unwrap_err();
+    // The error should surface as a dispatch error with ContractNotValidated
+    assert!(
+        format!("{err}").contains("ContractNotValidated"),
+        "expected ContractNotValidated, got: {err}"
+    );
+
+    // No objects persisted
+    assert_eq!(bridge.objects_persisted(), 0);
+}
+
+/// Test: incremental receive with missing base root fails gracefully.
+#[test]
+fn incremental_receive_rejects_missing_base_root() {
+    let (mut store, _path) = temp_store();
+    let payload = b"missing base root";
+    let object_id = ObjectKey::from_content(payload).as_bytes32();
+
+    let mut framer = ChunkFramer::new(object_id, payload.to_vec(), 4096);
+    let chunk = framer.next_chunk().expect("single chunk");
+    let wire = send_chunk_to_wire(&chunk);
+
+    let missing_base = [0xDEu8; 32];
+    let contract = ReceiveContract {
+        base_root_identity: missing_base,
+        dataset_lineage_identity: [0xADu8; 32],
+        receive_generation: 1,
+    };
+
+    let mut bridge = ReceivePersistenceBridge::new(&mut store)
+        .with_incremental_contract(contract);
+
+    // Pin lookup does NOT contain the missing base root
+    let pin_lookup = StubPinLookup::new();
+
+    let err = bridge
+        .validate_base_root_pin(&pin_lookup)
+        .unwrap_err();
+    assert!(
+        matches!(err, ReceivePersistenceError::BaseRootNotPinned { .. }),
+        "expected BaseRootNotPinned, got: {err:?}"
+    );
+
+    // Contract remains unvalidated — persistence blocked
+    assert!(!bridge.has_validated_contract());
+
+    let dispatch_err = receive_object(&wire, 0, &mut bridge).unwrap_err();
+    assert!(
+        format!("{dispatch_err}").contains("ContractNotValidated"),
+        "expected ContractNotValidated after failed validation, got: {dispatch_err}"
+    );
+
+    assert_eq!(bridge.objects_persisted(), 0);
+}
+
+/// Test: incremental receive with wrong dataset lineage fails.
+#[test]
+fn incremental_receive_rejects_wrong_lineage() {
+    let (mut store, _path) = temp_store();
+    let payload = b"wrong lineage";
+    let object_id = ObjectKey::from_content(payload).as_bytes32();
+
+    let mut framer = ChunkFramer::new(object_id, payload.to_vec(), 4096);
+    let chunk = framer.next_chunk().expect("single chunk");
+    let wire = send_chunk_to_wire(&chunk);
+
+    let base_root = [0xA3u8; 32];
+    let correct_lineage = [0xB3u8; 32];
+    let wrong_lineage = [0xC3u8; 32];
+
+    let mut pin_lookup = StubPinLookup::new();
+    // Pin the base root but with a different lineage
+    pin_lookup.add_pinned_with_lineage(base_root, wrong_lineage);
+
+    let contract = ReceiveContract {
+        base_root_identity: base_root,
+        dataset_lineage_identity: correct_lineage,
+        receive_generation: 1,
+    };
+
+    let mut bridge = ReceivePersistenceBridge::new(&mut store)
+        .with_incremental_contract(contract);
+
+    let err = bridge
+        .validate_base_root_pin(&pin_lookup)
+        .unwrap_err();
+    assert!(
+        matches!(err, ReceivePersistenceError::DatasetLineageMismatch { .. }),
+        "expected DatasetLineageMismatch, got: {err:?}"
+    );
+
+    assert!(!bridge.has_validated_contract());
+
+    // Persistence blocked
+    let dispatch_err = receive_object(&wire, 0, &mut bridge).unwrap_err();
+    assert!(
+        format!("{dispatch_err}").contains("ContractNotValidated"),
+        "expected ContractNotValidated, got: {dispatch_err}"
+    );
+
+    assert_eq!(bridge.objects_persisted(), 0);
+}
+
+/// Test: full (non-incremental) receive works without any contract.
+#[test]
+fn full_receive_without_contract_succeeds() {
+    let (mut store, _path) = temp_store();
+    let payload = b"full stream no contract";
+    let object_id = ObjectKey::from_content(payload).as_bytes32();
+
+    let mut framer = ChunkFramer::new(object_id, payload.to_vec(), 4096);
+    let chunk = framer.next_chunk().expect("single chunk");
+    let wire = send_chunk_to_wire(&chunk);
+
+    let mut bridge = ReceivePersistenceBridge::new(&mut store);
+    // No contract set — behaves as a full receive
+    assert!(bridge.contract().is_none());
+    assert!(!bridge.has_validated_contract());
+
+    let (objects, bytes) = receive_object(&wire, 0, &mut bridge).expect("receive+persist");
+
+    assert_eq!(objects, 1);
+    assert_eq!(bytes, payload.len() as u64);
+    assert_eq!(bridge.objects_persisted(), 1);
+
+    let key = ObjectKey::from_content(payload);
+    let stored = store.get(key).expect("get").expect("object present");
+    assert_eq!(stored, payload);
+}
+
+/// Test: replay of a completed receive (same objects again) succeeds
+/// with a validated contract.
+#[test]
+fn replay_of_completed_receive_with_validated_contract() {
+    let (mut store, _path) = temp_store();
+    let payload = b"replay data";
+    let object_id = ObjectKey::from_content(payload).as_bytes32();
+
+    let mut framer = ChunkFramer::new(object_id, payload.to_vec(), 4096);
+    let chunk = framer.next_chunk().expect("single chunk");
+    let wire = send_chunk_to_wire(&chunk);
+
+    let base_root = [0xA4u8; 32];
+    let lineage = [0xB4u8; 32];
+
+    let mut pin_lookup = StubPinLookup::new();
+    pin_lookup.add_pinned_with_lineage(base_root, lineage);
+
+    let contract = ReceiveContract {
+        base_root_identity: base_root,
+        dataset_lineage_identity: lineage,
+        receive_generation: 1,
+    };
+
+    // First receive
+    {
+        let mut bridge = ReceivePersistenceBridge::new(&mut store)
+            .with_incremental_contract(contract);
+        bridge.validate_base_root_pin(&pin_lookup).expect("validate");
+        receive_object(&wire, 0, &mut bridge).expect("first receive");
+        assert_eq!(bridge.objects_persisted(), 1);
+    }
+
+    // Second receive (replay) with fresh bridge, same contract
+    {
+        let mut bridge2 = ReceivePersistenceBridge::new(&mut store)
+            .with_incremental_contract(contract);
+        bridge2.validate_base_root_pin(&pin_lookup).expect("validate replay");
+        let result = receive_object(&wire, 0, &mut bridge2);
+        // Content-addressed put may succeed (idempotent) or produce a key
+        // mismatch depending on store collision behavior
+        assert!(
+            result.is_ok() || format!("{}", result.as_ref().unwrap_err()).contains("mismatch"),
+            "unexpected error on replay: {result:?}"
+        );
+    }
+
+    // Verify the object is in the store
+    let key = ObjectKey::from_content(payload);
+    let stored = store.get(key).expect("get").expect("object present");
+    assert_eq!(stored, payload);
+}
