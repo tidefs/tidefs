@@ -34,6 +34,19 @@ pub const LOCK_FRAME_HEADER_LEN: usize = 24;
 const LOCK_FRAME_MAGIC: [u8; 4] = *b"VLCK";
 
 const DEFAULT_TERM_MILLIS: u64 = 30_000;
+/// Unique identifier for a specific dataset mount instance.
+///
+/// Changes across unmount/remount cycles, ensuring advisory locks
+/// from different mounts are isolated even when inode numbers collide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DatasetMountId(pub u64);
+
+impl DatasetMountId {
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 const DEFAULT_PENDING_TIMEOUT_MILLIS: u64 = 30_000;
 
 /// Direction class for a LOCK frame payload.
@@ -192,6 +205,7 @@ pub struct AcquireRequest {
     pub target: LeaseTarget,
     pub mode: LockMode,
     pub owner: LockOwner,
+    pub dataset_mount_id: DatasetMountId,
     pub term: u64,
     pub epoch: EpochId,
     pub requested_term_millis: u64,
@@ -204,6 +218,7 @@ impl AcquireRequest {
         target: LeaseTarget,
         mode: LockMode,
         owner: LockOwner,
+        dataset_mount_id: DatasetMountId,
         term: u64,
         epoch: EpochId,
     ) -> Self {
@@ -211,6 +226,7 @@ impl AcquireRequest {
             target,
             mode,
             owner,
+            dataset_mount_id,
             term,
             epoch,
             requested_term_millis: 0,
@@ -224,6 +240,7 @@ impl AcquireRequest {
 pub struct AcquireAck {
     pub status: LockStatus,
     pub lease_id: u64,
+    pub dataset_mount_id: DatasetMountId,
     pub target: LeaseTarget,
     pub mode: LockMode,
     pub term: u64,
@@ -253,6 +270,7 @@ pub struct RenewAck {
 pub struct ReleaseRequest {
     pub lease_id: u64,
     pub owner: LockOwner,
+    pub dataset_mount_id: DatasetMountId,
     pub epoch: EpochId,
 }
 
@@ -261,6 +279,22 @@ pub struct ReleaseAck {
     pub lease_id: u64,
     pub status: LockServiceStatus,
 }
+
+/// Request to release all locks scoped to a dataset mount identity.
+/// Sent on unmount or forced unmount to clean up stale locks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnmountRequest {
+    pub dataset_mount_id: DatasetMountId,
+    pub epoch: EpochId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnmountAck {
+    pub dataset_mount_id: DatasetMountId,
+    pub released: u32,
+    pub status: LockServiceStatus,
+}
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -287,6 +321,7 @@ pub struct LeaseIdAck {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetlkRequest {
     pub dataset_id: u64,
+    pub dataset_mount_id: DatasetMountId,
     pub ino: u64,
     pub owner: LockOwner,
     pub lock_type: RangeLockType,
@@ -323,6 +358,7 @@ pub struct GetlkAck {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetlkRequest {
     pub dataset_id: u64,
+    pub dataset_mount_id: DatasetMountId,
     pub ino: u64,
     pub owner: LockOwner,
     pub lock_type: RangeLockType,
@@ -410,6 +446,8 @@ pub enum LockPayload {
     LockGrantEvent(LockGrantEvent),
     RecallAll(RecallAllEvent),
     RecallAllAck(RecallAllAck),
+    Unmount(UnmountRequest),
+    UnmountAck(UnmountAck),
 }
 
 impl LockPayload {
@@ -433,6 +471,7 @@ impl LockPayload {
             Self::LockGrantEvent(_) => LockMethod::LockGrantEvent,
             Self::RecallAll(_) => LockMethod::RecallAll,
             Self::RecallAllAck(_) => LockMethod::RecallAllAck,
+            Self::Unmount(_) | Self::UnmountAck(_) => LockMethod::Unmount,
         }
     }
 
@@ -443,7 +482,8 @@ impl LockPayload {
             | Self::Release(_)
             | Self::Getlk(_)
             | Self::Setlk(_)
-            | Self::Setlkw(_) => LockMessageKind::Request,
+            | Self::Setlkw(_)
+            | Self::Unmount(_) => LockMessageKind::Request,
             Self::AcquireAck(_)
             | Self::RenewAck(_)
             | Self::ReleaseAck(_)
@@ -451,7 +491,8 @@ impl LockPayload {
             | Self::BreakAck(_)
             | Self::GetlkAck(_)
             | Self::SetlkAck(_)
-            | Self::RecallAllAck(_) => LockMessageKind::Response,
+            | Self::RecallAllAck(_)
+            | Self::UnmountAck(_) => LockMessageKind::Response,
             Self::Recall(_) | Self::Break(_) | Self::LockGrantEvent(_) | Self::RecallAll(_) => {
                 LockMessageKind::Event
             }
@@ -780,6 +821,7 @@ impl LockServiceLeader {
             return AcquireAck {
                 status: LockStatus::DeniedFenced,
                 lease_id: 0,
+                dataset_mount_id: request.dataset_mount_id,
                 target: request.target,
                 mode: request.mode,
                 term: self.table.current_term(),
@@ -812,6 +854,7 @@ impl LockServiceLeader {
                         return AcquireAck {
                             status: LockStatus::Queued,
                             lease_id: 0,
+                            dataset_mount_id: request.dataset_mount_id,
                             target: request.target,
                             mode: request.mode,
                             term: self.table.current_term(),
@@ -824,6 +867,7 @@ impl LockServiceLeader {
                     return AcquireAck {
                         status: LockStatus::DeniedQuota,
                         lease_id: 0,
+                        dataset_mount_id: request.dataset_mount_id,
                         target: request.target,
                         mode: request.mode,
                         term: self.table.current_term(),
@@ -838,6 +882,7 @@ impl LockServiceLeader {
             return AcquireAck {
                 status: LockStatus::DeniedConflict,
                 lease_id: 0,
+                dataset_mount_id: request.dataset_mount_id,
                 target: request.target,
                 mode: request.mode,
                 term: self.table.current_term(),
@@ -859,6 +904,7 @@ impl LockServiceLeader {
             lease_class,
             domain,
             request.owner.node_id,
+            request.dataset_mount_id.0,
             term_millis,
             now_millis,
             request.epoch,
@@ -872,6 +918,7 @@ impl LockServiceLeader {
         AcquireAck {
             status: LockStatus::Granted,
             lease_id,
+            dataset_mount_id: request.dataset_mount_id,
             target: request.target,
             mode: request.mode,
             term: self.table.current_term(),
@@ -978,6 +1025,7 @@ impl LockServiceLeader {
             request.target(),
             request.mode(),
             request.owner,
+            request.dataset_mount_id,
             request.term,
             request.epoch,
         );
@@ -1018,6 +1066,17 @@ impl LockServiceLeader {
                 deadline_millis: 0,
             }),
         )
+    }
+
+    /// Release every lock and pending request scoped to a dataset mount
+    /// identity. Used on unmount or forced unmount.
+    pub fn unmount_mount(&mut self, dataset_mount_id: DatasetMountId, epoch: EpochId) -> UnmountAck {
+        let released = self.table.release_by_mount(dataset_mount_id.0, epoch);
+        UnmountAck {
+            dataset_mount_id,
+            released,
+            status: LockServiceStatus::Released,
+        }
     }
 
     pub fn sweep_pending(&mut self, now_millis: u64) -> Vec<(u64, u64, MemberId, u64)> {
@@ -1072,7 +1131,7 @@ impl LockServiceHandle {
         let op_id = self.next_op_id();
         LockFrame::new(
             op_id,
-            LockPayload::Acquire(AcquireRequest::new(target, mode, self.owner, term, epoch)),
+            LockPayload::Acquire(AcquireRequest::new(target, mode, self.owner, DatasetMountId(0), term, epoch)),
         )
     }
 
@@ -1083,6 +1142,7 @@ impl LockServiceHandle {
             LockPayload::Release(ReleaseRequest {
                 lease_id,
                 owner: self.owner,
+                dataset_mount_id: DatasetMountId(0),
                 epoch,
             }),
         )
@@ -1101,6 +1161,7 @@ impl LockServiceHandle {
             ack.mode.to_lease_class(),
             ack.target.to_domain(),
             self.owner.node_id,
+            ack.dataset_mount_id.0,
             ack.expires_at_millis.saturating_sub(now_millis),
             now_millis,
             ack.epoch,
@@ -1230,12 +1291,14 @@ mod tests {
                 },
                 LockMode::Exclusive,
                 owner,
+                DatasetMountId(1),
                 1,
                 EpochId::new(1),
             )),
             LockPayload::AcquireAck(AcquireAck {
                 status: LockStatus::Granted,
                 lease_id: 1,
+                dataset_mount_id: DatasetMountId(1),
                 target: LeaseTarget::Directory {
                     dataset_id: 1,
                     prefix: "/data/".into(),
@@ -1260,6 +1323,7 @@ mod tests {
                 version: 2,
             }),
             LockPayload::Release(ReleaseRequest {
+                    dataset_mount_id: DatasetMountId(1),
                 lease_id: 1,
                 owner,
                 epoch: EpochId::new(1),
@@ -1287,6 +1351,7 @@ mod tests {
                 status: LockServiceStatus::Released,
             }),
             LockPayload::Getlk(GetlkRequest {
+                dataset_mount_id: DatasetMountId(1),
                 dataset_id: 1,
                 ino: 10,
                 owner,
@@ -1301,6 +1366,7 @@ mod tests {
                 conflict: None,
             }),
             LockPayload::Setlk(SetlkRequest {
+                dataset_mount_id: DatasetMountId(1),
                 dataset_id: 1,
                 ino: 10,
                 owner,
@@ -1313,6 +1379,7 @@ mod tests {
                 callback_opaque: 0,
             }),
             LockPayload::Setlkw(SetlkRequest {
+                dataset_mount_id: DatasetMountId(1),
                 dataset_id: 1,
                 ino: 10,
                 owner,
@@ -1427,6 +1494,7 @@ mod tests {
             },
             LockMode::Exclusive,
             owner,
+            DatasetMountId(1),
             1,
             EpochId::new(1),
         );
@@ -1448,6 +1516,7 @@ mod tests {
         assert_eq!(renew.version, 2);
 
         let release = leader.release(ReleaseRequest {
+                    dataset_mount_id: DatasetMountId(1),
             lease_id: ack.lease_id,
             owner,
             epoch: EpochId::new(1),
@@ -1468,6 +1537,7 @@ mod tests {
                 },
                 LockMode::Exclusive,
                 owner(1, 1, 1),
+                DatasetMountId(1),
                 1,
                 EpochId::new(1),
             ),
@@ -1484,6 +1554,7 @@ mod tests {
                 },
                 LockMode::Shared,
                 owner(2, 2, 2),
+                DatasetMountId(1),
                 1,
                 EpochId::new(1),
             ),
@@ -1498,6 +1569,7 @@ mod tests {
     fn blocking_setlkw_queues_on_conflict() {
         let mut leader = leader();
         let write = SetlkRequest {
+                dataset_mount_id: DatasetMountId(1),
             dataset_id: 9,
             ino: 99,
             owner: owner(1, 10, 1),
@@ -1513,6 +1585,7 @@ mod tests {
         assert_eq!(first.status, LockServiceStatus::Granted);
 
         let blocked = SetlkRequest {
+                dataset_mount_id: DatasetMountId(1),
             dataset_id: 9,
             ino: 99,
             owner: owner(2, 20, 2),
@@ -1536,6 +1609,7 @@ mod tests {
         let first = leader.setlk(
             1,
             SetlkRequest {
+                dataset_mount_id: DatasetMountId(1),
                 dataset_id: 2,
                 ino: 8,
                 owner: owner(1, 1, 1),
@@ -1553,6 +1627,7 @@ mod tests {
         assert_eq!(first.status, LockServiceStatus::Granted);
 
         let ack = leader.getlk(GetlkRequest {
+                dataset_mount_id: DatasetMountId(1),
             dataset_id: 2,
             ino: 8,
             owner: owner(2, 2, 2),
@@ -1601,6 +1676,7 @@ mod tests {
             &AcquireAck {
                 status: LockStatus::Granted,
                 lease_id: 1,
+                dataset_mount_id: DatasetMountId(1),
                 target: LeaseTarget::Inode {
                     dataset_id: 3,
                     ino: 44,
@@ -1650,6 +1726,7 @@ mod tests {
                 },
                 LockMode::Exclusive,
                 owner(1, 1, 1),
+                DatasetMountId(1),
                 99,
                 EpochId::new(1),
             ),
@@ -1845,6 +1922,17 @@ impl LockService {
     pub fn grants_iter(&self) -> impl Iterator<Item = &LeaseGrant> {
         self.table.grants_iter()
     }
+    /// Release every lock and pending request scoped to a dataset mount
+    /// identity. Used on unmount or forced unmount.
+    pub fn unmount_mount(&mut self, dataset_mount_id: DatasetMountId, epoch: EpochId) -> UnmountAck {
+        let released = self.table.release_by_mount(dataset_mount_id.0, epoch);
+        UnmountAck {
+            dataset_mount_id,
+            released,
+            status: LockServiceStatus::Released,
+        }
+    }
+
     pub fn sweep_pending(&mut self, now_millis: u64) -> Vec<(u64, u64, MemberId, u64)> {
         self.table.sweep_pending(now_millis)
     }
@@ -1924,6 +2012,7 @@ impl LockService {
             lease_class,
             domain,
             owner.node_id,
+            1u64,
             term_millis,
             now_millis,
             self.config.current_epoch,

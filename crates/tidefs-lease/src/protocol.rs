@@ -317,6 +317,7 @@ impl LeaseProtocol {
             lease_class,
             domain,
             holder_id,
+            0u64,
             term_millis,
             now_millis,
             self.current_epoch,

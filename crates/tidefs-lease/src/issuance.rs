@@ -160,6 +160,7 @@ impl LeaseAuthority {
             request.lease_class,
             request.domain,
             request.requester_id,
+            0u64,
             term,
             now,
             self.config.current_epoch,

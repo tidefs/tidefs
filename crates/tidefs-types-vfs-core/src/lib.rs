@@ -1291,10 +1291,14 @@ impl LockList {
     }
 }
 
-/// Per-filesystem POSIX advisory byte-range lock registry.
+/// Dataset-scoped POSIX advisory byte-range lock registry.
+/// Keyed by (dataset_mount_id, inode) so locks from different mounts are isolated. now scoped
+/// by dataset mount identity so locks from different mounts are isolated.
+///
+/// Internal key is `(dataset_mount_id, inode)` instead of bare `inode`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LockTracker {
-    locks_by_inode: alloc::collections::BTreeMap<u64, LockList>,
+    locks_by_inode: alloc::collections::BTreeMap<(u64, u64), LockList>,
 }
 
 impl LockTracker {
@@ -1316,77 +1320,125 @@ impl LockTracker {
     }
 
     #[must_use]
-    pub fn locks_for_inode(&self, inode: u64) -> Option<&LockList> {
-        self.locks_by_inode.get(&inode)
+    pub fn locks_for_mount_inode(
+        &self,
+        dataset_mount_id: u64,
+        inode: u64,
+    ) -> Option<&LockList> {
+        self.locks_by_inode.get(&(dataset_mount_id, inode))
     }
 
-    pub fn acquire(&mut self, inode: u64, requested: LockRange) -> Result<(), LockConflict> {
+    pub fn acquire(
+        &mut self,
+        dataset_mount_id: u64,
+        inode: u64,
+        requested: LockRange,
+    ) -> Result<(), LockConflict> {
         if requested.lock_type == LockType::Unlock {
-            self.release(inode, requested);
+            self.release(dataset_mount_id, inode, requested);
             return Ok(());
         }
 
-        let lock_list = self.locks_by_inode.entry(inode).or_default();
+        let lock_list = self
+            .locks_by_inode
+            .entry((dataset_mount_id, inode))
+            .or_default();
         lock_list.acquire(requested)?;
         Ok(())
     }
 
-    pub fn release(&mut self, inode: u64, requested: LockRange) {
-        if let Some(lock_list) = self.locks_by_inode.get_mut(&inode) {
+    pub fn release(&mut self, dataset_mount_id: u64, inode: u64, requested: LockRange) {
+        if let Some(lock_list) = self.locks_by_inode.get_mut(&(dataset_mount_id, inode)) {
             lock_list.release(requested);
             if lock_list.is_empty() {
-                self.locks_by_inode.remove(&inode);
+                self.locks_by_inode.remove(&(dataset_mount_id, inode));
             }
         }
     }
 
     #[must_use]
-    pub fn query_conflict(&self, inode: u64, requested: LockRange) -> Option<LockConflict> {
+    pub fn query_conflict(
+        &self,
+        dataset_mount_id: u64,
+        inode: u64,
+        requested: LockRange,
+    ) -> Option<LockConflict> {
         self.locks_by_inode
-            .get(&inode)
+            .get(&(dataset_mount_id, inode))
             .and_then(|lock_list| lock_list.query_conflict(requested))
     }
 
-    pub fn release_by_pid(&mut self, pid: u32) {
-        let mut empty_inodes = alloc::vec::Vec::new();
-        for (inode, lock_list) in &mut self.locks_by_inode {
+    pub fn release_by_pid(&mut self, dataset_mount_id: u64, pid: u32) {
+        let mut empty_keys = alloc::vec::Vec::new();
+        for (&(mid, ino), lock_list) in &mut self.locks_by_inode {
+            if mid != dataset_mount_id {
+                continue;
+            }
             lock_list.release_by_pid(pid);
             if lock_list.is_empty() {
-                empty_inodes.push(*inode);
+                empty_keys.push((mid, ino));
             }
         }
-        for inode in empty_inodes {
-            self.locks_by_inode.remove(&inode);
+        for key in empty_keys {
+            self.locks_by_inode.remove(&key);
         }
     }
 
-    /// Release all locks held by `pid` on a single inode.
-    pub fn release_by_pid_inode(&mut self, inode: u64, pid: u32) {
+    /// Release all locks held by `pid` on a single inode within a mount.
+    pub fn release_by_pid_mount_inode(
+        &mut self,
+        dataset_mount_id: u64,
+        inode: u64,
+        pid: u32,
+    ) {
+        let key = (dataset_mount_id, inode);
         let mut remove = false;
-        if let Some(lock_list) = self.locks_by_inode.get_mut(&inode) {
+        if let Some(lock_list) = self.locks_by_inode.get_mut(&key) {
             lock_list.release_by_pid(pid);
             if lock_list.is_empty() {
                 remove = true;
             }
         }
         if remove {
-            self.locks_by_inode.remove(&inode);
+            self.locks_by_inode.remove(&key);
         }
     }
 
     /// Release all locks held through file-description `owner` on a
-    /// single inode.
-    pub fn release_by_owner_inode(&mut self, inode: u64, owner: u64) {
+    /// single inode within a mount.
+    pub fn release_by_owner_mount_inode(
+        &mut self,
+        dataset_mount_id: u64,
+        inode: u64,
+        owner: u64,
+    ) {
+        let key = (dataset_mount_id, inode);
         let mut remove = false;
-        if let Some(lock_list) = self.locks_by_inode.get_mut(&inode) {
+        if let Some(lock_list) = self.locks_by_inode.get_mut(&key) {
             lock_list.release_by_owner(owner);
             if lock_list.is_empty() {
                 remove = true;
             }
         }
         if remove {
-            self.locks_by_inode.remove(&inode);
+            self.locks_by_inode.remove(&key);
         }
+    }
+
+    /// Release every lock belonging to a dataset mount identity.
+    /// Returns the number of distinct (mount, inode) entries cleared.
+    pub fn release_all_for_mount(&mut self, dataset_mount_id: u64) -> usize {
+        let keys: alloc::vec::Vec<_> = self
+            .locks_by_inode
+            .keys()
+            .filter(|(mid, _)| *mid == dataset_mount_id)
+            .copied()
+            .collect();
+        let count = keys.len();
+        for key in keys {
+            self.locks_by_inode.remove(&key);
+        }
+        count
     }
 }
 
@@ -8412,5 +8464,6 @@ mod dir_entry_tests {
     fn dir_entry_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DirEntry>();
+
     }
 }
