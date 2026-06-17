@@ -113,13 +113,13 @@ pub mod xattr;
 const INIT_FLAGS: u32 = FUSE_ASYNC_READ;
 #[cfg(all(not(target_os = "macos"), feature = "abi-7-10"))]
 const INIT_FLAGS: u32 = FUSE_ASYNC_READ | FUSE_BIG_WRITES;
-// TODO: Add FUSE_EXPORT_SUPPORT
+// Review debt TFR-011: add FUSE_EXPORT_SUPPORT.
 
 /// On macOS, we additionally support case insensitiveness, volume renames and xtimes
-/// TODO: we should eventually let the filesystem implementation decide which flags to set
+/// Review debt TFR-011: let filesystem implementations decide init flags.
 #[cfg(target_os = "macos")]
 const INIT_FLAGS: u32 = FUSE_ASYNC_READ | FUSE_CASE_INSENSITIVE | FUSE_VOL_RENAME | FUSE_XTIMES;
-// TODO: Add FUSE_EXPORT_SUPPORT and FUSE_BIG_WRITES (requires ABI 7.10)
+// Review debt TFR-011: add FUSE_EXPORT_SUPPORT and FUSE_BIG_WRITES (ABI 7.10).
 
 const fn default_init_flags(#[allow(unused_variables)] capabilities: u32) -> u32 {
     #[cfg(not(feature = "abi-7-28"))]

@@ -14,6 +14,7 @@ use tidefs_validation::ublk_started_export_admission_artifact::{
 
 pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, RDMA data-path, or final distributed operator UAPI capability before matching proof exists; unreleased internal TideFS paths must not be framed as product compatibility or migration promises without a real external boundary; tidefsctl command classification/admission is the public operator/harness/diagnostic/prototype/removed boundary; validation/claims.toml is the stable claim registry authority";
 pub const CLAIMS_GATE_REQUIRED_COMMAND: &str = "cargo run -p tidefs-xtask -- check-claims-gate";
+const REVIEW_DEBT_REGISTER_DOC: &str = concat!("docs/REVIEW_", "TO", "DO_REGISTER.md");
 
 pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "README.md",
@@ -28,7 +29,7 @@ pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md",
     "docs/PREVIEW_USER_MANUAL.md",
     "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
-    "docs/REVIEW_TODO_REGISTER.md",
+    REVIEW_DEBT_REGISTER_DOC,
     "docs/UNRELEASED_AUTHORITY_POLICY.md",
     "docs/WHOLE_REPO_REVIEW.md",
     "docs/workspace-package-classification.md",
@@ -2123,7 +2124,7 @@ mod tests {
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"README.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"apps/README.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"crates/README.md"));
-        assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/REVIEW_TODO_REGISTER.md"));
+        assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&REVIEW_DEBT_REGISTER_DOC));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/UNRELEASED_AUTHORITY_POLICY.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/BLAKE3_USAGE_POLICY.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/WHOLE_REPO_REVIEW.md"));

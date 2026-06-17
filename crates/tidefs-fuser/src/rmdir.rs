@@ -203,7 +203,7 @@ pub fn check_rmdir_readonly(read_only: bool) -> Result<(), RmdirError> {
 pub fn plan_rmdir(name: &[u8], read_only: bool) -> Result<RmdirPlan, RmdirError> {
     validate_rmdir_name(name)?;
     check_rmdir_readonly(read_only)?;
-    // TODO(#5378): add tidefs-permission check_access(parent_dir, W_OK|X_OK)
+    // Review debt TFR-011: add tidefs-permission parent W_OK|X_OK checks.
     Ok(RmdirPlan {
         name: name.to_vec(),
     })

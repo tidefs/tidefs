@@ -122,7 +122,7 @@ impl<'a> Response<'a> {
         Self::from_struct(&r)
     }
 
-    // TODO: Could flags be more strongly typed?
+    // Review debt TFR-011: make open flags strongly typed.
     pub(crate) fn new_open(fh: FileHandle, flags: u32) -> Self {
         let r = abi::fuse_open_out {
             fh: fh.into(),
@@ -185,7 +185,7 @@ impl<'a> Response<'a> {
         Self::from_struct(&r)
     }
 
-    // TODO: Can flags be more strongly typed?
+    // Review debt TFR-011: make create flags strongly typed.
     pub(crate) fn new_create(
         ttl: &Duration,
         attr: &Attr,
@@ -223,7 +223,7 @@ impl<'a> Response<'a> {
         Self::from_struct(&r)
     }
 
-    // TODO: Are you allowed to send data while result != 0?
+    // Review debt TFR-011: document ioctl data semantics when result != 0.
     pub(crate) fn new_ioctl(result: i32, data: &[IoSlice<'_>]) -> Self {
         let r = abi::fuse_ioctl_out {
             result,
@@ -232,7 +232,7 @@ impl<'a> Response<'a> {
             in_iovs: 1,
             out_iovs: if !data.is_empty() { 1 } else { 0 },
         };
-        // TODO: Don't copy this data
+        // Review debt TFR-011: avoid copying ioctl reply data.
         let mut v: ResponseBuf = r.as_bytes().into();
         for x in data {
             v.extend_from_slice(x)
@@ -349,7 +349,7 @@ pub(crate) fn fuse_attr_from_attr(attr: &crate::FileAttr) -> abi::fuse_attr {
     }
 }
 
-// TODO: Add methods for creating this without making a `FileAttr` first.
+// Review debt TFR-011: add constructors that do not require `FileAttr`.
 #[derive(Debug, Clone, Copy)]
 pub struct Attr {
     pub(crate) attr: abi::fuse_attr,
