@@ -59,4 +59,6 @@ pub const CHUNK_FRAME_OVERHEAD: usize = CHUNK_HEADER_BYTES + AUTH_TAG_BYTES;
 pub use assembler::{AssemblerError, ObjectAssembler};
 pub use decoder::{ChunkDecodeError, ChunkDecoder, FramedChunk};
 pub use dispatch::{receive_object, NoOpDispatch, ReceiveDispatch};
-pub use receive_persistence::ReceivePersistenceBridge;
+pub use receive_persistence::{
+    BaseRootPinLookup, ReceiveContract, ReceivePersistenceBridge, ReceivePersistenceError,
+};
