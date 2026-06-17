@@ -2186,3 +2186,232 @@ mod tests {
         assert_eq!(result.bytes, vec![0u8; 128]);
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Receipt-aware chunk replacement helpers
+// ────────────────────────────────────────────────────────────────────
+
+/// Return the pool placement receipt generation for `object_key`, or 0 if
+/// no receipt is available.
+
+// ────────────────────────────────────────────────────────────────────
+// Receipt-aware chunk replacement helpers
+// ────────────────────────────────────────────────────────────────────
+
+/// Return the pool placement receipt generation for `object_key`, or 0 if
+/// no receipt is available.
+///
+/// This is the authoritative lookup that ties local-filesystem chunk refs
+/// to the pool's receipt authority. Callers use it to decide whether an old
+/// chunk can be reclaimed after a rewrite.
+#[allow(dead_code)]
+pub(crate) fn latest_receipt_generation_for_key(
+    pool: &tidefs_local_object_store::pool::Pool,
+    object_key: tidefs_local_object_store::ObjectKey,
+) -> u64 {
+    use tidefs_local_object_store::DeviceIoClass;
+
+    pool.placement_receipt_for_key(DeviceIoClass::Data, object_key)
+        .ok()
+        .flatten()
+        .map_or(0, |r| r.generation)
+}
+
+#[cfg(test)]
+mod receipt_rotation_tests {
+    use super::*;
+    use crate::allocation::{chunk_receipt_is_durable, replacement_receipt_is_durable};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tidefs_local_object_store::pool::{Pool, PoolConfig, PoolProperties};
+    use tidefs_local_object_store::{
+        DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, StoreOptions,
+    };
+
+    fn temp_pool(label: &str) -> Pool {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-receipt-rot-{label}-{nanos}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let data_dir = root.join("data");
+        let config = PoolConfig {
+            name: "testpool".into(),
+            root_path: root.clone(),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Single { path: data_dir },
+                encryption: None,
+                compression: None,
+            }],
+        };
+        Pool::create(config, PoolProperties::default(), &StoreOptions::test_fast())
+            .expect("create temp pool")
+    }
+
+    #[test]
+    fn chunk_receipt_generation_is_recorded_on_write() {
+        let mut pool = temp_pool("receipt-write");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"test-chunk-1");
+        let payload = b"hello receipt rotation";
+
+        let (_stored, receipt) = pool.put_with_receipt(key, payload).expect("put_with_receipt");
+        assert!(receipt.generation > 0, "receipt generation must be > 0");
+    }
+
+    #[test]
+    fn chunk_receipt_generation_increases_on_rewrite() {
+        let mut pool = temp_pool("receipt-rewrite");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"test-chunk-2");
+        let payload1 = b"first write";
+        let payload2 = b"second write (replacement)";
+
+        let (_stored1, receipt1) = pool.put_with_receipt(key, payload1).expect("put 1");
+        let (_stored2, receipt2) = pool.put_with_receipt(key, payload2).expect("put 2");
+
+        assert!(
+            receipt2.generation > receipt1.generation,
+            "rewrite must produce a higher receipt generation: {} -> {}",
+            receipt1.generation,
+            receipt2.generation
+        );
+    }
+
+    #[test]
+    fn chunk_ref_receipt_is_durable_after_commit() {
+        let mut pool = temp_pool("receipt-durable");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"test-chunk-3");
+        let payload = b"durable write";
+
+        let (_stored, receipt) = pool.put_with_receipt(key, payload).expect("put_with_receipt");
+
+        // Create a ContentChunkRef with the recorded receipt generation.
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: 1,
+            len: payload.len() as u32,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: receipt.generation,
+        };
+
+        assert!(
+            chunk_receipt_is_durable(&pool, &chunk_ref, key),
+            "chunk ref with matching receipt generation must be durable"
+        );
+    }
+
+    #[test]
+    fn chunk_ref_receipt_not_durable_when_generation_mismatch() {
+        let mut pool = temp_pool("receipt-mismatch");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"test-chunk-4");
+        let payload = b"mismatch test";
+
+        let (_stored, receipt) = pool.put_with_receipt(key, payload).expect("put_with_receipt");
+
+        // Create a ContentChunkRef with a DIFFERENT receipt generation.
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: 1,
+            len: payload.len() as u32,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: receipt.generation.saturating_add(999),
+        };
+
+        assert!(
+            !chunk_receipt_is_durable(&pool, &chunk_ref, key),
+            "chunk ref with mismatched receipt generation must NOT be durable"
+        );
+    }
+
+    #[test]
+    fn chunk_ref_receipt_durable_after_rewrite() {
+        let mut pool = temp_pool("receipt-rewrite-dur");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"test-chunk-5");
+
+        // First write
+        let (_stored1, receipt1) = pool.put_with_receipt(key, b"old data").expect("put 1");
+
+        // Second write (replacement)
+        let (_stored2, receipt2) = pool.put_with_receipt(key, b"new data").expect("put 2");
+
+        // The old chunk ref (with generation from receipt1) should still report
+        // durable because the pool has a receipt with generation >= old gen.
+        let old_chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: 1,
+            len: 8,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: receipt1.generation,
+        };
+
+        assert!(
+            chunk_receipt_is_durable(&pool, &old_chunk_ref, key),
+            "old chunk ref must report durable after rewrite because pool receipt generation >= old gen"
+        );
+
+        // Also check: the pool holds the latest receipt.
+        let pool_receipt = pool
+            .placement_receipt_for_key(DeviceIoClass::Data, key)
+            .expect("lookup")
+            .expect("receipt exists");
+        assert_eq!(
+            pool_receipt.generation, receipt2.generation,
+            "pool must hold the latest receipt"
+        );
+        assert!(
+            pool_receipt.generation > receipt1.generation,
+            "latest receipt generation must exceed original"
+        );
+    }
+
+    #[test]
+    fn replacement_receipt_is_durable_after_rewrite() {
+        let mut pool = temp_pool("receipt-repl-dur");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"test-chunk-6");
+
+        let (_stored1, receipt1) = pool.put_with_receipt(key, b"old").expect("put 1");
+        let (_stored2, _receipt2) = pool.put_with_receipt(key, b"new").expect("put 2");
+
+        assert!(
+            replacement_receipt_is_durable(&pool, key, receipt1.generation),
+            "replacement receipt must be durable after rewrite"
+        );
+    }
+
+    #[test]
+    fn hole_chunk_ref_is_always_durable() {
+        let pool = temp_pool("receipt-hole");
+        let hole_ref = ContentChunkRef::hole(0, 4096);
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"nonexistent-key");
+
+        assert!(
+            chunk_receipt_is_durable(&pool, &hole_ref, key),
+            "hole chunk ref must always be durable"
+        );
+    }
+
+    #[test]
+    fn zero_generation_chunk_ref_is_durable() {
+        let pool = temp_pool("receipt-zero-gen");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"nonexistent-key");
+
+        let legacy_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: 1,
+            len: 4096,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: 0, // pre-v6 format
+        };
+
+        assert!(
+            chunk_receipt_is_durable(&pool, &legacy_ref, key),
+            "zero-generation chunk ref must be durable (backward compat)"
+        );
+    }
+}

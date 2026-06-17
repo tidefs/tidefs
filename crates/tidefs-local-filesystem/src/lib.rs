@@ -3726,6 +3726,12 @@ impl LocalFileSystem {
     pub fn drain_local_reclaim_queue_into_store(&mut self) -> ReclaimDrainStats {
         const MAX_RECLAIM_PER_TICK: usize = 256;
 
+        // Receipt durability pre-check: collect keys whose placement receipt
+        // is not yet durable.  These are left in the queue for a future drain
+        // cycle.  We pre-compute the set before taking the mutable store borrow
+        // so the compiler can separate the immutable Pool access from the
+        // mutable store borrow below.
+
         // Collect keys protected by active snapshots so reclaim does not
         // delete content objects that snapshot manifests still reference (#6451).
         let protected_keys = self.collect_snapshot_protected_content_keys();
@@ -3738,6 +3744,17 @@ impl LocalFileSystem {
                 .collect()
         };
         let entries_drained = batch.len();
+
+        // Pre-compute receipt durability: for each key in the batch, check
+        // whether its placement receipt is durable.  Keys that pass are safe
+        // to delete; keys that fail stay in the queue.
+        let receipt_durable_keys: std::collections::BTreeSet<tidefs_local_object_store::ObjectKey> = batch
+            .iter()
+            .map(|(k, _)| tidefs_local_object_store::ObjectKey::from_bytes(k.0))
+            .filter(|local_key| {
+                crate::allocation::chunk_content_key_receipt_stable(&self.store, *local_key)
+            })
+            .collect();
 
         if !batch.is_empty() {
             let store = self.store.raw_primary_store_mut();
@@ -3782,6 +3799,14 @@ impl LocalFileSystem {
                             }
                         }
                     }
+                }
+
+                // Receipt authority gate: skip objects whose placement receipt
+                // is not yet durable.  The pre-computed set includes both content
+                // chunks with uncommitted receipts and keys where the pool was
+                // unreadable (conservative retain).
+                if !receipt_durable_keys.contains(&local_key) {
+                    continue;
                 }
 
                 let _ = store.delete(local_key);
