@@ -1,0 +1,11 @@
+# Local VFS vertical trace for issue #486.
+# `restart_pool` observes recovery after a synced write; it is not a runtime crash artifact.
+{"args":{"schema":"pool_trace_v1","version":1},"op":"trace_meta"}
+{"args":{"device_count":1,"device_size_bytes":4194304},"op":"create_pool"}
+{"args":{"name":"local_vfs"},"op":"create_dataset"}
+{"args":{"dataset":"local_vfs","path":"durable.bin"},"op":"create_file"}
+{"args":{"data_b64":"d3JpdGUtZnN5bmMtcmVhZC1yZWNvdmVyeQ==","dataset":"local_vfs","key":"durable.bin","offset":0},"op":"write_range"}
+{"args":{"datasync":false,"dataset":"local_vfs","key":"durable.bin"},"op":"fsync"}
+{"args":{"dataset":"local_vfs","key":"durable.bin","length":25,"offset":0},"expect":{"value_b64":"d3JpdGUtZnN5bmMtcmVhZC1yZWNvdmVyeQ=="},"op":"get_range"}
+{"args":{},"op":"restart_pool"}
+{"args":{"dataset":"local_vfs","key":"durable.bin"},"expect":{"value_b64":"d3JpdGUtZnN5bmMtcmVhZC1yZWNvdmVyeQ=="},"op":"get"}

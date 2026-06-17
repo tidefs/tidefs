@@ -7,6 +7,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use tidefs_trace_oracle::backend::compare_model_and_runtime_trace;
+use tidefs_trace_oracle::protocol::{OP_FSYNC, POOL_TRACE_OPS};
 use tidefs_trace_oracle::{load_trace, save_trace, JsonlTraceWriter};
 
 #[test]
@@ -75,6 +76,27 @@ fn model_runtime_backend_smoke_trace_matches() {
         comparison.final_fingerprint("local_runtime"),
         Some("1b5ff6cab46a09b38b0270d739ed5abdcbf17cb631219ad729439cd9230d3222")
     );
+}
+
+#[test]
+fn model_runtime_write_sync_restart_trace_matches() {
+    assert!(POOL_TRACE_OPS.contains(&OP_FSYNC));
+
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let trace_path = root
+        .join("traces")
+        .join("local-vfs-write-fsync-read-recovery.jsonl");
+
+    let comparison = compare_model_and_runtime_trace(&trace_path).unwrap();
+
+    assert!(comparison.passed(), "{:#?}", comparison.mismatches);
+    assert!(comparison.final_fingerprint("model").is_some());
+    assert!(comparison.final_fingerprint("local_runtime").is_some());
 }
 
 #[test]
