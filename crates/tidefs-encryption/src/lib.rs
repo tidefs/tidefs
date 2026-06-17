@@ -1826,11 +1826,12 @@ mod tests {
         let salt = PoolWrappingKey::generate_salt();
         let wk = PoolWrappingKey::derive("lease test passphrase", &salt).unwrap();
         let (mut handle, original_key) =
-            PoolEncryptionSecretHandle::mint("zero-test".into(), &wk, 1_700_000_000).unwrap();
+            PoolEncryptionSecretHandle::mint("zero-test".into(), None, &wk, 1_700_000_000).unwrap();
         handle.activate(1_700_000_100);
 
         let lease = handle
             .issue_lease(
+                None,
                 &wk,
                 std::time::Duration::from_secs(60),
                 LeaseUsageClass::PoolMount,
