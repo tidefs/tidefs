@@ -2700,7 +2700,7 @@ mod tests {
             "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json"
         );
         assert_eq!(runtime.validation_tier, "mounted-userspace");
-        assert_eq!(runtime.blocking_issues, vec!["#495".to_string()]);
+        assert_eq!(runtime.blocking_issues, vec!["#596".to_string()]);
         assert!(runtime.details.iter().any(|detail| detail
             .contains("no evidence_artifacts entry registers class `runtime-namespace-crash-artifact`")));
 
@@ -2714,7 +2714,7 @@ mod tests {
         let summary = render_claim_validation_summary(&receipt);
         assert!(summary.contains("status: BLOCKED"));
         assert!(summary.contains("class: runtime-namespace-crash-artifact"));
-        assert!(summary.contains("blocking_issues: #495"));
+        assert!(summary.contains("blocking_issues: #596"));
     }
 
     #[test]

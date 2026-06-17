@@ -13,8 +13,8 @@ use tidefs_model_core::{
 };
 use tidefs_types_vfs_core::{
     AdmissionIntent, BudgetIntent, CompletionDisposition, CompletionStatus, ContractEpoch, Errno,
-    FenceIntent, InodeId, RequestEnvelope, RequestId, RequestMetadata, RetryIntent, TideRequest,
-    TraceId, VfsNameToken, VfsRequest, WorkClass,
+    FenceIntent, FileHandleId, InodeId, RequestEnvelope, RequestId, RequestMetadata, RetryIntent,
+    TideRequest, TraceId, VfsNameToken, VfsRequest, WorkClass,
 };
 
 use crate::protocol::*;
@@ -445,6 +445,27 @@ impl ModelTraceBackend {
         );
         self.apply_contract_request(operation, envelope, &[], result_override)
     }
+
+    fn apply_contract_sync_path(
+        &mut self,
+        operation: &TraceOperation,
+        operation_index: usize,
+        path: &ModelPath,
+        result_override: Option<Value>,
+    ) -> Result<(BackendCompletion, Option<String>), TraceError> {
+        let inode_id = self
+            .live()?
+            .resolve_path_inode(path)
+            .map_err(model_errno_error)?;
+        let envelope = trace_contract_envelope(
+            operation_index,
+            TideRequest::Vfs(VfsRequest::Sync {
+                inode_id,
+                file_handle_id: FileHandleId::default(),
+            }),
+        );
+        self.apply_contract_request(operation, envelope, &[], result_override)
+    }
 }
 
 impl TraceBackend for ModelTraceBackend {
@@ -543,11 +564,7 @@ impl TraceBackend for ModelTraceBackend {
             }
             OP_FSYNC => {
                 let path = dataset_relative_path(&operation.args, KEY_KEY)?;
-                self.apply_model_request(
-                    operation,
-                    ModelRequest::Fsync { path },
-                    None,
-                )?
+                self.apply_contract_sync_path(operation, operation_index, &path, None)?
             }
             OP_UNLINK => {
                 let path = dataset_relative_path(&operation.args, KEY_PATH)?;

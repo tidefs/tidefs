@@ -1,0 +1,11 @@
+{"args":{"schema":"pool_trace_v1","version":1},"op":"trace_meta"}
+{"args":{"device_count":1,"device_size_bytes":4194304},"op":"create_pool"}
+{"args":{"name":"local_vfs"},"op":"create_dataset"}
+{"args":{"dataset":"local_vfs","path":"dir"},"op":"mkdir"}
+{"args":{"dataset":"local_vfs","path":"dir/source"},"op":"create_file"}
+{"args":{"data_b64":"cmVuYW1lLWF0b21pY2l0eS10ZXN0","dataset":"local_vfs","key":"dir/source","offset":0},"op":"write_range"}
+{"args":{"dataset":"local_vfs","dst":"dir/dest","src":"dir/source"},"op":"rename"}
+{"args":{"datasync":false,"dataset":"local_vfs","key":"dir/dest"},"op":"fsync"}
+{"args":{"dataset":"local_vfs","key":"dir/dest","length":25,"offset":0},"expect":{"value_b64":"cmVuYW1lLWF0b21pY2l0eS10ZXN0"},"op":"get_range"}
+{"args":{},"op":"restart_pool"}
+{"args":{"dataset":"local_vfs","key":"dir/dest"},"expect":{"value_b64":"cmVuYW1lLWF0b21pY2l0eS10ZXN0"},"op":"get"}
