@@ -95,6 +95,21 @@ pub const UBLK_IO_F_FUA: u32 = 1 << 13;
 pub const UBLK_IO_F_NOUNMAP: u32 = 1 << 15;
 pub const UBLK_IO_F_SWAP: u32 = 1 << 16;
 pub const UBLK_IO_F_NEED_REG_BUF: u32 = 1 << 17;
+/// Bitwise OR of every known uBLK I/O flag constant.
+/// Used to detect reserved-flag drift in [`UblkSrvIoDesc::validate`].
+pub const UBLK_IO_F_ALL_KNOWN: u32 = UBLK_IO_F_FAILFAST_DEV
+    | UBLK_IO_F_FAILFAST_TRANSPORT
+    | UBLK_IO_F_FAILFAST_DRIVER
+    | UBLK_IO_F_META
+    | UBLK_IO_F_FUA
+    | UBLK_IO_F_NOUNMAP
+    | UBLK_IO_F_SWAP
+    | UBLK_IO_F_NEED_REG_BUF;
+
+/// Mask of reserved bits in the `flags` portion (`op_flags >> 8`) of an
+/// [`UblkSrvIoDesc`].  Any set bit in this mask after masking out the known
+/// flag bits indicates reserved-field drift that must be rejected.
+pub const UBLK_IO_F_RESERVED_MASK: u32 = !(UBLK_IO_F_ALL_KNOWN >> 8); /* flags occupies bits 8+ of op_flags */
 
 pub const UBLK_ATTR_READ_ONLY: u32 = 1 << 0;
 pub const UBLK_ATTR_ROTATIONAL: u32 = 1 << 1;
@@ -305,6 +320,35 @@ pub struct UblkSrvCtrlCmd {
     pub reserved: u32,
 }
 
+/// Error returned when a uBLK control command fails validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UblkCtrlCmdDecodeError {
+    /// The `pad` field of the control command is non-zero.
+    /// Linux treats this field as reserved space.
+    PadFieldNonZero { pad: u16 },
+    /// The `reserved` field of the control command is non-zero.
+    /// The Linux uBLK UAPI requires this field to be zero.
+    ReservedFieldNonZero { reserved: u32 },
+}
+
+impl UblkSrvCtrlCmd {
+    /// Validate the structural invariants of a control command.
+    ///
+    /// Returns `Ok(self)` if the reserved fields are zero, or a specific
+    /// [`UblkCtrlCmdDecodeError`] naming the first non-zero field.
+    pub fn validate(self) -> Result<Self, UblkCtrlCmdDecodeError> {
+        if self.pad != 0 {
+            return Err(UblkCtrlCmdDecodeError::PadFieldNonZero { pad: self.pad });
+        }
+        if self.reserved != 0 {
+            return Err(UblkCtrlCmdDecodeError::ReservedFieldNonZero {
+                reserved: self.reserved,
+            });
+        }
+        Ok(self)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UblkSrvCtrlDevInfo {
@@ -343,6 +387,81 @@ impl UblkSrvIoDesc {
     pub const fn flags(self) -> u32 {
         self.op_flags >> 8
     }
+
+    /// Validate the structural invariants of an I/O descriptor.
+    ///
+    /// Returns `Ok(self)` if the descriptor is well-formed, or a specific
+    /// [`UblkDescDecodeError`] describing the exact failure reason.
+    ///
+    /// This is an ABI-layer structural check: it rejects reserved-field
+    /// drift and unrecognized opcodes but does not interpret sector
+    /// geometry, queue routing, or runtime I/O policy.
+    pub fn validate(self) -> Result<Self, UblkDescDecodeError> {
+        let opcode = self.op();
+        let flags = self.flags();
+
+        if !Self::is_known_opcode(opcode) {
+            return Err(UblkDescDecodeError::UnsupportedOpcode { opcode });
+        }
+
+        let reserved_bits = flags & UBLK_IO_F_RESERVED_MASK;
+        if reserved_bits != 0 {
+            return Err(UblkDescDecodeError::ReservedFlagBitsSet {
+                flags,
+                reserved_bits,
+            });
+        }
+
+        if opcode == UBLK_IO_OP_FLUSH && self.count_or_zones != 0 {
+            return Err(UblkDescDecodeError::NonZeroFlushSectorCount {
+                count: self.count_or_zones,
+            });
+        }
+
+        Ok(self)
+    }
+
+    /// Returns `true` if `opcode` is one of the Linux uBLK I/O operation codes
+    /// defined by this ABI surface.
+    #[must_use]
+    pub const fn is_known_opcode(opcode: u8) -> bool {
+        matches!(
+            opcode,
+            UBLK_IO_OP_READ
+                | UBLK_IO_OP_WRITE
+                | UBLK_IO_OP_FLUSH
+                | UBLK_IO_OP_DISCARD
+                | UBLK_IO_OP_WRITE_SAME
+                | UBLK_IO_OP_WRITE_ZEROES
+                | UBLK_IO_OP_ZONE_OPEN
+                | UBLK_IO_OP_ZONE_CLOSE
+                | UBLK_IO_OP_ZONE_FINISH
+                | UBLK_IO_OP_ZONE_APPEND
+                | UBLK_IO_OP_ZONE_RESET_ALL
+                | UBLK_IO_OP_ZONE_RESET
+                | UBLK_IO_OP_REPORT_ZONES,
+        )
+    }
+}
+
+/// Error returned when a uBLK I/O descriptor fails structural validation.
+///
+/// Each variant preserves the exact failure reason so callers can route
+/// or log distinct adapter status values rather than collapsing them into
+/// a generic error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UblkDescDecodeError {
+    /// The operation code in the low byte of `op_flags` is not a recognized
+    /// Linux uBLK I/O operation.
+    UnsupportedOpcode { opcode: u8 },
+    /// One or more reserved bits in the flags portion of `op_flags` are set.
+    /// Reserved bits are any bits in `op_flags` outside the known opcode
+    /// range (bits 0-7) and outside the known flag set.
+    ReservedFlagBitsSet { flags: u32, reserved_bits: u32 },
+    /// A flush operation carries a non-zero sector count.  Flush is a
+    /// barrier operation that must not transfer data; `count_or_zones` must
+    /// be zero.
+    NonZeroFlushSectorCount { count: u32 },
 }
 
 #[repr(C)]
@@ -352,6 +471,32 @@ pub struct UblkSrvIoCmd {
     pub tag: u16,
     pub result: i32,
     pub addr_or_zone_append_lba: u64,
+}
+
+/// Error returned when a uBLK I/O completion command fails validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UblkCmdResDecodeError {
+    /// The `result` field is not one of the recognized uBLK I/O result
+    /// status codes (`UBLK_IO_RES_OK`, `UBLK_IO_RES_NEED_GET_DATA`,
+    /// `UBLK_IO_RES_ABORT`).
+    UnrecognizedResultStatus { result: i32 },
+}
+
+impl UblkSrvIoCmd {
+    /// Validate the structural invariants of an I/O completion command.
+    ///
+    /// Returns `Ok(self)` if the result code is a recognized uBLK I/O
+    /// result status, or [`UblkCmdResDecodeError::UnrecognizedResultStatus`].
+    pub fn validate(self) -> Result<Self, UblkCmdResDecodeError> {
+        matches!(
+            self.result,
+            UBLK_IO_RES_OK | UBLK_IO_RES_NEED_GET_DATA | UBLK_IO_RES_ABORT
+        )
+        .then_some(self)
+        .ok_or(UblkCmdResDecodeError::UnrecognizedResultStatus {
+            result: self.result,
+        })
+    }
 }
 
 /// io_uring command descriptor for ublk passthrough block I/O dispatch.
@@ -1515,5 +1660,222 @@ mod tests {
             reserved1: 0x5678_9ABC,
         };
         assert_eq!(UblkAutoBufReg::from_sqe_addr(reg.to_sqe_addr()), reg);
+    }
+
+    // -----------------------------------------------------------------------
+    // IO descriptor validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_read_descriptor_passes_validation() {
+        let desc = UblkSrvIoDesc {
+            op_flags: UBLK_IO_OP_READ as u32,
+            count_or_zones: 1,
+            start_sector: 0,
+            addr: 0x1000,
+        };
+        assert_eq!(desc.validate(), Ok(desc));
+    }
+
+    #[test]
+    fn valid_write_descriptor_passes_validation() {
+        let desc = UblkSrvIoDesc {
+            op_flags: UBLK_IO_OP_WRITE as u32,
+            count_or_zones: 8,
+            start_sector: 4096,
+            addr: 0x2000,
+        };
+        assert_eq!(desc.validate(), Ok(desc));
+    }
+
+    #[test]
+    fn valid_flush_descriptor_passes_validation() {
+        let desc = UblkSrvIoDesc {
+            op_flags: UBLK_IO_OP_FLUSH as u32,
+            count_or_zones: 0,
+            start_sector: 0,
+            addr: 0,
+        };
+        assert_eq!(desc.validate(), Ok(desc));
+    }
+
+    #[test]
+    fn valid_discard_descriptor_passes_validation() {
+        let desc = UblkSrvIoDesc {
+            op_flags: UBLK_IO_OP_DISCARD as u32,
+            count_or_zones: 0,
+            start_sector: 0,
+            addr: 0x3000,
+        };
+        assert_eq!(desc.validate(), Ok(desc));
+    }
+
+    #[test]
+    fn descriptor_rejects_unsupported_opcode() {
+        let desc = UblkSrvIoDesc {
+            op_flags: 0xFF,
+            count_or_zones: 1,
+            start_sector: 0,
+            addr: 0,
+        };
+        assert_eq!(
+            desc.validate(),
+            Err(UblkDescDecodeError::UnsupportedOpcode { opcode: 0xFF })
+        );
+    }
+
+    #[test]
+    fn descriptor_rejects_reserved_flag_bits() {
+        let desc = UblkSrvIoDesc {
+            op_flags: UBLK_IO_OP_READ as u32 | (1 << 12),
+            count_or_zones: 1,
+            start_sector: 0,
+            addr: 0,
+        };
+        let err = desc.validate().unwrap_err();
+        match err {
+            UblkDescDecodeError::ReservedFlagBitsSet {
+                flags: _,
+                reserved_bits,
+            } => {
+                assert_eq!(reserved_bits, 1 << 4);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn descriptor_rejects_nonzero_flush_count() {
+        let desc = UblkSrvIoDesc {
+            op_flags: UBLK_IO_OP_FLUSH as u32,
+            count_or_zones: 42,
+            start_sector: 0,
+            addr: 0,
+        };
+        assert_eq!(
+            desc.validate(),
+            Err(UblkDescDecodeError::NonZeroFlushSectorCount { count: 42 })
+        );
+    }
+
+    #[test]
+    fn descriptor_allows_known_flag_combination() {
+        let desc = UblkSrvIoDesc {
+            op_flags: UBLK_IO_OP_WRITE as u32 | UBLK_IO_F_FUA | UBLK_IO_F_SWAP | UBLK_IO_F_META,
+            count_or_zones: 4,
+            start_sector: 100,
+            addr: 0x5000,
+        };
+        assert_eq!(desc.validate(), Ok(desc));
+    }
+
+    // -----------------------------------------------------------------------
+    // IO completion command validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_completion_commands_pass_validation() {
+        for result in [UBLK_IO_RES_OK, UBLK_IO_RES_NEED_GET_DATA, UBLK_IO_RES_ABORT] {
+            let cmd = UblkSrvIoCmd {
+                q_id: 0,
+                tag: 1,
+                result,
+                addr_or_zone_append_lba: 0,
+            };
+            assert_eq!(cmd.validate(), Ok(cmd), "result={}", result);
+        }
+    }
+
+    #[test]
+    fn completion_command_rejects_unrecognized_result() {
+        let cmd = UblkSrvIoCmd {
+            q_id: 0,
+            tag: 1,
+            result: -42,
+            addr_or_zone_append_lba: 0,
+        };
+        assert_eq!(
+            cmd.validate(),
+            Err(UblkCmdResDecodeError::UnrecognizedResultStatus { result: -42 })
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Control command validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn control_command_with_zero_reserved_passes_validation() {
+        let cmd = UblkSrvCtrlCmd {
+            pad: 0,
+            reserved: 0,
+            ..UblkSrvCtrlCmd::default()
+        };
+        assert_eq!(cmd.validate(), Ok(cmd));
+    }
+
+    #[test]
+    fn control_command_rejects_nonzero_pad() {
+        let cmd = UblkSrvCtrlCmd {
+            pad: 0xBEEF,
+            ..UblkSrvCtrlCmd::default()
+        };
+        assert_eq!(
+            cmd.validate(),
+            Err(UblkCtrlCmdDecodeError::PadFieldNonZero { pad: 0xBEEF })
+        );
+    }
+
+    #[test]
+    fn control_command_rejects_nonzero_reserved() {
+        let cmd = UblkSrvCtrlCmd {
+            reserved: 0xDEAD,
+            ..UblkSrvCtrlCmd::default()
+        };
+        assert_eq!(
+            cmd.validate(),
+            Err(UblkCtrlCmdDecodeError::ReservedFieldNonZero { reserved: 0xDEAD })
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_known_opcode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_known_opcode_accepts_all_defined_opcodes() {
+        let known = [
+            UBLK_IO_OP_READ,
+            UBLK_IO_OP_WRITE,
+            UBLK_IO_OP_FLUSH,
+            UBLK_IO_OP_DISCARD,
+            UBLK_IO_OP_WRITE_SAME,
+            UBLK_IO_OP_WRITE_ZEROES,
+            UBLK_IO_OP_ZONE_OPEN,
+            UBLK_IO_OP_ZONE_CLOSE,
+            UBLK_IO_OP_ZONE_FINISH,
+            UBLK_IO_OP_ZONE_APPEND,
+            UBLK_IO_OP_ZONE_RESET_ALL,
+            UBLK_IO_OP_ZONE_RESET,
+            UBLK_IO_OP_REPORT_ZONES,
+        ];
+        for &op in &known {
+            assert!(
+                UblkSrvIoDesc::is_known_opcode(op),
+                "opcode {} should be known",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn is_known_opcode_rejects_undefined_opcodes() {
+        for op in [6u8, 7, 8, 9, 16, 17, 19, 42, 255] {
+            assert!(
+                !UblkSrvIoDesc::is_known_opcode(op),
+                "opcode {} should be rejected",
+                op
+            );
+        }
     }
 }
