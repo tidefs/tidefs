@@ -153,6 +153,11 @@ impl DrainExecutor {
         self.drain.handle()
     }
 
+    /// Attach an evacuation receipt to the underlying drain.
+    pub fn set_evacuation_receipt(&mut self, receipt: crate::evacuation_receipt::EvacuationReceipt) {
+        self.drain.set_evacuation_receipt(receipt);
+    }
+
     /// Run a single tick of the executor.
     ///
     /// Returns the current stage after processing. If the drain has timed out,

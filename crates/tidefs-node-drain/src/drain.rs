@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::fmt;
 use tidefs_membership_epoch::MemberId;
+use crate::evacuation_receipt::{EvacuationReceipt, EvacuationReceiptError};
 
 // ---------------------------------------------------------------------------
 // Node lifecycle states
@@ -196,6 +197,20 @@ pub enum DrainError {
     Fenced { node_id: MemberId },
     /// The drain operation timed out.
     Timeout { node_id: MemberId, timeout_ms: u64 },
+    /// An evacuation receipt is required for this drain phase transition.
+    RequiresEvacuationReceipt {
+        node_id: MemberId,
+        stage: DrainStage,
+    },
+    /// The evacuation receipt is not yet committed.
+    EvacuationReceiptNotCommitted {
+        node_id: MemberId,
+    },
+    /// The evacuation receipt failed validation.
+    EvacuationReceiptInvalid {
+        node_id: MemberId,
+        error: EvacuationReceiptError,
+    },
 }
 
 impl From<String> for DrainError {
@@ -252,6 +267,27 @@ impl fmt::Display for DrainError {
                     node_id.0, timeout_ms
                 )
             }
+            Self::RequiresEvacuationReceipt { node_id, stage } => {
+                write!(
+                    f,
+                    "node {} requires an evacuation receipt to advance from stage {:?}",
+                    node_id.0, stage
+                )
+            }
+            Self::EvacuationReceiptNotCommitted { node_id } => {
+                write!(
+                    f,
+                    "node {} evacuation receipt is not yet committed",
+                    node_id.0
+                )
+            }
+            Self::EvacuationReceiptInvalid { node_id, error } => {
+                write!(
+                    f,
+                    "node {} evacuation receipt invalid: {}",
+                    node_id.0, error
+                )
+            }
         }
     }
 }
@@ -276,6 +312,8 @@ pub struct NodeDrain {
     elapsed_ms: u64,
     /// Configurable timeout for the entire drain operation.
     timeout_ms: u64,
+    /// Committed evacuation receipt gating drain completion.
+    evacuation_receipt: Option<EvacuationReceipt>,
 }
 
 impl NodeDrain {
@@ -291,6 +329,7 @@ impl NodeDrain {
             operator_initiated,
             elapsed_ms: 0,
             timeout_ms: 0,
+            evacuation_receipt: None,
         }
     }
 
@@ -345,6 +384,16 @@ impl NodeDrain {
 
     pub fn set_timeout(&mut self, timeout_ms: u64) {
         self.timeout_ms = timeout_ms;
+    }
+
+    /// Return a reference to the evacuation receipt, if attached.
+    pub fn evacuation_receipt(&self) -> Option<&EvacuationReceipt> {
+        self.evacuation_receipt.as_ref()
+    }
+
+    /// Attach a committed evacuation receipt to this drain.
+    pub fn set_evacuation_receipt(&mut self, receipt: EvacuationReceipt) {
+        self.evacuation_receipt = Some(receipt);
     }
 
     pub fn set_epoch(&mut self, epoch: u64) {
@@ -403,6 +452,16 @@ impl NodeDrain {
                         progress: self.progress,
                     });
                 }
+                // Data-to-cache transition requires a committed evacuation receipt
+                // when relocation receipts exist.  If no receipt is attached, the
+                // node had no data to migrate (vacuous satisfaction).
+                if let Some(receipt) = &self.evacuation_receipt {
+                    if !receipt.is_committed() {
+                        return Err(DrainError::EvacuationReceiptNotCommitted {
+                            node_id: self.node_id,
+                        });
+                    }
+                }
             }
             DrainStage::DrainingCache => {
                 if self.progress.bytes_remaining > 0 {
@@ -433,6 +492,18 @@ impl NodeDrain {
             // Reset progress for the new stage
             self.progress = DrainProgress::ZERO;
             if self.stage == DrainStage::Drained {
+                // Drained transition requires committed epoch boundary when
+                // an evacuation receipt exists (data was migrated).
+                if let Some(ref receipt) = self.evacuation_receipt {
+                    if receipt.committed_epoch_boundary.is_none() {
+                        return Err(DrainError::EvacuationReceiptInvalid {
+                            node_id: self.node_id,
+                            error: EvacuationReceiptError::EpochBoundaryNotCommitted {
+                                draining_node: self.node_id,
+                            },
+                        });
+                    }
+                }
                 self.state = NodeState::Drained;
             }
         }
