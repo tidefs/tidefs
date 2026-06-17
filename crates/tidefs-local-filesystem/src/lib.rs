@@ -3784,13 +3784,14 @@ impl LocalFileSystem {
         // Pre-compute receipt durability: for each key in the batch, check
         // whether its placement receipt is durable.  Keys that pass are safe
         // to delete; keys that fail stay in the queue.
-        let receipt_durable_keys: std::collections::BTreeSet<tidefs_local_object_store::ObjectKey> = batch
-            .iter()
-            .map(|(k, _)| tidefs_local_object_store::ObjectKey::from_bytes(k.0))
-            .filter(|local_key| {
-                crate::allocation::chunk_content_key_receipt_stable(&self.store, *local_key)
-            })
-            .collect();
+        let receipt_durable_keys: std::collections::BTreeSet<tidefs_local_object_store::ObjectKey> =
+            batch
+                .iter()
+                .map(|(k, _)| tidefs_local_object_store::ObjectKey::from_bytes(k.0))
+                .filter(|local_key| {
+                    crate::allocation::chunk_content_key_receipt_stable(&self.store, *local_key)
+                })
+                .collect();
 
         if !batch.is_empty() {
             let store = self.store.raw_primary_store_mut();
@@ -3855,12 +3856,10 @@ impl LocalFileSystem {
             for (object_key, delta) in &batch {
                 q.delete(object_key);
                 let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
-                if !receipt_durable_keys.contains(&local_key) && !protected_keys.contains(&local_key) {
-                    let entry = ReclaimQueueEntry::new(
-                        *object_key,
-                        *delta,
-                        QueueFamily::Extent,
-                    );
+                if !receipt_durable_keys.contains(&local_key)
+                    && !protected_keys.contains(&local_key)
+                {
+                    let entry = ReclaimQueueEntry::new(*object_key, *delta, QueueFamily::Extent);
                     q.insert(entry);
                 }
             }
@@ -6418,8 +6417,6 @@ impl LocalFileSystem {
                     &base_record,
                     offset,
                     base_len,
-                    true,
-                    Some(&self.store),
                 )?;
                 if base.len() > base_len {
                     return Err(FileSystemError::CorruptState {
@@ -10801,8 +10798,13 @@ impl LocalFileSystem {
         }
 
         if offset == 0 && length_u64 >= record.size {
-            let bytes =
-                read_content_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+            let bytes = read_content_from_store(
+                self.store.raw_primary_store(),
+                inode_id,
+                record,
+                true,
+                Some(&self.store),
+            )?;
             self.hot_read_cache.borrow_mut().admit(key, &bytes);
             return Ok(bytes);
         }
