@@ -95,12 +95,447 @@ impl ResourceDomain {
             Self::Cpu => "cpu",
         }
     }
+
+    /// Resolve a canonical metadata spelling into a known resource domain.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "foreground-io" => Some(Self::ForegroundIo),
+            "background-io" => Some(Self::BackgroundIo),
+            "dirty-bytes" => Some(Self::DirtyBytes),
+            "dirty-operations" => Some(Self::DirtyOperations),
+            "dirty-age" => Some(Self::DirtyAge),
+            "metadata" => Some(Self::Metadata),
+            "queue-slots" => Some(Self::QueueSlots),
+            "cpu" => Some(Self::Cpu),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ResourceDomain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Validation tier named by a performance metadata receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+#[non_exhaustive]
+pub enum ValidationTier {
+    SourceModel,
+    CargoUnit,
+    HarnessOnly,
+    MountedUserspace,
+    QemuGuest,
+    Kbuild,
+    QemuModuleLoad,
+    MountedKernelVfs,
+    KernelBlockIo,
+    FullKernelNoDaemon,
+    MultiProcessDistributed,
+}
+
+impl ValidationTier {
+    /// Return the canonical validation-tier spelling used in artifacts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceModel => "source-model",
+            Self::CargoUnit => "cargo-unit",
+            Self::HarnessOnly => "harness-only",
+            Self::MountedUserspace => "mounted-userspace",
+            Self::QemuGuest => "qemu-guest",
+            Self::Kbuild => "kbuild",
+            Self::QemuModuleLoad => "qemu-module-load",
+            Self::MountedKernelVfs => "mounted-kernel-vfs",
+            Self::KernelBlockIo => "kernel-block-io",
+            Self::FullKernelNoDaemon => "full-kernel-no-daemon",
+            Self::MultiProcessDistributed => "multi-process-distributed",
+        }
+    }
+
+    /// Return true for tiers backed only by source, schema, or model evidence.
+    #[must_use]
+    pub const fn is_metadata_only(self) -> bool {
+        matches!(
+            self,
+            Self::SourceModel | Self::CargoUnit | Self::HarnessOnly
+        )
+    }
+}
+
+impl fmt::Display for ValidationTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Stable workload scope named by a performance metadata receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct WorkloadScope<'a> {
+    pub id: &'a str,
+    pub description: &'a str,
+}
+
+impl<'a> WorkloadScope<'a> {
+    #[must_use]
+    pub const fn new(id: &'a str, description: &'a str) -> Self {
+        Self { id, description }
+    }
+}
+
+/// Environment profile identity for a comparable performance run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct EnvironmentProfileRef<'a> {
+    pub id: &'a str,
+}
+
+impl<'a> EnvironmentProfileRef<'a> {
+    #[must_use]
+    pub const fn new(id: &'a str) -> Self {
+        Self { id }
+    }
+}
+
+/// Resource-domain name carried by receipt metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct ResourceDomainName<'a> {
+    pub name: &'a str,
+}
+
+impl<'a> ResourceDomainName<'a> {
+    #[must_use]
+    pub const fn new(name: &'a str) -> Self {
+        Self { name }
+    }
+
+    #[must_use]
+    pub const fn from_known(domain: ResourceDomain) -> Self {
+        Self {
+            name: domain.as_str(),
+        }
+    }
+
+    #[must_use]
+    pub fn known_domain(self) -> Option<ResourceDomain> {
+        ResourceDomain::from_name(self.name)
+    }
+}
+
+/// Workload envelope used to compare one performance artifact with another.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct WorkloadEnvelope<'a> {
+    pub scope: WorkloadScope<'a>,
+    pub work_class: WorkClass,
+    pub environment_profile: EnvironmentProfileRef<'a>,
+    pub resource_domains: &'a [ResourceDomainName<'a>],
+}
+
+impl<'a> WorkloadEnvelope<'a> {
+    #[must_use]
+    pub const fn new(
+        scope: WorkloadScope<'a>,
+        work_class: WorkClass,
+        environment_profile: EnvironmentProfileRef<'a>,
+        resource_domains: &'a [ResourceDomainName<'a>],
+    ) -> Self {
+        Self {
+            scope,
+            work_class,
+            environment_profile,
+            resource_domains,
+        }
+    }
+}
+
+/// Integer measurement unit for deterministic performance receipts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+#[non_exhaustive]
+pub enum MeasurementUnit {
+    Bytes,
+    Operations,
+    Ticks,
+    Microseconds,
+    Count,
+    BytesPerSecond,
+    OperationsPerSecond,
+    BasisPoints,
+}
+
+impl MeasurementUnit {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::Operations => "operations",
+            Self::Ticks => "ticks",
+            Self::Microseconds => "microseconds",
+            Self::Count => "count",
+            Self::BytesPerSecond => "bytes-per-second",
+            Self::OperationsPerSecond => "operations-per-second",
+            Self::BasisPoints => "basis-points",
+        }
+    }
+}
+
+impl fmt::Display for MeasurementUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One deterministic value in a receipt measurement vector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct MeasurementPoint<'a> {
+    pub name: &'a str,
+    pub resource_domain: ResourceDomainName<'a>,
+    pub value: u64,
+    pub unit: MeasurementUnit,
+}
+
+impl<'a> MeasurementPoint<'a> {
+    #[must_use]
+    pub const fn new(
+        name: &'a str,
+        resource_domain: ResourceDomainName<'a>,
+        value: u64,
+        unit: MeasurementUnit,
+    ) -> Self {
+        Self {
+            name,
+            resource_domain,
+            value,
+            unit,
+        }
+    }
+}
+
+/// Vector of comparable performance measurements.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct MeasurementVector<'a> {
+    pub points: &'a [MeasurementPoint<'a>],
+}
+
+impl<'a> MeasurementVector<'a> {
+    #[must_use]
+    pub const fn new(points: &'a [MeasurementPoint<'a>]) -> Self {
+        Self { points }
+    }
+}
+
+/// Budget comparator family named by a budget decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+#[non_exhaustive]
+pub enum BudgetComparatorKind {
+    AbsoluteFloor,
+    AbsoluteCeiling,
+    BaselineRatio,
+    RegressionLock,
+}
+
+/// Explicit comparator policy for a budget decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct BudgetComparatorRef<'a> {
+    pub id: &'a str,
+    pub kind: BudgetComparatorKind,
+}
+
+impl<'a> BudgetComparatorRef<'a> {
+    #[must_use]
+    pub const fn new(id: &'a str, kind: BudgetComparatorKind) -> Self {
+        Self { id, kind }
+    }
+}
+
+/// Explicit baseline policy for a budget decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct BaselinePolicyRef<'a> {
+    pub id: &'a str,
+}
+
+impl<'a> BaselinePolicyRef<'a> {
+    #[must_use]
+    pub const fn new(id: &'a str) -> Self {
+        Self { id }
+    }
+}
+
+/// Outcome recorded after comparing a measurement vector with a budget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+#[non_exhaustive]
+pub enum BudgetOutcome {
+    Pass,
+    Fail,
+    Refuse,
+    Pending,
+}
+
+/// Budget decision metadata for one performance receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct BudgetDecision<'a> {
+    pub outcome: BudgetOutcome,
+    pub comparator: Option<BudgetComparatorRef<'a>>,
+    pub baseline_policy: Option<BaselinePolicyRef<'a>>,
+}
+
+impl<'a> BudgetDecision<'a> {
+    #[must_use]
+    pub const fn with_comparator(
+        outcome: BudgetOutcome,
+        comparator: BudgetComparatorRef<'a>,
+    ) -> Self {
+        Self {
+            outcome,
+            comparator: Some(comparator),
+            baseline_policy: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_baseline_policy(
+        outcome: BudgetOutcome,
+        baseline_policy: BaselinePolicyRef<'a>,
+    ) -> Self {
+        Self {
+            outcome,
+            comparator: None,
+            baseline_policy: Some(baseline_policy),
+        }
+    }
+
+    #[must_use]
+    pub const fn without_policy(outcome: BudgetOutcome) -> Self {
+        Self {
+            outcome,
+            comparator: None,
+            baseline_policy: None,
+        }
+    }
+
+    #[must_use]
+    pub fn has_explicit_policy(self) -> bool {
+        self.comparator
+            .is_some_and(|comparator| !is_blank(comparator.id))
+            || self
+                .baseline_policy
+                .is_some_and(|baseline_policy| !is_blank(baseline_policy.id))
+    }
+}
+
+/// Receipt metadata that scopes performance measurements to a comparable run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct PerformanceReceipt<'a> {
+    pub id: &'a str,
+    pub workload: WorkloadEnvelope<'a>,
+    pub measurement_vector: MeasurementVector<'a>,
+    pub budget_decision: BudgetDecision<'a>,
+    pub validation_tier: ValidationTier,
+    pub claim_ids: &'a [&'a str],
+}
+
+impl<'a> PerformanceReceipt<'a> {
+    #[must_use]
+    pub const fn new(
+        id: &'a str,
+        workload: WorkloadEnvelope<'a>,
+        measurement_vector: MeasurementVector<'a>,
+        budget_decision: BudgetDecision<'a>,
+        validation_tier: ValidationTier,
+        claim_ids: &'a [&'a str],
+    ) -> Self {
+        Self {
+            id,
+            workload,
+            measurement_vector,
+            budget_decision,
+            validation_tier,
+            claim_ids,
+        }
+    }
+
+    /// Validate the receipt metadata needed to compare runtime artifacts.
+    pub fn validate(&self) -> Result<(), PerformanceReceiptValidationError> {
+        if is_blank(self.workload.scope.id) {
+            return Err(PerformanceReceiptValidationError::MissingWorkloadScope);
+        }
+        if is_blank(self.workload.environment_profile.id) {
+            return Err(PerformanceReceiptValidationError::MissingEnvironmentProfile);
+        }
+        if self.workload.resource_domains.is_empty() {
+            return Err(PerformanceReceiptValidationError::MissingResourceDomains);
+        }
+        for (index, domain) in self.workload.resource_domains.iter().enumerate() {
+            if domain.known_domain().is_none() {
+                return Err(PerformanceReceiptValidationError::UnknownResourceDomain {
+                    source: ResourceDomainSource::WorkloadEnvelope,
+                    index,
+                });
+            }
+        }
+        if self.measurement_vector.points.is_empty() {
+            return Err(PerformanceReceiptValidationError::EmptyMeasurementVector);
+        }
+        for (index, measurement) in self.measurement_vector.points.iter().enumerate() {
+            if measurement.resource_domain.known_domain().is_none() {
+                return Err(PerformanceReceiptValidationError::UnknownResourceDomain {
+                    source: ResourceDomainSource::MeasurementVector,
+                    index,
+                });
+            }
+        }
+        if !self.budget_decision.has_explicit_policy() {
+            return Err(PerformanceReceiptValidationError::BudgetDecisionWithoutPolicy);
+        }
+        if self.claim_ids.is_empty() || self.claim_ids.iter().any(|claim_id| is_blank(claim_id)) {
+            return Err(PerformanceReceiptValidationError::MissingClaimIds);
+        }
+        Ok(())
+    }
+}
+
+/// Part of a receipt that named an unknown resource domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum ResourceDomainSource {
+    WorkloadEnvelope,
+    MeasurementVector,
+}
+
+/// Receipt metadata validation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum PerformanceReceiptValidationError {
+    MissingWorkloadScope,
+    MissingEnvironmentProfile,
+    MissingResourceDomains,
+    UnknownResourceDomain {
+        source: ResourceDomainSource,
+        index: usize,
+    },
+    EmptyMeasurementVector,
+    BudgetDecisionWithoutPolicy,
+    MissingClaimIds,
 }
 
 /// Per-tick service envelope for one work class.
@@ -759,12 +1194,274 @@ const fn min_u32(left: u32, right: u32) -> u32 {
     }
 }
 
+fn is_blank(value: &str) -> bool {
+    value
+        .as_bytes()
+        .iter()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::oracle::{
         with_scheduling_and_admission, without_scheduling_or_admission, OracleConfig,
     };
     use super::*;
+
+    const NO_STD_SCOPE: WorkloadScope<'static> = WorkloadScope::new(
+        "workload.local.writeback.flush",
+        "local writeback flush envelope",
+    );
+    const NO_STD_ENVIRONMENT: EnvironmentProfileRef<'static> =
+        EnvironmentProfileRef::new("env.local-ci.nix");
+    const NO_STD_DECISION: BudgetDecision<'static> = BudgetDecision::with_comparator(
+        BudgetOutcome::Pass,
+        BudgetComparatorRef::new(
+            "budget.local.writeback.absolute",
+            BudgetComparatorKind::AbsoluteCeiling,
+        ),
+    );
+
+    static RECEIPT_DOMAINS: [ResourceDomainName<'static>; 2] = [
+        ResourceDomainName::from_known(ResourceDomain::DirtyBytes),
+        ResourceDomainName::from_known(ResourceDomain::QueueSlots),
+    ];
+    static RECEIPT_MEASUREMENTS: [MeasurementPoint<'static>; 2] = [
+        MeasurementPoint::new(
+            "queued_dirty_bytes",
+            ResourceDomainName::from_known(ResourceDomain::DirtyBytes),
+            4096,
+            MeasurementUnit::Bytes,
+        ),
+        MeasurementPoint::new(
+            "queue_slots",
+            ResourceDomainName::from_known(ResourceDomain::QueueSlots),
+            4,
+            MeasurementUnit::Count,
+        ),
+    ];
+    static RECEIPT_CLAIMS: [&str; 1] = ["perf.local.no_unbounded_dirty_debt.v1"];
+
+    fn valid_receipt() -> PerformanceReceipt<'static> {
+        PerformanceReceipt::new(
+            "performance.local.writeback.receipt.v1",
+            WorkloadEnvelope::new(
+                NO_STD_SCOPE,
+                WorkClass::ForegroundWrite,
+                NO_STD_ENVIRONMENT,
+                &RECEIPT_DOMAINS,
+            ),
+            MeasurementVector::new(&RECEIPT_MEASUREMENTS),
+            NO_STD_DECISION,
+            ValidationTier::CargoUnit,
+            &RECEIPT_CLAIMS,
+        )
+    }
+
+    fn receipt_with<'a>(
+        scope_id: &'a str,
+        environment_id: &'a str,
+        resource_domains: &'a [ResourceDomainName<'a>],
+        measurements: &'a [MeasurementPoint<'a>],
+        budget_decision: BudgetDecision<'a>,
+        claim_ids: &'a [&'a str],
+    ) -> PerformanceReceipt<'a> {
+        PerformanceReceipt::new(
+            "performance.local.writeback.receipt.v1",
+            WorkloadEnvelope::new(
+                WorkloadScope::new(scope_id, "local writeback flush envelope"),
+                WorkClass::ForegroundWrite,
+                EnvironmentProfileRef::new(environment_id),
+                resource_domains,
+            ),
+            MeasurementVector::new(measurements),
+            budget_decision,
+            ValidationTier::CargoUnit,
+            claim_ids,
+        )
+    }
+
+    #[test]
+    fn receipt_metadata_has_no_std_safe_constructors() {
+        assert_eq!(NO_STD_SCOPE.id, "workload.local.writeback.flush");
+        assert_eq!(NO_STD_ENVIRONMENT.id, "env.local-ci.nix");
+        assert_eq!(NO_STD_DECISION.outcome, BudgetOutcome::Pass);
+        assert_eq!(
+            ResourceDomainName::from_known(ResourceDomain::DirtyBytes).name,
+            "dirty-bytes"
+        );
+    }
+
+    #[test]
+    fn performance_receipt_validates_complete_metadata() {
+        assert_eq!(valid_receipt().validate(), Ok(()));
+    }
+
+    #[test]
+    fn performance_receipt_validation_rejects_missing_workload_scope() {
+        let err = receipt_with(
+            "",
+            "env.local-ci.nix",
+            &RECEIPT_DOMAINS,
+            &RECEIPT_MEASUREMENTS,
+            NO_STD_DECISION,
+            &RECEIPT_CLAIMS,
+        )
+        .validate()
+        .expect_err("missing workload scope must be rejected");
+        assert_eq!(err, PerformanceReceiptValidationError::MissingWorkloadScope);
+    }
+
+    #[test]
+    fn performance_receipt_validation_rejects_missing_environment_profile() {
+        let err = receipt_with(
+            "workload.local.writeback.flush",
+            "",
+            &RECEIPT_DOMAINS,
+            &RECEIPT_MEASUREMENTS,
+            NO_STD_DECISION,
+            &RECEIPT_CLAIMS,
+        )
+        .validate()
+        .expect_err("missing environment profile must be rejected");
+        assert_eq!(
+            err,
+            PerformanceReceiptValidationError::MissingEnvironmentProfile
+        );
+    }
+
+    #[test]
+    fn performance_receipt_validation_rejects_unknown_workload_domain() {
+        let domains = [
+            ResourceDomainName::from_known(ResourceDomain::DirtyBytes),
+            ResourceDomainName::new("page-cache-untracked"),
+        ];
+        let err = receipt_with(
+            "workload.local.writeback.flush",
+            "env.local-ci.nix",
+            &domains,
+            &RECEIPT_MEASUREMENTS,
+            NO_STD_DECISION,
+            &RECEIPT_CLAIMS,
+        )
+        .validate()
+        .expect_err("unknown workload domain must be rejected");
+        assert_eq!(
+            err,
+            PerformanceReceiptValidationError::UnknownResourceDomain {
+                source: ResourceDomainSource::WorkloadEnvelope,
+                index: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn performance_receipt_validation_rejects_unknown_measurement_domain() {
+        let measurements = [MeasurementPoint::new(
+            "queued_dirty_bytes",
+            ResourceDomainName::new("opaque-cache-budget"),
+            4096,
+            MeasurementUnit::Bytes,
+        )];
+        let err = receipt_with(
+            "workload.local.writeback.flush",
+            "env.local-ci.nix",
+            &RECEIPT_DOMAINS,
+            &measurements,
+            NO_STD_DECISION,
+            &RECEIPT_CLAIMS,
+        )
+        .validate()
+        .expect_err("unknown measurement domain must be rejected");
+        assert_eq!(
+            err,
+            PerformanceReceiptValidationError::UnknownResourceDomain {
+                source: ResourceDomainSource::MeasurementVector,
+                index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn performance_receipt_validation_rejects_empty_measurement_vector() {
+        let err = receipt_with(
+            "workload.local.writeback.flush",
+            "env.local-ci.nix",
+            &RECEIPT_DOMAINS,
+            &[],
+            NO_STD_DECISION,
+            &RECEIPT_CLAIMS,
+        )
+        .validate()
+        .expect_err("empty measurement vector must be rejected");
+        assert_eq!(
+            err,
+            PerformanceReceiptValidationError::EmptyMeasurementVector
+        );
+    }
+
+    #[test]
+    fn performance_receipt_validation_rejects_budget_without_policy() {
+        let err = receipt_with(
+            "workload.local.writeback.flush",
+            "env.local-ci.nix",
+            &RECEIPT_DOMAINS,
+            &RECEIPT_MEASUREMENTS,
+            BudgetDecision::without_policy(BudgetOutcome::Pass),
+            &RECEIPT_CLAIMS,
+        )
+        .validate()
+        .expect_err("budget decisions need comparator or baseline policy");
+        assert_eq!(
+            err,
+            PerformanceReceiptValidationError::BudgetDecisionWithoutPolicy
+        );
+    }
+
+    #[test]
+    fn performance_receipt_validation_accepts_baseline_policy() {
+        let decision = BudgetDecision::with_baseline_policy(
+            BudgetOutcome::Pending,
+            BaselinePolicyRef::new("baseline.local.writeback.reference"),
+        );
+        assert_eq!(
+            receipt_with(
+                "workload.local.writeback.flush",
+                "env.local-ci.nix",
+                &RECEIPT_DOMAINS,
+                &RECEIPT_MEASUREMENTS,
+                decision,
+                &RECEIPT_CLAIMS,
+            )
+            .validate(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn performance_receipt_validation_rejects_missing_claim_ids() {
+        let err = receipt_with(
+            "workload.local.writeback.flush",
+            "env.local-ci.nix",
+            &RECEIPT_DOMAINS,
+            &RECEIPT_MEASUREMENTS,
+            NO_STD_DECISION,
+            &[],
+        )
+        .validate()
+        .expect_err("performance receipts must name claim ids");
+        assert_eq!(err, PerformanceReceiptValidationError::MissingClaimIds);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn performance_receipt_serialization_is_deterministic() {
+        let json = serde_json::to_string(&valid_receipt()).expect("serialize receipt");
+        assert_eq!(
+            json,
+            r#"{"id":"performance.local.writeback.receipt.v1","workload":{"scope":{"id":"workload.local.writeback.flush","description":"local writeback flush envelope"},"work_class":"ForegroundWrite","environment_profile":{"id":"env.local-ci.nix"},"resource_domains":[{"name":"dirty-bytes"},{"name":"queue-slots"}]},"measurement_vector":{"points":[{"name":"queued_dirty_bytes","resource_domain":{"name":"dirty-bytes"},"value":4096,"unit":"bytes"},{"name":"queue_slots","resource_domain":{"name":"queue-slots"},"value":4,"unit":"count"}]},"budget_decision":{"outcome":"pass","comparator":{"id":"budget.local.writeback.absolute","kind":"absolute-ceiling"},"baseline_policy":null},"validation_tier":"cargo-unit","claim_ids":["perf.local.no_unbounded_dirty_debt.v1"]}"#
+        );
+    }
 
     #[test]
     fn admission_permits_conserve_dirty_debt() {

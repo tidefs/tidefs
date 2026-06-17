@@ -17,5 +17,8 @@ serde = ["alloc", "dep:serde"]
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
 
+[dev-dependencies]
+serde_json = "1"
+
 [lib]
 path = "src/lib.rs"
