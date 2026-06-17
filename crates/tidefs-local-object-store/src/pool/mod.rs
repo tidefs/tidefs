@@ -8169,7 +8169,8 @@ mod tests {
             let mut pool = Pool::create(config, props, &test_options()).unwrap();
             set_deterministic_device_guids(&mut pool);
             let key = ObjectKey::from_name(b"ec42-obj");
-            pool.put(IoClass::Data, key, b"four data shards payload").unwrap();
+            pool.put(IoClass::Data, key, b"four data shards payload")
+                .unwrap();
             let receipt = pool
                 .placement_receipt_for_key(IoClass::Data, key)
                 .unwrap()

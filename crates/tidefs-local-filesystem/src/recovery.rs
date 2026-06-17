@@ -1893,8 +1893,13 @@ pub(crate) fn validate_loaded_state(
     }
     for inode in inodes.values() {
         if inode.is_file_like() {
-            let _ =
-                read_content_from_store(store, inode.inode_id, inode, allow_v0390_fixed_content, None)?;
+            let _ = read_content_from_store(
+                store,
+                inode.inode_id,
+                inode,
+                allow_v0390_fixed_content,
+                None,
+            )?;
         }
     }
     Ok(())
