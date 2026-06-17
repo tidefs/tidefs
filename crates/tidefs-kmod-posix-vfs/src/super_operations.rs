@@ -158,14 +158,19 @@ pub fn kill_sb<E: VfsEngine>(
         }
         for inode in dirty_inodes {
             let ranges = tracker.drain_inode(inode);
-            for range in &ranges {
+            for (idx, range) in ranges.iter().enumerate() {
                 let wb_range = WritebackRange::new(range.offset, range.length as u64);
                 let fh = EngineFileHandle::new(inode, 0, FileHandleId::default(), 0);
-                let outcome = engine.writeback_folios(inode, &fh, wb_range, ctx)?;
-                if !outcome.complete && outcome.bytes_written < wb_range.length {
-                    let tail_offset = range.offset + outcome.bytes_written;
-                    let tail_len = (wb_range.length - outcome.bytes_written) as u32;
-                    let _ = tracker.try_add(inode, tail_offset, tail_len);
+                let outcome = match engine.writeback_folios(inode, &fh, wb_range, ctx) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        tracker.redirty_unwritten(inode, &ranges, idx, 0)?;
+                        return Err(err);
+                    }
+                };
+                if !outcome.complete || outcome.bytes_written < wb_range.length {
+                    tracker.redirty_unwritten(inode, &ranges, idx, outcome.bytes_written)?;
+                    return Err(Errno::EIO);
                 }
             }
         }
@@ -294,7 +299,9 @@ mod tests {
     use crate::test_util::MockEngine;
     use crate::TideBox as Box;
     use crate::TideVec as Vec;
-    use tidefs_kmod_bridge::kernel_types::{EngineFileHandle, FileHandleId, InodeId, StatFs};
+    use tidefs_kmod_bridge::kernel_types::{
+        EngineFileHandle, FileHandleId, InodeId, StatFs, WritebackOutcome,
+    };
 
     // -- fill_super tests --
 
@@ -361,7 +368,68 @@ mod tests {
         let mut engine = MockEngine::new();
         engine.syncfs_fn = Box::new(|_| Err(Errno::EIO));
 
-        assert_eq!(kill_sb(&engine, &MockEngine::test_ctx(), None), Err(Errno::EIO));
+        assert_eq!(
+            kill_sb(&engine, &MockEngine::test_ctx(), None),
+            Err(Errno::EIO)
+        );
+    }
+
+    #[test]
+    fn kill_sb_writeback_error_keeps_dirty_range_and_skips_syncfs() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let mut engine = MockEngine::new();
+        let syncfs_called = Arc::new(AtomicBool::new(false));
+        let syncfs_seen = Arc::clone(&syncfs_called);
+        engine.writeback_folios_fn = Box::new(|_, _, _, _| Err(Errno::EIO));
+        engine.syncfs_fn = Box::new(move |_| {
+            syncfs_seen.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let inode = InodeId::new(9);
+        let mut tracker = DirtyFolioTracker::new(8);
+        tracker.add(inode, 0, 4096);
+
+        assert_eq!(
+            kill_sb(&engine, &MockEngine::test_ctx(), Some(&mut tracker)),
+            Err(Errno::EIO)
+        );
+        assert!(!syncfs_called.load(Ordering::SeqCst));
+        let ranges: Vec<_> = tracker.iter().collect();
+        assert_eq!(
+            ranges,
+            Vec::from([(inode, crate::writeback::DirtyRange::new(0, 4096))])
+        );
+    }
+
+    #[test]
+    fn kill_sb_partial_writeback_keeps_tail_and_skips_syncfs() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let mut engine = MockEngine::new();
+        let syncfs_called = Arc::new(AtomicBool::new(false));
+        let syncfs_seen = Arc::clone(&syncfs_called);
+        engine.writeback_folios_fn = Box::new(|_, _, _, _| Ok(WritebackOutcome::new(2048, false)));
+        engine.syncfs_fn = Box::new(move |_| {
+            syncfs_seen.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let inode = InodeId::new(10);
+        let mut tracker = DirtyFolioTracker::new(8);
+        tracker.add(inode, 0, 4096);
+
+        assert_eq!(
+            kill_sb(&engine, &MockEngine::test_ctx(), Some(&mut tracker)),
+            Err(Errno::EIO)
+        );
+        assert!(!syncfs_called.load(Ordering::SeqCst));
+        let ranges: Vec<_> = tracker.iter().collect();
+        assert_eq!(
+            ranges,
+            Vec::from([(inode, crate::writeback::DirtyRange::new(2048, 2048))])
+        );
     }
 
     // -- statfs tests --

@@ -109,16 +109,28 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
         ctx: &RequestCtx,
     ) -> Result<(), Errno> {
         let dirty_ranges = self.dirty_folio_tracker.drain_inode(fh.inode_id);
-        for range in &dirty_ranges {
+        for (idx, range) in dirty_ranges.iter().enumerate() {
             let wb_range = WritebackRange::new(range.offset, range.length as u64);
-            let outcome = self
-                .engine
-                .writeback_folios(fh.inode_id, fh, wb_range, ctx)?;
-            // Re-dirty any tail that was not fully committed.
-            if !outcome.complete && outcome.bytes_written < wb_range.length {
-                let tail_offset = range.offset + outcome.bytes_written;
-                let tail_len = (wb_range.length - outcome.bytes_written) as u32;
-                let _ = self.dirty_folio_tracker.try_add(fh.inode_id, tail_offset, tail_len);
+            let outcome = match self.engine.writeback_folios(fh.inode_id, fh, wb_range, ctx) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    self.dirty_folio_tracker.redirty_unwritten(
+                        fh.inode_id,
+                        &dirty_ranges,
+                        idx,
+                        0,
+                    )?;
+                    return Err(err);
+                }
+            };
+            if !outcome.complete || outcome.bytes_written < wb_range.length {
+                self.dirty_folio_tracker.redirty_unwritten(
+                    fh.inode_id,
+                    &dirty_ranges,
+                    idx,
+                    outcome.bytes_written,
+                )?;
+                return Err(Errno::EIO);
             }
         }
         Ok(())
@@ -250,20 +262,27 @@ pub fn bridge_fsync<E: VfsEngine + ?Sized>(
     // surface to the caller and prevent the engine fsync.
     if let Some(tracker) = tracker {
         let dirty_ranges = tracker.drain_inode(session.inode);
-        for range in &dirty_ranges {
+        for (idx, range) in dirty_ranges.iter().enumerate() {
             let wb_range = WritebackRange::new(range.offset, range.length as u64);
-            let outcome = engine.writeback_folios(
-                session.inode,
-                &session.handle,
-                wb_range,
-                ctx,
-            )?;
+            let outcome =
+                match engine.writeback_folios(session.inode, &session.handle, wb_range, ctx) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        tracker.redirty_unwritten(session.inode, &dirty_ranges, idx, 0)?;
+                        return Err(err);
+                    }
+                };
             // Re-dirty any tail that was not fully committed so the
-            // caller or a subsequent fsync can retry.
-            if !outcome.complete && outcome.bytes_written < wb_range.length {
-                let tail_offset = range.offset + outcome.bytes_written;
-                let tail_len = (wb_range.length - outcome.bytes_written) as u32;
-                let _ = tracker.try_add(session.inode, tail_offset, tail_len);
+            // caller or a subsequent fsync can retry. The durability
+            // barrier must not run while dirty writeback remains.
+            if !outcome.complete || outcome.bytes_written < wb_range.length {
+                tracker.redirty_unwritten(
+                    session.inode,
+                    &dirty_ranges,
+                    idx,
+                    outcome.bytes_written,
+                )?;
+                return Err(Errno::EIO);
             }
         }
     }
@@ -288,7 +307,7 @@ mod tests {
     use crate::test_util::MockEngine;
     use crate::TideBox as Box;
     use tidefs_kmod_bridge::kernel_types::{
-        DirHandleId, EngineDirHandle, EngineFileHandle, FileHandleId, InodeId,
+        DirHandleId, EngineDirHandle, EngineFileHandle, FileHandleId, InodeId, WritebackOutcome,
     };
 
     fn make_fh() -> EngineFileHandle {
@@ -332,8 +351,7 @@ mod tests {
             Ok(())
         });
         let mut kmod = KmodPosixVfs::new(e);
-        kmod.fsync(&fh, false, &MockEngine::test_ctx())
-            .unwrap();
+        kmod.fsync(&fh, false, &MockEngine::test_ctx()).unwrap();
     }
 
     #[test]
@@ -347,8 +365,7 @@ mod tests {
             Ok(())
         });
         let mut kmod = KmodPosixVfs::new(e);
-        kmod.fsync(&fh, true, &MockEngine::test_ctx())
-            .unwrap();
+        kmod.fsync(&fh, true, &MockEngine::test_ctx()).unwrap();
     }
 
     #[test]
@@ -358,9 +375,68 @@ mod tests {
         let fh = make_fh();
         let mut kmod = KmodPosixVfs::new(e);
         assert_eq!(
-            kmod.fsync(&fh, false, &MockEngine::test_ctx())
-                .unwrap_err(),
+            kmod.fsync(&fh, false, &MockEngine::test_ctx()).unwrap_err(),
             Errno::EIO,
+        );
+    }
+
+    #[test]
+    fn fsync_writeback_error_keeps_dirty_range_and_skips_barrier() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let mut e = MockEngine::new();
+        let fsync_called = Arc::new(AtomicBool::new(false));
+        let fsync_seen = Arc::clone(&fsync_called);
+        e.writeback_folios_fn = Box::new(|_, _, _, _| Err(Errno::EIO));
+        e.fsync_fn = Box::new(move |_, _, _| {
+            fsync_seen.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let fh = make_fh();
+        let mut kmod = KmodPosixVfs::new(e);
+        kmod.dirty_folio_tracker.add(fh.inode_id, 0, 4096);
+
+        assert_eq!(
+            kmod.fsync(&fh, false, &MockEngine::test_ctx()).unwrap_err(),
+            Errno::EIO
+        );
+        assert!(!fsync_called.load(Ordering::SeqCst));
+        let ranges: Vec<_> = kmod.dirty_folio_tracker.iter().collect();
+        assert_eq!(
+            ranges,
+            Vec::from([(fh.inode_id, crate::writeback::DirtyRange::new(0, 4096))])
+        );
+    }
+
+    #[test]
+    fn fsync_partial_writeback_keeps_tail_and_skips_barrier() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let mut e = MockEngine::new();
+        let fsync_called = Arc::new(AtomicBool::new(false));
+        let fsync_seen = Arc::clone(&fsync_called);
+        e.writeback_folios_fn = Box::new(|_, _, _, _| Ok(WritebackOutcome::new(2048, false)));
+        e.fsync_fn = Box::new(move |_, _, _| {
+            fsync_seen.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let fh = make_fh();
+        let mut kmod = KmodPosixVfs::new(e);
+        kmod.dirty_folio_tracker.add(fh.inode_id, 0, 4096);
+
+        assert_eq!(
+            kmod.fsync(&fh, false, &MockEngine::test_ctx()).unwrap_err(),
+            Errno::EIO
+        );
+        assert!(!fsync_called.load(Ordering::SeqCst));
+        let ranges: Vec<_> = kmod.dirty_folio_tracker.iter().collect();
+        assert_eq!(
+            ranges,
+            Vec::from([(fh.inode_id, crate::writeback::DirtyRange::new(2048, 2048))])
         );
     }
 
@@ -371,8 +447,7 @@ mod tests {
         let fh = make_fh();
         let mut kmod = KmodPosixVfs::new(e);
         assert_eq!(
-            kmod.fsync(&fh, false, &MockEngine::test_ctx())
-                .unwrap_err(),
+            kmod.fsync(&fh, false, &MockEngine::test_ctx()).unwrap_err(),
             Errno::EBADF,
         );
     }
@@ -442,8 +517,7 @@ mod tests {
         let fh = make_fh();
         let mut kmod = KmodPosixVfs::new(e);
         assert_eq!(
-            kmod.fsync(&fh, false, &MockEngine::test_ctx())
-                .unwrap_err(),
+            kmod.fsync(&fh, false, &MockEngine::test_ctx()).unwrap_err(),
             Errno::EROFS,
         );
     }
@@ -556,6 +630,44 @@ mod tests {
         assert_eq!(
             bridge_fsync(&e, &session, None, 0, 0, false, &MockEngine::test_ctx()).unwrap_err(),
             Errno::EIO,
+        );
+    }
+
+    #[test]
+    fn bridge_fsync_writeback_error_keeps_dirty_range_and_skips_engine_fsync() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let mut e = MockEngine::new();
+        let session = make_session(1, 1);
+        let fsync_called = Arc::new(AtomicBool::new(false));
+        let fsync_seen = Arc::clone(&fsync_called);
+        e.writeback_folios_fn = Box::new(|_, _, _, _| Err(Errno::ENOSPC));
+        e.fsync_fn = Box::new(move |_, _, _| {
+            fsync_seen.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let mut tracker = DirtyFolioTracker::new(8);
+        tracker.add(session.inode, 0, 4096);
+
+        assert_eq!(
+            bridge_fsync(
+                &e,
+                &session,
+                Some(&mut tracker),
+                0,
+                0,
+                false,
+                &MockEngine::test_ctx()
+            )
+            .unwrap_err(),
+            Errno::ENOSPC
+        );
+        assert!(!fsync_called.load(Ordering::SeqCst));
+        let ranges: Vec<_> = tracker.iter().collect();
+        assert_eq!(
+            ranges,
+            Vec::from([(session.inode, crate::writeback::DirtyRange::new(0, 4096))])
         );
     }
 

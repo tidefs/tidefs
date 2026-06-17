@@ -6,8 +6,8 @@
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge;
 
-use crate::TideVec as Vec;
 use crate::KmodPosixVfs;
+use crate::TideVec as Vec;
 use tidefs_kmod_bridge::kernel_types::VfsEngine;
 use tidefs_kmod_bridge::kernel_types::{
     EngineFileHandle, Errno, FileHandleId, InodeId, RequestCtx, WritebackRange,
@@ -36,17 +36,28 @@ impl<E: VfsEngine> KmodPosixVfs<E> {
         }
         for inode in dirty_inodes {
             let ranges = self.dirty_folio_tracker.drain_inode(inode);
-            for range in &ranges {
+            for (idx, range) in ranges.iter().enumerate() {
                 let wb_range = WritebackRange::new(range.offset, range.length as u64);
                 // We need a file handle for writeback_folios.  When no
                 // open handle is available (syncfs is filesystem-wide),
                 // construct a minimal handle from the inode.
                 let fh = EngineFileHandle::new(inode, 0, FileHandleId::default(), 0);
-                let outcome = self.engine.writeback_folios(inode, &fh, wb_range, ctx)?;
-                if !outcome.complete && outcome.bytes_written < wb_range.length {
-                    let tail_offset = range.offset + outcome.bytes_written;
-                    let tail_len = (wb_range.length - outcome.bytes_written) as u32;
-                    let _ = self.dirty_folio_tracker.try_add(inode, tail_offset, tail_len);
+                let outcome = match self.engine.writeback_folios(inode, &fh, wb_range, ctx) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        self.dirty_folio_tracker
+                            .redirty_unwritten(inode, &ranges, idx, 0)?;
+                        return Err(err);
+                    }
+                };
+                if !outcome.complete || outcome.bytes_written < wb_range.length {
+                    self.dirty_folio_tracker.redirty_unwritten(
+                        inode,
+                        &ranges,
+                        idx,
+                        outcome.bytes_written,
+                    )?;
+                    return Err(Errno::EIO);
                 }
             }
         }
@@ -60,14 +71,14 @@ mod tests {
     use super::*;
     use crate::test_util::MockEngine;
     use crate::TideBox as Box;
+    use tidefs_kmod_bridge::kernel_types::WritebackOutcome;
 
     #[test]
     fn syncfs_success() {
         let mut e = MockEngine::new();
         e.syncfs_fn = Box::new(|_| Ok(()));
         let mut kmod = KmodPosixVfs::new(e);
-        kmod.syncfs(&MockEngine::test_ctx())
-            .unwrap();
+        kmod.syncfs(&MockEngine::test_ctx()).unwrap();
     }
 
     #[test]
@@ -76,8 +87,7 @@ mod tests {
         e.syncfs_fn = Box::new(|_| Err(Errno::EIO));
         let mut kmod = KmodPosixVfs::new(e);
         assert_eq!(
-            kmod.syncfs(&MockEngine::test_ctx())
-                .unwrap_err(),
+            kmod.syncfs(&MockEngine::test_ctx()).unwrap_err(),
             Errno::EIO,
         );
     }
@@ -88,8 +98,7 @@ mod tests {
         e.syncfs_fn = Box::new(|_| Err(Errno::ENOSYS));
         let mut kmod = KmodPosixVfs::new(e);
         assert_eq!(
-            kmod.syncfs(&MockEngine::test_ctx())
-                .unwrap_err(),
+            kmod.syncfs(&MockEngine::test_ctx()).unwrap_err(),
             Errno::ENOSYS,
         );
     }
@@ -101,9 +110,68 @@ mod tests {
         let e = MockEngine::new();
         let mut kmod = KmodPosixVfs::new(e);
         assert_eq!(
-            kmod.syncfs(&MockEngine::test_ctx())
-                .unwrap_err(),
+            kmod.syncfs(&MockEngine::test_ctx()).unwrap_err(),
             Errno::ENOSYS,
+        );
+    }
+
+    #[test]
+    fn syncfs_writeback_error_keeps_dirty_range_and_skips_barrier() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let mut e = MockEngine::new();
+        let syncfs_called = Arc::new(AtomicBool::new(false));
+        let syncfs_seen = Arc::clone(&syncfs_called);
+        e.writeback_folios_fn = Box::new(|_, _, _, _| Err(Errno::ENOSPC));
+        e.syncfs_fn = Box::new(move |_| {
+            syncfs_seen.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let inode = InodeId::new(7);
+        let mut kmod = KmodPosixVfs::new(e);
+        kmod.dirty_folio_tracker.add(inode, 0, 4096);
+
+        assert_eq!(
+            kmod.syncfs(&MockEngine::test_ctx()).unwrap_err(),
+            Errno::ENOSPC
+        );
+        assert!(!syncfs_called.load(Ordering::SeqCst));
+        let ranges: Vec<_> = kmod.dirty_folio_tracker.iter().collect();
+        assert_eq!(
+            ranges,
+            Vec::from([(inode, crate::writeback::DirtyRange::new(0, 4096))])
+        );
+    }
+
+    #[test]
+    fn syncfs_partial_writeback_keeps_tail_and_skips_barrier() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let mut e = MockEngine::new();
+        let syncfs_called = Arc::new(AtomicBool::new(false));
+        let syncfs_seen = Arc::clone(&syncfs_called);
+        e.writeback_folios_fn = Box::new(|_, _, _, _| Ok(WritebackOutcome::new(1024, false)));
+        e.syncfs_fn = Box::new(move |_| {
+            syncfs_seen.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let inode = InodeId::new(8);
+        let mut kmod = KmodPosixVfs::new(e);
+        kmod.dirty_folio_tracker.add(inode, 0, 4096);
+
+        assert_eq!(
+            kmod.syncfs(&MockEngine::test_ctx()).unwrap_err(),
+            Errno::EIO
+        );
+        assert!(!syncfs_called.load(Ordering::SeqCst));
+        let ranges: Vec<_> = kmod.dirty_folio_tracker.iter().collect();
+        assert_eq!(
+            ranges,
+            Vec::from([(inode, crate::writeback::DirtyRange::new(1024, 3072))])
         );
     }
 }
