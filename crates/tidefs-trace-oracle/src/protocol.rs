@@ -37,6 +37,7 @@ pub const OP_PUT: &str = "put";
 pub const OP_GET: &str = "get";
 pub const OP_WRITE_RANGE: &str = "write_range";
 pub const OP_GET_RANGE: &str = "get_range";
+pub const OP_FSYNC: &str = "fsync";
 
 // ── Snapshot ops ───────────────────────────────────────────────────────────
 
@@ -80,6 +81,7 @@ pub const POOL_TRACE_OPS: &[&str] = &[
     OP_REFLINK,
     OP_LOOKUP,
     OP_PUT,
+    OP_FSYNC,
     OP_GET,
     OP_WRITE_RANGE,
     OP_GET_RANGE,
