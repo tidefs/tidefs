@@ -127,6 +127,7 @@ members = [
   "crates/tidefs-quorum-write",
   "crates/tidefs-quorum-write-runtime",
   "apps/tidefs-posix-filesystem-adapter-daemon",
+  "crates/tidefs-distributed-model-check",
   "apps/tidefs-block-volume-adapter-daemon",
   "apps/tidefsctl",
   "apps/tidefs-storage-node",

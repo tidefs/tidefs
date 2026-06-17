@@ -2402,6 +2402,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-distributed-model-check"
+version = "0.421.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tidefs-durability-layout"
 version = "0.421.0"
 dependencies = [
