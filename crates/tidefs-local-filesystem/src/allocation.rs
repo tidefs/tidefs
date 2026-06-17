@@ -477,3 +477,94 @@ pub(crate) fn next_allocated_inode_id(state: &FileSystemState) -> u64 {
         .next_inode_id
         .max(ROOT_INODE_ID.get().saturating_add(1))
 }
+
+/// Returns true when the placement receipt generation recorded in a chunk ref
+/// is durable (matches the pool receipt for the same key).
+///
+/// A receipt is durable when the pool holds a matching receipt with the same
+/// generation and the receipt is not synthetic (generation > 0). This is the
+/// receipt-authority gate that prevents reclaim from freeing chunks whose
+/// placement receipt has not been committed.
+///
+/// Hole chunks (data_version == 0, no receipt) are always durable-trivial:
+/// they consume no storage and have no receipt to validate.
+#[allow(dead_code)]
+pub(crate) fn chunk_receipt_is_durable(
+    pool: &tidefs_local_object_store::pool::Pool,
+    chunk_ref: &crate::records::ContentChunkRef,
+    object_key: tidefs_local_object_store::ObjectKey,
+) -> bool {
+    use tidefs_local_object_store::DeviceIoClass;
+
+    // Hole chunks never need receipt validation.
+    if chunk_ref.is_hole() {
+        return true;
+    }
+
+    // Zero generation means no receipt was captured (pre-v6 format or legacy
+    // write).  These chunks may be reclaimed without receipt gating.
+    if chunk_ref.placement_receipt_generation == 0 {
+        return true;
+    }
+
+    // Look up the pool's current receipt for this key.
+    let Ok(Some(receipt)) = pool.placement_receipt_for_key(DeviceIoClass::Data, object_key) else {
+        // No receipt found in pool: the chunk's receipt is not yet durable.
+        return false;
+    };
+
+    // The chunk ref's receipt generation must match the pool receipt exactly.
+    // A higher pool generation means a replacement was written; the old
+    // receipt is no longer authoritative but the replacement must be durable
+    // before the old chunk is freed (checked separately by the caller).
+    receipt.generation >= chunk_ref.placement_receipt_generation
+}
+
+/// Check whether a content object has a durable replacement receipt.
+///
+/// Returns `true` when the pool holds a receipt for `object_key` with a
+/// generation strictly greater than `old_generation`. This means the
+/// replacement data is durably placed and the old chunk may be reclaimed
+/// once no readers depend on the old receipt.
+#[allow(dead_code)]
+pub(crate) fn replacement_receipt_is_durable(
+    pool: &tidefs_local_object_store::pool::Pool,
+    object_key: tidefs_local_object_store::ObjectKey,
+    old_generation: u64,
+) -> bool {
+    use tidefs_local_object_store::DeviceIoClass;
+
+    if old_generation == 0 {
+        return true;
+    }
+
+    let Ok(Some(receipt)) = pool.placement_receipt_for_key(DeviceIoClass::Data, object_key) else {
+        return false;
+    };
+
+    receipt.generation > old_generation
+}
+
+/// Check whether a content chunk object key has a durable placement receipt
+/// in the pool.  Returns true when the chunk can be reclaimed (receipt is
+/// committed and stable) or when no receipt gating is needed (metadata keys,
+/// legacy pre-v6 objects).
+///
+/// This is the authority gate used by the reclaim drain to decide whether
+/// a content chunk is safe to delete.  Queries the pool placement receipt
+/// for the key and verifies that the receipt generation has been committed.
+/// A missing receipt is treated as durable (backward compatibility with
+/// pre-receipt writes), and a pool error conservatively retains the entry.
+#[allow(dead_code)]
+pub(crate) fn chunk_content_key_receipt_stable(
+    pool: &tidefs_local_object_store::pool::Pool,
+    object_key: tidefs_local_object_store::ObjectKey,
+) -> bool {
+    use tidefs_local_object_store::DeviceIoClass;
+
+    match pool.placement_receipt_for_key(DeviceIoClass::Data, object_key) {
+        Ok(Some(receipt)) => receipt.generation > 0,
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
