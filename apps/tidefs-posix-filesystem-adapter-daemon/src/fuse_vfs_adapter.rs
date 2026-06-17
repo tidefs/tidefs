@@ -620,6 +620,7 @@ impl DentryPolicy {
     fn for_timestamp_policy(self, timestamp_policy: TimestampPolicy, read_only: bool) -> Self {
         let mut policy = self;
         if read_only || timestamp_policy != TimestampPolicy::NoAtime {
+            policy.positive_entry_ttl = Duration::ZERO;
             policy.positive_attr_ttl = Duration::ZERO;
         }
         policy
@@ -43765,10 +43766,7 @@ mod tests {
             adapter.base_dentry_policy.positive_attr_ttl,
             Duration::from_secs(5)
         );
-        assert_eq!(
-            adapter.dentry_policy.positive_entry_ttl,
-            Duration::from_secs(5)
-        );
+        assert_eq!(adapter.dentry_policy.positive_entry_ttl, Duration::ZERO);
         assert_eq!(adapter.dentry_policy.positive_attr_ttl, Duration::ZERO);
         assert_eq!(adapter.dentry_policy.positive_reply_ttl(), Duration::ZERO);
     }
@@ -43800,10 +43798,7 @@ mod tests {
             .with_timestamp_policy(TimestampPolicy::RelativeAtime)
             .with_read_only();
 
-        assert_eq!(
-            adapter.dentry_policy.positive_entry_ttl,
-            Duration::from_secs(5)
-        );
+        assert_eq!(adapter.dentry_policy.positive_entry_ttl, Duration::ZERO);
         assert_eq!(adapter.dentry_policy.positive_attr_ttl, Duration::ZERO);
         assert_eq!(adapter.dentry_policy.positive_reply_ttl(), Duration::ZERO);
     }
