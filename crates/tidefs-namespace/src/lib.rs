@@ -38,7 +38,8 @@ use tidefs_dir_index::DirIndexError;
 
 #[allow(unused_imports)]
 use persistence::{
-    PersistentDirEntry, PersistentDirectoryStore, PersistentInodeStore, PersistentSwapMode,
+    NamespaceDatasetIdentity, PersistentDirEntry, PersistentDirectoryStore, PersistentInodeStore,
+    PersistentSwapMode,
 };
 use tidefs_dir_index::SwapMode;
 use tidefs_orphan_index::OrphanIndex;
@@ -273,6 +274,11 @@ pub enum NamespaceError {
     RenameCycle,
     /// Operation not yet supported.
     NotSupported,
+    /// Persisted namespace root belongs to a different dataset identity.
+    DatasetIdentityMismatch {
+        expected: NamespaceDatasetIdentity,
+        found: NamespaceDatasetIdentity,
+    },
     /// Underlying directory index error.
     DirIndex(DirIndexError),
 }
@@ -294,6 +300,14 @@ impl fmt::Display for NamespaceError {
             NamespaceError::LinkCountOverflow => f.write_str("link count overflow"),
             NamespaceError::RenameCycle => f.write_str("rename would create directory cycle"),
             NamespaceError::NotSupported => f.write_str("operation not supported"),
+            NamespaceError::DatasetIdentityMismatch { expected, found } => write!(
+                f,
+                "dataset identity mismatch: expected {}/{} found {}/{}",
+                expected.dataset_id(),
+                expected.lineage_id(),
+                found.dataset_id(),
+                found.lineage_id()
+            ),
             NamespaceError::DirIndex(e) => write!(f, "dir-index error: {e:?}"),
         }
     }
@@ -496,6 +510,7 @@ pub struct Namespace {
     #[cfg(feature = "persistent-dir-index")]
     persistent_manifest_dirs: RwLock<HashSet<Inode>>,
     policy: DatasetDirPolicy,
+    dataset_identity: NamespaceDatasetIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -872,6 +887,7 @@ impl Namespace {
             #[cfg(feature = "persistent-dir-index")]
             persistent_manifest_dirs: RwLock::new(HashSet::new()),
             policy,
+            dataset_identity: NamespaceDatasetIdentity::default(),
         }
     }
 
@@ -893,6 +909,7 @@ impl Namespace {
             persistent_dirs: None,
             persistent_dirs_shared: false,
             policy,
+            dataset_identity: NamespaceDatasetIdentity::default(),
             orphan_index: RwLock::new(OrphanIndex::new()),
             ..ns
         }
@@ -905,23 +922,42 @@ impl Namespace {
         inode_store: Option<Arc<dyn PersistentInodeStore>>,
         dir_store: Option<Arc<dyn PersistentDirectoryStore>>,
     ) -> Self {
+        Self::try_with_persistent_stores_for_dataset(
+            NamespaceDatasetIdentity::default(),
+            inode_store,
+            dir_store,
+        )
+        .expect("persistent namespace stores must match the default dataset identity")
+    }
+
+    /// Create a namespace for an explicit dataset identity.
+    #[allow(dead_code)]
+    pub fn try_with_persistent_stores_for_dataset(
+        identity: NamespaceDatasetIdentity,
+        inode_store: Option<Arc<dyn PersistentInodeStore>>,
+        dir_store: Option<Arc<dyn PersistentDirectoryStore>>,
+    ) -> Result<Self, NamespaceError> {
         let policy = DatasetDirPolicy::DEFAULT;
+        let root_attrs = InodeAttributes::new_dir(ROOT_INODE);
         if let Some(ref store) = inode_store {
-            if store.get_attrs(ROOT_INODE).is_none() {
-                let root_attrs = InodeAttributes::new_dir(ROOT_INODE);
-                let (_root_ino, _gen) = store.alloc_inode(&root_attrs).expect("root inode alloc");
+            let root = store.ensure_namespace_root(&identity, &root_attrs)?;
+            if root.root_inode != ROOT_INODE {
+                return Err(NamespaceError::NotFound);
             }
-            if let Some(ref dirs) = dir_store {
-                if dirs.lookup(ROOT_INODE, b".").unwrap_or(None).is_none() {
-                    dirs.init_dir(ROOT_INODE).expect("root dir init");
+        }
+        if let Some(ref dirs) = dir_store {
+            dirs.verify_dataset_identity(&identity)?;
+            match dirs.lookup_for_dataset(&identity, ROOT_INODE, b".") {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(NamespaceError::InodeNotFound | NamespaceError::NotFound) => {
+                    dirs.init_dir_for_dataset(&identity, ROOT_INODE)?;
                 }
+                Err(e) => return Err(e),
             }
         }
         let inode_table = Arc::new(MemInodeTable::new());
         if inode_store.is_none() {
-            inode_table
-                .alloc(InodeAttributes::new_dir(ROOT_INODE))
-                .expect("root fallback alloc");
+            inode_table.alloc(root_attrs).expect("root fallback alloc");
         }
         let mut root_dir = DirBackend::new(ROOT_INODE, policy);
         root_dir
@@ -932,13 +968,14 @@ impl Namespace {
             .expect("root ..");
         let mut persistent_dirs_shared = false;
         let dirs_arc: Arc<RwLock<HashMap<Inode, DirBackend>>> = if let Some(ref store) = dir_store {
-            if let Some(shared) = store.shared_dirs() {
+            if let Some(shared) = store.shared_dirs_for_dataset(&identity)? {
                 persistent_dirs_shared = true;
                 shared
             } else {
                 let mut dirs = HashMap::new();
-                let root_dir = Self::load_delegated_dir_backend(store.as_ref(), ROOT_INODE, policy)
-                    .unwrap_or(root_dir);
+                let root_dir =
+                    Self::load_delegated_dir_backend(store.as_ref(), &identity, ROOT_INODE, policy)
+                        .unwrap_or(root_dir);
                 dirs.insert(ROOT_INODE, root_dir);
                 Arc::new(RwLock::new(dirs))
             }
@@ -947,7 +984,7 @@ impl Namespace {
             dirs.insert(ROOT_INODE, root_dir);
             Arc::new(RwLock::new(dirs))
         };
-        Namespace {
+        Ok(Namespace {
             persistent_inodes: inode_store,
             persistent_dirs: dir_store,
             persistent_dirs_shared,
@@ -960,17 +997,17 @@ impl Namespace {
             #[cfg(feature = "persistent-dir-index")]
             persistent_manifest_dirs: RwLock::new(HashSet::new()),
             policy,
-        }
+            dataset_identity: identity,
+        })
     }
 
     // ── Persistent-store delegation ─────────────────────────────────
     #[allow(dead_code)]
-    fn alloc_inode_delegate(&self, attrs: InodeAttributes) -> Result<Inode, NamespaceError> {
+    fn alloc_inode_delegate(&self, attrs: InodeAttributes) -> Result<(Inode, u64), NamespaceError> {
         if let Some(ref store) = self.persistent_inodes {
-            let (ino, _gen) = store.alloc_inode(&attrs)?;
-            Ok(ino)
+            store.alloc_inode_for_dataset(&self.dataset_identity, &attrs)
         } else {
-            self.fallback_inode_table().alloc(attrs)
+            self.fallback_inode_table().alloc(attrs).map(|ino| (ino, 0))
         }
     }
     #[allow(dead_code)]
@@ -1016,6 +1053,7 @@ impl Namespace {
 
     fn load_delegated_dir_backend(
         store: &dyn PersistentDirectoryStore,
+        identity: &NamespaceDatasetIdentity,
         dir_inode: Inode,
         policy: DatasetDirPolicy,
     ) -> Result<DirBackend, NamespaceError> {
@@ -1023,7 +1061,7 @@ impl Namespace {
         let mut cookie = 0;
 
         loop {
-            let (entries, next_cookie) = store.list_dir(dir_inode, cookie)?;
+            let (entries, next_cookie) = store.list_dir_for_dataset(identity, dir_inode, cookie)?;
             if entries.is_empty() {
                 break;
             }
@@ -1050,7 +1088,12 @@ impl Namespace {
             return Ok(true);
         }
 
-        let dir = Self::load_delegated_dir_backend(store.as_ref(), dir_inode, self.policy)?;
+        let dir = Self::load_delegated_dir_backend(
+            store.as_ref(),
+            &self.dataset_identity,
+            dir_inode,
+            self.policy,
+        )?;
         self.dirs.write().unwrap().entry(dir_inode).or_insert(dir);
         Ok(true)
     }
@@ -1064,7 +1107,14 @@ impl Namespace {
         kind: u32,
     ) -> Result<(), NamespaceError> {
         if let Some(store) = self.delegated_dir_store() {
-            store.insert(parent, name, inode_id, generation, kind)?;
+            store.insert_for_dataset(
+                &self.dataset_identity,
+                parent,
+                name,
+                inode_id,
+                generation,
+                kind,
+            )?;
         }
         Ok(())
     }
@@ -1075,10 +1125,17 @@ impl Namespace {
         parent_inode: Inode,
     ) -> Result<(), NamespaceError> {
         if let Some(store) = self.delegated_dir_store() {
-            store.init_dir(dir_inode)?;
+            store.init_dir_for_dataset(&self.dataset_identity, dir_inode)?;
             if dir_inode != parent_inode {
-                store.remove(dir_inode, b"..")?;
-                store.insert(dir_inode, b"..", parent_inode, 0, KIND_DIR)?;
+                store.remove_for_dataset(&self.dataset_identity, dir_inode, b"..")?;
+                store.insert_for_dataset(
+                    &self.dataset_identity,
+                    dir_inode,
+                    b"..",
+                    parent_inode,
+                    0,
+                    KIND_DIR,
+                )?;
             }
         }
         Ok(())
@@ -1086,7 +1143,7 @@ impl Namespace {
 
     fn remove_delegated_dir_entry(&self, parent: Inode, name: &[u8]) -> Result<(), NamespaceError> {
         if let Some(store) = self.delegated_dir_store() {
-            store.remove(parent, name)?;
+            store.remove_for_dataset(&self.dataset_identity, parent, name)?;
         }
         Ok(())
     }
@@ -1105,7 +1162,14 @@ impl Namespace {
                 SwapMode::NoReplace => PersistentSwapMode::NoReplace,
                 SwapMode::Exchange => PersistentSwapMode::Exchange,
             };
-            store.atomic_swap(src_parent, src_name, dst_parent, dst_name, mode)?;
+            store.atomic_swap_for_dataset(
+                &self.dataset_identity,
+                src_parent,
+                src_name,
+                dst_parent,
+                dst_name,
+                mode,
+            )?;
         }
         Ok(())
     }
@@ -1179,6 +1243,7 @@ impl Namespace {
             persistent_object_store_root: Some(store.root().to_path_buf()),
             persistent_manifest_dirs: RwLock::new(manifest_dirs),
             policy,
+            dataset_identity: NamespaceDatasetIdentity::default(),
         })
     }
 
@@ -1456,6 +1521,12 @@ impl Namespace {
         self.policy
     }
 
+    /// Return the dataset identity boundary used by persistent stores.
+    #[must_use]
+    pub fn dataset_identity(&self) -> &NamespaceDatasetIdentity {
+        &self.dataset_identity
+    }
+
     // ------------------------------------------------------------------
     // Path resolution
     // ------------------------------------------------------------------
@@ -1578,7 +1649,7 @@ impl Namespace {
         let _ = self.ensure_persistent_dir_loaded(parent)?;
         let _ = self.ensure_delegated_dir_loaded(parent)?;
         // Allocate the new inode.
-        let ino = self.alloc_inode_delegate(attrs)?;
+        let (ino, generation) = self.alloc_inode_delegate(attrs)?;
 
         // Insert into parent's directory index.
         {
@@ -1589,14 +1660,15 @@ impl Namespace {
                 NamespaceError::InodeNotFound
             })?;
 
-            if let Err(e) = dir.insert(name.as_bytes(), ino, 0, KIND_FILE) {
+            if let Err(e) = dir.insert(name.as_bytes(), ino, generation, KIND_FILE) {
                 // Rollback.
                 let _ = self.free_inode_delegate(ino);
                 return Err(e.into());
             }
         }
 
-        if let Err(e) = self.insert_delegated_dir_entry(parent, name.as_bytes(), ino, 0, KIND_FILE)
+        if let Err(e) =
+            self.insert_delegated_dir_entry(parent, name.as_bytes(), ino, generation, KIND_FILE)
         {
             if let Some(dir) = self.dirs.write().unwrap().get_mut(&parent) {
                 let _ = dir.delete(name.as_bytes());
@@ -1627,7 +1699,7 @@ impl Namespace {
         #[cfg(feature = "persistent-dir-index")]
         let _ = self.ensure_persistent_dir_loaded(parent)?;
         let _ = self.ensure_delegated_dir_loaded(parent)?;
-        let ino =
+        let (ino, generation) =
             self.alloc_inode_delegate(InodeAttributes::new_symlink(0, target.len() as u64))?;
 
         {
@@ -1637,14 +1709,14 @@ impl Namespace {
                 NamespaceError::InodeNotFound
             })?;
 
-            if let Err(e) = dir.insert(name.as_bytes(), ino, 0, KIND_SYMLINK) {
+            if let Err(e) = dir.insert(name.as_bytes(), ino, generation, KIND_SYMLINK) {
                 let _ = self.free_inode_delegate(ino);
                 return Err(e.into());
             }
         }
 
         if let Err(e) =
-            self.insert_delegated_dir_entry(parent, name.as_bytes(), ino, 0, KIND_SYMLINK)
+            self.insert_delegated_dir_entry(parent, name.as_bytes(), ino, generation, KIND_SYMLINK)
         {
             if let Some(dir) = self.dirs.write().unwrap().get_mut(&parent) {
                 let _ = dir.delete(name.as_bytes());
@@ -1958,7 +2030,7 @@ impl Namespace {
             rdev,
         };
 
-        let ino = self.alloc_inode_delegate(attrs)?;
+        let (ino, generation) = self.alloc_inode_delegate(attrs)?;
 
         // Map mode to directory index entry kind.
         let kind = match file_type {
@@ -1979,13 +2051,15 @@ impl Namespace {
                 NamespaceError::InodeNotFound
             })?;
 
-            if let Err(e) = parent_dir.insert(name.as_bytes(), ino, 0, kind) {
+            if let Err(e) = parent_dir.insert(name.as_bytes(), ino, generation, kind) {
                 let _ = self.free_inode_delegate(ino);
                 return Err(e.into());
             }
         }
 
-        if let Err(e) = self.insert_delegated_dir_entry(parent, name.as_bytes(), ino, 0, kind) {
+        if let Err(e) =
+            self.insert_delegated_dir_entry(parent, name.as_bytes(), ino, generation, kind)
+        {
             if let Some(dir) = self.dirs.write().unwrap().get_mut(&parent) {
                 let _ = dir.delete(name.as_bytes());
             }
@@ -2041,12 +2115,12 @@ impl Namespace {
         let _ = self.ensure_persistent_dir_loaded(parent)?;
         let _ = self.ensure_delegated_dir_loaded(parent)?;
         // Allocate the new inode.
-        let ino = self.alloc_inode_delegate(attrs)?;
+        let (ino, generation) = self.alloc_inode_delegate(attrs)?;
 
         // Create the new directory's index with . and .. entries.
         let mut child_dir = DirBackend::new(ino, self.policy);
         child_dir
-            .insert(b".", ino, 0, KIND_DIR)
+            .insert(b".", ino, generation, KIND_DIR)
             .expect("self . insert");
         child_dir
             .insert(b"..", parent, 0, KIND_DIR)
@@ -2060,7 +2134,7 @@ impl Namespace {
                 NamespaceError::InodeNotFound
             })?;
 
-            if let Err(e) = parent_dir.insert(name.as_bytes(), ino, 0, KIND_DIR) {
+            if let Err(e) = parent_dir.insert(name.as_bytes(), ino, generation, KIND_DIR) {
                 let _ = self.free_inode_delegate(ino);
                 return Err(e.into());
             }
@@ -2071,7 +2145,9 @@ impl Namespace {
             dirs.insert(ino, child_dir);
         }
 
-        if let Err(e) = self.insert_delegated_dir_entry(parent, name.as_bytes(), ino, 0, KIND_DIR) {
+        if let Err(e) =
+            self.insert_delegated_dir_entry(parent, name.as_bytes(), ino, generation, KIND_DIR)
+        {
             let mut dirs = self.dirs.write().unwrap();
             if let Some(parent_dir) = dirs.get_mut(&parent) {
                 let _ = parent_dir.delete(name.as_bytes());

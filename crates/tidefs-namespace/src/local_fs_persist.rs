@@ -13,8 +13,8 @@ use tidefs_types_vfs_core::{
     S_IFSOCK,
 };
 
-use crate::persistence::PersistentInodeStore;
-use crate::{Inode, InodeAttributes, NamespaceError};
+use crate::persistence::{NamespaceDatasetIdentity, PersistentInodeStore, PersistentNamespaceRoot};
+use crate::{Inode, InodeAttributes, NamespaceError, ROOT_INODE};
 
 // ---------------------------------------------------------------------------
 // LocalFilesystemInodeStore
@@ -24,16 +24,40 @@ use crate::{Inode, InodeAttributes, NamespaceError};
 /// [`LocalFileSystem`] for durable inode persistence.
 pub struct LocalFilesystemInodeStore {
     fs: Arc<Mutex<LocalFileSystem>>,
+    identity: NamespaceDatasetIdentity,
 }
 
 impl LocalFilesystemInodeStore {
     /// Wrap an existing [`LocalFileSystem`] for use as a persistent inode store.
     pub fn new(fs: Arc<Mutex<LocalFileSystem>>) -> Self {
-        Self { fs }
+        Self::new_for_dataset(fs, NamespaceDatasetIdentity::default())
+    }
+
+    /// Wrap an existing [`LocalFileSystem`] for one namespace dataset identity.
+    pub fn new_for_dataset(
+        fs: Arc<Mutex<LocalFileSystem>>,
+        identity: NamespaceDatasetIdentity,
+    ) -> Self {
+        Self { fs, identity }
     }
 }
 
 impl PersistentInodeStore for LocalFilesystemInodeStore {
+    fn dataset_identity(&self) -> NamespaceDatasetIdentity {
+        self.identity.clone()
+    }
+
+    fn namespace_root(&self) -> Result<Option<PersistentNamespaceRoot>, NamespaceError> {
+        let fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
+        Ok(fs
+            .get_inode_by_id(InodeId::new(ROOT_INODE))
+            .map(|record| PersistentNamespaceRoot {
+                identity: self.identity.clone(),
+                root_inode: ROOT_INODE,
+                generation: record.generation.get(),
+            }))
+    }
+
     fn alloc_inode(&self, attrs: &InodeAttributes) -> Result<(Inode, u64), NamespaceError> {
         let mut fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
         let gen = fs.generation();
@@ -255,17 +279,30 @@ mod tests {
 /// [`LocalFileSystem`] for durable directory entry persistence.
 pub struct LocalFilesystemDirectoryStore {
     fs: Arc<Mutex<LocalFileSystem>>,
+    identity: NamespaceDatasetIdentity,
 }
 
 impl LocalFilesystemDirectoryStore {
     /// Wrap an existing [`LocalFileSystem`] for use as a persistent
     /// directory store.
     pub fn new(fs: Arc<Mutex<LocalFileSystem>>) -> Self {
-        Self { fs }
+        Self::new_for_dataset(fs, NamespaceDatasetIdentity::default())
+    }
+
+    /// Wrap an existing [`LocalFileSystem`] for one namespace dataset identity.
+    pub fn new_for_dataset(
+        fs: Arc<Mutex<LocalFileSystem>>,
+        identity: NamespaceDatasetIdentity,
+    ) -> Self {
+        Self { fs, identity }
     }
 }
 
 impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectoryStore {
+    fn dataset_identity(&self) -> NamespaceDatasetIdentity {
+        self.identity.clone()
+    }
+
     fn lookup(
         &self,
         parent: Inode,

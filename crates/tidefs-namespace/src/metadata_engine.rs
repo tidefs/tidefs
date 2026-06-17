@@ -17,6 +17,7 @@ use std::{
 use tidefs_btree::PartitionFn;
 use tidefs_dir_index::{DirIndex, DirIndexError};
 
+use crate::persistence::NamespaceDatasetIdentity;
 use crate::{Inode, MemInodeTable, NamespaceError};
 
 // ---------------------------------------------------------------------------
@@ -150,6 +151,8 @@ pub struct MetadataEngineStats {
 /// Multi-core metadata engine that dispatches operations to per-core queues
 /// and processes them against a partitioned directory B-tree.
 pub struct MetadataEngine<P: PartitionFn<u64> + Send + Sync + 'static> {
+    /// Dataset identity boundary for operations routed through this engine.
+    dataset_identity: NamespaceDatasetIdentity,
     /// One work queue per core.
     per_core_queues: Vec<Arc<PerCoreWorkQueue>>,
     /// The inode table (shared — namespace-wide).
@@ -173,17 +176,40 @@ impl<P: PartitionFn<u64> + Send + Sync + 'static> MetadataEngine<P> {
     /// Create a new metadata engine with `core_count` per-core queues.
     #[must_use]
     pub fn new(core_count: usize, inode_table: Arc<MemInodeTable>, partition_fn: P) -> Self {
+        Self::new_for_dataset(
+            NamespaceDatasetIdentity::default(),
+            core_count,
+            inode_table,
+            partition_fn,
+        )
+    }
+
+    /// Create a metadata engine bound to an explicit namespace dataset.
+    #[must_use]
+    pub fn new_for_dataset(
+        dataset_identity: NamespaceDatasetIdentity,
+        core_count: usize,
+        inode_table: Arc<MemInodeTable>,
+        partition_fn: P,
+    ) -> Self {
         assert!(core_count > 0, "core_count must be positive");
         let per_core_queues: Vec<Arc<PerCoreWorkQueue>> = (0..core_count)
             .map(|_| Arc::new(PerCoreWorkQueue::new()))
             .collect();
         Self {
+            dataset_identity,
             per_core_queues,
             inode_table,
             partition_fn: Arc::new(partition_fn),
             core_count,
             cross_partition_ops: AtomicU64::new(0),
         }
+    }
+
+    /// Return the dataset identity boundary for this engine instance.
+    #[must_use]
+    pub fn dataset_identity(&self) -> &NamespaceDatasetIdentity {
+        &self.dataset_identity
     }
 
     /// Return the number of cores.
