@@ -46,6 +46,9 @@ pub enum DeviceRemovalRefusalClass {
     EvacuationCompletionNotDurable,
     /// Durable evacuation completion evidence does not match the removal identity.
     EvacuationCompletionMismatch,
+    /// Placement receipts still reference the target device; evacuation is
+    /// not complete until all receipts have been relocated.
+    PlacementReceiptsStillReferenceDevice,
 }
 
 impl core::fmt::Display for DeviceRemovalRefusalClass {
@@ -59,6 +62,7 @@ impl core::fmt::Display for DeviceRemovalRefusalClass {
             Self::StaleTopologyGeneration => f.write_str("stale-topology-generation"),
             Self::EvacuationCompletionNotDurable => f.write_str("evacuation-completion-not-durable"),
             Self::EvacuationCompletionMismatch => f.write_str("evacuation-completion-mismatch"),
+            Self::PlacementReceiptsStillReferenceDevice => f.write_str("placement-receipts-still-reference-device"),
             Self::EvacuationFailed => f.write_str("evacuation-failed"),
             Self::EvacuationIncomplete => f.write_str("evacuation-incomplete"),
             Self::CheckpointReplayRejected => f.write_str("checkpoint-replay-rejected"),
@@ -1836,6 +1840,7 @@ mod tests {
             device_count: 3,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
         assert_eq!(config.device_count, 3);
         assert_eq!(config.topology_generation, 5);
@@ -1868,6 +1873,7 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
         let result = config.remove_device(Path::new("/dev/nonexistent"));
         assert!(matches!(
@@ -1893,6 +1899,7 @@ mod tests {
             device_count: 1,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
         let result = config.remove_device(Path::new("/dev/disk0"));
         assert!(matches!(result, Err(DeviceRemovalError::WouldEmptyPool)));
@@ -2472,6 +2479,7 @@ mod tests {
             device_count: 3,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
         let result = config.remove_device(Path::new("/dev/disk0"));
         assert!(result.is_ok());

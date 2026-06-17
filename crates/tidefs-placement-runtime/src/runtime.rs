@@ -726,6 +726,35 @@ fn policy_to_failure_domain(policy: &FailureDomainPlacementPolicy) -> FailureDom
     FailureDomainV1::new(level, 64).unwrap()
 }
 
+// ---------------------------------------------------------------------------
+// PlacementReceiptChecker implementation for PlacementRuntime
+// ---------------------------------------------------------------------------
+
+use tidefs_device_removal::{DeviceRemovalError, PlacementReceiptChecker};
+use tidefs_locator_table::ExtentId;
+
+impl PlacementReceiptChecker for PlacementRuntime {
+    fn receipts_referencing_extents(
+        &self,
+        extent_ids: &[ExtentId],
+    ) -> Result<Vec<tidefs_replication_model::PlacementReceiptRef>, DeviceRemovalError> {
+        let mut refs = Vec::new();
+        for receipt in &self.plan_registry.placed_receipts {
+            for subject_ref in &receipt.subject_refs {
+                // ExtentId(u64) maps to ReplicatedSubjectId(u64) with the
+                // same numeric value in the current TideFS model.
+                let subject_extent = ExtentId(subject_ref.0);
+                if extent_ids.contains(&subject_extent) {
+                    refs.extend(receipt.placement_receipt_refs.clone());
+                    break;
+                }
+            }
+        }
+        Ok(refs)
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

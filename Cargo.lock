@@ -2384,6 +2384,7 @@ dependencies = [
  "tidefs-local-object-store",
  "tidefs-locator-table",
  "tidefs-pool-scan",
+ "tidefs-replication-model",
  "tidefs-types-pool-label-core",
 ]
 
@@ -2981,9 +2982,11 @@ dependencies = [
  "blake3",
  "serde",
  "thiserror 2.0.18",
+ "tidefs-device-removal",
  "tidefs-durability-layout",
  "tidefs-flow-commit-coordinator",
  "tidefs-lease",
+ "tidefs-locator-table",
  "tidefs-membership-epoch",
  "tidefs-node-join",
  "tidefs-placement-planner",

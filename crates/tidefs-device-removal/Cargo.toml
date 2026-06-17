@@ -17,6 +17,7 @@ tidefs-pool-scan = { path = "../tidefs-pool-scan" }
 tidefs-locator-table = { path = "../tidefs-locator-table" }
 tidefs-block-allocator = { path = "../tidefs-block-allocator" }
 tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tidefs-replication-model = { path = "../tidefs-replication-model" }
 tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
