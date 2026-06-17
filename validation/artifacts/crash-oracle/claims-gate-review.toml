@@ -17,21 +17,21 @@ reviewed_claim_ids = [
 ]
 
 missing_runtime_evidence_classes = [
-  "runtime-crash-oracle",
   "runtime-namespace-crash-artifact",
 ]
-runtime_evidence_status = "missing-runtime-evidence"
+runtime_evidence_status = "write-fsync-runtime-present-namespace-runtime-missing"
 decision = "planned-blocked-fail-closed"
 
 boundary_review = [
   "The registered model-crash-matrix artifact is model-only evidence from tidefs-crash-oracle and does not satisfy runtime crash evidence classes.",
-  "runtime-crash-oracle evidence must come from local runtime write/fsync crash injection artifacts, not from the model matrix.",
+  "The local VFS write/fsync runtime-crash-oracle artifact records OpFsyncBeforeFlush runtime evidence and remains bounded to the local VFS hook path.",
   "runtime-namespace-crash-artifact evidence must come from interrupted runtime namespace/rename artifacts, not from the model matrix.",
-  "The storage and local VFS crash claims remain planned or blocked and fail-closed until runtime evidence is present.",
+  "The storage and local VFS crash claims remain planned or blocked and fail-closed until the registered runtime evidence, model evidence, dependency evidence, and claims-gate review are all fresh for the claimed scope.",
 ]
 
 non_claims = [
-  "This review does not provide local runtime crash injection evidence.",
+  "This review does not validate local runtime crash injection beyond the bounded OpFsyncBeforeFlush artifact.",
+  "This review does not validate the interrupted fsync payload as durable.",
   "This review does not validate production crash safety.",
   "This review does not validate mounted runtime durability, writeback, mmap, page-cache coherency, distributed recovery, or OpenZFS/Ceph-class status.",
 ]

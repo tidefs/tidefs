@@ -4,6 +4,10 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use tidefs_validation::local_vfs_runtime_crash_artifact::{
+    validate_local_vfs_runtime_crash_artifact_path,
+    LOCAL_VFS_WRITE_FSYNC_RUNTIME_CRASH_EVIDENCE_CLASS,
+};
 use tidefs_validation::ublk_completion_artifact::{
     validate_ublk_completion_artifact_path, UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS,
 };
@@ -320,11 +324,29 @@ pub struct ClaimValidationError {
 
 impl fmt::Display for ClaimValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "claim validation failed closed:")?;
+        writeln!(
+            f,
+            "{}: claim validation failed closed",
+            self.outcome_label()
+        )?;
         for item in &self.failures {
             writeln!(f, "- {item}")?;
         }
         Ok(())
+    }
+}
+
+impl ClaimValidationError {
+    fn outcome_label(&self) -> &'static str {
+        if self
+            .failures
+            .iter()
+            .any(|failure| claim_state_failure_is_blocked(failure))
+        {
+            "BLOCKED"
+        } else {
+            "FAIL"
+        }
     }
 }
 
@@ -706,7 +728,7 @@ pub fn validate_claim_current_workspace(id: &str) -> Result<(), ClaimValidationE
     let failures = validate_claim_record(&root, registry_modified, claim);
     if failures.is_empty() {
         println!(
-            "claim `{}` validated: {} evidence artifact(s) fresh",
+            "PASS: claim `{}` validated with {} fresh evidence artifact(s)",
             claim.id,
             claim.evidence_artifacts.len()
         );
@@ -1265,6 +1287,25 @@ fn validate_runtime_crash_artifact_content(
         Err(err) => failures.push(err),
     }
 
+    if artifact.class == LOCAL_VFS_WRITE_FSYNC_RUNTIME_CRASH_EVIDENCE_CLASS
+        && claim.id == LOCAL_VFS_WRITE_FSYNC_CRASH_CLAIM_ID
+    {
+        let rel = match workspace_relative_path(claim, artifact) {
+            Ok(rel) => rel,
+            Err(err) => {
+                failures.push(err);
+                return failures;
+            }
+        };
+        let artifact_path = root.join(&rel);
+        if let Err(error) = validate_local_vfs_runtime_crash_artifact_path(&artifact_path) {
+            failures.push(format!(
+                "claim `{}` local VFS runtime crash artifact `{}` failed verifier: {error}",
+                claim.id, artifact.path
+            ));
+        }
+    }
+
     failures
 }
 
@@ -1369,14 +1410,14 @@ fn validate_crash_claims_gate_review_artifact_content(
     }
     if !same_string_set(
         &review.missing_runtime_evidence_classes,
-        &[
-            RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS,
-            RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS,
-        ],
+        expected_missing_runtime_evidence_classes(),
     ) {
         failures.push(format!(
-            "claim `{}` crash claims-gate review `{}` must record both missing runtime crash evidence classes",
-            claim.id, artifact.path
+            "claim `{}` crash claims-gate review `{}` has missing runtime evidence classes {:?}, expected {:?}",
+            claim.id,
+            artifact.path,
+            review.missing_runtime_evidence_classes,
+            expected_missing_runtime_evidence_classes()
         ));
     }
 
@@ -1395,10 +1436,10 @@ fn validate_crash_claims_gate_review_artifact_content(
     let runtime_status = review.runtime_evidence_status.to_ascii_lowercase();
     if !decision.contains("fail-closed")
         || !(decision.contains("planned") || decision.contains("blocked"))
-        || !runtime_status.contains("missing")
+        || !(runtime_status.contains("missing") || runtime_status.contains("present"))
     {
         failures.push(format!(
-            "claim `{}` crash claims-gate review `{}` must keep crash claims planned/blocked and fail-closed while runtime evidence is missing",
+            "claim `{}` crash claims-gate review `{}` must keep crash claims planned/blocked and fail-closed while runtime evidence is incomplete",
             claim.id, artifact.path
         ));
     }
@@ -1414,6 +1455,10 @@ fn validate_crash_claims_gate_review_artifact_content(
     }
 
     failures
+}
+
+fn expected_missing_runtime_evidence_classes() -> &'static [&'static str] {
+    &[RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS]
 }
 
 fn validate_crash_artifact_source_scope(
@@ -1601,9 +1646,23 @@ fn validate_claim_record(
                 claim.blockers.join("; ")
             ));
         }
+        failures.extend(missing_required_evidence_class_failures(claim));
+        failures.extend(validate_registered_evidence_artifacts_for_claim(
+            root,
+            registry_modified,
+            claim,
+        ));
         return failures;
     }
 
+    validate_registered_evidence_artifacts_for_claim(root, registry_modified, claim)
+}
+
+fn validate_registered_evidence_artifacts_for_claim(
+    root: &Path,
+    registry_modified: SystemTime,
+    claim: &ClaimRecord,
+) -> Vec<String> {
     let mut failures = Vec::new();
     for class in &claim.required_evidence_classes {
         let matching = claim
@@ -1676,6 +1735,29 @@ fn validate_claim_record(
         }
     }
     failures
+}
+
+fn missing_required_evidence_class_failures(claim: &ClaimRecord) -> Vec<String> {
+    claim
+        .required_evidence_classes
+        .iter()
+        .filter(|class| {
+            !claim
+                .evidence_artifacts
+                .iter()
+                .any(|artifact| &artifact.class == *class)
+        })
+        .map(|class| {
+            format!(
+                "claim `{}` is missing evidence artifact for class `{class}`",
+                claim.id
+            )
+        })
+        .collect()
+}
+
+fn claim_state_failure_is_blocked(failure: &str) -> bool {
+    failure.contains(" is planned") || failure.contains(" is blocked")
 }
 
 fn render_claim_registry_doc(registry: &ClaimRegistry) -> String {
