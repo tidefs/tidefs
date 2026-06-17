@@ -5,7 +5,7 @@
 //! low-level VFSSEND2 stream types with transport-agnostic chunk delivery
 //! via `tidefs_chunk_shipper`.
 
-use crate::Bytes32;
+use crate::{Bytes32, LineageManifest, SendStreamError};
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -20,6 +20,15 @@ const FRAME_VERSION: u16 = 1;
 
 /// Fixed frame header size: magic(8) + version(2) + frame_len(4) = 14.
 const FRAME_HEADER_SIZE: usize = 14;
+
+/// Magic bytes for send-lineage manifest frames: `VMANF\0\0\0`.
+const MANIFEST_FRAME_MAGIC: [u8; 8] = *b"VMANF\0\0\0";
+
+/// Current send-lineage manifest frame wire version.
+const MANIFEST_FRAME_VERSION: u16 = 1;
+
+/// Fixed manifest frame header size: magic(8) + version(2) + frame_len(4) = 14.
+const MANIFEST_FRAME_HEADER_SIZE: usize = 14;
 
 // ---------------------------------------------------------------------------
 // ChunkFrame
@@ -157,6 +166,100 @@ impl ChunkFrame {
     /// Verify that this frame's BLAKE3 hash matches its payload.
     pub fn verify(&self) -> bool {
         crate::blake3_digest(&self.payload) == self.blake3_hash
+    }
+}
+
+/// A length-delimited send-lineage manifest frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LineageManifestFrame {
+    /// Canonical lineage manifest payload.
+    pub manifest: LineageManifest,
+    /// BLAKE3 digest of the canonical manifest payload.
+    pub manifest_digest: Bytes32,
+}
+
+impl LineageManifestFrame {
+    /// Create a new manifest frame.
+    #[must_use]
+    pub fn new(manifest: LineageManifest) -> Self {
+        let manifest_digest = manifest.digest();
+        Self {
+            manifest,
+            manifest_digest,
+        }
+    }
+
+    /// Encode this manifest frame as `[header | manifest_digest | manifest_payload]`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let body = self.encode_body();
+        let frame_len = body.len() as u32;
+        let mut frame = Vec::with_capacity(MANIFEST_FRAME_HEADER_SIZE + body.len());
+        frame.extend_from_slice(&MANIFEST_FRAME_MAGIC);
+        frame.extend_from_slice(&MANIFEST_FRAME_VERSION.to_be_bytes());
+        frame.extend_from_slice(&frame_len.to_be_bytes());
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    fn encode_body(&self) -> Vec<u8> {
+        let manifest_payload = self.manifest.encode();
+        let mut body = Vec::with_capacity(32 + manifest_payload.len());
+        body.extend_from_slice(&self.manifest_digest);
+        body.extend_from_slice(&manifest_payload);
+        body
+    }
+
+    /// Decode a manifest frame from wire bytes.
+    pub fn decode(mut bytes: &[u8]) -> Result<Self, SendStreamError> {
+        if bytes.len() < MANIFEST_FRAME_HEADER_SIZE {
+            return Err(SendStreamError::UnexpectedEof);
+        }
+        let magic: [u8; 8] = bytes[..8]
+            .try_into()
+            .map_err(|_| SendStreamError::UnexpectedEof)?;
+        if magic != MANIFEST_FRAME_MAGIC {
+            return Err(SendStreamError::BadMagic);
+        }
+        bytes = &bytes[8..];
+
+        let version = u16::from_be_bytes(
+            bytes[..2]
+                .try_into()
+                .map_err(|_| SendStreamError::UnexpectedEof)?,
+        );
+        if version != MANIFEST_FRAME_VERSION {
+            return Err(SendStreamError::UnsupportedVersion(version));
+        }
+        bytes = &bytes[2..];
+
+        let frame_len = u32::from_be_bytes(
+            bytes[..4]
+                .try_into()
+                .map_err(|_| SendStreamError::UnexpectedEof)?,
+        ) as usize;
+        bytes = &bytes[4..];
+        if bytes.len() != frame_len || frame_len < 32 {
+            return Err(SendStreamError::UnexpectedEof);
+        }
+
+        let manifest_digest: Bytes32 = bytes[..32]
+            .try_into()
+            .map_err(|_| SendStreamError::UnexpectedEof)?;
+        let manifest = LineageManifest::decode_payload(&bytes[32..])?;
+        if manifest.digest() != manifest_digest {
+            return Err(SendStreamError::RecordChecksumMismatch);
+        }
+        Ok(Self {
+            manifest,
+            manifest_digest,
+        })
+    }
+
+    /// Verify that the stored digest still matches the manifest payload.
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        self.manifest.digest() == self.manifest_digest
     }
 }
 
@@ -335,6 +438,11 @@ mod tests {
         [b; 32]
     }
 
+    fn manifest() -> LineageManifest {
+        let header = crate::SendStreamHeader::new([1; 16], [2; 16], [3; 16]);
+        LineageManifest::full(&header, [4; 32])
+    }
+
     // -- ChunkFrame encode/decode --
 
     #[test]
@@ -403,6 +511,16 @@ mod tests {
         let mut frame = ChunkFrame::new(obj_id(1), 0, 0, b"data".to_vec());
         frame.payload[0] ^= 0xFF;
         assert!(!frame.verify());
+    }
+
+    #[test]
+    fn manifest_frame_round_trips_before_data_frames() {
+        let frame = LineageManifestFrame::new(manifest());
+        let encoded = frame.encode();
+        let decoded = LineageManifestFrame::decode(&encoded).unwrap();
+
+        assert_eq!(decoded, frame);
+        assert!(decoded.verify());
     }
 
     // -- ChunkEncoder --

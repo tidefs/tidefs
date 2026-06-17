@@ -9,12 +9,52 @@
 use tidefs_binary_schema_checksum::blake3_domain_digest;
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
 
+use crate::LineageManifest;
+
 /// Schema family for send-stream chunk framing (canonical family 7).
 pub const SEND_CHUNK_FAMILY: SchemaFamilyId = SchemaFamilyId(7);
 /// Schema type for a framed data chunk within the send-stream family.
 pub const SEND_CHUNK_TYPE: SchemaTypeId = SchemaTypeId(1);
+/// Schema type for the lineage manifest prelude within the send-stream family.
+pub const SEND_MANIFEST_TYPE: SchemaTypeId = SchemaTypeId(2);
 /// Schema version for send-stream chunk framing v1.0.
 pub const SEND_CHUNK_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
+/// Schema version for send-stream lineage manifest framing v1.0.
+pub const SEND_MANIFEST_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
+
+/// A framed lineage manifest produced before object chunks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FramedManifest {
+    /// Canonical lineage manifest payload.
+    pub manifest: LineageManifest,
+    /// BLAKE3-256 domain-separated digest of the manifest payload.
+    pub auth_tag: [u8; 32],
+}
+
+impl FramedManifest {
+    /// Create a framed manifest with a domain-separated authentication tag.
+    #[must_use]
+    pub fn new(manifest: LineageManifest) -> Self {
+        let auth_tag = manifest_auth_tag(&manifest);
+        Self { manifest, auth_tag }
+    }
+
+    /// Verify that the auth tag matches the encoded manifest payload.
+    #[must_use]
+    pub fn verify_auth_tag(&self) -> bool {
+        manifest_auth_tag(&self.manifest) == self.auth_tag
+    }
+}
+
+fn manifest_auth_tag(manifest: &LineageManifest) -> [u8; 32] {
+    blake3_domain_digest(
+        &manifest.encode(),
+        SEND_CHUNK_FAMILY,
+        SEND_MANIFEST_TYPE,
+        SEND_MANIFEST_VERSION,
+        DomainTag::TransferStream,
+    )
+}
 
 /// A framed chunk produced by [`ChunkFramer`].
 ///
@@ -199,6 +239,11 @@ mod tests {
         id
     }
 
+    fn manifest() -> LineageManifest {
+        let header = crate::SendStreamHeader::new([1; 16], [2; 16], [3; 16]);
+        LineageManifest::full(&header, [4; 32])
+    }
+
     #[test]
     fn single_chunk_smaller_than_chunk_size() {
         let data = b"hello".to_vec();
@@ -267,6 +312,12 @@ mod tests {
         assert_eq!(framer.total_bytes(), 0);
         assert!(framer.is_exhausted());
         assert!(framer.next_chunk().is_none());
+    }
+
+    #[test]
+    fn framed_manifest_verifies_domain_separated_tag() {
+        let framed = FramedManifest::new(manifest());
+        assert!(framed.verify_auth_tag());
     }
 
     #[test]

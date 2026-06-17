@@ -5,7 +5,8 @@
 //! TCP/simnet, or ublk block-device transport) without coupling to a
 //! concrete protocol.
 
-use crate::framer::FramedChunk;
+use crate::framer::{FramedChunk, FramedManifest};
+use crate::LineageManifest;
 
 /// Trait for dispatching framed chunks to a transport backend.
 ///
@@ -14,6 +15,11 @@ use crate::framer::FramedChunk;
 pub trait SendDispatch {
     /// The error type for dispatch operations.
     type Error: std::fmt::Debug;
+
+    /// Push the send-lineage manifest before any object chunks.
+    fn send_manifest(&mut self, _manifest: FramedManifest) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Push one framed chunk to the transport.
     ///
@@ -34,6 +40,8 @@ pub trait SendDispatch {
 /// Stores all dispatched chunks in a `Vec` for later inspection.
 #[derive(Debug, Default)]
 pub struct NoOpDispatch {
+    /// Lineage manifests dispatched so far.
+    pub manifests_sent: Vec<FramedManifest>,
     /// Chunks dispatched so far.
     pub chunks_sent: Vec<FramedChunk>,
     /// Total bytes dispatched.
@@ -45,6 +53,7 @@ impl NoOpDispatch {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            manifests_sent: Vec::new(),
             chunks_sent: Vec::new(),
             total_bytes_sent: 0,
         }
@@ -54,11 +63,32 @@ impl NoOpDispatch {
 impl SendDispatch for NoOpDispatch {
     type Error = std::convert::Infallible;
 
+    fn send_manifest(&mut self, manifest: FramedManifest) -> Result<(), Self::Error> {
+        self.manifests_sent.push(manifest);
+        Ok(())
+    }
+
     fn send_chunk(&mut self, chunk: FramedChunk) -> Result<(), Self::Error> {
         self.total_bytes_sent += chunk.payload.len() as u64;
         self.chunks_sent.push(chunk);
         Ok(())
     }
+}
+
+/// Send the lineage manifest first, then all chunks for one object.
+///
+/// # Errors
+///
+/// Returns the first dispatch error encountered.
+pub fn send_manifest_then_object<D: SendDispatch>(
+    manifest: LineageManifest,
+    object_id: [u8; 32],
+    data: &[u8],
+    chunk_size: usize,
+    dispatch: &mut D,
+) -> Result<crate::framer::ChunkFramer, D::Error> {
+    dispatch.send_manifest(FramedManifest::new(manifest))?;
+    send_object(object_id, data, chunk_size, dispatch)
 }
 
 /// Send all chunks from a [`ChunkFramer`](crate::framer::ChunkFramer)
@@ -86,11 +116,17 @@ pub fn send_object<D: SendDispatch>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{LineageManifest, SendStreamHeader};
 
     fn obj_id() -> [u8; 32] {
         let mut id = [0u8; 32];
         id[0] = 0x42;
         id
+    }
+
+    fn manifest() -> LineageManifest {
+        let header = SendStreamHeader::new([1; 16], [2; 16], [3; 16]);
+        LineageManifest::full(&header, [4; 32])
     }
 
     #[test]
@@ -125,6 +161,18 @@ mod tests {
         assert_eq!(framer.total_chunks(), 0);
         assert_eq!(dispatch.chunks_sent.len(), 0);
         assert_eq!(dispatch.total_bytes_sent, 0);
+    }
+
+    #[test]
+    fn send_manifest_then_object_dispatches_manifest_first() {
+        let data = b"with lineage";
+        let mut dispatch = NoOpDispatch::new();
+        let framer =
+            send_manifest_then_object(manifest(), obj_id(), data, 4, &mut dispatch).unwrap();
+        assert!(framer.is_exhausted());
+        assert_eq!(dispatch.manifests_sent.len(), 1);
+        assert!(dispatch.manifests_sent[0].verify_auth_tag());
+        assert_eq!(dispatch.chunks_sent.len(), data.len().div_ceil(4));
     }
 
     #[test]
