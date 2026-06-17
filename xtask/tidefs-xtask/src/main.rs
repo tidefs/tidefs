@@ -848,6 +848,27 @@ fn main() {
                 process::exit(1);
             }
         }
+        Some("validate-no-hidden-queues-receipt") => {
+            let receipt_path = match args.next() {
+                Some(path) => path,
+                None => {
+                    eprintln!("validate-no-hidden-queues-receipt requires a receipt path");
+                    process::exit(2);
+                }
+            };
+            if let Some(extra) = args.next() {
+                eprintln!(
+                    "validate-no-hidden-queues-receipt accepts one path, got extra argument `{extra}`"
+                );
+                process::exit(2);
+            }
+            if let Err(err) =
+                no_hidden_queues::validate_review_receipt_current_workspace(&receipt_path)
+            {
+                eprintln!("{err}");
+                process::exit(1);
+            }
+        }
         Some("check-claim-gate" | "check-worktree-claim") => {
             if let Err(err) = forgejo_work::check_claim_gate_current_workspace() {
                 eprintln!("{err}");
@@ -2102,6 +2123,9 @@ fn print_help() {
     println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
     println!(
         "  validate-evidence-manifest <path> validate a claim evidence artifact manifest JSON against schema"
+    );
+    println!(
+        "  validate-no-hidden-queues-receipt <path> validate a source/registry queue review receipt"
     );
     println!("  check-claim-gate        validate current worktree has a valid issue owner");
     println!("  check-worktree-claim    alias for check-claim-gate");

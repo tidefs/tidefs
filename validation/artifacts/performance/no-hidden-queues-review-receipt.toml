@@ -1,0 +1,104 @@
+receipt_version = 1
+evidence_class = "no-hidden-queues-review-receipt"
+evidence_tier = "source-registry-review"
+issue = 532
+registry_path = "validation/performance/no-hidden-queues.toml"
+registry_schema_version = 1
+source_coverage_kind = "recursive-source-registry-review"
+runtime_artifact_boundary = "source-registry-review-only-does-not-satisfy-queue-depth-runtime-artifact"
+decision = "claims-remain-blocked"
+reviewed_at = "2026-06-18"
+affected_claim_ids = [
+  "scheduler.dirty_debt.no_hidden.v1",
+  "perf.local.no_unbounded_dirty_debt.v1",
+]
+blocked_claim_ids = [
+  "scheduler.dirty_debt.no_hidden.v1",
+  "perf.local.no_unbounded_dirty_debt.v1",
+]
+non_claims = [
+  "This receipt records source and registry coverage only.",
+  "This receipt does not satisfy queue-depth-runtime-artifact evidence.",
+  "This receipt does not validate mounted runtime queue depth or dirty-debt exhaustion behavior.",
+]
+
+[reviewer]
+name = "gpt5"
+role = "managed TideFS Codex session"
+
+[tool]
+name = "tidefs-xtask"
+command = "cargo run -p tidefs-xtask -- check-no-hidden-queues"
+version = "no-hidden-queues-review-receipt-v1"
+
+[[scanned_roots]]
+name = "performance-contract-src"
+package = "tidefs-performance-contract"
+path = "crates/tidefs-performance-contract/src"
+scan = "recursive-rust-source-review"
+
+[[scanned_roots]]
+name = "local-filesystem-src"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src"
+scan = "recursive-rust-source-review"
+
+[[queue_root_coverage]]
+id = "performance_contract.budgeted_queue"
+package = "tidefs-performance-contract"
+path = "crates/tidefs-performance-contract/src/lib.rs"
+symbol = "BudgetedQueue"
+source_root = "crates/tidefs-performance-contract/src"
+coverage = "registered-source-marker-present"
+
+[[queue_root_coverage]]
+id = "local_fs.write_admission"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src/admission.rs"
+symbol = "LocalWriteAdmission"
+source_root = "crates/tidefs-local-filesystem/src"
+coverage = "registered-source-marker-present"
+
+[[queue_root_coverage]]
+id = "local_fs.write_buffers"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src/lib.rs"
+symbol = "write_buffers"
+source_root = "crates/tidefs-local-filesystem/src"
+coverage = "registered-source-marker-present"
+
+[[queue_root_coverage]]
+id = "local_fs.dirty_set"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src/writeback.rs"
+symbol = "DirtySet"
+source_root = "crates/tidefs-local-filesystem/src"
+coverage = "registered-source-marker-present"
+
+[[queue_root_coverage]]
+id = "local_fs.dirty_page_tracker"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src/dirty_page_tracker.rs"
+symbol = "DirtyPageTracker"
+source_root = "crates/tidefs-local-filesystem/src"
+coverage = "registered-source-marker-present"
+
+[[queue_root_coverage]]
+id = "local_fs.page_cache_lru"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src/page_cache/mod.rs"
+symbol = "lru"
+source_root = "crates/tidefs-local-filesystem/src"
+coverage = "registered-source-marker-present"
+
+[[out_of_scope]]
+root = "mounted-runtime-queue-depth"
+reason = "GitHub issue #498 owns mounted runtime queue-depth artifact evidence; this receipt is source/registry review evidence only."
+owner_issue = 498
+claim_ids = [
+  "scheduler.dirty_debt.no_hidden.v1",
+  "perf.local.no_unbounded_dirty_debt.v1",
+]
+does_not_satisfy_evidence_classes = [
+  "queue-depth-runtime-artifact",
+]
