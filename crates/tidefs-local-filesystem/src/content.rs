@@ -2261,7 +2261,7 @@ mod receipt_rotation_tests {
         let key = tidefs_local_object_store::ObjectKey::from_name(b"test-chunk-1");
         let payload = b"hello receipt rotation";
 
-        let (_stored, receipt) = pool.put_with_receipt(key, payload).expect("put_with_receipt");
+        let (_stored, receipt) = pool.put_with_receipt(DeviceIoClass::Data, key, payload).expect("put_with_receipt");
         assert!(receipt.generation > 0, "receipt generation must be > 0");
     }
 
@@ -2272,8 +2272,8 @@ mod receipt_rotation_tests {
         let payload1 = b"first write";
         let payload2 = b"second write (replacement)";
 
-        let (_stored1, receipt1) = pool.put_with_receipt(key, payload1).expect("put 1");
-        let (_stored2, receipt2) = pool.put_with_receipt(key, payload2).expect("put 2");
+        let (_stored1, receipt1) = pool.put_with_receipt(DeviceIoClass::Data, key, payload1).expect("put 1");
+        let (_stored2, receipt2) = pool.put_with_receipt(DeviceIoClass::Data, key, payload2).expect("put 2");
 
         assert!(
             receipt2.generation > receipt1.generation,
@@ -2289,7 +2289,7 @@ mod receipt_rotation_tests {
         let key = tidefs_local_object_store::ObjectKey::from_name(b"test-chunk-3");
         let payload = b"durable write";
 
-        let (_stored, receipt) = pool.put_with_receipt(key, payload).expect("put_with_receipt");
+        let (_stored, receipt) = pool.put_with_receipt(DeviceIoClass::Data, key, payload).expect("put_with_receipt");
 
         // Create a ContentChunkRef with the recorded receipt generation.
         let chunk_ref = ContentChunkRef {
@@ -2312,7 +2312,7 @@ mod receipt_rotation_tests {
         let key = tidefs_local_object_store::ObjectKey::from_name(b"test-chunk-4");
         let payload = b"mismatch test";
 
-        let (_stored, receipt) = pool.put_with_receipt(key, payload).expect("put_with_receipt");
+        let (_stored, receipt) = pool.put_with_receipt(DeviceIoClass::Data, key, payload).expect("put_with_receipt");
 
         // Create a ContentChunkRef with a DIFFERENT receipt generation.
         let chunk_ref = ContentChunkRef {
@@ -2335,10 +2335,10 @@ mod receipt_rotation_tests {
         let key = tidefs_local_object_store::ObjectKey::from_name(b"test-chunk-5");
 
         // First write
-        let (_stored1, receipt1) = pool.put_with_receipt(key, b"old data").expect("put 1");
+        let (_stored1, receipt1) = pool.put_with_receipt(DeviceIoClass::Data, key, b"old data").expect("put 1");
 
         // Second write (replacement)
-        let (_stored2, receipt2) = pool.put_with_receipt(key, b"new data").expect("put 2");
+        let (_stored2, receipt2) = pool.put_with_receipt(DeviceIoClass::Data, key, b"new data").expect("put 2");
 
         // The old chunk ref (with generation from receipt1) should still report
         // durable because the pool has a receipt with generation >= old gen.
@@ -2375,8 +2375,8 @@ mod receipt_rotation_tests {
         let mut pool = temp_pool("receipt-repl-dur");
         let key = tidefs_local_object_store::ObjectKey::from_name(b"test-chunk-6");
 
-        let (_stored1, receipt1) = pool.put_with_receipt(key, b"old").expect("put 1");
-        let (_stored2, _receipt2) = pool.put_with_receipt(key, b"new").expect("put 2");
+        let (_stored1, receipt1) = pool.put_with_receipt(DeviceIoClass::Data, key, b"old").expect("put 1");
+        let (_stored2, _receipt2) = pool.put_with_receipt(DeviceIoClass::Data, key, b"new").expect("put 2");
 
         assert!(
             replacement_receipt_is_durable(&pool, key, receipt1.generation),

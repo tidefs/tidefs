@@ -513,7 +513,7 @@ pub(crate) fn chunk_receipt_is_durable(
         return false;
     };
 
-    // The chunk ref's receipt generation must match the pool receipt exactly.
+    // The chunk ref's receipt generation must match or be less than the pool receipt.
     // A higher pool generation means a replacement was written; the old
     // receipt is no longer authoritative but the replacement must be durable
     // before the old chunk is freed (checked separately by the caller).
