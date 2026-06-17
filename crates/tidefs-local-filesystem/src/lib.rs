@@ -5864,7 +5864,6 @@ impl LocalFileSystem {
                 dedup_index: &mut dedup,
                 quorum_store: self.quorum_store.as_mut(),
                 compression_policy: &self.content_compression_policy,
-                        placement_receipt_generation: 0,
 })
         };
         if let Err(err) = result {
@@ -7012,7 +7011,6 @@ impl LocalFileSystem {
             hole_length: effective_length,
             quorum_store,
             compression_policy: &self.content_compression_policy,
-                    placement_receipt_generation: 0,
 })?;
 
         // Update the inode record in the inode table.
@@ -7126,7 +7124,6 @@ impl LocalFileSystem {
             hole_length: effective_length,
             quorum_store: self.quorum_store.as_mut(),
             compression_policy: &self.content_compression_policy,
-                    placement_receipt_generation: 0,
 })?;
         // Capture old record in mutation delta BEFORE replacing it
         self.mark_inode_metadata_dirty(inode_id);
@@ -7414,7 +7411,6 @@ impl LocalFileSystem {
             hole_length: effective_length,
             quorum_store: self.quorum_store.as_mut(),
             compression_policy: &self.content_compression_policy,
-                    placement_receipt_generation: 0,
 })?;
         self.mark_inode_metadata_dirty(inode_id);
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated.clone());
@@ -8661,9 +8657,7 @@ impl LocalFileSystem {
                 initial_content,
                 &mut dedup,
                 self.quorum_store.as_mut(),
-                &self.content_compression_policy,
-                0,
-            )
+                &self.content_compression_policy,            )
         };
         if let Err(err) = result {
             self.rollback_mutation_delta();
@@ -8822,9 +8816,7 @@ impl LocalFileSystem {
                 &content,
                 &mut dedup,
                 self.quorum_store.as_mut(),
-                &self.content_compression_policy,
-                0,
-            )
+                &self.content_compression_policy,            )
         };
         if let Err(err) = result {
             self.rollback_mutation_delta();
@@ -8932,7 +8924,6 @@ impl LocalFileSystem {
                 dedup_index: &mut dedup,
                 quorum_store: self.quorum_store.as_mut(),
                 compression_policy: &self.content_compression_policy,
-                        placement_receipt_generation: 0,
 })
         };
         if let Err(err) = result {
