@@ -183,7 +183,7 @@ fn single_entry_dir_all_iterator_ops() {
     // list, range_scan, list_from all return single entry
     assert_eq!(idx.list().len(), 1);
     assert_eq!(idx.range_scan(b"", 10).len(), 1);
-    let (entries, _) = idx.list_from(DirCookie::START);
+    let (entries, _) = idx.list_from(DirCookie::START).unwrap();
     assert_eq!(entries.len(), 1);
 }
 

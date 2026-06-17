@@ -71,7 +71,9 @@ pub fn run_dir_index_smoke() -> SmokeHarness {
 
     // List iteration.
     h.record(TraceEvent::DirIter { cookie: 0 });
-    let (entries_list, _cookie) = di.list_from(DirCookie(0));
+    let (entries_list, _cookie) = di
+        .list_from(DirCookie(0))
+        .expect("dir-index smoke list_from should succeed");
     h.assert_eq_ev("list_from(0) count == 3", entries_list.len(), 3);
 
     // Delete entry.
@@ -96,7 +98,9 @@ pub fn run_dir_index_smoke() -> SmokeHarness {
 
     // List count updated.
     h.record(TraceEvent::DirIter { cookie: 0 });
-    let (entries_after, _) = di.list_from(DirCookie(0));
+    let (entries_after, _) = di
+        .list_from(DirCookie(0))
+        .expect("dir-index smoke list_from after delete should succeed");
     h.assert_eq_ev(
         "list_from(0) after delete count == 2",
         entries_after.len(),

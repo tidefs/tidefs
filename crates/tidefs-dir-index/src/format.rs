@@ -318,6 +318,102 @@ pub fn dir_batch_commit_key(dir_ino: u64) -> ObjectKey {
 /// Magic bytes for the batch commit marker payload: "DBTC".
 pub const DIR_BATCH_COMMIT_MAGIC: [u8; 4] = [b'D', b'B', b'T', b'C'];
 
+#[cfg(feature = "persistent-dir-index")]
+/// Derive the object-store key for the directory version record.
+///
+/// The directory version is persisted as a separate key so that
+/// [`crate::persistent::PersistentDirIndex::list_from_store`] can
+/// validate version-bound cookies without loading the full directory
+/// index into memory.
+#[must_use]
+pub fn dir_version_key(dir_ino: u64) -> ObjectKey {
+    let name = alloc::format!("dir_version:{dir_ino:020x}");
+    ObjectKey::from_name(name)
+}
+
+// ---------------------------------------------------------------------------
+// Version-bound cookie encoding (embedded in DirCookie u64 payload)
+// ---------------------------------------------------------------------------
+
+/// Bit 62 set indicates this cookie carries directory-version evidence.
+pub const DIR_COOKIE_VERSIONED_BIT: u64 = 62;
+
+/// Mask for the versioned-cookie flag.
+pub const DIR_COOKIE_VERSIONED_MASK: u64 = 1u64 << DIR_COOKIE_VERSIONED_BIT;
+
+/// Number of bits allocated to the directory-version tag within a versioned cookie.
+pub const DIR_COOKIE_VERSION_TAG_BITS: u64 = 14;
+
+/// Shift for the version tag field within a versioned cookie.
+pub const DIR_COOKIE_VERSION_TAG_SHIFT: u64 = 48;
+
+/// Mask for the version tag field (bits [48, 61]).
+pub const DIR_COOKIE_VERSION_TAG_MASK: u64 =
+    ((1u64 << DIR_COOKIE_VERSION_TAG_BITS) - 1) << DIR_COOKIE_VERSION_TAG_SHIFT;
+
+/// Mask for the positional skip count (bits [0, 47]).
+pub const DIR_COOKIE_POSITION_MASK: u64 = (1u64 << DIR_COOKIE_VERSION_TAG_SHIFT) - 1;
+
+/// Encode a directory version tag from the full 64-bit version.
+///
+/// The tag occupies the low `DIR_COOKIE_VERSION_TAG_BITS` bits of the
+/// version, providing a check that fails when the directory is mutated
+/// between readdir batches.
+#[inline]
+#[must_use]
+pub const fn dir_cookie_version_tag(version: u64) -> u64 {
+    version & ((1u64 << DIR_COOKIE_VERSION_TAG_BITS) - 1)
+}
+
+/// Decode the version tag from a version-bound cookie.
+///
+/// Returns `None` when the cookie does not have the versioned flag set.
+/// Returns `Some(tag)` where `tag` is the embedded version evidence.
+#[inline]
+#[must_use]
+pub fn dir_cookie_decode_version(cookie_raw: u64) -> Option<u64> {
+    if cookie_raw & DIR_COOKIE_VERSIONED_MASK == 0 {
+        None
+    } else {
+        Some((cookie_raw & DIR_COOKIE_VERSION_TAG_MASK) >> DIR_COOKIE_VERSION_TAG_SHIFT)
+    }
+}
+
+/// Encode a versioned positional cookie from a skip count and directory version.
+#[inline]
+#[must_use]
+pub const fn dir_cookie_encode_versioned(skip: u64, version: u64) -> u64 {
+    DIR_COOKIE_VERSIONED_MASK
+        | (dir_cookie_version_tag(version) << DIR_COOKIE_VERSION_TAG_SHIFT)
+        | (skip & DIR_COOKIE_POSITION_MASK)
+}
+
+/// Extract the positional skip count from a (possibly versioned) cookie.
+#[inline]
+#[must_use]
+pub const fn dir_cookie_skip(cookie_raw: u64) -> usize {
+    (cookie_raw & DIR_COOKIE_POSITION_MASK) as usize
+}
+
+/// Validate a readdir resume cookie against the current directory version.
+///
+/// `0` is the only unversioned cookie accepted here: it means start a fresh
+/// scan. Any non-zero resume cookie must carry version evidence that matches
+/// the current directory version tag.
+#[inline]
+#[must_use]
+pub fn dir_cookie_resume_skip(cookie_raw: u64, directory_version: u64) -> Option<usize> {
+    if cookie_raw == 0 {
+        return Some(0);
+    }
+    let cookie_version = dir_cookie_decode_version(cookie_raw)?;
+    if cookie_version == dir_cookie_version_tag(directory_version) {
+        Some(dir_cookie_skip(cookie_raw))
+    } else {
+        None
+    }
+}
+
 #[cfg(all(test, feature = "persistent-dir-index"))]
 mod tests {
     use super::*;

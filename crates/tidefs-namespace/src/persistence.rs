@@ -212,7 +212,14 @@ impl PersistentDirectoryStore for MemoryPersistentDirectoryStore {
         let dirs = self.dirs.read().unwrap();
         match dirs.get(&parent) {
             Some(dir) => {
-                let (raw, next) = dir.list_from(tidefs_dir_index::DirCookie(cookie));
+                let (raw, next) =
+                    dir.list_from(tidefs_dir_index::DirCookie(cookie))
+                        .map_err(|e| match e {
+                            tidefs_dir_index::DirIndexError::StaleCursor => {
+                                NamespaceError::StaleCursor
+                            }
+                            _ => NamespaceError::NotFound,
+                        })?;
                 let entries = raw
                     .into_iter()
                     .map(|e| PersistentDirEntry {
@@ -231,7 +238,14 @@ impl PersistentDirectoryStore for MemoryPersistentDirectoryStore {
         let dirs = self.dirs.read().unwrap();
         match dirs.get(&parent) {
             Some(dir) => {
-                let (entries, _) = dir.list_from(tidefs_dir_index::DirCookie(0));
+                let (entries, _) =
+                    dir.list_from(tidefs_dir_index::DirCookie(0))
+                        .map_err(|e| match e {
+                            tidefs_dir_index::DirIndexError::StaleCursor => {
+                                NamespaceError::StaleCursor
+                            }
+                            _ => NamespaceError::NotFound,
+                        })?;
                 Ok(entries.iter().all(|e| e.name == b"." || e.name == b".."))
             }
             None => Err(NamespaceError::InodeNotFound),

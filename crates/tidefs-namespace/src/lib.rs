@@ -250,6 +250,9 @@ pub enum NamespaceError {
     NotEmpty,
     /// Operation expected a directory but found a non-directory.
     NotDirectory,
+    /// Directory cursor is stale — the directory was mutated between
+    /// paginated readdir batches.
+    StaleCursor,
     /// Operation expected a non-directory but found a directory.
     IsDirectory,
     /// The name is invalid (empty, contains `/`, or is `.` / `..` where
@@ -280,6 +283,7 @@ impl fmt::Display for NamespaceError {
             NamespaceError::AlreadyExists => f.write_str("already exists"),
             NamespaceError::NotEmpty => f.write_str("directory not empty"),
             NamespaceError::NotDirectory => f.write_str("not a directory"),
+            NamespaceError::StaleCursor => f.write_str("stale directory cursor"),
             NamespaceError::IsDirectory => f.write_str("is a directory"),
             NamespaceError::InvalidName => f.write_str("invalid name"),
             NamespaceError::InodeNotFound => f.write_str("inode not found"),
@@ -302,6 +306,7 @@ impl From<DirIndexError> for NamespaceError {
             DirIndexError::EntryAlreadyExists => NamespaceError::AlreadyExists,
             DirIndexError::EntryNotFound => NamespaceError::NotFound,
             DirIndexError::DirNotEmpty => NamespaceError::NotEmpty,
+            DirIndexError::StaleCursor => NamespaceError::StaleCursor,
         }
     }
 }
@@ -1273,7 +1278,12 @@ impl Namespace {
         };
         PersistentDirIndex::list_from_store(&store, dir_ino, cookie)
             .map(Some)
-            .map_err(|_| NamespaceError::NotFound)
+            .map_err(|e| match e {
+                tidefs_dir_index::persistent::DirListError::StaleCursor => {
+                    NamespaceError::StaleCursor
+                }
+                tidefs_dir_index::persistent::DirListError::Store(_) => NamespaceError::NotFound,
+            })
     }
 
     #[cfg(feature = "persistent-dir-index")]
@@ -2519,43 +2529,54 @@ impl Namespace {
     fn collect_dir_entries(
         dir: &PersistentDirIndex,
         cookie: tidefs_dir_index::DirCookie,
-    ) -> (
-        Vec<tidefs_types_polymorphic_directory_index_core::DirMicroEntry>,
-        tidefs_dir_index::DirCookie,
-    ) {
-        dir.list_from(cookie)
+    ) -> Result<
+        (
+            Vec<tidefs_types_polymorphic_directory_index_core::DirMicroEntry>,
+            tidefs_dir_index::DirCookie,
+        ),
+        NamespaceError,
+    > {
+        dir.list_from(cookie).map_err(|e| match e {
+            tidefs_dir_index::DirIndexError::StaleCursor => NamespaceError::StaleCursor,
+            _ => NamespaceError::NotFound,
+        })
     }
 
     #[cfg(not(feature = "persistent-dir-index"))]
     fn collect_dir_entries(
         dir: &DirIndex,
         cookie: tidefs_dir_index::DirCookie,
-    ) -> (
-        Vec<tidefs_types_polymorphic_directory_index_core::DirMicroEntry>,
-        tidefs_dir_index::DirCookie,
-    ) {
-        use tidefs_dir_index::DirIndexIter;
-        let mut iter = DirIndexIter::new(dir);
-        // For the in-memory backend, skip entries by count since
-        // DirIndexIter cookies are structural, not sequential.
-        let skip = cookie.0 as usize;
-        let mut skipped = 0usize;
-        while skipped < skip {
-            if iter.next().is_none() {
-                break;
-            }
-            skipped += 1;
+    ) -> Result<
+        (
+            Vec<tidefs_types_polymorphic_directory_index_core::DirMicroEntry>,
+            tidefs_dir_index::DirCookie,
+        ),
+        NamespaceError,
+    > {
+        let start = if cookie.0 == 0 {
+            0
+        } else if tidefs_dir_index::format::dir_cookie_decode_version(cookie.0).is_some() {
+            tidefs_dir_index::format::dir_cookie_skip(cookie.0)
+        } else if let Some(index) = cookie.as_micro_entry_index() {
+            index as usize
+        } else if let Some((page, entry)) = cookie.as_btree_indices() {
+            (page as usize).saturating_mul(128) + (entry as usize)
+        } else {
+            cookie.payload() as usize
+        };
+        let (mut entries, _) = dir.list_from(cookie).map_err(NamespaceError::from)?;
+        if entries.len() > 128 {
+            entries.truncate(128);
         }
-        let mut entries = Vec::new();
-        let _last_cookie = cookie;
-        while let Some((entry, _ec)) = iter.next() {
-            entries.push(entry);
-            if entries.len() >= 128 {
-                break;
-            }
-        }
-        let next = tidefs_dir_index::DirCookie(cookie.0 + entries.len() as u64);
-        (entries, next)
+        let next = if entries.is_empty() {
+            cookie
+        } else {
+            tidefs_dir_index::DirCookie(tidefs_dir_index::format::dir_cookie_encode_versioned(
+                start.saturating_add(entries.len()) as u64,
+                dir.directory_version(),
+            ))
+        };
+        Ok((entries, next))
     }
 
     /// up to 128 entries and the next cookie for pagination.
@@ -2585,7 +2606,7 @@ impl Namespace {
                 dirs.get(&dir_inode)
                     .map(|dir| Self::collect_dir_entries(dir, cookie))
             } {
-                return Ok(result);
+                return result;
             }
 
             if let Some(result) = self.list_persistent_dir_entries_in_store(dir_inode, cookie)? {
@@ -2596,7 +2617,7 @@ impl Namespace {
         let dirs = self.dirs.read().unwrap();
         let dir = dirs.get(&dir_inode).ok_or(NamespaceError::InodeNotFound)?;
 
-        let (entries, next_cookie) = Self::collect_dir_entries(dir, cookie);
+        let (entries, next_cookie) = Self::collect_dir_entries(dir, cookie)?;
         Ok((entries, next_cookie))
     }
 
@@ -4344,7 +4365,7 @@ mod tests {
         assert_eq!(tail.len(), 34);
         assert_eq!(tail[0].name, b"file_126");
         assert_eq!(tail[33].name, b"file_159");
-        assert_eq!(tail_next, tidefs_dir_index::DirCookie(162));
+        assert_eq!(tidefs_dir_index::format::dir_cookie_skip(tail_next.0), 162);
         assert_eq!(
             loaded.loaded_dir_count_for_test(),
             0,

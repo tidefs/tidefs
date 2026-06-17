@@ -12,7 +12,28 @@ use alloc::vec::Vec;
 use tidefs_local_object_store::LocalObjectStore;
 use tidefs_types_polymorphic_directory_index_core::{DatasetDirPolicy, DirCookie, DirMicroEntry};
 
-use crate::{pages::DirPageIndex, pages::DirPageIndexError, DirIndexError, SwapMode};
+use crate::{
+    format::{self, dir_cookie_encode_versioned, dir_cookie_resume_skip},
+    pages::DirPageIndex,
+    pages::DirPageIndexError,
+    DirIndexError, SwapMode,
+};
+
+/// Error returned by [`PersistentDirIndex::list_from_store`] when the
+/// caller-supplied non-zero cookie does not carry matching version evidence.
+#[derive(Debug)]
+pub enum DirListError {
+    /// Underlying object-store failure.
+    Store(tidefs_local_object_store::StoreError),
+    /// The supplied non-zero cookie has missing or stale version evidence.
+    StaleCursor,
+}
+
+impl From<tidefs_local_object_store::StoreError> for DirListError {
+    fn from(e: tidefs_local_object_store::StoreError) -> Self {
+        DirListError::Store(e)
+    }
+}
 
 /// Page-based persistent directory index with a [`DirMicroEntry`] API.
 #[derive(Debug)]
@@ -39,13 +60,27 @@ impl PersistentDirIndex {
         dir_ino: u64,
         _policy: DatasetDirPolicy,
     ) -> tidefs_local_object_store::Result<Option<Self>> {
-        DirPageIndex::load(store, dir_ino).map(|opt| {
-            opt.map(|inner| PersistentDirIndex {
-                inner,
-                has_subdirs: false,
-                version: 0,
-            })
-        })
+        let opt_inner = DirPageIndex::load(store, dir_ino)?;
+        match opt_inner {
+            Some(inner) => {
+                let version = store
+                    .get(format::dir_version_key(dir_ino))?
+                    .and_then(|raw| {
+                        if raw.len() >= 8 {
+                            Some(u64::from_le_bytes(raw[0..8].try_into().unwrap()))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                Ok(Some(PersistentDirIndex {
+                    inner,
+                    has_subdirs: false,
+                    version,
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Look up one live entry directly from persisted directory pages.
@@ -118,13 +153,28 @@ impl PersistentDirIndex {
         store: &LocalObjectStore,
         dir_ino: u64,
         cookie: DirCookie,
-    ) -> tidefs_local_object_store::Result<(Vec<DirMicroEntry>, DirCookie)> {
-        let mut remaining_skip: usize = if cookie.0 == 0 {
-            0
-        } else {
-            usize::try_from(cookie.0).unwrap_or(usize::MAX)
-        };
+    ) -> Result<(Vec<DirMicroEntry>, DirCookie), DirListError> {
+        // Resolve the on-disk directory version for cookie validation.
+        let store_version: u64 = store
+            .get(format::dir_version_key(dir_ino))
+            .map_err(DirListError::Store)?
+            .map(|raw| {
+                if raw.len() >= 8 {
+                    u64::from_le_bytes(raw[0..8].try_into().unwrap())
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+
+        let original_skip: usize =
+            dir_cookie_resume_skip(cookie.0, store_version).ok_or(DirListError::StaleCursor)?;
+        let mut remaining_skip = original_skip;
         let mut start_name = Vec::new();
+        let empty_next = DirCookie(dir_cookie_encode_versioned(
+            original_skip as u64,
+            store_version,
+        ));
 
         loop {
             let scan_limit = if remaining_skip >= LIST_FROM_WINDOW_ENTRIES {
@@ -136,7 +186,7 @@ impl PersistentDirIndex {
                 DirPageIndex::range_scan_in_store(store, dir_ino, &start_name, scan_limit)?;
 
             if window.is_empty() {
-                return Ok((Vec::new(), cookie));
+                return Ok((Vec::new(), empty_next));
             }
 
             if remaining_skip >= window.len() {
@@ -146,7 +196,7 @@ impl PersistentDirIndex {
                     .map(|(name, _, _, _, _)| name.clone())
                     .unwrap_or_default();
                 if window.len() < scan_limit {
-                    return Ok((Vec::new(), cookie));
+                    return Ok((Vec::new(), empty_next));
                 }
                 continue;
             }
@@ -163,7 +213,9 @@ impl PersistentDirIndex {
                     name,
                 })
                 .collect::<Vec<_>>();
-            let next = DirCookie(cookie.0.saturating_add(entries.len() as u64));
+            let next_skip = (original_skip as u64).saturating_add(entries.len() as u64);
+            let next_raw = dir_cookie_encode_versioned(next_skip, store_version);
+            let next = DirCookie(next_raw);
             return Ok((entries, next));
         }
     }
@@ -396,13 +448,23 @@ impl PersistentDirIndex {
     /// The cookie `.0` value is treated as a positional skip count:
     /// - 0 (START): begin at position 0.
     /// - N > 0:     skip N entries, return up to 128 starting at N.
-    #[must_use]
-    pub fn list_from(&self, cookie: DirCookie) -> (Vec<DirMicroEntry>, DirCookie) {
-        let skip: usize = if cookie.0 == 0 {
-            0
-        } else {
-            usize::try_from(cookie.0).unwrap_or(usize::MAX)
-        };
+    /// Return a page of directory entries starting from the position
+    /// encoded in `cookie`.  Returns up to 128 entries and the cookie
+    /// for the next page (`skip + emitted`), with directory-version
+    /// evidence bound into the returned cookie.
+    ///
+    /// `DirCookie::START` is the only unversioned cookie accepted.  Every
+    /// non-zero resume cookie must carry version evidence (bit 62 set) that
+    /// matches the current [`Self::directory_version`]; otherwise this returns
+    /// [`DirIndexError::StaleCursor`].
+    ///
+    /// Pass [`DirCookie::START`] to begin from the first entry.
+    pub fn list_from(
+        &self,
+        cookie: DirCookie,
+    ) -> Result<(Vec<DirMicroEntry>, DirCookie), DirIndexError> {
+        let skip: usize =
+            dir_cookie_resume_skip(cookie.0, self.version).ok_or(DirIndexError::StaleCursor)?;
         let window = self
             .inner
             .entries_from_sorted_index(skip, LIST_FROM_WINDOW_ENTRIES)
@@ -415,8 +477,10 @@ impl PersistentDirIndex {
                 name,
             })
             .collect::<Vec<_>>();
-        let next = DirCookie(cookie.0.saturating_add(window.len() as u64));
-        (window, next)
+        let next_skip = (skip as u64).saturating_add(window.len() as u64);
+        let next_raw = dir_cookie_encode_versioned(next_skip, self.version);
+        let next = DirCookie(next_raw);
+        Ok((window, next))
     }
 
     /// Produce a test-only entry snapshot suitable for iteration checks.
@@ -453,11 +517,17 @@ impl PersistentDirIndex {
     }
 
     pub fn flush(&mut self, store: &mut LocalObjectStore) -> tidefs_local_object_store::Result<()> {
-        self.inner.flush(store)
+        self.inner.flush(store)?;
+        let version_key = format::dir_version_key(self.inner.dir_ino());
+        store.put(version_key, &self.version.to_le_bytes())?;
+        Ok(())
     }
 
     pub fn sync(&mut self, store: &mut LocalObjectStore) -> tidefs_local_object_store::Result<()> {
-        self.inner.sync(store)
+        self.inner.sync(store)?;
+        let version_key = format::dir_version_key(self.inner.dir_ino());
+        store.put(version_key, &self.version.to_le_bytes())?;
+        Ok(())
     }
 }
 
@@ -762,7 +832,7 @@ mod tests {
         let mut idx = PersistentDirIndex::new(1, default_policy());
         idx.insert(b"zulu", 26, 0, DT_DIR as u32).unwrap();
         idx.insert(b"alpha", 1, 0, DT_DIR as u32).unwrap();
-        let (entries, _cookie) = idx.list_from(DirCookie::START);
+        let (entries, _cookie) = idx.list_from(DirCookie::START).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, b"alpha");
         assert_eq!(entries[1].name, b"zulu");
@@ -775,17 +845,21 @@ mod tests {
             idx.insert(name.as_bytes(), i, 0, DT_DIR as u32).unwrap();
         }
 
-        let (entries, next) = idx.list_from(DirCookie(128));
+        let start = DirCookie(crate::format::dir_cookie_encode_versioned(
+            128,
+            idx.directory_version(),
+        ));
+        let (entries, next) = idx.list_from(start).unwrap();
         assert_eq!(entries.len(), 128);
         assert_eq!(entries[0].name, b"entry_0128");
         assert_eq!(entries[127].name, b"entry_0255");
-        assert_eq!(next, DirCookie(256));
+        assert_eq!(crate::format::dir_cookie_skip(next.0), 256);
 
-        let (tail, tail_next) = idx.list_from(next);
+        let (tail, tail_next) = idx.list_from(next).unwrap();
         assert_eq!(tail.len(), 4);
         assert_eq!(tail[0].name, b"entry_0256");
         assert_eq!(tail[3].name, b"entry_0259");
-        assert_eq!(tail_next, DirCookie(260));
+        assert_eq!(crate::format::dir_cookie_skip(tail_next.0), 260);
     }
 
     #[test]
@@ -804,21 +878,21 @@ mod tests {
         assert_eq!(first.len(), 128);
         assert_eq!(first[0].name, b"entry_0000");
         assert_eq!(first[127].name, b"entry_0127");
-        assert_eq!(first_next, DirCookie(128));
+        assert_eq!(crate::format::dir_cookie_skip(first_next.0), 128);
 
         let (second, second_next) =
             PersistentDirIndex::list_from_store(&store, 1, first_next).unwrap();
         assert_eq!(second.len(), 128);
         assert_eq!(second[0].name, b"entry_0128");
         assert_eq!(second[127].name, b"entry_0255");
-        assert_eq!(second_next, DirCookie(256));
+        assert_eq!(crate::format::dir_cookie_skip(second_next.0), 256);
 
         let (tail, tail_next) =
             PersistentDirIndex::list_from_store(&store, 1, second_next).unwrap();
         assert_eq!(tail.len(), 4);
         assert_eq!(tail[0].name, b"entry_0256");
         assert_eq!(tail[3].name, b"entry_0259");
-        assert_eq!(tail_next, DirCookie(260));
+        assert_eq!(crate::format::dir_cookie_skip(tail_next.0), 260);
 
         let (empty, empty_next) =
             PersistentDirIndex::list_from_store(&store, 1, tail_next).unwrap();
@@ -1052,7 +1126,7 @@ mod tests {
         let loaded = PersistentDirIndex::load(&store, 600, default_policy())
             .unwrap()
             .unwrap();
-        let (entries, _) = loaded.list_from(DirCookie::START);
+        let (entries, _) = loaded.list_from(DirCookie::START).unwrap();
         assert_eq!(entries[0].name, b"alpha");
         assert_eq!(entries[1].name, b"mike");
         assert_eq!(entries[2].name, b"zulu");
@@ -1184,5 +1258,158 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(loaded.contains(b"entry"));
+    }
+
+    // ── Version-bound cookie tests ──────────────────────────────────
+
+    #[test]
+    fn list_from_stable_continuation_no_mutation() {
+        // Stable continuation: multiple list_from calls without mutation
+        // should return versioned cookies that can be used for pagination.
+        let mut idx = PersistentDirIndex::new(1, default_policy());
+        for i in 0..300u64 {
+            let name = alloc::format!("entry_{i:04}");
+            idx.insert(name.as_bytes(), i, 0, DT_DIR as u32).unwrap();
+        }
+
+        let (page1, cookie1) = idx.list_from(DirCookie::START).unwrap();
+        assert_eq!(page1.len(), 128);
+        assert!(cookie1.0 & crate::format::DIR_COOKIE_VERSIONED_MASK != 0);
+
+        let (page2, cookie2) = idx.list_from(cookie1).unwrap();
+        assert_eq!(page2.len(), 128);
+        assert_eq!(crate::format::dir_cookie_skip(cookie2.0), 256);
+
+        let (page3, cookie3) = idx.list_from(cookie2).unwrap();
+        assert_eq!(page3.len(), 44); // 300 - 256 = 44
+        assert_eq!(crate::format::dir_cookie_skip(cookie3.0), 300);
+
+        // Verify entry ordering is correct
+        assert_eq!(page1[0].name, b"entry_0000");
+        assert_eq!(page2[0].name, b"entry_0128");
+        assert_eq!(page3[0].name, b"entry_0256");
+        assert_eq!(page3[43].name, b"entry_0299");
+    }
+
+    #[test]
+    fn list_from_stale_cookie_after_mutation() {
+        // Mutation between batches: version changes, cookie becomes stale.
+        let mut idx = PersistentDirIndex::new(1, default_policy());
+        for i in 0..200u64 {
+            let name = alloc::format!("entry_{i:04}");
+            idx.insert(name.as_bytes(), i, 0, DT_DIR as u32).unwrap();
+        }
+
+        let (page1, cookie1) = idx.list_from(DirCookie::START).unwrap();
+        assert_eq!(page1.len(), 128);
+
+        // Mutate the directory
+        idx.insert(b"intruder", 9999, 1, DT_DIR as u32).unwrap();
+
+        // Resume with stale cookie should fail
+        let result = idx.list_from(cookie1);
+        assert_eq!(result, Err(DirIndexError::StaleCursor));
+    }
+
+    #[test]
+    fn list_from_stale_cookie_after_deletion_before_resume() {
+        // Deletion before the resume point: version changes, stale detection.
+        let mut idx = PersistentDirIndex::new(1, default_policy());
+        for i in 0..200u64 {
+            let name = alloc::format!("entry_{i:04}");
+            idx.insert(name.as_bytes(), i, 0, DT_DIR as u32).unwrap();
+        }
+
+        let (page1, cookie1) = idx.list_from(DirCookie::START).unwrap();
+        assert_eq!(page1.len(), 128);
+
+        // Delete an entry before the resume point
+        idx.delete(b"entry_0000").unwrap();
+
+        let result = idx.list_from(cookie1);
+        assert_eq!(result, Err(DirIndexError::StaleCursor));
+    }
+
+    #[test]
+    fn list_from_stale_cookie_after_insertion_before_resume() {
+        // Insertion before the resume point: version changes, stale detection.
+        let mut idx = PersistentDirIndex::new(1, default_policy());
+        for i in 0..200u64 {
+            let name = alloc::format!("entry_{i:04}");
+            idx.insert(name.as_bytes(), i, 0, DT_DIR as u32).unwrap();
+        }
+
+        let (page1, cookie1) = idx.list_from(DirCookie::START).unwrap();
+        assert_eq!(page1.len(), 128);
+
+        // Insert a new entry (bumps version)
+        idx.insert(b"aaaa_early", 5000, 0, DT_DIR as u32).unwrap();
+
+        let result = idx.list_from(cookie1);
+        assert_eq!(result, Err(DirIndexError::StaleCursor));
+    }
+
+    #[test]
+    fn list_from_rejects_nonzero_unversioned_cookie() {
+        // DirCookie::START (0) has no version evidence and is always accepted.
+        let mut idx = PersistentDirIndex::new(1, default_policy());
+        idx.insert(b"a", 1, 0, DT_DIR as u32).unwrap();
+        idx.insert(b"b", 2, 0, DT_DIR as u32).unwrap();
+
+        let (entries, cookie) = idx.list_from(DirCookie::START).unwrap();
+        assert!(!entries.is_empty());
+        assert!(cookie.0 & crate::format::DIR_COOKIE_VERSIONED_MASK != 0);
+
+        assert_eq!(idx.list_from(DirCookie(1)), Err(DirIndexError::StaleCursor));
+    }
+
+    #[test]
+    fn list_from_store_detects_stale_cursor() {
+        // list_from_store validates version against on-disk state.
+        let (_tmp, mut store) = open_store();
+        let mut idx = PersistentDirIndex::new(1, default_policy());
+        for i in 0..10u64 {
+            let name = alloc::format!("e{i:02}");
+            idx.insert(name.as_bytes(), i, 0, DT_DIR as u32).unwrap();
+        }
+        idx.flush(&mut store).unwrap();
+
+        // First page from store
+        let (page1, cookie1) =
+            PersistentDirIndex::list_from_store(&store, 1, DirCookie::START).unwrap();
+        assert!(!page1.is_empty());
+        assert!(cookie1.0 & crate::format::DIR_COOKIE_VERSIONED_MASK != 0);
+
+        // Mutate and flush new version
+        let mut idx2 = PersistentDirIndex::load(&store, 1, default_policy())
+            .unwrap()
+            .unwrap();
+        idx2.insert(b"new_one", 100, 0, DT_DIR as u32).unwrap();
+        idx2.flush(&mut store).unwrap();
+
+        // Resume store read with stale cookie should fail
+        let result = PersistentDirIndex::list_from_store(&store, 1, cookie1);
+        assert!(matches!(result, Err(DirListError::StaleCursor)));
+    }
+
+    #[test]
+    fn list_from_version_bump_preserves_checksum_integrity() {
+        // Version changes do not affect checksum verification.
+        let mut idx = PersistentDirIndex::new(1, default_policy());
+        for i in 0..50u64 {
+            let name = alloc::format!("f{i:04}");
+            idx.insert(name.as_bytes(), i, 0, DT_DIR as u32).unwrap();
+        }
+
+        // First page is fine
+        let (page1, _cookie1) = idx.list_from(DirCookie::START).unwrap();
+        assert!(!page1.is_empty());
+
+        // Mutate (bumps version, but checksums should still be valid)
+        idx.insert(b"zzz_new", 999, 0, DT_DIR as u32).unwrap();
+
+        // New page from START should still work
+        let (page2, _cookie2) = idx.list_from(DirCookie::START).unwrap();
+        assert!(page2.len() >= page1.len()); // might have the new entry too
     }
 }

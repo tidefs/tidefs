@@ -18,7 +18,6 @@
 
 extern crate alloc;
 
-#[cfg(any(feature = "persistent-dir-index", feature = "kernel"))]
 pub mod format;
 #[cfg(feature = "persistent-dir-index")]
 pub mod pages;
@@ -74,6 +73,9 @@ pub enum DirIndexError {
     EntryNotFound,
     /// Attempted to remove a directory that still has entries.
     DirNotEmpty,
+    /// The readdir cursor cookie is stale because the directory was
+    /// mutated between paginated readdir batches.
+    StaleCursor,
 }
 
 // ---------------------------------------------------------------------------
@@ -639,30 +641,39 @@ impl DirIndex {
         }
     }
 
-    #[must_use]
-    pub fn list_from(&self, cookie: DirCookie) -> (Vec<DirEntry>, DirCookie) {
-        let start = match &self.storage {
-            DirStorage::MicroList(_) => cookie.as_micro_entry_index().unwrap_or(0) as usize,
-            DirStorage::BTree(_) => {
-                let (start_page, start_entry) = cookie.as_btree_indices().unwrap_or((0, 0));
-                (start_page as usize).saturating_mul(128) + (start_entry as usize)
-            }
-        };
+    /// Return directory entries starting from the position encoded in
+    /// `cookie`.  Returns all remaining entries and the cookie for the
+    /// next page, with directory-version evidence bound into the returned
+    /// cookie.
+    ///
+    /// `DirCookie::START` is the only unversioned cookie accepted.  Every
+    /// non-zero resume cookie must carry version evidence (bit 62 set) that
+    /// matches the current [`Self::directory_version`]; otherwise this returns
+    /// [`DirIndexError::StaleCursor`].
+    ///
+    /// Pass [`DirCookie::START`] to begin from the first entry.
+    pub fn list_from(
+        &self,
+        cookie: DirCookie,
+    ) -> Result<(Vec<DirEntry>, DirCookie), DirIndexError> {
+        let version = self.directory_version();
+        let start = crate::format::dir_cookie_resume_skip(cookie.0, version)
+            .ok_or(DirIndexError::StaleCursor)?;
 
-        match &self.storage {
+        let entries = match &self.storage {
             DirStorage::MicroList(_) => {
                 let entries = self.list();
                 if start >= entries.len() {
-                    return (Vec::new(), DirCookie::START);
+                    Vec::new()
+                } else {
+                    entries[start..].to_vec()
                 }
-
-                (entries[start..].to_vec(), DirCookie::START)
             }
-            DirStorage::BTree(_) => (
-                self.btree_entries_from_sorted_index(start, usize::MAX),
-                DirCookie::START,
-            ),
-        }
+            DirStorage::BTree(_) => self.btree_entries_from_sorted_index(start, usize::MAX),
+        };
+        let next_skip = start.saturating_add(entries.len());
+        let next_raw = crate::format::dir_cookie_encode_versioned(next_skip as u64, version);
+        Ok((entries, DirCookie(next_raw)))
     }
 
     /// Return up to `max_entries` directory entries in sorted name order
@@ -2376,8 +2387,27 @@ mod tests {
         idx.insert(b"z", 1, 0, 0).unwrap();
         idx.insert(b"a", 2, 0, 0).unwrap();
         idx.insert(b"m", 3, 0, 0).unwrap();
-        let (entries, _) = idx.list_from(DirCookie::START);
+        let (entries, _) = idx.list_from(DirCookie::START).unwrap();
         assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn list_from_rejects_stale_versioned_cookie() {
+        let mut idx = DirIndex::new(1, test_policy());
+        for i in 0..10 {
+            idx.insert(alloc::format!("entry_{i:02}").as_bytes(), i, 0, 0)
+                .unwrap();
+        }
+
+        let (entries, cookie) = idx.list_from(DirCookie::START).unwrap();
+        assert_eq!(entries.len(), 10);
+        assert!(cookie.0 & crate::format::DIR_COOKIE_VERSIONED_MASK != 0);
+        assert_eq!(crate::format::dir_cookie_skip(cookie.0), 10);
+        assert_eq!(idx.list_from(DirCookie(1)), Err(DirIndexError::StaleCursor));
+
+        idx.insert(b"entry_new", 100, 0, 0).unwrap();
+
+        assert_eq!(idx.list_from(cookie), Err(DirIndexError::StaleCursor));
     }
 
     #[test]
@@ -2463,8 +2493,9 @@ mod tests {
             idx.insert(name, index as u64, 0, 0).unwrap();
         }
         assert_eq!(idx.representation(), DirStorageKind::BTREE);
-        let (entries, cookie) = idx.list_from(DirCookie::START);
-        assert_eq!(cookie, DirCookie::START);
+        let (entries, cookie) = idx.list_from(DirCookie::START).unwrap();
+        // Cookie carries version evidence
+        assert!(cookie.0 & crate::format::DIR_COOKIE_VERSIONED_MASK != 0);
         assert_eq!(
             names(&entries),
             alloc::vec![
@@ -2523,9 +2554,10 @@ mod tests {
     #[test]
     fn empty_dir_readdir() {
         let idx = DirIndex::new(1, test_policy());
-        let (entries, c) = idx.list_from(DirCookie::START);
+        let (entries, c) = idx.list_from(DirCookie::START).unwrap();
         assert!(entries.is_empty());
-        assert_eq!(c, DirCookie::START);
+        assert!(c.0 & crate::format::DIR_COOKIE_VERSIONED_MASK != 0);
+        assert_eq!(crate::format::dir_cookie_skip(c.0), 0);
     }
 
     // ------------------------------------------------------------------
@@ -3753,7 +3785,7 @@ mod tests {
         assert!(idx.is_empty());
         assert_eq!(idx.list().len(), 0);
         assert_eq!(idx.range_scan(b"", 10).len(), 0);
-        let (entries, _) = idx.list_from(DirCookie::START);
+        let (entries, _) = idx.list_from(DirCookie::START).unwrap();
         assert!(entries.is_empty());
     }
 
@@ -3840,7 +3872,7 @@ mod tests {
         let _ = shared.policy();
         let _ = shared.storage();
         let _ = shared.list();
-        let _ = shared.list_from(DirCookie::START);
+        let _ = shared.list_from(DirCookie::START).unwrap();
         let _ = shared.range_scan(b"", 10);
         let _ = shared.to_bytes();
         // No mutation method is callable through &DirIndex — the borrow

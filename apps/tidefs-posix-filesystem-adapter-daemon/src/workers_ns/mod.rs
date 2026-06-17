@@ -291,6 +291,7 @@ pub enum NsOpError {
     NameTooLong,
     NoSpace,
     DirectoryNotEmpty,
+    StaleCursor,
     IsDirectory,
     NotDirectory,
     NotSymlink,
@@ -326,6 +327,7 @@ impl NsOpError {
             Self::XattrTooLarge => ns_errno::E2BIG,
             Self::XattrInvalidName => ns_errno::EINVAL,
             Self::XattrNotSupported => ns_errno::EOPNOTSUPP,
+            Self::StaleCursor => libc::EAGAIN,
         }
     }
 }
@@ -1237,6 +1239,7 @@ fn dir_index_error_to_ns_error(error: tidefs_dir_index::DirIndexError) -> NsOpEr
         tidefs_dir_index::DirIndexError::EntryAlreadyExists => NsOpError::EntryAlreadyExists,
         tidefs_dir_index::DirIndexError::EntryNotFound => NsOpError::EntryNotFound,
         tidefs_dir_index::DirIndexError::DirNotEmpty => NsOpError::DirectoryNotEmpty,
+        DirIndexError::StaleCursor => NsOpError::StaleCursor,
     }
 }
 
@@ -1480,15 +1483,34 @@ pub fn plan_readdir_resume(
     dir_index: &DirIndex,
     offset: u64,
     max_entries: usize,
-) -> ReaddirResumePlan {
+) -> Result<ReaddirResumePlan, NsOpError> {
     let cookie = DirCookie(offset);
-    let (raw_entries, _) = dir_index.list_from(cookie);
+    let raw_start = if offset == 0 {
+        0
+    } else if tidefs_dir_index::format::dir_cookie_decode_version(offset).is_some() {
+        tidefs_dir_index::format::dir_cookie_skip(offset)
+    } else if let Some(index) = cookie.as_micro_entry_index() {
+        index as usize
+    } else if let Some((page, entry)) = cookie.as_btree_indices() {
+        (page as usize).saturating_mul(128) + (entry as usize)
+    } else {
+        cookie.payload() as usize
+    };
+    let (raw_entries, _) = dir_index
+        .list_from(cookie)
+        .map_err(dir_index_error_to_ns_error)?;
 
     let count = raw_entries.len().min(max_entries);
     let entries: Vec<DirStreamEntry> = raw_entries[..count]
         .iter()
         .enumerate()
-        .map(|(i, e)| entry_from_dir_micro_entry(e, 0, offset, i))
+        .map(|(i, e)| {
+            let entry_cookie = tidefs_dir_index::format::dir_cookie_encode_versioned(
+                raw_start.saturating_add(i).saturating_add(1) as u64,
+                dir_index.directory_version(),
+            );
+            entry_from_dir_micro_entry(e, entry_cookie, offset, i)
+        })
         .collect();
 
     let eof = count >= raw_entries.len();
@@ -1500,41 +1522,42 @@ pub fn plan_readdir_resume(
         entries.last().map_or(offset, |entry| entry.cookie)
     };
 
-    ReaddirResumePlan {
+    Ok(ReaddirResumePlan {
         start_offset: offset,
         max_entries,
         available_entries: raw_entries.len(),
         entries,
         next_offset,
         eof,
-    }
+    })
 }
 
 /// Iterate a [`DirIndex`] from `offset` and return the next page of directory
 /// entries plus the FUSE resume offset for the following call.
-#[must_use]
 pub fn handle_readdir(
     dir_index: &DirIndex,
     offset: u64,
     max_entries: usize,
-) -> (Vec<DirStreamEntry>, u64) {
-    let plan = plan_readdir_resume(dir_index, offset, max_entries);
-    (plan.entries, plan.next_offset)
+) -> Result<(Vec<DirStreamEntry>, u64), NsOpError> {
+    let plan = plan_readdir_resume(dir_index, offset, max_entries)?;
+    Ok((plan.entries, plan.next_offset))
 }
 
 /// Convenience: iterate all remaining entries unconditionally.
-#[must_use]
-pub fn handle_readdir_all(dir_index: &DirIndex) -> Vec<DirStreamEntry> {
-    let (entries, _) = handle_readdir(dir_index, 0, usize::MAX);
-    entries
+pub fn handle_readdir_all(dir_index: &DirIndex) -> Result<Vec<DirStreamEntry>, NsOpError> {
+    let (entries, _) = handle_readdir(dir_index, 0, usize::MAX)?;
+    Ok(entries)
 }
 
 /// Check whether the dir-index is at EOF (no more entries beyond `offset`).
 #[must_use]
 pub fn is_readdir_eof(dir_index: &DirIndex, offset: u64) -> bool {
     let cookie = DirCookie(offset);
-    let (entries, next_cookie) = dir_index.list_from(cookie);
-    entries.is_empty() && next_cookie.0 == 0
+    let Ok((entries, next_cookie)) = dir_index.list_from(cookie) else {
+        // Stale cursor or other error: treat conservatively as not-EOF.
+        return false;
+    };
+    entries.is_empty() || next_cookie.0 == 0
 }
 /// Pure rename errors before reply-layer errno mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1622,6 +1645,7 @@ pub const fn namespace_rename_errno(error: NamespaceRenameError) -> i32 {
             RENAME_ERRNO_EEXIST
         }
         NamespaceRenameError::DirectoryIndex(DirIndexError::DirNotEmpty) => RENAME_ERRNO_ENOTEMPTY,
+        NamespaceRenameError::DirectoryIndex(DirIndexError::StaleCursor) => libc::EAGAIN,
     }
 }
 
@@ -1885,7 +1909,7 @@ pub fn dispatch_readdir<B: DirStreamBackend>(
         .get_dir_index(dir_ino)
         .ok_or(NsOpError::NotDirectory)?;
 
-    let plan = plan_readdir_resume(dir_index, offset, max_entries);
+    let plan = plan_readdir_resume(dir_index, offset, max_entries)?;
 
     Ok(DirStreamReadResult {
         entries: plan.entries,
@@ -3304,7 +3328,7 @@ mod tests {
     #[test]
     fn handle_readdir_empty_dir() {
         let idx = DirIndex::new(1, DatasetDirPolicy::DEFAULT);
-        let (entries, next_off) = handle_readdir(&idx, 0, 128);
+        let (entries, next_off) = handle_readdir(&idx, 0, 128).unwrap();
         assert!(entries.is_empty());
         assert_eq!(next_off, 0);
         assert!(is_readdir_eof(&idx, 0));
@@ -3313,14 +3337,18 @@ mod tests {
     #[test]
     fn plan_readdir_resume_records_page_boundary() {
         let idx = test_dir_index(8);
-        let plan = plan_readdir_resume(&idx, 0, 3);
+        let plan = plan_readdir_resume(&idx, 0, 3).unwrap();
 
         assert_eq!(plan.start_offset, 0);
         assert_eq!(plan.max_entries, 3);
         assert_eq!(plan.available_entries, 8);
         assert_eq!(plan.returned_entries(), 3);
         assert_eq!(plan.remaining_entries(), 5);
-        assert_eq!(plan.next_offset, 3);
+        assert_ne!(plan.next_offset, 0);
+        assert_eq!(
+            tidefs_dir_index::format::dir_cookie_skip(plan.next_offset),
+            3
+        );
         assert!(!plan.eof);
         assert_eq!(plan.entries[0].name.as_bytes(), b"file_000.txt");
         assert_eq!(plan.entries[2].name.as_bytes(), b"file_002.txt");
@@ -3329,22 +3357,40 @@ mod tests {
     #[test]
     fn plan_readdir_resume_continues_after_last_cookie() {
         let idx = test_dir_index(8);
-        let first = plan_readdir_resume(&idx, 0, 3);
-        let second = plan_readdir_resume(&idx, first.next_offset, 3);
+        let first = plan_readdir_resume(&idx, 0, 3).unwrap();
+        let second = plan_readdir_resume(&idx, first.next_offset, 3).unwrap();
 
         assert_eq!(second.start_offset, first.next_offset);
         assert_eq!(second.available_entries, 5);
         assert_eq!(second.returned_entries(), 3);
-        assert_eq!(second.next_offset, 6);
+        assert_eq!(
+            tidefs_dir_index::format::dir_cookie_skip(second.next_offset),
+            6
+        );
         assert!(!second.eof);
         assert_eq!(second.entries[0].name.as_bytes(), b"file_003.txt");
         assert_eq!(second.entries[2].name.as_bytes(), b"file_005.txt");
     }
 
     #[test]
+    fn plan_readdir_resume_rejects_stale_versioned_cookie() {
+        let mut idx = test_dir_index(8);
+        let first = plan_readdir_resume(&idx, 0, 3).unwrap();
+
+        idx.insert(b"file_new.txt", 500, 0, 1).unwrap();
+
+        assert_eq!(
+            plan_readdir_resume(&idx, first.next_offset, 3),
+            Err(NsOpError::StaleCursor)
+        );
+    }
+
+    #[test]
     fn plan_readdir_resume_marks_eof_only_when_drained() {
         let idx = test_dir_index(5);
-        let plan = plan_readdir_resume(&idx, 4, 10);
+        let offset =
+            tidefs_dir_index::format::dir_cookie_encode_versioned(4, idx.directory_version());
+        let plan = plan_readdir_resume(&idx, offset, 10).unwrap();
 
         assert_eq!(plan.available_entries, 1);
         assert_eq!(plan.returned_entries(), 1);
@@ -3357,13 +3403,15 @@ mod tests {
     #[test]
     fn plan_readdir_resume_zero_limit_does_not_claim_eof() {
         let idx = test_dir_index(5);
-        let plan = plan_readdir_resume(&idx, 2, 0);
+        let offset =
+            tidefs_dir_index::format::dir_cookie_encode_versioned(2, idx.directory_version());
+        let plan = plan_readdir_resume(&idx, offset, 0).unwrap();
 
-        assert_eq!(plan.start_offset, 2);
+        assert_eq!(plan.start_offset, offset);
         assert_eq!(plan.available_entries, 3);
         assert_eq!(plan.returned_entries(), 0);
         assert_eq!(plan.remaining_entries(), 3);
-        assert_eq!(plan.next_offset, 2);
+        assert_eq!(plan.next_offset, offset);
         assert!(!plan.eof);
         assert!(plan.entries.is_empty());
     }
@@ -3371,7 +3419,7 @@ mod tests {
     #[test]
     fn handle_readdir_single_page() {
         let idx = test_dir_index(5);
-        let (entries, next_off) = handle_readdir(&idx, 0, 128);
+        let (entries, next_off) = handle_readdir(&idx, 0, 128).unwrap();
         assert_eq!(entries.len(), 5);
         // Names are sorted by dir-index ordering
         assert_eq!(entries[0].name.as_bytes(), b"file_000.txt");
@@ -3387,23 +3435,29 @@ mod tests {
     fn handle_readdir_multi_page() {
         let idx = test_dir_index(10);
         // Request only 3 entries per page
-        let (page1, off1) = handle_readdir(&idx, 0, 3);
+        let (page1, off1) = handle_readdir(&idx, 0, 3).unwrap();
         assert_eq!(page1.len(), 3);
-        assert_eq!(page1[0].cookie, 1);
-        assert_eq!(page1[2].cookie, 3);
+        assert_eq!(
+            tidefs_dir_index::format::dir_cookie_skip(page1[0].cookie),
+            1
+        );
+        assert_eq!(
+            tidefs_dir_index::format::dir_cookie_skip(page1[2].cookie),
+            3
+        );
         assert!(off1 > 0); // more entries remain
 
         // Resume from page1's last cookie (kernel passes cookie as-is)
-        let (page2, off2) = handle_readdir(&idx, off1, 3);
+        let (page2, off2) = handle_readdir(&idx, off1, 3).unwrap();
         assert_eq!(page2.len(), 3);
         assert_eq!(page2[0].name.as_bytes(), b"file_003.txt");
         assert_eq!(page2[2].name.as_bytes(), b"file_005.txt");
         assert!(off2 > 0);
 
         // Last page (4 remaining)
-        let (page3, off3) = handle_readdir(&idx, off2, 3);
+        let (page3, off3) = handle_readdir(&idx, off2, 3).unwrap();
         assert_eq!(page3.len(), 3);
-        let (page4, off4) = handle_readdir(&idx, off3, 3);
+        let (page4, off4) = handle_readdir(&idx, off3, 3).unwrap();
         assert_eq!(page4.len(), 1); // only file_009.txt left
         assert_eq!(off4, 0); // EOF
 
@@ -3415,14 +3469,14 @@ mod tests {
     #[test]
     fn handle_readdir_respects_max_entries() {
         let idx = test_dir_index(10);
-        let (entries, _) = handle_readdir(&idx, 0, 4);
+        let (entries, _) = handle_readdir(&idx, 0, 4).unwrap();
         assert_eq!(entries.len(), 4);
     }
 
     #[test]
     fn handle_readdir_all_returns_all() {
         let idx = test_dir_index(7);
-        let entries = handle_readdir_all(&idx);
+        let entries = handle_readdir_all(&idx).unwrap();
         assert_eq!(entries.len(), 7);
     }
 
@@ -3439,11 +3493,10 @@ mod tests {
     #[test]
     fn handle_readdir_from_mid_offset_basic() {
         let idx = test_dir_index(5);
-        // offset 2 should mean "start after the entry with cookie <= 2"
-        let (entries, _) = handle_readdir(&idx, 2, 128);
-        // dir-index list_from returns all entries >= cookie
-        // In micro-list mode, offset 2 = DirCookie(2) = entry index 2
-        // So we get entries [2..], i.e. file_002, file_003, file_004
+        let offset =
+            tidefs_dir_index::format::dir_cookie_encode_versioned(2, idx.directory_version());
+        let (entries, _) = handle_readdir(&idx, offset, 128).unwrap();
+        // dir-index list_from resumes from the versioned positional skip.
         assert!(!entries.is_empty());
     }
     #[test]
