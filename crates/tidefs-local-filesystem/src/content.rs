@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::vec;
 
+use tidefs_local_object_store::DeviceIoClass;
+use tidefs_local_object_store::Pool;
 use tidefs_local_object_store::{checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey, StoredObject};
 use tidefs_local_object_store::pool::{PlacementReceipt, PoolStoreMut};
 use tidefs_types_vfs_core::InodeId;
@@ -179,12 +181,13 @@ pub(crate) fn read_content_from_store(
     inode_id: InodeId,
     record: &InodeRecord,
     allow_v0390_fixed_content: bool,
+    pool: Option<&Pool>,
 ) -> Result<Vec<u8>> {
     let layout =
         read_content_layout_from_store(store, inode_id, record, allow_v0390_fixed_content)?;
     match &layout {
         ContentLayout::Inline(content) => Ok(content.bytes.clone()),
-        ContentLayout::Chunked(manifest) => read_chunked_content(store, manifest, record.size),
+        ContentLayout::Chunked(manifest) => read_chunked_content(store, manifest, record.size, pool),
     }
 }
 
@@ -439,6 +442,7 @@ pub(crate) fn read_content_chunk_from_store(
     store: &LocalObjectStore,
     inode_id: InodeId,
     chunk_ref: &ContentChunkRef,
+    pool: Option<&Pool>,
 ) -> Result<ContentChunkObject> {
     // Hole (sparse) chunks have no backing object-store data; synthesize zeros.
     if chunk_ref.is_hole() {
@@ -455,9 +459,8 @@ pub(crate) fn read_content_chunk_from_store(
         chunk_ref.data_version,
         chunk_ref.chunk_index,
     );
-    let bytes = store.get(key)?.ok_or(FileSystemError::CorruptState {
-        reason: "content manifest references a missing chunk object",
-    })?;
+
+    let bytes = read_chunk_bytes_with_receipt(store, pool, chunk_ref, key)?;
     // Validate the chunk bytes. try_validate_chunk_bytes handles dedup
     // redirect resolution internally, including cross-file inode_id
     // validation skip for reflinked chunks (#841).
@@ -476,6 +479,52 @@ pub(crate) fn read_content_chunk_from_store(
 
     Err(FileSystemError::CorruptState {
         reason: "content chunk checksum mismatch (all historical versions also corrupt)",
+    })
+}
+
+/// Read chunk bytes, preferring receipt-aware routing through the pool when
+/// the chunk ref carries a non-zero placement receipt generation that can be
+/// verified against the pool's stored receipt.
+///
+/// Receiptless chunks (generation == 0) and reads where no pool is available
+/// fall back to the raw store get.
+fn read_chunk_bytes_with_receipt(
+    store: &LocalObjectStore,
+    pool: Option<&Pool>,
+    chunk_ref: &ContentChunkRef,
+    key: ObjectKey,
+) -> Result<Vec<u8>> {
+    // Fast path: receiptless chunk or no pool — use raw store.
+    if chunk_ref.placement_receipt_generation == 0 || pool.is_none() {
+        return store.get(key)?.ok_or(FileSystemError::CorruptState {
+            reason: "content manifest references a missing chunk object",
+        });
+    }
+
+    let pool = pool.unwrap();
+    match pool.placement_receipt_for_key(DeviceIoClass::Data, key) {
+        Ok(Some(receipt)) if receipt.generation == chunk_ref.placement_receipt_generation => {
+            // Receipt generation matches: route through pool for
+            // receipt-verified device selection.
+            match pool.get(DeviceIoClass::Data, key) {
+                Ok(Some(bytes)) => return Ok(bytes),
+                Ok(None) => {}
+                Err(_) => {}
+            }
+        }
+        Ok(Some(receipt)) => {
+            eprintln!(
+                "TideFS: content chunk {:?} receipt generation mismatch                  (stored {} != pool {}); falling back to topology lookup",
+                key, chunk_ref.placement_receipt_generation, receipt.generation,
+            );
+        }
+        Ok(None) => {}
+        Err(_) => {}
+    }
+
+    // Fallback: raw store get without receipt authority.
+    store.get(key)?.ok_or(FileSystemError::CorruptState {
+        reason: "content manifest references a missing chunk object",
     })
 }
 
@@ -1013,7 +1062,7 @@ fn write_sparse_size_change<S: ContentWriteStore>(
             continue;
         }
 
-        let old_chunk = read_content_chunk_from_store(store.raw_store(), new_record.inode_id, old_ref)?;
+        let old_chunk = read_content_chunk_from_store(store.raw_store(), new_record.inode_id, old_ref, None)?;
         let mut chunk_bytes = old_chunk.bytes.to_vec();
         chunk_bytes.resize(expected_len as usize, 0);
 
@@ -1403,7 +1452,7 @@ pub(crate) fn punch_hole_content<S: ContentWriteStore>(request: PunchHoleContent
         } else if !old_ref.is_hole() {
             // Chunk partially overlaps the hole: read the chunk, zero the
             // hole bytes, and write a modified chunk under the new data version.
-            let old_chunk = read_content_chunk_from_store(store.raw_store(), inode_id, old_ref)?;
+            let old_chunk = read_content_chunk_from_store(store.raw_store(), inode_id, old_ref, None)?;
             let mut modified = old_chunk.bytes.to_vec();
             let zero_start = hole_offset.saturating_sub(chunk_start);
             let zero_start_idx = usize::try_from(zero_start).unwrap_or(0);
@@ -1506,7 +1555,7 @@ pub(crate) fn copy_old_content_into_chunk(
     let copy_len = chunk_bytes
         .len()
         .min(usize::try_from(available).unwrap_or(usize::MAX));
-    let old_bytes = read_content_range_from_layout(store, old_layout, chunk_start, copy_len)?;
+    let old_bytes = read_content_range_from_layout(store, old_layout, chunk_start, copy_len, None)?;
     chunk_bytes[..old_bytes.len()].copy_from_slice(&old_bytes);
     Ok(())
 }
@@ -1595,6 +1644,7 @@ pub(crate) fn read_chunked_content(
     store: &LocalObjectStore,
     manifest: &ContentManifestObject,
     file_size: u64,
+    pool: Option<&Pool>,
 ) -> Result<Vec<u8>> {
     let capacity = usize::try_from(file_size).map_err(|_| FileSystemError::SizeOverflow {
         requested: file_size,
@@ -1612,7 +1662,7 @@ pub(crate) fn read_chunked_content(
             })?;
             out.resize(out.len() + hole_len, 0);
         }
-        let chunk = read_content_chunk_from_store(store, manifest.inode_id, chunk_ref)?;
+        let chunk = read_content_chunk_from_store(store, manifest.inode_id, chunk_ref, pool)?;
         out.extend_from_slice(&chunk.bytes);
         expected_pos = chunk_start + chunk_ref.len as u64;
     }
@@ -1634,6 +1684,7 @@ pub(crate) fn read_content_range_from_store(
     offset: u64,
     len: usize,
     allow_v0390_fixed_content: bool,
+    pool: Option<&Pool>,
 ) -> Result<Vec<u8>> {
     if len == 0 || offset >= record.size {
         return Ok(Vec::new());
@@ -1648,7 +1699,7 @@ pub(crate) fn read_content_range_from_store(
         })?;
     let layout =
         read_content_layout_from_store(store, inode_id, record, allow_v0390_fixed_content)?;
-    read_content_range_from_layout(store, &layout, offset, clipped_len)
+    read_content_range_from_layout(store, &layout, offset, clipped_len, pool)
 }
 
 pub(crate) fn read_content_range_from_layout(
@@ -1656,6 +1707,7 @@ pub(crate) fn read_content_range_from_layout(
     layout: &ContentLayout,
     offset: u64,
     len: usize,
+    pool: Option<&Pool>,
 ) -> Result<Vec<u8>> {
     if len == 0 {
         return Ok(Vec::new());
@@ -1710,7 +1762,7 @@ pub(crate) fn read_content_range_from_layout(
                         continue;
                     }
 
-                    let chunk = read_content_chunk_from_store(store, manifest.inode_id, chunk_ref)?;
+                    let chunk = read_content_chunk_from_store(store, manifest.inode_id, chunk_ref, pool)?;
                     if in_chunk > chunk.bytes.len() {
                         return Err(FileSystemError::CorruptState {
                             reason: "content range starts beyond chunk length",
@@ -2050,7 +2102,7 @@ mod tests {
             chunks: vec![ContentChunkRef::hole(0, u32::MAX)],
         });
 
-        let bytes = read_content_range_from_layout(&store, &layout, u32::MAX as u64 - 1, 1)
+        let bytes = read_content_range_from_layout(&store, &layout, u32::MAX as u64 - 1, 1, None)
             .expect("read tail byte from sparse hole ref");
 
         assert_eq!(bytes, vec![0]);
@@ -2067,9 +2119,70 @@ mod tests {
             chunks: Vec::new(),
         });
 
-        let bytes = read_content_range_from_layout(&store, &layout, u32::MAX as u64 - 1, 1)
+        let bytes = read_content_range_from_layout(&store, &layout, u32::MAX as u64 - 1, 1, None)
             .expect("read tail byte from implicit sparse chunk");
 
         assert_eq!(bytes, vec![0]);
+    }
+
+    /// `read_chunk_bytes_with_receipt` falls back to the raw store when
+    /// the chunk ref carries receipt generation zero (receiptless path).
+    #[test]
+    fn receiptless_chunk_reads_via_raw_store() {
+        let mut store = temp_store("receiptless-raw");
+        let key = ObjectKey::from_name([1; 32]);
+        let payload = b"receiptless test payload".to_vec();
+        store.put(key, &payload).expect("write chunk");
+
+        let chunk_ref = ContentChunkRef {
+            data_version: 1,
+            chunk_index: 0,
+            len: payload.len() as u32,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: 0,
+        };
+
+        let result = read_chunk_bytes_with_receipt(&store, None, &chunk_ref, key)
+            .expect("read receiptless chunk bytes");
+        assert_eq!(result, payload);
+    }
+
+    /// `read_chunk_bytes_with_receipt` skips the pool path when no pool is
+    /// available, even for a non-zero receipt generation.
+    #[test]
+    fn receipted_chunk_reads_via_raw_store_when_pool_is_none() {
+        let mut store = temp_store("receipted-no-pool");
+        let key = ObjectKey::from_name([2; 32]);
+        let payload = b"receipted but no pool".to_vec();
+        store.put(key, &payload).expect("write chunk");
+
+        let chunk_ref = ContentChunkRef {
+            data_version: 1,
+            chunk_index: 0,
+            len: payload.len() as u32,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: 42, // non-zero, but pool is None
+        };
+
+        let result = read_chunk_bytes_with_receipt(&store, None, &chunk_ref, key)
+            .expect("read receipted chunk without pool");
+        assert_eq!(result, payload);
+    }
+
+    /// `read_content_chunk_from_store` with a hole ref must synthesize zeros
+    /// and never touch the pool or store.
+    #[test]
+    fn hole_chunk_synthesizes_zeros() {
+        let store = temp_store("hole-zeros");
+        let hole_ref = ContentChunkRef::hole(0, 128);
+
+        let result = read_content_chunk_from_store(
+            &store,
+            InodeId::new(30),
+            &hole_ref,
+            None,
+        )
+        .expect("read hole chunk");
+        assert_eq!(result.bytes, vec![0u8; 128]);
     }
 }

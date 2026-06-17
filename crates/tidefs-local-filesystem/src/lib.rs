@@ -5732,6 +5732,7 @@ impl LocalFileSystem {
                         chunk.start,
                         base_len,
                         true,
+                        Some(&self.store),
                     )?;
                     overlay[..base.len()].copy_from_slice(&base);
                 }
@@ -6359,6 +6360,7 @@ impl LocalFileSystem {
                     offset,
                     base_len,
                     true,
+                    Some(&self.store),
                 )?;
                 if base.len() > base_len {
                     return Err(FileSystemError::CorruptState {
@@ -10442,7 +10444,7 @@ impl LocalFileSystem {
             return Ok(bytes);
         }
         let bytes =
-            read_content_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+            read_content_from_store(self.store.raw_primary_store(), inode_id, record, true, Some(&self.store))?;
         self.hot_read_cache.borrow_mut().admit(key, &bytes);
         Ok(bytes)
     }
@@ -10517,6 +10519,7 @@ impl LocalFileSystem {
                 &layout,
                 offset,
                 clipped_len,
+                Some(&self.store),
             );
         }
 
@@ -10527,6 +10530,7 @@ impl LocalFileSystem {
             &layout,
             offset,
             clipped_len,
+            Some(&self.store),
         )?;
         if matches!(layout, ContentLayout::Chunked(_)) {
             self.content_layout_cache.borrow_mut().insert(key, layout);

@@ -1395,7 +1395,7 @@ pub(crate) fn replay_entry(
             let new_size = record.size.max(write_end);
 
             let existing_bytes =
-                match crate::content::read_content_from_store(store, *inode_id, &record, true) {
+                match crate::content::read_content_from_store(store, *inode_id, &record, true, None) {
                     Ok(bytes) => bytes,
                     Err(_) => vec![0u8; record.size as usize],
                 };
@@ -1613,7 +1613,7 @@ impl ReplayBatcher {
 
             // 1. Read existing content once.
             let existing_bytes =
-                match crate::content::read_content_from_store(store, inode_id, &record, true) {
+                match crate::content::read_content_from_store(store, inode_id, &record, true, None) {
                     Ok(bytes) => bytes,
                     Err(_) => vec![0u8; record.size as usize],
                 };

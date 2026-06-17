@@ -211,6 +211,7 @@ impl SparseAnonymousData {
                         fs.store.raw_primary_store(),
                         record.inode_id,
                         chunk_ref,
+                        Some(&fs.store),
                     )?;
                     let offset = content_chunk_start(chunk_ref.chunk_index)?;
                     data.insert_if_data(offset, chunk.bytes);

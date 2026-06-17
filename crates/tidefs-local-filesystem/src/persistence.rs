@@ -131,7 +131,7 @@ pub(crate) fn ensure_versioned_content_object(
     {
         return Ok(());
     }
-    let content = read_content_from_store(store, inode.inode_id, inode, true)?;
+    let content = read_content_from_store(store, inode.inode_id, inode, true, None)?;
     write_chunked_content(
         false,
         store,
@@ -192,7 +192,7 @@ pub(crate) fn transaction_manifest_entries_for_content(
                         reason: "transaction manifest references a missing content chunk",
                     })?;
                 let is_dedup = crate::encoding::is_dedup_redirect(&stored_bytes);
-                let chunk = read_content_chunk_from_store(store, manifest.inode_id, chunk_ref)?;
+                let chunk = read_content_chunk_from_store(store, manifest.inode_id, chunk_ref, None)?;
                 if !is_dedup && chunk.chunk_index != chunk_ref.chunk_index {
                     return Err(FileSystemError::CorruptState {
                         reason: "content chunk does not match manifest",
