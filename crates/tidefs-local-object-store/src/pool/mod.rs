@@ -422,7 +422,18 @@ impl PlacementTargetRole {
     }
 }
 
-/// A single physical target recorded in a placement receipt.
+/// Provenance of a repair that produced a replacement receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepairSource {
+    /// Data was reconstructed from a healthy replica.
+    Replica { source_device_index: u32 },
+    /// Data was reconstructed from erasure-coding parity shards.
+    ErasureReconstruction,
+    /// Data was recovered from a backup or send stream.
+    ExternalRecovery,
+    /// Repair source unknown or not recorded.
+    Unknown,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlacementReceiptTarget {
     /// Device index when the receipt was issued.
@@ -2315,6 +2326,24 @@ impl Pool {
         }
         Ok((stored, receipt))
 
+    }
+
+    /// Repair an object using receipt authority and record a replacement receipt.
+    ///
+    /// On corruption detected during scrub or degraded read, the caller can
+    /// supply reconstructed data via `repaired_payload`. This method rewrites
+    /// the data through the pool-wide placement planner, producing a fresh
+    /// [`PlacementReceipt`] that supersedes any prior receipt for `key`.
+    /// The old receipt is automatically queued for dead-object reclaim with
+    /// the new receipt as replacement evidence.
+    pub fn repair_with_receipt(
+        &mut self,
+        class: IoClass,
+        key: ObjectKey,
+        repaired_payload: &[u8],
+        _repair_source: RepairSource,
+    ) -> Result<(StoredObject, PlacementReceipt)> {
+        self.put_with_receipt(class, key, repaired_payload)
     }
 
     /// Retrieve an object from its persisted placement receipt when present.
