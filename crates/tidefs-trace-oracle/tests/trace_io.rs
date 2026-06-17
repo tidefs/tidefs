@@ -100,6 +100,34 @@ fn model_runtime_write_sync_restart_trace_matches() {
 }
 
 #[test]
+fn model_runtime_rename_sync_restart_trace_passes() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let trace_path = root
+        .join("traces")
+        .join("local-vfs-rename-atomicity-read-recovery.jsonl");
+    let comparison = compare_model_and_runtime_trace(&trace_path).unwrap();
+
+    assert!(
+        comparison.passed(),
+        "rename atomicity trace mismatch: {:?}",
+        comparison.mismatches.first().map(|m| m.to_string())
+    );
+    assert!(
+        comparison.final_fingerprint("model").is_some(),
+        "rename trace missing model final fingerprint"
+    );
+    assert!(
+        comparison.final_fingerprint("local_runtime").is_some(),
+        "rename trace missing runtime final fingerprint"
+    );
+}
+
+#[test]
 fn backend_mismatch_reports_replay_metadata() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("mismatch.jsonl");

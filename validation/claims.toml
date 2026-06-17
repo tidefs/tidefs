@@ -36,12 +36,13 @@ required_evidence_classes = [
 ]
 evidence_requirements = [
   { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = ["#286"] },
-  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#495"] },
+  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#596"] },
   { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
 ]
 blockers = [
   "GitHub issue #286 model-first evidence is bounded to the executable model, not local runtime crash injection.",
-  "Runtime evidence for interrupted rename sequences is not recorded.",
+  "Runtime evidence for interrupted rename sequences is not recorded (#596).",
+  "Rename directory-entry and orphan-index no-hidden-queue evidence is tracked separately (#597).",
 ]
 generated_doc = "Planned rename atomicity claim for local namespace operations. TideFS must keep rename wording aspirational until model and runtime crash evidence covers the claimed scope."
 evidence_artifacts = [
@@ -85,12 +86,13 @@ required_evidence_classes = [
 ]
 evidence_requirements = [
   { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = ["#286"] },
-  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#495"] },
+  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#596"] },
   { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
 ]
 blockers = [
   "Model-only issue #286 evidence is not local runtime crash evidence.",
-  "Local runtime rename crash injection remains blocked until local-filesystem write-set conflicts clear.",
+  "Local runtime rename crash injection remains blocked until #596 records the runtime crash artifact.",
+  "Rename directory-entry and orphan-index no-hidden-queue evidence is tracked separately in #597.",
 ]
 generated_doc = "Blocked local VFS rename crash claim. TideFS must keep rename crash-safety wording behind model and runtime evidence."
 evidence_artifacts = [
