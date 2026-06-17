@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::vec;
 
-use tidefs_local_object_store::{checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey};
+use tidefs_local_object_store::{checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey, StoredObject};
+use tidefs_local_object_store::pool::{PlacementReceipt, PoolStoreMut};
 use tidefs_types_vfs_core::InodeId;
 
 use crate::constants::*;
@@ -18,6 +19,81 @@ use crate::object_keys::{
 };
 use crate::types::*;
 use crate::{ContentChunkObject, ContentChunkRef, ContentLayout, ContentManifestObject, Result};
+
+/// Trait abstracting content-store writes so that write functions can
+/// accept either a receipt-producing [`PoolStoreMut`] (VFS write path) or
+/// a raw [`LocalObjectStore`] (transaction serialisation path).
+pub(crate) trait ContentWriteStore {
+    fn put_with_receipt(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<(StoredObject, PlacementReceipt)>;
+
+    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject>;
+
+    fn contains_key(&self, key: ObjectKey) -> bool;
+
+    fn raw_store(&self) -> &LocalObjectStore;
+    fn raw_store_mut(&mut self) -> &mut LocalObjectStore;
+}
+
+impl<'a> ContentWriteStore for PoolStoreMut<'a> {
+    fn put_with_receipt(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<(StoredObject, PlacementReceipt)> {
+        Ok(PoolStoreMut::put_with_receipt(self, key, payload)?)
+    }
+    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        Ok(PoolStoreMut::put(self, key, payload)?)
+    }
+    fn contains_key(&self, key: ObjectKey) -> bool {
+        PoolStoreMut::raw_store(self).contains_key(key)
+    }
+    fn raw_store(&self) -> &LocalObjectStore {
+        PoolStoreMut::raw_store(self)
+    }
+    fn raw_store_mut(&mut self) -> &mut LocalObjectStore {
+        PoolStoreMut::raw_store_mut(self)
+    }
+}
+
+impl<'a> ContentWriteStore for &'a mut LocalObjectStore {
+    fn put_with_receipt(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<(StoredObject, PlacementReceipt)> {
+        let stored = LocalObjectStore::put(self, key, payload)?;
+        let receipt = PlacementReceipt {
+            object_key: key,
+            epoch: 0,
+            generation: 0,
+            policy: Default::default(),
+            failure_domain_level: tidefs_durability_layout::FailureDomainLevel::Device,
+            payload_len: payload.len() as u64,
+            shard_len: 0,
+            payload_digest: [0u8; 32],
+            targets: Vec::new(),
+            planner_replay_receipt: None,
+        };
+        Ok((stored, receipt))
+    }
+    fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+        Ok(LocalObjectStore::put(self, key, payload)?)
+    }
+    fn contains_key(&self, key: ObjectKey) -> bool {
+        LocalObjectStore::contains_key(self, key)
+    }
+    fn raw_store(&self) -> &LocalObjectStore {
+        self
+    }
+    fn raw_store_mut(&mut self) -> &mut LocalObjectStore {
+        self
+    }
+}
 
 pub(crate) struct WriteChunkedContentOverlay<'a> {
     pub dedup_enabled: bool,
