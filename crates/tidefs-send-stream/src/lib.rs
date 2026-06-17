@@ -64,6 +64,9 @@ pub const DEFAULT_MAX_RECORD_PAYLOAD: u32 = 1024 * 1024;
 const STREAM_DIGEST_CONTEXT: &str = "TideFS VFSSEND2 stream digest v1";
 const RECORD_DIGEST_CONTEXT: &str = "TideFS VFSSEND2 record payload digest v1";
 const CURSOR_DIGEST_CONTEXT: &str = "TideFS VFSSEND2 cursor digest v1";
+const LINEAGE_ROOT_DIGEST_CONTEXT: &str = "TideFS VFSSEND2 lineage root digest v1";
+const LINEAGE_MANIFEST_DIGEST_CONTEXT: &str = "TideFS VFSSEND2 lineage manifest digest v1";
+const LINEAGE_MANIFEST_BASE_PRESENT: u16 = 1 << 0;
 
 const HEADER_FIXED_LEN: usize = 8 + 2 + 2 + 16 + 16 + 16 + 16 + 8 + 8 + 8 + 4 + 4 + 4;
 const RECORD_HEADER_LEN: usize = 2 + 2 + 4 + 8 + 32;
@@ -295,6 +298,7 @@ pub enum SendRecordType {
     SnapshotEnd = 0x0009,
     ResumeMarker = 0x000a,
     StreamEnd = 0x000b,
+    LineageManifest = 0x000c,
 }
 
 impl TryFrom<u16> for SendRecordType {
@@ -313,6 +317,7 @@ impl TryFrom<u16> for SendRecordType {
             0x0009 => Ok(Self::SnapshotEnd),
             0x000a => Ok(Self::ResumeMarker),
             0x000b => Ok(Self::StreamEnd),
+            0x000c => Ok(Self::LineageManifest),
             other => Err(SendStreamError::UnknownRecordType(other)),
         }
     }
@@ -377,6 +382,7 @@ impl SendRecord {
 /// Record payload variants.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SendRecordPayload {
+    LineageManifest(LineageManifest),
     SnapshotBegin(SnapshotBoundary),
     ObjectBegin(ObjectBegin),
     ObjectWrite(ObjectWrite),
@@ -394,6 +400,7 @@ impl SendRecordPayload {
     #[must_use]
     pub const fn record_type(&self) -> SendRecordType {
         match self {
+            Self::LineageManifest(_) => SendRecordType::LineageManifest,
             Self::SnapshotBegin(_) => SendRecordType::SnapshotBegin,
             Self::ObjectBegin(_) => SendRecordType::ObjectBegin,
             Self::ObjectWrite(_) => SendRecordType::ObjectWrite,
@@ -411,6 +418,7 @@ impl SendRecordPayload {
     fn encode(&self) -> Result<Vec<u8>, SendStreamError> {
         let mut out = Vec::new();
         match self {
+            Self::LineageManifest(payload) => payload.encode_into(&mut out),
             Self::SnapshotBegin(boundary) | Self::SnapshotEnd(boundary) => {
                 boundary.encode_into(&mut out)?;
             }
@@ -430,6 +438,9 @@ impl SendRecordPayload {
     fn decode(record_type: SendRecordType, payload: &[u8]) -> Result<Self, SendStreamError> {
         let mut decoder = Decoder::new(payload);
         let decoded = match record_type {
+            SendRecordType::LineageManifest => {
+                Self::LineageManifest(LineageManifest::decode(&mut decoder)?)
+            }
             SendRecordType::SnapshotBegin => {
                 Self::SnapshotBegin(SnapshotBoundary::decode(&mut decoder)?)
             }
@@ -454,6 +465,251 @@ impl SendRecordPayload {
         };
         decoder.finish()?;
         Ok(decoded)
+    }
+}
+
+/// First record in every send stream, binding stream lineage before object data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LineageManifest {
+    pub source_pool_id: Id128,
+    pub source_dataset_id: Id128,
+    pub base_root_id: Option<Id128>,
+    pub target_root_id: Id128,
+    pub stream_format_version: u16,
+    pub base_root_digest: Option<Bytes32>,
+    pub target_root_digest: Bytes32,
+}
+
+impl LineageManifest {
+    #[must_use]
+    pub fn full(header: &SendStreamHeader, target_root_digest: Bytes32) -> Self {
+        Self {
+            source_pool_id: header.source_pool_id,
+            source_dataset_id: header.source_dataset_id,
+            base_root_id: None,
+            target_root_id: header.to_snapshot_id,
+            stream_format_version: STREAM_VERSION,
+            base_root_digest: None,
+            target_root_digest,
+        }
+    }
+
+    #[must_use]
+    pub fn incremental(
+        header: &SendStreamHeader,
+        base_root: &PinnedBaseRoot,
+        target_root_digest: Bytes32,
+    ) -> Self {
+        Self {
+            source_pool_id: header.source_pool_id,
+            source_dataset_id: header.source_dataset_id,
+            base_root_id: Some(base_root.root_id),
+            target_root_id: header.to_snapshot_id,
+            stream_format_version: STREAM_VERSION,
+            base_root_digest: Some(base_root.root_digest),
+            target_root_digest,
+        }
+    }
+
+    #[must_use]
+    pub fn declares_full_send(&self) -> bool {
+        self.base_root_id.is_none() && self.base_root_digest.is_none()
+    }
+
+    #[must_use]
+    pub fn declares_incremental_send(&self) -> bool {
+        self.base_root_id.is_some() && self.base_root_digest.is_some()
+    }
+
+    /// Encode the manifest payload in canonical little-endian field order.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(132);
+        self.encode_into(&mut out);
+        out
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> Bytes32 {
+        let encoded = self.encode();
+        let mut hasher = blake3::Hasher::new_derive_key(LINEAGE_MANIFEST_DIGEST_CONTEXT);
+        hasher.update(&encoded);
+        *hasher.finalize().as_bytes()
+    }
+
+    pub fn decode_payload(bytes: &[u8]) -> Result<Self, SendStreamError> {
+        let mut decoder = Decoder::new(bytes);
+        let manifest = Self::decode(&mut decoder)?;
+        decoder.finish()?;
+        Ok(manifest)
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        let base_present = self.base_root_id.is_some() || self.base_root_digest.is_some();
+        let base_root_id = self.base_root_id.unwrap_or([0; 16]);
+        let base_root_digest = self.base_root_digest.unwrap_or([0; 32]);
+        out.extend_from_slice(&self.source_pool_id);
+        out.extend_from_slice(&self.source_dataset_id);
+        out.extend_from_slice(&base_root_id);
+        out.extend_from_slice(&self.target_root_id);
+        push_u16(out, self.stream_format_version);
+        push_u16(
+            out,
+            if base_present {
+                LINEAGE_MANIFEST_BASE_PRESENT
+            } else {
+                0
+            },
+        );
+        out.extend_from_slice(&base_root_digest);
+        out.extend_from_slice(&self.target_root_digest);
+    }
+
+    pub(crate) fn decode(decoder: &mut Decoder<'_>) -> Result<Self, SendStreamError> {
+        let source_pool_id = decoder.read_id128()?;
+        let source_dataset_id = decoder.read_id128()?;
+        let raw_base_root_id = decoder.read_id128()?;
+        let target_root_id = decoder.read_id128()?;
+        let stream_format_version = decoder.read_u16()?;
+        let flags = decoder.read_u16()?;
+        if flags & !LINEAGE_MANIFEST_BASE_PRESENT != 0 {
+            return Err(SendStreamError::ReservedFlagBits { bits: flags });
+        }
+        let raw_base_root_digest = decoder.read_bytes32()?;
+        let target_root_digest = decoder.read_bytes32()?;
+        let base_present = flags & LINEAGE_MANIFEST_BASE_PRESENT != 0;
+        if base_present && raw_base_root_id == [0; 16] {
+            return Err(SendStreamError::LineageManifestMismatch(
+                "base root id is absent",
+            ));
+        }
+        if base_present && raw_base_root_digest == [0; 32] {
+            return Err(SendStreamError::LineageManifestMismatch(
+                "base root digest is absent",
+            ));
+        }
+        if !base_present && (raw_base_root_id != [0; 16] || raw_base_root_digest != [0; 32]) {
+            return Err(SendStreamError::LineageManifestMismatch(
+                "base root fields set without base flag",
+            ));
+        }
+        Ok(Self {
+            source_pool_id,
+            source_dataset_id,
+            base_root_id: base_present.then_some(raw_base_root_id),
+            target_root_id,
+            stream_format_version,
+            base_root_digest: base_present.then_some(raw_base_root_digest),
+            target_root_digest,
+        })
+    }
+
+    fn validate_for_header(&self, header: &SendStreamHeader) -> Result<(), SendStreamError> {
+        if self.source_pool_id != header.source_pool_id {
+            return Err(SendStreamError::LineageManifestMismatch(
+                "source pool does not match header",
+            ));
+        }
+        if self.source_dataset_id != header.source_dataset_id {
+            return Err(SendStreamError::LineageManifestMismatch(
+                "source dataset does not match header",
+            ));
+        }
+        if self.target_root_id != header.to_snapshot_id {
+            return Err(SendStreamError::LineageManifestMismatch(
+                "target root does not match header",
+            ));
+        }
+        if self.stream_format_version != STREAM_VERSION {
+            return Err(SendStreamError::UnsupportedVersion(
+                self.stream_format_version,
+            ));
+        }
+        let incremental = header.flags.contains(StreamFlags::INCREMENTAL);
+        match (incremental, self.base_root_id, self.base_root_digest) {
+            (false, None, None) => Ok(()),
+            (true, Some(base_root_id), Some(_)) if base_root_id == header.from_snapshot_id => {
+                Ok(())
+            }
+            (true, _, _) => Err(SendStreamError::LineageManifestMismatch(
+                "incremental manifest base root does not match header",
+            )),
+            (false, _, _) => Err(SendStreamError::LineageManifestMismatch(
+                "full send manifest must not declare a base root",
+            )),
+        }
+    }
+}
+
+/// Base-root evidence accepted by the send side before incremental planning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PinnedBaseRoot {
+    pub source_dataset_id: Id128,
+    pub root_id: Id128,
+    pub root_digest: Bytes32,
+    pub object_digests: BTreeMap<Bytes32, Bytes32>,
+    pub pinned: bool,
+}
+
+impl PinnedBaseRoot {
+    #[must_use]
+    pub fn new(
+        source_dataset_id: Id128,
+        root_id: Id128,
+        root_digest: Bytes32,
+        object_digests: BTreeMap<Bytes32, Bytes32>,
+        pinned: bool,
+    ) -> Self {
+        Self {
+            source_dataset_id,
+            root_id,
+            root_digest,
+            object_digests,
+            pinned,
+        }
+    }
+
+    pub fn pinned_from_objects(
+        source_dataset_id: Id128,
+        root_id: Id128,
+        object_digests: BTreeMap<Bytes32, Bytes32>,
+    ) -> Result<Self, SendStreamError> {
+        if root_id == [0; 16] || object_digests.is_empty() {
+            return Err(SendStreamError::MissingBaseRoot);
+        }
+        let root_digest =
+            root_digest_from_object_digests(source_dataset_id, root_id, &object_digests);
+        Ok(Self::new(
+            source_dataset_id,
+            root_id,
+            root_digest,
+            object_digests,
+            true,
+        ))
+    }
+
+    fn validate_for_header(&self, header: &SendStreamHeader) -> Result<(), SendStreamError> {
+        if header.from_snapshot_id == [0; 16] {
+            return Err(SendStreamError::MissingBaseRoot);
+        }
+        if !self.pinned {
+            return Err(SendStreamError::UnpinnedBaseRoot {
+                root_id: self.root_id,
+            });
+        }
+        if self.source_dataset_id != header.source_dataset_id {
+            return Err(SendStreamError::BaseRootDatasetMismatch {
+                expected: header.source_dataset_id,
+                actual: self.source_dataset_id,
+            });
+        }
+        if self.root_id != header.from_snapshot_id {
+            return Err(SendStreamError::BaseRootMismatch {
+                expected: header.from_snapshot_id,
+                actual: self.root_id,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1386,6 +1642,11 @@ impl SendBuilder {
         header: SendStreamHeader,
         snapshots: Vec<SnapshotDelta>,
     ) -> Result<Self, SendStreamError> {
+        if header.flags.contains(StreamFlags::INCREMENTAL) {
+            return Err(SendStreamError::InvalidHeader(
+                "full send must not declare an incremental base root",
+            ));
+        }
         Self::build(header, snapshots, None)
     }
 
@@ -1395,12 +1656,24 @@ impl SendBuilder {
         snapshots: Vec<SnapshotDelta>,
         base_object_digests: BTreeMap<Bytes32, Bytes32>,
     ) -> Result<Self, SendStreamError> {
-        let from_snapshot_id = header.from_snapshot_id;
-        Self::build(
-            header.incremental_from(from_snapshot_id),
-            snapshots,
-            Some(base_object_digests),
-        )
+        let base_root = PinnedBaseRoot::pinned_from_objects(
+            header.source_dataset_id,
+            header.from_snapshot_id,
+            base_object_digests,
+        )?;
+        Self::incremental_from_base(header, snapshots, base_root)
+    }
+
+    /// Build an incremental send stream from explicit send-side base authority.
+    pub fn incremental_from_base(
+        header: SendStreamHeader,
+        snapshots: Vec<SnapshotDelta>,
+        base_root: PinnedBaseRoot,
+    ) -> Result<Self, SendStreamError> {
+        if !header.flags.contains(StreamFlags::INCREMENTAL) {
+            return Err(SendStreamError::MissingBaseRoot);
+        }
+        Self::build(header, snapshots, Some(base_root))
     }
 
     /// Return immutable planned records.
@@ -1455,18 +1728,38 @@ impl SendBuilder {
     fn build(
         header: SendStreamHeader,
         mut snapshots: Vec<SnapshotDelta>,
-        base_object_digests: Option<BTreeMap<Bytes32, Bytes32>>,
+        base_root: Option<PinnedBaseRoot>,
     ) -> Result<Self, SendStreamError> {
         if snapshots.is_empty() {
             return Err(SendStreamError::EmptyStream);
         }
         snapshots.sort_by_key(|snapshot| snapshot.commit_group);
+        let target_root_digest = target_root_digest_from_snapshots(
+            header.source_dataset_id,
+            header.to_snapshot_id,
+            &snapshots,
+        )?;
+        let manifest = match &base_root {
+            Some(base_root) => {
+                base_root.validate_for_header(&header)?;
+                LineageManifest::incremental(&header, base_root, target_root_digest)
+            }
+            None => LineageManifest::full(&header, target_root_digest),
+        };
+        manifest.validate_for_header(&header)?;
         let mut records = Vec::new();
         let mut stats = SendStats::default();
+        records.push(SendRecord::new(SendRecordPayload::LineageManifest(
+            manifest,
+        )));
+        stats.records_sent += 1;
         let max_payload = usize::try_from(header.max_record_payload)
             .map_err(|_| SendStreamError::LengthOverflow("max record payload"))?;
         let checkpoint_interval = header.checkpoint_interval_records as u64;
         let mut payload_bytes_since_checkpoint = 0_u64;
+        let base_object_digests = base_root
+            .as_ref()
+            .map(|base_root| &base_root.object_digests);
 
         for (snapshot_index, snapshot) in snapshots.into_iter().enumerate() {
             records.push(SendRecord::new(SendRecordPayload::SnapshotBegin(
@@ -1500,7 +1793,7 @@ impl SendBuilder {
             }
 
             for object in snapshot.objects {
-                if let Some(base) = &base_object_digests {
+                if let Some(base) = base_object_digests {
                     if base.get(&object.object_id).copied() == Some(object.digest()) {
                         continue;
                     }
@@ -1781,6 +2074,10 @@ impl ReceiveBuilder {
             .ok_or(SendStreamError::MissingStreamEnd)?;
         self.next_index += 1;
         match record.payload {
+            SendRecordPayload::LineageManifest(manifest) => {
+                manifest.validate_for_header(&self.header)?;
+                Ok(ReceiveProgress::Continue)
+            }
             SendRecordPayload::SnapshotBegin(boundary) => {
                 if self.current_snapshot.is_some() {
                     return Err(SendStreamError::ReceiveProtocol(
@@ -2298,6 +2595,73 @@ fn cursor_digest(cursor: &SendCursor) -> Bytes32 {
     *hasher.finalize().as_bytes()
 }
 
+fn root_digest_from_object_digests(
+    source_dataset_id: Id128,
+    root_id: Id128,
+    object_digests: &BTreeMap<Bytes32, Bytes32>,
+) -> Bytes32 {
+    let mut hasher = blake3::Hasher::new_derive_key(LINEAGE_ROOT_DIGEST_CONTEXT);
+    hasher.update(b"base");
+    hasher.update(&source_dataset_id);
+    hasher.update(&root_id);
+    hash_u64(&mut hasher, object_digests.len() as u64);
+    for (object_id, digest) in object_digests {
+        hasher.update(object_id);
+        hasher.update(digest);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn target_root_digest_from_snapshots(
+    source_dataset_id: Id128,
+    target_root_id: Id128,
+    snapshots: &[SnapshotDelta],
+) -> Result<Bytes32, SendStreamError> {
+    let mut hasher = blake3::Hasher::new_derive_key(LINEAGE_ROOT_DIGEST_CONTEXT);
+    hasher.update(b"target");
+    hasher.update(&source_dataset_id);
+    hasher.update(&target_root_id);
+    hash_u64(&mut hasher, snapshots.len() as u64);
+    for snapshot in snapshots {
+        hasher.update(&snapshot.snapshot_id);
+        hash_u64(&mut hasher, snapshot.commit_group);
+        hash_bytes(&mut hasher, &snapshot.snapshot_name, "snapshot name")?;
+
+        let mut objects: Vec<&DeltaObject> = snapshot.objects.iter().collect();
+        objects.sort_by_key(|object| object.object_id);
+        hash_u64(&mut hasher, objects.len() as u64);
+        for object in objects {
+            hasher.update(&object.object_id);
+            hasher.update(&[object.kind as u8]);
+            hash_u64(&mut hasher, object.birth_commit_group);
+            hash_bytes(&mut hasher, &object.metadata, "object metadata")?;
+            hash_bytes(&mut hasher, &object.payload, "object payload")?;
+            hasher.update(&object.digest());
+        }
+
+        hash_u64(&mut hasher, snapshot.removed_objects.len() as u64);
+        for removed in &snapshot.removed_objects {
+            hasher.update(removed);
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn hash_u64(hasher: &mut blake3::Hasher, value: u64) {
+    hasher.update(&value.to_le_bytes());
+}
+
+fn hash_bytes(
+    hasher: &mut blake3::Hasher,
+    bytes: &[u8],
+    name: &'static str,
+) -> Result<(), SendStreamError> {
+    let len = u64::try_from(bytes.len()).map_err(|_| SendStreamError::LengthOverflow(name))?;
+    hash_u64(hasher, len);
+    hasher.update(bytes);
+    Ok(())
+}
+
 fn blake3_digest(bytes: &[u8]) -> Bytes32 {
     *blake3::hash(bytes).as_bytes()
 }
@@ -2447,6 +2811,19 @@ pub enum SendStreamError {
     MissingStreamEnd,
     EmptyStream,
     EmptyIncrementalDelta,
+    MissingBaseRoot,
+    UnpinnedBaseRoot {
+        root_id: Id128,
+    },
+    BaseRootDatasetMismatch {
+        expected: Id128,
+        actual: Id128,
+    },
+    BaseRootMismatch {
+        expected: Id128,
+        actual: Id128,
+    },
+    LineageManifestMismatch(&'static str),
     LengthOverflow(&'static str),
     RecordChecksumMismatch,
     PayloadChecksumMismatch,
@@ -2489,6 +2866,31 @@ impl fmt::Display for SendStreamError {
             Self::MissingStreamEnd => write!(f, "VFSSEND2 stream is missing StreamEnd"),
             Self::EmptyStream => write!(f, "VFSSEND2 stream contains no snapshots"),
             Self::EmptyIncrementalDelta => write!(f, "incremental VFSSEND2 stream has no changes"),
+            Self::MissingBaseRoot => {
+                write!(f, "incremental VFSSEND2 stream is missing a base root")
+            }
+            Self::UnpinnedBaseRoot { root_id } => {
+                write!(
+                    f,
+                    "incremental VFSSEND2 base root {} is not pinned",
+                    Hex16(root_id)
+                )
+            }
+            Self::BaseRootDatasetMismatch { expected, actual } => write!(
+                f,
+                "incremental VFSSEND2 base root dataset mismatch: expected {}, got {}",
+                Hex16(expected),
+                Hex16(actual)
+            ),
+            Self::BaseRootMismatch { expected, actual } => write!(
+                f,
+                "incremental VFSSEND2 base root mismatch: expected {}, got {}",
+                Hex16(expected),
+                Hex16(actual)
+            ),
+            Self::LineageManifestMismatch(reason) => {
+                write!(f, "VFSSEND2 lineage manifest mismatch: {reason}")
+            }
             Self::LengthOverflow(field) => write!(f, "VFSSEND2 length overflow in {field}"),
             Self::RecordChecksumMismatch => write!(f, "VFSSEND2 record checksum mismatch"),
             Self::PayloadChecksumMismatch => write!(f, "VFSSEND2 payload checksum mismatch"),
@@ -2529,6 +2931,17 @@ impl std::error::Error for SendStreamError {}
 struct Hex32<'a>(&'a Bytes32);
 
 impl fmt::Display for Hex32<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+struct Hex16<'a>(&'a Id128);
+
+impl fmt::Display for Hex16<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in self.0 {
             write!(f, "{byte:02x}")?;

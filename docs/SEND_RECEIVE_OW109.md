@@ -49,6 +49,14 @@ epochs are reported as stable only when both sides carry the same explicit
 epoch; mismatched explicit epochs refuse the incremental receive, and absent
 evidence remains unknown/unstable.
 
+Current VFSSEND2 send-side authority emits a lineage manifest as the first
+send record, before snapshot or object payload records. The manifest names the
+source pool/dataset, target root, stream format version, target-root digest,
+and either a pinned base-root id plus base-root digest for incrementals or an
+explicit no-base declaration for full sends. Incremental send construction
+fails before object records are planned when the requested base root is absent,
+unpinned, or bound to a different dataset/root than the stream header.
+
 ## Source Surfaces
 
 - `SEND_RECEIVE_CHANGED_RECORD_SPEC`

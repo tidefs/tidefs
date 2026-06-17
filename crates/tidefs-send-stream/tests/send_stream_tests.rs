@@ -3,8 +3,13 @@
 //! end-to-end verification.
 
 use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions};
-use tidefs_send_stream::{ChunkPacket, FrameError, ObjectChunkFramer, SendQueue};
+use tidefs_send_stream::{
+    decode_stream, ChunkPacket, DeltaObject, FrameError, LineageManifest, ObjectChunkFramer,
+    ObjectKind, PinnedBaseRoot, SendBuilder, SendQueue, SendRecordPayload, SendStreamError,
+    SendStreamHeader, STREAM_VERSION,
+};
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
 
@@ -14,10 +19,165 @@ fn object_id(b: u8) -> [u8; 32] {
     [b; 32]
 }
 
+fn id128(b: u8) -> [u8; 16] {
+    [b; 16]
+}
+
+fn send_header() -> SendStreamHeader {
+    SendStreamHeader::new(id128(1), id128(2), id128(3))
+}
+
+fn delta_object(b: u8, payload: &[u8]) -> DeltaObject {
+    DeltaObject::new(object_id(b), ObjectKind::Extent, payload.to_vec())
+}
+
 fn temp_store() -> (LocalObjectStore, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let store = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast()).unwrap();
     (store, dir)
+}
+
+// ── Lineage manifests ────────────────────────────────────────────
+
+#[test]
+fn full_send_manifest_output_declares_no_base_root() {
+    let mut snapshot = tidefs_send_stream::SnapshotDelta::new(id128(3), "snap-a", 7);
+    snapshot.objects.push(delta_object(10, b"hello"));
+
+    let builder = SendBuilder::full(send_header(), vec![snapshot]).unwrap();
+    let manifest = match &builder.records()[0].payload {
+        SendRecordPayload::LineageManifest(manifest) => manifest,
+        other => panic!("first record was {other:?}, not LineageManifest"),
+    };
+
+    assert!(manifest.declares_full_send());
+    assert_eq!(manifest.source_dataset_id, id128(2));
+    assert_eq!(manifest.base_root_id, None);
+    assert_eq!(manifest.target_root_id, id128(3));
+    assert_eq!(manifest.stream_format_version, STREAM_VERSION);
+
+    let (_decoded_header, records) = decode_stream(&builder.encode().unwrap()).unwrap();
+    assert!(matches!(
+        records.first().map(|record| &record.payload),
+        Some(SendRecordPayload::LineageManifest(decoded)) if decoded == manifest
+    ));
+}
+
+#[test]
+fn incremental_send_manifest_precedes_object_chunks() {
+    let unchanged = delta_object(10, b"same");
+    let changed = delta_object(11, b"new");
+    let mut base = BTreeMap::new();
+    base.insert(unchanged.object_id, unchanged.digest());
+    base.insert(changed.object_id, *blake3::hash(b"old").as_bytes());
+
+    let expected_base =
+        PinnedBaseRoot::pinned_from_objects(id128(2), id128(9), base.clone()).unwrap();
+    let mut snapshot = tidefs_send_stream::SnapshotDelta::new(id128(3), "snap-b", 9);
+    snapshot.objects.push(unchanged);
+    snapshot.objects.push(changed);
+
+    let builder = SendBuilder::incremental(
+        send_header().incremental_from(id128(9)),
+        vec![snapshot],
+        base,
+    )
+    .unwrap();
+    let manifest = match &builder.records()[0].payload {
+        SendRecordPayload::LineageManifest(manifest) => manifest,
+        other => panic!("first record was {other:?}, not LineageManifest"),
+    };
+
+    assert!(manifest.declares_incremental_send());
+    assert_eq!(manifest.base_root_id, Some(id128(9)));
+    assert_eq!(manifest.base_root_digest, Some(expected_base.root_digest));
+
+    let first_write = builder
+        .records()
+        .iter()
+        .position(|record| matches!(record.payload, SendRecordPayload::ObjectWrite(_)))
+        .unwrap();
+    assert!(first_write > 0);
+    assert!(builder.records()[..first_write]
+        .iter()
+        .any(|record| matches!(record.payload, SendRecordPayload::LineageManifest(_))));
+}
+
+#[test]
+fn incremental_send_rejects_missing_base_root() {
+    let mut snapshot = tidefs_send_stream::SnapshotDelta::new(id128(3), "snap-b", 9);
+    snapshot.objects.push(delta_object(11, b"new"));
+
+    assert_eq!(
+        SendBuilder::incremental(
+            send_header().incremental_from(id128(9)),
+            vec![snapshot],
+            BTreeMap::new()
+        )
+        .unwrap_err(),
+        SendStreamError::MissingBaseRoot
+    );
+}
+
+#[test]
+fn incremental_send_rejects_unpinned_base_root() {
+    let mut base_objects = BTreeMap::new();
+    base_objects.insert(object_id(11), *blake3::hash(b"old").as_bytes());
+    let base_root = PinnedBaseRoot::new(id128(2), id128(9), [0x55; 32], base_objects, false);
+    let mut snapshot = tidefs_send_stream::SnapshotDelta::new(id128(3), "snap-b", 9);
+    snapshot.objects.push(delta_object(11, b"new"));
+
+    assert_eq!(
+        SendBuilder::incremental_from_base(
+            send_header().incremental_from(id128(9)),
+            vec![snapshot],
+            base_root
+        )
+        .unwrap_err(),
+        SendStreamError::UnpinnedBaseRoot { root_id: id128(9) }
+    );
+}
+
+#[test]
+fn incremental_send_rejects_mismatched_dataset_lineage() {
+    let mut base_objects = BTreeMap::new();
+    base_objects.insert(object_id(11), *blake3::hash(b"old").as_bytes());
+    let base_root = PinnedBaseRoot::new(id128(99), id128(9), [0x55; 32], base_objects, true);
+    let mut snapshot = tidefs_send_stream::SnapshotDelta::new(id128(3), "snap-b", 9);
+    snapshot.objects.push(delta_object(11, b"new"));
+
+    assert_eq!(
+        SendBuilder::incremental_from_base(
+            send_header().incremental_from(id128(9)),
+            vec![snapshot],
+            base_root
+        )
+        .unwrap_err(),
+        SendStreamError::BaseRootDatasetMismatch {
+            expected: id128(2),
+            actual: id128(99),
+        }
+    );
+}
+
+#[test]
+fn lineage_manifest_encoding_is_stable() {
+    let manifest = LineageManifest::full(&send_header(), [4u8; 32]);
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&id128(1));
+    expected.extend_from_slice(&id128(2));
+    expected.extend_from_slice(&[0u8; 16]);
+    expected.extend_from_slice(&id128(3));
+    expected.extend_from_slice(&STREAM_VERSION.to_le_bytes());
+    expected.extend_from_slice(&0u16.to_le_bytes());
+    expected.extend_from_slice(&[0u8; 32]);
+    expected.extend_from_slice(&[4u8; 32]);
+
+    assert_eq!(manifest.encode(), expected);
+    assert_eq!(
+        LineageManifest::decode_payload(&expected).unwrap(),
+        manifest
+    );
 }
 
 // ── ObjectChunkFramer with real store ────────────────────────────

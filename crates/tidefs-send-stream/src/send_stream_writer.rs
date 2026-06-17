@@ -13,6 +13,22 @@ use tidefs_local_object_store::store::ObjectStore;
 use tidefs_local_object_store::ObjectKey;
 
 use super::chunk_encoder::{TransferChunk, TransferChunkEncoder, TransferChunkEncoderConfig};
+use super::encoder::LineageManifestFrame;
+use crate::LineageManifest;
+
+/// A send-stream writer output frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SendStreamWriterFrame {
+    /// Lineage manifest that must precede object chunks.
+    LineageManifest(LineageManifestFrame),
+    /// Object payload chunk.
+    ObjectChunk {
+        /// Object key whose payload produced this chunk.
+        key: ObjectKey,
+        /// TransferStream chunk frame.
+        chunk: TransferChunk,
+    },
+}
 
 /// Drives chunk encoding for objects read from a local-object-store.
 ///
@@ -21,6 +37,7 @@ use super::chunk_encoder::{TransferChunk, TransferChunkEncoder, TransferChunkEnc
 pub struct SendStreamWriter<'a, T: ObjectStore> {
     store: &'a T,
     encoder: TransferChunkEncoder,
+    manifest: Option<LineageManifest>,
 }
 
 impl<'a, T: ObjectStore> SendStreamWriter<'a, T> {
@@ -29,12 +46,44 @@ impl<'a, T: ObjectStore> SendStreamWriter<'a, T> {
         Self {
             store,
             encoder: TransferChunkEncoder::new(config),
+            manifest: None,
+        }
+    }
+
+    /// Create a new writer that emits `manifest` before object chunks.
+    pub fn new_with_manifest(
+        store: &'a T,
+        config: TransferChunkEncoderConfig,
+        manifest: LineageManifest,
+    ) -> Self {
+        Self {
+            store,
+            encoder: TransferChunkEncoder::new(config),
+            manifest: Some(manifest),
         }
     }
 
     /// Return a copy of the encoder configuration.
     pub fn config(&self) -> TransferChunkEncoderConfig {
         self.encoder.config()
+    }
+
+    /// Return the configured lineage manifest, if one was supplied.
+    #[must_use]
+    pub fn lineage_manifest(&self) -> Option<&LineageManifest> {
+        self.manifest.as_ref()
+    }
+
+    /// Encode the configured lineage manifest frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer was created without a manifest.
+    pub fn write_manifest_frame(&self) -> Result<LineageManifestFrame, std::io::Error> {
+        self.manifest
+            .clone()
+            .map(LineageManifestFrame::new)
+            .ok_or_else(|| std::io::Error::other("send lineage manifest is missing"))
     }
 
     /// Read one object from the store and encode it into TransferStream chunks.
@@ -72,6 +121,27 @@ impl<'a, T: ObjectStore> SendStreamWriter<'a, T> {
             }
         }
         Ok(results)
+    }
+
+    /// Encode the lineage manifest followed by every live object chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer has no manifest or if any store read fails.
+    pub fn write_all_frames(&self) -> Result<Vec<SendStreamWriterFrame>, std::io::Error> {
+        let mut frames = vec![SendStreamWriterFrame::LineageManifest(
+            self.write_manifest_frame()?,
+        )];
+        for key in self.store.scan() {
+            if let Some(chunks) = self.write_object(key)? {
+                frames.extend(
+                    chunks
+                        .into_iter()
+                        .map(|chunk| SendStreamWriterFrame::ObjectChunk { key, chunk }),
+                );
+            }
+        }
+        Ok(frames)
     }
 
     /// Estimate how many chunks an object will produce without reading it.
@@ -169,6 +239,11 @@ mod tests {
         ObjectKey::from_bytes(bytes)
     }
 
+    fn manifest() -> LineageManifest {
+        let header = crate::SendStreamHeader::new([1; 16], [2; 16], [3; 16]);
+        LineageManifest::full(&header, [4; 32])
+    }
+
     #[test]
     fn write_single_object_produces_chunks() {
         let mut store = MockStore::new();
@@ -235,6 +310,28 @@ mod tests {
         assert_eq!(all[&k1].len(), 1);
         assert_eq!(all[&k2].len(), 2);
         assert_eq!(all[&k3].len(), 1);
+    }
+
+    #[test]
+    fn write_all_frames_emits_manifest_before_chunks() {
+        let mut store = MockStore::new();
+        let key = test_key(1);
+        store.insert(key, vec![0xAAu8; 100]);
+
+        let writer = SendStreamWriter::new_with_manifest(
+            &store,
+            TransferChunkEncoderConfig { chunk_size: 64 },
+            manifest(),
+        );
+        let frames = writer.write_all_frames().unwrap();
+
+        assert!(matches!(
+            frames.first(),
+            Some(SendStreamWriterFrame::LineageManifest(frame)) if frame.verify()
+        ));
+        assert!(frames[1..]
+            .iter()
+            .all(|frame| matches!(frame, SendStreamWriterFrame::ObjectChunk { .. })));
     }
 
     #[test]
