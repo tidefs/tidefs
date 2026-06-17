@@ -6380,25 +6380,13 @@ impl FuseVfsAdapter {
         written: u32,
         data: &[u8],
     ) {
-        let page_size = cache.page_size() as u64;
-        let start_off = offset;
-        let end_off = start_off.saturating_add(u64::from(written));
-        let mut off = (start_off / page_size) * page_size;
-        while off < end_off {
-            let copy_start = start_off.max(off);
-            let copy_end = end_off.min(off.saturating_add(page_size));
-            if let Some(mut page) = cache.lookup(ino, off) {
-                if copy_start < copy_end {
-                    let src_start = (copy_start - start_off) as usize;
-                    let dst_start = (copy_start - off) as usize;
-                    let copy_len = (copy_end - copy_start) as usize;
-                    page.data_mut()[dst_start..dst_start + copy_len]
-                        .copy_from_slice(&data[src_start..src_start + copy_len]);
-                }
-                page.clear_dirty();
-            }
-            off = off.saturating_add(page_size);
+        if written == 0 {
+            return;
         }
+        let patch_len = usize::try_from(written)
+            .unwrap_or(data.len())
+            .min(data.len());
+        let _ = cache.patch_resident_clean_range(ino, offset, &data[..patch_len]);
     }
 
     fn reconcile_write_through_dirty_range_without_block_volume(

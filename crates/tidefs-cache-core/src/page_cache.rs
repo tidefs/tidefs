@@ -722,16 +722,14 @@ impl PageCache {
     /// the page is moved to the MRU position.
     pub fn lookup(&self, inode: u64, offset: u64) -> Option<PageHandle<'_>> {
         let key = PageKey { inode, offset };
-        let mut inner = self.inner.lock().unwrap();
-        if inner.pages.contains_key(&key) {
-            inner.touch_lru(&key);
-            inner.hits += 1;
+        let mut guard = self.inner.lock().unwrap();
+        if guard.pages.contains_key(&key) {
+            guard.touch_lru(&key);
+            guard.hits += 1;
         } else {
-            inner.misses += 1;
+            guard.misses += 1;
             return None;
         }
-        drop(inner);
-        let guard = self.inner.lock().unwrap();
         Some(PageHandle { guard, key })
     }
 
@@ -771,6 +769,80 @@ impl PageCache {
         inner.dirty_pages_by_inode.remove(&inode);
         count
     }
+
+    /// Patch already-resident clean mirrors overlapping `[offset, offset + data.len())`.
+    ///
+    /// This does not allocate missing pages. It is intended for authoritative
+    /// write-through paths that have already reconciled dirty overlap and need
+    /// resident mirrors to stay coherent without turning absent sparse pages
+    /// into cache entries. Patched pages are left clean.
+    #[must_use]
+    pub fn patch_resident_clean_range(&self, inode: u64, offset: u64, data: &[u8]) -> usize {
+        if data.is_empty() {
+            return 0;
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+        let page_size = inner.page_size as u64;
+        if page_size == 0 {
+            return 0;
+        }
+        let Ok(data_len) = u64::try_from(data.len()) else {
+            return 0;
+        };
+        let Some(end) = offset.checked_add(data_len) else {
+            return 0;
+        };
+
+        let mut patched = 0usize;
+        let mut cleared_dirty = Vec::new();
+        let mut poff = (offset / page_size) * page_size;
+        while poff < end {
+            let key = PageKey {
+                inode,
+                offset: poff,
+            };
+            if inner.pages.contains_key(&key) {
+                inner.touch_lru(&key);
+                inner.hits = inner.hits.saturating_add(1);
+
+                let copy_start = offset.max(poff);
+                let copy_end = end.min(poff.saturating_add(page_size));
+                if copy_start < copy_end {
+                    let src_start = usize::try_from(copy_start - offset)
+                        .expect("source start is bounded by data length");
+                    let dst_start = usize::try_from(copy_start - poff)
+                        .expect("destination start is bounded by page size");
+                    let copy_len = usize::try_from(copy_end - copy_start)
+                        .expect("copy length is bounded by page size");
+                    if let Some(page) = inner.pages.get_mut(&key) {
+                        if src_start < data.len()
+                            && dst_start < page.data.len()
+                            && copy_len <= data.len().saturating_sub(src_start)
+                            && copy_len <= page.data.len().saturating_sub(dst_start)
+                        {
+                            page.data[dst_start..dst_start + copy_len]
+                                .copy_from_slice(&data[src_start..src_start + copy_len]);
+                            if page.is_dirty() {
+                                page.flags &= !page_flags::DIRTY;
+                                cleared_dirty.push(key);
+                            }
+                            patched = patched.saturating_add(1);
+                        }
+                    }
+                }
+            } else {
+                inner.misses = inner.misses.saturating_add(1);
+            }
+            poff = poff.saturating_add(page_size);
+        }
+
+        for key in cleared_dirty {
+            inner.forget_dirty_page(key);
+        }
+        patched
+    }
+
     // ── Eviction ────────────────────────────────────────────────────
 
     /// Evict the oldest clean, unpinned page.
@@ -1169,6 +1241,47 @@ mod tests {
         assert!(cache.lookup(1, 0).is_none());
         assert!(cache.lookup(99, 4096).is_none());
         assert_eq!(cache.miss_count(), 2);
+    }
+
+    #[test]
+    fn patch_resident_clean_range_skips_missing_pages() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).expect("insert first page");
+        cache.insert(1, 8192).expect("insert third page");
+
+        {
+            let mut page = cache.lookup(1, 0).expect("lookup first page");
+            page.data_mut().fill(0x11);
+        }
+        {
+            let mut page = cache.lookup(1, 8192).expect("lookup third page");
+            page.data_mut().fill(0x33);
+            page.mark_dirty();
+        }
+
+        let payload = vec![0xAA; 8192];
+        assert_eq!(cache.patch_resident_clean_range(1, 1024, &payload), 2);
+        assert!(
+            cache.lookup(1, 4096).is_none(),
+            "missing middle page must not be allocated"
+        );
+
+        {
+            let page = cache.lookup(1, 0).expect("lookup patched first page");
+            assert_eq!(&page.data()[..1024], &[0x11; 1024]);
+            assert_eq!(&page.data()[1024..], &[0xAA; PAGE_SIZE - 1024]);
+            assert!(!page.is_dirty());
+        }
+        {
+            let page = cache.lookup(1, 8192).expect("lookup patched third page");
+            assert_eq!(&page.data()[..1024], &[0xAA; 1024]);
+            assert_eq!(&page.data()[1024..], &[0x33; PAGE_SIZE - 1024]);
+            assert!(
+                !page.is_dirty(),
+                "authoritative clean patch clears any dirty resident mirror"
+            );
+        }
+        assert!(cache.dirty_pages_for_inode(1).is_empty());
     }
 
     // ── Test 2: distinct keys, no cross-talk ────────────────────────
