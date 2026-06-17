@@ -434,6 +434,7 @@ pub enum RepairSource {
     /// Repair source unknown or not recorded.
     Unknown,
 }
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlacementReceiptTarget {
     /// Device index when the receipt was issued.
@@ -2297,11 +2298,11 @@ impl Pool {
         }
     }
 
-
     /// Store an object and return the authoritative placement receipt.
     ///
-    /// Identical to [`Pool::put`] except that it also returns the persisted
-    /// [`PlacementReceipt`] that records the pool-wide placement decision.
+    /// Identical to [`Pool::put`] for receipt-publishing I/O classes except
+    /// that it also returns the persisted [`PlacementReceipt`] that records
+    /// the pool-wide placement decision.
     /// Callers that need durable receipt references for distributed
     /// rebuild/backfill, rebake gating, or reclaim durability checks should
     /// use this method rather than [`Pool::put`] plus a subsequent receipt
@@ -2312,20 +2313,25 @@ impl Pool {
         key: ObjectKey,
         payload: &[u8],
     ) -> Result<(StoredObject, PlacementReceipt)> {
+        if matches!(class, IoClass::IntentLog) {
+            return Err(StoreError::InvalidOptions {
+                reason: "IntentLog writes do not publish placement receipts",
+            });
+        }
+
         let stored = self.put(class, key, payload)?;
         let indices: Vec<usize> = self.class_map.get(class).to_vec();
-        let receipt = self
-            .load_placement_receipt(&indices, key)?
-            .ok_or(StoreError::InvalidOptions {
-                reason: "placement receipt not found after pool-wide write",
-            })?;
+        let receipt =
+            self.load_placement_receipt(&indices, key)?
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement receipt not found after pool-wide write",
+                })?;
         if receipt.object_key != key {
             return Err(StoreError::InvalidOptions {
                 reason: "placement receipt key mismatch after write",
             });
         }
         Ok((stored, receipt))
-
     }
 
     /// Repair an object using receipt authority and record a replacement receipt.
@@ -7793,7 +7799,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-
     #[test]
     fn put_with_receipt_returns_placement_receipt() {
         let root = temp_dir("put-with-receipt");
@@ -7824,6 +7829,49 @@ mod tests {
     }
 
     #[test]
+    fn put_with_receipt_rejects_receiptless_intent_log() {
+        let root = temp_dir("put-with-receipt-intent-log");
+        let _ = std::fs::remove_dir_all(&root);
+        let options = test_options();
+        let data_dir = root.join("data");
+        let log_dir = root.join("log");
+        let config = PoolConfig {
+            name: "testpool-intent-log-receipt".into(),
+            root_path: root.to_path_buf(),
+            devices: vec![
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: log_dir.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::IntentLog,
+                    kind: DeviceKind::Single { path: log_dir },
+                    encryption: None,
+                    compression: None,
+                },
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: data_dir.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: data_dir },
+                    encryption: None,
+                    compression: None,
+                },
+            ],
+        };
+        let mut pool = Pool::create(config, PoolProperties::default(), &options).unwrap();
+        let key = ObjectKey::from_name(b"intent-log-receiptless");
+
+        assert_invalid_options_reason_contains(
+            pool.put_with_receipt(IoClass::IntentLog, key, b"log payload"),
+            "IntentLog writes do not publish placement receipts",
+        );
+        assert_eq!(pool.get(IoClass::IntentLog, key).unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn repair_with_receipt_supersedes_original() {
         let root = temp_dir("repair-with-receipt");
         let _ = std::fs::remove_dir_all(&root);
@@ -7844,7 +7892,9 @@ mod tests {
                 IoClass::Data,
                 key,
                 repaired,
-                RepairSource::Replica { source_device_index: 0 },
+                RepairSource::Replica {
+                    source_device_index: 0,
+                },
             )
             .expect("repair succeeds");
 
