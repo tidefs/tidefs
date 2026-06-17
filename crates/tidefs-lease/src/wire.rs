@@ -24,7 +24,7 @@ use tidefs_binary_schema_core::{
     BinarySchemaError, ChecksumProfile, DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion,
 };
 use tidefs_binary_schema_framing::EnvelopeBuilder;
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 use crate::types::{LeaseClass, LeaseDomain, LeaseGrant};
 
@@ -103,6 +103,8 @@ pub struct LeaseRequestPayload {
     pub term_millis: u64,
     /// Membership epoch for epoch-gated lease issuance.
     pub epoch: EpochId,
+    /// Committed dataset mount identity for fencing on remount / epoch change.
+    pub mount_identity: DatasetMountIdentity,
 }
 
 /// A granted lease, wrapping the domain LeaseGrant with a request correlation id.
@@ -327,6 +329,7 @@ impl LeaseWireCodec {
 
 #[cfg(test)]
 mod tests {
+    use tidefs_membership_epoch::DatasetMountIdentity;
     use super::*;
 
     // ── helpers ────────────────────────────────────────────────────────
@@ -342,6 +345,7 @@ mod tests {
             holder_id: MemberId(7),
             term_millis: 30_000,
             epoch: EpochId(5),
+            mount_identity: DatasetMountIdentity::new(1, 1, 1),
         })
     }
 
@@ -358,6 +362,7 @@ mod tests {
             30_000,
             1_000_000,
             EpochId(5),
+            DatasetMountIdentity::new(1, 1, 1),
             1,
             3,
             5,
@@ -547,6 +552,7 @@ mod tests {
             holder_id: MemberId(3),
             term_millis: 10_000,
             epoch: EpochId(10),
+            mount_identity: DatasetMountIdentity::new(1, 1, 1),
         });
         let encoded = LeaseWireCodec::encode(&msg).unwrap();
         let decoded = LeaseWireCodec::decode(&encoded).unwrap();
@@ -564,6 +570,7 @@ mod tests {
             60_000,
             2_000_000,
             EpochId(7),
+            DatasetMountIdentity::new(1, 1, 1),
             2,
             4,
             7,

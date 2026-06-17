@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tidefs_cache_coherency::CoherencyEventBus;
 use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseError, LeaseGrant, LeaseLifecycle};
 use tidefs_lease::{LeaseMessage, LeaseMessageCodec, LeaseProtocolError};
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 /// Configuration for the distributed lease manager.
 #[derive(Clone, Debug)]
@@ -15,6 +15,7 @@ pub struct LeaseManagerConfig {
     pub max_leases_per_holder: usize,
     pub renewal_advance_fraction: u8,
     pub priority_inheritance_enabled: bool,
+    pub current_mount_identity: DatasetMountIdentity,
 }
 
 impl Default for LeaseManagerConfig {
@@ -27,6 +28,7 @@ impl Default for LeaseManagerConfig {
             max_leases_per_holder: 4096,
             renewal_advance_fraction: 4,
             priority_inheritance_enabled: true,
+            current_mount_identity: DatasetMountIdentity::ZERO,
         }
     }
 }
@@ -73,6 +75,7 @@ pub struct LeaseManager {
     domain_index: BTreeMap<DomainKey, u64>,
     next_lease_id: u64,
     current_epoch: EpochId,
+    current_mount_identity: DatasetMountIdentity,
     stats: ManagerStats,
     /// Optional coherency event bus for dispatching cache invalidation
     /// when leases are revoked (mmap coherency integration).
@@ -127,6 +130,7 @@ impl From<&LeaseDomain> for DomainKey {
 
 impl LeaseManager {
     pub fn new(config: LeaseManagerConfig, current_epoch: EpochId) -> Self {
+        let mount = config.current_mount_identity;
         Self {
             config,
             grants: BTreeMap::new(),
@@ -134,6 +138,7 @@ impl LeaseManager {
             domain_index: BTreeMap::new(),
             next_lease_id: 1,
             current_epoch,
+            current_mount_identity: mount,
             stats: ManagerStats::default(),
             coherency_bus: None,
         }
@@ -150,6 +155,11 @@ impl LeaseManager {
     }
     pub fn current_epoch(&self) -> EpochId {
         self.current_epoch
+    }
+
+    /// Return the current dataset mount identity.
+    pub fn current_mount_identity(&self) -> DatasetMountIdentity {
+        self.current_mount_identity
     }
     pub fn stats(&self) -> &ManagerStats {
         &self.stats
@@ -222,6 +232,7 @@ impl LeaseManager {
             self.config.default_term_millis,
             now_millis,
             self.current_epoch,
+            self.current_mount_identity,
             0,
             witness_confirmations,
             self.config.witness_total,
@@ -264,6 +275,7 @@ impl LeaseManager {
             term_millis,
             now_millis,
             self.current_epoch,
+            self.current_mount_identity,
             0,
             witness_confirmations,
             self.config.witness_total,

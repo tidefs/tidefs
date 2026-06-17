@@ -8,6 +8,7 @@ use crate::types::*;
 use std::collections::BTreeMap;
 use tidefs_clock_timing::types::{DriftClass, LeaseDeadlineState};
 use tidefs_clock_timing::LeaseDeadline;
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId};
 
 /// Manages the lifecycle of multiple lease grants.
 ///
@@ -18,6 +19,8 @@ pub struct LeaseLifecycleManager {
     default_renew_period_ns: u64,
     default_expiry_period_ns: u64,
     default_grace_period_ns: u64,
+    current_epoch: EpochId,
+    current_mount_identity: DatasetMountIdentity,
 }
 
 impl LeaseLifecycleManager {
@@ -26,12 +29,16 @@ impl LeaseLifecycleManager {
         default_renew_period_ns: u64,
         default_expiry_period_ns: u64,
         default_grace_period_ns: u64,
+        current_epoch: EpochId,
+        current_mount_identity: DatasetMountIdentity,
     ) -> Self {
         LeaseLifecycleManager {
             leases: BTreeMap::new(),
             default_renew_period_ns,
             default_expiry_period_ns,
             default_grace_period_ns,
+            current_epoch,
+            current_mount_identity,
         }
     }
 
@@ -85,6 +92,23 @@ impl LeaseLifecycleManager {
             .get_mut(&lease_id)
             .ok_or(LeaseError::NotFound { lease_id })?;
 
+        // Reject renewal if the current epoch doesn't match the lease epoch.
+        if grant.epoch != self.current_epoch {
+            return Err(LeaseError::EpochMismatch {
+                lease_id,
+                lease_epoch: grant.epoch,
+                current_epoch: self.current_epoch,
+            });
+        }
+
+        // Reject renewal if the mount identity has changed.
+        if grant.mount_identity != self.current_mount_identity {
+            return Err(LeaseError::MountIdentityMismatch {
+                lease_mount: grant.mount_identity,
+                current_mount: self.current_mount_identity,
+            });
+        }
+
         if grant.lifecycle.is_terminal() {
             return Err(LeaseError::AlreadyTerminal {
                 lease_id,
@@ -114,6 +138,32 @@ impl LeaseLifecycleManager {
             lease_lifecycle: grant.lifecycle,
             version: grant.version,
         })
+    }
+
+    /// Update the current epoch, fencing all leases from the previous epoch.
+    pub fn advance_epoch(&mut self, new_epoch: EpochId) -> Vec<u64> {
+        let mut fenced = Vec::new();
+        for (lease_id, (grant, _deadline)) in &mut self.leases {
+            if grant.epoch != new_epoch && !grant.lifecycle.is_terminal() {
+                grant.lifecycle = LeaseLifecycle::Fenced;
+                fenced.push(*lease_id);
+            }
+        }
+        self.current_epoch = new_epoch;
+        fenced
+    }
+
+    /// Invalidate all leases from a previous mount identity.
+    pub fn remount_invalidate(&mut self, new_mount: DatasetMountIdentity) -> Vec<u64> {
+        let mut fenced = Vec::new();
+        for (lease_id, (grant, _deadline)) in &mut self.leases {
+            if grant.mount_identity != new_mount && !grant.lifecycle.is_terminal() {
+                grant.lifecycle = LeaseLifecycle::Fenced;
+                fenced.push(*lease_id);
+            }
+        }
+        self.current_mount_identity = new_mount;
+        fenced
     }
 
     /// Remove a lease from tracking (e.g., after release/fence/release).
@@ -152,6 +202,8 @@ fn now_nanos() -> u64 {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use tidefs_membership_epoch::DatasetMountIdentity;
+    use tidefs_membership_epoch::EpochId;
 
     fn make_grant(id: u64) -> LeaseGrant {
         LeaseGrant::request(
@@ -165,6 +217,7 @@ mod lifecycle_tests {
             60_000,
             0,
             tidefs_membership_epoch::EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
             id,
             3,
             3,
@@ -177,6 +230,8 @@ mod lifecycle_tests {
             500_000_000,   // 500ms renew
             2_000_000_000, // 2s expiry
             1_000_000_000, // 1s grace
+            EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
         );
         let grant = make_grant(1);
         mgr.register(&grant);
@@ -192,7 +247,13 @@ mod lifecycle_tests {
 
     #[test]
     fn test_renewal() {
-        let mut mgr = LeaseLifecycleManager::new(500_000_000, 2_000_000_000, 1_000_000_000);
+        let mut mgr = LeaseLifecycleManager::new(
+            500_000_000,
+            2_000_000_000,
+            1_000_000_000,
+            EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
+        );
         let grant = make_grant(1);
         mgr.register(&grant);
         mgr.renew(1).expect("renewal should succeed");
@@ -202,7 +263,13 @@ mod lifecycle_tests {
 
     #[test]
     fn test_deregister() {
-        let mut mgr = LeaseLifecycleManager::new(500_000_000, 2_000_000_000, 1_000_000_000);
+        let mut mgr = LeaseLifecycleManager::new(
+            500_000_000,
+            2_000_000_000,
+            1_000_000_000,
+            EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
+        );
         let grant = make_grant(1);
         mgr.register(&grant);
         assert_eq!(mgr.len(), 1);
@@ -216,6 +283,8 @@ mod lifecycle_tests {
             500_000_000,
             1,
             1, // very short expiry
+            EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
         );
         let grant = make_grant(1);
         mgr.register(&grant);
@@ -228,14 +297,26 @@ mod lifecycle_tests {
 
     #[test]
     fn test_renewal_not_found() {
-        let mut mgr = LeaseLifecycleManager::new(500_000_000, 2_000_000_000, 1_000_000_000);
+        let mut mgr = LeaseLifecycleManager::new(
+            500_000_000,
+            2_000_000_000,
+            1_000_000_000,
+            EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
+        );
         let result = mgr.renew(999);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_stage_failover_not_expired() {
-        let mut mgr = LeaseLifecycleManager::new(500_000_000, 60_000_000_000, 10_000_000_000);
+        let mut mgr = LeaseLifecycleManager::new(
+            500_000_000,
+            60_000_000_000,
+            10_000_000_000,
+            EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
+        );
         let grant = make_grant(1);
         mgr.register(&grant);
         // Should be Open, not expired - failover should not be possible.

@@ -498,6 +498,7 @@ mod protocol_integration_tests {
     use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseGrant, LeaseLifecycle};
     use tidefs_lease::{LeaseMessage, LeaseProtocolError};
     use tidefs_membership_epoch::{EpochId, MemberId};
+    use tidefs_membership_epoch::DatasetMountIdentity;
 
     fn m(id: u64) -> MemberId {
         MemberId::new(id)
@@ -642,6 +643,7 @@ mod protocol_integration_tests {
             30_000,
             1_000_000,
             epoch(1),
+            DatasetMountIdentity::new(1, 1, 1),
             0,
             3,
             5,
@@ -674,6 +676,7 @@ mod protocol_integration_tests {
             30_000,
             1_000_000,
             epoch(1),
+            DatasetMountIdentity::new(1, 1, 1),
             0,
             3,
             5,
@@ -698,6 +701,7 @@ mod protocol_integration_tests {
             30_000,
             1_000_000,
             epoch(1),
+            DatasetMountIdentity::new(1, 1, 1),
             0,
             0,
             0,

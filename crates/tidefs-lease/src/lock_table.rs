@@ -552,6 +552,7 @@ pub enum LockQueueError {
 
 #[cfg(test)]
 mod tests {
+    use tidefs_membership_epoch::DatasetMountIdentity;
     use super::*;
     use tidefs_membership_epoch::EpochId;
 
@@ -581,6 +582,7 @@ mod tests {
             30_000,
             1_000_000,
             EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
             100,
             3,
             3,
@@ -606,6 +608,7 @@ mod tests {
             30_000,
             1_000_000,
             EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
             200,
             3,
             3,
@@ -635,6 +638,7 @@ mod tests {
             30_000,
             800_000,
             EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
             300,
             3,
             3,
@@ -671,6 +675,7 @@ mod tests {
             30_000,
             100_000,
             EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
             1,
             3,
             3,
@@ -689,6 +694,7 @@ mod tests {
             30_000,
             200_000,
             EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
             2,
             3,
             3,
@@ -719,6 +725,7 @@ mod tests {
             30_000,
             500_000,
             EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
             400,
             3,
             3,
@@ -747,6 +754,7 @@ mod tests {
             30_000,
             100_000,
             EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
             1,
             3,
             3,
@@ -800,6 +808,7 @@ mod tests {
             30_000,
             100_000,
             EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
             10,
             3,
             3,
