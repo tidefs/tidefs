@@ -411,6 +411,7 @@ fn arb_chunk_ref() -> impl Strategy<Value = ContentChunkRef> {
             data_version,
             len,
             checksum: IntegrityDigest64(1),
+            placement_receipt_generation: 0,
         })
 }
 

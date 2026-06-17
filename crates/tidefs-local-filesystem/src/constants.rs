@@ -1,4 +1,6 @@
-pub const FILESYSTEM_FORMAT_VERSION: u16 = 5;
+/// Format v6 adds placement receipt generation to content chunk references.
+/// Format v5 and earlier do not carry receipt refs on extents.
+pub const FILESYSTEM_FORMAT_VERSION: u16 = 6;
 pub const CURRENT_FORMAT_VERSION: u16 = FILESYSTEM_FORMAT_VERSION;
 /// Oldest format version this code can read (backward-compat window).
 pub const FORMAT_COMPAT_WINDOW_MIN: u16 = 1;
