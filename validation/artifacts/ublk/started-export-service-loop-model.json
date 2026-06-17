@@ -1,0 +1,1071 @@
+{
+  "report_version": 1,
+  "generated_by": "tidefs-env-ublk-model-rust-v0.421.0",
+  "claim_id": "ublk.started_export.live_service_loop.v1",
+  "evidence_class": "started-export-service-loop-model",
+  "evidence_tier": "model",
+  "runtime_admission_boundary": "This is model-tier evidence only; runtime-ublk-started-export-admission-artifact remains required for live daemon proof.",
+  "config": {
+    "queue_count": 2,
+    "queue_depth": 3,
+    "sector_size": 512,
+    "device_id": 1
+  },
+  "queue_bounds": {
+    "queue_count": 2,
+    "queue_depth": 3,
+    "max_queue_count_abi": 4096,
+    "max_queue_depth_abi": 4096,
+    "total_slots": 6
+  },
+  "request_classes_exercised": [
+    "discard",
+    "flush",
+    "read",
+    "write"
+  ],
+  "unsupported_opcodes_exercised": [
+    {
+      "opcode": 4,
+      "opcode_name": "write_same",
+      "error_kind": "UnsupportedOpcode { opcode: 4 }"
+    },
+    {
+      "opcode": 5,
+      "opcode_name": "write_zeroes",
+      "error_kind": "UnsupportedOpcode { opcode: 5 }"
+    },
+    {
+      "opcode": 10,
+      "opcode_name": "zone_open",
+      "error_kind": "UnsupportedOpcode { opcode: 10 }"
+    },
+    {
+      "opcode": 11,
+      "opcode_name": "zone_close",
+      "error_kind": "UnsupportedOpcode { opcode: 11 }"
+    },
+    {
+      "opcode": 12,
+      "opcode_name": "zone_finish",
+      "error_kind": "UnsupportedOpcode { opcode: 12 }"
+    },
+    {
+      "opcode": 13,
+      "opcode_name": "zone_append",
+      "error_kind": "UnsupportedOpcode { opcode: 13 }"
+    },
+    {
+      "opcode": 14,
+      "opcode_name": "zone_reset_all",
+      "error_kind": "UnsupportedOpcode { opcode: 14 }"
+    },
+    {
+      "opcode": 15,
+      "opcode_name": "zone_reset",
+      "error_kind": "UnsupportedOpcode { opcode: 15 }"
+    },
+    {
+      "opcode": 18,
+      "opcode_name": "report_zones",
+      "error_kind": "UnsupportedOpcode { opcode: 18 }"
+    }
+  ],
+  "events": [
+    {
+      "sequence": 1,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 0,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 2,
+      "event_kind": "timeout",
+      "qid": 0,
+      "tag": 0,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 3,
+      "event_kind": "reissue_after_timeout",
+      "qid": 0,
+      "tag": 0,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 4,
+      "event_kind": "complete",
+      "qid": 0,
+      "tag": 0,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 5,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 0,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 6,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 0,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 7,
+      "event_kind": "timeout",
+      "qid": 0,
+      "tag": 0,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 8,
+      "event_kind": "reissue_after_timeout",
+      "qid": 0,
+      "tag": 0,
+      "generation": 4,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 9,
+      "event_kind": "complete",
+      "qid": 0,
+      "tag": 0,
+      "generation": 4,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 10,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 0,
+      "generation": 4,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 11,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 0,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 12,
+      "event_kind": "complete",
+      "qid": 0,
+      "tag": 0,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 13,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 0,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 14,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 0,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 15,
+      "event_kind": "abort",
+      "qid": 0,
+      "tag": 0,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 16,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 0,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 17,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 1,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 18,
+      "event_kind": "abort",
+      "qid": 0,
+      "tag": 1,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 19,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 1,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 20,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 1,
+      "generation": 2,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 21,
+      "event_kind": "timeout",
+      "qid": 0,
+      "tag": 1,
+      "generation": 2,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 22,
+      "event_kind": "reissue_after_timeout",
+      "qid": 0,
+      "tag": 1,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 23,
+      "event_kind": "complete",
+      "qid": 0,
+      "tag": 1,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 24,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 1,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 25,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 1,
+      "generation": 4,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 26,
+      "event_kind": "timeout",
+      "qid": 0,
+      "tag": 1,
+      "generation": 4,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 27,
+      "event_kind": "reissue_after_timeout",
+      "qid": 0,
+      "tag": 1,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 28,
+      "event_kind": "complete",
+      "qid": 0,
+      "tag": 1,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 29,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 1,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 30,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 1,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 31,
+      "event_kind": "abort",
+      "qid": 0,
+      "tag": 1,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 32,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 1,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 33,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 2,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 34,
+      "event_kind": "timeout",
+      "qid": 0,
+      "tag": 2,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 35,
+      "event_kind": "reissue_after_timeout",
+      "qid": 0,
+      "tag": 2,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 36,
+      "event_kind": "complete",
+      "qid": 0,
+      "tag": 2,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 37,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 2,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 38,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 2,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 39,
+      "event_kind": "abort",
+      "qid": 0,
+      "tag": 2,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 40,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 2,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 41,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 2,
+      "generation": 4,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 42,
+      "event_kind": "timeout",
+      "qid": 0,
+      "tag": 2,
+      "generation": 4,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 43,
+      "event_kind": "reissue_after_timeout",
+      "qid": 0,
+      "tag": 2,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 44,
+      "event_kind": "complete",
+      "qid": 0,
+      "tag": 2,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 45,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 2,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 46,
+      "event_kind": "submit",
+      "qid": 0,
+      "tag": 2,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 47,
+      "event_kind": "complete",
+      "qid": 0,
+      "tag": 2,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 48,
+      "event_kind": "release",
+      "qid": 0,
+      "tag": 2,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 49,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 0,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 50,
+      "event_kind": "timeout",
+      "qid": 1,
+      "tag": 0,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 51,
+      "event_kind": "reissue_after_timeout",
+      "qid": 1,
+      "tag": 0,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 52,
+      "event_kind": "complete",
+      "qid": 1,
+      "tag": 0,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 53,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 0,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 54,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 0,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 55,
+      "event_kind": "timeout",
+      "qid": 1,
+      "tag": 0,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 56,
+      "event_kind": "reissue_after_timeout",
+      "qid": 1,
+      "tag": 0,
+      "generation": 4,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 57,
+      "event_kind": "complete",
+      "qid": 1,
+      "tag": 0,
+      "generation": 4,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 58,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 0,
+      "generation": 4,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 59,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 0,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 60,
+      "event_kind": "abort",
+      "qid": 1,
+      "tag": 0,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 61,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 0,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 62,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 0,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 63,
+      "event_kind": "timeout",
+      "qid": 1,
+      "tag": 0,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 64,
+      "event_kind": "reissue_after_timeout",
+      "qid": 1,
+      "tag": 0,
+      "generation": 7,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 65,
+      "event_kind": "complete",
+      "qid": 1,
+      "tag": 0,
+      "generation": 7,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 66,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 0,
+      "generation": 7,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 67,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 1,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 68,
+      "event_kind": "timeout",
+      "qid": 1,
+      "tag": 1,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 69,
+      "event_kind": "reissue_after_timeout",
+      "qid": 1,
+      "tag": 1,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 70,
+      "event_kind": "complete",
+      "qid": 1,
+      "tag": 1,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 71,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 1,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 72,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 1,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 73,
+      "event_kind": "timeout",
+      "qid": 1,
+      "tag": 1,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 74,
+      "event_kind": "reissue_after_timeout",
+      "qid": 1,
+      "tag": 1,
+      "generation": 4,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 75,
+      "event_kind": "complete",
+      "qid": 1,
+      "tag": 1,
+      "generation": 4,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 76,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 1,
+      "generation": 4,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 77,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 1,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 78,
+      "event_kind": "abort",
+      "qid": 1,
+      "tag": 1,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 79,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 1,
+      "generation": 5,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 80,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 1,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 81,
+      "event_kind": "abort",
+      "qid": 1,
+      "tag": 1,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 82,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 1,
+      "generation": 6,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 83,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 2,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 84,
+      "event_kind": "timeout",
+      "qid": 1,
+      "tag": 2,
+      "generation": 1,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 85,
+      "event_kind": "reissue_after_timeout",
+      "qid": 1,
+      "tag": 2,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 86,
+      "event_kind": "complete",
+      "qid": 1,
+      "tag": 2,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 87,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 2,
+      "generation": 2,
+      "request_class": "read",
+      "detail": null
+    },
+    {
+      "sequence": 88,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 2,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 89,
+      "event_kind": "complete",
+      "qid": 1,
+      "tag": 2,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 90,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 2,
+      "generation": 3,
+      "request_class": "write",
+      "detail": null
+    },
+    {
+      "sequence": 91,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 2,
+      "generation": 4,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 92,
+      "event_kind": "complete",
+      "qid": 1,
+      "tag": 2,
+      "generation": 4,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 93,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 2,
+      "generation": 4,
+      "request_class": "flush",
+      "detail": null
+    },
+    {
+      "sequence": 94,
+      "event_kind": "submit",
+      "qid": 1,
+      "tag": 2,
+      "generation": 5,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 95,
+      "event_kind": "complete",
+      "qid": 1,
+      "tag": 2,
+      "generation": 5,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 96,
+      "event_kind": "release",
+      "qid": 1,
+      "tag": 2,
+      "generation": 5,
+      "request_class": "discard",
+      "detail": null
+    },
+    {
+      "sequence": 97,
+      "event_kind": "unsupported_opcode_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "opcode=4 unsupported uBLK opcode 4"
+    },
+    {
+      "sequence": 98,
+      "event_kind": "unsupported_opcode_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "opcode=5 unsupported uBLK opcode 5"
+    },
+    {
+      "sequence": 99,
+      "event_kind": "unsupported_opcode_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "opcode=10 unsupported uBLK opcode 10"
+    },
+    {
+      "sequence": 100,
+      "event_kind": "unsupported_opcode_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "opcode=11 unsupported uBLK opcode 11"
+    },
+    {
+      "sequence": 101,
+      "event_kind": "unsupported_opcode_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "opcode=12 unsupported uBLK opcode 12"
+    },
+    {
+      "sequence": 102,
+      "event_kind": "unsupported_opcode_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "opcode=13 unsupported uBLK opcode 13"
+    },
+    {
+      "sequence": 103,
+      "event_kind": "unsupported_opcode_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "opcode=14 unsupported uBLK opcode 14"
+    },
+    {
+      "sequence": 104,
+      "event_kind": "unsupported_opcode_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "opcode=15 unsupported uBLK opcode 15"
+    },
+    {
+      "sequence": 105,
+      "event_kind": "unsupported_opcode_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "opcode=18 unsupported uBLK opcode 18"
+    },
+    {
+      "sequence": 106,
+      "event_kind": "queue_bound_exceeded_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "q=0 d=0: zero queues"
+    },
+    {
+      "sequence": 107,
+      "event_kind": "queue_bound_exceeded_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "q=0 d=1: zero queue count with depth"
+    },
+    {
+      "sequence": 108,
+      "event_kind": "queue_bound_exceeded_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "q=4097 d=1: queue count exceeds ABI max"
+    },
+    {
+      "sequence": 109,
+      "event_kind": "queue_bound_exceeded_rejected",
+      "qid": 0,
+      "tag": 0,
+      "generation": 0,
+      "request_class": null,
+      "detail": "q=1 d=4097: queue depth exceeds ABI max"
+    }
+  ],
+  "completion_summary": {
+    "completed": 17,
+    "aborted": 7,
+    "timed_out": 12,
+    "timed_out_reissued": 12,
+    "total_terminal": 36
+  },
+  "deterministic_identity": {
+    "seed": 6073460636809113649,
+    "queue_count": 2,
+    "queue_depth": 3,
+    "event_count": 109,
+    "operations_sequence_hash": "f3d76916913c049d"
+  }
+}

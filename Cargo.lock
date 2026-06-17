@@ -2448,6 +2448,8 @@ dependencies = [
 name = "tidefs-env-ublk-model"
 version = "0.421.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "tidefs-types-vfs-core",
  "tidefs-ublk-abi",
 ]
