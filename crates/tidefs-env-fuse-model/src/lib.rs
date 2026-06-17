@@ -2,6 +2,11 @@
 
 //! Pure FUSE environment model for adapter-to-contract refinement.
 //!
+//! **IMPORTANT**: The model traces, sequences, and assertions provided by this
+//! crate are adapter-environment model evidence only. They must not be used to
+//! validate mounted FUSE runtime crash claims or replace runtime xfstests
+//! coverage.  See issue #533 for the model authority boundaries.
+//!
 //! This crate models legal FUSE connection and request lifecycles at the
 //! adapter boundary. It translates semantic FUSE requests into the current
 //! TideFS request contract and replays those envelopes through
@@ -1147,6 +1152,106 @@ pub fn issue_290_acceptance_trace() -> Result<Vec<FuseModelStep>, FuseModelError
         .collect()
 }
 
+/// Deterministic writeback flush/fsync lifecycle sequence for issue #533.
+///
+/// This sequence proves that writeback-cache writes must be followed by an
+/// explicit flush or fsync outcome before the model can claim the inode has
+/// no dirty adapter-local work.  The sequence covers:
+///
+/// - writeback write → flush → fsync → release → daemon teardown → destroy (success)
+/// - writeback write without flush/fsync → release (blocked)
+/// - writeback write without flush/fsync → daemon teardown (blocked)
+/// - interrupted writeback write with reissue and fsync cleanup
+///
+/// **Model-only evidence**: this sequence is a pure environment-model trace
+/// and cannot validate mounted FUSE runtime crash claims.  See issue #533.
+#[must_use]
+pub fn issue_533_writeback_flush_fsync_events() -> Vec<FuseEvent> {
+    let file = InodeId::new(2);
+    let fh = FileHandleId::new(7);
+    vec![
+        FuseEvent::Init(FuseConnectionConfig {
+            max_background: 2,
+            writeback_cache: true,
+            capabilities: vec![FuseCapability::AsyncRead, FuseCapability::WritebackCache],
+        }),
+        // Create and open the target file.
+        FuseEvent::Dispatch {
+            unique: 1,
+            request: FuseRequest::Create {
+                path: path("/file"),
+            },
+            completion: DispatchCompletion::Complete,
+        },
+        FuseEvent::Dispatch {
+            unique: 2,
+            request: FuseRequest::Open {
+                inode: file,
+                file_handle: fh,
+                flags: 0,
+            },
+            completion: DispatchCompletion::Complete,
+        },
+        // Writeback-cache write marks the inode dirty.
+        FuseEvent::Dispatch {
+            unique: 3,
+            request: FuseRequest::Write {
+                inode: file,
+                file_handle: fh,
+                offset: 0,
+                bytes: b"data".to_vec(),
+                writeback_cache: true,
+            },
+            completion: DispatchCompletion::Complete,
+        },
+        // Flush clears the dirty writeback state.
+        FuseEvent::Dispatch {
+            unique: 4,
+            request: FuseRequest::Flush {
+                inode: file,
+                file_handle: fh,
+            },
+            completion: DispatchCompletion::Complete,
+        },
+        // Fsync is also accepted through the request contract after flush.
+        FuseEvent::Dispatch {
+            unique: 5,
+            request: FuseRequest::Fsync {
+                inode: file,
+                file_handle: fh,
+                datasync: false,
+            },
+            completion: DispatchCompletion::Complete,
+        },
+        // Release now succeeds because explicit sync work already ran.
+        FuseEvent::Dispatch {
+            unique: 6,
+            request: FuseRequest::Release {
+                inode: file,
+                file_handle: fh,
+            },
+            completion: DispatchCompletion::Complete,
+        },
+        // Clean shutdown is legal with zero dirty inodes.
+        FuseEvent::DaemonTeardown,
+        FuseEvent::Destroy,
+    ]
+}
+
+/// Run the deterministic issue #533 writeback flush/fsync trace.
+///
+/// # Errors
+///
+/// Returns a lifecycle/model error only if the hard-coded acceptance trace is
+/// no longer legal.
+pub fn issue_533_writeback_flush_fsync_trace() -> Result<Vec<FuseModelStep>, FuseModelError> {
+    let mut model = FuseEnvironmentModel::new();
+    issue_533_writeback_flush_fsync_events()
+        .into_iter()
+        .map(|event| model.apply(event))
+        .collect()
+}
+
 fn path(value: &str) -> ModelPath {
     ModelPath::parse_absolute(value).expect("issue #290 trace paths are absolute and legal")
 }
@@ -1442,5 +1547,389 @@ mod tests {
                     .join("\n")
             );
         }
+    }
+
+    // --- Issue #533 writeback flush/fsync lifecycle tests ---
+    //
+    // These tests are adapter-environment model evidence only.  They must not
+    // be used to validate mounted FUSE runtime crash claims.  See issue #533.
+
+    /// Model-only evidence: the writeback-cache write → flush → fsync →
+    /// release → daemon teardown → destroy success path.
+    #[test]
+    fn writeback_write_flush_release_destroy_success_path() {
+        let trace = issue_533_writeback_flush_fsync_trace()
+            .expect("issue #533 success trace remains legal");
+
+        // Every event in the success trace must succeed.
+        for step in &trace {
+            assert!(
+                step.completion
+                    .as_ref()
+                    .map_or(true, |c| c.errno.is_success()),
+                "step {:?} should succeed but got {:?}",
+                step.kind,
+                step.completion
+            );
+        }
+
+        // The trace must end with Destroy.
+        assert_eq!(trace.last().map(|s| s.kind), Some(FuseStepKind::Destroy));
+
+        // No dirty writeback inodes remain at teardown.
+        let teardown_step = trace
+            .iter()
+            .find(|s| s.kind == FuseStepKind::DaemonTeardown)
+            .expect("teardown step present");
+        assert_eq!(teardown_step.queue.dirty_writeback_inodes, 0);
+    }
+
+    /// Model-only evidence: flush and fsync both clear the dirty writeback
+    /// state, allowing a subsequent release.
+    #[test]
+    fn writeback_write_fsync_release_success_path() {
+        let mut model = FuseEnvironmentModel::new();
+        model
+            .apply(FuseEvent::Init(FuseConnectionConfig {
+                max_background: 1,
+                writeback_cache: true,
+                capabilities: vec![FuseCapability::WritebackCache],
+            }))
+            .unwrap();
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 1,
+                request: FuseRequest::Create {
+                    path: path("/file"),
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 2,
+                request: FuseRequest::Write {
+                    inode: InodeId::new(2),
+                    file_handle: FileHandleId::new(7),
+                    offset: 0,
+                    bytes: b"xyz".to_vec(),
+                    writeback_cache: true,
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+
+        // Fsync (not flush) clears the dirty inode.
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 3,
+                request: FuseRequest::Fsync {
+                    inode: InodeId::new(2),
+                    file_handle: FileHandleId::new(7),
+                    datasync: false,
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+
+        // Release must succeed.
+        let step = model
+            .apply(FuseEvent::Dispatch {
+                unique: 4,
+                request: FuseRequest::Release {
+                    inode: InodeId::new(2),
+                    file_handle: FileHandleId::new(7),
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+        assert_eq!(step.kind, FuseStepKind::Dispatch);
+    }
+
+    /// Model-only evidence: release is blocked for dirty writeback inodes
+    /// that have not been flushed or fsynced.
+    #[test]
+    fn writeback_release_blocked_without_flush_fsync() {
+        let mut model = FuseEnvironmentModel::new();
+        model
+            .apply(FuseEvent::Init(FuseConnectionConfig {
+                max_background: 1,
+                writeback_cache: true,
+                capabilities: vec![FuseCapability::WritebackCache],
+            }))
+            .unwrap();
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 1,
+                request: FuseRequest::Create {
+                    path: path("/file"),
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 2,
+                request: FuseRequest::Write {
+                    inode: InodeId::new(2),
+                    file_handle: FileHandleId::new(7),
+                    offset: 0,
+                    bytes: b"abc".to_vec(),
+                    writeback_cache: true,
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+
+        let err = model
+            .apply(FuseEvent::Dispatch {
+                unique: 3,
+                request: FuseRequest::Release {
+                    inode: InodeId::new(2),
+                    file_handle: FileHandleId::new(7),
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            FuseModelError::DirtyWritebackOutstanding {
+                inode: InodeId::new(2)
+            }
+        );
+    }
+
+    /// Model-only evidence: daemon teardown is rejected when dirty writeback
+    /// inodes are still outstanding.
+    #[test]
+    fn writeback_daemon_teardown_blocked_without_flush_fsync() {
+        let mut model = FuseEnvironmentModel::new();
+        model
+            .apply(FuseEvent::Init(FuseConnectionConfig {
+                max_background: 1,
+                writeback_cache: true,
+                capabilities: vec![FuseCapability::WritebackCache],
+            }))
+            .unwrap();
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 1,
+                request: FuseRequest::Create {
+                    path: path("/file"),
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 2,
+                request: FuseRequest::Write {
+                    inode: InodeId::new(2),
+                    file_handle: FileHandleId::new(7),
+                    offset: 0,
+                    bytes: b"abc".to_vec(),
+                    writeback_cache: true,
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+
+        let err = model.apply(FuseEvent::DaemonTeardown).unwrap_err();
+        assert_eq!(
+            err,
+            FuseModelError::DirtyWritebackDuringTeardown { count: 1 }
+        );
+    }
+
+    /// Model-only evidence: destroy is rejected when dirty writeback inodes
+    /// are still outstanding (even after daemon teardown transition).
+    #[test]
+    fn writeback_destroy_blocked_without_flush_fsync() {
+        let mut model = FuseEnvironmentModel::new();
+        model
+            .apply(FuseEvent::Init(FuseConnectionConfig {
+                max_background: 1,
+                writeback_cache: true,
+                capabilities: vec![FuseCapability::WritebackCache],
+            }))
+            .unwrap();
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 1,
+                request: FuseRequest::Create {
+                    path: path("/file"),
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 2,
+                request: FuseRequest::Write {
+                    inode: InodeId::new(2),
+                    file_handle: FileHandleId::new(7),
+                    offset: 0,
+                    bytes: b"abc".to_vec(),
+                    writeback_cache: true,
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+
+        // Destroy (without prior teardown) is also rejected.
+        let err = model.apply(FuseEvent::Destroy).unwrap_err();
+        assert_eq!(
+            err,
+            FuseModelError::DirtyWritebackDuringTeardown { count: 1 }
+        );
+    }
+
+    /// Model-only evidence: an interrupted writeback write that is never
+    /// flushed or fsynced leaves the inode dirty; a subsequent teardown is
+    /// blocked.
+    #[test]
+    fn writeback_interrupted_write_blocked_teardown_without_flush_fsync() {
+        let mut model = FuseEnvironmentModel::new();
+        model
+            .apply(FuseEvent::Init(FuseConnectionConfig {
+                max_background: 2,
+                writeback_cache: true,
+                capabilities: vec![FuseCapability::WritebackCache],
+            }))
+            .unwrap();
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 1,
+                request: FuseRequest::Create {
+                    path: path("/file"),
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+
+        // Dispatch a held writeback write (not immediately completed).
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 2,
+                request: FuseRequest::Write {
+                    inode: InodeId::new(2),
+                    file_handle: FileHandleId::new(7),
+                    offset: 0,
+                    bytes: b"xyz".to_vec(),
+                    writeback_cache: true,
+                },
+                completion: DispatchCompletion::Hold,
+            })
+            .unwrap();
+
+        // Interrupt the held write.
+        model
+            .apply(FuseEvent::Interrupt {
+                unique: 30,
+                target_unique: 2,
+            })
+            .unwrap();
+
+        // Abort the interrupted write.
+        model.apply(FuseEvent::Abort { unique: 2 }).unwrap();
+
+        // Reissue the aborted write as a new request, still held.
+        model
+            .apply(FuseEvent::Reissue {
+                aborted_unique: 2,
+                new_unique: 3,
+            })
+            .unwrap();
+
+        // Complete the reissued write (marks inode dirty).
+        model.apply(FuseEvent::Complete { unique: 3 }).unwrap();
+
+        // Now try daemon teardown without flush/fsync — must be blocked.
+        let err = model.apply(FuseEvent::DaemonTeardown).unwrap_err();
+        assert_eq!(
+            err,
+            FuseModelError::DirtyWritebackDuringTeardown { count: 1 }
+        );
+    }
+
+    /// Model-only evidence: after an interrupted writeback write is
+    /// reissued, completed, flushed, and released, teardown proceeds
+    /// cleanly (full recovery path).
+    #[test]
+    fn writeback_interrupted_write_reissued_flushed_teardown_success() {
+        let mut model = FuseEnvironmentModel::new();
+        model
+            .apply(FuseEvent::Init(FuseConnectionConfig {
+                max_background: 2,
+                writeback_cache: true,
+                capabilities: vec![FuseCapability::WritebackCache],
+            }))
+            .unwrap();
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 1,
+                request: FuseRequest::Create {
+                    path: path("/file"),
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+
+        // Held writeback write → interrupted → aborted → reissued → completed.
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 2,
+                request: FuseRequest::Write {
+                    inode: InodeId::new(2),
+                    file_handle: FileHandleId::new(7),
+                    offset: 0,
+                    bytes: b"xyz".to_vec(),
+                    writeback_cache: true,
+                },
+                completion: DispatchCompletion::Hold,
+            })
+            .unwrap();
+        model
+            .apply(FuseEvent::Interrupt {
+                unique: 30,
+                target_unique: 2,
+            })
+            .unwrap();
+        model.apply(FuseEvent::Abort { unique: 2 }).unwrap();
+        model
+            .apply(FuseEvent::Reissue {
+                aborted_unique: 2,
+                new_unique: 3,
+            })
+            .unwrap();
+        model.apply(FuseEvent::Complete { unique: 3 }).unwrap();
+
+        // Flush to clear dirty state.
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 4,
+                request: FuseRequest::Flush {
+                    inode: InodeId::new(2),
+                    file_handle: FileHandleId::new(7),
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+
+        // Release.
+        model
+            .apply(FuseEvent::Dispatch {
+                unique: 5,
+                request: FuseRequest::Release {
+                    inode: InodeId::new(2),
+                    file_handle: FileHandleId::new(7),
+                },
+                completion: DispatchCompletion::Complete,
+            })
+            .unwrap();
+
+        // Teardown and destroy succeed.
+        model.apply(FuseEvent::DaemonTeardown).unwrap();
+        model.apply(FuseEvent::Destroy).unwrap();
     }
 }
