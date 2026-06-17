@@ -214,6 +214,7 @@ fn full_3_device_removal_lifecycle() {
         removing_device_indices: vec![],
     };
 
+    driver.record_evacuation_receipt(vec![], 0);
     driver.commit_vacated(updated_config).unwrap();
     assert_eq!(driver.state().phase, DeviceRemovalPhase::Vacated);
 
@@ -389,6 +390,7 @@ fn removal_with_zero_objects_completes_cleanly() {
         missing_indices: vec![],
         removing_device_indices: vec![],
     };
+    driver.record_evacuation_receipt(vec![], 0);
     driver.commit_vacated(updated_config).unwrap();
     driver.mark_removed().unwrap();
 

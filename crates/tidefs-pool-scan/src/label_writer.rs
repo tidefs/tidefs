@@ -411,7 +411,6 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         }
     }
 
@@ -521,7 +520,6 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
 
         let scan_cfg = PoolScanConfig::new(vec![dev0_path.clone(), dev1_path.clone()])
@@ -619,7 +617,6 @@ mod tests {
             device_count: 3,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
 
         // Remove disk2 (device at /dev/removed-disk).
@@ -769,7 +766,6 @@ mod tests {
             device_count: 1,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
 
         let scan_cfg = PoolScanConfig::new(vec![dev_path.clone()]).with_label_area(256 * 1024);

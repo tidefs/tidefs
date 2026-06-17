@@ -1840,7 +1840,6 @@ mod tests {
             device_count: 3,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
         assert_eq!(config.device_count, 3);
         assert_eq!(config.topology_generation, 5);
@@ -1873,7 +1872,6 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
         let result = config.remove_device(Path::new("/dev/nonexistent"));
         assert!(matches!(
@@ -1899,7 +1897,6 @@ mod tests {
             device_count: 1,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
         let result = config.remove_device(Path::new("/dev/disk0"));
         assert!(matches!(result, Err(DeviceRemovalError::WouldEmptyPool)));
@@ -2479,7 +2476,6 @@ mod tests {
             device_count: 3,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
         };
         let result = config.remove_device(Path::new("/dev/disk0"));
         assert!(result.is_ok());
