@@ -675,6 +675,8 @@ struct MutationDelta {
     old_capacity_authority: CapacityAuthoritySnapshot,
     old_dirty_pages: BTreeMap<InodeId, Vec<DirtyRange>>,
     old_extent_allocator: ExtentAllocator,
+    old_reclaim_queue: BPlusTreeReclaimQueue,
+    old_deferred_rewrite_trims: Vec<(ObjectKey, ObjectKey)>,
     intent_log_seq_at_begin: u64,
 }
 
@@ -10641,6 +10643,8 @@ impl LocalFileSystem {
                 old_capacity_authority: self.capacity_authority.snapshot_for_rollback(),
                 old_dirty_pages,
                 old_extent_allocator: self.extent_allocator.clone(),
+                old_reclaim_queue: self.reclaim_queue.lock().unwrap().clone(),
+                old_deferred_rewrite_trims: self.deferred_rewrite_trims.clone(),
                 intent_log_seq_at_begin: self.intent_log.next_entry_id(),
             });
         }
@@ -10709,6 +10713,8 @@ impl LocalFileSystem {
             if let Ok(mut tracker) = self.writeback_range_tracker.lock() {
                 tracker.restore_ranges(delta.old_dirty_pages);
             }
+            *self.reclaim_queue.lock().unwrap() = delta.old_reclaim_queue;
+            self.deferred_rewrite_trims = delta.old_deferred_rewrite_trims;
             // Discard intent-log entries appended during the transaction.
             if self.intent_log.next_entry_id() > delta.intent_log_seq_at_begin {
                 let _ = self.intent_log.clear(self.store.raw_primary_store_mut());
@@ -13479,6 +13485,59 @@ mod recovery_integration_tests {
         assert_eq!(
             space_accounting_before, fs.state.space_accounting,
             "space accounting must be restored after rollback"
+        );
+
+        drop(fs);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn transaction_rollback_restores_rewrite_trim_side_ledgers() {
+        let root = temp_root("txn-rollback-rewrite-trims");
+        let mut fs =
+            LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
+
+        let created = fs.create_file("/rewrite-me", 0o644).expect("create_file");
+        let old_content = b"stable old content".to_vec();
+        let committed = fs
+            .replace_content(created.inode_id, created, old_content.clone())
+            .expect("write old content");
+        fs.tick_background_services();
+
+        let reclaim_depth_before = fs.reclaim_queue_depth();
+        let deferred_trims_before = fs.deferred_rewrite_trims.len();
+
+        fs.set_auto_commit(false);
+        fs.begin_transaction().expect("begin_transaction");
+        fs.replace_content(
+            committed.inode_id,
+            committed.clone(),
+            b"rolled back content".to_vec(),
+        )
+        .expect("rewrite inside transaction");
+
+        assert!(
+            fs.reclaim_queue_depth() > reclaim_depth_before
+                || fs.deferred_rewrite_trims.len() > deferred_trims_before,
+            "transactional rewrite must stage trim side state before rollback"
+        );
+
+        fs.rollback_transaction().expect("rollback_transaction");
+
+        assert_eq!(
+            fs.reclaim_queue_depth(),
+            reclaim_depth_before,
+            "rollback must restore reclaim queue trim state"
+        );
+        assert_eq!(
+            fs.deferred_rewrite_trims.len(),
+            deferred_trims_before,
+            "rollback must restore deferred rewrite trim state"
+        );
+        assert_eq!(
+            fs.read_file("/rewrite-me").expect("read after rollback"),
+            old_content,
+            "rollback must leave the pre-transaction content reachable"
         );
 
         drop(fs);
