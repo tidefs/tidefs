@@ -1304,12 +1304,6 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
 
     tidefs_product_limitation() {
         case "$1" in
-            generic/007)
-                echo "TideFS FUSE bounded smoke classifies generic/007 high-count create/unlink/stat namespace stress as a current product scalability limitation instead of an opaque timeout"
-                ;;
-            generic/011)
-                echo "TideFS FUSE bounded smoke classifies generic/011 parallel dirstress as a current product scalability limitation instead of an opaque timeout"
-                ;;
             generic/013)
                 echo "TideFS FUSE bounded smoke classifies generic/013 fsstress as a current product scalability limitation instead of a QEMU-level timeout"
                 ;;
