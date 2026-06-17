@@ -1040,6 +1040,7 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
     export SCRATCH_MNT="$MNT/xfstests-scratch"
     export RESULT_BASE="$RESULTS"
     export TIDEFS_XFSTESTS_TRACE=__XFSTESTS_TRACE__
+    FOCUSED_TESTS=__XFSTESTS_FOCUSED_TESTS__
     PER_TEST_TIMEOUT=__XFSTESTS_PER_TEST_TIMEOUT__
     GENERIC_013_TIMEOUT=__XFSTESTS_GENERIC_013_TIMEOUT__
     ACTIVE_TEST_TIMEOUT="$PER_TEST_TIMEOUT"
@@ -1069,14 +1070,41 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             mounts_target="$1"
             awk -v target="$mounts_target" '$2 == target { found = 1 } END { exit(found ? 0 : 1) }' /proc/mounts
         }
+        stop_tidefs_daemons_for_mount() {
+            daemon_mount="$1"
+            for proc_dir in /proc/[0-9]*; do
+                [ -d "$proc_dir" ] || continue
+                pid="''${proc_dir#/proc/}"
+                cmd=$(tr '\000' ' ' <"$proc_dir/cmdline" 2>/dev/null || true)
+                case "$cmd" in
+                    *"tidefs-posix-filesystem-adapter-daemon "*"--mount $daemon_mount "*)
+                        echo "cleanup: stop TideFS daemon pid=$pid mount=$daemon_mount"
+                        kill "$pid" 2>/dev/null || true
+                        ;;
+                esac
+            done
+            sleep 1
+            for proc_dir in /proc/[0-9]*; do
+                [ -d "$proc_dir" ] || continue
+                pid="''${proc_dir#/proc/}"
+                cmd=$(tr '\000' ' ' <"$proc_dir/cmdline" 2>/dev/null || true)
+                case "$cmd" in
+                    *"tidefs-posix-filesystem-adapter-daemon "*"--mount $daemon_mount "*)
+                        echo "cleanup: kill TideFS daemon pid=$pid mount=$daemon_mount"
+                        kill -9 "$pid" 2>/dev/null || true
+                        ;;
+                esac
+            done
+        }
         unmount_path_bounded() {
             unmount_target="$1"
             [ -e "$unmount_target" ] || return 0
             is_mounted_path "$unmount_target" || return 0
-            if timeout 10 umount "$unmount_target" 2>/tmp/tidefs-umount.err; then
+            if timeout -k 5s 10s umount "$unmount_target" 2>/tmp/tidefs-umount.err; then
                 return 0
             fi
-            if timeout 10 umount -l "$unmount_target" 2>/tmp/tidefs-umount-lazy.err; then
+            stop_tidefs_daemons_for_mount "$unmount_target"
+            if timeout -k 5s 10s umount -l "$unmount_target" 2>/tmp/tidefs-umount-lazy.err; then
                 return 0
             fi
             echo "cleanup: failed to unmount $unmount_target"
@@ -1106,8 +1134,8 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
             unmount_path_bounded "$nested_mnt" || true
         done
         echo "cleanup: stop nested TideFS daemons"
-        pkill -f "tidefs-posix-filesystem-adapter-daemon.*--mount $TEST_DIR" 2>/dev/null || true
-        pkill -f "tidefs-posix-filesystem-adapter-daemon.*--mount $SCRATCH_MNT" 2>/dev/null || true
+        stop_tidefs_daemons_for_mount "$TEST_DIR"
+        stop_tidefs_daemons_for_mount "$SCRATCH_MNT"
         echo "cleanup: remove xfstests tmp"
         rm -rf /tmp/xfstests.* /tmp/cutmp* 2>/dev/null || true
         echo "cleanup: remove xfstests results"
@@ -1502,10 +1530,10 @@ if [ "$MOUNTED" -eq 1 ]; then
     if ! run_cleanup_xfstests_test_bounded "phase4" "teardown" "$RESULTS" /dev/null; then
         fail "cleanup" "phase4 cleanup timed out"
     fi
-    timeout 10 umount "$MNT/xfstests-test" 2>/dev/null || timeout 10 umount -l "$MNT/xfstests-test" 2>/dev/null || true
-    timeout 10 umount "$MNT/xfstests-scratch" 2>/dev/null || timeout 10 umount -l "$MNT/xfstests-scratch" 2>/dev/null || true
+    timeout -k 5s 10s umount "$MNT/xfstests-test" 2>/dev/null || timeout -k 5s 10s umount -l "$MNT/xfstests-test" 2>/dev/null || true
+    timeout -k 5s 10s umount "$MNT/xfstests-scratch" 2>/dev/null || timeout -k 5s 10s umount -l "$MNT/xfstests-scratch" 2>/dev/null || true
     # Unmount the main mountpoint
-    if timeout 20 umount "$MNT" 2>/tmp/um.err; then
+    if timeout -k 5s 20s umount "$MNT" 2>/tmp/um.err; then
         pass "unmount"
     else
         fail "unmount" "$(cat /tmp/um.err 2>/dev/null || echo "umount timed out")"
@@ -1554,6 +1582,7 @@ INITSCRIPT
     sed -i "s|__XFSTESTS_TESTS__|$TEST_LIST|g" "$RUN_DIR/init"
     sed -i "s|__ROOT_AUTH_KEY__|$ROOT_AUTH_KEY|g" "$RUN_DIR/init"
     sed -i "s|__XFSTESTS_TRACE__|$TRACE_XFSTESTS|g" "$RUN_DIR/init"
+    sed -i "s|__XFSTESTS_FOCUSED_TESTS__|$FOCUSED_TESTS|g" "$RUN_DIR/init"
     sed -i "s|__XFSTESTS_PER_TEST_TIMEOUT__|$PER_TEST_TIMEOUT_SEC|g" "$RUN_DIR/init"
     sed -i "s|__XFSTESTS_GENERIC_013_TIMEOUT__|$GENERIC_013_TIMEOUT_SEC|g" "$RUN_DIR/init"
     sed -i "s|__PANIC_ON_WARN_MODE__|$PANIC_ON_WARN_MODE|g" "$RUN_DIR/init"
