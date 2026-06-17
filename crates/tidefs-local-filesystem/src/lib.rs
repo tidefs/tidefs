@@ -5916,7 +5916,7 @@ impl LocalFileSystem {
                 dedup_index: &mut dedup,
                 quorum_store: self.quorum_store.as_mut(),
                 compression_policy: &self.content_compression_policy,
-})
+            })
         };
         if let Err(err) = result {
             self.rollback_mutation_delta();
@@ -7251,7 +7251,7 @@ impl LocalFileSystem {
             hole_length: effective_length,
             quorum_store,
             compression_policy: &self.content_compression_policy,
-})?;
+        })?;
 
         // Update the inode record in the inode table.
         self.update_inode_record(inode_id, updated)?;
@@ -7365,7 +7365,7 @@ impl LocalFileSystem {
             hole_length: effective_length,
             quorum_store: self.quorum_store.as_mut(),
             compression_policy: &self.content_compression_policy,
-})?;
+        })?;
         // Capture old record in mutation delta BEFORE replacing it
         self.mark_inode_metadata_dirty(inode_id);
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated.clone());
@@ -7653,7 +7653,7 @@ impl LocalFileSystem {
             hole_length: effective_length,
             quorum_store: self.quorum_store.as_mut(),
             compression_policy: &self.content_compression_policy,
-})?;
+        })?;
         self.mark_inode_metadata_dirty(inode_id);
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated.clone());
         self.inode_cache.borrow_mut().invalidate(inode_id);
@@ -9093,7 +9093,8 @@ impl LocalFileSystem {
                 &content,
                 &mut dedup,
                 self.quorum_store.as_mut(),
-                &self.content_compression_policy,            )
+                &self.content_compression_policy,
+            )
         };
         if let Err(err) = result {
             self.rollback_mutation_delta();
@@ -9202,7 +9203,7 @@ impl LocalFileSystem {
                 dedup_index: &mut dedup,
                 quorum_store: self.quorum_store.as_mut(),
                 compression_policy: &self.content_compression_policy,
-})
+            })
         };
         if let Err(err) = result {
             self.rollback_mutation_delta();

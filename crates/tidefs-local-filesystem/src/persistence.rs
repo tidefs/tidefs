@@ -137,7 +137,8 @@ pub(crate) fn ensure_versioned_content_object(
         &content,
         &mut DedupIndex::new(),
         None,
-        compression_policy,    )
+        compression_policy,
+    )
 }
 
 pub(crate) fn transaction_manifest_entries_for_existing_content(

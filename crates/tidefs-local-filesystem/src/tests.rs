@@ -10052,8 +10052,14 @@ fn posix_time_record_now_uses_wall_clock() {
     let now = crate::types::PosixTimeRecord::now();
     let after_ns = crate::types::current_posix_time_ns();
     for ts in [now.atime_ns, now.mtime_ns, now.ctime_ns, now.btime_ns] {
-        assert!(ts >= before_ns, "timestamp {ts} before clock snapshot {before_ns}");
-        assert!(ts <= after_ns, "timestamp {ts} after clock snapshot {after_ns}");
+        assert!(
+            ts >= before_ns,
+            "timestamp {ts} before clock snapshot {before_ns}"
+        );
+        assert!(
+            ts <= after_ns,
+            "timestamp {ts} after clock snapshot {after_ns}"
+        );
     }
 }
 
