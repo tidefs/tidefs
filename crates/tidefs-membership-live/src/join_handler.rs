@@ -89,6 +89,12 @@ pub enum JoinRejectionReason {
         current_incarnation: Incarnation,
     },
     InvalidMemberId,
+    /// The pool-scan evidence for the joining member is not committed.
+    UncommittedPoolScan,
+    /// The label agreement for the joining member has not been committed.
+    LabelAgreementNotCommitted,
+    /// The pool-scan does not include the joining member's identity.
+    MemberNotInPoolScan,
 }
 
 impl std::fmt::Display for JoinRejectionReason {
@@ -106,6 +112,15 @@ impl std::fmt::Display for JoinRejectionReason {
                 "stale incarnation: msg={msg_incarnation} current={current_incarnation}"
             ),
             Self::InvalidMemberId => write!(f, "invalid member id"),
+            Self::UncommittedPoolScan => {
+                write!(f, "pool-scan evidence not committed")
+            }
+            Self::LabelAgreementNotCommitted => {
+                write!(f, "label agreement not committed")
+            }
+            Self::MemberNotInPoolScan => {
+                write!(f, "member identity not found in committed pool scan")
+            }
         }
     }
 }
