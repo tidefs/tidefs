@@ -1620,11 +1620,7 @@ impl std::fmt::Display for SecretViolationClass {
 }
 
 /// Relative paths scanned by the secret-policy gate.
-const SECRET_POLICY_SCAN_PATHS: &[&str] = &[
-    ".github/workflows/",
-    "docs/GITHUB_CI.md",
-    "AGENTS.md",
-];
+const SECRET_POLICY_SCAN_PATHS: &[&str] = &[".github/workflows/", "docs/GITHUB_CI.md", "AGENTS.md"];
 
 /// Per-line allowlist: (file_rel_path, line_substring).
 ///
@@ -1635,7 +1631,10 @@ const SECRET_POLICY_ALLOWLIST: &[(&str, &str)] = &[
     // docs/GITHUB_CI.md explains the policy; its mentions are educational.
     ("docs/GITHUB_CI.md", "Do not use GitHub deploy keys"),
     ("docs/GITHUB_CI.md", "`secrets.*` workflow expressions"),
-    ("docs/GITHUB_CI.md", "Secrets such as runner registration tokens"),
+    (
+        "docs/GITHUB_CI.md",
+        "Secrets such as runner registration tokens",
+    ),
     ("docs/GITHUB_CI.md", "encrypted secret payloads"),
     // AGENTS.md references the policy; not secret storage.
     ("AGENTS.md", "`secrets.*`"),
@@ -1643,13 +1642,15 @@ const SECRET_POLICY_ALLOWLIST: &[(&str, &str)] = &[
     ("AGENTS.md", "runner registration tokens"),
     ("AGENTS.md", "encrypted secret payloads"),
     ("AGENTS.md", "encrypted secret blobs"),
-    // The secret-policy workflow uses `secrets` in a grep pattern to detect
-    // violations — it is the detector, not the violation.
-    (".github/workflows/secret-policy.yml", "secrets"),
-    (".github/workflows/secret-policy.yml", "secret-policy"),
     // The nexus relay workflow references a host-local secret file.
-    (".github/workflows/tidefs-codex-nexus-relay.yml", "NEXUS_SECRET_FILE"),
-    (".github/workflows/tidefs-codex-nexus-relay.yml", "/etc/tidefs-codex-nexus/webhook-secret"),
+    (
+        ".github/workflows/tidefs-codex-nexus-relay.yml",
+        "NEXUS_SECRET_FILE",
+    ),
+    (
+        ".github/workflows/tidefs-codex-nexus-relay.yml",
+        "/etc/tidefs-codex-nexus/webhook-secret",
+    ),
 ];
 
 // ── Pattern matchers (no regex dependency — simple substring matching) ──
@@ -1669,9 +1670,7 @@ fn classify_secret_violation(rel_path: &str, line: &str) -> Option<SecretViolati
     }
 
     // 2. Deploy key references.
-    if lower.contains("deploy_key")
-        || lower.contains("deploy-key")
-        || lower.contains("deploy key")
+    if lower.contains("deploy_key") || lower.contains("deploy-key") || lower.contains("deploy key")
     {
         return Some(SecretViolationClass::DeployKey);
     }
@@ -1825,10 +1824,8 @@ pub fn check_secret_policy_current_workspace() -> Result<(), WorkspacePolicyErro
                 let entry = match entry {
                     Ok(e) => e,
                     Err(err) => {
-                        violations.push(format!(
-                            "cannot read entry in {}: {err}",
-                            target.display()
-                        ));
+                        violations
+                            .push(format!("cannot read entry in {}: {err}", target.display()));
                         continue;
                     }
                 };
@@ -1870,11 +1867,7 @@ pub fn check_secret_policy_current_workspace() -> Result<(), WorkspacePolicyErro
     }
 }
 
-fn scan_file_for_secret_violations(
-    root: &Path,
-    rel_path: &str,
-    violations: &mut Vec<String>,
-) {
+fn scan_file_for_secret_violations(root: &Path, rel_path: &str, violations: &mut Vec<String>) {
     let full_path = root.join(rel_path);
     let text = match std::fs::read_to_string(&full_path) {
         Ok(t) => t,
@@ -3206,23 +3199,27 @@ license = "GPL-2.0-only WITH Linux-syscall-note"
     }
 
     #[test]
-    fn secret_policy_workflow_self_is_allowlisted() {
-        // The secret-policy.yml grep pattern uses the word "secrets" to
-        // detect violations; that must not be a self-hit.
-        let line = "          pattern='secrets[[:space:]]*[.]'";
-        assert!(classify_secret_violation(
-            ".github/workflows/secret-policy.yml",
-            line
-        ).is_none());
+    fn secret_policy_command_name_is_not_a_secret_surface() {
+        let line = "          cargo run -p tidefs-xtask -- check-secret-policy";
+        assert!(classify_secret_violation(".github/workflows/secret-policy.yml", line).is_none());
+    }
+
+    #[test]
+    fn secret_policy_workflow_secrets_context_is_not_allowlisted() {
+        let line = "          TOKEN: ${{ secrets.DEPLOY_TOKEN }}";
+        assert_eq!(
+            classify_secret_violation(".github/workflows/secret-policy.yml", line),
+            Some(SecretViolationClass::SecretsContext)
+        );
     }
 
     #[test]
     fn nexus_relay_secret_file_is_allowlisted() {
         let line = "      NEXUS_SECRET_FILE: /etc/tidefs-codex-nexus/webhook-secret";
-        assert!(classify_secret_violation(
-            ".github/workflows/tidefs-codex-nexus-relay.yml",
-            line
-        ).is_none());
+        assert!(
+            classify_secret_violation(".github/workflows/tidefs-codex-nexus-relay.yml", line)
+                .is_none()
+        );
     }
 
     #[test]
