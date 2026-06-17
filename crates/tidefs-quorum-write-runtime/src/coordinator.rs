@@ -10,6 +10,9 @@ use tidefs_quorum_write::{
     NodeId, QuorumWriteId, QuorumWriteResult, QuorumWriteSummary, QuorumWriteTargetRecord,
     TransferTicketId, WriteClass, WriteReceiptId,
 };
+use tidefs_replication_model::{
+    CommittedReceiptIdentity, PlacementReceiptRef, ReplicatedReceiptId,
+};
 
 use crate::config::QuorumWriteConfig;
 use crate::config::WriteQuorumConfig;
@@ -260,30 +263,58 @@ impl QuorumWriteRuntime {
         // Resolve the write: clone resolution before committing
         let resolution = leader.resolve(wid).cloned();
         let quorum_was_met = matches!(&resolution, Some(QuorumWriteResolution::QuorumMet { .. }));
-        let (write_class, acks_count, placement_receipts) = if quorum_was_met {
-            let _receipt = leader.commit(wid);
-            let receipts: Vec<WriteReceiptId> = targets
-                .iter()
-                .take(total_acks)
-                .enumerate()
-                .map(|(i, _)| WriteReceiptId::new(wid.0 * 100 + i as u64))
-                .collect();
-            if total_acks < target_count {
-                (WriteClass::DegradedCommitted, total_acks as u64, receipts)
+        let (write_class, acks_count, placement_receipts, committed_nodes) = if quorum_was_met {
+            if let Some(receipt) = leader.commit(wid) {
+                let receipts: Vec<WriteReceiptId> = receipt
+                    .durability_token
+                    .receipt_ids()
+                    .into_iter()
+                    .map(|receipt_id| WriteReceiptId::new(receipt_id.0))
+                    .collect();
+                let committed_nodes: Vec<NodeId> = receipt
+                    .committed_targets
+                    .iter()
+                    .map(|member| NodeId::new(member.0))
+                    .collect();
+                let write_class = if receipt.partial {
+                    WriteClass::DegradedCommitted
+                } else {
+                    WriteClass::Committed
+                };
+                (
+                    write_class,
+                    receipt.durability_token.committed_count() as u64,
+                    receipts,
+                    committed_nodes,
+                )
             } else {
-                (WriteClass::Committed, total_acks as u64, receipts)
+                (WriteClass::RefusedNoQuorum, 0, Vec::new(), Vec::new())
             }
         } else {
             match &resolution {
-                Some(QuorumWriteResolution::QuorumFailed { acks, .. }) => {
-                    (WriteClass::RefusedNoQuorum, *acks as u64, Vec::new())
-                }
+                Some(QuorumWriteResolution::QuorumFailed { acks, .. }) => (
+                    WriteClass::RefusedNoQuorum,
+                    *acks as u64,
+                    Vec::new(),
+                    Vec::new(),
+                ),
                 _ => {
                     // Should not happen in synchronous dispatch
-                    (WriteClass::RefusedNoQuorum, total_acks as u64, Vec::new())
+                    (
+                        WriteClass::RefusedNoQuorum,
+                        total_acks as u64,
+                        Vec::new(),
+                        Vec::new(),
+                    )
                 }
             }
         };
+
+        for record in &mut target_records {
+            let committed = committed_nodes.contains(&record.target);
+            record.commit_acked = committed;
+            record.witness_attested = committed;
+        }
 
         let result = QuorumWriteResult {
             write_id: QuorumWriteId::new(wid.0),
@@ -295,7 +326,7 @@ impl QuorumWriteRuntime {
             quorum_size: min_quorum as u64,
             durability_mode,
             placement_receipts,
-            witnesses: targets.to_vec(),
+            witnesses: committed_nodes.clone(),
             needs_repair: write_class == WriteClass::DegradedCommitted,
             digests_matched: true,
             digest: expected_digest,
@@ -524,6 +555,8 @@ fn compute_sha256_digest(data: &[u8]) -> u64 {
 pub struct QuorumWriteLeader {
     /// Per-write quorum threshold config.
     config: WriteQuorumConfig,
+    /// Membership epoch used to bind committed receipt identities.
+    epoch: EpochId,
     /// Replication protocol for fanout and receipt tracking.
     protocol: ReplicationProtocol,
     /// Open write state: write_id -> (handle, chunk_class, target_count).
@@ -555,6 +588,7 @@ impl QuorumWriteLeader {
     ) -> Self {
         Self {
             config,
+            epoch,
             protocol: ReplicationProtocol::new(epoch),
             open_writes: BTreeMap::new(),
             default_phase_timeout: phase_timeout,
@@ -599,6 +633,19 @@ impl QuorumWriteLeader {
         replica: NodeId,
         digest_ok: bool,
     ) -> (QuorumAckOutcome, Option<WriteResult>) {
+        let committed_receipt =
+            digest_ok.then(|| self.committed_receipt_identity(write_id, replica));
+        self.record_ack_with_receipt(write_id, replica, digest_ok, committed_receipt)
+    }
+
+    /// Record an acknowledgement with explicit committed receipt evidence.
+    pub fn record_ack_with_receipt(
+        &mut self,
+        write_id: WriteId,
+        replica: NodeId,
+        digest_ok: bool,
+        committed_receipt: Option<CommittedReceiptIdentity>,
+    ) -> (QuorumAckOutcome, Option<WriteResult>) {
         // Record in the protocol layer
         let member = Self::node_to_member(replica);
         self.protocol.collect_ack(
@@ -606,12 +653,17 @@ impl QuorumWriteLeader {
             WriteAck {
                 target: member,
                 digest_ok,
-                placement_receipt_ref: None,
+                committed_receipt,
             },
         );
 
         // Record in the handle
-        let outcome = if let Some(entry) = self.open_writes.get_mut(&write_id.0) {
+        let receipt_committed = committed_receipt
+            .map(|receipt| receipt.is_committed_for(member, self.epoch))
+            .unwrap_or(false);
+        let outcome = if !receipt_committed {
+            QuorumAckOutcome::AckReceived
+        } else if let Some(entry) = self.open_writes.get_mut(&write_id.0) {
             entry.handle.record_ack(replica)
         } else {
             QuorumAckOutcome::AlreadyResolved
@@ -779,6 +831,33 @@ impl QuorumWriteLeader {
 
     fn node_to_member(n: NodeId) -> MemberId {
         MemberId::new(n.0)
+    }
+
+    fn committed_receipt_identity(
+        &self,
+        write_id: WriteId,
+        replica: NodeId,
+    ) -> CommittedReceiptIdentity {
+        let member = Self::node_to_member(replica);
+        let generation = write_id.0.saturating_mul(1000).saturating_add(replica.0);
+        let mut object_key = [0u8; 32];
+        object_key[..8].copy_from_slice(&write_id.0.to_le_bytes());
+        object_key[8..16].copy_from_slice(&replica.0.to_le_bytes());
+        let mut payload_digest = [0u8; 32];
+        payload_digest[..8].copy_from_slice(&generation.to_le_bytes());
+        CommittedReceiptIdentity::new(
+            member,
+            ReplicatedReceiptId::new(generation),
+            PlacementReceiptRef::replicated(
+                write_id.0,
+                object_key,
+                self.epoch,
+                generation,
+                1,
+                0,
+                payload_digest,
+            ),
+        )
     }
 }
 
@@ -983,7 +1062,10 @@ mod tests {
         );
         rt.set_targets(vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)]);
         let (r, _) = rt.execute_write("o2", b"qdata").unwrap();
-        assert_eq!(r.write_class, WriteClass::Committed);
+        assert_eq!(r.write_class, WriteClass::DegradedCommitted);
+        assert_eq!(r.acks_count, 2);
+        assert_eq!(r.placement_receipts.len(), 2);
+        assert_eq!(r.witnesses.len(), 2);
     }
 
     #[test]
