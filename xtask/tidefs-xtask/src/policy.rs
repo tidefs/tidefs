@@ -1658,15 +1658,15 @@ const SECRET_POLICY_ALLOWLIST: &[(&str, &str)] = &[
 /// Returns the violation class if `line` contains a forbidden secret surface,
 /// and the match is not covered by the allowlist for `rel_path`.
 fn classify_secret_violation(rel_path: &str, line: &str) -> Option<SecretViolationClass> {
-    if is_secret_policy_allowed(rel_path, line) {
-        return None;
-    }
-
     let lower = line.to_lowercase();
 
     // 1. secrets.* context — the primary GitHub Actions secret surface.
     if has_secrets_context(line) {
         return Some(SecretViolationClass::SecretsContext);
+    }
+
+    if is_secret_policy_allowed(rel_path, line) {
+        return None;
     }
 
     // 2. Deploy key references.
@@ -1755,43 +1755,8 @@ fn is_host_local_secret_path(line: &str) -> bool {
     false
 }
 
-/// Build a safe, truncated snippet that does not leak secret values.
-fn safe_snippet(line: &str) -> String {
-    let trimmed = line.trim();
-    let capped: &str = if trimmed.len() > 120 {
-        &trimmed[..120]
-    } else {
-        trimmed
-    };
-    // Redact `${{ secrets.X }}` blocks so the report never includes
-    // secret names.
-    redact_secrets_expressions(capped)
-}
-
-fn redact_secrets_expressions(text: &str) -> String {
-    // Replace `${{ secrets.XXX }}` patterns with `${{ secrets.<redacted> }}`.
-    // Handles both `${{ secrets.X }}` and `${{secrets.X}}` spacing.
-    let mut result = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(b"${{") {
-            let rest = &bytes[i + 3..];
-            let rest_str = std::str::from_utf8(rest).unwrap_or("");
-            let trimmed = rest_str.trim_start();
-            if trimmed.starts_with("secrets.") {
-                // Find the closing `}}`.
-                if let Some(end) = rest_str.find("}}") {
-                    result.push_str("${{ secrets.<redacted> }}");
-                    i += 3 + end + 2; // skip past `}}`
-                    continue;
-                }
-            }
-        }
-        result.push(bytes[i] as char);
-        i += 1;
-    }
-    result
+fn format_secret_violation(rel_path: &str, line_no: usize, class: SecretViolationClass) -> String {
+    format!("{rel_path}:{line_no}: forbidden GitHub secret surface ({class})")
 }
 
 // ── Public entry point ─────────────────────────────────────────────────
@@ -1880,10 +1845,7 @@ fn scan_file_for_secret_violations(root: &Path, rel_path: &str, violations: &mut
     for (line_idx, line_text) in text.lines().enumerate() {
         let line_no = line_idx + 1; // 1-based for human reports.
         if let Some(class) = classify_secret_violation(rel_path, line_text) {
-            let snippet = safe_snippet(line_text);
-            violations.push(format!(
-                "{rel_path}:{line_no}: forbidden GitHub secret surface ({class}): {snippet}",
-            ));
+            violations.push(format_secret_violation(rel_path, line_no, class));
         }
     }
 }
@@ -3175,27 +3137,22 @@ license = "GPL-2.0-only WITH Linux-syscall-note"
     }
 
     #[test]
-    fn redact_secrets_expression_masks_secret_name() {
-        let input = "run: echo ${{ secrets.MY_SECRET }}";
-        let output = redact_secrets_expressions(input);
-        assert!(!output.contains("MY_SECRET"));
-        assert!(output.contains("<redacted>"));
+    fn host_local_path_does_not_allow_github_secrets_context() {
+        let line = "          TOKEN: ${{ secrets.DEPLOY_TOKEN }} # /etc/tidefs/local-secret";
+        assert_eq!(
+            classify_secret_violation("test.yml", line),
+            Some(SecretViolationClass::SecretsContext)
+        );
     }
 
     #[test]
-    fn redact_secrets_preserves_non_secret_text() {
-        let input = "run: echo \"hello\" && curl -H 'Auth: Bearer ${{ secrets.TOKEN }}'";
-        let output = redact_secrets_expressions(input);
-        assert!(output.contains("echo \"hello\""));
-        assert!(output.contains("curl"));
-        assert!(!output.contains("TOKEN"));
-    }
-
-    #[test]
-    fn safe_snippet_truncates_long_lines() {
-        let long_line = "          run: ".to_string() + &"x".repeat(200);
-        let snippet = safe_snippet(&long_line);
-        assert!(snippet.len() <= 120);
+    fn violation_report_omits_source_line_snippet() {
+        let report = format_secret_violation("test.yml", 42, SecretViolationClass::SecretsContext);
+        assert_eq!(
+            report,
+            "test.yml:42: forbidden GitHub secret surface (secrets-context)"
+        );
+        assert!(!report.contains("DEPLOY_TOKEN"));
     }
 
     #[test]
