@@ -140,6 +140,7 @@ pub(crate) fn ensure_versioned_content_object(
         &mut DedupIndex::new(),
         None,
         compression_policy,
+        0,
     )
 }
 

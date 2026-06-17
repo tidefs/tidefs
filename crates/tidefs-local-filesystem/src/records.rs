@@ -123,6 +123,13 @@ pub(crate) struct ContentChunkRef {
     pub(crate) data_version: u64,
     pub(crate) len: u32,
     pub(crate) checksum: IntegrityDigest64,
+    /// Pool placement receipt generation that made this chunk durable.
+    ///
+    /// Zero means no receipt was captured (pre-v6 format, hole chunks,
+    /// or writes that predate receipt capture).  When non-zero, the
+    /// (object_key, generation) pair uniquely identifies the pool
+    /// placement receipt that locates this extent.
+    pub(crate) placement_receipt_generation: u64,
 }
 
 impl ContentChunkRef {
@@ -139,11 +146,18 @@ impl ContentChunkRef {
             data_version: Self::HOLE_SENTINEL,
             len,
             checksum: IntegrityDigest64(0),
+            placement_receipt_generation: 0,
         }
     }
 
+    /// Returns true when this chunk reference represents a hole.
+    ///
+    /// Hole chunks carry no backing object-store data and must have
+    /// placement_receipt_generation == 0.
     pub(crate) fn is_hole(&self) -> bool {
-        self.data_version == Self::HOLE_SENTINEL && self.checksum == IntegrityDigest64(0)
+        self.data_version == Self::HOLE_SENTINEL
+            && self.checksum == IntegrityDigest64(0)
+            && self.placement_receipt_generation == 0
     }
 }
 

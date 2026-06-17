@@ -543,6 +543,7 @@ mod tests {
             data_version: 1,
             len: 100,
             checksum: IntegrityDigest64(0),
+            placement_receipt_generation: 0,
         };
         let outcome = scrub_content_chunk(fs.store_ref(), InodeId::new(999), &chunk_ref);
         match outcome {

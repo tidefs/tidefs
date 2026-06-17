@@ -1080,6 +1080,8 @@ fn encode_content_manifest_impl(manifest: &ContentManifestObject, sparse: bool) 
     push_u64(&mut out, manifest.file_size);
     push_u32(&mut out, manifest.chunk_size);
     push_u32(&mut out, 0);
+    // Format v6: each chunk entry carries a placement receipt generation
+    // for durable pool placement authority.
     push_u64(&mut out, manifest.chunks.len() as u64);
     for chunk in &manifest.chunks {
         push_u64(&mut out, chunk.chunk_index);
@@ -1087,6 +1089,7 @@ fn encode_content_manifest_impl(manifest: &ContentManifestObject, sparse: bool) 
         push_u32(&mut out, chunk.len);
         push_u32(&mut out, 0);
         push_u64(&mut out, chunk.checksum.get());
+        push_u64(&mut out, chunk.placement_receipt_generation);
     }
     out
 }
@@ -1124,8 +1127,9 @@ pub(crate) fn decode_content_manifest(bytes: &[u8]) -> Result<ContentManifestObj
             reason: "reserved chunk-size field is non-zero",
         });
     }
-    // Each chunk entry is 32 bytes. Cap count from remaining bytes to
-    // prevent OOM from corrupt or malicious count values.
+    // Each chunk entry is 40 bytes (v6) or 32 bytes (v5).
+    // Cap count from remaining bytes to prevent OOM from corrupt or
+    // malicious count values.
     let max_chunks = decoder.remaining() / 32;
     let count = decoder.read_count_bounded(max_chunks)?;
     if count > file_size as usize {
@@ -1146,11 +1150,19 @@ pub(crate) fn decode_content_manifest(bytes: &[u8]) -> Result<ContentManifestObj
             });
         }
         let checksum = IntegrityDigest64(decoder.read_u64()?);
+        // placement_receipt_generation was introduced in format v6.
+        // Earlier manifests have 32-byte chunk entries without this field.
+        let placement_receipt_generation = if version >= 6 && decoder.remaining() >= 8 {
+            decoder.read_u64()?
+        } else {
+            0
+        };
         chunks.push(ContentChunkRef {
             chunk_index,
             data_version: chunk_data_version,
             len,
             checksum,
+            placement_receipt_generation,
         });
     }
     decoder.finish()?;

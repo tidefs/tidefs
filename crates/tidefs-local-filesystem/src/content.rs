@@ -31,6 +31,7 @@ pub(crate) struct WriteChunkedContentOverlay<'a> {
     pub dedup_index: &'a mut DedupIndex,
     pub quorum_store: Option<&'a mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     pub compression_policy: &'a ContentCompressionPolicy,
+    pub placement_receipt_generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +51,7 @@ pub(crate) struct WriteChunkedContentPatchBatch<'a> {
     pub dedup_index: &'a mut DedupIndex,
     pub quorum_store: Option<&'a mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     pub compression_policy: &'a ContentCompressionPolicy,
+    pub placement_receipt_generation: u64,
 }
 
 pub(crate) struct PunchHoleContent<'a> {
@@ -61,6 +63,7 @@ pub(crate) struct PunchHoleContent<'a> {
     pub hole_length: u64,
     pub quorum_store: Option<&'a mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     pub compression_policy: &'a ContentCompressionPolicy,
+    pub placement_receipt_generation: u64,
 }
 
 pub(crate) fn read_content_from_store(
@@ -376,7 +379,9 @@ pub(crate) fn write_chunked_content(
     dedup_index: &mut DedupIndex,
     mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     compression_policy: &ContentCompressionPolicy,
+    placement_receipt_generation: u64,
 ) -> Result<()> {
+    let _ = placement_receipt_generation;
     let actual_size = u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
         requested: u64::MAX,
     })?;
@@ -447,7 +452,8 @@ pub(crate) fn write_chunked_content(
             data_version: record.data_version,
             len: chunk_bytes.len() as u32,
             checksum,
-        });
+                    placement_receipt_generation: 0,
+});
     }
     let manifest = ContentManifestObject {
         inode_id: record.inode_id,
@@ -475,7 +481,9 @@ fn write_same_size_sparse_overlay(
     dedup_index: &mut DedupIndex,
     mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     compression_policy: &ContentCompressionPolicy,
+    placement_receipt_generation: u64,
 ) -> Result<()> {
+    let _ = placement_receipt_generation;
     let chunk_count = content_chunk_count(new_record.size)?;
     let mut chunks_by_index = BTreeMap::new();
     for old_ref in &old_manifest.chunks {
@@ -597,7 +605,8 @@ fn write_same_size_sparse_overlay(
                 data_version: new_record.data_version,
                 len: chunk_bytes.len() as u32,
                 checksum,
-            },
+                        placement_receipt_generation: 0,
+},
         );
     }
 
@@ -628,7 +637,9 @@ fn write_same_size_sparse_patch_batch(
     dedup_index: &mut DedupIndex,
     mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     compression_policy: &ContentCompressionPolicy,
+    placement_receipt_generation: u64,
 ) -> Result<()> {
+    let _ = placement_receipt_generation;
     let chunk_count = content_chunk_count(new_record.size)?;
     let mut patches_by_chunk: BTreeMap<u64, Vec<ContentOverlayPatch<'_>>> = BTreeMap::new();
     for patch in patches {
@@ -746,7 +757,8 @@ fn write_same_size_sparse_patch_batch(
                 data_version: new_record.data_version,
                 len: chunk_bytes.len() as u32,
                 checksum,
-            },
+                        placement_receipt_generation: 0,
+},
         );
     }
 
@@ -851,7 +863,8 @@ fn write_same_size_sparse_patch_batch(
                 data_version: new_record.data_version,
                 len: chunk_bytes.len() as u32,
                 checksum,
-            },
+                        placement_receipt_generation: 0,
+},
         );
     }
 
@@ -879,7 +892,9 @@ fn write_sparse_size_change(
     dedup_index: &mut DedupIndex,
     mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     compression_policy: &ContentCompressionPolicy,
+    placement_receipt_generation: u64,
 ) -> Result<()> {
+    let _ = placement_receipt_generation;
     let new_chunk_count = content_chunk_count(new_record.size)?;
     let max_retained_chunks = usize::try_from(new_chunk_count).unwrap_or(usize::MAX);
     let mut chunks = Vec::with_capacity(old_manifest.chunks.len().min(max_retained_chunks));
@@ -970,7 +985,8 @@ fn write_sparse_size_change(
             data_version: new_record.data_version,
             len: expected_len,
             checksum,
-        });
+                    placement_receipt_generation: 0,
+});
     }
 
     let manifest = ContentManifestObject {
@@ -1004,6 +1020,7 @@ pub(crate) fn write_chunked_content_with_overlay(
         dedup_index,
         mut quorum_store,
         compression_policy,
+        placement_receipt_generation,
     } = request;
     let old_layout = read_content_layout_from_store(store, inode_id, old_record, true)?;
     if allow_holes && overlay_bytes.is_empty() {
@@ -1016,6 +1033,7 @@ pub(crate) fn write_chunked_content_with_overlay(
                 dedup_index,
                 quorum_store,
                 compression_policy,
+                placement_receipt_generation,
             );
         }
     }
@@ -1033,6 +1051,7 @@ pub(crate) fn write_chunked_content_with_overlay(
                 dedup_index,
                 quorum_store,
                 compression_policy,
+                placement_receipt_generation,
             );
         }
     }
@@ -1168,7 +1187,8 @@ pub(crate) fn write_chunked_content_with_overlay(
             data_version: new_record.data_version,
             len: chunk_bytes.len() as u32,
             checksum,
-        });
+                    placement_receipt_generation: 0,
+});
     }
     let manifest = ContentManifestObject {
         inode_id: new_record.inode_id,
@@ -1200,6 +1220,7 @@ pub(crate) fn write_chunked_content_with_patch_batch(
         dedup_index,
         quorum_store,
         compression_policy,
+        placement_receipt_generation,
     } = request;
     let old_layout = read_content_layout_from_store(store, inode_id, old_record, true)?;
     if allow_holes && old_record.size <= new_record.size {
@@ -1215,6 +1236,7 @@ pub(crate) fn write_chunked_content_with_patch_batch(
                 dedup_index,
                 quorum_store,
                 compression_policy,
+                placement_receipt_generation,
             );
         }
     }
@@ -1234,7 +1256,9 @@ pub(crate) fn punch_hole_content(request: PunchHoleContent<'_>) -> Result<()> {
         hole_length,
         mut quorum_store,
         compression_policy,
+        placement_receipt_generation,
     } = request;
+    let _ = placement_receipt_generation;
     let old_layout = read_content_layout_from_store(store, inode_id, old_record, true)?;
 
     // Handle inline content: zero the hole range in-place and re-encode.
@@ -1312,7 +1336,8 @@ pub(crate) fn punch_hole_content(request: PunchHoleContent<'_>) -> Result<()> {
                 data_version: new_record.data_version,
                 len: modified.len() as u32,
                 checksum,
-            });
+                        placement_receipt_generation: 0,
+});
         } else {
             // Existing sparse marker partially overlaps the hole. Keep the
             // marker so sparse tail-length metadata survives unchanged.
@@ -1797,7 +1822,8 @@ pub(crate) fn reflink_chunked_content(
                         data_version: dest_record.data_version,
                         len: src_chunk_ref.len,
                         checksum: checksum64(&src_encoded),
-                    });
+                                placement_receipt_generation: 0,
+});
                 }
                 let dest_manifest = ContentManifestObject {
                     inode_id: dest_record.inode_id,
@@ -1880,7 +1906,8 @@ pub(crate) fn reflink_chunked_content(
                     data_version: dest_record.data_version,
                     len: src_chunk_ref.len,
                     checksum: checksum64(&redirect),
-                });
+                            placement_receipt_generation: 0,
+});
             }
 
             let dest_manifest = ContentManifestObject {
