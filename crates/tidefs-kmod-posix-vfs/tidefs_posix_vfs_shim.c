@@ -5789,6 +5789,108 @@ static int tidefs_posix_vfs_read_folio(struct file *file, struct folio *folio)
 	return 0;
 }
 
+
+/*
+ * Engine-backed readahead for regular files.  Populates clean page-cache
+ * folios from the engine for the range described by rac.  The folios are
+ * populated and marked uptodate on success; on engine-read failure or
+ * short read the folio is unlocked without marking it uptodate so the
+ * kernel will fall back to a synchronous read_folio on demand.
+ *
+ * This is advisory: no mapping_set_error is recorded and dirty state is
+ * never set.  Short reads, holes, EOF, and engine-read errors are handled
+ * as advisory prefetch outcomes without exposing stale bytes or poisoning
+ * later demand reads.
+ */
+static void tidefs_posix_vfs_readahead(struct readahead_control *rac)
+{
+	struct inode *inode = rac->mapping->host;
+	struct tidefs_posix_vfs_mount *ctx;
+	struct folio *folio;
+	loff_t isize;
+
+	if (!inode || !inode->i_sb)
+		return;
+
+	ctx = inode->i_sb->s_fs_info;
+	if (!ctx)
+		return;
+
+	isize = i_size_read(inode);
+
+	while ((folio = readahead_folio(rac)) != NULL) {
+		loff_t pos = folio_pos(folio);
+		size_t fsize = folio_size(folio);
+		size_t read_len;
+		void *kbuf;
+		int ret;
+		u64 fh_ino;
+
+		fh_ino = inode->i_ino;
+
+		/* Beyond EOF: zero-fill the folio and mark it uptodate.
+		 * This avoids leaving an unlocked, non-uptodate folio
+		 * that would trigger an unnecessary read_folio fallback
+		 * for a known hole or EOF region.
+		 */
+		if (pos >= isize) {
+			folio_zero_range(folio, 0, fsize);
+			folio_mark_uptodate(folio);
+			folio_unlock(folio);
+			continue;
+		}
+
+		read_len = min_t(loff_t, (loff_t)fsize, isize - pos);
+		kbuf = kmalloc(read_len, GFP_KERNEL);
+		if (!kbuf) {
+			/* Advisory: skip this folio on transient alloc
+			 * failure; the kernel will retry via read_folio.
+			 */
+			folio_unlock(folio);
+			continue;
+		}
+
+		memset(kbuf, 0, read_len);
+
+		ret = tidefs_posix_vfs_engine_read(fh_ino,
+						   fh_ino, /* fh_id */
+						   (u64)pos,
+						   kbuf,
+						   (u32)read_len);
+		if (ret < 0) {
+			kfree(kbuf);
+			/* Advisory: do not call mapping_set_error.
+			 * Unlock without marking uptodate so the kernel
+			 * falls back to synchronous read_folio on demand.
+			 */
+			folio_unlock(folio);
+			continue;
+		}
+
+		if (ret > 0) {
+			void *addr = kmap_local_folio(folio, 0);
+			size_t copy_len = min_t(size_t, (size_t)ret, read_len);
+
+			memcpy(addr, kbuf, copy_len);
+			kunmap_local(addr);
+
+			/* Zero-fill remainder for short reads
+			 * (holes within the engine range).
+			 */
+			if (copy_len < fsize)
+				folio_zero_range(folio, copy_len,
+						 fsize - copy_len);
+		} else {
+			/* Zero-length engine read: hole. */
+			folio_zero_range(folio, 0, fsize);
+		}
+
+		kfree(kbuf);
+		folio_mark_uptodate(folio);
+		folio_unlock(folio);
+	}
+}
+
 /*
  * address_space_operations vtable for TideFS regular files.
  *
@@ -5801,15 +5903,16 @@ static int tidefs_posix_vfs_read_folio(struct file *file, struct folio *folio)
  * retry. `.invalidate_folio` remains unregistered: mounted truncate,
  * fallocate, direct-write, and copy mutations own live cleanup through the C
  * filemap write-and-wait, unmap, invalidate, and truncate_setsize helpers.
- * Remaining: readahead and C-to-Rust invalidate_folio/page-authority bridge
- * work under Review debt TFR-018.
+ * Remaining: C-to-Rust invalidate_folio/page-authority bridge
+ * work under Review debt TFR-018; readahead is now wired.
  */
 static const struct address_space_operations tidefs_posix_vfs_aops = {
 	.write_begin = tidefs_posix_vfs_write_begin,
 	.write_end   = tidefs_posix_vfs_write_end,
 	.dirty_folio = tidefs_posix_vfs_dirty_folio,
 	.writepages = tidefs_posix_vfs_writepages,
-	.read_folio = tidefs_posix_vfs_read_folio,
+	.read_folio  = tidefs_posix_vfs_read_folio,
+	.readahead  = tidefs_posix_vfs_readahead,
 	/* Remaining fields default to NULL; kernel falls back to
 	 * generic implementations or skips the operation. */
 };

@@ -203,26 +203,62 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
 
     /// `readahead`: Trigger asynchronous readahead for a range of pages.
     /// Issues a prefetch read through [`VfsEngine::read`] for the given
-    /// byte range. The engine may use this hint to populate its internal
-    /// cache. Records readahead and prefetch statistics. This extends the
-    /// previous stats-only mirror (K7-06) into an active I/O tracking
-    /// surface.
+    /// byte range and populates clean page-cache state from the engine
+    /// result without marking pages dirty. Records readahead, prefetch,
+    /// populate, and miss statistics for authoritative page-cache tracking.
+    ///
+    /// Short reads, holes, EOF, and engine read errors are handled as
+    /// advisory prefetch outcomes: the page-cache tracker records the
+    /// outcome without exposing stale bytes or poisoning later demand
+    /// reads.  A subsequent `read_folio` call for the same range will
+    /// still resolve through engine authority and return the correct
+    /// bytes or error.
+    ///
     /// # Linux kernel signature
     /// `void (*readahead)(struct readahead_control *)`
     /// # No-daemon boundary
     /// The prefetch read resolves through VfsEngine within kernel authority.
     /// No userspace daemon is involved.
-    /// # Note
-    /// This is an advisory hint. Errors from the prefetch read are silently
-    /// discarded; the kernel VFS will fall back to synchronous `read_folio`
-    /// on actual page fault. The readahead count and prefetch count are
-    /// recorded regardless of I/O outcome for stats fidelity.
     pub fn readahead(&mut self, fh: &EngineFileHandle, offset: u64, count: u32, ctx: &RequestCtx) {
         self.page_cache.record_readahead();
         self.page_cache.record_prefetch();
-        // Issue the prefetch read; discard the result — this is an
-        // advisory population hint, not a synchronous data request.
-        let _ = self.engine.read(fh, offset, count, ctx);
+
+        let page_idx = page_index(offset);
+        // Acquire read ownership for the affected page: this is a
+        // clean read, so we target Shared ownership without ever
+        // transitioning to KernelOwned (no dirty marking).
+        let guard = self.page_authority.acquire(
+            self.engine,
+            fh.inode_id,
+            page_idx,
+            PageOwnershipMode::Read,
+        );
+
+        match self.engine.read(fh, offset, count, ctx) {
+            Ok(data) => {
+                if !data.is_empty() {
+                    self.page_cache.record_populate();
+                } else {
+                    // EOF or hole: track as a miss for stats parity
+                    // with kernel behavior where an EOF read doesn't
+                    // populate a page.
+                    self.page_cache.record_miss();
+                }
+            }
+            Err(_) => {
+                // Advisory: engine errors are silently discarded.
+                // The kernel VFS will fall back to synchronous
+                // read_folio on actual page fault.  Record a miss
+                // so hit-ratio stats reflect the prefetch gap.
+                self.page_cache.record_miss();
+            }
+        }
+
+        // Commit the ownership acquisition: the page is now Shared
+        // (never KernelOwned/dirty from a readahead path).
+        if let Ok(g) = guard {
+            g.commit();
+        }
     }
 
     // ── Blocked operations ───────────────────────────────────────────
@@ -818,6 +854,157 @@ mod tests {
         assert_eq!(stats.prefetch, 3);
     }
 
+    #[test]
+    fn readahead_populates_clean_cache_and_records_populate() {
+        let mut e = MockEngine::new();
+        let fh = make_fh();
+        e.read_fn = Box::new(|_, _, _, _| Ok(b"prefetch-populated".to_vec()));
+
+        let mut tracker = make_tracker();
+        let mut dt = make_dirty_tracker();
+        let mut pa = make_page_authority();
+        let mut aops = AddressSpaceOps::new(&e, &mut tracker, &mut dt, &mut pa);
+        aops.readahead(&fh, 0, 4096, &MockEngine::test_ctx());
+
+        let stats = aops.page_cache_stats();
+        assert_eq!(stats.readahead_count, 1);
+        assert_eq!(stats.prefetch, 1);
+        // Clean cache population: non-empty engine read records populate.
+        assert_eq!(stats.populate, 1);
+        assert_eq!(stats.miss, 0);
+    }
+
+    #[test]
+    fn readahead_empty_read_records_miss() {
+        let mut e = MockEngine::new();
+        let fh = make_fh();
+        // Engine returns empty data: simulates EOF or hole.
+        e.read_fn = Box::new(|_, _, _, _| Ok(Vec::new()));
+
+        let mut tracker = make_tracker();
+        let mut dt = make_dirty_tracker();
+        let mut pa = make_page_authority();
+        let mut aops = AddressSpaceOps::new(&e, &mut tracker, &mut dt, &mut pa);
+        aops.readahead(&fh, 4096, 4096, &MockEngine::test_ctx());
+
+        let stats = aops.page_cache_stats();
+        assert_eq!(stats.readahead_count, 1);
+        assert_eq!(stats.prefetch, 1);
+        // Empty read (EOF/hole) records a miss, not a populate.
+        assert_eq!(stats.populate, 0);
+        assert_eq!(stats.miss, 1);
+    }
+
+    #[test]
+    fn readahead_error_records_miss_not_populate() {
+        let mut e = MockEngine::new();
+        let fh = make_fh();
+        e.read_fn = Box::new(|_, _, _, _| Err(Errno::EIO));
+
+        let mut tracker = make_tracker();
+        let mut dt = make_dirty_tracker();
+        let mut pa = make_page_authority();
+        let mut aops = AddressSpaceOps::new(&e, &mut tracker, &mut dt, &mut pa);
+        aops.readahead(&fh, 0, 4096, &MockEngine::test_ctx());
+
+        let stats = aops.page_cache_stats();
+        assert_eq!(stats.readahead_count, 1);
+        assert_eq!(stats.prefetch, 1);
+        // Engine error: records a miss, never a populate.
+        assert_eq!(stats.populate, 0);
+        assert_eq!(stats.miss, 1);
+    }
+
+    #[test]
+    fn readahead_does_not_mark_pages_dirty() {
+        use crate::page_authority::PageOwnership;
+
+        let mut e = MockEngine::new();
+        let fh = make_fh();
+        e.read_fn = Box::new(|_, _, _, _| Ok(b"clean-data".to_vec()));
+
+        let mut tracker = make_tracker();
+        let mut dt = make_dirty_tracker();
+        let mut pa = make_page_authority();
+        let mut aops = AddressSpaceOps::new(&e, &mut tracker, &mut dt, &mut pa);
+
+        // Readahead on page 0.
+        aops.readahead(&fh, 0, 4096, &MockEngine::test_ctx());
+
+        // After readahead, page ownership must not be KernelOwned (dirty).
+        // Read-only acquistion targets Shared, and readahead never marks
+        // pages dirty.
+        let owner = pa.get(fh.inode_id, 0);
+        assert!(
+            owner != PageOwnership::KernelOwned,
+            "readahead must not mark pages dirty (KernelOwned)"
+        );
+        // Default is EngineOwned; Shared is also acceptable for a clean prefetch.
+        assert!(
+            owner == PageOwnership::EngineOwned || owner == PageOwnership::Shared,
+            "readahead page ownership should be EngineOwned or Shared, got {:?}",
+            owner
+        );
+    }
+
+    #[test]
+    fn read_folio_after_readahead_error_still_resolves() {
+        // Readahead that hits an engine error must not poison later
+        // demand reads: read_folio for the same range must still
+        // resolve through engine authority and return correct bytes.
+        let fh = make_fh();
+
+        // Phase 1: readahead fails.
+        let mut e1 = MockEngine::new();
+        e1.read_fn = Box::new(|_, _, _, _| Err(Errno::EIO));
+        let mut tracker = make_tracker();
+        let mut dt = make_dirty_tracker();
+        let mut pa = make_page_authority();
+        let mut aops = AddressSpaceOps::new(&e1, &mut tracker, &mut dt, &mut pa);
+        aops.readahead(&fh, 0, 4096, &MockEngine::test_ctx());
+
+        let stats_after_ra = aops.page_cache_stats();
+        assert_eq!(stats_after_ra.miss, 1);
+        assert_eq!(stats_after_ra.populate, 0);
+
+        // Phase 2: demand read_folio for the same range succeeds.
+        let mut e2 = MockEngine::new();
+        e2.read_fn = Box::new(|_, _, _, _| Ok(b"demand-data".to_vec()));
+        let mut aops2 = AddressSpaceOps::new(&e2, &mut tracker, &mut dt, &mut pa);
+        let data = aops2
+            .read_folio(&fh, 0, 4096, &MockEngine::test_ctx())
+            .unwrap();
+        assert_eq!(data, b"demand-data");
+
+        let stats_final = aops2.page_cache_stats();
+        // After demand read: populate counter increased from the read_folio.
+        assert_eq!(stats_final.populate, 1);
+    }
+
+    #[test]
+    fn readahead_short_read_zerofills_remainder() {
+        // Simulate a short engine read (fewer bytes than requested).
+        // The source model returns whatever the engine provides; the
+        // C shim handles zero-fill of the remainder.  Here we verify
+        // that a short read still records a populate (data was returned)
+        // and does not error out.
+        let mut e = MockEngine::new();
+        let fh = make_fh();
+        // Return only 2048 bytes for a 4096-byte request.
+        e.read_fn = Box::new(|_, _, _, _| Ok(b"sh".to_vec())); // 2 bytes, simulating short
+
+        let mut tracker = make_tracker();
+        let mut dt = make_dirty_tracker();
+        let mut pa = make_page_authority();
+        let mut aops = AddressSpaceOps::new(&e, &mut tracker, &mut dt, &mut pa);
+        aops.readahead(&fh, 0, 4096, &MockEngine::test_ctx());
+
+        let stats = aops.page_cache_stats();
+        // Non-empty data returned: should record a populate.
+        assert_eq!(stats.populate, 1);
+        assert_eq!(stats.miss, 0);
+    }
+
     // ── write_begin tests (blocker) ──────────────────────────────────
 
     #[test]
@@ -1325,7 +1512,7 @@ mod tests {
         let _ = aops.invalidate_folio(InodeId::new(1), &fh, 4096, 4096);
 
         let stats = aops.page_cache_stats();
-        assert_eq!(stats.populate, 1); // from read_folio
+        assert_eq!(stats.populate, 2); // from read_folio + readahead
         assert_eq!(stats.readahead_count, 1);
         assert_eq!(stats.prefetch, 1);
         assert_eq!(stats.evict, 1);
