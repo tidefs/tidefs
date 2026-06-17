@@ -185,6 +185,289 @@ impl From<LabelError> for PoolSuperblockError {
     }
 }
 
+// ── Pool superblock import evidence ────────────────────────────────────
+
+/// Claim anchor for pool-superblock import evidence receipts.
+pub const POOL_SUPERBLOCK_IMPORT_EVIDENCE_CLAIM: &str =
+    "kernel-storage-io.pool-superblock-import-evidence";
+
+/// GitHub issue that introduced pool-superblock import evidence receipts.
+pub const POOL_SUPERBLOCK_IMPORT_EVIDENCE_ISSUE: u32 = 537;
+
+/// Evidence tier represented by a pool-superblock import receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolSuperblockImportValidationTier {
+    /// Focused source/unit evidence only.
+    FocusedUnit,
+}
+
+/// Pool label copy represented in an import evidence receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolSuperblockLabelCopy {
+    /// Label copy at the head of the member device.
+    Primary,
+    /// Secondary label copy, normally read from the member-device tail.
+    Secondary,
+}
+
+/// Fail-closed import decision captured by a pool-superblock evidence receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolSuperblockImportDecision {
+    /// Both label copies agree on pool/member identity, generation, and digest.
+    Accepted,
+    /// Import evidence is incomplete or incoherent.
+    Rejected(PoolSuperblockImportRejectReason),
+}
+
+impl PoolSuperblockImportDecision {
+    /// Returns `true` only for a coherent accepted decision.
+    #[must_use]
+    pub const fn is_accepted(self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+}
+
+/// Reason an import evidence receipt rejected the observed label evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolSuperblockImportRejectReason {
+    /// No label evidence was supplied.
+    UnknownEvidence,
+    /// The primary label copy was not available.
+    MissingPrimaryEvidence,
+    /// The secondary label copy was not available.
+    MissingSecondaryEvidence,
+    /// Label copies describe different pools or member devices.
+    MixedLabels,
+    /// Label copies disagree on the superblock generation.
+    StaleGeneration,
+    /// Label copies have different verified label digests.
+    LabelDigestMismatch,
+}
+
+/// Verified label-copy evidence used to decide whether import can proceed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolSuperblockLabelEvidence {
+    copy: PoolSuperblockLabelCopy,
+    pool_guid: [u8; 16],
+    member_id: [u8; 16],
+    superblock_generation: u64,
+    label_digest: [u8; 32],
+}
+
+impl PoolSuperblockLabelEvidence {
+    /// Build label-copy evidence from a decoded and checksum-verified
+    /// pool superblock.
+    #[must_use]
+    pub const fn from_superblock(
+        copy: PoolSuperblockLabelCopy,
+        superblock: &KernelPoolSuperblock,
+    ) -> Self {
+        Self {
+            copy,
+            pool_guid: superblock.pool_guid,
+            member_id: superblock.device_guid,
+            superblock_generation: superblock.commit_group,
+            label_digest: superblock.checksum,
+        }
+    }
+
+    /// Label copy described by this evidence.
+    #[must_use]
+    pub const fn copy(&self) -> PoolSuperblockLabelCopy {
+        self.copy
+    }
+
+    /// Pool identity from the label copy.
+    #[must_use]
+    pub const fn pool_guid(&self) -> [u8; 16] {
+        self.pool_guid
+    }
+
+    /// Member identity from the label copy.
+    #[must_use]
+    pub const fn member_id(&self) -> [u8; 16] {
+        self.member_id
+    }
+
+    /// Superblock generation represented by the label's recovery commit group.
+    #[must_use]
+    pub const fn superblock_generation(&self) -> u64 {
+        self.superblock_generation
+    }
+
+    /// Verified BLAKE3-256 digest from the label copy.
+    #[must_use]
+    pub const fn label_digest(&self) -> [u8; 32] {
+        self.label_digest
+    }
+}
+
+/// Pool-superblock import evidence receipt for one member device.
+///
+/// The constructor is fail-closed: `Accepted` is produced only when both
+/// primary and secondary label evidence are present and agree on pool/member
+/// identity, superblock generation, and verified label digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolSuperblockImportEvidence {
+    primary: Option<PoolSuperblockLabelEvidence>,
+    secondary: Option<PoolSuperblockLabelEvidence>,
+    member_id: Option<[u8; 16]>,
+    superblock_generation: Option<u64>,
+    label_digest: Option<[u8; 32]>,
+    import_decision: PoolSuperblockImportDecision,
+    validation_tier: PoolSuperblockImportValidationTier,
+    claim_ref: &'static str,
+    issue_ref: u32,
+}
+
+impl PoolSuperblockImportEvidence {
+    /// Evaluate primary/secondary label evidence at the focused unit tier.
+    #[must_use]
+    pub fn focused_unit(
+        primary: Option<PoolSuperblockLabelEvidence>,
+        secondary: Option<PoolSuperblockLabelEvidence>,
+    ) -> Self {
+        Self::new(
+            primary,
+            secondary,
+            PoolSuperblockImportValidationTier::FocusedUnit,
+        )
+    }
+
+    /// Evaluate primary/secondary label evidence for a caller-selected tier.
+    #[must_use]
+    pub fn new(
+        primary: Option<PoolSuperblockLabelEvidence>,
+        secondary: Option<PoolSuperblockLabelEvidence>,
+        validation_tier: PoolSuperblockImportValidationTier,
+    ) -> Self {
+        let (candidate, import_decision) = match (primary, secondary) {
+            (None, None) => (
+                None,
+                PoolSuperblockImportDecision::Rejected(
+                    PoolSuperblockImportRejectReason::UnknownEvidence,
+                ),
+            ),
+            (None, Some(secondary)) => (
+                Some(secondary),
+                PoolSuperblockImportDecision::Rejected(
+                    PoolSuperblockImportRejectReason::MissingPrimaryEvidence,
+                ),
+            ),
+            (Some(primary), None) => (
+                Some(primary),
+                PoolSuperblockImportDecision::Rejected(
+                    PoolSuperblockImportRejectReason::MissingSecondaryEvidence,
+                ),
+            ),
+            (Some(primary), Some(secondary)) => {
+                let decision = if primary.pool_guid != secondary.pool_guid
+                    || primary.member_id != secondary.member_id
+                {
+                    PoolSuperblockImportDecision::Rejected(
+                        PoolSuperblockImportRejectReason::MixedLabels,
+                    )
+                } else if primary.superblock_generation != secondary.superblock_generation {
+                    PoolSuperblockImportDecision::Rejected(
+                        PoolSuperblockImportRejectReason::StaleGeneration,
+                    )
+                } else if primary.label_digest != secondary.label_digest {
+                    PoolSuperblockImportDecision::Rejected(
+                        PoolSuperblockImportRejectReason::LabelDigestMismatch,
+                    )
+                } else {
+                    PoolSuperblockImportDecision::Accepted
+                };
+
+                let candidate = if primary.superblock_generation >= secondary.superblock_generation
+                {
+                    primary
+                } else {
+                    secondary
+                };
+                (Some(candidate), decision)
+            }
+        };
+
+        Self {
+            primary,
+            secondary,
+            member_id: candidate.map(|evidence| evidence.member_id),
+            superblock_generation: candidate.map(|evidence| evidence.superblock_generation),
+            label_digest: candidate.map(|evidence| evidence.label_digest),
+            import_decision,
+            validation_tier,
+            claim_ref: POOL_SUPERBLOCK_IMPORT_EVIDENCE_CLAIM,
+            issue_ref: POOL_SUPERBLOCK_IMPORT_EVIDENCE_ISSUE,
+        }
+    }
+
+    /// Primary label evidence, if it was observed.
+    #[must_use]
+    pub const fn primary(&self) -> Option<PoolSuperblockLabelEvidence> {
+        self.primary
+    }
+
+    /// Secondary label evidence, if it was observed.
+    #[must_use]
+    pub const fn secondary(&self) -> Option<PoolSuperblockLabelEvidence> {
+        self.secondary
+    }
+
+    /// Candidate member identity summarized by this receipt.
+    #[must_use]
+    pub const fn member_id(&self) -> Option<[u8; 16]> {
+        self.member_id
+    }
+
+    /// Candidate superblock generation summarized by this receipt.
+    #[must_use]
+    pub const fn superblock_generation(&self) -> Option<u64> {
+        self.superblock_generation
+    }
+
+    /// Candidate verified label digest summarized by this receipt.
+    #[must_use]
+    pub const fn label_digest(&self) -> Option<[u8; 32]> {
+        self.label_digest
+    }
+
+    /// Import decision made from the supplied evidence.
+    #[must_use]
+    pub const fn import_decision(&self) -> PoolSuperblockImportDecision {
+        self.import_decision
+    }
+
+    /// Validation tier represented by this receipt.
+    #[must_use]
+    pub const fn validation_tier(&self) -> PoolSuperblockImportValidationTier {
+        self.validation_tier
+    }
+
+    /// Claim anchor this receipt can cite.
+    #[must_use]
+    pub const fn claim_ref(&self) -> &'static str {
+        self.claim_ref
+    }
+
+    /// GitHub issue that introduced this receipt schema.
+    #[must_use]
+    pub const fn issue_ref(&self) -> u32 {
+        self.issue_ref
+    }
+
+    /// Returns `true` only when the receipt contains a coherent accepted import.
+    #[must_use]
+    pub const fn is_accepted(&self) -> bool {
+        self.import_decision.is_accepted()
+            && self.primary.is_some()
+            && self.secondary.is_some()
+            && self.member_id.is_some()
+            && self.superblock_generation.is_some()
+            && self.label_digest.is_some()
+    }
+}
+
 // ── read_pool_superblock ───────────────────────────────────────────────
 
 /// Read and validate the TideFS pool superblock from a block device.
@@ -323,6 +606,26 @@ mod tests {
         let mut buf = alloc::vec![0u8; padded_len];
         buf[..POOL_LABEL_V1_EXT_WIRE_SIZE].copy_from_slice(&label_buf);
         buf
+    }
+
+    fn make_test_superblock(
+        pool_guid: [u8; 16],
+        device_guid: [u8; 16],
+        generation: u64,
+        system_area_size: u64,
+    ) -> KernelPoolSuperblock {
+        let mut label = PoolLabelV1::new(pool_guid, device_guid, "evidence");
+        label.commit_group = generation;
+        label.system_area_size = system_area_size;
+        let sealed = seal_label(label).unwrap();
+        KernelPoolSuperblock::from_label(&sealed)
+    }
+
+    fn label_evidence(
+        copy: PoolSuperblockLabelCopy,
+        superblock: &KernelPoolSuperblock,
+    ) -> PoolSuperblockLabelEvidence {
+        PoolSuperblockLabelEvidence::from_superblock(copy, superblock)
     }
 
     /// In-memory KernelStorageIo backed by a Vec<u8>.
@@ -535,6 +838,170 @@ mod tests {
         assert_eq!(sb.features_ro_compat, 2);
         assert_eq!(sb.features_compat, 4);
         assert_ne!(sb.checksum, [0u8; 32]);
+    }
+
+    // ── Pool superblock import evidence ────────────────────────────
+
+    #[test]
+    fn import_evidence_accepts_coherent_labels() {
+        let pool_guid = [0x11u8; 16];
+        let member_id = [0x22u8; 16];
+        let primary_sb = make_test_superblock(pool_guid, member_id, 42, 65536);
+        let secondary_sb = primary_sb.clone();
+
+        let receipt = PoolSuperblockImportEvidence::focused_unit(
+            Some(label_evidence(
+                PoolSuperblockLabelCopy::Primary,
+                &primary_sb,
+            )),
+            Some(label_evidence(
+                PoolSuperblockLabelCopy::Secondary,
+                &secondary_sb,
+            )),
+        );
+
+        assert!(receipt.is_accepted());
+        assert_eq!(
+            receipt.import_decision(),
+            PoolSuperblockImportDecision::Accepted
+        );
+        assert_eq!(receipt.member_id(), Some(member_id));
+        assert_eq!(receipt.superblock_generation(), Some(42));
+        assert_eq!(receipt.label_digest(), Some(primary_sb.checksum));
+        assert_eq!(
+            receipt.validation_tier(),
+            PoolSuperblockImportValidationTier::FocusedUnit
+        );
+        assert_eq!(receipt.claim_ref(), POOL_SUPERBLOCK_IMPORT_EVIDENCE_CLAIM);
+        assert_eq!(receipt.issue_ref(), POOL_SUPERBLOCK_IMPORT_EVIDENCE_ISSUE);
+        assert_eq!(
+            receipt.primary().unwrap().copy(),
+            PoolSuperblockLabelCopy::Primary
+        );
+        assert_eq!(
+            receipt.secondary().unwrap().copy(),
+            PoolSuperblockLabelCopy::Secondary
+        );
+    }
+
+    #[test]
+    fn import_evidence_rejects_mixed_labels() {
+        let pool_guid = [0x33u8; 16];
+        let primary_sb = make_test_superblock(pool_guid, [0x44u8; 16], 7, 4096);
+        let secondary_sb = make_test_superblock(pool_guid, [0x45u8; 16], 7, 4096);
+
+        let receipt = PoolSuperblockImportEvidence::focused_unit(
+            Some(label_evidence(
+                PoolSuperblockLabelCopy::Primary,
+                &primary_sb,
+            )),
+            Some(label_evidence(
+                PoolSuperblockLabelCopy::Secondary,
+                &secondary_sb,
+            )),
+        );
+
+        assert!(!receipt.is_accepted());
+        assert_eq!(
+            receipt.import_decision(),
+            PoolSuperblockImportDecision::Rejected(PoolSuperblockImportRejectReason::MixedLabels)
+        );
+    }
+
+    #[test]
+    fn import_evidence_rejects_stale_generation() {
+        let pool_guid = [0x55u8; 16];
+        let member_id = [0x66u8; 16];
+        let primary_sb = make_test_superblock(pool_guid, member_id, 9, 4096);
+        let secondary_sb = make_test_superblock(pool_guid, member_id, 8, 4096);
+
+        let receipt = PoolSuperblockImportEvidence::focused_unit(
+            Some(label_evidence(
+                PoolSuperblockLabelCopy::Primary,
+                &primary_sb,
+            )),
+            Some(label_evidence(
+                PoolSuperblockLabelCopy::Secondary,
+                &secondary_sb,
+            )),
+        );
+
+        assert!(!receipt.is_accepted());
+        assert_eq!(
+            receipt.import_decision(),
+            PoolSuperblockImportDecision::Rejected(
+                PoolSuperblockImportRejectReason::StaleGeneration
+            )
+        );
+        assert_eq!(receipt.member_id(), Some(member_id));
+        assert_eq!(receipt.superblock_generation(), Some(9));
+    }
+
+    #[test]
+    fn import_evidence_rejects_missing_secondary() {
+        let primary_sb = make_test_superblock([0x77u8; 16], [0x88u8; 16], 12, 4096);
+
+        let receipt = PoolSuperblockImportEvidence::focused_unit(
+            Some(label_evidence(
+                PoolSuperblockLabelCopy::Primary,
+                &primary_sb,
+            )),
+            None,
+        );
+
+        assert!(!receipt.is_accepted());
+        assert_eq!(
+            receipt.import_decision(),
+            PoolSuperblockImportDecision::Rejected(
+                PoolSuperblockImportRejectReason::MissingSecondaryEvidence
+            )
+        );
+        assert!(receipt.secondary().is_none());
+        assert_eq!(receipt.member_id(), Some([0x88u8; 16]));
+    }
+
+    #[test]
+    fn import_evidence_rejects_digest_mismatch() {
+        let pool_guid = [0x99u8; 16];
+        let member_id = [0xAAu8; 16];
+        let primary_sb = make_test_superblock(pool_guid, member_id, 15, 4096);
+        let secondary_sb = make_test_superblock(pool_guid, member_id, 15, 8192);
+        assert_ne!(primary_sb.checksum, secondary_sb.checksum);
+
+        let receipt = PoolSuperblockImportEvidence::focused_unit(
+            Some(label_evidence(
+                PoolSuperblockLabelCopy::Primary,
+                &primary_sb,
+            )),
+            Some(label_evidence(
+                PoolSuperblockLabelCopy::Secondary,
+                &secondary_sb,
+            )),
+        );
+
+        assert!(!receipt.is_accepted());
+        assert_eq!(
+            receipt.import_decision(),
+            PoolSuperblockImportDecision::Rejected(
+                PoolSuperblockImportRejectReason::LabelDigestMismatch
+            )
+        );
+    }
+
+    #[test]
+    fn import_evidence_rejects_unknown_evidence() {
+        let receipt = PoolSuperblockImportEvidence::focused_unit(None, None);
+
+        assert!(!receipt.is_accepted());
+        assert_eq!(
+            receipt.import_decision(),
+            PoolSuperblockImportDecision::Rejected(
+                PoolSuperblockImportRejectReason::UnknownEvidence
+            )
+        );
+        assert_eq!(receipt.member_id(), None);
+        assert_eq!(receipt.superblock_generation(), None);
+        assert_eq!(receipt.label_digest(), None);
     }
 
     #[test]

@@ -54,5 +54,8 @@ pub mod traits;
 pub use adapter::KernelStorageAdapter;
 pub use pool_superblock::{
     read_pool_superblock, read_pool_superblock_at, KernelPoolSuperblock, PoolSuperblockError,
+    PoolSuperblockImportDecision, PoolSuperblockImportEvidence, PoolSuperblockImportRejectReason,
+    PoolSuperblockImportValidationTier, PoolSuperblockLabelCopy, PoolSuperblockLabelEvidence,
+    POOL_SUPERBLOCK_IMPORT_EVIDENCE_CLAIM, POOL_SUPERBLOCK_IMPORT_EVIDENCE_ISSUE,
 };
 pub use traits::{KernelStorageIo, KernelStorageIoCapabilities, RawBlockIo};
