@@ -1,59 +1,74 @@
 # Local/Distributed Placement Receipt Authority
 
-Maturity: **implementation** for the unified receipt framework driving
-placement, rebuild, rebake, and reclaim (issue #18).
+Maturity: scoped implementation note for the local object-store receipt APIs
+that feed issue #18. This document is not a closure claim for the full
+local-filesystem, distributed transport, rebake, rebuild, and runtime
+validation surface.
 
-## 1. Receipt Authority Model
+## Authority Model
 
-TideFS uses one placement receipt per logical object/stripe. The receipt is
-the durable source of truth for physical extent location. Local and
-distributed code consult the same receipt format; no second object-store
-authority is bolted onto the side.
+TideFS records physical placement with a `PlacementReceipt`. The receipt is
+the durable locator authority for a logical object or stripe: it binds the
+object key, placement epoch, receipt generation, redundancy policy, payload
+digest, and selected physical targets.
 
-| Layer | Receipt Role |
-|-------|-------------|
-| `Pool::put_with_receipt` | Produces a `PlacementReceipt` on every pool-wide write |
-| `Pool::get` | Prefers receipt-driven lookup before directory scanning |
-| `Pool::repair_with_receipt` | Records a replacement receipt after scrub/read repair |
-| `ReplicatedObjectStore` | Projects receipts into `PlacementReceiptRef` for distributed I/O |
-| `RebuildRuntime` | Consumes receipt refs for backfill and rebuild movement |
-| `ReclaimConsumer` | Gates dead-object trimming on durable replacement receipts |
+Local and distributed layers should consume projections of this same authority
+instead of inventing a second placement truth. In this slice, the local
+object-store exposes receipt-returning write and repair entry points so callers
+can carry durable placement identity forward without doing a second lookup.
 
-## 2. Receipt Format
+## Implemented Local APIs
 
-### PlacementReceipt (local authority)
+| Surface | Current behavior |
+|---------|------------------|
+| `Pool::put` | Writes receipt-publishing I/O classes through pool-wide placement and persists a `PlacementReceipt` |
+| `Pool::put_with_receipt` | Performs the same receipt-publishing write and returns the persisted receipt |
+| `PoolStoreMut::put_with_receipt` | Data-class convenience wrapper for callers holding a mutable pool store |
+| `Pool::get` | Prefers persisted receipt lookup and falls back to device scans only when no receipt exists |
+| `Pool::placement_receipts` | Scans persisted receipts and returns the latest logical receipt per object key |
+| `PlacementReceipt::shared_receipt_ref` | Projects local receipts into the shared `PlacementReceiptRef` model |
+| `Pool::repair_with_receipt` | Rewrites reconstructed bytes through placement and returns the replacement receipt |
+| receipt-bound drains | Hold obsolete physical objects until replacement receipt generation is stable |
+
+`IntentLog` writes keep receiptless write-ahead-log semantics. Callers that
+need receipt authority must use a receipt-publishing I/O class such as `Data`,
+`Metadata`, or `ReadCache`.
+
+## Receipt Format
+
+### `PlacementReceipt`
 
 ```rust
 pub struct PlacementReceipt {
-    pub object_key: ObjectKey,          // 32-byte logical object key
-    pub epoch: u64,                      // topology/membership epoch
-    pub generation: u64,                 // monotonic receipt write generation
-    pub policy: PoolRedundancyPolicy,    // Replicated{copies} or Erasure{k,m}
+    pub object_key: ObjectKey,
+    pub epoch: u64,
+    pub generation: u64,
+    pub policy: PoolRedundancyPolicy,
     pub failure_domain_level: FailureDomainLevel,
-    pub payload_len: u64,                // logical payload length
-    pub shard_len: u32,                  // erasure shard length (0 for replicated)
-    pub payload_digest: [u8; 32],        // BLAKE3 of logical payload
+    pub payload_len: u64,
+    pub shard_len: u32,
+    pub payload_digest: [u8; 32],
     pub targets: Vec<PlacementReceiptTarget>,
     pub planner_replay_receipt: Option<PlacementReplayReceipt>,
 }
 ```
 
-### PlacementReceiptTarget (per-device record)
+### `PlacementReceiptTarget`
 
 ```rust
 pub struct PlacementReceiptTarget {
-    pub device_index: u32,      // device index at receipt epoch
-    pub device_guid: [u8; 16],  // persistent device GUID
-    pub shard_index: u16,       // replica/shard index within stripe
-    pub role: PlacementTargetRole,  // Data or Parity
-    pub stored_digest: [u8; 32],    // BLAKE3 of stored bytes
+    pub device_index: u32,
+    pub device_guid: [u8; 16],
+    pub shard_index: u16,
+    pub role: PlacementTargetRole,
+    pub stored_digest: [u8; 32],
 }
 ```
 
-### PlacementReceiptRef (distributed projection)
+### `PlacementReceiptRef`
 
-The shared `PlacementReceiptRef` carries receipt identity fields needed
-by distributed rebuild, backfill, and transport code:
+The shared reference carries the receipt identity needed by rebuild, backfill,
+and transport models without copying the entire local receipt payload:
 
 ```rust
 pub struct PlacementReceiptRef {
@@ -68,70 +83,69 @@ pub struct PlacementReceiptRef {
 }
 ```
 
-## 3. Write Path
+## Write And Repair Flow
 
-1. Caller invokes `Pool::put_with_receipt(class, key, payload)`
-2. Pool runs `plan_pool_wide_placement` through the hash-ring placement
-   planner to select target devices from all eligible pool devices
-3. Data is written to every target (replicated fanout or erasure stripe)
-4. Stored digests are recorded in each `PlacementReceiptTarget`
-5. The receipt is persisted on target devices via `write_placement_receipt`
-6. If an old receipt existed for this key, it is enqueued for dead-object
-   reclaim with the new receipt as replacement evidence
+1. A caller writes through `Pool::put_with_receipt` or
+   `PoolStoreMut::put_with_receipt`.
+2. The pool uses pool-wide placement to select target devices for the active
+   redundancy policy.
+3. The write persists the physical object or shards and then persists a
+   `PlacementReceipt`.
+4. The caller receives the `StoredObject` plus the authoritative
+   `PlacementReceipt`.
+5. If a previous receipt existed, obsolete physical locations are enqueued for
+   receipt-bound reclaim using the replacement receipt as evidence.
 
-## 4. Read Path
+`Pool::repair_with_receipt` uses the same write path for reconstructed bytes.
+The replacement receipt has a higher generation and becomes the current
+authority for subsequent reads.
 
-1. `Pool::get` first attempts `load_placement_receipt` for the key
-2. If a receipt exists, `get_with_receipt` reads from recorded targets:
-   - Replicated: tries each target; verifies `payload_digest`
-   - Erasure: reads available shards; reconstructs if needed
-3. If no receipt exists, falls back to device directory scanning
-4. On checksum mismatch, the read-self-heal path records a
-   `ReadRepairEvent` and repairs from healthy replicas
+## Read And Reclaim Flow
 
-## 5. Rebuild Path
+`Pool::get` first loads the current receipt for the object key. Replicated
+receipts try recorded targets and verify the logical payload digest. Erasure
+receipts read recorded shards, verify stored shard digests, and reconstruct
+when enough shards remain available. If no receipt is present, pre-receipt
+device scanning remains the local fallback for older in-tree harness data.
 
-1. `Pool::placement_receipts` scans all persisted receipts
-2. Receipts are projected into `PlacementReceiptRef` via `shared_receipt_ref`
-3. `RebuildRuntime` consumes receipt refs for backfill/rebuild tasks
-4. Data movement is verified against the receipt's `payload_digest`
-5. Completed movements are anchored via receipt-based completion records
+Receipt-bound dead-object drains only free obsolete physical objects after the
+replacement receipt generation is stable. This keeps reclaim from racing the
+durable publication of the replacement placement authority.
 
-## 6. Reclaim Path
+## Validation In This Slice
 
-1. When a write replaces an old receipt, `enqueue_obsolete_placement_after_replacement`
-   enqueues a `DeadObjectEntry` with `DeadObjectReplacementReceipt`
-2. The reclaim queue's `dequeue_receipt_bound_batch` filters for entries
-   whose replacement receipt authorizes reclaim (non-synthetic, correct
-   key, well-formed policy, sufficient target count)
-3. Only after the replacement receipt is durable and policy-satisfying
-   are dead segments freed
+The local object-store tests cover:
 
-## 7. Repair Path
+- receipt-returning writes through `put_with_receipt`;
+- rejection of receiptless `IntentLog` writes through `put_with_receipt`;
+- repair rewrites that publish a newer replacement receipt;
+- latest-receipt scans after rewrites and stale receipt injection;
+- projection from local receipts into `PlacementReceiptRef`;
+- receipt-bound reclaim gating for replicated and erasure rewrites.
 
-1. Scrub detects corruption via checksum verification
-2. `resolve_violation` selects a repair strategy (reconstruct, truncate,
-   mark-corrupt)
-3. `Pool::repair_with_receipt` rewrites data through placement planner,
-   producing a fresh receipt that supersedes the original
-4. The original receipt is automatically enqueued for reclaim
+## Remaining Issue #18 Acceptance Work
 
-## 8. Tests
+The following work remains under issue #18 and the focused split issues:
 
-- `put_with_receipt_returns_placement_receipt`: local pool write produces
-  retrievable receipt
-- `repair_with_receipt_supersedes_original`: repair produces receipt with
-  higher generation
-- `receipt_bound_dead_object_drain_*`: reclaim gating on replacement receipts
-- Two-node receipt transfer (distributed transport)
-- Degraded read with receipt authority
-- Rebuild after device replacement (receipt-driven)
+- #344: local-filesystem extent writes must persist and replay receipt
+  references;
+- #345: distributed storage-node and transport paths must move
+  receipt-addressed extents between nodes;
+- degraded read, rebuild, and backfill runtimes must consume durable receipt
+  authority instead of synthesizing placement from current topology alone;
+- #346: rebake and reclaim flows must prove ingest/base trimming is gated on
+  durable replacement receipts;
+- two-node transfer, degraded-read, rebuild-after-replacement, and runtime
+  reclaim validation rows must run in GitHub Actions.
 
-## 9. References
+## References
 
-- Issue #18 (this authority)
-- Issue #16 (media substrate)
-- Issue #17 (pool-wide redundancy placement)
+- Issue #18: local/distributed receipt authority
+- Issue #344: local-filesystem receipt-ref extent IO
+- Issue #345: distributed receipt-addressed extent transfer
+- Issue #346: receipt-driven rebake/reclaim durability gating
+- Issue #17: pool-wide redundancy placement
+- Issue #16: media substrate
 - `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md`
 - `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`
 - `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`
