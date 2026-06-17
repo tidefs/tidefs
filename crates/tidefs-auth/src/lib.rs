@@ -42,12 +42,16 @@ pub use audit::{
     append_audit_event_and_seal_chain_if_needed, AuditEvent, AuditEventId, AuditEventKind, AuditLog,
 };
 pub use authorization::{
-    derive_authorization_decision_for_request, derive_capability_grant_or_denial_from_policy,
-    evaluate_authorization, evaluate_role_bindings_for_action_scope_and_visibility,
-    required_capability, required_class, scope_covers, ActionClass, AuthorizationDecision,
-    AuthorizationOutcome, AuthorizationRequest,
+    consume_capability_grant_for_request, derive_authorization_decision_for_request,
+    derive_capability_grant_or_denial_from_policy, evaluate_authorization,
+    evaluate_role_bindings_for_action_scope_and_visibility, required_capability, required_class,
+    scope_covers, ActionClass, AuthorizationDecision, AuthorizationOutcome, AuthorizationRequest,
+    CapabilityGrantAuthorization,
 };
-pub use capability::{CapabilityGrant, CapabilityGrantId};
+pub use capability::{
+    CapabilityGrant, CapabilityGrantConsumeResult, CapabilityGrantDenial,
+    CapabilityGrantDenialReason, CapabilityGrantId, CapabilityGrantUse,
+};
 pub use envelope::{SecurityResponseClass, SecurityResponseEnvelope};
 pub use error::{AttestationError, AuthorizationError, IdentityError};
 pub use handshake::{

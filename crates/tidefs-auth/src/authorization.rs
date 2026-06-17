@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::capability::{CapabilityGrant, CapabilityGrantConsumeResult};
 use crate::principal::{Principal, PrincipalClass, ScopeSelector};
 
 // ---------------------------------------------------------------------------
@@ -88,6 +89,12 @@ pub enum AuthorizationOutcome {
     Denied(String),
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityGrantAuthorization {
+    pub decision: AuthorizationDecision,
+    pub consume_result: CapabilityGrantConsumeResult,
+}
+
 // ---------------------------------------------------------------------------
 // Authorization engine
 // ---------------------------------------------------------------------------
@@ -122,6 +129,37 @@ pub fn required_class(action: ActionClass) -> PrincipalClass {
         ActionClass::GrantRole => PrincipalClass::HumanOperator,
         ActionClass::RevokeRole => PrincipalClass::HumanOperator,
         ActionClass::ReadAuditLog => PrincipalClass::Auditor,
+    }
+}
+
+pub fn consume_capability_grant_for_request(
+    grant: &mut CapabilityGrant,
+    request: &AuthorizationRequest,
+    decider_node_id: u64,
+) -> CapabilityGrantAuthorization {
+    let matched_role = format!("capability_grant:{}", grant.grant_id.0);
+    let consume_result = grant.consume(
+        request.principal.principal_id,
+        &request.resource,
+        required_capability(request.action),
+    );
+    let (outcome, matched_roles) = match &consume_result {
+        Ok(_) => (AuthorizationOutcome::Allowed, vec![matched_role]),
+        Err(denial) => (
+            AuthorizationOutcome::Denied(denial.reason.to_string()),
+            Vec::new(),
+        ),
+    };
+
+    CapabilityGrantAuthorization {
+        decision: AuthorizationDecision {
+            request: request.clone(),
+            outcome,
+            matched_roles,
+            decided_at_millis: crate::identity::current_time_utils(),
+            decider_node_id,
+        },
+        consume_result,
     }
 }
 

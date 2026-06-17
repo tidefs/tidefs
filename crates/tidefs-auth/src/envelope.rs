@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::authorization::{AuthorizationDecision, AuthorizationRequest};
+use crate::capability::{CapabilityGrantDenial, CapabilityGrantDenialReason, CapabilityGrantId};
 use crate::principal::PrincipalId;
 
 // ---------------------------------------------------------------------------
@@ -23,6 +24,12 @@ pub enum SecurityResponseClass {
     AuthzDenied {
         principal_id: PrincipalId,
         reason: String,
+    },
+    /// Capability grant denied before recording a use
+    CapabilityGrantDenied {
+        principal_id: PrincipalId,
+        grant_id: CapabilityGrantId,
+        reason: CapabilityGrantDenialReason,
     },
     /// Override is required to proceed with this action
     OverrideRequired {
@@ -49,6 +56,15 @@ impl SecurityResponseClass {
         Self::AuthzDenied {
             principal_id,
             reason,
+        }
+    }
+
+    /// Construct from a capability grant denial.
+    pub fn capability_grant_denied(denial: &CapabilityGrantDenial) -> Self {
+        Self::CapabilityGrantDenied {
+            principal_id: denial.principal_id,
+            grant_id: denial.grant_id,
+            reason: denial.reason.clone(),
         }
     }
 
@@ -108,6 +124,16 @@ impl std::fmt::Display for SecurityResponseClass {
             } => {
                 write!(f, "authz_denied: principal {principal_id:?} — {reason}")
             }
+            Self::CapabilityGrantDenied {
+                principal_id,
+                grant_id,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "capability_grant_denied: principal {principal_id:?}, grant {grant_id:?}: {reason}"
+                )
+            }
             Self::OverrideRequired {
                 principal_id,
                 action,
@@ -160,5 +186,17 @@ impl SecurityResponseEnvelope {
             decision,
             issued_at_millis: crate::identity::current_time_utils(),
         }
+    }
+
+    pub fn from_capability_grant_denial(
+        denial: &CapabilityGrantDenial,
+        request: Option<AuthorizationRequest>,
+        decision: Option<AuthorizationDecision>,
+    ) -> Self {
+        Self::new(
+            SecurityResponseClass::capability_grant_denied(denial),
+            request,
+            decision,
+        )
     }
 }

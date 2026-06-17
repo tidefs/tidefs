@@ -300,11 +300,31 @@ fn test_capability_grant_max_uses() {
         ScopeSelector::All,
     )
     .with_max_uses(2);
-    assert!(grant.is_valid());
-    grant.record_use();
-    assert!(grant.is_valid());
-    grant.record_use();
-    assert!(!grant.is_valid());
+    assert_eq!(
+        grant
+            .consume(PrincipalId::new(1), &ScopeSelector::All, "observe")
+            .expect("first use should succeed")
+            .use_count,
+        1
+    );
+    assert_eq!(
+        grant
+            .consume(PrincipalId::new(1), &ScopeSelector::All, "observe")
+            .expect("final allowed use should succeed")
+            .use_count,
+        2
+    );
+    let denial = grant
+        .consume(PrincipalId::new(1), &ScopeSelector::All, "observe")
+        .expect_err("exhausted grant should be denied");
+    assert!(matches!(
+        denial.reason,
+        CapabilityGrantDenialReason::Exhausted {
+            max_uses: 2,
+            use_count: 2
+        }
+    ));
+    assert_eq!(grant.use_count, 2);
 }
 
 // =========================================================================

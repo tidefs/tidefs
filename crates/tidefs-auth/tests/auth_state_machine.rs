@@ -672,6 +672,37 @@ fn security_response_class_authz_denied() {
 }
 
 #[test]
+fn security_response_class_capability_grant_denied() {
+    let mut grant = CapabilityGrant::new(
+        CapabilityGrantId::new(1),
+        PrincipalId::new(1),
+        "observe".into(),
+        ScopeSelector::All,
+    );
+    let denial = grant
+        .consume(PrincipalId::new(2), &ScopeSelector::All, "observe")
+        .expect_err("wrong principal should be denied");
+    let class = SecurityResponseClass::capability_grant_denied(&denial);
+
+    match class {
+        SecurityResponseClass::CapabilityGrantDenied {
+            principal_id,
+            grant_id,
+            reason,
+        } => {
+            assert_eq!(principal_id, PrincipalId::new(2));
+            assert_eq!(grant_id, CapabilityGrantId::new(1));
+            assert!(matches!(
+                reason,
+                CapabilityGrantDenialReason::PrincipalMismatch { .. }
+            ));
+        }
+        other => panic!("unexpected response class: {other:?}"),
+    }
+    assert_eq!(grant.use_count, 0);
+}
+
+#[test]
 fn security_response_class_override_required() {
     let class = SecurityResponseClass::override_required(
         PrincipalId::new(1),
@@ -719,6 +750,85 @@ fn security_response_class_from_denied() {
     };
     let class = SecurityResponseClass::from_denied(PrincipalId::new(1), &decision);
     assert!(matches!(class, SecurityResponseClass::AuthzDenied { .. }));
+}
+
+#[test]
+fn capability_grant_authorization_consumes_on_allow() {
+    let principal = Principal::new(PrincipalId::new(1), PrincipalClass::Auditor, 10, vec![]);
+    let request = AuthorizationRequest::new(
+        principal,
+        1,
+        ActionClass::Observe,
+        ScopeSelector::Volume { volume_id: 7 },
+    );
+    let mut grant = CapabilityGrant::new(
+        CapabilityGrantId::new(7),
+        PrincipalId::new(1),
+        "observe".into(),
+        ScopeSelector::All,
+    )
+    .with_max_uses(1);
+
+    let authorization = consume_capability_grant_for_request(&mut grant, &request, 10);
+
+    assert!(matches!(
+        authorization.decision.outcome,
+        AuthorizationOutcome::Allowed
+    ));
+    assert_eq!(grant.use_count, 1);
+    assert_eq!(
+        authorization
+            .consume_result
+            .expect("grant should consume")
+            .use_count,
+        1
+    );
+}
+
+#[test]
+fn capability_grant_denial_envelope_preserves_reason() {
+    let principal = Principal::new(PrincipalId::new(1), PrincipalClass::Auditor, 10, vec![]);
+    let request = AuthorizationRequest::new(principal, 1, ActionClass::Observe, ScopeSelector::All);
+    let mut grant = CapabilityGrant::new(
+        CapabilityGrantId::new(7),
+        PrincipalId::new(1),
+        "stage".into(),
+        ScopeSelector::All,
+    );
+
+    let authorization = consume_capability_grant_for_request(&mut grant, &request, 10);
+    let denial = authorization
+        .consume_result
+        .as_ref()
+        .expect_err("capability mismatch should deny");
+    let envelope = SecurityResponseEnvelope::from_capability_grant_denial(
+        denial,
+        Some(request),
+        Some(authorization.decision.clone()),
+    );
+
+    match envelope.response_class {
+        SecurityResponseClass::CapabilityGrantDenied {
+            principal_id,
+            grant_id,
+            reason:
+                CapabilityGrantDenialReason::CapabilityMismatch {
+                    grant_capability,
+                    requested_capability,
+                },
+        } => {
+            assert_eq!(principal_id, PrincipalId::new(1));
+            assert_eq!(grant_id, CapabilityGrantId::new(7));
+            assert_eq!(grant_capability, "stage");
+            assert_eq!(requested_capability, "observe");
+        }
+        other => panic!("unexpected response class: {other:?}"),
+    }
+    assert!(matches!(
+        authorization.decision.outcome,
+        AuthorizationOutcome::Denied(_)
+    ));
+    assert_eq!(grant.use_count, 0);
 }
 
 // ---------------------------------------------------------------------------

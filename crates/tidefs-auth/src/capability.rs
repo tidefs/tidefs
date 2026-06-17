@@ -17,6 +17,99 @@ impl CapabilityGrantId {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityGrantUse {
+    pub grant_id: CapabilityGrantId,
+    pub principal_id: PrincipalId,
+    pub capability: String,
+    pub scope: ScopeSelector,
+    pub use_count: u32,
+    pub max_uses: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityGrantDenial {
+    pub grant_id: CapabilityGrantId,
+    pub principal_id: PrincipalId,
+    pub requested_capability: String,
+    pub requested_scope: ScopeSelector,
+    pub reason: CapabilityGrantDenialReason,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum CapabilityGrantDenialReason {
+    PrincipalMismatch {
+        grant_principal_id: PrincipalId,
+        requested_principal_id: PrincipalId,
+    },
+    ScopeMismatch {
+        grant_scope: ScopeSelector,
+        requested_scope: ScopeSelector,
+    },
+    CapabilityMismatch {
+        grant_capability: String,
+        requested_capability: String,
+    },
+    Expired {
+        expired_at_millis: u64,
+        now_millis: u64,
+    },
+    Exhausted {
+        max_uses: u32,
+        use_count: u32,
+    },
+    UseCountOverflow {
+        use_count: u32,
+    },
+}
+
+pub type CapabilityGrantConsumeResult = Result<CapabilityGrantUse, CapabilityGrantDenial>;
+
+impl std::fmt::Display for CapabilityGrantDenialReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrincipalMismatch {
+                grant_principal_id,
+                requested_principal_id,
+            } => write!(
+                f,
+                "principal {requested_principal_id:?} does not match grant principal {grant_principal_id:?}"
+            ),
+            Self::ScopeMismatch {
+                grant_scope,
+                requested_scope,
+            } => write!(
+                f,
+                "scope {requested_scope:?} is not covered by grant scope {grant_scope:?}"
+            ),
+            Self::CapabilityMismatch {
+                grant_capability,
+                requested_capability,
+            } => write!(
+                f,
+                "capability '{requested_capability}' does not match grant capability '{grant_capability}'"
+            ),
+            Self::Expired {
+                expired_at_millis,
+                now_millis,
+            } => write!(
+                f,
+                "capability grant expired at {expired_at_millis} (now {now_millis})"
+            ),
+            Self::Exhausted {
+                max_uses,
+                use_count,
+            } => write!(
+                f,
+                "capability grant exhausted after {use_count} of {max_uses} uses"
+            ),
+            Self::UseCountOverflow { use_count } => {
+                write!(f, "capability grant use count overflow at {use_count}")
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityGrant {
     pub grant_id: CapabilityGrantId,
     pub principal_id: PrincipalId,
@@ -58,28 +151,124 @@ impl CapabilityGrant {
         self
     }
 
-    /// Whether this grant is still valid.
-    pub fn is_valid(&self) -> bool {
-        // Check expiration
-        if let Some(exp) = self.expires_at_millis {
-            if crate::identity::current_time_utils() > exp {
-                return false;
+    pub fn consume(
+        &mut self,
+        principal_id: PrincipalId,
+        requested_scope: &ScopeSelector,
+        requested_capability: &str,
+    ) -> CapabilityGrantConsumeResult {
+        if self.principal_id != principal_id {
+            return Err(self.denial(
+                principal_id,
+                requested_scope,
+                requested_capability,
+                CapabilityGrantDenialReason::PrincipalMismatch {
+                    grant_principal_id: self.principal_id,
+                    requested_principal_id: principal_id,
+                },
+            ));
+        }
+
+        if !grant_scope_covers(&self.scope, requested_scope) {
+            return Err(self.denial(
+                principal_id,
+                requested_scope,
+                requested_capability,
+                CapabilityGrantDenialReason::ScopeMismatch {
+                    grant_scope: self.scope.clone(),
+                    requested_scope: requested_scope.clone(),
+                },
+            ));
+        }
+
+        if self.capability != requested_capability {
+            return Err(self.denial(
+                principal_id,
+                requested_scope,
+                requested_capability,
+                CapabilityGrantDenialReason::CapabilityMismatch {
+                    grant_capability: self.capability.clone(),
+                    requested_capability: requested_capability.to_string(),
+                },
+            ));
+        }
+
+        let now_millis = crate::identity::current_time_utils();
+        if let Some(expired_at_millis) = self.expires_at_millis {
+            if now_millis >= expired_at_millis {
+                return Err(self.denial(
+                    principal_id,
+                    requested_scope,
+                    requested_capability,
+                    CapabilityGrantDenialReason::Expired {
+                        expired_at_millis,
+                        now_millis,
+                    },
+                ));
             }
         }
 
-        // Check use count
-        if let Some(max) = self.max_uses {
-            if self.use_count >= max {
-                return false;
+        if let Some(max_uses) = self.max_uses {
+            if self.use_count >= max_uses {
+                return Err(self.denial(
+                    principal_id,
+                    requested_scope,
+                    requested_capability,
+                    CapabilityGrantDenialReason::Exhausted {
+                        max_uses,
+                        use_count: self.use_count,
+                    },
+                ));
             }
         }
 
-        true
+        let use_count = self.use_count.checked_add(1).ok_or_else(|| {
+            self.denial(
+                principal_id,
+                requested_scope,
+                requested_capability,
+                CapabilityGrantDenialReason::UseCountOverflow {
+                    use_count: self.use_count,
+                },
+            )
+        })?;
+        self.use_count = use_count;
+
+        Ok(CapabilityGrantUse {
+            grant_id: self.grant_id,
+            principal_id,
+            capability: self.capability.clone(),
+            scope: requested_scope.clone(),
+            use_count,
+            max_uses: self.max_uses,
+        })
     }
 
-    /// Record a use of this grant.
-    pub fn record_use(&mut self) {
-        self.use_count += 1;
+    fn denial(
+        &self,
+        principal_id: PrincipalId,
+        requested_scope: &ScopeSelector,
+        requested_capability: &str,
+        reason: CapabilityGrantDenialReason,
+    ) -> CapabilityGrantDenial {
+        CapabilityGrantDenial {
+            grant_id: self.grant_id,
+            principal_id,
+            requested_capability: requested_capability.to_string(),
+            requested_scope: requested_scope.clone(),
+            reason,
+        }
+    }
+}
+
+fn grant_scope_covers(grant_scope: &ScopeSelector, requested_scope: &ScopeSelector) -> bool {
+    match grant_scope {
+        ScopeSelector::All => true,
+        ScopeSelector::Path(prefix) => match requested_scope {
+            ScopeSelector::Path(path) => path.starts_with(prefix.as_str()),
+            _ => false,
+        },
+        _ => grant_scope == requested_scope,
     }
 }
 
@@ -94,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn grant_record_use_increments() {
+    fn grant_consume_increments_once() {
         let mut grant = CapabilityGrant::new(
             CapabilityGrantId::new(1),
             PrincipalId::new(100),
@@ -102,12 +291,11 @@ mod tests {
             ScopeSelector::All,
         );
         assert_eq!(grant.use_count, 0);
-        grant.record_use();
+        let use_record = grant
+            .consume(PrincipalId::new(100), &ScopeSelector::All, "read")
+            .expect("grant should consume");
+        assert_eq!(use_record.use_count, 1);
         assert_eq!(grant.use_count, 1);
-        grant.record_use();
-        assert_eq!(grant.use_count, 2);
-        grant.record_use();
-        assert_eq!(grant.use_count, 3);
     }
 
     #[test]
@@ -139,20 +327,24 @@ mod tests {
     }
 
     #[test]
-    fn grant_is_valid_when_no_expiry_and_under_max_uses() {
+    fn grant_consume_allows_unlimited_uses_when_no_max() {
         let mut grant = CapabilityGrant::new(
             CapabilityGrantId::new(1),
             PrincipalId::new(100),
             "read".into(),
             ScopeSelector::All,
         );
-        assert!(grant.is_valid());
-        grant.record_use();
-        assert!(grant.is_valid());
+        assert!(grant
+            .consume(PrincipalId::new(100), &ScopeSelector::All, "read")
+            .is_ok());
+        assert!(grant
+            .consume(PrincipalId::new(100), &ScopeSelector::All, "read")
+            .is_ok());
+        assert_eq!(grant.use_count, 2);
     }
 
     #[test]
-    fn grant_is_valid_respects_max_uses() {
+    fn grant_consume_final_use_succeeds_once() {
         let mut grant = CapabilityGrant::new(
             CapabilityGrantId::new(1),
             PrincipalId::new(100),
@@ -160,10 +352,127 @@ mod tests {
             ScopeSelector::All,
         )
         .with_max_uses(2);
-        assert!(grant.is_valid());
-        grant.record_use();
-        assert!(grant.is_valid());
-        grant.record_use();
-        assert!(!grant.is_valid());
+        assert_eq!(
+            grant
+                .consume(PrincipalId::new(100), &ScopeSelector::All, "read")
+                .expect("first use should succeed")
+                .use_count,
+            1
+        );
+        assert_eq!(
+            grant
+                .consume(PrincipalId::new(100), &ScopeSelector::All, "read")
+                .expect("last allowed use should succeed")
+                .use_count,
+            2
+        );
+        let denial = grant
+            .consume(PrincipalId::new(100), &ScopeSelector::All, "read")
+            .expect_err("next use should be denied");
+        assert!(matches!(
+            denial.reason,
+            CapabilityGrantDenialReason::Exhausted {
+                max_uses: 2,
+                use_count: 2
+            }
+        ));
+        assert_eq!(grant.use_count, 2);
+    }
+
+    #[test]
+    fn grant_consume_denies_expired_without_increment() {
+        let mut grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        );
+        grant.expires_at_millis = Some(1);
+        let denial = grant
+            .consume(PrincipalId::new(100), &ScopeSelector::All, "read")
+            .expect_err("expired grant should be denied");
+        assert!(matches!(
+            denial.reason,
+            CapabilityGrantDenialReason::Expired { .. }
+        ));
+        assert_eq!(grant.use_count, 0);
+    }
+
+    #[test]
+    fn grant_consume_denies_principal_mismatch_without_increment() {
+        let mut grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        );
+        let denial = grant
+            .consume(PrincipalId::new(101), &ScopeSelector::All, "read")
+            .expect_err("wrong principal should be denied");
+        assert!(matches!(
+            denial.reason,
+            CapabilityGrantDenialReason::PrincipalMismatch {
+                grant_principal_id: PrincipalId(100),
+                requested_principal_id: PrincipalId(101)
+            }
+        ));
+        assert_eq!(grant.use_count, 0);
+    }
+
+    #[test]
+    fn grant_consume_denies_scope_mismatch_without_increment() {
+        let mut grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::Cluster { cluster_id: 1 },
+        );
+        let denial = grant
+            .consume(
+                PrincipalId::new(100),
+                &ScopeSelector::Cluster { cluster_id: 2 },
+                "read",
+            )
+            .expect_err("wrong scope should be denied");
+        assert!(matches!(
+            denial.reason,
+            CapabilityGrantDenialReason::ScopeMismatch { .. }
+        ));
+        assert_eq!(grant.use_count, 0);
+    }
+
+    #[test]
+    fn grant_consume_denies_capability_mismatch_without_increment() {
+        let mut grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        );
+        let denial = grant
+            .consume(PrincipalId::new(100), &ScopeSelector::All, "write")
+            .expect_err("wrong capability should be denied");
+        assert!(matches!(
+            denial.reason,
+            CapabilityGrantDenialReason::CapabilityMismatch { .. }
+        ));
+        assert_eq!(grant.use_count, 0);
+    }
+
+    #[test]
+    fn grant_consume_all_scope_covers_requested_scope() {
+        let mut grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        );
+        assert!(grant
+            .consume(
+                PrincipalId::new(100),
+                &ScopeSelector::Volume { volume_id: 7 },
+                "read"
+            )
+            .is_ok());
     }
 }
