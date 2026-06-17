@@ -41,5 +41,6 @@ Key current design and policy areas:
 - `docs/REQUEST_CONTRACT.md`
 - `docs/RDMA_TRANSPORT_POSITION.md`
 - `docs/TEST_SIGNAL_POLICY.md`
+- `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`
 - `docs/UNRELEASED_AUTHORITY_POLICY.md`
 - `docs/workspace-package-classification.md`
