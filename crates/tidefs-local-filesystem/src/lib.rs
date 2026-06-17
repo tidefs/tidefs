@@ -555,10 +555,18 @@ pub fn inspect_filesystem_content_objects_with_root_authentication_key(
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FilesystemContentInspectionReport> {
     options.repair_torn_tail = false;
-    let Some(mut store) = LocalObjectStore::open_read_only_with_options(root, options)? else {
-        return Ok(FilesystemContentInspectionReport::empty());
-    };
-    inspect_filesystem_content_objects_store(&mut store, root_authentication_key, None)
+    if let Some(mut store) = LocalObjectStore::open_read_only_with_options(&root, options.clone())?
+    {
+        return inspect_filesystem_content_objects_store(&mut store, root_authentication_key, None);
+    }
+    match LocalFileSystem::default_development_pool(root.as_ref(), &options, None, None) {
+        Ok(mut pool) => inspect_filesystem_content_objects_store(
+            pool.raw_primary_store_mut(),
+            root_authentication_key,
+            None,
+        ),
+        Err(_) => Ok(FilesystemContentInspectionReport::empty()),
+    }
 }
 
 pub fn plan_root_retention(
@@ -2433,7 +2441,7 @@ impl LocalFileSystem {
     }
 
     /// Create the development default pool from a hidden regular-file device image.
-    fn default_development_pool(
+    pub fn default_development_pool(
         root: &std::path::Path,
         options: &StoreOptions,
         encryption: Option<EncryptionConfig>,
@@ -2451,7 +2459,7 @@ impl LocalFileSystem {
             .join(DEFAULT_DEVELOPMENT_DEVICE_IMAGE)
     }
 
-    fn ensure_default_development_device_image(
+    pub fn ensure_default_development_device_image(
         root: &std::path::Path,
     ) -> Result<std::path::PathBuf> {
         fs::create_dir_all(root).map_err(|source| {
@@ -2508,7 +2516,7 @@ impl LocalFileSystem {
     #[allow(dead_code)]
     /// Create a pool backed by block devices for object data, using a
     /// metadata directory for pool labels and markers.
-    fn block_device_pool(
+    pub fn block_device_pool(
         metadata_dir: &std::path::Path,
         block_devices: &[std::path::PathBuf],
         encryption: Option<EncryptionConfig>,
@@ -2538,7 +2546,7 @@ impl LocalFileSystem {
         Ok(Pool::create(config, PoolProperties::default(), options)?)
     }
 
-    fn byte_addressable_device_backing(path: &std::path::Path) -> Result<DeviceBacking> {
+    pub fn byte_addressable_device_backing(path: &std::path::Path) -> Result<DeviceBacking> {
         match tidefs_pool_scan::classify_pool_device_backing(path).map_err(|source| {
             FileSystemError::Store(StoreError::Io {
                 operation: "pool_device_backing",

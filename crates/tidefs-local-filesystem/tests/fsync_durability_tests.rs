@@ -245,12 +245,17 @@ fn fsync_empty_file_creates_valid_content_object() {
         inode
     };
 
-    // Content object exists in store (possibly empty-layout manifest).
+    // Empty files are metadata-only: no content object should exist.
     {
-        let store = LocalObjectStore::open_with_options(&root, opts()).expect("open store");
-        assert_content_object_exists(&store, &inode);
+        let pool = tidefs_local_filesystem::LocalFileSystem::default_development_pool(
+            &root,
+            &opts(),
+            None,
+            None,
+        )
+        .expect("open pool");
+        assert_content_object_absent(pool.raw_primary_store(), &inode);
     }
-
     // Reopen: empty file still exists and is empty.
     {
         let fs = LocalFileSystem::open_with_options(&root, opts()).expect("reopen fs");
