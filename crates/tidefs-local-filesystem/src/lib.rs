@@ -3551,12 +3551,27 @@ impl LocalFileSystem {
 
         // Legacy unversioned content key — matches the object-key prefix
         // used by older content writes before per-version chunking.
+        // For overwrite (nlink > 0), gate on replacement receipt durability
+        // so the legacy key is only queued for reclaim after the replacement
+        // receipt is durably committed.
         let legacy_key = content_object_key(inode_id);
-        rq.insert(ReclaimQueueEntry::new(
-            ReclaimObjectKey(*legacy_key.as_bytes()),
-            -1,
-            ReclaimQueueFamily::Extent,
-        ));
+        let legacy_nlink = record.as_ref().map(|r| r.nlink).unwrap_or(0);
+        if legacy_nlink == 0
+            || crate::allocation::replacement_receipt_is_durable(
+                &self.store,
+                tidefs_local_object_store::ObjectKey::from_bytes(*legacy_key.as_bytes()),
+                crate::content::latest_receipt_generation_for_key(
+                    &self.store,
+                    tidefs_local_object_store::ObjectKey::from_bytes(*legacy_key.as_bytes()),
+                ),
+            )
+        {
+            rq.insert(ReclaimQueueEntry::new(
+                ReclaimObjectKey(*legacy_key.as_bytes()),
+                -1,
+                ReclaimQueueFamily::Extent,
+            ));
+        }
 
         // Versioned content keys for current and baseline data versions.
         if let Some(dv) = dv {

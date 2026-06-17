@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tidefs_local_object_store::{
-    checksum64, pool::Pool, CrashInjectionPoint, DeviceIoClass, LocalObjectStore, ObjectKey,
+    checksum64, pool::Pool, CrashInjectionPoint, LocalObjectStore, ObjectKey,
     ObjectLocation,
 };
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
@@ -572,22 +572,16 @@ fn inspect_chunk_object(
     });
 
     // Validate stored receipt generation against pool when pool is available.
+    // Uses chunk_receipt_is_durable from allocation.rs for authoritative
+    // receipt-authority gating: hole chunks and zero-generation (pre-v6)
+    // chunks return durable-trivial, while non-zero chunks must match the
+    // pool's current durable receipt.
     if let Some(pool) = pool {
-        if !chunk_ref.is_hole() && chunk_ref.placement_receipt_generation != 0 {
-            let pool_receipt = pool
-                .placement_receipt_for_key(DeviceIoClass::Data, key)
-                .unwrap_or(None);
-            let mismatch = match pool_receipt {
-                Some(receipt) => receipt.generation != chunk_ref.placement_receipt_generation,
-                None => true,
-            };
-            if mismatch {
-                // Flag the reference we just pushed.
-                if let Some(last) = report.referenced_objects.last_mut() {
-                    if !last.receipt_mismatch {
-                        last.receipt_mismatch = true;
-                        report.receipt_mismatches = report.receipt_mismatches.saturating_add(1);
-                    }
+        if !crate::allocation::chunk_receipt_is_durable(pool, chunk_ref, key) {
+            if let Some(last) = report.referenced_objects.last_mut() {
+                if !last.receipt_mismatch {
+                    last.receipt_mismatch = true;
+                    report.receipt_mismatches = report.receipt_mismatches.saturating_add(1);
                 }
             }
         }
@@ -2334,7 +2328,7 @@ mod receipt_validation_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tidefs_local_object_store::pool::Pool;
     use tidefs_local_object_store::{
-        DeviceBacking, DeviceClass, DeviceConfig, DeviceKind, IntegrityDigest64, LocalObjectStore,
+        DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, IntegrityDigest64, LocalObjectStore,
         PoolConfig, PoolProperties, StoreOptions,
     };
     use tidefs_types_vfs_core::S_IFREG;

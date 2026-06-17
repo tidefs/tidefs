@@ -2197,7 +2197,6 @@ mod tests {
 /// This is the authoritative lookup that ties local-filesystem chunk refs
 /// to the pool's receipt authority. Callers use it to decide whether an old
 /// chunk can be reclaimed after a rewrite.
-#[allow(dead_code)]
 pub(crate) fn latest_receipt_generation_for_key(
     pool: &tidefs_local_object_store::pool::Pool,
     object_key: tidefs_local_object_store::ObjectKey,

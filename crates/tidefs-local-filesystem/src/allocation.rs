@@ -488,7 +488,6 @@ pub(crate) fn next_allocated_inode_id(state: &FileSystemState) -> u64 {
 ///
 /// Hole chunks (data_version == 0, no receipt) are always durable-trivial:
 /// they consume no storage and have no receipt to validate.
-#[allow(dead_code)]
 pub(crate) fn chunk_receipt_is_durable(
     pool: &tidefs_local_object_store::pool::Pool,
     chunk_ref: &crate::records::ContentChunkRef,
@@ -526,7 +525,6 @@ pub(crate) fn chunk_receipt_is_durable(
 /// generation strictly greater than `old_generation`. This means the
 /// replacement data is durably placed and the old chunk may be reclaimed
 /// once no readers depend on the old receipt.
-#[allow(dead_code)]
 pub(crate) fn replacement_receipt_is_durable(
     pool: &tidefs_local_object_store::pool::Pool,
     object_key: tidefs_local_object_store::ObjectKey,
@@ -555,7 +553,6 @@ pub(crate) fn replacement_receipt_is_durable(
 /// for the key and verifies that the receipt generation has been committed.
 /// A missing receipt is treated as durable (backward compatibility with
 /// pre-receipt writes), and a pool error conservatively retains the entry.
-#[allow(dead_code)]
 pub(crate) fn chunk_content_key_receipt_stable(
     pool: &tidefs_local_object_store::pool::Pool,
     object_key: tidefs_local_object_store::ObjectKey,
