@@ -1,7 +1,8 @@
 # Local/Distributed Placement Receipt Authority
 
-Maturity: live implementation note for the local and distributed receipt APIs
-that feed issue #18. This document is not a closure claim for the full
+Maturity: live implementation note tracking issue #18 receipt-authority
+progress.
+This document is not a closure claim for the full
 local-filesystem, distributed transport, rebake, rebuild, and runtime
 validation surface.
 
@@ -118,26 +119,44 @@ The local object-store tests cover:
 
 - receipt-returning writes through `put_with_receipt`;
 - rejection of receiptless `IntentLog` writes through `put_with_receipt`;
-- repair rewrites that publish a newer replacement receipt;
-- latest-receipt scans after rewrites and stale receipt injection;
-- projection from local receipts into `PlacementReceiptRef`;
-- receipt-bound reclaim gating for replicated and erasure rewrites.
+- repair rewrites that publish a newer receipt generation;
+- receipt persistence across pool close/reopen cycles (local replay);
+- receipt-bound reclaim that holds dead objects until the replacement receipt
+  generation is stable and durable;
+- rebake-gated dead-object enqueue via `QueueFamily::Rebake` with generation
+  stability enforcement.
 
-## Distributed Receipt Transfer Protocol
+The replicated object-store tests cover:
 
-The peer-replication wire protocol (`ReplicationMessage`) now carries
-receipt authority on the write path via `PutWithReceipt`:
+- `put_named_with_receipt` quorum-write integration with receipt validation;
+- receipt-validated degraded reads with replica fallback;
+- two-node receipt transfer and receipt-read tests via
+  `SegmentFetchRequest`/`SegmentFetchResponse`;
+- receipt-repair task execution with verified completion tracking;
+- placement map versioning and receipt-ref propagation.
 
-- `PutWithReceipt { name, payload, placement_receipt_ref }` — a peer sends
-  payload bytes with the durable placement receipt that authorized the source
-  write. The receiver validates that the receipt is non-synthetic and returns
-  its own receipt in the acknowledgment.
-- `PutWithReceiptAck { key_hash, success, recorded_receipt_ref }` — the
-  pool-backed receiver writes through `put_with_receipt` and returns its local
-  placement receipt reference in the acknowledgment. Transport-backed and
-  local stores accept the data but report `recorded_receipt_ref: None`.
+The rebuild planner tests cover:
 
-This complements the existing receipt-bearing protocol messages:
+- receipt-backed object placement validation;
+- reconstruction planning with receipt-ref authority;
+- malformed-policy receipt rejection;
+- erasure and replicated layout planning;
+- deterministic plan sealing and integrity verification.
+
+The local-filesystem tests cover:
+
+- receipt generation during content writes through `put_with_receipt`;
+- receipt durability gating in rewrite-path extent trimming;
+- receipt rotation through the content rewrite path;
+- reclaim drain gating on durable receipt evidence;
+- re-enqueue when replacement receipt is not yet durable.
+
+The scrub-core multi-node fanout protocol carries `PlacementReceiptRef` so
+peers validate placement authority during distributed verification.
+
+### Transport Protocol Receipt Carriage
+
+The replication transport carries receipts in key protocol messages:
 
 - `SyncResponse { entries: Vec<SyncEntry> }` where each `SyncEntry` carries
   an optional `placement_receipt_ref`;
@@ -163,63 +182,67 @@ receipt lookups drive the segment read.
 
 ### Completed
 
-Completed under issue #18 and the focused split issues:
+Completed issue #18 split work merged so far:
 
 - #343 (merged): pool exposes receipt-returning placement writes;
 - #344 (merged via PR #358): local-filesystem extent writes persist and replay
   receipt references through extent IO;
+- #345 (merged via PR #350): distributed storage-node and transport paths move
+  receipt-addressed extents between nodes via `PutWithReceipt` protocol;
 - #346 (merged via PR #357): rebake/reclaim receipt publishing, generation-stability
   gating, `DeadObjectReplacementReceipt::erasure_coded` constructor, and
   `authorizes_reclaim_for_with_stable_generation` enforcement;
-- #345 (merged via PR #350): distributed storage-node and transport paths move
-  receipt-addressed extents between nodes via `PutWithReceipt` protocol;
 - #352 (merged via PR #362): local-filesystem routes content writes through
   `PoolStoreMut::put_with_receipt` for receipt generation;
+- #354 (merged via PR #375): local-filesystem preserves durable receipt evidence
+  during rewrites, deletion, and reclaim;
 - #355 (merged via PR #355): erasure receipt coverage and
   rebuild-after-replacement tests;
-- #360 (merged via PR #360): receipt generation consumed during recovery and
-  replay paths;
 - #356 (merged via PR #366): replicated-object-store receipt-validated
   degraded reads and two-node receipt-read tests;
+- #360 (merged via PR #360): receipt generation consumed during recovery and
+  replay paths;
+- #363 (merged via PR #372): local-filesystem read-path extent lookup via
+  receipt generation;
+- #364 (merged via 5aaf309): local-filesystem tests for receipt generation
+  validation in content inspection;
 - #369 (merged via PR #369): scrub-core receipt authority in multi-node fanout
   protocol and rebuild-after-replacement integration test;
 - #370 / #371 (merged via e0915b6, 8c59fb4): distributed model-check
   integration with settled receipt types and durable-rebuild gating;
-- #364 (merged via 5aaf309): local-filesystem tests for receipt generation
-  validation in content inspection;
+- #376 (merged via PR #379): local-filesystem receipt rotation wired into
+  the content rewrite path;
+- #377 (merged via PR #388): receipt durability wired into rewrite-path
+  extent trimming, with rollback state preservation;
+- #378 (merged via PR #378): docs updated to reflect current merged state;
+- #380 (merged via PR #380): `put_named_with_receipt` added to
+  `TransportReplicatedStore` with quorum-write and receipt-validation
+  integration;
 - rebuild completion receives receipt-verified task tracking with
   `record_receipt_verified_task_completion` that validates erasure and
   replicated policy correctness, including erasure malformed-policy rejection.
 
-### In Progress (CI)
+### Remaining
 
-- PR #372 (ds3/issue-363): local-filesystem read-path extent lookup via
-  receipt generation (#363);
-- PR #375 (ds2/issue-354): local-filesystem receipt durability helpers,
-  reclaim drain gate, and re-enqueue when receipt not yet durable (#354).
+The merged split issues above do not close the full issue #18 acceptance
+criteria. Remaining implementation and validation work includes:
 
-### Remaining (blocked on in-flight PRs)
+- Wire primary distributed writes so the storage-node and pool-backed write
+  paths record durable receipts before transport fan-out;
+- Finish read, degraded-read, scrub, repair, and rebuild paths that still need
+  to consume receipt authority outside the focused split APIs above;
+- Finish rebake/reclaim runtime paths that must trim only after durable
+  replacement receipt evidence is available;
+- Complete distributed state-transfer paths that move receipt-addressed extents
+  and preserve read availability during node/device loss within the configured
+  redundancy policy;
+- Add two-node/distributed storage-node integration tests plus runtime rows for
+  two-node receipt transfer, degraded-read availability, rebuild after
+  replacement, and reclaim under sustained write pressure.
 
-- #376: wire receipt rotation into the content rewrite path (depends on
-  PR #375 landing);
-- #377: wire receipt durability into rewrite-path extent trimming (depends on
-  PR #375 landing);
-- Runtime validation rows for two-node receipt transfer, degraded-read
-  availability, and rebuild-after-replacement with node/device loss scenarios.
-
-### Recently Completed (since last update)
-
-- #366 (merged 2026-06-17): receipt-validated degraded reads and two-node
-  receipt-read tests in `replicated-object-store`, with `SegmentFetchRequest`
-  carrying `PlacementReceiptRef` for cross-node segment reads served from
-  pool-backed receipt lookups;
-- Distributed read-path receipt validation: `validate_degraded_read_receipt`
-  checks receipt non-synthetic, policy well-formed, payload length, and BLAKE3
-  digest match before returning replica bytes;
-- The `SegmentFetchRequest`/`SegmentFetchResponse` transport protocol carries
-  receipt authority for cross-node reads; the `ReadPlanResponse` and
-  `RepairObject`/`RepairObjectAck` protocols carry receipt refs for planned
-  reads and receipt-bound repairs.
+Runtime rows remain milestone-gate validation, not first-edit implementation.
+RDMA and broad release-candidate runs are further milestone gates (see issue
+#18 validation tier).
 
 ## References
 
