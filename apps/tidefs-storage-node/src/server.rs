@@ -3827,7 +3827,7 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     if let Err(e) = validate_transfer_receipt_for_name(
                         name.as_bytes(),
                         &payload,
-                        placement_receipt_ref,
+                        *placement_receipt_ref,
                     ) {
                         eprintln!(
                             "[storage-node] session {}: rejecting receipt-authorized put for {}: {}",
