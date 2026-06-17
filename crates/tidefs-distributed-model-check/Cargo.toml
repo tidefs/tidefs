@@ -11,6 +11,9 @@ description = "Deterministic distributed safety model checker: membership epoch,
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 
+tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+
 [dev-dependencies]
 serde_json = "1"
 

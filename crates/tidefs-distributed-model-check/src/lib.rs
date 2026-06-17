@@ -9,10 +9,11 @@
 //! violations are returned as structured errors so model-check tests can
 //! assert on expected safety properties.
 //!
-//! This crate is a self-contained deterministic model that mirrors the
-//! TideFS membership epoch, lease, quorum write, and placement protocols
-//! using its own bounded in-process types.  It does not depend on the
-//! live runtime crates, so it can run as a fast compile-time safety gate.
+//! Placement/receipt identity and locator types are sourced from the
+//! settled authority crates (`tidefs-replication-model`,
+//! `tidefs-membership-epoch`) rather than inventing parallel types.
+//! The model itself remains deterministic and self-contained for lease,
+//! quorum-write, and network behaviour.
 //!
 //! # Safety invariants
 //!
@@ -42,12 +43,17 @@ pub use lease::{LeaseState, LeaseModel, LeaseOutcome};
 pub use quorum::{
     QuorumWriteModel, QuorumWriteOutcome, QuorumWriteRequest, QuorumWriteState,
 };
-pub use placement::{PlacementModel, PlacementReceiptState, RebuildPolicy};
+pub use placement::{
+    PlacementReceiptRef,
+    model_placement_receipt_ref, receipt_ref_to_model_key, PlacementModel,
+    PlacementReceiptState, RebuildAttempt, RebuildPolicy,
+};
 pub use invariants::{
     check_distributed_invariants, DistributedInvariantViolation,
     no_conflicting_committed_writers, no_stale_epoch_commit, no_false_quorum_success,
     no_rebuild_before_receipt,
 };
+
 
 /// Maximum number of nodes in a model-check scenario (keeps state space bounded).
 pub const MAX_MODEL_NODES: usize = 7;
@@ -156,5 +162,7 @@ pub struct CommittedObjectWrite {
     pub epoch: u64,
     pub writer_node_id: u64,
     pub write_id: u64,
-    pub placement_receipt_id: u64,
+    /// The settled placement receipt ref that authorises this write.
+    /// Carries the receipt identity from `tidefs-replication-model`.
+    pub placement_receipt_ref: PlacementReceiptRef,
 }

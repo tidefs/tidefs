@@ -4,7 +4,8 @@
 //! and duplicate behaviour.
 
 use std::collections::VecDeque;
-use super::{LeaseState, NodeState, PlacementReceiptState, quorum::{QuorumPhase, QuorumWriteState}};
+use super::{LeaseState, NodeState, quorum::{QuorumPhase, QuorumWriteState}};
+use super::placement::PlacementReceiptState;
 
 pub type NodeAddress = u64;
 
@@ -33,7 +34,10 @@ pub enum MessageKind {
     LeaseRevoke { lease_id: u64 },
     QuorumPrepare { write_id: u64, object_key: String },
     QuorumCommitAck { write_id: u64, ack: bool },
-    PlacementReceipt { receipt_id: u64, object_key: String },
+    /// A placement receipt delivered to a node.  Carries an object id and
+    /// key so the receiver can construct a [`PlacementReceiptRef`] for
+    /// identity tracking.
+    PlacementReceipt { object_id: u64, object_key_str: String },
 }
 
 #[derive(Clone, Debug)]
@@ -119,11 +123,15 @@ impl NetworkModel {
                         }
                     }
                 }
-                MessageKind::PlacementReceipt { receipt_id, object_key } => {
-                    node.placement_receipts.push(PlacementReceiptState {
-                        receipt_id: *receipt_id, object_key: object_key.clone(),
-                        node_id: msg.to, epoch: msg.epoch, durable: true,
-                    });
+                MessageKind::PlacementReceipt { object_id, object_key_str } => {
+                    let receipt_state = PlacementReceiptState::for_model(
+                        *object_id,
+                        object_key_str,
+                        msg.to,
+                        msg.epoch,
+                        true, // durable on delivery
+                    );
+                    node.placement_receipts.push(receipt_state);
                 }
             }
         }
