@@ -804,4 +804,66 @@ mod tests {
         let result = dispatch_setlkw(&mut backend, 1, 1, LockType::Read, 50, 10, 200);
         assert!(matches!(result, Err(LockError::Conflict(_))));
     }
+
+    // ── Dataset mount scoping tests ─────────────────────────────────
+
+    #[test]
+    fn cross_dataset_locks_do_not_conflict() {
+        let mut tracker = LockTracker::new();
+        tracker.acquire(1, 42, LockRange::write(0, 100, 100)).unwrap();
+        assert!(tracker.acquire(2, 42, LockRange::write(0, 100, 200)).is_ok());
+        assert_eq!(tracker.inode_count(), 2);
+    }
+
+    #[test]
+    fn cross_dataset_inode_collision_isolated() {
+        let mut tracker = LockTracker::new();
+        tracker.acquire(1, 1, LockRange::write(0, 100, 10)).unwrap();
+        assert!(tracker.query_conflict(2, 1, LockRange::read(0, 100, 20)).is_none());
+        assert!(tracker.query_conflict(1, 1, LockRange::read(0, 100, 20)).is_some());
+    }
+
+    #[test]
+    fn unmount_releases_all_locks_for_mount() {
+        let mut tracker = LockTracker::new();
+        tracker.acquire(1, 1, LockRange::write(0, 100, 10)).unwrap();
+        tracker.acquire(1, 2, LockRange::read(0, 50, 10)).unwrap();
+        tracker.acquire(2, 1, LockRange::write(0, 50, 20)).unwrap();
+        assert_eq!(tracker.inode_count(), 3);
+        let released = tracker.release_all_for_mount(1);
+        assert_eq!(released, 2);
+        assert_eq!(tracker.inode_count(), 1);
+        assert!(tracker.locks_for_mount_inode(2, 1).is_some());
+    }
+
+    #[test]
+    fn forced_unmount_clears_stale_locks() {
+        let mut tracker = LockTracker::new();
+        tracker.acquire(1, 10, LockRange::write(0, 200, 100)).unwrap();
+        tracker.acquire(1, 20, LockRange::read(100, 50, 100)).unwrap();
+        assert_eq!(tracker.release_all_for_mount(1), 2);
+        assert!(tracker.is_empty());
+        tracker.acquire(2, 10, LockRange::write(0, 200, 200)).unwrap();
+        assert_eq!(tracker.inode_count(), 1);
+    }
+
+    #[test]
+    fn ofd_lock_mount_scoping_preserved() {
+        let mut tracker = LockTracker::new();
+        let owner_a: u64 = 100;
+        let owner_b: u64 = 200;
+        tracker.acquire(1, 5, LockRange::new(0, 100, LockType::Write, owner_a, 10)).unwrap();
+        assert!(tracker.acquire(2, 5, LockRange::new(0, 100, LockType::Write, owner_a, 10)).is_ok());
+        assert!(tracker.acquire(1, 5, LockRange::new(0, 100, LockType::Write, owner_b, 20)).is_err());
+    }
+
+    #[test]
+    fn upgrade_deadlock_cross_dataset_no_false_positive() {
+        let mut tracker = LockTracker::new();
+        tracker.acquire(1, 1, LockRange::write(0, 100, 10)).unwrap();
+        tracker.acquire(1, 2, LockRange::write(0, 100, 20)).unwrap();
+        assert!(tracker.acquire(1, 2, LockRange::write(0, 100, 10)).is_err());
+        assert!(tracker.acquire(1, 1, LockRange::write(0, 100, 20)).is_err());
+        assert!(tracker.acquire(2, 1, LockRange::write(0, 100, 20)).is_ok());
+    }
 }
