@@ -2407,11 +2407,6 @@ version = "0.421.0"
 dependencies = [
  "serde",
  "serde_json",
- "tidefs-lease",
- "tidefs-membership-epoch",
- "tidefs-placement-runtime",
- "tidefs-quorum-write",
- "tidefs-replication-model",
 ]
 
 [[package]]

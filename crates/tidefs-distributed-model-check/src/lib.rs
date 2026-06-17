@@ -9,9 +9,10 @@
 //! violations are returned as structured errors so model-check tests can
 //! assert on expected safety properties.
 //!
-//! The model consumes the `ReceiptId`, `MembershipPlacementVerdictRecord`,
-//! and other placement/receipt authority types from #17/#18 instead of
-//! inventing a parallel distributed placement truth.
+//! This crate is a self-contained deterministic model that mirrors the
+//! TideFS membership epoch, lease, quorum write, and placement protocols
+//! using its own bounded in-process types.  It does not depend on the
+//! live runtime crates, so it can run as a fast compile-time safety gate.
 //!
 //! # Safety invariants
 //!

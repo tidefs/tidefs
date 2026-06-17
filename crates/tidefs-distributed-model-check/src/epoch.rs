@@ -2,10 +2,8 @@
 
 //! Membership-epoch model for the distributed model checker.
 //!
-//! Consumes `EpochId`, `ReceiptId`, and placement-authority types from
-//! `tidefs-membership-epoch` (the #17/#18 placement/receipt authority).
-//! This module is a pure model — it does not depend on a live network
-//! or consensus runtime.
+//! This module is a pure model that mirrors the TideFS membership-epoch
+//! protocol.  It does not depend on a live network or consensus runtime.
 
 use std::collections::BTreeMap;
 

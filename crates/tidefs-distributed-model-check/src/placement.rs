@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 
-//! Placement/receipt authority model consuming #17/#18 types.
+//! Placement/receipt authority model for the distributed model checker.
 //!
-//! The model tracks placement receipts (from `tidefs-membership-epoch`)
-//! and enforces that rebuild/reclaim operations require prior durable
-//! placement receipts.  It does not invent a parallel placement truth.
+//! Tracks placement receipts and enforces that rebuild/reclaim operations
+//! require prior durable placement receipts.  This is a self-contained
+//! model that mirrors the TideFS placement protocol without depending on
+//! live runtime crates.
 
 use std::collections::BTreeMap;
 
