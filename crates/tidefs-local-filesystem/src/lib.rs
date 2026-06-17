@@ -5475,9 +5475,10 @@ impl LocalFileSystem {
         // Zero-copy reflink: store dedup redirects at destination chunk keys.
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
+            let mut pool_store = self.store.pool_store_mut();
             reflink_chunked_content(
                 self.dedup_enabled,
-                self.store.raw_primary_store_mut(),
+                &mut pool_store,
                 source_inode_id,
                 &source_record,
                 &dest_record,
@@ -5853,9 +5854,10 @@ impl LocalFileSystem {
         record.metadata_version = tick;
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
+            let mut pool_store = self.store.pool_store_mut();
             write_chunked_content_with_patch_batch(WriteChunkedContentPatchBatch {
                 dedup_enabled: self.dedup_enabled,
-                store: self.store.raw_primary_store_mut(),
+                store: &mut pool_store,
                 inode_id,
                 old_record: &old_record,
                 new_record: &record,
@@ -7001,9 +7003,10 @@ impl LocalFileSystem {
         }
         // Zero the content range in the object store via punch_hole_content.
         // This ensures subsequent reads return zeros for the freed range.
+        let mut pool_store = self.store.pool_store_mut();
         let quorum_store = None; // block-device discard is a local operation.
         crate::content::punch_hole_content(PunchHoleContent {
-            store: self.store.raw_primary_store_mut(),
+            store: &mut pool_store,
             inode_id,
             old_record: &record,
             new_record: &updated,
@@ -7114,9 +7117,10 @@ impl LocalFileSystem {
         let mut updated = record.clone();
         updated.data_version = tick;
         updated.metadata_version = tick;
+        let mut pool_store = self.store.pool_store_mut();
         // Size is preserved (KEEP_SIZE semantics)
         punch_hole_content(PunchHoleContent {
-            store: self.store.raw_primary_store_mut(),
+            store: &mut pool_store,
             inode_id,
             old_record: &record,
             new_record: &updated,
@@ -7401,9 +7405,10 @@ impl LocalFileSystem {
         let mut updated = record.clone();
         updated.data_version = tick;
         updated.metadata_version = tick;
+        let mut pool_store = self.store.pool_store_mut();
         updated.size = record_size;
         punch_hole_content(PunchHoleContent {
-            store: self.store.raw_primary_store_mut(),
+            store: &mut pool_store,
             inode_id,
             old_record: &record,
             new_record: &updated,
@@ -8650,9 +8655,10 @@ impl LocalFileSystem {
 
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
+            let mut pool_store = self.store.pool_store_mut();
             write_chunked_content(
                 self.dedup_enabled,
-                self.store.raw_primary_store_mut(),
+                &mut pool_store,
                 &record,
                 initial_content,
                 &mut dedup,
@@ -8748,9 +8754,10 @@ impl LocalFileSystem {
 
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
+            let mut pool_store = self.store.pool_store_mut();
             reflink_chunked_content(
                 self.dedup_enabled,
-                self.store.raw_primary_store_mut(),
+                &mut pool_store,
                 source_inode_id,
                 &source_record,
                 &dest_record,
@@ -8809,9 +8816,10 @@ impl LocalFileSystem {
         record.metadata_version = tick;
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
+            let mut pool_store = self.store.pool_store_mut();
             write_chunked_content(
                 self.dedup_enabled,
-                self.store.raw_primary_store_mut(),
+                &mut pool_store,
                 &record,
                 &content,
                 &mut dedup,
@@ -8912,9 +8920,10 @@ impl LocalFileSystem {
         record.metadata_version = tick;
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
+            let mut pool_store = self.store.pool_store_mut();
             write_chunked_content_with_overlay(WriteChunkedContentOverlay {
                 dedup_enabled: self.dedup_enabled,
-                store: self.store.raw_primary_store_mut(),
+                store: &mut pool_store,
                 inode_id,
                 old_record: &old_record,
                 new_record: &record,
