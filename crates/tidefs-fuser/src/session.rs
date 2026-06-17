@@ -145,6 +145,13 @@ impl<FS: Filesystem> Session<FS> {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
             match self.ch.receive(buf) {
+                Ok(0) => {
+                    eprintln!(
+                        "FUSE session run loop exiting: read returned EOF on mount {}",
+                        self.mountpoint.display()
+                    );
+                    break;
+                }
                 Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
                     Some(req) => req.dispatch(self),
@@ -155,7 +162,7 @@ impl<FS: Filesystem> Session<FS> {
                             self.mountpoint.display()
                         );
                         break;
-                    },
+                    }
                 },
                 Err(err) => match err.raw_os_error() {
                     // Operation interrupted. Accordingly to FUSE, this is safe to retry
@@ -171,9 +178,15 @@ impl<FS: Filesystem> Session<FS> {
                             self.mountpoint.display()
                         );
                         break;
-                    },
+                    }
                     // Unhandled error
-                    _ => return Err(err),
+                    _ => {
+                        eprintln!(
+                            "FUSE session run loop exiting: read error on mount {}: {err}",
+                            self.mountpoint.display()
+                        );
+                        return Err(err);
+                    }
                 },
             }
         }

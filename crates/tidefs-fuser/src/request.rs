@@ -55,6 +55,7 @@ impl<'a> Request<'a> {
             Ok(request) => request,
             Err(err) => {
                 error!("{err}");
+                eprintln!("FUSE request parse error: {err}");
                 return None;
             }
         };
