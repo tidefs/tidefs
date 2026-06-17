@@ -31,6 +31,7 @@ tidefs-types-claim-ledger-core = { path = "../tidefs-types-claim-ledger-core" }
 tidefs-reserve-ledger = { path = "../tidefs-reserve-ledger" }
 tidefs-claim-ledger = { path = "../tidefs-claim-ledger" }
 tidefs-erasure-coding = { path = "../tidefs-erasure-coding" }
+tidefs-performance-contract = { path = "../tidefs-performance-contract", features = ["alloc"] }
 tidefs-types-polymorphic-xattr-core = { path = "../tidefs-types-polymorphic-xattr-core", features = ["alloc"] }
 tidefs-posix-acl = { path = "../tidefs-posix-acl", features = ["alloc"] }
 tidefs-inode-table = { path = "../tidefs-inode-table" }

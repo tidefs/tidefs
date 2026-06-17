@@ -158,6 +158,12 @@ pub enum FileSystemError {
     DatasetLocked {
         reason: String,
     },
+    /// Write admission rejected by the performance contract — dirty
+    /// byte, op, age, or permit cap has been reached.  Writers must
+    /// wait for a commit group SYNC to release dirty debt.
+    DirtyAdmissionRejected {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,6 +275,7 @@ impl fmt::Display for FileSystemError {
             ),
             Self::LifecycleError { reason } => write!(f, "mount refused by lifecycle: {reason}"),
             Self::DatasetLocked { reason } => write!(f, "dataset is locked: {reason}"),
+            Self::DirtyAdmissionRejected { reason } => write!(f, "write admission rejected: {reason}"),
         }
     }
 }
@@ -372,6 +379,14 @@ impl From<tidefs_dataset_lifecycle::LifecycleError> for FileSystemError {
     fn from(e: tidefs_dataset_lifecycle::LifecycleError) -> Self {
         FileSystemError::LifecycleError {
             reason: format!("{e}"),
+        }
+    }
+}
+
+impl From<tidefs_performance_contract::AdmissionError> for FileSystemError {
+    fn from(e: tidefs_performance_contract::AdmissionError) -> Self {
+        FileSystemError::DirtyAdmissionRejected {
+            reason: format!("{e:?}"),
         }
     }
 }

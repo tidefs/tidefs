@@ -285,6 +285,7 @@
 //!   standalone local filesystem layer that can operate independently of
 //!   the distributed layer.
 
+pub mod admission;
 mod allocation;
 mod background_cleaner;
 mod background_orphan_reclamation;
@@ -382,6 +383,7 @@ use tidefs_local_object_store::{
     StoreEncryptionKey, StoreError, StoreOptions,
 };
 use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
+use tidefs_performance_contract::AdmissionPermit;
 use tidefs_quorum_write_runtime::{QuorumConfig, QuorumObjectStore};
 use tidefs_reserve_ledger::{BudgetDomain, ReserveClass};
 use tidefs_space_accounting::{
@@ -434,6 +436,7 @@ use crate::hot_read_cache::*;
 use crate::inode_cache::*;
 // PC-008 intent-log module (types used via glob re-export)
 // PC-008 intent-log module (re-exported for future use)
+use crate::admission::LocalWriteAdmission;
 use crate::background_cleaner::{BackgroundCleaner, BackgroundCleanerConfig};
 use crate::capacity_authority::{
     CapacityAuthority, CapacityAuthoritySnapshot, CapacityReservationHandle, CapacityStatfs,
@@ -1373,6 +1376,13 @@ pub struct LocalFileSystem {
     state_before_transaction: Option<FileSystemState>,
     mutation_delta: Option<MutationDelta>,
     domain_registry: SpaceDomainRegistry,
+    /// Runtime write-admission state with hard dirty-byte/op/age caps.
+    /// Every dirty producer must acquire an [`AdmissionPermit`] before
+    /// work enters any tracked queue or buffer.
+    write_admission: LocalWriteAdmission,
+    /// Outstanding admission permits for dirty writes not yet committed.
+    /// Released en masse when dirty_set is cleared after a successful SYNC.
+    pending_permits: Vec<AdmissionPermit>,
     /// Centralised dirty-state tracker for the writeback layer (§4 of #1190).
     /// Accounts data bytes, metadata ops, inode/dir dirty sets, and catalog
     /// dirty flag.  Read by commit_group auto-sync triggers; cleared on successful SYNC.
@@ -1424,6 +1434,8 @@ pub struct LocalFileSystem {
     writeback_handle: Option<crate::writeback_daemon::WritebackHandle>,
     lock_tracker: RefCell<LockTracker>,
     pool_uuid: u64,
+    /// tidefs-queue-root: local_fs.write_buffers
+    /// admission: AdmissionPermit  service_curve: ServiceCurve
     write_buffers: BTreeMap<InodeId, WriteBuffer>,
     write_buffer_config: WriteBufferConfig,
     fsync_stats: FsyncStats,
@@ -3064,6 +3076,8 @@ impl LocalFileSystem {
             mutation_delta: None,
             domain_registry: SpaceDomainRegistry::new(),
             state_before_transaction: None,
+            write_admission: LocalWriteAdmission::new(Default::default()),
+            pending_permits: Vec::new(),
             dirty_set: DirtySet::default(),
             intent_log,
             intent_log_buffer: None,
@@ -6361,6 +6375,34 @@ impl LocalFileSystem {
         Ok(Some(bytes))
     }
 
+    /// Try to admit a dirty write operation through the performance contract.
+    ///
+    /// Acquires an `AdmissionPermit` that conserves dirty-byte and dirty-op
+    /// budget. The permit is stored in `pending_permits` and released
+    /// en masse when the dirty set is cleared after a successful commit.
+    fn try_admit_write(&mut self, dirty_bytes: u64, dirty_ops: u32) -> Result<()> {
+        let permit = self
+            .write_admission
+            .try_admit_dirty_write(dirty_bytes, dirty_ops)?;
+        self.pending_permits.push(permit);
+        Ok(())
+    }
+
+    /// Release all outstanding admission permits after a successful SYNC.
+    fn release_pending_permits(&mut self) {
+        for permit in self.pending_permits.drain(..) {
+            let _ = self.write_admission.release(permit);
+        }
+    }
+
+    /// Take a bounded peak-usage snapshot for runtime evidence collection.
+    ///
+    /// Resets peak counters after the snapshot so callers can poll
+    /// bounded queue-depth evidence without unbounded memory growth.
+    pub fn take_admission_snapshot(&mut self) -> crate::admission::AdmissionPeakSnapshot {
+        self.write_admission.take_peak_snapshot()
+    }
+
     pub fn write_file(
         &mut self,
         path: impl AsRef<str>,
@@ -6471,6 +6513,10 @@ impl LocalFileSystem {
                 .write_buffers
                 .entry(inode_id)
                 .or_insert_with(|| WriteBuffer::new(self.write_buffer_config.clone()));
+            // Acquire a write-admission permit before dirty bytes enter
+            // any tracked buffer.  The permit conserves dirty-byte and
+            // dirty-op budget until the commit group SYNC releases it.
+            self.try_admit_write(bytes_len, 1)?;
             wb.ingest(bytes, offset);
             wb.should_flush()
         };
@@ -9732,6 +9778,9 @@ impl LocalFileSystem {
     }
 
     pub(crate) fn do_commit(&mut self) -> Result<()> {
+        // Advance the admission tick so dirty-age caps can be enforced
+        // against the current commit cycle.
+        self.write_admission.advance_tick();
         let write_buffers_before = self.write_buffers.len();
         self.flush_all_write_buffers()?;
         let flushed_write_buffers = self.write_buffers.len() < write_buffers_before;
@@ -10204,6 +10253,7 @@ impl LocalFileSystem {
             self.state.dirty_inodes.clear();
             self.state.dirty_dirs.clear();
             self.dirty_set.clear();
+            self.release_pending_permits();
 
             // Restore side ledgers to pre-transaction state (#5980).
             if let Some(old_write_buffers) = delta.old_write_buffers {

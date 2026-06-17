@@ -20,3 +20,77 @@ hard_caps = [
   "dirty-age",
   "queue-slots",
 ]
+
+[[queue_roots]]
+id = "local_fs.write_admission"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src/admission.rs"
+symbol = "LocalWriteAdmission"
+work_class = "foreground-write"
+resource_domains = [
+  "dirty-bytes",
+  "dirty-operations",
+  "dirty-age",
+  "queue-slots",
+]
+admission = "AdmissionPermit"
+service_curve = "ServiceCurve"
+hard_caps = [
+  "dirty-bytes",
+  "dirty-operations",
+  "dirty-age",
+  "queue-slots",
+]
+
+[[queue_roots]]
+id = "local_fs.write_buffers"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src/lib.rs"
+symbol = "write_buffers"
+work_class = "foreground-write"
+resource_domains = [
+  "dirty-bytes",
+  "dirty-operations",
+]
+admission = "AdmissionPermit"
+service_curve = "ServiceCurve"
+hard_caps = [
+  "dirty-bytes",
+  "dirty-operations",
+]
+
+[[queue_roots]]
+id = "local_fs.dirty_set"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src/writeback.rs"
+symbol = "DirtySet"
+work_class = "foreground-write"
+resource_domains = [
+  "dirty-bytes",
+  "dirty-operations",
+  "dirty-age",
+]
+admission = "AdmissionPermit"
+service_curve = "ServiceCurve"
+hard_caps = [
+  "dirty-bytes",
+  "dirty-operations",
+  "dirty-age",
+]
+
+[[queue_roots]]
+id = "local_fs.dirty_page_tracker"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src/dirty_page_tracker.rs"
+symbol = "DirtyPageTracker"
+work_class = "writeback-flush"
+resource_domains = [
+  "dirty-bytes",
+  "dirty-age",
+]
+admission = "AdmissionPermit"
+service_curve = "ServiceCurve"
+hard_caps = [
+  "dirty-bytes",
+  "dirty-age",
+]

@@ -2683,6 +2683,7 @@ dependencies = [
  "tidefs-intent-log",
  "tidefs-local-object-store",
  "tidefs-orphan-index",
+ "tidefs-performance-contract",
  "tidefs-pool-scan",
  "tidefs-posix-acl",
  "tidefs-posix-semantics",
