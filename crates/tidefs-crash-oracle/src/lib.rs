@@ -29,6 +29,9 @@ pub const STORAGE_WRITE_FSYNC_CLAIM_ID: &str = "storage.write_fsync.crash_safety
 pub const NAMESPACE_RENAME_CLAIM_ID: &str = "namespace.rename.atomicity.v1";
 pub const LOCAL_VFS_WRITE_FSYNC_CLAIM_ID: &str = "local.vfs.write_fsync_crash.v1";
 pub const LOCAL_VFS_RENAME_CLAIM_ID: &str = "local.vfs.rename_atomic_crash.v1";
+pub const CACHE_DIRTY_CRASH_MATRIX_ID: &str = "cache.dirty_page_crash_matrix.v1";
+pub const CACHE_COHERENCY_CLAIM_ID: &str = "cache.coherency.crash_safety.v1";
+pub const CACHE_WRITEBACK_CRASH_CLAIM_ID: &str = "cache.writeback.crash_safety.v1";
 const ISSUE_286_ARTIFACT_PATH: &str = "validation/artifacts/crash-oracle/model-crash-matrices.json";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -41,6 +44,19 @@ pub enum CrashBoundary {
     RootPublish,
     FsyncCommit,
     RecoveryReplay,
+    /// Crash after a page is marked dirty in the cache but before
+    /// writeback starts.  The dirty data exists only in the page
+    /// cache; no log entry has been written.
+    PageDirtyMark,
+    /// Crash during active writeback.  Writeback is in flight;
+    /// the page is pinned with the WRITEBACK flag.
+    PageWritebackStart,
+    /// Crash after writeback completes (page clean, log entry
+    /// durable) but before the file-level fsync commits.
+    PageWritebackComplete,
+    /// Crash after a clean cached page is evicted.  The data was
+    /// clean so no durability gap.
+    CacheEvict,
 }
 
 impl CrashBoundary {
@@ -54,6 +70,10 @@ impl CrashBoundary {
             Self::RootPublish => "root-publish",
             Self::FsyncCommit => "fsync-commit",
             Self::RecoveryReplay => "recovery-replay",
+            Self::PageDirtyMark => "page-dirty-mark",
+            Self::PageWritebackStart => "page-writeback-start",
+            Self::PageWritebackComplete => "page-writeback-complete",
+            Self::CacheEvict => "cache-evict",
         }
     }
 }
@@ -254,6 +274,100 @@ impl From<serde_json::Error> for CrashOracleError {
     }
 }
 
+/// Build the cache dirty-page crash matrix.
+///
+/// This matrix classifies crash outcomes at each cache lifecycle boundary
+/// for a dirty page.  The model writes data, then crashes at cache-specific
+/// boundaries; the recovery classification reflects whether the write data
+/// is durable after replay.
+fn cache_dirty_page_matrix() -> Result<CrashMatrix, CrashOracleError> {
+    let baseline = model_with_file("/file", b"initial")?;
+
+    // State after write (dirty in cache, no fsync): page-dirty-mark boundary
+    let mut after_write = baseline.clone();
+    apply_success(
+        &mut after_write,
+        ModelRequest::Write {
+            path: model_path("/file")?,
+            offset: 0,
+            bytes: b"dirty-data".to_vec(),
+        },
+        "write /file (dirty in cache)",
+    )?;
+
+    // State after fsync (clean, durable): page-writeback-complete boundary
+    let mut after_fsync = after_write.clone();
+    apply_success(
+        &mut after_fsync,
+        ModelRequest::Fsync {
+            path: model_path("/file")?,
+        },
+        "fsync /file (writeback complete)",
+    )?;
+
+    Ok(CrashMatrix {
+        id: CACHE_DIRTY_CRASH_MATRIX_ID.to_string(),
+        claim_ids: vec![
+            CACHE_COHERENCY_CLAIM_ID.to_string(),
+            CACHE_WRITEBACK_CRASH_CLAIM_ID.to_string(),
+        ],
+        backend: MODEL_BACKEND.to_string(),
+        description:
+            "cache dirty-page crash matrix across writeback lifecycle boundaries"
+                .to_string(),
+        cases: vec![
+            crash_case(
+                "cache.page_dirty_mark",
+                "page dirty mark",
+                CrashBoundary::PageDirtyMark,
+                CrashClassification::LostUnfsynced,
+                &baseline,
+                vec![
+                    acceptable("initial-data", CrashClassification::LostUnfsynced, &baseline),
+                ],
+                vec![],
+                None,
+            ),
+            crash_case(
+                "cache.page_writeback_start",
+                "page writeback start",
+                CrashBoundary::PageWritebackStart,
+                CrashClassification::LostUnfsynced,
+                &baseline,
+                vec![
+                    acceptable("initial-data", CrashClassification::LostUnfsynced, &baseline),
+                ],
+                vec![],
+                None,
+            ),
+            crash_case(
+                "cache.page_writeback_complete",
+                "page writeback complete",
+                CrashBoundary::PageWritebackComplete,
+                CrashClassification::Valid,
+                &after_fsync,
+                vec![
+                    acceptable("durable-data", CrashClassification::Valid, &after_fsync),
+                ],
+                vec![],
+                None,
+            ),
+            crash_case(
+                "cache.evict_clean_page",
+                "clean page eviction",
+                CrashBoundary::CacheEvict,
+                CrashClassification::Valid,
+                &baseline,
+                vec![
+                    acceptable("initial-data", CrashClassification::Valid, &baseline),
+                ],
+                vec![],
+                None,
+            ),
+        ],
+    })
+}
+
 pub fn run_model_crash_matrices() -> Result<CrashOracleReport, CrashOracleError> {
     let report = CrashOracleReport {
         report_version: REPORT_VERSION,
@@ -263,7 +377,7 @@ pub fn run_model_crash_matrices() -> Result<CrashOracleReport, CrashOracleError>
         runtime_claim_boundary:
             "local runtime write/fsync and rename claims stay planned/blocked until runtime evidence exists"
                 .to_string(),
-        matrices: vec![write_fsync_matrix()?, rename_matrix()?],
+        matrices: vec![write_fsync_matrix()?, rename_matrix()?, cache_dirty_page_matrix()?],
         runtime_claims: vec![
             RuntimeClaimStatus {
                 claim_id: LOCAL_VFS_WRITE_FSYNC_CLAIM_ID.to_string(),
@@ -279,6 +393,14 @@ pub fn run_model_crash_matrices() -> Result<CrashOracleReport, CrashOracleError>
                 classification: CrashClassification::UnsupportedFailClosed,
                 reason:
                     "local runtime rename crash evidence waits for runtime write-set clearance"
+                        .to_string(),
+            },
+            RuntimeClaimStatus {
+                claim_id: CACHE_COHERENCY_CLAIM_ID.to_string(),
+                status: "proof-in-progress".to_string(),
+                classification: CrashClassification::LostUnfsynced,
+                reason:
+                    "cache dirty-page crash matrix added; runtime crash injection deferred to runtime validation"
                         .to_string(),
             },
         ],
@@ -1081,6 +1203,26 @@ mod tests {
             .iter()
             .flat_map(|matrix| &matrix.cases)
             .any(|case| case.boundary == CrashBoundary::RecoveryReplay));
+        assert!(report
+            .matrices
+            .iter()
+            .flat_map(|matrix| &matrix.cases)
+            .any(|case| case.boundary == CrashBoundary::PageDirtyMark));
+        assert!(report
+            .matrices
+            .iter()
+            .flat_map(|matrix| &matrix.cases)
+            .any(|case| case.boundary == CrashBoundary::PageWritebackStart));
+        assert!(report
+            .matrices
+            .iter()
+            .flat_map(|matrix| &matrix.cases)
+            .any(|case| case.boundary == CrashBoundary::PageWritebackComplete));
+        assert!(report
+            .matrices
+            .iter()
+            .flat_map(|matrix| &matrix.cases)
+            .any(|case| case.boundary == CrashBoundary::CacheEvict));
         assert!(report.classification_count(CrashClassification::Valid) > 0);
         assert!(report.classification_count(CrashClassification::LostUnfsynced) > 0);
         assert!(report.classification_count(CrashClassification::Forbidden) > 0);
@@ -1140,6 +1282,47 @@ mod tests {
             rename_case.recovered_fingerprint.as_deref(),
             Some(expected.as_str())
         );
+    }
+
+    #[test]
+    fn cache_dirty_page_matrix_covers_writeback_lifecycle() {
+        let report = run_model_crash_matrices().expect("crash matrices");
+        let cache_matrix = report
+            .matrices
+            .iter()
+            .find(|m| m.id == CACHE_DIRTY_CRASH_MATRIX_ID)
+            .expect("cache dirty page matrix present");
+
+        assert_eq!(cache_matrix.cases.len(), 4);
+        assert!(cache_matrix
+            .cases
+            .iter()
+            .any(|c| c.id == "cache.page_dirty_mark"
+                && c.classification == CrashClassification::LostUnfsynced));
+        assert!(cache_matrix
+            .cases
+            .iter()
+            .any(|c| c.id == "cache.page_writeback_start"
+                && c.classification == CrashClassification::LostUnfsynced));
+        assert!(cache_matrix
+            .cases
+            .iter()
+            .any(|c| c.id == "cache.page_writeback_complete"
+                && c.classification == CrashClassification::Valid));
+        assert!(cache_matrix
+            .cases
+            .iter()
+            .any(|c| c.id == "cache.evict_clean_page"
+                && c.classification == CrashClassification::Valid));
+    }
+
+    #[test]
+    fn cache_crash_claim_is_recorded() {
+        let report = run_model_crash_matrices().expect("crash matrices");
+        assert!(report.runtime_claims.iter().any(|c| {
+            c.claim_id == CACHE_COHERENCY_CLAIM_ID
+                && c.status == "proof-in-progress"
+        }));
     }
 
     #[test]

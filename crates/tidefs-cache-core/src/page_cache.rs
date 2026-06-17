@@ -165,6 +165,22 @@ impl fmt::Display for PageFlushError {
 
 impl std::error::Error for PageFlushError {}
 
+// ---------------------------------------------------------------------------
+// WritebackToken: active writeback proof
+// ---------------------------------------------------------------------------
+
+/// A token proving an active writeback operation on a cached page.
+///
+/// Created by [`PageCache::start_writeback`].  The holder must consume it
+/// via [`PageCache::complete_writeback_with_token`] or
+/// [`PageCache::abort_writeback_with_token`].  The token carries the page
+/// key so the caller can split writeback dispatch from completion without
+/// repeating the inode/offset lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WritebackToken {
+    pub key: PageKey,
+}
+
 // PageCacheInner — all mutable state behind the Mutex
 // ---------------------------------------------------------------------------
 
@@ -177,6 +193,8 @@ struct PageCacheInner {
     page_size: usize,
     hits: u64,
     misses: u64,
+    /// Count of pages currently in the writeback state.
+    writeback_count: u64,
     evictions: u64,
     inserts: u64,
 }
@@ -191,6 +209,7 @@ impl PageCacheInner {
             page_size,
             hits: 0,
             misses: 0,
+            writeback_count: 0,
             evictions: 0,
             inserts: 0,
         }
@@ -243,6 +262,9 @@ impl PageCacheInner {
         if self.pages.contains_key(&key) {
             return Err(InsertError::AlreadyExists);
         }
+        if page.is_writeback() {
+            self.writeback_count += 1;
+        }
 
         // If at capacity, evict the oldest clean, unpinned page.
         let evicted = if self.pages.len() >= self.max_pages {
@@ -279,7 +301,13 @@ impl PageCacheInner {
         })?;
 
         let key = self.lru_order.remove(idx).unwrap();
-        self.pages.remove(&key)
+        let removed = self.pages.remove(&key);
+        if let Some(ref page) = removed {
+            if page.is_writeback() {
+                self.writeback_count = self.writeback_count.saturating_sub(1);
+            }
+        }
+        removed
     }
 
     /// Mark a page dirty by key.  Returns false if the page does not exist.
@@ -320,6 +348,7 @@ impl PageCacheInner {
                 return false; // already in writeback
             }
             page.flags |= page_flags::WRITEBACK | page_flags::PINNED;
+            self.writeback_count += 1;
             true
         } else {
             false
@@ -332,6 +361,7 @@ impl PageCacheInner {
         let cleared_dirty = if let Some(page) = self.pages.get_mut(key) {
             page.flags &= !page_flags::WRITEBACK;
             page.flags &= !page_flags::PINNED;
+            self.writeback_count = self.writeback_count.saturating_sub(1);
             let cleared_dirty = success && page.is_dirty();
             if success {
                 page.flags &= !page_flags::DIRTY;
@@ -351,6 +381,7 @@ impl PageCacheInner {
     fn abort_writeback_inner(&mut self, key: &PageKey) -> bool {
         if let Some(page) = self.pages.get_mut(key) {
             page.flags &= !page_flags::WRITEBACK;
+            self.writeback_count = self.writeback_count.saturating_sub(1);
             page.flags &= !page_flags::PINNED;
             true
         } else {
@@ -519,6 +550,104 @@ impl PageCacheInner {
     fn is_full(&self) -> bool {
         self.pages.len() >= self.max_pages
     }
+
+    /// Number of pages currently in the writeback state.
+    fn writeback_queue_len(&self) -> usize {
+        self.writeback_count as usize
+    }
+
+    /// Collect keys of all pages currently in the writeback state.
+    fn writeback_queue_keys(&self) -> Vec<PageKey> {
+        self.pages
+            .iter()
+            .filter(|(_, p)| p.is_writeback())
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    /// Truncate invalidation: remove ALL pages (including dirty) for the
+    /// given inode whose offset is at or beyond `new_size`.  Pages that
+    /// overlap the truncation boundary are also removed.
+    ///
+    /// Returns (pages_removed, dirty_pages_removed).
+    fn truncate_invalidate_inner(&mut self, inode: u64, new_size: u64) -> (usize, usize) {
+        let page_size = self.page_size as u64;
+        let keys: Vec<PageKey> = self
+            .pages
+            .iter()
+            .filter(|(k, _)| {
+                k.inode == inode && k.offset.saturating_add(page_size) > new_size
+            })
+            .map(|(k, _)| *k)
+            .collect();
+
+        let mut total = 0usize;
+        let mut dirty = 0usize;
+        for key in &keys {
+            if let Some(page) = self.pages.remove(key) {
+                self.unlink_lru(key);
+                if page.is_dirty() {
+                    dirty += 1;
+                }
+                if page.is_writeback() {
+                    self.writeback_count = self.writeback_count.saturating_sub(1);
+                }
+                self.forget_dirty_page(*key);
+                total += 1;
+            }
+        }
+        self.evictions += total as u64;
+        (total, dirty)
+    }
+
+    /// Unlink invalidation: remove ALL pages for the given inode,
+    /// including dirty and writeback pages.  The file no longer exists.
+    ///
+    /// Returns (pages_removed, dirty_pages_removed).
+    fn unlink_invalidate_inner(&mut self, inode: u64) -> (usize, usize) {
+        let keys: Vec<PageKey> = self
+            .pages
+            .iter()
+            .filter(|(k, _)| k.inode == inode)
+            .map(|(k, _)| *k)
+            .collect();
+
+        let mut total = 0usize;
+        let mut dirty = 0usize;
+        for key in &keys {
+            if let Some(page) = self.pages.remove(key) {
+                self.unlink_lru(key);
+                if page.is_dirty() {
+                    dirty += 1;
+                }
+                if page.is_writeback() {
+                    self.writeback_count = self.writeback_count.saturating_sub(1);
+                }
+                self.forget_dirty_page(*key);
+                total += 1;
+            }
+        }
+        self.evictions += total as u64;
+        (total, dirty)
+    }
+
+    /// Invalidate all clean, unpinned, non-writeback pages across the
+    /// entire cache.  Returns the count of pages removed.
+    fn invalidate_all_clean_inner(&mut self) -> usize {
+        let keys: Vec<PageKey> = self
+            .pages
+            .iter()
+            .filter(|(_, p)| !p.is_dirty() && !p.is_writeback() && !p.is_pinned())
+            .map(|(k, _)| *k)
+            .collect();
+        let count = keys.len();
+        for key in &keys {
+            self.unlink_lru(key);
+            self.pages.remove(key);
+        }
+        self.evictions += count as u64;
+        count
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +759,7 @@ impl<'a> PageHandle<'a> {
                 return false;
             }
             page.flags |= page_flags::WRITEBACK | page_flags::PINNED;
+            self.guard.writeback_count += 1;
             true
         } else {
             false
@@ -648,6 +778,7 @@ impl<'a> PageHandle<'a> {
     pub fn abort_writeback(&mut self) {
         if let Some(page) = self.guard.pages.get_mut(&self.key) {
             page.flags &= !(page_flags::WRITEBACK | page_flags::PINNED);
+            self.guard.writeback_count = self.guard.writeback_count.saturating_sub(1);
         }
     }
 }
@@ -1109,7 +1240,113 @@ impl PageCache {
     pub fn insert_count(&self) -> u64 {
         self.inner.lock().unwrap().inserts
     }
+
+    // ── WritebackToken lifecycle ─────────────────────────────────
+
+    /// Start writeback on the page at `(inode, offset)` and return a
+    /// [`WritebackToken`] that proves the writeback is active.  The
+    /// token must be consumed by [`complete_writeback_with_token`] or
+    /// [`abort_writeback_with_token`].
+    ///
+    /// Returns `None` if the page does not exist or is already in
+    /// writeback.
+    #[must_use]
+    pub fn start_writeback_token(&self, inode: u64, offset: u64) -> Option<WritebackToken> {
+        let key = PageKey { inode, offset };
+        let mut inner = self.inner.lock().unwrap();
+        if inner.start_writeback_inner(&key) {
+            Some(WritebackToken { key })
+        } else {
+            None
+        }
+    }
+
+    /// Complete writeback for the page referenced by `token`.  If
+    /// `success`, the page is marked clean.  The writeback flag and pin
+    /// are cleared regardless.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the page has been evicted (should not happen while the
+    /// token is alive).
+    pub fn complete_writeback_with_token(&self, token: WritebackToken, success: bool) {
+        self.inner
+            .lock()
+            .unwrap()
+            .complete_writeback_inner(&token.key, success);
+    }
+
+    /// Abort writeback for the page referenced by `token`.  The
+    /// writeback flag and pin are cleared, but the dirty flag is
+    /// preserved so the page remains eligible for retry.
+    pub fn abort_writeback_with_token(&self, token: WritebackToken) {
+        self.inner
+            .lock()
+            .unwrap()
+            .abort_writeback_inner(&token.key);
+    }
+
+    /// Number of pages currently in the writeback state.
+    #[must_use]
+    pub fn writeback_queue_size(&self) -> usize {
+        self.inner.lock().unwrap().writeback_queue_len()
+    }
+
+    /// Snapshotted keys of all pages currently in the writeback state.
+    #[must_use]
+    pub fn writeback_queue_keys(&self) -> Vec<PageKey> {
+        self.inner.lock().unwrap().writeback_queue_keys()
+    }
+
+    // ── Truncate / unlink invalidation ───────────────────────────
+
+    /// Truncate invalidation: remove ALL pages for `inode` whose offset
+    /// is at or beyond `new_size`.  Unlike [`invalidate_range`], this
+    /// removes dirty pages too — data beyond EOF after truncate is
+    /// meaningless.
+    ///
+    /// Pages that overlap the truncation boundary (offset < new_size <
+    /// offset + page_size) are also removed.
+    ///
+    /// Returns `(pages_removed, dirty_pages_removed)`.
+    pub fn truncate_invalidate(&self, inode: u64, new_size: u64) -> (usize, usize) {
+        self.inner.lock().unwrap().truncate_invalidate_inner(inode, new_size)
+    }
+
+    /// Unlink invalidation: remove ALL pages (including dirty and
+    /// writeback) for `inode`.  Called when the inode is deleted.
+    ///
+    /// Returns `(pages_removed, dirty_pages_removed)`.
+    pub fn unlink_invalidate(&self, inode: u64) -> (usize, usize) {
+        self.inner.lock().unwrap().unlink_invalidate_inner(inode)
+    }
+
+    /// Number of resident pages for a given inode.
+    #[must_use]
+    pub fn page_count_for_inode(&self, inode: u64) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.pages.iter().filter(|(k, _)| k.inode == inode).count()
+    }
+
+    /// Return the keys of all resident pages for a given inode.
+    #[must_use]
+    pub fn page_keys_for_inode(&self, inode: u64) -> Vec<PageKey> {
+        let inner = self.inner.lock().unwrap();
+        inner.pages.iter()
+            .filter(|(k, _)| k.inode == inode)
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    /// Invalidate all clean, unpinned, non-writeback pages across the
+    /// entire cache.  Dirty, pinned, and writeback pages are preserved.
+    ///
+    /// Returns the count of pages removed.
+    pub fn invalidate_all_clean(&self) -> usize {
+        self.inner.lock().unwrap().invalidate_all_clean_inner()
+    }
 }
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1174,22 +1411,7 @@ impl crate::CacheInvalidationSubscriber for PageCache {
     }
 
     fn on_invalidate_all(&self) -> usize {
-        // Invalidate all clean pages in the cache. We iterate over all
-        // cached inodes and invalidate each one.
-        let mut total = 0;
-        // Lock once to collect all inode keys
-        let inodes: Vec<u64> = {
-            let inner = self.inner.lock().unwrap();
-            inner.pages.keys().map(|k| k.inode).collect()
-        };
-        // Deduplicate and invalidate each
-        let mut seen = std::collections::HashSet::new();
-        for inode in inodes {
-            if seen.insert(inode) {
-                total += self.invalidate_inode(inode);
-            }
-        }
-        total
+        self.invalidate_all_clean()
     }
 
     fn subscriber_name(&self) -> &'static str {
@@ -2198,5 +2420,435 @@ mod tests {
         let removed = cache.invalidate_inode(1);
         assert_eq!(removed, 1, "only clean page should be removed");
         assert!(cache.lookup(1, 4096).is_some(), "dirty page must survive");
+    }
+
+    // ── WritebackToken lifecycle tests ────────────────────────────
+
+    #[test]
+    fn writeback_token_lifecycle_success() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.mark_dirty(1, 0);
+
+        let token = cache.start_writeback_token(1, 0).expect("start writeback");
+        assert_eq!(token.key, PageKey { inode: 1, offset: 0 });
+        assert_eq!(cache.writeback_queue_size(), 1);
+
+        // Complete with success: page becomes clean
+        cache.complete_writeback_with_token(token, true);
+        assert_eq!(cache.writeback_queue_size(), 0);
+        {
+            let h = cache.lookup(1, 0).unwrap();
+            assert!(!h.is_dirty());
+            assert!(!h.is_writeback());
+            assert!(!h.is_pinned());
+        }
+    }
+
+    #[test]
+    fn writeback_token_lifecycle_failure_retains_dirty() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.mark_dirty(1, 0);
+
+        let token = cache.start_writeback_token(1, 0).expect("start writeback");
+        cache.complete_writeback_with_token(token, false);
+
+        {
+            let h = cache.lookup(1, 0).unwrap();
+            assert!(h.is_dirty());
+            assert!(!h.is_writeback());
+        }
+        assert_eq!(cache.writeback_queue_size(), 0);
+    }
+
+    #[test]
+    fn writeback_token_abort_preserves_dirty() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.mark_dirty(1, 0);
+
+        let token = cache.start_writeback_token(1, 0).expect("start writeback");
+        cache.abort_writeback_with_token(token);
+
+        {
+            let h = cache.lookup(1, 0).unwrap();
+            assert!(h.is_dirty());
+            assert!(!h.is_writeback());
+            assert!(!h.is_pinned());
+        }
+        assert_eq!(cache.writeback_queue_size(), 0);
+    }
+
+    #[test]
+    fn writeback_token_already_in_writeback_returns_none() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.mark_dirty(1, 0);
+
+        let _t1 = cache.start_writeback_token(1, 0).expect("first writeback");
+        assert!(cache.start_writeback_token(1, 0).is_none());
+    }
+
+    #[test]
+    fn writeback_token_nonexistent_returns_none() {
+        let cache = new_cache(10);
+        assert!(cache.start_writeback_token(99, 0).is_none());
+    }
+
+    #[test]
+    fn writeback_queue_tracks_active_writebacks() {
+        let cache = new_cache(10);
+        for i in 0..5 {
+            cache.insert(i, 0).unwrap();
+            cache.mark_dirty(i, 0);
+        }
+
+        assert_eq!(cache.writeback_queue_size(), 0);
+        assert!(cache.writeback_queue_keys().is_empty());
+
+        let t0 = cache.start_writeback_token(0, 0).unwrap();
+        let t2 = cache.start_writeback_token(2, 0).unwrap();
+        assert_eq!(cache.writeback_queue_size(), 2);
+        let wb_keys = cache.writeback_queue_keys();
+        assert_eq!(wb_keys.len(), 2);
+
+        cache.complete_writeback_with_token(t0, true);
+        assert_eq!(cache.writeback_queue_size(), 1);
+        cache.abort_writeback_with_token(t2);
+        assert_eq!(cache.writeback_queue_size(), 0);
+    }
+
+    #[test]
+    fn writeback_token_eviction_decrements_queue() {
+        let cache = new_cache(2);
+        cache.insert(1, 0).unwrap();
+        cache.insert(2, 0).unwrap();
+        cache.mark_dirty(1, 0);
+        let _t = cache.start_writeback_token(1, 0).unwrap();
+        assert_eq!(cache.writeback_queue_size(), 1);
+
+        // Evict page 2 (clean); page 1 is writeback+pinned, not evictable
+        let evicted = cache.evict_one();
+        assert!(evicted.is_some());
+        assert_eq!(evicted.unwrap().key.inode, 2);
+        assert!(cache.evict_one().is_none(), "writeback page not evictable");
+        assert_eq!(cache.writeback_queue_size(), 1);
+
+        // Use unlink to remove writeback page, which decrements queue
+        cache.unlink_invalidate(1);
+        assert_eq!(cache.writeback_queue_size(), 0);
+    }
+
+    // ── Dirty→writeback→clean lifecycle (full contract) ───────────
+
+    #[test]
+    fn dirty_to_writeback_to_clean_lifecycle() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+
+        // Page starts clean
+        let h = cache.lookup(1, 0).unwrap();
+        assert!(!h.is_dirty() && !h.is_writeback());
+        assert!(!h.is_dirty());
+        drop(h);
+
+        // Mark dirty
+        cache.mark_dirty(1, 0);
+        assert_eq!(cache.dirty_pages().len(), 1);
+
+        // Start writeback
+        let token = cache.start_writeback_token(1, 0).unwrap();
+        assert_eq!(cache.writeback_queue_size(), 1);
+        // Page is still tracked as dirty during writeback
+        assert_eq!(cache.dirty_pages().len(), 1);
+
+        // Complete writeback with success
+        cache.complete_writeback_with_token(token, true);
+        assert_eq!(cache.writeback_queue_size(), 0);
+        assert!(cache.dirty_pages().is_empty());
+        {
+            let h = cache.lookup(1, 0).unwrap();
+            assert!(!h.is_dirty());
+            assert!(!h.is_writeback());
+        }
+    }
+
+    #[test]
+    fn dirty_eviction_eligibility() {
+        let cache = new_cache(2);
+        cache.insert(1, 0).unwrap(); // clean
+        cache.insert(2, 0).unwrap(); // clean
+
+        // Mark 1 dirty → not evictable
+        cache.mark_dirty(1, 0);
+        let evicted = cache.evict_one().unwrap();
+        assert_eq!(evicted.key.inode, 2, "clean page 2 must be evicted first");
+
+        // Now only dirty page 1 remains → eviction returns none
+        assert!(cache.evict_one().is_none());
+    }
+
+    #[test]
+    fn clean_page_is_eviction_eligible() {
+        let cache = new_cache(1);
+        cache.insert(1, 0).unwrap(); // clean
+        let evicted = cache.evict_one().unwrap();
+        assert_eq!(evicted.key.inode, 1);
+        assert!(!evicted.is_dirty() && !evicted.is_writeback());
+    }
+
+    #[test]
+    fn writeback_page_not_evicted() {
+        let cache = new_cache(2);
+        cache.insert(1, 0).unwrap();
+        cache.insert(2, 0).unwrap();
+        cache.mark_dirty(1, 0);
+        let _t = cache.start_writeback_token(1, 0).unwrap();
+
+        let evicted = cache.evict_one().unwrap();
+        assert_eq!(evicted.key.inode, 2, "writeback page 1 must not be evicted");
+        assert!(cache.evict_one().is_none(), "only writeback page left");
+    }
+
+    // ── Truncate invalidation ─────────────────────────────────────
+
+    #[test]
+    fn truncate_invalidate_removes_pages_beyond_new_size() {
+        let cache = new_cache(10);
+        // 4 KiB pages: offsets 0, 4096, 8192, 12288
+        for off in [0u64, 4096, 8192, 12288] {
+            cache.insert(1, off).unwrap();
+        }
+        assert_eq!(cache.page_count_for_inode(1), 4);
+
+        // Truncate to 5000 bytes: pages at 4096 (overlaps boundary),
+        // 8192, and 12288 are beyond or overlap new_size
+        let (removed, dirty) = cache.truncate_invalidate(1, 5000);
+        assert_eq!(removed, 3);
+        assert_eq!(dirty, 0);
+        assert_eq!(cache.page_count_for_inode(1), 1);
+        assert!(cache.lookup(1, 0).is_some());
+        assert!(cache.lookup(1, 4096).is_none());
+        assert!(cache.lookup(1, 8192).is_none());
+        assert!(cache.lookup(1, 12288).is_none());
+    }
+
+    #[test]
+    fn truncate_invalidate_removes_dirty_pages_beyond_new_size() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.insert(1, 4096).unwrap();
+        cache.insert(1, 8192).unwrap();
+        cache.mark_dirty(1, 4096);
+        cache.mark_dirty(1, 8192);
+
+        let (removed, dirty) = cache.truncate_invalidate(1, 4096);
+        assert_eq!(removed, 2, "pages at 4096 and 8192 removed");
+        assert_eq!(dirty, 2, "both pages were dirty");
+        assert!(cache.lookup(1, 0).is_some());
+        assert!(cache.lookup(1, 4096).is_none());
+        assert!(cache.lookup(1, 8192).is_none());
+    }
+
+    #[test]
+    fn truncate_invalidate_removes_page_overlapping_boundary() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();   // [0, 4096)
+        cache.insert(1, 4096).unwrap(); // [4096, 8192)
+
+        // Truncate to 3000: page at 0 overlaps (0 < 3000 < 4096) → removed
+        let (removed, _) = cache.truncate_invalidate(1, 3000);
+        assert_eq!(removed, 2, "both pages removed: one beyond, one overlapping");
+        assert_eq!(cache.page_count_for_inode(1), 0);
+    }
+
+    #[test]
+    fn truncate_invalidate_empty_inode_returns_zero() {
+        let cache = new_cache(10);
+        let (removed, dirty) = cache.truncate_invalidate(99, 0);
+        assert_eq!(removed, 0);
+        assert_eq!(dirty, 0);
+    }
+
+    #[test]
+    fn truncate_invalidate_other_inodes_unaffected() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.insert(1, 4096).unwrap();
+        cache.insert(2, 0).unwrap();
+        cache.insert(2, 4096).unwrap();
+
+        cache.truncate_invalidate(1, 4096);
+        assert_eq!(cache.page_count_for_inode(2), 2);
+        assert!(cache.lookup(2, 0).is_some());
+        assert!(cache.lookup(2, 4096).is_some());
+    }
+
+    // ── Unlink invalidation ───────────────────────────────────────
+
+    #[test]
+    fn unlink_invalidate_removes_all_pages_for_inode() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.insert(1, 4096).unwrap();
+        cache.insert(1, 8192).unwrap();
+        cache.mark_dirty(1, 4096);
+        cache.insert(2, 0).unwrap();
+
+        let (removed, dirty) = cache.unlink_invalidate(1);
+        assert_eq!(removed, 3);
+        assert_eq!(dirty, 1);
+        assert_eq!(cache.page_count_for_inode(1), 0);
+        assert_eq!(cache.page_count_for_inode(2), 1);
+        assert!(cache.lookup(2, 0).is_some());
+    }
+
+    #[test]
+    fn unlink_invalidate_removes_writeback_pages() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.mark_dirty(1, 0);
+        let _t = cache.start_writeback_token(1, 0).unwrap();
+        assert_eq!(cache.writeback_queue_size(), 1);
+
+        let (removed, _) = cache.unlink_invalidate(1);
+        assert_eq!(removed, 1);
+        assert_eq!(cache.writeback_queue_size(), 0);
+        assert_eq!(cache.page_count_for_inode(1), 0);
+    }
+
+    #[test]
+    fn unlink_invalidate_empty_inode_returns_zero() {
+        let cache = new_cache(10);
+        let (removed, dirty) = cache.unlink_invalidate(99);
+        assert_eq!(removed, 0);
+        assert_eq!(dirty, 0);
+    }
+
+    // ── Rename invalidation (cross-directory) ─────────────────────
+
+    #[test]
+    fn rename_invalidation_inodes_unaffected_by_other_inode_ops() {
+        // Rename in TideFS is an inode-level operation.  The cache tracks
+        // pages by inode number, so a rename that changes the directory
+        // entry does not change the inode number.  Pages for the renamed
+        // inode remain valid.
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.insert(1, 4096).unwrap();
+        cache.mark_dirty(1, 0);
+
+        // "Rename" inode 1 — inode number unchanged, pages stay
+        assert_eq!(cache.page_count_for_inode(1), 2);
+        assert!(cache.has_dirty_pages_for_inode(1));
+        assert!(cache.lookup(1, 0).is_some());
+        assert!(cache.lookup(1, 4096).is_some());
+    }
+
+    #[test]
+    fn rename_source_and_target_inodes_independent() {
+        // Rename from inode 5 to inode 6 (overwrite).  Inode 6 pages
+        // should be invalidated (unlink of target), inode 5 pages
+        // remain valid.
+        let cache = new_cache(10);
+        cache.insert(5, 0).unwrap(); // source inode
+        cache.insert(6, 0).unwrap(); // target inode (to be overwritten)
+        cache.mark_dirty(5, 0);
+        cache.mark_dirty(6, 0);
+
+        // Unlink target inode 6
+        let (removed, dirty) = cache.unlink_invalidate(6);
+        assert_eq!(removed, 1);
+        assert_eq!(dirty, 1);
+        assert_eq!(cache.page_count_for_inode(6), 0);
+
+        // Source inode 5 unchanged
+        assert_eq!(cache.page_count_for_inode(5), 1);
+        assert!(cache.has_dirty_pages_for_inode(5));
+    }
+
+    #[test]
+    fn cross_directory_rename_invalidation_is_scoped() {
+        // Pages from /dirA/inode are not affected by invalidating /dirB/inode
+        let cache = new_cache(10);
+        cache.insert(10, 0).unwrap();   // /dirA file
+        cache.insert(11, 4096).unwrap(); // /dirB file
+        cache.mark_dirty(10, 0);
+
+        // Invalidate /dirB (inode 11) — /dirA (inode 10) unaffected
+        let removed = cache.invalidate_inode(11);
+        assert_eq!(removed, 1);
+        assert_eq!(cache.page_count_for_inode(10), 1);
+        assert!(cache.lookup(10, 0).is_some());
+    }
+
+    // ── Coherency: bounded invalidation ───────────────────────────
+
+    #[test]
+    fn coherency_invalidation_does_not_leave_stale_dirty_pages_reachable() {
+        // After truncate, no dirty pages beyond new EOF can be looked up.
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.insert(1, 4096).unwrap();
+        cache.insert(1, 8192).unwrap();
+        cache.mark_dirty(1, 4096);
+        cache.mark_dirty(1, 8192);
+
+        cache.truncate_invalidate(1, 4096);
+
+        assert!(cache.lookup(1, 0).is_some());
+        // 4096 and 8192 removed (overlap/beyond boundary)
+        assert!(cache.lookup(1, 4096).is_none());
+        assert!(cache.lookup(1, 8192).is_none());
+        // Dirty tracking for removed pages must be cleared
+        assert!(!cache.has_dirty_pages_in_range(1, 4096, 12288));
+    }
+
+    #[test]
+    fn coherency_after_unlink_no_pages_reachable() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.insert(1, 4096).unwrap();
+        cache.mark_dirty(1, 0);
+        cache.mark_dirty(1, 4096);
+
+        cache.unlink_invalidate(1);
+
+        assert_eq!(cache.page_count_for_inode(1), 0);
+        assert!(cache.lookup(1, 0).is_none());
+        assert!(cache.lookup(1, 4096).is_none());
+        assert!(!cache.has_dirty_pages_for_inode(1));
+    }
+
+    // ── page_count_for_inode / page_keys_for_inode ───────────────
+
+    #[test]
+    fn page_count_and_keys_for_inode() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.insert(1, 4096).unwrap();
+        cache.insert(2, 0).unwrap();
+
+        assert_eq!(cache.page_count_for_inode(1), 2);
+        assert_eq!(cache.page_count_for_inode(2), 1);
+        assert_eq!(cache.page_count_for_inode(99), 0);
+
+        let keys = cache.page_keys_for_inode(1);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&PageKey { inode: 1, offset: 0 }));
+        assert!(keys.contains(&PageKey { inode: 1, offset: 4096 }));
+    }
+
+    #[test]
+    fn writeback_queue_keys_snapshot() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.mark_dirty(1, 0);
+        let _t = cache.start_writeback_token(1, 0).unwrap();
+
+        let keys = cache.writeback_queue_keys();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], PageKey { inode: 1, offset: 0 });
     }
 }

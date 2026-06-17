@@ -10,6 +10,31 @@
 //! This crate is intentionally dependency-free so it can sit in the
 //! storage-core dependency closure without pulling in POSIX-adapter or
 //! control-plane scaffold crates.
+//!
+//! ## Coherency Contract
+//!
+//! The TideFS cache coherency model satisfies these invariants:
+//!
+//! 1. **No global locks across datasets.**  Invalidation is scoped to a
+//!    single inode (`on_invalidate_inode`) or byte range
+//!    (`on_invalidate_range`).  The coherency event bus never acquires a
+//!    global cross-dataset lock; each subscriber independently serializes
+//!    its own invalidation.
+//!
+//! 2. **Dirty/writeback pages survive coherency invalidation.**
+//!    `on_invalidate_range` evicts only clean, unpinned, non-writeback
+//!    pages.  Dirty data is preserved until writeback completes.  This
+//!    guarantees that a lease revocation does not silently discard
+//!    uncommitted writes.
+//!
+//! 3. **Unlink and truncate are authoritative.**
+//!    `PageCache::unlink_invalidate` and `PageCache::truncate_invalidate`
+//!    remove all pages (including dirty) for the affected inode, because
+//!    the data is no longer reachable after the operation commits.
+//!
+//! 4. **Crash integration.**  After intent-log replay, any dirty state
+//!    that existed pre-crash is either replayed from the log or cleanly
+//!    invalidated with a classified gap (see `tidefs-crash-oracle`).
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
