@@ -13276,6 +13276,74 @@ mod orphan_index_integration_tests {
         drop(fs2);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // -- orphan replay watermark integration tests --
+
+    /// Verify that after a crash, the orphan index entries are cleaned
+    /// up on reopen (full pipeline: insert -> crash -> replay -> reclaim).
+    #[test]
+    fn watermark_pipeline_insert_crash_recover() {
+        let root = std::env::temp_dir().join("oi_wm_pipeline");
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            let mut fs = LocalFileSystem::open(&root).expect("open");
+            for i in 1..=5u64 {
+                let path = format!("/file_{i}");
+                fs.create_file(&path, 0o644).expect("create_file");
+                fs.unlink(&path).expect("unlink");
+            }
+            assert_eq!(fs.orphan_index.lock().unwrap().len(), 5);
+        }
+        let fs2 = LocalFileSystem::open(&root).expect("reopen");
+        assert!(fs2.orphan_index.lock().unwrap().is_empty());
+        drop(fs2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Verify multiple unlink-then-crash recovery at scale.
+    #[test]
+    fn multiple_orphans_survive_crash_recovery() {
+        let root = std::env::temp_dir().join("oi_wm_multi");
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        let count = 10u64;
+        {
+            let mut fs = LocalFileSystem::open(&root).expect("open");
+            for i in 1..=count {
+                let path = format!("/orphan_{i}");
+                fs.create_file(&path, 0o644).expect("create_file");
+                fs.unlink(&path).expect("unlink");
+            }
+            assert_eq!(fs.orphan_index.lock().unwrap().len(), count as usize);
+        }
+        let fs2 = LocalFileSystem::open(&root).expect("reopen");
+        assert!(fs2.orphan_index.lock().unwrap().is_empty());
+        drop(fs2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Verify committed orphan persists and is reclaimed on reopen.
+    #[test]
+    fn committed_orphan_persists_across_reopen() {
+        let root = std::env::temp_dir().join("oi_wm_persist");
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            let mut fs = LocalFileSystem::open(&root).expect("open");
+            fs.create_file("/persist_me", 0o644).expect("create_file");
+            fs.unlink("/persist_me").expect("unlink");
+            fs.do_commit().expect("commit");
+            assert_eq!(fs.orphan_index.lock().unwrap().len(), 1);
+        }
+        let fs2 = LocalFileSystem::open(&root).expect("reopen");
+        assert!(fs2.orphan_index.lock().unwrap().is_empty());
+        drop(fs2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 // ── commit_group recovery integration tests ─────────────────────────

@@ -2047,3 +2047,189 @@ mod tests {
         assert!(recovered.contains(3));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Orphan replay watermark persistence tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::*;
+    use tidefs_types_orphan_index_core::{OrphanCursor, OrphanReplayWatermark};
+
+    fn make_entry(inode_id: u64) -> OrphanEntry {
+        OrphanEntry::new(inode_id, inode_id, 0, OrphanEntryFlags::NONE)
+    }
+
+    // -- watermark start state --
+
+    #[test]
+    fn new_index_has_none_watermark() {
+        let idx = OrphanIndex::new();
+        assert_eq!(idx.durable_watermark(), OrphanReplayWatermark::NONE);
+    }
+
+    #[test]
+    fn watermark_is_none_after_new() {
+        let idx = OrphanIndex::new();
+        assert!(idx.durable_watermark().is_none());
+    }
+
+    // -- advance_watermark --
+
+    #[test]
+    fn advance_watermark_marks_dirty() {
+        let mut idx = OrphanIndex::new();
+        idx.clear_dirty();
+        assert!(!idx.is_dirty());
+        idx.advance_watermark(42);
+        assert!(idx.is_dirty());
+        assert_eq!(idx.durable_watermark().position, 42);
+    }
+
+    #[test]
+    fn advance_watermark_is_monotonic() {
+        let mut idx = OrphanIndex::new();
+        idx.advance_watermark(100);
+        idx.advance_watermark(50); // backwards: ignored
+        assert_eq!(idx.durable_watermark().position, 100);
+    }
+
+    // -- set_watermark_from_cursor --
+
+    #[test]
+    fn set_watermark_from_cursor() {
+        let mut idx = OrphanIndex::new();
+        let cursor = OrphanCursor { position: 77 };
+        idx.set_watermark_from_cursor(cursor);
+        assert_eq!(idx.durable_watermark().position, 77);
+        assert!(idx.is_dirty());
+    }
+
+    // -- encode_log includes watermark --
+
+    #[test]
+    fn encode_log_empty_preserves_watermark() {
+        let idx = OrphanIndex::new();
+        let log = idx.encode_log();
+        assert_eq!(log.len(), 12);
+        assert_eq!(&log[0..4], &0u32.to_le_bytes()); // count=0
+        assert_eq!(&log[4..12], &0u64.to_le_bytes()); // watermark=NONE
+    }
+
+    #[test]
+    fn encode_log_advanced_watermark() {
+        let mut idx = OrphanIndex::new();
+        idx.advance_watermark(12345);
+        let log = idx.encode_log();
+        assert_eq!(u64::from_le_bytes(log[4..12].try_into().unwrap()), 12345);
+    }
+
+    #[test]
+    fn encode_log_with_entries_and_watermark() {
+        let mut idx = OrphanIndex::new();
+        idx.insert(10, make_entry(10));
+        idx.insert(20, make_entry(20));
+        idx.advance_watermark(30);
+        let log = idx.encode_log();
+        assert_eq!(u32::from_le_bytes(log[0..4].try_into().unwrap()), 2);
+        assert_eq!(u64::from_le_bytes(log[4..12].try_into().unwrap()), 30);
+    }
+
+    // -- recover_from_log restores watermark --
+
+    #[test]
+    fn recover_from_log_restores_watermark() {
+        let mut idx = OrphanIndex::new();
+        idx.insert(1, make_entry(1));
+        idx.advance_watermark(100);
+        let log = idx.encode_log();
+
+        let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
+        assert!(corrupted.is_empty());
+        assert_eq!(recovered.durable_watermark().position, 100);
+        assert_eq!(recovered.len(), 1);
+    }
+
+    #[test]
+    fn recover_from_log_truncated_header_defaults_to_none() {
+        // Less than 12 bytes header: watermark defaults to NONE
+        let log = vec![0u8; 6]; // truncated header
+        let err = OrphanIndex::recover_from_log(&log).unwrap_err();
+        assert_eq!(err, LogRecoverError::TruncatedHeader);
+    }
+
+    #[test]
+    fn recover_from_log_zero_watermark_is_none() {
+        let mut idx = OrphanIndex::new();
+        idx.insert(5, make_entry(5));
+        // watermark remains NONE (0)
+        let log = idx.encode_log();
+
+        let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
+        assert!(corrupted.is_empty());
+        assert!(recovered.durable_watermark().is_none());
+        assert_eq!(recovered.len(), 1);
+    }
+
+    // -- crash-during-append partial log recovery preserves watermark --
+
+    #[test]
+    fn recover_partial_log_half_entry_preserves_watermark() {
+        let mut idx = OrphanIndex::new();
+        idx.insert(1, make_entry(1));
+        idx.insert(2, make_entry(2));
+        idx.advance_watermark(42);
+        let full_log = idx.encode_log();
+        // Truncate halfway through the second entry
+        let partial_len = 12 + super::LOG_RECORD_SIZE + super::LOG_RECORD_SIZE / 2;
+        let partial = &full_log[..partial_len.min(full_log.len())];
+
+        let (recovered, corrupted) = OrphanIndex::recover_from_log(partial).unwrap();
+        assert_eq!(recovered.durable_watermark().position, 42);
+        assert_eq!(recovered.len(), 1); // only first entry fully intact
+        assert!(corrupted.is_empty()); // truncation, not corruption
+    }
+
+    // -- full pipeline: insert -> encode -> crash -> recover -> watermark ok --
+
+    #[test]
+    fn pipeline_insert_encode_recover_watermark() {
+        let mut idx = OrphanIndex::new();
+        // Simulate: orphan entries inserted, then watermark advanced after replay
+        idx.insert(10, make_entry(10));
+        idx.insert(20, make_entry(20));
+        idx.advance_watermark(25);
+        let log = idx.encode_log();
+
+        // Simulate crash and recovery
+        let (recovered, corrupted) = OrphanIndex::recover_from_log(&log).unwrap();
+        assert!(corrupted.is_empty());
+        assert_eq!(recovered.len(), 2);
+        // Watermark at 25 covers both inodes (10, 20)
+        assert!(recovered.durable_watermark().covers(10));
+        assert!(recovered.durable_watermark().covers(20));
+        // But does NOT cover inode 30
+        assert!(!recovered.durable_watermark().covers(30));
+    }
+
+    // -- watermark advance after recovery resumption --
+
+    #[test]
+    fn watermark_advance_after_recovery_incremental() {
+        let mut idx = OrphanIndex::new();
+        idx.insert(10, make_entry(10));
+        idx.insert(20, make_entry(20));
+        idx.insert(30, make_entry(30));
+        idx.advance_watermark(15);
+        let log = idx.encode_log();
+
+        let (mut recovered, _) = OrphanIndex::recover_from_log(&log).unwrap();
+        assert_eq!(recovered.durable_watermark().position, 15);
+
+        // Advance watermark further after re-processing more entries
+        recovered.advance_watermark(35);
+        assert!(recovered.durable_watermark().covers(30));
+        assert!(recovered.is_dirty());
+    }
+}

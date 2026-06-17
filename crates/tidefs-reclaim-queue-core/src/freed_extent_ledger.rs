@@ -1258,3 +1258,190 @@ mod tests {
         assert_eq!(l.config(), &ReclaimQueueLedgerConfig::default());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Orphan replay watermark gating tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::*;
+    use tidefs_types_orphan_index_core::OrphanReplayWatermark;
+
+    fn wm(pos: u64) -> OrphanReplayWatermark {
+        OrphanReplayWatermark { position: pos }
+    }
+
+    fn fe_inode(seed: u8, inode_id: u64) -> FreedExtent {
+        let mut hash = [0u8; 32];
+        hash[0] = seed;
+        FreedExtent::with_inode(
+            seed as u64,
+            (seed as u64) * 4096,
+            (seed as u64) * 1024,
+            hash,
+            (seed as u64) * 100,
+            inode_id,
+        )
+    }
+
+    fn fe_no_inode(seed: u8) -> FreedExtent {
+        let mut hash = [0u8; 32];
+        hash[0] = seed;
+        FreedExtent::new(
+            seed as u64,
+            (seed as u64) * 4096,
+            (seed as u64) * 1024,
+            hash,
+            (seed as u64) * 100,
+        )
+    }
+
+    // -- FreedExtent::with_inode encode/decode round-trip --
+
+    #[test]
+    fn with_inode_roundtrip() {
+        let e = fe_inode(5, 42);
+        let encoded = e.encode();
+        let decoded = FreedExtent::decode(&encoded);
+        assert_eq!(decoded, e);
+        assert_eq!(decoded.inode_id, Some(42));
+    }
+
+    #[test]
+    fn no_inode_sentinel_roundtrip() {
+        let e = fe_no_inode(7);
+        let encoded = e.encode();
+        let decoded = FreedExtent::decode(&encoded);
+        assert_eq!(decoded, e);
+        assert_eq!(decoded.inode_id, None);
+    }
+
+    #[test]
+    fn with_inode_near_max_roundtrip() {
+        let e = fe_inode(9, u64::MAX - 1);
+        let encoded = e.encode();
+        let decoded = FreedExtent::decode(&encoded);
+        assert_eq!(decoded.inode_id, Some(u64::MAX - 1));
+    }
+
+    // -- dequeue_batch_with_orphan_watermark --
+
+    #[test]
+    fn watermark_none_blocks_all_dequeue() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 20));
+        let batch = l.dequeue_batch_with_orphan_watermark(
+            10,
+            Some(OrphanReplayWatermark::NONE),
+        );
+        assert_eq!(batch.len(), 0);
+        assert_eq!(l.len(), 2);
+    }
+
+    #[test]
+    fn watermark_covered_extents_dequeued() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 20));
+        let batch = l.dequeue_batch_with_orphan_watermark(10, Some(wm(50)));
+        assert_eq!(batch.len(), 2);
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn watermark_partial_cover_filters_blocked() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 100));
+        let batch = l.dequeue_batch_with_orphan_watermark(10, Some(wm(50)));
+        assert_eq!(batch.len(), 1);
+        assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn watermark_no_inode_mapping_blocked() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_no_inode(1));
+        let batch = l.dequeue_batch_with_orphan_watermark(10, Some(wm(100)));
+        assert_eq!(batch.len(), 0);
+        assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn watermark_none_option_bypasses_gate() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 20));
+        let batch = l.dequeue_batch_with_orphan_watermark(10, None);
+        assert_eq!(batch.len(), 2);
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn watermark_respects_max_count() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 20));
+        l.enqueue(fe_inode(3, 30));
+        let batch = l.dequeue_batch_with_orphan_watermark(2, Some(wm(100)));
+        assert_eq!(batch.len(), 2);
+        assert_eq!(l.len(), 1);
+    }
+
+    // -- orphan_watermark_blocked_count --
+
+    #[test]
+    fn watermark_blocked_count_none_option_returns_zero() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        assert_eq!(l.orphan_watermark_blocked_count(None), 0);
+    }
+
+    #[test]
+    fn watermark_blocked_count_none_watermark_blocks_all() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 20));
+        assert_eq!(
+            l.orphan_watermark_blocked_count(Some(OrphanReplayWatermark::NONE)),
+            2
+        );
+    }
+
+    #[test]
+    fn watermark_blocked_count_partial() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 100));
+        l.enqueue(fe_no_inode(3));
+        assert_eq!(l.orphan_watermark_blocked_count(Some(wm(50))), 2);
+    }
+
+    #[test]
+    fn watermark_blocked_count_all_covered_returns_zero() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 20));
+        assert_eq!(l.orphan_watermark_blocked_count(Some(wm(100))), 0);
+    }
+
+    // -- watermark + encode/decode round-trip preserves inode_id --
+
+    #[test]
+    fn ledger_roundtrip_preserves_inode_ids() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 42));
+        l.enqueue(fe_no_inode(2));
+        l.enqueue(fe_inode(3, 99));
+        let encoded = l.encode();
+        let decoded =
+            ReclaimQueueLedger::decode(&encoded, ReclaimQueueLedgerConfig::default()).unwrap();
+        assert_eq!(decoded.len(), 3);
+        let entries: Vec<FreedExtent> = decoded.entries.iter().copied().collect();
+        assert_eq!(entries[0].inode_id, Some(42));
+        assert_eq!(entries[1].inode_id, None);
+        assert_eq!(entries[2].inode_id, Some(99));
+    }
+}
