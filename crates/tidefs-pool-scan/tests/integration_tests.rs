@@ -604,12 +604,12 @@ fn validate_membership_many_devices_same_pool() {
 }
 
 #[test]
-fn validate_membership_duplicate_device_guids_accepted() {
+fn validate_membership_duplicate_device_guid_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let pool_guid = [0xD0u8; 16];
     let device_guid = [0xD1u8; 16];
 
-    // Two devices with same device GUID but different indices.
+    // Two distinct devices with the same device GUID — must be rejected.
     let dev0 = dir.path().join("dev0");
     let label0 = make_label(pool_guid, device_guid, "dupdevs", 0, 2);
     write_label(&dev0, &label0);
@@ -620,8 +620,19 @@ fn validate_membership_duplicate_device_guids_accepted() {
 
     let cfg = PoolScanConfig::new(vec![dev0, dev1]);
     let reader = LabelReader::new(cfg);
-    let result = validate_pool_membership(&reader).unwrap();
-    assert_eq!(result, pool_guid);
+    let err = validate_pool_membership(&reader).unwrap_err();
+    match err {
+        MembershipError::DuplicateMemberIdentity {
+            kind,
+            identity_value,
+            observations,
+        } => {
+            assert!(matches!(kind, tidefs_pool_scan::label::DuplicateIdentityKind::DeviceGuid));
+            assert_eq!(identity_value, "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1");
+            assert_eq!(observations.len(), 2);
+        }
+        other => panic!("expected DuplicateMemberIdentity, got {other:?}"),
+    }
 }
 
 #[test]
@@ -652,6 +663,117 @@ fn validate_membership_single_foreign_device_reported() {
         }
         other => panic!("expected PoolGuidMismatch, got {other:?}"),
     }
+}
+
+// — Duplicate member identity tests —
+
+#[test]
+fn validate_membership_duplicate_device_index_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool_guid = [0x50u8; 16];
+
+    // Two distinct devices claiming the same device_index=0.
+    let dev0 = dir.path().join("dev0");
+    let label0 = make_label(pool_guid, [0x01u8; 16], "dupindex", 0, 2);
+    write_label(&dev0, &label0);
+
+    let dev1 = dir.path().join("dev1");
+    let label1 = make_label(pool_guid, [0x02u8; 16], "dupindex", 0, 2);
+    write_label(&dev1, &label1);
+
+    let cfg = PoolScanConfig::new(vec![dev0, dev1]);
+    let reader = LabelReader::new(cfg);
+    let err = validate_pool_membership(&reader).unwrap_err();
+
+    match err {
+        MembershipError::DuplicateMemberIdentity {
+            kind,
+            identity_value,
+            observations,
+        } => {
+            assert!(matches!(kind, tidefs_pool_scan::label::DuplicateIdentityKind::DeviceIndex));
+            assert_eq!(identity_value, "0");
+            assert_eq!(observations.len(), 2);
+            // Observations mention different device GUIDs.
+            let details: Vec<&str> = observations.iter().map(|(_, d)| d.as_str()).collect();
+            assert!(details.iter().any(|d| d.contains("01010101010101010101010101010101")));
+            assert!(details.iter().any(|d| d.contains("02020202020202020202020202020202")));
+        }
+        other => panic!("expected DuplicateMemberIdentity, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_membership_same_path_twice_is_benign() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool_guid = [0x60u8; 16];
+
+    let dev = dir.path().join("onlydev");
+    let label = make_label(pool_guid, [0x01u8; 16], "benign", 0, 1);
+    write_label(&dev, &label);
+
+    // Scan the same path twice — must succeed (benign repeated scan).
+    let cfg = PoolScanConfig::new(vec![dev.clone(), dev.clone()]);
+    let reader = LabelReader::new(cfg);
+    let guid = validate_pool_membership(&reader).unwrap();
+    assert_eq!(guid, pool_guid);
+}
+
+#[test]
+fn validate_membership_healthy_unique_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool_guid = [0x70u8; 16];
+
+    let dev0 = dir.path().join("dev0");
+    let label0 = make_label(pool_guid, [0x01u8; 16], "healthy", 0, 2);
+    write_label(&dev0, &label0);
+
+    let dev1 = dir.path().join("dev1");
+    let label1 = make_label(pool_guid, [0x02u8; 16], "healthy", 1, 2);
+    write_label(&dev1, &label1);
+
+    let cfg = PoolScanConfig::new(vec![dev0, dev1]);
+    let reader = LabelReader::new(cfg);
+    let guid = validate_pool_membership(&reader).unwrap();
+    assert_eq!(guid, pool_guid);
+}
+
+#[test]
+fn duplicate_member_identity_error_display() {
+    use tidefs_pool_scan::label::DuplicateIdentityKind;
+    let err = MembershipError::DuplicateMemberIdentity {
+        kind: DuplicateIdentityKind::DeviceGuid,
+        identity_value: "abcdef".into(),
+        observations: vec![
+            (PathBuf::from("/dev/sda"), "device_index=0".into()),
+            (PathBuf::from("/dev/sdb"), "device_index=1".into()),
+        ],
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("duplicate device GUID identity"));
+    assert!(msg.contains("abcdef"));
+    assert!(msg.contains("/dev/sda"));
+    assert!(msg.contains("/dev/sdb"));
+    assert!(msg.contains("device_index=0"));
+    assert!(msg.contains("device_index=1"));
+}
+
+#[test]
+fn duplicate_member_identity_error_display_device_index() {
+    use tidefs_pool_scan::label::DuplicateIdentityKind;
+    let err = MembershipError::DuplicateMemberIdentity {
+        kind: DuplicateIdentityKind::DeviceIndex,
+        identity_value: "3".into(),
+        observations: vec![
+            (PathBuf::from("/dev/nvme0n1"), "device_guid=aaa".into()),
+            (PathBuf::from("/dev/nvme1n1"), "device_guid=bbb".into()),
+        ],
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("duplicate device index identity"));
+    assert!(msg.contains("\"3\""));
+    assert!(msg.contains("/dev/nvme0n1"));
+    assert!(msg.contains("/dev/nvme1n1"));
 }
 
 // — PoolScanConfig edge cases —
