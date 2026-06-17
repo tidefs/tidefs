@@ -17,8 +17,8 @@
 use std::time::Instant;
 
 use tidefs_performance_contract::{
-    AdmissionCharge, AdmissionError, AdmissionPermit, DynamicAdmissionTuning, ResourceDomain,
-    WorkClass, WriteAdmissionConfig, WriteAdmissionState, WriteAdmissionUsage,
+    AdmissionCharge, AdmissionError, AdmissionPermit, DynamicAdmissionTuning,
+    WriteAdmissionConfig, WriteAdmissionState, WriteAdmissionUsage,
 };
 
 /// Hard admission caps for a mounted local filesystem.

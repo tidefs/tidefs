@@ -6508,15 +6508,15 @@ impl LocalFileSystem {
                 .mark_dirty(inode_id, offset, bytes_len);
         }
         self.snapshot_write_buffers_for_rollback();
+        // Acquire a write-admission permit before dirty bytes enter
+        // any tracked buffer.  The permit conserves dirty-byte and
+        // dirty-op budget until the commit group SYNC releases it.
+        self.try_admit_write(bytes_len, 1)?;
         let should_flush = {
             let wb = self
                 .write_buffers
                 .entry(inode_id)
                 .or_insert_with(|| WriteBuffer::new(self.write_buffer_config.clone()));
-            // Acquire a write-admission permit before dirty bytes enter
-            // any tracked buffer.  The permit conserves dirty-byte and
-            // dirty-op budget until the commit group SYNC releases it.
-            self.try_admit_write(bytes_len, 1)?;
             wb.ingest(bytes, offset);
             wb.should_flush()
         };
