@@ -2296,6 +2296,7 @@ version = "0.421.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tidefs-intent-log",
  "tidefs-model-core",
  "tidefs-types-vfs-core",
 ]

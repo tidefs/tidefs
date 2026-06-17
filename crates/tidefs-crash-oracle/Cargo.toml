@@ -20,3 +20,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "tidefs-crash-oracle"
 path = "src/main.rs"
+
+[features]
+intent-log-replay = ["tidefs-intent-log"]
+
+[dependencies.tidefs-intent-log]
+path = "../tidefs-intent-log"
+optional = true
