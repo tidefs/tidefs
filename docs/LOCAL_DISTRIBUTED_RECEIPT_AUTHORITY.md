@@ -147,25 +147,31 @@ This complements the existing receipt-bearing protocol messages:
 
 ## Remaining Issue #18 Acceptance Work
 
-The following work remains under issue #18 and the focused split issues:
 
-- #344: local-filesystem extent writes must persist and replay receipt
-  references;
-- #345: distributed storage-node and transport paths must move
-  receipt-addressed extents between nodes;
-- degraded read, rebuild, and backfill runtimes must consume durable receipt
-  authority instead of synthesizing placement from current topology alone;
-- #346: rebake and reclaim flows must prove ingest/base trimming is gated on
-  durable replacement receipts. The `DeadObjectReclaimQueue` now supports
-  `publish_replacement_receipt` for rebake to attach replacement evidence,
-  and `dequeue_receipt_bound_batch_with_stable_generation` to gate reclaim
-  drains on generation-stable receipt authority;
-- `DeadObjectReplacementReceipt` carries an `erasure_coded` constructor and
-  `authorizes_reclaim_for_with_stable_generation` to enforce both policy
-  correctness and generation stability;
-- two-node transfer, degraded-read, rebuild-after-replacement, and runtime
-  reclaim validation rows must run in GitHub Actions.
 
+Completed under issue #18 and the focused split issues:
+
+- #343 (merged): pool exposes receipt-returning placement writes;
+- #344 (merged via PR #358): local-filesystem extent writes persist and replay
+  receipt references through extent IO;
+- #346 (merged via PR #357): rebake/reclaim receipt publishing, generation-stability
+  gating, `DeadObjectReplacementReceipt::erasure_coded` constructor, and
+  `authorizes_reclaim_for_with_stable_generation` enforcement;
+- #345 (merged via PR #350): distributed storage-node and transport paths move
+  receipt-addressed extents between nodes via `PutWithReceipt` protocol;
+- rebuild completion receives receipt-verified task tracking with
+  `record_receipt_verified_task_completion` that validates erasure and
+  replicated policy correctness, including erasure malformed-policy rejection.
+
+Remaining:
+
+- #356: two-node receipt-addressed read and degraded-read validation after
+  node/device loss within the configured redundancy policy;
+- scrub receipt-authority integration (no focused issue yet);
+- backfill runtime receipt-authority consumption;
+- runtime validation rows for two-node transfer, degraded-read,
+  rebuild-after-replacement, and reclaim not racing durable receipt
+  publication.
 ## References
 
 - Issue #18: local/distributed receipt authority
