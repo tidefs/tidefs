@@ -260,6 +260,64 @@ impl DeadObjectReclaimQueue {
             .collect()
     }
 
+    /// Dequeue up to `max_count` entries authorized by txg, eligibility,
+    /// replacement receipt evidence, and generation stability.
+    ///
+    /// This is the strictest drain gate required by rebake/reclaim durability
+    /// gating (#346). Entries are only dequeued when their replacement
+    /// receipt generation is at or below `stable_committed_generation`,
+    /// proving the receipt publication is stable and cannot be rolled back.
+    #[must_use]
+    pub fn dequeue_receipt_bound_batch_with_stable_generation(
+        &self,
+        max_count: usize,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+    ) -> Vec<DeadObjectEntry> {
+        if max_count == 0 || self.is_empty() {
+            return Vec::new();
+        }
+        self.entries
+            .values()
+            .filter(|e| {
+                e.is_receipt_bound_reclaimable_with_stable_generation(
+                    stable_committed_txg,
+                    stable_committed_generation,
+                )
+            })
+            .take(max_count)
+            .copied()
+            .collect()
+    }
+
+    /// Publish a replacement/base placement receipt for a dead-object entry
+    /// already in the queue. This is the rebake pathway: after rebake converts
+    /// ingest extents to base shards, it calls this to attach the durable
+    /// replacement receipt so the queue can authorize obsolete-ingest trim.
+    ///
+    /// If the entry already has a replacement receipt, the new receipt is
+    /// accepted only when its generation is strictly greater (monotonic
+    /// progression). A lower or equal generation is silently ignored.
+    ///
+    /// Returns `true` if the receipt was attached or replaced.
+    pub fn publish_replacement_receipt(
+        &mut self,
+        object_id: &ObjectKey,
+        receipt: DeadObjectReplacementReceipt,
+    ) -> bool {
+        if let Some(entry) = self.entries.get_mut(object_id) {
+            let accept = match entry.replacement_receipt {
+                Some(existing) => receipt.receipt_generation > existing.receipt_generation,
+                None => true,
+            };
+            if accept {
+                entry.replacement_receipt = Some(receipt);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Remove successfully reclaimed entries from the queue.
     ///
     /// Call this after the allocator has freed the objects' space.
@@ -329,6 +387,25 @@ impl DeadObjectReclaimQueue {
         self.entries
             .values()
             .filter(|e| e.is_receipt_bound_reclaimable(stable_committed_txg))
+            .count()
+    }
+
+    /// Number of entries eligible for receipt-bound reclamation with
+    /// generation-stability gating.
+    #[must_use]
+    pub fn receipt_bound_eligible_count_with_stable_generation(
+        &self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+    ) -> usize {
+        self.entries
+            .values()
+            .filter(|e| {
+                e.is_receipt_bound_reclaimable_with_stable_generation(
+                    stable_committed_txg,
+                    stable_committed_generation,
+                )
+            })
             .count()
     }
 
@@ -1299,4 +1376,195 @@ mod tests {
         let decoded = DeadObjectReclaimQueue::decode(&bytes1).unwrap();
         assert_eq!(decoded.len(), q.len());
     }
+    // ── receipt-bound reclaim tests for #346 ────────────────────────────
+
+    fn erasure_entry(
+        object_byte: u8,
+        death_txg: u64,
+        receipt_generation: u64,
+        data_shards: u8,
+        parity_shards: u8,
+    ) -> DeadObjectEntry {
+        let key = oid(object_byte);
+        let receipt = DeadObjectReplacementReceipt::erasure_coded(
+            key,
+            7,
+            receipt_generation,
+            data_shards,
+            parity_shards,
+            4096,
+            digest_for_key(key),
+        );
+        DeadObjectEntry::new(key, [object_byte; 16], death_txg, true, death_txg)
+            .with_replacement_receipt(receipt)
+    }
+
+    fn digest_for_key(key: ObjectKey) -> [u8; 32] {
+        let mut d = [0u8; 32];
+        d[0] = key.0[0];
+        d
+    }
+
+    #[test]
+    fn erasure_coded_replacement_receipt_authorizes_reclaim() {
+        let key = oid(42);
+        let receipt = DeadObjectReplacementReceipt::erasure_coded(
+            key, 7, 1, 4, 2, 8192, digest_for_key(key),
+        );
+        assert!(!receipt.is_synthetic());
+        assert!(receipt.authorizes_reclaim_for(key));
+    }
+
+    #[test]
+    fn erasure_entry_passes_receipt_bound_dequeue() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(erasure_entry(10, 5, 1, 4, 2));
+
+        let batch = q.dequeue_receipt_bound_batch(10, 10);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].object_id, oid(10));
+    }
+
+    #[test]
+    fn stable_generation_gating_blocks_uncommitted_receipt() {
+        let mut q = DeadObjectReclaimQueue::new();
+        // Receipt generation 5, but stable committed generation is only 3
+        q.enqueue(erasure_entry(20, 5, 5, 4, 2));
+
+        // Receipt-bound batch (no generation check): should pass
+        let batch = q.dequeue_receipt_bound_batch(10, 10);
+        assert_eq!(batch.len(), 1);
+
+        // Stable-generation batch: should block because gen 5 > stable 3
+        let batch = q.dequeue_receipt_bound_batch_with_stable_generation(10, 10, 3);
+        assert_eq!(batch.len(), 0);
+
+        // Stable-generation batch at gen 5 or higher: should pass
+        let batch = q.dequeue_receipt_bound_batch_with_stable_generation(10, 10, 5);
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn stable_generation_gating_rejects_zero_generation() {
+        let mut q = DeadObjectReclaimQueue::new();
+        let key = oid(30);
+        let receipt = DeadObjectReplacementReceipt::replicated(
+            key, 7, 0, 2, 4096, digest_for_key(key),
+        );
+        q.enqueue(
+            DeadObjectEntry::new(key, [30; 16], 5, true, 5)
+                .with_replacement_receipt(receipt),
+        );
+
+        // Synthetic receipt (gen 0): stable-generation batch rejects
+        let batch = q.dequeue_receipt_bound_batch_with_stable_generation(10, 10, 5);
+        assert_eq!(batch.len(), 0);
+
+        // Even receipt-bound batch rejects synthetic
+        let batch = q.dequeue_receipt_bound_batch(10, 10);
+        assert_eq!(batch.len(), 0);
+    }
+
+    #[test]
+    fn rebake_publishes_replacement_receipt() {
+        let mut q = DeadObjectReclaimQueue::new();
+        let key = oid(40);
+        // Enqueue without replacement receipt (pre-rebake)
+        q.enqueue(DeadObjectEntry::new(key, [40; 16], 5, true, 5));
+
+        // Not yet reclaimable via receipt-bound path
+        assert_eq!(q.receipt_bound_eligible_count(10), 0);
+
+        // Rebake publishes replacement receipt
+        let receipt = DeadObjectReplacementReceipt::replicated(
+            key, 7, 1, 2, 4096, digest_for_key(key),
+        );
+        assert!(q.publish_replacement_receipt(&key, receipt));
+
+        // Now reclaimable
+        assert_eq!(q.receipt_bound_eligible_count(10), 1);
+    }
+
+    #[test]
+    fn rebake_publish_rejects_lower_generation() {
+        let mut q = DeadObjectReclaimQueue::new();
+        let key = oid(50);
+        let receipt_gen3 = DeadObjectReplacementReceipt::replicated(
+            key, 7, 3, 2, 4096, digest_for_key(key),
+        );
+        q.enqueue(
+            DeadObjectEntry::new(key, [50; 16], 5, true, 5)
+                .with_replacement_receipt(receipt_gen3),
+        );
+
+        // Attempt to publish older generation: rejected
+        let receipt_gen2 = DeadObjectReplacementReceipt::replicated(
+            key, 7, 2, 2, 4096, digest_for_key(key),
+        );
+        assert!(!q.publish_replacement_receipt(&key, receipt_gen2));
+
+        // Attempt to publish same generation: rejected
+        let receipt_gen3b = DeadObjectReplacementReceipt::replicated(
+            key, 7, 3, 2, 4096, digest_for_key(key),
+        );
+        assert!(!q.publish_replacement_receipt(&key, receipt_gen3b));
+
+        // Publish higher generation: accepted
+        let receipt_gen4 = DeadObjectReplacementReceipt::replicated(
+            key, 7, 4, 2, 4096, digest_for_key(key),
+        );
+        assert!(q.publish_replacement_receipt(&key, receipt_gen4));
+    }
+
+    #[test]
+    fn reclaim_does_not_race_receipt_publication() {
+        let mut q = DeadObjectReclaimQueue::new();
+        let key = oid(60);
+        // Dead object enqueued, receipt published at gen 8
+        let receipt = DeadObjectReplacementReceipt::erasure_coded(
+            key, 7, 8, 4, 2, 8192, digest_for_key(key),
+        );
+        q.enqueue(
+            DeadObjectEntry::new(key, [60; 16], 5, true, 5)
+                .with_replacement_receipt(receipt),
+        );
+
+        // stable_committed_generation = 7 (behind the receipt gen 8)
+        // Reclaim must NOT proceed because receipt generation is not yet stable
+        let batch = q.dequeue_receipt_bound_batch_with_stable_generation(10, 10, 7);
+        assert_eq!(batch.len(), 0, "reclaim must not race uncommitted receipt");
+
+        // Once stable generation catches up to 8, reclaim proceeds
+        let batch = q.dequeue_receipt_bound_batch_with_stable_generation(10, 10, 8);
+        assert_eq!(batch.len(), 1);
+
+        // After ack, entry is removed
+        let removed = q.ack_reclaimed(&[key]);
+        assert_eq!(removed, 1);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn mixed_replicated_and_erasure_entries() {
+        let mut q = DeadObjectReclaimQueue::new();
+        let k1 = oid(70);
+        let k2 = oid(71);
+
+        let r1 = DeadObjectReplacementReceipt::replicated(
+            k1, 7, 1, 3, 4096, digest_for_key(k1),
+        );
+        let r2 = DeadObjectReplacementReceipt::erasure_coded(
+            k2, 7, 2, 8, 3, 16384, digest_for_key(k2),
+        );
+
+        q.enqueue(DeadObjectEntry::new(k1, [70; 16], 5, true, 5).with_replacement_receipt(r1));
+        q.enqueue(DeadObjectEntry::new(k2, [71; 16], 5, true, 5).with_replacement_receipt(r2));
+
+        assert_eq!(q.receipt_bound_eligible_count(10), 2);
+        assert_eq!(q.receipt_bound_eligible_count_with_stable_generation(10, 5), 2);
+
+        let batch = q.dequeue_receipt_bound_batch_with_stable_generation(10, 10, 5);
+        assert_eq!(batch.len(), 2);
+    }
+
 }

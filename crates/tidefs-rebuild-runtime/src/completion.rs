@@ -1024,4 +1024,117 @@ mod tests {
         let s3 = CompletionStatus::new(MemberId::new(10), 0);
         assert!((s3.fraction() - 1.0).abs() < f64::EPSILON);
     }
+
+    // ── erasure-coded receipt tests for #346 ──────────────────────────
+
+    fn erasure_receipt_ref(subject: u64, generation: u64, data_shards: u8, parity_shards: u8) -> PlacementReceiptRef {
+        let mut object_key = [0xA5; 32];
+        object_key[..8].copy_from_slice(&subject.to_le_bytes());
+        let mut digest = [0x5A; 32];
+        digest[..8].copy_from_slice(&subject.to_le_bytes());
+        digest[8..16].copy_from_slice(&generation.to_le_bytes());
+        PlacementReceiptRef::erasure(
+            subject,
+            object_key,
+            tidefs_membership_epoch::EpochId::new(7),
+            generation,
+            data_shards,
+            parity_shards,
+            4096,
+            digest,
+        )
+    }
+
+    fn make_erasure_task(subject: u64, member: u64, generation: u64, data_shards: u8, parity_shards: u8) -> BackfillTask {
+        let placement_receipt_ref = erasure_receipt_ref(subject, generation, data_shards, parity_shards);
+        BackfillTask::new(BackfillTaskInit {
+            subject_ref: ReplicatedSubjectId::new(subject),
+            placement_receipt_ref,
+            source_member: MemberId::new(1),
+            target_member: MemberId::new(member),
+            movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
+            payload_digest: receipt_digest_to_object_digest(placement_receipt_ref.payload_digest),
+            payload_len: placement_receipt_ref.payload_len,
+            created_at_ns: 0,
+            deadline_ns: 10_000,
+        })
+    }
+
+    #[test]
+    fn erasure_receipt_verification_passes() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+
+        let task = make_erasure_task(42, 10, 1, 4, 2);
+        let mut repaired = erasure_receipt_ref(42, 1, 4, 2);
+        repaired.receipt_generation = 2;
+
+        let event = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect("erasure receipt should verify")
+            .expect("first verified receipt completes member");
+
+        assert_eq!(event.succeeded, 1);
+        assert!(event.fully_successful);
+        assert_eq!(completion.total_completed_subjects(), 1);
+    }
+
+    #[test]
+    fn erasure_receipt_rejects_under_width_targets() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+
+        let task = make_erasure_task(42, 10, 1, 4, 2);
+        // Repaired receipt claims only 5 targets, but 4+2=6 required
+        let mut repaired = erasure_receipt_ref(42, 1, 4, 2);
+        repaired.receipt_generation = 2;
+        repaired.target_count = 5;
+
+        let err = completion
+            .record_receipt_verified_task_completion(&task, repaired, &mut admission)
+            .expect_err("under-width erasure receipt must not complete");
+
+        assert_eq!(
+            err,
+            ReceiptCompletionError::InsufficientReceiptTargets {
+                object_id: 42,
+                required: 6,
+                actual: 5,
+            }
+        );
+        assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
+    }
+
+    #[test]
+    fn rebuild_after_replacement_receipt_completes() {
+        // Simulates rebuild after a device replacement: the replacement
+        // receipt has a higher generation than the original source receipt.
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(1);
+        let member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, member, 1);
+
+        let task = make_erasure_task(42, 10, 1, 4, 2);
+        // Replacement receipt has generation 5 (much higher than original gen 1)
+        let mut replacement_receipt = erasure_receipt_ref(42, 1, 4, 2);
+        replacement_receipt.receipt_generation = 5;
+
+        let event = completion
+            .record_receipt_verified_task_completion(&task, replacement_receipt, &mut admission)
+            .expect("replacement receipt should verify")
+            .expect("completes rebuild after replacement");
+
+        assert_eq!(event.succeeded, 1);
+        assert!(event.fully_successful);
+
+        let records = completion.verified_receipt_completions();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_placement_receipt_ref.receipt_generation, 1);
+        assert_eq!(records[0].repaired_placement_receipt_ref.receipt_generation, 5);
+    }
+
 }

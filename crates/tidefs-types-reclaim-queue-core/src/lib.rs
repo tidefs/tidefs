@@ -779,6 +779,33 @@ impl DeadObjectReplacementReceipt {
         )
     }
 
+    /// Construct a replacement receipt with an erasure-coded redundancy policy.
+    #[must_use]
+    pub const fn erasure_coded(
+        object_key: ObjectKey,
+        receipt_epoch: u64,
+        receipt_generation: u64,
+        data_shards: u8,
+        parity_shards: u8,
+        payload_len: u64,
+        payload_digest: [u8; 32],
+    ) -> Self {
+        let redundancy_policy = DeadObjectReceiptPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        };
+        let target_count = data_shards as u16 + parity_shards as u16;
+        Self::new(
+            object_key,
+            receipt_epoch,
+            receipt_generation,
+            redundancy_policy,
+            payload_len,
+            payload_digest,
+            target_count,
+        )
+    }
+
     /// True when this evidence is the legacy compatibility placeholder rather
     /// than a durable placement receipt.
     #[must_use]
@@ -793,6 +820,23 @@ impl DeadObjectReplacementReceipt {
             && self.object_key.0 == object_key.0
             && self.redundancy_policy.is_well_formed()
             && self.target_count >= self.redundancy_policy.target_width()
+    }
+
+    /// True when this receipt is durable, policy-satisfying, and its
+    /// generation is at or below the stable committed generation — meaning
+    /// the receipt cannot be rolled back.
+    ///
+    /// Compatibility callers that don't track committed generations may use
+    /// [`Self::authorizes_reclaim_for`] instead.
+    #[must_use]
+    pub fn authorizes_reclaim_for_with_stable_generation(
+        self,
+        object_key: ObjectKey,
+        stable_committed_generation: u64,
+    ) -> bool {
+        self.receipt_generation > 0
+            && self.receipt_generation <= stable_committed_generation
+            && self.authorizes_reclaim_for(object_key)
     }
 
     #[must_use]
@@ -913,6 +957,31 @@ impl DeadObjectEntry {
         }
         match self.replacement_receipt {
             Some(receipt) => receipt.authorizes_reclaim_for(self.object_id),
+            None => false,
+        }
+    }
+
+    /// Returns `true` when the normal txg/eligibility gate, replacement
+    /// receipt evidence, and generation stability all authorize reclaim.
+    ///
+    /// This is the stricter variant required by rebake/reclaim durability
+    /// gating (#346): the replacement receipt must be non-synthetic,
+    /// policy-satisfying, and its generation must not exceed the stable
+    /// committed generation, proving the receipt cannot be rolled back.
+    #[must_use]
+    pub fn is_receipt_bound_reclaimable_with_stable_generation(
+        self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+    ) -> bool {
+        if !self.is_reclaimable(stable_committed_txg) {
+            return false;
+        }
+        match self.replacement_receipt {
+            Some(receipt) => receipt.authorizes_reclaim_for_with_stable_generation(
+                self.object_id,
+                stable_committed_generation,
+            ),
             None => false,
         }
     }
