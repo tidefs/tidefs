@@ -722,20 +722,68 @@ fn main() {
             }
         }
         Some("validate-claim") => {
-            let claim_id = match args.next() {
+            let mut format = claims::ClaimValidationFormat::Summary;
+            let mut claim_id: Option<String> = None;
+            while let Some(arg) = args.next() {
+                if arg == "--format" {
+                    let Some(value) = args.next() else {
+                        eprintln!("validate-claim --format requires `summary` or `json`");
+                        process::exit(2);
+                    };
+                    format = match value.as_str() {
+                        "summary" => claims::ClaimValidationFormat::Summary,
+                        "json" => claims::ClaimValidationFormat::Json,
+                        other => {
+                            eprintln!(
+                                "validate-claim --format accepts `summary` or `json`, got `{other}`"
+                            );
+                            process::exit(2);
+                        }
+                    };
+                    continue;
+                }
+                if let Some(value) = arg.strip_prefix("--format=") {
+                    format = match value {
+                        "summary" => claims::ClaimValidationFormat::Summary,
+                        "json" => claims::ClaimValidationFormat::Json,
+                        other => {
+                            eprintln!(
+                                "validate-claim --format accepts `summary` or `json`, got `{other}`"
+                            );
+                            process::exit(2);
+                        }
+                    };
+                    continue;
+                }
+                if arg == "--json" {
+                    format = claims::ClaimValidationFormat::Json;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    eprintln!("validate-claim got unknown option `{arg}`");
+                    process::exit(2);
+                }
+                if let Some(existing) = claim_id.replace(arg) {
+                    eprintln!(
+                        "validate-claim accepts one claim id, got `{existing}` and extra argument"
+                    );
+                    process::exit(2);
+                }
+            }
+            let claim_id = match claim_id {
                 Some(claim_id) => claim_id,
                 None => {
                     eprintln!("validate-claim requires a claim id");
                     process::exit(2);
                 }
             };
-            if let Some(extra) = args.next() {
-                eprintln!("validate-claim accepts one claim id, got extra argument `{extra}`");
-                process::exit(2);
-            }
-            if let Err(err) = claims::validate_claim_current_workspace(&claim_id) {
-                eprintln!("{err}");
-                process::exit(1);
+            match claims::validate_claim_current_workspace(&claim_id, format) {
+                Ok(true) => {}
+                Ok(false) => process::exit(1),
+                Err(err) => {
+                    eprintln!("{err}");
+                    process::exit(1);
+                }
             }
         }
         Some("validate-ublk-completion-artifact") => {
