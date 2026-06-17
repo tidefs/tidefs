@@ -2504,3 +2504,363 @@ mod receipt_rotation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod rewrite_extent_trimming_tests {
+    use super::*;
+    use crate::allocation::{
+        obsolete_extent_keys_for_chunked_rewrite,
+        obsolete_extent_keys_for_full_replace, queue_deferred_extent_keys_for_reclaim,
+    };
+    use crate::object_keys::{
+        content_chunk_object_key_for_version, content_object_key_for_version,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tidefs_local_object_store::pool::{Pool, PoolConfig, PoolProperties};
+    use tidefs_local_object_store::{
+        DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, StoreOptions,
+    };
+    use tidefs_reclaim_queue_core::BPlusTreeReclaimQueue;
+
+    fn temp_pool(label: &str) -> Pool {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-trim-{label}-{nanos}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let data_dir = root.join("data");
+        let config = PoolConfig {
+            name: "testpool".into(),
+            root_path: root.clone(),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Single { path: data_dir },
+                encryption: None,
+                compression: None,
+            }],
+        };
+        Pool::create(config, PoolProperties::default(), &StoreOptions::test_fast())
+            .expect("create temp pool")
+    }
+
+    /// Build a ContentChunkRef with a durable receipt (via pool put_with_receipt).
+    fn durable_chunk_ref(
+        pool: &mut Pool,
+        inode_id: InodeId,
+        data_version: u64,
+        chunk_index: u64,
+        len: u32,
+        payload: &[u8],
+    ) -> (ObjectKey, ContentChunkRef) {
+        let key = content_chunk_object_key_for_version(inode_id, data_version, chunk_index);
+        let (_, receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, key, payload)
+            .expect("put_with_receipt");
+        let chunk_ref = ContentChunkRef {
+            chunk_index,
+            data_version,
+            len,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: receipt.generation,
+        };
+        (key, chunk_ref)
+    }
+
+    /// Build a ContentChunkRef with a receipt that is NOT durable
+    /// (uses a non-existent key so no receipt exists in the pool).
+    fn non_durable_chunk_ref(
+        _inode_id: InodeId,
+        data_version: u64,
+        chunk_index: u64,
+        len: u32,
+    ) -> ContentChunkRef {
+        ContentChunkRef {
+            chunk_index,
+            data_version,
+            len,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: 1, // non-zero but no matching pool receipt
+        }
+    }
+
+    #[test]
+    fn obsolete_extent_keys_trimmable_when_replacement_durable() {
+        let mut pool = temp_pool("trim-durable");
+        let inode_id = InodeId(1);
+
+        // Write old chunks (data_version 1).
+        let (old_key0, old_chunk0) =
+            durable_chunk_ref(&mut pool, inode_id, 1, 0, 4096, b"old chunk 0 data");
+        let (old_key1, old_chunk1) =
+            durable_chunk_ref(&mut pool, inode_id, 1, 1, 4096, b"old chunk 1 data");
+
+        // Write replacement chunks (data_version 2) with durable receipts.
+        let (_new_key0, new_chunk0) =
+            durable_chunk_ref(&mut pool, inode_id, 2, 0, 4096, b"new chunk 0 data");
+        let (_new_key1, new_chunk1) =
+            durable_chunk_ref(&mut pool, inode_id, 2, 1, 4096, b"new chunk 1 data");
+
+        let old_manifest = ContentManifestObject {
+            inode_id,
+            data_version: 1,
+            file_size: 8192,
+            chunk_size: 4096,
+            chunks: vec![old_chunk0, old_chunk1],
+        };
+
+        let new_chunks = vec![new_chunk0, new_chunk1];
+
+        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
+            &pool, inode_id, &old_manifest, &new_chunks,
+        );
+
+        assert_eq!(trimmable.len(), 2, "both old chunks should be trimmable");
+        assert!(deferred.is_empty(), "no chunks should be deferred");
+        assert!(trimmable.contains(&old_key0));
+        assert!(trimmable.contains(&old_key1));
+    }
+
+    #[test]
+    fn obsolete_extent_keys_deferred_when_replacement_not_durable() {
+        let mut pool = temp_pool("trim-deferred");
+        let inode_id = InodeId(2);
+
+        // Write old chunks (data_version 1) with durable receipts.
+        let (old_key0, old_chunk0) =
+            durable_chunk_ref(&mut pool, inode_id, 1, 0, 4096, b"old chunk 0 data");
+
+        // Create replacement chunk ref WITHOUT writing it to the pool
+        // (no durable receipt).
+        let new_chunk0 = non_durable_chunk_ref(inode_id, 2, 0, 4096);
+
+        let old_manifest = ContentManifestObject {
+            inode_id,
+            data_version: 1,
+            file_size: 4096,
+            chunk_size: 4096,
+            chunks: vec![old_chunk0],
+        };
+
+        let new_chunks = vec![new_chunk0];
+
+        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
+            &pool, inode_id, &old_manifest, &new_chunks,
+        );
+
+        assert!(trimmable.is_empty(), "no chunks should be trimmable when replacement not durable");
+        assert_eq!(deferred.len(), 1, "old chunk should be deferred");
+        assert!(deferred.contains(&old_key0));
+    }
+
+    #[test]
+    fn retained_chunks_are_not_obsolete() {
+        let mut pool = temp_pool("trim-retained");
+        let inode_id = InodeId(3);
+
+        // Write chunks at data_version 1.
+        let (_old_key0, chunk0) =
+            durable_chunk_ref(&mut pool, inode_id, 1, 0, 4096, b"chunk 0 data");
+
+        // The "new" chunks include the same chunk (same data_version).
+        let old_manifest = ContentManifestObject {
+            inode_id,
+            data_version: 1,
+            file_size: 4096,
+            chunk_size: 4096,
+            chunks: vec![chunk0.clone()],
+        };
+
+        let new_chunks = vec![chunk0]; // same chunk, same data_version
+
+        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
+            &pool, inode_id, &old_manifest, &new_chunks,
+        );
+
+        assert!(trimmable.is_empty(), "retained chunks should not be trimmable");
+        assert!(deferred.is_empty(), "retained chunks should not be deferred");
+    }
+
+    #[test]
+    fn hole_chunks_are_skipped() {
+        let pool = temp_pool("trim-hole");
+        let inode_id = InodeId(4);
+
+        let hole_chunk = ContentChunkRef::hole(0, 4096);
+
+        let old_manifest = ContentManifestObject {
+            inode_id,
+            data_version: 1,
+            file_size: 4096,
+            chunk_size: 4096,
+            chunks: vec![hole_chunk],
+        };
+
+        let new_chunks: Vec<ContentChunkRef> = vec![];
+
+        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
+            &pool, inode_id, &old_manifest, &new_chunks,
+        );
+
+        assert!(trimmable.is_empty(), "hole chunks should not be trimmable");
+        assert!(deferred.is_empty(), "hole chunks should not be deferred");
+    }
+
+    #[test]
+    fn chunk_past_new_size_is_trimmable_unconditionally() {
+        let mut pool = temp_pool("trim-shrink");
+        let inode_id = InodeId(5);
+
+        // Write old chunks (data_version 1) for a larger file.
+        let (old_key0, old_chunk0) =
+            durable_chunk_ref(&mut pool, inode_id, 1, 0, 4096, b"chunk 0 data");
+        let (old_key1, old_chunk1) =
+            durable_chunk_ref(&mut pool, inode_id, 1, 1, 4096, b"chunk 1 data (shrunk)");
+
+        let old_manifest = ContentManifestObject {
+            inode_id,
+            data_version: 1,
+            file_size: 8192,
+            chunk_size: 4096,
+            chunks: vec![old_chunk0, old_chunk1],
+        };
+
+        // New file only has chunk 0 — chunk 1 is past new file size.
+        let new_chunks = vec![ContentChunkRef {
+            chunk_index: 0,
+            data_version: 1,
+            len: 4096,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: 1,
+        }];
+
+        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
+            &pool, inode_id, &old_manifest, &new_chunks,
+        );
+
+        // Chunk 0 is retained (same data_version) — not obsolete.
+        // Chunk 1 is past new file size — trimmable unconditionally.
+        assert_eq!(trimmable.len(), 1, "chunk past new size should be trimmable");
+        assert!(deferred.is_empty());
+        assert!(trimmable.contains(&old_key1));
+        assert!(!trimmable.contains(&old_key0));
+    }
+
+    #[test]
+    fn full_replace_includes_manifest_key() {
+        let mut pool = temp_pool("trim-full-replace");
+        let inode_id = InodeId(6);
+
+        // Write old chunk with durable receipt.
+        let (_old_key, old_chunk) =
+            durable_chunk_ref(&mut pool, inode_id, 1, 0, 4096, b"old chunk data");
+
+        // Write new chunk with durable receipt.
+        let (_new_key, new_chunk) =
+            durable_chunk_ref(&mut pool, inode_id, 2, 0, 4096, b"new chunk data");
+
+        let old_manifest = ContentManifestObject {
+            inode_id,
+            data_version: 1,
+            file_size: 4096,
+            chunk_size: 4096,
+            chunks: vec![old_chunk],
+        };
+
+        let new_chunks = vec![new_chunk];
+        let new_data_version = 2;
+
+        let (trimmable, deferred) = obsolete_extent_keys_for_full_replace(
+            &pool, inode_id, &old_manifest, &new_chunks, new_data_version,
+        );
+
+        let old_manifest_key = content_object_key_for_version(inode_id, 1);
+        assert!(trimmable.contains(&old_manifest_key),
+            "old manifest key should be trimmable when new manifest receipt is durable");
+        // Old chunk + old manifest = 2 entries
+        assert_eq!(trimmable.len(), 2);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn queue_deferred_extent_keys_inserts_into_reclaim_queue() {
+        let queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
+        let key1 = ObjectKey::from_name(b"test-key-1");
+        let key2 = ObjectKey::from_name(b"test-key-2");
+
+        queue_deferred_extent_keys_for_reclaim(&queue, &[key1, key2]);
+
+        let q = queue.lock().unwrap();
+        assert_eq!(q.len(), 2, "both keys should be in the reclaim queue");
+    }
+
+    #[test]
+    fn deferred_trim_workflow_durable_replacement() {
+        // End-to-end: write old chunk, write replacement (durable), then
+        // verify the old chunk is classified as trimmable.
+        let mut pool = temp_pool("trim-workflow-dur");
+        let inode_id = InodeId(7);
+
+        let (old_key, old_chunk) =
+            durable_chunk_ref(&mut pool, inode_id, 1, 0, 4096, b"old data");
+        let (_new_key, new_chunk) =
+            durable_chunk_ref(&mut pool, inode_id, 2, 0, 4096, b"new data");
+
+        let old_manifest = ContentManifestObject {
+            inode_id,
+            data_version: 1,
+            file_size: 4096,
+            chunk_size: 4096,
+            chunks: vec![old_chunk],
+        };
+
+        let new_chunks = vec![new_chunk];
+
+        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
+            &pool, inode_id, &old_manifest, &new_chunks,
+        );
+
+        assert_eq!(trimmable.len(), 1);
+        assert!(trimmable.contains(&old_key));
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn deferred_trim_workflow_non_durable_replacement() {
+        // End-to-end: write old chunk, create non-durable replacement ref.
+        // The old chunk should be deferred, not trimmable.
+        let mut pool = temp_pool("trim-workflow-nondur");
+        let inode_id = InodeId(8);
+
+        let (old_key, old_chunk) =
+            durable_chunk_ref(&mut pool, inode_id, 1, 0, 4096, b"old data");
+
+        // Non-durable replacement: ref exists but no pool receipt.
+        let new_chunk = non_durable_chunk_ref(inode_id, 2, 0, 4096);
+
+        let old_manifest = ContentManifestObject {
+            inode_id,
+            data_version: 1,
+            file_size: 4096,
+            chunk_size: 4096,
+            chunks: vec![old_chunk],
+        };
+
+        let new_chunks = vec![new_chunk];
+
+        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
+            &pool, inode_id, &old_manifest, &new_chunks,
+        );
+
+        assert!(trimmable.is_empty());
+        assert_eq!(deferred.len(), 1);
+        assert!(deferred.contains(&old_key));
+    }
+}

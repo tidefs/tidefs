@@ -1453,6 +1453,10 @@ pub struct LocalFileSystem {
     scrub_corruption_detected: Option<Arc<AtomicBool>>,
     pending_orphan_deletions: Arc<Mutex<Vec<u64>>>,
     reclaim_queue: Arc<Mutex<BPlusTreeReclaimQueue>>,
+    /// Deferred rewrite extent trims: (old_key, new_key) pairs where the
+    /// old extent should be reclaimed once the replacement receipt is
+    /// durable.  Processed by [`process_deferred_rewrite_trims`].
+    deferred_rewrite_trims: Vec<(tidefs_local_object_store::ObjectKey, tidefs_local_object_store::ObjectKey)>,
     total_reclaim_drains: u64,
     total_reclaim_entries_drained: u64,
     page_cache: RefCell<PageCache>,
@@ -3140,6 +3144,7 @@ impl LocalFileSystem {
             scrub_repair_schedule: None,
             scrub_corruption_detected: None,
             reclaim_queue: Arc::new(Mutex::new(BPlusTreeReclaimQueue::new())),
+            deferred_rewrite_trims: Vec::new(),
             total_reclaim_drains: 0,
             total_reclaim_entries_drained: 0,
             page_cache: RefCell::new(PageCache::with_default_page_size()),
@@ -3884,7 +3889,109 @@ impl LocalFileSystem {
 
         ReclaimDrainStats { entries_drained }
     }
+    /// Record deferred extent trim pairs for a successful content rewrite.
+    ///
+    /// For chunked layouts, compares old and new manifests to identify
+    /// replaced chunks and records (old_key, new_key) pairs that defer
+    /// reclaim until the replacement receipt is durable.  Retained chunks
+    /// are excluded; chunks past the new file size are queued directly for
+    /// reclaim (no replacement to gate on).
+    ///
+    /// For inline layouts, records (old_key, new_key) for the single
+    /// content object.
+    fn record_deferred_rewrite_trims_for_layout(
+        &mut self,
+        inode_id: InodeId,
+        old_layout: &ContentLayout,
+        new_record: &InodeRecord,
+    ) -> Result<()> {
+        match old_layout {
+            ContentLayout::Chunked(ref old_manifest) => {
+                let new_layout = read_content_layout_from_store(
+                    self.store.raw_primary_store(), inode_id,
+                    new_record,
+                    false,
+                )?;
+                if let ContentLayout::Chunked(ref new_manifest) = new_layout {
+                    for old_chunk in &old_manifest.chunks {
+                        if old_chunk.is_hole() {
+                            continue;
+                        }
+                        let old_key = content_chunk_object_key_for_version(
+                            inode_id, old_chunk.data_version, old_chunk.chunk_index);
+                        match new_manifest.chunks.iter()
+                            .find(|c| c.chunk_index == old_chunk.chunk_index)
+                        {
+                            Some(new_chunk) if new_chunk.data_version != old_chunk.data_version => {
+                                let new_key = content_chunk_object_key_for_version(
+                                    inode_id, new_chunk.data_version, new_chunk.chunk_index);
+                                self.deferred_rewrite_trims.push((old_key, new_key));
+                            }
+                            Some(_) => {
+                                // Retained chunk: same data_version, not obsolete.
+                            }
+                            None => {
+                                // Chunk past new file size: queue directly for reclaim.
+                                crate::allocation::queue_deferred_extent_keys_for_reclaim(
+                                    &self.reclaim_queue, &[old_key]);
+                            }
+                        }
+                    }
+                    // Old manifest key is always obsolete after a rewrite.
+                    let old_manifest_key = content_object_key_for_version(
+                        inode_id, old_manifest.data_version);
+                    let new_manifest_key = content_object_key_for_version(
+                        inode_id, new_manifest.data_version);
+                    self.deferred_rewrite_trims.push((old_manifest_key, new_manifest_key));
+                }
+            }
+            ContentLayout::Inline(ref old_inline) => {
+                let old_key = content_object_key_for_version(
+                    inode_id, old_inline.data_version);
+                let new_key = content_object_key_for_version(
+                    inode_id, new_record.data_version);
+                self.deferred_rewrite_trims.push((old_key, new_key));
+            }
+        }
+        Ok(())
+    }
 
+
+    /// Process deferred rewrite extent trims, promoting old extent keys
+    ///
+    /// For each `(old_key, new_key)` pair recorded during a rewrite,
+    /// checks whether the replacement receipt for `new_key` is durable
+    /// in the pool.  When durable, queues `old_key` for immediate reclaim
+    /// and removes the pair from the deferred list.  Pairs whose
+    /// replacement is not yet durable stay in the list for a future cycle.
+    ///
+    /// Called after each commit_group commit to bound deferred-trim
+    /// accumulation and prevent unbounded capacity drift.
+    pub fn process_deferred_rewrite_trims(&mut self) {
+        if self.deferred_rewrite_trims.is_empty() {
+            return;
+        }
+
+        let mut promoted = Vec::new();
+        let mut remaining = Vec::new();
+
+        for (old_key, new_key) in self.deferred_rewrite_trims.drain(..) {
+            if crate::content::latest_receipt_generation_for_key(&self.store, new_key) > 0 {
+                promoted.push(old_key);
+            } else {
+                remaining.push((old_key, new_key));
+            }
+        }
+
+        if !promoted.is_empty() {
+            crate::allocation::queue_deferred_extent_keys_for_reclaim(
+                &self.reclaim_queue,
+                &promoted,
+            );
+        }
+
+        self.deferred_rewrite_trims = remaining;
+    }
     /// Access the dirty page tracker (interior mutability via RefCell).
     pub fn dirty_page_tracker_mut(&self) -> std::cell::RefMut<'_, DirtyPageTracker> {
         self.dirty_page_tracker.borrow_mut()
@@ -4247,6 +4354,11 @@ impl LocalFileSystem {
         // is drained by LocalObjectStore::drain_dead_segments, the sole
         // segment-freeing authority.
         let _drain_stats = self.drain_local_reclaim_queue_into_store();
+
+        // Process deferred rewrite extent trims: promote old extent keys to
+        // the reclaim queue once their replacement receipt is durable.
+        // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
+        self.process_deferred_rewrite_trims();
 
         // --- Duty 3: dispatch pending scrub-triggered repairs ---
         // The background scrubber sets scrub_corruption_detected when it finds
@@ -9085,6 +9197,7 @@ impl LocalFileSystem {
         self.begin_mutation(); // was: let previous_state = self.state.clone()
         let tick = self.bump_generation();
         debug_assert_eq!(tick, planned_tick);
+        let old_record = record.clone();
         record.size = size;
         record.data_version = tick;
         record.metadata_version = tick;
@@ -9105,6 +9218,17 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
+        // Record deferred extent trims for old content objects replaced by
+        // this write.  Each (old_key, new_key) pair defers reclaim of the
+        // old object until the replacement receipt is durable.
+        // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
+        {
+            let old_layout = read_content_layout_from_store(
+                self.store.raw_primary_store(), inode_id, &old_record, true)?;
+            self.record_deferred_rewrite_trims_for_layout(
+                inode_id, &old_layout, &record)?;
+        }
+
         // Release old claims and register new allocation claim per Rule 8
         // (space-as-claimed-capital: every allocation is an obligation)
         self.obligation_ledger.release_claims_for_inode(inode_id);
@@ -9214,6 +9338,17 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
+        // Record deferred extent trims for old content objects replaced by
+        // this overlay write.  Each (old_key, new_key) pair defers reclaim
+        // of the old object until the replacement receipt is durable.
+        // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
+        {
+            let old_layout = read_content_layout_from_store(
+                self.store.raw_primary_store(), inode_id, &old_record, true)?;
+            self.record_deferred_rewrite_trims_for_layout(
+                inode_id, &old_layout, &record)?;
+        }
+
         if dirty_allocation_bytes > 0 {
             self.dirty_set
                 .record_data_write(inode_id, dirty_allocation_bytes);
