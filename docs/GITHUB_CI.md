@@ -86,6 +86,14 @@ Push-triggered and scheduled self-hosted jobs stay skipped until the repository
 variable `TIDEFS_SELF_HOSTED_READY` is set to `1`. Manual dispatch ignores that
 gate so a specific lane can be run during bring-up.
 
+Draft pull requests are not integration candidates, so required self-hosted PR
+checks skip them until the PR is marked ready for review. The `ready_for_review`
+event reruns the standing checks on the current head before integration.
+Manual workflow dispatch remains available for draft branches that need early
+evidence. Codex Nexus Relay jobs may cancel stale relay runs for the same issue,
+PR, or ref because Nexus reconciles from live GitHub state rather than treating
+each queued relay job as durable work.
+
 Runner host configuration and bring-up notes live in
 `tidefs/tidefs-infra-configuration`.
 

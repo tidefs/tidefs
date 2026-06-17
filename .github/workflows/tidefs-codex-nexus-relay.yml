@@ -14,8 +14,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.run_id }}-${{ github.run_attempt }}
-  cancel-in-progress: false
+  # Nexus reconciles from live GitHub state, so stale relay jobs for the same
+  # issue, PR, or ref should collapse instead of filling the runner queue.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   relay:
