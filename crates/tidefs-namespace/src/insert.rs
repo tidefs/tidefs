@@ -75,6 +75,7 @@ pub fn insert_entry(
                 DirIndexError::EntryAlreadyExists => NamespaceError::AlreadyExists,
                 DirIndexError::EntryNotFound => NamespaceError::NotFound,
                 DirIndexError::DirNotEmpty => NamespaceError::NotEmpty,
+                DirIndexError::StaleCursor => NamespaceError::StaleCursor,
             })?;
     }
 

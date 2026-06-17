@@ -63,6 +63,8 @@ impl From<BTreeError> for DirCursorError {
 pub struct DirCursor {
     /// Directory inode this cursor iterates over.
     dir_ino: u64,
+    /// Directory version at cursor construction time, for version evidence.
+    version: u64,
     /// Sorted window entries, including synthetic `.` and `..` when present.
     entries: Vec<DirCursorEntry>,
     /// Current cursor position (index into `entries`).
@@ -91,6 +93,7 @@ impl DirCursor {
         idx.verify_checksums()?;
 
         let dir_ino = idx.directory_inode_id();
+        let version = idx.directory_version();
 
         let mut entries: Vec<DirCursorEntry> = Vec::new();
 
@@ -147,6 +150,7 @@ impl DirCursor {
         };
 
         Ok(DirCursor {
+            version,
             dir_ino,
             entries,
             position,
@@ -171,6 +175,7 @@ impl DirCursor {
         idx.verify_checksums()?;
 
         let dir_ino = idx.directory_inode_id();
+        let version = idx.directory_version();
         let total_entries = idx.len().saturating_add(2);
         let start = if start_offset == 0 {
             0usize
@@ -231,6 +236,7 @@ impl DirCursor {
         let has_more = end < total_entries;
         Ok((
             DirCursor {
+                version,
                 dir_ino,
                 entries,
                 position: 0,
@@ -322,6 +328,16 @@ impl DirCursor {
     #[must_use]
     pub fn dir_ino(&self) -> u64 {
         self.dir_ino
+    }
+
+    /// Directory version at cursor construction time.
+    ///
+    /// Callers can compare this against the live
+    /// [`crate::DirIndex::directory_version`] to detect stale cursors
+    /// after mutation.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
     }
 }
 

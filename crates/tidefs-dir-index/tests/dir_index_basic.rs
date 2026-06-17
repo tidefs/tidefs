@@ -60,9 +60,10 @@ fn empty_dir_range_scan_returns_empty() {
 #[test]
 fn empty_dir_list_from_returns_empty() {
     let idx = DirIndex::new(1, test_policy());
-    let (entries, cookie) = idx.list_from(DirCookie::START);
+    let (entries, cookie) = idx.list_from(DirCookie::START).unwrap();
     assert!(entries.is_empty());
-    assert_eq!(cookie, DirCookie::START);
+    assert!(cookie.0 & tidefs_dir_index::format::DIR_COOKIE_VERSIONED_MASK != 0);
+    assert_eq!(tidefs_dir_index::format::dir_cookie_skip(cookie.0), 0);
 }
 
 #[test]
@@ -517,7 +518,7 @@ fn list_from_start_returns_all() {
     idx.insert(b"a", 1, 0, 1).unwrap();
     idx.insert(b"c", 3, 0, 1).unwrap();
 
-    let (entries, _) = idx.list_from(DirCookie::START);
+    let (entries, _) = idx.list_from(DirCookie::START).unwrap();
     assert_eq!(entries.len(), 3);
     assert_eq!(
         names(&entries),
@@ -528,9 +529,10 @@ fn list_from_start_returns_all() {
 #[test]
 fn list_from_empty_dir_cookie() {
     let idx = DirIndex::new(1, test_policy());
-    let (entries, cookie) = idx.list_from(DirCookie::START);
+    let (entries, cookie) = idx.list_from(DirCookie::START).unwrap();
     assert!(entries.is_empty());
-    assert_eq!(cookie, DirCookie::START);
+    assert!(cookie.0 & tidefs_dir_index::format::DIR_COOKIE_VERSIONED_MASK != 0);
+    assert_eq!(tidefs_dir_index::format::dir_cookie_skip(cookie.0), 0);
 }
 
 // ---------------------------------------------------------------------------
