@@ -167,10 +167,92 @@ pub trait AllocationFence: std::fmt::Debug {
     fn is_device_fenced(&self, device_id: DeviceId) -> bool;
 }
 
-/// Each phase in the five-phase device removal state machine.
+// ---------------------------------------------------------------------------
+// EvacuationCompletionGeneration
+// ---------------------------------------------------------------------------
+
+/// Durable evidence that evacuation completed for a specific device removal.
 ///
-/// The normal forward progression is:
-/// [`Removing`] -> [`Evacuating`] -> [`Evacuated`] -> [`Vacated`] -> [`Removed`].
+/// Binds the target device GUID, the topology generation, the evacuation-set
+/// digest, and the removal phase-chain digest at the point evacuation finished.
+/// Stored durably before pool-label retirement so that crash replay can verify
+/// completion rather than relying on in-memory state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvacuationCompletionGeneration {
+    /// GUID of the target device that was evacuated.
+    pub target_device_guid: [u8; 16],
+
+    /// Topology generation against which this evacuation completed.
+    pub target_topology_generation: u64,
+
+    /// Digest binding the enumerated evacuation set identity.
+    pub evacuation_set_digest: [u8; 32],
+
+    /// Removal phase-chain digest at the point evacuation completed.
+    pub removal_chain_digest: [u8; 32],
+}
+
+impl EvacuationCompletionGeneration {
+    /// Create a completion generation from the current removal state.
+    #[must_use]
+    pub fn from_state(
+        state: &DeviceRemovalState,
+        set_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            target_device_guid: state.target_device_guid,
+            target_topology_generation: state.target_topology_generation,
+            evacuation_set_digest: set_digest,
+            removal_chain_digest: state.chain_digest,
+        }
+    }
+
+    /// Verify this completion generation against the current removal state.
+    ///
+    /// Returns `None` on success, or a human-readable mismatch reason.
+    #[must_use]
+    pub fn verify(
+        &self,
+        state: &DeviceRemovalState,
+        expected_set_digest: [u8; 32],
+    ) -> Option<String> {
+        if self.target_device_guid != state.target_device_guid {
+            return Some(format!(
+                "completion generation target guid {:x?} does not match state {:x?}",
+                self.target_device_guid, state.target_device_guid
+            ));
+        }
+        if self.target_topology_generation != state.target_topology_generation {
+            return Some(format!(
+                "completion generation topology {} does not match state topology {}",
+                self.target_topology_generation, state.target_topology_generation
+            ));
+        }
+        if self.evacuation_set_digest != expected_set_digest {
+            return Some(
+                "completion generation evacuation set digest does not match".to_string()
+            );
+        }
+        None
+    }
+
+    /// Verify the completion generation against the given chain digest.
+    ///
+    /// Unlike [`Self::verify`], this also checks that the completion
+    /// generation was created at the same chain-digest point.  Use this
+    /// for intra-phase verification (e.g., during crash replay) where the
+    /// chain digest should not have advanced.
+    #[must_use]
+    pub fn verify_chain(&self, expected_chain_digest: &[u8; 32]) -> Option<String> {
+        if self.removal_chain_digest != *expected_chain_digest {
+            return Some(format!(
+                "completion generation chain digest {:x?} does not match expected {:x?}",
+                self.removal_chain_digest, expected_chain_digest
+            ));
+        }
+        None
+    }
+}
 ///
 /// At any non-terminal phase the removal can transition to [`Failed`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -236,6 +318,26 @@ impl std::fmt::Display for DeviceRemovalPhase {
 }
 
 // ---------------------------------------------------------------------------
+// DeviceRemovalStatus
+// ---------------------------------------------------------------------------
+
+/// Operator-visible removal status for progress reporting and
+/// crash-replay gating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DeviceRemovalStatus {
+    /// Object evacuation is in progress; some live objects remain on the device.
+    EvacuationInProgress,
+    /// Evacuation finished in memory but the completion generation has not been
+    /// durably recorded.  Crash before persistence rolls back to evacuation.
+    CompletionNotDurable,
+    /// The topology generation has changed since evacuation completed.
+    TopologyMismatch,
+    /// Evacuation completion is durable and topology matches; label retirement
+    /// or final removal can proceed.
+    LabelRetirementReady,
+}
+
+// ---------------------------------------------------------------------------
 // DeviceRemovalState
 // ---------------------------------------------------------------------------
 
@@ -289,6 +391,13 @@ pub struct DeviceRemovalState {
     /// [`compute_device_removal_chain_digest`].  Zero-filled at creation
     /// (representing no prior anchor).
     pub chain_digest: [u8; 32],
+
+    /// Evacuation completion generation evidence.
+    ///
+    /// Populated in memory after [`DeviceRemovalPhase::Evacuated`] is reached.
+    /// Durable recording happens at [`DeviceRemovalPhase::Vacated`] commit.
+    /// `None` until evacuation completes; `Some` afterwards.
+    pub evacuation_completion_generation: Option<EvacuationCompletionGeneration>,
 }
 
 impl DeviceRemovalState {
@@ -318,6 +427,7 @@ impl DeviceRemovalState {
             error: None,
             failure_evidence: None,
             chain_digest: [0u8; 32],
+            evacuation_completion_generation: None,
         }
     }
 
@@ -394,6 +504,65 @@ impl DeviceRemovalState {
     #[must_use]
     pub fn is_evacuation_complete(&self) -> bool {
         self.objects_failed == 0 && self.objects_remaining() == 0
+    }
+
+    /// Record the evacuation completion generation from the current state.
+    ///
+    /// Captures the target device GUID, topology generation, evacuation-set
+    /// digest, and removal phase-chain digest at the point evacuation finished.
+    /// This is an in-memory recording; durability comes at Vacated commit.
+    pub fn record_evacuation_completion(&mut self, set_digest: [u8; 32]) {
+        self.evacuation_completion_generation =
+            Some(EvacuationCompletionGeneration::from_state(self, set_digest));
+    }
+
+    /// Return a reference to the evacuation completion generation, if recorded.
+    #[must_use]
+    pub fn evacuation_completion_generation(&self) -> Option<&EvacuationCompletionGeneration> {
+        self.evacuation_completion_generation.as_ref()
+    }
+
+    /// Returns `true` if the evacuation completion generation is recorded
+    /// (non-`None`).  Note that this does not imply durability — use
+    /// [`Self::completion_status`] for the full picture.
+    #[must_use]
+    pub fn is_completion_recorded(&self) -> bool {
+        self.evacuation_completion_generation.is_some()
+    }
+
+    /// Operator-visible status for progress reporting and crash-replay gating.
+    ///
+    /// Consults the current phase, completion generation, and pool config
+    /// to determine whether evacuation is done, durable, and topology-matched.
+    #[must_use]
+    pub fn completion_status(
+        &self,
+        pool_config: &tidefs_pool_scan::PoolConfig,
+    ) -> DeviceRemovalStatus {
+        match self.phase {
+            DeviceRemovalPhase::Removing | DeviceRemovalPhase::Evacuating => {
+                DeviceRemovalStatus::EvacuationInProgress
+            }
+            DeviceRemovalPhase::Evacuated => {
+                if self.evacuation_completion_generation.is_some() {
+                    DeviceRemovalStatus::CompletionNotDurable
+                } else {
+                    DeviceRemovalStatus::EvacuationInProgress
+                }
+            }
+            DeviceRemovalPhase::Vacated | DeviceRemovalPhase::Removed => {
+                let Some(ref gen) = self.evacuation_completion_generation else {
+                    return DeviceRemovalStatus::CompletionNotDurable;
+                };
+                if gen.target_topology_generation != pool_config.topology_generation {
+                    return DeviceRemovalStatus::TopologyMismatch;
+                }
+                DeviceRemovalStatus::LabelRetirementReady
+            }
+            DeviceRemovalPhase::Failed => {
+                DeviceRemovalStatus::EvacuationInProgress
+            }
+        }
     }
 }
 
@@ -730,6 +899,15 @@ impl DeviceRemovalDriver {
         &self.surviving_device_ids
     }
 
+    /// Return the operator-visible removal status.
+    ///
+    /// Distinguishes evacuation-in-progress, completion-not-durable,
+    /// topology-mismatch, and label-retirement-ready outcomes.
+    #[must_use]
+    pub fn status(&self) -> DeviceRemovalStatus {
+        self.state.completion_status(&self.pool_config_snapshot)
+    }
+
     // ── Phase transitions ──────────────────────────────────────────
 
     /// Advance from Removing to Evacuating.
@@ -813,7 +991,14 @@ impl DeviceRemovalDriver {
             return Err(self.transition_to_failed(evidence));
         }
         self.state
-            .advance_with_digest(&evacuation_success_digest_data(&self.state))
+            .advance_with_digest(&evacuation_success_digest_data(&self.state))?;
+
+        // Record the evacuation completion generation so that subsequent
+        // transitions (commit_vacated, mark_removed) can verify durable
+        // completion evidence rather than in-memory state alone.
+        let set_digest = evacuation_set_digest(&self.state);
+        self.state.record_evacuation_completion(set_digest);
+        Ok(())
     }
 
     /// Advance from Evacuated to Vacated.
@@ -830,6 +1015,25 @@ impl DeviceRemovalDriver {
         updated_pool_config: tidefs_pool_scan::PoolConfig,
     ) -> Result<(), DeviceRemovalError> {
         self.require_phase(DeviceRemovalPhase::Evacuated, "commit_vacated")?;
+
+        // Verify that evacuation completion generation is recorded and matches.
+        let set_digest = evacuation_set_digest(&self.state);
+        let Some(ref completion) = self.state.evacuation_completion_generation else {
+            let evidence = DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::EvacuationCompletionNotDurable,
+                self.state.target_device.clone(),
+                "evacuation completion generation is missing; commit requires durable evidence",
+            );
+            return Err(self.transition_to_failed(evidence));
+        };
+        if let Some(reason) = completion.verify(&self.state, set_digest) {
+            let evidence = DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::EvacuationCompletionMismatch,
+                self.state.target_device.clone(),
+                reason,
+            );
+            return Err(self.transition_to_failed(evidence));
+        }
 
         // Validate that the updated config no longer contains the target device.
         let updated_leaves = DeviceRemovalPlanner::flatten_leaves(&updated_pool_config.device_tree);
@@ -878,10 +1082,33 @@ impl DeviceRemovalDriver {
         self.require_phase(DeviceRemovalPhase::Vacated, "mark_removed")?;
         self.alloc_fence
             .unfence_device(DeviceId(self.state.target_device_id));
+
+        // Verify durable evacuation completion before final removal.
+        // The completion generation must be present and match the current state;
+        // a missing or mismatched completion means the evacuation was never
+        // durably recorded and the removal cannot be finalized.
+        let set_digest = evacuation_set_digest(&self.state);
+        let Some(ref completion) = self.state.evacuation_completion_generation else {
+            let evidence = DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::EvacuationCompletionNotDurable,
+                self.state.target_device.clone(),
+                "evacuation completion generation is missing; removal requires durable evidence",
+            );
+            return Err(self.transition_to_failed(evidence));
+        };
+        if let Some(reason) = completion.verify(&self.state, set_digest) {
+            let evidence = DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::EvacuationCompletionMismatch,
+                self.state.target_device.clone(),
+                reason,
+            );
+            return Err(self.transition_to_failed(evidence));
+        }
+
         self.state
             .advance_with_digest(&removed_digest_data(&self.state))
-    }
 
+    }
     /// Transition the removal to Failed.
     pub fn fail(&mut self, error: impl Into<String>) {
         let evidence = DeviceRemovalRefusal::new(
@@ -2106,6 +2333,7 @@ mod tests {
             error: Some("transient I/O error".into()),
             failure_evidence: None,
             chain_digest: [0xBBu8; 32],
+            evacuation_completion_generation: None,
         };
         let json = serde_json::to_string(&state).expect("serialize");
         let round: DeviceRemovalState = serde_json::from_str(&json).expect("deserialize");
@@ -2663,5 +2891,290 @@ mod tests {
         driver.mark_removed().unwrap();
         let d4 = driver.state().chain_digest;
         assert_ne!(d4, d3);
+    }
+
+    // ── Evacuation completion generation tests ──────────────────────
+
+    #[test]
+    fn completion_generation_recorded_after_evacuation() {
+        let mut driver = make_evacuating_driver(2);
+        // Evacuate objects.
+        driver
+            .record_object_evacuated(ExtentId::from(1u64), 100)
+            .unwrap();
+        driver
+            .record_object_evacuated(ExtentId::from(2u64), 200)
+            .unwrap();
+        assert!(driver.state().is_evacuation_complete());
+
+        // mark_evacuated should record the completion generation.
+        driver.mark_evacuated().unwrap();
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Evacuated);
+
+        let completion = driver
+            .state()
+            .evacuation_completion_generation()
+            .expect("completion generation must be recorded");
+        assert_eq!(
+            completion.target_device_guid,
+            driver.state().target_device_guid
+        );
+        assert_eq!(
+            completion.target_topology_generation,
+            driver.state().target_topology_generation
+        );
+        // The completion should have a non-zero chain digest.
+        let nonzero = completion
+            .removal_chain_digest
+            .iter()
+            .any(|&b| b != 0);
+        assert!(nonzero, "chain digest must be non-zero");
+
+        // Status should be CompletionNotDurable (not yet committed).
+        assert_eq!(
+            driver.status(),
+            DeviceRemovalStatus::CompletionNotDurable
+        );
+    }
+
+    #[test]
+    fn commit_vacated_rejects_missing_completion() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            0,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver.mark_evacuated().unwrap();
+
+        // Manually clear the completion generation to simulate
+        // a state that was deserialized without it (pre-this-issue data).
+        driver.state.evacuation_completion_generation = None;
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+
+        let err = driver.commit_vacated(updated).unwrap_err();
+        let evidence =
+            assert_refusal_class(err, DeviceRemovalRefusalClass::EvacuationCompletionNotDurable);
+        assert!(
+            evidence
+                .details
+                .contains("completion generation is missing"),
+            "details must mention missing completion"
+        );
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+    }
+
+    #[test]
+    fn mark_removed_rejects_missing_completion() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            0,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver.mark_evacuated().unwrap();
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+        driver.commit_vacated(updated).unwrap();
+
+        // Clear the completion generation to simulate deserialized
+        // state without durable evidence.
+        driver.state.evacuation_completion_generation = None;
+
+        let err = driver.mark_removed().unwrap_err();
+        let evidence =
+            assert_refusal_class(err, DeviceRemovalRefusalClass::EvacuationCompletionNotDurable);
+        assert!(
+            evidence
+                .details
+                .contains("completion generation is missing"),
+            "details must mention missing completion"
+        );
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+    }
+
+    #[test]
+    fn completion_mismatched_evacuation_set_rejected() {
+        let mut driver = make_evacuating_driver(1);
+        driver
+            .record_object_evacuated(ExtentId::from(1u64), 100)
+            .unwrap();
+        driver.mark_evacuated().unwrap();
+
+        // Tamper with the completion generation set digest.
+        if let Some(ref mut completion) = driver.state.evacuation_completion_generation {
+            completion.evacuation_set_digest = [0xFFu8; 32];
+        }
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+
+        let err = driver.commit_vacated(updated).unwrap_err();
+        let evidence =
+            assert_refusal_class(err, DeviceRemovalRefusalClass::EvacuationCompletionMismatch);
+        assert!(
+            evidence
+                .details
+                .contains("evacuation set digest does not match"),
+            "details must mention set digest mismatch"
+        );
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+    }
+
+    #[test]
+    fn completion_stale_topology_rejected_in_mark_removed() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            0,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver.mark_evacuated().unwrap();
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+        driver.commit_vacated(updated).unwrap();
+
+        // Tamper with the completion generation topology.
+        if let Some(ref mut completion) = driver.state.evacuation_completion_generation {
+            completion.target_topology_generation = 99;
+        }
+
+        let err = driver.mark_removed().unwrap_err();
+        let evidence =
+            assert_refusal_class(err, DeviceRemovalRefusalClass::EvacuationCompletionMismatch);
+        assert!(
+            evidence.details.contains("topology"),
+            "details must mention topology mismatch"
+        );
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+    }
+
+    #[test]
+    fn completion_status_transitions_through_phases() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            1,
+        )
+        .unwrap();
+
+        // Removing phase: evacuation in progress.
+        assert_eq!(driver.status(), DeviceRemovalStatus::EvacuationInProgress);
+
+        driver.begin_evacuation().unwrap();
+        // Evacuating phase: still in progress.
+        assert_eq!(driver.status(), DeviceRemovalStatus::EvacuationInProgress);
+
+        driver
+            .record_object_evacuated(ExtentId::from(1u64), 100)
+            .unwrap();
+        driver.mark_evacuated().unwrap();
+        // Evacuated phase: not yet durable.
+        assert_eq!(
+            driver.status(),
+            DeviceRemovalStatus::CompletionNotDurable
+        );
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+        driver.commit_vacated(updated).unwrap();
+        // Vacated phase with matching topology: ready for retirement.
+        assert_eq!(
+            driver.status(),
+            DeviceRemovalStatus::LabelRetirementReady
+        );
+
+        driver.mark_removed().unwrap();
+        // Removed phase: still LabelRetirementReady.
+        assert_eq!(
+            driver.status(),
+            DeviceRemovalStatus::LabelRetirementReady
+        );
+    }
+
+    #[test]
+    fn replay_after_evacuation_recovers_completion() {
+        // Simulate crash after mark_evacuated but before commit_vacated.
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config.clone(),
+            vec![DeviceId(0)],
+            0,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver.mark_evacuated().unwrap();
+
+        // Serialize state (simulating persistence).
+        let serialized = driver.serialize_state().unwrap();
+
+        // Deserialize into a new state (simulating pool import after crash).
+        let recovered_state =
+            DeviceRemovalDriver::deserialize_state(&serialized).unwrap();
+        assert_eq!(recovered_state.phase, DeviceRemovalPhase::Evacuated);
+        assert!(
+            recovered_state.evacuation_completion_generation.is_some(),
+            "completion generation must survive serialization roundtrip"
+        );
+
+        // Resume the driver from the recovered state.
+        let mut resumed = DeviceRemovalDriver::resume(
+            Box::new(NoopAllocationFence::new()),
+            recovered_state,
+            config,
+            vec![DeviceId(0)],
+        );
+
+        // Status should be CompletionNotDurable (in Evacuated phase).
+        assert_eq!(
+            resumed.status(),
+            DeviceRemovalStatus::CompletionNotDurable
+        );
+
+        // The resumed driver can continue to commit_vacated.
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+        resumed.commit_vacated(updated).unwrap();
+        assert_eq!(resumed.state().phase, DeviceRemovalPhase::Vacated);
+
+        resumed.mark_removed().unwrap();
+        assert_eq!(resumed.state().phase, DeviceRemovalPhase::Removed);
     }
 }
