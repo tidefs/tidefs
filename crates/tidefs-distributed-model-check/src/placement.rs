@@ -93,10 +93,12 @@ impl PlacementModel {
     /// Record a placement receipt as durable.
     pub fn record_receipt(&mut self, state: PlacementReceiptState) {
         let object_key = object_key_from_receipt_ref(&state.receipt_ref);
-        self.object_placements
-            .entry(object_key)
-            .or_default()
-            .push(state.node_id);
+        if state.durable {
+            self.object_placements
+                .entry(object_key)
+                .or_default()
+                .push(state.node_id);
+        }
         self.receipts.insert(state.receipt_ref, state);
     }
 
