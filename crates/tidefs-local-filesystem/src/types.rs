@@ -1656,6 +1656,8 @@ pub struct FilesystemContentObjectRef {
     pub missing: bool,
     pub zero_length_record: bool,
     pub malformed_reason: Option<String>,
+    /// True when a non-hole chunk lacks a placement receipt generation.
+    pub missing_receipt: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1666,6 +1668,8 @@ pub struct FilesystemContentInspectionReport {
     pub missing_objects: u64,
     pub zero_length_records: u64,
     pub size_mismatches: u64,
+    /// Count of non-hole chunk objects lacking placement receipt authority.
+    pub missing_receipts: u64,
     pub malformed_records: u64,
     pub mutating_repair_attempted: bool,
 }
@@ -1679,6 +1683,7 @@ impl FilesystemContentInspectionReport {
             missing_objects: 0,
             zero_length_records: 0,
             size_mismatches: 0,
+            missing_receipts: 0,
             malformed_records: 0,
             mutating_repair_attempted: false,
         }
@@ -1698,6 +1703,9 @@ impl FilesystemContentInspectionReport {
             .unwrap_or(false)
         {
             self.size_mismatches = self.size_mismatches.saturating_add(1);
+        }
+        if reference.missing_receipt {
+            self.missing_receipts = self.missing_receipts.saturating_add(1);
         }
         if reference.malformed_reason.is_some() {
             self.malformed_records = self.malformed_records.saturating_add(1);

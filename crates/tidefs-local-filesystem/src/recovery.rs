@@ -454,6 +454,7 @@ fn inspect_inode_content_objects(
             observed_encoded_len: None,
             missing,
             zero_length_record,
+            missing_receipt: false,
             malformed_reason: None,
         });
         return Ok(());
@@ -472,6 +473,7 @@ fn inspect_inode_content_objects(
                 observed_encoded_len: content_bytes.as_ref().map(|bytes| bytes.len() as u64),
                 missing,
                 zero_length_record,
+                missing_receipt: false,
                 malformed_reason: None,
             });
         }
@@ -487,6 +489,7 @@ fn inspect_inode_content_objects(
                 observed_encoded_len: content_bytes.as_ref().map(|bytes| bytes.len() as u64),
                 missing,
                 zero_length_record,
+                missing_receipt: false,
                 malformed_reason: None,
             });
             for chunk_ref in &manifest.chunks {
@@ -508,6 +511,7 @@ fn inspect_inode_content_objects(
                 observed_encoded_len: content_bytes.as_ref().map(|bytes| bytes.len() as u64),
                 missing,
                 zero_length_record,
+                missing_receipt: false,
                 malformed_reason: Some(err.to_string()),
             });
         }
@@ -554,6 +558,7 @@ fn inspect_chunk_object(
         observed_encoded_len: bytes.as_ref().map(|bytes| bytes.len() as u64),
         missing,
         zero_length_record,
+        missing_receipt: !chunk_ref.is_hole() && chunk_ref.placement_receipt_generation == 0,
         malformed_reason,
     });
     Ok(())
