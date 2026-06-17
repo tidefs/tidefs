@@ -22,6 +22,8 @@ tidefs-node-join = { path = "../tidefs-node-join" }
 tidefs-rebuild-planner = { path = "../tidefs-rebuild-planner" }
 tidefs-replica-health = { path = "../tidefs-replica-health" }
 tidefs-durability-layout = { path = "../tidefs-durability-layout" }
+tidefs-device-removal = { path = "../tidefs-device-removal" }
+tidefs-locator-table = { path = "../tidefs-locator-table" }
 
 [dev-dependencies]
 

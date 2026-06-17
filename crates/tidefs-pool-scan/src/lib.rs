@@ -1241,6 +1241,24 @@ impl DeviceType {
 
 /// Output of a successful pool assembly: a coherent view of one pool's
 /// devices, topology, and capability flags.
+/// Durable evidence that a device evacuation completed with a committed
+/// evacuation receipt.  Stored in pool metadata so that post-removal scans
+/// can verify that placement receipts were relocated before the device
+/// was retired.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletedEvacuation {
+    /// GUID of the evacuated device.
+    pub target_device_guid: [u8; 16],
+    /// Topology generation at evacuation completion.
+    pub topology_generation: u64,
+    /// BLAKE3 digest of the committed evacuation receipt.
+    pub receipt_digest: [u8; 32],
+    /// Monotonic receipt identifier.
+    pub receipt_id: u64,
+}
+
+/// Output of a successful pool assembly: a coherent view of one pool's
+/// devices, topology, and capability flags.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PoolConfig {
     /// Pool UUID (identical across all devices).
@@ -1269,6 +1287,13 @@ pub struct PoolConfig {
     pub missing_indices: Vec<u32>,
     /// Indices of devices currently being removed (allocation-fenced).
     pub removing_device_indices: Vec<u32>,
+    /// Completed device evacuations with committed receipt evidence.
+    ///
+    /// Each entry records a device that was successfully evacuated and
+    /// removed.  Post-removal pool scans surface this evidence to confirm
+    /// that placement receipts were relocated before device retirement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_evacuations: Vec<CompletedEvacuation>,
 }
 /// A borrowed reference to a leaf device's immutable fields,
 /// returned by [`DeviceType::find_leaf`].
@@ -2182,6 +2207,7 @@ impl PoolAssembler {
             device_count: ref_count,
             missing_indices: missing,
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         })
     }
 }
@@ -3033,6 +3059,7 @@ mod tests {
             device_count: 1,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         }
     }
 
@@ -3077,6 +3104,7 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         }
     }
 
@@ -3173,6 +3201,7 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         let (stats, trigger) =
@@ -3261,6 +3290,7 @@ mod tests {
             device_count: leaf_count,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         let result = PoolAddVdev::add_vdev(device_path, DeviceRole::PoolDataMember, &mut config);
@@ -3369,6 +3399,7 @@ mod tests {
             device_count: 1,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         // 1. Generate labels from the config.
@@ -3467,6 +3498,7 @@ mod tests {
             device_count: 3,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         // Generate labels and write each to its corresponding device file.
