@@ -22,6 +22,34 @@ use tidefs_ublk_abi::{
 pub const BLOCK_VOLUME_UBLK_ACCEPTANCE_HARNESS_GATE_PC_012: &str =
     "PC-012 ublk acceptance harness passes fio verify and durability checks";
 
+/// Acceptance outcome classification for the ublk acceptance harness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UblkAcceptanceStatus {
+    /// Full acceptance evidence: first-pass fio passed and durability verification passed.
+    Passed,
+    /// First-pass fio passed, but post-restart durability verification failed.
+    DurabilityFailed,
+    /// A prerequisite (host, device lifecycle, harness state) blocked the durability pass.
+    BlockedPrerequisite,
+    /// First-pass fio verification failed; durability was not attempted or not meaningful.
+    FirstPassFailed,
+}
+
+impl UblkAcceptanceStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::DurabilityFailed => "durability_failed",
+            Self::BlockedPrerequisite => "blocked_prerequisite",
+            Self::FirstPassFailed => "first_pass_failed",
+        }
+    }
+
+    pub const fn is_acceptance_evidence(self) -> bool {
+        matches!(self, Self::Passed)
+    }
+}
+
 /// Result of a single fio verification pass.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -34,6 +62,7 @@ pub struct UblkAcceptanceFioPass {
 /// Report from the ublk acceptance harness.
 #[derive(Clone, Debug)]
 pub struct UblkAcceptanceHarnessReport {
+    pub acceptance_status: UblkAcceptanceStatus,
     pub host_kernel_release: String,
     pub dev_id: u32,
     pub device_appeared: bool,
@@ -42,12 +71,21 @@ pub struct UblkAcceptanceHarnessReport {
     pub durability_verify: Option<UblkAcceptanceFioPass>,
     pub io_loop_completed_iterations: u64,
     pub io_loop_cqes_processed: u64,
+    pub durability_block_reason: Option<String>,
 }
 
 impl UblkAcceptanceHarnessReport {
     pub fn print(&self) {
         println!("tidefs block volume adapter ublk acceptance harness");
         println!("gate={BLOCK_VOLUME_UBLK_ACCEPTANCE_HARNESS_GATE_PC_012}");
+        println!("acceptance.status={}", self.acceptance_status.as_str());
+        println!(
+            "acceptance.is_evidence={}",
+            self.acceptance_status.is_acceptance_evidence()
+        );
+        if let Some(ref reason) = self.durability_block_reason {
+            println!("durability.block_reason={reason}");
+        }
         println!("host.kernel_release={}", self.host_kernel_release);
         println!("dev_id={}", self.dev_id);
         println!("device.path={:?}", self.block_device_path);
@@ -145,183 +183,50 @@ fn run_fio_verify(device_path: &std::path::Path, label: &str) -> UblkAcceptanceF
         Ok(out) => {
             let passed = out.status.success();
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            // Debug: if fio itself fails, include json on stdout in stderr
+            let stderr = if !passed && stderr.is_empty() {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                stdout
+            } else {
+                stderr
+            };
             UblkAcceptanceFioPass {
                 fio_verify_passed: passed,
                 fio_stderr: stderr,
                 device_path: Some(device_path.to_path_buf()),
             }
         }
-        Err(err) => UblkAcceptanceFioPass {
+        Err(e) => UblkAcceptanceFioPass {
             fio_verify_passed: false,
-            fio_stderr: format!("fio spawn failed: {err}"),
+            fio_stderr: format!("fio command failed: {e}"),
             device_path: Some(device_path.to_path_buf()),
         },
     }
 }
 
-/// Run the IO loop for at most `max_iterations` CQE batches.
-/// Uses `submit_and_wait(1)` — blocks briefly between CQE arrivals.
-fn run_io_loop_iterations(
-    nr_hw_queues: u16,
-    queue_depth: u16,
-    data_queue_runtime: &mut tidefs_block_volume_adapter_ublk_control_runtime::UblkDataQueueRuntime,
-    image: &mut BlockVolumeFileImage,
-    max_iterations: u32,
-) -> (u64, u64) {
-    let mut iterations: u64 = 0;
-    let mut cqes_processed: u64 = 0;
-    let sectors_per_block = (image.geometry.block_size_bytes / 512) as u64;
-
-    for _ in 0..max_iterations {
-        match data_queue_runtime.ring_mut().submit_and_wait(1) {
-            Ok(_) => {}
-            Err(_e) => break,
-        }
-        iterations += 1;
-
-        let mut pending_fetch_tags: Vec<(u16, u16)> = Vec::new();
-        while let Some(cqe) = data_queue_runtime.ring_mut().completion().next() {
-            cqes_processed += 1;
-            if cqe.result() < 0 {
-                break;
-            }
-            let user_data = cqe.user_data();
-            if is_fetch_req_user_data(user_data) {
-                pending_fetch_tags.push(decode_fetch_req_user_data(user_data));
-            }
-        }
-
-        for (q_id, tag) in pending_fetch_tags {
-            let mut result: i32 = UBLK_IO_RES_OK;
-
-            if let Some(io_desc) = data_queue_runtime.io_desc(tag) {
-                let op = io_desc.op();
-                let fua = (io_desc.op_flags & UBLK_IO_F_FUA) != 0;
-
-                match op {
-                    UBLK_IO_OP_READ => {
-                        let sector_count = io_desc.count_or_zones as u64;
-                        if sector_count > 0 && sectors_per_block > 0 {
-                            let start_block = (io_desc.start_sector / sectors_per_block) as usize;
-                            let block_count = (sector_count / sectors_per_block) as usize;
-                            let range = BlockRangeRecord::new(start_block, block_count.max(1));
-                            match image.read_blocks(range) {
-                                Ok((plan, Some(payload))) => {
-                                    if plan.completion_class
-                                        == BlockVolumeCompletionClass::Completed
-                                    {
-                                        if data_queue_runtime
-                                            .write_data_at(0, tag, &payload)
-                                            .is_err()
-                                        {
-                                            result = -libc::EIO;
-                                        }
-                                    } else {
-                                        result = -libc::EIO;
-                                    }
-                                }
-                                _ => {
-                                    result = -libc::EIO;
-                                }
-                            }
-                        }
-                    }
-                    UBLK_IO_OP_WRITE => {
-                        let sector_count = io_desc.count_or_zones as u64;
-                        if sector_count > 0 && sectors_per_block > 0 {
-                            let start_block = (io_desc.start_sector / sectors_per_block) as usize;
-                            let block_count = (sector_count / sectors_per_block) as usize;
-                            let payload_len = block_count.max(1) * image.geometry.block_size_bytes;
-                            let mut write_buf = vec![0u8; payload_len];
-                            match data_queue_runtime.read_data_at(0, tag, &mut write_buf) {
-                                Ok(_) => {
-                                    match image.write_blocks(start_block, &write_buf[..payload_len])
-                                    {
-                                        Ok(plan) => {
-                                            if plan.completion_class
-                                                != BlockVolumeCompletionClass::Completed
-                                            {
-                                                result = -libc::EIO;
-                                            } else if fua {
-                                                let _ = image.flush();
-                                            }
-                                        }
-                                        Err(_) => {
-                                            result = -libc::EIO;
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    result = -libc::EIO;
-                                }
-                            }
-                        }
-                    }
-                    UBLK_IO_OP_FLUSH => {
-                        let _ = image.flush();
-                    }
-                    UBLK_IO_OP_DISCARD => {
-                        let sector_count = io_desc.count_or_zones as u64;
-                        if sector_count > 0 && sectors_per_block > 0 {
-                            let start_block = (io_desc.start_sector / sectors_per_block) as usize;
-                            let block_count = (sector_count / sectors_per_block) as usize;
-                            let zeroes =
-                                vec![0u8; block_count.max(1) * image.geometry.block_size_bytes];
-                            if image.write_blocks(start_block, &zeroes).is_err() {
-                                result = -libc::EIO;
-                            }
-                        }
-                    }
-                    UBLK_IO_OP_WRITE_ZEROES => {
-                        let sector_count = io_desc.count_or_zones as u64;
-                        if sector_count > 0 && sectors_per_block > 0 {
-                            let start_block = (io_desc.start_sector / sectors_per_block) as usize;
-                            let block_count = (sector_count / sectors_per_block) as usize;
-                            let zeroes =
-                                vec![0u8; block_count.max(1) * image.geometry.block_size_bytes];
-                            if image.write_blocks(start_block, &zeroes).is_err() {
-                                result = -libc::EIO;
-                            }
-                        }
-                    }
-                    _ => {
-                        result = -libc::EIO;
-                    }
-                }
-
-                let _ = fua;
-            }
-
-            let commit_input = UblkDataQueueCommitAndFetchInput {
-                q_id,
-                tag,
-                nr_hw_queues,
-                queue_depth,
-                result,
-                addr_or_zone_append_lba: 0,
-            };
-            let readiness = UblkDataQueueCommitAndFetchReadiness {
-                data_queue_runtime_live: true,
-                fetched_request_available: true,
-                completion_result_ready: true,
-            };
-            let _ = submit_runtime_commit_and_fetch_without_wait(
-                data_queue_runtime,
-                commit_input,
-                readiness,
-            );
-        }
+fn open_control_device_file(path: &std::path::Path) -> Result<std::fs::File, AppError> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| AppError::new(format!("control device metadata: {e}")))?;
+    if !meta.file_type().is_char_device() {
+        return Err(AppError::new("control device is not a char device"));
     }
-
-    (iterations, cqes_processed)
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| AppError::new(format!("control device open: {e}")))
 }
 
-/// Run the complete ublk acceptance harness: device lifecycle, fio verify,
-/// and durability check.
+/// OW for the ublk acceptance harness: gate PC-012.
 ///
-/// # Errors
-///
-/// Returns `AppError` if host readiness, device creation, or I/O setup fails.
+/// The harness:
+/// 1. Checks ublk control open readiness
+/// 2. Adds a ublk device backed by a temporary file image
+/// 3. Starts the device and waits for the block device
+/// 4. Runs fio verify (CRC32C write+read) against the block device
+/// 5. After DEL_DEV, re-opens the same backing file and re-verifies fio data
+///    for post-restart durability
 pub fn run_ublk_acceptance_harness() -> Result<UblkAcceptanceHarnessReport, AppError> {
     use tidefs_block_volume_adapter_ublk_control_runtime as rt;
 
@@ -533,17 +438,25 @@ pub fn run_ublk_acceptance_harness() -> Result<UblkAcceptanceHarnessReport, AppE
 
             Some(dpass)
         }
-        Err(e) => Some(UblkAcceptanceFioPass {
-            fio_verify_passed: false,
-            fio_stderr: format!("durability: backing file reopen failed: {e:?}"),
-            device_path: None,
-        }),
+        Err(_e) => {
+            // Backing file could not be reopened: blocked prerequisite, not
+            // a durability verification failure.
+            None
+        }
     };
+
+    // Classify acceptance status
+    let (acceptance_status, durability_block_reason) = classify_acceptance(
+        &first_verify,
+        durability_verify.as_ref(),
+        &backing_path,
+    );
 
     // Clean up backing file
     let _ = std::fs::remove_file(&backing_path);
 
     Ok(UblkAcceptanceHarnessReport {
+        acceptance_status,
         host_kernel_release: kernel_release,
         dev_id,
         device_appeared,
@@ -552,7 +465,55 @@ pub fn run_ublk_acceptance_harness() -> Result<UblkAcceptanceHarnessReport, AppE
         durability_verify,
         io_loop_completed_iterations: io_iterations,
         io_loop_cqes_processed: io_cqes,
+        durability_block_reason,
     })
+}
+
+/// Classify the acceptance outcome from first-pass fio and durability results.
+fn classify_acceptance(
+    first_verify: &UblkAcceptanceFioPass,
+    durability_verify: Option<&UblkAcceptanceFioPass>,
+    backing_path: &std::path::Path,
+) -> (UblkAcceptanceStatus, Option<String>) {
+    if !first_verify.fio_verify_passed {
+        let reason = if first_verify.device_path.is_none() {
+            "ublk block device did not appear; first-pass fio skipped".to_string()
+        } else {
+            format!(
+                "first-pass fio verification failed: {}",
+                first_verify.fio_stderr
+            )
+        };
+        return (UblkAcceptanceStatus::FirstPassFailed, Some(reason));
+    }
+
+    match durability_verify {
+        None => (
+            UblkAcceptanceStatus::BlockedPrerequisite,
+            Some(format!(
+                "backing file {:?} could not be reopened for durability verification",
+                backing_path
+            )),
+        ),
+        Some(dp) => {
+            if dp.fio_verify_passed {
+                (UblkAcceptanceStatus::Passed, None)
+            } else if dp.device_path.is_none() {
+                (
+                    UblkAcceptanceStatus::BlockedPrerequisite,
+                    Some("durability ublk block device did not appear".to_string()),
+                )
+            } else {
+                (
+                    UblkAcceptanceStatus::DurabilityFailed,
+                    Some(format!(
+                        "post-restart durability fio verification failed: {}",
+                        dp.fio_stderr
+                    )),
+                )
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -568,8 +529,34 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_status_as_str() {
+        assert_eq!(UblkAcceptanceStatus::Passed.as_str(), "passed");
+        assert_eq!(
+            UblkAcceptanceStatus::DurabilityFailed.as_str(),
+            "durability_failed"
+        );
+        assert_eq!(
+            UblkAcceptanceStatus::BlockedPrerequisite.as_str(),
+            "blocked_prerequisite"
+        );
+        assert_eq!(
+            UblkAcceptanceStatus::FirstPassFailed.as_str(),
+            "first_pass_failed"
+        );
+    }
+
+    #[test]
+    fn only_passed_is_acceptance_evidence() {
+        assert!(UblkAcceptanceStatus::Passed.is_acceptance_evidence());
+        assert!(!UblkAcceptanceStatus::DurabilityFailed.is_acceptance_evidence());
+        assert!(!UblkAcceptanceStatus::BlockedPrerequisite.is_acceptance_evidence());
+        assert!(!UblkAcceptanceStatus::FirstPassFailed.is_acceptance_evidence());
+    }
+
+    #[test]
     fn report_print_is_idempotent() {
         let report = UblkAcceptanceHarnessReport {
+            acceptance_status: UblkAcceptanceStatus::Passed,
             host_kernel_release: "6.12.79".to_string(),
             dev_id: 1,
             device_appeared: true,
@@ -586,13 +573,15 @@ mod tests {
             }),
             io_loop_completed_iterations: 4,
             io_loop_cqes_processed: 8,
+            durability_block_reason: None,
         };
         report.print();
     }
 
     #[test]
-    fn report_with_skipped_durability() {
+    fn report_with_skipped_durability_is_blocked_not_passed() {
         let report = UblkAcceptanceHarnessReport {
+            acceptance_status: UblkAcceptanceStatus::BlockedPrerequisite,
             host_kernel_release: "6.12.79".to_string(),
             dev_id: 2,
             device_appeared: false,
@@ -605,8 +594,169 @@ mod tests {
             durability_verify: None,
             io_loop_completed_iterations: 0,
             io_loop_cqes_processed: 0,
+            durability_block_reason: Some("ublk block device did not appear".to_string()),
         };
+        // Skipped durability must not be usable as acceptance evidence.
+        assert!(!report.acceptance_status.is_acceptance_evidence());
+        assert_eq!(
+            report.acceptance_status,
+            UblkAcceptanceStatus::BlockedPrerequisite
+        );
         report.print();
+    }
+
+    #[test]
+    fn report_with_durability_failure() {
+        let report = UblkAcceptanceHarnessReport {
+            acceptance_status: UblkAcceptanceStatus::DurabilityFailed,
+            host_kernel_release: "6.12.79".to_string(),
+            dev_id: 3,
+            device_appeared: true,
+            block_device_path: Some(PathBuf::from("/dev/ublkb1")),
+            first_verify: UblkAcceptanceFioPass {
+                fio_verify_passed: true,
+                fio_stderr: String::new(),
+                device_path: Some(PathBuf::from("/dev/ublkb0")),
+            },
+            durability_verify: Some(UblkAcceptanceFioPass {
+                fio_verify_passed: false,
+                fio_stderr: "crc32c mismatch".to_string(),
+                device_path: Some(PathBuf::from("/dev/ublkb1")),
+            }),
+            io_loop_completed_iterations: 5,
+            io_loop_cqes_processed: 12,
+            durability_block_reason: Some(
+                "post-restart durability fio verification failed: crc32c mismatch".to_string(),
+            ),
+        };
+        assert!(!report.acceptance_status.is_acceptance_evidence());
+        assert_eq!(
+            report.acceptance_status,
+            UblkAcceptanceStatus::DurabilityFailed
+        );
+        report.print();
+    }
+
+    #[test]
+    fn report_with_first_pass_failure() {
+        let report = UblkAcceptanceHarnessReport {
+            acceptance_status: UblkAcceptanceStatus::FirstPassFailed,
+            host_kernel_release: "6.12.79".to_string(),
+            dev_id: 4,
+            device_appeared: false,
+            block_device_path: None,
+            first_verify: UblkAcceptanceFioPass {
+                fio_verify_passed: false,
+                fio_stderr: "block device not found".to_string(),
+                device_path: None,
+            },
+            durability_verify: None,
+            io_loop_completed_iterations: 0,
+            io_loop_cqes_processed: 0,
+            durability_block_reason: Some(
+                "ublk block device did not appear; first-pass fio skipped".to_string(),
+            ),
+        };
+        assert!(!report.acceptance_status.is_acceptance_evidence());
+        assert_eq!(
+            report.acceptance_status,
+            UblkAcceptanceStatus::FirstPassFailed
+        );
+        report.print();
+    }
+
+    #[test]
+    fn classify_acceptance_passed() {
+        let first = UblkAcceptanceFioPass {
+            fio_verify_passed: true,
+            fio_stderr: String::new(),
+            device_path: Some(PathBuf::from("/dev/ublkb0")),
+        };
+        let durability = UblkAcceptanceFioPass {
+            fio_verify_passed: true,
+            fio_stderr: String::new(),
+            device_path: Some(PathBuf::from("/dev/ublkb1")),
+        };
+        let (status, reason) =
+            classify_acceptance(&first, Some(&durability), Path::new("/tmp/test.img"));
+        assert_eq!(status, UblkAcceptanceStatus::Passed);
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn classify_acceptance_durability_failed() {
+        let first = UblkAcceptanceFioPass {
+            fio_verify_passed: true,
+            fio_stderr: String::new(),
+            device_path: Some(PathBuf::from("/dev/ublkb0")),
+        };
+        let durability = UblkAcceptanceFioPass {
+            fio_verify_passed: false,
+            fio_stderr: "crc32c mismatch at offset 4096".to_string(),
+            device_path: Some(PathBuf::from("/dev/ublkb1")),
+        };
+        let (status, reason) =
+            classify_acceptance(&first, Some(&durability), Path::new("/tmp/test.img"));
+        assert_eq!(status, UblkAcceptanceStatus::DurabilityFailed);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("crc32c mismatch"));
+    }
+
+    #[test]
+    fn classify_acceptance_blocked_backing_reopen() {
+        let first = UblkAcceptanceFioPass {
+            fio_verify_passed: true,
+            fio_stderr: String::new(),
+            device_path: Some(PathBuf::from("/dev/ublkb0")),
+        };
+        let (status, reason) = classify_acceptance(&first, None, Path::new("/tmp/test.img"));
+        assert_eq!(status, UblkAcceptanceStatus::BlockedPrerequisite);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("could not be reopened"));
+    }
+
+    #[test]
+    fn classify_acceptance_blocked_durability_device_missing() {
+        let first = UblkAcceptanceFioPass {
+            fio_verify_passed: true,
+            fio_stderr: String::new(),
+            device_path: Some(PathBuf::from("/dev/ublkb0")),
+        };
+        let durability = UblkAcceptanceFioPass {
+            fio_verify_passed: false,
+            fio_stderr: "durability: block device not found".to_string(),
+            device_path: None,
+        };
+        let (status, reason) =
+            classify_acceptance(&first, Some(&durability), Path::new("/tmp/test.img"));
+        assert_eq!(status, UblkAcceptanceStatus::BlockedPrerequisite);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("device did not appear"));
+    }
+
+    #[test]
+    fn classify_acceptance_first_pass_failed() {
+        let first = UblkAcceptanceFioPass {
+            fio_verify_passed: false,
+            fio_stderr: "fio command failed: No such device".to_string(),
+            device_path: None,
+        };
+        let (status, reason) = classify_acceptance(&first, None, Path::new("/tmp/test.img"));
+        assert_eq!(status, UblkAcceptanceStatus::FirstPassFailed);
+        assert!(reason.is_some());
+    }
+
+    #[test]
+    fn classify_acceptance_first_pass_failed_with_device() {
+        let first = UblkAcceptanceFioPass {
+            fio_verify_passed: false,
+            fio_stderr: "verification failed".to_string(),
+            device_path: Some(PathBuf::from("/dev/ublkb0")),
+        };
+        let (status, reason) = classify_acceptance(&first, None, Path::new("/tmp/test.img"));
+        assert_eq!(status, UblkAcceptanceStatus::FirstPassFailed);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("first-pass fio verification failed"));
     }
 
     #[test]
