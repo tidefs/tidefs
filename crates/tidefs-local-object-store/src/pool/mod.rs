@@ -2286,6 +2286,37 @@ impl Pool {
         }
     }
 
+
+    /// Store an object and return the authoritative placement receipt.
+    ///
+    /// Identical to [`Pool::put`] except that it also returns the persisted
+    /// [`PlacementReceipt`] that records the pool-wide placement decision.
+    /// Callers that need durable receipt references for distributed
+    /// rebuild/backfill, rebake gating, or reclaim durability checks should
+    /// use this method rather than [`Pool::put`] plus a subsequent receipt
+    /// lookup.
+    pub fn put_with_receipt(
+        &mut self,
+        class: IoClass,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<(StoredObject, PlacementReceipt)> {
+        let stored = self.put(class, key, payload)?;
+        let indices: Vec<usize> = self.class_map.get(class).to_vec();
+        let receipt = self
+            .load_placement_receipt(&indices, key)?
+            .ok_or(StoreError::InvalidOptions {
+                reason: "placement receipt not found after pool-wide write",
+            })?;
+        if receipt.object_key != key {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt key mismatch after write",
+            });
+        }
+        Ok((stored, receipt))
+
+    }
+
     /// Retrieve an object from its persisted placement receipt when present.
     pub fn get(&self, class: IoClass, key: ObjectKey) -> Result<Option<Vec<u8>>> {
         if self.locked {
@@ -3744,6 +3775,15 @@ impl<'a> PoolStoreMut<'a> {
     /// Store an object, compressing/encrypting transparently.
     pub fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         self.pool.put(IoClass::Data, key, payload)
+    }
+
+    /// Store an object and return the authoritative placement receipt.
+    pub fn put_with_receipt(
+        &mut self,
+        key: ObjectKey,
+        payload: &[u8],
+    ) -> Result<(StoredObject, PlacementReceipt)> {
+        self.pool.put_with_receipt(IoClass::Data, key, payload)
     }
 
     /// Delete an object.
