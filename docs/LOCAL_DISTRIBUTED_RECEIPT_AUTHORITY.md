@@ -134,7 +134,13 @@ The following work remains under issue #18 and the focused split issues:
 - degraded read, rebuild, and backfill runtimes must consume durable receipt
   authority instead of synthesizing placement from current topology alone;
 - #346: rebake and reclaim flows must prove ingest/base trimming is gated on
-  durable replacement receipts;
+  durable replacement receipts. The `DeadObjectReclaimQueue` now supports
+  `publish_replacement_receipt` for rebake to attach replacement evidence,
+  and `dequeue_receipt_bound_batch_with_stable_generation` to gate reclaim
+  drains on generation-stable receipt authority;
+- `DeadObjectReplacementReceipt` carries an `erasure_coded` constructor and
+  `authorizes_reclaim_for_with_stable_generation` to enforce both policy
+  correctness and generation stability;
 - two-node transfer, degraded-read, rebuild-after-replacement, and runtime
   reclaim validation rows must run in GitHub Actions.
 

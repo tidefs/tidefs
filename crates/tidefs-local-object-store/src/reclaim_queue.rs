@@ -410,6 +410,72 @@ mod tests {
         assert!(loaded.is_empty());
     }
 
+    // -- DeadObjectReclaimQueue #346 receipt-bound drain tests --
+
+    fn erasure_receipt_for_key(
+        key: ObjectKey,
+        generation: u64,
+        data_shards: u8,
+        parity_shards: u8,
+    ) -> DeadObjectReplacementReceipt {
+        DeadObjectReplacementReceipt::erasure_coded(
+            key,
+            7,
+            generation,
+            data_shards,
+            parity_shards,
+            4096,
+            digest(key.0[0]),
+        )
+    }
+
+    #[test]
+    fn dead_object_reclaim_queue_roundtrip_erasure_entry() {
+        let (mut store, _dir) = temp_store();
+        let mut queue = DeadObjectReclaimQueue::new();
+        let key = dead_object_key(0xEC);
+        let receipt = erasure_receipt_for_key(key, 1, 4, 2);
+        let entry = DeadObjectEntry::new(key, [0xEC; 16], 5, true, 5)
+            .with_replacement_receipt(receipt);
+        assert!(queue.enqueue(entry));
+
+        store_dead_object_reclaim_queue(&queue, &mut store).expect("store erasure entry");
+        let loaded = load_dead_object_reclaim_queue(&store);
+
+        assert_eq!(loaded, queue);
+        assert_eq!(loaded.receipt_bound_eligible_count(6), 1);
+        assert_eq!(loaded.receipt_bound_eligible_count_with_stable_generation(6, 5), 1);
+    }
+
+    #[test]
+    fn dead_object_reclaim_queue_stable_generation_drain() {
+        let (mut store, _dir) = temp_store();
+        let mut queue = DeadObjectReclaimQueue::new();
+
+        // Entry with receipt generation 3
+        let key = dead_object_key(0xDA);
+        let receipt = DeadObjectReplacementReceipt::replicated(
+            key, 7, 3, 2, 4096, digest(key.0[0]),
+        );
+        let entry = DeadObjectEntry::new(key, [0xDA; 16], 5, true, 5)
+            .with_replacement_receipt(receipt);
+        assert!(queue.enqueue(entry));
+
+        // stable_committed_generation = 2: receipt gen 3 not yet stable
+        let batch = queue.dequeue_receipt_bound_batch_with_stable_generation(10, 6, 2);
+        assert!(batch.is_empty());
+
+        // stable_committed_generation = 3: receipt is now stable
+        let batch = queue.dequeue_receipt_bound_batch_with_stable_generation(10, 6, 3);
+        assert_eq!(batch.len(), 1);
+
+        // Persist and verify drain state
+        store_dead_object_reclaim_queue(&queue, &mut store).expect("store");
+        let loaded = load_dead_object_reclaim_queue(&store);
+        assert_eq!(loaded, queue);
+        assert_eq!(loaded.receipt_bound_eligible_count_with_stable_generation(6, 3), 1);
+    }
+
     // -- Wire-format corruption detection tests --
 
     #[test]
