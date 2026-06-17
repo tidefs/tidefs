@@ -3373,6 +3373,7 @@ dependencies = [
  "tidefs-locator-table",
  "tidefs-rebuild-planner",
  "tidefs-recovery-loop",
+ "tidefs-replication-model",
  "tidefs-types-incremental-job-core",
  "tidefs-types-reclaim-queue-core",
  "tidefs-verification-engine",

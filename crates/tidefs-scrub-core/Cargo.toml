@@ -20,6 +20,7 @@ tidefs-checksum-tree = { path = "../tidefs-checksum-tree" }
 tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
 tidefs-durability-layout = { path = "../tidefs-durability-layout" }
 tidefs-verification-engine = { path = "../tidefs-verification-engine" }
+tidefs-replication-model = { path = "../tidefs-replication-model" }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 blake3 = "1"

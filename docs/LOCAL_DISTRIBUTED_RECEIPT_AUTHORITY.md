@@ -147,7 +147,7 @@ This complements the existing receipt-bearing protocol messages:
 
 ## Remaining Issue #18 Acceptance Work
 
-
+### Completed
 
 Completed under issue #18 and the focused split issues:
 
@@ -166,12 +166,22 @@ Completed under issue #18 and the focused split issues:
 Remaining:
 
 - #356: two-node receipt-addressed read and degraded-read validation after
-  node/device loss within the configured redundancy policy;
-- scrub receipt-authority integration (no focused issue yet);
-- backfill runtime receipt-authority consumption;
-- runtime validation rows for two-node transfer, degraded-read,
-  rebuild-after-replacement, and reclaim not racing durable receipt
-  publication.
+  node/device loss within the configured redundancy policy (in progress via
+  PR #366);
+- runtime validation rows for two-node transfer, degraded-read, and
+  rebuild-after-replacement (local-pool rebuild-after-replacement test
+  added; two-node transport rows pending);
+- reclaim not racing durable receipt publication (receipt-bound drain
+  gating implemented and tested in `tidefs-reclaim`).
+
+### Recently Completed
+
+- scrub receipt-authority integration: `ScrubFanoutRequest` now carries an
+  optional `PlacementReceiptRef`; the fanout coordinator exposes a
+  `fanout_with_receipt` method for receipt-aware multi-node verification;
+- backfill runtime receipt-authority consumption: the `DataMovementEngine`
+  already validates receipt digests and lengths during transfer; the
+  receipt-verified task completion path rejects synthetic receipt refs.
 ## References
 
 - Issue #18: local/distributed receipt authority
