@@ -638,10 +638,17 @@ impl VfsLocalFileSystem {
     fn update_anonymous_size(file: &mut AnonymousTmpfile, size: u64) {
         file.attr.posix.size = size;
         file.attr.posix.blocks_512 = size.saturating_add(511) / 512;
-        let next_version = file.attr.posix.mtime_ns.saturating_add(1).max(1);
-        file.attr.posix.mtime_ns = next_version;
-        file.attr.posix.ctime_ns = next_version;
-        file.attr.subtree_rev = u64::try_from(next_version).unwrap_or(u64::MAX);
+        let now_ns = crate::types::current_posix_time_ns();
+        // POSIX: content mutation advances mtime and ctime to the current
+        // wall clock.  The ctime advancement ensures it never steps backward
+        // even when the wall clock is unchanged across rapid mutations.
+        let new_mtime = now_ns.max(file.attr.posix.mtime_ns.saturating_add(1));
+        let new_ctime = now_ns.max(file.attr.posix.ctime_ns.saturating_add(1));
+        file.attr.posix.mtime_ns = new_mtime;
+        file.attr.posix.ctime_ns = new_ctime;
+        // subtree_rev is a storage identity counter, not a POSIX timestamp.
+        // Increment it independently of wall-clock time.
+        file.attr.subtree_rev = file.attr.subtree_rev.saturating_add(1).max(1);
     }
 
     fn apply_anonymous_metadata_setattr(file: &mut AnonymousTmpfile, attr: &SetAttr) {

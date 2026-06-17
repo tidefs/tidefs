@@ -230,6 +230,18 @@ Important 2026-06-01 findings:
   register-backed markers, but the item remains open until POSIX time,
   storage generation, replay, scrub, and format compatibility are designed as
   one contract.
+- `TFR-005`: issue #330 removes `PosixTimeRecord::from_generation` and
+  `PosixTimeRecord::legacy_from_versions` from the local-filesystem runtime
+  projection.  `PosixTimeRecord::synthetic(now_ns)` provides the named
+  authority boundary for synthetic inodes.  The encoding format version < 5
+  legacy path now returns a clean decode error instead of reconstructing
+  POSIX timestamps from storage fields.  The VFS engine
+  `update_anonymous_size` no longer derives a version counter from `mtime_ns`.
+  Remaining TFR-005 local-filesystem sites include `subtree_rev`/`dir_rev`
+  coupling through `metadata_version`, intent-log replay version projection,
+  scrub/repair identity, and send/receive serialization.  See
+  `docs/TIMESTAMP_GENERATION_AUTHORITY.md` for the updated remaining-sites
+  list.
 - `TFR-005`: issue #325 adds `docs/TIMESTAMP_GENERATION_AUTHORITY.md` and
   shared VFS/inode-attribute helper boundaries for POSIX nanosecond timestamps
   versus VFS inode `Generation`. This narrows the shared API contract and

@@ -2097,24 +2097,19 @@ impl PosixTimeRecord {
     }
 
     #[must_use]
-    pub fn from_generation(generation: u64) -> Self {
-        let ns = i64::try_from(generation).unwrap_or(i64::MAX);
-        Self::new(ns, ns, ns, ns)
-    }
-
-    #[must_use]
     pub fn now() -> Self {
         let ns = current_posix_time_ns();
         Self::new(ns, ns, ns, ns)
     }
 
+    /// Create a PosixTimeRecord from the caller-resolved wall-clock
+    /// nanosecond value.  This is the named authority boundary for synthetic
+    /// inodes and test fixtures that previously used the removed
+    /// `from_generation` shortcut.  The `now_ns` argument must be a POSIX
+    /// wall-clock timestamp, never a storage version, generation, or object key.
     #[must_use]
-    pub fn legacy_from_versions(data_version: u64, metadata_version: u64, generation: u64) -> Self {
-        let atime_ns = i64::try_from(metadata_version).unwrap_or(i64::MAX);
-        let mtime_ns = i64::try_from(data_version.max(metadata_version)).unwrap_or(i64::MAX);
-        let ctime_ns = i64::try_from(metadata_version).unwrap_or(i64::MAX);
-        let btime_ns = i64::try_from(generation).unwrap_or(i64::MAX);
-        Self::new(atime_ns, mtime_ns, ctime_ns, btime_ns)
+    pub fn synthetic(now_ns: i64) -> Self {
+        Self::new(now_ns, now_ns, now_ns, now_ns)
     }
 }
 
