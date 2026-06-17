@@ -291,7 +291,11 @@ pub fn map_namespace_error(err: tidefs_namespace::NamespaceError) -> Errno {
         NamespaceError::NotSymlink => Errno(libc::EINVAL as u16),
         NamespaceError::NotSupported => Errno(libc::EOPNOTSUPP as u16),
         NamespaceError::DirIndex(_) => Errno(libc::EIO as u16),
+
         NamespaceError::StaleCursor => Errno(libc::EAGAIN as u16),
+
+        NamespaceError::DatasetIdentityMismatch { .. } => Errno(libc::EIO as u16),
+
     }
 }
 
