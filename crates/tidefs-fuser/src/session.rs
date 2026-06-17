@@ -270,9 +270,37 @@ impl BackgroundSession {
         #[allow(clippy::unwrap_used)]
         let mount = std::mem::take(&mut *se.mount.lock().unwrap());
         let mount = mount.ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
+        let mountpoint_captured = mountpoint.clone();
         let guard = thread::spawn(move || {
             let mut se = se;
-            se.run()
+            // Wrap the FUSE session run loop in catch_unwind so that a
+            // panic inside the session thread (poisoned lock, assertion,
+            // or any Rust-level failure) is converted into a stderr
+            // diagnostic and an io::Error return instead of silently
+            // aborting the thread.  Without this wrapper, a panic in the
+            // session thread is invisible to the daemon is_finished()
+            // detection because JoinHandle drops the panic payload when
+            // the handle is leaked/dropped without a join.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| se.run())) {
+                Ok(result) => result,
+                Err(panic_payload) => {
+                    let msg: String = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic payload".to_string()
+                    };
+                    eprintln!(
+                        "FUSE session thread panicked on mount {}: {msg}",
+                        mountpoint_captured.display()
+                    );
+                    Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("FUSE session thread panicked: {msg}"),
+                    ))
+                }
+            }
         });
         Ok(BackgroundSession {
             mountpoint,
