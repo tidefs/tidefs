@@ -197,23 +197,6 @@ generated_doc = "Planned uBLK started-export live service-loop claim. TideFS may
 evidence_artifacts = []
 
 [[claims]]
-id = "ublk.started_export.live_service_loop.v1"
-status = "planned"
-scope = "uBLK started export admission and daemon-owned live data-queue service loop"
-required_evidence_classes = [
-  "runtime-ublk-started-export-admission-artifact",
-  "runtime-ublk-completion-artifact",
-  "claims-gate-review",
-]
-blockers = [
-  "The focused qemu-ublk-smoke started-export artifact is bounded service-loop evidence, not fio workload breadth, mkfs/mount acceptance, online resize acceptance, crash durability, or production block-device readiness.",
-  "The started-export artifact must remain paired with the qid/tag completion artifact verifier before completion handling can be treated as runtime evidence.",
-  "No claims-gate-review artifact is recorded for this claim.",
-]
-generated_doc = "Planned uBLK started-export live service-loop claim. TideFS may treat a verified artifact as bounded runtime evidence for started-export admission only; it is not fio, mkfs/mount, online resize, crash durability, or production block-device readiness."
-evidence_artifacts = []
-
-[[claims]]
 id = "kernel.teardown.no_work_after.v1"
 status = "planned"
 scope = "kernel teardown and post-teardown work exclusion"
