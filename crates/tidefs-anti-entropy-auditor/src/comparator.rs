@@ -197,7 +197,7 @@ impl DigestComparator {
             } else {
                 self.total_divergences += 1;
                 let class = self.classify_divergence(primary_digest, digest, witness_digest);
-                divergences.push(ComparisonResult::diverged(
+                let mut result = ComparisonResult::diverged(
                     subject_ref,
                     node_id,
                     primary_digest,
@@ -205,7 +205,11 @@ impl DigestComparator {
                     class,
                     epoch,
                     now_ns,
-                ));
+                );
+                if let Some(wd) = witness_digest {
+                    result.witness_digest = wd;
+                }
+                divergences.push(result);
             }
         }
 
@@ -233,7 +237,7 @@ impl DigestComparator {
                 } else if witness == replica_digest {
                     DivergenceClass::LagBehind
                 } else {
-                    DivergenceClass::DigestMismatch
+                    DivergenceClass::WitnessDisagreement
                 }
             }
             None => DivergenceClass::DigestMismatch,
@@ -346,6 +350,28 @@ mod tests {
             results[0].divergence_class,
             Some(DivergenceClass::MissingReplica)
         );
+    }
+
+    #[test]
+    fn witness_disagrees_with_primary_and_replica() {
+        let mut cmp = DigestComparator::default();
+        let inputs = vec![ComparisonInput {
+            subject_ref: 1,
+            target_node: 1,
+            primary_digest: 42,
+            replica_digest: 99,
+            witness_digest: Some(77),
+            epoch: 1,
+        }];
+
+        let results = cmp.compare_batch(&inputs, 1000);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].diverged);
+        assert_eq!(
+            results[0].divergence_class,
+            Some(DivergenceClass::WitnessDisagreement)
+        );
+        assert_eq!(results[0].witness_digest, 77);
     }
 
     #[test]

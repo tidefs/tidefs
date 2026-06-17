@@ -233,10 +233,10 @@ fn witness_all_three_disagree() {
     let results = cmp.compare_batch(&inputs, 1000);
     assert_eq!(results.len(), 1);
     assert!(results[0].diverged);
-    // Witness matches neither -> DigestMismatch
+    // Witness matches neither -> authority-selection disagreement
     assert_eq!(
         results[0].divergence_class,
-        Some(DivergenceClass::DigestMismatch)
+        Some(DivergenceClass::WitnessDisagreement)
     );
 }
 
@@ -331,6 +331,7 @@ fn anti_entropy_state_serde_roundtrip() {
             classified_lag: 2,
             classified_corruption: 5,
             classified_missing: 3,
+            classified_witness_disagreement: 0,
         },
         AntiEntropyState::Ticketed {
             created_at_ns: 6000,
@@ -827,6 +828,7 @@ fn state_has_divergences_detects_active_issues() {
         classified_lag: 0,
         classified_corruption: 0,
         classified_missing: 0,
+        classified_witness_disagreement: 0,
     };
     assert!(with_divs.has_divergences());
 
@@ -844,6 +846,7 @@ fn state_has_divergences_detects_active_issues() {
         classified_lag: 0,
         classified_corruption: 0,
         classified_missing: 0,
+        classified_witness_disagreement: 0,
     };
     assert!(!zero_divs.has_divergences());
 

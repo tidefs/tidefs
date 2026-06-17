@@ -546,6 +546,21 @@ impl ChecksumTree {
         leaves
     }
 
+    /// Return the digest for one leaf index.
+    pub fn leaf_digest(&self, leaf_index: u64) -> Option<Digest> {
+        if leaf_index >= self.block_count || self.is_empty() {
+            return None;
+        }
+
+        let node_index = (leaf_index / FANOUT as u64) as usize;
+        let child_index = (leaf_index % FANOUT as u64) as usize;
+
+        self.nodes
+            .get(node_index)
+            .and_then(|node| node.valid_children().get(child_index))
+            .copied()
+    }
+
     /// Generate a Merkle subtree proof for the given leaf index.
     ///
     /// Returns `None` if the leaf index is out of range or the tree

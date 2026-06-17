@@ -423,10 +423,10 @@ fn witness_disagrees_with_both_primary_and_replica() {
     }];
     let results = cmp.compare_batch(&inputs, 1000);
     assert!(results[0].diverged);
-    // Neither primary nor replica matches witness → DigestMismatch
+    // Neither primary nor replica matches witness -> authority-selection disagreement
     assert_eq!(
         results[0].divergence_class,
-        Some(DivergenceClass::DigestMismatch)
+        Some(DivergenceClass::WitnessDisagreement)
     );
 }
 
