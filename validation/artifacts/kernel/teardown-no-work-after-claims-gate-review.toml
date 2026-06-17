@@ -1,0 +1,53 @@
+artifact_version = 1
+evidence_class = "claims-gate-review"
+source = "tidefs-kernel-cutover-runtime"
+scope = "kernel-teardown-source-model-boundary-review"
+issue = 536
+
+claim_id = "kernel.teardown.no_work_after.v1"
+reviewed_claim_ids = [
+  "kernel.teardown.no_work_after.v1",
+]
+
+validation_tier = "T4 source/model claims-gate review"
+source_model_evidence = true
+mounted_linux_runtime_evidence = false
+runtime_evidence_status = "mounted-linux-runtime-evidence-missing"
+decision = "blocked-until-mounted-kernel-runtime-evidence"
+
+source_artifact = "validation/artifacts/kernel/teardown-race-proof-artifact.json"
+source_artifact_evidence_class = "teardown-race-proof-artifact"
+source_artifact_digest_algorithm = "sha256"
+source_artifact_digest = "af34e9e782ff656690d84990b3f5cb339744e206c0f5c0702af012bfe8f1f6ed"
+
+token_states_covered = [
+  "accepting generation accepts modeled work",
+  "draining generation rejects new modeled work while queued work drains",
+  "torn-down generation rejects modeled work after final teardown and increments the owner token generation",
+]
+
+forbidden_post_teardown_work_cases = [
+  "deferred writeback enqueue after teardown begins",
+  "deferred flush enqueue after teardown begins",
+  "queued work start after final teardown",
+  "kernel callback borrow after final teardown",
+  "teardown callback enqueue of normal deferred work",
+]
+
+boundary_review = [
+  "The receipt records source/model proof evidence for the kernel teardown token state machine only.",
+  "The helper rejects modeled work once teardown begins and rejects stale token generations after final teardown increments the generation.",
+  "The source proof artifact reports no explored schedule starts modeled work after final teardown.",
+  "This review does not exercise a mounted Linux kernel module, Linux workqueue execution, mounted filesystem I/O, QEMU, xfstests, mmap, syncfs, or crash/recovery runtime rows.",
+]
+
+missing_runtime_evidence = [
+  "T5 mounted-kernel teardown stress with Linux workqueue and callback activity tracing",
+  "T6 mounted kernel I/O teardown and recovery rows across the filesystem runtime",
+]
+
+non_claims = [
+  "This review does not validate mounted kernel I/O semantics.",
+  "This review does not validate production kernel residency, crash recovery, mmap, writeback, syncfs, or unmount behavior.",
+  "This review does not move kernel.teardown.no_work_after.v1 to validated status.",
+]

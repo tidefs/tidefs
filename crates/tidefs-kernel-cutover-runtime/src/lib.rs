@@ -1,7 +1,16 @@
 //! Userspace kernel-cutover runtime: state-machine executor, fence manager,
 //! dry-run gate evaluator, and rollback engine. d2 domain (userspace std).
 
+mod teardown_review;
 mod types;
+pub use crate::teardown_review::{
+    teardown_proof_review_receipt, TeardownGenerationToken, TeardownProofReviewError,
+    TeardownProofReviewReceipt, TeardownProofReviewState, TeardownRecordedWork, TeardownTokenState,
+    TeardownWorkCase, KERNEL_TEARDOWN_NO_WORK_AFTER_CLAIM_ID, TEARDOWN_PROOF_FORBIDDEN_WORK_CASES,
+    TEARDOWN_PROOF_MISSING_RUNTIME_EVIDENCE, TEARDOWN_PROOF_SOURCE_ARTIFACT_PATH,
+    TEARDOWN_PROOF_SOURCE_ARTIFACT_SHA256, TEARDOWN_PROOF_TOKEN_STATES_COVERED,
+    TEARDOWN_PROOF_VALIDATION_TIER,
+};
 pub use crate::types::{
     CutoverFenceKind, CutoverFenceToken, CutoverGateResult, CutoverState, CutoverStep,
     CutoverTransition, KernelMode, RollbackPlan, RollbackReceipt,
