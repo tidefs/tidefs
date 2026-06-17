@@ -178,6 +178,9 @@ pub struct NodeJoinHandshake {
     pub rejection: Option<RejectionReason>,
     /// The epoch the joining node proposes.
     pub target_epoch: EpochId,
+    /// The join session epoch binding recorded on successful join.
+    /// Set by `record_session_epoch` after the handshake is active.
+    pub session_epoch: Option<crate::JoinSessionEpoch>,
 }
 
 impl NodeJoinHandshake {
@@ -194,6 +197,7 @@ impl NodeJoinHandshake {
             epoch_verified: false,
             rejection: None,
             target_epoch,
+            session_epoch: None,
         }
     }
 
@@ -291,6 +295,69 @@ impl NodeJoinHandshake {
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.is_active() && !self.is_rejected()
+    }
+
+    /// Record the join session epoch binding after a successful handshake.
+    ///
+    /// Stores the membership epoch, quorum evidence, and joining member
+    /// identity for use by state transfer and promotion gates.
+    /// Must only be called when the handshake is active and epoch-verified.
+    pub fn record_session_epoch(
+        &mut self,
+        joining_member_id: tidefs_membership_epoch::MemberId,
+        quorum_evidence: Option<crate::QuorumEvidence>,
+    ) -> Result<(), crate::JoinError> {
+        if !self.is_active() {
+            return Err(crate::JoinError::PreflightDenied(
+                "cannot record session epoch: handshake not active".into(),
+            ));
+        }
+
+        let session = crate::JoinSessionEpoch::new(
+            self.target_epoch,
+            joining_member_id,
+            0, // nonce assigned by caller or generated externally
+        );
+
+        let session = if let Some(qe) = quorum_evidence {
+            session.with_quorum(qe)
+        } else {
+            session
+        };
+
+        self.session_epoch = Some(session);
+        Ok(())
+    }
+
+    /// The operator-visible join status for this handshake.
+    #[must_use]
+    pub fn join_status(&self, current_epoch: EpochId) -> crate::JoinStatus {
+        if self.is_rejected() {
+            return crate::JoinStatus::Failed(
+                self.rejection
+                    .as_ref()
+                    .map_or_else(|| "rejected".into(), |r| r.to_string()),
+            );
+        }
+
+        if !self.is_active() {
+            return crate::JoinStatus::WaitingForQuorum;
+        }
+
+        let session = match &self.session_epoch {
+            Some(s) => s,
+            None => return crate::JoinStatus::MissingEpochEvidence,
+        };
+
+        let assigned_id = match self.inner.assigned_member_id {
+            Some(id) => id,
+            None => return crate::JoinStatus::MissingEpochEvidence,
+        };
+
+        match session.is_valid_for(assigned_id, current_epoch) {
+            Ok(()) => crate::JoinStatus::TransferReady,
+            Err(status) => status,
+        }
     }
 }
 

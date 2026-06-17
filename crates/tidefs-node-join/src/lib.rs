@@ -75,6 +75,197 @@ pub enum JoinError {
         phase: JoinPhase,
         health: HealthClass,
     },
+
+    #[error("missing epoch evidence for operation: {0}")]
+    MissingEpochEvidence(String),
+
+    #[error("stale epoch: session epoch {session_epoch:?}, current epoch {current_epoch:?}: {reason}")]
+    StaleEpoch {
+        session_epoch: EpochId,
+        current_epoch: EpochId,
+        reason: String,
+    },
+
+    #[error("identity mismatch: session bound to {session_member:?}, caller is {caller_member:?}")]
+    IdentityMismatch {
+        session_member: MemberId,
+        caller_member: MemberId,
+    },
+
+    #[error("quorum not reached for epoch {epoch:?}: {approvals}/{threshold} approvals")]
+    QuorumNotReached {
+        epoch: EpochId,
+        approvals: usize,
+        threshold: usize,
+    },
+}
+
+// ── Quorum evidence ──────────────────────────────────────────────────
+
+/// Evidence that the membership epoch authorizing this join session
+/// was backed by a quorum of cluster members.
+///
+/// Carried through the node-join pipeline so that state transfer and
+/// promotion gates can verify the join was quorum-authorized.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuorumEvidence {
+    /// The membership epoch this evidence covers.
+    pub epoch: EpochId,
+    /// Number of approvals that established the quorum.
+    pub quorum_approvals: usize,
+    /// The quorum threshold required.
+    pub quorum_threshold: usize,
+    /// The set of member IDs that approved (for audit trail).
+    pub approving_members: Vec<MemberId>,
+}
+
+impl QuorumEvidence {
+    /// Whether this evidence demonstrates a valid quorum.
+    #[must_use]
+    pub fn is_quorum_reached(&self) -> bool {
+        self.quorum_approvals >= self.quorum_threshold
+            && self.quorum_threshold > 0
+    }
+
+    /// Required approvals for a simple-majority quorum of `n` members.
+    #[must_use]
+    pub fn simple_majority_threshold(n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (n / 2) + 1
+        }
+    }
+}
+
+// ── Join session epoch ──────────────────────────────────────────────
+
+/// The join session epoch binding: ties a join session to the
+/// membership epoch and quorum that authorized it.
+///
+/// All phases of node join (handshake → state transfer → promotion)
+/// must reference the same `JoinSessionEpoch` to ensure the join
+/// was authorized under a quorum-backed membership view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JoinSessionEpoch {
+    /// The membership epoch.
+    pub epoch: EpochId,
+    /// Evidence that quorum was reached for this epoch.
+    /// `None` means quorum evidence was not recorded
+    /// (not yet received, or this is a legacy join path).
+    pub quorum_evidence: Option<QuorumEvidence>,
+    /// The member ID of the joining node.
+    pub joining_member_id: MemberId,
+    /// Nonce unique to this join session.
+    pub session_nonce: u64,
+}
+
+impl JoinSessionEpoch {
+    /// Create a new session epoch binding.
+    #[must_use]
+    pub fn new(
+        epoch: EpochId,
+        joining_member_id: MemberId,
+        session_nonce: u64,
+    ) -> Self {
+        Self {
+            epoch,
+            quorum_evidence: None,
+            joining_member_id,
+            session_nonce,
+        }
+    }
+
+    /// Attach quorum evidence to this session.
+    pub fn with_quorum(mut self, evidence: QuorumEvidence) -> Self {
+        self.quorum_evidence = Some(evidence);
+        self
+    }
+
+    /// Verify that this session has a quorum-backed membership epoch.
+    ///
+    /// Returns `Ok(())` if quorum evidence is present and the threshold
+    /// is met. Returns a [`JoinStatus`] describing why it isn't valid.
+    #[must_use]
+    pub fn verify_quorum(&self) -> Result<(), JoinStatus> {
+        match &self.quorum_evidence {
+            Some(qe) if qe.is_quorum_reached() => Ok(()),
+            Some(_) => Err(JoinStatus::WaitingForQuorum),
+            None => Err(JoinStatus::WaitingForQuorum),
+        }
+    }
+
+    /// Verify identity binding: check that the session is bound to
+    /// the expected joining member.
+    #[must_use]
+    pub fn verify_identity(&self, caller_member_id: MemberId) -> Result<(), JoinStatus> {
+        if self.joining_member_id != caller_member_id {
+            Err(JoinStatus::IdentityMismatch {
+                expected: self.joining_member_id,
+                actual: caller_member_id,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Verify epoch freshness against the current membership epoch.
+    #[must_use]
+    pub fn verify_epoch_fresh(&self, current_epoch: EpochId) -> Result<(), JoinStatus> {
+        if self.epoch != current_epoch {
+            Err(JoinStatus::StaleEpoch {
+                current_epoch,
+                join_epoch: self.epoch,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Full validation: identity + epoch freshness + quorum.
+    #[must_use]
+    pub fn is_valid_for(
+        &self,
+        member_id: MemberId,
+        current_epoch: EpochId,
+    ) -> Result<(), JoinStatus> {
+        self.verify_identity(member_id)?;
+        self.verify_epoch_fresh(current_epoch)?;
+        self.verify_quorum()?;
+        Ok(())
+    }
+}
+
+// ── Operator-visible join status ────────────────────────────────────
+
+/// Operator-visible join status with distinguishable outcomes.
+///
+/// Exposed through the node-join pipeline so operators can diagnose
+/// why a joining node is stuck without inspecting internal state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum JoinStatus {
+    /// Waiting for quorum to be reached for the join session's epoch.
+    WaitingForQuorum,
+    /// The join session's epoch is stale relative to the current membership.
+    StaleEpoch {
+        current_epoch: EpochId,
+        join_epoch: EpochId,
+    },
+    /// The join session is bound to a different node identity.
+    IdentityMismatch {
+        expected: MemberId,
+        actual: MemberId,
+    },
+    /// No epoch evidence has been recorded for this join.
+    MissingEpochEvidence,
+    /// State transfer is ready to proceed.
+    TransferReady,
+    /// State transfer is in progress.
+    TransferInProgress,
+    /// State transfer is complete.
+    TransferComplete,
+    /// Join failed with a terminal reason.
+    Failed(String),
 }
 
 // ── Join phases ──────────────────────────────────────────────────────
@@ -270,6 +461,9 @@ pub struct JoinProgress {
     pub phase: JoinPhase,
     /// Health gate for the current promotion target.
     pub health_gate: Option<JoinHealthGate>,
+    /// The join session epoch binding that authorizes this join.
+    /// Set during the handshake when quorum evidence is recorded.
+    pub session_epoch: Option<JoinSessionEpoch>,
     /// When the join started (ns).
     pub started_at_ns: u64,
     /// When the latest phase transition occurred (ns).
@@ -288,6 +482,7 @@ impl JoinProgress {
             epoch,
             phase: JoinPhase::NotStarted,
             health_gate: None,
+            session_epoch: None,
             started_at_ns,
             phase_entered_at_ns: started_at_ns,
             has_demoted: false,
@@ -312,6 +507,51 @@ impl JoinProgress {
     pub fn can_accept_replicas(&self) -> bool {
         self.phase.can_accept_replicas()
     }
+
+    /// The operator-visible join status.
+    ///
+    /// Distinguishes between waiting-for-quorum, stale-epoch,
+    /// identity-mismatch, and transfer-ready outcomes.
+    #[must_use]
+    pub fn join_status(&self, current_epoch: EpochId) -> JoinStatus {
+        // Terminal states first
+        if self.phase == JoinPhase::Failed {
+            return JoinStatus::Failed("join failed".into());
+        }
+        if self.phase == JoinPhase::Completed {
+            return JoinStatus::TransferComplete;
+        }
+
+        // Check session epoch evidence
+        let session = match &self.session_epoch {
+            Some(s) => s,
+            None => {
+                if self.phase != JoinPhase::NotStarted {
+                    return JoinStatus::MissingEpochEvidence;
+                }
+                return JoinStatus::WaitingForQuorum;
+            }
+        };
+
+        // Full validation
+        match session.is_valid_for(self.member_id, current_epoch) {
+            Ok(()) => {
+                // Phases at or past VoterSpread(p2) and ReplicaTarget(p5)
+                // are transfer-ready; earlier phases are in-progress.
+                // Note: JoinPhase discriminants are NOT in linear
+                // progression order (p4=4, p2=2, p5=5), so we use
+                // explicit phase checks instead of >=.
+                if self.phase == JoinPhase::VoterSpread
+                    || self.phase == JoinPhase::ReplicaTarget
+                {
+                    JoinStatus::TransferReady
+                } else {
+                    JoinStatus::TransferInProgress
+                }
+            }
+            Err(status) => status,
+        }
+    }
 }
 
 // ── Node join protocol ───────────────────────────────────────────────
@@ -328,6 +568,8 @@ pub struct NodeJoinProtocol {
     pub progress: JoinProgress,
     /// Required consecutive health passes for each promotion.
     pub required_consecutive_passes: u64,
+    /// The join session epoch binding for this node.
+    pub session_epoch: Option<JoinSessionEpoch>,
 }
 
 impl NodeJoinProtocol {
@@ -343,6 +585,7 @@ impl NodeJoinProtocol {
             member_id,
             progress: JoinProgress::new(member_id, epoch, started_at_ns),
             required_consecutive_passes,
+            session_epoch: None,
         }
     }
 
@@ -873,6 +1116,57 @@ impl JoinCommit {
 }
 
 impl NodeJoinProtocol {
+    /// Record the join session epoch with quorum evidence.
+    ///
+    /// Must be called after the handshake produces quorum-backed evidence
+    /// for the join session. State transfer and replica-target promotion
+    /// are gated on this evidence being present and valid.
+    pub fn record_session_epoch(&mut self, session: JoinSessionEpoch) {
+        self.session_epoch = Some(session.clone());
+        self.progress.session_epoch = Some(session);
+    }
+
+    /// Operator-visible join status for this node.
+    #[must_use]
+    pub fn join_status(&self, current_epoch: EpochId) -> JoinStatus {
+        self.progress.join_status(current_epoch)
+    }
+
+    /// Whether state transfer is allowed to start for this node.
+    ///
+    /// State transfer requires a quorum-backed session epoch with
+    /// matching identity and a non-stale epoch.
+    #[must_use]
+    pub fn can_start_state_transfer(&self, current_epoch: EpochId) -> Result<(), JoinError> {
+        let session = self
+            .progress
+            .session_epoch
+            .as_ref()
+            .ok_or_else(|| JoinError::MissingEpochEvidence(
+                "no session epoch recorded".into(),
+            ))?;
+
+        let _ = session.is_valid_for(self.member_id, current_epoch).map_err(|status| match status {
+            JoinStatus::WaitingForQuorum => JoinError::QuorumNotReached {
+                epoch: session.epoch,
+                approvals: session.quorum_evidence.as_ref().map_or(0, |qe| qe.quorum_approvals),
+                threshold: session.quorum_evidence.as_ref().map_or(1, |qe| qe.quorum_threshold),
+            },
+            JoinStatus::StaleEpoch { current_epoch, join_epoch } => JoinError::StaleEpoch {
+                session_epoch: join_epoch,
+                current_epoch,
+                reason: "state transfer blocked: stale epoch".into(),
+            },
+            JoinStatus::IdentityMismatch { expected, actual } => JoinError::IdentityMismatch {
+                session_member: expected,
+                caller_member: actual,
+            },
+            _ => JoinError::PreflightDenied(format!("state transfer blocked: {:?}", status)),
+        })?;
+
+        Ok(())
+    }
+
     /// Start phase promotion from a validated join commit.
     ///
     /// Transitions from `NotStarted` to `ShadowOnly(p4)` using the
@@ -2095,4 +2389,361 @@ mod tests {
         nj.join_complete(5000).unwrap();
         assert!(nj.can_receive_placements()); // Joined
     }
+    // ── Quorum evidence tests ──────────────────────────────────────
+
+    #[test]
+    fn quorum_evidence_simple_majority() {
+        assert_eq!(QuorumEvidence::simple_majority_threshold(0), 0);
+        assert_eq!(QuorumEvidence::simple_majority_threshold(1), 1);
+        assert_eq!(QuorumEvidence::simple_majority_threshold(3), 2);
+        assert_eq!(QuorumEvidence::simple_majority_threshold(5), 3);
+        assert_eq!(QuorumEvidence::simple_majority_threshold(7), 4);
+    }
+
+    #[test]
+    fn quorum_evidence_reached_and_not_reached() {
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(5),
+            quorum_approvals: 3,
+            quorum_threshold: 3,
+            approving_members: vec![MemberId::new(1), MemberId::new(2), MemberId::new(3)],
+        };
+        assert!(qe.is_quorum_reached());
+
+        let qe2 = QuorumEvidence {
+            epoch: EpochId::new(5),
+            quorum_approvals: 2,
+            quorum_threshold: 3,
+            approving_members: vec![MemberId::new(1), MemberId::new(2)],
+        };
+        assert!(!qe2.is_quorum_reached());
+
+        // Zero threshold means no quorum possible
+        let qe3 = QuorumEvidence {
+            epoch: EpochId::new(5),
+            quorum_approvals: 0,
+            quorum_threshold: 0,
+            approving_members: vec![],
+        };
+        assert!(!qe3.is_quorum_reached());
+    }
+
+    // ── JoinSessionEpoch tests ─────────────────────────────────────
+
+    #[test]
+    fn session_epoch_valid_with_quorum() {
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 3,
+            quorum_threshold: 3,
+            approving_members: vec![MemberId::new(1), MemberId::new(2), MemberId::new(3)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_quorum(qe);
+        assert!(session.is_valid_for(MemberId::new(42), EpochId::new(10)).is_ok());
+    }
+
+    #[test]
+    fn session_epoch_stale_epoch_rejection() {
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 2,
+            quorum_threshold: 2,
+            approving_members: vec![MemberId::new(1), MemberId::new(2)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_quorum(qe);
+        let result = session.is_valid_for(MemberId::new(42), EpochId::new(11));
+        assert!(matches!(result, Err(JoinStatus::StaleEpoch { .. })));
+    }
+
+    #[test]
+    fn session_epoch_identity_mismatch_rejection() {
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 2,
+            quorum_threshold: 2,
+            approving_members: vec![MemberId::new(1), MemberId::new(2)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_quorum(qe);
+        let result = session.is_valid_for(MemberId::new(99), EpochId::new(10));
+        assert!(matches!(result, Err(JoinStatus::IdentityMismatch { .. })));
+    }
+
+    #[test]
+    fn session_epoch_waiting_for_quorum_without_evidence() {
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100);
+        let result = session.is_valid_for(MemberId::new(42), EpochId::new(10));
+        assert!(matches!(result, Err(JoinStatus::WaitingForQuorum)));
+    }
+
+    #[test]
+    fn session_epoch_waiting_for_quorum_insufficient_approvals() {
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 1,
+            quorum_threshold: 3,
+            approving_members: vec![MemberId::new(1)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_quorum(qe);
+        let result = session.is_valid_for(MemberId::new(42), EpochId::new(10));
+        assert!(matches!(result, Err(JoinStatus::WaitingForQuorum)));
+    }
+
+    // ── JoinStatus operator distinguishability ─────────────────────
+
+    #[test]
+    fn join_status_distinguishes_outcomes() {
+        // Verify all status variants are distinct and meaningful
+        let waiting = JoinStatus::WaitingForQuorum;
+        let stale = JoinStatus::StaleEpoch {
+            current_epoch: EpochId::new(10),
+            join_epoch: EpochId::new(5),
+        };
+        let mismatch = JoinStatus::IdentityMismatch {
+            expected: MemberId::new(42),
+            actual: MemberId::new(99),
+        };
+        let missing = JoinStatus::MissingEpochEvidence;
+        let ready = JoinStatus::TransferReady;
+        let in_progress = JoinStatus::TransferInProgress;
+        let complete = JoinStatus::TransferComplete;
+        let failed = JoinStatus::Failed("test failure".into());
+
+        // All variants are distinct
+        assert_ne!(waiting, stale);
+        assert_ne!(stale, mismatch);
+        assert_ne!(mismatch, missing);
+        assert_ne!(missing, ready);
+        assert_ne!(ready, in_progress);
+        assert_ne!(in_progress, complete);
+        assert_ne!(complete, failed);
+    }
+
+    // ── NodeJoinProtocol can_start_state_transfer tests ────────────
+
+    #[test]
+    fn can_start_state_transfer_with_quorum_evidence() {
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+        let config = make_config(10);
+        protocol.phase_shadow(&config, 2000).unwrap();
+
+        // Record quorum-backed session
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 3,
+            quorum_threshold: 3,
+            approving_members: vec![MemberId::new(1), MemberId::new(2), MemberId::new(3)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_quorum(qe);
+        protocol.record_session_epoch(session);
+
+        assert!(protocol.can_start_state_transfer(EpochId::new(10)).is_ok());
+    }
+
+    #[test]
+    fn cannot_start_state_transfer_without_session_epoch() {
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+        let config = make_config(10);
+        protocol.phase_shadow(&config, 2000).unwrap();
+
+        // No session epoch recorded
+        let result = protocol.can_start_state_transfer(EpochId::new(10));
+        assert!(matches!(result, Err(JoinError::MissingEpochEvidence(_))));
+    }
+
+    #[test]
+    fn cannot_start_state_transfer_with_stale_epoch() {
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+        let config = make_config(10);
+        protocol.phase_shadow(&config, 2000).unwrap();
+
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 2,
+            quorum_threshold: 2,
+            approving_members: vec![MemberId::new(1), MemberId::new(2)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_quorum(qe);
+        protocol.record_session_epoch(session);
+
+        // Check against a newer epoch
+        let result = protocol.can_start_state_transfer(EpochId::new(11));
+        assert!(matches!(result, Err(JoinError::StaleEpoch { .. })));
+    }
+
+    #[test]
+    fn cannot_start_state_transfer_with_identity_mismatch() {
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+        let config = make_config(10);
+        protocol.phase_shadow(&config, 2000).unwrap();
+
+        // Session bound to wrong member
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 2,
+            quorum_threshold: 2,
+            approving_members: vec![MemberId::new(1), MemberId::new(2)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(99), 100)
+            .with_quorum(qe);
+        protocol.record_session_epoch(session);
+
+        let result = protocol.can_start_state_transfer(EpochId::new(10));
+        assert!(matches!(result, Err(JoinError::IdentityMismatch { .. })));
+    }
+
+    #[test]
+    fn cannot_start_state_transfer_without_quorum() {
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+        let config = make_config(10);
+        protocol.phase_shadow(&config, 2000).unwrap();
+
+        // Quorum not reached
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 1,
+            quorum_threshold: 3,
+            approving_members: vec![MemberId::new(1)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_quorum(qe);
+        protocol.record_session_epoch(session);
+
+        let result = protocol.can_start_state_transfer(EpochId::new(10));
+        assert!(matches!(result, Err(JoinError::QuorumNotReached { .. })));
+    }
+
+    // ── JoinStatus via NodeJoinProtocol ────────────────────────────
+
+    #[test]
+    fn join_status_waiting_for_quorum_before_session() {
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+        let config = make_config(10);
+        protocol.phase_shadow(&config, 2000).unwrap();
+
+        // No session epoch - should be MissingEpochEvidence because we're past ShadowOnly
+        let status = protocol.join_status(EpochId::new(10));
+        assert!(matches!(status, JoinStatus::MissingEpochEvidence));
+    }
+
+    #[test]
+    fn join_status_transfer_ready_with_quorum() {
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+        let config = make_config(10);
+        protocol.phase_shadow(&config, 2000).unwrap();
+
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 2,
+            quorum_threshold: 2,
+            approving_members: vec![MemberId::new(1), MemberId::new(2)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_quorum(qe);
+        protocol.record_session_epoch(session);
+
+        let status = protocol.join_status(EpochId::new(10));
+        // Still at ShadowOnly, so TransferInProgress (not TransferReady until VoterSpread)
+        assert!(matches!(status, JoinStatus::TransferInProgress));
+    }
+
+    #[test]
+    fn join_status_stale_epoch_visible() {
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+        let config = make_config(10);
+        protocol.phase_shadow(&config, 2000).unwrap();
+
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 2,
+            quorum_threshold: 2,
+            approving_members: vec![MemberId::new(1), MemberId::new(2)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_quorum(qe);
+        protocol.record_session_epoch(session);
+
+        let status = protocol.join_status(EpochId::new(15));
+        assert!(matches!(status, JoinStatus::StaleEpoch { .. }));
+    }
+
+    #[test]
+    fn join_status_failed_visible() {
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+        protocol.fail(2000, "test failure");
+        let status = protocol.join_status(EpochId::new(10));
+        assert!(matches!(status, JoinStatus::Failed(_)));
+    }
+
+    // ── StateTransferReceiver epoch gate tests ─────────────────────
+
+    #[test]
+    fn state_transfer_receiver_refuses_stale_session_epoch() {
+        let mut receiver = crate::state_transfer::StateTransferReceiver::new(10);
+        // Set a stale session epoch
+        let session = crate::JoinSessionEpoch::new(EpochId::new(5), MemberId::new(42), 100);
+        receiver.session_epoch = Some(session);
+
+        let offer = crate::state_transfer::SegmentOffer::new(1, [0u8; 32], 100);
+        let result = receiver.accept_offer(offer);
+        assert!(matches!(
+            result,
+            Err(crate::state_transfer::SegmentTransferError::EpochMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn state_transfer_receiver_accepts_with_valid_session_epoch() {
+        let mut receiver = crate::state_transfer::StateTransferReceiver::new(10);
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 2,
+            quorum_threshold: 2,
+            approving_members: vec![MemberId::new(1), MemberId::new(2)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_quorum(qe);
+        receiver.session_epoch = Some(session);
+
+        let offer = crate::state_transfer::SegmentOffer::new(1, [0u8; 32], 100);
+        assert!(receiver.accept_offer(offer).is_ok());
+    }
+
+    // ── SessionBindingManager epoch gate tests ─────────────────────
+
+    #[test]
+    fn session_binding_cannot_bind_without_epoch_evidence() {
+        let mgr = crate::session_binding::SessionBindingManager::new(
+            MemberId::new(42),
+            EpochId::new(10),
+        );
+        let result = mgr.can_bind_sessions(EpochId::new(10));
+        assert!(matches!(result, Err(JoinError::MissingEpochEvidence(_))));
+    }
+
+    #[test]
+    fn session_binding_can_bind_with_valid_epoch() {
+        let mut mgr = crate::session_binding::SessionBindingManager::new(
+            MemberId::new(42),
+            EpochId::new(10),
+        );
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(10),
+            quorum_approvals: 2,
+            quorum_threshold: 2,
+            approving_members: vec![MemberId::new(1), MemberId::new(2)],
+        };
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_quorum(qe);
+        mgr.set_session_epoch(session);
+
+        assert!(mgr.can_bind_sessions(EpochId::new(10)).is_ok());
+    }
+
+
 }

@@ -14,7 +14,7 @@ use super::JoinError;
 // ── NodeJoinState ────────────────────────────────────────────────────
 
 /// High-level join lifecycle state.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum NodeJoinState {
     /// Node has not started joining.
     Idle = 0,
@@ -79,6 +79,9 @@ pub struct JoinToken {
     pub issued_at_ns: u64,
     /// When the token expires (nanoseconds since some epoch).
     pub expires_at_ns: u64,
+    /// The membership epoch this token authorizes the join under.
+    /// `None` for legacy tokens that predate epoch binding.
+    pub epoch: Option<EpochId>,
 }
 
 impl JoinToken {
@@ -97,7 +100,15 @@ impl JoinToken {
             bootstrap_peer,
             issued_at_ns,
             expires_at_ns: issued_at_ns.saturating_add(ttl_ns),
+            epoch: None,
         }
+    }
+
+    /// Attach an epoch binding to this token.
+    #[must_use]
+    pub fn with_epoch(mut self, epoch: EpochId) -> Self {
+        self.epoch = Some(epoch);
+        self
     }
 
     /// Whether the token has expired at the given time.
@@ -156,6 +167,9 @@ pub struct NodeJoin {
     pub current_epoch: EpochId,
     /// The bootstrap peer being used for this join.
     pub bootstrap_peer: Option<MemberId>,
+    /// The join session epoch binding that authorizes this join.
+    /// Set when the token is accepted or the join commit is validated.
+    pub session_epoch: Option<crate::JoinSessionEpoch>,
 }
 
 impl NodeJoin {
@@ -171,6 +185,7 @@ impl NodeJoin {
             state_entered_at_ns: started_at_ns,
             current_epoch: epoch,
             bootstrap_peer: None,
+            session_epoch: None,
         }
     }
 
@@ -216,6 +231,16 @@ impl NodeJoin {
                 "token invalid: expired or wrong member".into(),
             ));
         }
+
+        // Record the session epoch binding from the token.
+        let join_epoch = token.epoch.unwrap_or(self.current_epoch);
+        self.session_epoch = Some(crate::JoinSessionEpoch::new(
+            join_epoch,
+            self.member_id,
+            token.nonce,
+        ));
+        self.current_epoch = join_epoch;
+
         self.token = Some(token);
         self.state = NodeJoinState::Bootstrapping;
         self.state_entered_at_ns = at_ns;
@@ -307,6 +332,41 @@ impl NodeJoin {
     pub fn can_receive_placements(&self) -> bool {
         self.state.can_receive_placements()
     }
+
+    /// Operator-visible join status for this node.
+    ///
+    /// Distinguishes between waiting-for-quorum, stale-epoch,
+    /// identity-mismatch, transfer-ready, and terminal outcomes.
+    #[must_use]
+    pub fn join_status(&self) -> crate::JoinStatus {
+        if self.state == NodeJoinState::Failed {
+            return crate::JoinStatus::Failed("join lifecycle failed".into());
+        }
+        if self.state == NodeJoinState::Joined {
+            return crate::JoinStatus::TransferComplete;
+        }
+
+        let session = match &self.session_epoch {
+            Some(s) => s,
+            None => {
+                if self.state >= NodeJoinState::Bootstrapping {
+                    return crate::JoinStatus::MissingEpochEvidence;
+                }
+                return crate::JoinStatus::WaitingForQuorum;
+            }
+        };
+
+        match session.is_valid_for(self.member_id, self.current_epoch) {
+            Ok(()) => {
+                if self.state >= NodeJoinState::CatchingUp {
+                    crate::JoinStatus::TransferInProgress
+                } else {
+                    crate::JoinStatus::TransferReady
+                }
+            }
+            Err(status) => status,
+        }
+    }
 }
 
 // ── Catch-up plan and progress ────────────────────────────────────────
@@ -388,6 +448,13 @@ impl NodeJoin {
                 self.state
             )));
         }
+
+        // Record the session epoch binding from the join commit.
+        self.session_epoch = Some(crate::JoinSessionEpoch::new(
+            commit.epoch,
+            self.member_id,
+            at_ns,
+        ));
 
         self.state = NodeJoinState::Bootstrapping;
         self.state_entered_at_ns = at_ns;
