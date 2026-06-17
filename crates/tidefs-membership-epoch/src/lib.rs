@@ -148,6 +148,45 @@ pub struct ReceiptId(pub u64);
 impl ReceiptId {
     pub const ZERO: Self = Self(0);
 }
+// ---------------------------------------------------------------------------
+// DatasetMountIdentity -- committed dataset mount identity token
+// ---------------------------------------------------------------------------
+
+/// Committed dataset mount identity that binds lease lifecycle to a specific
+/// mount instance and membership epoch.
+///
+/// A lease acquired under one mount identity is invalid after a remount
+/// (different `mount_id`) or after the membership epoch advances, even if
+/// the lease interval has not expired. This prevents conflicting writes from
+/// stale lease holders after membership or mount transitions.
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd,
+)]
+pub struct DatasetMountIdentity {
+    /// The dataset this mount belongs to.
+    pub dataset_id: u64,
+    /// Unique id for this mount instance (generation counter incremented on remount).
+    pub mount_id: u64,
+    /// The epoch during which this mount identity was committed.
+    pub committed_epoch: u64,
+}
+
+impl DatasetMountIdentity {
+    pub const ZERO: Self = Self {
+        dataset_id: 0,
+        mount_id: 0,
+        committed_epoch: 0,
+    };
+
+    #[must_use]
+    pub const fn new(dataset_id: u64, mount_id: u64, committed_epoch: u64) -> Self {
+        Self {
+            dataset_id,
+            mount_id,
+            committed_epoch,
+        }
+    }
+}
 
 #[derive(
     Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd,

@@ -5,7 +5,9 @@
 
 use crate::types::*;
 use std::collections::BTreeMap;
-use tidefs_membership_epoch::{ClusterMemberRecord, EpochId, HealthClass, MemberClass, MemberId};
+use tidefs_membership_epoch::{
+    ClusterMemberRecord, DatasetMountIdentity, EpochId, HealthClass, MemberClass, MemberId,
+};
 
 #[derive(Clone, Debug)]
 pub struct LeaseAuthorityConfig {
@@ -14,6 +16,7 @@ pub struct LeaseAuthorityConfig {
     pub default_term_millis: u64,
     pub grace_period_denominator: u64,
     pub current_epoch: EpochId,
+    pub current_mount_identity: DatasetMountIdentity,
     pub voters: Vec<ClusterMemberRecord>,
     pub witness_pubkeys: BTreeMap<MemberId, Vec<u8>>,
 }
@@ -26,6 +29,7 @@ impl Default for LeaseAuthorityConfig {
             default_term_millis: 30_000,
             grace_period_denominator: 8,
             current_epoch: EpochId::new(1),
+            current_mount_identity: DatasetMountIdentity::ZERO,
             voters: Vec::new(),
             witness_pubkeys: BTreeMap::new(),
         }
@@ -39,6 +43,7 @@ pub struct LeaseRequest {
     pub domain: LeaseDomain,
     pub requester_id: MemberId,
     pub term_millis: Option<u64>,
+    pub mount_identity: DatasetMountIdentity,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +109,13 @@ impl LeaseAuthority {
                 }
             }
         };
+
+        // Verify mount identity matches current committed mount.
+        if request.mount_identity != self.config.current_mount_identity {
+            return LeaseIssuanceResult::DeniedNotVoter {
+                requester_id: request.requester_id,
+            };
+        }
         if voter.member_class != MemberClass::Voter {
             return LeaseIssuanceResult::DeniedNotVoter {
                 requester_id: request.requester_id,
@@ -164,6 +176,7 @@ impl LeaseAuthority {
             term,
             now,
             self.config.current_epoch,
+            request.mount_identity,
             request.lease_id,
             confirmations,
             total,

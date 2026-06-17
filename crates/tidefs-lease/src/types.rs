@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tidefs_membership_epoch::{EpochId, MemberId, ReceiptId};
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId, ReceiptId};
 
 // ---------------------------------------------------------------------------
 // Lease class
@@ -158,6 +158,7 @@ pub struct LeaseGrant {
     pub renew_by_millis: u64,
     pub grace_period_millis: u64,
     pub epoch: EpochId,
+    pub mount_identity: DatasetMountIdentity,
     pub version: u64,
     pub witness_set_id: u64,
     pub witness_confirmations: usize,
@@ -174,6 +175,7 @@ impl LeaseGrant {
         term_millis: u64,
         granted_at_millis: u64,
         epoch: EpochId,
+        mount_identity: DatasetMountIdentity,
         witness_set_id: u64,
         witness_confirmations: usize,
         witness_total: usize,
@@ -194,6 +196,7 @@ impl LeaseGrant {
             renew_by_millis: renew_by,
             grace_period_millis: grace_period,
             epoch,
+            mount_identity,
             version: 1,
             witness_set_id,
             witness_confirmations,
@@ -310,6 +313,11 @@ pub enum LeaseError {
     HolderMismatch {
         holder_id: u64,
         lease_holder_id: u64,
+    },
+    #[error("mount identity mismatch: lease mount {lease_mount:?} != current mount {current_mount:?}")]
+    MountIdentityMismatch {
+        lease_mount: DatasetMountIdentity,
+        current_mount: DatasetMountIdentity,
     },
     #[error("lease {lease_id} is not in epoch {lease_epoch:?}, current is {current_epoch:?}")]
     EpochMismatch {

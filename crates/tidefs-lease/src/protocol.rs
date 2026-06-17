@@ -20,7 +20,7 @@ use tidefs_binary_schema_core::{
     BinarySchemaError, ChecksumProfile, DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion,
 };
 use tidefs_binary_schema_framing::EnvelopeBuilder;
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 use crate::lease_state_machine::{LeaseHolder, LeaseStateMachine, TransitionError};
 use crate::types::{LeaseClass, LeaseDomain, LeaseError, LeaseGrant, LeaseLifecycle};
@@ -229,6 +229,8 @@ pub enum LeaseProtocolError {
     EpochNotAdvanced(EpochId, EpochId),
     #[error("state machine transition error: {0:?}")]
     Transition(TransitionError),
+    #[error("lease {0} epoch {1:?} does not match current {2:?}")]
+    EpochMismatch(u64, EpochId, EpochId),
     #[error("codec error: {0:?}")]
     Codec(BinarySchemaError),
 }
@@ -251,6 +253,7 @@ impl From<BinarySchemaError> for LeaseProtocolError {
 /// preventing split-brain writes across epoch boundaries.
 pub struct LeaseProtocol {
     current_epoch: EpochId,
+    current_mount_identity: DatasetMountIdentity,
     machines: BTreeMap<u64, LeaseStateMachine>,
     grants: BTreeMap<u64, LeaseGrant>,
     next_lease_id: u64,
@@ -258,9 +261,10 @@ pub struct LeaseProtocol {
 
 impl LeaseProtocol {
     /// Create a new protocol instance at the given epoch.
-    pub fn new(current_epoch: EpochId) -> Self {
+    pub fn new(current_epoch: EpochId, mount_identity: DatasetMountIdentity) -> Self {
         Self {
             current_epoch,
+            current_mount_identity: mount_identity,
             machines: BTreeMap::new(),
             grants: BTreeMap::new(),
             next_lease_id: 1,
@@ -270,6 +274,11 @@ impl LeaseProtocol {
     /// Return the current membership epoch.
     pub fn current_epoch(&self) -> EpochId {
         self.current_epoch
+    }
+
+    /// Return the current dataset mount identity.
+    pub fn current_mount_identity(&self) -> DatasetMountIdentity {
+        self.current_mount_identity
     }
 
     /// Return the number of tracked active leases.
@@ -308,6 +317,7 @@ impl LeaseProtocol {
         domain: LeaseDomain,
         holder_id: MemberId,
         term_millis: u64,
+        mount_identity: DatasetMountIdentity,
     ) -> Result<LeaseGrant, LeaseProtocolError> {
         let lease_id = self.next_id();
         let now_millis = now_millis();
@@ -321,6 +331,7 @@ impl LeaseProtocol {
             term_millis,
             now_millis,
             self.current_epoch,
+            mount_identity,
             0,
             0,
             0,
@@ -348,6 +359,24 @@ impl LeaseProtocol {
         holder_id: MemberId,
         term_millis: u64,
     ) -> Result<LeaseGrant, LeaseProtocolError> {
+        // Reject renewal if the lease epoch or mount identity do not match.
+        {
+            let grant = self
+                .grants
+                .get(&lease_id)
+                .ok_or(LeaseProtocolError::NotFound(lease_id))?;
+            if grant.epoch != self.current_epoch {
+                return Err(LeaseProtocolError::EpochMismatch(
+                    lease_id,
+                    grant.epoch,
+                    self.current_epoch,
+                ));
+            }
+            if grant.mount_identity != self.current_mount_identity {
+                return Err(LeaseProtocolError::NotFound(lease_id));
+            }
+        }
+
         let sm = self
             .machines
             .get_mut(&lease_id)
@@ -419,6 +448,28 @@ impl LeaseProtocol {
     /// Revokes all active leases whose epoch is older than new_epoch.
     /// Returns the IDs of revoked leases. This is the epoch-bound
     /// invalidation guarantee: no lease from an old epoch survives.
+    /// Invalidate all leases that were granted under a different mount identity.
+    ///
+    /// Called after a dataset remount to fence any leases from the previous mount,
+    /// even if their time interval has not expired.
+    pub fn remount_invalidate(
+        &mut self,
+        new_mount_identity: DatasetMountIdentity,
+    ) -> Vec<u64> {
+        let mut revoked = Vec::new();
+        for (lease_id, grant) in &mut self.grants {
+            if grant.mount_identity != new_mount_identity && !grant.lifecycle.is_terminal() {
+                grant.lifecycle = LeaseLifecycle::Fenced;
+                revoked.push(*lease_id);
+                if let Some(sm) = self.machines.get_mut(lease_id) {
+                    let _ = sm.fence();
+                }
+            }
+        }
+        self.current_mount_identity = new_mount_identity;
+        revoked
+    }
+
     pub fn advance_epoch(&mut self, new_epoch: EpochId) -> Result<Vec<u64>, LeaseProtocolError> {
         if new_epoch <= self.current_epoch {
             return Err(LeaseProtocolError::EpochNotAdvanced(
@@ -532,6 +583,7 @@ mod tests {
             30_000,
             1_000_000,
             epoch(1),
+            DatasetMountIdentity::new(1, 1, 1),
             0,
             0,
             0,
@@ -699,9 +751,9 @@ mod tests {
 
     #[test]
     fn test_grant_lease_basic() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         let grant = proto
-            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000)
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         assert_eq!(grant.lease_id, 1);
         assert_eq!(grant.holder_id, m(7));
@@ -712,12 +764,12 @@ mod tests {
 
     #[test]
     fn test_grant_lease_multiple() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         proto
-            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 1), m(10), 30_000)
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 1), m(10), 30_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         proto
-            .grant_lease(LeaseClass::Shared, inode_domain(1, 2), m(20), 15_000)
+            .grant_lease(LeaseClass::Shared, inode_domain(1, 2), m(20), 15_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         assert_eq!(proto.active_count(), 2);
         assert!(proto.is_active(1));
@@ -728,9 +780,9 @@ mod tests {
 
     #[test]
     fn test_renew_basic() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         let g = proto
-            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000)
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         std::thread::sleep(Duration::from_millis(5));
         let renewed = proto.renew_lease(g.lease_id, m(7), 60_000).unwrap();
@@ -741,9 +793,9 @@ mod tests {
 
     #[test]
     fn test_renew_wrong_holder() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         let g = proto
-            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000)
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         let result = proto.renew_lease(g.lease_id, m(99), 30_000);
         assert!(matches!(
@@ -754,7 +806,7 @@ mod tests {
 
     #[test]
     fn test_renew_not_found() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         let result = proto.renew_lease(999, m(1), 30_000);
         assert!(matches!(result, Err(LeaseProtocolError::NotFound(999))));
     }
@@ -763,9 +815,9 @@ mod tests {
 
     #[test]
     fn test_revoke_basic() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         let g = proto
-            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000)
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         proto.revoke_lease(g.lease_id).unwrap();
         assert!(!proto.is_active(g.lease_id));
@@ -777,7 +829,7 @@ mod tests {
 
     #[test]
     fn test_revoke_not_found() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         assert!(matches!(
             proto.revoke_lease(999),
             Err(LeaseProtocolError::NotFound(999))
@@ -786,9 +838,9 @@ mod tests {
 
     #[test]
     fn test_revoke_twice_fails() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         let g = proto
-            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000)
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         proto.revoke_lease(g.lease_id).unwrap();
         let result = proto.revoke_lease(g.lease_id);
@@ -799,12 +851,12 @@ mod tests {
 
     #[test]
     fn test_advance_epoch_revokes_all_active() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         let g1 = proto
-            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 1), m(10), 30_000)
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 1), m(10), 30_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         let g2 = proto
-            .grant_lease(LeaseClass::Shared, inode_domain(1, 2), m(20), 30_000)
+            .grant_lease(LeaseClass::Shared, inode_domain(1, 2), m(20), 30_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
 
         let revoked = proto.advance_epoch(epoch(2)).unwrap();
@@ -817,15 +869,15 @@ mod tests {
 
     #[test]
     fn test_advance_epoch_new_leases_survive() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         proto
-            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 1), m(10), 30_000)
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 1), m(10), 30_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         proto.advance_epoch(epoch(2)).unwrap();
         assert_eq!(proto.active_count(), 0);
 
         let g = proto
-            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 2), m(10), 30_000)
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 2), m(10), 30_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         assert_eq!(g.epoch, epoch(2));
         assert_eq!(proto.active_count(), 1);
@@ -833,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_advance_epoch_same_or_backward_fails() {
-        let mut proto = LeaseProtocol::new(epoch(5));
+        let mut proto = LeaseProtocol::new(epoch(5), DatasetMountIdentity::new(1, 1, 5));
         assert!(proto.advance_epoch(epoch(5)).is_err());
         assert!(proto.advance_epoch(epoch(3)).is_err());
     }
@@ -842,13 +894,14 @@ mod tests {
 
     #[test]
     fn test_tick_all_expires_stale() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         proto
             .grant_lease(
                 LeaseClass::Exclusive,
                 inode_domain(1, 42),
                 m(7),
                 1, // 1ms
+                DatasetMountIdentity::new(1, 1, 1),
             )
             .unwrap();
         std::thread::sleep(Duration::from_millis(5));
@@ -859,9 +912,9 @@ mod tests {
 
     #[test]
     fn test_tick_all_noop_on_active() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         proto
-            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 60_000)
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 60_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         assert!(proto.tick_all().is_empty());
         assert_eq!(proto.active_count(), 1);
@@ -871,9 +924,9 @@ mod tests {
 
     #[test]
     fn test_protocol_encode_decode_roundtrip() {
-        let mut proto = LeaseProtocol::new(epoch(1));
+        let mut proto = LeaseProtocol::new(epoch(1), DatasetMountIdentity::new(1, 1, 1));
         let grant = proto
-            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000)
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000, DatasetMountIdentity::new(1, 1, 1))
             .unwrap();
         let msg = LeaseMessage::Grant(grant);
         let encoded = LeaseProtocol::encode_message(&msg).unwrap();
@@ -908,4 +961,134 @@ mod tests {
             assert_eq!(&decoded, msg);
         }
     }
+    // ── Issue #469: mount-identity and epoch binding ──────────────────
+
+    fn mount_id(dataset_id: u64, mount_id: u64, committed_epoch: u64) -> DatasetMountIdentity {
+        DatasetMountIdentity::new(dataset_id, mount_id, committed_epoch)
+    }
+
+    /// AC1: Lease acquisition requires a committed dataset mount identity token.
+    #[test]
+    fn test_lease_acquisition_with_correct_mount_identity() {
+        let mi = mount_id(1, 1, 1);
+        let mut proto = LeaseProtocol::new(epoch(1), mi);
+        let grant = proto
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000, mi)
+            .expect("grant should succeed with matching mount identity");
+        assert_eq!(grant.mount_identity, mi);
+        assert_eq!(grant.epoch, epoch(1));
+        assert!(proto.is_active(grant.lease_id));
+    }
+
+    /// AC2: Lease renewal is rejected if the current membership epoch
+    /// does not match the lease epoch.
+    #[test]
+    fn test_lease_rejection_after_epoch_change() {
+        let mi = mount_id(1, 1, 1);
+        let mut proto = LeaseProtocol::new(epoch(1), mi);
+        let grant = proto
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000, mi)
+            .unwrap();
+        // Advance the epoch — all old leases are revoked.
+        proto.advance_epoch(epoch(2)).unwrap();
+        // The lease should no longer be active.
+        assert!(!proto.is_active(grant.lease_id));
+        // A new lease with the new epoch should succeed.
+        let g2 = proto
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 99), m(7), 30_000, mi)
+            .unwrap();
+        assert_eq!(g2.epoch, epoch(2));
+        assert!(proto.is_active(g2.lease_id));
+    }
+
+    /// AC2 (renewal rejection): renewing a lease from an old epoch fails.
+    #[test]
+    fn test_renewal_rejected_on_epoch_mismatch() {
+        let mi = mount_id(1, 1, 1);
+        let mut proto = LeaseProtocol::new(epoch(1), mi);
+        let grant = proto
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000, mi)
+            .unwrap();
+        // Advance epoch — should fence all old leases.
+        proto.advance_epoch(epoch(2)).unwrap();
+        // Attempting to renew the old lease should fail.
+        let result = proto.renew_lease(grant.lease_id, m(7), 30_000);
+        assert!(result.is_err(), "renewal should be rejected after epoch change");
+    }
+
+    /// AC3: A lease from a previous mount is invalid after remount,
+    /// even if the lease interval has not expired.
+    #[test]
+    fn test_lease_invalidation_after_remount() {
+        let mi1 = mount_id(1, 1, 1);
+        let mut proto = LeaseProtocol::new(epoch(1), mi1);
+        let grant = proto
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 60_000, mi1)
+            .unwrap();
+        assert!(proto.is_active(grant.lease_id));
+        // Remount with a new mount identity (same epoch, different mount_id).
+        let mi2 = mount_id(1, 2, 1);
+        let revoked = proto.remount_invalidate(mi2);
+        assert!(revoked.contains(&grant.lease_id));
+        assert!(!proto.is_active(grant.lease_id));
+        assert_eq!(proto.current_mount_identity(), mi2);
+    }
+
+    /// AC3 (continued): after remount, new leases use the new mount identity.
+    #[test]
+    fn test_new_leases_use_current_mount_after_remount() {
+        let mi1 = mount_id(1, 1, 1);
+        let mi2 = mount_id(1, 2, 1);
+        let mut proto = LeaseProtocol::new(epoch(1), mi1);
+        proto.remount_invalidate(mi2);
+        let g = proto
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 30_000, mi2)
+            .expect("grant should succeed with current mount identity");
+        assert_eq!(g.mount_identity, mi2);
+    }
+
+    /// AC4: Leases are persisted with mount-identity and epoch binding
+    /// (verified through encode/decode round-trip maintaining both fields).
+    #[test]
+    fn test_lease_persistence_with_identity_binding() {
+        let mi = mount_id(1, 42, 7);
+        let mut proto = LeaseProtocol::new(epoch(7), mi);
+        let grant = proto
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 100), m(7), 30_000, mi)
+            .unwrap();
+        // Encode and decode the grant message.
+        let msg = LeaseMessage::Grant(grant.clone());
+        let encoded = LeaseProtocol::encode_message(&msg).unwrap();
+        let decoded = LeaseProtocol::decode_message(&encoded).unwrap();
+        match decoded {
+            LeaseMessage::Grant(decoded_grant) => {
+                assert_eq!(decoded_grant.mount_identity, mi);
+                assert_eq!(decoded_grant.epoch, epoch(7));
+                assert_eq!(decoded_grant.lease_id, grant.lease_id);
+            }
+            other => panic!("expected Grant, got {other:?}"),
+        }
+    }
+
+    /// AC4 (continued): a lease decoded from persistence is still invalid
+    /// after remount, even though it was encoded correctly.
+    #[test]
+    fn test_persisted_lease_invalid_after_remount() {
+        let mi1 = mount_id(1, 1, 1);
+        let mi2 = mount_id(1, 2, 1);
+        // Create and encode a lease under mi1.
+        let mut proto1 = LeaseProtocol::new(epoch(1), mi1);
+        let grant = proto1
+            .grant_lease(LeaseClass::Exclusive, inode_domain(1, 42), m(7), 60_000, mi1)
+            .unwrap();
+        let encoded = LeaseProtocol::encode_message(&LeaseMessage::Grant(grant.clone())).unwrap();
+        // A new protocol instance with mi2 should recognize the persisted lease as stale.
+        let proto2 = LeaseProtocol::new(epoch(1), mi2);
+        let decoded = LeaseProtocol::decode_message(&encoded).unwrap();
+        if let LeaseMessage::Grant(decoded_grant) = decoded {
+            assert_eq!(decoded_grant.mount_identity, mi1);
+            assert_ne!(decoded_grant.mount_identity, proto2.current_mount_identity());
+        }
+    }
+
 }

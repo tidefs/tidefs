@@ -1,3 +1,4 @@
+use tidefs_membership_epoch::DatasetMountIdentity;
 use super::*;
 use tidefs_membership_epoch::{EpochId, MemberId, ReceiptId};
 
@@ -65,6 +66,7 @@ fn test_lease_grant_with_subtree_domain() {
         60_000,
         1_000_000,
         EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
         200,
         3,
         3,
@@ -91,6 +93,7 @@ fn test_lease_grant_with_byte_range_domain() {
         120_000,
         0,
         EpochId::new(2),
+            DatasetMountIdentity::new(1, 1, 1),
         300,
         3,
         3,
@@ -522,6 +525,7 @@ fn make_grant(id: u64, term_millis: u64, granted_at_millis: u64) -> LeaseGrant {
         term_millis,
         granted_at_millis,
         EpochId::new(1),
+            DatasetMountIdentity::new(1, 1, 1),
         id * 100,
         3,
         3,
