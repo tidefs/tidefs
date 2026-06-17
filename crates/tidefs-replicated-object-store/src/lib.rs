@@ -157,6 +157,10 @@ pub struct DegradedReadStats {
     pub total_degraded_reads: u64,
     /// Per-replica hit counts. Index 0 = first replica.
     pub replica_hits: Vec<u64>,
+    /// Degraded reads validated against durable placement receipt authority.
+    pub receipt_validated_reads: u64,
+    /// Receipt validation failures during degraded reads.
+    pub receipt_validation_failures: u64,
     /// Cumulative latency per replica in microseconds.
     pub replica_latency_us: Vec<u64>,
     /// Count of latency samples per replica.
@@ -173,6 +177,8 @@ impl DegradedReadStats {
     fn with_replica_count(n: usize) -> Self {
         Self {
             replica_hits: vec![0; n],
+            receipt_validated_reads: 0,
+            receipt_validation_failures: 0,
             replica_latency_us: vec![0; n],
             replica_latency_samples: vec![0; n],
             ..Default::default()
@@ -214,17 +220,26 @@ impl DegradedReadStats {
     #[must_use]
     pub fn report(&self) -> String {
         let mut s = format!(
-            "degraded reads: {} total | repairs: {} attempted / {} succeeded / {} failed",
+            "degraded reads: {} total ({} receipt-validated, {} receipt-failures) | repairs: {} attempted / {} succeeded / {} failed",
             self.total_degraded_reads,
+            self.receipt_validated_reads,
+            self.receipt_validation_failures,
             self.repair_attempts,
             self.repair_successes,
             self.repair_failures,
         );
+        let has_replica_hits = self.replica_hits.iter().any(|&h| h > 0);
+        if has_replica_hits {
+            s.push_str(" | replicas:");
+        }
         for (i, &hits) in self.replica_hits.iter().enumerate() {
             if hits > 0 {
                 let avg = self.avg_latency_us(i).unwrap_or(0.0);
                 s.push_str(&format!("\n  replica {i}: {hits} hits, avg {avg:.1} µs"));
             }
+        }
+        if has_replica_hits {
+            s.push('\n');
         }
         s
     }
@@ -683,6 +698,81 @@ impl ReplicatedObjectStore {
     pub fn get_named(&self, name: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, String> {
         let key = ObjectKey::from_name(&name);
         self.get_inner(key)
+    }
+
+    /// Get an object by name with receipt authority validation.
+    ///
+    /// Behaves like [`Self::get_named`] but additionally validates the
+    /// returned payload against the provided placement receipt reference.
+    /// This is the degraded-read path that consumes durable receipt authority
+    /// (#356 / #18) rather than trusting replica bytes alone.
+    ///
+    /// When `receipt` is `Some`, the returned payload (whether from primary,
+    /// quorum runtime, or replica fallback) is validated against the receipt's
+    /// digest, length, and policy before it is returned.  When `receipt` is
+    /// `None`, this method behaves identically to [`Self::get_named`].
+    pub fn get_named_with_receipt(
+        &self,
+        name: impl AsRef<[u8]>,
+        receipt: Option<PlacementReceiptRef>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let key = ObjectKey::from_name(&name);
+        let data = self.get_inner(key)?;
+        match (data, receipt) {
+            (Some(payload), Some(receipt_ref)) => {
+                self.validate_degraded_read_receipt(&receipt_ref, &payload)?;
+                Ok(Some(payload))
+            }
+            (data, _) => Ok(data),
+        }
+    }
+
+    /// Validate a degraded-read payload against a placement receipt.
+    ///
+    /// This is the core receipt-authority check for the local degraded-read
+    /// path (#356 / #18).  It verifies that the receipt is non-synthetic,
+    /// the policy is well-formed, the payload length matches, and the
+    /// BLAKE3 digest matches.  On failure, the degraded-read receipt-failure
+    /// counter is incremented and an error is returned so the caller can
+    /// fall back to the next replica or fail the read.
+    fn validate_degraded_read_receipt(
+        &self,
+        receipt: &PlacementReceiptRef,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        if receipt.is_synthetic() {
+            self.degraded_read_stats
+                .borrow_mut()
+                .receipt_validation_failures += 1;
+            return Err("degraded-read receipt is synthetic (generation zero)".into());
+        }
+        if !receipt.redundancy_policy.is_well_formed() {
+            self.degraded_read_stats
+                .borrow_mut()
+                .receipt_validation_failures += 1;
+            return Err("degraded-read receipt has malformed redundancy policy".into());
+        }
+        if receipt.payload_len != payload.len() as u64 {
+            self.degraded_read_stats
+                .borrow_mut()
+                .receipt_validation_failures += 1;
+            return Err(format!(
+                "degraded-read receipt length mismatch: receipt={} actual={}",
+                receipt.payload_len,
+                payload.len()
+            ));
+        }
+        let actual_digest: [u8; 32] = blake3::hash(payload).into();
+        if receipt.payload_digest != actual_digest {
+            self.degraded_read_stats
+                .borrow_mut()
+                .receipt_validation_failures += 1;
+            return Err("degraded-read receipt digest mismatch".into());
+        }
+        self.degraded_read_stats
+            .borrow_mut()
+            .receipt_validated_reads += 1;
+        Ok(())
     }
 
     /// Get an object by key directly. Tries primary first, then replicas.
