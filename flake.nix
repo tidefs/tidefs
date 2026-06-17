@@ -4300,8 +4300,10 @@ EOF
             pkgs.cpio
             pkgs.qemu
             self.packages.${system}.kernelFsyncValidation
+            self.packages.${system}.tidefsPosixVfsKmod
           ] ''
-            exec ${self.packages.${system}.kernelFsyncValidation}/bin/tidefs-kmod-fsync-validation "$@"
+            exec ${self.packages.${system}.kernelFsyncValidation}/bin/tidefs-kmod-fsync-validation \
+              --module ${self.packages.${system}.tidefsPosixVfsKmod}/tidefs_posix_vfs.ko "$@"
           '';
 
           kernel-inotify-fanotify-validation = script "tidefs-kmod-inotify-fanotify-validation" [

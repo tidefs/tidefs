@@ -1,0 +1,76 @@
+name: Kernel fsync/syncfs validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_seconds:
+        description: QEMU boot timeout per phase in seconds
+        required: false
+        default: "600"
+        type: string
+      pool_size_mb:
+        description: Backing pool disk size in MB
+        required: false
+        default: "256"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fsync:
+    name: Kernel fsync/syncfs durability row
+    runs-on: [self-hosted, linux, x64, tidefs, nix, kvm]
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Host preflight
+        run: |
+          test -c /dev/kvm || { echo "BLOCKED: /dev/kvm not available on this runner"; exit 1; }
+          echo "KVM available: $(ls -la /dev/kvm)"
+
+      - name: Prepare validation output
+        run: |
+          rm -rf /tmp/tidefs-kmod-fsync-validation /tmp/tidefs-validation/kernel-fsync-validation
+          mkdir -p /tmp/tidefs-validation/kernel-fsync-validation
+
+      - name: Run kernel fsync/syncfs validation
+        env:
+          TIDEFS_FSYNC_SUMMARY_DIR: /tmp/tidefs-validation/kernel-fsync-validation
+        run: |
+          timeout --foreground 7200s nix run .#kernel-fsync-validation -- \
+            --timeout "${{ inputs.timeout_seconds }}" \
+            --pool-size "${{ inputs.pool_size_mb }}"
+
+      - name: Upload fsync validation logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-fsync-validation
+          path: |
+            /tmp/tidefs-kmod-fsync-validation/**
+            /tmp/tidefs-validation/kernel-fsync-validation/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Report summary
+        if: always()
+        run: |
+          echo "## Kernel fsync/syncfs durability validation" >> "$GITHUB_STEP_SUMMARY"
+          latest=$(find /tmp/tidefs-validation/kernel-fsync-validation -name summary.env -type f 2>/dev/null | sort | tail -1 || true)
+          if [[ -n "$latest" && -f "$latest" ]]; then
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat "$latest" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No summary.env artifact was produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Validation logs uploaded as artifact: kernel-fsync-validation" >> "$GITHUB_STEP_SUMMARY"
