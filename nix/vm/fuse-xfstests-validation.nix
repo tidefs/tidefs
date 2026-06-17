@@ -118,6 +118,7 @@ EOF
 
     KEEP_TMP=0
     TEST_LIST="$DEFAULT_TESTS"
+    FOCUSED_TESTS=0
     JSON_OUT=""
     TRACE_XFSTESTS=0
 
@@ -125,7 +126,7 @@ EOF
       case "$1" in
         --timeout) TIMEOUT_SEC="$2"; shift 2 ;;
         --keep-tmp) KEEP_TMP=1; shift ;;
-        --tests) TEST_LIST="$2"; shift 2 ;;
+        --tests) TEST_LIST="$2"; FOCUSED_TESTS=1; shift 2 ;;
         --output) JSON_OUT="$2"; shift 2 ;;
         --trace-xfstests) TRACE_XFSTESTS=1; shift ;;
         --help|-h) usage; exit 0 ;;
@@ -1334,7 +1335,10 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         # Bound each test so one stuck row cannot consume the whole VM run.
         # Run test with output visible on console for debugging
         echo "=== Running $test ==="
-        LIMITATION_DETAIL=$(tidefs_product_limitation "$test" || true)
+        LIMITATION_DETAIL=""
+        if [ "$FOCUSED_TESTS" -eq 0 ]; then
+            LIMITATION_DETAIL=$(tidefs_product_limitation "$test" || true)
+        fi
         if [ -n "$LIMITATION_DETAIL" ]; then
             unsupported "xfstests_$test" "$LIMITATION_DETAIL"
             continue
