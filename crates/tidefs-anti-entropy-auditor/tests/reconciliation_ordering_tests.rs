@@ -27,6 +27,7 @@ fn severity_rank(class: DivergenceClass) -> u8 {
         DivergenceClass::MissingReplica => 1,
         DivergenceClass::ReplicaUnhealthy => 2,
         DivergenceClass::LagBehind => 3,
+        DivergenceClass::WitnessDisagreement => 4,
     }
 }
 

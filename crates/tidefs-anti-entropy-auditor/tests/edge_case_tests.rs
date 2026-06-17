@@ -208,10 +208,10 @@ fn witness_collision_all_three_different_digests() {
     }];
     let results = cmp.compare_batch(&inputs, 1000);
     assert!(results[0].diverged);
-    // Witness disagrees with both -> DigestMismatch (replica is suspect)
+    // Witness disagrees with both -> authority-selection disagreement
     assert_eq!(
         results[0].divergence_class,
-        Some(DivergenceClass::DigestMismatch)
+        Some(DivergenceClass::WitnessDisagreement)
     );
 }
 
@@ -470,6 +470,7 @@ fn state_with_max_u64_values() {
             classified_lag: u64::MAX,
             classified_corruption: u64::MAX,
             classified_missing: u64::MAX,
+            classified_witness_disagreement: u64::MAX,
         },
         AntiEntropyState::Ticketed {
             created_at_ns: u64::MAX,
@@ -507,6 +508,7 @@ fn state_with_zero_values() {
         classified_lag: 0,
         classified_corruption: 0,
         classified_missing: 0,
+        classified_witness_disagreement: 0,
     };
     assert!(!div_zero.has_divergences());
 }

@@ -38,10 +38,12 @@ pub mod scan_scheduler;
 
 use ae_state::{AntiEntropyState, DivergenceClass, DivergenceRecord};
 use comparator::{ComparisonInput, ComparisonResult, DigestComparator};
-use merkle_exchange::{MerkleExchange, MerkleExchangeResult};
+use merkle_exchange::{
+    MerkleExchange, MerkleExchangeResult, MerkleExchangeStatus, MerkleLeafRange,
+};
 use scan_scheduler::{ScanDecision, ScanSchedulePolicy, ScanScheduler};
 
-use tidefs_checksum_tree::{ChecksumTree, Digest};
+use tidefs_checksum_tree::{ChecksumTree, Digest, SubtreeProof};
 use tidefs_local_object_store::{SuspectEntry, SuspectLog};
 use tidefs_replica_health::ReplicaLagStateRecord;
 
@@ -85,17 +87,19 @@ pub trait ScrubTrigger: Send + Sync {
 impl From<&DivergenceRecord> for SuspectEntry {
     fn from(rec: &DivergenceRecord) -> Self {
         let record_type: u8 = match rec.class {
-            DivergenceClass::LagBehind => 10,        // AE: lag detected
-            DivergenceClass::DigestMismatch => 11,   // AE: digest mismatch
-            DivergenceClass::MissingReplica => 12,   // AE: missing replica
-            DivergenceClass::ReplicaUnhealthy => 13, // AE: unhealthy replica
+            DivergenceClass::LagBehind => 10,           // AE: lag detected
+            DivergenceClass::DigestMismatch => 11,      // AE: digest mismatch
+            DivergenceClass::MissingReplica => 12,      // AE: missing replica
+            DivergenceClass::ReplicaUnhealthy => 13,    // AE: unhealthy replica
+            DivergenceClass::WitnessDisagreement => 14, // AE: witness disagreement
         };
 
-        let mut expected = [0u8; 32];
-        let mut actual = [0u8; 32];
-        // Encode u64 digests into [u8; 32] (low 8 bytes carry the value)
-        expected[..8].copy_from_slice(&rec.expected_digest.to_le_bytes());
-        actual[..8].copy_from_slice(&rec.actual_digest.to_le_bytes());
+        let expected = rec
+            .expected_hash
+            .unwrap_or_else(|| digest_from_u64(rec.expected_digest));
+        let actual = rec
+            .actual_hash
+            .unwrap_or_else(|| digest_from_u64(rec.actual_digest));
 
         SuspectEntry {
             entry_id: 0, // auto-assigned by SuspectLog::record
@@ -112,6 +116,12 @@ impl From<&DivergenceRecord> for SuspectEntry {
             timestamp_secs: (rec.detected_at_ns / 1_000_000_000),
         }
     }
+}
+
+fn digest_from_u64(digest: u64) -> Digest {
+    let mut hash = [0u8; 32];
+    hash[..8].copy_from_slice(&digest.to_le_bytes());
+    hash
 }
 
 /// The anti-entropy auditor — orchestrates periodic scan/compare cycles.
@@ -205,6 +215,82 @@ impl AntiEntropyAuditor {
     ) -> Option<MerkleExchangeResult> {
         let exchange = self.merkle_exchange.as_mut()?;
         Some(exchange.compare_with_remote_tree(remote_tree))
+    }
+
+    /// Run Merkle exchange with remote leaf proofs for one exact subject range.
+    pub fn run_merkle_exchange_with_remote_proofs(
+        &mut self,
+        range: MerkleLeafRange,
+        proofs: &[SubtreeProof],
+    ) -> Option<MerkleExchangeResult> {
+        let exchange = self.merkle_exchange.as_mut()?;
+        Some(exchange.compare_with_remote_leaf_proofs(range, proofs))
+    }
+
+    /// Record validated Merkle leaf divergences as repair-eligible evidence.
+    ///
+    /// Root mismatches without complete leaf proof, corrupt proof data, and
+    /// witness disagreements remain audit evidence and do not enter the
+    /// divergence registry that feeds scrub and repair scheduling.
+    pub fn record_merkle_exchange_result(
+        &mut self,
+        result: &MerkleExchangeResult,
+        target_node: u64,
+        now_ns: u64,
+    ) -> usize {
+        if !result.is_repair_evidence() {
+            match result.status {
+                MerkleExchangeStatus::ProofNeededRootMismatch => {
+                    self.last_error =
+                        Some("merkle root mismatch requires complete remote leaf proof".into());
+                }
+                MerkleExchangeStatus::CorruptProof => {
+                    self.last_error = Some(format!(
+                        "remote merkle proof failed closed: {:?}",
+                        result.proof_failure
+                    ));
+                }
+                MerkleExchangeStatus::WitnessTieBreakDisagreement => {
+                    self.last_error =
+                        Some("witness digest disagrees with primary and replica".into());
+                }
+                MerkleExchangeStatus::EqualRoots
+                | MerkleExchangeStatus::CompleteDivergentLeafProof => {}
+            }
+            return 0;
+        }
+
+        let mut new_divergences = 0;
+        for divergence in &result.leaf_divergences {
+            let record = DivergenceRecord::new_with_hashes(
+                divergence.subject_ref,
+                target_node,
+                DivergenceClass::DigestMismatch,
+                divergence.expected_digest,
+                divergence.actual_digest,
+                self.epoch,
+                now_ns,
+            );
+
+            self.scheduler
+                .frontier
+                .register_degraded(divergence.subject_ref);
+            self.divergence_history.push(record.clone());
+            self.current_divergences.push(record);
+            new_divergences += 1;
+        }
+
+        if let AntiEntropyState::Compare {
+            ref mut comparisons_done,
+            ref mut divergences_found,
+            ..
+        } = self.state
+        {
+            *comparisons_done += result.blocks_compared;
+            *divergences_found += new_divergences;
+        }
+
+        new_divergences as usize
     }
 
     /// Clear the current Merkle exchange session.
@@ -451,6 +537,11 @@ impl AntiEntropyAuditor {
                 )
             })
             .count() as u64;
+        let classified_witness_disagreement = self
+            .current_divergences
+            .iter()
+            .filter(|d| d.is_witness_disagreement())
+            .count() as u64;
 
         self.state = AntiEntropyState::DivergenceFound {
             detected_at_ns: now_ns,
@@ -458,6 +549,7 @@ impl AntiEntropyAuditor {
             classified_lag,
             classified_corruption,
             classified_missing,
+            classified_witness_disagreement,
         };
     }
 
@@ -819,6 +911,46 @@ mod tests {
     }
 
     #[test]
+    fn witness_disagreement_is_not_lag_or_repair_ticket() {
+        let mut aud = auditor();
+        aud.begin_compare(NS_PER_MIN, 1);
+        let inputs = vec![ComparisonInput {
+            subject_ref: 99,
+            target_node: 1,
+            primary_digest: 42,
+            replica_digest: 99,
+            witness_digest: Some(77),
+            epoch: 1,
+        }];
+
+        let results = aud.targeted_audit(&inputs, NS_PER_MIN);
+        assert_eq!(
+            results[0].divergence_class,
+            Some(DivergenceClass::WitnessDisagreement)
+        );
+        assert_eq!(aud.ticketable_divergences().len(), 0);
+        assert_eq!(aud.lag_divergences().len(), 0);
+
+        aud.classify_divergences(2 * NS_PER_MIN);
+        assert!(matches!(
+            aud.state,
+            AntiEntropyState::DivergenceFound {
+                classified_lag: 0,
+                classified_corruption: 0,
+                classified_missing: 0,
+                classified_witness_disagreement: 1,
+                ..
+            }
+        ));
+
+        let mut suspect_log = SuspectLog::new();
+        assert_eq!(aud.feed_suspect_log(&mut suspect_log), 0);
+
+        let trigger = CountingScrubTrigger::default();
+        assert_eq!(aud.trigger_scrub_for_divergences(&trigger, 1, 2), 0);
+    }
+
+    #[test]
     fn drain_divergences_clears_current_cycle() {
         let mut aud = auditor();
         aud.set_total_subjects(10);
@@ -1094,6 +1226,17 @@ mod tests {
         builder.finish()
     }
 
+    fn merkle_test_trees() -> (ChecksumTree, ChecksumTree) {
+        let data1: Vec<Vec<u8>> = (0..100).map(|i| vec![i as u8; 64]).collect();
+        let mut data2 = data1.clone();
+        data2[42][0] = 0xFF;
+
+        let slices1: Vec<&[u8]> = data1.iter().map(|d| d.as_slice()).collect();
+        let slices2: Vec<&[u8]> = data2.iter().map(|d| d.as_slice()).collect();
+
+        (build_tree(&slices1), build_tree(&slices2))
+    }
+
     #[test]
     fn merkle_exchange_init_and_compare() {
         let data: Vec<Vec<u8>> = (0..50).map(|i| vec![i as u8; 64]).collect();
@@ -1105,6 +1248,7 @@ mod tests {
         aud.init_merkle_exchange(tree.clone(), root);
 
         let result = aud.run_merkle_exchange().unwrap();
+        assert_eq!(result.status, MerkleExchangeStatus::EqualRoots);
         assert!(result.consistent);
         assert_eq!(result.divergent_blocks, 0);
     }
@@ -1124,6 +1268,10 @@ mod tests {
         aud.init_merkle_exchange(tree1.clone(), tree2.root_hash);
 
         let result = aud.run_merkle_exchange_with_remote(&tree2).unwrap();
+        assert_eq!(
+            result.status,
+            MerkleExchangeStatus::CompleteDivergentLeafProof
+        );
         assert!(!result.consistent);
         assert_eq!(result.divergent_blocks, 1);
         assert_eq!(result.divergent_indices, vec![42]);
@@ -1142,7 +1290,82 @@ mod tests {
         // Update with real remote root
         let result = aud.cross_node_merkle_audit(root);
         assert!(result.is_some());
-        assert!(result.unwrap().consistent);
+        let result = result.unwrap();
+        assert_eq!(result.status, MerkleExchangeStatus::EqualRoots);
+        assert!(result.consistent);
+    }
+
+    #[test]
+    fn merkle_root_mismatch_without_leaf_proof_does_not_feed_repair() {
+        let (tree1, tree2) = merkle_test_trees();
+        let mut aud = auditor();
+        aud.init_merkle_exchange(tree1, tree2.root_hash);
+
+        let result = aud.run_merkle_exchange().unwrap();
+        assert_eq!(result.status, MerkleExchangeStatus::ProofNeededRootMismatch);
+        assert_eq!(aud.record_merkle_exchange_result(&result, 2, NS_PER_MIN), 0);
+        assert!(!aud.has_divergences());
+
+        let mut suspect_log = SuspectLog::new();
+        assert_eq!(aud.feed_suspect_log(&mut suspect_log), 0);
+
+        let trigger = CountingScrubTrigger::default();
+        assert_eq!(aud.trigger_scrub_for_divergences(&trigger, 1, 2), 0);
+    }
+
+    #[test]
+    fn corrupt_merkle_leaf_proof_does_not_feed_repair() {
+        let (tree1, tree2) = merkle_test_trees();
+        let mut proof = tree2.generate_proof(42).unwrap();
+        proof.leaf_digest[0] ^= 0x80;
+        let range = MerkleLeafRange::new(42, 42, 1);
+
+        let mut aud = auditor();
+        aud.init_merkle_exchange(tree1, tree2.root_hash);
+        let result = aud
+            .run_merkle_exchange_with_remote_proofs(range, &[proof])
+            .unwrap();
+
+        assert_eq!(result.status, MerkleExchangeStatus::CorruptProof);
+        assert_eq!(
+            result.proof_failure,
+            Some(crate::merkle_exchange::MerkleProofFailure::ChecksumMismatch { leaf_index: 42 })
+        );
+        assert_eq!(aud.record_merkle_exchange_result(&result, 2, NS_PER_MIN), 0);
+        assert!(!aud.has_divergences());
+
+        let mut suspect_log = SuspectLog::new();
+        assert_eq!(aud.feed_suspect_log(&mut suspect_log), 0);
+    }
+
+    #[test]
+    fn valid_merkle_leaf_proof_feeds_exact_suspect_entry() {
+        let (tree1, tree2) = merkle_test_trees();
+        let proof = tree2.generate_proof(42).unwrap();
+        let range = MerkleLeafRange::new(1_042, 42, 1);
+
+        let mut aud = auditor();
+        aud.begin_compare(NS_PER_MIN, 1);
+        aud.init_merkle_exchange(tree1.clone(), tree2.root_hash);
+        let result = aud
+            .run_merkle_exchange_with_remote_proofs(range, &[proof])
+            .unwrap();
+
+        assert_eq!(
+            result.status,
+            MerkleExchangeStatus::CompleteDivergentLeafProof
+        );
+        assert_eq!(aud.record_merkle_exchange_result(&result, 2, NS_PER_MIN), 1);
+        assert_eq!(aud.ticketable_divergences().len(), 1);
+
+        let mut suspect_log = SuspectLog::new();
+        assert_eq!(aud.feed_suspect_log(&mut suspect_log), 1);
+        let entries: Vec<SuspectEntry> = suspect_log.iter().copied().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].locator_id, 1_042);
+        assert_eq!(entries[0].record_type, 11);
+        assert_eq!(entries[0].expected_hash, tree1.leaf_digest(42).unwrap());
+        assert_eq!(entries[0].actual_hash, tree2.leaf_digest(42).unwrap());
     }
 
     #[test]

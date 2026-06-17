@@ -9,6 +9,7 @@
 //! follow-through.
 
 use serde::{Deserialize, Serialize};
+use tidefs_checksum_tree::Digest;
 
 /// The six states of the anti-entropy lifecycle.
 ///
@@ -53,6 +54,8 @@ pub enum AntiEntropyState {
         classified_corruption: u64,
         /// Classified as missing (no replica at expected location).
         classified_missing: u64,
+        /// Classified as witness disagreement needing authority selection.
+        classified_witness_disagreement: u64,
     },
 
     /// Repair/replication/rebuild tickets created for divergent chunks.
@@ -129,6 +132,8 @@ pub enum DivergenceClass {
     MissingReplica,
     /// Replica exists but is in a degraded/unreachable state.
     ReplicaUnhealthy,
+    /// Witness digest disagrees with both primary and replica.
+    WitnessDisagreement,
 }
 
 /// A single divergence record produced by the comparator.
@@ -144,6 +149,10 @@ pub struct DivergenceRecord {
     pub expected_digest: u64,
     /// Replica's digest at scan time (0 if missing).
     pub actual_digest: u64,
+    /// Full expected digest when the evidence source provides one.
+    pub expected_hash: Option<Digest>,
+    /// Full actual digest when the evidence source provides one.
+    pub actual_hash: Option<Digest>,
     /// Epoch when the divergence was detected.
     pub epoch: u64,
     /// When the divergence was detected.
@@ -167,6 +176,31 @@ impl DivergenceRecord {
             class,
             expected_digest,
             actual_digest,
+            expected_hash: None,
+            actual_hash: None,
+            epoch,
+            detected_at_ns,
+        }
+    }
+
+    #[must_use]
+    pub fn new_with_hashes(
+        subject_ref: u64,
+        target_node: u64,
+        class: DivergenceClass,
+        expected_hash: Digest,
+        actual_hash: Digest,
+        epoch: u64,
+        detected_at_ns: u64,
+    ) -> Self {
+        DivergenceRecord {
+            subject_ref,
+            target_node,
+            class,
+            expected_digest: digest_prefix_u64(&expected_hash),
+            actual_digest: digest_prefix_u64(&actual_hash),
+            expected_hash: Some(expected_hash),
+            actual_hash: Some(actual_hash),
             epoch,
             detected_at_ns,
         }
@@ -188,6 +222,18 @@ impl DivergenceRecord {
     pub fn is_lag_only(&self) -> bool {
         matches!(self.class, DivergenceClass::LagBehind)
     }
+
+    /// Whether this divergence needs an explicit witness-authority decision.
+    #[must_use]
+    pub fn is_witness_disagreement(&self) -> bool {
+        matches!(self.class, DivergenceClass::WitnessDisagreement)
+    }
+}
+
+fn digest_prefix_u64(digest: &Digest) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(bytes)
 }
 
 #[cfg(test)]
@@ -260,5 +306,34 @@ mod tests {
 
         let missing = DivergenceRecord::new(3, 4, DivergenceClass::MissingReplica, 300, 0, 1, 1000);
         assert!(missing.requires_ticket());
+
+        let witness =
+            DivergenceRecord::new(4, 5, DivergenceClass::WitnessDisagreement, 10, 11, 1, 1000);
+        assert!(!witness.requires_ticket());
+        assert!(!witness.is_lag_only());
+        assert!(witness.is_witness_disagreement());
+    }
+
+    #[test]
+    fn divergence_records_can_carry_full_hashes() {
+        let mut expected = [0u8; 32];
+        expected[0] = 9;
+        let mut actual = [0u8; 32];
+        actual[0] = 7;
+
+        let record = DivergenceRecord::new_with_hashes(
+            1,
+            2,
+            DivergenceClass::DigestMismatch,
+            expected,
+            actual,
+            3,
+            4,
+        );
+
+        assert_eq!(record.expected_hash, Some(expected));
+        assert_eq!(record.actual_hash, Some(actual));
+        assert_eq!(record.expected_digest, 9);
+        assert_eq!(record.actual_digest, 7);
     }
 }
