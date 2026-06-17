@@ -362,6 +362,202 @@ pub struct WitnessReceipt {
 }
 
 // ---------------------------------------------------------------------------
+// Validation receipt records
+// ---------------------------------------------------------------------------
+
+/// Bounded text carried by validation receipt records.
+///
+/// The claim ledger treats claim ids, evidence classes, tiers, statuses, and
+/// producer identifiers as opaque labels. `validation/claims.toml` and
+/// `xtask validate-claim` remain the authority for their meaning.
+const VALIDATION_RECEIPT_TEXT_MAX_LEN: usize = 128;
+
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct ValidationReceiptText {
+    len: u8,
+    buf: [u8; VALIDATION_RECEIPT_TEXT_MAX_LEN],
+}
+
+impl ValidationReceiptText {
+    pub const MAX_LEN: usize = VALIDATION_RECEIPT_TEXT_MAX_LEN;
+
+    /// Construct a receipt text label, panicking if it is empty, too long, or
+    /// contains non-printable ASCII bytes.
+    #[must_use]
+    pub fn from_str(s: &str) -> Self {
+        Self::try_from_str(s).expect("invalid validation receipt text")
+    }
+
+    /// Construct a receipt text label with explicit error reporting.
+    pub fn try_from_str(s: &str) -> Result<Self, ValidationReceiptTextError> {
+        let bytes = s.as_bytes();
+        if bytes.is_empty() {
+            return Err(ValidationReceiptTextError::Empty);
+        }
+        if bytes.len() > Self::MAX_LEN {
+            return Err(ValidationReceiptTextError::TooLong {
+                max_len: Self::MAX_LEN,
+            });
+        }
+        if bytes.iter().any(|byte| !matches!(byte, 0x20..=0x7e)) {
+            return Err(ValidationReceiptTextError::NonPrintableAscii);
+        }
+
+        let mut buf = [0_u8; Self::MAX_LEN];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            len: bytes.len() as u8,
+            buf,
+        })
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or("")
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+}
+
+impl fmt::Debug for ValidationReceiptText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ValidationReceiptText({})", self.as_str())
+    }
+}
+
+impl fmt::Display for ValidationReceiptText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned when a validation receipt label cannot be represented in
+/// the fixed-width no_std receipt record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValidationReceiptTextError {
+    Empty,
+    TooLong { max_len: usize },
+    NonPrintableAscii,
+}
+
+impl fmt::Display for ValidationReceiptTextError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("validation receipt text is empty"),
+            Self::TooLong { max_len } => {
+                write!(f, "validation receipt text exceeds {max_len} bytes")
+            }
+            Self::NonPrintableAscii => {
+                f.write_str("validation receipt text contains non-printable ASCII")
+            }
+        }
+    }
+}
+
+/// BLAKE3-256 digest of a validation artifact payload or manifest.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct ValidationArtifactDigest([u8; 32]);
+
+impl ValidationArtifactDigest {
+    pub const ZERO: Self = Self([0_u8; 32]);
+
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// BLAKE3-256 digest of a validation receipt record.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct ValidationReceiptDigest([u8; 32]);
+
+impl ValidationReceiptDigest {
+    pub const ZERO: Self = Self([0_u8; 32]);
+
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        let mut index = 0;
+        while index < self.0.len() {
+            if self.0[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+}
+
+/// Metadata for the tool or workflow that produced a validation receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ValidationReceiptProducer {
+    pub producer_id: ValidationReceiptText,
+    pub producer_version: ValidationReceiptText,
+    pub run_id: ValidationReceiptText,
+    pub produced_at_millis: u64,
+}
+
+/// Append-only validation receipt evidence for a claim-registry entry.
+///
+/// The record carries opaque claim/evidence labels and hashes only. It does
+/// not change claim status and does not prove a claim is validated by itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ValidationReceiptRecord {
+    pub sequence: u64,
+    pub claim_id: ValidationReceiptText,
+    pub evidence_class: ValidationReceiptText,
+    pub validation_tier: ValidationReceiptText,
+    pub status: ValidationReceiptText,
+    pub artifact_digest: ValidationArtifactDigest,
+    pub previous_receipt_digest: ValidationReceiptDigest,
+    pub producer: ValidationReceiptProducer,
+}
+
+impl ValidationReceiptRecord {
+    #[must_use]
+    pub const fn new(
+        sequence: u64,
+        claim_id: ValidationReceiptText,
+        evidence_class: ValidationReceiptText,
+        validation_tier: ValidationReceiptText,
+        status: ValidationReceiptText,
+        artifact_digest: ValidationArtifactDigest,
+        previous_receipt_digest: ValidationReceiptDigest,
+        producer: ValidationReceiptProducer,
+    ) -> Self {
+        Self {
+            sequence,
+            claim_id,
+            evidence_class,
+            validation_tier,
+            status,
+            artifact_digest,
+            previous_receipt_digest,
+            producer,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ObligationLedger
 // ---------------------------------------------------------------------------
 
@@ -903,6 +1099,51 @@ mod tests {
         let w = ledger.witnesses_iter().next().unwrap();
         assert_eq!(w.claim_id, claim_id);
         assert_eq!(w.witness_bytes, [0xAA; 32]);
+    }
+
+    #[test]
+    fn validation_receipt_text_rejects_empty_and_control_bytes() {
+        assert_eq!(
+            ValidationReceiptText::try_from_str(""),
+            Err(ValidationReceiptTextError::Empty)
+        );
+        assert_eq!(
+            ValidationReceiptText::try_from_str("runtime\nartifact"),
+            Err(ValidationReceiptTextError::NonPrintableAscii)
+        );
+    }
+
+    #[test]
+    fn validation_receipt_record_captures_claim_evidence_and_producer() {
+        let mut artifact = [0_u8; 32];
+        artifact[0] = 0x11;
+        let mut previous = [0_u8; 32];
+        previous[31] = 0x22;
+        let producer = ValidationReceiptProducer {
+            producer_id: ValidationReceiptText::from_str("focused-rust"),
+            producer_version: ValidationReceiptText::from_str("ci-v1"),
+            run_id: ValidationReceiptText::from_str("github-run-123"),
+            produced_at_millis: 1_781_738_000_000,
+        };
+        let record = ValidationReceiptRecord::new(
+            7,
+            ValidationReceiptText::from_str("local.vfs.write_fsync_crash.v1"),
+            ValidationReceiptText::from_str("runtime-crash-oracle"),
+            ValidationReceiptText::from_str("focused-rust"),
+            ValidationReceiptText::from_str("pass"),
+            ValidationArtifactDigest::from_bytes(artifact),
+            ValidationReceiptDigest::from_bytes(previous),
+            producer,
+        );
+
+        assert_eq!(record.sequence, 7);
+        assert_eq!(record.claim_id.as_str(), "local.vfs.write_fsync_crash.v1");
+        assert_eq!(record.evidence_class.as_str(), "runtime-crash-oracle");
+        assert_eq!(record.validation_tier.as_str(), "focused-rust");
+        assert_eq!(record.status.as_str(), "pass");
+        assert_eq!(record.artifact_digest.as_bytes(), &artifact);
+        assert_eq!(record.previous_receipt_digest.as_bytes(), &previous);
+        assert_eq!(record.producer.producer_id.as_str(), "focused-rust");
     }
 
     #[test]

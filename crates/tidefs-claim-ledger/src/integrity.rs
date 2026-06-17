@@ -17,7 +17,8 @@ use std::fmt;
 use tidefs_types_claim_ledger_core::StorageAuthorityToken;
 use tidefs_types_claim_ledger_core::{
     BudgetDomainId, ClaimEntry, ClaimId, ClaimReason, ObligationLedger, ReserveEntry, ReserveId,
-    WitnessReceipt,
+    ValidationArtifactDigest, ValidationReceiptDigest, ValidationReceiptProducer,
+    ValidationReceiptRecord, ValidationReceiptText, WitnessReceipt,
 };
 use tidefs_types_vfs_core::InodeId;
 
@@ -343,6 +344,82 @@ fn decode_receipt_id(
     Ok(StorageAuthorityToken(bytes))
 }
 
+fn encode_validation_receipt_text(text: &ValidationReceiptText, out: &mut Vec<u8>) {
+    write_bytes(text.as_bytes(), out);
+}
+
+fn decode_validation_receipt_text(
+    buf: &[u8],
+    pos: &mut usize,
+    field: &'static str,
+) -> Result<ValidationReceiptText, EncodingError> {
+    let bytes = read_bytes(buf, pos, field)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| EncodingError::InvalidValue {
+        field,
+        detail: "validation receipt text is not UTF-8".into(),
+    })?;
+    ValidationReceiptText::try_from_str(text).map_err(|err| EncodingError::InvalidValue {
+        field,
+        detail: err.to_string(),
+    })
+}
+
+fn encode_validation_artifact_digest(digest: ValidationArtifactDigest, out: &mut Vec<u8>) {
+    out.extend_from_slice(digest.as_bytes());
+}
+
+fn decode_validation_artifact_digest(
+    buf: &[u8],
+    pos: &mut usize,
+    field: &'static str,
+) -> Result<ValidationArtifactDigest, EncodingError> {
+    if *pos + 32 > buf.len() {
+        return Err(EncodingError::UnexpectedEof { field });
+    }
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&buf[*pos..*pos + 32]);
+    *pos += 32;
+    Ok(ValidationArtifactDigest::from_bytes(bytes))
+}
+
+fn encode_validation_receipt_digest(digest: ValidationReceiptDigest, out: &mut Vec<u8>) {
+    out.extend_from_slice(digest.as_bytes());
+}
+
+fn decode_validation_receipt_digest(
+    buf: &[u8],
+    pos: &mut usize,
+    field: &'static str,
+) -> Result<ValidationReceiptDigest, EncodingError> {
+    if *pos + 32 > buf.len() {
+        return Err(EncodingError::UnexpectedEof { field });
+    }
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&buf[*pos..*pos + 32]);
+    *pos += 32;
+    Ok(ValidationReceiptDigest::from_bytes(bytes))
+}
+
+fn encode_validation_receipt_producer(producer: &ValidationReceiptProducer, out: &mut Vec<u8>) {
+    encode_validation_receipt_text(&producer.producer_id, out);
+    encode_validation_receipt_text(&producer.producer_version, out);
+    encode_validation_receipt_text(&producer.run_id, out);
+    write_u64(producer.produced_at_millis, out);
+}
+
+fn decode_validation_receipt_producer(
+    buf: &[u8],
+    pos: &mut usize,
+    field: &'static str,
+) -> Result<ValidationReceiptProducer, EncodingError> {
+    Ok(ValidationReceiptProducer {
+        producer_id: decode_validation_receipt_text(buf, pos, field)?,
+        producer_version: decode_validation_receipt_text(buf, pos, field)?,
+        run_id: decode_validation_receipt_text(buf, pos, field)?,
+        produced_at_millis: read_u64(buf, pos, field)?,
+    })
+}
+
 // /// Deserialize an InodeId from 8 bytes LE.
 // ── ClaimantRef ──────────────────────────────────────────────────────────
 
@@ -478,6 +555,58 @@ fn decode_entry(
         claim_receipt_ref,
         expiration_deadline,
     })
+}
+
+// ── ValidationReceiptRecord ──────────────────────────────────────────────
+
+const VALIDATION_RECEIPT_RECORD_VERSION: u32 = 1;
+
+impl ClaimEncoding for ValidationReceiptRecord {
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(384);
+        write_u32(VALIDATION_RECEIPT_RECORD_VERSION, &mut out);
+        write_u64(self.sequence, &mut out);
+        encode_validation_receipt_text(&self.claim_id, &mut out);
+        encode_validation_receipt_text(&self.evidence_class, &mut out);
+        encode_validation_receipt_text(&self.validation_tier, &mut out);
+        encode_validation_receipt_text(&self.status, &mut out);
+        encode_validation_artifact_digest(self.artifact_digest, &mut out);
+        encode_validation_receipt_digest(self.previous_receipt_digest, &mut out);
+        encode_validation_receipt_producer(&self.producer, &mut out);
+        out
+    }
+
+    fn deserialize(buf: &[u8]) -> Result<Self, EncodingError> {
+        let mut pos = 0_usize;
+        let version = read_u32(buf, &mut pos, "validation_receipt.version")?;
+        if version != VALIDATION_RECEIPT_RECORD_VERSION {
+            return Err(EncodingError::InvalidValue {
+                field: "validation_receipt.version",
+                detail: format!("unsupported validation receipt version {version}"),
+            });
+        }
+        let record = ValidationReceiptRecord::new(
+            read_u64(buf, &mut pos, "validation_receipt.sequence")?,
+            decode_validation_receipt_text(buf, &mut pos, "validation_receipt.claim_id")?,
+            decode_validation_receipt_text(buf, &mut pos, "validation_receipt.evidence_class")?,
+            decode_validation_receipt_text(buf, &mut pos, "validation_receipt.validation_tier")?,
+            decode_validation_receipt_text(buf, &mut pos, "validation_receipt.status")?,
+            decode_validation_artifact_digest(buf, &mut pos, "validation_receipt.artifact_digest")?,
+            decode_validation_receipt_digest(
+                buf,
+                &mut pos,
+                "validation_receipt.previous_receipt_digest",
+            )?,
+            decode_validation_receipt_producer(buf, &mut pos, "validation_receipt.producer")?,
+        );
+        if pos != buf.len() {
+            return Err(EncodingError::InvalidValue {
+                field: "validation_receipt",
+                detail: format!("trailing bytes: expected {} consumed, got {pos}", buf.len()),
+            });
+        }
+        Ok(record)
+    }
 }
 
 // ── ClaimLedger ──────────────────────────────────────────────────────────

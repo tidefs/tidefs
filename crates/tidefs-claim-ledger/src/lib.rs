@@ -20,6 +20,9 @@ use tidefs_types_vfs_core::InodeId;
 mod integrity;
 pub use integrity::{ClaimEncoding, ClaimIntegrity, EncodingError, IntegrityError};
 
+mod receipt_chain;
+pub use receipt_chain::{ValidationReceiptLedger, ValidationReceiptLedgerError};
+
 // ---------------------------------------------------------------------------
 // ClaimClass — what kind of consumption this claim represents
 // ---------------------------------------------------------------------------
