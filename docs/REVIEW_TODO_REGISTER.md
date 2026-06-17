@@ -12,7 +12,7 @@ OpenZFS/Ceph-class claims.
 | TFR-005 | Timestamp/revision/on-disk format | POSIX timestamps, storage version fields, content object keys, scrub identity, replay ticks, rename metadata stamps, and serialized format fields are coupled. | Specify one authority model for POSIX time, generation, txg, object-version, and on-disk compatibility before changing behavior. |
 | TFR-006 | Compression/encryption | Compression and encryption paths may bypass or duplicate raw object-store authority. | Consolidate transform ordering, checksums, key handling, and raw-store visibility. |
 | TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Define one capacity authority and make all adapters consume it. |
-| TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Specify and test the end-to-end durability and cache-coherency contract. |
+| TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Use `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` as the page-cache writeback authority contract, then prove and test the end-to-end durability and cache-coherency contract. |
 | TFR-010 | Snapshot/clone/send-receive/deadlist | Snapshot retention, deadlists, clone lineage, and send/receive are not one coherent storage model. | Unify snapshot lifecycle, object protection, deadlists, and stream formats. |
 | TFR-011 | Operator CLI/UAPI | CLI, FUSE, ublk, kernel UAPI, and docs can describe different truths. | Define one public operator/UAPI boundary and keep internal crates behind it. |
 | TFR-013 | Stub/placeholder stage | Several crates and docs still look like stage scaffolding rather than product behavior. | Classify placeholders explicitly and delete or implement them. |
@@ -403,6 +403,14 @@ Important 2026-06-01 findings:
   remain planned or blocked until runtime crash evidence exists. This does not
   close TFR-008 and does not claim production crash safety, mounted runtime
   durability, or final recovery authority.
+- `TFR-008`: issue #511 adds `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` as the
+  current authority document for dirty page lifecycle, writeback triggers,
+  fsync/intent-log/recovery ordering, and the `tidefs-cache-coherency` /
+  `tidefs-intent-log` boundary. The new claim path is
+  `local.vfs.page_cache_writeback_authority.v1`. This narrows the contract and
+  terminology, but it does not implement runtime writeback, close TFR-008, or
+  validate crash safety. Issue #443 still owns the cache-coherency writeback
+  proof, and issue #445 still owns intent-log replay idempotency.
 - `TFR-009`: Kernel residency is still a tiered bring-up, not terminal; TideFS
   is not yet full-kernel. The kernel-resident architecture doc explicitly says the
   current mounted operation slice uses a small fixed in-kernel namespace/data
