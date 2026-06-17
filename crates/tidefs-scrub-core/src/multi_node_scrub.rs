@@ -508,9 +508,9 @@ impl ScrubFanoutCoordinator {
     /// Fan out a suspect entry with receipt authority for multi-node verification.
     ///
     /// Like [`fanout`] but carries the durable placement receipt so peers can
-    /// verify the placement authority of the object under scrub. The receipt
-    /// identifies which members are authoritative for this object; the fanout
-    /// uses the reachable subset of those members rather than all known peers.
+    /// validate the placement authority of the object under scrub. The receipt
+    /// identifies which members are authoritative for this object; future
+    /// work should filter fanout targets to the receipt's authoritative set.
     ///
     /// Returns the number of requests queued.
     pub fn fanout_with_receipt(
