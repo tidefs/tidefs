@@ -7,7 +7,7 @@
 //! path reconstruction.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -45,7 +45,10 @@ use tidefs_posix_semantics::apply_setgid_inheritance_for_create;
 use tidefs_posix_semantics::sticky_dir_allows_unlink_or_rename;
 
 use crate::namespace::rename::RenameAt2Flags;
-use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType, SyncGuarantee};
+use tidefs_dataset_lifecycle::{
+    DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
+};
+use tidefs_dataset_properties::{PropertySet, PropertyType, PropertyValue};
 #[cfg(feature = "encryption")]
 use tidefs_encryption::key_hierarchy::{DatasetDEK, PoolWrappingKey, SALT_LEN};
 #[cfg(feature = "encryption")]
@@ -1516,16 +1519,16 @@ impl VfsLocalFileSystem {
         let args = request.get("args").unwrap_or(&Value::Null);
 
         Ok(match (command, operation) {
-            ("dataset", "create") => self.live_dataset_create(pool, args),
-            ("dataset", "list") => self.live_dataset_list(pool, wants_json),
+            ("dataset", "create") => self.live_dataset_create(pool, args, wants_json),
+            ("dataset", "list") => self.live_dataset_list(pool, args, wants_json),
             ("dataset", "rename") => self.live_dataset_rename(pool, args),
-            ("dataset", "destroy") => self.live_dataset_destroy(args),
+            ("dataset", "destroy") => self.live_dataset_destroy(pool, args, wants_json),
             ("dataset", "set-strategy") => self.live_dataset_set_strategy(args),
             ("dataset", "upgrade") => self.live_dataset_upgrade(args),
             ("dataset", "seal-key") => self.live_dataset_seal_key(args),
             ("dataset", "rotate-key") => self.live_dataset_rotate_key(args),
-            ("dataset", "get") => self.live_dataset_get(pool, args),
-            ("dataset", "set") => self.live_dataset_set(pool, args),
+            ("dataset", "get") => self.live_dataset_get(pool, args, wants_json),
+            ("dataset", "set") => self.live_dataset_set(pool, args, wants_json),
             ("dataset", "list-props") => self.live_dataset_list_props(pool, args),
             ("snapshot", "create") => self.live_snapshot_create(args),
             ("snapshot", "list") => self.live_snapshot_list(wants_json),
@@ -1626,13 +1629,25 @@ impl VfsLocalFileSystem {
         }))
     }
 
-    fn live_dataset_create(&self, pool: &str, args: &Value) -> Vec<u8> {
-        let name = match live_admin_arg(args, "name") {
+    fn live_dataset_create(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
         };
         let parent = live_admin_arg(args, "parent").unwrap_or("root");
         let sync = live_admin_arg(args, "sync").unwrap_or("local");
+        let dataset_type = match live_dataset_type_arg(args) {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(1, err),
+        };
+        let properties = match live_property_set_from_request(args) {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(1, err),
+        };
+        let features = match live_feature_names_from_request(args) {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(1, err),
+        };
+        let mountpoint = live_admin_optional_arg(args, "mountpoint");
 
         if name == "root" {
             return live_admin_error(1, "dataset create: 'root' dataset cannot be re-created");
@@ -1674,9 +1689,9 @@ impl VfsLocalFileSystem {
         if let Err(err) = fs.dataset_catalog_mut().create(
             &full_path,
             dataset_id,
-            DatasetType::Filesystem,
+            dataset_type,
             1,
-            vec![],
+            properties.to_key_value_blob(),
             DatasetFlags::default_create(),
             sync_guarantee,
         ) {
@@ -1692,24 +1707,62 @@ impl VfsLocalFileSystem {
             );
         }
 
+        let requested_properties = args.get("properties").cloned().unwrap_or_else(|| json!([]));
+
+        if wants_json {
+            return live_admin_ok_json(json!({
+                "ok": true,
+                "operation": "create",
+                "pool": pool,
+                "dataset": full_path,
+                "id": dataset_id.to_string(),
+                "type": dataset_type.to_string(),
+                "parent": parent,
+                "mountpoint": mountpoint,
+                "properties": requested_properties,
+                "features": features,
+            }));
+        }
+
         live_admin_ok_text(format!(
             "dataset '{full_path}' created in imported pool '{pool}'\n  id={}  parent='{parent}'",
             format_dataset_id(&dataset_id)
         ))
     }
 
-    fn live_dataset_list(&self, pool: &str, wants_json: bool) -> Vec<u8> {
-        let fs = self.fs.borrow();
+    fn live_dataset_list(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
+        let type_filter = match live_dataset_type_filter_arg(args) {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(1, err),
+        };
+        let mut fs = self.fs.borrow_mut();
+        let available_bytes = fs
+            .statfs()
+            .ok()
+            .map(|stats| stats.bavail.saturating_mul(u64::from(stats.bsize)));
         let catalog = fs.dataset_catalog();
-        let mut entries: Vec<_> = catalog.entries().into_iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let entries: Vec<_> = catalog
+            .list_all()
+            .into_iter()
+            .filter(|(_, _, dataset_type, _, _, _)| {
+                type_filter
+                    .map(|filter| filter == *dataset_type)
+                    .unwrap_or(true)
+            })
+            .collect();
 
         if wants_json {
             let values: Vec<_> = entries
                 .iter()
-                .map(|(path, id)| {
+                .map(|(path, id, dataset_type, _, _, _)| {
                     json!({
+                        "pool": pool,
+                        "name": format!("{pool}/{path}"),
                         "path": path,
+                        "type": dataset_type.to_string(),
+                        "used": Value::Null,
+                        "available": available_bytes,
+                        "mountpoint": Value::Null,
                         "id": id.to_string(),
                         "sync": catalog.sync_guarantee(path).ok().map(|value| value.to_string()),
                         "state": catalog.lifecycle_state(path).ok().map(|value| format!("{value:?}")),
@@ -1717,6 +1770,7 @@ impl VfsLocalFileSystem {
                 })
                 .collect();
             return live_admin_ok_json(json!({
+                "ok": true,
                 "pool": pool,
                 "datasets": values,
             }));
@@ -1726,20 +1780,21 @@ impl VfsLocalFileSystem {
             return live_admin_ok_text(format!("pool '{pool}' has no datasets"));
         }
 
-        let mut out = format!("pool '{pool}' datasets:");
-        for (path, id) in &entries {
-            let sg = catalog
-                .sync_guarantee(path)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|_| "---".to_string());
-            let lc = catalog
-                .lifecycle_state(path)
-                .map(|value| format!("{value:?}"))
-                .unwrap_or_else(|_| "---".to_string());
+        let mut out = format!(
+            "{:<40} {:<12} {:>14} {:>14} {}",
+            "NAME", "TYPE", "USED", "AVAILABLE", "MOUNTPOINT"
+        );
+        for (path, _, dataset_type, _, _, _) in &entries {
             let _ = write!(
                 out,
-                "\n  dataset '{path}' id={} sync={sg} state={lc}",
-                format_dataset_id(id)
+                "\n{:<40} {:<12} {:>14} {:>14} {}",
+                format!("{pool}/{path}"),
+                dataset_type,
+                "-",
+                available_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                "-"
             );
         }
         live_admin_ok_text(out)
@@ -1791,11 +1846,12 @@ impl VfsLocalFileSystem {
         ))
     }
 
-    fn live_dataset_destroy(&self, args: &Value) -> Vec<u8> {
+    fn live_dataset_destroy(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
         };
+        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
         if name == "root" {
             return live_admin_error(1, "dataset destroy: 'root' dataset cannot be destroyed");
         }
@@ -1807,36 +1863,73 @@ impl VfsLocalFileSystem {
                 format!("dataset destroy: dataset '{name}' does not exist in the catalog"),
             );
         }
-        match fs.dataset_catalog().list_children(name) {
-            Ok(children) if !children.is_empty() => {
-                return live_admin_error(
-                    1,
-                    format!(
-                    "dataset destroy: dataset '{name}' has {} child(ren) and cannot be destroyed",
-                    children.len()
-                ),
-                )
-            }
+        let child_count = match fs.dataset_catalog().list_children(name) {
+            Ok(children) => children.len(),
             Err(err) => {
                 return live_admin_error(
                     1,
                     format!("dataset destroy: catalog error listing children of '{name}': {err}"),
                 )
             }
-            Ok(_) => {}
+        };
+        let snapshot_count = fs.list_snapshots().len();
+        let live_mount = fs
+            .dataset_catalog()
+            .lookup(name)
+            .map(|dataset_id| *dataset_id.as_bytes() == fs.mounted_dataset_id())
+            .unwrap_or(false);
+        let mut hazards = Vec::new();
+        if child_count > 0 {
+            hazards.push(format!("{child_count} child dataset(s)"));
         }
-
-        if let Err(err) = fs.dataset_catalog_mut().destroy(name) {
+        if snapshot_count > 0 {
+            hazards.push(format!("{snapshot_count} snapshot(s)"));
+        }
+        if live_mount {
+            hazards.push("a live mount".to_string());
+        }
+        if !hazards.is_empty() && !force {
             return live_admin_error(
                 1,
-                format!("dataset destroy: catalog error destroying '{name}': {err}"),
+                format!(
+                    "dataset destroy: dataset '{name}' has {}; retry with --force to destroy it",
+                    hazards.join(", ")
+                ),
             );
         }
+
+        let destroyed_entries = if force {
+            match live_destroy_catalog_subtree(fs.dataset_catalog_mut(), name) {
+                Ok(count) => count,
+                Err(err) => return live_admin_error(1, err),
+            }
+        } else {
+            if let Err(err) = fs.dataset_catalog_mut().destroy(name) {
+                return live_admin_error(
+                    1,
+                    format!("dataset destroy: catalog error destroying '{name}': {err}"),
+                );
+            }
+            1
+        };
         if let Err(err) = fs.persist_dataset_catalog() {
             return live_admin_error(
                 1,
                 format!("dataset destroy: failed to persist catalog: {err}"),
             );
+        }
+        if wants_json {
+            return live_admin_ok_json(json!({
+                "ok": true,
+                "operation": "destroy",
+                "pool": pool,
+                "dataset": name,
+                "force": force,
+                "destroyed_entries": destroyed_entries,
+                "child_count": child_count,
+                "snapshot_count": snapshot_count,
+                "live_mount": live_mount,
+            }));
         }
         live_admin_ok_text(format!("dataset '{name}' destroyed"))
     }
@@ -2211,7 +2304,7 @@ impl VfsLocalFileSystem {
         )
     }
 
-    fn live_dataset_get(&self, _pool: &str, args: &Value) -> Vec<u8> {
+    fn live_dataset_get(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2238,10 +2331,25 @@ impl VfsLocalFileSystem {
             }
         };
         match effective.get(&key) {
-            Some(entry) => live_admin_ok_text(format!(
-                "property:  {property}\nvalue:     {}\nsource:    {}",
-                entry.value, entry.source
-            )),
+            Some(entry) => {
+                if wants_json {
+                    live_admin_ok_json(json!({
+                        "ok": true,
+                        "operation": "get",
+                        "pool": pool,
+                        "dataset": name,
+                        "property": property,
+                        "value": live_property_value_json(&entry.value),
+                        "display_value": entry.value.to_string(),
+                        "source": entry.source.to_string(),
+                    }))
+                } else {
+                    live_admin_ok_text(format!(
+                        "property:  {property}\nvalue:     {}\nsource:    {}",
+                        entry.value, entry.source
+                    ))
+                }
+            }
             None => live_admin_error(
                 1,
                 format!("dataset get: internal error resolving '{property}'"),
@@ -2249,23 +2357,29 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_dataset_set(&self, _pool: &str, args: &Value) -> Vec<u8> {
+    fn live_dataset_set(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
         };
-        let assignment = match live_admin_arg(args, "assignment") {
-            Ok(value) => value,
-            Err(err) => return live_admin_error(2, err),
-        };
-        let (prop_name, prop_val_str) = match assignment.split_once('=') {
-            Some((key, value)) => (key.trim(), value.trim()),
-            None => {
-                return live_admin_error(
-                    1,
-                    format!("dataset set: invalid assignment '{assignment}' (expected key=value)"),
-                )
-            }
+        let assignment = live_admin_optional_arg(args, "assignment");
+        let (prop_name, prop_val_str) = match live_admin_optional_arg(args, "property") {
+            Some(property) => (
+                property.trim(),
+                live_admin_optional_arg(args, "display_value"),
+            ),
+            None => match assignment.and_then(|value| value.split_once('=')) {
+                Some((key, value)) => (key.trim(), Some(value.trim())),
+                None => {
+                    return live_admin_error(
+                        1,
+                        format!(
+                            "dataset set: invalid assignment '{}' (expected key=value)",
+                            assignment.unwrap_or("")
+                        ),
+                    )
+                }
+            },
         };
         if prop_name.is_empty() {
             return live_admin_error(1, "dataset set: property name must not be empty");
@@ -2279,11 +2393,25 @@ impl VfsLocalFileSystem {
                 return live_admin_error(1, format!("dataset set: unknown property '{prop_name}'"))
             }
         };
-        let is_clear = prop_val_str.is_empty() || prop_val_str == "-";
+        let is_clear = args
+            .get("clear")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| prop_val_str.map_or(true, |value| value.is_empty() || value == "-"));
         let value = if is_clear {
             tidefs_dataset_properties::PropertyValue::None
+        } else if let Some(value_json) = args.get("value") {
+            match live_property_value_from_json(value_json, def.value_type) {
+                Ok(value) => value,
+                Err(err) => return live_admin_error(1, format!("dataset set: {err}")),
+            }
         } else {
-            tidefs_dataset_properties::PropertySet::parse_value_from_str(prop_val_str)
+            let Some(prop_val_str) = prop_val_str else {
+                return live_admin_error(1, "dataset set: property value must not be empty");
+            };
+            match live_property_value_from_str(prop_val_str, def.value_type) {
+                Ok(value) => value,
+                Err(err) => return live_admin_error(1, format!("dataset set: {err}")),
+            }
         };
         let path = name;
         let mut fs = self.fs.borrow_mut();
@@ -2314,7 +2442,18 @@ impl VfsLocalFileSystem {
                 format!("dataset set: property set but catalog persist failed: {err}"),
             );
         }
-        if is_clear {
+        if wants_json {
+            live_admin_ok_json(json!({
+                "ok": true,
+                "operation": "set",
+                "pool": pool,
+                "dataset": name,
+                "property": prop_name,
+                "value": live_property_value_json(&value),
+                "display_value": value.to_string(),
+                "clear": is_clear,
+            }))
+        } else if is_clear {
             live_admin_ok_text(format!(
                 "cleared '{prop_name}' (now using default/inherited value)"
             ))
@@ -2929,6 +3068,259 @@ fn live_admin_optional_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
+}
+
+fn live_dataset_type_arg(args: &Value) -> Result<DatasetType, String> {
+    match live_admin_optional_arg(args, "type").unwrap_or("filesystem") {
+        "filesystem" => Ok(DatasetType::Filesystem),
+        "volume" => Ok(DatasetType::Volume),
+        "snapshot" => Ok(DatasetType::Snapshot),
+        other => Err(format!(
+            "dataset create: invalid dataset type '{other}' (expected filesystem, volume, or snapshot)"
+        )),
+    }
+}
+
+fn live_dataset_type_filter_arg(args: &Value) -> Result<Option<DatasetType>, String> {
+    match live_admin_optional_arg(args, "type") {
+        Some("filesystem") => Ok(Some(DatasetType::Filesystem)),
+        Some("volume") => Ok(Some(DatasetType::Volume)),
+        Some("snapshot") => Ok(Some(DatasetType::Snapshot)),
+        Some(other) => Err(format!(
+            "dataset list: invalid dataset type '{other}' (expected filesystem, volume, or snapshot)"
+        )),
+        None => Ok(None),
+    }
+}
+
+fn live_property_set_from_request(args: &Value) -> Result<PropertySet, String> {
+    let Some(values) = args.get("properties") else {
+        return Ok(PropertySet::new());
+    };
+    let values = values
+        .as_array()
+        .ok_or_else(|| "dataset create: properties must be a JSON array".to_string())?;
+    let registry = tidefs_dataset_properties::build_registry();
+    let mut properties = PropertySet::new();
+    let mut seen = BTreeSet::new();
+    for entry in values {
+        let key_name = entry
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "dataset create: property entry is missing key".to_string())?;
+        let key = tidefs_dataset_properties::PropertyKey::new(key_name);
+        if !seen.insert(key_name.to_string()) {
+            return Err(format!(
+                "dataset create: duplicate dataset property key: {key_name}"
+            ));
+        }
+        let def = tidefs_dataset_properties::lookup_property(&registry, &key).ok_or_else(|| {
+            format!("dataset create: unsupported dataset property key: {key_name}")
+        })?;
+        let clear = entry.get("clear").and_then(Value::as_bool).unwrap_or(false);
+        if clear {
+            continue;
+        }
+        let value_json = entry
+            .get("value")
+            .ok_or_else(|| format!("dataset create: property '{key_name}' is missing value"))?;
+        let value = live_property_value_from_json(value_json, def.value_type)?;
+        tidefs_dataset_properties::validate_set(&key, &value, def, &properties)
+            .map_err(|err| format!("dataset create: invalid value for {key_name}: {err}"))?;
+        properties.set_local(key, value);
+    }
+    Ok(properties)
+}
+
+fn live_feature_names_from_request(args: &Value) -> Result<Vec<String>, String> {
+    let Some(values) = args.get("features") else {
+        return Ok(Vec::new());
+    };
+    let values = values
+        .as_array()
+        .ok_or_else(|| "dataset create: features must be a JSON array".to_string())?;
+    let mut features = Vec::with_capacity(values.len());
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let feature = value
+            .as_str()
+            .ok_or_else(|| "dataset create: feature names must be strings".to_string())?;
+        let name = FeatureName::from_str(feature)
+            .ok_or_else(|| format!("dataset create: invalid feature flag name: {feature}"))?;
+        if get_feature_class(&name).is_none() {
+            return Err(format!(
+                "dataset create: unsupported dataset feature flag: {feature}"
+            ));
+        }
+        if !seen.insert(feature.to_string()) {
+            return Err(format!(
+                "dataset create: duplicate dataset feature flag: {feature}"
+            ));
+        }
+        features.push(feature.to_string());
+    }
+    Ok(features)
+}
+
+fn live_destroy_catalog_subtree(catalog: &mut DatasetCatalog, path: &str) -> Result<usize, String> {
+    let prefix = format!("{path}/");
+    let mut descendants: Vec<String> = catalog
+        .list_all()
+        .into_iter()
+        .map(|(entry_path, _, _, _, _, _)| entry_path)
+        .filter(|entry_path| entry_path.starts_with(&prefix))
+        .collect();
+    descendants.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| right.cmp(left)));
+    let mut destroyed = 0;
+    for descendant in descendants {
+        catalog.destroy(&descendant).map_err(|err| {
+            format!("dataset destroy: catalog error destroying '{descendant}': {err}")
+        })?;
+        destroyed += 1;
+    }
+    catalog
+        .destroy(path)
+        .map_err(|err| format!("dataset destroy: catalog error destroying '{path}': {err}"))?;
+    Ok(destroyed + 1)
+}
+
+fn live_property_value_json(value: &PropertyValue) -> Value {
+    match value {
+        PropertyValue::None => Value::Null,
+        PropertyValue::U64(value) => json!(value),
+        PropertyValue::I64(value) => json!(value),
+        PropertyValue::String(value) => json!(value),
+        PropertyValue::Bool(value) => json!(value),
+        PropertyValue::EnumVariant(value) => json!(value),
+        PropertyValue::Bytes(value) => json!(value),
+        PropertyValue::Size(value) => json!(value),
+    }
+}
+
+fn live_property_value_from_json(
+    value: &Value,
+    value_type: PropertyType,
+) -> Result<PropertyValue, String> {
+    if value.is_null() {
+        return Ok(PropertyValue::None);
+    }
+    match value_type {
+        PropertyType::Bool => value
+            .as_bool()
+            .map(PropertyValue::Bool)
+            .ok_or_else(|| "expected boolean property value".to_string()),
+        PropertyType::U64 => value
+            .as_u64()
+            .map(PropertyValue::U64)
+            .ok_or_else(|| "expected unsigned integer property value".to_string()),
+        PropertyType::I64 => value
+            .as_i64()
+            .map(PropertyValue::I64)
+            .ok_or_else(|| "expected signed integer property value".to_string()),
+        PropertyType::String => value
+            .as_str()
+            .map(|value| PropertyValue::String(value.to_string()))
+            .ok_or_else(|| "expected string property value".to_string()),
+        PropertyType::Enum => value
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .map(PropertyValue::EnumVariant)
+            .ok_or_else(|| "expected enum variant number 0..255".to_string()),
+        PropertyType::Bytes => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| "expected byte array property value".to_string())?;
+            values
+                .iter()
+                .map(|byte| {
+                    byte.as_u64()
+                        .and_then(|byte| u8::try_from(byte).ok())
+                        .ok_or_else(|| "expected byte value 0..255".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(PropertyValue::Bytes)
+        }
+        PropertyType::Size => value
+            .as_u64()
+            .map(PropertyValue::Size)
+            .ok_or_else(|| "expected size property value in bytes".to_string()),
+    }
+}
+
+fn live_property_value_from_str(
+    raw: &str,
+    value_type: PropertyType,
+) -> Result<PropertyValue, String> {
+    match value_type {
+        PropertyType::Bool => match raw.to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => Ok(PropertyValue::Bool(true)),
+            "off" | "false" | "no" | "0" => Ok(PropertyValue::Bool(false)),
+            _ => Err("expected on/off, true/false, yes/no, or 1/0".to_string()),
+        },
+        PropertyType::U64 => raw
+            .parse::<u64>()
+            .map(PropertyValue::U64)
+            .map_err(|err| format!("expected unsigned integer: {err}")),
+        PropertyType::I64 => raw
+            .parse::<i64>()
+            .map(PropertyValue::I64)
+            .map_err(|err| format!("expected signed integer: {err}")),
+        PropertyType::String => Ok(PropertyValue::String(raw.to_string())),
+        PropertyType::Enum => {
+            let raw = raw
+                .strip_prefix("variant(")
+                .and_then(|inner| inner.strip_suffix(')'))
+                .unwrap_or(raw);
+            raw.parse::<u8>()
+                .map(PropertyValue::EnumVariant)
+                .map_err(|err| format!("expected enum variant number 0..255: {err}"))
+        }
+        PropertyType::Bytes => {
+            let hex = raw.strip_prefix("0x").unwrap_or(raw);
+            if hex.len() % 2 != 0 {
+                return Err("hex byte value must contain an even number of digits".to_string());
+            }
+            hex.as_bytes()
+                .chunks(2)
+                .map(|chunk| {
+                    let part = std::str::from_utf8(chunk)
+                        .map_err(|err| format!("invalid UTF-8: {err}"))?;
+                    u8::from_str_radix(part, 16)
+                        .map_err(|err| format!("invalid hex byte {part}: {err}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(PropertyValue::Bytes)
+        }
+        PropertyType::Size => parse_live_size(raw).map(PropertyValue::Size),
+    }
+}
+
+fn parse_live_size(raw: &str) -> Result<u64, String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    let (number, multiplier) = match normalized.as_str() {
+        value if value.ends_with("kib") => (&value[..value.len() - 3], 1024),
+        value if value.ends_with("kb") => (&value[..value.len() - 2], 1024),
+        value if value.ends_with('k') => (&value[..value.len() - 1], 1024),
+        value if value.ends_with("mib") => (&value[..value.len() - 3], 1024_u64.pow(2)),
+        value if value.ends_with("mb") => (&value[..value.len() - 2], 1024_u64.pow(2)),
+        value if value.ends_with('m') => (&value[..value.len() - 1], 1024_u64.pow(2)),
+        value if value.ends_with("gib") => (&value[..value.len() - 3], 1024_u64.pow(3)),
+        value if value.ends_with("gb") => (&value[..value.len() - 2], 1024_u64.pow(3)),
+        value if value.ends_with('g') => (&value[..value.len() - 1], 1024_u64.pow(3)),
+        value if value.ends_with("tib") => (&value[..value.len() - 3], 1024_u64.pow(4)),
+        value if value.ends_with("tb") => (&value[..value.len() - 2], 1024_u64.pow(4)),
+        value if value.ends_with('t') => (&value[..value.len() - 1], 1024_u64.pow(4)),
+        value if value.ends_with('b') => (&value[..value.len() - 1], 1),
+        value => (value, 1),
+    };
+    if number.is_empty() {
+        return Err("size value must include a number".to_string());
+    }
+    let base = number
+        .parse::<u64>()
+        .map_err(|err| format!("expected size in bytes or KiB/MiB/GiB/TiB form: {err}"))?;
+    base.checked_mul(multiplier)
+        .ok_or_else(|| "size value overflows u64".to_string())
 }
 
 fn live_admin_string_vec(args: &Value, key: &str) -> Result<Vec<String>, String> {

@@ -411,6 +411,22 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
     let command = route.command;
     let operation = route.operation;
     let pool = route.pool;
+    if route.json {
+        let mut out = serde_json::json!({
+            "ok": false,
+            "command": command,
+            "operation": operation,
+            "pool_name": pool,
+            "owner_required": true,
+            "error": format!("cannot use a live-owner interface for imported pool '{pool}': {lookup_error}"),
+            "recovery": "repair or restart the kernel UAPI or userspace daemon owner before operating on live state; do not open cached imported-pool state directly",
+        });
+        if let Some(pool_uuid) = route.pool_uuid {
+            out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
+        }
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        process::exit(1);
+    }
     eprintln!(
         "tidefsctl {command} {operation}: cannot use a live-owner interface for imported pool '{pool}': {lookup_error}"
     );
@@ -436,6 +452,22 @@ fn exit_owner_error(route: LivePoolRoute<'_>, exit_code: i32, message: &str) -> 
     let command = route.command;
     let operation = route.operation;
     let pool = route.pool;
+    if route.json {
+        let mut out = serde_json::json!({
+            "ok": false,
+            "command": command,
+            "operation": operation,
+            "pool_name": pool,
+            "owner_required": true,
+            "error": message,
+            "recovery": "use the live owner response as authoritative; tidefsctl will not fall back to direct device access for imported pool state",
+        });
+        if let Some(pool_uuid) = route.pool_uuid {
+            out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
+        }
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        process::exit(if exit_code == 0 { 1 } else { exit_code });
+    }
     eprintln!(
         "tidefsctl {command} {operation}: live owner for imported pool '{pool}' refused request: {message}"
     );
