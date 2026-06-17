@@ -357,6 +357,7 @@ pub struct CommitAck {
     pub ticket_id: TransferTicketId,
     pub target: NodeId,
     pub placement_receipt_id: WriteReceiptId,
+    pub receipt_committed: bool,
     pub digest: u64,
 }
 
@@ -540,6 +541,7 @@ pub fn execute_commit_phase(
             ticket_id: protocol.ticket_id,
             target: ta.target,
             placement_receipt_id: receipt_id,
+            receipt_committed: true,
             digest,
         });
     }
@@ -593,18 +595,22 @@ pub fn evaluate_quorum_result(
 ) -> QuorumWriteResult {
     let min_q = protocol.min_quorum() as u64;
     let target_count = protocol.target_nodes.len() as u64;
-    let valid_commit_acks = commit_acks.len() as u64;
+    let committed_receipt_acks: Vec<&CommitAck> = commit_acks
+        .iter()
+        .filter(|ack| ack.receipt_committed && ack.placement_receipt_id != WriteReceiptId::ZERO)
+        .collect();
+    let valid_commit_acks = committed_receipt_acks.len() as u64;
     let _valid_witness = witness_acks.iter().filter(|w| w.attested).count() as u64;
 
-    let write_class = if valid_commit_acks == 0 {
+    let write_class = if valid_commit_acks < min_q {
         WriteClass::RefusedNoQuorum
-    } else if valid_commit_acks >= min_q {
+    } else if valid_commit_acks == target_count {
         WriteClass::Committed
     } else {
         WriteClass::DegradedCommitted
     };
 
-    let placement_receipts: Vec<WriteReceiptId> = commit_acks
+    let placement_receipts: Vec<WriteReceiptId> = committed_receipt_acks
         .iter()
         .map(|ca| ca.placement_receipt_id)
         .collect();
@@ -745,7 +751,7 @@ pub fn build_quorum_write_summary(
             prepare_refusal_reason: pr.and_then(|r| r.reason_if_refused),
             transfer_acked: ta.is_some(),
             transfer_digest_ok: ta.map(|a| a.digest_ok).unwrap_or(false),
-            commit_acked: ca.is_some(),
+            commit_acked: ca.map(|a| a.receipt_committed).unwrap_or(false),
             witness_attested: wa.map(|a| a.attested).unwrap_or(false),
         });
     }
@@ -754,7 +760,10 @@ pub fn build_quorum_write_summary(
         write_id: result.write_id,
         write_class: result.write_class,
         target_records,
-        acks_at_commit: commit_acks.len() as u64,
+        acks_at_commit: commit_acks
+            .iter()
+            .filter(|ack| ack.receipt_committed && ack.placement_receipt_id != WriteReceiptId::ZERO)
+            .count() as u64,
         acks_at_witness: witness_acks.iter().filter(|w| w.attested).count() as u64,
         min_quorum: result.quorum_size,
         degraded: result.write_class == WriteClass::DegradedCommitted,
@@ -779,20 +788,26 @@ pub fn validate_quorum_invariants(
             result.acks_count, result.quorum_size
         ));
     }
-    if result.write_class == WriteClass::RefusedNoQuorum && result.acks_count > 0 {
+    if result.write_class == WriteClass::RefusedNoQuorum
+        && result.quorum_size > 0
+        && result.acks_count >= result.quorum_size
+    {
         violations.push(format!(
-            "RefusedNoQuorum but acks ({}) > 0",
-            result.acks_count
+            "RefusedNoQuorum but acks ({}) >= quorum ({})",
+            result.acks_count, result.quorum_size
         ));
     }
     if result.write_class == WriteClass::DegradedCommitted {
-        if result.acks_count == 0 {
-            violations.push("DegradedCommitted but acks == 0".into());
-        }
-        if result.acks_count >= result.quorum_size {
+        if result.acks_count < result.quorum_size {
             violations.push(format!(
-                "DegradedCommitted but acks ({}) >= quorum ({})",
+                "DegradedCommitted but acks ({}) < quorum ({})",
                 result.acks_count, result.quorum_size
+            ));
+        }
+        if result.acks_count >= result.target_count {
+            violations.push(format!(
+                "DegradedCommitted but acks ({}) >= target count ({})",
+                result.acks_count, result.target_count
             ));
         }
     }
@@ -1170,12 +1185,14 @@ mod tests {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(1),
                 placement_receipt_id: WriteReceiptId::new(1),
+                receipt_committed: true,
                 digest: 0,
             },
             CommitAck {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(2),
                 placement_receipt_id: WriteReceiptId::new(2),
+                receipt_committed: true,
                 digest: 0,
             },
         ];
@@ -1194,12 +1211,14 @@ mod tests {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(1),
                 placement_receipt_id: WriteReceiptId::new(1),
+                receipt_committed: true,
                 digest: 0,
             },
             CommitAck {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(2),
                 placement_receipt_id: WriteReceiptId::new(2),
+                receipt_committed: true,
                 digest: 0,
             },
         ];
@@ -1255,18 +1274,21 @@ mod tests {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(1),
                 placement_receipt_id: WriteReceiptId::new(1),
+                receipt_committed: true,
                 digest: 0,
             },
             CommitAck {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(2),
                 placement_receipt_id: WriteReceiptId::new(2),
+                receipt_committed: true,
                 digest: 0,
             },
             CommitAck {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(3),
                 placement_receipt_id: WriteReceiptId::new(3),
+                receipt_committed: true,
                 digest: 0,
             },
         ];
@@ -1301,7 +1323,73 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_degraded_when_1_of_3_ack() {
+    fn evaluate_rejects_quorum_when_receipt_uncommitted() {
+        let p = QuorumWriteProtocol::new(
+            QuorumWriteId::new(3),
+            TransferTicketId::new(300),
+            "obj/full".into(),
+            DurabilityMode::QuorumFull,
+            NodeId::new(0),
+            nodes(3),
+            512,
+            empty_digest(),
+            EpochId::new(1),
+        );
+        let transfer: Vec<TransferAck> = nodes(3)
+            .into_iter()
+            .enumerate()
+            .map(|(chunk_index, target)| TransferAck {
+                ticket_id: p.ticket_id,
+                chunk_index: chunk_index as u64,
+                target,
+                received_digest: empty_digest(),
+                digest_ok: true,
+            })
+            .collect();
+        let commit = vec![
+            CommitAck {
+                ticket_id: p.ticket_id,
+                target: NodeId::new(1),
+                placement_receipt_id: WriteReceiptId::new(1),
+                receipt_committed: true,
+                digest: 0,
+            },
+            CommitAck {
+                ticket_id: p.ticket_id,
+                target: NodeId::new(2),
+                placement_receipt_id: WriteReceiptId::new(2),
+                receipt_committed: false,
+                digest: 0,
+            },
+            CommitAck {
+                ticket_id: p.ticket_id,
+                target: NodeId::new(3),
+                placement_receipt_id: WriteReceiptId::new(3),
+                receipt_committed: true,
+                digest: 0,
+            },
+        ];
+        let witness: Vec<WitnessAck> = nodes(3)
+            .into_iter()
+            .map(|target| WitnessAck {
+                ticket_id: p.ticket_id,
+                target,
+                attested: true,
+                digest: 0,
+            })
+            .collect();
+
+        let result = evaluate_quorum_result(&p, &transfer, &commit, &witness);
+        assert_eq!(result.write_class, WriteClass::RefusedNoQuorum);
+        assert_eq!(result.acks_count, 2);
+        assert_eq!(
+            result.placement_receipts,
+            vec![WriteReceiptId::new(1), WriteReceiptId::new(3)]
+        );
+    }
+
+    #[test]
+    fn evaluate_refuses_when_1_of_3_ack() {
         let p = basic_protocol();
         let transfer = vec![TransferAck {
             ticket_id: p.ticket_id,
@@ -1314,6 +1402,7 @@ mod tests {
             ticket_id: p.ticket_id,
             target: NodeId::new(1),
             placement_receipt_id: WriteReceiptId::new(1),
+            receipt_committed: true,
             digest: 0,
         }];
         let witness = vec![WitnessAck {
@@ -1324,8 +1413,54 @@ mod tests {
         }];
 
         let result = evaluate_quorum_result(&p, &transfer, &commit, &witness);
-        assert_eq!(result.write_class, WriteClass::DegradedCommitted);
+        assert_eq!(result.write_class, WriteClass::RefusedNoQuorum);
         assert_eq!(result.acks_count, 1);
+        assert!(!result.needs_repair);
+    }
+
+    #[test]
+    fn evaluate_degraded_when_committed_quorum_short_of_targets() {
+        let p = basic_protocol();
+        let transfer: Vec<TransferAck> = nodes(2)
+            .into_iter()
+            .enumerate()
+            .map(|(chunk_index, target)| TransferAck {
+                ticket_id: p.ticket_id,
+                chunk_index: chunk_index as u64,
+                target,
+                received_digest: empty_digest(),
+                digest_ok: true,
+            })
+            .collect();
+        let commit = vec![
+            CommitAck {
+                ticket_id: p.ticket_id,
+                target: NodeId::new(1),
+                placement_receipt_id: WriteReceiptId::new(1),
+                receipt_committed: true,
+                digest: 0,
+            },
+            CommitAck {
+                ticket_id: p.ticket_id,
+                target: NodeId::new(2),
+                placement_receipt_id: WriteReceiptId::new(2),
+                receipt_committed: true,
+                digest: 0,
+            },
+        ];
+        let witness: Vec<WitnessAck> = nodes(2)
+            .into_iter()
+            .map(|target| WitnessAck {
+                ticket_id: p.ticket_id,
+                target,
+                attested: true,
+                digest: 0,
+            })
+            .collect();
+
+        let result = evaluate_quorum_result(&p, &transfer, &commit, &witness);
+        assert_eq!(result.write_class, WriteClass::DegradedCommitted);
+        assert_eq!(result.acks_count, 2);
         assert!(result.needs_repair);
     }
 
@@ -1371,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn full_protocol_1_target_no_capacity_degraded() {
+    fn full_protocol_1_target_no_capacity_refused() {
         let targets = nodes(3);
         let mut capacities = all_capacity(&targets, true);
         capacities[1] = (NodeId::new(2), false); // target 2 no capacity
@@ -1394,9 +1529,9 @@ mod tests {
             &all_capacity(&targets, true),
             &all_capacity(&targets, true),
         );
-        assert_eq!(result.write_class, WriteClass::DegradedCommitted);
+        assert_eq!(result.write_class, WriteClass::RefusedNoQuorum);
         assert_eq!(result.acks_count, 1); // only target 1
-        assert!(result.needs_repair);
+        assert!(!result.needs_repair);
     }
 
     #[test]
@@ -1476,8 +1611,8 @@ mod tests {
             &all_capacity(&targets, true),
             &all_capacity(&targets, true),
         );
-        // QuorumFull requires 3, we have 2 → degraded
-        assert_eq!(result.write_class, WriteClass::DegradedCommitted);
+        // QuorumFull requires 3 committed receipts, and only 2 were committed.
+        assert_eq!(result.write_class, WriteClass::RefusedNoQuorum);
         assert_eq!(result.quorum_size, 3);
     }
 
@@ -1575,18 +1710,21 @@ mod tests {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(1),
                 placement_receipt_id: WriteReceiptId::new(1),
+                receipt_committed: true,
                 digest: 0,
             },
             CommitAck {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(2),
                 placement_receipt_id: WriteReceiptId::new(2),
+                receipt_committed: true,
                 digest: 0,
             },
             CommitAck {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(3),
                 placement_receipt_id: WriteReceiptId::new(3),
+                receipt_committed: true,
                 digest: 0,
             },
         ];
@@ -1679,12 +1817,14 @@ mod tests {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(1),
                 placement_receipt_id: WriteReceiptId::new(1),
+                receipt_committed: true,
                 digest: 0,
             },
             CommitAck {
                 ticket_id: p.ticket_id,
                 target: NodeId::new(2),
                 placement_receipt_id: WriteReceiptId::new(2),
+                receipt_committed: true,
                 digest: 0,
             },
         ];
@@ -1788,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn digest_mismatch_on_one_target_still_committed_if_quorum_met() {
+    fn digest_mismatch_on_one_target_is_degraded_when_quorum_met() {
         let targets = nodes(3);
         let mut digest_ok = all_capacity(&targets, true);
         digest_ok[2] = (NodeId::new(3), false); // target 3 digest mismatch
@@ -1810,9 +1950,10 @@ mod tests {
             &digest_ok,
             &all_capacity(&targets, true),
         );
-        // 2 of 3 digest OK → commit acks = 2, quorum_witness min = 2 → Committed
-        assert_eq!(result.write_class, WriteClass::Committed);
+        // 2 of 3 digest OK → commit acks = 2, quorum_witness min = 2.
+        assert_eq!(result.write_class, WriteClass::DegradedCommitted);
         assert_eq!(result.acks_count, 2);
+        assert!(result.needs_repair);
         assert!(!result.digests_matched); // one mismatch
     }
 

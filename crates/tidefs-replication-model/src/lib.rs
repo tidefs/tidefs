@@ -117,6 +117,20 @@ impl ReplicatedSubjectId {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ReplicatedReceiptId(pub u64);
 
+impl ReplicatedReceiptId {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ObjectDigest(pub u64);
 
@@ -297,6 +311,161 @@ impl PlacementReceiptRef {
     #[must_use]
     pub const fn is_synthetic(self) -> bool {
         self.receipt_generation == 0
+    }
+
+    #[must_use]
+    pub const fn is_committed_authority(self) -> bool {
+        !self.is_synthetic() && self.redundancy_policy.is_well_formed() && self.target_count > 0
+    }
+}
+
+/// Per-member receipt identity committed by the placement authority.
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd,
+)]
+pub struct CommittedReceiptIdentity {
+    pub member: MemberId,
+    pub receipt_id: ReplicatedReceiptId,
+    pub placement_receipt_ref: PlacementReceiptRef,
+}
+
+impl CommittedReceiptIdentity {
+    #[must_use]
+    pub const fn new(
+        member: MemberId,
+        receipt_id: ReplicatedReceiptId,
+        placement_receipt_ref: PlacementReceiptRef,
+    ) -> Self {
+        Self {
+            member,
+            receipt_id,
+            placement_receipt_ref,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_committed_for(self, member: MemberId, epoch: EpochId) -> bool {
+        self.member.0 == member.0
+            && !self.receipt_id.is_zero()
+            && self.placement_receipt_ref.receipt_epoch.0 == epoch.0
+            && self.placement_receipt_ref.is_committed_authority()
+    }
+}
+
+/// Durable quorum token bound to the per-member receipt identities that
+/// actually satisfied a quorum.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct QuorumDurabilityToken {
+    pub write_id: u64,
+    pub epoch: EpochId,
+    pub target_count: usize,
+    pub quorum_required: usize,
+    pub receipt_identities: Vec<CommittedReceiptIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QuorumDurabilityTokenError {
+    EmptyQuorum,
+    QuorumExceedsTargets {
+        quorum_required: usize,
+        target_count: usize,
+    },
+    InsufficientCommittedReceipts {
+        committed_receipts: usize,
+        quorum_required: usize,
+    },
+    InvalidReceiptIdentity {
+        member: MemberId,
+        receipt_id: ReplicatedReceiptId,
+    },
+    DuplicateMember(MemberId),
+    DuplicateReceipt(ReplicatedReceiptId),
+}
+
+impl QuorumDurabilityToken {
+    /// Build a quorum durability token from committed receipt identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the quorum shape is impossible, a receipt is not
+    /// committed authority for this epoch, or duplicate member/receipt
+    /// identities appear in the quorum.
+    pub fn new(
+        write_id: u64,
+        epoch: EpochId,
+        target_count: usize,
+        quorum_required: usize,
+        receipt_identities: Vec<CommittedReceiptIdentity>,
+    ) -> Result<Self, QuorumDurabilityTokenError> {
+        if quorum_required == 0 || target_count == 0 {
+            return Err(QuorumDurabilityTokenError::EmptyQuorum);
+        }
+        if quorum_required > target_count {
+            return Err(QuorumDurabilityTokenError::QuorumExceedsTargets {
+                quorum_required,
+                target_count,
+            });
+        }
+        if receipt_identities.len() < quorum_required {
+            return Err(QuorumDurabilityTokenError::InsufficientCommittedReceipts {
+                committed_receipts: receipt_identities.len(),
+                quorum_required,
+            });
+        }
+        if receipt_identities.len() > target_count {
+            return Err(QuorumDurabilityTokenError::QuorumExceedsTargets {
+                quorum_required: receipt_identities.len(),
+                target_count,
+            });
+        }
+
+        let mut members = BTreeSet::new();
+        let mut receipts = BTreeSet::new();
+        for identity in &receipt_identities {
+            if !identity.is_committed_for(identity.member, epoch) {
+                return Err(QuorumDurabilityTokenError::InvalidReceiptIdentity {
+                    member: identity.member,
+                    receipt_id: identity.receipt_id,
+                });
+            }
+            if !members.insert(identity.member) {
+                return Err(QuorumDurabilityTokenError::DuplicateMember(identity.member));
+            }
+            if !receipts.insert(identity.receipt_id) {
+                return Err(QuorumDurabilityTokenError::DuplicateReceipt(
+                    identity.receipt_id,
+                ));
+            }
+        }
+
+        Ok(Self {
+            write_id,
+            epoch,
+            target_count,
+            quorum_required,
+            receipt_identities,
+        })
+    }
+
+    #[must_use]
+    pub fn committed_count(&self) -> usize {
+        self.receipt_identities.len()
+    }
+
+    #[must_use]
+    pub fn committed_members(&self) -> Vec<MemberId> {
+        self.receipt_identities
+            .iter()
+            .map(|identity| identity.member)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn receipt_ids(&self) -> Vec<ReplicatedReceiptId> {
+        self.receipt_identities
+            .iter()
+            .map(|identity| identity.receipt_id)
+            .collect()
     }
 }
 
@@ -2899,6 +3068,80 @@ mod tests {
         assert_eq!(receipt.object_id, 77);
         assert_eq!(receipt.receipt_generation, 0);
         assert!(receipt.is_synthetic());
+    }
+
+    fn committed_identity(
+        member: u64,
+        object_id: u64,
+        generation: u64,
+    ) -> CommittedReceiptIdentity {
+        CommittedReceiptIdentity::new(
+            MemberId::new(member),
+            ReplicatedReceiptId::new(generation),
+            intent_receipt_ref(object_id, 4096, generation),
+        )
+    }
+
+    #[test]
+    fn quorum_durability_token_binds_committed_receipt_identities() {
+        let token = QuorumDurabilityToken::new(
+            55,
+            EpochId::new(1),
+            3,
+            2,
+            vec![
+                committed_identity(10, 100, 1000),
+                committed_identity(20, 200, 2000),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(token.committed_count(), 2);
+        assert_eq!(
+            token.committed_members(),
+            vec![MemberId::new(10), MemberId::new(20)]
+        );
+        assert_eq!(
+            token.receipt_ids(),
+            vec![
+                ReplicatedReceiptId::new(1000),
+                ReplicatedReceiptId::new(2000)
+            ]
+        );
+    }
+
+    #[test]
+    fn quorum_durability_token_rejects_synthetic_receipts() {
+        let identity = CommittedReceiptIdentity::new(
+            MemberId::new(10),
+            ReplicatedReceiptId::new(1),
+            PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(1)),
+        );
+
+        assert!(matches!(
+            QuorumDurabilityToken::new(55, EpochId::new(1), 1, 1, vec![identity]),
+            Err(QuorumDurabilityTokenError::InvalidReceiptIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn quorum_durability_token_round_trips_across_restart() {
+        let token = QuorumDurabilityToken::new(
+            55,
+            EpochId::new(1),
+            3,
+            2,
+            vec![
+                committed_identity(10, 100, 1000),
+                committed_identity(20, 200, 2000),
+            ],
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&token).unwrap();
+        let decoded: QuorumDurabilityToken = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded, token);
+        assert_eq!(decoded.committed_count(), 2);
     }
 
     const fn domain(seed: u64, rack: u64) -> FailureDomainVector {

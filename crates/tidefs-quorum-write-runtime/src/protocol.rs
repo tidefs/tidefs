@@ -9,6 +9,9 @@
 use std::collections::BTreeMap;
 
 use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_replication_model::{
+    CommittedReceiptIdentity, QuorumDurabilityToken, QuorumDurabilityTokenError,
+};
 
 use crate::policy::{ReplicationChunkClass, ReplicationPolicy, ReplicationPolicySelector};
 
@@ -31,6 +34,8 @@ pub struct WriteCommitReceipt {
     pub chunk_class: ReplicationChunkClass,
     pub epoch: EpochId,
     pub committed_targets: Vec<MemberId>,
+    pub committed_receipts: Vec<CommittedReceiptIdentity>,
+    pub durability_token: QuorumDurabilityToken,
     pub target_count: usize,
     pub policy: ReplicationPolicy,
     pub partial: bool,
@@ -82,6 +87,18 @@ pub enum QuorumFailureReason {
     },
     Timeout {
         acks_collected: usize,
+        committed_receipts: usize,
+        quorum_required: usize,
+    },
+    CommittedReceiptQuorumNotMet {
+        acks_collected: usize,
+        committed_receipts: usize,
+        quorum_required: usize,
+    },
+    InvalidDurabilityToken(QuorumDurabilityTokenError),
+    ReceiptLostAfterAck {
+        target: MemberId,
+        committed_receipts: usize,
         quorum_required: usize,
     },
     Cancelled,
@@ -91,7 +108,20 @@ pub enum QuorumFailureReason {
 pub struct WriteAck {
     pub target: MemberId,
     pub digest_ok: bool,
-    pub placement_receipt_ref: Option<u64>,
+    pub committed_receipt: Option<CommittedReceiptIdentity>,
+}
+
+impl WriteAck {
+    #[must_use]
+    pub fn committed_receipt_for_epoch(&self, epoch: EpochId) -> Option<CommittedReceiptIdentity> {
+        if !self.digest_ok {
+            return None;
+        }
+        let receipt = self.committed_receipt?;
+        receipt
+            .is_committed_for(self.target, epoch)
+            .then_some(receipt)
+    }
 }
 
 /// Transfer priority class for admission ordering.
@@ -131,6 +161,7 @@ struct PendingWrite {
     failed_targets: Vec<MemberId>,
     epoch: EpochId,
     quorum_impossible: bool,
+    terminal_result_recorded: bool,
 }
 
 /// The production replication protocol runtime.
@@ -201,6 +232,7 @@ impl ReplicationProtocol {
                 failed_targets: Vec::new(),
                 epoch: self.epoch,
                 quorum_impossible: false,
+                terminal_result_recorded: false,
             },
         );
 
@@ -213,11 +245,27 @@ impl ReplicationProtocol {
             return;
         };
 
-        if pending.quorum_impossible {
+        if pending.quorum_impossible || pending.terminal_result_recorded {
             return;
         }
 
-        pending.acks.push(ack);
+        let new_is_committed = ack.committed_receipt_for_epoch(pending.epoch).is_some();
+        if let Some(existing) = pending
+            .acks
+            .iter_mut()
+            .find(|existing| existing.target == ack.target)
+        {
+            let existing_is_committed = existing
+                .committed_receipt_for_epoch(pending.epoch)
+                .is_some();
+            if !existing_is_committed && new_is_committed {
+                *existing = ack;
+            } else {
+                return;
+            }
+        } else {
+            pending.acks.push(ack);
+        }
         self.check_write_completion(write_id);
     }
 
@@ -227,62 +275,132 @@ impl ReplicationProtocol {
             return;
         };
 
-        if pending.quorum_impossible {
+        if pending.quorum_impossible || pending.terminal_result_recorded {
+            return;
+        }
+        if pending.acks.iter().any(|ack| {
+            ack.target == failed_target && ack.committed_receipt_for_epoch(pending.epoch).is_some()
+        }) {
             return;
         }
 
-        pending.failed_targets.push(failed_target);
+        if !pending.failed_targets.contains(&failed_target) {
+            pending.failed_targets.push(failed_target);
+        }
 
+        let committed_so_far = Self::committed_receipts_for_pending(pending).len();
         let remaining = pending
             .target_count
-            .saturating_sub(pending.failed_targets.len());
+            .saturating_sub(pending.failed_targets.len())
+            .saturating_sub(committed_so_far);
         let needed = pending.policy.min_quorum(pending.target_count);
-        let acks_so_far = pending.acks.len();
 
-        if acks_so_far + remaining < needed {
+        if committed_so_far + remaining < needed {
             pending.quorum_impossible = true;
+            pending.terminal_result_recorded = true;
             let result = WriteResult::QuorumFailed {
                 write_id,
-                acks_collected: acks_so_far,
+                acks_collected: pending.acks.len(),
                 quorum_required: needed,
                 reason: QuorumFailureReason::QuorumImpossible {
                     remaining,
-                    needed: needed.saturating_sub(acks_so_far),
+                    needed: needed.saturating_sub(committed_so_far),
                 },
             };
             self.completed_writes.push(result);
         }
     }
 
-    fn check_write_completion(&mut self, write_id: WriteId) {
-        let Some(pending) = self.pending_writes.get(&write_id.0) else {
+    /// Mark a previously acknowledged committed receipt as lost.
+    ///
+    /// Receipt loss after ACK invalidates the pending quorum result rather
+    /// than allowing the write to fall back to uncommitted acknowledgement
+    /// evidence.
+    pub fn lose_committed_receipt(&mut self, write_id: WriteId, target: MemberId) {
+        self.completed_writes.retain(|result| match result {
+            WriteResult::Committed { write_id: wid, .. }
+            | WriteResult::Partial { write_id: wid, .. }
+            | WriteResult::QuorumFailed { write_id: wid, .. } => *wid != write_id,
+        });
+
+        let Some(pending) = self.pending_writes.get_mut(&write_id.0) else {
             return;
         };
 
-        if pending.quorum_impossible {
+        pending.acks.retain(|ack| ack.target != target);
+        if !pending.failed_targets.contains(&target) {
+            pending.failed_targets.push(target);
+        }
+
+        let committed_count = Self::committed_receipts_for_pending(pending).len();
+        let needed = pending.policy.min_quorum(pending.target_count);
+        pending.quorum_impossible = true;
+        pending.terminal_result_recorded = true;
+        self.completed_writes.push(WriteResult::QuorumFailed {
+            write_id,
+            acks_collected: pending.acks.len(),
+            quorum_required: needed,
+            reason: QuorumFailureReason::ReceiptLostAfterAck {
+                target,
+                committed_receipts: committed_count,
+                quorum_required: needed,
+            },
+        });
+    }
+
+    fn check_write_completion(&mut self, write_id: WriteId) {
+        let Some(pending) = self.pending_writes.get_mut(&write_id.0) else {
+            return;
+        };
+
+        if pending.quorum_impossible || pending.terminal_result_recorded {
             return;
         }
 
         let policy = pending.policy;
         let min_q = policy.min_quorum(pending.target_count);
-        let acks = pending.acks.len();
+        let committed_receipts = Self::committed_receipts_for_pending(pending);
+        let committed_count = committed_receipts.len();
 
-        if acks >= min_q {
-            let committed: Vec<MemberId> = pending.acks.iter().map(|a| a.target).collect();
+        if committed_count >= min_q {
+            let durability_token = match QuorumDurabilityToken::new(
+                write_id.0,
+                pending.epoch,
+                pending.target_count,
+                min_q,
+                committed_receipts,
+            ) {
+                Ok(token) => token,
+                Err(err) => {
+                    pending.quorum_impossible = true;
+                    pending.terminal_result_recorded = true;
+                    self.completed_writes.push(WriteResult::QuorumFailed {
+                        write_id,
+                        acks_collected: pending.acks.len(),
+                        quorum_required: min_q,
+                        reason: QuorumFailureReason::InvalidDurabilityToken(err),
+                    });
+                    return;
+                }
+            };
+            let committed = durability_token.committed_members();
             let failed: Vec<MemberId> = pending.failed_targets.clone();
-            let partial = !failed.is_empty();
+            let partial = committed_count < pending.target_count || !failed.is_empty();
 
             let receipt = WriteCommitReceipt {
                 write_id,
                 chunk_class: pending.chunk_class,
                 epoch: pending.epoch,
                 committed_targets: committed,
+                committed_receipts: durability_token.receipt_identities.clone(),
+                durability_token,
                 target_count: pending.target_count,
                 policy,
                 partial,
                 failed_targets: failed.clone(),
             };
 
+            pending.terminal_result_recorded = true;
             if partial {
                 self.completed_writes.push(WriteResult::Partial {
                     write_id,
@@ -293,7 +411,28 @@ impl ReplicationProtocol {
                 self.completed_writes
                     .push(WriteResult::Committed { write_id, receipt });
             }
+        } else if pending.acks.len() + pending.failed_targets.len() >= pending.target_count {
+            pending.quorum_impossible = true;
+            pending.terminal_result_recorded = true;
+            self.completed_writes.push(WriteResult::QuorumFailed {
+                write_id,
+                acks_collected: pending.acks.len(),
+                quorum_required: min_q,
+                reason: QuorumFailureReason::CommittedReceiptQuorumNotMet {
+                    acks_collected: pending.acks.len(),
+                    committed_receipts: committed_count,
+                    quorum_required: min_q,
+                },
+            });
         }
+    }
+
+    fn committed_receipts_for_pending(pending: &PendingWrite) -> Vec<CommittedReceiptIdentity> {
+        pending
+            .acks
+            .iter()
+            .filter_map(|ack| ack.committed_receipt_for_epoch(pending.epoch))
+            .collect()
     }
 
     /// Commit a write, emitting a `WriteCommitReceipt`.
@@ -326,9 +465,7 @@ impl ReplicationProtocol {
             | WriteResult::QuorumFailed { write_id: wid, .. } => *wid == write_id,
         }) {
             let result = self.completed_writes.remove(pos);
-            if result.is_success() {
-                self.pending_writes.remove(&write_id.0);
-            }
+            self.pending_writes.remove(&write_id.0);
             Some(result)
         } else {
             None
@@ -352,20 +489,23 @@ impl ReplicationProtocol {
 
     /// Timeout a pending write.
     pub fn timeout_write(&mut self, write_id: WriteId) {
-        let Some(pending) = self.pending_writes.get(&write_id.0) else {
+        let Some(pending) = self.pending_writes.get_mut(&write_id.0) else {
             return;
         };
-        if pending.quorum_impossible {
+        if pending.quorum_impossible || pending.terminal_result_recorded {
             return;
         }
         let acks = pending.acks.len();
+        let committed_receipts = Self::committed_receipts_for_pending(pending).len();
         let needed = pending.policy.min_quorum(pending.target_count);
+        pending.terminal_result_recorded = true;
         let result = WriteResult::QuorumFailed {
             write_id,
             acks_collected: acks,
             quorum_required: needed,
             reason: QuorumFailureReason::Timeout {
                 acks_collected: acks,
+                committed_receipts,
                 quorum_required: needed,
             },
         };
@@ -406,9 +546,48 @@ impl CatchupRepairTicket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_replication_model::{PlacementReceiptRef, ReplicatedReceiptId};
 
     fn test_epoch() -> EpochId {
         EpochId::new(1)
+    }
+
+    fn receipt_for(target: u64) -> CommittedReceiptIdentity {
+        let member = MemberId::new(target);
+        let mut object_key = [0u8; 32];
+        object_key[..8].copy_from_slice(&target.to_le_bytes());
+        let mut payload_digest = [0u8; 32];
+        payload_digest[0] = target as u8;
+        let generation = 100 + target;
+        CommittedReceiptIdentity::new(
+            member,
+            ReplicatedReceiptId::new(generation),
+            PlacementReceiptRef::replicated(
+                10_000 + target,
+                object_key,
+                test_epoch(),
+                generation,
+                1,
+                4096,
+                payload_digest,
+            ),
+        )
+    }
+
+    fn ack(target: u64) -> WriteAck {
+        WriteAck {
+            target: MemberId::new(target),
+            digest_ok: true,
+            committed_receipt: Some(receipt_for(target)),
+        }
+    }
+
+    fn uncommitted_ack(target: u64) -> WriteAck {
+        WriteAck {
+            target: MemberId::new(target),
+            digest_ok: true,
+            committed_receipt: None,
+        }
     }
 
     #[test]
@@ -423,24 +602,98 @@ mod tests {
     fn standard_policy_quorum_with_2_of_3() {
         let mut proto = ReplicationProtocol::new(test_epoch());
         let wid = proto.fanout_write(ReplicationChunkClass::ContentPayload, 3);
+        proto.collect_ack(wid, ack(1));
+        proto.collect_ack(wid, ack(2));
+        let result = proto.poll_result(wid).unwrap();
+        match result {
+            WriteResult::Partial { receipt, .. } => {
+                assert_eq!(receipt.durability_token.committed_count(), 2);
+                assert_eq!(
+                    receipt.durability_token.receipt_ids(),
+                    vec![ReplicatedReceiptId::new(101), ReplicatedReceiptId::new(102)]
+                );
+            }
+            other => panic!("expected partial committed quorum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn critical_quorum_rejects_uncommitted_receipt() {
+        let mut proto = ReplicationProtocol::new(test_epoch());
+        let wid = proto.fanout_write(ReplicationChunkClass::MetadataHead, 3);
+        proto.collect_ack(wid, ack(1));
+        proto.collect_ack(wid, uncommitted_ack(2));
+        proto.collect_ack(wid, ack(3));
+
+        match proto.poll_result(wid).unwrap() {
+            WriteResult::QuorumFailed { reason, .. } => match reason {
+                QuorumFailureReason::CommittedReceiptQuorumNotMet {
+                    acks_collected,
+                    committed_receipts,
+                    quorum_required,
+                } => {
+                    assert_eq!(acks_collected, 3);
+                    assert_eq!(committed_receipts, 2);
+                    assert_eq!(quorum_required, 3);
+                }
+                other => panic!("unexpected failure reason: {other:?}"),
+            },
+            other => panic!("expected receipt quorum failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn receipt_loss_after_ack_fails_closed() {
+        let mut proto = ReplicationProtocol::new(test_epoch());
+        let wid = proto.fanout_write(ReplicationChunkClass::ContentPayload, 3);
+        proto.collect_ack(wid, ack(1));
+        proto.collect_ack(wid, ack(2));
+        assert_eq!(proto.completed_count(), 1);
+
+        proto.lose_committed_receipt(wid, MemberId::new(2));
+
+        match proto.poll_result(wid).unwrap() {
+            WriteResult::QuorumFailed { reason, .. } => match reason {
+                QuorumFailureReason::ReceiptLostAfterAck {
+                    target,
+                    committed_receipts,
+                    quorum_required,
+                } => {
+                    assert_eq!(target, MemberId::new(2));
+                    assert_eq!(committed_receipts, 1);
+                    assert_eq!(quorum_required, 2);
+                }
+                other => panic!("unexpected failure reason: {other:?}"),
+            },
+            other => panic!("expected fail-closed receipt loss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quorum_accepts_committed_receipt_after_member_restart() {
+        let mut proto = ReplicationProtocol::new(test_epoch());
+        let wid = proto.fanout_write(ReplicationChunkClass::ContentPayload, 3);
+        let restarted_member_receipt = receipt_for(1);
         proto.collect_ack(
             wid,
             WriteAck {
                 target: MemberId::new(1),
                 digest_ok: true,
-                placement_receipt_ref: None,
+                committed_receipt: Some(restarted_member_receipt),
             },
         );
-        proto.collect_ack(
-            wid,
-            WriteAck {
-                target: MemberId::new(2),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
-        let result = proto.poll_result(wid).unwrap();
-        assert!(result.is_success());
+        proto.collect_ack(wid, ack(2));
+
+        match proto.poll_result(wid).unwrap() {
+            WriteResult::Partial { receipt, .. } => {
+                assert!(receipt
+                    .durability_token
+                    .receipt_identities
+                    .contains(&restarted_member_receipt));
+                assert_eq!(receipt.durability_token.committed_count(), 2);
+            }
+            other => panic!("expected committed quorum after restart, got {other:?}"),
+        }
     }
 
     #[test]
@@ -448,22 +701,8 @@ mod tests {
         let mut proto = ReplicationProtocol::new(test_epoch());
         let wid = proto.fanout_write(ReplicationChunkClass::ContentPayload, 3);
         proto.handle_write_failure(wid, MemberId::new(3));
-        proto.collect_ack(
-            wid,
-            WriteAck {
-                target: MemberId::new(1),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
-        proto.collect_ack(
-            wid,
-            WriteAck {
-                target: MemberId::new(2),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
+        proto.collect_ack(wid, ack(1));
+        proto.collect_ack(wid, ack(2));
         let result = proto.poll_result(wid).unwrap();
         assert!(result.is_partial());
     }
@@ -472,31 +711,10 @@ mod tests {
     fn critical_policy_requires_all() {
         let mut proto = ReplicationProtocol::new(test_epoch());
         let wid = proto.fanout_write(ReplicationChunkClass::MetadataHead, 3);
-        proto.collect_ack(
-            wid,
-            WriteAck {
-                target: MemberId::new(1),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
-        proto.collect_ack(
-            wid,
-            WriteAck {
-                target: MemberId::new(2),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
+        proto.collect_ack(wid, ack(1));
+        proto.collect_ack(wid, ack(2));
         assert!(proto.poll_result(wid).is_none());
-        proto.collect_ack(
-            wid,
-            WriteAck {
-                target: MemberId::new(3),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
+        proto.collect_ack(wid, ack(3));
         assert!(proto.poll_result(wid).unwrap().is_success());
     }
 
@@ -512,14 +730,7 @@ mod tests {
     fn best_effort_needs_one_ack() {
         let mut proto = ReplicationProtocol::new(test_epoch());
         let wid = proto.fanout_write(ReplicationChunkClass::BackgroundData, 5);
-        proto.collect_ack(
-            wid,
-            WriteAck {
-                target: MemberId::new(3),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
+        proto.collect_ack(wid, ack(3));
         assert!(proto.poll_result(wid).unwrap().is_success());
     }
 
@@ -527,22 +738,8 @@ mod tests {
     fn commit_write_returns_receipt() {
         let mut proto = ReplicationProtocol::new(test_epoch());
         let wid = proto.fanout_write(ReplicationChunkClass::ContentPayload, 3);
-        proto.collect_ack(
-            wid,
-            WriteAck {
-                target: MemberId::new(1),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
-        proto.collect_ack(
-            wid,
-            WriteAck {
-                target: MemberId::new(2),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
+        proto.collect_ack(wid, ack(1));
+        proto.collect_ack(wid, ack(2));
         let receipt = proto.commit_write(wid).unwrap();
         assert_eq!(receipt.write_id, wid);
         assert_eq!(receipt.policy, ReplicationPolicy::Standard);
@@ -552,14 +749,7 @@ mod tests {
     fn timeout_write_fails() {
         let mut proto = ReplicationProtocol::new(test_epoch());
         let wid = proto.fanout_write(ReplicationChunkClass::ContentPayload, 3);
-        proto.collect_ack(
-            wid,
-            WriteAck {
-                target: MemberId::new(1),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
+        proto.collect_ack(wid, ack(1));
         proto.timeout_write(wid);
         assert!(proto.poll_result(wid).unwrap().is_failed());
     }
@@ -595,39 +785,11 @@ mod tests {
         let w1 = proto.fanout_write(ReplicationChunkClass::ContentPayload, 3);
         let w2 = proto.fanout_write(ReplicationChunkClass::MetadataHead, 2);
         assert_eq!(proto.pending_count(), 2);
-        proto.collect_ack(
-            w1,
-            WriteAck {
-                target: MemberId::new(1),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
-        proto.collect_ack(
-            w1,
-            WriteAck {
-                target: MemberId::new(2),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
+        proto.collect_ack(w1, ack(1));
+        proto.collect_ack(w1, ack(2));
         assert!(proto.poll_result(w1).unwrap().is_success());
-        proto.collect_ack(
-            w2,
-            WriteAck {
-                target: MemberId::new(1),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
-        proto.collect_ack(
-            w2,
-            WriteAck {
-                target: MemberId::new(2),
-                digest_ok: true,
-                placement_receipt_ref: None,
-            },
-        );
+        proto.collect_ack(w2, ack(1));
+        proto.collect_ack(w2, ack(2));
         assert!(proto.poll_result(w2).unwrap().is_success());
     }
 }
