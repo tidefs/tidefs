@@ -5824,7 +5824,7 @@ mod cluster_pool_handler_tests {
     use tidefs_replicated_object_store::ReceiptRepairCompletionEvidence;
     use tidefs_replication_model::{
         FlowCommitClass, FlowCommitResult, FlowState, ReceiptRedundancyPolicy, ReplicaCopyRecord,
-        ReplicaPlacementReceipt,
+        ReplicaPlacementReceipt, ReplicatedReceiptId, ReplicatedSubjectId,
     };
 
     /// Minimum device size for pool creation: 2 * 256KB labels + 8KB offset + 256KB commit region.
