@@ -433,6 +433,12 @@ impl CompressedExtentPayload {
             compressed_data,
         })
     }
+
+    /// Produce a verification token that captures the identity of this payload's transform header.
+    #[must_use]
+    pub fn verification_token(&self) -> TransformVerificationToken {
+        TransformVerificationToken::from_payload(self)
+    }
 }
 
 /// Compress extent payload data according to a per-dataset policy.
@@ -499,6 +505,150 @@ pub fn decompress_extent(payload: &CompressedExtentPayload) -> Result<Vec<u8>> {
         CompressionAlgorithm::Lz4 => Ok(payload.compressed_data.clone()),
     }
 }
+// ── Transform verification ─────────────────────────────────────────────────
+
+/// Compact encoded size of a [`TransformVerificationToken`]:
+/// algorithm (1) + uncompressed_len (8) + physical_len (8) = 17 bytes.
+pub const TRANSFORM_TOKEN_ENCODED_LEN: usize = 17;
+
+/// Verification token capturing the committed identity of a compressed
+/// extent's transform header.
+///
+/// A mismatch between this token and the on-disk header means the stored data
+/// is corrupt or was written under a different transform than what the
+/// commit-group receipt records.  Read paths must reject such extents
+/// instead of silently decompressing them.
+///
+/// ## Compact encoding (17 bytes)
+///
+/// ```text
+/// [algorithm: 1 byte][uncompressed_len: 8 bytes LE][physical_len: 8 bytes LE]
+/// ```
+///
+/// A smaller 13-byte variant ([`encode_token_u13`]) is also provided for
+/// storage in extent-map entry reserved fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransformVerificationToken {
+    /// Compression algorithm in the committed receipt.
+    pub algorithm: CompressionAlgorithm,
+    /// Original uncompressed byte length (pre-size).
+    pub uncompressed_len: u64,
+    /// Physical stored byte count including the extent payload header
+    /// (post-size).
+    pub physical_len: u64,
+}
+
+impl TransformVerificationToken {
+    /// Create a token from its component fields.
+    #[must_use]
+    pub fn new(algorithm: CompressionAlgorithm, uncompressed_len: u64, physical_len: u64) -> Self {
+        Self {
+            algorithm,
+            uncompressed_len,
+            physical_len,
+        }
+    }
+
+    /// Derive a token from an already-constructed [`CompressedExtentPayload`].
+    #[must_use]
+    pub fn from_payload(payload: &CompressedExtentPayload) -> Self {
+        Self {
+            algorithm: payload.compression,
+            uncompressed_len: payload.uncompressed_len,
+            physical_len: payload.physical_bytes(),
+        }
+    }
+
+    /// Verify that a [`CompressedExtentPayload`] matches this token.
+    ///
+    /// Returns `true` when the payload's algorithm, uncompressed length, and
+    /// physical byte count all match the token exactly.
+    pub fn verify(&self, payload: &CompressedExtentPayload) -> bool {
+        payload.compression == self.algorithm
+            && payload.uncompressed_len == self.uncompressed_len
+            && payload.physical_bytes() == self.physical_len
+    }
+
+    /// Encode to a 17-byte compact representation.
+    #[must_use]
+    pub fn encode(&self) -> [u8; TRANSFORM_TOKEN_ENCODED_LEN] {
+        let mut buf = [0u8; TRANSFORM_TOKEN_ENCODED_LEN];
+        buf[0] = self.algorithm as u8;
+        buf[1..9].copy_from_slice(&self.uncompressed_len.to_le_bytes());
+        buf[9..17].copy_from_slice(&self.physical_len.to_le_bytes());
+        buf
+    }
+
+    /// Decode from a 17-byte buffer previously produced by [`encode`].
+    ///
+    /// Returns `None` when the algorithm byte is unrecognised.
+    #[must_use]
+    pub fn decode(buf: &[u8; TRANSFORM_TOKEN_ENCODED_LEN]) -> Option<Self> {
+        let algorithm = CompressionAlgorithm::from_byte(buf[0])?;
+        let uncompressed_len = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+        let physical_len = u64::from_le_bytes(buf[9..17].try_into().unwrap());
+        Some(Self {
+            algorithm,
+            uncompressed_len,
+            physical_len,
+        })
+    }
+}
+
+/// Decode a byte buffer as a [`CompressedExtentPayload`] and verify its
+/// transform header against `token`.
+///
+/// This combines [`CompressedExtentPayload::decode`] with
+/// [`TransformVerificationToken::verify`] so that read paths can check
+/// the on-disk transform header against the committed receipt in one
+/// atomic step.
+///
+/// Returns `None` when decoding fails or the decoded header does not
+/// match the token.  Callers must treat this as corruption.
+pub fn verify_transform_header(
+    buf: &[u8],
+    token: &TransformVerificationToken,
+) -> Option<CompressedExtentPayload> {
+    let payload = CompressedExtentPayload::decode(buf)?;
+    if token.verify(&payload) {
+        Some(payload)
+    } else {
+        None
+    }
+}
+
+/// Encode a [`TransformVerificationToken`] into a 13-byte compact form for
+/// storage in the [`ExtentMapEntryV2`] reserved field.
+///
+/// The `physical_len` field is truncated to u32 (sufficient for any
+/// extent limited by recordsize policy).  Format: algorithm (1) +
+/// uncompressed_len (8) + physical_len_u32 (4) = 13 bytes.
+#[must_use]
+pub fn encode_token_u13(token: &TransformVerificationToken) -> [u8; 13] {
+    let mut buf = [0u8; 13];
+    buf[0] = token.algorithm as u8;
+    buf[1..9].copy_from_slice(&token.uncompressed_len.to_le_bytes());
+    let physical_u32 = token.physical_len.min(u32::MAX as u64) as u32;
+    buf[9..13].copy_from_slice(&physical_u32.to_le_bytes());
+    buf
+}
+
+/// Decode a 13-byte compact token previously produced by [`encode_token_u13`].
+///
+/// Returns `None` when the algorithm byte is unrecognised.
+#[must_use]
+pub fn decode_token_u13(buf: &[u8; 13]) -> Option<TransformVerificationToken> {
+    let algorithm = CompressionAlgorithm::from_byte(buf[0])?;
+    let uncompressed_len = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+    let physical_u32 = u32::from_le_bytes(buf[9..13].try_into().unwrap());
+    Some(TransformVerificationToken {
+        algorithm,
+        uncompressed_len,
+        physical_len: physical_u32 as u64,
+    })
+}
+
+
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
@@ -990,4 +1140,144 @@ mod tests {
         let result = decompress_extent(&payload);
         assert!(result.is_err());
     }
+
+    // ── Transform verification token ───────────────────────────────────
+
+    #[test]
+    fn token_from_payload_matches() {
+        let payload = CompressedExtentPayload {
+            compression: CompressionAlgorithm::Zstd,
+            uncompressed_len: 4096,
+            compressed_data: vec![0xAA; 100],
+        };
+        let token = payload.verification_token();
+        assert_eq!(token.algorithm, CompressionAlgorithm::Zstd);
+        assert_eq!(token.uncompressed_len, 4096);
+        assert_eq!(token.physical_len, EXTENT_PAYLOAD_HEADER_LEN as u64 + 100);
+    }
+
+    #[test]
+    fn token_verify_correct_payload() {
+        let payload = CompressedExtentPayload {
+            compression: CompressionAlgorithm::Zstd,
+            uncompressed_len: 1024,
+            compressed_data: vec![0xBB; 50],
+        };
+        let token = TransformVerificationToken::from_payload(&payload);
+        assert!(token.verify(&payload));
+    }
+
+    #[test]
+    fn token_verify_algorithm_mismatch() {
+        let payload = CompressedExtentPayload {
+            compression: CompressionAlgorithm::Zstd,
+            uncompressed_len: 1024,
+            compressed_data: vec![0; 100],
+        };
+        let token = TransformVerificationToken {
+            algorithm: CompressionAlgorithm::Uncompressed,
+            uncompressed_len: 1024,
+            physical_len: payload.physical_bytes(),
+        };
+        assert!(!token.verify(&payload));
+    }
+
+    #[test]
+    fn token_verify_uncompressed_len_mismatch() {
+        let payload = CompressedExtentPayload {
+            compression: CompressionAlgorithm::Zstd,
+            uncompressed_len: 1024,
+            compressed_data: vec![0; 100],
+        };
+        let token = TransformVerificationToken {
+            algorithm: CompressionAlgorithm::Zstd,
+            uncompressed_len: 2048,
+            physical_len: payload.physical_bytes(),
+        };
+        assert!(!token.verify(&payload));
+    }
+
+    #[test]
+    fn token_verify_physical_len_mismatch() {
+        let payload = CompressedExtentPayload {
+            compression: CompressionAlgorithm::Zstd,
+            uncompressed_len: 1024,
+            compressed_data: vec![0; 100],
+        };
+        let token = TransformVerificationToken {
+            algorithm: CompressionAlgorithm::Zstd,
+            uncompressed_len: 1024,
+            physical_len: 999,
+        };
+        assert!(!token.verify(&payload));
+    }
+
+    #[test]
+    fn token_encode_decode_roundtrip() {
+        let token = TransformVerificationToken {
+            algorithm: CompressionAlgorithm::Zstd,
+            uncompressed_len: 65536,
+            physical_len: 12345,
+        };
+        let encoded = token.encode();
+        let decoded = TransformVerificationToken::decode(&encoded).unwrap();
+        assert_eq!(decoded, token);
+    }
+
+    #[test]
+    fn token_decode_unknown_algorithm() {
+        let mut buf = [0u8; TRANSFORM_TOKEN_ENCODED_LEN];
+        buf[0] = 0xFF;
+        assert!(TransformVerificationToken::decode(&buf).is_none());
+    }
+
+    #[test]
+    fn verify_transform_header_correct() {
+        let data = b"AAAA".repeat(200);
+        let policy = CompressionPolicy::zstd_default();
+        let payload = compress_extent(&data, &policy);
+        let token = payload.verification_token();
+        let encoded = payload.encode();
+        let verified = verify_transform_header(&encoded, &token);
+        assert!(verified.is_some());
+        assert_eq!(verified.unwrap().uncompressed_len, data.len() as u64);
+    }
+
+    #[test]
+    fn verify_transform_header_mismatch_rejected() {
+        let payload = CompressedExtentPayload {
+            compression: CompressionAlgorithm::Uncompressed,
+            uncompressed_len: 64,
+            compressed_data: b"hello".to_vec(),
+        };
+        let encoded = payload.encode();
+        let bad_token = TransformVerificationToken::new(CompressionAlgorithm::Zstd, 64, 100);
+        assert!(verify_transform_header(&encoded, &bad_token).is_none());
+    }
+
+    #[test]
+    fn encode_token_u13_roundtrip() {
+        let token = TransformVerificationToken::new(CompressionAlgorithm::Lz4, 4096, 1024);
+        let buf = encode_token_u13(&token);
+        assert_eq!(buf.len(), 13);
+        assert_eq!(buf[0], CompressionAlgorithm::Lz4 as u8);
+        let decoded = decode_token_u13(&buf).unwrap();
+        assert_eq!(decoded.algorithm, CompressionAlgorithm::Lz4);
+        assert_eq!(decoded.uncompressed_len, 4096);
+        assert_eq!(decoded.physical_len, 1024);
+    }
+
+    #[test]
+    fn encode_token_u13_physical_truncation() {
+        let token = TransformVerificationToken::new(
+            CompressionAlgorithm::Zstd,
+            4096,
+            u32::MAX as u64 + 1,
+        );
+        let buf = encode_token_u13(&token);
+        let decoded = decode_token_u13(&buf).unwrap();
+        // physical_len should be truncated to u32::MAX
+        assert_eq!(decoded.physical_len, u32::MAX as u64);
+    }
+
 }

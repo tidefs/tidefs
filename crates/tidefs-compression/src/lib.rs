@@ -93,7 +93,9 @@ pub use tidefs_frame::FRAME_HEADER_LEN;
 // Extent-level compression types and functions.
 pub use tidefs_frame::{
     compress_extent, decompress_extent, CompressedExtentPayload, CompressionPolicy,
-    EXTENT_PAYLOAD_HEADER_LEN,
+    EXTENT_PAYLOAD_HEADER_LEN, TransformVerificationToken,
+    TRANSFORM_TOKEN_ENCODED_LEN,
+    verify_transform_header, encode_token_u13, decode_token_u13,
 };
 
 pub mod algorithm;
@@ -112,6 +114,8 @@ pub enum CompressionError {
     DecompressionFailed(String),
     /// Underlying store error.
     Store(StoreError),
+    /// Transform header in stored data does not match the committed receipt token.
+    CorruptTransformHeader,
 }
 
 impl fmt::Display for CompressionError {
@@ -130,6 +134,12 @@ impl fmt::Display for CompressionError {
                 write!(f, "decompression failed: {reason}")
             }
             Self::Store(e) => write!(f, "store error: {e}"),
+            Self::CorruptTransformHeader => {
+                write!(
+                    f,
+                    "transform header does not match committed receipt: extent is corrupt"
+                )
+            }
         }
     }
 }
@@ -317,6 +327,56 @@ impl CompressedObjectStore {
         let encoded = payload.encode();
         self.inner.put_named(name, &encoded)?;
         Ok(payload)
+    }
+
+    /// Store extent data with compression and return both the payload and
+    /// a [`TransformVerificationToken`] that must be recorded alongside the
+    /// extent-map entry for later verification on read.
+    ///
+    /// The returned token captures the transform header identity so that
+    /// [`get_extent_verified`] can detect on-disk corruption or replay
+    /// of an extent stored under an incompatible policy.
+    pub fn put_extent_verified(
+        &mut self,
+        name: impl AsRef<[u8]>,
+        data: &[u8],
+        policy: &CompressionPolicy,
+    ) -> Result<(CompressedExtentPayload, TransformVerificationToken)> {
+        let payload = compress_extent(data, policy);
+        let token = payload.verification_token();
+        let encoded = payload.encode();
+        self.inner.put_named(name, &encoded)?;
+        Ok((payload, token))
+    }
+
+    /// Retrieve, verify, and decompress extent data previously stored
+    /// via [`put_extent_verified`].
+    ///
+    /// The on-disk transform header is verified against `token` before
+    /// decompression.  A mismatch produces [`CompressionError::CorruptTransformHeader`].
+    /// Returns `Ok(None)` when the key does not exist.
+    pub fn get_extent_verified(
+        &self,
+        name: impl AsRef<[u8]>,
+        token: &TransformVerificationToken,
+    ) -> Result<Option<Vec<u8>>> {
+        match self.inner.get_named(name)? {
+            Some(encoded) => {
+                let payload = verify_transform_header(&encoded, token)
+                    .ok_or(CompressionError::CorruptTransformHeader)?;
+                decompress_extent(&payload)
+                    .map_err(|e| match e {
+                        tidefs_frame::FrameError::ZstdDecompressionFailed => {
+                            CompressionError::DecompressionFailed(
+                                "zstd decompression failed".into(),
+                            )
+                        }
+                        other => CompressionError::DecompressionFailed(format!("{other:?}")),
+                    })
+                    .map(Some)
+            }
+            None => Ok(None),
+        }
     }
 
     /// Retrieve and decompress extent payload data stored via [`put_extent`].
@@ -1356,5 +1416,125 @@ mod tests {
         let store = CompressedObjectStore::new(inner, CompressionConfig::default());
         let result = store.get_extent("trunc");
         assert!(result.is_err());
+    }
+    // ── Verified extent put/get ───────────────────────────────────────
+    #[test]
+    fn extent_put_get_verified_correct_receipt() {
+        let (_dir, inner) = temp_store();
+        let mut store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"AAAA".repeat(200);
+        let (payload, token) = store
+            .put_extent_verified("ext_v1", &data, &policy)
+            .unwrap();
+        assert_eq!(payload.compression, CompressionAlgorithm::Zstd);
+        assert_eq!(token.algorithm, CompressionAlgorithm::Zstd);
+        let roundtrip = store
+            .get_extent_verified("ext_v1", &token)
+            .unwrap()
+            .unwrap();
+        assert_eq!(roundtrip, data);
+    }
+    #[test]
+    fn extent_get_verified_corrupt_header_rejected() {
+        let (_dir, inner) = temp_store();
+        let mut store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"BBBB".repeat(200);
+        let (_payload, token) = store
+            .put_extent_verified("ext_v2", &data, &policy)
+            .unwrap();
+        // Corrupt the stored payload header
+        {
+            let key = ObjectKey::from_name("ext_v2");
+            let framed = store.inner().get(key).unwrap().unwrap();
+            let mut corrupt = framed.clone();
+            // Invert the algorithm byte
+            corrupt[0] = CompressionAlgorithm::Uncompressed as u8;
+            store.inner_mut().put(key, &corrupt).unwrap();
+        }
+        let result = store.get_extent_verified("ext_v2", &token);
+        assert!(result.is_err());
+        match result {
+            Err(CompressionError::CorruptTransformHeader) => {} // expected
+            other => panic!("expected CorruptTransformHeader, got {other:?}"),
+        }
+    }
+    #[test]
+    fn extent_get_verified_uncompressed_len_mismatch_rejected() {
+        let (_dir, inner) = temp_store();
+        let mut store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let policy = CompressionPolicy::zstd_default();
+        let data = b"CCCC".repeat(200);
+        let (_payload, token) = store
+            .put_extent_verified("ext_v3", &data, &policy)
+            .unwrap();
+        // Corrupt the uncompressed_len in the stored header
+        {
+            let key = ObjectKey::from_name("ext_v3");
+            let framed = store.inner().get(key).unwrap().unwrap();
+            let mut corrupt = framed.clone();
+            // Zero out uncompressed_len bytes (positions 1-8)
+            corrupt[1] = 0x00;
+            corrupt[2] = 0x00;
+            store.inner_mut().put(key, &corrupt).unwrap();
+        }
+        let result = store.get_extent_verified("ext_v3", &token);
+        assert!(result.is_err());
+        match result {
+            Err(CompressionError::CorruptTransformHeader) => {}
+            other => panic!("expected CorruptTransformHeader, got {other:?}"),
+        }
+    }
+    #[test]
+    fn extent_put_get_verified_multiple_extents() {
+        let (_dir, inner) = temp_store();
+        let mut store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let policy = CompressionPolicy::zstd_default();
+        // Simulate a multi-extent file write
+        let chunks: Vec<Vec<u8>> = (0..4)
+            .map(|i| format!("chunk_{i}_").repeat(50).into_bytes())
+            .collect();
+        let mut tokens = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let name = format!("ext_multi_{i}");
+            let (_payload, token) = store
+                .put_extent_verified(&name, chunk, &policy)
+                .unwrap();
+            tokens.push((name, token));
+        }
+        // Read back and verify each chunk
+        for (i, (name, token)) in tokens.iter().enumerate() {
+            let roundtrip = store
+                .get_extent_verified(name, token)
+                .unwrap()
+                .unwrap();
+            assert_eq!(roundtrip, chunks[i], "chunk {i} mismatch");
+        }
+    }
+    #[test]
+    fn extent_put_get_verified_uncompressed_policy() {
+        let (_dir, inner) = temp_store();
+        let mut store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let policy = CompressionPolicy::off();
+        let data = b"plain uncompressed data";
+        let (_payload, token) = store
+            .put_extent_verified("ext_vu", data, &policy)
+            .unwrap();
+        assert_eq!(token.algorithm, CompressionAlgorithm::Uncompressed);
+        assert_eq!(token.uncompressed_len, data.len() as u64);
+        let roundtrip = store
+            .get_extent_verified("ext_vu", &token)
+            .unwrap()
+            .unwrap();
+        assert_eq!(roundtrip, data);
+    }
+    #[test]
+    fn extent_get_verified_nonexistent_key() {
+        let (_dir, inner) = temp_store();
+        let store = CompressedObjectStore::new(inner, CompressionConfig::default());
+        let token = TransformVerificationToken::new(CompressionAlgorithm::Zstd, 100, 50);
+        let result = store.get_extent_verified("nonexistent", &token).unwrap();
+        assert!(result.is_none());
     }
 }

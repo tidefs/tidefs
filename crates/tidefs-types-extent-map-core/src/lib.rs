@@ -397,6 +397,46 @@ impl ExtentMapEntryV2 {
     pub fn set_base_complete(&mut self) {
         self.flags = (self.flags & !Self::FLAG_INGEST) | Self::FLAG_BASE_COMPLETE;
     }
+
+    // ── Compression verification token (reserved[0..13]) ──────────
+
+    /// Flag in `reserved[12]` that indicates a compression token is present.
+    const COMPRESSION_TOKEN_FLAG: u8 = 0x01;
+
+    /// Store the compression verification token in the reserved field.
+    ///
+    /// `uncompressed_len` and `physical_len` record the transform header
+    /// identity committed for this extent so readers can detect on-disk
+    /// corruption or policy mismatch.
+    pub fn set_compression_token(&mut self, uncompressed_len: u64, physical_len: u64) {
+        self.reserved[0..8].copy_from_slice(&uncompressed_len.to_le_bytes());
+        let phys_u32 = physical_len.min(u32::MAX as u64) as u32;
+        self.reserved[8..12].copy_from_slice(&phys_u32.to_le_bytes());
+        self.reserved[12] = Self::COMPRESSION_TOKEN_FLAG;
+    }
+
+    /// Read the compression verification token, if one was stored.
+    ///
+    /// Returns `None` when no compression token has been set.
+    /// When `Some`, returns `(uncompressed_len, physical_len)`.
+    #[must_use]
+    pub fn compression_token(&self) -> Option<(u64, u64)> {
+        if self.reserved[12] != Self::COMPRESSION_TOKEN_FLAG {
+            return None;
+        }
+        let uncompressed_len = u64::from_le_bytes(
+            self.reserved[0..8].try_into().unwrap(),
+        );
+        let physical_u32 = u32::from_le_bytes(
+            self.reserved[8..12].try_into().unwrap(),
+        );
+        Some((uncompressed_len, physical_u32 as u64))
+    }
+
+    /// Clear any stored compression verification token.
+    pub fn clear_compression_token(&mut self) {
+        self.reserved[12] = 0;
+    }
 }
 
 impl fmt::Display for ExtentMapEntryV2 {
@@ -1192,4 +1232,112 @@ mod tests {
         let grandchild = RecordsizeProperty::Inherit.resolve(Some(child));
         assert_eq!(grandchild, RecordsizeProperty::Fixed(1_048_576));
     }
+
+
+    // ── Compression token ─────────────────────────────────────────
+
+
+
+    #[test]
+
+    fn v2_compression_token_set_and_get() {
+
+        let mut entry = ExtentMapEntryV2::new_data(0, 4096, LocatorId(42), [0xAA; 32], 1);
+
+        assert!(entry.compression_token().is_none());
+
+        entry.set_compression_token(4096, 1024);
+
+        let (uncompressed, physical) = entry.compression_token().unwrap();
+
+        assert_eq!(uncompressed, 4096);
+
+        assert_eq!(physical, 1024);
+
+    }
+
+
+
+    #[test]
+
+    fn v2_compression_token_clear() {
+
+        let mut entry = ExtentMapEntryV2::new_data(0, 2048, LocatorId(1), [0xBB; 32], 2);
+
+        entry.set_compression_token(2048, 512);
+
+        assert!(entry.compression_token().is_some());
+
+        entry.clear_compression_token();
+
+        assert!(entry.compression_token().is_none());
+
+    }
+
+
+
+    #[test]
+
+    fn v2_compression_token_preserves_other_reserved() {
+
+        let mut entry = ExtentMapEntryV2::new_data(0, 1024, LocatorId(3), [0xCC; 32], 3);
+
+        entry.reserved[13] = 0x42;
+
+        entry.reserved[14] = 0x99;
+
+        entry.set_compression_token(1024, 256);
+
+        assert_eq!(entry.reserved[13], 0x42);
+
+        assert_eq!(entry.reserved[14], 0x99);
+
+        let (uncompressed, physical) = entry.compression_token().unwrap();
+
+        assert_eq!(uncompressed, 1024);
+
+        assert_eq!(physical, 256);
+
+    }
+
+
+
+    #[test]
+
+    fn v2_compression_token_physical_truncation() {
+
+        let mut entry = ExtentMapEntryV2::new_data(0, 8192, LocatorId(5), [0xDD; 32], 4);
+
+        // physical_len exceeds u32 max, should be truncated
+
+        entry.set_compression_token(8192, u32::MAX as u64 + 1);
+
+        let (_uncompressed, physical) = entry.compression_token().unwrap();
+
+        assert_eq!(physical, u32::MAX as u64);
+
+    }
+
+
+
+    #[test]
+
+    fn v2_compression_token_unwritten_entry() {
+
+        let mut entry = ExtentMapEntryV2::new_unwritten(0, 4096, 1);
+
+        assert!(entry.compression_token().is_none());
+
+        // Compression token doesn't make sense for unwritten, but should store/retrieve
+
+        entry.set_compression_token(4096, 0);
+
+        let (uncompressed, physical) = entry.compression_token().unwrap();
+
+        assert_eq!(uncompressed, 4096);
+
+        assert_eq!(physical, 0);
+
+    }
+
 }

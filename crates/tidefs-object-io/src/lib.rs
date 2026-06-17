@@ -35,6 +35,8 @@ pub enum ObjectIoError {
     MissingObject(ObjectKey),
     /// The read range lies entirely in a hole past EOF.
     HoleBeyondEof,
+    /// Transform header in stored data does not match the committed extent receipt.
+    CorruptTransform,
 }
 
 impl fmt::Display for ObjectIoError {
@@ -46,6 +48,9 @@ impl fmt::Display for ObjectIoError {
             Self::InvalidChunkSize => f.write_str("invalid object I/O chunk size"),
             Self::MissingObject(key) => write!(f, "extent references missing object {key}"),
             Self::HoleBeyondEof => f.write_str("read entirely in hole past EOF"),
+            Self::CorruptTransform => {
+                f.write_str("compression transform header mismatch: extent is corrupt")
+            }
         }
     }
 }
@@ -174,6 +179,43 @@ where
     ObjectIoError::StoreError(Box::new(err))
 }
 
+/// Verify the compression transform header in `raw_bytes` against
+/// the committed receipt recorded in the extent map entry.
+///
+/// Returns `Ok(())` when the entry has no compression token or the
+/// transform header matches.  Returns `Err(CorruptTransform)` on mismatch.
+fn verify_extent_transform(
+    raw_bytes: &[u8],
+    entry: &ExtentMapEntryV2,
+) -> Result<()> {
+    let compression_hint = entry.compression_hint();
+    let token = match entry.compression_token() {
+        Some(t) => t,
+        None => {
+            // No compression token stored: nothing to verify.
+            return Ok(());
+        }
+    };
+    // When a token is present, the stored bytes must have a 9-byte header
+    // matching the committed receipt.
+    if raw_bytes.len() < 9 {
+        return Err(ObjectIoError::CorruptTransform);
+    }
+    let stored_algo = raw_bytes[0];
+    let stored_uncompressed = u64::from_le_bytes(
+        raw_bytes[1..9].try_into().unwrap(),
+    );
+    let stored_physical = raw_bytes.len() as u64;
+
+    if stored_algo != compression_hint
+        || stored_uncompressed != token.0
+        || stored_physical != token.1
+    {
+        return Err(ObjectIoError::CorruptTransform);
+    }
+    Ok(())
+}
+
 fn load_object<S: ObjectStore>(store: &S, key: ObjectKey) -> Result<Vec<u8>> {
     store
         .get(&key)
@@ -223,6 +265,7 @@ fn preserve_fragment<S: ObjectStore>(
 
     let key = entry_object_key(source);
     let payload = load_object(store, key)?;
+    verify_extent_transform(&payload, source)?;
     let payload_start = usize::try_from(fragment_range.start - source_range.start)
         .map_err(|_| ObjectIoError::InvalidRange)?;
     let fragment_len_usize = fragment_range.len_usize()?;
@@ -308,6 +351,7 @@ impl ObjectReader {
             let read_len = read_range.len_usize()?;
             if entry.extent_type().is_data() {
                 let payload = load_object(store, entry_object_key(&entry))?;
+                verify_extent_transform(&payload, &entry)?;
                 let payload_start = usize::try_from(read_range.start - entry_range.start)
                     .map_err(|_| ObjectIoError::InvalidRange)?;
                 if payload_start < payload.len() {
@@ -1540,4 +1584,272 @@ mod tests {
         assert_eq!(read, 12);
         assert_eq!(&buf, b"offset-write");
     }
+
+
+    // ── Compression transform verification ────────────────────────
+
+
+
+    /// Build a 9-byte compressed extent payload header for testing.
+
+    fn make_compressed_payload(algo: u8, uncompressed_len: u64, data: &[u8]) -> Vec<u8> {
+
+        let mut buf = Vec::with_capacity(9 + data.len());
+
+        buf.push(algo);
+
+        buf.extend_from_slice(&uncompressed_len.to_le_bytes());
+
+        buf.extend_from_slice(data);
+
+        buf
+
+    }
+
+
+
+    #[test]
+
+    fn read_compressed_extent_with_valid_token_succeeds() {
+
+        let _data = b"AAAA".repeat(100); // 400 bytes
+
+        let compressed = b"ZZZZ".repeat(50); // 200 bytes "compressed"
+
+        let payload = make_compressed_payload(0x01, 400, &compressed);
+
+        // payload len = 9 + 200 = 209
+
+
+
+        let key = content_hash(&payload);
+
+        let mut store = MemStore::default();
+
+        store.put(key, &payload).unwrap();
+
+
+
+        let mut entry = ExtentMapEntryV2::new_data(
+
+            0,
+
+            400,
+
+            derive_locator_id(key),
+
+            key.as_bytes32(),
+
+            1,
+
+        );
+
+        entry.set_compression_hint(0x01); // zstd
+
+        entry.set_compression_token(400, 209);
+
+
+
+        let mut map = InlineExtentMap::new();
+
+        map.entries.push(entry);
+
+        map.header.file_size = 400;
+
+
+
+        let mut buf = vec![0; 400];
+
+        let read = ObjectReader::new()
+
+            .read(&map, &store, 0, &mut buf)
+
+            .unwrap();
+
+        assert_eq!(read, 400);
+
+    }
+
+
+
+    #[test]
+
+    fn read_compressed_extent_corrupt_algorithm_rejected() {
+
+        let _data = b"BBBB".repeat(100);
+
+        let compressed = b"YYYY".repeat(50);
+
+        let payload = make_compressed_payload(0x01, 400, &compressed);
+
+
+
+        let key = content_hash(&payload);
+
+        let mut store = MemStore::default();
+
+        store.put(key, &payload).unwrap();
+
+
+
+        let mut entry = ExtentMapEntryV2::new_data(
+
+            0,
+
+            400,
+
+            derive_locator_id(key),
+
+            key.as_bytes32(),
+
+            1,
+
+        );
+
+        // Token says uncompressed, but stored bytes say zstd (0x01)
+
+        entry.set_compression_hint(0x00);
+
+        entry.set_compression_token(400, 209);
+
+
+
+        let mut map = InlineExtentMap::new();
+
+        map.entries.push(entry);
+
+        map.header.file_size = 400;
+
+
+
+        let mut buf = vec![0; 400];
+
+        let result = ObjectReader::new().read(&map, &store, 0, &mut buf);
+
+        assert!(result.is_err());
+
+        assert!(matches!(result.unwrap_err(), ObjectIoError::CorruptTransform));
+
+    }
+
+
+
+    #[test]
+
+    fn read_compressed_extent_corrupt_uncompressed_len_rejected() {
+
+        let _data = b"CCCC".repeat(100);
+
+        let compressed = b"XXXX".repeat(50);
+
+        let payload = make_compressed_payload(0x01, 400, &compressed);
+
+
+
+        let key = content_hash(&payload);
+
+        let mut store = MemStore::default();
+
+        store.put(key, &payload).unwrap();
+
+
+
+        let mut entry = ExtentMapEntryV2::new_data(
+
+            0,
+
+            400,
+
+            derive_locator_id(key),
+
+            key.as_bytes32(),
+
+            1,
+
+        );
+
+        entry.set_compression_hint(0x01);
+
+        // Token says 800 uncompressed, but stored says 400
+
+        entry.set_compression_token(800, 209);
+
+
+
+        let mut map = InlineExtentMap::new();
+
+        map.entries.push(entry);
+
+        map.header.file_size = 400;
+
+
+
+        let mut buf = vec![0; 400];
+
+        let result = ObjectReader::new().read(&map, &store, 0, &mut buf);
+
+        assert!(result.is_err());
+
+        assert!(matches!(result.unwrap_err(), ObjectIoError::CorruptTransform));
+
+    }
+
+
+
+    #[test]
+
+    fn read_compressed_extent_no_token_passes_through() {
+
+        // When no compression token is set, the read should succeed
+
+        // even if the payload has a transform header.
+
+        let payload = make_compressed_payload(0x01, 100, b"compressed_data");
+
+        let key = content_hash(&payload);
+
+        let mut store = MemStore::default();
+
+        store.put(key, &payload).unwrap();
+
+
+
+        let entry = ExtentMapEntryV2::new_data(
+
+            0,
+
+            100,
+
+            derive_locator_id(key),
+
+            key.as_bytes32(),
+
+            1,
+
+        );
+
+        // No compression token set, no compression hint
+
+
+
+        let mut map = InlineExtentMap::new();
+
+        map.entries.push(entry);
+
+        map.header.file_size = 100;
+
+
+
+        let mut buf = vec![0; 100];
+
+        let read = ObjectReader::new()
+
+            .read(&map, &store, 0, &mut buf)
+
+            .unwrap();
+
+        assert_eq!(read, 100);
+
+    }
+
 }

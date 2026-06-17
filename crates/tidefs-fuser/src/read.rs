@@ -341,6 +341,9 @@ impl From<tidefs_object_io::ObjectIoError> for ReadError {
             }
             tidefs_object_io::ObjectIoError::MissingObject(_) => Self::MissingObject,
             tidefs_object_io::ObjectIoError::HoleBeyondEof => Self::HoleBeyondEof,
+            tidefs_object_io::ObjectIoError::CorruptTransform => {
+                Self::Internal("compression transform header mismatch".into())
+            }
         }
     }
 }
