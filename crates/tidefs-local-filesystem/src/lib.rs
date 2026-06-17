@@ -3913,44 +3913,34 @@ impl LocalFileSystem {
                     false,
                 )?;
                 if let ContentLayout::Chunked(ref new_manifest) = new_layout {
-                    for old_chunk in &old_manifest.chunks {
-                        if old_chunk.is_hole() {
-                            continue;
-                        }
-                        let old_key = content_chunk_object_key_for_version(
-                            inode_id, old_chunk.data_version, old_chunk.chunk_index);
-                        match new_manifest.chunks.iter()
-                            .find(|c| c.chunk_index == old_chunk.chunk_index)
-                        {
-                            Some(new_chunk) if new_chunk.data_version != old_chunk.data_version => {
-                                let new_key = content_chunk_object_key_for_version(
-                                    inode_id, new_chunk.data_version, new_chunk.chunk_index);
-                                self.deferred_rewrite_trims.push((old_key, new_key));
-                            }
-                            Some(_) => {
-                                // Retained chunk: same data_version, not obsolete.
-                            }
-                            None => {
-                                // Chunk past new file size: queue directly for reclaim.
-                                crate::allocation::queue_deferred_extent_keys_for_reclaim(
-                                    &self.reclaim_queue, &[old_key]);
-                            }
-                        }
-                    }
-                    // Old manifest key is always obsolete after a rewrite.
-                    let old_manifest_key = content_object_key_for_version(
-                        inode_id, old_manifest.data_version);
-                    let new_manifest_key = content_object_key_for_version(
-                        inode_id, new_manifest.data_version);
-                    self.deferred_rewrite_trims.push((old_manifest_key, new_manifest_key));
+                    let (trimmable, deferred) =
+                        crate::allocation::obsolete_extent_keys_for_full_replace(
+                            &self.store,
+                            inode_id,
+                            old_manifest,
+                            &new_manifest.chunks,
+                            new_manifest.data_version,
+                        );
+                    crate::allocation::queue_extent_keys_for_reclaim(
+                        &self.reclaim_queue,
+                        &trimmable,
+                    );
+                    self.deferred_rewrite_trims.extend(deferred);
                 }
             }
             ContentLayout::Inline(ref old_inline) => {
-                let old_key = content_object_key_for_version(
-                    inode_id, old_inline.data_version);
-                let new_key = content_object_key_for_version(
-                    inode_id, new_record.data_version);
-                self.deferred_rewrite_trims.push((old_key, new_key));
+                let (trimmable, deferred) =
+                    crate::allocation::obsolete_extent_keys_for_inline_replace(
+                        &self.store,
+                        inode_id,
+                        old_inline.data_version,
+                        new_record.data_version,
+                    );
+                crate::allocation::queue_extent_keys_for_reclaim(
+                    &self.reclaim_queue,
+                    &trimmable,
+                );
+                self.deferred_rewrite_trims.extend(deferred);
             }
         }
         Ok(())
@@ -3976,7 +3966,7 @@ impl LocalFileSystem {
         let mut remaining = Vec::new();
 
         for (old_key, new_key) in self.deferred_rewrite_trims.drain(..) {
-            if crate::content::latest_receipt_generation_for_key(&self.store, new_key) > 0 {
+            if crate::allocation::replacement_key_receipt_is_durable(&self.store, new_key) {
                 promoted.push(old_key);
             } else {
                 remaining.push((old_key, new_key));
@@ -3984,7 +3974,7 @@ impl LocalFileSystem {
         }
 
         if !promoted.is_empty() {
-            crate::allocation::queue_deferred_extent_keys_for_reclaim(
+            crate::allocation::queue_extent_keys_for_reclaim(
                 &self.reclaim_queue,
                 &promoted,
             );

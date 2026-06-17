@@ -2509,8 +2509,8 @@ mod receipt_rotation_tests {
 mod rewrite_extent_trimming_tests {
     use super::*;
     use crate::allocation::{
-        obsolete_extent_keys_for_chunked_rewrite,
-        obsolete_extent_keys_for_full_replace, queue_deferred_extent_keys_for_reclaim,
+        obsolete_extent_keys_for_chunked_rewrite, obsolete_extent_keys_for_full_replace,
+        obsolete_extent_keys_for_inline_replace, queue_extent_keys_for_reclaim,
     };
     use crate::object_keys::{
         content_chunk_object_key_for_version, content_object_key_for_version,
@@ -2650,6 +2650,7 @@ mod rewrite_extent_trimming_tests {
         };
 
         let new_chunks = vec![new_chunk0];
+        let new_key0 = content_chunk_object_key_for_version(inode_id, 2, 0);
 
         let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
             &pool, inode_id, &old_manifest, &new_chunks,
@@ -2657,7 +2658,7 @@ mod rewrite_extent_trimming_tests {
 
         assert!(trimmable.is_empty(), "no chunks should be trimmable when replacement not durable");
         assert_eq!(deferred.len(), 1, "old chunk should be deferred");
-        assert!(deferred.contains(&old_key0));
+        assert!(deferred.contains(&(old_key0, new_key0)));
     }
 
     #[test]
@@ -2776,6 +2777,9 @@ mod rewrite_extent_trimming_tests {
 
         let new_chunks = vec![new_chunk];
         let new_data_version = 2;
+        let new_manifest_key = content_object_key_for_version(inode_id, new_data_version);
+        pool.put_with_receipt(DeviceIoClass::Data, new_manifest_key, b"new manifest")
+            .expect("put new manifest receipt");
 
         let (trimmable, deferred) = obsolete_extent_keys_for_full_replace(
             &pool, inode_id, &old_manifest, &new_chunks, new_data_version,
@@ -2790,12 +2794,35 @@ mod rewrite_extent_trimming_tests {
     }
 
     #[test]
-    fn queue_deferred_extent_keys_inserts_into_reclaim_queue() {
+    fn inline_replace_defers_until_replacement_receipt_durable() {
+        let mut pool = temp_pool("trim-inline-replace");
+        let inode_id = InodeId(9);
+        let old_key = content_object_key_for_version(inode_id, 1);
+        let new_key = content_object_key_for_version(inode_id, 2);
+
+        let (trimmable, deferred) =
+            obsolete_extent_keys_for_inline_replace(&pool, inode_id, 1, 2);
+
+        assert!(trimmable.is_empty());
+        assert_eq!(deferred, vec![(old_key, new_key)]);
+
+        pool.put_with_receipt(DeviceIoClass::Data, new_key, b"new inline")
+            .expect("put new inline receipt");
+
+        let (trimmable, deferred) =
+            obsolete_extent_keys_for_inline_replace(&pool, inode_id, 1, 2);
+
+        assert_eq!(trimmable, vec![old_key]);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn queue_extent_keys_inserts_into_reclaim_queue() {
         let queue = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
         let key1 = ObjectKey::from_name(b"test-key-1");
         let key2 = ObjectKey::from_name(b"test-key-2");
 
-        queue_deferred_extent_keys_for_reclaim(&queue, &[key1, key2]);
+        queue_extent_keys_for_reclaim(&queue, &[key1, key2]);
 
         let q = queue.lock().unwrap();
         assert_eq!(q.len(), 2, "both keys should be in the reclaim queue");
@@ -2854,6 +2881,7 @@ mod rewrite_extent_trimming_tests {
         };
 
         let new_chunks = vec![new_chunk];
+        let new_key = content_chunk_object_key_for_version(inode_id, 2, 0);
 
         let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
             &pool, inode_id, &old_manifest, &new_chunks,
@@ -2861,6 +2889,6 @@ mod rewrite_extent_trimming_tests {
 
         assert!(trimmable.is_empty());
         assert_eq!(deferred.len(), 1);
-        assert!(deferred.contains(&old_key));
+        assert!(deferred.contains(&(old_key, new_key)));
     }
 }

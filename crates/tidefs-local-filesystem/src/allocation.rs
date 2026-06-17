@@ -569,6 +569,23 @@ pub(crate) fn chunk_content_key_receipt_stable(
     }
 }
 
+/// Check whether a replacement object key has a durable placement receipt.
+///
+/// Unlike [`chunk_content_key_receipt_stable`], a missing receipt is not
+/// treated as legacy-durable here: this gate protects old extents until the
+/// replacement side of a rewrite has an explicit pool receipt.
+pub(crate) fn replacement_key_receipt_is_durable(
+    pool: &tidefs_local_object_store::pool::Pool,
+    object_key: tidefs_local_object_store::ObjectKey,
+) -> bool {
+    use tidefs_local_object_store::DeviceIoClass;
+
+    match pool.placement_receipt_for_key(DeviceIoClass::Data, object_key) {
+        Ok(Some(receipt)) => receipt.generation > 0,
+        Ok(None) | Err(_) => false,
+    }
+}
+
 /// Classify old extent keys from a chunked rewrite into trimmable and
 /// deferred sets, gated on replacement receipt durability.
 ///
@@ -584,17 +601,16 @@ pub(crate) fn chunk_content_key_receipt_stable(
 /// - When the same chunk is retained (identical `data_version`), it is
 ///   not obsolete at all and is excluded.
 ///
-/// Returns `(trimmable_keys, deferred_keys)` where trimmable entries
-/// can be queued for immediate reclaim and deferred entries must wait
-/// for a future receipt-durability check.
+/// Returns `(trimmable_keys, deferred_pairs)` where trimmable entries
+/// can be queued for immediate reclaim and deferred entries carry
+/// `(old_key, replacement_key)` pairs for a future receipt-durability check.
 /// INTENT: wired into rewrite path in lib.rs (issue #377)
-#[allow(dead_code)]
 pub(crate) fn obsolete_extent_keys_for_chunked_rewrite(
     pool: &tidefs_local_object_store::pool::Pool,
     inode_id: InodeId,
     old_manifest: &crate::records::ContentManifestObject,
     new_chunks: &[crate::records::ContentChunkRef],
-) -> (Vec<ObjectKey>, Vec<ObjectKey>) {
+) -> (Vec<ObjectKey>, Vec<(ObjectKey, ObjectKey)>) {
     let mut trimmable = Vec::new();
     let mut deferred = Vec::new();
 
@@ -624,7 +640,7 @@ pub(crate) fn obsolete_extent_keys_for_chunked_rewrite(
                 if chunk_receipt_is_durable(pool, new_chunk, new_key) {
                     trimmable.push(old_key);
                 } else {
-                    deferred.push(old_key);
+                    deferred.push((old_key, new_key));
                 }
             }
             Some(_new_chunk) => {
@@ -641,23 +657,22 @@ pub(crate) fn obsolete_extent_keys_for_chunked_rewrite(
     (trimmable, deferred)
 }
 
-/// Compute obsolete extent keys for a full content replace (non-overlay).
+/// Compute obsolete extent keys for a chunked content rewrite.
 ///
-/// Every old chunk is obsolete because the entire content was rewritten
-/// at a new data version.  Each old chunk key is classified as trimmable
-/// or deferred based on whether the corresponding new chunk's replacement
-/// receipt is durable.
+/// Each old chunk key is classified by
+/// [`obsolete_extent_keys_for_chunked_rewrite`].  The old manifest object is
+/// also obsolete because the inode now points at the new data version; it is
+/// gated on the new manifest object's replacement receipt.
 ///
 /// Also returns the old versioned content-manifest key, similarly gated.
 /// INTENT: wired into replace_content in lib.rs (issue #377)
-#[allow(dead_code)]
 pub(crate) fn obsolete_extent_keys_for_full_replace(
     pool: &tidefs_local_object_store::pool::Pool,
     inode_id: InodeId,
     old_manifest: &crate::records::ContentManifestObject,
     new_chunks: &[crate::records::ContentChunkRef],
     new_data_version: u64,
-) -> (Vec<ObjectKey>, Vec<ObjectKey>) {
+) -> (Vec<ObjectKey>, Vec<(ObjectKey, ObjectKey)>) {
     // For a full replace, the old manifest key is always obsolete.
     let old_manifest_key =
         content_object_key_for_version(inode_id, old_manifest.data_version);
@@ -669,23 +684,10 @@ pub(crate) fn obsolete_extent_keys_for_full_replace(
         obsolete_extent_keys_for_chunked_rewrite(pool, inode_id, old_manifest, new_chunks);
 
     // Gate old manifest key on new manifest receipt durability.
-    // Use chunk_receipt_is_durable with a synthetic ref: a missing pool
-    // receipt means the replacement is not yet durable.
-    {
-        let new_manifest_ref = crate::records::ContentChunkRef {
-            chunk_index: 0,
-            data_version: new_data_version,
-            len: 0,
-            checksum: tidefs_local_object_store::IntegrityDigest64(0),
-            placement_receipt_generation: crate::content::latest_receipt_generation_for_key(pool, new_manifest_key),
-        };
-        if new_manifest_ref.placement_receipt_generation == 0
-            || chunk_receipt_is_durable(pool, &new_manifest_ref, new_manifest_key)
-        {
-            trimmable.push(old_manifest_key);
-        } else {
-            deferred.push(old_manifest_key);
-        }
+    if replacement_key_receipt_is_durable(pool, new_manifest_key) {
+        trimmable.push(old_manifest_key);
+    } else {
+        deferred.push((old_manifest_key, new_manifest_key));
     }
 
     (trimmable, deferred)
@@ -696,44 +698,25 @@ pub(crate) fn obsolete_extent_keys_for_full_replace(
 /// The old inline content object is obsolete.  Trimming is gated on
 /// the replacement receipt for the new inline content key.
 /// INTENT: wired into replace_content inline path in lib.rs (issue #377)
-#[allow(dead_code)]
 pub(crate) fn obsolete_extent_keys_for_inline_replace(
     pool: &tidefs_local_object_store::pool::Pool,
     inode_id: InodeId,
     old_data_version: u64,
     new_data_version: u64,
-) -> (Vec<ObjectKey>, Vec<ObjectKey>) {
+) -> (Vec<ObjectKey>, Vec<(ObjectKey, ObjectKey)>) {
     let old_key = content_object_key_for_version(inode_id, old_data_version);
     let new_key = content_object_key_for_version(inode_id, new_data_version);
 
-    let gen = crate::content::latest_receipt_generation_for_key(pool, new_key);
-    if gen == 0 {
+    if replacement_key_receipt_is_durable(pool, new_key) {
         (vec![old_key], Vec::new())
     } else {
-        let new_ref = crate::records::ContentChunkRef {
-            chunk_index: 0,
-            data_version: new_data_version,
-            len: 0,
-            checksum: tidefs_local_object_store::IntegrityDigest64(0),
-            placement_receipt_generation: gen,
-        };
-        if chunk_receipt_is_durable(pool, &new_ref, new_key) {
-            (vec![old_key], Vec::new())
-        } else {
-            (Vec::new(), vec![old_key])
-        }
+        (Vec::new(), vec![(old_key, new_key)])
     }
 }
 
-/// Queue deferred extent keys into the reclaim queue so they are
-/// re-evaluated during a future drain cycle.
-///
-/// The drain's existing receipt-durability pre-check will skip keys
-/// whose replacement receipt is still not durable, naturally deferring
-/// deletion until the pool confirms the replacement.
+/// Queue extent keys into the reclaim queue for the next drain cycle.
 /// INTENT: wired into rewrite reclaim queuing in lib.rs (issue #377)
-#[allow(dead_code)]
-pub(crate) fn queue_deferred_extent_keys_for_reclaim(
+pub(crate) fn queue_extent_keys_for_reclaim(
     queue: &std::sync::Arc<std::sync::Mutex<tidefs_reclaim_queue_core::BPlusTreeReclaimQueue>>,
     keys: &[ObjectKey],
 ) {
