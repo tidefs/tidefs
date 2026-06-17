@@ -204,6 +204,14 @@ fn run_fio_verify(device_path: &std::path::Path, label: &str) -> UblkAcceptanceF
     }
 }
 
+fn blocked_durability_pass(reason: impl Into<String>) -> UblkAcceptanceFioPass {
+    UblkAcceptanceFioPass {
+        fio_verify_passed: false,
+        fio_stderr: reason.into(),
+        device_path: None,
+    }
+}
+
 fn open_control_device_file(path: &std::path::Path) -> Result<std::fs::File, AppError> {
     use std::os::unix::fs::FileTypeExt;
     let meta = std::fs::metadata(path)
@@ -373,7 +381,6 @@ fn run_io_loop_iterations(
     (iterations, cqes_processed)
 }
 
-
 /// OW for the ublk acceptance harness: gate PC-012.
 ///
 /// The harness:
@@ -514,83 +521,128 @@ pub fn run_ublk_acceptance_harness() -> Result<UblkAcceptanceHarnessReport, AppE
     // Phase 11: Durability — re-open the same backing file and verify data
     let durability_verify = match BlockVolumeFileImage::reopen_existing(&backing_path, geometry) {
         Ok(mut image_durability) => {
-            // Reload ublk lifecycle for the second pass
-            let add_durability = rt::issue_add_dev(control_device.as_fd(), add_dev_input)
-                .map_err(|e| AppError::new(format!("durability add_dev: {e:?}")))?;
-            let durability_dev_id = add_durability.dev_info.dev_id;
-
-            let set_params_durability = UblkControlSetParamsInput::from_kernel_dev_id_and_params(
-                durability_dev_id,
-                parameter_report.params,
-            );
-            rt::issue_set_params(control_device.as_fd(), set_params_durability)
-                .map_err(|e| AppError::new(format!("durability set_params: {e:?}")))?;
-
-            let dq_input_durability = UblkDataQueueRuntimeOpenInput::from_kernel_dev_id(
-                durability_dev_id,
-                0,
-                nr_hw_queues,
-                queue_depth,
-            );
-            let dq_path_durability = rt::ublk_data_queue_device_path(dq_input_durability.dev_id);
-            let mut dq_runtime_durability =
-                rt::open_data_queue_runtime(&dq_path_durability, dq_input_durability)
-                    .map_err(|e| AppError::new(format!("durability data queue: {e:?}")))?;
-
-            let fetch_durability =
-                rt::submit_runtime_fetch_reqs_without_wait(&mut dq_runtime_durability)
-                    .map_err(|e| AppError::new(format!("durability fetch: {e:?}")))?;
-            let readiness_durability = fetch_durability.start_dev_readiness();
-            if !readiness_durability.all_fetches_ready() {
-                return Err(AppError::new("durability FETCH_REQs not ready"));
-            }
-
-            let start_dev_durability = UblkControlStartDevInput::from_kernel_dev_id_and_daemon_pid(
-                durability_dev_id,
-                daemon_pid,
-            );
-            rt::issue_start_dev(
-                control_device.as_fd(),
-                start_dev_durability,
-                readiness_durability,
-            )
-            .map_err(|e| AppError::new(format!("durability start_dev: {e:?}")))?;
-
-            let device_path_durability =
-                wait_for_ublk_device(durability_dev_id, Duration::from_secs(5));
-
-            // Spawn fio in thread; IO loop on main thread
-            let fio_durability_path = device_path_durability.clone();
-            let fio_durability_handle = thread::spawn(move || {
-                if let Some(ref p) = fio_durability_path {
-                    run_fio_verify(p, "durability")
-                } else {
-                    UblkAcceptanceFioPass {
-                        fio_verify_passed: false,
-                        fio_stderr: "durability: block device not found".to_string(),
-                        device_path: None,
+            let dpass = 'durability: {
+                // Reload ublk lifecycle for the second pass.
+                let add_durability = match rt::issue_add_dev(control_device.as_fd(), add_dev_input)
+                {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        break 'durability blocked_durability_pass(format!(
+                            "durability add_dev blocked: {e:?}"
+                        ));
                     }
+                };
+                let durability_dev_id = add_durability.dev_info.dev_id;
+
+                let set_params_durability =
+                    UblkControlSetParamsInput::from_kernel_dev_id_and_params(
+                        durability_dev_id,
+                        parameter_report.params,
+                    );
+                if let Err(e) = rt::issue_set_params(control_device.as_fd(), set_params_durability)
+                {
+                    let del_durability =
+                        UblkControlDelDevInput::from_kernel_dev_id(durability_dev_id);
+                    let _ = rt::issue_del_dev(control_device.as_fd(), del_durability);
+                    break 'durability blocked_durability_pass(format!(
+                        "durability set_params blocked: {e:?}"
+                    ));
                 }
-            });
 
-            let _ = run_io_loop_iterations(
-                nr_hw_queues,
-                queue_depth,
-                &mut dq_runtime_durability,
-                &mut image_durability,
-                ACCEPTANCE_IO_LOOP_MAX_ITERATIONS,
-            );
+                let dq_input_durability = UblkDataQueueRuntimeOpenInput::from_kernel_dev_id(
+                    durability_dev_id,
+                    0,
+                    nr_hw_queues,
+                    queue_depth,
+                );
+                let dq_path_durability =
+                    rt::ublk_data_queue_device_path(dq_input_durability.dev_id);
+                let mut dq_runtime_durability =
+                    match rt::open_data_queue_runtime(&dq_path_durability, dq_input_durability) {
+                        Ok(runtime) => runtime,
+                        Err(e) => {
+                            let del_durability =
+                                UblkControlDelDevInput::from_kernel_dev_id(durability_dev_id);
+                            let _ = rt::issue_del_dev(control_device.as_fd(), del_durability);
+                            break 'durability blocked_durability_pass(format!(
+                                "durability data queue blocked: {e:?}"
+                            ));
+                        }
+                    };
 
-            let dpass = fio_durability_handle
-                .join()
-                .unwrap_or_else(|_| UblkAcceptanceFioPass {
-                    fio_verify_passed: false,
-                    fio_stderr: "durability fio thread panicked".to_string(),
-                    device_path: device_path_durability,
+                let fetch_durability =
+                    match rt::submit_runtime_fetch_reqs_without_wait(&mut dq_runtime_durability) {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            let del_durability =
+                                UblkControlDelDevInput::from_kernel_dev_id(durability_dev_id);
+                            let _ = rt::issue_del_dev(control_device.as_fd(), del_durability);
+                            break 'durability blocked_durability_pass(format!(
+                                "durability fetch blocked: {e:?}"
+                            ));
+                        }
+                    };
+                let readiness_durability = fetch_durability.start_dev_readiness();
+                if !readiness_durability.all_fetches_ready() {
+                    let del_durability =
+                        UblkControlDelDevInput::from_kernel_dev_id(durability_dev_id);
+                    let _ = rt::issue_del_dev(control_device.as_fd(), del_durability);
+                    break 'durability blocked_durability_pass("durability FETCH_REQs not ready");
+                }
+
+                let start_dev_durability =
+                    UblkControlStartDevInput::from_kernel_dev_id_and_daemon_pid(
+                        durability_dev_id,
+                        daemon_pid,
+                    );
+                if let Err(e) = rt::issue_start_dev(
+                    control_device.as_fd(),
+                    start_dev_durability,
+                    readiness_durability,
+                ) {
+                    let del_durability =
+                        UblkControlDelDevInput::from_kernel_dev_id(durability_dev_id);
+                    let _ = rt::issue_del_dev(control_device.as_fd(), del_durability);
+                    break 'durability blocked_durability_pass(format!(
+                        "durability start_dev blocked: {e:?}"
+                    ));
+                }
+
+                let device_path_durability =
+                    wait_for_ublk_device(durability_dev_id, Duration::from_secs(5));
+
+                // Spawn fio in thread; IO loop on main thread.
+                let fio_durability_path = device_path_durability.clone();
+                let fio_durability_handle = thread::spawn(move || {
+                    if let Some(ref p) = fio_durability_path {
+                        run_fio_verify(p, "durability")
+                    } else {
+                        blocked_durability_pass("durability: block device not found")
+                    }
                 });
 
-            let del_durability = UblkControlDelDevInput::from_kernel_dev_id(durability_dev_id);
-            let _ = rt::issue_del_dev(control_device.as_fd(), del_durability);
+                let _ = run_io_loop_iterations(
+                    nr_hw_queues,
+                    queue_depth,
+                    &mut dq_runtime_durability,
+                    &mut image_durability,
+                    ACCEPTANCE_IO_LOOP_MAX_ITERATIONS,
+                );
+
+                let dpass =
+                    fio_durability_handle
+                        .join()
+                        .unwrap_or_else(|_| UblkAcceptanceFioPass {
+                            fio_verify_passed: false,
+                            fio_stderr: "durability fio thread panicked".to_string(),
+                            device_path: device_path_durability,
+                        });
+
+                let del_durability = UblkControlDelDevInput::from_kernel_dev_id(durability_dev_id);
+                let _ = rt::issue_del_dev(control_device.as_fd(), del_durability);
+
+                dpass
+            };
 
             Some(dpass)
         }
@@ -602,11 +654,8 @@ pub fn run_ublk_acceptance_harness() -> Result<UblkAcceptanceHarnessReport, AppE
     };
 
     // Classify acceptance status
-    let (acceptance_status, durability_block_reason) = classify_acceptance(
-        &first_verify,
-        durability_verify.as_ref(),
-        &backing_path,
-    );
+    let (acceptance_status, durability_block_reason) =
+        classify_acceptance(&first_verify, durability_verify.as_ref(), &backing_path);
 
     // Clean up backing file
     let _ = std::fs::remove_file(&backing_path);
@@ -657,7 +706,10 @@ fn classify_acceptance(
             } else if dp.device_path.is_none() {
                 (
                     UblkAcceptanceStatus::BlockedPrerequisite,
-                    Some("durability ublk block device did not appear".to_string()),
+                    Some(format!(
+                        "durability prerequisite blocked before block device appeared: {}",
+                        dp.fio_stderr
+                    )),
                 )
             } else {
                 (
@@ -675,6 +727,7 @@ fn classify_acceptance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn gate_constant_is_stable() {
@@ -887,7 +940,22 @@ mod tests {
             classify_acceptance(&first, Some(&durability), Path::new("/tmp/test.img"));
         assert_eq!(status, UblkAcceptanceStatus::BlockedPrerequisite);
         assert!(reason.is_some());
-        assert!(reason.unwrap().contains("device did not appear"));
+        assert!(reason.unwrap().contains("prerequisite blocked"));
+    }
+
+    #[test]
+    fn classify_acceptance_blocked_durability_lifecycle() {
+        let first = UblkAcceptanceFioPass {
+            fio_verify_passed: true,
+            fio_stderr: String::new(),
+            device_path: Some(PathBuf::from("/dev/ublkb0")),
+        };
+        let durability = blocked_durability_pass("durability add_dev blocked: EPERM");
+        let (status, reason) =
+            classify_acceptance(&first, Some(&durability), Path::new("/tmp/test.img"));
+        assert_eq!(status, UblkAcceptanceStatus::BlockedPrerequisite);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("durability add_dev blocked"));
     }
 
     #[test]
@@ -912,7 +980,9 @@ mod tests {
         let (status, reason) = classify_acceptance(&first, None, Path::new("/tmp/test.img"));
         assert_eq!(status, UblkAcceptanceStatus::FirstPassFailed);
         assert!(reason.is_some());
-        assert!(reason.unwrap().contains("first-pass fio verification failed"));
+        assert!(reason
+            .unwrap()
+            .contains("first-pass fio verification failed"));
     }
 
     #[test]
