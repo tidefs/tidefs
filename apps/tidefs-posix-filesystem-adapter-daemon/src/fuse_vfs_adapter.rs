@@ -2735,6 +2735,22 @@ impl FuseVfsAdapter {
         self
     }
 
+    /// Populate the short-lived getattr cache after an engine mutation
+    /// (create, mkdir, link, symlink, mknod) so subsequent getattr calls
+    /// avoid the engine lock until the cache TTL expires.
+    fn populate_getattr_cache(&self, ino: u64, attr: &InodeAttr) {
+        let cache_ttl = self.dentry_policy.positive_attr_ttl;
+        if cache_ttl.is_zero() {
+            return;
+        }
+        let attr_out = crate::workers_meta::fuse_attr_out(ino, &attr.posix, attr.kind);
+        let attr_out = fuse_attr_out_with_ttl(attr_out, cache_ttl);
+        self.getattr_cache
+            .lock()
+            .unwrap()
+            .insert(ino, (attr_out, std::time::Instant::now() + cache_ttl));
+    }
+
     /// Return a cloneable handle to the namespace, if one is attached.
     ///
     /// The handle can be used by the main thread to flush the namespace
@@ -3346,6 +3362,7 @@ impl FuseVfsAdapter {
         let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
         let attr = namespace_attrs_to_inode_attr(&ns_attrs);
         self.record_dentry_child_mutation(parent, name);
+        self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
 
@@ -3387,6 +3404,7 @@ impl FuseVfsAdapter {
         .next()
         .unwrap()?;
         self.record_dentry_child_mutation(parent, name);
+        self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
 
@@ -3767,6 +3785,8 @@ impl FuseVfsAdapter {
 
         self.record_dentry_rename(parent, name, newparent, newname);
 
+        self.invalidate_inode_metadata_after_engine_write(parent);
+        self.invalidate_inode_metadata_after_engine_write(newparent);
 
         result
     }
@@ -3819,6 +3839,7 @@ impl FuseVfsAdapter {
         .unwrap()?;
         self.invalidate_inode_metadata_after_engine_write(attr.inode_id.get());
         self.record_dentry_child_mutation(newparent, newname);
+        self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
     /// Namespace-backed mkdir: call [`tidefs_namespace::Namespace::create_dir`]
@@ -3838,6 +3859,7 @@ impl FuseVfsAdapter {
         let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
         let attr = namespace_attrs_to_inode_attr(&ns_attrs);
         self.record_dentry_child_mutation(new_parent, new_name);
+        self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
 
@@ -3869,6 +3891,7 @@ impl FuseVfsAdapter {
         let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
         let attr = namespace_attrs_to_inode_attr(&ns_attrs);
         self.record_dentry_child_mutation(parent, name);
+        self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
 
@@ -3903,6 +3926,7 @@ impl FuseVfsAdapter {
         let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
         let attr = namespace_attrs_to_inode_attr(&ns_attrs);
         self.record_dentry_child_mutation(parent, name);
+        self.populate_getattr_cache(attr.inode_id.get(), &attr);
 
         let engine_fh = tidefs_types_vfs_core::EngineFileHandle::new(
             tidefs_types_vfs_core::InodeId::new(attr.inode_id.get()),
@@ -3944,6 +3968,7 @@ impl FuseVfsAdapter {
         let ns_attrs = ns.get_attrs(ino).ok_or(Errno::EIO)?;
         let attr = namespace_attrs_to_inode_attr(&ns_attrs);
         self.record_dentry_child_mutation(parent, name);
+        self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
 
@@ -3963,10 +3988,8 @@ impl FuseVfsAdapter {
             .lookup(parent, name_str)
             .map_err(namespace_error_to_errno)?
             .ok_or(Errno::ENOENT)?;
-        let engine_attr = {
-            let e = self.engine.lock().unwrap();
-            e.getattr(InodeId::new(ino), None, ctx)
-        };
+        let e = self.engine.lock().unwrap();
+        let engine_attr = e.getattr(InodeId::new(ino), None, ctx);
         match engine_attr {
             Ok(attr) => {
                 self.sync_namespace_attrs_local(ino, &attr);
@@ -3978,10 +4001,7 @@ impl FuseVfsAdapter {
             Err(errno) => return Err(errno),
         }
 
-        let engine_lookup_attr = {
-            let e = self.engine.lock().unwrap();
-            e.lookup(InodeId::new(parent), name, ctx)
-        };
+        let engine_lookup_attr = e.lookup(InodeId::new(parent), name, ctx);
         match engine_lookup_attr {
             Ok(attr) if attr.inode_id.get() == ino => {
                 self.sync_namespace_attrs_local(ino, &attr);
@@ -4072,6 +4092,7 @@ impl FuseVfsAdapter {
         .next()
         .unwrap()?;
         self.record_dentry_child_mutation(parent, name);
+        self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
 
@@ -5222,6 +5243,7 @@ impl FuseVfsAdapter {
         check_parent_write_execute_mutation_preflight(&**e, InodeId::new(parent), ctx)?;
         let attr = e.mknod(InodeId::new(parent), name, mode, rdev, ctx)?;
         self.record_dentry_child_mutation(parent, name);
+        self.populate_getattr_cache(attr.inode_id.get(), &attr);
         Ok(attr)
     }
 
@@ -5287,6 +5309,7 @@ impl FuseVfsAdapter {
         {
             Ok((attr, fh)) => {
                 self.record_dentry_child_mutation(parent, name);
+                self.populate_getattr_cache(attr.inode_id.get(), &attr);
                 let fuse_open_flags = self.fuse_open_flags_for_request(engine_open_flags);
                 let adapter_fh = {
                     let mut handles = self.file_handles.lock().unwrap();
@@ -35292,6 +35315,16 @@ mod tests {
         let ns_attrs = ns.get_attrs(target_ino).expect("ns get_attrs");
         assert_eq!(ns_attrs.nlink, 2);
 
+        let cached = fixture
+            .adapter
+            .getattr_cache
+            .lock()
+            .unwrap()
+            .get(&target_ino)
+            .map(|(attr_out, _expiry)| *attr_out)
+            .expect("namespace hard link refreshed getattr cache");
+        assert_eq!(cached.attr.ino, target_ino);
+        assert_eq!(cached.attr.nlink, 2);
     }
 
     #[test]
