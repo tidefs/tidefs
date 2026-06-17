@@ -541,6 +541,14 @@ impl TraceBackend for ModelTraceBackend {
                     .unwrap_or(0);
                 self.apply_get(operation, Some((offset, length)))?
             }
+            OP_FSYNC => {
+                let path = dataset_relative_path(&operation.args, KEY_KEY)?;
+                self.apply_model_request(
+                    operation,
+                    ModelRequest::Fsync { path },
+                    None,
+                )?
+            }
             OP_UNLINK => {
                 let path = dataset_relative_path(&operation.args, KEY_PATH)?;
                 self.apply_contract_unlink_path(operation, operation_index, &path, None)?

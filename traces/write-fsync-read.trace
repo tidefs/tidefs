@@ -1,0 +1,11 @@
+# TideFS trace: write-fsync-read vertical slice (model-only harness)
+# Schema: pool_trace_v1, Version: 1
+# Covers: file create, write, fsync, read back, file remove
+{"op":"trace_meta","args":{"schema":"pool_trace_v1","version":1}}
+{"op":"create_pool","args":{"device_count":1,"device_size_bytes":4194304}}
+{"op":"create_dataset","args":{"name":"ds"}}
+{"op":"create_file","args":{"dataset":"ds","path":"file"}}
+{"op":"write_range","args":{"dataset":"ds","key":"file","offset":0,"data_b64":"YWJjZA=="}}
+{"op":"fsync","args":{"dataset":"ds","key":"file"}}
+{"op":"get_range","args":{"dataset":"ds","key":"file","offset":0,"length":4},"expect":{"value_b64":"YWJjZA=="}}
+{"op":"unlink","args":{"dataset":"ds","path":"file"}}
