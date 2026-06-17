@@ -678,7 +678,7 @@ mod tests {
         assert!(plan.total_source_segments >= 3);
         assert_eq!(
             plan.total_source_segments,
-            plan.groups.iter().map(|g| g.len()).sum()
+            plan.groups.iter().map(|g| g.len()).sum::<usize>()
         );
         assert!(plan.total_live_bytes <= 170_000);
     }

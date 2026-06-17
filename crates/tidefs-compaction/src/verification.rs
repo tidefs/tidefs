@@ -300,6 +300,233 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Swap manifest domain
+// ---------------------------------------------------------------------------
+
+/// Domain string for BLAKE3 domain-separated swap-manifest hashing.
+pub const SWAP_MANIFEST_DOMAIN: &[u8] = b"TideFS compaction v1 swap-manifest";
+
+// ---------------------------------------------------------------------------
+// SwapVerificationError -- reasons a swap manifest fails verification
+// ---------------------------------------------------------------------------
+
+/// Reasons a swap manifest fails post-rewrite verification against
+/// the stored target data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SwapVerificationError {
+    /// The manifest itself is missing required fields.
+    MissingManifestData { detail: String },
+    /// Reading back an object from the target store failed.
+    TargetReadFailed { key: [u8; 32], reason: String },
+    /// The BLAKE3 digest of the stored object does not match the
+    /// digest recorded in the relocation entry.
+    DigestMismatch {
+        key: [u8; 32],
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    /// The number of relocation entries in the manifest does not
+    /// match the number of objects actually found in the target.
+    EntryCountMismatch {
+        manifest_count: usize,
+        actual_count: usize,
+    },
+    /// A source or target segment reference is inconsistent.
+    SourceTargetMismatch { detail: String },
+    /// The manifest is explicitly empty and cannot release segments.
+    EmptyManifest,
+}
+
+impl core::fmt::Display for SwapVerificationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingManifestData { detail } => {
+                write!(f, "missing manifest data: {detail}")
+            }
+            Self::TargetReadFailed { key, reason } => {
+                write!(f, "target read failed for {key:02x?}: {reason}")
+            }
+            Self::DigestMismatch {
+                key,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "BLAKE3 digest mismatch for {key:02x?}: expected {expected:02x?}, got {actual:02x?}"
+                )
+            }
+            Self::EntryCountMismatch {
+                manifest_count,
+                actual_count,
+            } => {
+                write!(
+                    f,
+                    "entry count mismatch: manifest={manifest_count}, actual={actual_count}"
+                )
+            }
+            Self::SourceTargetMismatch { detail } => {
+                write!(f, "source/target mismatch: {detail}")
+            }
+            Self::EmptyManifest => {
+                write!(f, "empty manifest cannot release source segments")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SwapVerification -- outcome of verifying a swap manifest
+// ---------------------------------------------------------------------------
+
+/// Result of verifying a swap manifest against stored target data.
+///
+/// Source segments become eligible for release only when `verified`
+/// is `true` and `errors` is empty.
+#[derive(Clone, Debug)]
+pub struct SwapVerification {
+    /// Whether all relocation entries passed verification.
+    pub verified: bool,
+    /// Number of relocation entries that matched.
+    pub entries_verified: usize,
+    /// Total relocation entries checked.
+    pub entries_total: usize,
+    /// Total bytes compared.
+    pub bytes_compared: u64,
+    /// Errors encountered during verification.
+    pub errors: Vec<SwapVerificationError>,
+}
+
+impl SwapVerification {
+    /// Construct a failed verification with a single error.
+    #[must_use]
+    pub fn failed(error: SwapVerificationError) -> Self {
+        Self {
+            verified: false,
+            entries_verified: 0,
+            entries_total: 0,
+            bytes_compared: 0,
+            errors: vec![error],
+        }
+    }
+
+    /// Construct a successful verification.
+    #[must_use]
+    fn success(entries_verified: usize, bytes_compared: u64) -> Self {
+        Self {
+            verified: true,
+            entries_verified,
+            entries_total: entries_verified,
+            bytes_compared,
+            errors: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// verify_swap_manifest -- post-rewrite integrity check
+// ---------------------------------------------------------------------------
+
+/// Verify a swap manifest against the data stored in `store`.
+///
+/// Every relocation entry in the manifest is checked:
+///
+/// 1. The manifest must not be empty if it claims to release segments.
+/// 2. Each object key is read back from the store.
+/// 3. The BLAKE3 digest of the stored data is compared against the
+///    digest recorded in the relocation entry.
+/// 4. Entry counts and source/target consistency are checked.
+///
+/// Source segments become eligible for release only when this function
+/// returns [`SwapVerification::verified`] == `true`.
+pub fn verify_swap_manifest<S: crate::CompactionStore>(
+    manifest: &crate::rewrite_engine::SwapManifest,
+    store: &S,
+) -> SwapVerification {
+    // Empty manifests cannot release segments.
+    if manifest.is_empty() {
+        return SwapVerification::failed(SwapVerificationError::EmptyManifest);
+    }
+
+    // Manifest must carry relocation entries to be meaningful.
+    if manifest.relocation_entries.is_empty() && !manifest.source_segments.is_empty() {
+        return SwapVerification::failed(SwapVerificationError::MissingManifestData {
+            detail: "manifest declares source segments but has no relocation entries".into(),
+        });
+    }
+
+    // Verify the manifest's own hash is internally consistent.
+    if !manifest.verify_self() {
+        return SwapVerification::failed(SwapVerificationError::MissingManifestData {
+            detail: "manifest hash mismatch; data may be corrupted".into(),
+        });
+    }
+
+    let mut entries_verified: usize = 0;
+    let mut bytes_compared: u64 = 0;
+    let mut errors: Vec<SwapVerificationError> = Vec::new();
+
+    for entry in &manifest.relocation_entries {
+        // Verify source segment membership.
+        if !manifest.source_segments.contains(&entry.source_segment) {
+            errors.push(SwapVerificationError::SourceTargetMismatch {
+                detail: format!(
+                    "relocation entry references source segment {} not in manifest",
+                    entry.source_segment
+                ),
+            });
+            continue;
+        }
+
+        // Read the object back from the store and verify its digest.
+        match store.read_object(&entry.object_key) {
+            Ok(data) => {
+                let actual_hash: [u8; 32] = blake3::hash(&data).into();
+
+                if actual_hash != entry.blake3_hash {
+                    errors.push(SwapVerificationError::DigestMismatch {
+                        key: entry.object_key,
+                        expected: entry.blake3_hash,
+                        actual: actual_hash,
+                    });
+                    continue;
+                }
+
+                entries_verified = entries_verified.saturating_add(1);
+                bytes_compared = bytes_compared.saturating_add(data.len() as u64);
+            }
+            Err(e) => {
+                errors.push(SwapVerificationError::TargetReadFailed {
+                    key: entry.object_key,
+                    reason: format!("{e}"),
+                });
+                continue;
+            }
+        }
+    }
+
+    // Entry count mismatch: manifest says N entries but only M verified.
+    if entries_verified != manifest.relocation_entries.len() && errors.is_empty() {
+        errors.push(SwapVerificationError::EntryCountMismatch {
+            manifest_count: manifest.relocation_entries.len(),
+            actual_count: entries_verified,
+        });
+    }
+
+    if errors.is_empty() {
+        SwapVerification::success(entries_verified, bytes_compared)
+    } else {
+        SwapVerification {
+            verified: false,
+            entries_verified,
+            entries_total: manifest.relocation_entries.len(),
+            bytes_compared,
+            errors,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
