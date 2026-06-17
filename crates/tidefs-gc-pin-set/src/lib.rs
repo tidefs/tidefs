@@ -525,6 +525,162 @@ impl<const N: usize> GcPinSet<N> {
 }
 
 // ---------------------------------------------------------------------------
+// SnapshotExtentPinSet — snapshot-pinned extent tracking for reclaim gating
+// ---------------------------------------------------------------------------
+
+/// Set of extent [`ObjectKey`]s pinned by live snapshots.
+///
+/// Reclaim consults this set before freeing any extent; an extent still
+/// pinned by a live snapshot must be skipped. When the snapshot pruner
+/// destroys a snapshot, it calls [`release_snapshot`] to remove all pins
+/// for that snapshot, making the corresponding extents eligible for
+/// reclamation.
+///
+/// # Design
+///
+/// Uses a bidirectional index: an `extent → snapshots` map for fast
+/// [`is_pinned`] queries, and a `snapshot → extents` reverse index for
+/// efficient snapshot-level release (O(|pinned extents|) for the
+/// released snapshot).
+///
+/// [`ObjectKey`]: tidefs_types_reclaim_queue_core::ObjectKey
+/// [`release_snapshot`]: SnapshotExtentPinSet::release_snapshot
+/// [`is_pinned`]: SnapshotExtentPinSet::is_pinned
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotExtentPinSet {
+    /// Extent → set of snapshot identifiers that pin it.
+    extent_pins: alloc::collections::BTreeMap<
+        tidefs_types_reclaim_queue_core::ObjectKey,
+        alloc::collections::BTreeSet<alloc::string::String>,
+    >,
+    /// Snapshot → set of extent IDs it pins (reverse index).
+    snapshot_index: alloc::collections::BTreeMap<
+        alloc::string::String,
+        alloc::vec::Vec<tidefs_types_reclaim_queue_core::ObjectKey>,
+    >,
+    /// Monotonic epoch incremented on each pin / release operation
+    /// so reclaim can detect stale clearance evidence.
+    epoch: u64,
+}
+
+impl SnapshotExtentPinSet {
+    /// Create an empty pin set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            extent_pins: alloc::collections::BTreeMap::new(),
+            snapshot_index: alloc::collections::BTreeMap::new(),
+            epoch: 0,
+        }
+    }
+
+    /// Pin an extent for a snapshot.
+    ///
+    /// Idempotent: pinning the same (snapshot, extent) pair multiple times
+    /// has no additional effect beyond the first call.
+    pub fn pin(
+        &mut self,
+        snapshot_id: &str,
+        extent_key: tidefs_types_reclaim_queue_core::ObjectKey,
+    ) {
+        let inserted = self
+            .extent_pins
+            .entry(extent_key)
+            .or_default()
+            .insert(snapshot_id.into());
+        if inserted {
+            self.snapshot_index
+                .entry(snapshot_id.into())
+                .or_default()
+                .push(extent_key);
+        }
+        if inserted {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+    }
+
+    /// Release all extent pins held by a snapshot.
+    ///
+    /// After this call, extents that were exclusively pinned by
+    /// `snapshot_id` become eligible for reclaim (assuming deadlist
+    /// clearance is also satisfied). Returns the number of extent
+    /// pins removed.
+    pub fn release_snapshot(&mut self, snapshot_id: &str) -> usize {
+        let Some(pinned_extents) = self.snapshot_index.remove(snapshot_id) else {
+            return 0;
+        };
+
+        let mut removed = 0usize;
+        for extent_key in &pinned_extents {
+            if let Some(snap_set) = self.extent_pins.get_mut(extent_key) {
+                snap_set.remove(snapshot_id);
+                removed += 1;
+                if snap_set.is_empty() {
+                    self.extent_pins.remove(extent_key);
+                }
+            }
+        }
+
+        if removed > 0 {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+        removed
+    }
+
+    /// Returns `true` if any live snapshot still pins `extent_key`.
+    #[must_use]
+    pub fn is_pinned(&self, extent_key: &tidefs_types_reclaim_queue_core::ObjectKey) -> bool {
+        self.extent_pins
+            .get(extent_key)
+            .is_some_and(|s| !s.is_empty())
+    }
+
+    /// Number of distinct extents currently pinned.
+    #[must_use]
+    pub fn pinned_extent_count(&self) -> usize {
+        self.extent_pins.len()
+    }
+
+    /// Total number of (snapshot, extent) pin entries.
+    #[must_use]
+    pub fn total_pin_entries(&self) -> usize {
+        self.snapshot_index.values().map(|v| v.len()).sum()
+    }
+
+    /// Current pin-set epoch (monotonic counter).
+    ///
+    /// Incremented on every mutation; used by reclaim to detect that
+    /// a cached clearance check has become stale.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Whether the pin set is empty (no extent has any pin).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.extent_pins.is_empty()
+    }
+
+    /// Number of snapshots with active pins.
+    #[must_use]
+    pub fn snapshot_count(&self) -> usize {
+        self.snapshot_index.len()
+    }
+
+    /// List the snapshot IDs that pin a given extent.
+    #[must_use]
+    pub fn pinning_snapshots(
+        &self,
+        extent_key: &tidefs_types_reclaim_queue_core::ObjectKey,
+    ) -> alloc::vec::Vec<alloc::string::String> {
+        self.extent_pins
+            .get(extent_key)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1012,5 +1168,181 @@ mod tests {
             .unwrap();
         assert_eq!(set.count_by_type(TraversalRootType::SnapshotCatalog), 2);
         assert_eq!(set.count_by_type(TraversalRootType::InodeTable), 1);
+    }
+
+    // ── SnapshotExtentPinSet tests ─────────────────────────────────────────
+
+    fn extent_key(id: u8) -> tidefs_types_reclaim_queue_core::ObjectKey {
+        let mut key = [0u8; 32];
+        key[0] = id;
+        tidefs_types_reclaim_queue_core::ObjectKey(key)
+    }
+
+    #[test]
+    fn snapshot_pin_set_empty_by_default() {
+        let set = SnapshotExtentPinSet::new();
+        assert!(set.is_empty());
+        assert_eq!(set.pinned_extent_count(), 0);
+        assert_eq!(set.total_pin_entries(), 0);
+        assert_eq!(set.snapshot_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_pin_set_pin_and_check() {
+        let mut set = SnapshotExtentPinSet::new();
+        let k1 = extent_key(1);
+        let k2 = extent_key(2);
+
+        set.pin("snap-a", k1);
+        set.pin("snap-a", k2);
+        set.pin("snap-b", k1);
+
+        assert!(set.is_pinned(&k1));
+        assert!(set.is_pinned(&k2));
+        assert_eq!(set.pinned_extent_count(), 2);
+        assert_eq!(set.total_pin_entries(), 3);
+        assert_eq!(set.snapshot_count(), 2);
+
+        let pins = set.pinning_snapshots(&k1);
+        assert_eq!(pins.len(), 2);
+        assert!(pins.contains(&"snap-a".to_string()));
+        assert!(pins.contains(&"snap-b".to_string()));
+    }
+
+    #[test]
+    fn snapshot_pin_set_release_snapshot() {
+        let mut set = SnapshotExtentPinSet::new();
+        let k1 = extent_key(1);
+        let k2 = extent_key(2);
+        let k3 = extent_key(3);
+
+        set.pin("snap-a", k1);
+        set.pin("snap-a", k2);
+        set.pin("snap-b", k1);
+        set.pin("snap-b", k3);
+
+        // Release snap-a: k1 should still be pinned by snap-b, k2 should be freed
+        let removed = set.release_snapshot("snap-a");
+        assert_eq!(removed, 2);
+
+        assert!(set.is_pinned(&k1)); // still pinned by snap-b
+        assert!(!set.is_pinned(&k2)); // only snap-a pinned it
+        assert!(set.is_pinned(&k3)); // pinned by snap-b
+        assert_eq!(set.pinned_extent_count(), 2);
+        assert_eq!(set.snapshot_count(), 1);
+
+        // Release snap-b: everything freed
+        let removed = set.release_snapshot("snap-b");
+        assert_eq!(removed, 2);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn snapshot_pin_set_release_nonexistent_snapshot() {
+        let mut set = SnapshotExtentPinSet::new();
+        let removed = set.release_snapshot("nonexistent");
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn snapshot_pin_set_epoch_increments_on_pin() {
+        let mut set = SnapshotExtentPinSet::new();
+        let e0 = set.epoch();
+        set.pin("snap-a", extent_key(1));
+        let e1 = set.epoch();
+        assert_ne!(e0, e1);
+
+        // Idempotent re-pin does NOT increment epoch
+        set.pin("snap-a", extent_key(1));
+        assert_eq!(set.epoch(), e1);
+    }
+
+    #[test]
+    fn snapshot_pin_set_epoch_increments_on_release() {
+        let mut set = SnapshotExtentPinSet::new();
+        set.pin("snap-a", extent_key(1));
+        let e1 = set.epoch();
+        set.release_snapshot("snap-a");
+        let e2 = set.epoch();
+        assert_ne!(e1, e2);
+
+        // Releasing non-existent snapshot does NOT increment epoch
+        set.release_snapshot("snap-a");
+        assert_eq!(set.epoch(), e2);
+    }
+
+    #[test]
+    fn snapshot_pin_set_epoch_wraps() {
+        let mut set = SnapshotExtentPinSet::new();
+        // Directly set epoch near wraparound
+        set.epoch = u64::MAX - 1;
+        set.pin("snap-x", extent_key(99));
+        assert_eq!(set.epoch(), u64::MAX);
+        set.release_snapshot("snap-x");
+        assert_eq!(set.epoch(), 0); // wraps
+    }
+
+    #[test]
+    fn snapshot_pin_set_idempotent_pin() {
+        let mut set = SnapshotExtentPinSet::new();
+        let k1 = extent_key(1);
+        set.pin("snap-a", k1);
+        set.pin("snap-a", k1);
+        set.pin("snap-a", k1);
+        assert_eq!(set.pinned_extent_count(), 1);
+        assert_eq!(set.total_pin_entries(), 1);
+
+        // Releasing once clears the only pin
+        let removed = set.release_snapshot("snap-a");
+        assert_eq!(removed, 1);
+        assert!(!set.is_pinned(&k1));
+    }
+
+    #[test]
+    fn snapshot_pin_set_pinning_snapshots_returns_empty_for_unknown_extent() {
+        let set = SnapshotExtentPinSet::new();
+        let pins = set.pinning_snapshots(&extent_key(99));
+        assert!(pins.is_empty());
+    }
+
+    #[test]
+    fn snapshot_pin_set_clone_preserves_state() {
+        let mut set = SnapshotExtentPinSet::new();
+        set.pin("snap-a", extent_key(1));
+        set.pin("snap-a", extent_key(2));
+        set.pin("snap-b", extent_key(1));
+
+        let cloned = set.clone();
+        assert_eq!(cloned.pinned_extent_count(), set.pinned_extent_count());
+        assert_eq!(cloned.total_pin_entries(), set.total_pin_entries());
+        assert_eq!(cloned.snapshot_count(), set.snapshot_count());
+        assert!(cloned.is_pinned(&extent_key(1)));
+        assert!(cloned.is_pinned(&extent_key(2)));
+    }
+
+    #[test]
+    fn snapshot_pin_set_full_lifecycle() {
+        let mut set = SnapshotExtentPinSet::new();
+
+        // Create 3 snapshots with overlapping extent pins
+        for i in 0u8..10 {
+            let snap = &format!("snap-{}", i % 3);
+            set.pin(snap, extent_key(i));
+        }
+
+        assert_eq!(set.snapshot_count(), 3);
+        assert_eq!(set.pinned_extent_count(), 10);
+
+        // Release snap-0
+        let removed = set.release_snapshot("snap-0");
+        assert!(removed > 0);
+        // Extents pinned by snap-0 that were also pinned by snap-1/snap-2 remain pinned
+        assert!(set.pinned_extent_count() > 0);
+        assert_eq!(set.snapshot_count(), 2);
+
+        // Release remaining
+        set.release_snapshot("snap-1");
+        set.release_snapshot("snap-2");
+        assert!(set.is_empty());
     }
 }

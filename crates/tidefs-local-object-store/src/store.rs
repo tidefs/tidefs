@@ -58,7 +58,8 @@ use tidefs_checksum_tree::{ChecksumTree, ChecksumTreeBuilder, DomainTag, ObjectD
 use tidefs_durability_layout::DurabilityLayoutV1;
 use tidefs_pool_allocator::{PoolAllocator, PoolAllocatorError, SpacePressureEvent};
 use tidefs_reclaim::{
-    DrainError, ReclaimConfig, ReclaimConsumerConfig, ReclaimConsumerService, ReclaimScheduler,
+    ClearanceEvidence, DrainError, GateDecision, GateDenyReason, ReclaimConfig,
+    ReclaimConsumerConfig, ReclaimConsumerService, ReclaimGate, ReclaimScheduler,
     SegmentLiveCounts,
 };
 use tidefs_reclaim_queue_core::{
@@ -131,11 +132,32 @@ impl tidefs_reclaim::SegmentResolver for DeadObjectDrainSegmentResolver {
 struct ReceiptBoundDeadObjectDrainPlan {
     resolver: DeadObjectDrainSegmentResolver,
     dead_segments: Vec<u64>,
+    eligible_object_ids: BTreeSet<ReclaimObjectKey>,
 }
 
 impl ReceiptBoundDeadObjectDrainPlan {
     fn current_segment_would_be_reclaimed(&self, current_segment_id: u64) -> bool {
         self.dead_segments.contains(&current_segment_id)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CommittedDeadObjectReclaimGate {
+    eligible_object_ids: BTreeSet<ReclaimObjectKey>,
+    stable_committed_txg: u64,
+    pin_clearance_epoch: u64,
+}
+
+impl ReclaimGate for CommittedDeadObjectReclaimGate {
+    fn check_extent(&self, extent_key: &ReclaimObjectKey) -> GateDecision {
+        if self.eligible_object_ids.contains(extent_key) {
+            GateDecision::Allow(ClearanceEvidence::Verified {
+                deadlist_committed_txg: self.stable_committed_txg,
+                pin_clearance_epoch: self.pin_clearance_epoch,
+            })
+        } else {
+            GateDecision::Deny(GateDenyReason::DeadlistReferenced)
+        }
     }
 }
 
@@ -2266,6 +2288,11 @@ impl LocalObjectStore {
         }
 
         let queue_snapshot = self.dead_object_reclaim_queue.clone();
+        let gate = CommittedDeadObjectReclaimGate {
+            eligible_object_ids: plan.eligible_object_ids.clone(),
+            stable_committed_txg,
+            pin_clearance_epoch: 0,
+        };
         let mut reclaim_consumer = std::mem::replace(
             &mut self.reclaim_consumer,
             ReclaimConsumerService::new(ReclaimConsumerConfig::default(), SegmentLiveCounts::new()),
@@ -2277,6 +2304,7 @@ impl LocalObjectStore {
             max_count,
             &plan.resolver,
             self,
+            &gate,
         );
         self.reclaim_consumer = reclaim_consumer;
         let drain = drain_result?;
@@ -2295,8 +2323,8 @@ impl LocalObjectStore {
             self.dead_object_reclaim_queue_dirty = true;
         }
 
-        for segment_id in plan.dead_segments {
-            let seg_path = segment_path(&self.segments_dir, segment_id);
+        for segment_id in &drain.reclaimed_segment_ids {
+            let seg_path = segment_path(&self.segments_dir, *segment_id);
             let _ = std::fs::remove_file(&seg_path);
         }
 
@@ -2323,6 +2351,7 @@ impl LocalObjectStore {
                 stable_committed_generation,
             );
         let mut resolver = DeadObjectDrainSegmentResolver::default();
+        let mut eligible_object_ids = BTreeSet::new();
         let mut segment_refdrops: std::collections::HashMap<u64, u64> =
             std::collections::HashMap::new();
 
@@ -2336,6 +2365,7 @@ impl LocalObjectStore {
                 continue;
             };
             resolver.segments.insert(entry.object_id, segment_id);
+            eligible_object_ids.insert(entry.object_id);
             *segment_refdrops.entry(segment_id).or_default() += 1;
         }
 
@@ -2350,6 +2380,7 @@ impl LocalObjectStore {
         ReceiptBoundDeadObjectDrainPlan {
             resolver,
             dead_segments,
+            eligible_object_ids,
         }
     }
 

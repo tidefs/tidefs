@@ -21,4 +21,5 @@ alloc = ["tidefs-types-dataset-lifecycle-core/alloc"]
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
 
 [dependencies]
+tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core", default-features = false }
 tidefs-types-dataset-lifecycle-core = { path = "../tidefs-types-dataset-lifecycle-core", default-features = false }

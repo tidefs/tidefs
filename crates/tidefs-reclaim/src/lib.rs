@@ -556,6 +556,12 @@ pub struct ReclaimConsumerStats {
     /// Number of entries remaining in the queue after this drain.
     pub reclaim_queue_depth: usize,
 
+    /// Number of segments skipped because at least one extent was denied by the reclaim gate.
+    pub gate_segments_skipped: u64,
+
+    /// Number of extents denied by the reclaim gate (deadlist or pin clearance).
+    pub gate_extents_denied: u64,
+
     /// Number of dead-segment batches that triggered a spacemap
     /// checkpoint commit.
     pub checkpoint_batches: usize,
@@ -569,6 +575,8 @@ impl ReclaimConsumerStats {
         blocks_freed: 0,
         reclaim_queue_depth: 0,
         checkpoint_batches: 0,
+        gate_segments_skipped: 0,
+        gate_extents_denied: 0,
     };
 
     /// Returns `true` if no work was done.
@@ -591,6 +599,10 @@ pub struct ReceiptBoundDeadObjectDrain {
     /// Exact dead-object ids whose segment liveness delta was applied and may
     /// be acknowledged after queue persistence succeeds.
     pub ack_object_ids: Vec<ObjectKey>,
+    /// Exact segment ids returned to the free pool by this drain.
+    pub reclaimed_segment_ids: Vec<u64>,
+    /// Committed receipt for extents actually freed by this drain.
+    pub receipt: Option<ReclaimReceipt>,
 }
 
 impl ReceiptBoundDeadObjectDrain {
@@ -598,7 +610,10 @@ impl ReceiptBoundDeadObjectDrain {
     /// no segments.
     #[must_use]
     pub fn is_idle(&self) -> bool {
-        self.stats.is_idle() && self.ack_object_ids.is_empty()
+        self.stats.is_idle()
+            && self.ack_object_ids.is_empty()
+            && self.reclaimed_segment_ids.is_empty()
+            && self.receipt.is_none()
     }
 }
 
@@ -648,6 +663,298 @@ impl<R: fmt::Debug + fmt::Display, F: fmt::Debug + fmt::Display> fmt::Display fo
 /// Does not panic on valid input.  Queue entries are consumed
 /// non-destructively by this function (it reads them; the caller is
 /// responsible for removing processed entries from the source queue).
+// =========================================================================
+// ReclaimGate — deadlist and snapshot-pin clearance gating
+// =========================================================================
+
+/// Clearance evidence recorded in a reclaim receipt for each freed extent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClearanceEvidence {
+    /// Extent was cleared by deadlist and pin-set verification.
+    Verified {
+        /// Committed deadlist txg at time of clearance.
+        deadlist_committed_txg: u64,
+        /// Snapshot pin-set epoch at time of clearance.
+        pin_clearance_epoch: u64,
+    },
+}
+
+impl ClearanceEvidence {
+    /// The deadlist commit_group used for clearance, if any.
+    #[must_use]
+    pub const fn deadlist_txg(self) -> Option<u64> {
+        match self {
+            Self::Verified {
+                deadlist_committed_txg,
+                ..
+            } => Some(deadlist_committed_txg),
+        }
+    }
+
+    /// The pin-set epoch used for clearance, if any.
+    #[must_use]
+    pub const fn pin_epoch(self) -> Option<u64> {
+        match self {
+            Self::Verified {
+                pin_clearance_epoch,
+                ..
+            } => Some(pin_clearance_epoch),
+        }
+    }
+}
+
+/// Gating decisions produced by [`ReclaimGate::check_extent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateDecision {
+    /// Extent may be freed.
+    Allow(ClearanceEvidence),
+    /// Extent must be skipped (still deadlist-referenced or snapshot-pinned).
+    Deny(GateDenyReason),
+}
+
+impl GateDecision {
+    /// Whether the extent is allowed to be freed.
+    #[must_use]
+    pub const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allow(_))
+    }
+
+    /// Whether the extent is denied.
+    #[must_use]
+    pub const fn is_denied(self) -> bool {
+        matches!(self, Self::Deny(_))
+    }
+}
+
+/// Reason an extent was denied by the reclaim gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateDenyReason {
+    /// Extent is still referenced by a committed deadlist entry.
+    DeadlistReferenced,
+    /// Extent is still pinned by at least one live snapshot.
+    SnapshotPinned,
+}
+
+impl fmt::Display for GateDenyReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeadlistReferenced => f.write_str("extent still referenced by deadlist"),
+            Self::SnapshotPinned => f.write_str("extent still pinned by live snapshot"),
+        }
+    }
+}
+
+/// Trait for checking deadlist and snapshot-pin clearance before freeing
+/// an extent.
+///
+/// Implementations consult the committed deadlist (to confirm the extent
+/// is eligible for reclamation) and the snapshot pin set (to confirm no
+/// live snapshot still references the extent).
+pub trait ReclaimGate {
+    /// Check whether `extent_key` may be freed.
+    ///
+    /// Returns [`GateDecision::Allow`] with clearance evidence when the
+    /// extent passes both deadlist and snapshot-pin checks.
+    /// Returns [`GateDecision::Deny`] with a reason when the extent
+    /// must be skipped.
+    fn check_extent(&self, extent_key: &ObjectKey) -> GateDecision;
+}
+
+// =========================================================================
+// ReclaimReceipt — committed evidence of freed extents
+// =========================================================================
+
+/// A durable receipt recording a batch of freed extents together with the
+/// deadlist and snapshot-pin clearance evidence at time of free.
+///
+/// Receipts are persisted and replayed during crash recovery so that the
+/// allocator does not double-free space.
+///
+/// # Wire format
+///
+/// ```text
+/// MAGIC:     4 bytes  "RCRP"
+/// VERSION:   4 bytes  LE u32 = 1
+/// COUNT:     4 bytes  LE u32 (number of extents)
+/// EVIDENCE:  16 bytes (deadlist_txg: u64 LE, pin_epoch: u64 LE)
+/// EXTENTS:   COUNT * 32 bytes ([u8; 32] each, ObjectKey)
+/// CHECKSUM:  32 bytes BLAKE3-256 over MAGIC..EXTENTS
+/// ```text
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimReceipt {
+    /// Extent keys freed in this batch.
+    pub freed_extents: Vec<tidefs_types_reclaim_queue_core::ObjectKey>,
+    /// Committed deadlist txg at time of clearance.
+    pub deadlist_committed_txg: u64,
+    /// Snapshot pin-set epoch at time of clearance.
+    pub pin_clearance_epoch: u64,
+}
+
+impl ReclaimReceipt {
+    /// Magic bytes for the reclaim receipt wire format.
+    pub const MAGIC: &[u8; 4] = b"RCRP";
+    /// Current wire format version.
+    pub const VERSION: u32 = 1;
+    /// Size of the fixed header (magic + version + count + evidence).
+    pub const HEADER_SIZE: usize = 28;
+    /// Size of one extent entry in the wire format.
+    pub const EXTENT_ENTRY_SIZE: usize = 32;
+
+    /// Create a new receipt with the given clearance evidence.
+    #[must_use]
+    pub fn new(
+        freed_extents: Vec<tidefs_types_reclaim_queue_core::ObjectKey>,
+        deadlist_committed_txg: u64,
+        pin_clearance_epoch: u64,
+    ) -> Self {
+        Self {
+            freed_extents,
+            deadlist_committed_txg,
+            pin_clearance_epoch,
+        }
+    }
+
+    /// Whether the receipt records any freed extents.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.freed_extents.is_empty()
+    }
+
+    /// Number of freed extents recorded.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.freed_extents.len()
+    }
+
+    /// Encode the receipt to its wire format including the BLAKE3
+    /// integrity checksum.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let extent_bytes = self.len() * Self::EXTENT_ENTRY_SIZE;
+        let payload_len = Self::HEADER_SIZE + extent_bytes;
+        let checksum_len = 32;
+        let total = payload_len + checksum_len;
+
+        let mut buf = Vec::with_capacity(total);
+
+        // Magic
+        buf.extend_from_slice(Self::MAGIC);
+        // Version
+        buf.extend_from_slice(&Self::VERSION.to_le_bytes());
+        // Count
+        buf.extend_from_slice(&(self.len() as u32).to_le_bytes());
+        // Evidence
+        buf.extend_from_slice(&self.deadlist_committed_txg.to_le_bytes());
+        buf.extend_from_slice(&self.pin_clearance_epoch.to_le_bytes());
+        // Extents
+        for ek in &self.freed_extents {
+            buf.extend_from_slice(&ek.0);
+        }
+
+        // BLAKE3-256 integrity checksum
+        let checksum = *blake3::hash(&buf).as_bytes();
+        buf.extend_from_slice(&checksum);
+
+        buf
+    }
+
+    /// Decode a receipt from its wire format.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReclaimReceiptDecodeError` for truncated input, invalid
+    /// magic, unsupported version, count overflow, or checksum mismatch.
+    pub fn decode(data: &[u8]) -> Result<Self, ReclaimReceiptDecodeError> {
+        if data.len() < Self::HEADER_SIZE + 32 {
+            return Err(ReclaimReceiptDecodeError::Truncated);
+        }
+
+        // Magic
+        if &data[0..4] != Self::MAGIC {
+            return Err(ReclaimReceiptDecodeError::InvalidMagic);
+        }
+
+        // Version
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != Self::VERSION {
+            return Err(ReclaimReceiptDecodeError::UnsupportedVersion {
+                found: version,
+                expected: Self::VERSION,
+            });
+        }
+
+        // Count
+        let count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+
+        // Evidence
+        let deadlist_committed_txg = u64::from_le_bytes(data[12..20].try_into().unwrap());
+        let pin_clearance_epoch = u64::from_le_bytes(data[20..28].try_into().unwrap());
+
+        // Length check (header + extents + checksum)
+        let expected_len = Self::HEADER_SIZE + count * Self::EXTENT_ENTRY_SIZE + 32;
+        if data.len() < expected_len {
+            return Err(ReclaimReceiptDecodeError::Truncated);
+        }
+
+        // Verify checksum
+        let payload_end = expected_len - 32;
+        let expected_checksum = *blake3::hash(&data[..payload_end]).as_bytes();
+        let stored_checksum: [u8; 32] = data[payload_end..payload_end + 32].try_into().unwrap();
+        if expected_checksum != stored_checksum {
+            return Err(ReclaimReceiptDecodeError::ChecksumMismatch);
+        }
+
+        // Decode extents
+        let mut freed_extents = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = Self::HEADER_SIZE + i * Self::EXTENT_ENTRY_SIZE;
+            let end = start + Self::EXTENT_ENTRY_SIZE;
+            let key_bytes: [u8; 32] = data[start..end].try_into().unwrap();
+            freed_extents.push(tidefs_types_reclaim_queue_core::ObjectKey(key_bytes));
+        }
+
+        Ok(Self {
+            freed_extents,
+            deadlist_committed_txg,
+            pin_clearance_epoch,
+        })
+    }
+
+    /// Predicted encoded length for a receipt with `count` extents.
+    #[must_use]
+    pub const fn encoded_len(count: usize) -> usize {
+        Self::HEADER_SIZE + count * Self::EXTENT_ENTRY_SIZE + 32
+    }
+}
+
+/// Errors returned by [`ReclaimReceipt::decode`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReclaimReceiptDecodeError {
+    /// Input too short for header and checksum.
+    Truncated,
+    /// Magic bytes do not match expected value.
+    InvalidMagic,
+    /// Version field is not the current version.
+    UnsupportedVersion { found: u32, expected: u32 },
+    /// Checksum verification failed (corruption or tampering).
+    ChecksumMismatch,
+}
+
+impl fmt::Display for ReclaimReceiptDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated => f.write_str("reclaim receipt truncated"),
+            Self::InvalidMagic => f.write_str("reclaim receipt invalid magic"),
+            Self::UnsupportedVersion { found, expected } => {
+                write!(
+                    f,
+                    "reclaim receipt unsupported version {found} (expected {expected})"
+                )
+            }
+            Self::ChecksumMismatch => f.write_str("reclaim receipt checksum mismatch"),
+        }
+    }
+}
 pub fn drain_reclaim_queue<R, F>(
     entries: &[(ObjectKey, ReclaimQueueEntry)],
     resolver: &impl SegmentResolver<Error = R>,
@@ -731,15 +1038,211 @@ where
     Ok(stats)
 }
 
+/// Result of a gated drain operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatedDrainResult {
+    /// Segment reclaim accounting for this drain.
+    pub stats: ReclaimConsumerStats,
+    /// Reclaim receipt recording freed extents and clearance evidence.
+    /// `None` if no gate was provided or no extents were freed.
+    pub receipt: Option<ReclaimReceipt>,
+}
+
+impl GatedDrainResult {
+    /// Whether the drain freed no segments and recorded no extents.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.stats.is_idle() && self.receipt.as_ref().is_none_or(|r| r.is_empty())
+    }
+}
+
+/// Drain reclaim-queue entries, identify fully-dead segments, gate each
+/// extent through [`ReclaimGate`] (deadlist + snapshot-pin clearance),
+/// and return fully-cleared dead segments to the free pool.
+///
+/// # Gate behaviour
+///
+/// When a gate is provided (`Some(gate)`), each extent in a
+/// fully-dead segment is checked via [`ReclaimGate::check_extent`].
+/// If any extent in the segment is denied, the entire segment is
+/// skipped and remains in `live_counts`. This conservative
+/// all-or-none rule prevents partial segment freeing, which the
+/// segment-based allocator does not support.
+///
+/// When no gate is provided (`None`), the function behaves as the
+/// legacy ungated drain: all fully-dead segments are freed regardless
+/// of deadlist or pin state.
+///
+/// # Flow
+///
+/// 1. Extract up to `config.max_entries_per_drain` entries from `queue`.
+/// 2. Resolve each entry's object key to a segment id via `resolver`.
+/// 3. Apply the entry's refcount delta to `live_counts` for that segment.
+/// 4. After processing all entries, scan for segments whose live count
+///    reached zero (fully dead).
+/// 5. For each fully-dead segment with a gate, check every extent
+///    against the gate; skip the segment if any extent is denied.
+/// 6. Batch-free the gated dead segments via `freer`.
+/// 7. Remove freed segments from `live_counts`.
+/// 8. Build a [`ReclaimReceipt`] if any extents were freed with a gate.
+///
+/// # Errors
+///
+/// Returns `DrainError::ResolveError` if the resolver cannot map a key.
+/// Returns `DrainError::FreeError` if the freer cannot release a segment.
+///
+/// # Panics
+///
+/// Does not panic on valid input.
+pub fn drain_reclaim_queue_gated<R, F>(
+    entries: &[(ObjectKey, ReclaimQueueEntry)],
+    resolver: &impl SegmentResolver<Error = R>,
+    freer: &mut impl SegmentFreer<Error = F>,
+    live_counts: &mut SegmentLiveCounts,
+    config: &ReclaimConsumerConfig,
+    gate: Option<&impl ReclaimGate>,
+) -> Result<GatedDrainResult, DrainError<R, F>>
+where
+    R: fmt::Debug + fmt::Display,
+    F: fmt::Debug + fmt::Display,
+{
+    if entries.is_empty() {
+        return Ok(GatedDrainResult {
+            stats: ReclaimConsumerStats {
+                reclaim_queue_depth: 0,
+                ..ReclaimConsumerStats::ZERO
+            },
+            receipt: None,
+        });
+    }
+
+    let mut stats = ReclaimConsumerStats {
+        reclaim_queue_depth: entries.len(),
+        ..ReclaimConsumerStats::ZERO
+    };
+
+    // Phase 1: resolve segments and apply deltas.
+    let mut segment_entries: HashMap<u64, Vec<(ObjectKey, i64)>> = HashMap::new();
+
+    for (key, entry) in entries.iter().take(config.max_entries_per_drain) {
+        let segment_id = resolver
+            .resolve(key)
+            .map_err(|e| DrainError::ResolveError {
+                key: *key,
+                error: e,
+            })?;
+
+        let sid = match segment_id {
+            Some(id) => id,
+            None => continue,
+        };
+
+        live_counts.apply_delta(sid, entry.delta);
+        segment_entries
+            .entry(sid)
+            .or_default()
+            .push((*key, entry.delta));
+        stats.entries_processed += 1;
+    }
+
+    // Phase 2: collect fully-dead segments.
+    let dead_segments: Vec<u64> = segment_entries
+        .keys()
+        .copied()
+        .filter(|sid| live_counts.is_dead(*sid))
+        .collect();
+
+    if dead_segments.is_empty() {
+        return Ok(GatedDrainResult {
+            stats,
+            receipt: None,
+        });
+    }
+
+    // Phase 3: gate each dead segment before freeing.
+    let mut freed_extents: Vec<ObjectKey> = Vec::new();
+    let mut clearance_deadlist_txg: Option<u64> = None;
+    let mut clearance_pin_epoch: Option<u64> = None;
+
+    for batch in dead_segments.chunks(config.max_free_batch) {
+        for &segment_id in batch {
+            // Gate: check every extent in this segment
+            let mut segment_allowed = true;
+            if let Some(gate) = gate {
+                if let Some(extent_entries) = segment_entries.get(&segment_id) {
+                    for (object_key, _delta) in extent_entries {
+                        let decision = gate.check_extent(object_key);
+                        match decision {
+                            GateDecision::Allow(evidence) => {
+                                // Record clearance evidence from first allowed extent
+                                if clearance_deadlist_txg.is_none() {
+                                    clearance_deadlist_txg = evidence.deadlist_txg();
+                                    clearance_pin_epoch = evidence.pin_epoch();
+                                }
+                            }
+                            GateDecision::Deny(_reason) => {
+                                segment_allowed = false;
+                                stats.gate_extents_denied += 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !segment_allowed {
+                stats.gate_segments_skipped += 1;
+                continue;
+            }
+
+            freer
+                .free_segment(segment_id)
+                .map_err(|e| DrainError::FreeError {
+                    segment_id,
+                    error: e,
+                })?;
+            live_counts.remove(segment_id);
+            stats.segments_reclaimed += 1;
+
+            // Collect freed extents for the receipt
+            if let Some(extent_entries) = segment_entries.get(&segment_id) {
+                let obj_count = extent_entries.iter().filter(|(_, d)| *d < 0).count() as u64;
+                stats.blocks_freed += obj_count;
+                if gate.is_some() {
+                    for (object_key, delta) in extent_entries {
+                        if *delta < 0 {
+                            freed_extents.push(*object_key);
+                        }
+                    }
+                }
+            }
+        }
+        stats.checkpoint_batches += 1;
+    }
+
+    let receipt = if gate.is_some() && !freed_extents.is_empty() {
+        Some(ReclaimReceipt::new(
+            freed_extents,
+            clearance_deadlist_txg.unwrap_or(0),
+            clearance_pin_epoch.unwrap_or(0),
+        ))
+    } else {
+        None
+    };
+
+    Ok(GatedDrainResult { stats, receipt })
+}
 /// Drain receipt-authorized dead objects into segment liveness accounting.
 ///
 /// This is the release-facing dead-object physical reclaim entry point: it
 /// selects candidates through
 /// [`DeadObjectReclaimQueue::dequeue_receipt_bound_batch_with_stable_generation`]
 /// so legacy, synthetic, malformed, under-width, ineligible, or
-/// generation-unstable entries remain queued. The caller owns source-queue
-/// mutation and should acknowledge only the returned object ids after any
-/// queue persistence succeeds.
+/// generation-unstable entries remain queued. Each fully-dead segment is then
+/// checked through `gate`; denied segments remain queued with their liveness
+/// deltas rolled back. The caller owns source-queue mutation and should
+/// acknowledge only the returned object ids after any queue persistence
+/// succeeds.
 pub fn drain_receipt_bound_dead_objects<R, F>(
     queue: &DeadObjectReclaimQueue,
     stable_committed_txg: u64,
@@ -749,6 +1252,7 @@ pub fn drain_receipt_bound_dead_objects<R, F>(
     freer: &mut impl SegmentFreer<Error = F>,
     live_counts: &mut SegmentLiveCounts,
     config: &ReclaimConsumerConfig,
+    gate: &impl ReclaimGate,
 ) -> Result<ReceiptBoundDeadObjectDrain, DrainError<R, F>>
 where
     R: fmt::Debug + fmt::Display,
@@ -764,6 +1268,8 @@ where
         return Ok(ReceiptBoundDeadObjectDrain {
             stats,
             ack_object_ids: Vec::new(),
+            reclaimed_segment_ids: Vec::new(),
+            receipt: None,
         });
     }
 
@@ -776,10 +1282,13 @@ where
         return Ok(ReceiptBoundDeadObjectDrain {
             stats,
             ack_object_ids: Vec::new(),
+            reclaimed_segment_ids: Vec::new(),
+            receipt: None,
         });
     }
 
     let mut segment_entries: HashMap<u64, Vec<ObjectKey>> = HashMap::new();
+    let mut segment_prior_counts: HashMap<u64, u64> = HashMap::new();
     let mut ack_object_ids = Vec::with_capacity(entries.len());
 
     for entry in &entries {
@@ -791,6 +1300,9 @@ where
             continue;
         };
 
+        segment_prior_counts
+            .entry(segment_id)
+            .or_insert_with(|| live_counts.live_count(segment_id));
         live_counts.apply_delta(segment_id, -1);
         segment_entries.entry(segment_id).or_default().push(key);
         ack_object_ids.push(key);
@@ -803,25 +1315,71 @@ where
         .filter(|sid| live_counts.is_dead(*sid))
         .collect();
 
+    let mut freed_extents = Vec::new();
+    let mut reclaimed_segment_ids = Vec::new();
+    let mut clearance_deadlist_txg: Option<u64> = None;
+    let mut clearance_pin_epoch: Option<u64> = None;
+
     for batch in dead_segments.chunks(config.max_free_batch) {
         for &segment_id in batch {
+            let Some(extent_entries) = segment_entries.get(&segment_id) else {
+                continue;
+            };
+
+            let mut segment_allowed = true;
+            for object_key in extent_entries {
+                match gate.check_extent(object_key) {
+                    GateDecision::Allow(evidence) => {
+                        if clearance_deadlist_txg.is_none() {
+                            clearance_deadlist_txg = evidence.deadlist_txg();
+                            clearance_pin_epoch = evidence.pin_epoch();
+                        }
+                    }
+                    GateDecision::Deny(_reason) => {
+                        segment_allowed = false;
+                        stats.gate_extents_denied += 1;
+                        break;
+                    }
+                }
+            }
+
+            if !segment_allowed {
+                if let Some(previous) = segment_prior_counts.get(&segment_id) {
+                    live_counts.set_live_count(segment_id, *previous);
+                }
+                ack_object_ids.retain(|object_key| !extent_entries.contains(object_key));
+                stats.gate_segments_skipped += 1;
+                continue;
+            }
+
             freer
                 .free_segment(segment_id)
                 .map_err(|error| DrainError::FreeError { segment_id, error })?;
             live_counts.remove(segment_id);
+            reclaimed_segment_ids.push(segment_id);
             stats.segments_reclaimed += 1;
-            stats.blocks_freed += segment_entries
-                .get(&segment_id)
-                .map_or(0, |entries| entries.len() as u64);
+            stats.blocks_freed += extent_entries.len() as u64;
+            freed_extents.extend(extent_entries.iter().copied());
         }
         stats.checkpoint_batches += 1;
     }
 
     stats.reclaim_queue_depth = queue.len().saturating_sub(ack_object_ids.len());
+    let receipt = if freed_extents.is_empty() {
+        None
+    } else {
+        Some(ReclaimReceipt::new(
+            freed_extents,
+            clearance_deadlist_txg.unwrap_or(0),
+            clearance_pin_epoch.unwrap_or(0),
+        ))
+    };
 
     Ok(ReceiptBoundDeadObjectDrain {
         stats,
         ack_object_ids,
+        reclaimed_segment_ids,
+        receipt,
     })
 }
 
@@ -865,7 +1423,7 @@ impl SegmentFreer for PoolAllocator {
 /// let mut allocator = pool_allocator.clone();
 ///
 /// let stats = service.drain(&entries, &resolver, &mut allocator)?;
-/// ```
+/// ```text
 #[derive(Clone, Debug)]
 pub struct ReclaimConsumerService {
     config: ReclaimConsumerConfig,
@@ -921,6 +1479,27 @@ impl ReclaimConsumerService {
 
     /// Drain receipt-authorized dead objects while preserving queue mutation
     /// authority for the caller.
+    pub fn gated_drain<R, F>(
+        &mut self,
+        entries: &[(ObjectKey, ReclaimQueueEntry)],
+        resolver: &impl SegmentResolver<Error = R>,
+        freer: &mut impl SegmentFreer<Error = F>,
+        gate: Option<&impl ReclaimGate>,
+    ) -> Result<GatedDrainResult, DrainError<R, F>>
+    where
+        R: fmt::Debug + fmt::Display,
+        F: fmt::Debug + fmt::Display,
+    {
+        drain_reclaim_queue_gated(
+            entries,
+            resolver,
+            freer,
+            &mut self.live_counts,
+            &self.config,
+            gate,
+        )
+    }
+
     pub fn drain_receipt_bound_dead_objects<R, F>(
         &mut self,
         queue: &DeadObjectReclaimQueue,
@@ -929,6 +1508,7 @@ impl ReclaimConsumerService {
         max_count: usize,
         resolver: &impl SegmentResolver<Error = R>,
         freer: &mut impl SegmentFreer<Error = F>,
+        gate: &impl ReclaimGate,
     ) -> Result<ReceiptBoundDeadObjectDrain, DrainError<R, F>>
     where
         R: fmt::Debug + fmt::Display,
@@ -943,6 +1523,7 @@ impl ReclaimConsumerService {
             freer,
             &mut self.live_counts,
             &self.config,
+            gate,
         )
     }
 
@@ -1026,7 +1607,7 @@ impl DedupReclaimStats {
 ///     &resolver,
 ///     &mut freer,
 /// );
-/// ```
+/// ```text
 pub struct DedupReclaimWriter {
     live_counts: SegmentLiveCounts,
 }
@@ -1164,6 +1745,7 @@ impl<R: fmt::Debug + fmt::Display, F: fmt::Debug + fmt::Display> fmt::Display
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_types_reclaim_queue_core::QueueFamily;
 
     #[test]
     fn activate_resets_counters() {
@@ -1651,6 +2233,35 @@ mod tests {
         }
     }
 
+    /// Gate that allows everything with stable committed clearance evidence.
+    struct AllowAllGate;
+    impl ReclaimGate for AllowAllGate {
+        fn check_extent(&self, _extent_key: &ObjectKey) -> GateDecision {
+            GateDecision::Allow(ClearanceEvidence::Verified {
+                deadlist_committed_txg: 100,
+                pin_clearance_epoch: 10,
+            })
+        }
+    }
+
+    /// Gate that denies extents whose key[0] is in a deny set.
+    struct DenySetGate {
+        deny_keys: Vec<u8>,
+        reason: GateDenyReason,
+    }
+    impl ReclaimGate for DenySetGate {
+        fn check_extent(&self, extent_key: &ObjectKey) -> GateDecision {
+            if self.deny_keys.contains(&extent_key.0[0]) {
+                GateDecision::Deny(self.reason)
+            } else {
+                GateDecision::Allow(ClearanceEvidence::Verified {
+                    deadlist_committed_txg: 100,
+                    pin_clearance_epoch: 10,
+                })
+            }
+        }
+    }
+
     // Helper: create an ObjectKey from a u8.
     fn obj_key(id: u8) -> ObjectKey {
         let mut k = [0u8; 32];
@@ -1998,6 +2609,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
+            &AllowAllGate,
         )
         .expect("receipt-bound drain");
 
@@ -2006,8 +2618,59 @@ mod tests {
         assert_eq!(drain.stats.segments_reclaimed, 1);
         assert_eq!(drain.stats.blocks_freed, 2);
         assert_eq!(drain.stats.reclaim_queue_depth, 1);
+        assert_eq!(
+            drain.receipt.as_ref().map(|receipt| (
+                receipt.freed_extents.clone(),
+                receipt.deadlist_committed_txg,
+                receipt.pin_clearance_epoch,
+            )),
+            Some((vec![obj_key(1), obj_key(2)], 100, 10))
+        );
         assert_eq!(freer.freed_segments(), vec![100]);
         assert!(live_counts.is_dead(100));
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_skips_gate_denied_segment() {
+        let mut queue = DeadObjectReclaimQueue::new();
+        queue.enqueue(dead_entry(1, 5, true, Some(10)));
+        queue.enqueue(dead_entry(2, 5, true, Some(11)));
+
+        let mut resolver = MockResolver::new();
+        resolver.set(1, 100);
+        resolver.set(2, 100);
+
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.set_live_count(100, 2);
+        let mut freer = MockFreer::new();
+        let config = ReclaimConsumerConfig::default();
+        let gate = DenySetGate {
+            deny_keys: vec![2],
+            reason: GateDenyReason::DeadlistReferenced,
+        };
+
+        let drain = drain_receipt_bound_dead_objects(
+            &queue,
+            6,
+            11,
+            16,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+            &gate,
+        )
+        .expect("receipt-bound gated drain");
+
+        assert!(drain.ack_object_ids.is_empty());
+        assert_eq!(drain.stats.entries_processed, 2);
+        assert_eq!(drain.stats.segments_reclaimed, 0);
+        assert_eq!(drain.stats.gate_segments_skipped, 1);
+        assert_eq!(drain.stats.gate_extents_denied, 1);
+        assert_eq!(drain.stats.reclaim_queue_depth, 2);
+        assert!(drain.receipt.is_none());
+        assert_eq!(live_counts.live_count(100), 2);
+        assert!(freer.freed_segments().is_empty());
     }
 
     #[test]
@@ -2038,6 +2701,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
+            &AllowAllGate,
         )
         .expect("receipt-bound drain");
 
@@ -2069,6 +2733,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
+            &AllowAllGate,
         )
         .expect("receipt-bound held drain");
 
@@ -2086,6 +2751,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
+            &AllowAllGate,
         )
         .expect("receipt-bound stable drain");
 
@@ -2125,6 +2791,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
+            &AllowAllGate,
         )
         .expect("receipt-bound drain");
 
@@ -2151,7 +2818,15 @@ mod tests {
         let mut freer = MockFreer::new();
 
         let drain = service
-            .drain_receipt_bound_dead_objects(&queue, 6, 18, 8, &resolver, &mut freer)
+            .drain_receipt_bound_dead_objects(
+                &queue,
+                6,
+                18,
+                8,
+                &resolver,
+                &mut freer,
+                &AllowAllGate,
+            )
             .expect("service receipt-bound drain");
 
         assert_eq!(drain.ack_object_ids, vec![obj_key(8)]);
@@ -2186,6 +2861,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
+            &AllowAllGate,
         )
         .expect("receipt-bound erasure drain");
 
@@ -2218,6 +2894,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
+            &AllowAllGate,
         )
         .expect("receipt-bound erasure segment drain");
 
@@ -2255,6 +2932,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
+            &AllowAllGate,
         )
         .expect("mixed receipt-bound drain");
 
@@ -2792,6 +3470,378 @@ mod tests {
             "second free of same segment should be idempotent"
         );
         assert!(allocator.is_free(seg));
+    }
+
+    // -- ReclaimReceipt tests -------------------------------------------------
+
+    fn receipt_extent_key(id: u8) -> ObjectKey {
+        let mut k = [0u8; 32];
+        k[0] = id;
+        ObjectKey(k)
+    }
+
+    #[test]
+    fn reclaim_receipt_encode_decode_roundtrip_empty() {
+        let receipt = ReclaimReceipt::new(Vec::new(), 100, 5);
+        let encoded = receipt.encode();
+        let decoded = ReclaimReceipt::decode(&encoded).unwrap();
+        assert_eq!(decoded, receipt);
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn reclaim_receipt_encode_decode_roundtrip_single_extent() {
+        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 42, 7);
+        let encoded = receipt.encode();
+        assert_eq!(encoded.len(), ReclaimReceipt::encoded_len(1));
+        let decoded = ReclaimReceipt::decode(&encoded).unwrap();
+        assert_eq!(decoded, receipt);
+        assert_eq!(decoded.len(), 1);
+    }
+
+    #[test]
+    fn reclaim_receipt_encode_decode_roundtrip_many_extents() {
+        let extents: Vec<ObjectKey> = (0u8..128).map(receipt_extent_key).collect();
+        let receipt = ReclaimReceipt::new(extents.clone(), u64::MAX, u64::MAX);
+        let encoded = receipt.encode();
+        let decoded = ReclaimReceipt::decode(&encoded).unwrap();
+        assert_eq!(decoded.freed_extents, extents);
+        assert_eq!(decoded.deadlist_committed_txg, u64::MAX);
+        assert_eq!(decoded.pin_clearance_epoch, u64::MAX);
+    }
+
+    #[test]
+    fn reclaim_receipt_decode_rejects_truncated() {
+        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 1, 1);
+        let encoded = receipt.encode();
+        let truncated = &encoded[..10];
+        assert_eq!(
+            ReclaimReceipt::decode(truncated),
+            Err(ReclaimReceiptDecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn reclaim_receipt_decode_rejects_invalid_magic() {
+        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 1, 1);
+        let mut encoded = receipt.encode();
+        encoded[0] = b'X';
+        assert_eq!(
+            ReclaimReceipt::decode(&encoded),
+            Err(ReclaimReceiptDecodeError::InvalidMagic)
+        );
+    }
+
+    #[test]
+    fn reclaim_receipt_decode_rejects_unsupported_version() {
+        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 1, 1);
+        let mut encoded = receipt.encode();
+        encoded[4..8].copy_from_slice(&99u32.to_le_bytes());
+        assert_eq!(
+            ReclaimReceipt::decode(&encoded),
+            Err(ReclaimReceiptDecodeError::UnsupportedVersion {
+                found: 99,
+                expected: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn reclaim_receipt_decode_rejects_checksum_mismatch() {
+        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 1, 1);
+        let mut encoded = receipt.encode();
+        // Flip a byte in the extents area
+        let flip_idx = encoded.len() - 33;
+        encoded[flip_idx] ^= 0xFF;
+        assert_eq!(
+            ReclaimReceipt::decode(&encoded),
+            Err(ReclaimReceiptDecodeError::ChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn reclaim_receipt_decode_error_display_non_empty() {
+        let errors = [
+            ReclaimReceiptDecodeError::Truncated,
+            ReclaimReceiptDecodeError::InvalidMagic,
+            ReclaimReceiptDecodeError::UnsupportedVersion {
+                found: 2,
+                expected: 1,
+            },
+            ReclaimReceiptDecodeError::ChecksumMismatch,
+        ];
+        for err in &errors {
+            let s = format!("{err}");
+            assert!(!s.is_empty(), "Display empty for {err:?}");
+        }
+    }
+
+    // -- ReclaimGate tests ----------------------------------------------------
+
+    /// Mock resolver: maps key[0] directly as segment id.
+    struct MockSegmentResolver;
+    impl SegmentResolver for MockSegmentResolver {
+        type Error = &'static str;
+        fn resolve(&self, key: &ObjectKey) -> Result<Option<u64>, Self::Error> {
+            Ok(Some(key.0[0] as u64))
+        }
+    }
+
+    /// Mock freer: records freed segments.
+    #[derive(Default)]
+    struct MockSegmentFreer {
+        freed: Vec<u64>,
+        fail_on: Option<u64>,
+    }
+    impl SegmentFreer for MockSegmentFreer {
+        type Error = &'static str;
+        fn free_segment(&mut self, segment_id: u64) -> Result<(), Self::Error> {
+            if self.fail_on == Some(segment_id) {
+                return Err("mock free failure");
+            }
+            self.freed.push(segment_id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn gated_drain_allows_when_no_denials() {
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.apply_delta(1, 2);
+        live_counts.apply_delta(2, 1);
+
+        // Two entries that make segments 1 and 2 dead
+        let entries = vec![
+            (
+                receipt_extent_key(1),
+                ReclaimQueueEntry::new(receipt_extent_key(1), -2, QueueFamily::Extent),
+            ),
+            (
+                receipt_extent_key(2),
+                ReclaimQueueEntry::new(receipt_extent_key(2), -1, QueueFamily::Extent),
+            ),
+        ];
+
+        let resolver = MockSegmentResolver;
+        let mut freer = MockSegmentFreer::default();
+        let gate = AllowAllGate;
+        let config = ReclaimConsumerConfig::default();
+
+        let result = drain_reclaim_queue_gated(
+            &entries,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+            Some(&gate),
+        )
+        .unwrap();
+
+        assert_eq!(result.stats.segments_reclaimed, 2);
+        assert_eq!(result.stats.gate_segments_skipped, 0);
+        assert_eq!(result.stats.gate_extents_denied, 0);
+        assert!(result.receipt.is_some());
+        let receipt = result.receipt.unwrap();
+        assert_eq!(receipt.freed_extents.len(), 2);
+        assert_eq!(receipt.deadlist_committed_txg, 100);
+        assert_eq!(receipt.pin_clearance_epoch, 10);
+    }
+
+    #[test]
+    fn gated_drain_skips_deadlist_referenced_extent() {
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.apply_delta(1, 2); // seg 1 needs -2 to be dead
+
+        let entries = vec![(
+            receipt_extent_key(1),
+            ReclaimQueueEntry::new(receipt_extent_key(1), -2, QueueFamily::Extent),
+        )];
+
+        let resolver = MockSegmentResolver;
+        let mut freer = MockSegmentFreer::default();
+        let gate = DenySetGate {
+            deny_keys: vec![1], // deny extent key 1 as deadlist-referenced
+            reason: GateDenyReason::DeadlistReferenced,
+        };
+        let config = ReclaimConsumerConfig::default();
+
+        let result = drain_reclaim_queue_gated(
+            &entries,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+            Some(&gate),
+        )
+        .unwrap();
+
+        assert_eq!(result.stats.segments_reclaimed, 0);
+        assert_eq!(result.stats.gate_segments_skipped, 1);
+        assert_eq!(result.stats.gate_extents_denied, 1);
+        assert!(freer.freed.is_empty());
+        assert!(result.receipt.is_none());
+    }
+
+    #[test]
+    fn gated_drain_skips_snapshot_pinned_extent() {
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.apply_delta(2, 1); // seg 2 needs -1 to be dead
+
+        let entries = vec![(
+            receipt_extent_key(2),
+            ReclaimQueueEntry::new(receipt_extent_key(2), -1, QueueFamily::Extent),
+        )];
+
+        let resolver = MockSegmentResolver;
+        let mut freer = MockSegmentFreer::default();
+        let gate = DenySetGate {
+            deny_keys: vec![2], // deny extent key 2 as snapshot-pinned
+            reason: GateDenyReason::SnapshotPinned,
+        };
+        let config = ReclaimConsumerConfig::default();
+
+        let result = drain_reclaim_queue_gated(
+            &entries,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+            Some(&gate),
+        )
+        .unwrap();
+
+        assert_eq!(result.stats.segments_reclaimed, 0);
+        assert_eq!(result.stats.gate_segments_skipped, 1);
+        assert_eq!(result.stats.gate_extents_denied, 1);
+        assert!(freer.freed.is_empty());
+    }
+
+    #[test]
+    fn gated_drain_frees_extent_after_pin_release() {
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.apply_delta(3, 1);
+
+        let entries = vec![(
+            receipt_extent_key(3),
+            ReclaimQueueEntry::new(receipt_extent_key(3), -1, QueueFamily::Extent),
+        )];
+
+        let resolver = MockSegmentResolver;
+        let mut freer = MockSegmentFreer::default();
+        let gate = AllowAllGate; // simulate pin released
+        let config = ReclaimConsumerConfig::default();
+
+        let result = drain_reclaim_queue_gated(
+            &entries,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+            Some(&gate),
+        )
+        .unwrap();
+
+        assert_eq!(result.stats.segments_reclaimed, 1);
+        assert_eq!(result.stats.gate_segments_skipped, 0);
+        assert_eq!(freer.freed, vec![3]);
+    }
+
+    #[test]
+    fn gated_drain_no_gate_behaves_like_legacy() {
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.apply_delta(4, 1);
+
+        let entries = vec![(
+            receipt_extent_key(4),
+            ReclaimQueueEntry::new(receipt_extent_key(4), -1, QueueFamily::Extent),
+        )];
+
+        let resolver = MockSegmentResolver;
+        let mut freer = MockSegmentFreer::default();
+        let config = ReclaimConsumerConfig::default();
+
+        let result = drain_reclaim_queue_gated(
+            &entries,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+            None::<&AllowAllGate>, // no gate
+        )
+        .unwrap();
+
+        assert_eq!(result.stats.segments_reclaimed, 1);
+        assert_eq!(result.stats.gate_segments_skipped, 0);
+        assert_eq!(freer.freed, vec![4]);
+        assert!(result.receipt.is_none()); // no receipt without gate
+    }
+
+    #[test]
+    fn gated_drain_receipt_is_empty_when_no_freed_extents() {
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.apply_delta(5, 10); // seg 5 not dead with -1
+
+        let entries = vec![(
+            receipt_extent_key(5),
+            ReclaimQueueEntry::new(receipt_extent_key(5), -1, QueueFamily::Extent),
+        )];
+
+        let resolver = MockSegmentResolver;
+        let mut freer = MockSegmentFreer::default();
+        let gate = AllowAllGate;
+        let config = ReclaimConsumerConfig::default();
+
+        let result = drain_reclaim_queue_gated(
+            &entries,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+            Some(&gate),
+        )
+        .unwrap();
+
+        assert_eq!(result.stats.segments_reclaimed, 0);
+        assert!(result.receipt.is_none());
+    }
+
+    #[test]
+    fn gated_drain_result_is_idle_when_no_work() {
+        let result = GatedDrainResult {
+            stats: ReclaimConsumerStats::ZERO,
+            receipt: None,
+        };
+        assert!(result.is_idle());
+    }
+
+    #[test]
+    fn gate_decision_is_allowed_and_denied() {
+        let allow = GateDecision::Allow(ClearanceEvidence::Verified {
+            deadlist_committed_txg: 1,
+            pin_clearance_epoch: 2,
+        });
+        assert!(allow.is_allowed());
+        assert!(!allow.is_denied());
+
+        let deny = GateDecision::Deny(GateDenyReason::SnapshotPinned);
+        assert!(!deny.is_allowed());
+        assert!(deny.is_denied());
+    }
+
+    #[test]
+    fn gate_deny_reason_display_non_empty() {
+        assert!(!format!("{}", GateDenyReason::DeadlistReferenced).is_empty());
+        assert!(!format!("{}", GateDenyReason::SnapshotPinned).is_empty());
+    }
+
+    #[test]
+    fn clearance_evidence_deadlist_txg_and_pin_epoch() {
+        let evidence = ClearanceEvidence::Verified {
+            deadlist_committed_txg: 42,
+            pin_clearance_epoch: 7,
+        };
+        assert_eq!(evidence.deadlist_txg(), Some(42));
+        assert_eq!(evidence.pin_epoch(), Some(7));
     }
 }
 
