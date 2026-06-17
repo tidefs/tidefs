@@ -2,6 +2,7 @@
 use crate::drain::{NodeDrain, NodeState};
 use serde::{Deserialize, Serialize};
 use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_replication_model::ReplicatedReceiptId;
 
 // ---------------------------------------------------------------------------
 // FenceToken — monotonically increasing counter per node
@@ -226,6 +227,9 @@ pub struct ForcedFencing {
     consecutive_fences: std::collections::BTreeMap<u64, u32>,
     /// Nodes currently fenced (node_id -> (token, epoch_when_fenced)).
     fenced_nodes: std::collections::BTreeMap<u64, (FenceToken, u64)>,
+    /// Placement receipt ids that referenced the node at the time of
+    /// the last fence, keyed by node_id. Captured for audit/recovery.
+    placement_evidence: std::collections::BTreeMap<u64, Vec<ReplicatedReceiptId>>,
 }
 
 impl ForcedFencing {
@@ -238,6 +242,7 @@ impl ForcedFencing {
             tokens: std::collections::BTreeMap::new(),
             consecutive_fences: std::collections::BTreeMap::new(),
             fenced_nodes: std::collections::BTreeMap::new(),
+            placement_evidence: std::collections::BTreeMap::new(),
         }
     }
 
@@ -250,6 +255,7 @@ impl ForcedFencing {
             tokens: std::collections::BTreeMap::new(),
             consecutive_fences: std::collections::BTreeMap::new(),
             fenced_nodes: std::collections::BTreeMap::new(),
+            placement_evidence: std::collections::BTreeMap::new(),
         }
     }
 
@@ -346,6 +352,16 @@ impl ForcedFencing {
 
         // Mark the node as fenced
         drain.mark_fenced();
+
+        // Record placement evidence captured at fence time so the fencing
+        // event carries the last committed placement evidence known for the
+        // node. This is used for post-fence audit and recovery.
+        self.record_placement_evidence(
+            nid,
+            drain.evacuation_receipt()
+                .map(|r| r.placement_receipt_refs.clone())
+                .unwrap_or_default(),
+        );
         self.fenced_nodes.insert(nid, (new_token, current_epoch));
 
         // Record stats
@@ -387,6 +403,24 @@ impl ForcedFencing {
     /// rejoins after catching up.
     ///
     /// The presented token must be at least the current token.
+    /// Record placement receipt evidence captured at fence time.
+    fn record_placement_evidence(&mut self, node_id: u64, receipt_ids: Vec<ReplicatedReceiptId>) {
+        self.placement_evidence.insert(node_id, receipt_ids);
+    }
+
+    /// Return the placement receipt ids referencing `node_id` at the
+    /// time it was last fenced, if any.
+    #[must_use]
+    pub fn placement_evidence_for(&self, node_id: MemberId) -> Option<&[ReplicatedReceiptId]> {
+        self.placement_evidence.get(&node_id.0).map(|v| v.as_slice())
+    }
+
+    /// Returns true if placement evidence was recorded for this node.
+    #[must_use]
+    pub fn has_placement_evidence(&self, node_id: MemberId) -> bool {
+        self.placement_evidence.contains_key(&node_id.0)
+    }
+
     pub fn clear_fence(
         &mut self,
         node_id: MemberId,

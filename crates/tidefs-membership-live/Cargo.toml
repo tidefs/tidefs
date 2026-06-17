@@ -29,6 +29,7 @@ tidefs-placement-runtime = { path = "../tidefs-placement-runtime" }
 tidefs-durability-layout = { path = "../tidefs-durability-layout" }
 tidefs-placement-planner = { path = "../tidefs-placement-planner" }
 tidefs-node-drain = { path = "../tidefs-node-drain" }
+tidefs-replication-model = { path = "../tidefs-replication-model" }
 tidefs-cluster = { path = "../tidefs-cluster" }
 tidefs-local-object-store = { path = "../tidefs-local-object-store" }
 

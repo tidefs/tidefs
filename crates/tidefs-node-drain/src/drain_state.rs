@@ -46,6 +46,23 @@ pub trait MembershipVerificationOps {
 }
 
 // ---------------------------------------------------------------------------
+// PlacementEvidenceVerifier — receipt-to-node reference check
+// ---------------------------------------------------------------------------
+
+/// Verifier that checks whether any placement receipt still references
+/// a given node.  Used by the drain safety gate: decommission must fail
+/// closed when any placement receipt still references the draining node.
+pub trait PlacementEvidenceVerifier {
+    /// Return the set of placement receipt ids that reference `node_id`.
+    fn receipts_referencing_node(&self, node_id: MemberId) -> Vec<tidefs_replication_model::ReplicatedReceiptId>;
+
+    /// Returns true if any placement receipt references `node_id`.
+    fn has_receipts_referencing_node(&self, node_id: MemberId) -> bool {
+        !self.receipts_referencing_node(node_id).is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DrainRequest — BLAKE3-verified drain request
 // ---------------------------------------------------------------------------
 

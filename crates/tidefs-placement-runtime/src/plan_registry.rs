@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use tidefs_membership_epoch::{EpochId, MemberId};
-use tidefs_replication_model::{ReplicaPlacementReceipt, ReplicatedSubjectId};
+use tidefs_replication_model::{ReplicaPlacementReceipt, ReplicatedReceiptId, ReplicatedSubjectId};
 
 use crate::types::{CycleId, PlacementDecision, PlacementPhase};
 
@@ -604,5 +604,109 @@ mod tests {
     fn test_registry_default_uses_zero_epoch() {
         let reg = PlacementPlanRegistry::default();
         assert_eq!(reg.current_epoch, EpochId::ZERO);
+    }
+}
+
+// ── Node-referencing receipt check ──────────────────────────────────
+
+impl PlacementPlanRegistry {
+    /// Return placement receipt ids that reference `node_id`.
+    ///
+    /// Used by the drain safety gate: decommission must fail closed when any
+    /// placement receipt still references the draining node.
+    #[must_use]
+    pub fn receipts_referencing_node(
+        &self,
+        node_id: MemberId,
+    ) -> Vec<ReplicatedReceiptId> {
+        self.placed_receipts
+            .iter()
+            .filter(|r| r.placed_on == node_id)
+            .map(|r| r.receipt_id)
+            .collect()
+    }
+
+    /// Returns true if any placement receipt references `node_id`.
+    #[must_use]
+    pub fn has_receipts_referencing_node(&self, node_id: MemberId) -> bool {
+        self.placed_receipts.iter().any(|r| r.placed_on == node_id)
+    }
+}
+
+#[cfg(test)]
+mod node_reference_tests {
+    use super::*;
+
+    #[test]
+    fn test_receipts_referencing_node_empty() {
+        let reg = PlacementPlanRegistry::new(EpochId::new(1));
+        let refs = reg.receipts_referencing_node(MemberId::new(1));
+        assert!(refs.is_empty());
+        assert!(!reg.has_receipts_referencing_node(MemberId::new(1)));
+    }
+
+    #[test]
+    fn test_receipts_referencing_node_finds_match() {
+        let mut reg = PlacementPlanRegistry::new(EpochId::new(1));
+        let subject = ReplicatedSubjectId::new(42);
+        let node_a = MemberId::new(7);
+        let node_b = MemberId::new(8);
+
+        reg.record_placement(ReplicaPlacementReceipt {
+            receipt_id: ReplicatedReceiptId(1),
+            verification_ref: ReplicatedReceiptId(0),
+            transfer_ref: ReplicatedReceiptId(0),
+            subject_refs: vec![subject],
+            placed_on: node_a,
+            placement_epoch: EpochId::new(1),
+            subjects_placed: 1,
+            placement_receipt_refs: Vec::new(),
+        });
+
+        reg.record_placement(ReplicaPlacementReceipt {
+            receipt_id: ReplicatedReceiptId(2),
+            verification_ref: ReplicatedReceiptId(0),
+            transfer_ref: ReplicatedReceiptId(0),
+            subject_refs: vec![ReplicatedSubjectId::new(43)],
+            placed_on: node_b,
+            placement_epoch: EpochId::new(1),
+            subjects_placed: 1,
+            placement_receipt_refs: Vec::new(),
+        });
+
+        let refs_a = reg.receipts_referencing_node(node_a);
+        assert_eq!(refs_a, vec![ReplicatedReceiptId(1)]);
+        assert!(reg.has_receipts_referencing_node(node_a));
+
+        let refs_b = reg.receipts_referencing_node(node_b);
+        assert_eq!(refs_b, vec![ReplicatedReceiptId(2)]);
+        assert!(reg.has_receipts_referencing_node(node_b));
+
+        let refs_c = reg.receipts_referencing_node(MemberId::new(99));
+        assert!(refs_c.is_empty());
+        assert!(!reg.has_receipts_referencing_node(MemberId::new(99)));
+    }
+
+    #[test]
+    fn test_receipts_referencing_node_multiple() {
+        let mut reg = PlacementPlanRegistry::new(EpochId::new(1));
+        let node = MemberId::new(5);
+
+        for i in 0..5 {
+            reg.record_placement(ReplicaPlacementReceipt {
+                receipt_id: ReplicatedReceiptId(i),
+                verification_ref: ReplicatedReceiptId(0),
+                transfer_ref: ReplicatedReceiptId(0),
+                subject_refs: vec![ReplicatedSubjectId::new(i)],
+                placed_on: node,
+                placement_epoch: EpochId::new(1),
+                subjects_placed: 1,
+                placement_receipt_refs: Vec::new(),
+            });
+        }
+
+        let refs = reg.receipts_referencing_node(node);
+        assert_eq!(refs.len(), 5);
+        assert!(reg.has_receipts_referencing_node(node));
     }
 }

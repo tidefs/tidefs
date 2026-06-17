@@ -14,6 +14,7 @@ blake3 = "1"
 bincode = "1"
 tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
 tidefs-lease = { path = "../tidefs-lease" }
+tidefs-replication-model = { path = "../tidefs-replication-model" }
 
 [dev-dependencies]
 

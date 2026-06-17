@@ -52,6 +52,7 @@ pub mod config;
 pub mod drain;
 pub mod drain_state;
 pub mod epoch_gate;
+pub mod evacuation_receipt;
 pub mod executor;
 pub mod forced_fencing;
 pub mod health_verify;

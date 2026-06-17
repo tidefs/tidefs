@@ -2831,6 +2831,7 @@ dependencies = [
  "tidefs-node-drain",
  "tidefs-placement-planner",
  "tidefs-placement-runtime",
+ "tidefs-replication-model",
  "tidefs-transport",
  "tokio",
 ]
@@ -2878,6 +2879,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tidefs-lease",
  "tidefs-membership-epoch",
+ "tidefs-replication-model",
 ]
 
 [[package]]

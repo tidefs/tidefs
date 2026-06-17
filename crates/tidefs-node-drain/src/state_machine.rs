@@ -20,6 +20,7 @@
 
 use serde::Serialize;
 use std::fmt;
+use crate::evacuation_receipt::{EvacuationReceipt, EvacuationReceiptId};
 use tidefs_membership_epoch::{EpochId, MemberId};
 
 // ---------------------------------------------------------------------------
@@ -193,6 +194,10 @@ pub struct DrainProtocolSnapshot {
     pub acks_expected: u64,
     /// BLAKE3-256 digest covering (`state`, `node_id`, `epoch_id`).
     pub blake3_digest: [u8; 32],
+    /// Evacuation receipt id, if set.
+    pub evacuation_receipt_id: Option<EvacuationReceiptId>,
+    /// Whether the evacuation receipt is committed.
+    pub evacuation_receipt_committed: bool,
 }
 
 impl DrainProtocolSnapshot {
@@ -213,6 +218,8 @@ impl DrainProtocolSnapshot {
             acks_received,
             acks_expected,
             blake3_digest: digest,
+            evacuation_receipt_id: None,
+            evacuation_receipt_committed: false,
         }
     }
 
@@ -224,6 +231,12 @@ impl DrainProtocolSnapshot {
 
     /// Returns true if all expected acks have been received.
     #[must_use]
+    /// Returns true if the evacuation receipt is attached.
+
+    pub fn has_evacuation_receipt(&self) -> bool {
+        self.evacuation_receipt_id.is_some()
+    }
+
     pub fn all_acks_received(&self) -> bool {
         self.acks_received >= self.acks_expected
     }
@@ -249,6 +262,9 @@ pub struct DrainProtocolMachine {
     acks_expected: u64,
     /// Human-readable reason for the last error or cancellation.
     failure_reason: Option<String>,
+    /// Committed evacuation receipt proving data relocation off the
+    /// draining node. Set during drain completion.
+    evacuation_receipt: Option<EvacuationReceipt>,
 }
 
 impl DrainProtocolMachine {
@@ -262,6 +278,7 @@ impl DrainProtocolMachine {
             acks_received: 0,
             acks_expected: 0,
             failure_reason: None,
+            evacuation_receipt: None,
         }
     }
 
@@ -335,6 +352,7 @@ impl DrainProtocolMachine {
         self.acks_received = 0;
         self.acks_expected = expected_peers;
         self.failure_reason = None;
+        self.evacuation_receipt = None;
         self.state = self
             .state
             .transition_to(DrainProtocolState::DrainAnnounced)?;
@@ -385,6 +403,16 @@ impl DrainProtocolMachine {
     ///
     /// # Errors
     /// - `WrongState` if not in `Draining`.
+    /// Complete draining and attach an evacuation receipt.
+    pub fn complete_draining_with_evacuation(
+        &mut self,
+        receipt: EvacuationReceipt,
+    ) -> Result<DrainProtocolSnapshot, DrainProtocolError> {
+        self.state = self.state.transition_to(DrainProtocolState::DrainComplete)?;
+        self.evacuation_receipt = Some(receipt);
+        Ok(self.snapshot())
+    }
+
     pub fn complete_draining(&mut self) -> Result<DrainProtocolSnapshot, DrainProtocolError> {
         if self.state != DrainProtocolState::Draining {
             return Err(DrainProtocolError::WrongState {
@@ -449,6 +477,7 @@ impl DrainProtocolMachine {
         self.acks_received = 0;
         self.acks_expected = 0;
         self.failure_reason = None;
+        self.evacuation_receipt = None;
     }
 }
 

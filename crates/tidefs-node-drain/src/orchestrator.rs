@@ -9,6 +9,7 @@
 use crate::drain::{DrainError, DrainHandle, NodeDrain};
 use crate::drain_state::{DrainRequest, DrainStateMachine, MembershipVerificationOps};
 use crate::epoch_gate::{EpochGate, EpochGateConfig, EpochGateOps, EpochGateResult};
+use crate::evacuation_receipt::EvacuationReceipt;
 use crate::executor::DrainExecutor;
 use crate::health_verify::{DrainHealthVerifier, HealthVerifyOps, HealthVerifyResult};
 use crate::migration::{MigrationDriver, MigrationOps, MigrationOutcome};
@@ -221,6 +222,8 @@ pub struct DrainNodeOutcome {
     pub health_verify_result: Option<HealthVerifyResult>,
     /// Outcome of the pool label update.
     pub pool_label_result: Option<PoolLabelResult>,
+    /// The committed evacuation receipt, if drain reached data-migration.
+    pub evacuation_receipt: Option<EvacuationReceipt>,
     /// Total elapsed wall-clock milliseconds.
     pub elapsed_ms: u64,
 }
@@ -232,6 +235,7 @@ impl DrainNodeOutcome {
         node_id: MemberId,
         migration: Option<MigrationOutcome>,
         gate: Option<EpochGateResult>,
+        evacuation_receipt: Option<EvacuationReceipt>,
         elapsed_ms: u64,
     ) -> Self {
         let gate_ok = gate.as_ref().is_none_or(|g| g.success);
@@ -243,6 +247,7 @@ impl DrainNodeOutcome {
             drain_outcome: None,
             migration_outcome: migration,
             epoch_gate_result: gate,
+            evacuation_receipt,
             health_verify_result: None,
             pool_label_result: None,
             elapsed_ms,
@@ -258,6 +263,7 @@ impl DrainNodeOutcome {
             drain_outcome: Some(error),
             migration_outcome: None,
             epoch_gate_result: None,
+            evacuation_receipt: None,
             health_verify_result: None,
             pool_label_result: None,
             elapsed_ms,
@@ -368,6 +374,30 @@ pub fn drain_node(
     let migration_outcome = Some(migration_driver.outcome());
 
     // -------------------------------------------------------------------
+    // Phase 2.1: Build evacuation receipt from migration result
+    // -------------------------------------------------------------------
+    // The evacuation receipt records which placement receipts relocated
+    // data off the draining node.  In production this references the
+    // committed placement receipts emitted by the placement runtime
+    // during migration; in tests it can be injected separately.
+    // Only attach an evacuation receipt when migration actually
+    // relocated data.  Vacuous drains (empty nodes) skip the receipt
+    // gate.
+    let mut evacuation_receipt = EvacuationReceipt::new(
+        config.node_id,
+        verify_ops.current_epoch(),
+        config.reason.clone(),
+    );
+
+    let migration_had_data = migration_outcome
+        .as_ref()
+        .map_or(false, |m| m.objects_migrated > 0);
+
+    if migration_had_data {
+        executor.set_evacuation_receipt(evacuation_receipt.clone());
+    }
+
+    // -------------------------------------------------------------------
     // Phase 2.5: Replication health verification
     // -------------------------------------------------------------------
     let health_verify_result = {
@@ -401,6 +431,12 @@ pub fn drain_node(
     ) {
         Ok(_) => {
             let result = EpochGateResult::from_gate(&gate);
+            // Set the committed epoch boundary on the evacuation receipt
+            // and attach the finalized receipt to the drain.
+            if migration_had_data {
+                evacuation_receipt.set_committed_epoch_boundary(verify_ops.current_epoch());
+                executor.set_evacuation_receipt(evacuation_receipt.clone());
+            }
             // Signal drain completion to the state machine
             let _ = state_machine.complete_drain();
             Some(result)
@@ -420,8 +456,19 @@ pub fn drain_node(
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
-    let mut outcome =
-        DrainNodeOutcome::success(config.node_id, migration_outcome, gate_result, elapsed_ms);
+    let evac = if migration_had_data {
+        Some(evacuation_receipt)
+    } else {
+        None
+    };
+
+    let mut outcome = DrainNodeOutcome::success(
+        config.node_id,
+        migration_outcome,
+        gate_result,
+        evac,
+        elapsed_ms,
+    );
     outcome.health_verify_result = health_verify_result;
     Ok(outcome)
 }

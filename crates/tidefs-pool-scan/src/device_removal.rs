@@ -2669,3 +2669,130 @@ mod enumeration_tests {
         assert!(map.all_placements().is_empty());
     }
 }
+
+// ── Post-drain evidence verification ────────────────────────────────
+
+/// Verify that no placement data references a drained node after
+/// evacuation. Used by pool-scan as a post-drain safety check: after
+/// a node-drain completes, this function confirms that the pool's
+/// placement evidence does not still reference the drained node.
+///
+/// Returns `Ok(())` when no receipt references `node_id`,
+/// or an error listing the referencing receipt ids.
+pub fn verify_no_receipts_reference_node(
+    node_id: tidefs_membership_epoch::MemberId,
+    receipt_ids: &[tidefs_replication_model::ReplicatedReceiptId],
+    // closure to look up placed_on from receipt_id
+    receipt_lookup: impl Fn(tidefs_replication_model::ReplicatedReceiptId) -> Option<tidefs_membership_epoch::MemberId>,
+) -> Result<(), PostDrainVerificationError> {
+    let mut referencing = Vec::new();
+    for &rid in receipt_ids {
+        if let Some(placed_on) = receipt_lookup(rid) {
+            if placed_on == node_id {
+                referencing.push(rid);
+            }
+        }
+    }
+    if referencing.is_empty() {
+        Ok(())
+    } else {
+        Err(PostDrainVerificationError::ReceiptsStillReferenceNode {
+            node_id,
+            receipt_ids: referencing,
+        })
+    }
+}
+
+/// Errors from post-drain evidence verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PostDrainVerificationError {
+    /// One or more placement receipts still reference the drained node.
+    ReceiptsStillReferenceNode {
+        node_id: tidefs_membership_epoch::MemberId,
+        receipt_ids: Vec<tidefs_replication_model::ReplicatedReceiptId>,
+    },
+}
+
+impl std::fmt::Display for PostDrainVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReceiptsStillReferenceNode { node_id, receipt_ids } => {
+                write!(
+                    f,
+                    "{} placement receipt(s) still reference drained node {}: {:?}",
+                    receipt_ids.len(),
+                    node_id.0,
+                    receipt_ids.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PostDrainVerificationError {}
+
+#[cfg(test)]
+mod post_drain_tests {
+    use super::*;
+    use tidefs_membership_epoch::MemberId;
+    use tidefs_replication_model::ReplicatedReceiptId;
+
+    fn mid(id: u64) -> MemberId {
+        MemberId::new(id)
+    }
+
+    fn rid(id: u64) -> ReplicatedReceiptId {
+        ReplicatedReceiptId(id)
+    }
+
+    #[test]
+    fn test_empty_receipts_ok() {
+        let lookup = |_rid: ReplicatedReceiptId| -> Option<MemberId> { None };
+        let result = verify_no_receipts_reference_node(mid(1), &[], lookup);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_all_receipts_on_other_nodes_ok() {
+        let lookup = |rid: ReplicatedReceiptId| -> Option<MemberId> {
+            match rid.0 {
+                10 => Some(mid(2)),
+                20 => Some(mid(3)),
+                _ => None,
+            }
+        };
+        let result = verify_no_receipts_reference_node(
+            mid(1),
+            &[rid(10), rid(20)],
+            lookup,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_self_referencing_receipt_fails() {
+        let lookup = |rid: ReplicatedReceiptId| -> Option<MemberId> {
+            match rid.0 {
+                10 => Some(mid(1)), // self-reference!
+                20 => Some(mid(3)),
+                _ => None,
+            }
+        };
+        let result = verify_no_receipts_reference_node(
+            mid(1),
+            &[rid(10), rid(20)],
+            lookup,
+        );
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PostDrainVerificationError::ReceiptsStillReferenceNode {
+                node_id,
+                receipt_ids,
+            } => {
+                assert_eq!(node_id, mid(1));
+                assert_eq!(receipt_ids, vec![rid(10)]);
+            }
+            _ => panic!("expected ReceiptsStillReferenceNode"),
+        }
+    }
+}

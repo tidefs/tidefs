@@ -11,6 +11,9 @@
 use tidefs_membership_epoch::EpochId;
 use tidefs_membership_epoch::MemberId;
 use tidefs_node_drain::MembershipVerificationOps;
+use tidefs_node_drain::PlacementEvidenceVerifier;
+use tidefs_placement_runtime::PlacementPlanRegistry;
+use tidefs_replication_model::ReplicatedReceiptId;
 
 use crate::failure_detector::FailureDetector;
 
@@ -58,7 +61,81 @@ impl MembershipVerificationOps for DrainMembershipVerifier<'_> {
     }
 }
 
+/// Production bridge: checks whether placement receipts reference
+/// a draining node via the live [`PlacementPlanRegistry`].
+///
+/// Construct with [`Self::new`], passing a reference to the live
+/// placement plan registry. Used by the drain safety gate to ensure
+/// decommission fails closed when any live extent still references
+/// the draining node.
+pub struct DrainPlacementVerifier<'a> {
+    registry: &'a PlacementPlanRegistry,
+}
+
+impl<'a> DrainPlacementVerifier<'a> {
+    #[must_use]
+    pub fn new(registry: &'a PlacementPlanRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+impl PlacementEvidenceVerifier for DrainPlacementVerifier<'_> {
+    fn receipts_referencing_node(&self, node_id: tidefs_membership_epoch::MemberId) -> Vec<ReplicatedReceiptId> {
+        self.registry.receipts_referencing_node(node_id)
+    }
+
+    fn has_receipts_referencing_node(&self, node_id: tidefs_membership_epoch::MemberId) -> bool {
+        self.registry.has_receipts_referencing_node(node_id)
+    }
+}
+
 #[cfg(test)]
+mod placement_verifier_tests {
+    use super::*;
+    use tidefs_membership_epoch::{EpochId, MemberId};
+    use tidefs_placement_runtime::PlacementPlanRegistry;
+    use tidefs_replication_model::{ReplicaPlacementReceipt, ReplicatedReceiptId, ReplicatedSubjectId};
+
+    fn mid(id: u64) -> MemberId {
+        MemberId::new(id)
+    }
+
+    #[test]
+    fn placement_verifier_detects_referencing_receipts() {
+        let mut registry = PlacementPlanRegistry::new(EpochId::new(1));
+        let verifier = DrainPlacementVerifier::new(&registry);
+
+        // Empty registry has no references
+        assert!(!verifier.has_receipts_referencing_node(mid(7)));
+        assert!(verifier.receipts_referencing_node(mid(7)).is_empty());
+    }
+
+    #[test]
+    fn placement_verifier_after_placement_detects_node() {
+        let mut registry = PlacementPlanRegistry::new(EpochId::new(1));
+        let node = mid(7);
+        let subject = ReplicatedSubjectId::new(100);
+
+        registry.record_placement(ReplicaPlacementReceipt {
+            receipt_id: ReplicatedReceiptId(1),
+            verification_ref: ReplicatedReceiptId(0),
+            transfer_ref: ReplicatedReceiptId(0),
+            subject_refs: vec![subject],
+            placed_on: node,
+            placement_epoch: EpochId::new(1),
+            subjects_placed: 1,
+            placement_receipt_refs: Vec::new(),
+        });
+
+        let verifier = DrainPlacementVerifier::new(&registry);
+        assert!(verifier.has_receipts_referencing_node(node));
+        assert_eq!(verifier.receipts_referencing_node(node), vec![ReplicatedReceiptId(1)]);
+        assert!(!verifier.has_receipts_referencing_node(mid(99)));
+    }
+}
+
+#[cfg(test)]
+
 mod tests {
     use super::*;
     use crate::failure_detector::FailureDetector;
