@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use serde::{Deserialize, Serialize};
+use tidefs_permission::MountIdentity;
 
 use crate::principal::{PrincipalId, ScopeSelector};
 
@@ -61,6 +62,16 @@ pub enum CapabilityGrantDenialReason {
     UseCountOverflow {
         use_count: u32,
     },
+    MissingMountIdentity {
+        grant_mount_identity: MountIdentity,
+    },
+    InvalidMountIdentity {
+        presented_mount_identity: MountIdentity,
+    },
+    MountIdentityMismatch {
+        grant_mount_identity: MountIdentity,
+        presented_mount_identity: MountIdentity,
+    },
 }
 
 pub type CapabilityGrantConsumeResult = Result<CapabilityGrantUse, CapabilityGrantDenial>;
@@ -106,6 +117,25 @@ impl std::fmt::Display for CapabilityGrantDenialReason {
             Self::UseCountOverflow { use_count } => {
                 write!(f, "capability grant use count overflow at {use_count}")
             }
+            Self::MissingMountIdentity {
+                grant_mount_identity,
+            } => write!(
+                f,
+                "capability grant requires mount identity {grant_mount_identity:?}"
+            ),
+            Self::InvalidMountIdentity {
+                presented_mount_identity,
+            } => write!(
+                f,
+                "capability grant was presented with invalid mount identity {presented_mount_identity:?}"
+            ),
+            Self::MountIdentityMismatch {
+                grant_mount_identity,
+                presented_mount_identity,
+            } => write!(
+                f,
+                "capability grant mount identity {grant_mount_identity:?} does not match presented mount identity {presented_mount_identity:?}"
+            ),
         }
     }
 }
@@ -120,6 +150,7 @@ pub struct CapabilityGrant {
     pub expires_at_millis: Option<u64>,
     pub max_uses: Option<u32>,
     pub use_count: u32,
+    pub mount_identity: Option<MountIdentity>,
 }
 
 impl CapabilityGrant {
@@ -139,6 +170,7 @@ impl CapabilityGrant {
             expires_at_millis: None,
             max_uses: None,
             use_count: 0,
+            mount_identity: None,
         }
     }
 
@@ -152,7 +184,101 @@ impl CapabilityGrant {
         self
     }
 
+    pub fn with_mount_identity(mut self, mount_identity: MountIdentity) -> Self {
+        self.mount_identity = Some(mount_identity);
+        self
+    }
+
+    pub fn is_valid(&self) -> bool {
+        let now_millis = crate::identity::current_time_utils();
+        if self
+            .expires_at_millis
+            .is_some_and(|expired_at_millis| now_millis >= expired_at_millis)
+        {
+            return false;
+        }
+
+        if self
+            .max_uses
+            .is_some_and(|max_uses| self.use_count >= max_uses)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn is_valid_for_mount(&self, mount_identity: &MountIdentity) -> bool {
+        if !mount_identity.is_valid() {
+            return false;
+        }
+
+        match self.mount_identity {
+            Some(bound) => bound.is_valid() && bound == *mount_identity,
+            None => true,
+        }
+    }
+
+    pub fn is_valid_with_mount(&self, mount_identity: &MountIdentity) -> bool {
+        self.is_valid() && self.is_valid_for_mount(mount_identity)
+    }
+
     pub fn consume(
+        &mut self,
+        principal_id: PrincipalId,
+        requested_scope: &ScopeSelector,
+        requested_capability: &str,
+    ) -> CapabilityGrantConsumeResult {
+        if let Some(grant_mount_identity) = self.mount_identity {
+            return Err(self.denial(
+                principal_id,
+                requested_scope,
+                requested_capability,
+                CapabilityGrantDenialReason::MissingMountIdentity {
+                    grant_mount_identity,
+                },
+            ));
+        }
+
+        self.consume_unbound(principal_id, requested_scope, requested_capability)
+    }
+
+    pub fn consume_for_mount(
+        &mut self,
+        principal_id: PrincipalId,
+        requested_scope: &ScopeSelector,
+        requested_capability: &str,
+        mount_identity: &MountIdentity,
+    ) -> CapabilityGrantConsumeResult {
+        if !mount_identity.is_valid() {
+            return Err(self.denial(
+                principal_id,
+                requested_scope,
+                requested_capability,
+                CapabilityGrantDenialReason::InvalidMountIdentity {
+                    presented_mount_identity: *mount_identity,
+                },
+            ));
+        }
+
+        if let Some(grant_mount_identity) = self.mount_identity {
+            if !grant_mount_identity.is_valid() || grant_mount_identity != *mount_identity {
+                return Err(self.denial(
+                    principal_id,
+                    requested_scope,
+                    requested_capability,
+                    CapabilityGrantDenialReason::MountIdentityMismatch {
+                        grant_mount_identity,
+                        presented_mount_identity: *mount_identity,
+                    },
+                ));
+            }
+        }
+
+        self.consume_unbound(principal_id, requested_scope, requested_capability)
+    }
+
+    fn consume_unbound(
         &mut self,
         principal_id: PrincipalId,
         requested_scope: &ScopeSelector,
@@ -276,6 +402,26 @@ fn grant_scope_covers(grant_scope: &ScopeSelector, requested_scope: &ScopeSelect
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_mount_a() -> MountIdentity {
+        MountIdentity::new(
+            [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10,
+            ],
+            1,
+        )
+    }
+
+    fn make_mount_b() -> MountIdentity {
+        MountIdentity::new(
+            [
+                0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+                0x1f, 0x20,
+            ],
+            2,
+        )
+    }
 
     #[test]
     fn grant_id_new_roundtrip() {
@@ -475,5 +621,163 @@ mod tests {
                 "read"
             )
             .is_ok());
+    }
+
+    #[test]
+    fn grant_with_mount_identity_stores_binding() {
+        let mount = make_mount_a();
+        let grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        )
+        .with_mount_identity(mount);
+
+        assert_eq!(grant.mount_identity, Some(mount));
+    }
+
+    #[test]
+    fn grant_unbound_valid_for_any_valid_mount() {
+        let grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        );
+
+        assert!(grant.is_valid_for_mount(&make_mount_a()));
+        assert!(grant.is_valid_for_mount(&make_mount_b()));
+        assert!(!grant.is_valid_for_mount(&MountIdentity::default()));
+    }
+
+    #[test]
+    fn grant_bound_to_mount_rejects_different_mount() {
+        let mount_a = make_mount_a();
+        let mount_b = make_mount_b();
+        let grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        )
+        .with_mount_identity(mount_a);
+
+        assert!(grant.is_valid_for_mount(&mount_a));
+        assert!(!grant.is_valid_for_mount(&mount_b));
+    }
+
+    #[test]
+    fn grant_is_valid_with_mount_checks_both_time_and_mount() {
+        let mount_a = make_mount_a();
+        let mount_b = make_mount_b();
+        let mut grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        )
+        .with_max_uses(1)
+        .with_mount_identity(mount_a);
+
+        assert!(grant.is_valid_with_mount(&mount_a));
+        assert!(!grant.is_valid_with_mount(&mount_b));
+        assert!(grant
+            .consume_for_mount(PrincipalId::new(100), &ScopeSelector::All, "read", &mount_a)
+            .is_ok());
+        assert!(!grant.is_valid_with_mount(&mount_a));
+    }
+
+    #[test]
+    fn grant_consume_without_mount_rejects_bound_grant() {
+        let mount = make_mount_a();
+        let mut grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        )
+        .with_mount_identity(mount);
+
+        let denial = grant
+            .consume(PrincipalId::new(100), &ScopeSelector::All, "read")
+            .expect_err("mount-bound grant must fail closed without a mount identity");
+        assert!(matches!(
+            denial.reason,
+            CapabilityGrantDenialReason::MissingMountIdentity {
+                grant_mount_identity
+            } if grant_mount_identity == mount
+        ));
+        assert_eq!(grant.use_count, 0);
+    }
+
+    #[test]
+    fn grant_consume_for_mount_accepts_matching_bound_grant() {
+        let mount = make_mount_a();
+        let mut grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        )
+        .with_mount_identity(mount);
+
+        let use_record = grant
+            .consume_for_mount(PrincipalId::new(100), &ScopeSelector::All, "read", &mount)
+            .expect("matching mount identity should consume");
+        assert_eq!(use_record.use_count, 1);
+        assert_eq!(grant.use_count, 1);
+    }
+
+    #[test]
+    fn grant_consume_for_mount_rejects_different_mount() {
+        let mount_a = make_mount_a();
+        let mount_b = make_mount_b();
+        let mut grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        )
+        .with_mount_identity(mount_a);
+
+        let denial = grant
+            .consume_for_mount(PrincipalId::new(100), &ScopeSelector::All, "read", &mount_b)
+            .expect_err("different mount identity should be denied");
+        assert!(matches!(
+            denial.reason,
+            CapabilityGrantDenialReason::MountIdentityMismatch {
+                grant_mount_identity,
+                presented_mount_identity,
+            } if grant_mount_identity == mount_a && presented_mount_identity == mount_b
+        ));
+        assert_eq!(grant.use_count, 0);
+    }
+
+    #[test]
+    fn grant_consume_for_mount_rejects_invalid_mount() {
+        let invalid_mount = MountIdentity::default();
+        let mut grant = CapabilityGrant::new(
+            CapabilityGrantId::new(1),
+            PrincipalId::new(100),
+            "read".into(),
+            ScopeSelector::All,
+        );
+
+        let denial = grant
+            .consume_for_mount(
+                PrincipalId::new(100),
+                &ScopeSelector::All,
+                "read",
+                &invalid_mount,
+            )
+            .expect_err("invalid mount identity should be denied");
+        assert!(matches!(
+            denial.reason,
+            CapabilityGrantDenialReason::InvalidMountIdentity {
+                presented_mount_identity
+            } if presented_mount_identity == invalid_mount
+        ));
+        assert_eq!(grant.use_count, 0);
     }
 }

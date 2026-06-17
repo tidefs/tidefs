@@ -93,6 +93,7 @@ pub fn check_write_permission(
     caller_uid: u32,
     caller_gid: u32,
     caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
 ) -> Result<(), c_int> {
     crate::access::check_fuse_access(
         mode,
@@ -102,6 +103,7 @@ pub fn check_write_permission(
         caller_gid,
         caller_groups,
         crate::access::ACCESS_WRITE,
+        mount_identity,
     )
 }
 

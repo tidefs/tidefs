@@ -21,7 +21,7 @@
 //! # Access checking quick-start
 //!
 //! ```ignore
-//! use tidefs_permission::{InodeAttr, check_access, ACCESS_READ};
+//! use tidefs_permission::{InodeAttr, MountIdentity, check_access, ACCESS_READ};
 //!
 //! struct MyInode { uid: u32, gid: u32, mode: u32 }
 //! impl InodeAttr for MyInode {
@@ -31,7 +31,8 @@
 //! }
 //!
 //! let ino = MyInode { uid: 1000, gid: 100, mode: 0o644 };
-//! if check_access(&ino, None, 1000, 100, &[], ACCESS_READ) {
+//! let mount_id = MountIdentity::new([1u8; 16], 1);
+//! if check_access(&ino, None, 1000, 100, &[], ACCESS_READ, &mount_id) {
 //!     // access granted
 //! }
 //! ```
@@ -49,6 +50,81 @@ use alloc::vec::Vec;
 
 /// Inode identifier used to key xattr storage.
 pub type InodeId = u64;
+
+// ---------------------------------------------------------------------------
+// MountIdentity — committed dataset mount identity token
+// ---------------------------------------------------------------------------
+
+/// Committed dataset mount identity token.
+///
+/// Binds every permission evaluation to the specific dataset mount. A zero
+/// or default [`MountIdentity`] is invalid and causes permission checks to
+/// fail closed. The mount epoch increments on each dataset mount, ensuring
+/// that stale mounts cannot reuse privileges from a prior mount.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MountIdentity {
+    /// Dataset UUID (16 bytes).
+    pub dataset_id: [u8; 16],
+    /// Mount epoch — incremented on each dataset mount.
+    pub mount_epoch: u64,
+}
+
+impl MountIdentity {
+    /// Create a new mount identity.
+    #[must_use]
+    pub const fn new(dataset_id: [u8; 16], mount_epoch: u64) -> Self {
+        Self {
+            dataset_id,
+            mount_epoch,
+        }
+    }
+
+    /// Returns `true` when this mount identity is valid (non-zero dataset
+    /// and non-zero epoch).
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.dataset_id != [0u8; 16] && self.mount_epoch > 0
+    }
+}
+
+impl Default for MountIdentity {
+    fn default() -> Self {
+        Self {
+            dataset_id: [0u8; 16],
+            mount_epoch: 0,
+        }
+    }
+}
+
+/// Error returned when a mount identity validation fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MountIdentityError {
+    /// The mount identity is invalid (zero dataset id or zero epoch).
+    InvalidMountIdentity,
+}
+
+impl core::fmt::Display for MountIdentityError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidMountIdentity => write!(f, "invalid mount identity"),
+        }
+    }
+}
+
+/// Validate that `mount_identity` is valid (non-zero dataset, non-zero
+/// epoch). Returns `Ok(())` when valid, or
+/// `Err(MountIdentityError::InvalidMountIdentity)` when invalid.
+#[inline]
+#[allow(dead_code)]
+pub fn validate_mount_identity(mount_identity: &MountIdentity) -> Result<(), MountIdentityError> {
+    if mount_identity.is_valid() {
+        Ok(())
+    } else {
+        Err(MountIdentityError::InvalidMountIdentity)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Permission bit constants (classic Unix rwx)
@@ -240,7 +316,13 @@ pub fn check_access_result(
     uid: u32,
     gid: u32,
     requested: AccessMode,
+    mount_identity: &MountIdentity,
 ) -> Result<(), PermissionError> {
+    // Fail closed on invalid mount identity
+    if !mount_identity.is_valid() {
+        return Err(PermissionError::AccessDenied);
+    }
+
     let mask = requested.to_mask();
 
     // Root override with execute-on-regular-file restriction
@@ -287,7 +369,17 @@ fn mode_permission_bits_result(mode: u32, inode: &dyn InodeAttr, uid: u32, gid: 
 ///
 /// Returns `Ok(())` when traversal is allowed, or
 /// `Err(PermissionError::AccessDenied)` when denied.
-pub fn check_search(inode: &dyn InodeAttr, uid: u32, gid: u32) -> Result<(), PermissionError> {
+pub fn check_search(
+    inode: &dyn InodeAttr,
+    uid: u32,
+    gid: u32,
+    mount_identity: &MountIdentity,
+) -> Result<(), PermissionError> {
+    // Fail closed on invalid mount identity
+    if !mount_identity.is_valid() {
+        return Err(PermissionError::AccessDenied);
+    }
+
     if uid == 0 {
         return Ok(());
     }
@@ -346,7 +438,13 @@ pub fn check_mode_access(
     gid: u32,
     groups: &[u32],
     requested: u8,
+    mount_identity: &MountIdentity,
 ) -> bool {
+    // Fail closed on invalid mount identity
+    if !mount_identity.is_valid() {
+        return false;
+    }
+
     // Root bypasses most DAC checks, but may not execute a regular file
     // that has no execute bits set for anyone (POSIX rule).
     if uid == 0 {
@@ -409,7 +507,13 @@ pub fn check_access(
     gid: u32,
     groups: &[u32],
     requested: u8,
+    mount_identity: &MountIdentity,
 ) -> bool {
+    // Fail closed on invalid mount identity
+    if !mount_identity.is_valid() {
+        return false;
+    }
+
     // Root (uid 0) bypasses most DAC checks, but may not execute a regular
     // file that has no execute bits set for anyone (POSIX rule).  This
     // applies regardless of whether an ACL is present.
@@ -436,7 +540,7 @@ pub fn check_access(
             );
             (perm & requested) == requested
         }
-        _ => check_mode_access(attrs, uid, gid, groups, requested),
+        _ => check_mode_access(attrs, uid, gid, groups, requested, mount_identity),
     }
 }
 
@@ -453,13 +557,56 @@ pub fn check_validated_access(
     gid: u32,
     groups: &[u32],
     requested: u8,
+    mount_identity: &MountIdentity,
 ) -> Result<bool, AccessRequestError> {
+    // Fail closed on invalid mount identity
+    if !mount_identity.is_valid() {
+        return Ok(false);
+    }
+
     validate_access_request(requested)?;
     if requested == ACCESS_NONE {
         return Ok(true);
     }
 
-    Ok(check_access(attrs, acl, uid, gid, groups, requested))
+    Ok(check_access(
+        attrs,
+        acl,
+        uid,
+        gid,
+        groups,
+        requested,
+        mount_identity,
+    ))
+}
+
+/// Structured report for a validated permission check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionCheckReport {
+    /// Mount identity used for the permission evaluation.
+    pub mount_identity: MountIdentity,
+    /// Original requested access mask.
+    pub requested: u8,
+    /// Final allow/deny result after mount validation and DAC evaluation.
+    pub allowed: bool,
+}
+
+/// Run a validated permission check and return the mount-bound report.
+pub fn check_access_report(
+    attrs: &dyn InodeAttr,
+    acl: Option<&[PosixAclEntry]>,
+    uid: u32,
+    gid: u32,
+    groups: &[u32],
+    requested: u8,
+    mount_identity: &MountIdentity,
+) -> Result<PermissionCheckReport, AccessRequestError> {
+    let allowed = check_validated_access(attrs, acl, uid, gid, groups, requested, mount_identity)?;
+    Ok(PermissionCheckReport {
+        mount_identity: *mount_identity,
+        requested,
+        allowed,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -473,8 +620,9 @@ pub fn can_read(
     uid: u32,
     gid: u32,
     groups: &[u32],
+    mount_identity: &MountIdentity,
 ) -> bool {
-    check_access(attrs, acl, uid, gid, groups, ACCESS_READ)
+    check_access(attrs, acl, uid, gid, groups, ACCESS_READ, mount_identity)
 }
 
 /// Short-hand: does the caller have write permission?
@@ -484,8 +632,9 @@ pub fn can_write(
     uid: u32,
     gid: u32,
     groups: &[u32],
+    mount_identity: &MountIdentity,
 ) -> bool {
-    check_access(attrs, acl, uid, gid, groups, ACCESS_WRITE)
+    check_access(attrs, acl, uid, gid, groups, ACCESS_WRITE, mount_identity)
 }
 
 /// Short-hand: does the caller have execute permission?
@@ -495,8 +644,9 @@ pub fn can_execute(
     uid: u32,
     gid: u32,
     groups: &[u32],
+    mount_identity: &MountIdentity,
 ) -> bool {
-    check_access(attrs, acl, uid, gid, groups, ACCESS_EXECUTE)
+    check_access(attrs, acl, uid, gid, groups, ACCESS_EXECUTE, mount_identity)
 }
 
 /// Short-hand: can the caller traverse (lookup) a directory?
@@ -508,8 +658,9 @@ pub fn can_lookup(
     uid: u32,
     gid: u32,
     groups: &[u32],
+    mount_identity: &MountIdentity,
 ) -> bool {
-    check_access(attrs, acl, uid, gid, groups, ACCESS_EXECUTE)
+    check_access(attrs, acl, uid, gid, groups, ACCESS_EXECUTE, mount_identity)
 }
 
 /// One directory component whose execute/search permission must be granted
@@ -569,9 +720,22 @@ pub fn check_path_traversal(
     uid: u32,
     gid: u32,
     groups: &[u32],
+    mount_identity: &MountIdentity,
 ) -> Result<(), PathTraversalDenied> {
+    // Fail closed on invalid mount identity
+    if !mount_identity.is_valid() {
+        return Err(PathTraversalDenied { component_index: 0 });
+    }
+
     for (component_index, component) in components.iter().enumerate() {
-        if !can_lookup(component.attrs, component.acl, uid, gid, groups) {
+        if !can_lookup(
+            component.attrs,
+            component.acl,
+            uid,
+            gid,
+            groups,
+            mount_identity,
+        ) {
             return Err(PathTraversalDenied { component_index });
         }
     }
@@ -1107,6 +1271,29 @@ impl XattrMap {
 
 #[cfg(test)]
 mod tests {
+    // Mount identity constants shared by all permission binding tests.
+    const VALID_MOUNT: MountIdentity = MountIdentity::new(
+        [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ],
+        1,
+    );
+
+    #[allow(dead_code)]
+    const OTHER_MOUNT: MountIdentity = MountIdentity::new(
+        [
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+            0x1f, 0x20,
+        ],
+        2,
+    );
+
+    #[allow(dead_code)]
+    const INVALID_MOUNT_ZERO_DATASET: MountIdentity = MountIdentity::new([0u8; 16], 1);
+    #[allow(dead_code)]
+    const INVALID_MOUNT_ZERO_EPOCH: MountIdentity = MountIdentity::new([0x01u8; 16], 0);
+
     use super::*;
     use alloc::vec;
 
@@ -1166,7 +1353,7 @@ mod tests {
 
         for (requested, expected) in cases {
             assert_eq!(
-                check_mode_access(inode, uid, gid, groups, requested),
+                check_mode_access(inode, uid, gid, groups, requested, &VALID_MOUNT),
                 expected,
                 "mode={:#05o} uid={} gid={} groups={:?} requested={:#04x}",
                 inode.mode(),
@@ -1185,92 +1372,197 @@ mod tests {
     #[test]
     fn mode_owner_read_granted() {
         let ino = TestInode::new(1000, 100, 0o400);
-        assert!(check_mode_access(&ino, 1000, 100, &[], ACCESS_READ));
+        assert!(check_mode_access(
+            &ino,
+            1000,
+            100,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_owner_read_denied() {
         let ino = TestInode::new(1000, 100, 0o200); // write-only
-        assert!(!check_mode_access(&ino, 1000, 100, &[], ACCESS_READ));
+        assert!(!check_mode_access(
+            &ino,
+            1000,
+            100,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_owner_write_granted() {
         let ino = TestInode::new(1000, 100, 0o200);
-        assert!(check_mode_access(&ino, 1000, 200, &[], ACCESS_WRITE));
+        assert!(check_mode_access(
+            &ino,
+            1000,
+            200,
+            &[],
+            ACCESS_WRITE,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_owner_execute_granted() {
         let ino = TestInode::new(1000, 100, 0o100);
-        assert!(check_mode_access(&ino, 1000, 100, &[], ACCESS_EXECUTE));
+        assert!(check_mode_access(
+            &ino,
+            1000,
+            100,
+            &[],
+            ACCESS_EXECUTE,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_owner_all_granted() {
         let ino = TestInode::new(1000, 100, 0o700);
-        assert!(check_mode_access(&ino, 1000, 100, &[], ACCESS_RWX));
+        assert!(check_mode_access(
+            &ino,
+            1000,
+            100,
+            &[],
+            ACCESS_RWX,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_group_read_granted_by_gid() {
         let ino = TestInode::new(1000, 100, 0o040);
-        assert!(check_mode_access(&ino, 2000, 100, &[], ACCESS_READ));
+        assert!(check_mode_access(
+            &ino,
+            2000,
+            100,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_group_read_granted_by_supplementary() {
         let ino = TestInode::new(1000, 100, 0o040);
-        assert!(check_mode_access(&ino, 2000, 200, &[100], ACCESS_READ));
+        assert!(check_mode_access(
+            &ino,
+            2000,
+            200,
+            &[100],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_group_read_denied() {
         let ino = TestInode::new(1000, 100, 0o004); // only other-read
-        assert!(!check_mode_access(&ino, 2000, 100, &[], ACCESS_READ));
+        assert!(!check_mode_access(
+            &ino,
+            2000,
+            100,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_group_write_denied() {
         let ino = TestInode::new(1000, 100, 0o040); // group read-only
-        assert!(!check_mode_access(&ino, 2000, 100, &[], ACCESS_WRITE));
+        assert!(!check_mode_access(
+            &ino,
+            2000,
+            100,
+            &[],
+            ACCESS_WRITE,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_other_read_granted() {
         let ino = TestInode::new(1000, 100, 0o004);
-        assert!(check_mode_access(&ino, 2000, 200, &[], ACCESS_READ));
+        assert!(check_mode_access(
+            &ino,
+            2000,
+            200,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_other_read_denied() {
         let ino = TestInode::new(1000, 100, 0o000);
-        assert!(!check_mode_access(&ino, 2000, 200, &[], ACCESS_READ));
+        assert!(!check_mode_access(
+            &ino,
+            2000,
+            200,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_other_all_granted() {
         let ino = TestInode::new(1000, 100, 0o007);
-        assert!(check_mode_access(&ino, 2000, 300, &[], ACCESS_RWX));
+        assert!(check_mode_access(
+            &ino,
+            2000,
+            300,
+            &[],
+            ACCESS_RWX,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_root_always_granted() {
         let ino = TestInode::new(1000, 100, 0o000);
-        assert!(check_mode_access(&ino, 0, 200, &[], ACCESS_RWX));
+        assert!(check_mode_access(
+            &ino,
+            0,
+            200,
+            &[],
+            ACCESS_RWX,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_root_read_on_write_only() {
         let ino = TestInode::new(1000, 100, 0o222);
-        assert!(check_mode_access(&ino, 0, 200, &[], ACCESS_READ));
+        assert!(check_mode_access(
+            &ino,
+            0,
+            200,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_owner_overrides_group() {
         // Owner bits are rwx, group bits are ---, uid matches owner
         let ino = TestInode::new(1000, 100, 0o700);
-        assert!(check_mode_access(&ino, 1000, 100, &[], ACCESS_RWX));
+        assert!(check_mode_access(
+            &ino,
+            1000,
+            100,
+            &[],
+            ACCESS_RWX,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
@@ -1282,24 +1574,60 @@ mod tests {
             2000,
             100,
             &[],
-            ACCESS_READ | ACCESS_EXECUTE
+            ACCESS_READ | ACCESS_EXECUTE,
+            &VALID_MOUNT
         ));
-        assert!(!check_mode_access(&ino, 2000, 100, &[], ACCESS_WRITE));
+        assert!(!check_mode_access(
+            &ino,
+            2000,
+            100,
+            &[],
+            ACCESS_WRITE,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_supplementary_group_takes_group_bits() {
         let ino = TestInode::new(1000, 100, 0o070);
-        assert!(check_mode_access(&ino, 2000, 200, &[100], ACCESS_RWX));
+        assert!(check_mode_access(
+            &ino,
+            2000,
+            200,
+            &[100],
+            ACCESS_RWX,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn mode_other_when_neither_owner_nor_group() {
         let ino = TestInode::new(1000, 100, 0o701);
         // uid 2000 != owner 1000, gid 200 != 100, no supp groups -> other bits
-        assert!(check_mode_access(&ino, 2000, 200, &[], ACCESS_EXECUTE));
-        assert!(!check_mode_access(&ino, 2000, 200, &[], ACCESS_READ));
-        assert!(!check_mode_access(&ino, 2000, 200, &[], ACCESS_WRITE));
+        assert!(check_mode_access(
+            &ino,
+            2000,
+            200,
+            &[],
+            ACCESS_EXECUTE,
+            &VALID_MOUNT
+        ));
+        assert!(!check_mode_access(
+            &ino,
+            2000,
+            200,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
+        assert!(!check_mode_access(
+            &ino,
+            2000,
+            200,
+            &[],
+            ACCESS_WRITE,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
@@ -1311,17 +1639,17 @@ mod tests {
             let expected_w = ((mode >> 6) & 2) != 0;
             let expected_x = ((mode >> 6) & 1) != 0;
             assert_eq!(
-                check_mode_access(&ino, 1000, 100, &[], ACCESS_READ),
+                check_mode_access(&ino, 1000, 100, &[], ACCESS_READ, &VALID_MOUNT),
                 expected_r,
                 "mode={mode:#05o} owner read"
             );
             assert_eq!(
-                check_mode_access(&ino, 1000, 100, &[], ACCESS_WRITE),
+                check_mode_access(&ino, 1000, 100, &[], ACCESS_WRITE, &VALID_MOUNT),
                 expected_w,
                 "mode={mode:#05o} owner write"
             );
             assert_eq!(
-                check_mode_access(&ino, 1000, 100, &[], ACCESS_EXECUTE),
+                check_mode_access(&ino, 1000, 100, &[], ACCESS_EXECUTE, &VALID_MOUNT),
                 expected_x,
                 "mode={mode:#05o} owner exec"
             );
@@ -1373,14 +1701,38 @@ mod tests {
     #[test]
     fn unified_no_acl_falls_back_to_mode() {
         let ino = TestInode::new(1000, 100, 0o400);
-        assert!(check_access(&ino, None, 1000, 100, &[], ACCESS_READ));
-        assert!(!check_access(&ino, None, 1000, 100, &[], ACCESS_WRITE));
+        assert!(check_access(
+            &ino,
+            None,
+            1000,
+            100,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
+        assert!(!check_access(
+            &ino,
+            None,
+            1000,
+            100,
+            &[],
+            ACCESS_WRITE,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn unified_empty_acl_falls_back_to_mode() {
         let ino = TestInode::new(1000, 100, 0o200);
-        assert!(check_access(&ino, Some(&[]), 1000, 100, &[], ACCESS_WRITE));
+        assert!(check_access(
+            &ino,
+            Some(&[]),
+            1000,
+            100,
+            &[],
+            ACCESS_WRITE,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
@@ -1388,7 +1740,7 @@ mod tests {
         let ino = TestInode::new(1000, 100, 0o000);
 
         assert_eq!(
-            check_validated_access(&ino, None, 2000, 200, &[], ACCESS_NONE),
+            check_validated_access(&ino, None, 2000, 200, &[], ACCESS_NONE, &VALID_MOUNT),
             Ok(true)
         );
     }
@@ -1399,7 +1751,7 @@ mod tests {
         let invalid = ACCESS_VALID_MASK | 0x08;
 
         assert_eq!(
-            check_validated_access(&ino, None, 1000, 100, &[], invalid),
+            check_validated_access(&ino, None, 1000, 100, &[], invalid, &VALID_MOUNT),
             Err(AccessRequestError::InvalidMask {
                 requested: invalid,
                 invalid_bits: 0x08,
@@ -1412,7 +1764,7 @@ mod tests {
         let ino = TestInode::new(1000, 100, 0o000);
 
         assert_eq!(
-            check_validated_access(&ino, None, 0, 0, &[], 0x80),
+            check_validated_access(&ino, None, 0, 0, &[], 0x80, &VALID_MOUNT),
             Err(AccessRequestError::InvalidMask {
                 requested: 0x80,
                 invalid_bits: 0x80,
@@ -1425,23 +1777,31 @@ mod tests {
         let ino = TestInode::new(1000, 100, 0o754);
 
         assert_eq!(
-            check_validated_access(&ino, None, 1000, 200, &[], ACCESS_RWX),
+            check_validated_access(&ino, None, 1000, 200, &[], ACCESS_RWX, &VALID_MOUNT),
             Ok(true)
         );
         assert_eq!(
-            check_validated_access(&ino, None, 2000, 100, &[], ACCESS_READ | ACCESS_EXECUTE),
+            check_validated_access(
+                &ino,
+                None,
+                2000,
+                100,
+                &[],
+                ACCESS_READ | ACCESS_EXECUTE,
+                &VALID_MOUNT
+            ),
             Ok(true)
         );
         assert_eq!(
-            check_validated_access(&ino, None, 2000, 200, &[100], ACCESS_WRITE),
+            check_validated_access(&ino, None, 2000, 200, &[100], ACCESS_WRITE, &VALID_MOUNT),
             Ok(false)
         );
         assert_eq!(
-            check_validated_access(&ino, None, 3000, 300, &[], ACCESS_READ),
+            check_validated_access(&ino, None, 3000, 300, &[], ACCESS_READ, &VALID_MOUNT),
             Ok(true)
         );
         assert_eq!(
-            check_validated_access(&ino, None, 3000, 300, &[], ACCESS_EXECUTE),
+            check_validated_access(&ino, None, 3000, 300, &[], ACCESS_EXECUTE, &VALID_MOUNT),
             Ok(false)
         );
     }
@@ -1451,11 +1811,19 @@ mod tests {
         let ino = TestInode::new(1000, 100, 0o000);
 
         assert_eq!(
-            check_validated_access(&ino, None, 0, 0, &[], ACCESS_READ | ACCESS_WRITE),
+            check_validated_access(
+                &ino,
+                None,
+                0,
+                0,
+                &[],
+                ACCESS_READ | ACCESS_WRITE,
+                &VALID_MOUNT
+            ),
             Ok(true)
         );
         assert_eq!(
-            check_validated_access(&ino, None, 0, 0, &[], ACCESS_EXECUTE),
+            check_validated_access(&ino, None, 0, 0, &[], ACCESS_EXECUTE, &VALID_MOUNT),
             Ok(true)
         );
     }
@@ -1486,7 +1854,8 @@ mod tests {
             1000,
             100,
             &[],
-            ACCESS_READ | ACCESS_WRITE
+            ACCESS_READ | ACCESS_WRITE,
+            &VALID_MOUNT
         ));
         assert!(!check_access(
             &ino,
@@ -1494,7 +1863,8 @@ mod tests {
             1000,
             100,
             &[],
-            ACCESS_EXECUTE
+            ACCESS_EXECUTE,
+            &VALID_MOUNT
         ));
     }
 
@@ -1530,14 +1900,14 @@ mod tests {
         ];
         let ino = TestInode::new(1000, 100, 0o000);
         // Caller 2000 gets mask-clamped r--
-        assert!(check_access(&ino, Some(&acl), 2000, 200, &[], ACCESS_READ));
-        assert!(!check_access(
+        assert!(check_access(
             &ino,
             Some(&acl),
             2000,
             200,
             &[],
-            ACCESS_WRITE
+            ACCESS_READ,
+            &VALID_MOUNT
         ));
         assert!(!check_access(
             &ino,
@@ -1545,7 +1915,17 @@ mod tests {
             2000,
             200,
             &[],
-            ACCESS_EXECUTE
+            ACCESS_WRITE,
+            &VALID_MOUNT
+        ));
+        assert!(!check_access(
+            &ino,
+            Some(&acl),
+            2000,
+            200,
+            &[],
+            ACCESS_EXECUTE,
+            &VALID_MOUNT
         ));
     }
 
@@ -1586,7 +1966,8 @@ mod tests {
             2000,
             200,
             &[500],
-            ACCESS_READ | ACCESS_EXECUTE
+            ACCESS_READ | ACCESS_EXECUTE,
+            &VALID_MOUNT
         ));
         assert!(!check_access(
             &ino,
@@ -1594,7 +1975,8 @@ mod tests {
             2000,
             200,
             &[500],
-            ACCESS_WRITE
+            ACCESS_WRITE,
+            &VALID_MOUNT
         ));
     }
 
@@ -1625,7 +2007,15 @@ mod tests {
         ];
         let ino = TestInode::new(1000, 100, 0o000);
         // caller 2000 != owner 1000 -> falls through to named user check
-        assert!(check_access(&ino, Some(&acl), 2000, 200, &[], ACCESS_RWX));
+        assert!(check_access(
+            &ino,
+            Some(&acl),
+            2000,
+            200,
+            &[],
+            ACCESS_RWX,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
@@ -1654,14 +2044,23 @@ mod tests {
         ];
         let ino = TestInode::new(1000, 100, 0o000);
         // Caller 3000, gid 300 – not owner, not in group 100 -> other
-        assert!(check_access(&ino, Some(&acl), 3000, 300, &[], ACCESS_READ));
+        assert!(check_access(
+            &ino,
+            Some(&acl),
+            3000,
+            300,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
         assert!(!check_access(
             &ino,
             Some(&acl),
             3000,
             300,
             &[],
-            ACCESS_WRITE
+            ACCESS_WRITE,
+            &VALID_MOUNT
         ));
     }
 
@@ -1773,35 +2172,38 @@ mod tests {
     #[test]
     fn can_read_wrapper() {
         let ino = TestInode::new(1000, 100, 0o400);
-        assert!(can_read(&ino, None, 1000, 100, &[]));
-        assert!(!can_read(&ino, None, 2000, 200, &[]));
+        assert!(can_read(&ino, None, 1000, 100, &[], &VALID_MOUNT));
+        assert!(!can_read(&ino, None, 2000, 200, &[], &VALID_MOUNT));
     }
 
     #[test]
     fn can_write_wrapper() {
         let ino = TestInode::new(1000, 100, 0o020);
-        assert!(can_write(&ino, None, 2000, 100, &[]));
-        assert!(!can_write(&ino, None, 2000, 200, &[]));
+        assert!(can_write(&ino, None, 2000, 100, &[], &VALID_MOUNT));
+        assert!(!can_write(&ino, None, 2000, 200, &[], &VALID_MOUNT));
     }
 
     #[test]
     fn can_execute_wrapper() {
         let ino = TestInode::new(1000, 100, 0o001);
-        assert!(can_execute(&ino, None, 2000, 200, &[]));
-        assert!(!can_execute(&ino, None, 1000, 100, &[]));
+        assert!(can_execute(&ino, None, 2000, 200, &[], &VALID_MOUNT));
+        assert!(!can_execute(&ino, None, 1000, 100, &[], &VALID_MOUNT));
     }
 
     #[test]
     fn can_lookup_same_as_execute() {
         let ino = TestInode::new(1000, 100, 0o001);
-        assert!(can_lookup(&ino, None, 2000, 200, &[]));
+        assert!(can_lookup(&ino, None, 2000, 200, &[], &VALID_MOUNT));
         let ino2 = TestInode::new(1000, 100, 0o000);
-        assert!(!can_lookup(&ino2, None, 2000, 200, &[]));
+        assert!(!can_lookup(&ino2, None, 2000, 200, &[], &VALID_MOUNT));
     }
 
     #[test]
     fn path_traversal_empty_path_is_allowed() {
-        assert_eq!(check_path_traversal(&[], 1000, 100, &[]), Ok(()));
+        assert_eq!(
+            check_path_traversal(&[], 1000, 100, &[], &VALID_MOUNT),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1815,7 +2217,10 @@ mod tests {
             PathTraversalComponent::new(&project, None),
         ];
 
-        assert_eq!(check_path_traversal(&components, 2000, 100, &[]), Ok(()));
+        assert_eq!(
+            check_path_traversal(&components, 2000, 100, &[], &VALID_MOUNT),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1830,7 +2235,7 @@ mod tests {
         ];
 
         assert_eq!(
-            check_path_traversal(&components, 2000, 200, &[]),
+            check_path_traversal(&components, 2000, 200, &[], &VALID_MOUNT),
             Err(PathTraversalDenied { component_index: 1 })
         );
     }
@@ -1840,9 +2245,12 @@ mod tests {
         let shared = TestInode::new(1000, 500, 0o010);
         let components = [PathTraversalComponent::new(&shared, None)];
 
-        assert_eq!(check_path_traversal(&components, 2000, 200, &[500]), Ok(()));
         assert_eq!(
-            check_path_traversal(&components, 2000, 200, &[]),
+            check_path_traversal(&components, 2000, 200, &[500], &VALID_MOUNT),
+            Ok(())
+        );
+        assert_eq!(
+            check_path_traversal(&components, 2000, 200, &[], &VALID_MOUNT),
             Err(PathTraversalDenied { component_index: 0 })
         );
     }
@@ -1879,9 +2287,12 @@ mod tests {
         ];
         let components = [PathTraversalComponent::new(&dir, Some(&acl))];
 
-        assert_eq!(check_path_traversal(&components, 2000, 200, &[]), Ok(()));
         assert_eq!(
-            check_path_traversal(&components, 3000, 300, &[]),
+            check_path_traversal(&components, 2000, 200, &[], &VALID_MOUNT),
+            Ok(())
+        );
+        assert_eq!(
+            check_path_traversal(&components, 3000, 300, &[], &VALID_MOUNT),
             Err(PathTraversalDenied { component_index: 0 })
         );
     }
@@ -1891,7 +2302,10 @@ mod tests {
         let private = TestInode::new(1000, 100, 0o000);
         let components = [PathTraversalComponent::new(&private, None)];
 
-        assert_eq!(check_path_traversal(&components, 0, 0, &[]), Ok(()));
+        assert_eq!(
+            check_path_traversal(&components, 0, 0, &[], &VALID_MOUNT),
+            Ok(())
+        );
     }
 
     // =====================================================================
@@ -2690,10 +3104,42 @@ mod tests {
             },
         ];
         let ino = TestInode::new(1000, 100, 0o000);
-        assert!(check_access(&ino, Some(&acl), 0, 0, &[], ACCESS_READ));
-        assert!(check_access(&ino, Some(&acl), 0, 0, &[], ACCESS_WRITE));
-        assert!(check_access(&ino, Some(&acl), 0, 0, &[], ACCESS_EXECUTE));
-        assert!(check_access(&ino, Some(&acl), 0, 0, &[], ACCESS_RWX));
+        assert!(check_access(
+            &ino,
+            Some(&acl),
+            0,
+            0,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
+        assert!(check_access(
+            &ino,
+            Some(&acl),
+            0,
+            0,
+            &[],
+            ACCESS_WRITE,
+            &VALID_MOUNT
+        ));
+        assert!(check_access(
+            &ino,
+            Some(&acl),
+            0,
+            0,
+            &[],
+            ACCESS_EXECUTE,
+            &VALID_MOUNT
+        ));
+        assert!(check_access(
+            &ino,
+            Some(&acl),
+            0,
+            0,
+            &[],
+            ACCESS_RWX,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
@@ -2716,17 +3162,57 @@ mod tests {
             },
         ];
         let ino = TestInode::new(1000, 100, 0o777); // mode is permissive, ACL overrides
-        assert!(!check_access(&ino, Some(&acl), 1000, 100, &[], ACCESS_READ));
-        assert!(!check_access(&ino, Some(&acl), 2000, 100, &[], ACCESS_READ));
-        assert!(!check_access(&ino, Some(&acl), 3000, 300, &[], ACCESS_READ));
+        assert!(!check_access(
+            &ino,
+            Some(&acl),
+            1000,
+            100,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
+        assert!(!check_access(
+            &ino,
+            Some(&acl),
+            2000,
+            100,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
+        assert!(!check_access(
+            &ino,
+            Some(&acl),
+            3000,
+            300,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
     }
 
     #[test]
     fn check_access_non_root_falls_back_to_mode_when_acl_none() {
         let ino = TestInode::new(1000, 100, 0o400);
-        assert!(check_access(&ino, None, 1000, 100, &[], ACCESS_READ));
+        assert!(check_access(
+            &ino,
+            None,
+            1000,
+            100,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
         // Non-owner, non-group -> other bits (0)
-        assert!(!check_access(&ino, None, 2000, 200, &[], ACCESS_READ));
+        assert!(!check_access(
+            &ino,
+            None,
+            2000,
+            200,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
     }
 
     // =====================================================================
@@ -2788,7 +3274,7 @@ mod tests {
     fn validated_access_accepts_none_with_root() {
         let ino = TestInode::new(1000, 100, 0o000);
         assert_eq!(
-            check_validated_access(&ino, None, 0, 0, &[], ACCESS_NONE),
+            check_validated_access(&ino, None, 0, 0, &[], ACCESS_NONE, &VALID_MOUNT),
             Ok(true)
         );
     }
@@ -2797,7 +3283,7 @@ mod tests {
     fn validated_access_rejects_none_with_invalid_bits() {
         let ino = TestInode::new(1000, 100, 0o777);
         assert_eq!(
-            check_validated_access(&ino, None, 1000, 100, &[], ACCESS_NONE | 0x08),
+            check_validated_access(&ino, None, 1000, 100, &[], ACCESS_NONE | 0x08, &VALID_MOUNT),
             Err(AccessRequestError::InvalidMask {
                 requested: ACCESS_NONE | 0x08,
                 invalid_bits: 0x08,
@@ -2809,8 +3295,22 @@ mod tests {
     fn mode_owner_check_preserves_access_none_always_true() {
         // ACCESS_NONE after validation always returns true (F_OK semantics)
         let ino = TestInode::new(1000, 100, 0o000);
-        assert!(check_mode_access(&ino, 2000, 200, &[], ACCESS_NONE));
-        assert!(check_mode_access(&ino, 0, 0, &[], ACCESS_NONE));
+        assert!(check_mode_access(
+            &ino,
+            2000,
+            200,
+            &[],
+            ACCESS_NONE,
+            &VALID_MOUNT
+        ));
+        assert!(check_mode_access(
+            &ino,
+            0,
+            0,
+            &[],
+            ACCESS_NONE,
+            &VALID_MOUNT
+        ));
     }
 
     // =====================================================================
@@ -2865,5 +3365,206 @@ mod tests {
     #[test]
     fn xattr_name_max_matches_posix_value() {
         assert_eq!(XATTR_NAME_MAX, 255);
+    }
+
+    // =====================================================================
+    // Mount identity binding tests
+    // =====================================================================
+
+    #[test]
+    fn mount_identity_valid_allows_access() {
+        let ino = TestInode::new(1000, 100, 0o644);
+        assert!(check_access(
+            &ino,
+            None,
+            1000,
+            100,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
+    }
+
+    #[test]
+    fn mount_identity_invalid_denies_access() {
+        let ino = TestInode::new(1000, 100, 0o644);
+        // Zero dataset — caller would normally have owner read access
+        assert!(!check_access(
+            &ino,
+            None,
+            1000,
+            100,
+            &[],
+            ACCESS_READ,
+            &INVALID_MOUNT_ZERO_DATASET
+        ));
+    }
+
+    #[test]
+    fn mount_identity_zero_epoch_denies_access() {
+        let ino = TestInode::new(1000, 100, 0o644);
+        // Zero epoch — invalid mount
+        assert!(!check_access(
+            &ino,
+            None,
+            1000,
+            100,
+            &[],
+            ACCESS_READ,
+            &INVALID_MOUNT_ZERO_EPOCH
+        ));
+    }
+
+    #[test]
+    fn mount_identity_invalid_denies_root() {
+        let ino = TestInode::new(1000, 100, 0o644);
+        // Even root (uid 0) is denied when mount identity is invalid
+        assert!(!check_access(
+            &ino,
+            None,
+            0,
+            0,
+            &[],
+            ACCESS_READ,
+            &INVALID_MOUNT_ZERO_DATASET
+        ));
+    }
+
+    #[test]
+    fn mount_identity_valid_allows_root() {
+        let ino = TestInode::new(1000, 100, 0o000); // no permissions
+        assert!(check_access(
+            &ino,
+            None,
+            0,
+            0,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT
+        ));
+    }
+
+    #[test]
+    fn mount_identity_different_id_same_epoch_are_distinct() {
+        let m1 = MountIdentity::new([0x01u8; 16], 1);
+        let m2 = MountIdentity::new([0x02u8; 16], 1);
+        assert_ne!(m1, m2);
+    }
+
+    #[test]
+    fn mount_identity_same_id_different_epoch_are_distinct() {
+        let m1 = MountIdentity::new([0x01u8; 16], 1);
+        let m2 = MountIdentity::new([0x01u8; 16], 2);
+        assert_ne!(m1, m2);
+    }
+
+    #[test]
+    fn validate_mount_identity_accepts_valid() {
+        assert_eq!(validate_mount_identity(&VALID_MOUNT), Ok(()));
+    }
+
+    #[test]
+    fn validate_mount_identity_rejects_invalid() {
+        assert_eq!(
+            validate_mount_identity(&INVALID_MOUNT_ZERO_DATASET),
+            Err(MountIdentityError::InvalidMountIdentity)
+        );
+    }
+
+    #[test]
+    fn check_access_result_fails_on_invalid_mount() {
+        let ino = TestInode::new(1000, 100, 0o644);
+        assert_eq!(
+            check_access_result(
+                &ino,
+                1000,
+                100,
+                AccessMode::Read,
+                &INVALID_MOUNT_ZERO_DATASET
+            ),
+            Err(PermissionError::AccessDenied)
+        );
+    }
+
+    #[test]
+    fn check_search_fails_on_invalid_mount() {
+        let dir = TestInode::new(1000, 100, S_IFDIR | 0o755);
+        assert_eq!(
+            check_search(&dir, 1000, 100, &INVALID_MOUNT_ZERO_DATASET),
+            Err(PermissionError::AccessDenied)
+        );
+    }
+
+    #[test]
+    fn check_validated_access_fails_on_invalid_mount() {
+        let ino = TestInode::new(1000, 100, 0o644);
+        assert_eq!(
+            check_validated_access(
+                &ino,
+                None,
+                1000,
+                100,
+                &[],
+                ACCESS_READ,
+                &INVALID_MOUNT_ZERO_DATASET
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn check_access_report_records_mount_identity() {
+        let ino = TestInode::new(1000, 100, 0o644);
+        let report = check_access_report(&ino, None, 1000, 100, &[], ACCESS_READ, &VALID_MOUNT)
+            .expect("valid access report");
+
+        assert_eq!(report.mount_identity, VALID_MOUNT);
+        assert_eq!(report.requested, ACCESS_READ);
+        assert!(report.allowed);
+    }
+
+    #[test]
+    fn check_access_report_records_invalid_mount_fail_closed() {
+        let ino = TestInode::new(1000, 100, 0o644);
+        let report = check_access_report(
+            &ino,
+            None,
+            1000,
+            100,
+            &[],
+            ACCESS_READ,
+            &INVALID_MOUNT_ZERO_DATASET,
+        )
+        .expect("invalid mount returns a fail-closed report");
+
+        assert_eq!(report.mount_identity, INVALID_MOUNT_ZERO_DATASET);
+        assert_eq!(report.requested, ACCESS_READ);
+        assert!(!report.allowed);
+    }
+
+    #[test]
+    fn can_read_fails_on_invalid_mount() {
+        let ino = TestInode::new(1000, 100, 0o644);
+        assert!(!can_read(
+            &ino,
+            None,
+            1000,
+            100,
+            &[],
+            &INVALID_MOUNT_ZERO_DATASET
+        ));
+    }
+
+    #[test]
+    fn can_lookup_fails_on_invalid_mount() {
+        let ino = TestInode::new(1000, 100, S_IFDIR | 0o755);
+        assert!(!can_lookup(
+            &ino,
+            None,
+            1000,
+            100,
+            &[],
+            &INVALID_MOUNT_ZERO_DATASET
+        ));
     }
 }

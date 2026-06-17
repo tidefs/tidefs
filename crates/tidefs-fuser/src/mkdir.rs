@@ -53,6 +53,7 @@ pub fn check_mkdir_parent_permission(
     caller_uid: u32,
     caller_gid: u32,
     caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
 ) -> Result<(), c_int> {
     crate::access::check_fuse_access(
         parent_mode,
@@ -62,6 +63,7 @@ pub fn check_mkdir_parent_permission(
         caller_gid,
         caller_groups,
         crate::access::ACCESS_WRITE | crate::access::ACCESS_EXECUTE,
+        mount_identity,
     )
 }
 
@@ -190,6 +192,9 @@ pub fn handle_mkdir(name: &[u8], mode: u32, umask: u32, read_only: bool) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID_MOUNT: tidefs_permission::MountIdentity =
+        tidefs_permission::MountIdentity::new([0x41; 16], 1);
 
     // -- validate_mkdir_name -------------------------------------------------
 
@@ -520,6 +525,7 @@ mod tests {
             1000,
             100,
             &[], // caller uid, gid, groups
+            &VALID_MOUNT,
         );
         assert_eq!(result, Ok(()));
     }
@@ -527,28 +533,28 @@ mod tests {
     #[test]
     fn parent_permission_missing_write_rejected() {
         // Owner matches but mode 0o100 (execute only, no write).
-        let result = check_mkdir_parent_permission(0o100, 1000, 100, 1000, 100, &[]);
+        let result = check_mkdir_parent_permission(0o100, 1000, 100, 1000, 100, &[], &VALID_MOUNT);
         assert_eq!(result, Err(errno::EACCES));
     }
 
     #[test]
     fn parent_permission_missing_execute_rejected() {
         // Owner matches but mode 0o200 (write only, no execute).
-        let result = check_mkdir_parent_permission(0o200, 1000, 100, 1000, 100, &[]);
+        let result = check_mkdir_parent_permission(0o200, 1000, 100, 1000, 100, &[], &VALID_MOUNT);
         assert_eq!(result, Err(errno::EACCES));
     }
 
     #[test]
     fn parent_permission_root_bypass() {
         // Root (uid 0) bypasses permission checks.
-        let result = check_mkdir_parent_permission(0o000, 1000, 100, 0, 0, &[]);
+        let result = check_mkdir_parent_permission(0o000, 1000, 100, 0, 0, &[], &VALID_MOUNT);
         assert_eq!(result, Ok(()));
     }
 
     #[test]
     fn parent_permission_other_no_access_rejected() {
         // Caller is neither owner, group, nor root, mode 0o000.
-        let result = check_mkdir_parent_permission(0o000, 1000, 100, 2000, 200, &[]);
+        let result = check_mkdir_parent_permission(0o000, 1000, 100, 2000, 200, &[], &VALID_MOUNT);
         assert_eq!(result, Err(errno::EACCES));
     }
 }
