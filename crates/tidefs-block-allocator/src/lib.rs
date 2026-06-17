@@ -170,13 +170,14 @@ pub mod error;
 pub mod quota;
 pub mod statfs;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::RwLock;
 
 pub use bitmap::{FreeBlockBitmap, FreeExtentIter};
 pub use error::AllocError;
 pub use quota::QuotaTable;
 pub use statfs::Statfs;
+pub use tidefs_commit_group::{CommitGroupEpochFence, CommitGroupId};
 
 use tidefs_spacemap_allocator::SegmentFreeMap;
 use tidefs_types_vfs_core::InodeId;
@@ -567,6 +568,14 @@ struct AllocatorInner {
     trim_stats: TrimStats,
     /// Devices currently fenced for removal (no new allocations).
     fenced_devices: HashSet<DeviceId>,
+    /// Blocks allocated by commit-group epochs that are not durable yet.
+    pending_allocations: BTreeMap<CommitGroupEpochFence, BTreeSet<BlockId>>,
+    /// Fast owner lookup for blocks in `pending_allocations`.
+    pending_allocation_blocks: BTreeMap<BlockId, CommitGroupEpochFence>,
+    /// Blocks waiting for their freeing commit-group epoch to become durable.
+    pending_frees: BTreeMap<CommitGroupEpochFence, BTreeSet<BlockId>>,
+    /// Fast membership lookup for blocks in `pending_frees`.
+    pending_free_blocks: BTreeSet<BlockId>,
 }
 
 impl std::fmt::Debug for AllocatorInner {
@@ -585,6 +594,10 @@ impl std::fmt::Debug for AllocatorInner {
             .field("min_discard_bytes", &self.min_discard_bytes)
             .field("trim_stats", &self.trim_stats)
             .field("fenced_devices", &self.fenced_devices)
+            .field("pending_allocations", &self.pending_allocations)
+            .field("pending_allocation_blocks", &self.pending_allocation_blocks)
+            .field("pending_frees", &self.pending_frees)
+            .field("pending_free_blocks", &self.pending_free_blocks)
             .finish()
     }
 }
@@ -688,6 +701,107 @@ impl AllocResult {
     }
 }
 
+/// Physical block allocation reserved by a commit-group epoch.
+///
+/// The blocks named by this handle are unavailable to other allocations until
+/// the owning epoch is made durable or the reservation is explicitly released.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockAllocationReservation {
+    epoch_fence: CommitGroupEpochFence,
+    blocks: Vec<BlockId>,
+}
+
+impl BlockAllocationReservation {
+    fn new(epoch_fence: CommitGroupEpochFence, blocks: Vec<BlockId>) -> Self {
+        Self {
+            epoch_fence,
+            blocks,
+        }
+    }
+
+    /// Commit-group epoch that owns this block reservation.
+    #[must_use]
+    pub fn epoch_fence(&self) -> CommitGroupEpochFence {
+        self.epoch_fence
+    }
+
+    /// Reserved physical block ids.
+    #[must_use]
+    pub fn blocks(&self) -> &[BlockId] {
+        &self.blocks
+    }
+
+    /// Number of reserved blocks.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Returns true when the reservation is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    /// Consume the reservation and return its physical block ids.
+    #[must_use]
+    pub fn into_blocks(self) -> Vec<BlockId> {
+        self.blocks
+    }
+}
+
+/// Pending-free reservation owned by a commit-group epoch.
+///
+/// The blocks in this handle remain allocated and excluded from physical free
+/// space until the owning epoch is made durable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockFreeReservation {
+    epoch_fence: CommitGroupEpochFence,
+    blocks: Vec<BlockId>,
+}
+
+impl BlockFreeReservation {
+    fn new(epoch_fence: CommitGroupEpochFence, blocks: Vec<BlockId>) -> Self {
+        Self {
+            epoch_fence,
+            blocks,
+        }
+    }
+
+    /// Commit-group epoch that owns this pending free.
+    #[must_use]
+    pub fn epoch_fence(&self) -> CommitGroupEpochFence {
+        self.epoch_fence
+    }
+
+    /// Blocks waiting for the commit-group durability barrier.
+    #[must_use]
+    pub fn blocks(&self) -> &[BlockId] {
+        &self.blocks
+    }
+
+    /// Number of blocks waiting to be freed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Returns true when no blocks were accepted into the pending-free set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+/// Summary of allocator state retired at a commit-group epoch barrier.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CommitGroupBlockDelta {
+    /// Allocation reservations retired for the epoch.
+    pub allocations: u64,
+    /// Pending-free reservations retired for the epoch.
+    pub frees: u64,
+}
+
 /// The public block allocator handle.
 ///
 /// All operations are synchronized through an internal `RwLock`.
@@ -760,6 +874,10 @@ impl BlockAllocator {
             min_discard_bytes: BlockAllocator::DEFAULT_MIN_DISCARD_BYTES,
             trim_stats: TrimStats::default(),
             fenced_devices: HashSet::new(),
+            pending_allocations: BTreeMap::new(),
+            pending_allocation_blocks: BTreeMap::new(),
+            pending_frees: BTreeMap::new(),
+            pending_free_blocks: BTreeSet::new(),
         })
     }
 
@@ -916,6 +1034,10 @@ impl BlockAllocator {
             min_discard_bytes: BlockAllocator::DEFAULT_MIN_DISCARD_BYTES,
             trim_stats: TrimStats::default(),
             fenced_devices: HashSet::new(),
+            pending_allocations: BTreeMap::new(),
+            pending_allocation_blocks: BTreeMap::new(),
+            pending_frees: BTreeMap::new(),
+            pending_free_blocks: BTreeSet::new(),
         })
     }
 
@@ -1105,12 +1227,16 @@ impl BlockAllocator {
         Ok(())
     }
 
-    /// Allocate `nblocks`, preferring contiguous blocks and falling back to
-    /// scattered blocks when the free space is fragmented.
-    #[must_use = "allocation result must be consumed to track block usage"]
-    pub fn alloc(&self, nblocks: u32) -> Result<Vec<BlockId>, AllocError> {
-        let mut inner = self.inner.write().unwrap();
-        Self::admit_allocation(&inner, nblocks)?;
+    fn validate_epoch_fence(epoch_fence: CommitGroupEpochFence) -> Result<(), AllocError> {
+        if epoch_fence.is_valid() {
+            Ok(())
+        } else {
+            Err(AllocError::CommitGroupConflict)
+        }
+    }
+
+    fn alloc_locked(inner: &mut AllocatorInner, nblocks: u32) -> Result<Vec<BlockId>, AllocError> {
+        Self::admit_allocation(inner, nblocks)?;
         let blocks = if inner.fenced_devices.is_empty() {
             inner.bitmap.alloc(nblocks)?
         } else {
@@ -1126,18 +1252,236 @@ impl BlockAllocator {
                         .alloc_any_skip_devices(nblocks, bs, &extents, &fenced)
                 })?
         };
-        // Keep spacemap in sync: mark allocated blocks as used.
-        for &blk in &blocks {
-            // Ignore errors (idempotent for already-used blocks).
+        Self::mark_blocks_used_in_spacemap(inner, &blocks);
+        Ok(blocks)
+    }
+
+    fn mark_blocks_used_in_spacemap(inner: &mut AllocatorInner, blocks: &[BlockId]) {
+        for &blk in blocks {
             let _ = inner.spacemap.remove_free(blk);
         }
         inner.spacemap.rebuild_hints();
+    }
+
+    fn mark_blocks_free_locked(inner: &mut AllocatorInner, blocks: &[BlockId]) {
+        inner.bitmap.free_blocks(blocks);
+        for &blk in blocks {
+            let _ = inner.spacemap.add_free(blk);
+        }
+        inner.spacemap.rebuild_hints();
+    }
+
+    /// Allocate `nblocks`, preferring contiguous blocks and falling back to
+    /// scattered blocks when the free space is fragmented.
+    #[must_use = "allocation result must be consumed to track block usage"]
+    pub fn alloc(&self, nblocks: u32) -> Result<Vec<BlockId>, AllocError> {
+        let mut inner = self.inner.write().unwrap();
+        let blocks = Self::alloc_locked(&mut inner, nblocks)?;
         #[cfg(debug_assertions)]
         debug_assert!(
             inner.bitmap.check_invariants(),
             "invariant violation after alloc"
         );
         Ok(blocks)
+    }
+
+    /// Reserve physical blocks for a commit-group epoch.
+    ///
+    /// The returned reservation names blocks that are already withheld from
+    /// the free bitmap, so other writers cannot reallocate them while the
+    /// owning commit group is still in flight. Call
+    /// [`Self::mark_commit_group_durable`] when the epoch becomes durable, or
+    /// [`Self::release_allocation`] / [`Self::abort_commit_group`] to roll the
+    /// reservation back.
+    #[must_use = "block allocation reservations must be retired at the commit-group barrier"]
+    pub fn reserve_allocation(
+        &self,
+        epoch_fence: CommitGroupEpochFence,
+        nblocks: u32,
+    ) -> Result<BlockAllocationReservation, AllocError> {
+        Self::validate_epoch_fence(epoch_fence)?;
+
+        let mut inner = self.inner.write().unwrap();
+        let blocks = Self::alloc_locked(&mut inner, nblocks)?;
+        inner
+            .pending_allocations
+            .entry(epoch_fence)
+            .or_default()
+            .extend(blocks.iter().copied());
+        for &block in &blocks {
+            inner.pending_allocation_blocks.insert(block, epoch_fence);
+        }
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            inner.bitmap.check_invariants(),
+            "invariant violation after reserve_allocation"
+        );
+        Ok(BlockAllocationReservation::new(epoch_fence, blocks))
+    }
+
+    /// Release a single in-flight allocation reservation before durability.
+    ///
+    /// This rolls back only the blocks present in `reservation`. To retire every
+    /// reservation owned by an epoch, use [`Self::abort_commit_group`].
+    pub fn release_allocation(
+        &self,
+        reservation: BlockAllocationReservation,
+    ) -> Result<CommitGroupBlockDelta, AllocError> {
+        let epoch_fence = reservation.epoch_fence();
+        Self::validate_epoch_fence(epoch_fence)?;
+
+        let mut inner = self.inner.write().unwrap();
+        let mut released = Vec::new();
+        if let Some(pending) = inner.pending_allocations.get_mut(&epoch_fence) {
+            for &block in reservation.blocks() {
+                if pending.remove(&block) {
+                    released.push(block);
+                }
+            }
+        }
+        if inner
+            .pending_allocations
+            .get(&epoch_fence)
+            .is_some_and(BTreeSet::is_empty)
+        {
+            inner.pending_allocations.remove(&epoch_fence);
+        }
+        for block in &released {
+            if inner.pending_allocation_blocks.get(block) == Some(&epoch_fence) {
+                inner.pending_allocation_blocks.remove(block);
+            }
+        }
+        Self::mark_blocks_free_locked(&mut inner, &released);
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            inner.bitmap.check_invariants(),
+            "invariant violation after release_allocation"
+        );
+        Ok(CommitGroupBlockDelta {
+            allocations: released.len() as u64,
+            frees: 0,
+        })
+    }
+
+    /// Hold blocks in the pending-free set until a commit group is durable.
+    ///
+    /// Accepted blocks remain allocated in the bitmap and are not included in
+    /// allocator free-space reporting until [`Self::mark_commit_group_durable`]
+    /// is called for `epoch_fence`.
+    #[must_use = "pending frees must be retired at the commit-group barrier"]
+    pub fn free_on_commit(
+        &self,
+        epoch_fence: CommitGroupEpochFence,
+        blocks: &[BlockId],
+    ) -> Result<BlockFreeReservation, AllocError> {
+        Self::validate_epoch_fence(epoch_fence)?;
+
+        let mut inner = self.inner.write().unwrap();
+        let mut scheduled = Vec::new();
+        for &block in blocks {
+            if block >= inner.bitmap.block_count() || inner.bitmap.is_free(block) {
+                continue;
+            }
+            if let Some(owner) = inner.pending_allocation_blocks.get(&block) {
+                if *owner != epoch_fence {
+                    return Err(AllocError::CommitGroupConflict);
+                }
+            }
+            if inner.pending_free_blocks.insert(block) {
+                scheduled.push(block);
+            }
+        }
+
+        if !scheduled.is_empty() {
+            inner
+                .pending_frees
+                .entry(epoch_fence)
+                .or_default()
+                .extend(scheduled.iter().copied());
+        }
+
+        Ok(BlockFreeReservation::new(epoch_fence, scheduled))
+    }
+
+    /// Retire all block reservations owned by a durable commit-group epoch.
+    ///
+    /// Allocation reservations become ordinary committed used blocks. Pending
+    /// frees become reusable and are reflected in free-space reporting.
+    pub fn mark_commit_group_durable(
+        &self,
+        epoch_fence: CommitGroupEpochFence,
+    ) -> Result<CommitGroupBlockDelta, AllocError> {
+        Self::validate_epoch_fence(epoch_fence)?;
+
+        let mut inner = self.inner.write().unwrap();
+        let allocations = inner
+            .pending_allocations
+            .remove(&epoch_fence)
+            .unwrap_or_default();
+        for block in &allocations {
+            if inner.pending_allocation_blocks.get(block) == Some(&epoch_fence) {
+                inner.pending_allocation_blocks.remove(block);
+            }
+        }
+
+        let frees = inner.pending_frees.remove(&epoch_fence).unwrap_or_default();
+        let freed: Vec<BlockId> = frees.iter().copied().collect();
+        for block in &freed {
+            inner.pending_free_blocks.remove(block);
+        }
+        Self::mark_blocks_free_locked(&mut inner, &freed);
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            inner.bitmap.check_invariants(),
+            "invariant violation after mark_commit_group_durable"
+        );
+        self.maybe_discard_freed(&mut inner, &freed);
+
+        Ok(CommitGroupBlockDelta {
+            allocations: allocations.len() as u64,
+            frees: freed.len() as u64,
+        })
+    }
+
+    /// Abort all block reservations owned by a commit-group epoch.
+    ///
+    /// In-flight allocations are returned to the allocator. Pending frees are
+    /// discarded without changing bitmap state because the freeing epoch did
+    /// not become durable.
+    pub fn abort_commit_group(
+        &self,
+        epoch_fence: CommitGroupEpochFence,
+    ) -> Result<CommitGroupBlockDelta, AllocError> {
+        Self::validate_epoch_fence(epoch_fence)?;
+
+        let mut inner = self.inner.write().unwrap();
+        let allocations = inner
+            .pending_allocations
+            .remove(&epoch_fence)
+            .unwrap_or_default();
+        let released: Vec<BlockId> = allocations.iter().copied().collect();
+        for block in &released {
+            if inner.pending_allocation_blocks.get(block) == Some(&epoch_fence) {
+                inner.pending_allocation_blocks.remove(block);
+            }
+        }
+
+        let frees = inner.pending_frees.remove(&epoch_fence).unwrap_or_default();
+        for block in &frees {
+            inner.pending_free_blocks.remove(block);
+        }
+
+        Self::mark_blocks_free_locked(&mut inner, &released);
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            inner.bitmap.check_invariants(),
+            "invariant violation after abort_commit_group"
+        );
+
+        Ok(CommitGroupBlockDelta {
+            allocations: released.len() as u64,
+            frees: frees.len() as u64,
+        })
     }
 
     /// Allocate `nblocks` contiguous blocks.
@@ -1482,12 +1826,15 @@ impl BlockAllocator {
             );
         }
         let mut inner = self.inner.write().unwrap();
-        inner.bitmap.free_blocks(blocks);
-        // Keep spacemap in sync: add freed blocks back.
-        for &blk in blocks {
-            let _ = inner.spacemap.add_free(blk);
-        }
-        inner.spacemap.rebuild_hints();
+        let immediate: Vec<BlockId> = blocks
+            .iter()
+            .copied()
+            .filter(|block| {
+                !inner.pending_allocation_blocks.contains_key(block)
+                    && !inner.pending_free_blocks.contains(block)
+            })
+            .collect();
+        Self::mark_blocks_free_locked(&mut inner, &immediate);
         #[cfg(debug_assertions)]
         debug_assert!(
             inner.bitmap.check_invariants(),
@@ -1495,7 +1842,7 @@ impl BlockAllocator {
         );
 
         // Issue TRIM for freed extents that meet the minimum discard threshold.
-        self.maybe_discard_freed(&mut inner, blocks);
+        self.maybe_discard_freed(&mut inner, &immediate);
     }
 
     /// Set the minimum discard threshold in bytes.
@@ -1733,6 +2080,18 @@ impl BlockAllocator {
     #[must_use]
     pub fn free_count(&self) -> u64 {
         self.inner.read().unwrap().bitmap.free_count()
+    }
+
+    /// Number of blocks reserved by non-durable commit-group allocations.
+    #[must_use]
+    pub fn pending_allocation_count(&self) -> u64 {
+        self.inner.read().unwrap().pending_allocation_blocks.len() as u64
+    }
+
+    /// Number of blocks held in the pending-free set.
+    #[must_use]
+    pub fn pending_free_count(&self) -> u64 {
+        self.inner.read().unwrap().pending_free_blocks.len() as u64
     }
 
     /// Collect all free block ranges as `TrimRequest` byte ranges.

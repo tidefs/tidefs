@@ -45,6 +45,8 @@ pub enum AllocError {
     /// `logical_sector_size` is not a power of two, or
     /// `alignment_offset >= logical_sector_size`.
     InvalidDeviceTopology,
+    /// The requested operation conflicts with a commit-group epoch fence.
+    CommitGroupConflict,
 }
 
 impl fmt::Display for AllocError {
@@ -79,6 +81,9 @@ impl fmt::Display for AllocError {
             }
             Self::InvalidDeviceTopology => {
                 write!(f, "the supplied device topology is invalid")
+            }
+            Self::CommitGroupConflict => {
+                write!(f, "block operation conflicts with commit-group epoch fence")
             }
         }
     }
