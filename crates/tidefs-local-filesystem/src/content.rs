@@ -2193,13 +2193,6 @@ mod tests {
 
 /// Return the pool placement receipt generation for `object_key`, or 0 if
 /// no receipt is available.
-
-// ────────────────────────────────────────────────────────────────────
-// Receipt-aware chunk replacement helpers
-// ────────────────────────────────────────────────────────────────────
-
-/// Return the pool placement receipt generation for `object_key`, or 0 if
-/// no receipt is available.
 ///
 /// This is the authoritative lookup that ties local-filesystem chunk refs
 /// to the pool's receipt authority. Callers use it to decide whether an old
