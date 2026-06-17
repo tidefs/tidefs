@@ -12,6 +12,7 @@ on:
         type: choice
         options:
           - kmod-xfstests-smoke
+          - kernel-fsync-validation
           - kernel-mmap-validation
           - qemu-ublk-smoke
           - all
@@ -36,12 +37,19 @@ jobs:
           - id: kmod-xfstests-smoke
             name: kmod-xfstests-smoke
             command: nix run .#kmod-xfstests-smoke -- --timeout 1800
+            output_dir: /tmp/tidefs-validation/kmod-xfstests-smoke
+          - id: kernel-fsync-validation
+            name: kernel-fsync-validation
+            command: nix run .#kernel-fsync-validation -- --timeout 600 --pool-size 256
+            output_dir: /tmp/tidefs-validation/kernel-fsync-validation
           - id: kernel-mmap-validation
             name: kernel-mmap-validation
             command: nix run .#kernel-mmap-validation -- --timeout 900
+            output_dir: /tmp/tidefs-validation/kernel-mmap-validation
           - id: qemu-ublk-smoke
             name: qemu-ublk-smoke
             command: nix run .#qemu-ublk-smoke -- --timeout 3600
+            output_dir: /tmp/tidefs-validation/ublk
 
     steps:
       - name: Checkout
@@ -54,8 +62,16 @@ jobs:
           test -c /dev/kvm
           test -c /dev/fuse
 
+      - name: Prepare runtime output
+        if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke') }}
+        run: |
+          rm -rf '${{ matrix.output_dir }}'
+          mkdir -p '${{ matrix.output_dir }}'
+
       - name: Run smoke target
         if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke') }}
+        env:
+          TIDEFS_FSYNC_SUMMARY_DIR: ${{ matrix.output_dir }}
         run: timeout --foreground 7200s bash -lc '${{ matrix.command }}'
 
       - name: Upload runtime output
@@ -64,6 +80,6 @@ jobs:
         with:
           name: qemu-smoke-${{ matrix.name }}
           path: |
-            /tmp/tidefs-validation/**
+            ${{ matrix.output_dir }}/**
           if-no-files-found: ignore
           retention-days: 7
