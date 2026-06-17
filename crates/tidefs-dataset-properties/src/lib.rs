@@ -11,10 +11,18 @@
 //!
 //! ## Authority boundary (non-claim)
 //!
-//! The `compression.algorithm` property registered in this crate is a
-//! **property-library surface** — it defines metadata, types, defaults,
-//! and inheritance rules for the unified property framework.  It does **not**
+//! Content-transform properties such as `compression.algorithm`,
+//! `integrity.checksum`, `integrity.dedup`, and `layout.recordsize` are
+//! **property-library metadata** — they define types, defaults, inheritance
+//! rules, and provenance for the unified property framework.  They do **not**
 //! directly drive mounted content writes.
+//!
+//! Every [`PropertyEntryV1`] carries a [`MountedWriteAuthority`] status.
+//! For content-transform properties, [`resolve_effective`] always returns
+//! [`MountedWriteAuthority::NotAuthoritative`].  A mounted-write consumer
+//! that wishes to adopt a dataset-property value as live content-transform
+//! policy must explicitly set the entry's authority to
+//! [`MountedWriteAuthority::Authoritative`] at its own authority boundary.
 //!
 //! The **live mounted-write compression authority** is:
 //!
@@ -24,10 +32,10 @@
 //!   -> encode_content_chunk                  [encoding.rs]
 //! ```
 //!
-//! The property registry and the feature-flag system are separate layers.
-//! Do not use the presence of `compression.algorithm` in this crate as
-//! validation that per-dataset compression policy is wired into mounted
-//! content writes.
+//! The property registry and the feature-flag system are separate layers;
+//! the [`MountedWriteAuthority`] mechanism is the crate-level guard that
+//! prevents callers from accidentally treating an inherited or default
+//! property value as live mounted content-transform policy.
 //!
 //! # Key types
 //!
@@ -296,6 +304,47 @@ impl fmt::Display for PropertySource {
 }
 
 // ---------------------------------------------------------------------------
+// MountedWriteAuthority — whether a resolved property value is authoritative
+// for mounted content writes
+// ---------------------------------------------------------------------------
+
+/// Indicates whether a resolved [`PropertyEntryV1`] is authoritative for
+/// mounted content writes.
+///
+/// Content-transform properties (compression, integrity, layout) are always
+/// resolved as [`NotAuthoritative`] by default.  A mounted-write consumer
+/// that wishes to adopt a dataset-property value as live content-transform
+/// policy must explicitly opt in at its own authority boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(u8)]
+pub enum MountedWriteAuthority {
+    /// The property value is authoritative for mounted content writes.
+    Authoritative = 0x00,
+    /// The property value is **not** authoritative for mounted content writes;
+    /// a separate mounted-write authority must supply the actual policy.
+    NotAuthoritative = 0x01,
+}
+
+impl MountedWriteAuthority {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            MountedWriteAuthority::Authoritative => "authoritative",
+            MountedWriteAuthority::NotAuthoritative => "not-authoritative",
+        }
+    }
+}
+
+impl fmt::Display for MountedWriteAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MountedWriteAuthority::Authoritative => write!(f, "authoritative"),
+            MountedWriteAuthority::NotAuthoritative => write!(f, "not-authoritative"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PropertyKey — property name
 // ---------------------------------------------------------------------------
 
@@ -370,6 +419,9 @@ pub struct PropertyEntryV1 {
     pub value: PropertyValue,
     /// Where this value came from.
     pub source: PropertySource,
+    /// Whether this value is authoritative for mounted content writes.
+    /// Content-transform properties default to [`MountedWriteAuthority::NotAuthoritative`].
+    pub mounted_write_authority: MountedWriteAuthority,
 }
 
 impl PropertyEntryV1 {
@@ -377,6 +429,7 @@ impl PropertyEntryV1 {
     #[must_use]
     pub fn local(value: PropertyValue) -> Self {
         PropertyEntryV1 {
+            mounted_write_authority: MountedWriteAuthority::Authoritative,
             value,
             source: PropertySource::Local,
         }
@@ -386,6 +439,7 @@ impl PropertyEntryV1 {
     #[must_use]
     pub fn inherited(value: PropertyValue, parent_dataset_id: u64) -> Self {
         PropertyEntryV1 {
+            mounted_write_authority: MountedWriteAuthority::Authoritative,
             value,
             source: PropertySource::Inherited { parent_dataset_id },
         }
@@ -395,6 +449,7 @@ impl PropertyEntryV1 {
     #[must_use]
     pub fn default_value(value: PropertyValue) -> Self {
         PropertyEntryV1 {
+            mounted_write_authority: MountedWriteAuthority::Authoritative,
             value,
             source: PropertySource::Default,
         }
@@ -432,7 +487,7 @@ impl PropertySet {
         value: PropertyValue,
         source: PropertySource,
     ) {
-        self.entries.insert(key, PropertyEntryV1 { value, source });
+        self.entries.insert(key, PropertyEntryV1 { value, source, mounted_write_authority: MountedWriteAuthority::Authoritative });
     }
 
     /// Get a property entry by key.
@@ -702,6 +757,9 @@ pub struct PropertyDefinitionV1 {
     pub cross_constraints: Vec<CrossPropertyPredicate>,
     /// Allowed range for numeric types (min, max).
     pub range: Option<(u64, u64)>,
+    /// Whether this property is a content-transform property whose resolved
+    /// value defaults to [`MountedWriteAuthority::NotAuthoritative`].
+    pub is_content_transform: bool,
 }
 
 impl PropertyDefinitionV1 {
@@ -727,6 +785,7 @@ impl PropertyDefinitionV1 {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: None,
+            is_content_transform: false,
         }
     }
 }
@@ -742,6 +801,15 @@ impl PropertyDefinitionV1 {
 /// 2. For `PARENT` / `PARENT_RECEIVED` mode: walk parent chain.
 /// 3. Fall back to the registry default.
 ///
+/// ## Mounted-write authority
+///
+/// The returned [`PropertyEntryV1::mounted_write_authority`] is set to
+/// [`MountedWriteAuthority::Authoritative`] for non-transform properties and
+/// [`MountedWriteAuthority::NotAuthoritative`] for content-transform
+/// properties (those with [`PropertyDefinitionV1::is_content_transform`]
+/// set).  This prevents callers from accidentally treating dataset-property
+/// values as live mounted content-transform policy.
+///
 /// `parent_sets` is ordered from immediate parent to root ancestor.
 #[must_use]
 pub fn resolve_effective(
@@ -750,21 +818,34 @@ pub fn resolve_effective(
     parent_sets: &[&PropertySet],
     def: &PropertyDefinitionV1,
 ) -> PropertyEntryV1 {
+    let authority = if def.is_content_transform {
+        MountedWriteAuthority::NotAuthoritative
+    } else {
+        MountedWriteAuthority::Authoritative
+    };
+
     // 1. Local override always wins.
     if let Some(entry) = local_set.get(property_key) {
         if matches!(entry.source, PropertySource::Local) && entry.value.is_some() {
-            return entry.clone();
+            let mut resolved = entry.clone();
+            resolved.mounted_write_authority = authority;
+            return resolved;
         }
     }
 
     // 2. Walk parent chain.
     match def.inheritance {
-        InheritanceMode::None_ => PropertyEntryV1::default_value(def.default_value.clone()),
+        InheritanceMode::None_ => {
+            let mut entry = PropertyEntryV1::default_value(def.default_value.clone());
+            entry.mounted_write_authority = authority;
+            entry
+        }
         InheritanceMode::Parent | InheritanceMode::ParentReceived => {
             for (depth, parent) in parent_sets.iter().enumerate() {
                 if let Some(entry) = parent.get(property_key) {
                     if entry.value.is_some() {
                         let mut inherited = entry.clone();
+                        inherited.mounted_write_authority = authority;
                         if matches!(inherited.source, PropertySource::Local) {
                             inherited.source = PropertySource::Inherited {
                                 parent_dataset_id: depth as u64,
@@ -774,7 +855,11 @@ pub fn resolve_effective(
                     }
                 }
             }
-            PropertyEntryV1::default_value(def.default_value.clone())
+            {
+                let mut entry = PropertyEntryV1::default_value(def.default_value.clone());
+                entry.mounted_write_authority = authority;
+                entry
+            }
         }
     }
 }
@@ -911,6 +996,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             feature_flag: Some("org.tidefs:compression_lz4"),
             cross_constraints: Vec::new(),
             range: None,
+            is_content_transform: true,
         },
         // -- Access family --
         PropertyDefinitionV1 {
@@ -924,6 +1010,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: None,
+            is_content_transform: false,
         },
         PropertyDefinitionV1 {
             name: PropertyKey::new("access.atime"),
@@ -936,6 +1023,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: None,
+            is_content_transform: false,
         },
         PropertyDefinitionV1 {
             name: PropertyKey::new("access.relatime"),
@@ -948,6 +1036,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: None,
+            is_content_transform: false,
         },
         PropertyDefinitionV1 {
             name: PropertyKey::new("access.exec"),
@@ -960,6 +1049,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: None,
+            is_content_transform: false,
         },
         PropertyDefinitionV1 {
             name: PropertyKey::new("access.setuid"),
@@ -972,6 +1062,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: None,
+            is_content_transform: false,
         },
         // -- Layout family --
         PropertyDefinitionV1 {
@@ -985,6 +1076,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: Some((512, 1_048_576)),
+            is_content_transform: true,
         },
         // -- Integrity family --
         PropertyDefinitionV1 {
@@ -998,6 +1090,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: None,
+            is_content_transform: true,
         },
         PropertyDefinitionV1 {
             name: PropertyKey::new("integrity.dedup"),
@@ -1016,6 +1109,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
                 error_message: "dedup requires checksum to be enabled",
             }],
             range: None,
+            is_content_transform: true,
         },
         // -- Space family --
         PropertyDefinitionV1 {
@@ -1029,6 +1123,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: Some((0, i64::MAX as u64)),
+            is_content_transform: false,
         },
         // -- Snapshot family --
         PropertyDefinitionV1 {
@@ -1042,6 +1137,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: None,
+            is_content_transform: false,
         },
     ]
 }
@@ -1616,6 +1712,7 @@ mod tests {
             feature_flag: None,
             cross_constraints,
             range: None,
+            is_content_transform: false,
         }
     }
 
@@ -1678,6 +1775,7 @@ mod tests {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: Some((512, 1_048_576)),
+            is_content_transform: false,
         };
         let set = PropertySet::new();
         let key = PropertyKey::new("layout.recordsize");
@@ -1699,6 +1797,7 @@ mod tests {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: Some((512, 1_048_576)),
+            is_content_transform: false,
         };
         let set = PropertySet::new();
         let key = PropertyKey::new("layout.recordsize");
@@ -1726,6 +1825,7 @@ mod tests {
             feature_flag: None,
             cross_constraints: Vec::new(),
             range: Some((512, 1_048_576)),
+            is_content_transform: false,
         };
         let set = PropertySet::new();
         let key = PropertyKey::new("layout.recordsize");
@@ -2171,5 +2271,266 @@ mod tests {
         assert!(restored
             .get(&PropertyKey::new("layout.recordsize"))
             .is_none());
+    }
+
+    // ── MountedWriteAuthority ──────────────────────────────────
+
+    #[test]
+    fn mounted_write_authority_discriminants() {
+        assert_eq!(MountedWriteAuthority::Authoritative as u8, 0x00);
+        assert_eq!(MountedWriteAuthority::NotAuthoritative as u8, 0x01);
+    }
+
+    #[test]
+    fn mounted_write_authority_labels_and_display() {
+        assert_eq!(
+            MountedWriteAuthority::Authoritative.label(),
+            "authoritative"
+        );
+        assert_eq!(
+            MountedWriteAuthority::NotAuthoritative.label(),
+            "not-authoritative"
+        );
+        assert_eq!(
+            format!("{}", MountedWriteAuthority::Authoritative),
+            "authoritative"
+        );
+        assert_eq!(
+            format!("{}", MountedWriteAuthority::NotAuthoritative),
+            "not-authoritative"
+        );
+    }
+
+    #[test]
+    fn entry_constructors_default_authoritative() {
+        let local = PropertyEntryV1::local(PropertyValue::Bool(true));
+        assert_eq!(
+            local.mounted_write_authority,
+            MountedWriteAuthority::Authoritative
+        );
+        let inherited = PropertyEntryV1::inherited(PropertyValue::U64(100), 5);
+        assert_eq!(
+            inherited.mounted_write_authority,
+            MountedWriteAuthority::Authoritative
+        );
+        let default = PropertyEntryV1::default_value(PropertyValue::Size(4096));
+        assert_eq!(
+            default.mounted_write_authority,
+            MountedWriteAuthority::Authoritative
+        );
+    }
+
+    #[test]
+    fn registry_transform_properties_are_marked() {
+        let registry = build_registry();
+
+        let comp = lookup_property(&registry, &PropertyKey::new("compression.algorithm")).unwrap();
+        assert!(comp.is_content_transform);
+
+        let rec = lookup_property(&registry, &PropertyKey::new("layout.recordsize")).unwrap();
+        assert!(rec.is_content_transform);
+
+        let csum = lookup_property(&registry, &PropertyKey::new("integrity.checksum")).unwrap();
+        assert!(csum.is_content_transform);
+
+        let dedup = lookup_property(&registry, &PropertyKey::new("integrity.dedup")).unwrap();
+        assert!(dedup.is_content_transform);
+    }
+
+    #[test]
+    fn registry_non_transform_properties_are_not_marked() {
+        let registry = build_registry();
+
+        let ro = lookup_property(&registry, &PropertyKey::new("access.readonly")).unwrap();
+        assert!(!ro.is_content_transform);
+
+        let atime = lookup_property(&registry, &PropertyKey::new("access.atime")).unwrap();
+        assert!(!atime.is_content_transform);
+
+        let quota = lookup_property(&registry, &PropertyKey::new("space.quota")).unwrap();
+        assert!(!quota.is_content_transform);
+
+        let snap = lookup_property(&registry, &PropertyKey::new("snapshot.retention")).unwrap();
+        assert!(!snap.is_content_transform);
+    }
+
+    #[test]
+    fn resolve_transform_local_not_authoritative() {
+        let mut local = PropertySet::new();
+        let key = PropertyKey::new("compression.algorithm");
+        local.set_local(key.clone(), PropertyValue::String("zstd".into()));
+
+        let def = PropertyDefinitionV1 {
+            name: key.clone(),
+            value_type: PropertyType::String,
+            default_value: PropertyValue::None,
+            inheritance: InheritanceMode::Parent,
+            change_policy: ChangePolicy::Always,
+            scope: PropertyScope::Dataset,
+            family: PropertyFamily::Compression,
+            feature_flag: None,
+            cross_constraints: Vec::new(),
+            range: None,
+            is_content_transform: true,
+        };
+
+        let parent = PropertySet::new();
+        let result = resolve_effective(&key, &local, &[&parent], &def);
+        assert_eq!(result.value, PropertyValue::String("zstd".into()));
+        assert!(matches!(result.source, PropertySource::Local));
+        assert_eq!(
+            result.mounted_write_authority,
+            MountedWriteAuthority::NotAuthoritative
+        );
+    }
+
+    #[test]
+    fn resolve_transform_inherited_not_authoritative() {
+        let local = PropertySet::new();
+        let key = PropertyKey::new("compression.algorithm");
+
+        let mut parent = PropertySet::new();
+        parent.set_local(key.clone(), PropertyValue::String("lz4".into()));
+
+        let def = PropertyDefinitionV1 {
+            name: key.clone(),
+            value_type: PropertyType::String,
+            default_value: PropertyValue::None,
+            inheritance: InheritanceMode::Parent,
+            change_policy: ChangePolicy::Always,
+            scope: PropertyScope::Dataset,
+            family: PropertyFamily::Compression,
+            feature_flag: None,
+            cross_constraints: Vec::new(),
+            range: None,
+            is_content_transform: true,
+        };
+
+        let result = resolve_effective(&key, &local, &[&parent], &def);
+        assert_eq!(result.value, PropertyValue::String("lz4".into()));
+        assert!(matches!(result.source, PropertySource::Inherited { .. }));
+        assert_eq!(
+            result.mounted_write_authority,
+            MountedWriteAuthority::NotAuthoritative
+        );
+    }
+
+    #[test]
+    fn resolve_transform_default_not_authoritative() {
+        let local = PropertySet::new();
+        let parent = PropertySet::new();
+        let key = PropertyKey::new("compression.algorithm");
+
+        let def = PropertyDefinitionV1 {
+            name: key.clone(),
+            value_type: PropertyType::String,
+            default_value: PropertyValue::String("off".into()),
+            inheritance: InheritanceMode::Parent,
+            change_policy: ChangePolicy::Always,
+            scope: PropertyScope::Dataset,
+            family: PropertyFamily::Compression,
+            feature_flag: None,
+            cross_constraints: Vec::new(),
+            range: None,
+            is_content_transform: true,
+        };
+
+        let result = resolve_effective(&key, &local, &[&parent], &def);
+        assert_eq!(result.value, PropertyValue::String("off".into()));
+        assert!(matches!(result.source, PropertySource::Default));
+        assert_eq!(
+            result.mounted_write_authority,
+            MountedWriteAuthority::NotAuthoritative
+        );
+    }
+
+    #[test]
+    fn resolve_transform_unset_not_authoritative() {
+        // compression.algorithm default is PropertyValue::None, so
+        // resolution falls through to default with None value.
+        let local = PropertySet::new();
+        let parent = PropertySet::new();
+        let key = PropertyKey::new("compression.algorithm");
+
+        let def = PropertyDefinitionV1 {
+            name: key.clone(),
+            value_type: PropertyType::String,
+            default_value: PropertyValue::None,
+            inheritance: InheritanceMode::Parent,
+            change_policy: ChangePolicy::Always,
+            scope: PropertyScope::Dataset,
+            family: PropertyFamily::Compression,
+            feature_flag: None,
+            cross_constraints: Vec::new(),
+            range: None,
+            is_content_transform: true,
+        };
+
+        let result = resolve_effective(&key, &local, &[&parent], &def);
+        assert!(result.value.is_none());
+        assert!(matches!(result.source, PropertySource::Default));
+        assert_eq!(
+            result.mounted_write_authority,
+            MountedWriteAuthority::NotAuthoritative
+        );
+    }
+
+    #[test]
+    fn resolve_non_transform_local_is_authoritative() {
+        let mut local = PropertySet::new();
+        let key = PropertyKey::new("access.readonly");
+        local.set_local(key.clone(), PropertyValue::Bool(true));
+
+        let def = PropertyDefinitionV1 {
+            name: key.clone(),
+            value_type: PropertyType::Bool,
+            default_value: PropertyValue::Bool(false),
+            inheritance: InheritanceMode::Parent,
+            change_policy: ChangePolicy::Always,
+            scope: PropertyScope::Dataset,
+            family: PropertyFamily::Access,
+            feature_flag: None,
+            cross_constraints: Vec::new(),
+            range: None,
+            is_content_transform: false,
+        };
+
+        let parent = PropertySet::new();
+        let result = resolve_effective(&key, &local, &[&parent], &def);
+        assert_eq!(result.value, PropertyValue::Bool(true));
+        assert_eq!(
+            result.mounted_write_authority,
+            MountedWriteAuthority::Authoritative
+        );
+    }
+
+    #[test]
+    fn resolve_non_transform_inherited_is_authoritative() {
+        let local = PropertySet::new();
+        let key = PropertyKey::new("access.readonly");
+
+        let mut parent = PropertySet::new();
+        parent.set_local(key.clone(), PropertyValue::Bool(true));
+
+        let def = PropertyDefinitionV1 {
+            name: key.clone(),
+            value_type: PropertyType::Bool,
+            default_value: PropertyValue::Bool(false),
+            inheritance: InheritanceMode::Parent,
+            change_policy: ChangePolicy::Always,
+            scope: PropertyScope::Dataset,
+            family: PropertyFamily::Access,
+            feature_flag: None,
+            cross_constraints: Vec::new(),
+            range: None,
+            is_content_transform: false,
+        };
+
+        let result = resolve_effective(&key, &local, &[&parent], &def);
+        assert_eq!(result.value, PropertyValue::Bool(true));
+        assert_eq!(
+            result.mounted_write_authority,
+            MountedWriteAuthority::Authoritative
+        );
     }
 }
