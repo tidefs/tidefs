@@ -786,17 +786,20 @@ mod corruption_detection {
     use std::fs;
 
     use tidefs_local_filesystem::LocalFileSystem;
-    use tidefs_local_object_store::{LocalObjectStore, StoreOptions};
+    use tidefs_local_object_store::StoreOptions;
 
     /// List all keys in the object store and overwrite each with garbage.
     /// Returns the number of corrupted keys.
     fn corrupt_all_keys(root: &std::path::Path) -> usize {
-        let mut store = LocalObjectStore::open_with_options(root, StoreOptions::test_fast())
-            .expect("open store for corruption");
+        let opts = StoreOptions::test_fast();
+        let mut pool = tidefs_local_filesystem::LocalFileSystem::default_development_pool(
+            root, &opts, None, None,
+        )
+        .expect("open pool for corruption");
+        let store = pool.raw_primary_store_mut();
         let keys = store.list_keys();
         let count = keys.len();
         for key in keys {
-            // Overwrite each object with garbage bytes
             let _ = store.put(key, b"corrupted-by-test-garbage-bytes");
         }
         count
