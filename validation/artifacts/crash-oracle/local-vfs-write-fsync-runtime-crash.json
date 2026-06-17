@@ -1,0 +1,120 @@
+{
+  "report_version": 1,
+  "generated_by": "crates/tidefs-local-filesystem/tests/crash_injection_tests.rs::local_vfs_write_fsync_runtime_crash_oracle_artifact",
+  "claim_ids": [
+    "local.vfs.write_fsync_crash.v1"
+  ],
+  "evidence_class": "runtime-crash-oracle",
+  "evidence_scope": "local VFS runtime write/fsync/read crash/recover artifact for OpFsyncBeforeFlush",
+  "scenario": "local-vfs-write-fsync-read-crash-recover",
+  "runtime_path": "local-vfs",
+  "crash_injection_point": "OpFsyncBeforeFlush",
+  "crash_mode": "PowerLoss",
+  "hook_hit_count": 1,
+  "child_exit_code": 99,
+  "completed_fsync": {
+    "path": "/oracle.txt",
+    "payload_label": "fsync-payload-v1",
+    "content_digest": "sha256:9d75419392aa7ad35de75d2058a69ae7818a74f5a7ce12fa174f0d73b139a198",
+    "fsync_completed": true,
+    "read_back_before_crash": true
+  },
+  "interrupted_fsync": {
+    "path": "/oracle.txt",
+    "payload_label": "fsync-payload-v2",
+    "content_digest": "sha256:a554ae7a22c96045f47211e671ae89fa4b9fef8fdab708b53ac8893a825bf480",
+    "fsync_attempted": true,
+    "fsync_completed": false,
+    "hook_hit": true,
+    "crash_triggered": true
+  },
+  "recovery": {
+    "reopen_succeeded": true,
+    "read_after_recovery_succeeded": true,
+    "path": "/oracle.txt",
+    "recovered_content_digest": "sha256:9d75419392aa7ad35de75d2058a69ae7818a74f5a7ce12fa174f0d73b139a198",
+    "classification": "last-completed-fsync-survived"
+  },
+  "dependencies": [
+    {
+      "issue": 392,
+      "subject": "fsync/syncfs infrastructure",
+      "status": "consumed as existing fsync_file and OpFsyncBeforeFlush hook surface"
+    },
+    {
+      "issue": 443,
+      "subject": "cache-coherency/writeback authority",
+      "status": "open dependency; this artifact does not close cache/writeback authority"
+    },
+    {
+      "issue": 445,
+      "subject": "intent-log replay idempotency",
+      "status": "open dependency; this artifact does not close replay idempotency"
+    }
+  ],
+  "non_claims": [
+    "This artifact is bounded runtime evidence for the local VFS OpFsyncBeforeFlush hook, not production crash safety.",
+    "This artifact is not model-only evidence and does not replace the model crash matrix.",
+    "This artifact does not provide queue-depth runtime evidence or change no-hidden-queue admission coverage.",
+    "The interrupted fsync exits before fsync completion; the artifact proves last completed fsync data survives this hook, not that the interrupted payload is durable."
+  ],
+  "validation_hint": "cargo test -p tidefs-local-filesystem --locked --test crash_injection_tests local_vfs_write_fsync_runtime_crash_oracle_artifact -- --nocapture",
+  "events": [
+    {
+      "sequence": 1,
+      "operation": "write",
+      "path": "/oracle.txt",
+      "result": "fsync-payload-v1 staged through LocalFileSystem::write_file",
+      "source": "parent setup"
+    },
+    {
+      "sequence": 2,
+      "operation": "fsync",
+      "path": "/oracle.txt",
+      "result": "LocalFileSystem::fsync_file completed",
+      "source": "parent setup"
+    },
+    {
+      "sequence": 3,
+      "operation": "read",
+      "path": "/oracle.txt",
+      "result": "fsync-payload-v1 read before crash child",
+      "source": "parent setup"
+    },
+    {
+      "sequence": 4,
+      "operation": "write",
+      "path": "/oracle.txt",
+      "result": "fsync-payload-v2 staged in crash child",
+      "source": "runtime_crash_oracle_child_workload"
+    },
+    {
+      "sequence": 5,
+      "operation": "fsync",
+      "path": "/oracle.txt",
+      "result": "LocalFileSystem::fsync_file interrupted at OpFsyncBeforeFlush",
+      "source": "runtime_crash_oracle_child_workload"
+    },
+    {
+      "sequence": 6,
+      "operation": "crash",
+      "path": null,
+      "result": "PowerLoss exit code 99",
+      "source": "crash_hooks::check_crash_hook"
+    },
+    {
+      "sequence": 7,
+      "operation": "recover",
+      "path": null,
+      "result": "LocalFileSystem::open_with_options reopened the root",
+      "source": "parent recovery"
+    },
+    {
+      "sequence": 8,
+      "operation": "read_recovered",
+      "path": "/oracle.txt",
+      "result": "fsync-payload-v1 recovered after crash",
+      "source": "parent recovery"
+    }
+  ]
+}

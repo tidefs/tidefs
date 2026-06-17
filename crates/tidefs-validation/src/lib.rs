@@ -25,6 +25,7 @@ pub mod kernel_validation_matrix;
 pub mod kmod_crash_consistency_e2e;
 pub mod kmod_mmap_fault;
 pub mod kmod_no_daemon_fullstack_validation;
+pub mod local_vfs_runtime_crash_artifact;
 pub mod metadata_durability;
 pub mod mount_harness;
 pub mod performance_gate;

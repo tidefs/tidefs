@@ -976,6 +976,83 @@ fn crash_during_fsync_preserves_committed_commit_group_data() {
     cleanup(&root);
 }
 
+#[test]
+fn runtime_crash_oracle_child_workload() {
+    let root_str = match std::env::var("TIDEFS_RUNTIME_CRASH_ORACLE_ROOT") {
+        Ok(root) => root,
+        Err(_) => return,
+    };
+
+    set_test_key();
+
+    use std::collections::BTreeMap;
+    let mut armed = BTreeMap::new();
+    armed.insert(CrashInjectionPoint::OpFsyncBeforeFlush, 1);
+    tidefs_local_filesystem::crash_hooks::arm_crash_hooks(
+        tidefs_local_filesystem::crash_hooks::CrashTestConfig {
+            armed_hooks: armed,
+            crash_mode: tidefs_local_filesystem::crash_hooks::CrashMode::PowerLoss,
+        },
+    );
+
+    let root = std::path::PathBuf::from(root_str);
+    let mut fs =
+        LocalFileSystem::open_with_options(&root, StoreOptions::test_fast()).expect("child open");
+    fs.write_file("/oracle.txt", 0, b"fsync-payload-v2")
+        .expect("child write oracle");
+    let content = fs.read_file("/oracle.txt").expect("child read oracle");
+    assert_eq!(content, b"fsync-payload-v2");
+    let _ = fs.fsync_file("/oracle.txt");
+
+    std::process::exit(0);
+}
+
+#[test]
+fn local_vfs_write_fsync_runtime_crash_oracle_artifact() {
+    set_test_key();
+
+    let root = temp_root("ch-local-vfs-fsync-oracle");
+
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
+        fs.create_file("/oracle.txt", 0o644).expect("create oracle");
+        fs.write_file("/oracle.txt", 0, b"fsync-payload-v1")
+            .expect("write oracle v1");
+        fs.fsync_file("/oracle.txt").expect("fsync oracle v1");
+        let content = fs.read_file("/oracle.txt").expect("read oracle v1");
+        assert_eq!(content, b"fsync-payload-v1");
+        drop(fs);
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current exe"))
+        .env("TIDEFS_ROOT_AUTHENTICATION_KEY_HEX", "A".repeat(64))
+        .env(
+            "TIDEFS_RUNTIME_CRASH_ORACLE_ROOT",
+            root.to_str().expect("root utf8"),
+        )
+        .arg("--exact")
+        .arg("runtime_crash_oracle_child_workload")
+        .output()
+        .expect("spawn runtime crash oracle child");
+    assert_eq!(
+        output.status.code(),
+        Some(99),
+        "child must exit with PowerLoss code after OpFsyncBeforeFlush"
+    );
+
+    {
+        let fs = LocalFileSystem::open_with_options(&root, opts()).expect("reopen fs");
+        let content = fs.read_file("/oracle.txt").expect("read recovered oracle");
+        assert_eq!(
+            content, b"fsync-payload-v1",
+            "last completed fsync payload must survive interrupted fsync crash"
+        );
+        drop(fs);
+    }
+
+    cleanup(&root);
+}
+
 // ---------------------------------------------------------------------------
 // Test: All 18 injection points iterate without panic when disarmed
 // ---------------------------------------------------------------------------
