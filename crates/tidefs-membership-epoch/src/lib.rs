@@ -58,6 +58,7 @@ pub mod leave_coordinator;
 pub mod member_lifecycle;
 pub mod membership_quorum_tracker;
 pub mod persistence;
+pub mod pool_scan_gate;
 pub mod proposal;
 pub mod proposal_idempotency;
 pub mod quorum;
