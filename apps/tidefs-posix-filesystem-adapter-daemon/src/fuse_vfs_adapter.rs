@@ -1668,6 +1668,14 @@ fn lookup_cache_ttl(config: LookupConfig) -> Duration {
     }
 }
 
+fn lookup_entry_ttl(entry: &LookupEntryReply) -> Duration {
+    Duration::new(entry.entry_valid, entry.entry_valid_nsec)
+}
+
+fn lookup_attr_ttl(entry: &LookupEntryReply) -> Duration {
+    Duration::new(entry.attr_valid, entry.attr_valid_nsec)
+}
+
 fn lookup_config_from_ttls(entry_ttl: Duration, attr_ttl: Duration) -> LookupConfig {
     LookupConfig {
         entry_ttl_secs: entry_ttl.as_secs(),
@@ -1811,19 +1819,27 @@ fn emit_lookup_reply(reply: ReplyEntry, plan: LookupReplyPlan) {
     let LookupReplyPlan {
         outcome,
         attr,
-        wire_entry: _wire_entry,
+        wire_entry,
         generation,
         ttl,
         error,
     } = plan;
     match outcome {
-        LookupOutcome::Found { .. } => match attr {
-            Some(attr) => reply.entry(&ttl, &attr, generation),
-            None => reply.reply_errno(Errno::EIO),
+        LookupOutcome::Found { .. } => match (attr, wire_entry) {
+            (Some(attr), Some(entry)) => reply.entry_with_ttls(
+                &lookup_entry_ttl(&entry),
+                &lookup_attr_ttl(&entry),
+                &attr,
+                generation,
+            ),
+            (Some(attr), None) => reply.entry(&ttl, &attr, generation),
+            _ => reply.reply_errno(Errno::EIO),
         },
-        LookupOutcome::NotFound | LookupOutcome::Error { .. } => {
-            reply.reply_errno(error.unwrap_or(Errno::EIO));
-        }
+        LookupOutcome::NotFound => match wire_entry {
+            Some(entry) if entry.negative => reply.negative(&lookup_entry_ttl(&entry)),
+            _ => reply.reply_errno(error.unwrap_or(Errno::ENOENT)),
+        },
+        LookupOutcome::Error { .. } => reply.reply_errno(error.unwrap_or(Errno::EIO)),
     }
 }
 
@@ -1952,6 +1968,8 @@ struct FuseReadDispatchPlan {
 pub struct SymlinkEntryReplyPlan {
     attr: Option<FileAttr>,
     generation: u64,
+    entry_ttl: Duration,
+    attr_ttl: Duration,
     ttl: Duration,
     error: Option<Errno>,
 }
@@ -1970,12 +1988,16 @@ fn plan_symlink_entry_reply(
         Ok(attr) => SymlinkEntryReplyPlan {
             attr: Some(file_attr_from_inode_attr(&attr)),
             generation: attr.generation.get(),
+            entry_ttl: policy.positive_entry_ttl,
+            attr_ttl: policy.positive_attr_ttl,
             ttl: policy.positive_reply_ttl(),
             error: None,
         },
         Err(errno) => SymlinkEntryReplyPlan {
             attr: None,
             generation: 0,
+            entry_ttl: Duration::ZERO,
+            attr_ttl: Duration::ZERO,
             ttl: Duration::ZERO,
             error: Some(errno),
         },
@@ -1984,7 +2006,9 @@ fn plan_symlink_entry_reply(
 
 fn emit_symlink_entry_reply(reply: ReplyEntry, plan: SymlinkEntryReplyPlan) {
     match (plan.attr, plan.error) {
-        (Some(attr), None) => reply.entry(&plan.ttl, &attr, plan.generation),
+        (Some(attr), None) => {
+            reply.entry_with_ttls(&plan.entry_ttl, &plan.attr_ttl, &attr, plan.generation)
+        }
         (_, Some(errno)) => reply.reply_errno(errno),
         (None, None) => reply.reply_errno(Errno::EIO),
     }
@@ -8800,6 +8824,7 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .invalidate_child(parent, name);
+        self.try_inval_entry(parent, name);
     }
 
     fn record_dentry_rename(&self, parent: u64, name: &[u8], newparent: u64, newname: &[u8]) {
@@ -8823,6 +8848,8 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .invalidate_child(newparent, newname);
+        self.try_inval_entry(parent, name);
+        self.try_inval_entry(newparent, newname);
     }
     /// Collect xattr metadata from the engine for statx reply enrichment.
     fn collect_xattr_metadata(
@@ -9259,8 +9286,9 @@ impl Filesystem for FuseVfsAdapter {
         match self.dispatch_mknod(&ctx, parent, name.as_bytes(), mode, rdev) {
             Ok(attr) => {
                 let fa = file_attr_from_inode_attr(&attr);
-                reply.entry(
-                    &self.dentry_policy.positive_reply_ttl(),
+                reply.entry_with_ttls(
+                    &self.dentry_policy.positive_entry_ttl,
+                    &self.dentry_policy.positive_attr_ttl,
                     &fa,
                     attr.generation.get(),
                 );
@@ -9289,8 +9317,9 @@ impl Filesystem for FuseVfsAdapter {
         match self.dispatch_mkdir(&ctx, parent, name.as_bytes(), mode) {
             Ok(attr) => {
                 let fa = file_attr_from_inode_attr(&attr);
-                reply.entry(
-                    &self.dentry_policy.positive_reply_ttl(),
+                reply.entry_with_ttls(
+                    &self.dentry_policy.positive_entry_ttl,
+                    &self.dentry_policy.positive_attr_ttl,
                     &fa,
                     attr.generation.get(),
                 );
@@ -9391,8 +9420,9 @@ impl Filesystem for FuseVfsAdapter {
         match self.dispatch_link(&ctx, ino, newparent, newname.as_bytes()) {
             Ok(attr) => {
                 let fa = file_attr_from_inode_attr(&attr);
-                reply.entry(
-                    &self.dentry_policy.positive_reply_ttl(),
+                reply.entry_with_ttls(
+                    &self.dentry_policy.positive_entry_ttl,
+                    &self.dentry_policy.positive_attr_ttl,
                     &fa,
                     attr.generation.get(),
                 );
@@ -9764,7 +9794,8 @@ impl Filesystem for FuseVfsAdapter {
         };
         match self.dispatch_readdirplus(&ctx, ino, fh, requested_offset) {
             Ok((pairs, _more)) => {
-                let ttl = self.dentry_policy.positive_reply_ttl();
+                let entry_ttl = self.dentry_policy.positive_entry_ttl;
+                let attr_ttl = self.dentry_policy.positive_attr_ttl;
                 let mut last_emitted_cookie = None;
                 for (i, (entry, attr)) in pairs.iter().enumerate() {
                     let cookie = match fuse_dir_offset(entry.cookie, requested_offset, i) {
@@ -9775,11 +9806,12 @@ impl Filesystem for FuseVfsAdapter {
                         }
                     };
                     let fa = file_attr_from_inode_attr(attr);
-                    if reply.add(
+                    if reply.add_with_ttls(
                         entry.inode_id.get(),
                         cookie,
                         OsStr::from_bytes(&entry.name),
-                        &ttl,
+                        &entry_ttl,
+                        &attr_ttl,
                         &fa,
                         entry.generation.get(),
                     ) {
@@ -9842,8 +9874,9 @@ impl Filesystem for FuseVfsAdapter {
             Ok(dispatch) => {
                 crate::observability::HIST_CREATE.record(_start.elapsed());
                 let fa = file_attr_from_inode_attr(&dispatch.attr);
-                reply.created(
-                    &self.dentry_policy.positive_reply_ttl(),
+                reply.created_with_ttls(
+                    &self.dentry_policy.positive_entry_ttl,
+                    &self.dentry_policy.positive_attr_ttl,
                     &fa,
                     dispatch.attr.generation.get(),
                     dispatch.adapter_fh,
@@ -19978,6 +20011,8 @@ mod tests {
 
         assert!(plan.is_success());
         assert_eq!(plan.generation, 12);
+        assert_eq!(plan.entry_ttl, Duration::from_secs(1));
+        assert_eq!(plan.attr_ttl, Duration::from_secs(1));
         assert_eq!(plan.ttl, Duration::from_secs(1));
         assert_eq!(plan.error, None);
         let attr = plan.attr.expect("symlink attr");
@@ -19986,6 +20021,21 @@ mod tests {
         assert_eq!(attr.perm, 0o777);
         assert_eq!(attr.nlink, 1);
         assert_eq!(attr.size, 9);
+    }
+
+    #[test]
+    fn symlink_entry_plan_preserves_entry_ttl_when_attr_ttl_zero() {
+        let policy = DentryPolicy {
+            positive_entry_ttl: Duration::from_secs(5),
+            positive_attr_ttl: Duration::ZERO,
+            negative_entry_ttl: Duration::from_millis(250),
+        };
+        let plan = plan_symlink_entry_reply(Ok(test_symlink_attr(55, 12, 9)), policy);
+
+        assert!(plan.is_success());
+        assert_eq!(plan.entry_ttl, Duration::from_secs(5));
+        assert_eq!(plan.attr_ttl, Duration::ZERO);
+        assert_eq!(plan.ttl, Duration::ZERO);
     }
 
     #[test]
@@ -20163,6 +20213,24 @@ mod tests {
         assert_eq!(wire_entry.entry_valid_nsec, 0);
         assert_eq!(wire_entry.attr_valid, 2);
         assert_eq!(wire_entry.attr_valid_nsec, 250_000_000);
+    }
+
+    #[test]
+    fn lookup_plan_preserves_entry_ttl_when_attr_ttl_zero() {
+        let ctx = classify_lookup_request(106, 1, 0, 0, 0);
+        let policy = DentryPolicy {
+            positive_entry_ttl: Duration::from_secs(5),
+            positive_attr_ttl: Duration::ZERO,
+            negative_entry_ttl: Duration::from_millis(250),
+        };
+        let (_ctx, plan) = plan_lookup_reply(ctx, 1, b"file.txt", Ok(test_attr(42, 7)), policy);
+
+        assert_eq!(plan.ttl, Duration::ZERO);
+        let wire_entry = plan.wire_entry.expect("wire entry");
+        assert_eq!(wire_entry.entry_valid, 5);
+        assert_eq!(wire_entry.entry_valid_nsec, 0);
+        assert_eq!(wire_entry.attr_valid, 0);
+        assert_eq!(wire_entry.attr_valid_nsec, 0);
     }
 
     #[test]

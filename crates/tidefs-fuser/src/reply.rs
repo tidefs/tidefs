@@ -237,12 +237,61 @@ impl Reply for ReplyEntry {
 impl ReplyEntry {
     /// Reply to a request with the given entry
     pub fn entry(mut self, ttl: &Duration, attr: &FileAttr, generation: u64) {
+        self.reply_entry_with_ttls(ttl, ttl, attr, generation);
+    }
+
+    /// Reply to a request with separate dentry and attribute cache TTLs.
+    pub fn entry_with_ttls(
+        mut self,
+        entry_ttl: &Duration,
+        attr_ttl: &Duration,
+        attr: &FileAttr,
+        generation: u64,
+    ) {
+        self.reply_entry_with_ttls(entry_ttl, attr_ttl, attr, generation);
+    }
+
+    fn reply_entry_with_ttls(
+        &mut self,
+        entry_ttl: &Duration,
+        attr_ttl: &Duration,
+        attr: &FileAttr,
+        generation: u64,
+    ) {
         self.reply.reply_raw(&ll::Response::new_entry(
             ll::INodeNo(attr.ino),
             ll::Generation(generation),
             &attr.into(),
-            *ttl,
-            *ttl,
+            *attr_ttl,
+            *entry_ttl,
+        ));
+    }
+
+    /// Reply to a lookup miss with a cacheable negative dentry.
+    pub fn negative(mut self, entry_ttl: &Duration) {
+        let attr = FileAttr {
+            ino: 0,
+            size: 0,
+            blocks: 0,
+            atime: std::time::UNIX_EPOCH,
+            mtime: std::time::UNIX_EPOCH,
+            ctime: std::time::UNIX_EPOCH,
+            crtime: std::time::UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: 0,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 0,
+            flags: 0,
+        };
+        self.reply.reply_raw(&ll::Response::new_entry(
+            ll::INodeNo(0),
+            ll::Generation(0),
+            &attr.into(),
+            Duration::ZERO,
+            *entry_ttl,
         ));
     }
 
@@ -474,6 +523,38 @@ impl ReplyCreate {
             ll::Generation(generation),
             ll::FileHandle(fh),
             flags,
+        ));
+    }
+
+    /// Reply to a create request with separate dentry and attribute TTLs.
+    pub fn created_with_ttls(
+        mut self,
+        entry_ttl: &Duration,
+        attr_ttl: &Duration,
+        attr: &FileAttr,
+        generation: u64,
+        fh: u64,
+        flags: u32,
+    ) {
+        self.reply_created_with_ttls(entry_ttl, attr_ttl, attr, generation, fh, flags);
+    }
+
+    fn reply_created_with_ttls(
+        &mut self,
+        entry_ttl: &Duration,
+        attr_ttl: &Duration,
+        attr: &FileAttr,
+        generation: u64,
+        fh: u64,
+        flags: u32,
+    ) {
+        self.reply.reply_raw(&ll::Response::new_create_with_ttls(
+            entry_ttl,
+            attr_ttl,
+            &attr.into(),
+            ll::Generation(generation),
+            ll::FileHandle(fh),
+            flags,
         ))
     }
 
@@ -676,15 +757,29 @@ impl ReplyDirectoryPlus {
         attr: &FileAttr,
         generation: u64,
     ) -> bool {
+        self.add_with_ttls(ino, offset, name, ttl, ttl, attr, generation)
+    }
+
+    /// Add a directory-plus entry with separate dentry and attribute TTLs.
+    pub fn add_with_ttls<T: AsRef<OsStr>>(
+        &mut self,
+        ino: u64,
+        offset: i64,
+        name: T,
+        entry_ttl: &Duration,
+        attr_ttl: &Duration,
+        attr: &FileAttr,
+        generation: u64,
+    ) -> bool {
         let name = name.as_ref();
         self.buf.push(&DirEntryPlus::new(
             INodeNo(ino),
             Generation(generation),
             DirEntOffset(offset),
             name,
-            *ttl,
+            *entry_ttl,
             attr.into(),
-            *ttl,
+            *attr_ttl,
         ))
     }
 
@@ -1521,6 +1616,80 @@ mod test {
         let mut bytes = [0u8; 4];
         bytes.copy_from_slice(&buf[offset..offset + 4]);
         u32::from_le_bytes(bytes)
+    }
+
+    fn assert_entry_ttls(payload: &[u8], entry_ttl: Duration, attr_ttl: Duration) {
+        assert_eq!(read_u64_le(payload, 16), entry_ttl.as_secs());
+        assert_eq!(read_u64_le(payload, 24), attr_ttl.as_secs());
+        assert_eq!(read_u32_le(payload, 32), entry_ttl.subsec_nanos());
+        assert_eq!(read_u32_le(payload, 36), attr_ttl.subsec_nanos());
+    }
+
+    #[test]
+    fn reply_entry_with_ttls_keeps_entry_cache_when_attrs_uncached() {
+        let (sender, captured) = CapturingSender::new();
+        let reply: ReplyEntry = Reply::new(0xdeadbeef, sender);
+        let entry_ttl = Duration::new(5, 0);
+        let attr_ttl = Duration::ZERO;
+        let attr = make_test_attr(0x42);
+
+        reply.entry_with_ttls(&entry_ttl, &attr_ttl, &attr, 0x01);
+
+        let bytes = captured.lock().unwrap();
+        let payload = &bytes[16..];
+        assert_eq!(read_u64_le(payload, 0), 0x42);
+        assert_eq!(read_u64_le(payload, 8), 0x01);
+        assert_entry_ttls(payload, entry_ttl, attr_ttl);
+    }
+
+    #[test]
+    fn reply_entry_negative_uses_nodeid_zero_and_entry_ttl() {
+        let (sender, captured) = CapturingSender::new();
+        let reply: ReplyEntry = Reply::new(0xdeadbeef, sender);
+        let entry_ttl = Duration::new(0, 250_000_000);
+
+        reply.negative(&entry_ttl);
+
+        let bytes = captured.lock().unwrap();
+        let payload = &bytes[16..];
+        assert_eq!(read_u64_le(payload, 0), 0);
+        assert_eq!(read_u64_le(payload, 8), 0);
+        assert_entry_ttls(payload, entry_ttl, Duration::ZERO);
+    }
+
+    #[test]
+    fn reply_create_with_ttls_keeps_entry_cache_when_attrs_uncached() {
+        let (sender, captured) = CapturingSender::new();
+        let reply: ReplyCreate = Reply::new(0xdeadbeef, sender);
+        let entry_ttl = Duration::new(5, 0);
+        let attr_ttl = Duration::ZERO;
+        let attr = make_test_attr(0x55);
+
+        reply.created_with_ttls(&entry_ttl, &attr_ttl, &attr, 0x02, 0xaa, 0);
+
+        let bytes = captured.lock().unwrap();
+        let payload = &bytes[16..];
+        assert_eq!(read_u64_le(payload, 0), 0x55);
+        assert_eq!(read_u64_le(payload, 8), 0x02);
+        assert_entry_ttls(payload, entry_ttl, attr_ttl);
+    }
+
+    #[test]
+    fn reply_directory_plus_add_with_ttls_keeps_entry_cache_when_attrs_uncached() {
+        let (sender, captured) = CapturingSender::new();
+        let mut reply = ReplyDirectoryPlus::new(0xdeadbeef, sender, 4096);
+        let entry_ttl = Duration::new(5, 0);
+        let attr_ttl = Duration::ZERO;
+        let attr = make_test_attr(0x66);
+
+        assert!(!reply.add_with_ttls(0x66, 1, "cached", &entry_ttl, &attr_ttl, &attr, 0x03));
+        reply.ok();
+
+        let bytes = captured.lock().unwrap();
+        let payload = &bytes[16..];
+        assert_eq!(read_u64_le(payload, 0), 0x66);
+        assert_eq!(read_u64_le(payload, 8), 0x03);
+        assert_entry_ttls(payload, entry_ttl, attr_ttl);
     }
 
     #[test]
