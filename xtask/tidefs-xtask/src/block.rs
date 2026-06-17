@@ -1820,6 +1820,12 @@ pub fn check_block_volume_ublk_acceptance_harness_current_workspace() -> Result<
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/acceptance_harness.rs",
         &[
             "BLOCK_VOLUME_UBLK_ACCEPTANCE_HARNESS_GATE_PC_012",
+            "UblkAcceptanceStatus",
+            "acceptance.status={}",
+            "acceptance.is_evidence={}",
+            "durability.block_reason={}",
+            "classify_acceptance",
+            "is_acceptance_evidence",
             "PC-012 ublk acceptance harness passes fio verify and durability checks",
             "UblkAcceptanceFioPass",
             "fio_verify_passed",
@@ -1847,7 +1853,7 @@ pub fn check_block_volume_ublk_acceptance_harness_current_workspace() -> Result<
 
     if missing.is_empty() {
         println!(
-            "PC-012 block-volume ublk acceptance harness ok: command wiring, fio verify fields, durability verify fields, and report markers are implementation-tracked non-release"
+            "PC-012 block-volume ublk acceptance harness ok: command wiring, fio verify fields, durability verify fields, acceptance status classification, and report markers are implementation-tracked non-release"
         );
         Ok(())
     } else {
