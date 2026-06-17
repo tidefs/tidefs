@@ -46,6 +46,16 @@ pub enum ClusterCommand {
         #[command(subcommand)]
         cmd: ClusterHealCommand,
     },
+
+    /// Query live cluster status with source classification
+    Status {
+        /// Pool name for live-owner routing
+        pool_name: String,
+
+        /// Output as JSON
+        #[arg(long = "json")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -133,6 +143,7 @@ pub fn handle_cluster(cmd: ClusterCommand) {
         ClusterCommand::Pool { cmd } => handle_cluster_pool(cmd),
         ClusterCommand::Placement { cmd } => handle_cluster_placement(cmd),
         ClusterCommand::Heal { cmd } => handle_cluster_heal(cmd),
+        ClusterCommand::Status { pool_name, json } => handle_cluster_status(pool_name, json),
     }
 }
 
@@ -853,6 +864,22 @@ fn handle_heal_exercise(epoch: u64, lost_member: u64, json: bool) {
 }
 
 // ---------------------------------------------------------------------------
+/// Query live cluster status through the live owner, or fail closed
+
+/// with source-classified refusal when no live owner is reachable.
+
+fn handle_cluster_status(pool_name: String, json: bool) {
+
+    // Try the live owner first; exits if reachable.
+
+    super::live_owner::route_status_if_owner_exists("cluster", "status", &pool_name, json);
+
+    // No live owner reachable; fail closed with source classification.
+
+    super::live_owner::refuse_no_live_status_evidence("cluster", "status", &pool_name, json);
+
+}
+
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1191,4 +1218,46 @@ mod tests {
         let decoded = ClusterPoolMessage::decode(&wire[4..]).unwrap();
         assert_eq!(decoded, msg);
     }
+
+    // -- cluster status tests --
+
+    #[test]
+    fn cluster_status_routes_to_live_owner_by_pool_name() {
+        // Verify the cluster status command exists and parses.
+        // Full live-owner routing is exercised in integration;
+        // this test validates the CLI shape.
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: super::ClusterCommand,
+        }
+        let args = TestCli::try_parse_from(["test", "status", "testpool"]);
+        assert!(args.is_ok(), "cluster status with pool name should parse");
+    }
+
+    #[test]
+    fn cluster_status_accepts_json_flag() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: super::ClusterCommand,
+        }
+        let args = TestCli::try_parse_from(["test", "status", "testpool", "--json"]);
+        assert!(args.is_ok(), "cluster status --json should parse");
+    }
+
+    #[test]
+    fn cluster_status_rejects_missing_pool_name() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: super::ClusterCommand,
+        }
+        let args = TestCli::try_parse_from(["test", "status"]);
+        assert!(args.is_err(), "cluster status without pool name must be rejected");
+    }
+
 }

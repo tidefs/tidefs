@@ -88,6 +88,53 @@ impl fmt::Display for RoutingSemantics {
     }
 }
 
+
+/// Authority source for a reported status fact.
+///
+/// Every status fact emitted by `tidefsctl cluster status` or
+/// `tidefsctl device status` must carry one of these classifications
+/// so operators can distinguish live evidence from cached or
+/// unavailable data.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StatusSource {
+    /// Fact obtained directly from a reachable live owner (kernel,
+    /// FUSE daemon, or ublk runtime).
+    LiveOwner,
+    /// Fact read from a kernel UAPI control surface.
+    KernelUapi,
+    /// Fact obtained from a running userspace daemon endpoint.
+    UserspaceDaemon,
+    /// Fact read from cached local metadata that is not a live
+    /// runtime interface; non-authoritative for current cluster or
+    /// device state.
+    CachedLocalMetadata,
+    /// Fact derived from command-line arguments; not cluster or
+    /// device authority.
+    CommandLineParse,
+    /// Fact sourced from a static configuration file or embedded
+    /// default; not live state evidence.
+    StaticConfiguration,
+    /// Fact is an unsupported or offline placeholder; no live
+    /// evidence was obtained and the reported data is not
+    /// authoritative.
+    UnsupportedOrOffline,
+}
+
+impl StatusSource {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::LiveOwner => "source:live-owner",
+            Self::KernelUapi => "source:kernel-uapi",
+            Self::UserspaceDaemon => "source:userspace-daemon",
+            Self::CachedLocalMetadata => "source:cached-local-metadata",
+            Self::CommandLineParse => "source:command-line-parse",
+            Self::StaticConfiguration => "source:static-configuration",
+            Self::UnsupportedOrOffline => "source:unsupported-or-offline",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CommandSurface {
     pub(crate) path: &'static str,
@@ -258,6 +305,12 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary: "route device evacuation/removal through live placement and refcount authority",
     },
     CommandSurface {
+        path: "device status",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwner,
+        summary: "query live device status through the live owner; fail closed when no live owner is reachable",
+    },
+    CommandSurface {
         path: "defrag",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::NoLivePoolState,
@@ -406,6 +459,12 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         class: CommandClass::DevelopmentDiagnostic,
         routing: RoutingSemantics::DevelopmentExercise,
         summary: "development diagnostic exercise for placement-heal code",
+    },
+    CommandSurface {
+        path: "cluster status",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwner,
+        summary: "query live cluster status through the live owner; fail closed when no live owner is reachable",
     },
     CommandSurface {
         path: "pool list",
@@ -660,4 +719,50 @@ mod tests {
         assert!(!help.contains("pool list [removed]"));
         assert!(!help.contains("device rebuild [removed]"));
     }
+
+    // -- StatusSource tests --
+
+    #[test]
+    fn status_source_labels_are_distinct_and_stable() {
+        use super::StatusSource;
+        let sources = [
+            (StatusSource::LiveOwner, "source:live-owner"),
+            (StatusSource::KernelUapi, "source:kernel-uapi"),
+            (StatusSource::UserspaceDaemon, "source:userspace-daemon"),
+            (StatusSource::CachedLocalMetadata, "source:cached-local-metadata"),
+            (StatusSource::CommandLineParse, "source:command-line-parse"),
+            (StatusSource::StaticConfiguration, "source:static-configuration"),
+            (StatusSource::UnsupportedOrOffline, "source:unsupported-or-offline"),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (source, label) in &sources {
+            assert_eq!(source.label(), *label, "StatusSource label mismatch");
+            assert!(seen.insert(*label), "duplicate StatusSource label: {}", label);
+        }
+        assert_eq!(seen.len(), sources.len(), "all StatusSource labels must be covered");
+    }
+
+    #[test]
+    fn cluster_and_device_status_are_classified_as_public_operator_live_owner() {
+        for path in ["cluster status", "device status"] {
+            let surface = super::find_surface(path)
+                .unwrap_or_else(|| panic!("classified command surface for {path}"));
+            assert_eq!(surface.class, super::CommandClass::PublicOperator,
+                "{path} must be public-operator");
+            assert_eq!(surface.routing, super::RoutingSemantics::LiveOwner,
+                "{path} must route through live owner");
+            assert!(surface.summary.contains("fail closed"),
+                "{path} summary must state fail-closed behavior");
+        }
+    }
+
+    #[test]
+    fn status_commands_appear_in_root_help() {
+        let help = super::root_long_about();
+        for path in ["cluster status", "device status"] {
+            assert!(help.contains(path),
+                "root help must include classified command {path}");
+        }
+    }
+
 }
