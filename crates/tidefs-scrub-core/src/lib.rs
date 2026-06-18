@@ -677,6 +677,10 @@ impl ScrubWorker {
             .iter()
             .filter(|o| matches!(o, ScrubOutcome::Mismatch { .. }))
             .count();
+        let locator_mismatches = outcomes
+            .iter()
+            .filter(|o| matches!(o, ScrubOutcome::LocatorMismatch { .. }))
+            .count();
         let io_errors = outcomes
             .iter()
             .filter(|o| matches!(o, ScrubOutcome::IoError { .. }))
@@ -686,6 +690,7 @@ impl ScrubWorker {
             total,
             clean,
             mismatches,
+            locator_mismatches,
             io_errors,
             outcomes,
         }
@@ -705,6 +710,8 @@ pub struct ScrubSummary {
     pub clean: usize,
     /// Objects with checksum mismatches.
     pub mismatches: usize,
+    /// Objects with locator token mismatches (data intact, locator stale).
+    pub locator_mismatches: usize,
     /// Objects that could not be read due to I/O errors.
     pub io_errors: usize,
     /// Per-object outcomes in enumeration order.
@@ -715,7 +722,7 @@ impl ScrubSummary {
     /// Return true when no mismatches or I/O errors were found.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.mismatches == 0 && self.io_errors == 0
+        self.mismatches == 0 && self.locator_mismatches == 0 && self.io_errors == 0
     }
 
     /// Produce a human-readable text summary.
@@ -740,6 +747,11 @@ impl ScrubSummary {
             "  mismatches: {}
 ",
             self.mismatches
+        ));
+        out.push_str(&format!(
+            "  locator mismatches: {}
+",
+            self.locator_mismatches
         ));
         out.push_str(&format!(
             "  io errors: {}
@@ -3944,6 +3956,7 @@ mod tests {
             total: 10,
             clean: 8,
             mismatches: 1,
+            locator_mismatches: 0,
             io_errors: 1,
             outcomes: vec![
                 ScrubOutcome::Clean {
