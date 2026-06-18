@@ -97,6 +97,7 @@ pub(crate) fn load_reclaim_queue_entries(store: &LocalObjectStore) -> BPlusTreeR
 }
 
 /// Persist a [`BPlusTreeReclaimQueue`] to the object store.
+#[cfg(test)]
 pub(crate) fn store_reclaim_queue_entries(
     queue: &BPlusTreeReclaimQueue,
     store: &mut LocalObjectStore,
