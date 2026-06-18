@@ -1300,7 +1300,9 @@ mod concurrency_bound_tests {
 mod durable_dispatch_tests {
     use super::*;
     use tidefs_background_scheduler::BackgroundScheduler;
+    use tidefs_cleanup_job_core::CleanupJob;
     use tidefs_incremental_job_core::{DispatchStore, DispatchStoreError, InMemoryDispatchStore};
+    use tidefs_types_deferred_cleanup_core::{BtreeRootPointer, CleanupWorkItemV1, WorkItemKind};
     use tidefs_types_incremental_job_core::{
         DispatchRecord, DispatchRecordId, DispatchState, JobId, JobKind, SchedulerEpoch,
     };
@@ -1338,7 +1340,10 @@ mod durable_dispatch_tests {
 
         let id1 = s
             .register_dispatched(
-                Box::new(IncrementalJobAdapter::new("a", MockJob::new(1, JobKind::Scrub, 10))),
+                Box::new(IncrementalJobAdapter::new(
+                    "a",
+                    MockJob::new(1, JobKind::Scrub, 10),
+                )),
                 JobId(1),
                 JobKind::Scrub,
             )
@@ -1359,6 +1364,19 @@ mod durable_dispatch_tests {
         assert_eq!(s.load_resumable_records().unwrap().len(), 2);
     }
 
+    #[test]
+    fn register_incremental_job_uses_job_identity() {
+        let mut s = scheduler_with_store();
+        let id = s
+            .register_incremental_job("scrub", MockJob::new(11, JobKind::Scrub, 10))
+            .unwrap();
+
+        let record = s.load_dispatch_record(id).unwrap().unwrap();
+        assert_eq!(record.job_id, JobId(11));
+        assert_eq!(record.job_kind, JobKind::Scrub);
+        assert_eq!(record.state, DispatchState::InProgress);
+    }
+
     // ── Dispatch → complete → restart (no re-dispatch) ───────────
 
     #[test]
@@ -1367,7 +1385,10 @@ mod durable_dispatch_tests {
 
         let dispatch_id = s
             .register_dispatched(
-                Box::new(IncrementalJobAdapter::new("task", MockJob::new(1, JobKind::Scrub, 10))),
+                Box::new(IncrementalJobAdapter::new(
+                    "task",
+                    MockJob::new(1, JobKind::Scrub, 10),
+                )),
                 JobId(1),
                 JobKind::Scrub,
             )
@@ -1387,24 +1408,21 @@ mod durable_dispatch_tests {
     // ── Double-dispatch rejection ─────────────────────────────────
 
     #[test]
-    fn double_dispatch_same_id_rejected() {
-        let store = Box::new(InMemoryDispatchStore::new());
-        let mut s = BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, store);
+    fn double_dispatch_same_identity_same_epoch_rejected() {
+        let mut s = scheduler_with_store();
 
-        // Register first dispatch
-        s.register_dispatched(
-            Box::new(IncrementalJobAdapter::new("only", MockJob::new(1, JobKind::Scrub, 10))),
-            JobId(1),
-            JobKind::Scrub,
-        )
-        .unwrap();
+        let first_id = s
+            .register_incremental_job("only", MockJob::new(1, JobKind::Scrub, 10))
+            .unwrap();
 
-        // Try to dispatch with the same job_id + job_kind within the same epoch
-        // The store should reject the duplicate DispatchRecordId
-        // Since register_dispatched auto-increments the id, we test via store directly
-        let existing_id = DispatchRecordId(0); // first dispatch got id 0
-        let dup = s.is_duplicate_dispatch(existing_id).unwrap();
-        assert!(dup, "dispatch id 0 should already exist");
+        let err = s
+            .register_incremental_job("dupe", MockJob::new(1, JobKind::Scrub, 10))
+            .unwrap_err();
+        assert!(matches!(err, DispatchStoreError::DuplicateDispatch(id) if id == first_id));
+        assert!(s.is_duplicate_dispatch(first_id).unwrap());
+        assert!(s
+            .is_duplicate_job_dispatch(JobId(1), JobKind::Scrub)
+            .unwrap());
     }
 
     #[test]
@@ -1419,6 +1437,31 @@ mod durable_dispatch_tests {
         );
         store.store_record(&rec).unwrap();
         let err = store.store_record(&rec).unwrap_err();
+        assert!(matches!(
+            err,
+            DispatchStoreError::DuplicateDispatch(DispatchRecordId(42))
+        ));
+    }
+
+    #[test]
+    fn duplicate_store_record_identity_rejected() {
+        let mut store = InMemoryDispatchStore::new();
+        let rec = DispatchRecord::new(
+            JobId(7),
+            JobKind::BtreeCompaction,
+            SchedulerEpoch(1),
+            DispatchRecordId(42),
+            0,
+        );
+        let same_job = DispatchRecord::new(
+            JobId(7),
+            JobKind::BtreeCompaction,
+            SchedulerEpoch(1),
+            DispatchRecordId(43),
+            0,
+        );
+        store.store_record(&rec).unwrap();
+        let err = store.store_record(&same_job).unwrap_err();
         assert!(matches!(
             err,
             DispatchStoreError::DuplicateDispatch(DispatchRecordId(42))
@@ -1447,7 +1490,10 @@ mod durable_dispatch_tests {
 
         // Cancelled jobs should not be resumable
         let resumable = s.load_resumable_records().unwrap();
-        assert!(resumable.is_empty(), "cancelled job should not be resumable");
+        assert!(
+            resumable.is_empty(),
+            "cancelled job should not be resumable"
+        );
     }
 
     // ── Crash → resume (in-progress job survives) ─────────────────
@@ -1522,19 +1568,14 @@ mod durable_dispatch_tests {
         let kinds = [
             JobKind::Scrub,
             JobKind::DeferredCleanup,
-            JobKind::GCMark,
             JobKind::BtreeCompaction,
-            JobKind::Rebake,
+            JobKind::Recovery,
         ];
 
         for (i, &kind) in kinds.iter().enumerate() {
-            s.register_dispatched(
-                Box::new(IncrementalJobAdapter::new(
-                    Box::leak(format!("job-{i}").into_boxed_str()),
-                    MockJob::new(i as u64, kind, 20),
-                )),
-                JobId(i as u64),
-                kind,
+            s.register_incremental_job(
+                Box::leak(format!("job-{i}").into_boxed_str()),
+                MockJob::new(i as u64 + 1, kind, 20),
             )
             .unwrap();
         }
@@ -1547,6 +1588,27 @@ mod durable_dispatch_tests {
             assert_eq!(rec.state, DispatchState::InProgress);
             assert!(rec.can_resume());
         }
+    }
+
+    #[test]
+    fn real_cleanup_job_dispatch_survives_crash() {
+        let mut s = scheduler_with_store();
+        let item = CleanupWorkItemV1::new(
+            99,
+            WorkItemKind::UnlinkFree,
+            1,
+            BtreeRootPointer::EMPTY,
+            4096,
+        );
+        let job = CleanupJob::new(vec![item]).with_job_id(JobId(44));
+
+        s.register_incremental_job("cleanup", job).unwrap();
+
+        let resumable = s.load_resumable_records().unwrap();
+        assert_eq!(resumable.len(), 1);
+        assert_eq!(resumable[0].job_id, JobId(44));
+        assert_eq!(resumable[0].job_kind, JobKind::DeferredCleanup);
+        assert_eq!(resumable[0].state, DispatchState::InProgress);
     }
 
     // ── Checkpoint update on dispatched job ───────────────────────
@@ -1592,7 +1654,10 @@ mod durable_dispatch_tests {
         let mut s = BackgroundScheduler::new(ServiceBudget::SMALL_TICK);
         let id = s
             .register_dispatched(
-                Box::new(IncrementalJobAdapter::new("no-store", MockJob::new(1, JobKind::Scrub, 10))),
+                Box::new(IncrementalJobAdapter::new(
+                    "no-store",
+                    MockJob::new(1, JobKind::Scrub, 10),
+                )),
                 JobId(1),
                 JobKind::Scrub,
             )
@@ -1614,25 +1679,56 @@ mod durable_dispatch_tests {
         let mut s = scheduler_with_store();
 
         let dispatch_id = s
-            .register_dispatched(
-                Box::new(IncrementalJobAdapter::new("finish", MockJob::new(99, JobKind::Scrub, 1))),
-                JobId(99),
-                JobKind::Scrub,
-            )
+            .register_incremental_job("finish", MockJob::new(99, JobKind::Scrub, 1))
             .unwrap();
 
-        // Job runs to completion (through the scheduler cycle)
         s.run_cycle();
 
-        // Mark completed
-        s.mark_dispatched_completed(dispatch_id).unwrap();
+        let completed = s.load_dispatch_record(dispatch_id).unwrap().unwrap();
+        assert_eq!(completed.state, DispatchState::Completed);
+        assert!(completed.last_checkpoint.is_some());
 
-        // On restart, not resumable
         let resumable = s.load_resumable_records().unwrap();
-        assert!(
-            resumable.is_empty(),
-            "completed job must not be resumable"
+        assert!(resumable.is_empty(), "completed job must not be resumable");
+    }
+
+    #[test]
+    fn run_cycle_persists_in_progress_checkpoint() {
+        let mut s = scheduler_with_store();
+        let dispatch_id = s
+            .register_incremental_job("progress", MockJob::new(77, JobKind::BtreeCompaction, 100))
+            .unwrap();
+
+        s.run_cycle();
+
+        let record = s.load_dispatch_record(dispatch_id).unwrap().unwrap();
+        assert_eq!(record.state, DispatchState::InProgress);
+        assert!(record.last_checkpoint.is_some());
+        assert_eq!(
+            record.last_checkpoint.as_ref().unwrap().job_kind,
+            JobKind::BtreeCompaction
         );
+    }
+
+    #[test]
+    fn next_dispatch_id_starts_after_persisted_terminal_records() {
+        let mut store = InMemoryDispatchStore::new();
+        let mut old = DispatchRecord::new(
+            JobId(1),
+            JobKind::Scrub,
+            SchedulerEpoch::INITIAL,
+            DispatchRecordId(9),
+            0,
+        );
+        old.mark_completed();
+        store.store_record(&old).unwrap();
+
+        let mut s =
+            BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, Box::new(store));
+        let id = s
+            .register_incremental_job("new-scrub", MockJob::new(2, JobKind::Scrub, 10))
+            .unwrap();
+        assert_eq!(id, DispatchRecordId(10));
     }
 
     // ── run_cycle with dispatch store ─────────────────────────────
@@ -1642,7 +1738,10 @@ mod durable_dispatch_tests {
         let mut s = scheduler_with_store();
 
         s.register_dispatched(
-            Box::new(IncrementalJobAdapter::new("svc1", MockJob::new(1, JobKind::Scrub, 10))),
+            Box::new(IncrementalJobAdapter::new(
+                "svc1",
+                MockJob::new(1, JobKind::Scrub, 10),
+            )),
             JobId(1),
             JobKind::Scrub,
         )
