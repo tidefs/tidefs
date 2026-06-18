@@ -49,7 +49,8 @@ use crate::compress::CompressionStats;
 use crate::io_scheduler::{IoScheduler, IoSchedulerConfig};
 use crate::reclaim_queue::{
     flush_segment_liveness_queue, load_dead_object_reclaim_queue, load_reclaim_queue_entries,
-    load_segment_liveness_queue, store_dead_object_reclaim_queue, store_reclaim_queue_entries,
+    load_reclaim_receipts, load_segment_liveness_queue, store_dead_object_reclaim_queue,
+    store_reclaim_queue_entries, store_reclaim_receipts,
 };
 use crate::segment_builder::{FlushResult, SegmentBuilder};
 use crate::txg_manager::{compute_committed_root_digest, CommitGroupManager};
@@ -60,7 +61,7 @@ use tidefs_durability_layout::DurabilityLayoutV1;
 use tidefs_pool_allocator::{PoolAllocator, PoolAllocatorError, SpacePressureEvent};
 use tidefs_reclaim::{
     ClearanceEvidence, DrainError, GateDecision, GateDenyReason, ReclaimConfig,
-    ReclaimConsumerConfig, ReclaimConsumerService, ReclaimGate, ReclaimScheduler,
+    ReclaimConsumerConfig, ReclaimConsumerService, ReclaimGate, ReclaimReceipt, ReclaimScheduler,
     SegmentLiveCounts,
 };
 use tidefs_reclaim_queue_core::{
@@ -320,6 +321,8 @@ pub struct LocalObjectStore {
     reclaim_queue: BPlusTreeReclaimQueue,
     dead_object_reclaim_queue: DeadObjectReclaimQueue,
     dead_object_reclaim_queue_dirty: bool,
+    reclaim_receipts: Vec<ReclaimReceipt>,
+    reclaim_receipts_dirty: bool,
     segment_liveness: SegmentLivenessQueue,
     reclaim_consumer: ReclaimConsumerService,
     pub(crate) enospc_bytes_written: u64,
@@ -790,6 +793,8 @@ impl LocalObjectStore {
             reclaim_queue: BPlusTreeReclaimQueue::default(),
             dead_object_reclaim_queue: DeadObjectReclaimQueue::default(),
             dead_object_reclaim_queue_dirty: false,
+            reclaim_receipts: Vec::new(),
+            reclaim_receipts_dirty: false,
             segment_liveness: SegmentLivenessQueue::default(),
             reclaim_consumer: ReclaimConsumerService::new(
                 ReclaimConsumerConfig::default(),
@@ -1091,6 +1096,8 @@ impl LocalObjectStore {
             reclaim_queue: BPlusTreeReclaimQueue::new(),
             dead_object_reclaim_queue: DeadObjectReclaimQueue::new(),
             dead_object_reclaim_queue_dirty: false,
+            reclaim_receipts: Vec::new(),
+            reclaim_receipts_dirty: false,
             segment_liveness: SegmentLivenessQueue::new(),
             reclaim_consumer: ReclaimConsumerService::new(
                 ReclaimConsumerConfig::default(),
@@ -1124,6 +1131,8 @@ impl LocalObjectStore {
         store.reclaim_queue = load_reclaim_queue_entries(&store);
         // Restore persisted receipt-bound dead-object reclaim entries.
         store.dead_object_reclaim_queue = load_dead_object_reclaim_queue(&store);
+        // Restore committed reclaim receipt evidence.
+        store.reclaim_receipts = load_reclaim_receipts(&store);
         // Restore persisted segment-liveness queue.
         store.segment_liveness = match load_segment_liveness_queue(&store) {
             Ok(q) => q,
@@ -2114,6 +2123,13 @@ impl LocalObjectStore {
         })
     }
 
+    /// Committed reclaim receipts loaded during open and appended after
+    /// receipt-bound physical frees.
+    #[must_use]
+    pub fn reclaim_receipts(&self) -> &[ReclaimReceipt] {
+        &self.reclaim_receipts
+    }
+
     /// Enqueue one dead object whose old placement may be retired only after
     /// replacement/base receipt evidence and commit-group stability agree.
     ///
@@ -2187,10 +2203,16 @@ impl LocalObjectStore {
         let drain = drain_result?;
 
         if drain.ack_object_ids.is_empty() {
+            debug_assert!(drain.receipt.is_none());
             return Ok(tidefs_reclaim::ReclaimConsumerStats {
                 reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
                 ..drain.stats
             });
+        }
+
+        if let Some(receipt) = drain.receipt {
+            self.reclaim_receipts.push(receipt);
+            self.reclaim_receipts_dirty = true;
         }
 
         let removed = self
@@ -3323,6 +3345,14 @@ impl LocalObjectStore {
             self.dead_object_reclaim_queue = queue;
             result?;
             self.dead_object_reclaim_queue_dirty = false;
+        }
+
+        if self.reclaim_receipts_dirty {
+            let receipts = std::mem::take(&mut self.reclaim_receipts);
+            let result = store_reclaim_receipts(&receipts, self);
+            self.reclaim_receipts = receipts;
+            result?;
+            self.reclaim_receipts_dirty = false;
         }
 
         let path = segment_path(&self.segments_dir, self.current_segment_id);
@@ -7000,6 +7030,12 @@ mod reclaim_queue_production_tests {
         assert_eq!(stats.reclaim_queue_depth, 0);
         assert!(store.dead_object_reclaim_queue.is_empty());
         assert!(!store.dead_object_reclaim_queue_dirty);
+        assert_eq!(store.reclaim_receipts().len(), 1);
+        let receipt = store.reclaim_receipts()[0].clone();
+        assert_eq!(receipt.freed_extents, vec![reclaim_key]);
+        assert_eq!(receipt.deadlist_committed_txg, 1);
+        assert_eq!(receipt.pin_clearance_epoch, 0);
+        assert!(!store.reclaim_receipts_dirty);
         assert!(
             !segment_path(&store.segments_dir, old_segment_id).exists(),
             "freed segment file must not be rediscovered on reopen"
@@ -7009,6 +7045,7 @@ mod reclaim_queue_production_tests {
         let reopened = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
             .expect("reopen store");
         assert!(reopened.dead_object_reclaim_queue.is_empty());
+        assert_eq!(reopened.reclaim_receipts(), &[receipt]);
         assert!(!segment_path(&reopened.segments_dir, old_segment_id).exists());
     }
 

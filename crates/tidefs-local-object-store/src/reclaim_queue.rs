@@ -11,7 +11,10 @@
 //! protected wire format ([`tidefs_reclaim::encode_reclaim_wire`])
 //! wire-format frame is verified before deserialisation.
 
-use tidefs_reclaim::{decode_reclaim_wire, encode_reclaim_wire, ReclaimWireError};
+use tidefs_reclaim::{
+    decode_reclaim_wire, encode_reclaim_wire, ReclaimReceipt, ReclaimReceiptDecodeError,
+    ReclaimWireError,
+};
 use tidefs_reclaim_queue_core::{
     BPlusTreeReclaimQueue, DeadObjectReclaimQueue, ReclaimQueueStorage,
     SegmentLivenessPersistError, SegmentLivenessQueue,
@@ -41,6 +44,40 @@ pub(crate) const RECLAIM_QUEUE_ENTRIES_OBJECT_NAME: &str = "tidefs-reclaim-queue
 
 /// Well-known name for receipt-bound dead-object reclaim entries.
 pub(crate) const DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME: &str = "tidefs-dead-object-reclaim-queue";
+
+/// Well-known name for committed reclaim-receipt evidence.
+pub(crate) const RECLAIM_RECEIPTS_OBJECT_NAME: &str = "tidefs-reclaim-receipts";
+
+const RECLAIM_RECEIPTS_MAGIC: &[u8; 4] = b"RCRL";
+const RECLAIM_RECEIPTS_VERSION: u32 = 1;
+const RECLAIM_RECEIPTS_HEADER_LEN: usize = 12;
+const RECLAIM_RECEIPTS_ENTRY_LEN_LEN: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReclaimReceiptLogError {
+    Truncated,
+    InvalidMagic,
+    UnsupportedVersion { found: u32, expected: u32 },
+    LengthOverflow,
+    Receipt(ReclaimReceiptDecodeError),
+    TrailingBytes,
+}
+
+impl std::fmt::Display for ReclaimReceiptLogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => f.write_str("reclaim receipt log truncated"),
+            Self::InvalidMagic => f.write_str("reclaim receipt log invalid magic"),
+            Self::UnsupportedVersion { found, expected } => write!(
+                f,
+                "reclaim receipt log unsupported version {found} (expected {expected})"
+            ),
+            Self::LengthOverflow => f.write_str("reclaim receipt log length overflow"),
+            Self::Receipt(error) => write!(f, "reclaim receipt decode failed: {error}"),
+            Self::TrailingBytes => f.write_str("reclaim receipt log has trailing bytes"),
+        }
+    }
+}
 
 /// Load a [`BPlusTreeReclaimQueue`] from the object store.
 pub(crate) fn load_reclaim_queue_entries(store: &LocalObjectStore) -> BPlusTreeReclaimQueue {
@@ -98,6 +135,90 @@ pub(crate) fn store_dead_object_reclaim_queue(
 ) -> Result<(), StoreError> {
     let bytes = queue.encode();
     store.put_named(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME, &bytes)?;
+    Ok(())
+}
+
+fn encode_reclaim_receipts(receipts: &[ReclaimReceipt]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(RECLAIM_RECEIPTS_HEADER_LEN);
+    bytes.extend_from_slice(RECLAIM_RECEIPTS_MAGIC);
+    bytes.extend_from_slice(&RECLAIM_RECEIPTS_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(receipts.len() as u32).to_le_bytes());
+    for receipt in receipts {
+        let encoded = receipt.encode();
+        bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&encoded);
+    }
+    bytes
+}
+
+fn decode_reclaim_receipts(bytes: &[u8]) -> Result<Vec<ReclaimReceipt>, ReclaimReceiptLogError> {
+    if bytes.len() < RECLAIM_RECEIPTS_HEADER_LEN {
+        return Err(ReclaimReceiptLogError::Truncated);
+    }
+    if &bytes[0..4] != RECLAIM_RECEIPTS_MAGIC {
+        return Err(ReclaimReceiptLogError::InvalidMagic);
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if version != RECLAIM_RECEIPTS_VERSION {
+        return Err(ReclaimReceiptLogError::UnsupportedVersion {
+            found: version,
+            expected: RECLAIM_RECEIPTS_VERSION,
+        });
+    }
+    let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let mut off = RECLAIM_RECEIPTS_HEADER_LEN;
+    let mut receipts = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len_end = off
+            .checked_add(RECLAIM_RECEIPTS_ENTRY_LEN_LEN)
+            .ok_or(ReclaimReceiptLogError::LengthOverflow)?;
+        if len_end > bytes.len() {
+            return Err(ReclaimReceiptLogError::Truncated);
+        }
+        let receipt_len = u32::from_le_bytes(bytes[off..len_end].try_into().unwrap()) as usize;
+        off = len_end;
+        let receipt_end = off
+            .checked_add(receipt_len)
+            .ok_or(ReclaimReceiptLogError::LengthOverflow)?;
+        if receipt_end > bytes.len() {
+            return Err(ReclaimReceiptLogError::Truncated);
+        }
+        let receipt = ReclaimReceipt::decode(&bytes[off..receipt_end])
+            .map_err(ReclaimReceiptLogError::Receipt)?;
+        receipts.push(receipt);
+        off = receipt_end;
+    }
+    if off != bytes.len() {
+        return Err(ReclaimReceiptLogError::TrailingBytes);
+    }
+    Ok(receipts)
+}
+
+/// Load committed reclaim receipt evidence from the object store.
+pub(crate) fn load_reclaim_receipts(store: &LocalObjectStore) -> Vec<ReclaimReceipt> {
+    match store.get_named(RECLAIM_RECEIPTS_OBJECT_NAME) {
+        Ok(Some(bytes)) => match decode_reclaim_receipts(&bytes) {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                eprintln!("tidefs: reclaim receipt log decode error: {error}");
+                Vec::new()
+            }
+        },
+        Ok(None) => Vec::new(),
+        Err(error) => {
+            eprintln!("tidefs: reclaim receipt log load error: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// Persist committed reclaim receipt evidence to the object store.
+pub(crate) fn store_reclaim_receipts(
+    receipts: &[ReclaimReceipt],
+    store: &mut LocalObjectStore,
+) -> Result<(), StoreError> {
+    let bytes = encode_reclaim_receipts(receipts);
+    store.put_named(RECLAIM_RECEIPTS_OBJECT_NAME, &bytes)?;
     Ok(())
 }
 
@@ -376,6 +497,35 @@ mod tests {
         assert_eq!(loaded, queue);
         assert_eq!(loaded.all_entries(), vec![entry]);
         assert_eq!(loaded.receipt_bound_eligible_count(6), 1);
+    }
+
+    #[test]
+    fn reclaim_receipts_roundtrip_and_reopen() {
+        let (mut store, dir) = temp_store();
+        let receipts = vec![
+            ReclaimReceipt::new(vec![dead_object_key(0x31)], 7, 11),
+            ReclaimReceipt::new(vec![dead_object_key(0x32), dead_object_key(0x33)], 8, 12),
+        ];
+
+        store_reclaim_receipts(&receipts, &mut store).expect("store reclaim receipts");
+        assert_eq!(load_reclaim_receipts(&store), receipts);
+        store.sync_all().expect("sync reclaim receipts");
+        drop(store);
+
+        let reopened = LocalObjectStore::open(dir.path()).expect("reopen");
+        assert_eq!(load_reclaim_receipts(&reopened), receipts);
+    }
+
+    #[test]
+    fn reclaim_receipts_corrupt_bytes_load_empty() {
+        let (mut store, _dir) = temp_store();
+
+        store
+            .put_named(RECLAIM_RECEIPTS_OBJECT_NAME, b"not reclaim receipts")
+            .expect("store corrupt bytes");
+        let loaded = load_reclaim_receipts(&store);
+
+        assert!(loaded.is_empty());
     }
 
     #[test]
