@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for workload classification.
 //!
 //! Exercises the public API across module boundaries: observing IO

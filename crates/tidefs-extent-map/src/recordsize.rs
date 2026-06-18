@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-file-handle workload detection and recordsize adaptation.
 //!
 //! `WorkloadDetector` observes write offsets on a per-fd basis and

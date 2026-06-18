@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mounted fsync/fdatasync/fsyncdir smoke tests for the VFS-backed FUSE adapter.
 //!
 //! Consolidates coverage previously split across:

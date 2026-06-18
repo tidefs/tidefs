@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cache coherency validation: lease revocation, membership epoch transitions,
 //! and node-drain scenarios against tidefs-transport.
 //!

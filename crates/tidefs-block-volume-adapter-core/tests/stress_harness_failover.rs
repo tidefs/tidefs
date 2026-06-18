@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P6-04 profile 5: block_acceptance_profile_5.failover
 //!
 //! Transition correctness under failover, cutover, and replay.

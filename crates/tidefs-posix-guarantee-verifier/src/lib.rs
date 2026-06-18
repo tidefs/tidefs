@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Runtime POSIX guarantee verifier.
 //!
 //! Ensures that the active coordination strategy for an inode or block

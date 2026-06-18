@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Property-based tests for tidefs-gc-pin-set.
 // Uses proptest to verify invariants under random operation sequences.
 // Updated for ref-counted pinning: pin() increments count on the same exact root.

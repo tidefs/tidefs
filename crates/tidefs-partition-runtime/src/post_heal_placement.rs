@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! PostHealPlacementRecompute: recomputes placement after partition healing,
 //! triggers anti-entropy scan, and rebuilds replicas as needed.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Peer liveness state machine driven by transport connection health scores.
 //!
 //! Bridges [`tidefs_transport::peer_health::LivenessSignal`] into per-peer

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Remount-persistence integration test for the FUSE RW persistence slice.
 //! Tests the advancement criterion: mount(RW) → write → sync → unmount →
 //! remount → read → verify bytes match exactly.  Uses the `MountHarness`

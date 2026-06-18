@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Automatic checksum scrub repair with BLAKE3-verified rebake validation.
 //!
 //! When checksum verification during scrub traversal detects a corrupted block,

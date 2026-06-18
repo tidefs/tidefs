@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! High-level node join lifecycle state machine.
 //!
 //! Tracks the progression of a new node through the five join phases:

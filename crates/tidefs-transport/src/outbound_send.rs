@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport outbound send pipeline: from message submission through
 //! length-delimited framing to async TCP socket write, complementing
 //! the inbound receive loop ([`crate::receive_loop`]).

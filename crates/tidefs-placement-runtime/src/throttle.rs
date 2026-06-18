@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Bandwidth throttling for recovery and rebalance traffic.
 //!
 //! Recovery and rebalance transfers can saturate network links and degrade

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Roster-scoped capability discovery for placement and transport selection.
 //!
 //! [`MembershipCapabilityView`] provides a read-only snapshot of per-peer

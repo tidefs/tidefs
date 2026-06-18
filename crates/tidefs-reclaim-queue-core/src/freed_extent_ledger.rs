@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Persistent freed-extent reclaim-queue ledger.
 //!
 //! Tracks extents freed during object deletion and truncation so the space

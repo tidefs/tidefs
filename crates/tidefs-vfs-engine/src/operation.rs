@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! VFS operation enum and request/response types.
 //!
 //! This module defines [`VfsOperation`] — a canonical operation type covering

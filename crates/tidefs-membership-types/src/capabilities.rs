@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Peer capability advertisement types for placement and transport carrier selection.
 //!
 //! Defines [`PeerCapabilities`], the per-peer operational capability record,

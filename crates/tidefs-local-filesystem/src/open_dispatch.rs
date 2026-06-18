@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE open dispatch handler with file-handle state management.
 //!
 //! Provides two layers:

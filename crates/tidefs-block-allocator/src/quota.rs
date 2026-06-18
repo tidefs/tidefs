@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-inode quota tracking table.
 //!
 //! Tracks reserved-but-not-yet-committed block counts per inode

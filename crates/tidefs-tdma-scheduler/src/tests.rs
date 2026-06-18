@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use super::*;
 use tidefs_membership_epoch::EpochId;
 

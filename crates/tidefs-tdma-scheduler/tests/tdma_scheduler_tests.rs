@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for the TDMA scheduler: slot allocation determinism,
 //! epoch-boundary expiry, BLAKE3 integrity verification, slot collision
 //! rejection, and slot-table capacity limits.

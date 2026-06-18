@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport send-completion tracking: delivery-acknowledgement oneshot
 //! handles that resolve after the framed message has been fully written
 //! to the socket.

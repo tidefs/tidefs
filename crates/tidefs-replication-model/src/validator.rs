@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Layout validation engine.
 //!
 //! The [`LayoutValidator`] checks whether a set of concrete placement entries

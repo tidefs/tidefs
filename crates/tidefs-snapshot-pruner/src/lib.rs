@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Snapshot auto-pruner: per-dataset retention policies, age-based expiry,
 // fail-closed pin-evidence planning, BLAKE3-verified integrity gating, and
 // explicit snapshot deletion with permission validation.

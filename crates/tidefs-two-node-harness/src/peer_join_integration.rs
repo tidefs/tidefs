@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! First-time peer-join integration test through the deterministic
 //! two-node transport harness.
 //!

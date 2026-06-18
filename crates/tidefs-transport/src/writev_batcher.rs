@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport outbound writev frame-coalescing dispatch: merges consecutive
 //! queued wire-frame buffers into vectored I/O calls to reduce per-frame
 //! send(2)/write(2) syscall overhead on the transport outbound hot path.

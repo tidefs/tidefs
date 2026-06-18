@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified drain protocol wire messages.
 //!
 //! Defines the five message types exchanged during a graceful node drain:

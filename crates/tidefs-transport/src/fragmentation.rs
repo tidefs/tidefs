@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport message fragmentation and reassembly for payloads exceeding
 //! the connection MTU.
 //!

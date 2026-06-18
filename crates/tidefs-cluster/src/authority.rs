@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster membership lease authority — slot assignment and grant/nack
 //! decision logic for incoming lease protocol requests.
 //!

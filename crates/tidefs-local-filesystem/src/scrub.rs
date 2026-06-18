@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Scrub pipeline for block-level integrity verification.
 //!
 //! The scrub module walks local filesystem content blocks and verifies

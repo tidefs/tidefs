@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch lifecycle state machine with BLAKE3-verified proposals.
 //!
 //! Defines the [`EpochState`] enum governing the four-phase epoch

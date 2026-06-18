@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE write-dispatch integration tests.
 //!
 //! Validates the FUSE write-dispatch pipeline end-to-end:

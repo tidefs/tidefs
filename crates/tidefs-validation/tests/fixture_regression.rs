@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Trace regression catalog: generate and replay smoke trace fixtures.
 //!
 //! ## Generating fixtures

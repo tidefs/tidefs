@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Fault injection scenario catalog (NEXT-VAL-012).
 //!
 //! Maps required failure scenarios to fault classes, crash injection points,

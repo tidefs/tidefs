@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // write_dispatch_tests.rs — property-based unit tests for the local-filesystem
 // write buffer assembly, extent splitting, ordering, padding, and error
 // propagation.

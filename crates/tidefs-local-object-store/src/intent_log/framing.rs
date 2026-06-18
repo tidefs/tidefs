@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Binary-schema framing for intent-log segments.
 //!
 //! Wraps batches of encoded [`IntentLogRecord`]s in a canonical binary-schema

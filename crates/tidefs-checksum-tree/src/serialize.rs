@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Binary serialization format for [`ChecksumTree`] and [`ChecksumTreeNode`].
 //!
 //! The on-disk/wire format is self-describing with a magic number and version

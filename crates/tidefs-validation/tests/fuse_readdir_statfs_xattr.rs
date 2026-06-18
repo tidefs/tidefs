@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE readdir/statfs/xattr integration test.
 //!
 //! Exercises the advancement criteria for the `fuse-readdir-statfs-xattr`

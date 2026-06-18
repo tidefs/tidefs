@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pin-set-aware candidate selection for segment cleaning.
 //!
 //! [`CandidateSelector`] extends the existing [`DeadObjectTracker`]-based

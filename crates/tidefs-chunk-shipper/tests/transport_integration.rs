@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Two-node loopback integration tests for chunk-shipper orchestrated
 //! state transfer with BLAKE3-256 integrity verification.
 //!

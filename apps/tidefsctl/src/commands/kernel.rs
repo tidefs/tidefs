@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-resident TideFS operator probes.
 //!
 //! This module reports whether the declared kernel control endpoint exists and

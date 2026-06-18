@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement transfer coordinator bridging placement plans to transport
 //! data movement.
 //!

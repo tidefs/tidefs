@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::fmt;
 
 /// Pool-wide unique extent identifier with generation counter.

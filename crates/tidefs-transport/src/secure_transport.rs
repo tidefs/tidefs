@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! SecureTransport: upgrades an unauthenticated transport session after HELLO.
 //!
 //! After the HELLO handshake establishes session keys, `SecureTransport`

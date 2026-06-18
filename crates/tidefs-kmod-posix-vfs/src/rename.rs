@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![allow(unused_variables)]
 //! Atomic rename mutation for the kernel VFS adapter -- K7 mutation seam.
 //! Bridges the kernel VFS rename(2) / renameat2(2) system calls to the

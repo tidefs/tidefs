@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! blk-mq request completion dispatch bridging VfsEngine I/O outcomes
 //! to Linux block-layer `blk_mq_end_request`.
 //!

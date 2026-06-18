@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TDMA clock synchronization: per-node clock offset tracking with bounded
 //! drift compensation for guard-interval collision avoidance.
 

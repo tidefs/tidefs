@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic two-node transport message dispatch round-trip validation.
 //!
 //! Exercises end-to-end message dispatch across the two-node deterministic

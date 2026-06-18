@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Durability layout placement mapping with domain-tagged BLAKE3 hashing.
 //!
 //! Provides deterministic object-to-domain placement: given an object

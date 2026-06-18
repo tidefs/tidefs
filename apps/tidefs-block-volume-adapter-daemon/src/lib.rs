@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Library target for tidefs-block-volume-adapter-daemon.
 // Exposes the daemon's product module graph to integration tests and library
 // consumers. The binary target at main.rs has its own root; the library

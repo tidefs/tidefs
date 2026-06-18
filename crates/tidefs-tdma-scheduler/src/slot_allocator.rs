@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch-gated deterministic slot allocator keyed on (epoch, node_id, write_txg).
 //!
 //! Produces collision-free slot assignments within an epoch. The slot index

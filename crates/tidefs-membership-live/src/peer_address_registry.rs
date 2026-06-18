@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Peer address registry for membership-to-transport endpoint resolution.
 //!
 //! Provides a shared [`PeerAddressRegistry`] that maps peer [`MemberId`]s to

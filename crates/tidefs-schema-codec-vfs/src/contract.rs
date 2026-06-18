@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Fixed-width little-endian codecs for the TideFS request contract.
 //!
 //! Versioned v1 records are exact-size packets. Decoding rejects unsupported

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster lease state machine with grant, revoke, renew, and expiry transitions.
 //!
 //! Provides the coordination primitive for single-writer arbitration in the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-mode transaction group sequence counter.
 //!
 //! `TxgSequenceCounter` provides a monotonic sequence-number allocator for

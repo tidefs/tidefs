@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE size-consistency integration test.
 //!
 //! Exercises truncate, write, and stat operations through a real FUSE mount

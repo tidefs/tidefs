@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![allow(dead_code)]
 // FUSE dispatch methods called through trait-object dynamic dispatch; static analysis cannot see callers from fuser::Filesystem impl and test code
 //! FUSE adapter backed by the VfsEngine trait (Contract 2).

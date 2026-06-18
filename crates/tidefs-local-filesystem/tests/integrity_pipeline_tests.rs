@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! End-to-end integrity pipeline tests for PC-019 (Integrity and repair).
 //!
 //! Validates the full checksum chain from object-store production-integrity

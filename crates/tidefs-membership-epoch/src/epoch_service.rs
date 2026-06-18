@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Membership-gated epoch service for authoritative epoch transitions.
 //!
 //! [`EpochService`] wraps the deterministic [`EpochStateMachine`] with

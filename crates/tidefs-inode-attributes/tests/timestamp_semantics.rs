@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Timestamp management validation tests.
 //!
 //! Exercises atime/mtime/ctime update semantics through MemInodeAttributeStore:

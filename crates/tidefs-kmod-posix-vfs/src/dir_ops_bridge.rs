@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Directory operations bridge — canonical namespace mutation entry point.
 //!
 //! Provides no_std-compatible bridge functions that translate kernel VFS

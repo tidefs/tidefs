@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! V2 B-tree extent map implementing `ExtentMapOps`.
 //!
 //! `BTreeExtentMap` provides the V2 (single B-tree) extent map

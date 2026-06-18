@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use serde::{Deserialize, Serialize};
 
 use crate::principal::{PrincipalId, ScopeSelector};

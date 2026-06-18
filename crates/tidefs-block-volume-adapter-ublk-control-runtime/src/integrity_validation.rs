@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! ublk block-volume sector-pattern data integrity validation.
 //!
 //! Closes the normal-operation data-correctness gap between crash-consistency

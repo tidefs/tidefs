@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mounted FUSE integration tests for setattr and flush through the VFS adapter.
 
 use std::ffi::CString;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-authenticated replica health probes.
 //!
 //! Generates tamper-evident challenge/response attestations that bind a

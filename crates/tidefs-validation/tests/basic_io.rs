@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Worker slot: s6
 //! Basic I/O validation tests: create/stat/unlink lifecycle, small
 //! write-read byte verification, sparse-hole zero-fill semantics,

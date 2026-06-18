@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Golden trace corpus manifest loader and verifier.
 //!
 //! Loads `traces/MANIFEST.json`, verifies sha256 of trace files, and replays

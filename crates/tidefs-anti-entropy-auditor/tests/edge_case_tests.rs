@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Edge case tests — empty replica sets, single-replica degenerate case,
 //! all-replicas-divergent, checksum-collision scenarios, rapid successive
 //! audits without state leak, and zero-length objects.

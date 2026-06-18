@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P5-02 FUSE ingress reader set: request classification, admission against backpressure.
 //!
 //! Part of the P5-02 classified multipool topology for the userspace FUSE runtime.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Rust-native golden trace generation tests.
 //!
 //! Run with: cargo test -p tidefs-trace-oracle -- --ignored --nocapture

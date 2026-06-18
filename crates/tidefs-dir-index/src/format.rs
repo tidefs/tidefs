@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Binary on-media format for persistent directory pages.
 //!
 //! Each directory is stored as a sequence of fixed-size [`DirPage`] objects

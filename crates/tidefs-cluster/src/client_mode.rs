@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Active-client-aware dataset/volume mode tracking.
 //!
 //! The [`ClientModeTracker`] records which clients have each dataset or volume

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Compilation smoke test: ensures the crate remains buildable and that
 //! key public types and functions are reachable from integration tests.
 

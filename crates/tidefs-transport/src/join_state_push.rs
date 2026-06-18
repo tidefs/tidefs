@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Join-state push message for delivering committed epoch state to a
 //! first-time joining peer during the transport join handshake.
 //!

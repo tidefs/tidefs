@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster pool orchestration: request builders for multi-node pool
 //! creation and import.
 //!

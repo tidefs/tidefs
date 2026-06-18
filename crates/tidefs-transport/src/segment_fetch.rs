@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Segment fetch message types for cross-node object reads.
 //!
 //! These types carry receipt-bound object segment identifiers and payload

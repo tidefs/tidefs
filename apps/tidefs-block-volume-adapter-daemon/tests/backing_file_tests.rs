@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Comprehensive backing-file tests for the block volume adapter daemon.
 //!
 //! Exercises `BlockVolumeFileImage` against real on-disk backing files

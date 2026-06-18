@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Correlation framing for request-response tracking over transport sessions.
 //!
 //! Provides lightweight framing that wraps an arbitrary payload with a

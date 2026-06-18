@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! CommitGroupCoordinator: two-phase commit coordinator managing monotonic commit_group
 //! number assignment and BLAKE3 digest chaining across sequential commits.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BackgroundReclaim — BackgroundService for refcount-delta reclaim queue processing.
 //!
 //! Incrementally processes entries from the persistent reclaim queue

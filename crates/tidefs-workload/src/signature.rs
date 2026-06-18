@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Workload signature enumeration and classification helpers.
 //!
 //! Defines the six canonical workload signatures that the sliding-window

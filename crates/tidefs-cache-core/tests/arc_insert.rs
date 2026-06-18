@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! ARC insertion, eviction, and ghost-list sizing tests.
 //!
 //! These integration tests exercise the public API of tidefs-cache-core

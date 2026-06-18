@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified get_xattr from persistent storage.
 //!
 //! [`XattrGetStore`] provides persistent `get_xattr` that:

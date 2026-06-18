@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Multi-node scrub fanout: coordinates scrub verification across peer nodes
 //! and records cross-node validation in a deterministic audit log.
 //!

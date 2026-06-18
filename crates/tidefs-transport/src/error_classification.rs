@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport error classification taxonomy and recovery action dispatch.
 //!
 //! This module provides systematic classification of connection-level errors

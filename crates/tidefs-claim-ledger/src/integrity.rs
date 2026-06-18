@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Claim serialization and BLAKE3-256 integrity proofs.
 //!
 //! Every claim persisted by the local-filesystem write-dispatch path is

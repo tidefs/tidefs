@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration smoke for POSIX access probes through the current FUSE adapter.
 
 use std::ffi::CString;

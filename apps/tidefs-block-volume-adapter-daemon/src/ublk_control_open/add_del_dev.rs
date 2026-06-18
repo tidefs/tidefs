@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use super::*;
 
 pub fn run_ublk_control_add_del_dev_boundary() -> Result<UblkControlAddDelDevReport, AppError> {

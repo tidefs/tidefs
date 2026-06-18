@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests: multi-block contiguous and non-contiguous allocation,
 //! block-level accounting invariants.
 

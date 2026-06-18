@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cleaning policy and backpressure signalling for the segment cleaner.
 //!
 //! [`CleaningPolicy`] selects the cleaning aggressiveness mode based on

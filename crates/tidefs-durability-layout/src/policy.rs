@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Layout policy trait and default implementation.
 //!
 //! The [`LayoutPolicy`] trait defines the contract for mapping objects

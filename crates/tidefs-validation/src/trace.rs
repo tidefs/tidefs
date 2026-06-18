@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Trace oracle: deterministic operation recording and replay for peer crates.
 //!
 //! The `TraceEvent` enum covers the union of operations exposed by active peer

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Quorum-level replica health aggregation.
 //!
 //! Collects `HealthSample` entries from a replica set after BLAKE3

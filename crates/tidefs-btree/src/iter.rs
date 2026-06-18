@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Range-scan iterator over a B+tree.
 //!
 //! See [`range_scan`](crate::range_scan) for the iterator implementation.

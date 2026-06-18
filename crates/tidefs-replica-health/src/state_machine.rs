@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-replica degradation state machine with hysteresis.
 //!
 //! Tracks replica-level degradation driven by I/O success/failure

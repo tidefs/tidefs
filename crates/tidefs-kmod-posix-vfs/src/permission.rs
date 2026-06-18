@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! inode_operations permission check for the kernel VFS adapter --
 //! K7-17 access-control seam.
 //!

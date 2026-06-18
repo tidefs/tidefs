@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic in-memory transport for the two-node membership harness.
 //!
 //! Replaces `std::sync::mpsc` channels with framed message passing using

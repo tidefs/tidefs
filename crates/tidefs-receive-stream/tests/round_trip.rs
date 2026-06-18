@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cross-crate round-trip validation: send-stream ChunkFramer output
 //! decoded by receive-stream ChunkDecoder with BLAKE3 verification.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Suspicion escalation levels for failure detection.
 //!
 //! Unlike Ceph's binary up/down or MongoDB's binary PRIMARY/SECONDARY,

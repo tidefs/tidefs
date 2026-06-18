@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! tidefs-storage-node: network-accessible replicated object store.
 //!
 //! Usage:

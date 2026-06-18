@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Storage performance budget measurement -- throughput, latency, IOPS.
 //!
 //! Measures key storage KPIs for the REL-STOR-015 storage lane performance

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Rebuild-replica integration tests for `tidefs-local-object-store`.
 //!
 //! Covers the `rebuild_replica_from_surviving` function that copies all

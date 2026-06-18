@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Continuous failure recovery loop: detect, scope, plan, execute, verify — PC-010.5.
 //!
 //! The [`recovery_loop`] module provides committed-root-validated crash recovery

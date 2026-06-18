@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 /// Format v6 adds placement receipt generation to content chunk references.
 /// Format v5 and earlier do not carry receipt refs on extents.
 pub const FILESYSTEM_FORMAT_VERSION: u16 = 6;

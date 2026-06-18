@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Work-item scheduling: per-lane priority queues with budget tracking,
 //! starvation prevention, and poll-driven dispatch.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement version tracker: bridges placement map versions from
 //! PlacementDispatch into the membership and multi-node workflow.
 //!

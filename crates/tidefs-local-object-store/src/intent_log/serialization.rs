@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Serialization helpers that convert transaction mutations into
 //! append-ready intent-log record buffers.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE readdir/readdirplus dispatch with DirIndexIter cursor support.
 //!
 //! Provides engine-level and FUSE-level dispatch functions for directory

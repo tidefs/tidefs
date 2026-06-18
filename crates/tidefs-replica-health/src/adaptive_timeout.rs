@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Drift-adaptive timeout window widening.
 //!
 //! Static timeouts break under real network conditions. Ceph uses fixed

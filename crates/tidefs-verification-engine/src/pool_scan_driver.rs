@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool-scan segment iteration driver.
 //!
 //! Uses [`tidefs_pool_scan`] to discover pool devices and their segment

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Free-block bitmap with bit-level alloc/free primitives.
 //!
 //! The bitmap is a flat bit array backing `BlockAllocator`: bit `i`

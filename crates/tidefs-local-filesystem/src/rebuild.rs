@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Rebuild from surviving replicas after device loss.
 //!
 //! This module bridges the pool-scan [`RebuildScheduler`] (which plans

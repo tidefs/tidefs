@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Background degradation-event task with broadcast channel.
 //!
 //! Wraps a shared `ReplicaDegradationTracker` in an `Arc<Mutex<>>` and

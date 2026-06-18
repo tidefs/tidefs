@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Bounded per-peer send buffer with memory accounting and backpressure
 //! propagation.
 //!

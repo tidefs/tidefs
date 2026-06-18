@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE rename dispatch with namespace renameat2 integration.
 //!
 //! This module provides the FUSE `rename` / `renameat2` operation dispatch

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Health state propagation structures.
 //!
 //! Health state propagates via piggyback on heartbeat messages and

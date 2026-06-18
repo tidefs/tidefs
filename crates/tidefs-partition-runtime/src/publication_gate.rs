@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! PublicationPipelineEpochGate: epoch-gated publication admission during
 //! network partitions. Freezes publication on the minority side while
 //! allowing the quorum side to continue with a new epoch.

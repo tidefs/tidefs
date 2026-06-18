@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Read-path integrity verification against anchored BLAKE3 checksum proofs.
 //!
 //! Every object read that carries a checksum proof is verified before the

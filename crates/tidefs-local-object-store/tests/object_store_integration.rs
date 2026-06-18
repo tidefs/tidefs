@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for tidefs-local-object-store.
 //!
 //! Each test creates a fresh temp directory, constructs a store instance

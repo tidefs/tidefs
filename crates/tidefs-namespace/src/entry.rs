@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Namespace entry types for in-memory directory operations.
 //!
 //! [`NamespaceEntry`] pairs every directory entry with a content hash computed

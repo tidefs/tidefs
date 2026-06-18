@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for tidefs-send-stream: ObjectChunkFramer with
 //! real ObjectStore backing, SendQueue backpressure, and chunk-integrity
 //! end-to-end verification.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-connection transport telemetry collector with rate-limited metric emission.
 //!
 //! This module provides connection-level byte, message, and error-class counters

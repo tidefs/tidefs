@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transaction group lifecycle: begin, commit, abort with intent-log barrier
 //! integration and BLAKE3-verified state tracking.
 //!

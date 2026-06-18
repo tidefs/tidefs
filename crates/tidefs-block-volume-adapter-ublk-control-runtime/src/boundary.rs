@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Capacity-boundary and sector-alignment validation for all ublk I/O
 //! types: read, write, discard, write-zeroes.
 //!

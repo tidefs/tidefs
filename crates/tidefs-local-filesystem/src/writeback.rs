@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! ## Authority Classification (per docs/cache-authority-model.md)
 //!
 //! This DirtySet is **Authoritative** for dirty-state classification and

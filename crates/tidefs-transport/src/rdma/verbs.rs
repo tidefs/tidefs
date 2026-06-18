@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![allow(unsafe_code)]
 #![allow(dead_code)]
 //! Safe Rust wrappers around raw libibverbs FFI bindings.

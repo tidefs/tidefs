@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE POSIX metadata operation validation tests.
 //!
 //! Exercises advancement criteria for the `fuse-metadata-batch` milestone

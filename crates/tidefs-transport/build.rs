@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 fn main() {
     let mut shim = cc::Build::new();
     shim.file("src/rdma/verbs_shim.c");

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Multi-core metadata engine with per-core work queues and partitioned
 //! directory B-tree sharding.
 //!

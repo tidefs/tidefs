@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TDMA scheduler: per-object round-robin slot allocation with starvation
 //! tracking and epoch fencing.
 

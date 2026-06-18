@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! fallocate space-management delegation for the kernel VFS adapter -- K7-16.
 //!
 //! Provides typed [`FallocateMode`] classification, [`FallocatePlan`]

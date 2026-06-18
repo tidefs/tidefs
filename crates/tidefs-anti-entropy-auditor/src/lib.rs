@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Anti-entropy auditor: periodic scan/compare/repair-candidate discovery
 //! for P8-03 data_copy_8.
 //!

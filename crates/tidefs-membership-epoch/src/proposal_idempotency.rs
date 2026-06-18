@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Proposal idempotency-key deduplication for safe coordinator retransmission.
 //!
 //! When a subsystem resubmits a proposal after coordinator failover, the

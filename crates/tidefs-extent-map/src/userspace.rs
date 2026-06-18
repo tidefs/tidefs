@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Userspace implementation body included by the crate root when the `std`
 // feature is enabled.
 #![forbid(unsafe_code)]

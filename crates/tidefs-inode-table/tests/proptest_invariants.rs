@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![cfg(feature = "std")]
 //! Property-based tests (proptest) for tidefs-inode-table invariants.
 //!

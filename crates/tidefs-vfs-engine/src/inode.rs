@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Inode lifecycle management for the VFS engine.
 //!
 //! Provides [`InodeHandle`] for tracking active inodes through allocation,

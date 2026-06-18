@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Per-member health tracking for witness set members.
 //
 // WitnessHealth tracks the liveness state of each witness set member.

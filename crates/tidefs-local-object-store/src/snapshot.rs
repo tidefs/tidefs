@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Snapshot creation with commit_group anchoring and persistent catalog entry.
 //!
 //! Captures the current transaction group as an immutable snapshot anchor

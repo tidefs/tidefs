@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement runtime: the execution engine.
 
 use std::collections::{BTreeMap, BTreeSet};

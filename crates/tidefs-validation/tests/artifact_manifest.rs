@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::fs;
 
 use tidefs_validation::evidence_artifact_manifest::{

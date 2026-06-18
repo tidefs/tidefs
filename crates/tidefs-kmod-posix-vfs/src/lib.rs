@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![cfg_attr(not(CONFIG_RUST), no_std)]
 #![forbid(unsafe_code)]
 

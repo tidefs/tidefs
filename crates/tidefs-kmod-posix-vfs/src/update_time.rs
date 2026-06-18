@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! inode_operations update_time dispatch for the kernel VFS adapter --
 //! K7 timestamp bridge.
 //! This module closes the last "Missing" gap from the #5637 VFS dispatch

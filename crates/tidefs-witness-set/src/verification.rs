@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use crate::types::*;
 use ed25519_dalek::{Keypair, PublicKey, Signature, Signer, Verifier};
 use std::collections::BTreeMap;

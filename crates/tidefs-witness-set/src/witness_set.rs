@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Deterministic witness set for quorum acknowledgment tracking.
 //
 // Every distributed consensus operation (quorum-write commit, lock acquisition,

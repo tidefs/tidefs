@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! fio CRC32C data-integrity verification harness for TideFS FUSE mounts.
 //!
 //! `FioCrc32cVerifier` shells out to `fio --verify=crc32c`, runs a

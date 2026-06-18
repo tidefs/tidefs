@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-256-hashed xattr value record for persistent storage.
 //!
 //! An [`XattrRecord`] is the on-disk representation of a single extended

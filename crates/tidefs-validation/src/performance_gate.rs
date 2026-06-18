@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Performance budget runtime gate -- turns P10/A16 design laws into
 //! benchmark receipts and comparator decisions.
 

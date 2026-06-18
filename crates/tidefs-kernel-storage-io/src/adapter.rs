@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! [`KernelStorageAdapter`] bridges a byte-offset [`RawBlockIo`] backend
 //! into the sector-aligned [`KernelStorageIo`] trait.
 //!

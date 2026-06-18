@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Outbound connection retry with exponential backoff and per-peer attempt
 //! coalescing.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Edge case tests: zero-length payloads, maximum-size payloads,
 //! empty chunk sequences, single-chunk shipments.
 

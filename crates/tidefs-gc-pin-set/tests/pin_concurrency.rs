@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Concurrency safety tests for tidefs-gc-pin-set.
 // Verifies correct behaviour under multi-threaded access via Arc<Mutex<GcPinSet>>.
 // Updated for ref-counted pinning: pin() on same root increments count.

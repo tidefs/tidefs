@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // concurrent_readers.rs — Integration tests for multiple independent iterators
 // operating on cloned DirIndex instances. Each clone has its own cursor state.
 // Since DirIndex derives Clone, multiple readers can iterate independently

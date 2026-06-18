@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Join authentication: mutual attestation handshake for node join.
 //!
 //! Wraps the `tidefs-auth` attestation protocol (HelloMessage/HelloResponse)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-resident pool core context with refcounted lifecycle states.
 //!
 //! [`KernelPoolCore`] is the shared kernel-side pool surface for both the

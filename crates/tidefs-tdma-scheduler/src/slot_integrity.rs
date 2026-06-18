@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3 domain-separated slot integrity verification.
 //!
 //! Every TDMA slot is hashed with BLAKE3-256 under a domain tag `"TdmaSlot"`

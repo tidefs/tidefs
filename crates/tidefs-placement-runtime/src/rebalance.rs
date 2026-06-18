@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Rebalance integration: wires the capacity rebalance planner into the
 //! placement runtime so that epoch transitions, capacity skew detection,
 //! and rebalance plan execution flow through the standard placement

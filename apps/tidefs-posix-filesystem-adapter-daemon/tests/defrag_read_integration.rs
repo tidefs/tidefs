@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration test: defrag a file then verify reads return correct data.
 //!
 //! Exercises the TIDEFS_IOC_DEFRAG dispatch path through the adapter's

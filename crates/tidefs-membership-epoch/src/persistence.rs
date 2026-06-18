@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Intent-log backed persistence for epoch transitions.
 //!
 //! Provides [`EpochPersistence`] with BLAKE3 domain-tagged integrity,

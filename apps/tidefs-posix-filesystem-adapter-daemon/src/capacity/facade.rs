@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Capacity facade wrapping a shared tidefs_block_allocator::BlockAllocator.
 
 use super::statfs_reply::StatfsReply;

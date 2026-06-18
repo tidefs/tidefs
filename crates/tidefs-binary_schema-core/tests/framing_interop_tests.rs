@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests verifying interop between tidefs-binary_schema-core
 // primitives and the tidefs-binary_schema-framing envelope/section/chunk
 // header encode/decode layer.

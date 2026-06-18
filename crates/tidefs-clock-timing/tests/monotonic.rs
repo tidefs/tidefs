@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Property-based tests for monotonic clock advancement (ClockSampler +
 //! TimeHealthMonitor). Verifies the monotonic clock never goes backward, advances
 //! by reasonable deltas under normal conditions, and detects step regressions.

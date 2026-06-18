@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests: allocate → free → reallocate with free-space convergence.
 //!
 //! These tests treat `BlockAllocator` as a black box and verify that

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Intent-log segment writer with automatic rotation.
 //!
 //! [`IntentLogWriter`] accepts intent-log frames, encodes them into the

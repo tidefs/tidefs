@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! POSIX ACL convenience layer wrapping [`tidefs_posix_acl`] for xattr storage
 //! and ACL enforcement paths in [`crate::LocalFileSystem`].
 //!

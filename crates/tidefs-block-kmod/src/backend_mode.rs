@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Backend-selection policy for the block-kmod Kbuild entrypoint.
 //!
 //! The production path must not silently downgrade from pool-backed storage to

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P8-03 data_copy_7 flow commit coordinator.
 //!
 //! The flow commit coordinator is the bridge between the verification pipeline

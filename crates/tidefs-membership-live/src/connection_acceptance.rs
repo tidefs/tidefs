@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Connection acceptance bridge: wires the PeerReconnectHandshake into the
 //! membership runtime so known-peer reconnects deliver epoch state and
 //! re-bind transport sessions to roster entries.

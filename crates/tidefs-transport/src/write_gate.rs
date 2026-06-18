@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Write-gate for single-writer fencing.
 //!
 //! The [`WriteGate`] is the transport-layer enforcement point for the

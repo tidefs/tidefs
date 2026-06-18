@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FsyncHandler: commit_group-integrated fsync/fdatasync dispatch.
 //!
 //! Wraps a [`tidefs_commit_group::CommitGroupSync`] and provides the

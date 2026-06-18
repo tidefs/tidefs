@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Orphan-index drain: reaps orphaned inodes after last-close cleanup.
 //!
 //! The [`OrphanDrain`] iterates the orphan index after each TXG commit,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE rename BLAKE3-verified validation harness.
 //!
 //! Validates that POSIX rename(2) completes correctly through a real FUSE

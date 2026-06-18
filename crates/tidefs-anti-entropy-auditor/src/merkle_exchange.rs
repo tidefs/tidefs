@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Merkle tree exchange protocol for efficient anti-entropy comparison.
 //!
 //! Instead of shipping full datasets or all digests between nodes,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Checksum-tree scrub verification for object payloads.
 //!
 //! This module verifies a stored object's payload against a previously

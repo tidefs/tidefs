@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P5-02 FUSE namespace mutation worker pool (queue_class_2.namespace_mut)
 //! and directory-stream readdir/readdirplus path.
 //!

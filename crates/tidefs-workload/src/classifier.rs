@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Sliding-window IO pattern classifier.
 //!
 //! Accumulates read/write/fsync observations over a configurable window

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Intent-log entry replication bridge for multi-node write durability.
 //!
 //! Bridges the local intent-log durability mechanism to a transport session

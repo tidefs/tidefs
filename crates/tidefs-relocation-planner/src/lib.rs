@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Relocation planner: reclaim/tiering/policy-change/drain relocation
 //! flow orchestration — P8-03 data_copy_5.
 //!

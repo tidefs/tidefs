@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Push retry policy with exponential backoff, jitter, and dead-target marking.
 //!
 //! `PushRetryPolicy` drives retry decisions for `ReplicaPush` fanout

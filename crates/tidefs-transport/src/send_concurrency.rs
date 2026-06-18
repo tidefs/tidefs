@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-connection send-concurrency limiter that caps the number of in-flight
 //! (sent but unacknowledged) messages per connection, releasing permits on
 //! send-completion acknowledgement.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lease lifecycle integration tests.
 //!
 //! Validate the full lifecycle of a lease: acquire, hold (epoch tracking),

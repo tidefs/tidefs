@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for per-object key derivation via HKDF-SHA256.
 //!
 //! Exercises ObjectKeyDeriver, EncryptedObjectStore with per-object key

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for the BLAKE3-verified reconnect protocol.
 //!
 //! These tests exercise the full reconnect lifecycle across the boundary

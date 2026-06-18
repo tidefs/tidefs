@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Session-disconnect-driven peer unreachability detection.
 //!
 //! Bridges transport session disconnect events into per-peer unreachability

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified scrub-repair validation harness.
 //!
 //! Domain: `tidefs-scrub-repair-v1`

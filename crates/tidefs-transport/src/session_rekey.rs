@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport session rekeying on membership epoch transitions.
 //!
 //! When the membership roster changes (peer joins, drains, or fails), the

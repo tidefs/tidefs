@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! blk-mq queue_rq dispatch bridging the Linux block layer to VfsEngine.
 //!
 //! This module implements the blk_mq `queue_rq` / `submit_bio` request-processing

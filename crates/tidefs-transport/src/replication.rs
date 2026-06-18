@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Replication message wire protocol and transport-level send/receive helpers.
 //!
 //! Defines the structured messages used for distributed object replication

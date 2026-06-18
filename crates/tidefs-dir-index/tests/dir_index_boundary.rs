@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // dir_index_boundary.rs — Boundary-condition integration tests for DirIndex
 // covering Send+Sync safety, entry overwrite semantics, and targeted patterns
 // from issue #3992 that complement the existing test suite.

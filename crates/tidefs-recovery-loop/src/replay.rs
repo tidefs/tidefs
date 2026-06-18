@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! VfsEngine-aware intent-log replay engine for mount-time crash recovery.
 //!
 //! [`ReplayEngine`] uses the [`tidefs_intent_log::replay::IntentReplayEngine`]

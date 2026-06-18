@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Ublk I/O boundary validator: sector alignment, capacity bounds,
 //! overflow guards, zero-length acceptance, and short-I/O detection.
 //!

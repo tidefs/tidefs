@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reconnect-state push message for delivering committed epoch state to a
 //! reconnecting known peer during transport session establishment.
 //!

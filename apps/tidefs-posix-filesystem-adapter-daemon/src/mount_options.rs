@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE daemon mount-option parser.
 //!
 //! Parses `-o atime,relatime,noatime,nodiratime,sync,async,dev,nodev,...` comma-separated

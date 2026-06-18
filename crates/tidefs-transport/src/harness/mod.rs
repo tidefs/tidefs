@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic multi-node transport loopback harness.
 //!
 //! Simulates multiple TideFS nodes communicating over loopback channels

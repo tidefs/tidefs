@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! In-memory ring-buffer intent log with transaction tracking.
 //!
 //! The [`InMemoryIntentLog`] accumulates [`IntentLogRecord`] entries in a

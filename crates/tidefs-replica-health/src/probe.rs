@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Replica liveness probing with configurable probe loop.
 //!
 //! Drives periodic liveness checks through transport sessions to determine

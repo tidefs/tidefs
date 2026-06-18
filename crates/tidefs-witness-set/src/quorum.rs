@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Quorum availability evaluation and membership-change recommendations.
 //
 // Given a WitnessSetConfig and per-member health map, quorum_available()

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Focused concurrency and edge-case validation tests for the local object store.
 //!
 //! These tests use Barrier/mpsc synchronization (no thread::sleep timing)

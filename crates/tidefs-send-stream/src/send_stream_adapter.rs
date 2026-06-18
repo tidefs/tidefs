@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Send-stream transport session adapter: bridges VFSSEND2 data-plane framing
 //! to tidefs-transport session channels.
 //!

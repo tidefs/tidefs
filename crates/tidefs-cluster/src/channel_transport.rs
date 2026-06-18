@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! In-memory channel transport for testing the cluster pool orchestrator.
 //!
 //! [`ChannelPoolTransport`] implements [`crate::pool_orchestrator::PoolTransport`]

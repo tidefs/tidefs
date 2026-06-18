@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Materialized workload-signature cache: a concrete precomputed-view
 //! consumer that holds the most recent workload classification with a
 //! configurable TTL and exposes it for adaptive subsystem tuning.

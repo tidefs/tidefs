@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Authority type definitions for locator tables (originally from
 //! tidefs-types-locator-table-core, now merged into locator-table).
 //!

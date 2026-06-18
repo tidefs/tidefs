@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BackfillTask: a single data-movement work item scoped to one
 //! replica placement (source → target), carrying priority, retry
 //! budget, and a creation deadline so the scheduler can age out

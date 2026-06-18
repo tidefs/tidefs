@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Validated drain protocol configuration.
 //!
 //! [`DrainConfig`] bundles all tunables for the node drain protocol with

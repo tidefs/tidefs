@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lease message dispatch for the transport session handler.
 //!
 //! Routes encoded [`tidefs_lease::wire::LeaseWireMessage`] values through

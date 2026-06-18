@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Membership roster-driven peer address registry.
 //!
 //! [`PeerAddressRegistry`] maps membership node identifiers ([`MemberId`]) to

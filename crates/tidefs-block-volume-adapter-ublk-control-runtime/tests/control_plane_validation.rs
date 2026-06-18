@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified ublk control-plane device registration and queue
 //! configuration protocol validation harness.
 //!

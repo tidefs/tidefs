@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Unified validation schema for runtime tiers.
 //!
 //! This module provides the canonical `ValidationTier` enum,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Fixed-size 4 KB page format for persistent B+tree storage.
 //!
 //! Every B+tree node lives in exactly one 4096-byte page. The page header

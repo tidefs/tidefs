@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Benchmarks comparing V1 InlineExtentMap vs V2 BTreeExtentMap.
 //!
 //! Measures insert, point-lookup, and full-iteration throughput

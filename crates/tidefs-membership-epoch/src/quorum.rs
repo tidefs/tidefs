@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Quorum-based epoch commitment with BLAKE3-verified voting.
 //!
 //! This module implements the proposal → vote → commit pipeline for

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! `tidefsctl block` subcommands: attach, detach, and list ublk block
 //! devices backed by a TideFS pool.
 //!

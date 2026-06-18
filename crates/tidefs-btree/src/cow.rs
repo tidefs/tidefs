@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Crash-safe copy-on-write B+tree operations.
 //!
 //! Every mutation first serializes the new child nodes into persistent

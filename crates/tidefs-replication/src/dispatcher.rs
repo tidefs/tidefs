@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Replication dispatch engine.
 //!
 //! Consumes a [`ReplicationIntent`] (Mirror or ErasureCoded) and fans out

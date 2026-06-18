@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-authenticated intent-log frame.
 //!
 //! An [`IntentLogFrame`] wraps an [`IntentLogRecord`] with a transaction

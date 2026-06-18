@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-mode intent-log append through [`KernelStorageIo`].
 //!
 //! This module is the no_std append primitive used by mounted kernel code. It

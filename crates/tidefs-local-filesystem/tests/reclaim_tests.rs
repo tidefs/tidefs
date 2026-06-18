@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reclaim integration tests for the TideFS LocalFileSystem.
 //!
 //! This file covers two reclaim domains:

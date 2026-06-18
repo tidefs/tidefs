@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Bounded slot-request queue with priority ordering and backpressure
 //! signaling for TDMA transport scheduling.
 //!

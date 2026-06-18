@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Alloc/free lifecycle tests for tidefs-block-allocator.
 //!
 //! Tests the full lifecycle: allocate blocks, verify they are consumed,

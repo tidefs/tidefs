@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Concurrent stress tests for tidefs-block-allocator.
 //!
 //! These tests verify that the allocator remains internally consistent

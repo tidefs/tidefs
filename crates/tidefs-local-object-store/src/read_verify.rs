@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Read-path checksum verification for the local object store.
 //! When `verify_read_checksums` is enabled on [`StoreOptions`],
 //! every read-path call validates the payload against the stored

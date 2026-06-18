@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Bootstrap dead-segment scan for reclaim-queue priming on pool open.
 //!
 //! On pool open, the reclaim queue starts empty. Online population

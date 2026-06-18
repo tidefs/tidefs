@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! ShipperSession: binds a send-stream SendQueue to a receive-stream
 //! ObjectAssembler with a shared BLAKE3-256 session-integrity hasher.
 //!

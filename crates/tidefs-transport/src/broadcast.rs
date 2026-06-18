@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Multi-session broadcast send for one-to-many message delivery.
 //!
 //! Enables efficient fan-out of a single message payload to a set of

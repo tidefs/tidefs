@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! CRC32C-verified transport message compression with per-message algorithm
 //! negotiation and compressed-frame wire format.
 //!

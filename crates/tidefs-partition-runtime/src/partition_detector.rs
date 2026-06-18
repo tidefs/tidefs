@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! PartitionDetector: monitors SWIM failure detector reachability, builds
 //! a reachability matrix, and identifies partition sides.
 

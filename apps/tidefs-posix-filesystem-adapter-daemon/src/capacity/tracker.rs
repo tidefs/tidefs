@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Capacity tracker with monotonic generation counter and a formal refresh
 //! lifecycle state machine.
 //!

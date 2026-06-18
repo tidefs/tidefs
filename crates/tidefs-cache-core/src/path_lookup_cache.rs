@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Path lookup cache for positive lookup/getattr acceleration and
 //! negative (ENOENT) caching.
 //!

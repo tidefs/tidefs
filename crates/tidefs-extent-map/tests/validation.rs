@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![allow(unused_variables)]
 //! Comprehensive validation tests for ExtentMap high-level API.
 //!

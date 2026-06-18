@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use crate::drain::{NodeDrain, NodeState};
 use serde::{Deserialize, Serialize};
 use tidefs_membership_epoch::{EpochId, MemberId};

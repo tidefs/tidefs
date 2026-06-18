@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TDMA slot allocator: deterministic slot allocation with configurable
 //! slot count, slot duration, guard intervals, and round-robin advancement.
 //!

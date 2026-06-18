@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Replica chunk push: encode, fanout to peer replicas, collect quorum
 //! acknowledgments, and retry on transient failures.
 //!

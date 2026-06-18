@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Linux 7.0 kernel validation matrix for xfstests, fio, mkfs, and QEMU.
 //!
 //! # Runtime artifact source guard

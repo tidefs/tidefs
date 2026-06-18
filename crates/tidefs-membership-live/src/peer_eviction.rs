@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Peer eviction execution on dead-peer epoch commit.
 //!
 //! [`EvictionExecutor`] bridges the epoch-commit subscriber dispatch (#5900)

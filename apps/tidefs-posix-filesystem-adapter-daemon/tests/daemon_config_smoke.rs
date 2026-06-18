@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lightweight daemon configuration smoke tests.
 //!
 //! These drive the compiled daemon binary far enough to validate CLI parsing

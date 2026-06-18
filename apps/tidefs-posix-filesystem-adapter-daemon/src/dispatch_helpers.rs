@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Shared dispatch helpers for FUSE operation handlers.
 //!
 //! This module centralizes error-to-errno mapping and reply boilerplate

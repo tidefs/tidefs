@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration smoke for hard links through the VFS-backed FUSE adapter.
 
 use std::fs;

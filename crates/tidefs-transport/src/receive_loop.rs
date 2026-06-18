@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport per-connection async receive loop: reads raw bytes from a TCP
 //! socket, decodes length-delimited frames via [`tidefs_binary_schema_framing`],
 //! demultiplexes by channel stream-ID, and dispatches complete messages to

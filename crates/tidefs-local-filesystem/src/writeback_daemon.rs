@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // writeback_daemon.rs — periodic dirty-page flush scheduling loop
 //
 // The WritebackDaemon bridges DirtyPageTracker and the local object store

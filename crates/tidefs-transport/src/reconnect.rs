@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reconnection state machine — preserves endpoint invariants across connection drops.
 //!
 //! ## Reconnection and the endpoint lifecycle

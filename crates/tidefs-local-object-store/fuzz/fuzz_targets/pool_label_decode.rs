@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

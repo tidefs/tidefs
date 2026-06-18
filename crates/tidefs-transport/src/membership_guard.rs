@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Membership session guard: tears down transport sessions to departed peers
 //! on epoch advancement.
 //!

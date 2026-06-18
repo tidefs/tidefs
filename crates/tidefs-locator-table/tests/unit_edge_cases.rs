@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Edge-case unit tests for tidefs-locator-table covering gaps not
 //! exercised by the existing inline and integration test suites:
 //! zero-length entries, maximum valid offset, delete-all verification,

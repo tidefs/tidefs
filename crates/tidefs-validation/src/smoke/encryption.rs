@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Encryption smoke: deterministic key derivation, encrypted object I/O,
 //! wrong-key refusal, reopen recovery, and tamper detection over
 //! `tidefs-encryption`.

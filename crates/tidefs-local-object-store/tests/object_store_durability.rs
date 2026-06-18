@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object-store durability unit tests for `tidefs-local-object-store`.
 //!
 //! Four test groups supporting the FUSE fsync/fdatasync fast-path:

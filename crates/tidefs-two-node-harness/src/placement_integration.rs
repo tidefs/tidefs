@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement integration: wires `tidefs-placement-planner` node placement
 //! decisions into the deterministic two-node harness.
 //!

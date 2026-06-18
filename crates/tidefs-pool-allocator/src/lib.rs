@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool-level segment allocator: the single authority on free-segment tracking,
 //! segment_group selection, and space-pressure signalling for the entire storage
 //! pool.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests: message encode/decode round-trip for all three header
 // types and the envelope builder.
 

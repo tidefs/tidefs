@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport-session to membership-roster binding.
 //!
 //! When a transport session is established between two TideFS storage nodes,

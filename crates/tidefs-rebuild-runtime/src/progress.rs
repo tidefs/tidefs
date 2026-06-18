@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BackfillProgress: per-task state machine tracking lifecycle from
 //! creation through scheduling, transfer, verification, and terminal
 //! completion or failure.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Namespace mutation layer for TideFS.
 //!
 //! This directory holds namespace-level operations that manipulate

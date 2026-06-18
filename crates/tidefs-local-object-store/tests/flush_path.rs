@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Flush-path and segment-seal unit tests for `tidefs-local-object-store`.
 //!
 //! Covers the write-to-sync lifecycle through the object-store layer:

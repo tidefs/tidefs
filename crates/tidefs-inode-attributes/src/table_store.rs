@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! [`InodeTable`]-backed attribute store.
 //!
 //! Wraps a [`tidefs_inode_table::InodeTable`] and implements the

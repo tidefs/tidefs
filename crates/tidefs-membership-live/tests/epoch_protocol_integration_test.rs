@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for the epoch proposal/commit protocol (#5044).
 //!
 //! Uses a deterministic N-node message bus to exercise the full protocol

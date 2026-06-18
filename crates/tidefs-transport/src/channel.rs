@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport channel multiplexing: per-connection channel-ID allocation,
 //! lifecycle state tracking, and per-channel byte counters.
 //!

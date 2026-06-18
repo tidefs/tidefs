@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! 7-step mutual attestation HELLO handshake state machine.
 //!
 //! Implements the full 7-step handshake from the cluster security identity

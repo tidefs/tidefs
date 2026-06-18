@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests: multi-node witness accumulation across epoch boundaries,
 // partition injection and heal with deterministic replay.
 //

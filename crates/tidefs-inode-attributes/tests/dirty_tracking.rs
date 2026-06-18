@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Dirty-change tracking and generation-counter validation tests.
 //!
 //! Exercises the per-field dirty flags, monotonic generation counter,

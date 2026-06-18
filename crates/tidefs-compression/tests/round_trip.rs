@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Property-based round-trip tests for tidefs-compression.
 //!
 //! Exercises frame-level compress/decompress through the tidefs-compression

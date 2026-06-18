@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Request-concurrency guard for per-session in-flight request limiting.
 //
 // Provides an RAII guard that atomically tracks in-flight request counts

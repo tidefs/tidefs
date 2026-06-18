@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-session message prioritization with Control/Data head-of-line bypass
 //! for the outbound send path.
 //!

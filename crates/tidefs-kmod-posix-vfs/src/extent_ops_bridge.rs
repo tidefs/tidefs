@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Extent operations bridge — canonical kernel extent allocation entry point.
 //!
 //! Provides the `bridge_allocate_extents` function that translates kernel

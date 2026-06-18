@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Concurrent access validation tests.
 //!
 //! Exercises thread-safe mutation and read paths through InlineExtentMap

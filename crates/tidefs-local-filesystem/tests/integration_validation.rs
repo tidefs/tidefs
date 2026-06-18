@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration validation suite for tidefs-local-filesystem.
 //!
 //! Exercises the full mount-to-unmount lifecycle through the public API:

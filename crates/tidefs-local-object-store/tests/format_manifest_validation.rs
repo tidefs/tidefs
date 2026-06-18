@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Format manifest lifecycle validation — Tier 3 userspace runtime validation.
 //!
 //! Validates that the [`LocalObjectStoreFormatManifest`] is written on store

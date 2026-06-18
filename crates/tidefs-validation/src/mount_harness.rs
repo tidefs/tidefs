@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! End-to-end FUSE mount harness for the TideFS POSIX filesystem adapter daemon.
 //!
 //! `MountHarness` spawns the `tidefs-posix-filesystem-adapter-daemon` binary,

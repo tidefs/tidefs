@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for mount eligibility, check_mount, poison gating,
 //! and write acceptance across the lifecycle. These directly exercise
 //! the DatasetOpenResult / DatasetOpenError path that the POSIX adapter

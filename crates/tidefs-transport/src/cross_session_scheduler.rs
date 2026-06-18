@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cross-session send scheduling with weighted fair queueing (WFQ)
 //! across active peer sessions.
 //!

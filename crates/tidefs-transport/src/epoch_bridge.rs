@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch event bridge: dispatches membership epoch transition events
 //! to registered transport subsystems, keeping per-peer state across
 //! all transport components consistent with the current membership

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lease protocol service: grant, renewal, revocation, and acknowledgement
 //! with BLAKE3-verified message integrity and epoch-bound state machines.
 //!

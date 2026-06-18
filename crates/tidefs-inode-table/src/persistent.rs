@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! On-disk inode-table persistence layer backed by [`tidefs_local_object_store`].
 //!
 //! [`PersistentInodeTable`] stores each inode record as a named object in the

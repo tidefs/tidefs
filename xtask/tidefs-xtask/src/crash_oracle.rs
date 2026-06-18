@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! check-crash-oracle gate for tidefs-xtask.
 //!
 //! Validates the `tidefs-crash-oracle` crate by running its tests and

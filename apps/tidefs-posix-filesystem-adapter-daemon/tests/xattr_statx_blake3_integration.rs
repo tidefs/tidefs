@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for xattr-statx round-trip with BLAKE3-verified
 //! xattr state integrity.
 //!

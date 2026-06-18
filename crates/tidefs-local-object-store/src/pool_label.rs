@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Bridge module that re-exports the on-disk pool label types from
 //! `tidefs-types-pool-label-core`.
 //!

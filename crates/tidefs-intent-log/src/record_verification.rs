@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Intent-log record verification: round-trip encoding, single-byte
 //! corruption detection, and in-memory replay state simulation.
 //!

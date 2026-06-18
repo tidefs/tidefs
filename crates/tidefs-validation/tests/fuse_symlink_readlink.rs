@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE symlink/readlink BLAKE3-verified validation harness.
 //!
 //! Exercises symlink creation and readlink resolution through a real

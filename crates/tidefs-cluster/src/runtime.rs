@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster lease runtime driving the membership lease lifecycle per node.
 //!
 //! The [`ClusterLeaseRuntime`] coordinates the [`LeaseStateMachine`] with

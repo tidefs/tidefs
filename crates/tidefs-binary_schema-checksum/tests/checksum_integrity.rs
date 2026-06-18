@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Comprehensive checksum integrity tests for tidefs-binary_schema-checksum.
 //!
 //! Covers empty/single-byte/page-aligned/large payload round-trips,

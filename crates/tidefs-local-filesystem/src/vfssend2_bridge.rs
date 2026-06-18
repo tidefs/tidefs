@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! VFSSEND2 bridge: convert local-filesystem changed-record exports into
 //! the canonical VFSSEND2 stream format defined in [`tidefs_send_stream`].
 //!

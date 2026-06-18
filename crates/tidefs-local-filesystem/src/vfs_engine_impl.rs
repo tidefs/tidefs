@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! VfsEngine trait implementation wrapping LocalFileSystem.
 //!
 //! Wraps `LocalFileSystem` in a `RefCell` to provide interior mutability,

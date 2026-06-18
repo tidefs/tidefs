@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use tidefs_kernel_cutover_runtime::{
     teardown_proof_review_receipt, TeardownProofReviewError, TeardownProofReviewState,
     TeardownTokenState, TeardownWorkCase, KERNEL_TEARDOWN_NO_WORK_AFTER_CLAIM_ID,

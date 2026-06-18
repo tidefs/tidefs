@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! xfstests tiering policy — maps xfstests groups to validation tiers,
 //! defines explicit expected-failure catalogs, and validates scoreboard
 //! runs against the tiering policy.

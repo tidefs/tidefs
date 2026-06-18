@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Segment liveness tracking for dead-segment reclamation.
 //!
 //! Tracks each segment's live-byte and dead-byte counts, updated by

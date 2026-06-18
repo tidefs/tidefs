@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![deny(clippy::all)]
 // clippy::pedantic is allowed for now; future chunks should whittle down this
 // allow list by fixing one pedantic lint group at a time.

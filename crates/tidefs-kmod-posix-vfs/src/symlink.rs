@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Symlink creation and readlink resolution for the kernel VFS adapter --
 //! K7-13 namespace mutation seam.
 //!

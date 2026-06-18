@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests: fragmentation scenarios.
 //!
 //! Interleaved allocate/free patterns that produce non-trivial

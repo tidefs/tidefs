@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE read-write mount CRUD integration test.
 //!
 //! Validates the full create-read-update-delete lifecycle through a

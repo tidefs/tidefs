@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Erasure coding profile definition.
 //!
 //! An [`ErasureCodingProfile`] defines the encoding parameters — data shard

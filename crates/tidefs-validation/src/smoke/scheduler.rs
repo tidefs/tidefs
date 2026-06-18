@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Scheduler smoke: deterministic writeback scheduling checks over
 //! `tidefs-posix-filesystem-adapter-daemon (scheduler module)`.
 //!

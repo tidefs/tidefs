@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! POSIX error-code regression tests for mkdir, rmdir, unlink, and rename
 //! through the FUSE-mounted adapter daemon.
 //!

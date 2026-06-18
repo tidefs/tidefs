@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! RebuildCompletion: tracks rebuild flow completion and emits
 //! signals when missing data has been fully recovered after
 //! node/device loss.

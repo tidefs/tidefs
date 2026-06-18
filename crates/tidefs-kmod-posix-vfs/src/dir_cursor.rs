@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Directory cursor tracking state across iterative getdents64 calls.
 //!
 //! The [`DirCursor`] maps the opaque kernel `ctx->pos` to VfsEngine

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Serde round-trip tests: every public type in tidefs-chunk-shipper must
 //! survive encode→decode symmetry.
 

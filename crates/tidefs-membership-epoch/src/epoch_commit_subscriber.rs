@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch-commit subscriber dispatch registry for transport epoch-gate notification.
 //!
 //! [`EpochCommitBus`] provides a multi-subscriber dispatch point so transport

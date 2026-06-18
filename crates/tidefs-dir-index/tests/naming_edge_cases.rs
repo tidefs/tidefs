@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // naming_edge_cases.rs — Edge-case tests for directory entry naming.
 //
 // Coverage rationale:

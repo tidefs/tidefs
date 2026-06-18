@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Portable kernel cutover mode, fence, and rollback state-machine types.
 //! d0 boundary domain -- formerly `tidefs-types-kernel-cutover-core`.
 //! Consolidated into the runtime crate per #5726 since it has a single consumer.

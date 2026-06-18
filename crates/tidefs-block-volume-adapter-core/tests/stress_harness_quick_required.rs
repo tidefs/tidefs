@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P6-04 profile 1: block_acceptance_profile_1.quick_required
 //!
 //! Required pre-release charter validation for `block_volume_adapter`.

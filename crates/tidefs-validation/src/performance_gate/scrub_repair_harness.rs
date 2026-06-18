@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Scrub, repair, and rebuild performance benchmark harness.
 //!
 //! Provides throughput and latency measurement for:

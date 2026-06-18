@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Deterministic codec for WitnessSet and WitnessEntry using
 // tidefs-binary_schema-core LE wrappers for wire-format identity
 // compatible with the quorum-write commit path and replication dispatch.

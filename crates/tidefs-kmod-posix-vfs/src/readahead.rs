@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Readahead and page-cache integration for the kernel VFS adapter.
 //!
 //! Mirrors the userspace VfsPageCacheStats from tidefs-vfs-engine::trace

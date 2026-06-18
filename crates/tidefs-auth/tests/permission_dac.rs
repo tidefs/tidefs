@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! POSIX DAC (Discretionary Access Control) permission evaluation tests.
 //!
 //! These tests exercise [`tidefs_permission`] through the `tidefs-auth`

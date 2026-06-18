@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mount-time orphan cleanup triggered during LocalFileSystem::open recovery.
 //!
 //! After intent log replay, inodes that reached nlink==0 before an unclean

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! JSON configuration file support for tidefs-storage-node.
 //!
 //! Provides [`StorageNodeConfig::from_json_file`] and [`JsonStorageNodeConfig`]

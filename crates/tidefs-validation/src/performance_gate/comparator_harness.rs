@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Comparator harness — executes fio benchmarks against incumbent filesystems
 //! (ext4, raw block) and captures baseline KPI vectors for performance gate
 //! comparator rows.  ZFS and Ceph are staged/unavailable with release

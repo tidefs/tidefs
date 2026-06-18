@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Directory entry removal (unlink) for the TideFS namespace.
 //!
 //! Implements POSIX `unlink(2)` semantics: removes a name from a

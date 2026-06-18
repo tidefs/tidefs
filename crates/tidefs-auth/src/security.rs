@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster security and identity model — sealed implementation.
 //!
 //! This module implements the sealed design specification from

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-object key derivation via HKDF-SHA256 (RFC 5869).
 //!
 //! [`ObjectKeyDeriver`] accepts a pool-level master key and derives a

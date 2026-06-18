@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Retention and GC validation for content-addressed chunk dedup canonical
 //! targets (#5966, #6167).
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Coordinator-side join-request handler with roster-constraint validation,
 //! coordinator-authority checks, incarnation-verified stale-message rejection,
 //! and idempotency-key-wrapped proposal submission.

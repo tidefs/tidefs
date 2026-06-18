@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport session set: binds node identities to active transport sessions.
 //!
 //! [`TransportSessionSet`] maps node IDs to [`SessionId`] values and provides

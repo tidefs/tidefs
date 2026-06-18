@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pure source model for Linux VFS callback context and teardown ordering.
 //!
 //! This module is a proof-harness seed for kernel-facing TideFS work. It does

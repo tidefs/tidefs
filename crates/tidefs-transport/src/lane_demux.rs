@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

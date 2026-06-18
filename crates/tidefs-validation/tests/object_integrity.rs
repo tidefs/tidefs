@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![cfg(feature = "fuse")]
 
 //! Property-based object integrity tests for the local object store.

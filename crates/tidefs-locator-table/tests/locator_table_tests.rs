@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::path::Path;
 use tidefs_local_object_store::{LocalObjectStore, StoreOptions};
 use tidefs_locator_table::{ExtentId, LocatorEntry, LocatorTable};

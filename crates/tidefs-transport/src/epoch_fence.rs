@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch-bound connection fence for departed member drain.
 //!
 //! [`EpochFence`] bridges membership epoch transitions to transport

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport per-session receive-side flow control with credit-based
 //! windowing for inbound frame backpressure.
 //!

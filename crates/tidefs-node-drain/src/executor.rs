@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use crate::drain::{DrainError, DrainProgress, DrainStage, NodeDrain};
 use tidefs_lease::lock_table::LockTable;
 use tidefs_lease::types::LockOwner;

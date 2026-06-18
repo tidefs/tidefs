@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! ublk discard/write-zeroes artifact-schema regression tests.
 //!
 //! This test file proves the DiscardValidationRow contract from

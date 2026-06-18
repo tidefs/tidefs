@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic object-store validation harness.
 //!
 //! [`ObjectStoreTestHarness`] wraps any [`ObjectStore`] implementation and

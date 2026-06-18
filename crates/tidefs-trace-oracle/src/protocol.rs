@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Wire-stable trace protocol constants.
 //!
 //! These op name strings are the cross-implementation contract. The Rust

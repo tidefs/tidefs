@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Property-based round-trip tests for tidefs-frame wire encoding.
 //!
 //! Every public frame type and encode/decode function is exercised under

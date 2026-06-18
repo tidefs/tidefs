@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! High-level intent log with bounded ring buffer, backpressure, commit,
 //! and replay.
 //!

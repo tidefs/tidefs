@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! SplitBrainGuard: membership-epoch-gated quorum checking, witness-vouche
 //! verification, minority-side freeze, and split-brain hazard emission.
 

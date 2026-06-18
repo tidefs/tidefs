@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Data migration driver for node drain.
 //!
 //! The [`MigrationDriver`] walks the object store on a draining node, groups

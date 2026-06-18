@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Snapshot pruner: clone/origin dependency tracking, retention evaluation,
 // and safe snapshot deletion.
 

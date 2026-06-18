@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Userspace kernel-cutover runtime: state-machine executor, fence manager,
 //! dry-run gate evaluator, and rollback engine. d2 domain (userspace std).
 

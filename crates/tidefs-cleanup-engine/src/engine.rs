@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! CleanupEngine: BLAKE3-verified deferred cleanup queue execution engine.
 //!
 //! The engine iterates the persistent [`CleanupQueue`], dispatches work

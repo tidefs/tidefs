@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Bridge error types for kernel-boundary operations.
 //!
 //! These error types represent failures that can occur at the kernel bridge

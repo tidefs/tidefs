@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // VoteRound: round-id generation, vote collection with duplicate detection,
 // and outcome determination (passed/failed/pending/deadlocked) for
 // quorum-based consensus.

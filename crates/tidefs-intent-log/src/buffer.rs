@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lock-free in-memory intent-log append buffer.
 //!
 //! [`IntentLogBuffer`] provides a concurrent append interface for recording

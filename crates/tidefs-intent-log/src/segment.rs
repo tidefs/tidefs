@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! On-disk intent-log segment format with BLAKE3 checksums.
 //!
 //! A segment is the durable unit of the intent log. Each segment contains a

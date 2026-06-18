@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Statfs filesystem statistics delegation for the kernel VFS adapter --
 //! K7-21 filesystem statistics seam.
 #[cfg(CONFIG_RUST)]

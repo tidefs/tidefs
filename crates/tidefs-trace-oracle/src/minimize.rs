@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Trace minimizer: reduces failing traces to minimal reproducers.
 //!
 //! When a trace fails during replay, the minimizer applies three phases:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Directory creation mutation for the kernel VFS adapter -- K7-11
 //! namespace mutation seam.
 

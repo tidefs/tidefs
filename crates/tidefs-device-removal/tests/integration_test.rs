@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration test: full device removal lifecycle with a 3-device pool,
 //! LocatorTable-backed enumeration, data-mover-backed evacuation, and
 //! pool-import detection.

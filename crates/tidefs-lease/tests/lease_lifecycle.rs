@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for lease state transitions through the public API.
 //!
 //! Exercises LeaseGrant lifecycle methods (fence, release, renew) and

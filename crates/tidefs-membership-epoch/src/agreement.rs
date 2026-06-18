@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Peer-to-peer epoch-agreement protocol with proposal broadcast,
 //! ack collection, quorum commit, and subscriber dispatch.
 //!

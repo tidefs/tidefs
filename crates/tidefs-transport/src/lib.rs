@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![deny(unsafe_code)]
 
 //! Transport/session layer for TideFS distributed runtime.

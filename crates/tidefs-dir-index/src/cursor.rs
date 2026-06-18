@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Ordered directory cursor with BLAKE3-verified entry iteration.
 //!
 //! [`DirCursor`] wraps a bounded [`crate::DirIndex`] window and yields

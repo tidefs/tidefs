@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Property-based tests for tidefs-binary_schema-core serialization
 // primitives. Gated behind the `proptest` feature so default test
 // builds stay fast.

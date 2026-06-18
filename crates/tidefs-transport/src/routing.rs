@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Message routing table with membership-driven next-hop resolution.
 //!
 //! [`RoutingTable`] computes shortest-path routes through the known peer

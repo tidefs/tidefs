@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Page-based persistent directory index backed by the object store.
 //!
 //! [`DirPageIndex`] stores directory entries in fixed-size 4 KiB [`DirPage`]

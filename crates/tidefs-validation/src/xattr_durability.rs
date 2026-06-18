@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Xattr-durability validation: mount, set/get/list/remove user extended
 //! attributes, fsync or remount, verify xattr data survives remount cycle.
 //!

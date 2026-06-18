@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! VFS dispatch trait — the canonical dispatch interface.
 //!
 //! Defines [`VfsDispatch`], the trait that both `tidefs-local-filesystem`

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Tier 7 multi-node/RDMA product path validation (#6561).
 //!
 //! Produces multi-process validation for distributed storage behavior

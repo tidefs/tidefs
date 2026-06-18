@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Property-based tests for ARC cache state invariants.
 //!
 //! Uses `proptest` to generate random sequences of insert/get/remove

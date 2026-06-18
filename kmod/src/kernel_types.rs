@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-compatible no_std type definitions for the TideFS VFS boundary.
 //!
 //! These types MUST match the userspace types in tidefs-types-vfs-core and

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement transfer control protocol messages for
 //! deterministic state transfers between nodes.
 //!

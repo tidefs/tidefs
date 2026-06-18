@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-session frame-size governance for the transport layer.
 //!
 //! ## Governance model

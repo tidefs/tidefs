@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport connection lifecycle state machine managing TCP and Unix domain
 //! socket connection establishment, acceptance, state tracking, and graceful
 //! drain. Provides the connection substrate for send (#5778) and receive

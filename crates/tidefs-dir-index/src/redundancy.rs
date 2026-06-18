@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Metadata redundancy: directory B-tree page replication, failover, and
 //! automatic repair.
 //!

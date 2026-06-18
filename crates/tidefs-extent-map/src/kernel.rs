@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-mode extent map reader for VFS block translation.
 //!
 //! `ExtentMapKernelReader` traverses the on-disk extent map B-tree pages

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration test for object payload transfer over transport sessions.
 //!
 //! Exercises the ObjectTransferMessage wire types, TransferHandle

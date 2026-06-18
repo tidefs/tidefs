@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! xfstests harness -- runs xfstests against a TideFS FUSE mount and produces
 //! a structured JSON scoreboard with per-test pass/fail/skip/diff entries.
 //!

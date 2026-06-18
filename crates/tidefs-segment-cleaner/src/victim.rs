@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Liveness-ratio victim selection for segment compaction.
 //!
 //! [`VictimSelector`] wraps a [`SegmentLivenessQueue`] and

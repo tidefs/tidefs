@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Device evacuation engine: safely drains all object data from a target
 //! device onto remaining pool members.
 //!

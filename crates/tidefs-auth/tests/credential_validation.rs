@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // credential_validation.rs — credential binding lifecycle, identity
 // revocation, credential hash matching, binding TTL/expiry, and
 // credential-binding-to-principal resolution.

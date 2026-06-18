@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Async task scheduler backed by a 5-lane priority [`LaneQueue`].
 //!
 //! The [`Scheduler`] accepts futures submitted with a [`SchedulingClass`]

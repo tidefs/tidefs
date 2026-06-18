@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Session-bound transport security with HMAC-SHA256 per-frame
 //! authentication and optional ChaCha20-Poly1305 encryption.
 //!

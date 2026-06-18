@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use blake3::Hasher;
 use std::collections::BTreeMap;
 use tidefs_membership_epoch::MemberId;

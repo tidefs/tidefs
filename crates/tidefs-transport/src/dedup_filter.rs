@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport per-peer message deduplication with sequence-number sliding
 //! window and domain-separated state-digest verification via BLAKE3.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! End-to-end crash-recovery validation for the full FUSE handler surface.
 //!
 //! Exercises the real FUSE mount path through the daemon binary:

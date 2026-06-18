@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Flap detection with exponential backoff.
 //!
 //! TideFS detects flap episodes and applies exponential backoff:

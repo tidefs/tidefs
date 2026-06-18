@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport connection keepalive protocol with deadline-based failure
 //! detection and health-score signal integration.
 //!

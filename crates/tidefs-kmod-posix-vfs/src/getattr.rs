@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! getattr read-side dispatch for the kernel VFS adapter -- K7 read seam.
 //!
 //! Bridges the kernel VFS `inode_operations::getattr` callback to `VfsEngine`,

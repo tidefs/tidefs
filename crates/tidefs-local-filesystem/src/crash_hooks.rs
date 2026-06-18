@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic crash injection hooks for commit_group-boundary testing (#1230).
 //!
 //! This module provides a thread_local!-based crash injection mechanism

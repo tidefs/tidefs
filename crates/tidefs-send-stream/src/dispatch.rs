@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Send dispatch trait for pushing framed chunks through a transport layer.
 //!
 //! Provides a trait-based abstraction so the send-stream crate can push

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! xfstests scoreboard integration -- invokes the TideFS xfstests harness,
 //! captures structured JSON results, and supports regression detection.
 //!

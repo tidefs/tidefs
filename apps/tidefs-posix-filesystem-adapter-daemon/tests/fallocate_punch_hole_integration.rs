@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE fallocate PUNCH_HOLE integration tests.
 //!
 //! Tests the FUSE fallocate handler's FALLOC_FL_PUNCH_HOLE mode through a

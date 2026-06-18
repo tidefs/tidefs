@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Central write-path coordinator for the local object store.
 //!
 //! The [`LocalObjectStore`] struct owns the full lifecycle of durable object

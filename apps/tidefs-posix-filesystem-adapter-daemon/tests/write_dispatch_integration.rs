@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Write-dispatch integration tests for the FUSE daemon.
 //!
 //! Validates the FUSE write dispatch path within a single mount session:

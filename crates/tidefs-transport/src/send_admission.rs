@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Typed send-pressure and admission evidence for outbound producers.
 //!
 //! This is the TFR-017 send-pressure boundary: it records what the local

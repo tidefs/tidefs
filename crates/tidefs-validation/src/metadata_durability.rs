@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Metadata-durability validation: mount, chmod/chown/utimens/truncate,
 //! fsync or remount, verify metadata survives remount cycle.
 //!

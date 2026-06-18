@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Tracing subscriber initialization for FUSE daemon observability.
 //!
 //! Supports two modes:

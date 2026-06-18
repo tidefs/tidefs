@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Extended attribute bridge types for the VFS Engine xattr surface.
 //!
 //! This module defines [`XattrSetFlags`] (semantic wrapper around Linux

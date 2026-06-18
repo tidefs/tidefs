@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use tidefs_model_core::{
     ModelRunEvidenceScope, ModelRunReceipt, ModelRunReceiptValidationError, ModelRunValidationTier,
 };

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests covering the full allocate->relocate->lookup->free
 //! cycle through the locator table, exercising compact(), swap_commit(),
 //! and relocate_extent() end to end.

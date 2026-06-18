@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Namespace-operation validation: mkdir, rmdir, rename, link, unlink.
 //!
 //! Exercises the full adapter stack (FUSE decode -> ingress -> capacity

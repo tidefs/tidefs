@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![cfg_attr(not(any(test, feature = "persistence")), no_std)]
 #![forbid(unsafe_code)]
 //! Runtime polymorphic xattr storage.

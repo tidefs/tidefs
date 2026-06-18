@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE release dispatch handler for file-handle teardown.
 //!
 //! Provides two layers:

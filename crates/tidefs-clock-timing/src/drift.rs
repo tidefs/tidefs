@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Drift estimation and classification (P8-04 Sections 3, 7.1).
 //!
 //! Estimates clock drift between nodes from observed remote/local clock

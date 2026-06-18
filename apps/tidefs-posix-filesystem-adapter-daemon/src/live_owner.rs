@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Userspace live-pool owner endpoint.
 //!
 //! This is the FUSE-session side of the imported-pool authority boundary:

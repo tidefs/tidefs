@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // dir_iterator_smoke.rs — Integration tests for DirIterator trait on populated
 // DirIndex instances. Covers full iteration, reset_cursor, seek_to_cursor
 // round-trip, current_cursor tracking, and representation stability.

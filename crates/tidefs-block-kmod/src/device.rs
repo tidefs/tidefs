@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TideFS block-volume kernel device registration.
 //!
 //! This module provides [`TidefsBlockDevice`] — the kernel-side wrapper that

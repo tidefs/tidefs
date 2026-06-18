@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-object BLAKE3-verified integrity checking.
 //!
 //! Low-level verification primitive consumed by background scrub

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-connection outbound send dispatch with ordered delivery and
 //! backpressure flow control.
 //!

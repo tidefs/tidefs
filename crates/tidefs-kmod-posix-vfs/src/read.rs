@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! File data read operation for the kernel VFS adapter -- K7-09 mutation seam.
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge;

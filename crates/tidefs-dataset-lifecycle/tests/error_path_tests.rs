@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for error paths, edge cases, and poison escalation
 //! across the DatasetLifecycle state machine. Exercises combinations that
 //! are not covered by the basic creation, destroy, or mount tests.

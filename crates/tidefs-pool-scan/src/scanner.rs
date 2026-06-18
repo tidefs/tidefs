@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool integrity scanner: segment traversal, object record verification,
 //! and health reporting.
 //!

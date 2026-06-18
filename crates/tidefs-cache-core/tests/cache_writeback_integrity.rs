@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified concurrent cache-core writeback integrity validation.
 //!
 //! This module exercises the `PageCache` writeback path with interleaved

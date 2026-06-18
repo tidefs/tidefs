@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE lookup/forget dispatch batch with dir-index name resolution and
 //! inode-table reference-count lifecycle integration.
 //!

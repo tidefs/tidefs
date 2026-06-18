@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Verification engine: top-level orchestrator for pool segment integrity.
 //!
 //! The [`VerificationEngine`] ties together pool-scan device discovery,

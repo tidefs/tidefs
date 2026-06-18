@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Inode operations for the kernel VFS adapter -- clean-read seam.
 //! delegation, and negative dentry tracking with generation
 //! validation.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Online pool geometry conversion: rewrites locator table entries to change
 //! durability policy (mirror <-> erasure coding) without destroying data.
 //!

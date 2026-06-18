@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Erasure-coded object write path: ErasureCodedWriteRequest, stripe assembly,
 //! Reed-Solomon parity computation, shard dispatch, and partial-write rollback.
 //!

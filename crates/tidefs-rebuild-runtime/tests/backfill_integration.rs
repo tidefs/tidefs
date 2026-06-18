@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration test: end-to-end backfill pipeline from degraded-replica
 //! detection through scheduler ingestion to data-movement execution.
 

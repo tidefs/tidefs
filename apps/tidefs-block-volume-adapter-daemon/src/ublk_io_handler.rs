@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // ublk_io_handler — ublk target IO command serving loop.
 //
 // Provides a ublk IO command handler that polls the ublk queue for

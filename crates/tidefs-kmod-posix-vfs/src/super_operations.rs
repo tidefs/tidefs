@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Super_operations dispatch for the kernel VFS adapter.
 //!
 //! Implements the Linux 7.0 kernel `super_operations` contract:

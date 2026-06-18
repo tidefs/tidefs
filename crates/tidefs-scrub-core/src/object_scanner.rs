@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object scanner that walks the live-object set from a committed root.
 //!
 //! [`ObjectScanner`] iterates over allocated objects in deterministic order

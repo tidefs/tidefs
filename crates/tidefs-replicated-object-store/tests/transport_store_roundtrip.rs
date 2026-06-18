@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration test: two TransportReplicatedStore instances performing
 //! a full write-then-read roundtrip over transport sessions.
 //!

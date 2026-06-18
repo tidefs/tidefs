@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Directory operations for the kernel VFS adapter — clean-read seam.
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge;

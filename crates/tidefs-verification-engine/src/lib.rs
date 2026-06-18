@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TideFS verification engine: P8-03 `data_copy_2.verification_engine`,
 //! pool-level segment integrity verification, and per-object BLAKE3-256
 //! integrity checking.

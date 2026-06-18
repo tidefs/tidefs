@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-priority send-path backpressure propagation with async capacity
 //! notification for caller flow control.
 //!

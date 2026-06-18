@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Quorum-backed lease issuance protocol (P8-03 core law 5).
 //!
 //! Issues leases only after a witness quorum confirms the grant request.

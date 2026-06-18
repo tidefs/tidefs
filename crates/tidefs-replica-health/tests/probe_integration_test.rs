@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::VecDeque;
 use tidefs_membership_epoch::EpochId;
 use tidefs_replication_model::ReplicatedReceiptId;

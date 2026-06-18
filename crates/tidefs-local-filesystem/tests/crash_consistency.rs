@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Crash-consistency unit tests for the local-filesystem layer.
 //!
 //! Exercises data-or-nothing semantics: write some data with fsync,

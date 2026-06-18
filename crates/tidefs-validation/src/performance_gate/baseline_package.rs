@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Baseline package loader -- reads external performance/SLO baseline
 //! outputs and maps their KPI data into performance gate
 //! entries for budget evaluation and regression enforcement.

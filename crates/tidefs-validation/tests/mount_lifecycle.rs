@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Worker slot: s6
 //! FUSE mount lifecycle tests: mount/unmount roundtrip, double-mount
 //! rejection, and mount/unmount stress.

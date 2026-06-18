@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Membership epoch checkpoint management for bounded-replay crash recovery.
 //!
 //! The [`CheckpointManager`] wraps the underlying [`EpochSnapshotStore`]

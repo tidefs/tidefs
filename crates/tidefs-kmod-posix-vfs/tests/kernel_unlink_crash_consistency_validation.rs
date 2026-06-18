@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! kmod-posix-vfs unlink crash-consistency validation module.
 //!
 //! Produces tier-classified validation output for kernel VFS unlink

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-session operational statistics with atomic counters.
 //!
 //! Tracks bytes sent/received, message counts by priority, error tallies,

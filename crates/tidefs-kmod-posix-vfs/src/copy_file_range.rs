@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Server-side copy_file_range delegation for the kernel VFS adapter -- K7-20.
 
 #[cfg(CONFIG_RUST)]

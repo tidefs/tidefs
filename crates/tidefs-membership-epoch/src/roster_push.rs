@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Committed-roster transport push for passive-peer epoch synchronization.
 //!
 //! After an epoch agreement round concludes via [`crate::quorum`], the

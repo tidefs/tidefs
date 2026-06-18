@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Frame-based TDMA scheduler: repeating schedule frame with per-slot
 //! node assignment, guard intervals, deterministic arbitration, and
 //! fairness tracking across observation windows.

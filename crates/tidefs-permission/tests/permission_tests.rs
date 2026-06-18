@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for POSIX mode-bit permission checking.
 //!
 //! Validates [`check_access_result`], [`check_search`], [`check_mode_access`],

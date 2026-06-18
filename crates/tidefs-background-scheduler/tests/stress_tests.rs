@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Randomized stress and timing-sensitive tests for tidefs-background-scheduler.
 //
 // Covers: high-volume task submission (10K+), randomized priority ordering

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Concurrent-operation and data-integrity validation tests for the
 //! VFS-backed FUSE adapter.
 //!

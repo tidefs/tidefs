@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object-store validation suite for `tidefs-local-object-store`.
 //!
 //! Covers orphan detection via `compact_retaining`, store stats consistency,

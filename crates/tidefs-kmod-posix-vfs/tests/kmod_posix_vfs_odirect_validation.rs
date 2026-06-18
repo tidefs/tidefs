@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! kmod-posix-vfs O_DIRECT crash-consistency validation module.
 //!
 //! Produces tier-classified validation output for kernel O_DIRECT I/O

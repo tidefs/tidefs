@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Statx rendering for the kernel VFS adapter.
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge;

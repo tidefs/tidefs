@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! B+tree smoke: deterministic insert, lookup, range, delete, rebuild,
 //! compaction, and validation checks over `tidefs-btree`.
 //!

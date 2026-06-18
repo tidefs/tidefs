@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object-level checksum integrity tests for `tidefs-local-object-store`.
 //!
 //! Validates checksum consistency across varying object sizes, deterministic

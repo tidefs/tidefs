@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Store abstraction for the commit_group subsystem.
 //!
 //! Defines `CommitGroupKey` (a wire-compatible 32-byte key) and the `CommitGroupStore` trait

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Peer-reconnect handshake bridging transport connection establishment to
 //! committed-epoch state delivery and session re-binding.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Session binding interface for transport lifecycle policy.
 //!
 //! Provides a membership-side type surface that the transport layer queries to

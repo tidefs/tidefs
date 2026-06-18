@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Segment state transfer protocol for node join bootstrap.
 //!
 //! Implements deterministic segment transfer from an existing node

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Imported-pool live-owner routing helpers.
 //!
 //! A pool name is an identity for state already owned by a runtime, not a

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool lease token: an opaque proof that the caller holds a valid cluster
 //! membership lease for a specific pool.
 //!

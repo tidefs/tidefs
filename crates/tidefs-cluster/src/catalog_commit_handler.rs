@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Catalog delta handlers for the cluster epoch commit path.
 //!
 //! Provides the concrete wiring between [`ClusterLeaseRuntime`] and the

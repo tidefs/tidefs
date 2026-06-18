@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Performance comparator matrix consolidation -- groups performance gate
 //! rows by product lane (userspace, storage, multi-node, kernel) and
 //! produces a unified gate receipt with lane-aware summaries.

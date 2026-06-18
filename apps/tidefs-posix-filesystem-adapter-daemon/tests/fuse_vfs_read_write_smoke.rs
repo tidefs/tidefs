@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mounted read/write smoke tests for the VFS-backed FUSE adapter.
 
 use std::fs::{self, File, OpenOptions};

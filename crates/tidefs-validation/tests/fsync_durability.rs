@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Local-filesystem fsync durability integration tests.
 //!
 //! Exercises the write → fsync → drop → reopen → read → verify durability

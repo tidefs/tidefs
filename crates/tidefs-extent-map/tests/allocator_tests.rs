@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration validation tests for ExtentAllocator lifecycle.
 //!
 //! Exercises allocate, lookup, free, resize, edge cases, and capacity

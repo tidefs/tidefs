@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use tidefs_durability_layout::DurabilityLayoutV1;

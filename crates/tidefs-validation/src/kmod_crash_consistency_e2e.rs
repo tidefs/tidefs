@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! kmod-posix-vfs intent-log to committed-root end-to-end crash-consistency
 //! validation module.
 //!

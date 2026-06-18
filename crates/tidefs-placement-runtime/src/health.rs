@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement health tracker.
 //!
 //! Monitors replica health with lag/degraded/stale/verified states per chunk.

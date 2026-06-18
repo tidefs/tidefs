@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Device removal planning: object enumeration, evacuation plan computation,
 //! and committed-root anchoring.
 //!

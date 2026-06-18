@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified xattr state integrity helpers.
 //!
 //! Domain: `tidefs-fuse-xattr-statx-v1`

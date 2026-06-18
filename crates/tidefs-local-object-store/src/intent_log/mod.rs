@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object-store-level write-ahead log: records object mutations before
 //! they are applied to the main object store.
 //!

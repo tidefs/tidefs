@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport connection idle timeout: passive activity-watch detection that
 //! drains or force-closes abandoned connections after a configurable deadline
 //! without inbound or outbound message activity.

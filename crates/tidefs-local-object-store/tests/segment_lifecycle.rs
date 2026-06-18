@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Segment lifecycle and compaction unit tests for `tidefs-local-object-store`.
 //!
 //! Covers full segment lifecycle — allocation, write, seal, read-back,

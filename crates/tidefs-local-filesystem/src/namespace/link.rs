@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Hard link creation for the TideFS namespace.
 //!
 //! Implements POSIX `link(2)` semantics: creates a new directory entry

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE POSIX advisory record-lock dispatch trait (getlk / setlk / setlkw).
 //!
 //! Defines the [`FusePosixLockDispatch`] trait that abstracts POSIX

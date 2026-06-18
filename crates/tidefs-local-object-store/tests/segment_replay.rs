@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Segment replay and format integrity tests for `tidefs-local-object-store`.
 //!
 //! Validates segment-level crash recovery semantics: single-segment and

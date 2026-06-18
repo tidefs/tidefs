@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cleanup-engine replay decision receipts.
 //!
 //! These records describe the cleanup engine's per-entry replay decision:

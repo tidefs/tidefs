@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Node join protocol: staged promotion with health gates — PC-010.4.
 //!
 //! Implements a 3-phase staged join that safely onboards a new member

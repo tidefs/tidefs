@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Membership roster verification trait for transport session gating.
 //!
 //! [`MembershipRosterVerifier`] provides the interface that the transport

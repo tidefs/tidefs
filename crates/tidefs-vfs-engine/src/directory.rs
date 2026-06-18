@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Directory cursor abstraction for stable iteration.
 //!
 //! Provides [`DirectoryCursor`] supporting `readdir` with seek position,

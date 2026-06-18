@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Roster state synchronization to newly joined peers.
 //!
 //! When an existing member receives a `PeerJoined` notification for a peer

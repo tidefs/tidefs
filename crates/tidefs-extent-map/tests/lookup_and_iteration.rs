@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lookup and iteration validation tests.
 //!
 //! Exercises boundary-condition lookup and ordered iteration through

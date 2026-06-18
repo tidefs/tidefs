@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! In-memory committed epoch chain store with prefix-ancestry lookup.
 //!
 //! [`CommittedEpochChain`] is the canonical in-memory data structure for

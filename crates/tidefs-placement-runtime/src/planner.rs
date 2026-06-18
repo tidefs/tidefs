@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement planner: computes per-chunk replica target sets.
 //!
 //! Wraps the deterministic placement model (OW-303) to compute target

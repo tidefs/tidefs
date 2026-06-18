@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // P8-03 witness set mechanism: quorum-based claim verification,
 // witness selection, and receipt integration.
 //

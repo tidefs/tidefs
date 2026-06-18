@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Protocol-level liveness tracking for membership peers.
 //!
 //! The [`LivenessTracker`] maintains per-member heartbeat expectations

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests: property-based harness using proptest.
 // Verifies:
 //  - Valid headers survive encode→decode round-trip byte-for-byte.

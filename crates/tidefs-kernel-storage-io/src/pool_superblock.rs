@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-portable pool superblock scanner.
 //!
 //! Reads and validates the TideFS pool label from a block device through

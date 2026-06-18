@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Send-transport bridge that drains a [`SendQueue`] of [`TransferChunk`]s
 //! and transmits them through a transport session for multi-node state
 //! transfer.

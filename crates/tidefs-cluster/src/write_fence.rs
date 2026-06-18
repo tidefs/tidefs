@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Write-fence mechanism preventing split ownership in the multi-node write path.
 //!
 //! When a node acquires the single-writer lease, the [`FenceAuthority`] generates

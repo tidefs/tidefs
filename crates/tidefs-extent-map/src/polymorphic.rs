@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Polymorphic extent map with hysteresis switching.
 //!
 //! `PolymorphicExtentMap` wraps both [`InlineExtentMap`] (V1) and

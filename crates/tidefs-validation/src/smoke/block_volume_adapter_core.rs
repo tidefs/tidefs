@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Block-volume-adapter-core smoke: deterministic runtime checks for the
 //! OW-301A block-volume model and file-backed image surface.
 //!

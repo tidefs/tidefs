@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::net::SocketAddr;
 use std::thread;

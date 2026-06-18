@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE mount integration suite: create/write/read/readdir/stat/unlink/rmdir
 //! through a real mount lifecycle.
 //!

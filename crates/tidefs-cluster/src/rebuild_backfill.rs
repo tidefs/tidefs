@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Rebuild backfill initiator bridging rebuild-planner outputs to
 //! transport state-transfer commands.
 //!

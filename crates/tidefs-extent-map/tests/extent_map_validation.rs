@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration validation tests for tidefs-extent-map.
 //!
 //! Exercises the public API of InlineExtentMap across allocation, lookup,

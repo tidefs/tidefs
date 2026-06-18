@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool-wide dataset catalog with B+tree path-to-ID mapping and online rename.
 //!
 //! Maps dataset paths to stable dataset IDs so file handles survive renames.

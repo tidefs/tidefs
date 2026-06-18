@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Outbound send gating against the committed membership roster.
 //!
 //! [`MembershipSendGate`] implements [`tidefs_transport::SendGate`] by

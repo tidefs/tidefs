@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Filesystem-wide synchronization delegation for the kernel VFS adapter --
 //! K7-24 syncfs seam.
 //!

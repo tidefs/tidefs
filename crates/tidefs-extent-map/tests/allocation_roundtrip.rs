@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Allocation/deallocation/lookup round-trip validation tests.
 //!
 //! Exercises the core alloc-free-lookup cycle through InlineExtentMap,

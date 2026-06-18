@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Crash recovery integration tests: SIGKILL + remount verifies fsyncd data
 //! survives byte-for-byte.
 //!

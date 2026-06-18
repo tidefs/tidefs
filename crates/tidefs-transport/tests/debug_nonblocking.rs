@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Barrier};
 use std::thread;

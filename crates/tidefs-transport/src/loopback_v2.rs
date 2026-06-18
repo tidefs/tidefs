@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Loopback v2: TransportBackend and ConnectionLike backed by in-memory queues.
 //!
 //! Unlike the harness `LoopbackTransport` which uses a custom `SimMessage`,

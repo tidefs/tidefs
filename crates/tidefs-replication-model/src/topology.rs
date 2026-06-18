@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Failure-domain topology model for TideFS durability layout.
 //!
 //! A [`FailureDomainTopology`] encodes the hierarchical containment

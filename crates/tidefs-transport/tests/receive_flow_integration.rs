@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Receive-flow control integration test: two-session loopback where a fast
 //! sender is throttled by a slow receiver via credit-based windowing.
 //!

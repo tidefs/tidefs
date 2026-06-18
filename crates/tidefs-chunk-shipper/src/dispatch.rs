@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Chunk dispatch: TransferPlan, ObjectDescriptor, TransferProgress events,
 //! and the ChunkDispatcher that coordinates chunking, flow control, and
 //! session delivery.

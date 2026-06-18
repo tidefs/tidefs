@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport-level integration test for lease wire protocol dispatch.
 //!
 //! Spawns two TCP transport sessions, sends a `LeaseRequest` from one,

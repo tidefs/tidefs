@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Dirty-page and dirty-metadata tracker.
 //!
 //! `DirtyTracker` maintains per-inode dirty byte ranges (coalesced into

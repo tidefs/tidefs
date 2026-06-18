@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Persistent cleanup-queue ledger bridging reclaim-queue output
 //! (FreedExtents) to block-allocator free-space reconciliation.
 //!

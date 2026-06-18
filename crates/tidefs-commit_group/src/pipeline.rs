@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Two-phase commit pipeline: prepare → commit with atomic root switch.
 //!
 //! The pipeline accumulates writes into a `CommitGroup`, validates them in

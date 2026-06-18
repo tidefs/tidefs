@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![allow(clippy::too_many_arguments)]
 //! tidefs-lease: Cluster-wide lease mechanism.
 //!

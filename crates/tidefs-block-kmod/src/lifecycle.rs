@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified block device lifecycle state machine.
 //!
 //! This module implements the gendisk registration and device-add lifecycle

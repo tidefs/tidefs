@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-side intent-log record construction and recording dispatch.
 #![allow(dead_code)]
 //!

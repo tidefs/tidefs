@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reconciliation priority ordering tests — verify that divergence
 //! records can be ordered by severity, age, affected object count,
 //! and data-vs-metadata distinction for reconciliation scheduling.

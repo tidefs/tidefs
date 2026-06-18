@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lease manager recovery and restart integration tests.
 //!
 //! Validate lease-manager behavior across restarts: re-initialization with

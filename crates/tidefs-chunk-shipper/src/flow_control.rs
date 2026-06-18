@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Flow-control backpressure for chunk shipping sessions.
 //!
 //! The [`FlowController`] manages a bounded send window with configurable

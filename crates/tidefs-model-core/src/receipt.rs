@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Claim-scoped model run receipts.
 //!
 //! The receipt records deterministic model evidence only. It carries claim

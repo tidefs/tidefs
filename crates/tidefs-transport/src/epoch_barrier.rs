@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Membership-epoch transport barrier: fences messages by epoch number
 //! so that stale-epoch messages are rejected and future-epoch messages are
 //! queued until the barrier advances.

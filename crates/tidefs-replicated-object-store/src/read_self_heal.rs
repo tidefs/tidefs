@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Demand-read self-healing for the replicated object store.
 //!
 //! When a checksum mismatch is detected during a read from the primary

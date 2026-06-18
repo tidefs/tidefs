@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Persistence round-trip validation tests.
 //!
 //! Exercises serialization of InodeAttr / PosixAttrs through the

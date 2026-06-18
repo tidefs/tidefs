@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Session-level handshake protocol for multi-node link negotiation.
 //!
 //! Implements a Hello/Accept/Reject state machine with configurable timeout

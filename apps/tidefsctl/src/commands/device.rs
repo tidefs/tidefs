@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! `tidefsctl device` subcommands: operator-triggered device lifecycle
 //! requests routed through TideFS pool authority.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! File-handle lifecycle tests for the local-filesystem layer.
 //!
 //! Exercises the [`FileHandleTable`] in isolation: register,

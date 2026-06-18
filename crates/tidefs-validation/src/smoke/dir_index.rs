@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Dir-index smoke: deterministic sequence of insert, lookup, contains,
 //! replace, list, and delete operations against `DirIndex`.
 //!

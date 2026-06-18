@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement constraint satisfaction engine.
 //!
 //! This module defines the constraint model that bridges durability layout

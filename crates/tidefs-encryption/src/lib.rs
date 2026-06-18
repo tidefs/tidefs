@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 
 //! Transparent ChaCha20-Poly1305 AEAD encryption wrapper for the TideFS

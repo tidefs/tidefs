@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TideFS Rust-for-Linux common bridge substrate (stratum s2 / c6).
 //!
 //! This crate is the shared kernel-boundary bridge (`kmod.common.bridge.k0`)

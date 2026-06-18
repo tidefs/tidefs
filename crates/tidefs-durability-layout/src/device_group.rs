@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic device-group assignment across failure domains.
 //!
 //! [`DeviceGroupMapper`] produces ordered, failure-domain-separated device

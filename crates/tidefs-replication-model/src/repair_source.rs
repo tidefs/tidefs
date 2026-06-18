@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Repair-source receipt manifests for bounded replication model evidence.
 //!
 //! These receipts say which candidate source was considered for a repair,

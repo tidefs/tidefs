@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! First-time peer-join transport handshake with epoch-state bootstrap
 //! and roster-inclusion queuing.
 //!

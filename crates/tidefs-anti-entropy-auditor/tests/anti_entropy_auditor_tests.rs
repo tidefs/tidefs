@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for tidefs-anti-entropy-auditor.
 //!
 //! Covers the full audit lifecycle, comparison engine behaviour,

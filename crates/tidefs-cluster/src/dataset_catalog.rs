@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster-aware dataset catalog authority gated by lease/fence ownership.
 //!
 //! Wraps the canonical [`tidefs_dataset_catalog::DatasetCatalog`] from

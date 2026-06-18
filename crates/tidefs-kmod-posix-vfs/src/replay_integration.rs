@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mounted replay integration cut point (#6252).
 //!
 //! Wires committed-root/object/extent/inode/intent contracts into one

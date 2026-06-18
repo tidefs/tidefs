@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Quorum acknowledgment tracker: maps (txg_id, object_id) to a bitset of
 // acknowledging replica indices. Used by quorum-write runtime for majority-quorum
 // decisions across replica groups.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Dead-object reclaim queue with commit_group-anchored reclamation eligibility.
 //!
 //! Provides a persistent, crash-safe queue for objects whose storage space

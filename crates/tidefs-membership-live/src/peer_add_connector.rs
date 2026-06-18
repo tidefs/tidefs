@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Peer-add connection establishment on committed-epoch roster additions.
 //!
 //! [`PeerAddConnector`] bridges committed-epoch roster additions to transport

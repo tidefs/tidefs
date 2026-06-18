@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lease and fence deadline tracking (P8-04 Sections 5.3-5.4, 9.1-9.2).
 //!
 //! Tracks lease expirations and fence ack deadlines. Deadlines are always

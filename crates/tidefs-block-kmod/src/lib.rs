@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TideFS block-volume kernel module (stratum s3 / c8).
 //!
 //! This crate is the `kmod.block_volume_adapter.block.k0` leaf module that

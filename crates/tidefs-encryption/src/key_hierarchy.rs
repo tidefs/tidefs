@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! 3-tier key management hierarchy for TideFS encryption-at-rest.
 //!
 //! ## Tier 1: PoolWrappingKey

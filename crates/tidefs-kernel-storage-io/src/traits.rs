@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Core storage I/O traits for kernel-mode block-device access.
 //!
 //! [`KernelStorageIo`] is the canonical portable trait consumed by TideFS

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Sync-write fast path: bypasses the ring buffer for O_SYNC/fsync writes.
 //!
 //! The [`IntentLog`] struct wraps [`InMemoryIntentLog`] and adds a

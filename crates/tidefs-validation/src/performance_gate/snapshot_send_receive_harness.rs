@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Snapshot send/receive performance benchmark harness.
 //!
 //! Measures VFSSEND2 stream encode/decode throughput and space metrics:

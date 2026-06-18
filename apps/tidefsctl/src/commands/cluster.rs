@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster commands: manage prototype multi-node TideFS cluster surfaces and
 //! development diagnostics.
 //!

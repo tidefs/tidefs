@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Property-based integration tests for tidefs-encryption key manager.
 //!
 //! Exercises SealedDEK serialisation, KeyManager seal/unseal,

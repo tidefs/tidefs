@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Repair scheduling bridge: connects scrub findings to prioritized repair
 //! and rebake dispatch through existing background-service and reclaim primitives.
 //!

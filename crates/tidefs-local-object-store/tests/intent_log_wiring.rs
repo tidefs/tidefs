@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for intent-log record append in the transaction commit path.
 
 use std::path::PathBuf;

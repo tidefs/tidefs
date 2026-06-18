@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Credit-based transmit scheduling with weighted fair queuing.
 //!
 //! Every node has a [`CreditAccount`] that tracks available bandwidth credits

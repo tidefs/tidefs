@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Error-injection and error-path integration tests for `tidefs-local-object-store`.
 //!
 //! Validates that error conditions are surfaced correctly: payload too large,

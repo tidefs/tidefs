@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! setattr mutation for the kernel VFS adapter -- K7 mutation seam.
 //!
 //! Delegates attribute mutations (truncate, chmod, chown, utimes) to the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch-version exchange message types for connection-time epoch
 //! synchronization.
 //!

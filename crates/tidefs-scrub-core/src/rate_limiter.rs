@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! I/O rate limiter for background scrub.
 //!
 //! [`RateLimiter`] uses a dual token-bucket algorithm to cap both bytes/sec

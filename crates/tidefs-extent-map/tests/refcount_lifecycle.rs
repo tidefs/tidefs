@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Refcount lifecycle and snapshot-semantics validation tests.
 //!
 //! NOTE: ExtentMapEntryV2 does not yet carry an explicit refcount field.

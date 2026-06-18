@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! `LocalFilesystemInodeStore` — bridges [`crate::persistence::PersistentInodeStore`]
 //! to [`tidefs_local_filesystem::LocalFileSystem`]'s persistent inode storage.
 //!

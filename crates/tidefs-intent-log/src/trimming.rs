@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Intent-log segment trimming after TXG commit.
 //!
 //! After a transaction group commits, log segments whose entire LSN range

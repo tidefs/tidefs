@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Smoke framework: deterministic harness that exercises peer crates.
 //!
 //! `SmokeHarness` instantiates one of each peer crate's core type (behind

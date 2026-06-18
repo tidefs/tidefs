@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-connection epoch gate for rejecting stale-epoch inbound messages.
 //!
 //! [`EpochGate`] holds a monotonically increasing `current_epoch` and rejects

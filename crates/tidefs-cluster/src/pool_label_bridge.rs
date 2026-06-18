@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool label bridge: connects [`ClusterPoolConfig`] and [`NodeDevice`] to
 //! the canonical on-device [`tidefs_types_pool_label_core::PoolLabelV1`]
 //! authority.

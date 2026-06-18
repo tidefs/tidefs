@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! CommitGroupCommit: flush an accumulator to the object store and update extent maps.
 //!
 //! The commit path is the critical write funnel: it takes all queued writes,

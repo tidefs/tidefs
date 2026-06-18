@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Backend abstraction for replaying one JSONL trace through multiple engines.
 
 use std::collections::BTreeMap;

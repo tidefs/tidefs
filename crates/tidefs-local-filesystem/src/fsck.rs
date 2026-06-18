@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::BTreeSet;
 
 use tidefs_local_object_store::LocalObjectStore;

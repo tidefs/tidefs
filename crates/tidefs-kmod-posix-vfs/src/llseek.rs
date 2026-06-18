@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel VFS llseek operation -- SEEK_DATA/SEEK_HOLE extent resolution.
 //!
 //! This module implements `tidefs_llseek()` dispatching SEEK_DATA and SEEK_HOLE

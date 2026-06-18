@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Node join handshake protocol: epoch-verified join request/response
 //! with structured rejection reasons.
 //!

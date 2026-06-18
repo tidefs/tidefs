@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Concurrent FUSE operation stress validation with deterministic
 //! data-integrity checking.
 //!

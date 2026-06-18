@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Listener overload protection with token-bucket accept-rate limiting and
 //! concurrent-pending-handshake bounding.
 //!

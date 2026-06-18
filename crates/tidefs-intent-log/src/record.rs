@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Intent-log record type enum and binary encoding/decoding.
 //!
 //! Every mutating filesystem operation has a corresponding variant in

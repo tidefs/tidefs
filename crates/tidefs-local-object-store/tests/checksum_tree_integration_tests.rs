@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for LocalObjectStore get_checksum_tree /
 //! verify_checksum_tree round-trip and tamper detection.
 //!

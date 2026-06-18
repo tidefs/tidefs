@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration bridge between membership epoch transitions and the cluster
 //! lease runtime.
 //!

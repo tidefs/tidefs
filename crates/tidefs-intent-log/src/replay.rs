@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Intent-log replay engine for mount-time crash recovery.
 //!
 //! [`IntentReplayEngine`] iterates unapplied intent records from segment

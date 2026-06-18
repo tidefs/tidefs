@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TideFS namespace layer: inode allocation, path resolution, and core
 //! namespace operations atop the polymorphic directory index.
 //!

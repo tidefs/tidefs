@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Node join discovery and handshake protocol.
 //!
 //! Implements the low-level discovery probe, join handshake wire protocol,

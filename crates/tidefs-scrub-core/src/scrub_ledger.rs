@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified persistent scrub progress ledger.
 //!
 //! [`ScrubLedger`] records the last-scanned position so that an interrupted

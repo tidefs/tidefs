@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport envelope wire protocol and message family definitions.
 //!
 //! ## Envelope flow in the endpoint lifecycle

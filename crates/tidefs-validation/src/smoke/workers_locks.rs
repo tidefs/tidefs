@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Workers-locks smoke: deterministic lock-wait dispatch and POSIX advisory
 //! byte-range lock checks over `tidefs-posix-filesystem-adapter-workers-locks`.
 //!

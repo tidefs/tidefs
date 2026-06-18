@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport message batch aggregation with domain-separated batch-payload
 //! integrity via BLAKE3.
 //!

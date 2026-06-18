@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Foreground I/O pressure probe for background operation throttling.
 //!
 //! [`IoPressureProbe`] provides a simple, Send+Sync callable that

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-portability dependency guard for tidefs-local-filesystem (#5942, #5985, #6174).
 //!
 //! This build script fails when a forbidden userspace/adapter dependency

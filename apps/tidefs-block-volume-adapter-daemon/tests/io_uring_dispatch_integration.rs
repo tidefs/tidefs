@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for the io_uring dispatch path: create a tempfile
 //! backing store, open a UblkIoUringDispatcher, submit read/write/flush ops,
 //! reap completions via reap_ublk_completions(), and assert byte-level

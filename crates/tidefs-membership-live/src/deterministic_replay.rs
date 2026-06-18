@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic replay harness for membership transport event logs.
 //!
 //! Accepts a recorded [`EventLog`] (from [`TransportEventRecorder`]) and replays

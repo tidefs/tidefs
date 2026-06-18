@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Page-cache ownership protocol for the kernel VFS adapter.
 //!
 //! Arbitrates dirty-page authority between the Linux kernel page cache

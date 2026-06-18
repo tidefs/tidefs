@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Unified transport configuration surface for endpoint addresses,
 //! timeouts, buffer sizes, keepalive parameters, and stream limits.
 //!

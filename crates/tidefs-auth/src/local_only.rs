@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Operator authorization boundary — local-only guard.
 //!
 //! This module provides the [`LocalOnlyGuard`], an explicit marker that a

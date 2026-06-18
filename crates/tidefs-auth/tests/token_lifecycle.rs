@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // token_lifecycle.rs — session token generation/expiry, session grant
 // lifecycle (expiry, revocation, audience), nonce cache replay
 // detection, hello message/response edge cases, and mutual attestation

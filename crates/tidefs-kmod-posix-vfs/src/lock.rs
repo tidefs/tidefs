@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! POSIX advisory lock delegation for the kernel VFS adapter -- K7-19 mutation seam.
 //!
 //! Provides getlk/setlk byte-range lock delegation and flock whole-file lock

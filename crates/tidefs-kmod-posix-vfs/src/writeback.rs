@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Writeback tracking for the kernel VFS adapter.
 //!
 //! Provides [`DirtyFolioTracker`] for the Rust address-space source model.

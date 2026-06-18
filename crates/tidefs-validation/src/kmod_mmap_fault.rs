@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-mode mmap fault-handling validation module.
 //!
 //! Produces tier-classified validation output for the kmod-posix-vfs mounted

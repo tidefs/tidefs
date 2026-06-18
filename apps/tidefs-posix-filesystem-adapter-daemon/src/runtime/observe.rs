@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P5-02 FUSE observe lane: validation sink handoff from maintenance.
 //!
 //! Part of the P5-02 classified multipool topology for the userspace FUSE runtime.

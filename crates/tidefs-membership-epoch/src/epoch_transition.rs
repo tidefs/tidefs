@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch transition state machine with BLAKE3-verified proposal,
 //! peer acknowledgment quorum, and commit finalization.
 //!

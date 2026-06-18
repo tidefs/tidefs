@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Chunk encoder: splits objects into fixed-size chunks, computes BLAKE3-256
 //! per-chunk hashes, and emits length-delimited wire-format frames.
 //!

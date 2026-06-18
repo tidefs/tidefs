@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Directory-based space quotas and reservations (ZFS dataset parity).
 //!
 //! Per-directory hard/soft limits on bytes and inode counts, plus

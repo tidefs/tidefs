@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! QuorumIntegration: coordinates backfill writes with the replication
 //! quorum so data-movement participates in replica-set consistency
 //! without violating single-writer invariants.

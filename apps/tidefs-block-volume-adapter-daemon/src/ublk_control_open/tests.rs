@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![cfg(test)]
 use super::resize_smoke::UblkControlResizeSmokeFailureClass;
 use super::*;

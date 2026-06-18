@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Two-node harness integration test for single-writer fencing across
 //! membership transitions and partitions.
 //!

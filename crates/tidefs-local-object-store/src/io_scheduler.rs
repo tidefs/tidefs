@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Token-bucket I/O scheduler with per-class admission control.
 //!
 //! The [`IoScheduler`] implements the ZFS I/O scheduler principle: partition

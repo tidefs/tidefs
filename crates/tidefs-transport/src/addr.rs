@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Unified transport endpoint address type supporting TCP, RDMA, and Unix
 //! domain sockets.
 //!

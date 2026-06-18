@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Device removal evacuation engine.
 //!
 //! When an operator requests device removal, this module coordinates the

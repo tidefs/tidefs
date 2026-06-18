@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration test for the replicated object read path.
 //!
 //! Exercises `ReplicatedObjectReader` with multiple replicas over TCP

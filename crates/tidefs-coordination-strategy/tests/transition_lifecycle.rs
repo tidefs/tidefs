@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for the strategy transition lifecycle.
 //!
 //! These tests exercise the full quiesce→drain→verify→switch→publish

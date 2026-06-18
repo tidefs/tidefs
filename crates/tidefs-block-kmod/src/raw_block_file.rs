@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Persistent file-backed [`PoolCoreOps`] adapter for kernel block kmod.
 //!
 //! [`RawBlockFile`] opens a regular file (or block device node) and

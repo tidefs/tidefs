@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Concrete adapter implementations for the replication dispatch traits.
 //!
 //! Provides feature-gated [`ObjectWriteTarget`] implementations for

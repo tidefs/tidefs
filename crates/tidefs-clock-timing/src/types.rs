@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Canonical clock, drift, health, and deadline types (P8-04 Sections 2-6).
 //!
 //! Authority ordering is receipt/epoch/anchor-based; time only gates waiting,

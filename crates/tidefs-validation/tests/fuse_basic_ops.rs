@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE basic-ops integration test: create, mkdir, rmdir, unlink, rename,
 //! and remount-persistence through a real read-write FUSE mount.
 //! Exercises the existing dispatch handlers in

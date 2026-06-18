@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! In-memory inode table for TideFS.
 //!
 //! [`InodeTable`] is the authoritative inode-number-to-attributes registry

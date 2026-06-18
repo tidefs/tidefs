@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Policy-toggle validation for content-addressed chunk dedup (#5966).
 //!
 //! Verifies that the `org.tidefs:dedup` feature flag controls whether chunk

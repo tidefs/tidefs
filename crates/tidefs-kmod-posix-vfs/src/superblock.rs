@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mount/superblock admission for the kernel VFS adapter.
 //!
 //! Implements committed-root-anchored mount validation with BLAKE3

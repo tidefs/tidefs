@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Clock-skew estimation tests for DriftEstimator. Covers known-offset skew,
 //! negative skew, large skew values without panic, jitter detection, and
 //! drift-class escalation/de-escalation.

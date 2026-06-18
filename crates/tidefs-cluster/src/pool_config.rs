@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster pool configuration: device-to-node topology, failure domains,
 //! placement policy, and redundancy for multi-node TideFS pools.
 //!

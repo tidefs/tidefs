@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BlockBackend adapter bridging block-kmod dispatch to a shared
 //! kernel pool core (canonical trait from #6131).
 //!

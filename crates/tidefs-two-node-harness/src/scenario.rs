@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Storage-plus-transport scenario glue for the two-node harness.
 //!
 //! Wires VFSSEND2 send-stream encoding/decoding through the deterministic

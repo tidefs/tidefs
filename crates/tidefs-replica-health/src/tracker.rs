@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Replica health tracker — P8-03 data_copy_3 core runtime component.
 //!
 //! Tracks per-chunk health across all replicas, updates health state
