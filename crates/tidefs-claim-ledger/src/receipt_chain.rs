@@ -10,7 +10,8 @@ use crate::ClaimEncoding;
 ///
 /// The stream stores receipt records and their BLAKE3-256 record digests. It
 /// proves append order and mutation resistance for receipt evidence only; it
-/// does not decide whether a claim is validated.
+/// does not decide whether a claim is validated. Callers that need to detect
+/// wholesale replacement must retain and compare the ledger head digest.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ValidationReceiptLedger {
     records: Vec<ValidationReceiptRecord>,
@@ -94,6 +95,19 @@ impl ValidationReceiptLedger {
         Self::verify_parts(&self.records, &self.digests)
     }
 
+    /// Verify the chain and compare its current head against a retained anchor.
+    pub fn verify_head_digest(
+        &self,
+        expected: ValidationReceiptDigest,
+    ) -> Result<(), ValidationReceiptLedgerError> {
+        self.verify()?;
+        let actual = self.head_digest();
+        if actual != expected {
+            return Err(ValidationReceiptLedgerError::HeadDigestMismatch { expected, actual });
+        }
+        Ok(())
+    }
+
     /// Compute the receipt digest for a single canonical receipt record.
     #[must_use]
     pub fn record_digest(record: &ValidationReceiptRecord) -> ValidationReceiptDigest {
@@ -174,6 +188,10 @@ pub enum ValidationReceiptLedgerError {
         expected: ValidationReceiptDigest,
         actual: ValidationReceiptDigest,
     },
+    HeadDigestMismatch {
+        expected: ValidationReceiptDigest,
+        actual: ValidationReceiptDigest,
+    },
     HistoricalMutation {
         sequence: u64,
         stored: ValidationReceiptDigest,
@@ -205,6 +223,9 @@ impl fmt::Display for ValidationReceiptLedgerError {
                 f,
                 "validation receipt {sequence} does not link to the previous receipt digest"
             ),
+            Self::HeadDigestMismatch { .. } => {
+                f.write_str("validation receipt ledger head digest does not match the retained anchor")
+            }
             Self::HistoricalMutation { sequence, .. } => {
                 write!(f, "validation receipt {sequence} digest no longer matches its record")
             }
