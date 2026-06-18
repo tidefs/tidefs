@@ -6,10 +6,11 @@
 //! (via [`LocalFileSystem::statfs`]), kernel VFS statfs, object-store
 //! allocation, dataset quotas, block trim/discard, and ENOSPC enforcement.
 //!
-//! The former dual-query statfs path through `SpaceBook`/`SpaceAccounting`
-//! has been retired in favor of this single authority. `SpaceBook` remains
-//! active for per-dataset write/delete auto-update tracking and persistence,
-//! but statfs derivation no longer queries it.
+//! This authority is the mounted-filesystem façade over the committed
+//! `tidefs-space-accounting` counters. `SpaceBook` remains active for
+//! per-dataset write/delete auto-update tracking and persistence, but
+//! mounted ENOSPC and statfs decisions flow through
+//! [`tidefs_space_accounting::SpaceAccounting`].
 //!
 //! # Relationship to existing layers
 //!
@@ -21,9 +22,8 @@
 //!   pool and reconciles with allocator-level counters.
 //! - [`tidefs_space_accounting::SpaceAccounting`]: dataset-level logical
 //!   space tracking for per-dataset commit/rollback lifecycle. The authority
-//!   provides the definitive physical capacity counters, but the former
-//!   dual statfs path (SpaceBook→SpaceAccounting→StatfsResult) is retired.
-//!   Statfs derivation uses [`CapacityAuthority::derive_statfs`] exclusively.
+//!   synchronizes the mounted filesystem view with this committed path and
+//!   delegates ENOSPC/statfs derivation to it.
 //! - [`tidefs_posix_filesystem_adapter_capacity::CapacityFacade`]:
 //!   retired adapter-local capacity bridge; removed from the production mount
 //!   and admission path as of #5938 and quarantined behind `#[cfg(test)]` as
@@ -66,8 +66,9 @@
 //!
 //! ## Retired Dual-Query Paths
 //!
-//! The former `SpaceBook`/`SpaceAccounting` statfs dual-query path is
-//! retired; statfs uses [`CapacityAuthority::derive_statfs`] exclusively.
+//! The former local fallback arithmetic path is retired; statfs uses
+//! [`CapacityAuthority::derive_statfs`], which delegates to
+//! [`tidefs_space_accounting::SpaceAccounting::statfs`].
 //! The former FUSE adapter `CapacityFacade` is quarantined behind
 //! `#[cfg(test)]` and excluded from the production mount path. The
 //! `pool_free_bytes_for_quota()` path previously queried the allocator
@@ -85,7 +86,7 @@
 //! ```text
 //! LocalFileSystem::open()
 //!   -> pool_stats + allocator_policy
-//!   -> CapacityAuthority::from_pool_stats(total, used, block_size, root_reserve)
+//!   -> CapacityAuthority::from_committed_accounting(total, accounting, block_size, root_reserve)
 //!   -> stored as engine.capacity_authority field
 //! ```
 //!
@@ -131,7 +132,12 @@
 //! ```
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::RwLock;
 
+use tidefs_space_accounting::{SpaceAccounting, StatfsResult};
+use tidefs_types_space_accounting_core::{
+    AdmissionResult, DatasetSpaceCountersV1, PoolPhysicalCountersV1, SpaceDomainId,
+};
 use tidefs_types_vfs_core::Errno;
 
 /// POSIX errno constants (no libc dependency).
@@ -153,6 +159,7 @@ pub struct CapacityAuthority {
     pending_bytes: AtomicU64,
     block_size: AtomicU32,
     root_reserve_bytes: AtomicU64,
+    committed_accounting: RwLock<SpaceAccounting>,
 }
 
 impl CapacityAuthority {
@@ -179,6 +186,7 @@ impl CapacityAuthority {
         // abort that drops the mount.
         let used_bytes = used_bytes.min(total_bytes);
         assert!(block_size > 0, "block_size must be positive");
+        let committed_accounting = Self::accounting_from_geometry(total_bytes, used_bytes);
         Self {
             total_bytes: AtomicU64::new(total_bytes),
             used_bytes: AtomicU64::new(used_bytes),
@@ -186,6 +194,7 @@ impl CapacityAuthority {
             pending_bytes: AtomicU64::new(0),
             block_size: AtomicU32::new(block_size),
             root_reserve_bytes: AtomicU64::new(root_reserve_bytes),
+            committed_accounting: RwLock::new(committed_accounting),
         }
     }
 
@@ -205,6 +214,93 @@ impl CapacityAuthority {
         )
     }
 
+    /// Create an authority from the mounted filesystem's committed
+    /// `tidefs-space-accounting` state.
+    #[must_use]
+    pub fn from_committed_accounting(
+        total_capacity_bytes: u64,
+        accounting: &SpaceAccounting,
+        block_size: u32,
+        root_reserve_bytes: u64,
+    ) -> Self {
+        assert!(block_size > 0, "block_size must be positive");
+        let consumed = accounting.counters().total_consumed_bytes();
+        let mut committed = accounting.clone();
+        committed.update_pool_counters(Self::pool_counters_for_capacity(
+            total_capacity_bytes,
+            consumed,
+        ));
+        Self {
+            total_bytes: AtomicU64::new(total_capacity_bytes),
+            used_bytes: AtomicU64::new(consumed.min(total_capacity_bytes)),
+            reserved_bytes: AtomicU64::new(0),
+            pending_bytes: AtomicU64::new(0),
+            block_size: AtomicU32::new(block_size),
+            root_reserve_bytes: AtomicU64::new(root_reserve_bytes),
+            committed_accounting: RwLock::new(committed),
+        }
+    }
+
+    fn accounting_from_geometry(total_bytes: u64, used_bytes: u64) -> SpaceAccounting {
+        let counters = DatasetSpaceCountersV1 {
+            logical_used_bytes: used_bytes.min(total_bytes),
+            quota_bytes: total_bytes,
+            ..DatasetSpaceCountersV1::default()
+        };
+        let mut accounting = SpaceAccounting::new(counters, SpaceDomainId::NONE);
+        accounting.update_pool_counters(Self::pool_counters_for_capacity(total_bytes, used_bytes));
+        accounting
+    }
+
+    fn pool_counters_for_capacity(total_bytes: u64, consumed_bytes: u64) -> PoolPhysicalCountersV1 {
+        let block_size = StatfsResult::DEFAULT_BLOCK_SIZE;
+        let free_bytes = total_bytes.saturating_sub(consumed_bytes.min(total_bytes));
+        PoolPhysicalCountersV1 {
+            phys_free_segments: free_bytes / block_size,
+            // SpaceAccounting::phys_capacity_bytes currently uses
+            // phys_free_bytes as the absolute admission/statfs ceiling.
+            // Feed it the mounted capacity ceiling here; committed counters
+            // provide the consumption side of the calculation.
+            phys_free_bytes: total_bytes,
+            phys_reclaimable_bytes: 0,
+            phys_tail_reserved_segments: 0,
+            phys_total_segments: total_bytes / block_size,
+            phys_total_bytes: total_bytes,
+        }
+    }
+
+    /// Refresh the committed accounting mirror without changing the local
+    /// transient reservation ledger.
+    pub fn refresh_committed_accounting(
+        &self,
+        accounting: &SpaceAccounting,
+        pool: PoolPhysicalCountersV1,
+    ) {
+        let mut committed = accounting.clone();
+        let consumed = committed.counters().total_consumed_bytes();
+        let total = pool.phys_total_bytes;
+        committed.update_pool_counters(Self::pool_counters_for_capacity(total, consumed));
+        self.total_bytes.store(total, Ordering::Release);
+        self.used_bytes
+            .store(consumed.min(total), Ordering::Release);
+        *self
+            .committed_accounting
+            .write()
+            .expect("capacity committed accounting lock poisoned") = committed;
+    }
+
+    /// Refresh the committed accounting mirror after a commit boundary and
+    /// clear transient bytes that are now part of committed counters.
+    pub fn refresh_committed_accounting_after_commit(
+        &self,
+        accounting: &SpaceAccounting,
+        pool: PoolPhysicalCountersV1,
+    ) {
+        self.refresh_committed_accounting(accounting, pool);
+        self.pending_bytes.store(0, Ordering::Release);
+        self.reserved_bytes.store(0, Ordering::Release);
+    }
+
     /// Set the root-reserve byte count.
     pub fn set_root_reserve_bytes(&self, bytes: u64) {
         self.root_reserve_bytes.store(bytes, Ordering::Release);
@@ -216,6 +312,12 @@ impl CapacityAuthority {
     /// block counts reflect the new configured ceiling.
     pub fn set_total_bytes(&self, bytes: u64) {
         self.total_bytes.store(bytes, Ordering::Release);
+        let mut accounting = self
+            .committed_accounting
+            .write()
+            .expect("capacity committed accounting lock poisoned");
+        let consumed = accounting.counters().total_consumed_bytes();
+        accounting.update_pool_counters(Self::pool_counters_for_capacity(bytes, consumed));
     }
 
     // ── Block accounting ────────────────────────────────────────────
@@ -223,6 +325,7 @@ impl CapacityAuthority {
     /// Record a committed allocation of `bytes` bytes.
     pub fn record_allocation(&self, bytes: u64) {
         self.used_bytes.fetch_add(bytes, Ordering::Release);
+        self.pending_bytes.fetch_add(bytes, Ordering::Release);
     }
 
     /// Record the freeing of `bytes` bytes from committed state.
@@ -230,6 +333,11 @@ impl CapacityAuthority {
         self.used_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 Some(used.saturating_sub(bytes))
+            })
+            .ok();
+        self.pending_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                Some(pending.saturating_sub(bytes))
             })
             .ok();
     }
@@ -255,10 +363,7 @@ impl CapacityAuthority {
                 resolved: false,
             });
         }
-        let available = self.available_bytes();
-        if bytes > available {
-            return Err(Errno(ENOSPC));
-        }
+        self.check_enospc(bytes)?;
         self.reserved_bytes.fetch_add(bytes, Ordering::Release);
         Ok(CapacityReservationHandle {
             authority: self,
@@ -277,6 +382,7 @@ impl CapacityAuthority {
             })
             .ok();
         self.used_bytes.fetch_add(bytes, Ordering::Release);
+        self.pending_bytes.fetch_add(bytes, Ordering::Release);
     }
 
     fn release_reservation(&self, bytes: u64) {
@@ -294,22 +400,25 @@ impl CapacityAuthority {
 
     /// Check whether `requested_bytes` can be accommodated.
     ///
-    /// Returns `Err(ENOSPC)` if the allocation would exceed available
-    /// space. Returns `Err(ENOSPC)` if `requested_bytes` exceeds total
-    /// capacity. A zero-byte request always succeeds.
+    /// Delegates to the committed `tidefs-space-accounting` admission path.
+    /// Transient mounted reservations are passed as additional requested
+    /// bytes so concurrent local operations cannot overcommit the committed
+    /// counters.
     pub fn check_enospc(&self, requested_bytes: u64) -> Result<(), Errno> {
         if requested_bytes == 0 {
             return Ok(());
         }
-        let total = self.total_bytes();
-        if requested_bytes > total {
-            return Err(Errno(ENOSPC));
+        let held_bytes = self.reserved_bytes().saturating_add(self.pending_bytes());
+        let needed_bytes = requested_bytes.saturating_add(held_bytes);
+        let accounting = self
+            .committed_accounting
+            .read()
+            .expect("capacity committed accounting lock poisoned");
+        match accounting.admission_check(needed_bytes) {
+            AdmissionResult::Allowed => Ok(()),
+            AdmissionResult::QuotaExceeded { .. }
+            | AdmissionResult::PhysicalCapacityExceeded { .. } => Err(Errno(ENOSPC)),
         }
-        let available = self.available_bytes();
-        if requested_bytes > available {
-            return Err(Errno(ENOSPC));
-        }
-        Ok(())
     }
 
     /// Record pending bytes in the write pipeline.
@@ -338,37 +447,25 @@ impl CapacityAuthority {
         inode_free: u64,
         name_max: u32,
     ) -> CapacityStatfs {
-        let bs = u64::from(self.block_size());
-        let total = self.total_bytes();
-        let used = self.used_bytes();
-        let reserved = self.reserved_bytes();
-        let root_reserve = self.root_reserve_bytes();
-
-        if bs == 0 {
-            return CapacityStatfs {
-                total_blocks: 0,
-                free_blocks: 0,
-                avail_blocks: 0,
-                total_inodes: inode_total,
-                free_inodes: inode_free,
-                block_size: 0,
-                name_max,
-            };
-        }
-
-        let total_blocks = total / bs;
-        let free_bytes = total.saturating_sub(used).saturating_sub(reserved);
-        let free_blocks = free_bytes / bs;
-        let avail_bytes = free_bytes.saturating_sub(root_reserve);
-        let avail_blocks = avail_bytes / bs;
+        let statfs = self
+            .committed_accounting
+            .read()
+            .expect("capacity committed accounting lock poisoned")
+            .statfs();
+        let block_size = u32::try_from(statfs.block_size).unwrap_or(u32::MAX);
+        let reserve_blocks = if statfs.block_size == 0 {
+            0
+        } else {
+            self.root_reserve_bytes() / statfs.block_size
+        };
 
         CapacityStatfs {
-            total_blocks,
-            free_blocks,
-            avail_blocks,
+            total_blocks: statfs.blocks,
+            free_blocks: statfs.blocks_free,
+            avail_blocks: statfs.blocks_avail.saturating_sub(reserve_blocks),
             total_inodes: inode_total,
             free_inodes: inode_free,
-            block_size: self.block_size(),
+            block_size,
             name_max,
         }
     }
@@ -402,17 +499,25 @@ impl CapacityAuthority {
 
     #[must_use]
     pub fn free_bytes(&self) -> u64 {
-        let total = self.total_bytes();
-        let used = self.used_bytes();
-        let reserved = self.reserved_bytes();
-        total.saturating_sub(used).saturating_sub(reserved)
+        let statfs = self
+            .committed_accounting
+            .read()
+            .expect("capacity committed accounting lock poisoned")
+            .statfs();
+        statfs.blocks_free.saturating_mul(statfs.block_size)
     }
 
     #[must_use]
     pub fn available_bytes(&self) -> u64 {
-        let free = self.free_bytes();
-        let root_reserve = self.root_reserve_bytes();
-        free.saturating_sub(root_reserve)
+        let statfs = self
+            .committed_accounting
+            .read()
+            .expect("capacity committed accounting lock poisoned")
+            .statfs();
+        statfs
+            .blocks_avail
+            .saturating_mul(statfs.block_size)
+            .saturating_sub(self.root_reserve_bytes())
     }
 
     #[must_use]
@@ -462,67 +567,41 @@ impl CapacityAuthority {
     #[must_use]
     pub(crate) fn snapshot_for_rollback(&self) -> CapacityAuthoritySnapshot {
         CapacityAuthoritySnapshot {
-            used_bytes: self.used_bytes(),
+            used_bytes: self.used_bytes.load(Ordering::Acquire),
             reserved_bytes: self.reserved_bytes(),
             pending_bytes: self.pending_bytes(),
+            committed_accounting: self
+                .committed_accounting
+                .read()
+                .expect("capacity committed accounting lock poisoned")
+                .clone(),
         }
     }
 
     /// Restore authority counters to a previously captured snapshot.
-    ///
-    /// Computes the delta between current and snapshot values, then applies
-    /// the inverse operation. Used by transaction rollback to undo side-ledger
-    /// mutations performed inside the rolled-back transaction.
     pub(crate) fn restore_from_snapshot(&self, snapshot: &CapacityAuthoritySnapshot) {
-        let cur_used = self.used_bytes();
-        let cur_reserved = self.reserved_bytes();
-        let cur_pending = self.pending_bytes();
-
-        // Undo used_bytes delta: if we allocated during the transaction, free it.
-        if cur_used > snapshot.used_bytes {
-            let delta = cur_used - snapshot.used_bytes;
-            self.record_free(delta);
-        } else if snapshot.used_bytes > cur_used {
-            let delta = snapshot.used_bytes - cur_used;
-            self.record_allocation(delta);
-        }
-
-        // Undo reserved_bytes delta.
-        if cur_reserved > snapshot.reserved_bytes {
-            let delta = cur_reserved - snapshot.reserved_bytes;
-            self.reserved_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |r| {
-                    Some(r.saturating_sub(delta))
-                })
-                .ok();
-        } else if snapshot.reserved_bytes > cur_reserved {
-            let delta = snapshot.reserved_bytes - cur_reserved;
-            // best-effort: restore prior reservation level
-            self.reserved_bytes.fetch_add(delta, Ordering::Release);
-        }
-
-        // Undo pending_bytes delta.
-        if cur_pending > snapshot.pending_bytes {
-            let delta = cur_pending - snapshot.pending_bytes;
-            self.pending_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |p| {
-                    Some(p.saturating_sub(delta))
-                })
-                .ok();
-        } else if snapshot.pending_bytes > cur_pending {
-            let delta = snapshot.pending_bytes - cur_pending;
-            self.pending_bytes.fetch_add(delta, Ordering::Release);
-        }
+        self.used_bytes
+            .store(snapshot.used_bytes, Ordering::Release);
+        self.reserved_bytes
+            .store(snapshot.reserved_bytes, Ordering::Release);
+        self.pending_bytes
+            .store(snapshot.pending_bytes, Ordering::Release);
+        *self
+            .committed_accounting
+            .write()
+            .expect("capacity committed accounting lock poisoned") =
+            snapshot.committed_accounting.clone();
     }
 }
 
-/// Snapshot of [] counters captured at transaction start
+/// Snapshot of capacity counters captured at transaction start
 /// for restoration on rollback.
 #[derive(Clone, Debug)]
 pub(crate) struct CapacityAuthoritySnapshot {
     pub used_bytes: u64,
     pub reserved_bytes: u64,
     pub pending_bytes: u64,
+    pub committed_accounting: SpaceAccounting,
 }
 
 // ── CapacityStatfs ───────────────────────────────────────────────────────
@@ -654,12 +733,13 @@ mod tests {
     }
 
     #[test]
-    fn record_allocation_reduces_free_bytes() {
+    fn record_allocation_tracks_pending_without_rederiving_free_bytes() {
         let a = authority(100, 0);
         assert_eq!(a.free_bytes(), 100 * 1024 * 1024);
         a.record_allocation(1024 * 1024);
         assert_eq!(a.used_bytes(), 1024 * 1024);
-        assert_eq!(a.free_bytes(), 99 * 1024 * 1024);
+        assert_eq!(a.pending_bytes(), 1024 * 1024);
+        assert_eq!(a.free_bytes(), 100 * 1024 * 1024);
     }
 
     #[test]
@@ -668,7 +748,7 @@ mod tests {
         assert_eq!(a.free_bytes(), 90 * 1024 * 1024);
         a.record_free(5 * 1024 * 1024);
         assert_eq!(a.used_bytes(), 5 * 1024 * 1024);
-        assert_eq!(a.free_bytes(), 95 * 1024 * 1024);
+        assert_eq!(a.free_bytes(), 90 * 1024 * 1024);
     }
 
     #[test]
@@ -695,7 +775,7 @@ mod tests {
         let h = a.reserve(4096).expect("reserve 1 block");
         assert_eq!(h.bytes(), 4096);
         assert_eq!(a.reserved_bytes(), 4096);
-        assert_eq!(a.free_bytes(), (100 * 1024 * 1024) - 4096);
+        assert_eq!(a.free_bytes(), 100 * 1024 * 1024);
         h.release();
         assert_eq!(a.reserved_bytes(), 0);
         assert_eq!(a.free_bytes(), 100 * 1024 * 1024);
@@ -710,7 +790,8 @@ mod tests {
         h.commit();
         assert_eq!(a.reserved_bytes(), 0);
         assert_eq!(a.used_bytes(), 8192);
-        assert_eq!(a.free_bytes(), (100 * 1024 * 1024) - 8192);
+        assert_eq!(a.pending_bytes(), 8192);
+        assert_eq!(a.free_bytes(), 100 * 1024 * 1024);
     }
 
     #[test]
@@ -835,8 +916,8 @@ mod tests {
         let s = a.derive_statfs(500, 400, 255);
         let bs = u64::from(a.block_size());
         assert_eq!(s.total_blocks, (100u64 * 1024 * 1024) / bs);
-        assert_eq!(s.free_blocks, (40u64 * 1024 * 1024) / bs);
-        assert_eq!(s.avail_blocks, (40u64 * 1024 * 1024) / bs);
+        assert_eq!(s.free_blocks, (50u64 * 1024 * 1024) / bs);
+        assert_eq!(s.avail_blocks, (50u64 * 1024 * 1024) / bs);
         assert_eq!(s.total_inodes, 500);
         assert_eq!(s.free_inodes, 400);
     }
@@ -848,6 +929,58 @@ mod tests {
         let bs = u64::from(a.block_size());
         assert_eq!(s.free_blocks, (100u64 * 1024 * 1024) / bs);
         assert_eq!(s.avail_blocks, ((100u64 * 1024 * 1024) - (50 * bs)) / bs);
+    }
+
+    #[test]
+    fn derive_statfs_uses_committed_space_accounting_consumption() {
+        let block_size: u32 = 4096;
+        let total = 100 * 1024 * 1024;
+        let counters = DatasetSpaceCountersV1 {
+            logical_used_bytes: 10 * 1024 * 1024,
+            reserved_bytes: 5 * 1024 * 1024,
+            orphan_bytes: 3 * 1024 * 1024,
+            pinned_snapshot_bytes: 2 * 1024 * 1024,
+            quota_bytes: total,
+            ..DatasetSpaceCountersV1::default()
+        };
+        let accounting = SpaceAccounting::new(counters, SpaceDomainId::NONE);
+        let a = CapacityAuthority::from_committed_accounting(total, &accounting, block_size, 0);
+
+        let s = a.derive_statfs(1000, 900, 255);
+
+        let consumed = 20 * 1024 * 1024;
+        assert_eq!(s.free_blocks, (total - consumed) / u64::from(block_size));
+        assert!(a.check_enospc(total - consumed).is_ok());
+        assert_eq!(a.check_enospc(total - consumed + 1), Err(Errno(ENOSPC)));
+    }
+
+    #[test]
+    fn refresh_committed_accounting_preserves_capacity_ceiling() {
+        let block_size: u32 = 4096;
+        let total = 100 * 1024 * 1024;
+        let used = 25 * 1024 * 1024;
+        let counters = DatasetSpaceCountersV1 {
+            logical_used_bytes: used,
+            ..DatasetSpaceCountersV1::default()
+        };
+        let accounting = SpaceAccounting::new(counters, SpaceDomainId::NONE);
+        let a = CapacityAuthority::new(total, 0, block_size, 0);
+        let pool_snapshot = PoolPhysicalCountersV1 {
+            phys_free_segments: (total - used) / u64::from(block_size),
+            phys_free_bytes: total - used,
+            phys_reclaimable_bytes: 0,
+            phys_tail_reserved_segments: 0,
+            phys_total_segments: total / u64::from(block_size),
+            phys_total_bytes: total,
+        };
+
+        a.refresh_committed_accounting(&accounting, pool_snapshot);
+
+        let s = a.derive_statfs(1000, 900, 255);
+        assert_eq!(a.free_bytes(), total - used);
+        assert_eq!(s.free_blocks, (total - used) / u64::from(block_size));
+        assert!(a.check_enospc(total - used).is_ok());
+        assert_eq!(a.check_enospc(total - used + 1), Err(Errno(ENOSPC)));
     }
 
     #[test]
@@ -869,11 +1002,13 @@ mod tests {
     }
 
     #[test]
-    fn free_plus_used_plus_reserved_does_not_exceed_total() {
+    fn transient_reservations_do_not_change_committed_free_bytes() {
         let a = authority(100, 40);
+        let free_before = a.free_bytes();
         let _h = a.reserve(10 * 1024 * 1024).expect("reserve");
-        let sum = a.used_bytes() + a.free_bytes() + a.reserved_bytes();
-        assert!(sum <= a.total_bytes() || a.total_bytes() == 0);
+        assert_eq!(a.free_bytes(), free_before);
+        assert!(a.check_enospc(50 * 1024 * 1024).is_ok());
+        assert_eq!(a.check_enospc(51 * 1024 * 1024), Err(Errno(ENOSPC)));
     }
 
     #[test]
@@ -926,23 +1061,23 @@ mod tests {
 
     #[test]
     fn reserve_at_capacity_minus_one_block_fills_capacity() {
-        // Exactly one block (4096 bytes) of free space remaining.
         let a = authority(10, 0); // 10 MiB total
-                                  // Fill all space except one block.
+                                  // Hold all but one block in transient pending bytes.
         let h = a.reserve(10 * 1024 * 1024 - 4096).expect("fill nearly all");
         h.commit();
-        assert_eq!(a.free_bytes(), 4096);
+        assert_eq!(a.free_bytes(), 10 * 1024 * 1024);
         // Reserve the last block.
         let handle = a.reserve(4096).expect("last block reserve");
         assert_eq!(a.reserved_bytes(), 4096);
-        assert_eq!(a.available_bytes(), 0);
+        assert_eq!(a.available_bytes(), 10 * 1024 * 1024);
         // Additional reservation must fail.
         assert_eq!(a.reserve(4096).unwrap_err(), Errno(ENOSPC));
         // Commit the reservation — pool is now full.
         handle.commit();
         assert_eq!(a.used_bytes(), 10 * 1024 * 1024);
         assert_eq!(a.reserved_bytes(), 0);
-        assert_eq!(a.free_bytes(), 0);
+        assert_eq!(a.pending_bytes(), 10 * 1024 * 1024);
+        assert_eq!(a.free_bytes(), 10 * 1024 * 1024);
     }
 
     #[test]
@@ -953,7 +1088,7 @@ mod tests {
         // Reserve and commit 10 MiB.
         let handle = a.reserve(10 * 1024 * 1024).expect("reserve");
         handle.commit();
-        assert_eq!(a.available_bytes(), avail_before - 10 * 1024 * 1024);
+        assert_eq!(a.available_bytes(), avail_before);
 
         // Free the same amount — capacity returns.
         a.record_free(10 * 1024 * 1024);
@@ -981,7 +1116,7 @@ mod tests {
         // Simulate a truncate that frees 20 MiB.
         a.record_allocation(20 * 1024 * 1024);
         assert_eq!(a.used_bytes(), 100 * 1024 * 1024);
-        assert_eq!(a.free_bytes(), 0);
+        assert_eq!(a.free_bytes(), 20 * 1024 * 1024);
 
         // Free 20 MiB — capacity returns exactly.
         a.record_free(20 * 1024 * 1024);
@@ -1010,7 +1145,7 @@ mod tests {
         // Simulate write: reserve + commit.
         let handle = a.reserve(10 * 1024 * 1024).expect("reserve");
         handle.commit();
-        assert!(a.free_bytes() < free_before);
+        assert_eq!(a.free_bytes(), free_before);
 
         // Simulate removal (unlink): free the bytes.
         a.record_free(10 * 1024 * 1024);
