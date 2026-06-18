@@ -2383,6 +2383,7 @@ dependencies = [
  "tidefs-block-allocator",
  "tidefs-local-object-store",
  "tidefs-locator-table",
+ "tidefs-membership-epoch",
  "tidefs-pool-scan",
  "tidefs-replication-model",
  "tidefs-types-pool-label-core",
