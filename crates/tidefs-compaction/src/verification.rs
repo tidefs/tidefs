@@ -466,6 +466,10 @@ pub fn verify_swap_manifest<S: crate::CompactionStore>(
     let mut bytes_compared: u64 = 0;
     let mut errors: Vec<SwapVerificationError> = Vec::new();
     let mut sources_with_entries: Vec<u64> = Vec::new();
+    let mut entries_by_source: std::collections::BTreeMap<
+        u64,
+        std::collections::BTreeSet<[u8; 32]>,
+    > = std::collections::BTreeMap::new();
 
     if manifest.target_segment == 0 {
         errors.push(SwapVerificationError::SourceTargetMismatch {
@@ -495,6 +499,19 @@ pub fn verify_swap_manifest<S: crate::CompactionStore>(
         }
         if !sources_with_entries.contains(&entry.source_segment) {
             sources_with_entries.push(entry.source_segment);
+        }
+        if !entries_by_source
+            .entry(entry.source_segment)
+            .or_default()
+            .insert(entry.object_key)
+        {
+            errors.push(SwapVerificationError::SourceTargetMismatch {
+                detail: format!(
+                    "duplicate relocation entry for source segment {} object {:02x?}",
+                    entry.source_segment, entry.object_key
+                ),
+            });
+            continue;
         }
 
         // Read the object back from the store and verify its digest.
@@ -539,6 +556,50 @@ pub fn verify_swap_manifest<S: crate::CompactionStore>(
             manifest_count: manifest.source_segments.len(),
             actual_count: sources_with_entries.len(),
         });
+    }
+
+    for source_segment in &manifest.source_segments {
+        match store.live_object_keys(*source_segment) {
+            Ok(expected_keys) => {
+                let expected: std::collections::BTreeSet<[u8; 32]> =
+                    expected_keys.into_iter().collect();
+                let actual = entries_by_source
+                    .get(source_segment)
+                    .cloned()
+                    .unwrap_or_default();
+
+                if expected.len() != actual.len() {
+                    errors.push(SwapVerificationError::EntryCountMismatch {
+                        manifest_count: expected.len(),
+                        actual_count: actual.len(),
+                    });
+                }
+
+                for missing in expected.difference(&actual) {
+                    errors.push(SwapVerificationError::MissingManifestData {
+                        detail: format!(
+                            "source segment {} live object {:02x?} has no relocation entry",
+                            source_segment, missing
+                        ),
+                    });
+                }
+
+                for unexpected in actual.difference(&expected) {
+                    errors.push(SwapVerificationError::SourceTargetMismatch {
+                        detail: format!(
+                            "relocation entry for object {:02x?} is not live in source segment {}",
+                            unexpected, source_segment
+                        ),
+                    });
+                }
+            }
+            Err(e) => errors.push(SwapVerificationError::MissingManifestData {
+                detail: format!(
+                    "source segment {} live-key enumeration failed: {e}",
+                    source_segment
+                ),
+            }),
+        }
     }
 
     if bytes_compared != manifest.total_bytes && errors.is_empty() {
