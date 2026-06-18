@@ -52,9 +52,7 @@ pub struct EvacuationReceipt {
 }
 
 /// Opaque receipt identifier.
-#[derive(
-    Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct EvacuationReceiptId(pub u64);
 
 impl EvacuationReceiptId {
@@ -88,11 +86,7 @@ impl EvacuationReceipt {
 
     /// Create an empty evacuation receipt for a draining node.
     #[must_use]
-    pub fn new(
-        draining_node: MemberId,
-        epoch: EpochId,
-        reason: String,
-    ) -> Self {
+    pub fn new(draining_node: MemberId, epoch: EpochId, reason: String) -> Self {
         Self {
             receipt_id: EvacuationReceiptId::ZERO,
             draining_node,
@@ -195,14 +189,10 @@ impl EvacuationReceipt {
                     });
                 }
                 if !committed {
-                    return Err(EvacuationReceiptError::UncommittedReceipt {
-                        receipt_id: rid,
-                    });
+                    return Err(EvacuationReceiptError::UncommittedReceipt { receipt_id: rid });
                 }
             } else {
-                return Err(EvacuationReceiptError::UnknownReceipt {
-                    receipt_id: rid,
-                });
+                return Err(EvacuationReceiptError::UnknownReceipt { receipt_id: rid });
             }
         }
         Ok(())
@@ -233,28 +223,23 @@ pub enum EvacuationReceiptError {
         draining_node: MemberId,
     },
     /// A placement receipt in the evacuation set is not yet committed.
-    UncommittedReceipt {
-        receipt_id: ReplicatedReceiptId,
-    },
+    UncommittedReceipt { receipt_id: ReplicatedReceiptId },
     /// A placement receipt referenced in the evacuation set is unknown.
-    UnknownReceipt {
-        receipt_id: ReplicatedReceiptId,
-    },
+    UnknownReceipt { receipt_id: ReplicatedReceiptId },
     /// The evacuation receipt has no placement receipts but drain
     /// expects data relocation.
-    EmptyEvacuation {
-        draining_node: MemberId,
-    },
+    EmptyEvacuation { draining_node: MemberId },
     /// The epoch boundary has not been committed.
-    EpochBoundaryNotCommitted {
-        draining_node: MemberId,
-    },
+    EpochBoundaryNotCommitted { draining_node: MemberId },
 }
 
 impl fmt::Display for EvacuationReceiptError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SelfReferencingReceipt { receipt_id, draining_node } => {
+            Self::SelfReferencingReceipt {
+                receipt_id,
+                draining_node,
+            } => {
                 write!(
                     f,
                     "placement receipt {} still references draining node {}",
@@ -303,10 +288,7 @@ mod tests {
         ReplicatedReceiptId(id)
     }
 
-    fn make_receipt(
-        placed_on: MemberId,
-        committed: bool,
-    ) -> (MemberId, bool) {
+    fn make_receipt(placed_on: MemberId, committed: bool) -> (MemberId, bool) {
         (placed_on, committed)
     }
 
@@ -389,10 +371,7 @@ mod tests {
 
         let lookup = |_rid: ReplicatedReceiptId| -> Option<(MemberId, bool)> { None };
         let err = receipt.verify_no_self_references(lookup).unwrap_err();
-        assert!(matches!(
-            err,
-            EvacuationReceiptError::UnknownReceipt { .. }
-        ));
+        assert!(matches!(err, EvacuationReceiptError::UnknownReceipt { .. }));
     }
 
     #[test]

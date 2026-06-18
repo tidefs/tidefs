@@ -358,7 +358,8 @@ impl ForcedFencing {
         // node. This is used for post-fence audit and recovery.
         self.record_placement_evidence(
             nid,
-            drain.evacuation_receipt()
+            drain
+                .evacuation_receipt()
                 .map(|r| r.placement_receipt_refs.clone())
                 .unwrap_or_default(),
         );
@@ -412,7 +413,9 @@ impl ForcedFencing {
     /// time it was last fenced, if any.
     #[must_use]
     pub fn placement_evidence_for(&self, node_id: MemberId) -> Option<&[ReplicatedReceiptId]> {
-        self.placement_evidence.get(&node_id.0).map(|v| v.as_slice())
+        self.placement_evidence
+            .get(&node_id.0)
+            .map(|v| v.as_slice())
     }
 
     /// Returns true if placement evidence was recorded for this node.

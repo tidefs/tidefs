@@ -54,7 +54,10 @@ pub trait MembershipVerificationOps {
 /// closed when any placement receipt still references the draining node.
 pub trait PlacementEvidenceVerifier {
     /// Return the set of placement receipt ids that reference `node_id`.
-    fn receipts_referencing_node(&self, node_id: MemberId) -> Vec<tidefs_replication_model::ReplicatedReceiptId>;
+    fn receipts_referencing_node(
+        &self,
+        node_id: MemberId,
+    ) -> Vec<tidefs_replication_model::ReplicatedReceiptId>;
 
     /// Returns true if any placement receipt references `node_id`.
     fn has_receipts_referencing_node(&self, node_id: MemberId) -> bool {

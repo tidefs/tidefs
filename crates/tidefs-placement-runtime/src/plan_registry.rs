@@ -615,10 +615,7 @@ impl PlacementPlanRegistry {
     /// Used by the drain safety gate: decommission must fail closed when any
     /// placement receipt still references the draining node.
     #[must_use]
-    pub fn receipts_referencing_node(
-        &self,
-        node_id: MemberId,
-    ) -> Vec<ReplicatedReceiptId> {
+    pub fn receipts_referencing_node(&self, node_id: MemberId) -> Vec<ReplicatedReceiptId> {
         self.placed_receipts
             .iter()
             .filter(|r| r.placed_on == node_id)

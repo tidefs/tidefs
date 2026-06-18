@@ -330,7 +330,7 @@ pub fn drain_node(
         })?;
 
     // -------------------------------------------------------------------
-    // Phase 1: Drain executor (leases, cache, admin stages)
+    // Phase 1: Drain executor lease stage
     // -------------------------------------------------------------------
     let (mut drain, _handle) = NodeDrain::drain(config.node_id);
     drain.set_timeout(config.drain_timeout_ms);
@@ -338,7 +338,7 @@ pub fn drain_node(
     let mut executor = DrainExecutor::new(drain);
 
     executor
-        .execute(drain_ops)
+        .execute_lease_stage(drain_ops)
         .map_err(|e| DrainNodeError::DrainFailed {
             node_id: config.node_id,
             error: e,
@@ -349,19 +349,16 @@ pub fn drain_node(
     // -------------------------------------------------------------------
     let mut migration_driver = MigrationDriver::new(config.node_id);
 
-    // Build migration plan using the ops trait
-    match migration_driver.build_plan(migration_ops, &config.target_nodes) {
-        Ok(_) => {
-            // Execute migration
-            migration_driver.execute(migration_ops).map_err(|e| {
-                DrainNodeError::MigrationFailed {
-                    node_id: config.node_id,
-                    reason: e.to_string(),
-                }
-            })?;
-        }
+    let migration_outcome = match migration_driver.build_plan(migration_ops, &config.target_nodes) {
+        Ok(_) => Some(migration_driver.execute(migration_ops).map_err(|e| {
+            DrainNodeError::MigrationFailed {
+                node_id: config.node_id,
+                reason: e.to_string(),
+            }
+        })?),
         Err(crate::migration::MigrationError::NothingToMigrate { .. }) => {
             // No objects to migrate — this is fine (empty node)
+            Some(migration_driver.outcome())
         }
         Err(e) => {
             return Err(DrainNodeError::MigrationFailed {
@@ -369,9 +366,7 @@ pub fn drain_node(
                 reason: e.to_string(),
             });
         }
-    }
-
-    let migration_outcome = Some(migration_driver.outcome());
+    };
 
     // -------------------------------------------------------------------
     // Phase 2.1: Build evacuation receipt from migration result
@@ -383,23 +378,47 @@ pub fn drain_node(
     // Only attach an evacuation receipt when migration actually
     // relocated data.  Vacuous drains (empty nodes) skip the receipt
     // gate.
-    let mut evacuation_receipt = EvacuationReceipt::new(
-        config.node_id,
-        verify_ops.current_epoch(),
-        config.reason.clone(),
-    );
-
     let migration_had_data = migration_outcome
         .as_ref()
         .map_or(false, |m| m.objects_migrated > 0);
 
-    if migration_had_data {
-        executor.set_evacuation_receipt(evacuation_receipt.clone());
-    }
+    let mut evacuation_receipt = if migration_had_data {
+        let outcome = migration_outcome
+            .as_ref()
+            .expect("migration_had_data implies migration outcome");
+        let mut receipt = EvacuationReceipt::new(
+            config.node_id,
+            verify_ops.current_epoch(),
+            config.reason.clone(),
+        );
+        receipt.record_relocated_receipts(outcome.placement_receipt_refs.clone());
+        executor
+            .complete_data_stage_with_evacuation(Some(receipt.clone()))
+            .map_err(|e| DrainNodeError::DrainFailed {
+                node_id: config.node_id,
+                error: e,
+            })?;
+        Some(receipt)
+    } else {
+        executor
+            .complete_data_stage_with_evacuation(None)
+            .map_err(|e| DrainNodeError::DrainFailed {
+                node_id: config.node_id,
+                error: e,
+            })?;
+        None
+    };
 
     // -------------------------------------------------------------------
-    // Phase 2.5: Replication health verification
+    // Phase 2.5: Cache invalidation and replication health verification
     // -------------------------------------------------------------------
+    executor
+        .execute_cache_stage(drain_ops)
+        .map_err(|e| DrainNodeError::DrainFailed {
+            node_id: config.node_id,
+            error: e,
+        })?;
+
     let health_verify_result = {
         let mut verifier = DrainHealthVerifier::new(config.node_id);
         match verifier.verify(health_verify_ops, &config.target_nodes) {
@@ -433,9 +452,9 @@ pub fn drain_node(
             let result = EpochGateResult::from_gate(&gate);
             // Set the committed epoch boundary on the evacuation receipt
             // and attach the finalized receipt to the drain.
-            if migration_had_data {
-                evacuation_receipt.set_committed_epoch_boundary(verify_ops.current_epoch());
-                executor.set_evacuation_receipt(evacuation_receipt.clone());
+            if let Some(receipt) = evacuation_receipt.as_mut() {
+                receipt.set_committed_epoch_boundary(verify_ops.current_epoch());
+                executor.set_evacuation_receipt(receipt.clone());
             }
             // Signal drain completion to the state machine
             let _ = state_machine.complete_drain();
@@ -452,21 +471,21 @@ pub fn drain_node(
     // -------------------------------------------------------------------
     // Done: mark node as decommissioned
     // -------------------------------------------------------------------
+    executor
+        .execute_admin_stage(drain_ops)
+        .map_err(|e| DrainNodeError::DrainFailed {
+            node_id: config.node_id,
+            error: e,
+        })?;
     executor.decommission();
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
-
-    let evac = if migration_had_data {
-        Some(evacuation_receipt)
-    } else {
-        None
-    };
 
     let mut outcome = DrainNodeOutcome::success(
         config.node_id,
         migration_outcome,
         gate_result,
-        evac,
+        evacuation_receipt,
         elapsed_ms,
     );
     outcome.health_verify_result = health_verify_result;
@@ -593,6 +612,17 @@ mod tests {
         fn verify_checksum(&self, _target: MemberId, _object_id: u64) -> Result<(), String> {
             Ok(())
         }
+
+        fn committed_placement_receipt_for(
+            &self,
+            _source_node: MemberId,
+            _target: MemberId,
+            object_id: u64,
+        ) -> Result<tidefs_replication_model::ReplicatedReceiptId, String> {
+            Ok(tidefs_replication_model::ReplicatedReceiptId(
+                object_id + 10_000,
+            ))
+        }
     }
 
     struct TestGateOps {
@@ -688,6 +718,19 @@ mod tests {
         assert_eq!(outcome.node_id, mid(1));
         assert!(outcome.migration_outcome.is_some());
         assert!(outcome.epoch_gate_result.is_some());
+        let receipt = outcome.evacuation_receipt.as_ref().unwrap();
+        assert_eq!(
+            receipt.placement_receipt_refs,
+            vec![
+                tidefs_replication_model::ReplicatedReceiptId(10_010),
+                tidefs_replication_model::ReplicatedReceiptId(10_020),
+                tidefs_replication_model::ReplicatedReceiptId(10_030)
+            ]
+        );
+        assert_eq!(
+            receipt.committed_epoch_boundary,
+            Some(verify_ops.current_epoch())
+        );
         let _elapsed_ms = outcome.elapsed_ms;
     }
 
@@ -727,6 +770,7 @@ mod tests {
 
         assert!(outcome.success);
         assert_eq!(outcome.node_id, mid(5));
+        assert!(outcome.evacuation_receipt.is_none());
     }
 
     #[test]
@@ -1009,5 +1053,6 @@ mod tests {
         assert_eq!(outcome.node_id, mid(1));
         assert!(outcome.migration_outcome.is_some());
         assert!(outcome.epoch_gate_result.is_some());
+        assert!(outcome.evacuation_receipt.is_some());
     }
 }

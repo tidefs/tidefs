@@ -11,6 +11,7 @@
 
 use std::fmt;
 use tidefs_membership_epoch::MemberId;
+use tidefs_replication_model::ReplicatedReceiptId;
 
 // ---------------------------------------------------------------------------
 // PlacementTarget
@@ -147,6 +148,7 @@ pub struct MigrationProgress {
     pub bytes_transferred: u64,
     pub bytes_remaining: u64,
     pub checksum_failures: u64,
+    pub placement_receipt_refs: Vec<ReplicatedReceiptId>,
     pub per_target: std::collections::BTreeMap<u64, PerTargetProgress>,
 }
 
@@ -172,6 +174,7 @@ impl MigrationProgress {
             bytes_transferred: 0,
             bytes_remaining: plan.total_bytes,
             checksum_failures: 0,
+            placement_receipt_refs: Vec::new(),
             per_target,
         }
     }
@@ -191,11 +194,17 @@ impl MigrationProgress {
     }
 
     /// Record a successful object migration to a target.
-    pub fn record_migrated(&mut self, target: MemberId, bytes: u64) {
+    pub fn record_migrated(
+        &mut self,
+        target: MemberId,
+        bytes: u64,
+        receipt_id: ReplicatedReceiptId,
+    ) {
         self.objects_migrated = self.objects_migrated.saturating_add(1);
         self.objects_remaining = self.objects_remaining.saturating_sub(1);
         self.bytes_transferred = self.bytes_transferred.saturating_add(bytes);
         self.bytes_remaining = self.bytes_remaining.saturating_sub(bytes);
+        self.placement_receipt_refs.push(receipt_id);
 
         if let Some(entry) = self.per_target.get_mut(&target.0) {
             entry.objects_migrated = entry.objects_migrated.saturating_add(1);
@@ -243,6 +252,14 @@ pub enum MigrationError {
         object_id: u64,
         expected: String,
         got: String,
+    },
+    /// Migration completed transfer, but no committed placement receipt was
+    /// available for the relocated object.
+    PlacementReceiptMissing {
+        source_node: MemberId,
+        target: MemberId,
+        object_id: u64,
+        reason: String,
     },
     /// The migration was cancelled mid-transfer.
     Cancelled {
@@ -296,6 +313,18 @@ impl fmt::Display for MigrationError {
                     f,
                     "node {} -> {} checksum mismatch for object {} (expected {}, got {})",
                     source_node.0, target.0, object_id, expected, got
+                )
+            }
+            Self::PlacementReceiptMissing {
+                source_node,
+                target,
+                object_id,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "node {} -> {} missing committed placement receipt for object {}: {}",
+                    source_node.0, target.0, object_id, reason
                 )
             }
             Self::Cancelled {
@@ -353,6 +382,22 @@ pub trait MigrationOps {
     /// Returns `Ok(())` if checksums match, or an error describing the
     /// mismatch.
     fn verify_checksum(&self, target: MemberId, object_id: u64) -> Result<(), String>;
+
+    /// Return the committed placement receipt for a successfully relocated
+    /// object.
+    ///
+    /// Production implementations must source this from the placement runtime
+    /// after the placement receipt has committed. The default fails closed so
+    /// callers cannot claim data relocation without receipt evidence.
+    fn committed_placement_receipt_for(
+        &self,
+        source_node: MemberId,
+        target: MemberId,
+        object_id: u64,
+    ) -> Result<ReplicatedReceiptId, String> {
+        let _ = (source_node, target, object_id);
+        Err("placement receipt integration not wired".to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +412,7 @@ pub struct MigrationOutcome {
     pub objects_migrated: u64,
     pub bytes_transferred: u64,
     pub checksum_failures: u64,
+    pub placement_receipt_refs: Vec<ReplicatedReceiptId>,
     pub per_target_results: std::collections::BTreeMap<u64, PerTargetProgress>,
 }
 
@@ -383,6 +429,7 @@ impl MigrationOutcome {
             objects_migrated: progress.objects_migrated,
             bytes_transferred: progress.bytes_transferred,
             checksum_failures: progress.checksum_failures,
+            placement_receipt_refs: progress.placement_receipt_refs.clone(),
             per_target_results: progress.per_target.clone(),
         }
     }
@@ -575,7 +622,16 @@ impl MigrationDriver {
                 }
             }
 
-            self.progress.record_migrated(target, bytes);
+            let receipt_id = ops
+                .committed_placement_receipt_for(self.plan.source_node, target, object_id)
+                .map_err(|e| MigrationError::PlacementReceiptMissing {
+                    source_node: self.plan.source_node,
+                    target,
+                    object_id,
+                    reason: e,
+                })?;
+
+            self.progress.record_migrated(target, bytes, receipt_id);
         }
 
         Ok(MigrationOutcome::from_progress(
@@ -620,6 +676,7 @@ mod tests {
         transferred: Vec<(u64, MemberId, u64)>,  // (object_id, target, bytes)
         checksum_ok: bool,
         transfer_fails_for: Option<u64>, // object_id that fails transfer
+        missing_receipt_for: Option<u64>,
     }
 
     impl MockMigrationOps {
@@ -630,6 +687,7 @@ mod tests {
                 transferred: Vec::new(),
                 checksum_ok: true,
                 transfer_fails_for: None,
+                missing_receipt_for: None,
             }
         }
 
@@ -645,6 +703,11 @@ mod tests {
 
         fn with_failing_transfer(mut self, object_id: u64) -> Self {
             self.transfer_fails_for = Some(object_id);
+            self
+        }
+
+        fn with_missing_receipt(mut self, object_id: u64) -> Self {
+            self.missing_receipt_for = Some(object_id);
             self
         }
     }
@@ -703,6 +766,18 @@ mod tests {
             } else {
                 Err("checksum mismatch".to_string())
             }
+        }
+
+        fn committed_placement_receipt_for(
+            &self,
+            _source_node: MemberId,
+            _target: MemberId,
+            object_id: u64,
+        ) -> Result<ReplicatedReceiptId, String> {
+            if self.missing_receipt_for == Some(object_id) {
+                return Err("receipt not committed".to_string());
+            }
+            Ok(ReplicatedReceiptId(object_id + 10_000))
         }
     }
 
@@ -814,6 +889,14 @@ mod tests {
         assert!(outcome.success);
         assert_eq!(outcome.objects_migrated, 3);
         assert_eq!(outcome.checksum_failures, 0);
+        assert_eq!(
+            outcome.placement_receipt_refs,
+            vec![
+                ReplicatedReceiptId(10_010),
+                ReplicatedReceiptId(10_020),
+                ReplicatedReceiptId(10_030)
+            ]
+        );
         assert_eq!(ops.transferred.len(), 3);
     }
 
@@ -829,6 +912,23 @@ mod tests {
 
         let err = driver.execute(&mut ops).unwrap_err();
         assert!(matches!(err, MigrationError::TransferFailed { .. }));
+    }
+
+    #[test]
+    fn execute_migration_requires_committed_receipts() {
+        let mut ops = MockMigrationOps::new()
+            .with_objects(1, vec![(10, 1024), (20, 2048)])
+            .with_missing_receipt(20);
+
+        let mut driver = MigrationDriver::new(nid(1));
+        let targets = vec![nid(2)];
+        driver.build_plan(&ops, &targets).unwrap();
+
+        let err = driver.execute(&mut ops).unwrap_err();
+        assert!(matches!(
+            err,
+            MigrationError::PlacementReceiptMissing { .. }
+        ));
     }
 
     #[test]
@@ -893,18 +993,22 @@ mod tests {
         assert!(!progress.is_complete());
         assert!(progress.fraction() < 0.01);
 
-        progress.record_migrated(nid(2), 1024);
+        progress.record_migrated(nid(2), 1024, ReplicatedReceiptId(1));
         assert_eq!(progress.objects_migrated, 1);
         assert_eq!(progress.objects_remaining, 4);
         assert_eq!(progress.bytes_transferred, 1024);
         assert_eq!(progress.bytes_remaining, 3976);
         assert_eq!(progress.fraction(), 0.2);
+        assert_eq!(
+            progress.placement_receipt_refs,
+            vec![ReplicatedReceiptId(1)]
+        );
 
         // Record 4 more to complete
-        progress.record_migrated(nid(2), 1024);
-        progress.record_migrated(nid(2), 1024);
-        progress.record_migrated(nid(3), 1024);
-        progress.record_migrated(nid(3), 1024);
+        progress.record_migrated(nid(2), 1024, ReplicatedReceiptId(2));
+        progress.record_migrated(nid(2), 1024, ReplicatedReceiptId(3));
+        progress.record_migrated(nid(3), 1024, ReplicatedReceiptId(4));
+        progress.record_migrated(nid(3), 1024, ReplicatedReceiptId(5));
         assert!(progress.is_complete());
         assert_eq!(progress.fraction(), 1.0);
     }
@@ -932,9 +1036,9 @@ mod tests {
 
         let mut progress = MigrationProgress::new(&plan);
 
-        progress.record_migrated(nid(2), 1000);
-        progress.record_migrated(nid(2), 1000);
-        progress.record_migrated(nid(3), 1000);
+        progress.record_migrated(nid(2), 1000, ReplicatedReceiptId(1));
+        progress.record_migrated(nid(2), 1000, ReplicatedReceiptId(2));
+        progress.record_migrated(nid(3), 1000, ReplicatedReceiptId(3));
 
         let t2 = progress.per_target.get(&2).unwrap();
         assert!(t2.is_complete());

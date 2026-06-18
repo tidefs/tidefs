@@ -58,12 +58,12 @@ use tidefs_types_pool_label_core::{
 pub mod device_removal;
 pub mod scanner;
 pub use device_removal::{
-    verify_no_receipts_reference_node, PostDrainVerificationError,
-    build_object_placements, check_removal_redundancy, run_device_removal, DeviceObjectMap,
-    DeviceRemovalError, DeviceRemovalExecutor, DeviceRemovalHooks, DeviceRemovalPhase,
-    DeviceRemovalPlan, DeviceRemovalPlanner, DeviceRemovalRefusal, DeviceRemovalRefusalClass,
-    DeviceRemovalResult, DeviceRemovalState, EvacuationEntry, EvacuationPlanOutcome,
-    NoopDeviceRemovalHooks, ObjectPlacement, VdevRemoveStats,
+    build_object_placements, check_removal_redundancy, run_device_removal,
+    verify_no_receipts_reference_node, DeviceObjectMap, DeviceRemovalError, DeviceRemovalExecutor,
+    DeviceRemovalHooks, DeviceRemovalPhase, DeviceRemovalPlan, DeviceRemovalPlanner,
+    DeviceRemovalRefusal, DeviceRemovalRefusalClass, DeviceRemovalResult, DeviceRemovalState,
+    EvacuationEntry, EvacuationPlanOutcome, NoopDeviceRemovalHooks, ObjectPlacement,
+    PostDrainVerificationError, VdevRemoveStats,
 };
 // ---------------------------------------------------------------------------
 // DeviceKind — runtime device classification (not the on-disk enum)
