@@ -1104,6 +1104,7 @@ where
 
     // Phase 1: resolve segments and apply deltas.
     let mut segment_entries: HashMap<u64, Vec<(ObjectKey, i64)>> = HashMap::new();
+    let mut segment_prior_counts: HashMap<u64, u64> = HashMap::new();
 
     for (key, entry) in entries.iter().take(config.max_entries_per_drain) {
         let segment_id = resolver
@@ -1118,6 +1119,9 @@ where
             None => continue,
         };
 
+        segment_prior_counts
+            .entry(sid)
+            .or_insert_with(|| live_counts.live_count(sid));
         live_counts.apply_delta(sid, entry.delta);
         segment_entries
             .entry(sid)
