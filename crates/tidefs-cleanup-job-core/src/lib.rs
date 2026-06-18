@@ -18,6 +18,14 @@
 //! `CleanupJob` implements [`IncrementalJob`] and can be wrapped in
 //! [`IncrementalJobAdapter`] to become a [`BackgroundService`] in the
 //! unified scheduler at `Throughput` priority (`JobKind::DeferredCleanup`).
+//!
+//! ## Cleanup job receipts
+//!
+//! [`CleanupJobReceipt`] records provide deterministic source evidence for
+//! cleanup job admission, skip, retry, failure, and completion decisions. They
+//! are intentionally lower-tier evidence until paired with cleanup queue replay
+//! receipts and mounted runtime artifacts; by themselves they do not claim
+//! crash recovery or mounted cleanup correctness.
 
 use std::fmt;
 use tidefs_types_deferred_cleanup_core::CleanupWorkItemV1;
@@ -258,6 +266,530 @@ impl IncrementalJob for CleanupJob {
 use serde::{Deserialize, Serialize};
 use std::collections::{BinaryHeap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// ---------------------------------------------------------------------------
+// CleanupJobReceipt -- deterministic cleanup job source evidence
+// ---------------------------------------------------------------------------
+
+/// Stable identity for one cleanup work item covered by a receipt.
+///
+/// The zero value is a sentinel and is rejected for completed receipts because
+/// completed evidence must identify the covered work.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize,
+)]
+pub struct CleanupWorkItemId(pub u64);
+
+impl CleanupWorkItemId {
+    /// Sentinel value for an absent work item identity.
+    pub const NONE: Self = CleanupWorkItemId(0);
+
+    /// Returns `true` when this is the absent work item sentinel.
+    #[must_use]
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns `true` when this is a concrete work item identity.
+    #[must_use]
+    pub const fn is_some(self) -> bool {
+        self.0 != 0
+    }
+}
+
+impl fmt::Display for CleanupWorkItemId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "work-item:{}", self.0)
+    }
+}
+
+/// Validation tier associated with the evidence that produced a receipt.
+///
+/// Labels match the repository validation schema without making this core
+/// cleanup crate depend on validation runtime infrastructure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CleanupReceiptValidationTier {
+    /// Tier 0: source/model/schema evidence only.
+    SourceModel,
+    /// Tier 1: focused cargo or unit-test evidence.
+    CargoUnit,
+    /// Tier 2: harness evidence without a mounted/live product path.
+    HarnessOnly,
+    /// Tier 3: mounted userspace runtime evidence.
+    MountedUserspace,
+    /// Tier 3: QEMU guest runtime evidence.
+    QemuGuest,
+    /// Tier 4: kernel build evidence.
+    Kbuild,
+    /// Tier 4: QEMU module-load evidence.
+    QemuModuleLoad,
+    /// Tier 5: mounted kernel VFS evidence.
+    MountedKernelVfs,
+    /// Tier 5: kernel block I/O evidence.
+    KernelBlockIo,
+    /// Tier 6: full-kernel no-daemon evidence.
+    FullKernelNoDaemon,
+    /// Tier 7: multi-process distributed evidence.
+    MultiProcessDistributed,
+}
+
+impl CleanupReceiptValidationTier {
+    /// Human-readable label used for JSON serialization.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            CleanupReceiptValidationTier::SourceModel => "source-model",
+            CleanupReceiptValidationTier::CargoUnit => "cargo-unit",
+            CleanupReceiptValidationTier::HarnessOnly => "harness-only",
+            CleanupReceiptValidationTier::MountedUserspace => "mounted-userspace",
+            CleanupReceiptValidationTier::QemuGuest => "qemu-guest",
+            CleanupReceiptValidationTier::Kbuild => "kbuild",
+            CleanupReceiptValidationTier::QemuModuleLoad => "qemu-module-load",
+            CleanupReceiptValidationTier::MountedKernelVfs => "mounted-kernel-vfs",
+            CleanupReceiptValidationTier::KernelBlockIo => "kernel-block-io",
+            CleanupReceiptValidationTier::FullKernelNoDaemon => "full-kernel-no-daemon",
+            CleanupReceiptValidationTier::MultiProcessDistributed => "multi-process-distributed",
+        }
+    }
+
+    /// Numeric validation tier level.
+    #[must_use]
+    pub const fn tier_level(self) -> u8 {
+        match self {
+            CleanupReceiptValidationTier::SourceModel => 0,
+            CleanupReceiptValidationTier::CargoUnit => 1,
+            CleanupReceiptValidationTier::HarnessOnly => 2,
+            CleanupReceiptValidationTier::MountedUserspace
+            | CleanupReceiptValidationTier::QemuGuest => 3,
+            CleanupReceiptValidationTier::Kbuild | CleanupReceiptValidationTier::QemuModuleLoad => {
+                4
+            }
+            CleanupReceiptValidationTier::MountedKernelVfs
+            | CleanupReceiptValidationTier::KernelBlockIo => 5,
+            CleanupReceiptValidationTier::FullKernelNoDaemon => 6,
+            CleanupReceiptValidationTier::MultiProcessDistributed => 7,
+        }
+    }
+}
+
+impl Default for CleanupReceiptValidationTier {
+    fn default() -> Self {
+        Self::SourceModel
+    }
+}
+
+impl fmt::Display for CleanupReceiptValidationTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Optional digest for a validation artifact that produced or checked a receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CleanupReceiptArtifactDigest {
+    /// Digest algorithm name, for example `blake3`.
+    pub algorithm: String,
+    /// Lowercase hex digest bytes.
+    pub hex: String,
+}
+
+impl CleanupReceiptArtifactDigest {
+    /// Construct an artifact digest record.
+    #[must_use]
+    pub fn new(algorithm: impl Into<String>, hex: impl Into<String>) -> Self {
+        Self {
+            algorithm: algorithm.into(),
+            hex: hex.into(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.algorithm.trim().is_empty() || self.hex.trim().is_empty()
+    }
+}
+
+/// Cleanup job receipt state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupJobReceiptState {
+    /// A cleanup job attempt was admitted for execution.
+    Admitted,
+    /// A cleanup job attempt was skipped before doing work.
+    Skipped,
+    /// A cleanup job attempt will be retried in a later generation.
+    Retried,
+    /// A cleanup job attempt failed terminally.
+    Failed,
+    /// A cleanup job attempt completed its covered work.
+    Completed,
+}
+
+impl CleanupJobReceiptState {
+    fn requires_reason(self) -> bool {
+        matches!(self, Self::Skipped | Self::Failed)
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Skipped | Self::Failed | Self::Completed)
+    }
+
+    fn can_transition_to(self, next: Self) -> bool {
+        match self {
+            Self::Admitted => {
+                matches!(
+                    next,
+                    Self::Skipped | Self::Retried | Self::Failed | Self::Completed
+                )
+            }
+            Self::Retried => matches!(next, Self::Admitted),
+            Self::Skipped | Self::Failed | Self::Completed => false,
+        }
+    }
+}
+
+/// Deterministic source receipt for a cleanup job state decision.
+///
+/// The `work_item_id` field is also the covered work identity for completed
+/// receipts. These records are source evidence only; higher tiers must attach
+/// cleanup queue replay and runtime artifacts before claiming mounted cleanup
+/// correctness.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CleanupJobReceipt {
+    /// Stable cleanup job identifier.
+    pub job_id: JobId,
+    /// Stable cleanup work item identifier.
+    pub work_item_id: CleanupWorkItemId,
+    /// Receipt state being recorded.
+    pub state: CleanupJobReceiptState,
+    /// Human-readable reason for the decision.
+    pub reason: String,
+    /// Monotonic attempt generation for this job/work item pair.
+    pub attempt_generation: u64,
+    /// Validation tier backing this receipt.
+    pub validation_tier: CleanupReceiptValidationTier,
+    /// Optional digest for the artifact that produced or checked the receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_digest: Option<CleanupReceiptArtifactDigest>,
+}
+
+impl CleanupJobReceipt {
+    /// Build a cleanup job receipt.
+    #[must_use]
+    pub fn new(
+        state: CleanupJobReceiptState,
+        job_id: JobId,
+        work_item_id: CleanupWorkItemId,
+        reason: impl Into<String>,
+        attempt_generation: u64,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> Self {
+        Self {
+            job_id,
+            work_item_id,
+            state,
+            reason: reason.into(),
+            attempt_generation,
+            validation_tier,
+            artifact_digest: None,
+        }
+    }
+
+    /// Build an admitted receipt.
+    #[must_use]
+    pub fn admitted(
+        job_id: JobId,
+        work_item_id: CleanupWorkItemId,
+        reason: impl Into<String>,
+        attempt_generation: u64,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> Self {
+        Self::new(
+            CleanupJobReceiptState::Admitted,
+            job_id,
+            work_item_id,
+            reason,
+            attempt_generation,
+            validation_tier,
+        )
+    }
+
+    /// Build a skipped receipt.
+    #[must_use]
+    pub fn skipped(
+        job_id: JobId,
+        work_item_id: CleanupWorkItemId,
+        reason: impl Into<String>,
+        attempt_generation: u64,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> Self {
+        Self::new(
+            CleanupJobReceiptState::Skipped,
+            job_id,
+            work_item_id,
+            reason,
+            attempt_generation,
+            validation_tier,
+        )
+    }
+
+    /// Build a retried receipt.
+    #[must_use]
+    pub fn retried(
+        job_id: JobId,
+        work_item_id: CleanupWorkItemId,
+        reason: impl Into<String>,
+        attempt_generation: u64,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> Self {
+        Self::new(
+            CleanupJobReceiptState::Retried,
+            job_id,
+            work_item_id,
+            reason,
+            attempt_generation,
+            validation_tier,
+        )
+    }
+
+    /// Build a failed receipt.
+    #[must_use]
+    pub fn failed(
+        job_id: JobId,
+        work_item_id: CleanupWorkItemId,
+        reason: impl Into<String>,
+        attempt_generation: u64,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> Self {
+        Self::new(
+            CleanupJobReceiptState::Failed,
+            job_id,
+            work_item_id,
+            reason,
+            attempt_generation,
+            validation_tier,
+        )
+    }
+
+    /// Build a completed receipt.
+    #[must_use]
+    pub fn completed(
+        job_id: JobId,
+        work_item_id: CleanupWorkItemId,
+        reason: impl Into<String>,
+        attempt_generation: u64,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> Self {
+        Self::new(
+            CleanupJobReceiptState::Completed,
+            job_id,
+            work_item_id,
+            reason,
+            attempt_generation,
+            validation_tier,
+        )
+    }
+
+    /// Attach an artifact digest to this receipt.
+    #[must_use]
+    pub fn with_artifact_digest(mut self, artifact_digest: CleanupReceiptArtifactDigest) -> Self {
+        self.artifact_digest = Some(artifact_digest);
+        self
+    }
+
+    /// Validate this receipt independent of any prior receipt chain.
+    pub fn validate(&self) -> Result<(), CleanupJobReceiptValidationError> {
+        validate_receipt_at_index(self, 0)
+    }
+
+    /// Serialize this receipt as deterministic compact JSON.
+    pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Deserialize a receipt from JSON bytes.
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
+}
+
+/// Error returned by cleanup job receipt validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CleanupJobReceiptValidationError {
+    /// Receipt is missing a concrete job id.
+    MissingJobId { index: usize },
+    /// Receipt is missing a concrete work item id.
+    MissingWorkItemId { index: usize },
+    /// Skipped or failed receipts must include non-empty reason text.
+    MissingReasonText {
+        index: usize,
+        state: CleanupJobReceiptState,
+    },
+    /// Completed receipts must identify the covered work.
+    MissingCoveredWorkIdentity { index: usize },
+    /// Receipt artifact digest was present but incomplete.
+    EmptyArtifactDigest { index: usize },
+    /// A chain mixed receipts for different job/work item identities.
+    ReceiptIdentityMismatch {
+        index: usize,
+        expected_job_id: JobId,
+        actual_job_id: JobId,
+        expected_work_item_id: CleanupWorkItemId,
+        actual_work_item_id: CleanupWorkItemId,
+    },
+    /// Attempt generation moved backward or failed to advance after retry.
+    StaleAttemptGeneration {
+        index: usize,
+        previous: u64,
+        current: u64,
+    },
+    /// The adjacent receipt states are not part of the known state machine.
+    UnknownStateTransition {
+        index: usize,
+        from: CleanupJobReceiptState,
+        to: CleanupJobReceiptState,
+    },
+}
+
+impl fmt::Display for CleanupJobReceiptValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingJobId { index } => {
+                write!(f, "cleanup receipt {index} is missing a job id")
+            }
+            Self::MissingWorkItemId { index } => {
+                write!(f, "cleanup receipt {index} is missing a work item id")
+            }
+            Self::MissingReasonText { index, state } => {
+                write!(
+                    f,
+                    "cleanup receipt {index} in state {state:?} is missing reason text"
+                )
+            }
+            Self::MissingCoveredWorkIdentity { index } => {
+                write!(
+                    f,
+                    "completed cleanup receipt {index} is missing covered work identity"
+                )
+            }
+            Self::EmptyArtifactDigest { index } => {
+                write!(f, "cleanup receipt {index} has an empty artifact digest")
+            }
+            Self::ReceiptIdentityMismatch {
+                index,
+                expected_job_id,
+                actual_job_id,
+                expected_work_item_id,
+                actual_work_item_id,
+            } => {
+                write!(
+                    f,
+                    "cleanup receipt {index} identity changed from {expected_job_id}/{expected_work_item_id} to {actual_job_id}/{actual_work_item_id}"
+                )
+            }
+            Self::StaleAttemptGeneration {
+                index,
+                previous,
+                current,
+            } => {
+                write!(
+                    f,
+                    "cleanup receipt {index} has stale attempt generation {current}; previous was {previous}"
+                )
+            }
+            Self::UnknownStateTransition { index, from, to } => {
+                write!(
+                    f,
+                    "cleanup receipt {index} has unknown transition {from:?} -> {to:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CleanupJobReceiptValidationError {}
+
+/// Validate a receipt chain for one job/work item identity.
+///
+/// The validator rejects invalid single-record fields, mixed identities, stale
+/// attempt generations, and state transitions outside the cleanup receipt state
+/// machine.
+pub fn validate_cleanup_job_receipts(
+    receipts: &[CleanupJobReceipt],
+) -> Result<(), CleanupJobReceiptValidationError> {
+    let Some(first) = receipts.first() else {
+        return Ok(());
+    };
+    validate_receipt_at_index(first, 0)?;
+
+    for (index, pair) in receipts.windows(2).enumerate() {
+        let previous = &pair[0];
+        let current = &pair[1];
+        let current_index = index + 1;
+        validate_receipt_at_index(current, current_index)?;
+
+        if previous.job_id != current.job_id || previous.work_item_id != current.work_item_id {
+            return Err(CleanupJobReceiptValidationError::ReceiptIdentityMismatch {
+                index: current_index,
+                expected_job_id: previous.job_id,
+                actual_job_id: current.job_id,
+                expected_work_item_id: previous.work_item_id,
+                actual_work_item_id: current.work_item_id,
+            });
+        }
+
+        if current.attempt_generation < previous.attempt_generation
+            || (previous.state == CleanupJobReceiptState::Retried
+                && current.state == CleanupJobReceiptState::Admitted
+                && current.attempt_generation <= previous.attempt_generation)
+        {
+            return Err(CleanupJobReceiptValidationError::StaleAttemptGeneration {
+                index: current_index,
+                previous: previous.attempt_generation,
+                current: current.attempt_generation,
+            });
+        }
+
+        if previous.state.is_terminal() || !previous.state.can_transition_to(current.state) {
+            return Err(CleanupJobReceiptValidationError::UnknownStateTransition {
+                index: current_index,
+                from: previous.state,
+                to: current.state,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_receipt_at_index(
+    receipt: &CleanupJobReceipt,
+    index: usize,
+) -> Result<(), CleanupJobReceiptValidationError> {
+    if receipt.job_id.is_none() {
+        return Err(CleanupJobReceiptValidationError::MissingJobId { index });
+    }
+    if receipt.state == CleanupJobReceiptState::Completed && receipt.work_item_id.is_none() {
+        return Err(CleanupJobReceiptValidationError::MissingCoveredWorkIdentity { index });
+    }
+    if receipt.work_item_id.is_none() {
+        return Err(CleanupJobReceiptValidationError::MissingWorkItemId { index });
+    }
+    if receipt.state.requires_reason() && receipt.reason.trim().is_empty() {
+        return Err(CleanupJobReceiptValidationError::MissingReasonText {
+            index,
+            state: receipt.state,
+        });
+    }
+    if receipt
+        .artifact_digest
+        .as_ref()
+        .is_some_and(CleanupReceiptArtifactDigest::is_empty)
+    {
+        return Err(CleanupJobReceiptValidationError::EmptyArtifactDigest { index });
+    }
+    Ok(())
+}
 
 /// Result of executing a single cleanup task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1245,6 +1777,302 @@ mod tests {
         (0..count)
             .map(|i| make_item(i, WorkItemKind::UnlinkFree, 4096 * (i + 1)))
             .collect()
+    }
+
+    fn receipt_for(state: CleanupJobReceiptState, attempt_generation: u64) -> CleanupJobReceipt {
+        CleanupJobReceipt::new(
+            state,
+            JobId(7),
+            CleanupWorkItemId(99),
+            "unit evidence",
+            attempt_generation,
+            CleanupReceiptValidationTier::CargoUnit,
+        )
+    }
+
+    // -- CleanupJobReceipt tests --
+
+    #[test]
+    fn cleanup_job_receipt_json_is_deterministic() {
+        let receipt = CleanupJobReceipt::completed(
+            JobId(7),
+            CleanupWorkItemId(99),
+            "processed frozen extent map root",
+            2,
+            CleanupReceiptValidationTier::CargoUnit,
+        )
+        .with_artifact_digest(CleanupReceiptArtifactDigest::new(
+            "blake3",
+            "0123456789abcdef",
+        ));
+
+        let json = receipt.to_json_string().unwrap();
+        assert_eq!(
+            json,
+            r#"{"job_id":7,"work_item_id":99,"state":"completed","reason":"processed frozen extent map root","attempt_generation":2,"validation_tier":"cargo-unit","artifact_digest":{"algorithm":"blake3","hex":"0123456789abcdef"}}"#
+        );
+
+        let decoded = CleanupJobReceipt::from_json_slice(json.as_bytes()).unwrap();
+        assert_eq!(decoded, receipt);
+    }
+
+    #[test]
+    fn cleanup_job_receipt_sequence_accepts_retry_then_completion() {
+        let receipts = vec![
+            CleanupJobReceipt::admitted(
+                JobId(7),
+                CleanupWorkItemId(99),
+                "scheduler admitted work item",
+                1,
+                CleanupReceiptValidationTier::SourceModel,
+            ),
+            CleanupJobReceipt::retried(
+                JobId(7),
+                CleanupWorkItemId(99),
+                "transient extent map read conflict",
+                1,
+                CleanupReceiptValidationTier::SourceModel,
+            ),
+            CleanupJobReceipt::admitted(
+                JobId(7),
+                CleanupWorkItemId(99),
+                "retry generation admitted",
+                2,
+                CleanupReceiptValidationTier::SourceModel,
+            ),
+            CleanupJobReceipt::completed(
+                JobId(7),
+                CleanupWorkItemId(99),
+                "cleanup source path completed",
+                2,
+                CleanupReceiptValidationTier::CargoUnit,
+            ),
+        ];
+
+        validate_cleanup_job_receipts(&receipts).unwrap();
+    }
+
+    #[test]
+    fn cleanup_job_receipt_validation_rejects_unknown_transition() {
+        let receipts = vec![
+            receipt_for(CleanupJobReceiptState::Admitted, 1),
+            receipt_for(CleanupJobReceiptState::Completed, 1),
+            receipt_for(CleanupJobReceiptState::Retried, 2),
+        ];
+
+        let err = validate_cleanup_job_receipts(&receipts).unwrap_err();
+        assert_eq!(
+            err,
+            CleanupJobReceiptValidationError::UnknownStateTransition {
+                index: 2,
+                from: CleanupJobReceiptState::Completed,
+                to: CleanupJobReceiptState::Retried,
+            }
+        );
+    }
+
+    #[test]
+    fn cleanup_job_receipt_validation_rejects_stale_attempt_generation() {
+        let receipts = vec![
+            CleanupJobReceipt::admitted(
+                JobId(7),
+                CleanupWorkItemId(99),
+                "retry admitted",
+                2,
+                CleanupReceiptValidationTier::SourceModel,
+            ),
+            CleanupJobReceipt::retried(
+                JobId(7),
+                CleanupWorkItemId(99),
+                "older retry receipt arrived late",
+                1,
+                CleanupReceiptValidationTier::SourceModel,
+            ),
+        ];
+
+        let err = validate_cleanup_job_receipts(&receipts).unwrap_err();
+        assert_eq!(
+            err,
+            CleanupJobReceiptValidationError::StaleAttemptGeneration {
+                index: 1,
+                previous: 2,
+                current: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn cleanup_job_receipt_validation_rejects_retry_without_new_generation() {
+        let receipts = vec![
+            CleanupJobReceipt::admitted(
+                JobId(7),
+                CleanupWorkItemId(99),
+                "first attempt admitted",
+                1,
+                CleanupReceiptValidationTier::SourceModel,
+            ),
+            CleanupJobReceipt::retried(
+                JobId(7),
+                CleanupWorkItemId(99),
+                "will retry",
+                1,
+                CleanupReceiptValidationTier::SourceModel,
+            ),
+            CleanupJobReceipt::admitted(
+                JobId(7),
+                CleanupWorkItemId(99),
+                "stale retry admission",
+                1,
+                CleanupReceiptValidationTier::SourceModel,
+            ),
+        ];
+
+        let err = validate_cleanup_job_receipts(&receipts).unwrap_err();
+        assert_eq!(
+            err,
+            CleanupJobReceiptValidationError::StaleAttemptGeneration {
+                index: 2,
+                previous: 1,
+                current: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn cleanup_job_receipt_validation_rejects_missing_skip_or_fail_reason() {
+        let skipped = CleanupJobReceipt::skipped(
+            JobId(7),
+            CleanupWorkItemId(99),
+            " ",
+            1,
+            CleanupReceiptValidationTier::SourceModel,
+        );
+        assert_eq!(
+            skipped.validate().unwrap_err(),
+            CleanupJobReceiptValidationError::MissingReasonText {
+                index: 0,
+                state: CleanupJobReceiptState::Skipped,
+            }
+        );
+
+        let failed = CleanupJobReceipt::failed(
+            JobId(7),
+            CleanupWorkItemId(99),
+            "",
+            1,
+            CleanupReceiptValidationTier::SourceModel,
+        );
+        assert_eq!(
+            failed.validate().unwrap_err(),
+            CleanupJobReceiptValidationError::MissingReasonText {
+                index: 0,
+                state: CleanupJobReceiptState::Failed,
+            }
+        );
+    }
+
+    #[test]
+    fn cleanup_job_receipt_validation_rejects_completed_without_work_identity() {
+        let receipt = CleanupJobReceipt::completed(
+            JobId(7),
+            CleanupWorkItemId::NONE,
+            "complete but missing covered work",
+            1,
+            CleanupReceiptValidationTier::SourceModel,
+        );
+
+        assert_eq!(
+            receipt.validate().unwrap_err(),
+            CleanupJobReceiptValidationError::MissingCoveredWorkIdentity { index: 0 }
+        );
+    }
+
+    #[test]
+    fn cleanup_job_receipt_validation_rejects_missing_base_identity() {
+        let missing_job = CleanupJobReceipt::admitted(
+            JobId::NONE,
+            CleanupWorkItemId(99),
+            "missing job identity",
+            1,
+            CleanupReceiptValidationTier::SourceModel,
+        );
+        assert_eq!(
+            missing_job.validate().unwrap_err(),
+            CleanupJobReceiptValidationError::MissingJobId { index: 0 }
+        );
+
+        let missing_work = CleanupJobReceipt::admitted(
+            JobId(7),
+            CleanupWorkItemId::NONE,
+            "missing work identity",
+            1,
+            CleanupReceiptValidationTier::SourceModel,
+        );
+        assert_eq!(
+            missing_work.validate().unwrap_err(),
+            CleanupJobReceiptValidationError::MissingWorkItemId { index: 0 }
+        );
+    }
+
+    #[test]
+    fn cleanup_job_receipt_validation_rejects_mixed_identity_chain() {
+        let receipts = vec![
+            CleanupJobReceipt::admitted(
+                JobId(7),
+                CleanupWorkItemId(99),
+                "scheduler admitted work item",
+                1,
+                CleanupReceiptValidationTier::SourceModel,
+            ),
+            CleanupJobReceipt::completed(
+                JobId(8),
+                CleanupWorkItemId(100),
+                "completed different work item",
+                1,
+                CleanupReceiptValidationTier::CargoUnit,
+            ),
+        ];
+
+        let err = validate_cleanup_job_receipts(&receipts).unwrap_err();
+        assert_eq!(
+            err,
+            CleanupJobReceiptValidationError::ReceiptIdentityMismatch {
+                index: 1,
+                expected_job_id: JobId(7),
+                actual_job_id: JobId(8),
+                expected_work_item_id: CleanupWorkItemId(99),
+                actual_work_item_id: CleanupWorkItemId(100),
+            }
+        );
+    }
+
+    #[test]
+    fn cleanup_job_receipt_validation_rejects_incomplete_artifact_digest() {
+        let empty_algorithm = CleanupJobReceipt::completed(
+            JobId(7),
+            CleanupWorkItemId(99),
+            "completed with incomplete artifact digest",
+            1,
+            CleanupReceiptValidationTier::CargoUnit,
+        )
+        .with_artifact_digest(CleanupReceiptArtifactDigest::new("", "0123456789abcdef"));
+        assert_eq!(
+            empty_algorithm.validate().unwrap_err(),
+            CleanupJobReceiptValidationError::EmptyArtifactDigest { index: 0 }
+        );
+
+        let empty_hex = CleanupJobReceipt::completed(
+            JobId(7),
+            CleanupWorkItemId(99),
+            "completed with incomplete artifact digest",
+            1,
+            CleanupReceiptValidationTier::CargoUnit,
+        )
+        .with_artifact_digest(CleanupReceiptArtifactDigest::new("blake3", " "));
+        assert_eq!(
+            empty_hex.validate().unwrap_err(),
+            CleanupJobReceiptValidationError::EmptyArtifactDigest { index: 0 }
+        );
     }
 
     // -- Existing CleanupJob / IncrementalJob tests --
