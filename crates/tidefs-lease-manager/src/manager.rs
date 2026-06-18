@@ -306,6 +306,21 @@ impl LeaseManager {
             })?;
         }
 
+        if grant.epoch != self.current_epoch {
+            return Err(LeaseError::EpochMismatch {
+                lease_id,
+                lease_epoch: grant.epoch,
+                current_epoch: self.current_epoch,
+            })?;
+        }
+
+        if grant.mount_identity != self.current_mount_identity {
+            return Err(LeaseError::MountIdentityMismatch {
+                lease_mount: grant.mount_identity,
+                current_mount: self.current_mount_identity,
+            })?;
+        }
+
         if grant.lifecycle.is_terminal() {
             return Err(LeaseManagerError::Terminal(lease_id, grant.lifecycle));
         }
@@ -486,6 +501,38 @@ impl LeaseManager {
         fenced
     }
 
+    /// Remount: fence all active leases from prior mount identities.
+    pub fn remount_invalidate(&mut self, new_mount_identity: DatasetMountIdentity) -> Vec<u64> {
+        let mut fenced = Vec::new();
+
+        let all_ids: Vec<u64> = self.grants.keys().copied().collect();
+        for lease_id in all_ids {
+            let grant_clone = {
+                let grant = match self.grants.get_mut(&lease_id) {
+                    Some(g) => g,
+                    None => continue,
+                };
+                if grant.mount_identity != new_mount_identity
+                    && !grant.lifecycle.is_terminal()
+                    && grant.fence().is_ok()
+                {
+                    fenced.push(lease_id);
+                    self.stats.revocations_total += 1;
+                    self.stats.grants_active = self.stats.grants_active.saturating_sub(1);
+                    Some(grant.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(g) = grant_clone {
+                self.dispatch_invalidation_for_grant(&g);
+            }
+        }
+
+        self.current_mount_identity = new_mount_identity;
+        fenced
+    }
+
     /// Process an incoming lease protocol message and return a response.
     ///
     /// Dispatches Grant (re-grant via id), Renew, and Revoke messages
@@ -573,6 +620,15 @@ impl LeaseManager {
                     tidefs_membership_epoch::MemberId::new(holder_id),
                     lease_holder_id,
                 ),
+                LeaseError::MountIdentityMismatch {
+                    lease_mount,
+                    current_mount,
+                } => LeaseProtocolError::MountIdentityMismatch(lease_mount, current_mount),
+                LeaseError::EpochMismatch {
+                    lease_id,
+                    lease_epoch,
+                    current_epoch,
+                } => LeaseProtocolError::EpochMismatch(lease_id, lease_epoch, current_epoch),
                 _ => LeaseProtocolError::NotFound(0),
             },
         })
