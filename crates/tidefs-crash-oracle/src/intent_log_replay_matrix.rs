@@ -30,11 +30,13 @@ impl IntentReplayHandler for CollectingHandler {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct DurableWriteState {
     writes: BTreeMap<(u64, u64, u64), [u8; 32]>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 struct DurableWriteHandler {
     state: DurableWriteState,
