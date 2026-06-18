@@ -9,11 +9,13 @@ use std::sync::{Arc, Mutex};
 use tidefs_block_allocator::DeviceId;
 use tidefs_device_removal::{
     locator_integration::{LocatorTableObjectEnumerator, LocatorTableObjectMover},
-    AllocationFence, DeviceRemovalDriver, DeviceRemovalPhase, EvacuationCheckpoint,
+    AllocationFence, DeviceRemovalDriver, DeviceRemovalError, DeviceRemovalPhase,
+    EvacuationCheckpoint, PlacementReceiptChecker,
 };
 use tidefs_local_object_store::LocalObjectStore;
 use tidefs_locator_table::{ExtentId, LocatorEntry, LocatorTable, RelocationDataMover};
 use tidefs_pool_scan::{DeviceHealth, DeviceType};
+use tidefs_replication_model::PlacementReceiptRef;
 use tidefs_types_pool_label_core::DeviceClass;
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -125,6 +127,22 @@ impl AllocationFence for TestAllocationFence {
     }
 }
 
+#[derive(Debug, Default)]
+struct EmptyPlacementReceiptChecker;
+
+impl PlacementReceiptChecker for EmptyPlacementReceiptChecker {
+    fn receipts_referencing_extents(
+        &self,
+        _extent_ids: &[ExtentId],
+    ) -> Result<Vec<PlacementReceiptRef>, DeviceRemovalError> {
+        Ok(vec![])
+    }
+}
+
+fn attach_empty_receipt_checker(driver: &mut DeviceRemovalDriver) {
+    driver.set_placement_receipt_checker(Box::new(EmptyPlacementReceiptChecker));
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[test]
@@ -215,6 +233,7 @@ fn full_3_device_removal_lifecycle() {
     };
 
     driver.record_evacuation_receipt(vec![], 0);
+    attach_empty_receipt_checker(&mut driver);
     driver.commit_vacated(updated_config).unwrap();
     assert_eq!(driver.state().phase, DeviceRemovalPhase::Vacated);
 
@@ -391,6 +410,7 @@ fn removal_with_zero_objects_completes_cleanly() {
         removing_device_indices: vec![],
     };
     driver.record_evacuation_receipt(vec![], 0);
+    attach_empty_receipt_checker(&mut driver);
     driver.commit_vacated(updated_config).unwrap();
     driver.mark_removed().unwrap();
 
