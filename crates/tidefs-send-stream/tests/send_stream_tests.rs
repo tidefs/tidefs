@@ -161,6 +161,19 @@ fn incremental_send_rejects_mismatched_dataset_lineage() {
 }
 
 #[test]
+fn full_send_rejects_header_with_base_root_identity() {
+    let mut header = send_header();
+    header.from_snapshot_id = id128(9);
+    let mut snapshot = tidefs_send_stream::SnapshotDelta::new(id128(3), "snap-a", 7);
+    snapshot.objects.push(delta_object(10, b"hello"));
+
+    assert!(matches!(
+        SendBuilder::full(header, vec![snapshot]).unwrap_err(),
+        SendStreamError::InvalidHeader("full send must not name an incremental base root")
+    ));
+}
+
+#[test]
 fn lineage_manifest_encoding_is_stable() {
     let manifest = LineageManifest::full(&send_header(), [4u8; 32]);
     let mut expected = Vec::new();
