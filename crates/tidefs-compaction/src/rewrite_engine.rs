@@ -1506,6 +1506,51 @@ mod tests {
     }
 
     #[test]
+    fn commit_outcome_missing_source_entry_blocks_release() {
+        let mut store = MockCompactionStore::new();
+        let k1 = make_key(1);
+        let d1 = vec![0xAAu8; 64];
+
+        store.add_segment_with_objects(10, &[(k1, d1.clone())]);
+        store.add_segment_with_objects(20, &[]);
+
+        let mut engine = RewriteEngine::new(store, default_config());
+        let entry = RelocationEntry {
+            source_segment: 10,
+            object_key: k1,
+            target_offset: 0,
+            blake3_hash: blake3::hash(&d1).into(),
+        };
+        let group = RewriteGroupOutcome {
+            group_index: 0,
+            freed_segments: vec![10, 20],
+            target_segment: 100,
+            objects_relocated: 1,
+            bytes_written: d1.len() as u64,
+            entries: vec![entry],
+        };
+        let outcome = RewriteOutcome {
+            outcome_hash: RewriteOutcome::compute_outcome_hash(core::slice::from_ref(&group)),
+            groups: vec![group],
+            total_segments_freed: 2,
+            total_objects_relocated: 1,
+            total_bytes_written: d1.len() as u64,
+            is_empty: false,
+        };
+
+        let report = engine.commit_outcome(&outcome).unwrap();
+        assert!(!report.verified());
+        assert!(report.freed_segments.is_empty());
+        assert_eq!(report.blocked_segments, vec![10, 20]);
+        assert!(report.verification_errors.iter().any(|err| matches!(
+            err,
+            crate::verification::SwapVerificationError::EntryCountMismatch { .. }
+        )));
+        let store = engine.into_store();
+        assert!(store.freed.is_empty());
+    }
+
+    #[test]
     fn commit_outcome_target_read_failure_blocks_release() {
         let mut store = MockCompactionStore::new();
         let k1 = make_key(1);
@@ -1659,6 +1704,35 @@ mod tests {
         assert!(verification.errors.iter().any(|e| matches!(
             e,
             crate::verification::SwapVerificationError::TargetReadFailed { .. }
+        )));
+    }
+
+    #[test]
+    fn verify_swap_manifest_rejects_source_as_target() {
+        let mut store = MockCompactionStore::new();
+        let k1 = make_key(1);
+        let data = vec![0xAAu8; 64];
+        store.objects.insert(k1, data.clone());
+        let hash: [u8; 32] = blake3::hash(&data).into();
+        let entry = RelocationEntry {
+            source_segment: 100,
+            object_key: k1,
+            target_offset: 0,
+            blake3_hash: hash,
+        };
+        let manifest = SwapManifest {
+            source_segments: vec![100],
+            target_segment: 100,
+            relocation_entries: vec![entry.clone()],
+            total_bytes: data.len() as u64,
+            manifest_hash: SwapManifest::compute_hash(&[100], 100, &[entry], data.len() as u64),
+        };
+
+        let verification = crate::verification::verify_swap_manifest(&manifest, &store);
+        assert!(!verification.verified);
+        assert!(verification.errors.iter().any(|e| matches!(
+            e,
+            crate::verification::SwapVerificationError::SourceTargetMismatch { .. }
         )));
     }
 

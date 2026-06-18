@@ -325,8 +325,8 @@ pub enum SwapVerificationError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
-    /// The number of relocation entries in the manifest does not
-    /// match the number of objects actually found in the target.
+    /// The manifest's release shape does not match the relocation
+    /// entries present for the claimed source segments.
     EntryCountMismatch {
         manifest_count: usize,
         actual_count: usize,
@@ -465,6 +465,22 @@ pub fn verify_swap_manifest<S: crate::CompactionStore>(
     let mut entries_verified: usize = 0;
     let mut bytes_compared: u64 = 0;
     let mut errors: Vec<SwapVerificationError> = Vec::new();
+    let mut sources_with_entries: Vec<u64> = Vec::new();
+
+    if manifest.target_segment == 0 {
+        errors.push(SwapVerificationError::SourceTargetMismatch {
+            detail: "manifest declares source release without a target segment".into(),
+        });
+    }
+
+    if manifest.source_segments.contains(&manifest.target_segment) {
+        errors.push(SwapVerificationError::SourceTargetMismatch {
+            detail: format!(
+                "target segment {} is also listed as a source segment",
+                manifest.target_segment
+            ),
+        });
+    }
 
     for entry in &manifest.relocation_entries {
         // Verify source segment membership.
@@ -477,6 +493,9 @@ pub fn verify_swap_manifest<S: crate::CompactionStore>(
             });
             continue;
         }
+        if !sources_with_entries.contains(&entry.source_segment) {
+            sources_with_entries.push(entry.source_segment);
+        }
 
         // Read the object back from the store and verify its digest.
         match store.read_object(&entry.object_key) {
@@ -488,6 +507,16 @@ pub fn verify_swap_manifest<S: crate::CompactionStore>(
                         key: entry.object_key,
                         expected: entry.blake3_hash,
                         actual: actual_hash,
+                    });
+                    continue;
+                }
+
+                if entry.target_offset != bytes_compared {
+                    errors.push(SwapVerificationError::SourceTargetMismatch {
+                        detail: format!(
+                            "entry target offset {} does not match expected contiguous offset {}",
+                            entry.target_offset, bytes_compared
+                        ),
                     });
                     continue;
                 }
@@ -505,11 +534,19 @@ pub fn verify_swap_manifest<S: crate::CompactionStore>(
         }
     }
 
-    // Entry count mismatch: manifest says N entries but only M verified.
-    if entries_verified != manifest.relocation_entries.len() && errors.is_empty() {
+    if sources_with_entries.len() != manifest.source_segments.len() {
         errors.push(SwapVerificationError::EntryCountMismatch {
-            manifest_count: manifest.relocation_entries.len(),
-            actual_count: entries_verified,
+            manifest_count: manifest.source_segments.len(),
+            actual_count: sources_with_entries.len(),
+        });
+    }
+
+    if bytes_compared != manifest.total_bytes && errors.is_empty() {
+        errors.push(SwapVerificationError::MissingManifestData {
+            detail: format!(
+                "manifest byte count {} does not match verified target bytes {}",
+                manifest.total_bytes, bytes_compared
+            ),
         });
     }
 
