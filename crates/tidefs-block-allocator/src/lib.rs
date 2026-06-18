@@ -574,8 +574,8 @@ struct AllocatorInner {
     pending_allocation_blocks: BTreeMap<BlockId, CommitGroupEpochFence>,
     /// Blocks waiting for their freeing commit-group epoch to become durable.
     pending_frees: BTreeMap<CommitGroupEpochFence, BTreeSet<BlockId>>,
-    /// Fast membership lookup for blocks in `pending_frees`.
-    pending_free_blocks: BTreeSet<BlockId>,
+    /// Fast owner lookup for blocks in `pending_frees`.
+    pending_free_blocks: BTreeMap<BlockId, CommitGroupEpochFence>,
 }
 
 impl std::fmt::Debug for AllocatorInner {
@@ -877,7 +877,7 @@ impl BlockAllocator {
             pending_allocations: BTreeMap::new(),
             pending_allocation_blocks: BTreeMap::new(),
             pending_frees: BTreeMap::new(),
-            pending_free_blocks: BTreeSet::new(),
+            pending_free_blocks: BTreeMap::new(),
         })
     }
 
@@ -1037,7 +1037,7 @@ impl BlockAllocator {
             pending_allocations: BTreeMap::new(),
             pending_allocation_blocks: BTreeMap::new(),
             pending_frees: BTreeMap::new(),
-            pending_free_blocks: BTreeSet::new(),
+            pending_free_blocks: BTreeMap::new(),
         })
     }
 
@@ -1377,7 +1377,7 @@ impl BlockAllocator {
         Self::validate_epoch_fence(epoch_fence)?;
 
         let mut inner = self.inner.write().unwrap();
-        let mut scheduled = Vec::new();
+        let mut scheduled = BTreeSet::new();
         for &block in blocks {
             if block >= inner.bitmap.block_count() || inner.bitmap.is_free(block) {
                 continue;
@@ -1387,12 +1387,20 @@ impl BlockAllocator {
                     return Err(AllocError::CommitGroupConflict);
                 }
             }
-            if inner.pending_free_blocks.insert(block) {
-                scheduled.push(block);
+            if let Some(owner) = inner.pending_free_blocks.get(&block) {
+                if *owner != epoch_fence {
+                    return Err(AllocError::CommitGroupConflict);
+                }
+                continue;
             }
+            scheduled.insert(block);
         }
+        let scheduled: Vec<BlockId> = scheduled.into_iter().collect();
 
         if !scheduled.is_empty() {
+            for &block in &scheduled {
+                inner.pending_free_blocks.insert(block, epoch_fence);
+            }
             inner
                 .pending_frees
                 .entry(epoch_fence)
@@ -1427,7 +1435,9 @@ impl BlockAllocator {
         let frees = inner.pending_frees.remove(&epoch_fence).unwrap_or_default();
         let freed: Vec<BlockId> = frees.iter().copied().collect();
         for block in &freed {
-            inner.pending_free_blocks.remove(block);
+            if inner.pending_free_blocks.get(block) == Some(&epoch_fence) {
+                inner.pending_free_blocks.remove(block);
+            }
         }
         Self::mark_blocks_free_locked(&mut inner, &freed);
         #[cfg(debug_assertions)]
@@ -1468,7 +1478,9 @@ impl BlockAllocator {
 
         let frees = inner.pending_frees.remove(&epoch_fence).unwrap_or_default();
         for block in &frees {
-            inner.pending_free_blocks.remove(block);
+            if inner.pending_free_blocks.get(block) == Some(&epoch_fence) {
+                inner.pending_free_blocks.remove(block);
+            }
         }
 
         Self::mark_blocks_free_locked(&mut inner, &released);
@@ -1831,7 +1843,7 @@ impl BlockAllocator {
             .copied()
             .filter(|block| {
                 !inner.pending_allocation_blocks.contains_key(block)
-                    && !inner.pending_free_blocks.contains(block)
+                    && !inner.pending_free_blocks.contains_key(block)
             })
             .collect();
         Self::mark_blocks_free_locked(&mut inner, &immediate);

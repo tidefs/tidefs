@@ -127,3 +127,51 @@ fn abort_releases_allocations_and_cancels_pending_frees() {
         .iter()
         .all(|block| !committed.contains(block)));
 }
+
+#[test]
+fn pending_free_conflict_leaves_prior_state_recoverable() {
+    let ba = BlockAllocator::new(16, 4096, region(16));
+    let first_epoch = fence(40);
+    let second_epoch = fence(41);
+
+    let in_flight = ba.reserve_allocation(first_epoch, 1).unwrap();
+    let committed = ba.alloc_contiguous(1).unwrap();
+    assert_eq!(ba.free_count(), 14);
+
+    assert_eq!(
+        ba.free_on_commit(second_epoch, &[committed[0], in_flight.blocks()[0]])
+            .unwrap_err(),
+        AllocError::CommitGroupConflict
+    );
+    assert_eq!(ba.pending_free_count(), 0);
+
+    ba.free(&committed);
+    assert_eq!(ba.free_count(), 15);
+
+    let delta = ba.abort_commit_group(first_epoch).unwrap();
+    assert_eq!(delta.allocations, 1);
+    assert_eq!(delta.frees, 0);
+    assert_eq!(ba.free_count(), 16);
+}
+
+#[test]
+fn pending_free_owner_blocks_other_commit_groups() {
+    let ba = BlockAllocator::new(16, 4096, region(16));
+    let first_epoch = fence(50);
+    let second_epoch = fence(51);
+
+    let block = ba.alloc_contiguous(1).unwrap();
+    let first = ba.free_on_commit(first_epoch, &block).unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(ba.pending_free_count(), 1);
+
+    assert_eq!(
+        ba.free_on_commit(second_epoch, &block).unwrap_err(),
+        AllocError::CommitGroupConflict
+    );
+    assert_eq!(ba.pending_free_count(), 1);
+
+    let delta = ba.mark_commit_group_durable(first_epoch).unwrap();
+    assert_eq!(delta.frees, 1);
+    assert_eq!(ba.free_count(), 16);
+}
