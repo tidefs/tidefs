@@ -69,6 +69,7 @@ fn make_grant() -> LeaseWireMessage {
             ino: 100,
         },
         MemberId(7),
+        0u64,
         30_000,
         1_000_000,
         EpochId(5),
