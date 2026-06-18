@@ -2371,10 +2371,9 @@ impl ReclaimStats {
 
 /// Stats returned by `LocalFileSystem::drain_local_reclaim_queue_into_store`.
 ///
-/// Records the handoff from the local-filesystem B+tree reclaim queue
-/// into the object-store durable reclaim queue via `store.delete()`. The
-/// object-store reclaim queue is drained by `LocalObjectStore::drain_dead_segments`,
-/// the sole mounted-pool segment-freeing authority.
+/// Records the handoff from the local-filesystem B+tree reclaim queue into
+/// the object-store legacy reclaim queue via `store.delete()`. Physical
+/// segment freeing is reserved for receipt-bound dead-object drains.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReclaimDrainStats {
     /// Number of reclaim entries drained from the local B+tree queue

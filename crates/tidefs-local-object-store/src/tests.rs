@@ -4204,7 +4204,7 @@ mod spacemap_integration {
     }
 
     #[test]
-    fn allocation_pressure_drains_dead_segments_before_nospace() {
+    fn allocation_pressure_preserves_legacy_queue_before_nospace() {
         let root = temp_dir();
         let segment_count = 10;
         let opts = StoreOptions {
@@ -4231,12 +4231,19 @@ mod spacemap_integration {
 
         let result = store.rotate_segment();
         assert!(
-            result.is_ok(),
-            "rotate should drain dead segments and retry allocation, got {result:?}"
+            matches!(result, Err(StoreError::NoSpace)),
+            "legacy reclaim queue must not free physical segments without receipt-bound evidence, got {result:?}"
         );
         assert!(
-            store.stats().free_segments > 0,
-            "draining four deleted segment entries should leave reusable capacity"
+            store.stats().free_segments == 0,
+            "legacy reclaim entries must remain allocated until receipt-bound reclaim"
+        );
+        let drain = store
+            .drain_dead_segments(&tidefs_reclaim::ReclaimConsumerConfig::default())
+            .expect("legacy drain inspection");
+        assert!(
+            drain.reclaim_queue_depth >= 4,
+            "legacy queue entries should remain visible for inspection"
         );
         cleanup(&root);
     }

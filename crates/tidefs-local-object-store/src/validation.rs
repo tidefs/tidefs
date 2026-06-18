@@ -1292,20 +1292,17 @@ mod tests {
 
     // ── Reclaim-queue consumer drain integration ─────────────────────
 
-    /// Integration test: put objects, delete them all from one segment,
-    /// drain the reclaim queue, verify the segment is freed and can be
-    /// re-allocated for new writes, then persist and reopen to confirm
-    /// the spacemap checkpoint survived.
+    /// Integration test: put objects, delete them all from one segment, and
+    /// verify the legacy reclaim queue fails closed without receipt-bound
+    /// clearance evidence.
     #[test]
-    fn drain_reclaim_frees_dead_segment_and_allows_reallocation() {
+    fn drain_dead_segments_keeps_legacy_queue_queued_without_receipts() {
         let root = temp_root("drain-reclaim");
         let key_a = ObjectKey::from_name("a");
         let key_b = ObjectKey::from_name("b");
         let key_c = ObjectKey::from_name("c");
 
         let mut store = open(&root);
-        let seg_before = store.free_map.free_count();
-
         // Put three objects, all land in the same active segment.
         store.put(key_a, b"aaa").unwrap();
         store.put(key_b, b"bbb").unwrap();
@@ -1331,48 +1328,43 @@ mod tests {
         // always holds system objects (committed root) that the drain must
         // not reclaim.
         store.rotate_segment().expect("rotate after deletes");
+        let free_before_drain = store.free_map.free_count();
 
-        // Drain within the same session: the in-memory reclaim queue
-        // has the entries; they will be persisted at the end of drain.
+        // The legacy queue records dead-object liveness, but current reclaim
+        // authority requires receipt-bound evidence before physical free.
         let stats = store
             .drain_dead_segments(&tidefs_reclaim::ReclaimConsumerConfig::default())
             .expect("drain should succeed");
 
-        assert_eq!(stats.entries_processed, 3);
-        assert_eq!(stats.segments_reclaimed, 1);
-        assert_eq!(stats.blocks_freed, 3, "three objects freed");
+        assert_eq!(stats.entries_processed, 0);
+        assert_eq!(stats.segments_reclaimed, 0);
+        assert_eq!(stats.blocks_freed, 0);
+        assert_eq!(stats.reclaim_queue_depth, 3);
 
-        // The segment should now be free.
-        assert!(store.free_map.is_free(segment_id));
-
-        // Verify we can allocate it again for a new write.
-        store.put(ObjectKey::from_name("new"), b"new-data").unwrap();
-        store.sync_all().unwrap();
-
-        // Free count should return to baseline after drain + reallocate.
+        // The segment remains allocated because no committed receipt-bound
+        // dead-object gate authorized physical reclaim.
+        assert!(!store.free_map.is_free(segment_id));
         let seg_after = store.free_map.free_count();
         assert_eq!(
-            seg_after, seg_before,
-            "free count returns to baseline after drain + reallocate"
+            seg_after, free_before_drain,
+            "free count is unchanged when the old queue fails closed"
         );
 
-        // Persist spacemap checkpoint so the free state survives reopen.
         drop(store);
 
-        // Reopen and verify the freed+reallocated state holds.
+        // Reopen and verify the segment was not freed by the legacy drain.
         {
             let store2 = open(&root);
             assert!(
-                store2.free_map.is_free(segment_id),
-                "segment remains free after reopen"
+                !store2.free_map.is_free(segment_id),
+                "segment remains allocated after reopen"
             );
         }
 
         cleanup(&root);
     }
 
-    /// Drain on a store with partially-live segments frees only the
-    /// fully-dead ones.
+    /// Legacy drain keeps queued entries without freeing partially-live segments.
     #[test]
     fn drain_partially_live_segment_not_freed() {
         let root = temp_root("drain-partial");
@@ -1394,11 +1386,12 @@ mod tests {
             .drain_dead_segments(&tidefs_reclaim::ReclaimConsumerConfig::default())
             .expect("drain should succeed");
 
-        assert_eq!(stats.entries_processed, 1);
+        assert_eq!(stats.entries_processed, 0);
         assert_eq!(
             stats.segments_reclaimed, 0,
-            "partially-live segment must not be freed"
+            "legacy queue drain must not physically free segments"
         );
+        assert_eq!(stats.reclaim_queue_depth, 1);
         assert!(
             !store.free_map.is_free(segment_id),
             "segment with live objects must remain allocated"

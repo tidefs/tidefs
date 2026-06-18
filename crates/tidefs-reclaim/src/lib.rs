@@ -6,7 +6,7 @@
 //! 1. **Segment compaction** ([`ReclaimScheduler`], [`ReclaimPlan`]):
 //!    waste-ratio-based compaction of partially-dead segments.
 //!
-//! 2. **Reclaim-queue consumer** ([`drain_reclaim_queue`],
+//! 2. **Reclaim-queue consumer** ([`drain_reclaim_queue_gated`],
 //!    [`ReclaimConsumerStats`]): drains entries populated by object
 //!    delete and overwrite, groups them by segment, computes per-segment
 //!    liveness, and returns fully-dead segments to the free pool.
@@ -19,7 +19,7 @@
 //!       │                              SegmentLiveCounts (per-seg refs)
 //!       │                                            │
 //!       ▼                                            ▼
-//!   drain_reclaim_queue() ─────► SegmentFreer ──► PoolAllocator::add_free
+//!   drain_reclaim_queue_gated() ─► ReclaimGate ─► SegmentFreer
 //! ```
 
 #![forbid(unsafe_code)]
@@ -640,30 +640,6 @@ impl<R: fmt::Debug + fmt::Display, F: fmt::Debug + fmt::Display> fmt::Display fo
     }
 }
 
-/// Drain reclaim-queue entries, identify fully-dead segments, and return
-/// them to the free pool.
-///
-/// # Flow
-///
-/// 1. Extract up to `config.max_entries_per_drain` entries from `queue`.
-/// 2. Resolve each entry's object key to a segment id via `resolver`.
-/// 3. Apply the entry's refcount delta to `live_counts` for that segment.
-/// 4. After processing all entries, scan for segments whose live count
-///    reached zero (fully dead).
-/// 5. Batch-free dead segments via `freer` in groups of at most
-///    `config.max_free_batch`.
-/// 6. Remove freed segments from `live_counts`.
-///
-/// # Errors
-///
-/// Returns `DrainError::ResolveError` if the resolver cannot map a key.
-/// Returns `DrainError::FreeError` if the freer cannot release a segment.
-///
-/// # Panics
-///
-/// Does not panic on valid input.  Queue entries are consumed
-/// non-destructively by this function (it reads them; the caller is
-/// responsible for removing processed entries from the source queue).
 // =========================================================================
 // ReclaimGate — deadlist and snapshot-pin clearance gating
 // =========================================================================
@@ -956,6 +932,11 @@ impl fmt::Display for ReclaimReceiptDecodeError {
         }
     }
 }
+
+// Test-only legacy helper retained for historical consumer coverage. Release
+// reclaim paths must use `drain_reclaim_queue_gated` or
+// `drain_receipt_bound_dead_objects`.
+#[cfg(test)]
 pub fn drain_reclaim_queue<R, F>(
     entries: &[(ObjectKey, ReclaimQueueEntry)],
     resolver: &impl SegmentResolver<Error = R>,
@@ -981,6 +962,7 @@ where
 
     // Phase 1: resolve segments and apply deltas.
     let mut segment_entries: HashMap<u64, Vec<(ObjectKey, i64)>> = HashMap::new();
+    let mut segment_prior_counts: HashMap<u64, u64> = HashMap::new();
 
     for (key, entry) in entries.iter().take(config.max_entries_per_drain) {
         let segment_id = resolver
@@ -995,6 +977,9 @@ where
             None => continue, // object already reclaimed; skip
         };
 
+        segment_prior_counts
+            .entry(sid)
+            .or_insert_with(|| live_counts.live_count(sid));
         live_counts.apply_delta(sid, entry.delta);
         segment_entries
             .entry(sid)
@@ -1045,7 +1030,7 @@ pub struct GatedDrainResult {
     /// Segment reclaim accounting for this drain.
     pub stats: ReclaimConsumerStats,
     /// Reclaim receipt recording freed extents and clearance evidence.
-    /// `None` if no gate was provided or no extents were freed.
+    /// `None` if no extents were freed.
     pub receipt: Option<ReclaimReceipt>,
 }
 
@@ -1063,16 +1048,12 @@ impl GatedDrainResult {
 ///
 /// # Gate behaviour
 ///
-/// When a gate is provided (`Some(gate)`), each extent in a
-/// fully-dead segment is checked via [`ReclaimGate::check_extent`].
+/// Each extent in a fully-dead segment is checked via
+/// [`ReclaimGate::check_extent`].
 /// If any extent in the segment is denied, the entire segment is
 /// skipped and remains in `live_counts`. This conservative
 /// all-or-none rule prevents partial segment freeing, which the
 /// segment-based allocator does not support.
-///
-/// When no gate is provided (`None`), the function behaves as the
-/// legacy ungated drain: all fully-dead segments are freed regardless
-/// of deadlist or pin state.
 ///
 /// # Flow
 ///
@@ -1081,11 +1062,11 @@ impl GatedDrainResult {
 /// 3. Apply the entry's refcount delta to `live_counts` for that segment.
 /// 4. After processing all entries, scan for segments whose live count
 ///    reached zero (fully dead).
-/// 5. For each fully-dead segment with a gate, check every extent
-///    against the gate; skip the segment if any extent is denied.
+/// 5. For each fully-dead segment, check every extent against the gate;
+///    skip the segment if any extent is denied.
 /// 6. Batch-free the gated dead segments via `freer`.
 /// 7. Remove freed segments from `live_counts`.
-/// 8. Build a [`ReclaimReceipt`] if any extents were freed with a gate.
+/// 8. Build a [`ReclaimReceipt`] if any extents were freed.
 ///
 /// # Errors
 ///
@@ -1101,7 +1082,7 @@ pub fn drain_reclaim_queue_gated<R, F>(
     freer: &mut impl SegmentFreer<Error = F>,
     live_counts: &mut SegmentLiveCounts,
     config: &ReclaimConsumerConfig,
-    gate: Option<&impl ReclaimGate>,
+    gate: &impl ReclaimGate,
 ) -> Result<GatedDrainResult, DrainError<R, F>>
 where
     R: fmt::Debug + fmt::Display,
@@ -1169,29 +1150,30 @@ where
         for &segment_id in batch {
             // Gate: check every extent in this segment
             let mut segment_allowed = true;
-            if let Some(gate) = gate {
-                if let Some(extent_entries) = segment_entries.get(&segment_id) {
-                    for (object_key, _delta) in extent_entries {
-                        let decision = gate.check_extent(object_key);
-                        match decision {
-                            GateDecision::Allow(evidence) => {
-                                // Record clearance evidence from first allowed extent
-                                if clearance_deadlist_txg.is_none() {
-                                    clearance_deadlist_txg = evidence.deadlist_txg();
-                                    clearance_pin_epoch = evidence.pin_epoch();
-                                }
+            if let Some(extent_entries) = segment_entries.get(&segment_id) {
+                for (object_key, _delta) in extent_entries {
+                    let decision = gate.check_extent(object_key);
+                    match decision {
+                        GateDecision::Allow(evidence) => {
+                            // Record clearance evidence from first allowed extent.
+                            if clearance_deadlist_txg.is_none() {
+                                clearance_deadlist_txg = evidence.deadlist_txg();
+                                clearance_pin_epoch = evidence.pin_epoch();
                             }
-                            GateDecision::Deny(_reason) => {
-                                segment_allowed = false;
-                                stats.gate_extents_denied += 1;
-                                break;
-                            }
+                        }
+                        GateDecision::Deny(_reason) => {
+                            segment_allowed = false;
+                            stats.gate_extents_denied += 1;
+                            break;
                         }
                     }
                 }
             }
 
             if !segment_allowed {
+                if let Some(previous) = segment_prior_counts.get(&segment_id) {
+                    live_counts.set_live_count(segment_id, *previous);
+                }
                 stats.gate_segments_skipped += 1;
                 continue;
             }
@@ -1209,11 +1191,9 @@ where
             if let Some(extent_entries) = segment_entries.get(&segment_id) {
                 let obj_count = extent_entries.iter().filter(|(_, d)| *d < 0).count() as u64;
                 stats.blocks_freed += obj_count;
-                if gate.is_some() {
-                    for (object_key, delta) in extent_entries {
-                        if *delta < 0 {
-                            freed_extents.push(*object_key);
-                        }
+                for (object_key, delta) in extent_entries {
+                    if *delta < 0 {
+                        freed_extents.push(*object_key);
                     }
                 }
             }
@@ -1221,7 +1201,7 @@ where
         stats.checkpoint_batches += 1;
     }
 
-    let receipt = if gate.is_some() && !freed_extents.is_empty() {
+    let receipt = if !freed_extents.is_empty() {
         Some(ReclaimReceipt::new(
             freed_extents,
             clearance_deadlist_txg.unwrap_or(0),
@@ -1402,14 +1382,13 @@ impl SegmentFreer for PoolAllocator {
 // ReclaimConsumerService -- callable entry point for reclaim-queue draining
 // =========================================================================
 
-/// Callable service entry point that drains the reclaim queue, identifies
-/// fully-dead segments, and returns their space to the free pool via the
-/// configured [`SegmentFreer`].
+/// Callable service entry point for gated reclaim drains.
 ///
 /// The service bundles configuration and live-count state so callers do not
-/// need to thread them through every drain invocation.  For each drain call,
-/// the caller supplies the entries (from the reclaim queue B+tree) and a
-/// resolver (typically backed by the locator table or extent map).
+/// need to thread them through every drain invocation. For each drain call,
+/// the caller supplies eligible entries, a resolver, a freer, and a
+/// [`ReclaimGate`] that proves deadlist and snapshot-pin clearance before
+/// physical segment release.
 ///
 /// # Example
 ///
@@ -1422,9 +1401,10 @@ impl SegmentFreer for PoolAllocator {
 /// let entries: Vec<(ObjectKey, ReclaimQueueEntry)> = reclaim_queue.dequeue_batch(None, 1024);
 /// let resolver = LocatorTableResolver::new(&locator_table);
 /// let mut allocator = pool_allocator.clone();
+/// let gate = CommittedClearanceGate::new(...);
 ///
-/// let stats = service.drain(&entries, &resolver, &mut allocator)?;
-/// ```text
+/// let result = service.gated_drain(&entries, &resolver, &mut allocator, &gate)?;
+/// ```
 #[derive(Clone, Debug)]
 pub struct ReclaimConsumerService {
     config: ReclaimConsumerConfig,
@@ -1459,6 +1439,7 @@ impl ReclaimConsumerService {
     ///
     /// Returns [`DrainError::ResolveError`] when the resolver cannot map an
     /// object key, or [`DrainError::FreeError`] when `freer` fails.
+    #[cfg(test)]
     pub fn drain<R, F>(
         &mut self,
         entries: &[(ObjectKey, ReclaimQueueEntry)],
@@ -1485,7 +1466,7 @@ impl ReclaimConsumerService {
         entries: &[(ObjectKey, ReclaimQueueEntry)],
         resolver: &impl SegmentResolver<Error = R>,
         freer: &mut impl SegmentFreer<Error = F>,
-        gate: Option<&impl ReclaimGate>,
+        gate: &impl ReclaimGate,
     ) -> Result<GatedDrainResult, DrainError<R, F>>
     where
         R: fmt::Debug + fmt::Display,
@@ -1552,9 +1533,11 @@ impl ReclaimConsumerService {
 // into the reclaim pipeline.
 // =========================================================================
 
+#[cfg(test)]
 use tidefs_dedup::{locator_id_to_object_key, RemoveConsumerOutcome};
 
 /// Accumulated stats for one [`DedupReclaimWriter::process_outcomes`] call.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DedupReclaimStats {
     /// Number of dedup outcomes examined.
@@ -1567,6 +1550,7 @@ pub struct DedupReclaimStats {
     pub deltas_applied: usize,
 }
 
+#[cfg(test)]
 impl DedupReclaimStats {
     /// Zero-valued stats.
     pub const ZERO: Self = Self {
@@ -1609,10 +1593,12 @@ impl DedupReclaimStats {
 ///     &mut freer,
 /// );
 /// ```text
+#[cfg(test)]
 pub struct DedupReclaimWriter {
     live_counts: SegmentLiveCounts,
 }
 
+#[cfg(test)]
 impl DedupReclaimWriter {
     /// Create a new writer wrapping the given live-counts state.
     ///
@@ -1704,6 +1690,7 @@ impl DedupReclaimWriter {
 }
 
 /// Errors returned by [`DedupReclaimWriter::process_outcomes`].
+#[cfg(test)]
 #[derive(Debug)]
 pub enum DedupReclaimError<R: fmt::Debug + fmt::Display, F: fmt::Debug + fmt::Display> {
     /// The segment resolver failed to map a locator-derived object key.
@@ -1722,6 +1709,7 @@ pub enum DedupReclaimError<R: fmt::Debug + fmt::Display, F: fmt::Debug + fmt::Di
     },
 }
 
+#[cfg(test)]
 impl<R: fmt::Debug + fmt::Display, F: fmt::Debug + fmt::Display> fmt::Display
     for DedupReclaimError<R, F>
 {
@@ -3634,7 +3622,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
-            Some(&gate),
+            &gate,
         )
         .unwrap();
 
@@ -3672,7 +3660,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
-            Some(&gate),
+            &gate,
         )
         .unwrap();
 
@@ -3681,6 +3669,7 @@ mod tests {
         assert_eq!(result.stats.gate_extents_denied, 1);
         assert!(freer.freed.is_empty());
         assert!(result.receipt.is_none());
+        assert_eq!(live_counts.live_count(1), 2);
     }
 
     #[test]
@@ -3707,7 +3696,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
-            Some(&gate),
+            &gate,
         )
         .unwrap();
 
@@ -3715,6 +3704,7 @@ mod tests {
         assert_eq!(result.stats.gate_segments_skipped, 1);
         assert_eq!(result.stats.gate_extents_denied, 1);
         assert!(freer.freed.is_empty());
+        assert_eq!(live_counts.live_count(2), 1);
     }
 
     #[test]
@@ -3738,43 +3728,13 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
-            Some(&gate),
+            &gate,
         )
         .unwrap();
 
         assert_eq!(result.stats.segments_reclaimed, 1);
         assert_eq!(result.stats.gate_segments_skipped, 0);
         assert_eq!(freer.freed, vec![3]);
-    }
-
-    #[test]
-    fn gated_drain_no_gate_behaves_like_legacy() {
-        let mut live_counts = SegmentLiveCounts::new();
-        live_counts.apply_delta(4, 1);
-
-        let entries = vec![(
-            receipt_extent_key(4),
-            ReclaimQueueEntry::new(receipt_extent_key(4), -1, QueueFamily::Extent),
-        )];
-
-        let resolver = MockSegmentResolver;
-        let mut freer = MockSegmentFreer::default();
-        let config = ReclaimConsumerConfig::default();
-
-        let result = drain_reclaim_queue_gated(
-            &entries,
-            &resolver,
-            &mut freer,
-            &mut live_counts,
-            &config,
-            None::<&AllowAllGate>, // no gate
-        )
-        .unwrap();
-
-        assert_eq!(result.stats.segments_reclaimed, 1);
-        assert_eq!(result.stats.gate_segments_skipped, 0);
-        assert_eq!(freer.freed, vec![4]);
-        assert!(result.receipt.is_none()); // no receipt without gate
     }
 
     #[test]
@@ -3798,7 +3758,7 @@ mod tests {
             &mut freer,
             &mut live_counts,
             &config,
-            Some(&gate),
+            &gate,
         )
         .unwrap();
 

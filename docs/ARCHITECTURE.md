@@ -39,7 +39,7 @@ Storage Layer (product)
   tidefs-intent-log                               Intent log for crash recovery
   tidefs-pool-import                              Pool import, committed-root recovery
   tidefs-pool-allocator                           Pool-level allocation
-  tidefs-segment-cleaner                          Segment cleaning (model surface; live authority is LocalObjectStore::drain_dead_segments)
+  tidefs-segment-cleaner                          Segment cleaning (model surface; live physical reclaim requires receipt-bound dead-object drains)
   tidefs-compaction                               Live-data relocation, segment merge
   tidefs-reclaim-queue-core                       Freed-extent reclaim queue
   tidefs-cleanup-queue-core                       Persistent cleanup work queue
