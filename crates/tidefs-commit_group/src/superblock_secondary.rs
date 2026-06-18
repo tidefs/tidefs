@@ -428,6 +428,16 @@ fn read_secondary_copy_validated<S: CommitGroupStore>(
     // Extract content region.
     let content = SuperblockSecondaryHeader::content_bytes(&raw)
         .ok_or(SuperblockReadError::SecondaryContentTruncated)?;
+    if content.len() < CommittedRootBlock::WIRE_SIZE {
+        return Err(SuperblockReadError::SecondaryContentTruncated);
+    }
+    if content.len() != CommittedRootBlock::WIRE_SIZE {
+        return Err(SuperblockReadError::SecondaryPayloadCorrupt(format!(
+            "unexpected root block length: expected {}, found {}",
+            CommittedRootBlock::WIRE_SIZE,
+            content.len()
+        )));
+    }
 
     // Verify header checksum over content.
     if !header.verify(content) {
@@ -1109,6 +1119,58 @@ mod tests {
             result,
             Err(SuperblockReadError::SecondaryContentTruncated)
         ));
+    }
+
+    #[test]
+    fn secondary_short_payload_is_content_truncated() {
+        let valid_content = [0xABu8; CommittedRootBlock::WIRE_SIZE - 1];
+        let mut header = SuperblockSecondaryHeader::new(1);
+        header.seal(&valid_content);
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&header.to_bytes());
+        combined.extend_from_slice(&valid_content);
+
+        let mut store = TestStore::new();
+        store
+            .data
+            .insert(secondary_key_name(CommitGroupId(1)), combined);
+
+        let result = read_secondary_copy_validated(&store, CommitGroupId(1), 0);
+        assert!(matches!(
+            result,
+            Err(SuperblockReadError::SecondaryContentTruncated)
+        ));
+    }
+
+    #[test]
+    fn secondary_oversized_payload_is_corrupt() {
+        let block = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 30, 40);
+        let sealed = CommitGroupWriter::seal_root_block(block);
+        let mut content = sealed.to_bytes().to_vec();
+        content.push(0);
+
+        let mut header = SuperblockSecondaryHeader::new(1);
+        header.seal(&content);
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&header.to_bytes());
+        combined.extend_from_slice(&content);
+
+        let mut store = TestStore::new();
+        store
+            .data
+            .insert(secondary_key_name(CommitGroupId(1)), combined);
+
+        let result = read_secondary_copy_validated(&store, CommitGroupId(1), 0);
+        match result {
+            Err(SuperblockReadError::SecondaryPayloadCorrupt(msg)) => {
+                assert!(msg.contains("unexpected root block length"));
+                assert!(msg.contains("expected 88"));
+                assert!(msg.contains("found 89"));
+            }
+            other => panic!("expected SecondaryPayloadCorrupt, got {other:?}"),
+        }
     }
 
     #[test]
