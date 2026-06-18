@@ -2753,6 +2753,7 @@ dependencies = [
  "tidefs-erasure-coding",
  "tidefs-extent-map",
  "tidefs-frame",
+ "tidefs-gc-pin-set",
  "tidefs-incremental-job-core",
  "tidefs-membership-epoch",
  "tidefs-placement-planner",

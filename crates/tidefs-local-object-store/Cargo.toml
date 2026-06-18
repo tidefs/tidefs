@@ -16,6 +16,7 @@ tidefs-replication-model = { path = "../tidefs-replication-model" }
 tidefs-block-allocator = { path = "../tidefs-block-allocator" }
 tidefs-spacemap-allocator = { path = "../tidefs-spacemap-allocator" }
 tidefs-pool-allocator = { path = "../tidefs-pool-allocator" }
+tidefs-gc-pin-set = { path = "../tidefs-gc-pin-set" }
 tidefs-reclaim = { path = "../tidefs-reclaim" }
 tidefs-segment-cleaner = { path = "../tidefs-segment-cleaner" }
 tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }

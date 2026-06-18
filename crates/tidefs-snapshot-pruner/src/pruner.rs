@@ -1594,9 +1594,11 @@ impl SnapshotPruner {
         for name in delete_set {
             match store.destroy_snapshot(dataset_name, &name) {
                 Ok(Some(_)) => {
+                    let snapshot_id = format!("{dataset_name}/{name}");
                     if let Some(ref mut pin_set) = self.extent_pin_set {
-                        pin_set.release_snapshot(&format!("{dataset_name}/{name}"));
+                        pin_set.release_snapshot(&snapshot_id);
                     }
+                    store.release_snapshot_extent_pins(&snapshot_id);
                     destroyed_names.push(name);
                 }
                 Ok(None) => {}
