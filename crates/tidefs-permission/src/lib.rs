@@ -80,11 +80,13 @@ impl MountIdentity {
         }
     }
 
-    /// Returns `true` when this mount identity is valid (non-zero dataset
-    /// and non-zero epoch).
+    /// Returns `true` when this mount identity has a non-zero epoch.
+    ///
+    /// The all-zero dataset id is reserved by current TideFS storage as the
+    /// root dataset, so the epoch is the invalid/default discriminator.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.dataset_id != [0u8; 16] && self.mount_epoch > 0
+        self.mount_epoch > 0
     }
 }
 
@@ -101,7 +103,7 @@ impl Default for MountIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MountIdentityError {
-    /// The mount identity is invalid (zero dataset id or zero epoch).
+    /// The mount identity is invalid (zero epoch).
     InvalidMountIdentity,
 }
 
@@ -113,8 +115,8 @@ impl core::fmt::Display for MountIdentityError {
     }
 }
 
-/// Validate that `mount_identity` is valid (non-zero dataset, non-zero
-/// epoch). Returns `Ok(())` when valid, or
+/// Validate that `mount_identity` is valid (non-zero epoch).
+/// Returns `Ok(())` when valid, or
 /// `Err(MountIdentityError::InvalidMountIdentity)` when invalid.
 #[inline]
 #[allow(dead_code)]
@@ -1290,7 +1292,7 @@ mod tests {
     );
 
     #[allow(dead_code)]
-    const INVALID_MOUNT_ZERO_DATASET: MountIdentity = MountIdentity::new([0u8; 16], 1);
+    const ROOT_MOUNT: MountIdentity = MountIdentity::new([0u8; 16], 1);
     #[allow(dead_code)]
     const INVALID_MOUNT_ZERO_EPOCH: MountIdentity = MountIdentity::new([0x01u8; 16], 0);
 
@@ -3386,21 +3388,6 @@ mod tests {
     }
 
     #[test]
-    fn mount_identity_invalid_denies_access() {
-        let ino = TestInode::new(1000, 100, 0o644);
-        // Zero dataset — caller would normally have owner read access
-        assert!(!check_access(
-            &ino,
-            None,
-            1000,
-            100,
-            &[],
-            ACCESS_READ,
-            &INVALID_MOUNT_ZERO_DATASET
-        ));
-    }
-
-    #[test]
     fn mount_identity_zero_epoch_denies_access() {
         let ino = TestInode::new(1000, 100, 0o644);
         // Zero epoch — invalid mount
@@ -3426,7 +3413,7 @@ mod tests {
             0,
             &[],
             ACCESS_READ,
-            &INVALID_MOUNT_ZERO_DATASET
+            &INVALID_MOUNT_ZERO_EPOCH
         ));
     }
 
@@ -3442,6 +3429,21 @@ mod tests {
             ACCESS_READ,
             &VALID_MOUNT
         ));
+    }
+
+    #[test]
+    fn mount_identity_root_dataset_with_epoch_is_valid() {
+        let ino = TestInode::new(1000, 100, 0o644);
+        assert!(check_access(
+            &ino,
+            None,
+            1000,
+            100,
+            &[],
+            ACCESS_READ,
+            &ROOT_MOUNT
+        ));
+        assert_eq!(validate_mount_identity(&ROOT_MOUNT), Ok(()));
     }
 
     #[test]
@@ -3466,7 +3468,7 @@ mod tests {
     #[test]
     fn validate_mount_identity_rejects_invalid() {
         assert_eq!(
-            validate_mount_identity(&INVALID_MOUNT_ZERO_DATASET),
+            validate_mount_identity(&INVALID_MOUNT_ZERO_EPOCH),
             Err(MountIdentityError::InvalidMountIdentity)
         );
     }
@@ -3475,13 +3477,7 @@ mod tests {
     fn check_access_result_fails_on_invalid_mount() {
         let ino = TestInode::new(1000, 100, 0o644);
         assert_eq!(
-            check_access_result(
-                &ino,
-                1000,
-                100,
-                AccessMode::Read,
-                &INVALID_MOUNT_ZERO_DATASET
-            ),
+            check_access_result(&ino, 1000, 100, AccessMode::Read, &INVALID_MOUNT_ZERO_EPOCH),
             Err(PermissionError::AccessDenied)
         );
     }
@@ -3490,7 +3486,7 @@ mod tests {
     fn check_search_fails_on_invalid_mount() {
         let dir = TestInode::new(1000, 100, S_IFDIR | 0o755);
         assert_eq!(
-            check_search(&dir, 1000, 100, &INVALID_MOUNT_ZERO_DATASET),
+            check_search(&dir, 1000, 100, &INVALID_MOUNT_ZERO_EPOCH),
             Err(PermissionError::AccessDenied)
         );
     }
@@ -3506,7 +3502,7 @@ mod tests {
                 100,
                 &[],
                 ACCESS_READ,
-                &INVALID_MOUNT_ZERO_DATASET
+                &INVALID_MOUNT_ZERO_EPOCH
             ),
             Ok(false)
         );
@@ -3533,11 +3529,11 @@ mod tests {
             100,
             &[],
             ACCESS_READ,
-            &INVALID_MOUNT_ZERO_DATASET,
+            &INVALID_MOUNT_ZERO_EPOCH,
         )
         .expect("invalid mount returns a fail-closed report");
 
-        assert_eq!(report.mount_identity, INVALID_MOUNT_ZERO_DATASET);
+        assert_eq!(report.mount_identity, INVALID_MOUNT_ZERO_EPOCH);
         assert_eq!(report.requested, ACCESS_READ);
         assert!(!report.allowed);
     }
@@ -3551,7 +3547,7 @@ mod tests {
             1000,
             100,
             &[],
-            &INVALID_MOUNT_ZERO_DATASET
+            &INVALID_MOUNT_ZERO_EPOCH
         ));
     }
 
@@ -3564,7 +3560,7 @@ mod tests {
             1000,
             100,
             &[],
-            &INVALID_MOUNT_ZERO_DATASET
+            &INVALID_MOUNT_ZERO_EPOCH
         ));
     }
 }
