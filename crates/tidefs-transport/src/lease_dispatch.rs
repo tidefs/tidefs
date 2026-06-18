@@ -438,6 +438,7 @@ mod harness_tests {
                 ino: 100,
             },
             MemberId(3),
+            0u64,
             30_000,
             1_000,
             EpochId(7),
