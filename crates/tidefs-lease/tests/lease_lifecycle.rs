@@ -6,7 +6,7 @@
 //! full lifecycle sequences.
 
 use tidefs_lease::*;
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 fn mid(v: u64) -> MemberId {
     MemberId::new(v)
@@ -25,6 +25,7 @@ fn make_grant(id: u64, term_millis: u64, granted_at_millis: u64) -> LeaseGrant {
         term_millis,
         granted_at_millis,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         id * 100,
         3,
         3,
@@ -81,6 +82,7 @@ fn double_grant_same_lease_id_overwrites_in_lock_table() {
         50_000,
         10_000,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         200,
         3,
         3,
@@ -190,6 +192,7 @@ fn leader_failover_fences_all_active_leases() {
             60_000,
             0,
             EpochId::new(1),
+        DatasetMountIdentity::ZERO,
             i * 100,
             3,
             3,

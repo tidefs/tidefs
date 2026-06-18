@@ -16,7 +16,7 @@ use tidefs_lease::{
     LeaseClass, LeaseDomain, LeaseGrant, LockMethod, LockOwner, LockStatus, LockTable,
     PendingLockRequest, RaftCommand, RangeLockType,
 };
-pub use tidefs_membership_epoch::{EpochId, MemberId};
+pub use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 pub use tidefs_lease::{
     LeaseClass as ServiceLeaseClass, LeaseDomain as ServiceLeaseDomain,
@@ -699,6 +699,7 @@ impl LockFrameSink for QueuedLockFrameSink {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LockServiceConfig {
+    pub current_mount_identity: DatasetMountIdentity,
     pub current_term: u64,
     pub current_epoch: EpochId,
     pub default_term_millis: u64,
@@ -715,6 +716,7 @@ impl Default for LockServiceConfig {
             current_epoch: EpochId::new(1),
             default_term_millis: DEFAULT_TERM_MILLIS,
             pending_timeout_millis: DEFAULT_PENDING_TIMEOUT_MILLIS,
+            current_mount_identity: DatasetMountIdentity::ZERO,
             witness_set_id: 1,
             witness_confirmations: 1,
             witness_total: 1,
@@ -908,6 +910,7 @@ impl LockServiceLeader {
             term_millis,
             now_millis,
             request.epoch,
+            self.config.current_mount_identity,
             self.config.witness_set_id,
             self.config.witness_confirmations,
             self.config.witness_total,
@@ -1165,6 +1168,7 @@ impl LockServiceHandle {
             ack.expires_at_millis.saturating_sub(now_millis),
             now_millis,
             ack.epoch,
+            DatasetMountIdentity::ZERO,
             0,
             1,
             1,
@@ -2016,6 +2020,7 @@ impl LockService {
             term_millis,
             now_millis,
             self.config.current_epoch,
+            self.config.current_mount_identity,
             self.config.witness_set_id,
             self.config.witness_confirmations,
             self.config.witness_total,

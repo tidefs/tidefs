@@ -10,7 +10,7 @@
 //! the lease-layer safety properties under clock skew conditions.
 
 use tidefs_lease::*;
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 fn mid(v: u64) -> MemberId {
     MemberId::new(v)
@@ -36,6 +36,7 @@ fn inode_grant(
         60_000,
         0,
         EpochId::new(epoch),
+        DatasetMountIdentity::ZERO,
         id * 100,
         3,
         3,
@@ -192,6 +193,7 @@ fn skewed_node_cannot_reacquire_fenced_domain() {
         60_000,
         0,
         EpochId::new(3), // same epoch but post-failover term
+        DatasetMountIdentity::ZERO,
         200,
         3,
         3,
@@ -230,6 +232,7 @@ fn lease_expiry_immutable_after_grant() {
         60_000, // 60s TTL
         0,      // granted at time 0
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         100,
         3,
         3,

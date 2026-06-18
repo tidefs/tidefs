@@ -6,7 +6,7 @@
 //! ordering and timeout sweep.
 
 use tidefs_lease::*;
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 fn mid(v: u64) -> MemberId {
     MemberId::new(v)
@@ -25,6 +25,7 @@ fn make_grant(id: u64, ds: u64, ino: u64) -> LeaseGrant {
         60_000,
         id * 1_000,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         id * 100,
         3,
         3,
@@ -67,6 +68,7 @@ fn grant_release_grant_cycle_many_times() {
             60_000,
             cycle * 60_000,
             EpochId::new(1),
+        DatasetMountIdentity::ZERO,
             100,
             3,
             3,
@@ -262,6 +264,7 @@ fn upgrade_downgrade_preserves_grant_count() {
         60_000,
         0,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         100,
         3,
         3,
@@ -314,6 +317,7 @@ fn raft_renew_updates_expiry_and_version() {
         60_000,
         0,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         100,
         3,
         3,

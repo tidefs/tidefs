@@ -26,6 +26,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::harness::{DeterministicMessageScheduler, LoopbackTransport, SimNode};
+#[cfg(test)]
+use tidefs_membership_epoch::DatasetMountIdentity;
 use tidefs_membership_epoch::{EpochMemberSet, NodeIdentity};
 
 use crate::envelope::MessageFamily;
@@ -133,6 +135,7 @@ mod tests {
             holder_id: MemberId(3),
             term_millis: 15_000,
             epoch: EpochId(2),
+            mount_identity: DatasetMountIdentity::ZERO,
         });
         let encoded = encode_lease_message(&msg).unwrap();
         let decoded = decode_lease_message(&encoded).unwrap();
@@ -256,6 +259,7 @@ mod tests {
             holder_id: MemberId(7),
             term_millis: 60_000,
             epoch: EpochId(1),
+            mount_identity: DatasetMountIdentity::ZERO,
         });
 
         // Simulate send: encode → transport would wrap in envelope → decode
@@ -425,6 +429,7 @@ mod harness_tests {
             holder_id: MemberId(3),
             term_millis: 30_000,
             epoch: EpochId(7),
+            mount_identity: DatasetMountIdentity::ZERO,
         })
     }
 
@@ -442,6 +447,7 @@ mod harness_tests {
             30_000,
             1_000,
             EpochId(7),
+            DatasetMountIdentity::ZERO,
             1,
             3,
             5,
@@ -519,6 +525,7 @@ mod harness_tests {
             holder_id: MemberId(1),
             term_millis: 60_000,
             epoch: EpochId(7),
+            mount_identity: DatasetMountIdentity::ZERO,
         });
         let renew2 = LeaseWireMessage::Renew(LeaseRenewPayload {
             lease_id: 99,

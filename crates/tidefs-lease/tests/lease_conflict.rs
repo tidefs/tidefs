@@ -6,7 +6,7 @@
 //! conflict checks.
 
 use tidefs_lease::*;
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 fn mid(v: u64) -> MemberId {
     MemberId::new(v)
@@ -25,6 +25,7 @@ fn inode_grant(id: u64, class: LeaseClass, ds: u64, ino: u64) -> LeaseGrant {
         60_000,
         0,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         id * 100,
         3,
         3,
@@ -53,6 +54,7 @@ fn byte_range_grant(
         60_000,
         0,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         id * 100,
         3,
         3,
@@ -72,6 +74,7 @@ fn subtree_grant(id: u64, class: LeaseClass, ds: u64, prefix: &str) -> LeaseGran
         60_000,
         0,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         id * 100,
         3,
         3,
