@@ -626,6 +626,11 @@ impl LineageManifest {
             ));
         }
         let incremental = header.flags.contains(StreamFlags::INCREMENTAL);
+        if !incremental && header.from_snapshot_id != [0; 16] {
+            return Err(SendStreamError::InvalidHeader(
+                "full send must not name an incremental base root",
+            ));
+        }
         match (incremental, self.base_root_id, self.base_root_digest) {
             (false, None, None) => Ok(()),
             (true, Some(base_root_id), Some(_)) if base_root_id == header.from_snapshot_id => {
@@ -1645,6 +1650,11 @@ impl SendBuilder {
         if header.flags.contains(StreamFlags::INCREMENTAL) {
             return Err(SendStreamError::InvalidHeader(
                 "full send must not declare an incremental base root",
+            ));
+        }
+        if header.from_snapshot_id != [0; 16] {
+            return Err(SendStreamError::InvalidHeader(
+                "full send must not name an incremental base root",
             ));
         }
         Self::build(header, snapshots, None)
