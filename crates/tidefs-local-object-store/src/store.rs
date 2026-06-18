@@ -2087,153 +2087,29 @@ impl LocalObjectStore {
         }
     }
 
-    /// Drain reclaim-queue entries, identify fully-dead segments, and
-    /// return them to the free pool via `PoolAllocator::add_free`.
+    /// Inspect legacy reclaim-queue entries without freeing segments.
     ///
-    /// Builds per-segment live-object counts from the in-memory index,
-    /// drains entries from the in-memory reclaim queue, groups by
-    /// segment, applies refcount deltas, and batch-frees segments whose
-    /// live count reaches zero.  Returns stats describing how many
-    /// entries were processed and how many segments were reclaimed.
+    /// Physical segment freeing requires committed dead-object receipt
+    /// evidence and must use
+    /// [`drain_receipt_bound_dead_objects_at_stable_generation`](Self::drain_receipt_bound_dead_objects_at_stable_generation).
+    /// The older B+tree reclaim queue is retained as liveness/debt input, but
+    /// this entry point now fails closed so ordinary delete/overwrite deltas
+    /// cannot return a segment to the pool without committed clearance.
     ///
     /// # Errors
     ///
-    /// Returns `DrainError::FreeError` if the pool allocator cannot
-    /// release a segment.  Persistence errors are non-fatal.
+    /// This compatibility inspection path does not free segments and therefore
+    /// cannot produce resolver or freer errors.
     pub fn drain_dead_segments(
         &mut self,
-        config: &ReclaimConsumerConfig,
+        _config: &ReclaimConsumerConfig,
     ) -> std::result::Result<
         tidefs_reclaim::ReclaimConsumerStats,
         tidefs_reclaim::DrainError<Infallible, tidefs_pool_allocator::PoolAllocatorError>,
     > {
-        // Live counts are maintained incrementally: initialized from
-        // the index at store-open time, incremented on every put of a
-        // new object, and decremented by reclaim-queue deltas during
-        // drain.  No full-index rescan is needed here.
-        let entries = self.reclaim_queue.entries();
-        let mut stats = tidefs_reclaim::ReclaimConsumerStats {
-            reclaim_queue_depth: entries.len(),
-            ..tidefs_reclaim::ReclaimConsumerStats::ZERO
-        };
-
-        // Phase 1: resolve entries to segments (immutable, no freer calls).
-        let mut segment_deltas: std::collections::HashMap<
-            u64,
-            Vec<(tidefs_types_reclaim_queue_core::ObjectKey, i64)>,
-        > = std::collections::HashMap::new();
-
-        for (key, entry) in entries.iter().take(config.max_entries_per_drain) {
-            let segment_id =
-                match <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(self, key) {
-                    Ok(Some(id)) => id,
-                    Ok(None) => continue,
-                    Err(_e) => continue, // Infallible
-                };
-            self.reclaim_consumer
-                .live_counts_mut()
-                .apply_delta(segment_id, entry.delta);
-            segment_deltas
-                .entry(segment_id)
-                .or_default()
-                .push((*key, entry.delta));
-            stats.entries_processed += 1;
-        }
-
-        // Phase 2: free fully-dead segments (mutable borrow).
-        let dead_segments: Vec<u64> = segment_deltas
-            .keys()
-            .copied()
-            .filter(|sid| self.reclaim_consumer.live_counts().is_dead(*sid))
-            .collect();
-
-        // Phase 2a: if the current active write segment is among the dead
-        // segments, rotate to a fresh segment first.  The current segment
-        // holds system objects (committed root) that keep it alive even
-        // after all user objects are dead.  After rotation the old segment
-        // is safe to reclaim.
-        let needs_rotation = dead_segments.contains(&self.current_segment_id);
-        if needs_rotation {
-            // rotate_segment writes a footer, syncs, and allocates a new
-            // current segment from the free map.
-            if let Err(_e) = self.rotate_segment() {
-                // Rotation failure is non-fatal for reclaim; continue
-                // without freeing the current segment.
-            }
-        }
-
-        for batch in dead_segments.chunks(config.max_free_batch) {
-            for &segment_id in batch {
-                match <LocalObjectStore as tidefs_reclaim::SegmentFreer>::free_segment(
-                    self, segment_id,
-                ) {
-                    Ok(()) => {
-                        self.reclaim_consumer.live_counts_mut().remove(segment_id);
-                        stats.segments_reclaimed += 1;
-                        // Count objects freed in this dead segment (sum of
-                        // |negative deltas| from the reclaim-queue entries).
-                        let seg_obj_count = segment_deltas
-                            .get(&segment_id)
-                            .map(|entries| entries.iter().filter(|(_, d)| *d < 0).count() as u64)
-                            .unwrap_or(0);
-                        stats.blocks_freed += seg_obj_count;
-
-                        // Delete the segment file so it is not rediscovered
-                        // on reopen. The free-map checkpoint already records
-                        // it as free; the file must not be present to prevent
-                        // the open path from re-marking it as used.
-                        let seg_path = segment_path(&self.segments_dir, segment_id);
-                        let _ = std::fs::remove_file(&seg_path);
-                    }
-                    Err(e) => {
-                        return Err(tidefs_reclaim::DrainError::FreeError {
-                            segment_id,
-                            error: e,
-                        });
-                    }
-                }
-            }
-            stats.checkpoint_batches += 1;
-        }
-
-        // Phase 3: remove processed entries and persist.
-        if stats.entries_processed > 0 {
-            for (key, _entry) in entries.iter().take(stats.entries_processed) {
-                self.reclaim_queue.delete(key);
-            }
-            // Temporarily swap out the queue so we can call
-            // store_reclaim_queue_entries without a borrow conflict
-            // (it needs &queue + &mut store which overlap on self).
-            let queue = std::mem::replace(
-                &mut self.reclaim_queue,
-                tidefs_reclaim_queue_core::BPlusTreeReclaimQueue::new(),
-            );
-            if let Err(e) = store_reclaim_queue_entries(&queue, self) {
-                tracing::warn!("reclaim-queue entries flush failed: {e}");
-            }
-            self.reclaim_queue = queue;
-        }
-
-        // Phase 4: checkpoint spacemap.
-        if stats.segments_reclaimed > 0 {
-            let _ = write_spacemap_checkpoint(&self.segments_dir, &self.free_map, false);
-            self.free_map.clear_dirty_segment_groups();
-            let _ = self.check_space_pressure();
-        }
-
-        // Persist the segment-liveness queue alongside the reclaim entries.
-        // Temporarily swap out the queue so flush_segment_liveness_queue can
-        // borrow both the queue and the store without overlapping on self.
-        let segment_liveness =
-            std::mem::replace(&mut self.segment_liveness, SegmentLivenessQueue::new());
-        if let Err(e) = flush_segment_liveness_queue(&segment_liveness, self) {
-            tracing::warn!("segment-liveness queue flush failed: {e}");
-        }
-        self.segment_liveness = segment_liveness;
-
         Ok(tidefs_reclaim::ReclaimConsumerStats {
             reclaim_queue_depth: self.reclaim_queue.len(),
-            ..stats
+            ..tidefs_reclaim::ReclaimConsumerStats::ZERO
         })
     }
 
@@ -4016,35 +3892,18 @@ impl LocalObjectStore {
         }
     }
 
-    /// Allocate a new segment, draining already-dead segments under pressure.
+    /// Allocate a new segment from the free map.
+    ///
+    /// Receipt-bound dead-object drains must run before this point when a
+    /// caller wants committed evidence to recover physical space under
+    /// pressure. The legacy reclaim queue is not a physical-free authority.
     fn allocate_segment_with_drain(&mut self) -> Result<u64> {
         match self.free_map.alloc_after(self.current_segment_id + 1) {
             Ok(id) => {
                 self.free_segment_counter.allocated();
                 Ok(id)
             }
-            Err(_) => {
-                if !self.options.reclaim_enabled || self.reclaim_queue.is_empty() {
-                    return Err(StoreError::NoSpace);
-                }
-                let config = ReclaimConsumerConfig::default();
-                match self.drain_dead_segments(&config) {
-                    Ok(stats) if stats.segments_reclaimed > 0 => {
-                        let id = self
-                            .free_map
-                            .alloc_after(self.current_segment_id + 1)
-                            .map_err(|_| StoreError::NoSpace)?;
-                        self.free_segment_counter.allocated();
-                        let stale_path = segment_path(&self.segments_dir, id);
-                        let _ = fs::remove_file(&stale_path);
-                        Ok(id)
-                    }
-                    _ => {
-                        // Drain produced no free segments; give up.
-                        Err(StoreError::NoSpace)
-                    }
-                }
-            }
+            Err(_) => Err(StoreError::NoSpace),
         }
     }
 

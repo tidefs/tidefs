@@ -7,8 +7,8 @@
 //!    `page_cache_evict_inode`.  These tests verify that clean pages are
 //!    dropped and dirty pages are preserved.
 //!
-//! **2. Storage reclaim (dead-segment freeing):** the live production
-//!    reclaim chain from filesystem mutation to object-store drain.
+//! **2. Storage reclaim (dead-segment handoff):** the live production
+//!    reclaim chain from filesystem mutation to object-store queueing.
 //!    The production chain is:
 //!
 //!    ```text
@@ -16,8 +16,8 @@
 //!      -> record_reclaim_delta()            -- records Extent/InodeTombstone deltas
 //!      -> local reclaim queue (LocalFileSystem.reclaim_queue)
 //!      -> tick_background_services() Duty 2  -- drain_local_reclaim_queue_into_store()
-//!      -> store.delete() into object-store durable reclaim queue
-//!      -> LocalObjectStore::drain_dead_segments()  -- sole segment-freeing authority
+//!      -> store.delete() into object-store legacy reclaim queue
+//!      -> receipt-bound dead-object drain  -- segment-freeing authority
 //!    ```
 //!
 //!    The integration tests below exercise the public-API portion of this
@@ -25,17 +25,17 @@
 //!
 //!    ## Nonclaim boundary
 //!
-//!    `drain_dead_segments()` requires `&mut LocalObjectStore`, which is
-//!    only accessible through `pub(crate)` paths.  The full end-to-end
-//!    chain (unlink -> drain_dead_segments -> reopen -> readback) is
-//!    tested in the `lib.rs` unit tests:
+//!    Receipt-bound segment freeing requires `&mut LocalObjectStore`, which is
+//!    only accessible through `pub(crate)` paths.  The legacy queue
+//!    fail-closed behavior (unlink -> drain_dead_segments -> reopen -> readback)
+//!    is tested in the `lib.rs` unit tests:
 //!
-//!    - `full_reclaim_chain_unlink_to_drain_dead_segments_reopen_readback`
+//!    - `legacy_reclaim_chain_unlink_to_drain_dead_segments_reopen_readback`
 //!
-//!    Truncate-shrink and rename-overwrite full-chain variants are not yet
-//!    individually covered by reopen-verified drain_dead_segments tests.
-//!    The queue-population and drain steps are verified here; segment-level
-//!    freeing for those paths remains a documented nonclaim until
+//!    Truncate-shrink and rename-overwrite receipt-bound full-chain variants
+//!    are not yet individually covered by reopen-verified tests.
+//!    The queue-population and drain steps are verified here; receipt-bound
+//!    segment freeing for those paths remains a documented nonclaim until
 //!    pub(crate)-level tests are added.
 
 use std::path::PathBuf;
@@ -241,18 +241,18 @@ fn test_unlink_triggers_page_cache_eviction() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// STORAGE RECLAIM TESTS (dead-segment freeing chain)
+// STORAGE RECLAIM TESTS (dead-segment handoff chain)
 // ═══════════════════════════════════════════════════════════════════════
 //
 // These tests exercise the public-API portion of the production reclaim
-// chain.  The full chain through drain_dead_segments() and reopen
-// verification requires pub(crate) access (tested in lib.rs unit tests).
+// handoff. Receipt-bound segment freeing and reopen verification require
+// pub(crate) access (tested in lib.rs unit tests).
 //
 // Nonclaim: truncate-shrink and rename-overwrite full-chain
-// drain_dead_segments + reopen variants are not individually covered.
+// receipt-bound drain + reopen variants are not individually covered.
 // The local-queue population and tick drain are verified below; the
-// segment-freeing step for those paths relies on the same
-// drain_dead_segments() authority proven by the unlink full-chain test.
+// segment-freeing step for those paths relies on receipt-bound dead-object
+// evidence rather than the legacy queue.
 
 // ── Storage Test 1: unlink populates reclaim queue ────────────────────
 
