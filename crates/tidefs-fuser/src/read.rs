@@ -292,6 +292,8 @@ pub enum ReadError {
     IoError(String),
     /// A data extent referenced a missing object (integrity failure).
     MissingObject,
+    /// A data extent failed durable receipt/header validation.
+    CorruptExtent(String),
     /// The read range lies entirely in a hole past EOF.
     HoleBeyondEof,
     /// An internal error occurred (should map to EIO).
@@ -306,6 +308,7 @@ impl fmt::Display for ReadError {
             Self::InvalidRange => f.write_str("invalid byte range for read"),
             Self::IoError(msg) => write!(f, "object store I/O error: {msg}"),
             Self::MissingObject => f.write_str("extent references missing object"),
+            Self::CorruptExtent(msg) => write!(f, "corrupt extent: {msg}"),
             Self::HoleBeyondEof => f.write_str("read entirely in hole past EOF"),
             Self::Internal(msg) => write!(f, "internal read error: {msg}"),
             Self::PermissionDenied => write!(f, "permission denied for read"),
@@ -323,6 +326,7 @@ impl ReadError {
             Self::InvalidRange => libc::EINVAL,
             Self::IoError(_) => libc::EIO,
             Self::MissingObject => libc::EIO,
+            Self::CorruptExtent(_) => libc::EIO,
             Self::HoleBeyondEof => libc::EINVAL,
             Self::Internal(_) => libc::EIO,
             Self::PermissionDenied => libc::EACCES,
@@ -340,6 +344,13 @@ impl From<tidefs_object_io::ObjectIoError> for ReadError {
                 Self::Internal("invalid chunk size".into())
             }
             tidefs_object_io::ObjectIoError::MissingObject(_) => Self::MissingObject,
+            tidefs_object_io::ObjectIoError::TransformMismatch {
+                field,
+                expected,
+                observed,
+            } => Self::CorruptExtent(format!(
+                "transform mismatch: {field} expected {expected}, observed {observed}"
+            )),
             tidefs_object_io::ObjectIoError::HoleBeyondEof => Self::HoleBeyondEof,
         }
     }
@@ -833,6 +844,9 @@ mod tests {
         assert!(ReadError::MissingObject
             .to_string()
             .contains("missing object"));
+        assert!(ReadError::CorruptExtent("transform mismatch".into())
+            .to_string()
+            .contains("corrupt extent"));
         assert!(ReadError::HoleBeyondEof
             .to_string()
             .contains("hole past EOF"));
@@ -846,6 +860,7 @@ mod tests {
         assert_eq!(ReadError::InvalidRange.to_errno(), libc::EINVAL);
         assert_eq!(ReadError::IoError("".into()).to_errno(), libc::EIO);
         assert_eq!(ReadError::MissingObject.to_errno(), libc::EIO);
+        assert_eq!(ReadError::CorruptExtent("".into()).to_errno(), libc::EIO);
         assert_eq!(ReadError::HoleBeyondEof.to_errno(), libc::EINVAL);
         assert_eq!(ReadError::Internal("".into()).to_errno(), libc::EIO);
     }
@@ -1049,6 +1064,19 @@ mod tests {
         let io_err = tidefs_object_io::ObjectIoError::HoleBeyondEof;
         let read_err = ReadError::from(io_err);
         assert_eq!(read_err.to_errno(), libc::EINVAL);
+    }
+
+    #[test]
+    fn fuse_read_transform_mismatch_maps_to_corrupt_extent_eio() {
+        let io_err = tidefs_object_io::ObjectIoError::TransformMismatch {
+            field: "algorithm",
+            expected: 1,
+            observed: 2,
+        };
+        let read_err = ReadError::from(io_err);
+        assert!(matches!(read_err, ReadError::CorruptExtent(_)));
+        assert_eq!(read_err.to_errno(), libc::EIO);
+        assert!(read_err.to_string().contains("transform mismatch"));
     }
 
     #[test]
