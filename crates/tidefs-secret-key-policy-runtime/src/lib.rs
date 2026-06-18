@@ -422,7 +422,7 @@ pub fn issue_bounded_secret_lease_for_runtime_use<S: SealProvider>(
 ///
 /// When a handle was minted with a mount identity binding, every lease
 /// issuance must present a matching .
-/// This function fails closed: missing or mismatched mount identity
+/// This function fails closed: missing, unbound, or mismatched mount identity
 /// causes lease refusal.
 ///
 /// Callers should invoke this before or during lease issuance to gate
@@ -453,8 +453,13 @@ pub fn validate_dataset_mount_identity_for_handle(
             })
         }
         (None, _) => {
-            // No binding on handle; accept regardless of presented identity.
-            Ok(())
+            // No binding on handle: refuse. Every key handle must carry a
+            // committed dataset mount identity per the current encryption
+            // authority.
+            Err(SecretKeyPolicyRuntimeError::HandleNotActive {
+                handle_id,
+                actual: SecretLifecycleState::default(),
+            })
         }
     }
 }
@@ -2004,16 +2009,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_mount_identity_succeeds_when_no_binding() {
+    fn validate_mount_identity_fails_when_no_binding() {
         let store = MockMountStore { binding: None };
-        // Unbound handle: accepts regardless
+        // Unbound handle: must be refused per current encryption authority.
         let result = validate_dataset_mount_identity_for_handle(
             &store,
             SecretKeyPolicyId128::ZERO,
             Some("pool/any"),
             99,
         );
-        assert!(result.is_ok());
+        assert!(result.is_err());
 
         let result = validate_dataset_mount_identity_for_handle(
             &store,
@@ -2021,12 +2026,14 @@ mod tests {
             None,
             0,
         );
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     #[test]
-    fn validate_mount_identity_default_implementation_returns_none() {
-        // Default HandleStore::lookup_dataset_mount_identity returns Ok(None)
+    fn validate_mount_identity_default_implementation_fails_closed() {
+        // Default HandleStore::lookup_dataset_mount_identity returns Ok(None).
+        // Since unbound handles are refused, the default implementation must
+        // cause validation to fail closed.
         struct DefaultStore;
         impl HandleStore for DefaultStore {
             fn lookup_handle(&self, _id: SecretKeyPolicyId128) -> Result<SecretHandleRecord, SecretKeyPolicyRuntimeError> {
@@ -2068,7 +2075,7 @@ mod tests {
             Some("any"),
             1,
         );
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 }
 
