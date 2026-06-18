@@ -153,7 +153,7 @@ USAGE
 
     RUN_DIR="$TMPDIR/validation-$$"
     mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,validation,etc,run/tidefs/import}
-    trap 'if [ -z "''${KEEP_TMP:-}" ]; then rm -rf "$RUN_DIR"; fi' EXIT
+    trap 'if [ -z "''${KEEP_TMP:-}" ]; then chmod -R u+w "$RUN_DIR" 2>/dev/null || true; rm -rf "$RUN_DIR"; fi' EXIT
 
     # Busybox + applet symlinks
     cp "$BUSYBOX" "$RUN_DIR/bin/busybox"
