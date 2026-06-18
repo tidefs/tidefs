@@ -167,6 +167,240 @@ impl fmt::Display for CleanupQueueRoot {
 }
 
 // ---------------------------------------------------------------------------
+// Cleanup root replay receipts
+// ---------------------------------------------------------------------------
+
+/// Reserved-field state recorded by a cleanup root replay receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupQueueReservedStatus {
+    /// Every reserved byte is zero, so the root is compatible with v1 replay.
+    Zeroed,
+}
+
+/// Replay decision made by cleanup root receipt verification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupQueueReplayDecision {
+    /// The root and page agree and may be used as cleanup queue replay evidence.
+    TreatAsDurableEvidence,
+}
+
+/// Scope of validation represented by a cleanup root replay receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupQueueReplayValidationTier {
+    /// Root-record and sealed-page source evidence only.
+    RootPageSourceEvidence,
+}
+
+/// Verified cleanup queue replay evidence.
+///
+/// This receipt proves the supplied [`CleanupQueueRoot`] and sealed cleanup
+/// queue page agree on the v1 root format, page digest, entry count, and
+/// reserved-field state. It is intentionally narrow evidence for cleanup queue
+/// replay and is not, by itself, a full crash-recovery proof for the filesystem.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupQueueReplayReceipt {
+    /// Magic bytes observed in the root record.
+    pub root_magic: [u8; 8],
+    /// Version observed in the root record.
+    pub root_version: u32,
+    /// Commit-group page key recorded by the root.
+    pub root_page_key: [u8; 32],
+    /// Domain-separated BLAKE3 digest stored in the sealed page prefix.
+    pub page_digest: [u8; 32],
+    /// Entry count observed in the root record.
+    pub root_entry_count: u64,
+    /// Entry count decoded from the sealed page payload.
+    pub page_entry_count: u64,
+    /// Reserved-field state observed after verification.
+    pub reserved_status: CleanupQueueReservedStatus,
+    /// Replay decision represented by this receipt.
+    pub replay_decision: CleanupQueueReplayDecision,
+    /// Validation tier represented by this receipt.
+    pub validation_tier: CleanupQueueReplayValidationTier,
+}
+
+/// Errors produced while verifying cleanup root replay evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CleanupQueueReplayReceiptError {
+    /// Root magic did not match [`CLEANUP_QUEUE_ROOT_MAGIC`].
+    InvalidMagic {
+        /// Magic bytes found in the root.
+        found: [u8; 8],
+    },
+    /// Root version is not supported by this verifier.
+    UnsupportedVersion {
+        /// Version found in the root.
+        found: u32,
+    },
+    /// A reserved byte was non-zero.
+    NonZeroReserved {
+        /// Offset within [`CleanupQueueRoot::reserved`] of the first non-zero byte.
+        first_nonzero_index: usize,
+        /// The offending byte value.
+        value: u8,
+    },
+    /// The sealed page is too short to contain its digest prefix.
+    PageTooShort {
+        /// Sealed page length in bytes.
+        len: usize,
+    },
+    /// The sealed page digest prefix did not match the payload digest.
+    PageDigestMismatch {
+        /// Digest stored in the sealed page prefix.
+        stored: [u8; 32],
+        /// Digest computed from the page payload.
+        computed: [u8; 32],
+    },
+    /// The sealed page payload could not be decoded.
+    PageDecodeFailed {
+        /// Decode error text.
+        reason: String,
+    },
+    /// Root entry count and decoded page entry count do not agree.
+    EntryCountMismatch {
+        /// Entry count recorded by the root.
+        root_entry_count: u64,
+        /// Entry count decoded from the page.
+        page_entry_count: u64,
+    },
+}
+
+impl fmt::Display for CleanupQueueReplayReceiptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidMagic { .. } => write!(f, "cleanup queue root magic mismatch"),
+            Self::UnsupportedVersion { found } => {
+                write!(f, "unsupported cleanup queue root version {found}")
+            }
+            Self::NonZeroReserved {
+                first_nonzero_index,
+                value,
+            } => write!(
+                f,
+                "cleanup queue root reserved byte {first_nonzero_index} is non-zero: {value:#04x}"
+            ),
+            Self::PageTooShort { len } => {
+                write!(f, "cleanup queue sealed page too short for digest: {len} bytes")
+            }
+            Self::PageDigestMismatch { .. } => {
+                write!(f, "cleanup queue sealed page digest mismatch")
+            }
+            Self::PageDecodeFailed { reason } => {
+                write!(f, "cleanup queue sealed page decode failed: {reason}")
+            }
+            Self::EntryCountMismatch {
+                root_entry_count,
+                page_entry_count,
+            } => write!(
+                f,
+                "cleanup queue entry-count mismatch: root={root_entry_count} page={page_entry_count}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CleanupQueueReplayReceiptError {}
+
+impl CleanupQueueRoot {
+    /// Verify this root against a stored cleanup queue page and return replay
+    /// evidence when they agree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root magic/version/reserved fields are invalid,
+    /// the sealed page digest does not match its payload, the page cannot be
+    /// decoded, or the root entry count differs from the decoded page count.
+    pub fn replay_receipt<S: CommitGroupStore>(
+        &self,
+        store: &S,
+    ) -> Result<CleanupQueueReplayReceipt, CleanupQueueReplayReceiptError> {
+        let sealed = store
+            .get_named(CLEANUP_QUEUE_PAGE_NAME)
+            .map_err(|reason| CleanupQueueReplayReceiptError::PageDecodeFailed { reason })?
+            .ok_or(CleanupQueueReplayReceiptError::PageDecodeFailed {
+                reason: "cleanup queue page not found in store".to_string(),
+            })?;
+
+        verify_cleanup_queue_root_replay_receipt(self, &sealed)
+    }
+}
+
+/// Verify cleanup queue root/page replay evidence and return a receipt.
+///
+/// The receipt is cleanup queue replay evidence only. It proves that this root
+/// record and sealed queue page agree at the source-evidence tier; it does not
+/// claim that every filesystem crash-recovery invariant has been proven.
+///
+/// # Errors
+///
+/// Returns an error when the root magic/version/reserved fields are invalid,
+/// the sealed page digest does not match its payload, the page cannot be
+/// decoded, or the root entry count differs from the decoded page count.
+pub fn verify_cleanup_queue_root_replay_receipt(
+    root: &CleanupQueueRoot,
+    sealed_page: &[u8],
+) -> Result<CleanupQueueReplayReceipt, CleanupQueueReplayReceiptError> {
+    if root.magic != CLEANUP_QUEUE_ROOT_MAGIC {
+        return Err(CleanupQueueReplayReceiptError::InvalidMagic { found: root.magic });
+    }
+    if root.version != CLEANUP_QUEUE_ROOT_VERSION {
+        return Err(CleanupQueueReplayReceiptError::UnsupportedVersion {
+            found: root.version,
+        });
+    }
+    if let Some((first_nonzero_index, value)) = root
+        .reserved
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, byte)| *byte != 0)
+    {
+        return Err(CleanupQueueReplayReceiptError::NonZeroReserved {
+            first_nonzero_index,
+            value,
+        });
+    }
+
+    if sealed_page.len() < 32 {
+        return Err(CleanupQueueReplayReceiptError::PageTooShort {
+            len: sealed_page.len(),
+        });
+    }
+    let mut page_digest = [0u8; 32];
+    page_digest.copy_from_slice(&sealed_page[0..32]);
+    let raw = &sealed_page[32..];
+    let computed_digest = hash_page(raw);
+    if page_digest != computed_digest {
+        return Err(CleanupQueueReplayReceiptError::PageDigestMismatch {
+            stored: page_digest,
+            computed: computed_digest,
+        });
+    }
+
+    let page_entries = deserialize_page(raw)
+        .map_err(|reason| CleanupQueueReplayReceiptError::PageDecodeFailed { reason })?;
+    let page_entry_count = page_entries.len() as u64;
+    if root.entry_count != page_entry_count {
+        return Err(CleanupQueueReplayReceiptError::EntryCountMismatch {
+            root_entry_count: root.entry_count,
+            page_entry_count,
+        });
+    }
+
+    Ok(CleanupQueueReplayReceipt {
+        root_magic: root.magic,
+        root_version: root.version,
+        root_page_key: root.root_page_key,
+        page_digest,
+        root_entry_count: root.entry_count,
+        page_entry_count,
+        reserved_status: CleanupQueueReservedStatus::Zeroed,
+        replay_decision: CleanupQueueReplayDecision::TreatAsDurableEvidence,
+        validation_tier: CleanupQueueReplayValidationTier::RootPageSourceEvidence,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // CleanupQueue — persistent cleanup work queue
 // ---------------------------------------------------------------------------
 
@@ -1243,6 +1477,14 @@ mod tests {
         CleanupWorkItemV1::new(inode_id, kind, commit_group, BtreeRootPointer::EMPTY, 0)
     }
 
+    fn cleanup_page(store: &MemCommitGroupStore) -> &[u8] {
+        store
+            .blobs
+            .get(CLEANUP_QUEUE_PAGE_NAME)
+            .expect("cleanup queue page")
+            .as_slice()
+    }
+
     // ── CleanupQueueRoot tests ────────────────────────────────────────
 
     #[test]
@@ -1307,6 +1549,165 @@ mod tests {
         assert_eq!(root.version, CLEANUP_QUEUE_ROOT_VERSION);
         assert_eq!(root.entry_count, 0);
         assert_eq!(root.reserved, [0u8; 12]);
+    }
+
+    // ── Cleanup replay receipt tests ─────────────────────────────────
+
+    #[test]
+    fn replay_receipt_accepts_empty_queue() {
+        let mut q = CleanupQueue::new();
+        let mut store = MemCommitGroupStore::default();
+        let root = q.commit(&mut store).expect("commit empty");
+
+        let receipt = root.replay_receipt(&store).expect("receipt");
+
+        assert_eq!(receipt.root_magic, CLEANUP_QUEUE_ROOT_MAGIC);
+        assert_eq!(receipt.root_version, CLEANUP_QUEUE_ROOT_VERSION);
+        assert_eq!(receipt.root_entry_count, 0);
+        assert_eq!(receipt.page_entry_count, 0);
+        assert_eq!(receipt.reserved_status, CleanupQueueReservedStatus::Zeroed);
+        assert_eq!(
+            receipt.replay_decision,
+            CleanupQueueReplayDecision::TreatAsDurableEvidence
+        );
+        assert_eq!(
+            receipt.validation_tier,
+            CleanupQueueReplayValidationTier::RootPageSourceEvidence
+        );
+        let mut expected_digest = [0u8; 32];
+        expected_digest.copy_from_slice(&cleanup_page(&store)[0..32]);
+        assert_eq!(receipt.page_digest, expected_digest);
+    }
+
+    #[test]
+    fn replay_receipt_accepts_populated_queue() {
+        let mut q = CleanupQueue::new();
+        q.enqueue(make_work_item(100, WorkItemKind::UnlinkFree, 1));
+        q.enqueue(make_work_item(200, WorkItemKind::TruncateFree, 1));
+        let mut store = MemCommitGroupStore::default();
+        let root = q.commit(&mut store).expect("commit");
+
+        let receipt =
+            verify_cleanup_queue_root_replay_receipt(&root, cleanup_page(&store)).expect("receipt");
+
+        assert_eq!(receipt.root_entry_count, 2);
+        assert_eq!(receipt.page_entry_count, 2);
+        assert_eq!(receipt.root_page_key, root.root_page_key);
+    }
+
+    #[test]
+    fn replay_receipt_rejects_invalid_magic() {
+        let mut q = CleanupQueue::new();
+        let mut store = MemCommitGroupStore::default();
+        let mut root = q.commit(&mut store).expect("commit");
+        root.magic = *b"BADMAGIC";
+
+        let err = verify_cleanup_queue_root_replay_receipt(&root, cleanup_page(&store))
+            .expect_err("bad magic rejected");
+
+        assert!(matches!(
+            err,
+            CleanupQueueReplayReceiptError::InvalidMagic { .. }
+        ));
+    }
+
+    #[test]
+    fn replay_receipt_rejects_unsupported_version() {
+        let mut q = CleanupQueue::new();
+        let mut store = MemCommitGroupStore::default();
+        let mut root = q.commit(&mut store).expect("commit");
+        root.version = CLEANUP_QUEUE_ROOT_VERSION + 1;
+
+        let err = verify_cleanup_queue_root_replay_receipt(&root, cleanup_page(&store))
+            .expect_err("bad version rejected");
+
+        assert_eq!(
+            err,
+            CleanupQueueReplayReceiptError::UnsupportedVersion {
+                found: CLEANUP_QUEUE_ROOT_VERSION + 1
+            }
+        );
+    }
+
+    #[test]
+    fn replay_receipt_rejects_nonzero_reserved_bytes() {
+        let mut q = CleanupQueue::new();
+        let mut store = MemCommitGroupStore::default();
+        let mut root = q.commit(&mut store).expect("commit");
+        root.reserved[3] = 0x7A;
+
+        let err = verify_cleanup_queue_root_replay_receipt(&root, cleanup_page(&store))
+            .expect_err("reserved byte rejected");
+
+        assert_eq!(
+            err,
+            CleanupQueueReplayReceiptError::NonZeroReserved {
+                first_nonzero_index: 3,
+                value: 0x7A
+            }
+        );
+    }
+
+    #[test]
+    fn replay_receipt_rejects_page_digest_mismatch() {
+        let mut q = CleanupQueue::new();
+        q.enqueue(make_work_item(100, WorkItemKind::UnlinkFree, 1));
+        let mut store = MemCommitGroupStore::default();
+        let root = q.commit(&mut store).expect("commit");
+        let blob = store.blobs.get_mut(CLEANUP_QUEUE_PAGE_NAME).unwrap();
+        blob[40] ^= 0xFF;
+
+        let err = verify_cleanup_queue_root_replay_receipt(&root, cleanup_page(&store))
+            .expect_err("page digest mismatch rejected");
+
+        assert!(matches!(
+            err,
+            CleanupQueueReplayReceiptError::PageDigestMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn replay_receipt_rejects_page_decode_failure() {
+        let mut q = CleanupQueue::new();
+        q.enqueue(make_work_item(100, WorkItemKind::UnlinkFree, 1));
+        let mut store = MemCommitGroupStore::default();
+        let root = q.commit(&mut store).expect("commit");
+        let raw = 1u64.to_le_bytes();
+        let digest = hash_page(&raw);
+        let blob = store.blobs.get_mut(CLEANUP_QUEUE_PAGE_NAME).unwrap();
+        blob.clear();
+        blob.extend_from_slice(&digest);
+        blob.extend_from_slice(&raw);
+
+        let err = verify_cleanup_queue_root_replay_receipt(&root, cleanup_page(&store))
+            .expect_err("page decode failure rejected");
+
+        assert!(matches!(
+            err,
+            CleanupQueueReplayReceiptError::PageDecodeFailed { ref reason }
+                if reason.contains("size mismatch")
+        ));
+    }
+
+    #[test]
+    fn replay_receipt_rejects_entry_count_mismatch() {
+        let mut q = CleanupQueue::new();
+        q.enqueue(make_work_item(100, WorkItemKind::UnlinkFree, 1));
+        q.enqueue(make_work_item(200, WorkItemKind::TruncateFree, 1));
+        let mut store = MemCommitGroupStore::default();
+        let mut root = q.commit(&mut store).expect("commit");
+        root.entry_count = 1;
+
+        let err = verify_cleanup_queue_root_replay_receipt(&root, cleanup_page(&store))
+            .expect_err("count mismatch rejected");
+
+        assert_eq!(
+            err,
+            CleanupQueueReplayReceiptError::EntryCountMismatch {
+                root_entry_count: 1,
+                page_entry_count: 2
+            }
+        );
     }
 
     // ── CleanupQueue basic operations ─────────────────────────────────
