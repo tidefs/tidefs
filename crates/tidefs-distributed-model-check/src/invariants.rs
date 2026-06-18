@@ -181,7 +181,7 @@ pub fn no_active_lease_epoch_conflict(
     violations
 }
 
-/// I-3: No committed quorum write may have fewer acks than its
+/// I-4: No committed quorum write may have fewer acks than its
 /// declared quorum size (false quorum success).
 #[must_use]
 pub fn no_false_quorum_success(sys: &DistributedSystem) -> Vec<DistributedInvariantViolation> {
@@ -218,7 +218,7 @@ pub fn no_false_quorum_success(sys: &DistributedSystem) -> Vec<DistributedInvari
     violations
 }
 
-/// I-4: No rebuild/reclaim attempt may be permitted without a prior
+/// I-5: No rebuild/reclaim attempt may be permitted without a prior
 /// durable placement receipt.
 #[must_use]
 pub fn no_rebuild_before_receipt(sys: &DistributedSystem) -> Vec<DistributedInvariantViolation> {
