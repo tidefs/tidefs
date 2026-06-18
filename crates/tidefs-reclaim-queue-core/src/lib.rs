@@ -53,7 +53,7 @@ pub use segment_liveness::{
 pub use dead_object_queue::{
     dead_object_entry_with_placement_ref, dead_object_policy_from_placement_ref,
     replacement_receipt_from_placement_ref, DeadObjectQueueDecodeError, DeadObjectReclaimQueue,
-    PlacementReceiptRefReclaimError,
+    OrphanWatermarkBlockSummary, PlacementReceiptRefReclaimError,
 };
 
 // Re-export freed-extent ledger types at crate root.

@@ -23,8 +23,9 @@ use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaV
 use tidefs_btree::{BPlusTree, BTreeError};
 use tidefs_commit_group::store::CommitGroupStore;
 use tidefs_types_orphan_index_core::{
-    OrphanCursor, OrphanKey, OrphanRecoveryBudget, OrphanRecoveryOutcome, OrphanRecoveryStats,
-    OrphanReplayWatermark, ORPHAN_INDEX_SPEC,
+    OrphanCursor, OrphanKey, OrphanLogIncompleteTail, OrphanLogRecoveryReport,
+    OrphanRecoveryBudget, OrphanRecoveryOutcome, OrphanRecoveryStats, OrphanReplayWatermark,
+    ORPHAN_INDEX_SPEC,
 };
 
 // ---------------------------------------------------------------------------
@@ -479,22 +480,25 @@ impl OrphanIndex {
         buf
     }
 
-    /// Recover the orphan index from an append-only log buffer.
+    /// Recover the orphan index from an append-only log buffer and return a
+    /// classified replay report.
     ///
     /// Scans the log, verifies BLAKE3 checksums per entry, and returns
-    /// the surviving index plus a list of inode IDs whose checksums
-    /// failed verification.
+    /// the surviving index plus operator-visible evidence for checksum
+    /// corruption and incomplete tail replay.
     ///
     /// Corrupted entries (those failing checksum verification) are skipped
-    /// and reported in the returned `Vec<u64>`; they do not block recovery
-    /// of intact entries.
+    /// and reported in the returned [`OrphanLogRecoveryReport`]; they do not
+    /// block recovery of intact entries.
     ///
     /// # Errors
     ///
-    /// Returns `LogRecoverError` if the log header is truncated or an
-    /// entry record is incomplete. Incomplete entries at the tail of
-    /// the log (crash during append) are treated as truncation.
-    pub fn recover_from_log(data: &[u8]) -> Result<(Self, Vec<u64>), LogRecoverError> {
+    /// Returns `LogRecoverError` if the log header is truncated. Incomplete
+    /// entries at the tail of the log (crash during append) are reported via
+    /// [`OrphanLogRecoveryReport::incomplete_tail`].
+    pub fn recover_from_log_report(
+        data: &[u8],
+    ) -> Result<(Self, OrphanLogRecoveryReport), LogRecoverError> {
         // Header: 4-byte count + 8-byte watermark position = 12 bytes
         if data.len() < 12 {
             return Err(LogRecoverError::TruncatedHeader);
@@ -503,13 +507,20 @@ impl OrphanIndex {
         let wm_pos = u64::from_le_bytes(data[4..12].try_into().unwrap());
         let mut idx = Self::new();
         idx.watermark = OrphanReplayWatermark { position: wm_pos };
-        let mut corrupted = Vec::new();
+        let mut report = OrphanLogRecoveryReport::new(count, idx.watermark);
         let mut offset: usize = 12;
 
-        for _ in 0..count {
+        for record_index in 0..count {
             if offset + LOG_RECORD_SIZE > data.len() {
-                // Truncated: crash during append. Treat remaining entries as lost.
-                return Ok((idx, corrupted));
+                let bytes_available = data.len().saturating_sub(offset);
+                report.incomplete_tail = Some(OrphanLogIncompleteTail::new(
+                    record_index,
+                    bytes_available,
+                    LOG_RECORD_SIZE,
+                    count,
+                ));
+                idx.clear_dirty();
+                return Ok((idx, report));
             }
             let entry_bytes: [u8; ENTRY_ENCODED_SIZE] = data[offset..offset + ENTRY_ENCODED_SIZE]
                 .try_into()
@@ -523,13 +534,23 @@ impl OrphanIndex {
             let entry = OrphanEntry::decode(&entry_bytes);
             if actual_csum == expected_csum {
                 idx.insert(entry.inode_id, entry);
+                report.replayed_entries += 1;
             } else {
-                corrupted.push(entry.inode_id);
+                report.corrupted_inodes.push(entry.inode_id);
             }
             offset += LOG_RECORD_SIZE;
         }
         idx.clear_dirty();
-        Ok((idx, corrupted))
+        Ok((idx, report))
+    }
+
+    /// Recover the orphan index from an append-only log buffer.
+    ///
+    /// This compatibility wrapper preserves the historic return shape while
+    /// [`Self::recover_from_log_report`] exposes the full operator-visible
+    /// recovery classification.
+    pub fn recover_from_log(data: &[u8]) -> Result<(Self, Vec<u64>), LogRecoverError> {
+        Self::recover_from_log_report(data).map(|(idx, report)| (idx, report.corrupted_inodes))
     }
 
     // -- TXG commit pipeline integration --
@@ -695,8 +716,8 @@ impl OrphanIndex {
     /// Returns the recovered index plus a list of corrupted entry inode IDs.
     pub fn replay_from_txg(store: &dyn CommitGroupStore, key_name: &str) -> (Self, Vec<u64>) {
         match store.get_named(key_name) {
-            Ok(Some(bytes)) => match Self::recover_from_log(&bytes) {
-                Ok((idx, corrupted)) => (idx, corrupted),
+            Ok(Some(bytes)) => match Self::recover_from_log_report(&bytes) {
+                Ok((idx, report)) => (idx, report.corrupted_inodes),
                 Err(_) => (Self::new(), Vec::new()),
             },
             Ok(None) => (Self::new(), Vec::new()),
@@ -807,6 +828,7 @@ fn pid_is_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_types_orphan_index_core::OrphanLogRecoveryClass;
 
     // Helper to create a simple entry
     fn make_entry(inode_id: u64) -> OrphanEntry {
@@ -1414,6 +1436,28 @@ mod tests {
     }
 
     #[test]
+    fn recover_report_classifies_incomplete_tail() {
+        let mut idx = OrphanIndex::new();
+        idx.insert(1, make_entry(1));
+        idx.insert(2, make_entry(2));
+        idx.advance_watermark(10);
+        let mut log = idx.encode_log();
+        log.truncate(12 + LOG_RECORD_SIZE + 7);
+
+        let (recovered, report) = OrphanIndex::recover_from_log_report(&log).unwrap();
+        assert_eq!(report.class(), OrphanLogRecoveryClass::IncompleteReplay);
+        assert_eq!(report.expected_entries, 2);
+        assert_eq!(report.replayed_entries, 1);
+        assert_eq!(report.watermark.position, 10);
+        let tail = report.incomplete_tail.unwrap();
+        assert_eq!(tail.next_entry_index, 1);
+        assert_eq!(tail.bytes_available, 7);
+        assert_eq!(tail.missing_entries, 1);
+        assert!(report.corrupted_inodes.is_empty());
+        assert_eq!(recovered.collect_inode_ids(), vec![1]);
+    }
+
+    #[test]
     fn recover_corrupted_checksum() {
         let mut idx = OrphanIndex::new();
         idx.insert(1, make_entry(1));
@@ -1431,6 +1475,25 @@ mod tests {
         assert!(recovered.contains(1));
         assert!(recovered.contains(3));
         assert!(!recovered.contains(2));
+    }
+
+    #[test]
+    fn recover_report_classifies_corrupt_log() {
+        let mut idx = OrphanIndex::new();
+        idx.insert(1, make_entry(1));
+        idx.insert(2, make_entry(2));
+        let mut log = idx.encode_log();
+
+        let second_csum_start = 12 + LOG_RECORD_SIZE + ENTRY_ENCODED_SIZE;
+        log[second_csum_start] ^= 0xFF;
+
+        let (recovered, report) = OrphanIndex::recover_from_log_report(&log).unwrap();
+        assert_eq!(report.class(), OrphanLogRecoveryClass::CorruptOrphanLog);
+        assert_eq!(report.expected_entries, 2);
+        assert_eq!(report.replayed_entries, 1);
+        assert_eq!(report.corrupted_inodes, vec![2]);
+        assert!(report.incomplete_tail.is_none());
+        assert_eq!(recovered.collect_inode_ids(), vec![1]);
     }
 
     #[test]
@@ -1684,12 +1747,15 @@ mod tests {
 
     #[test]
     fn tmpfile_timeout_reap_process_alive() {
-        // PID 1 (init) is always alive on Linux
+        let alive_pid = std::process::id();
         let mut idx = OrphanIndex::new();
-        idx.insert_tmpfile(10, 100, 1, 0);
-        // init is alive, so this tmpfile should not be reaped
+        idx.insert_tmpfile(10, 100, alive_pid, 0);
+        // The current test process is alive, so this tmpfile should not be reaped.
         let reap = idx.tmpfile_timeout_reap();
-        assert!(reap.is_empty(), "PID 1 should be alive, not reaped");
+        assert!(
+            reap.is_empty(),
+            "current process should be alive, not reaped"
+        );
     }
 
     #[test]
@@ -1724,8 +1790,8 @@ mod tests {
     #[test]
     fn tmpfile_timeout_reap_mixed_alive_and_dead() {
         let mut idx = OrphanIndex::new();
-        // PID 1 (init) is alive
-        idx.insert_tmpfile(1, 10, 1, 0);
+        // The current test process is alive.
+        idx.insert_tmpfile(1, 10, std::process::id(), 0);
         // Dead PID
         idx.insert_tmpfile(2, 20, 0xFFFFFD, 0);
         let reap = idx.tmpfile_timeout_reap();
