@@ -13,6 +13,10 @@
 //! - [`WorkItemFlags`] — bitfield wrapper for the flags byte: is_complete
 //!   and reserved bits
 //!
+//! Byte decoding in this crate is format validation only.  A successfully
+//! decoded work item is syntactically valid v1 input; it is not proof that a
+//! cleanup queue replay, cleanup job, or reclaim operation has run correctly.
+//!
 //! ## Design principle
 //!
 //! POSIX unlink, truncate, and rmdir on large files create a fundamental
@@ -53,6 +57,13 @@ pub const WORK_ITEM_MAGIC: [u8; 8] = *b"CLNWITEM";
 
 /// Total on-media size of `CleanupWorkItemV1` in bytes.
 pub const WORK_ITEM_SIZE: usize = 128;
+
+/// Current on-media version for `CleanupWorkItemV1` records.
+///
+/// The v1 record bytes do not store this value directly.  Callers that wrap
+/// work items in a versioned container must pass the container version to
+/// [`CleanupWorkItemV1::from_versioned_bytes`] before treating bytes as v1.
+pub const WORK_ITEM_VERSION: u8 = 1;
 
 /// Size of the opaque cursor field for resumable extent-map iteration.
 pub const CURSOR_SIZE: usize = 64;
@@ -188,7 +199,7 @@ impl fmt::Display for WorkItemKindError {
 ///
 /// Layout:
 /// - bit 0: `is_complete` — set when the background job finishes processing
-/// - bits 1–7: reserved (must be zero on write, ignored on read)
+/// - bits 1–7: reserved (must be zero on write and decode)
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WorkItemFlags(u8);
 
@@ -243,6 +254,66 @@ impl fmt::Display for WorkItemFlags {
 }
 
 // ---------------------------------------------------------------------------
+// CleanupWorkItemDecodeError
+// ---------------------------------------------------------------------------
+
+/// Error returned when decoding a `CleanupWorkItemV1` byte record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupWorkItemDecodeError {
+    /// The byte slice is not exactly [`WORK_ITEM_SIZE`] bytes.
+    InvalidLength { expected: usize, actual: usize },
+    /// The enclosing work-item record version is not supported by this crate.
+    UnsupportedVersion { version: u8, supported: u8 },
+    /// The magic bytes do not match [`WORK_ITEM_MAGIC`].
+    InvalidMagic { actual: [u8; 8] },
+    /// The kind byte does not name a known [`WorkItemKind`].
+    UnknownKind { raw: u8 },
+    /// The padding reserved next to the root pointer is non-zero.
+    NonZeroRootReserved { bytes: [u8; 8] },
+    /// The reserved flag bits are non-zero.
+    NonZeroFlagReservedBits { raw: u8 },
+    /// The trailing reserved bytes are non-zero.
+    NonZeroReserved { bytes: [u8; 6] },
+}
+
+impl fmt::Display for CleanupWorkItemDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CleanupWorkItemDecodeError::InvalidLength { expected, actual } => write!(
+                f,
+                "cleanup work item length mismatch: expected {expected} bytes, got {actual}"
+            ),
+            CleanupWorkItemDecodeError::UnsupportedVersion { version, supported } => write!(
+                f,
+                "unsupported cleanup work item version {version}; supported version is {supported}"
+            ),
+            CleanupWorkItemDecodeError::InvalidMagic { actual } => {
+                write!(f, "invalid cleanup work item magic: {actual:?}")
+            }
+            CleanupWorkItemDecodeError::UnknownKind { raw } => {
+                write!(f, "unknown cleanup work item kind: {raw}")
+            }
+            CleanupWorkItemDecodeError::NonZeroRootReserved { bytes } => {
+                write!(
+                    f,
+                    "cleanup work item root reserved bytes are non-zero: {bytes:?}"
+                )
+            }
+            CleanupWorkItemDecodeError::NonZeroFlagReservedBits { raw } => write!(
+                f,
+                "cleanup work item flag reserved bits are non-zero: {raw:#04x}"
+            ),
+            CleanupWorkItemDecodeError::NonZeroReserved { bytes } => {
+                write!(
+                    f,
+                    "cleanup work item reserved bytes are non-zero: {bytes:?}"
+                )
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CleanupWorkItemV1
 // ---------------------------------------------------------------------------
 
@@ -256,7 +327,8 @@ impl fmt::Display for WorkItemFlags {
 /// [8..16)   inode_id: u64 BE
 /// [16]      kind: WorkItemKind as u8
 /// [17..25)  created_commit_group: u64 BE
-/// [25..41)  extent_map_root: BtreeRootPointer (16 bytes)
+/// [25..33)  extent_map_root: BtreeRootPointer.0 u64 BE
+/// [33..41)  root reserved: [u8; 8]
 /// [41..105) cursor: [u8; 64] — opaque cursor state
 /// [105..113) bytes_to_free_estimate: u64 BE
 /// [113..121) extents_processed: u64 BE
@@ -364,6 +436,110 @@ impl CleanupWorkItemV1 {
             && self.flags == WorkItemFlags::PENDING
             && self.validate_reserved()
     }
+
+    /// Serialize this work item to the fixed-size v1 on-media record.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; WORK_ITEM_SIZE] {
+        let mut bytes = [0u8; WORK_ITEM_SIZE];
+        bytes[0..8].copy_from_slice(&self.magic);
+        bytes[8..16].copy_from_slice(&self.inode_id.to_be_bytes());
+        bytes[16] = u8::from(self.kind);
+        bytes[17..25].copy_from_slice(&self.created_commit_group.to_be_bytes());
+        bytes[25..33].copy_from_slice(&self.extent_map_root.0.to_be_bytes());
+        bytes[41..105].copy_from_slice(&self.cursor);
+        bytes[105..113].copy_from_slice(&self.bytes_to_free_estimate.to_be_bytes());
+        bytes[113..121].copy_from_slice(&self.extents_processed.to_be_bytes());
+        bytes[121] = self.flags.as_u8();
+        bytes[122..128].copy_from_slice(&self.reserved);
+        bytes
+    }
+
+    /// Decode an implicit v1 work item byte record.
+    ///
+    /// This is format validation only; success does not prove cleanup queue
+    /// replay, cleanup scheduling, or reclaim behavior.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CleanupWorkItemDecodeError> {
+        Self::from_versioned_bytes(WORK_ITEM_VERSION, bytes)
+    }
+
+    /// Decode a work item byte record from an enclosing versioned container.
+    ///
+    /// Only [`WORK_ITEM_VERSION`] is accepted.  No legacy fallback or
+    /// downgrade path is attempted for unsupported versions.
+    pub fn from_versioned_bytes(
+        version: u8,
+        bytes: &[u8],
+    ) -> Result<Self, CleanupWorkItemDecodeError> {
+        if version != WORK_ITEM_VERSION {
+            return Err(CleanupWorkItemDecodeError::UnsupportedVersion {
+                version,
+                supported: WORK_ITEM_VERSION,
+            });
+        }
+        if bytes.len() != WORK_ITEM_SIZE {
+            return Err(CleanupWorkItemDecodeError::InvalidLength {
+                expected: WORK_ITEM_SIZE,
+                actual: bytes.len(),
+            });
+        }
+
+        let mut magic = [0u8; 8];
+        magic.copy_from_slice(&bytes[0..8]);
+        if magic != WORK_ITEM_MAGIC {
+            return Err(CleanupWorkItemDecodeError::InvalidMagic { actual: magic });
+        }
+
+        let kind = WorkItemKind::try_from(bytes[16])
+            .map_err(|_| CleanupWorkItemDecodeError::UnknownKind { raw: bytes[16] })?;
+
+        let mut root_reserved = [0u8; 8];
+        root_reserved.copy_from_slice(&bytes[33..41]);
+        if root_reserved != [0u8; 8] {
+            return Err(CleanupWorkItemDecodeError::NonZeroRootReserved {
+                bytes: root_reserved,
+            });
+        }
+
+        let flags = WorkItemFlags::from_u8(bytes[121]);
+        if !flags.validate_reserved_bits() {
+            return Err(CleanupWorkItemDecodeError::NonZeroFlagReservedBits { raw: bytes[121] });
+        }
+
+        let mut reserved = [0u8; 6];
+        reserved.copy_from_slice(&bytes[122..128]);
+        if reserved != [0u8; 6] {
+            return Err(CleanupWorkItemDecodeError::NonZeroReserved { bytes: reserved });
+        }
+
+        let mut cursor = [0u8; CURSOR_SIZE];
+        cursor.copy_from_slice(&bytes[41..105]);
+
+        Ok(Self {
+            magic,
+            inode_id: read_u64_be(bytes, 8),
+            kind,
+            created_commit_group: read_u64_be(bytes, 17),
+            extent_map_root: BtreeRootPointer(read_u64_be(bytes, 25)),
+            cursor,
+            bytes_to_free_estimate: read_u64_be(bytes, 105),
+            extents_processed: read_u64_be(bytes, 113),
+            flags,
+            reserved,
+        })
+    }
+}
+
+fn read_u64_be(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
 }
 
 impl Default for CleanupWorkItemV1 {
@@ -542,6 +718,124 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_work_item_valid_v1_roundtrips_unchanged() {
+        for kind in [
+            WorkItemKind::UnlinkFree,
+            WorkItemKind::TruncateFree,
+            WorkItemKind::RmdirFree,
+            WorkItemKind::RenameOverwrite,
+            WorkItemKind::SnapDelete,
+            WorkItemKind::PunchHoleFree,
+        ] {
+            let mut item = CleanupWorkItemV1::new(100, kind, 10, BtreeRootPointer(42), 4096);
+            item.cursor[0] = u8::from(kind);
+            item.cursor[63] = 0xA5;
+            item.extents_processed = 3;
+            item.mark_complete();
+
+            let bytes = item.to_bytes();
+            let decoded = CleanupWorkItemV1::from_bytes(&bytes).unwrap();
+
+            assert_eq!(decoded, item);
+            assert_eq!(decoded.to_bytes(), bytes);
+        }
+    }
+
+    #[test]
+    fn cleanup_work_item_decode_rejects_unsupported_version() {
+        let item = CleanupWorkItemV1::default();
+        let bytes = item.to_bytes();
+
+        assert_eq!(
+            CleanupWorkItemV1::from_versioned_bytes(2, &bytes),
+            Err(CleanupWorkItemDecodeError::UnsupportedVersion {
+                version: 2,
+                supported: WORK_ITEM_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn cleanup_work_item_decode_rejects_malformed_length() {
+        let item = CleanupWorkItemV1::default();
+        let bytes = item.to_bytes();
+
+        assert_eq!(
+            CleanupWorkItemV1::from_bytes(&bytes[..WORK_ITEM_SIZE - 1]),
+            Err(CleanupWorkItemDecodeError::InvalidLength {
+                expected: WORK_ITEM_SIZE,
+                actual: WORK_ITEM_SIZE - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn cleanup_work_item_decode_rejects_invalid_magic() {
+        let item = CleanupWorkItemV1::default();
+        let mut bytes = item.to_bytes();
+        bytes[0..8].copy_from_slice(b"BADITEM!");
+
+        assert_eq!(
+            CleanupWorkItemV1::from_bytes(&bytes),
+            Err(CleanupWorkItemDecodeError::InvalidMagic {
+                actual: *b"BADITEM!",
+            })
+        );
+    }
+
+    #[test]
+    fn cleanup_work_item_decode_rejects_unknown_kind() {
+        let item = CleanupWorkItemV1::default();
+        let mut bytes = item.to_bytes();
+        bytes[16] = 99;
+
+        assert_eq!(
+            CleanupWorkItemV1::from_bytes(&bytes),
+            Err(CleanupWorkItemDecodeError::UnknownKind { raw: 99 })
+        );
+    }
+
+    #[test]
+    fn cleanup_work_item_decode_rejects_root_reserved_drift() {
+        let item = CleanupWorkItemV1::default();
+        let mut bytes = item.to_bytes();
+        bytes[40] = 0x80;
+
+        assert_eq!(
+            CleanupWorkItemV1::from_bytes(&bytes),
+            Err(CleanupWorkItemDecodeError::NonZeroRootReserved {
+                bytes: [0, 0, 0, 0, 0, 0, 0, 0x80],
+            })
+        );
+    }
+
+    #[test]
+    fn cleanup_work_item_decode_rejects_flag_reserved_drift() {
+        let item = CleanupWorkItemV1::default();
+        let mut bytes = item.to_bytes();
+        bytes[121] = 0x02;
+
+        assert_eq!(
+            CleanupWorkItemV1::from_bytes(&bytes),
+            Err(CleanupWorkItemDecodeError::NonZeroFlagReservedBits { raw: 0x02 })
+        );
+    }
+
+    #[test]
+    fn cleanup_work_item_decode_rejects_trailing_reserved_drift() {
+        let item = CleanupWorkItemV1::default();
+        let mut bytes = item.to_bytes();
+        bytes[122] = 0x01;
+
+        assert_eq!(
+            CleanupWorkItemV1::from_bytes(&bytes),
+            Err(CleanupWorkItemDecodeError::NonZeroReserved {
+                bytes: [1, 0, 0, 0, 0, 0],
+            })
+        );
+    }
+
+    #[test]
     fn cleanup_work_item_validate_magic() {
         let mut item =
             CleanupWorkItemV1::new(1, WorkItemKind::TruncateFree, 2, BtreeRootPointer::EMPTY, 0);
@@ -647,13 +941,12 @@ mod tests {
     #[test]
     fn cleanup_work_item_v1_is_128_bytes() {
         // 8 (magic) + 8 (inode_id) + 1 (kind) + 8 (created_commit_group)
-        // + 8 (extent_map_root) + 64 (cursor) + 8 (estimate)
+        // + 8 (extent_map_root) + 8 (root reserved) + 64 (cursor) + 8 (estimate)
         // + 8 (extents_processed) + 1 (flags) + 6 (reserved)
-        // = 120 bytes + padding. On-media layout guarantees 128.
-        // In memory, alignment may differ; this test verifies the
-        // field sizes sum correctly.
-        let field_sum: usize = 8 + 8 + 1 + 8 + 8 + 64 + 8 + 8 + 1 + 6;
-        assert_eq!(field_sum, 120); // 8 bytes remain for alignment padding
+        // = 128 bytes. In memory, alignment may differ; this test verifies the
+        // on-media field sizes sum correctly.
+        let field_sum: usize = 8 + 8 + 1 + 8 + 8 + 8 + 64 + 8 + 8 + 1 + 6;
+        assert_eq!(field_sum, WORK_ITEM_SIZE);
     }
 
     // ── Edge cases ────────────────────────────────────────────────────
