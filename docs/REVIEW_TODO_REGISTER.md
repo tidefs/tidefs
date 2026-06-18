@@ -249,6 +249,18 @@ Important 2026-06-01 findings:
   `dir_rev`, but it does not close TFR-005. Local-filesystem inode record
   projection, intent-log replay, scrub/repair identity, reclaim/content-key
   identity, and send/receive runtime projections remain unresolved.
+- `TFR-005`: issue #499 produces the comprehensive
+  `docs/TIMESTAMP_GENERATION_AUTHORITY.md` design authority document,
+  replacing the guardrail version from issue #325. The design doc specifies:
+  crate-per-concept ownership, monotonicity/wraparound/epoch rules,
+  cross-authority relationship map (POSIX time, txg, data_version,
+  metadata_version, subtree_rev/dir_rev, format version, scrub identity),
+  and on-disk format compatibility rules for version field changes. This is a
+  planning document; it does not change runtime behavior or close TFR-005.
+  Remaining implementation blockers are listed in section 9 of the design doc:
+  `metadata_version` to `subtree_rev`/`dir_rev` coupling, intent-log replay
+  version projection, scrub/repair identity, send/receive serialization,
+  content-object reclaim identity, and format-golden/codec surfaces.
 - `TFR-006`: Transform authority is still split across mounted-content
   compression, object-store device compression/encryption, helper compression
   and encryption crates, and inline content-addressed dedup. The
