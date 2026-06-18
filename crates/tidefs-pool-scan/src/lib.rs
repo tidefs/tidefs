@@ -1239,8 +1239,6 @@ impl DeviceType {
 // PoolConfig — assembled pool configuration
 // ---------------------------------------------------------------------------
 
-/// Output of a successful pool assembly: a coherent view of one pool's
-/// devices, topology, and capability flags.
 /// Durable evidence that a device evacuation completed with a committed
 /// evacuation receipt.  Stored in pool metadata so that post-removal scans
 /// can verify that placement receipts were relocated before the device
