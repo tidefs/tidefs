@@ -1426,6 +1426,26 @@ mod durable_dispatch_tests {
     }
 
     #[test]
+    fn completed_job_identity_rejected_after_epoch_advance() {
+        let mut s = scheduler_with_store();
+
+        let first_id = s
+            .register_incremental_job("first", MockJob::new(1, JobKind::Scrub, 1))
+            .unwrap();
+        s.run_cycle();
+        assert_eq!(
+            s.load_dispatch_record(first_id).unwrap().unwrap().state,
+            DispatchState::Completed
+        );
+
+        s.advance_epoch().unwrap();
+        let err = s
+            .register_incremental_job("restart-dupe", MockJob::new(1, JobKind::Scrub, 10))
+            .unwrap_err();
+        assert!(matches!(err, DispatchStoreError::DuplicateDispatch(id) if id == first_id));
+    }
+
+    #[test]
     fn duplicate_store_record_rejected() {
         let mut store = InMemoryDispatchStore::new();
         let rec = DispatchRecord::new(

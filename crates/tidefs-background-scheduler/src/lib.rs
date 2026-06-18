@@ -1187,7 +1187,7 @@ impl BackgroundScheduler {
         job_kind: JobKind,
     ) -> Result<DispatchRecordId, DispatchStoreError> {
         if let Some(ref store) = self.dispatch_store {
-            if let Some(existing) = store.load_record_by_identity(job_id, job_kind, self.epoch)? {
+            if let Some(existing) = store.load_record_by_job(job_id, job_kind)? {
                 return Err(DispatchStoreError::DuplicateDispatch(existing.dispatch_id));
             }
         }
@@ -1299,16 +1299,14 @@ impl BackgroundScheduler {
         }
     }
 
-    /// Return true if the current epoch already has a dispatch for a job identity.
+    /// Return true if a dispatch already exists for this stable job identity.
     pub fn is_duplicate_job_dispatch(
         &self,
         job_id: JobId,
         job_kind: JobKind,
     ) -> Result<bool, DispatchStoreError> {
         match &self.dispatch_store {
-            Some(store) => Ok(store
-                .load_record_by_identity(job_id, job_kind, self.epoch)?
-                .is_some()),
+            Some(store) => Ok(store.load_record_by_job(job_id, job_kind)?.is_some()),
             None => Ok(false),
         }
     }

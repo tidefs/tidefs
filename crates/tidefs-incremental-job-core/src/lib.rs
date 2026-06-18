@@ -688,7 +688,7 @@ pub trait DispatchStore: Send {
     ///
     /// Must fail with [`DuplicateDispatch`](DispatchStoreError::DuplicateDispatch)
     /// if a record with the same [`DispatchRecordId`] or logical
-    /// `(JobId, JobKind, SchedulerEpoch)` identity already exists.
+    /// `(JobId, JobKind)` identity already exists.
     fn store_record(&mut self, record: &DispatchRecord) -> Result<(), DispatchStoreError>;
 
     /// Update an existing dispatch record (state change, checkpoint update).
@@ -708,6 +708,18 @@ pub trait DispatchStore: Send {
         &self,
         dispatch_id: DispatchRecordId,
     ) -> Result<Option<DispatchRecord>, DispatchStoreError>;
+
+    /// Load a dispatch record by stable job identity across scheduler epochs.
+    fn load_record_by_job(
+        &self,
+        job_id: JobId,
+        job_kind: JobKind,
+    ) -> Result<Option<DispatchRecord>, DispatchStoreError> {
+        Ok(self
+            .load_records()?
+            .into_iter()
+            .find(|r| r.job_id == job_id && r.job_kind == job_kind))
+    }
 
     /// Load a dispatch record by its logical scheduler identity.
     fn load_record_by_identity(
@@ -766,9 +778,11 @@ impl DispatchStore for InMemoryDispatchStore {
         {
             return Err(DispatchStoreError::DuplicateDispatch(record.dispatch_id));
         }
-        if let Some(existing) = self.records.iter().find(|r| {
-            r.job_id == record.job_id && r.job_kind == record.job_kind && r.epoch == record.epoch
-        }) {
+        if let Some(existing) = self
+            .records
+            .iter()
+            .find(|r| r.job_id == record.job_id && r.job_kind == record.job_kind)
+        {
             return Err(DispatchStoreError::DuplicateDispatch(existing.dispatch_id));
         }
         self.records.push(record.clone());
@@ -1287,6 +1301,31 @@ mod tests {
             JobId(2),
             JobKind::DeferredCleanup,
             SchedulerEpoch(1),
+            DispatchRecordId(6),
+            0,
+        );
+        store.store_record(&rec).unwrap();
+        let err = store.store_record(&duplicate_identity).unwrap_err();
+        assert!(matches!(
+            err,
+            DispatchStoreError::DuplicateDispatch(DispatchRecordId(5))
+        ));
+    }
+
+    #[test]
+    fn duplicate_job_identity_rejected_across_epochs() {
+        let mut store = InMemoryDispatchStore::new();
+        let rec = DispatchRecord::new(
+            JobId(2),
+            JobKind::DeferredCleanup,
+            SchedulerEpoch(1),
+            DispatchRecordId(5),
+            0,
+        );
+        let duplicate_identity = DispatchRecord::new(
+            JobId(2),
+            JobKind::DeferredCleanup,
+            SchedulerEpoch(2),
             DispatchRecordId(6),
             0,
         );
