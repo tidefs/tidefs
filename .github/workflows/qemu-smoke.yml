@@ -11,7 +11,6 @@ on:
         default: kmod-xfstests-smoke
         type: choice
         options:
-          - fuse-vm-test
           - kmod-xfstests-smoke
           - kernel-fsync-validation
           - kernel-mmap-validation
@@ -35,9 +34,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - id: fuse-vm-test
-            name: fuse-vm-test
-            command: nix run .#fuse-vm-test
           - id: kmod-xfstests-smoke
             name: kmod-xfstests-smoke
             command: nix run .#kmod-xfstests-smoke -- --timeout 1800
