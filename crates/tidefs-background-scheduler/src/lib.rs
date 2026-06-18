@@ -1103,21 +1103,22 @@ impl BackgroundScheduler {
     pub fn with_dispatch_store(
         global_budget: ServiceBudget,
         mut store: Box<dyn DispatchStore>,
-    ) -> Self {
-        let epoch = match store.load_epoch().ok().flatten() {
+    ) -> Result<Self, DispatchStoreError> {
+        let epoch = match store.load_epoch()? {
             Some(epoch) => epoch,
             None => {
-                let _ = store.store_epoch(SchedulerEpoch::INITIAL);
+                store.store_epoch(SchedulerEpoch::INITIAL)?;
                 SchedulerEpoch::INITIAL
             }
         };
-        let next_dispatch_id = store
-            .load_records()
-            .ok()
-            .and_then(|records| records.iter().map(|r| r.dispatch_id.0).max())
+        let records = store.load_records()?;
+        let next_dispatch_id = records
+            .iter()
+            .map(|r| r.dispatch_id.0)
+            .max()
             .map(|max_id| DispatchRecordId(max_id.saturating_add(1)))
             .unwrap_or(DispatchRecordId(0));
-        Self {
+        Ok(Self {
             services: Vec::new(),
             service_dispatch_ids: Vec::new(),
             work_queue: crate::scheduling::WorkItemQueue::new_default(),
@@ -1128,7 +1129,7 @@ impl BackgroundScheduler {
             dispatch_store: Some(store),
             epoch,
             next_dispatch_id,
-        }
+        })
     }
 
     /// Load resumable dispatch records from the store.
