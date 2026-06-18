@@ -319,6 +319,34 @@ impl ForcedFencing {
         drain: &mut NodeDrain,
         current_epoch: u64,
     ) -> Result<FenceToken, FencingError> {
+        let placement_evidence = drain
+            .evacuation_receipt()
+            .map(|r| r.placement_receipt_refs.clone())
+            .unwrap_or_default();
+
+        self.fence_with_placement_evidence(
+            node_id,
+            trigger,
+            drain,
+            current_epoch,
+            placement_evidence,
+        )
+    }
+
+    /// Perform a forced fence while recording explicit placement evidence
+    /// captured from the committed placement authority.
+    ///
+    /// Callers that can query live placement receipts should use this path so
+    /// the fence event records the last committed receipts known to reference
+    /// the fenced node.
+    pub fn fence_with_placement_evidence(
+        &mut self,
+        node_id: MemberId,
+        trigger: FenceTrigger,
+        drain: &mut NodeDrain,
+        current_epoch: u64,
+        placement_evidence: Vec<ReplicatedReceiptId>,
+    ) -> Result<FenceToken, FencingError> {
         let nid = node_id.0;
 
         // Check eligibility
@@ -356,13 +384,7 @@ impl ForcedFencing {
         // Record placement evidence captured at fence time so the fencing
         // event carries the last committed placement evidence known for the
         // node. This is used for post-fence audit and recovery.
-        self.record_placement_evidence(
-            nid,
-            drain
-                .evacuation_receipt()
-                .map(|r| r.placement_receipt_refs.clone())
-                .unwrap_or_default(),
-        );
+        self.record_placement_evidence(nid, placement_evidence);
         self.fenced_nodes.insert(nid, (new_token, current_epoch));
 
         // Record stats
@@ -400,10 +422,6 @@ impl ForcedFencing {
         Ok(())
     }
 
-    /// Clear a node's fenced status — called when the node successfully
-    /// rejoins after catching up.
-    ///
-    /// The presented token must be at least the current token.
     /// Record placement receipt evidence captured at fence time.
     fn record_placement_evidence(&mut self, node_id: u64, receipt_ids: Vec<ReplicatedReceiptId>) {
         self.placement_evidence.insert(node_id, receipt_ids);
@@ -424,6 +442,10 @@ impl ForcedFencing {
         self.placement_evidence.contains_key(&node_id.0)
     }
 
+    /// Clear a node's fenced status — called when the node successfully
+    /// rejoins after catching up.
+    ///
+    /// The presented token must be at least the current token.
     pub fn clear_fence(
         &mut self,
         node_id: MemberId,
@@ -552,6 +574,27 @@ mod tests {
         assert_eq!(ff.stats().fence_triggers_manual, 1);
         assert_eq!(ff.stats().rebuilds_triggered, 1);
         assert_eq!(drain.state(), NodeState::Fenced);
+    }
+
+    #[test]
+    fn forced_fence_records_explicit_placement_evidence() {
+        let mut ff = ForcedFencing::new();
+        let (mut drain, _handle) = NodeDrain::drain(node(12));
+        let evidence = vec![ReplicatedReceiptId(40), ReplicatedReceiptId(41)];
+
+        let token = ff
+            .fence_with_placement_evidence(
+                node(12),
+                FenceTrigger::Timeout,
+                &mut drain,
+                5,
+                evidence.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(token.value(), 1);
+        assert!(ff.has_placement_evidence(node(12)));
+        assert_eq!(ff.placement_evidence_for(node(12)).unwrap(), evidence);
     }
 
     #[test]
