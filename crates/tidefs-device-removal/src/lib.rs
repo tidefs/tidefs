@@ -3491,4 +3491,227 @@ mod tests {
         resumed.mark_removed().unwrap();
         assert_eq!(resumed.state().phase, DeviceRemovalPhase::Removed);
     }
+    // ── Evacuation receipt gating tests ─────────────────────────────
+
+    /// Mock [`PlacementReceiptChecker`] that returns a fixed set of refs.
+    #[derive(Debug)]
+    struct MockPlacementReceiptChecker {
+        refs: Vec<PlacementReceiptRef>,
+    }
+
+    impl PlacementReceiptChecker for MockPlacementReceiptChecker {
+        fn receipts_referencing_extents(
+            &self,
+            _extent_ids: &[ExtentId],
+        ) -> Result<Vec<PlacementReceiptRef>, DeviceRemovalError> {
+            Ok(self.refs.clone())
+        }
+    }
+
+    #[test]
+    fn evacuation_receipt_digest_verifies() {
+        let completion = EvacuationCompletionGeneration {
+            target_device_guid: [0xAAu8; 16],
+            target_topology_generation: 7,
+            evacuation_set_digest: [0xBBu8; 32],
+            removal_chain_digest: [0xCCu8; 32],
+        };
+        let receipt = EvacuationReceipt::new(completion, vec![], 1);
+        assert!(receipt.verify_digest(), "fresh receipt must verify its own digest");
+
+        // Tamper with the receipt_id and check that the digest no longer matches.
+        let mut tampered = receipt.clone();
+        tampered.receipt_id = 42;
+        assert!(
+            !tampered.verify_digest(),
+            "tampered receipt_id must invalidate digest"
+        );
+
+        // Tamper with placement_receipt_refs.
+        let mut tampered2 = receipt.clone();
+        tampered2.placement_receipt_refs = vec![PlacementReceiptRef {
+            object_id: 1,
+            object_key: [0x01u8; 32],
+            receipt_epoch: tidefs_membership_epoch::EpochId(0),
+            receipt_generation: 1,
+            redundancy_policy: tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            payload_len: 0,
+            payload_digest: [0u8; 32],
+            target_count: 0,
+        }];
+        assert!(
+            !tampered2.verify_digest(),
+            "tampered placement_receipt_refs must invalidate digest"
+        );
+    }
+
+    #[test]
+    fn commit_vacated_rejects_missing_evacuation_receipt() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            0,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver.mark_evacuated().unwrap();
+        // Completion generation is recorded by mark_evacuated, but we do NOT
+        // call record_evacuation_receipt — receipt is intentionally missing.
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+
+        let err = driver.commit_vacated(updated).unwrap_err();
+        let evidence =
+            assert_refusal_class(err, DeviceRemovalRefusalClass::EvacuationCompletionNotDurable);
+        assert!(
+            evidence
+                .details
+                .contains("evacuation receipt is missing"),
+            "details must mention missing evacuation receipt"
+        );
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+    }
+
+    #[test]
+    fn mark_removed_rejects_missing_evacuation_receipt() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            0,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver.mark_evacuated().unwrap();
+        driver.record_evacuation_receipt(vec![], 0);
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+        driver.commit_vacated(updated).unwrap();
+
+        // Clear the evacuation receipt to simulate state where it was lost.
+        driver.state.evacuation_receipt = None;
+
+        let err = driver.mark_removed().unwrap_err();
+        let evidence =
+            assert_refusal_class(err, DeviceRemovalRefusalClass::EvacuationCompletionNotDurable);
+        assert!(
+            evidence
+                .details
+                .contains("evacuation receipt is missing"),
+            "details must mention missing evacuation receipt"
+        );
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+    }
+
+    #[test]
+    fn placement_receipt_checker_blocks_commit_vacated() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            0,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver.mark_evacuated().unwrap();
+        driver.record_evacuation_receipt(vec![], 0);
+
+        // Install a checker that reports references still exist.
+        driver.set_placement_receipt_checker(Box::new(MockPlacementReceiptChecker {
+            refs: vec![PlacementReceiptRef {
+                object_id: 1,
+                object_key: [0x01u8; 32],
+                receipt_epoch: tidefs_membership_epoch::EpochId(0),
+                receipt_generation: 1,
+                redundancy_policy: tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies: 2 },
+                payload_len: 0,
+                payload_digest: [0u8; 32],
+                target_count: 0,
+            }],
+        }));
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+
+        let err = driver.commit_vacated(updated).unwrap_err();
+        let evidence = assert_refusal_class(
+            err,
+            DeviceRemovalRefusalClass::PlacementReceiptsStillReferenceDevice,
+        );
+        assert!(
+            evidence
+                .details
+                .contains("placement receipts still reference the target device"),
+            "details must mention placement receipts still referencing device"
+        );
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+    }
+
+    #[test]
+    fn placement_receipt_checker_blocks_mark_removed() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            0,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver.mark_evacuated().unwrap();
+        driver.record_evacuation_receipt(vec![], 0);
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+        driver.commit_vacated(updated).unwrap();
+
+        // Install a checker that reports references still exist.
+        driver.set_placement_receipt_checker(Box::new(MockPlacementReceiptChecker {
+            refs: vec![PlacementReceiptRef {
+                object_id: 1,
+                object_key: [0x01u8; 32],
+                receipt_epoch: tidefs_membership_epoch::EpochId(0),
+                receipt_generation: 1,
+                redundancy_policy: tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies: 2 },
+                payload_len: 0,
+                payload_digest: [0u8; 32],
+                target_count: 0,
+            }],
+        }));
+
+        let err = driver.mark_removed().unwrap_err();
+        let evidence = assert_refusal_class(
+            err,
+            DeviceRemovalRefusalClass::PlacementReceiptsStillReferenceDevice,
+        );
+        assert!(
+            evidence
+                .details
+                .contains("placement receipts still reference the target device"),
+            "details must mention placement receipts still referencing device"
+        );
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+    }
 }
