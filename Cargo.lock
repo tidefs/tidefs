@@ -2592,6 +2592,7 @@ name = "tidefs-invalidation-feed"
 version = "0.421.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
