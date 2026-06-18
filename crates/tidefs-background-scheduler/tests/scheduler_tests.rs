@@ -1310,7 +1310,85 @@ mod durable_dispatch_tests {
     /// Helper: create a BackgroundScheduler with an InMemoryDispatchStore.
     fn scheduler_with_store() -> BackgroundScheduler {
         let store = Box::new(InMemoryDispatchStore::new());
-        BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, store)
+        BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, store).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct FailingDispatchStore {
+        load_epoch_error: bool,
+        store_epoch_error: bool,
+        load_records_error: bool,
+    }
+
+    impl FailingDispatchStore {
+        fn load_epoch_error() -> Self {
+            Self {
+                load_epoch_error: true,
+                store_epoch_error: false,
+                load_records_error: false,
+            }
+        }
+
+        fn store_epoch_error() -> Self {
+            Self {
+                load_epoch_error: false,
+                store_epoch_error: true,
+                load_records_error: false,
+            }
+        }
+
+        fn load_records_error() -> Self {
+            Self {
+                load_epoch_error: false,
+                store_epoch_error: false,
+                load_records_error: true,
+            }
+        }
+    }
+
+    impl DispatchStore for FailingDispatchStore {
+        fn store_record(&mut self, _record: &DispatchRecord) -> Result<(), DispatchStoreError> {
+            Ok(())
+        }
+
+        fn update_record(&mut self, _record: &DispatchRecord) -> Result<(), DispatchStoreError> {
+            Ok(())
+        }
+
+        fn load_resumable(&self) -> Result<Vec<DispatchRecord>, DispatchStoreError> {
+            Ok(Vec::new())
+        }
+
+        fn load_records(&self) -> Result<Vec<DispatchRecord>, DispatchStoreError> {
+            if self.load_records_error {
+                Err(DispatchStoreError::IoFailed("load records failed"))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        fn load_record(
+            &self,
+            _dispatch_id: DispatchRecordId,
+        ) -> Result<Option<DispatchRecord>, DispatchStoreError> {
+            Ok(None)
+        }
+
+        fn load_epoch(&self) -> Result<Option<SchedulerEpoch>, DispatchStoreError> {
+            if self.load_epoch_error {
+                Err(DispatchStoreError::IoFailed("load epoch failed"))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn store_epoch(&mut self, _epoch: SchedulerEpoch) -> Result<(), DispatchStoreError> {
+            if self.store_epoch_error {
+                Err(DispatchStoreError::IoFailed("store epoch failed"))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     // ── Basic dispatch record persistence ─────────────────────────
@@ -1332,6 +1410,39 @@ mod durable_dispatch_tests {
         assert_eq!(records[0].job_kind, JobKind::Scrub);
         assert_eq!(records[0].dispatch_id, dispatch_id);
         assert_eq!(records[0].state, DispatchState::InProgress);
+    }
+
+    #[test]
+    fn dispatch_store_init_errors_are_reported() {
+        let err = BackgroundScheduler::with_dispatch_store(
+            ServiceBudget::SMALL_TICK,
+            Box::new(FailingDispatchStore::load_epoch_error()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            DispatchStoreError::IoFailed("load epoch failed")
+        ));
+
+        let err = BackgroundScheduler::with_dispatch_store(
+            ServiceBudget::SMALL_TICK,
+            Box::new(FailingDispatchStore::store_epoch_error()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            DispatchStoreError::IoFailed("store epoch failed")
+        ));
+
+        let err = BackgroundScheduler::with_dispatch_store(
+            ServiceBudget::SMALL_TICK,
+            Box::new(FailingDispatchStore::load_records_error()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            DispatchStoreError::IoFailed("load records failed")
+        ));
     }
 
     #[test]
@@ -1560,7 +1671,8 @@ mod durable_dispatch_tests {
     #[test]
     fn epoch_persisted_across_store_reload() {
         let store = Box::new(InMemoryDispatchStore::new());
-        let mut s = BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, store);
+        let mut s =
+            BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, store).unwrap();
         s.advance_epoch().unwrap(); // epoch=1
         s.advance_epoch().unwrap(); // epoch=2
 
@@ -1660,7 +1772,7 @@ mod durable_dispatch_tests {
         assert_eq!(records[0].last_checkpoint, Some(cp));
     }
 
-    // ── Scheduler without store (backward compat) ─────────────────
+    // ── Scheduler without store ───────────────────────────────────
 
     #[test]
     fn scheduler_without_store_loads_no_records() {
@@ -1744,7 +1856,8 @@ mod durable_dispatch_tests {
         store.store_record(&old).unwrap();
 
         let mut s =
-            BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, Box::new(store));
+            BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, Box::new(store))
+                .unwrap();
         let id = s
             .register_incremental_job("new-scrub", MockJob::new(2, JobKind::Scrub, 10))
             .unwrap();
