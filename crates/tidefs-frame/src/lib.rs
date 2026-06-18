@@ -577,6 +577,15 @@ pub fn compress_extent(data: &[u8], policy: &CompressionPolicy) -> CompressedExt
 ///
 /// Returns an error when a zstd payload is corrupt.  LZ4 is reserved in
 /// phase 1 and treated as identity.
+pub fn decompress_extent(payload: &CompressedExtentPayload) -> Result<Vec<u8>> {
+    match payload.compression {
+        CompressionAlgorithm::Uncompressed => Ok(payload.compressed_data.clone()),
+        CompressionAlgorithm::Zstd => zstd::decode_all(payload.compressed_data.as_slice())
+            .map_err(|_| FrameError::ZstdDecompressionFailed),
+        // LZ4 reserved -- treat as uncompressed fallback in phase 1.
+        CompressionAlgorithm::Lz4 => Ok(payload.compressed_data.clone()),
+    }
+}
 
 /// Decompress a [`CompressedExtentPayload`] after verifying its transform
 /// header against the committed [`TransformVerification`] token.
@@ -590,16 +599,6 @@ pub fn decompress_extent_verified(
 ) -> Result<Vec<u8>> {
     token.verify(payload)?;
     decompress_extent(payload)
-}
-
-pub fn decompress_extent(payload: &CompressedExtentPayload) -> Result<Vec<u8>> {
-    match payload.compression {
-        CompressionAlgorithm::Uncompressed => Ok(payload.compressed_data.clone()),
-        CompressionAlgorithm::Zstd => zstd::decode_all(payload.compressed_data.as_slice())
-            .map_err(|_| FrameError::ZstdDecompressionFailed),
-        // LZ4 reserved -- treat as uncompressed fallback in phase 1.
-        CompressionAlgorithm::Lz4 => Ok(payload.compressed_data.clone()),
-    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
