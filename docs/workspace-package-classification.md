@@ -1,6 +1,6 @@
 # Workspace Package Classification
 
-Updated from current Cargo metadata and on-disk manifest discovery for issue #286 on 2026-06-15.
+Updated from current Cargo metadata and on-disk manifest discovery for issue #513 on 2026-06-18.
 This document is the package-role authority for TideFS workspace selection and TFR-002/TFR-019 reduction.
 It is enforced by `cargo run -p tidefs-xtask -- check-workspace-policy`.
 
