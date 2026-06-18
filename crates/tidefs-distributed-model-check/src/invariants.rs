@@ -2,6 +2,8 @@
 
 //! Distributed safety invariant checks.
 
+use std::collections::BTreeMap;
+
 use super::DistributedSystem;
 
 /// A single safety-invariant violation with a human-readable description.
@@ -14,7 +16,10 @@ pub struct DistributedInvariantViolation {
 impl DistributedInvariantViolation {
     #[must_use]
     pub fn new(invariant: &'static str, description: String) -> Self {
-        Self { invariant, description }
+        Self {
+            invariant,
+            description,
+        }
     }
 }
 
@@ -24,6 +29,7 @@ pub fn check_distributed_invariants(sys: &DistributedSystem) -> Vec<DistributedI
     let mut violations = Vec::new();
     violations.extend(no_conflicting_committed_writers(sys));
     violations.extend(no_stale_epoch_commit(sys));
+    violations.extend(no_active_lease_epoch_conflict(sys));
     violations.extend(no_false_quorum_success(sys));
     violations.extend(no_rebuild_before_receipt(sys));
     violations
@@ -32,7 +38,9 @@ pub fn check_distributed_invariants(sys: &DistributedSystem) -> Vec<DistributedI
 /// I-1: No two nodes may have committed writes for the same object
 /// in the same epoch from different writer nodes.
 #[must_use]
-pub fn no_conflicting_committed_writers(sys: &DistributedSystem) -> Vec<DistributedInvariantViolation> {
+pub fn no_conflicting_committed_writers(
+    sys: &DistributedSystem,
+) -> Vec<DistributedInvariantViolation> {
     let mut violations = Vec::new();
 
     for node in &sys.nodes {
@@ -51,9 +59,12 @@ pub fn no_conflicting_committed_writers(sys: &DistributedSystem) -> Vec<Distribu
                             format!(
                                 "conflict: node {} committed write_id {} on object {} epoch {}, \
                                  but node {} already committed write_id {} on same object/epoch",
-                                write.writer_node_id, write.write_id,
-                                write.object_key, write.epoch,
-                                ow.writer_node_id, ow.write_id,
+                                write.writer_node_id,
+                                write.write_id,
+                                write.object_key,
+                                write.epoch,
+                                ow.writer_node_id,
+                                ow.write_id,
                             ),
                         ));
                     }
@@ -81,8 +92,10 @@ pub fn no_stale_epoch_commit(sys: &DistributedSystem) -> Vec<DistributedInvarian
                     format!(
                         "node {} committed write_id {} on object {} at epoch {}, \
                          but current epoch is {}",
-                        node.node_id, write.write_id,
-                        write.object_key, write.epoch,
+                        node.node_id,
+                        write.write_id,
+                        write.object_key,
+                        write.epoch,
                         node.current_epoch,
                     ),
                 ));
@@ -95,15 +108,76 @@ pub fn no_stale_epoch_commit(sys: &DistributedSystem) -> Vec<DistributedInvarian
                     format!(
                         "node {} has committed quorum write_id {} on object {} at epoch {}, \
                          but current epoch is {}",
-                        node.node_id, qw.write_id,
-                        qw.object_key, qw.epoch,
-                        node.current_epoch,
+                        node.node_id, qw.write_id, qw.object_key, qw.epoch, node.current_epoch,
                     ),
                 ));
             }
         }
     }
 
+    violations
+}
+
+/// I-3: Active leases must not conflict for the same object/epoch, and
+/// must not remain active after the holder advances past the lease epoch.
+#[must_use]
+pub fn no_active_lease_epoch_conflict(
+    sys: &DistributedSystem,
+) -> Vec<DistributedInvariantViolation> {
+    let mut violations = Vec::new();
+    let mut active_leases = Vec::new();
+
+    for lease in &sys.lease_model.leases {
+        if lease.granted && !lease.revoked {
+            active_leases.push(lease);
+        }
+    }
+
+    for node in &sys.nodes {
+        for lease in &node.lease_grants {
+            if lease.granted && !lease.revoked {
+                active_leases.push(lease);
+            }
+        }
+    }
+
+    let mut holders_by_object_epoch: BTreeMap<(String, u64), u64> = BTreeMap::new();
+    for lease in active_leases {
+        let key = (lease.object_key.clone(), lease.epoch);
+        if let Some(existing_holder) = holders_by_object_epoch.get(&key) {
+            if *existing_holder != lease.holder {
+                violations.push(DistributedInvariantViolation::new(
+                    "no_active_lease_epoch_conflict",
+                    format!(
+                        "object {} epoch {} has active leases held by nodes {} and {}",
+                        lease.object_key, lease.epoch, existing_holder, lease.holder,
+                    ),
+                ));
+            }
+        } else {
+            holders_by_object_epoch.insert(key, lease.holder);
+        }
+
+        if let Some(holder) = sys.nodes.iter().find(|node| node.node_id == lease.holder) {
+            if lease.epoch < holder.current_epoch {
+                violations.push(DistributedInvariantViolation::new(
+                    "no_active_lease_epoch_conflict",
+                    format!(
+                        "node {} has active lease_id {} on object {} at epoch {}, \
+                         but current epoch is {}",
+                        lease.holder,
+                        lease.lease_id,
+                        lease.object_key,
+                        lease.epoch,
+                        holder.current_epoch,
+                    ),
+                ));
+            }
+        }
+    }
+
+    violations.sort_by(|a, b| a.description.cmp(&b.description));
+    violations.dedup_by(|a, b| a.description == b.description);
     violations
 }
 
@@ -121,9 +195,7 @@ pub fn no_false_quorum_success(sys: &DistributedSystem) -> Vec<DistributedInvari
                     format!(
                         "node {} quorum write_id {} on object {} is committed but has \
                          {} acks (need >= {})",
-                        node.node_id, qw.write_id,
-                        qw.object_key, qw.acks_received,
-                        qw.quorum_size,
+                        node.node_id, qw.write_id, qw.object_key, qw.acks_received, qw.quorum_size,
                     ),
                 ));
             }
@@ -137,8 +209,7 @@ pub fn no_false_quorum_success(sys: &DistributedSystem) -> Vec<DistributedInvari
                 format!(
                     "quorum model write_id {} on object {} is committed but has \
                      {} acks (need >= {})",
-                    qw.write_id, qw.object_key,
-                    qw.acks_received, qw.quorum_size,
+                    qw.write_id, qw.object_key, qw.acks_received, qw.quorum_size,
                 ),
             ));
         }

@@ -1,0 +1,59 @@
+{
+  "report_version": 1,
+  "generated_by": "tidefs-distributed-model-check::combined_safety_receipt-v1",
+  "evidence_class": "distributed-combined-safety-model",
+  "validation_tier": "bounded-model-only",
+  "evidence_scope": "bounded deterministic model-check evidence for epoch, lease, quorum, and placement safety invariants",
+  "runtime_boundary": "model evidence only; this does not validate storage-node runtime, transport, RDMA, production cluster, cluster CLI, or multi-process behavior",
+  "related_claim_ids": [],
+  "blocking_issues": [
+    "GitHub issue #538 owns this model-check receipt slice.",
+    "Runtime distributed evidence remains missing: no storage-node, transport, RDMA, production cluster, or multi-process runtime artifact is validated by this report."
+  ],
+  "bounds": {
+    "max_model_nodes": 7,
+    "max_model_epoch": 16,
+    "max_model_leases_per_node": 8,
+    "max_model_quorum_writes": 16,
+    "explored_nodes": 3,
+    "explored_steps": 2,
+    "epoch_advance_records": 3,
+    "active_lease_records": 2,
+    "quorum_write_records": 1,
+    "placement_receipt_records": 1,
+    "rebuild_attempts": 1,
+    "pending_network_messages": 0
+  },
+  "checked_invariants": [
+    {
+      "id": "no_stale_epoch_commit",
+      "family": "epoch",
+      "statement": "committed object writes and quorum writes must not be older than the observing node epoch"
+    },
+    {
+      "id": "no_active_lease_epoch_conflict",
+      "family": "lease",
+      "statement": "active leases must not conflict for the same object and epoch, and must not be older than the holder epoch"
+    },
+    {
+      "id": "no_false_quorum_success",
+      "family": "quorum",
+      "statement": "committed quorum writes must carry at least the declared quorum acknowledgements"
+    },
+    {
+      "id": "no_conflicting_committed_writers",
+      "family": "quorum",
+      "statement": "different writers must not commit the same object in the same epoch"
+    },
+    {
+      "id": "no_rebuild_before_receipt",
+      "family": "placement",
+      "statement": "rebuild and reclaim attempts require a prior durable placement receipt when the model policy requires one"
+    }
+  ],
+  "outcome": {
+    "passed": true,
+    "violation_count": 0,
+    "violations": []
+  }
+}
