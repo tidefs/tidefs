@@ -1205,7 +1205,7 @@ pub struct CompactionCycleReport {
     pub groups_planned: usize,
     /// Number of groups actually executed.
     pub groups_executed: usize,
-    /// Source segments freed in this cycle.
+    /// Source segments freed in this cycle after swap-manifest verification.
     pub segments_freed: usize,
     /// Objects relocated in this cycle.
     pub objects_relocated: u64,
@@ -1215,8 +1215,10 @@ pub struct CompactionCycleReport {
     pub bytes_reclaimed_estimate: u64,
     /// Whether the cycle was empty (no candidates found).
     pub cycle_empty: bool,
-    /// Whether the rewrite outcome verified successfully.
+    /// Whether the rewrite outcome and all committed swap manifests verified successfully.
     pub verification_passed: bool,
+    /// Structured swap-manifest verification failures for blocked releases.
+    pub swap_verification_errors: Vec<crate::verification::SwapVerificationError>,
 }
 
 impl CompactionCycleReport {
@@ -1275,22 +1277,28 @@ impl<S: CompactionStore> CompactionEngine<S> {
         let outcome = rewrite_engine.execute_plan(&plan);
 
         let groups_executed = outcome.groups.len();
-        let verification_passed = outcome.verify();
+        let outcome_verified = outcome.verify();
+        let mut commit_report = crate::rewrite_engine::RewriteCommitReport::default();
+        let mut commit_succeeded = outcome.is_empty;
 
         // Commit atomically.
-        if !outcome.is_empty
-            && verification_passed
-            && rewrite_engine.commit_outcome(&outcome).is_ok()
-        {
+        if !outcome.is_empty && outcome_verified {
+            if let Ok(report) = rewrite_engine.commit_outcome(&outcome) {
+                commit_succeeded = true;
+                commit_report = report;
+            }
+        }
+
+        if commit_succeeded && !commit_report.freed_segments.is_empty() {
             self.total_segments_freed = self
                 .total_segments_freed
-                .saturating_add(outcome.total_segments_freed as u64);
+                .saturating_add(commit_report.segments_freed() as u64);
             self.total_objects_relocated = self
                 .total_objects_relocated
-                .saturating_add(outcome.total_objects_relocated);
+                .saturating_add(commit_report.relocation_entries.len() as u64);
             self.total_bytes_relocated = self
                 .total_bytes_relocated
-                .saturating_add(outcome.total_bytes_written);
+                .saturating_add(commit_report.bytes_verified);
             self.total_bytes_reclaimed =
                 self.total_bytes_reclaimed.saturating_add(reclaim_estimate);
         }
@@ -1300,16 +1308,24 @@ impl<S: CompactionStore> CompactionEngine<S> {
 
         self.cycles_executed = self.cycles_executed.saturating_add(1);
 
+        let verification_passed = outcome_verified && commit_succeeded && commit_report.verified();
+        let bytes_reclaimed_estimate = if commit_report.freed_segments.is_empty() {
+            0
+        } else {
+            reclaim_estimate
+        };
+
         CompactionCycleReport {
             plans_generated: 1,
             groups_planned,
             groups_executed,
-            segments_freed: outcome.total_segments_freed,
-            objects_relocated: outcome.total_objects_relocated,
-            bytes_relocated: outcome.total_bytes_written,
-            bytes_reclaimed_estimate: reclaim_estimate,
+            segments_freed: commit_report.segments_freed(),
+            objects_relocated: commit_report.relocation_entries.len() as u64,
+            bytes_relocated: commit_report.bytes_verified,
+            bytes_reclaimed_estimate,
             cycle_empty: false,
             verification_passed,
+            swap_verification_errors: commit_report.verification_errors,
         }
     }
 
@@ -1729,6 +1745,8 @@ mod tests {
         read_failures: HashMap<[u8; 32], CompactionError>,
         /// Optional write failures: key -> error
         write_failures: HashMap<[u8; 32], CompactionError>,
+        /// Corrupt data during write_object to exercise manifest verification.
+        corrupt_writes: bool,
         /// Tracks where objects were written (new segment id)
         next_segment_id: u64,
     }
@@ -1741,6 +1759,7 @@ mod tests {
                 freed: Vec::new(),
                 read_failures: HashMap::new(),
                 write_failures: HashMap::new(),
+                corrupt_writes: false,
                 next_segment_id: 1000,
             }
         }
@@ -1781,7 +1800,11 @@ mod tests {
             if let Some(err) = self.write_failures.get(key) {
                 return Err(err.clone());
             }
-            self.objects.insert(*key, data.to_vec());
+            let mut stored = data.to_vec();
+            if self.corrupt_writes && !stored.is_empty() {
+                stored[0] ^= 0xFF;
+            }
+            self.objects.insert(*key, stored);
             let seg = self.next_segment_id;
             self.next_segment_id += 1;
             Ok(seg)
@@ -2217,6 +2240,36 @@ mod tests {
 
     fn make_seg_entry(seg_id: u64, live: u64, dead: u64) -> SegmentLivenessEntry {
         SegmentLivenessEntry::new(seg_id, live, dead)
+    }
+
+    #[test]
+    fn compaction_engine_manifest_failure_reports_no_release() {
+        let k1 = make_key(1);
+        let k2 = make_key(2);
+        let mut store = MockCompactionStore::new();
+        store.add_segment_with_objects(10, &[(k1, 64)]);
+        store.add_segment_with_objects(20, &[(k2, 64)]);
+        store.corrupt_writes = true;
+
+        let entries = vec![
+            SegmentLivenessEntry::new(10, 30_000, 70_000),
+            SegmentLivenessEntry::new(20, 30_000, 70_000),
+        ];
+        let mut engine = CompactionEngine::new(store, CompactionConfig::default());
+
+        let report = engine.run_cycle(&entries);
+        assert_eq!(report.segments_freed, 0);
+        assert_eq!(report.objects_relocated, 0);
+        assert_eq!(report.bytes_reclaimed_estimate, 0);
+        assert!(!report.verification_passed);
+        assert!(report.swap_verification_errors.iter().any(|err| matches!(
+            err,
+            crate::verification::SwapVerificationError::DigestMismatch { .. }
+        )));
+        assert_eq!(engine.total_segments_freed, 0);
+
+        let store = engine.into_store();
+        assert!(store.freed.is_empty());
     }
 
     #[test]
