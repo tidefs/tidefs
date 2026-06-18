@@ -2063,6 +2063,7 @@ name = "tidefs-block-allocator"
 version = "0.421.0"
 dependencies = [
  "proptest",
+ "tidefs-commit_group",
  "tidefs-spacemap-allocator",
  "tidefs-types-vfs-core",
 ]
