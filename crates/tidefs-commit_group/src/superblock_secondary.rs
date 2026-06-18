@@ -454,6 +454,13 @@ fn read_secondary_copy_validated<S: CommitGroupStore>(
         ));
     }
 
+    if block.commit_group_id != commit_group_id {
+        return Err(SuperblockReadError::SecondaryPayloadCorrupt(format!(
+            "commit group mismatch: expected {commit_group_id}, found {}",
+            block.commit_group_id
+        )));
+    }
+
     Ok(Some(block))
 }
 
@@ -1129,6 +1136,33 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn secondary_payload_commit_group_mismatch_direct() {
+        let mut store = TestStore::new();
+        let block = CommittedRootBlock::new(CommitGroupId(2), 10, 20, 30, 40);
+        let sealed = CommitGroupWriter::seal_root_block(block);
+
+        let content = sealed.to_bytes();
+        let mut header = SuperblockSecondaryHeader::new(1);
+        header.seal(&content);
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&header.to_bytes());
+        combined.extend_from_slice(&content);
+        store
+            .data
+            .insert(secondary_key_name(CommitGroupId(1)), combined);
+
+        let result = read_secondary_copy_validated(&store, CommitGroupId(1), 0);
+        match result {
+            Err(SuperblockReadError::SecondaryPayloadCorrupt(msg)) => {
+                assert!(msg.contains("expected commit_group-1"));
+                assert!(msg.contains("found commit_group-2"));
+            }
+            other => panic!("expected SecondaryPayloadCorrupt, got {other:?}"),
+        }
+    }
+
     // ------------------------------------------------------------------
     // Primary-valid / secondary-invalid: fail closed
     // ------------------------------------------------------------------
@@ -1171,6 +1205,33 @@ mod tests {
         assert!(matches!(
             result,
             Err(SuperblockReadError::SecondaryChecksumMismatch)
+        ));
+    }
+
+    #[test]
+    fn primary_valid_secondary_commit_group_mismatch_fails_closed() {
+        let mut store = TestStore::new();
+        let primary = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 30, 40);
+        let sealed_primary = CommitGroupWriter::seal_root_block(primary);
+        write_primary(&mut store, &sealed_primary);
+
+        let secondary = CommittedRootBlock::new(CommitGroupId(2), 50, 60, 70, 80);
+        let sealed_secondary = CommitGroupWriter::seal_root_block(secondary);
+        let content = sealed_secondary.to_bytes();
+        let mut header = SuperblockSecondaryHeader::new(1);
+        header.seal(&content);
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&header.to_bytes());
+        combined.extend_from_slice(&content);
+        store
+            .data
+            .insert(secondary_key_name(CommitGroupId(1)), combined);
+
+        let result = read_superblock_with_fallback(&store, CommitGroupId(1), 0);
+        assert!(matches!(
+            result,
+            Err(SuperblockReadError::SecondaryPayloadCorrupt(_))
         ));
     }
 
