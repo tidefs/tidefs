@@ -34,6 +34,54 @@ registered claim as validated evidence. Planned, blocked, and invalid claims
 fail closed; validated claims also fail closed when required evidence artifacts
 are missing or older than `validation/claims.toml`.
 
+## Validation Tier Evidence Map
+
+The nextgen program authority is
+`docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`. This policy document
+is the claims-facing reference for mapping the validation tiers implemented by
+`tidefs-validation` to the evidence classes required by
+`validation/claims.toml`.
+
+The rule is intentionally conservative: the claim registry names the required
+evidence classes, while the validation tier describes where the artifact came
+from. A tier does not substitute for a missing evidence class. Lower-tier
+evidence may diagnose, reproduce, narrow, or motivate a higher-tier claim, but
+it cannot validate that higher-tier claim. For example, a `source-model`
+crash matrix may satisfy `model-crash-matrix`, but it cannot satisfy
+`runtime-crash-oracle`; a `qemu-guest` uBLK smoke artifact may diagnose block
+runtime behavior, but it cannot close distributed or RDMA evidence classes.
+
+Use the smallest tier whose artifact source and scope match the claim:
+
+| Tier labels | Artifact source and examples | Evidence classes this tier can satisfy |
+| --- | --- | --- |
+| `source-model` | Deterministic models, schemas, static manifests, and bounded proof outputs. Examples include `validation/artifacts/crash-oracle/model-crash-matrices.json`, `validation/artifacts/ublk/qid-tag-state-model.json`, and model-scoped teardown artifacts. | Model-only or source-model classes such as `model-crash-matrix`, `qid-tag-state-model`, `kernel-context-token-model`, or other registry classes whose scope is explicitly model-only. |
+| `cargo-unit` | Focused crate tests, parser/schema/golden-vector checks, registry loaders, and source/registry review helpers run without a mounted product path. | Source, registry, codec, manifest, and helper-tool evidence classes whose required scope is source review or unit-level behavior. |
+| `harness-only` | Offline harnesses and simulations that do not mount FUSE, start a uBLK export, load a TideFS kernel module, or run a distributed transport. | Harness/model evidence classes such as admission-budget or isolation-model artifacts when the claim explicitly asks for harness-level evidence. |
+| `mounted-userspace` | A live mounted userspace path, normally a FUSE or userspace owner harness artifact with command, commit, backend, and output. | Runtime evidence classes for mounted local userspace behavior, such as `runtime-crash-oracle`, `runtime-namespace-crash-artifact`, or mounted performance artifacts when the artifact scope matches the claim. |
+| `qemu-guest` | Runtime evidence collected inside a QEMU guest, including focused uBLK or mounted userspace rows. | QEMU-scoped runtime evidence classes. For uBLK claims, examples include `runtime-ublk-completion-artifact` and `runtime-ublk-started-export-admission-artifact` when the artifact came from the relevant qemu-ublk workflow and verifier. |
+| `kbuild` | Kernel build evidence only. | Kernel source/build classes and review evidence that require compilation, but not mounted kernel runtime behavior. |
+| `qemu-module-load` | QEMU evidence that the kernel module can load and expose the expected control surface. | Module-load evidence classes. This tier does not satisfy mounted kernel VFS, block I/O, or full-kernel no-daemon classes by itself. |
+| `mounted-kernel-vfs` | Mounted kernel VFS runtime rows, usually from QEMU/kernel workflows with artifact output. | Runtime kernel VFS evidence classes whose claim scope is the mounted kernel filesystem path. |
+| `kernel-block-io` | Kernel block-device I/O runtime rows, including uBLK/kernel block interaction when the artifact scope names that path. | Runtime kernel block I/O evidence classes whose claim scope is block-device behavior. |
+| `full-kernel-no-daemon` | Mounted operation through the kernel-resident no-daemon path. | Full-kernel no-daemon evidence classes only when the artifact proves the specific claim scope. |
+| `multi-process-distributed` | Multi-process transport, cluster, or RDMA runtime rows with captured commands, topology, backend, and outputs. | Distributed or RDMA runtime evidence classes when the claim explicitly requires that class and the artifact scope matches the topology and transport. |
+
+`claims-gate-review` is an evidence class, not a runtime tier. A
+claims-gate review artifact may be produced by source/registry review and
+should document which model, source, runtime, or distributed artifacts were
+reviewed, which claim ids are covered, and which stronger classes remain
+missing. It can satisfy a `claims-gate-review` requirement, but it cannot
+replace the other required classes in `validation/claims.toml`.
+
+When choosing GitHub Actions validation, dispatch the smallest workflow that
+can produce the missing evidence class. Source and registry slices normally
+need only `git diff --check`, docs review, and a focused Rust workflow when a
+crate/tool changed. Mounted userspace, QEMU, kernel, uBLK, xfstests,
+distributed, and RDMA claims need the corresponding runtime workflow artifact.
+Model-only evidence must remain model-only in claim receipts and product
+wording until the required runtime class and claims-gate review both exist.
+
 ## Claims rule
 
 Current capability wording is blocked for these claim families unless the same
