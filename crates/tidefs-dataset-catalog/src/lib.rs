@@ -50,8 +50,8 @@
 //! tests alone. Mounted validation must involve the pool-level
 //! persistence path.
 
-use core::fmt;
 use blake3::Hasher;
+use core::fmt;
 use tidefs_binary_schema_checksum::blake3_domain_digest;
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
 use tidefs_btree::BPlusTree;
@@ -391,9 +391,7 @@ impl fmt::Display for CatalogError {
             CatalogError::CorruptEncoding => {
                 f.write_str("catalog encoding is corrupt or checksum mismatch")
             }
-            CatalogError::LineageCycle => {
-                f.write_str("clone or snapshot lineage contains a cycle")
-            }
+            CatalogError::LineageCycle => f.write_str("clone or snapshot lineage contains a cycle"),
             CatalogError::LineageParentNotFound => {
                 f.write_str("lineage parent dataset not found in catalog")
             }
@@ -403,9 +401,7 @@ impl fmt::Display for CatalogError {
             CatalogError::LineageDuplicateEdge => {
                 f.write_str("duplicate edge in clone or snapshot lineage")
             }
-            CatalogError::NotPublished => {
-                f.write_str("dataset root has not been published")
-            }
+            CatalogError::NotPublished => f.write_str("dataset root has not been published"),
             CatalogError::AlreadyPublished => {
                 f.write_str("dataset root has already been published")
             }
@@ -1019,12 +1015,15 @@ impl DatasetCatalog {
             .ok_or(CatalogError::NotFound)?;
 
         // Only snapshots and clones can have lineage parents.
-        if entry.dataset_type != DatasetType::Snapshot
-            && !entry.flags.contains(DatasetFlags::CLONE)
+        if entry.dataset_type != DatasetType::Snapshot && !entry.flags.contains(DatasetFlags::CLONE)
         {
             return Err(CatalogError::LineageNotSupported);
         }
         if entry.published {
+            return Err(CatalogError::AlreadyPublished);
+        }
+        let dataset_id = entry.dataset_id;
+        if self.published_lineage_references(dataset_id)? {
             return Err(CatalogError::AlreadyPublished);
         }
 
@@ -1253,6 +1252,42 @@ impl DatasetCatalog {
         let mut digest = [0u8; 32];
         digest.copy_from_slice(hasher.finalize().as_bytes().as_ref());
         Ok(digest)
+    }
+
+    /// Return whether an already-published root depends on `dataset_id`.
+    fn published_lineage_references(&self, dataset_id: DatasetId) -> Result<bool, CatalogError> {
+        for (_path, entry) in self.tree.entries() {
+            if !entry.published {
+                continue;
+            }
+
+            let mut visited: Vec<DatasetId> = Vec::new();
+            let mut current_parent = entry.lineage_parent_id;
+            while let Some(parent_id) = current_parent {
+                if parent_id == dataset_id {
+                    return Ok(true);
+                }
+                if visited.last() == Some(&parent_id) {
+                    return Err(CatalogError::LineageDuplicateEdge);
+                }
+                if visited.contains(&parent_id) {
+                    return Err(CatalogError::LineageCycle);
+                }
+
+                let parent_entry = self
+                    .tree
+                    .entries()
+                    .into_iter()
+                    .find(|(_, e)| e.dataset_id == parent_id)
+                    .map(|(_, e)| e)
+                    .ok_or(CatalogError::LineageParentNotFound)?;
+
+                visited.push(parent_id);
+                current_parent = parent_entry.lineage_parent_id;
+            }
+        }
+
+        Ok(false)
     }
 
     // ------------------------------------------------------------------
@@ -1495,9 +1530,7 @@ impl DatasetCatalog {
                 if offset + 16 > payload.len() {
                     return Err(CatalogError::CorruptEncoding);
                 }
-                let lpid = DatasetId::from_bytes(
-                    payload[offset..offset + 16].try_into().unwrap(),
-                );
+                let lpid = DatasetId::from_bytes(payload[offset..offset + 16].try_into().unwrap());
                 offset += 16;
                 Some(lpid)
             } else {
@@ -1515,8 +1548,7 @@ impl DatasetCatalog {
             if offset + 32 > payload.len() {
                 return Err(CatalogError::CorruptEncoding);
             }
-            let lineage_summary: [u8; 32] =
-                payload[offset..offset + 32].try_into().unwrap();
+            let lineage_summary: [u8; 32] = payload[offset..offset + 32].try_into().unwrap();
             offset += 32;
 
             // Properties blob
@@ -3897,12 +3929,7 @@ mod tests {
     // Lineage validation tests
     // ------------------------------------------------------------------
 
-    fn make_snap(
-        cat: &mut DatasetCatalog,
-        path: &str,
-        id_n: u8,
-        lineage_parent_id: DatasetId,
-    ) {
+    fn make_snap(cat: &mut DatasetCatalog, path: &str, id_n: u8, lineage_parent_id: DatasetId) {
         cat.create(
             path,
             did(id_n),
@@ -3916,12 +3943,7 @@ mod tests {
         cat.set_lineage_parent(path, lineage_parent_id).unwrap();
     }
 
-    fn make_clone(
-        cat: &mut DatasetCatalog,
-        path: &str,
-        id_n: u8,
-        lineage_parent_id: DatasetId,
-    ) {
+    fn make_clone(cat: &mut DatasetCatalog, path: &str, id_n: u8, lineage_parent_id: DatasetId) {
         cat.create(
             path,
             did(id_n),
@@ -4087,8 +4109,7 @@ mod tests {
         )
         .unwrap();
         // did(99) does not exist in catalog
-        cat.set_lineage_parent("pool/fs1@snap2", did(99))
-            .unwrap();
+        cat.set_lineage_parent("pool/fs1@snap2", did(99)).unwrap();
 
         assert_eq!(
             cat.publish_root("pool/fs1@snap2"),
@@ -4116,8 +4137,7 @@ mod tests {
         )
         .unwrap();
         // did(99) does not exist, and snap3 -> did(99) -> ... is missing
-        cat.set_lineage_parent("pool/fs1@snap3", did(99))
-            .unwrap();
+        cat.set_lineage_parent("pool/fs1@snap3", did(99)).unwrap();
 
         assert_eq!(
             cat.publish_root("pool/fs1@snap3"),
@@ -4260,6 +4280,25 @@ mod tests {
         assert_eq!(cat.lineage_summary("pool/fs1@snap1").unwrap(), summary);
     }
 
+    #[test]
+    fn set_lineage_parent_rejects_published_descendant_ancestor_rewrite() {
+        let mut cat = DatasetCatalog::new();
+        make_filesystem(&mut cat, "pool", 0);
+        make_filesystem(&mut cat, "pool/fs1", 1);
+        make_snap(&mut cat, "pool/fs1@snap1", 10, did(1));
+        make_snap(&mut cat, "pool/fs1@snap2", 11, did(10));
+
+        cat.publish_root("pool/fs1@snap2").unwrap();
+        let summary = cat.lineage_summary("pool/fs1@snap2").unwrap();
+
+        assert!(!cat.is_published("pool/fs1@snap1").unwrap());
+        assert_eq!(
+            cat.set_lineage_parent("pool/fs1@snap1", did(0)),
+            Err(CatalogError::AlreadyPublished)
+        );
+        assert_eq!(cat.lineage_summary("pool/fs1@snap2").unwrap(), summary);
+    }
+
     // --- lineage_summary pre-publish -----------------------------------------
 
     #[test]
@@ -4372,10 +4411,7 @@ mod tests {
     #[test]
     fn is_published_returns_not_found_for_missing() {
         let cat = DatasetCatalog::new();
-        assert_eq!(
-            cat.is_published("nonexistent"),
-            Err(CatalogError::NotFound)
-        );
+        assert_eq!(cat.is_published("nonexistent"), Err(CatalogError::NotFound));
     }
 
     // --- CatalogError Display for new variants --------------------------------
