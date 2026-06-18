@@ -79,9 +79,8 @@ use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
 use tidefs_types_incremental_job_core::{
-    Checkpoint, DispatchRecord, DispatchRecordId, IncrementalJob, JobError, JobId,
-    JobKind, JobProgress, SchedulerEpoch, ServiceCheckpoint, ServiceState, StepResult,
-    WorkBudget,
+    Checkpoint, DispatchRecord, DispatchRecordId, IncrementalJob, JobError, JobId, JobKind,
+    JobProgress, SchedulerEpoch, ServiceCheckpoint, ServiceState, StepResult, WorkBudget,
 };
 
 use tidefs_incremental_job_core::{DispatchStore, DispatchStoreError};
@@ -537,6 +536,22 @@ pub trait BackgroundService: Send {
     /// Whether this service has pending work. Used by the scheduler to
     /// skip idle services.
     fn has_work(&self) -> bool;
+
+    /// Stable job identity for durable dispatch tracking.
+    ///
+    /// Services that wrap an [`IncrementalJob`] return the job identity so
+    /// `BackgroundScheduler` can persist a dispatch record before execution.
+    fn dispatch_identity(&self) -> Option<(JobId, JobKind)> {
+        None
+    }
+
+    /// Latest checkpoint available after a successful tick.
+    ///
+    /// Durable dispatch records store this checkpoint so restart replay can
+    /// resume from the last committed position.
+    fn dispatch_checkpoint(&self) -> Option<Checkpoint> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +665,14 @@ impl<J: IncrementalJob + Send> BackgroundService for IncrementalJobAdapter<J> {
 
     fn has_work(&self) -> bool {
         !self.last_was_complete
+    }
+
+    fn dispatch_identity(&self) -> Option<(JobId, JobKind)> {
+        Some((self.job.job_id(), self.job.job_kind()))
+    }
+
+    fn dispatch_checkpoint(&self) -> Option<Checkpoint> {
+        Some(self.job.persist_checkpoint())
     }
 }
 
@@ -773,6 +796,7 @@ impl fmt::Display for CycleReport {
 pub struct BackgroundScheduler {
     work_queue: crate::scheduling::WorkItemQueue,
     services: Vec<Box<dyn BackgroundService>>,
+    service_dispatch_ids: Vec<Option<DispatchRecordId>>,
     global_budget: ServiceBudget,
     cursors: [usize; 5],
     stats: SchedulerStats,
@@ -800,6 +824,7 @@ impl BackgroundScheduler {
     pub fn new(global_budget: ServiceBudget) -> Self {
         Self {
             services: Vec::new(),
+            service_dispatch_ids: Vec::new(),
             work_queue: crate::scheduling::WorkItemQueue::new_default(),
             global_budget,
             cursors: [0; 5],
@@ -814,6 +839,7 @@ impl BackgroundScheduler {
     /// Register a service.
     pub fn register(&mut self, service: Box<dyn BackgroundService>) {
         self.services.push(service);
+        self.service_dispatch_ids.push(None);
     }
 
     /// Attach a demand-preemption signal.
@@ -842,6 +868,7 @@ impl BackgroundScheduler {
     /// Used by `MultiThreadedScheduler` for work stealing between cores.
     #[must_use]
     pub fn take_last_service(&mut self) -> Option<Box<dyn BackgroundService>> {
+        self.service_dispatch_ids.pop();
         self.services.pop()
     }
 
@@ -877,6 +904,32 @@ impl BackgroundScheduler {
     #[must_use]
     pub fn work_queued(&self) -> usize {
         self.work_queue.total_queued()
+    }
+
+    fn record_dispatched_tick(
+        &mut self,
+        dispatch_id: Option<DispatchRecordId>,
+        checkpoint: Option<Checkpoint>,
+        completed: bool,
+    ) -> Result<(), DispatchStoreError> {
+        let Some(dispatch_id) = dispatch_id else {
+            return Ok(());
+        };
+        let Some(store) = self.dispatch_store.as_mut() else {
+            return Ok(());
+        };
+        let mut record = store
+            .load_record(dispatch_id)?
+            .ok_or(DispatchStoreError::NotFound(dispatch_id))?;
+        if let Some(checkpoint) = checkpoint {
+            record.update_checkpoint(checkpoint);
+        }
+        if completed {
+            record.mark_completed();
+        } else {
+            record.mark_in_progress();
+        }
+        store.update_record(&record)
     }
 
     pub fn run_cycle(&mut self) -> CycleReport {
@@ -921,9 +974,39 @@ impl BackgroundScheduler {
                     break;
                 }
 
-                let svc = &mut self.services[idx];
-                match svc.tick(&per_service_budget) {
+                let (svc_name, dispatch_id, tick_result, checkpoint, service_has_work) = {
+                    let svc = &mut self.services[idx];
+                    let dispatch_id = self.service_dispatch_ids[idx];
+                    let svc_name = svc.name();
+                    let tick_result = svc.tick(&per_service_budget);
+                    let checkpoint = if tick_result.is_ok() {
+                        svc.dispatch_checkpoint()
+                    } else {
+                        None
+                    };
+                    let service_has_work = svc.has_work();
+                    (
+                        svc_name,
+                        dispatch_id,
+                        tick_result,
+                        checkpoint,
+                        service_has_work,
+                    )
+                };
+
+                match tick_result {
                     Ok(tick_report) => {
+                        let mut tick_report = tick_report;
+                        if self
+                            .record_dispatched_tick(
+                                dispatch_id,
+                                checkpoint,
+                                !tick_report.has_more || !service_has_work,
+                            )
+                            .is_err()
+                        {
+                            tick_report.errors = tick_report.errors.saturating_add(1);
+                        }
                         remaining_budget.subtract_consumed(
                             tick_report.items_consumed,
                             tick_report.bytes_consumed,
@@ -933,7 +1016,7 @@ impl BackgroundScheduler {
                         report.total_processed += tick_report.processed;
                         report.total_skipped += tick_report.skipped;
                         report.total_errors += tick_report.errors;
-                        report.push(svc.name(), tick_report);
+                        report.push(svc_name, tick_report);
                         last_index = idx;
                     }
                     Err(_e) => {
@@ -1019,15 +1102,24 @@ impl BackgroundScheduler {
     #[must_use]
     pub fn with_dispatch_store(
         global_budget: ServiceBudget,
-        store: Box<dyn DispatchStore>,
+        mut store: Box<dyn DispatchStore>,
     ) -> Self {
-        let epoch = store
-            .load_epoch()
+        let epoch = match store.load_epoch().ok().flatten() {
+            Some(epoch) => epoch,
+            None => {
+                let _ = store.store_epoch(SchedulerEpoch::INITIAL);
+                SchedulerEpoch::INITIAL
+            }
+        };
+        let next_dispatch_id = store
+            .load_records()
             .ok()
-            .flatten()
-            .unwrap_or(SchedulerEpoch::INITIAL);
+            .and_then(|records| records.iter().map(|r| r.dispatch_id.0).max())
+            .map(|max_id| DispatchRecordId(max_id.saturating_add(1)))
+            .unwrap_or(DispatchRecordId(0));
         Self {
             services: Vec::new(),
+            service_dispatch_ids: Vec::new(),
             work_queue: crate::scheduling::WorkItemQueue::new_default(),
             global_budget,
             cursors: [0; 5],
@@ -1035,7 +1127,7 @@ impl BackgroundScheduler {
             stats: SchedulerStats::default(),
             dispatch_store: Some(store),
             epoch,
-            next_dispatch_id: DispatchRecordId(0),
+            next_dispatch_id,
         }
     }
 
@@ -1044,13 +1136,40 @@ impl BackgroundScheduler {
     /// Returns records that were `Pending` or `InProgress` at the time of
     /// the last shutdown/crash. The caller should recreate jobs from these
     /// records and re-register them.
-    pub fn load_resumable_records(
-        &self,
-    ) -> Result<Vec<DispatchRecord>, DispatchStoreError> {
+    pub fn load_resumable_records(&self) -> Result<Vec<DispatchRecord>, DispatchStoreError> {
         match &self.dispatch_store {
             Some(store) => store.load_resumable(),
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Load one dispatch record by id.
+    pub fn load_dispatch_record(
+        &self,
+        dispatch_id: DispatchRecordId,
+    ) -> Result<Option<DispatchRecord>, DispatchStoreError> {
+        match &self.dispatch_store {
+            Some(store) => store.load_record(dispatch_id),
+            None => Ok(None),
+        }
+    }
+
+    /// Register an [`IncrementalJob`] service and persist its dispatch record.
+    pub fn register_incremental_job<J>(
+        &mut self,
+        name: &'static str,
+        job: J,
+    ) -> Result<DispatchRecordId, DispatchStoreError>
+    where
+        J: IncrementalJob + Send + 'static,
+    {
+        let job_id = job.job_id();
+        let job_kind = job.job_kind();
+        self.register_dispatched(
+            Box::new(IncrementalJobAdapter::new(name, job)),
+            job_id,
+            job_kind,
+        )
     }
 
     /// Register a service and persist its dispatch record.
@@ -1067,6 +1186,12 @@ impl BackgroundScheduler {
         job_id: JobId,
         job_kind: JobKind,
     ) -> Result<DispatchRecordId, DispatchStoreError> {
+        if let Some(ref store) = self.dispatch_store {
+            if let Some(existing) = store.load_record_by_identity(job_id, job_kind, self.epoch)? {
+                return Err(DispatchStoreError::DuplicateDispatch(existing.dispatch_id));
+            }
+        }
+
         let dispatch_id = self.next_dispatch_id;
         self.next_dispatch_id = DispatchRecordId(dispatch_id.0 + 1);
 
@@ -1084,6 +1209,7 @@ impl BackgroundScheduler {
         }
 
         self.services.push(service);
+        self.service_dispatch_ids.push(Some(dispatch_id));
         Ok(dispatch_id)
     }
 
@@ -1098,9 +1224,7 @@ impl BackgroundScheduler {
         if let Some(ref mut store) = self.dispatch_store {
             let mut record = store
                 .load_record(dispatch_id)?
-                .ok_or(DispatchStoreError::NotFound(
-                    dispatch_id,
-                ))?;
+                .ok_or(DispatchStoreError::NotFound(dispatch_id))?;
             record.mark_completed();
             store.update_record(&record)?;
         }
@@ -1117,9 +1241,7 @@ impl BackgroundScheduler {
         if let Some(ref mut store) = self.dispatch_store {
             let mut record = store
                 .load_record(dispatch_id)?
-                .ok_or(DispatchStoreError::NotFound(
-                    dispatch_id,
-                ))?;
+                .ok_or(DispatchStoreError::NotFound(dispatch_id))?;
             record.mark_cancelled();
             store.update_record(&record)?;
         }
@@ -1135,9 +1257,7 @@ impl BackgroundScheduler {
         if let Some(ref mut store) = self.dispatch_store {
             let mut record = store
                 .load_record(dispatch_id)?
-                .ok_or(DispatchStoreError::NotFound(
-                    dispatch_id,
-                ))?;
+                .ok_or(DispatchStoreError::NotFound(dispatch_id))?;
             record.update_checkpoint(checkpoint);
             store.update_record(&record)?;
         }
@@ -1175,6 +1295,20 @@ impl BackgroundScheduler {
                 let existing = store.load_record(dispatch_id)?;
                 Ok(existing.is_some())
             }
+            None => Ok(false),
+        }
+    }
+
+    /// Return true if the current epoch already has a dispatch for a job identity.
+    pub fn is_duplicate_job_dispatch(
+        &self,
+        job_id: JobId,
+        job_kind: JobKind,
+    ) -> Result<bool, DispatchStoreError> {
+        match &self.dispatch_store {
+            Some(store) => Ok(store
+                .load_record_by_identity(job_id, job_kind, self.epoch)?
+                .is_some()),
             None => Ok(false),
         }
     }

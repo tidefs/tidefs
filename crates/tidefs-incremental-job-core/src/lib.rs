@@ -80,8 +80,8 @@
 extern crate alloc;
 
 use tidefs_types_incremental_job_core::{
-    Checkpoint, DispatchRecord, DispatchRecordId, DispatchState, JobError, JobId,
-    JobKind, SchedulerEpoch, StepResult, WorkBudget,
+    Checkpoint, DispatchRecord, DispatchRecordId, DispatchState, JobError, JobId, JobKind,
+    SchedulerEpoch, StepResult, WorkBudget,
 };
 
 // ---------------------------------------------------------------------------
@@ -638,7 +638,7 @@ pub enum DispatchStoreError {
     IoFailed(&'static str),
     /// Record not found.
     NotFound(DispatchRecordId),
-    /// Duplicate dispatch detected (same id already exists).
+    /// Duplicate dispatch detected (same dispatch id or job identity already exists).
     DuplicateDispatch(DispatchRecordId),
     /// Record in unexpected state for the requested operation.
     InvalidState {
@@ -687,7 +687,8 @@ pub trait DispatchStore: Send {
     /// Persist a new dispatch record.
     ///
     /// Must fail with [`DuplicateDispatch`](DispatchStoreError::DuplicateDispatch)
-    /// if a record with the same [`DispatchRecordId`] already exists.
+    /// if a record with the same [`DispatchRecordId`] or logical
+    /// `(JobId, JobKind, SchedulerEpoch)` identity already exists.
     fn store_record(&mut self, record: &DispatchRecord) -> Result<(), DispatchStoreError>;
 
     /// Update an existing dispatch record (state change, checkpoint update).
@@ -699,11 +700,27 @@ pub trait DispatchStore: Send {
     /// Load all dispatch records whose state is `Pending` or `InProgress`.
     fn load_resumable(&self) -> Result<Vec<DispatchRecord>, DispatchStoreError>;
 
+    /// Load all persisted dispatch records, including terminal records.
+    fn load_records(&self) -> Result<Vec<DispatchRecord>, DispatchStoreError>;
+
     /// Load a single dispatch record by id.
     fn load_record(
         &self,
         dispatch_id: DispatchRecordId,
     ) -> Result<Option<DispatchRecord>, DispatchStoreError>;
+
+    /// Load a dispatch record by its logical scheduler identity.
+    fn load_record_by_identity(
+        &self,
+        job_id: JobId,
+        job_kind: JobKind,
+        epoch: SchedulerEpoch,
+    ) -> Result<Option<DispatchRecord>, DispatchStoreError> {
+        Ok(self
+            .load_records()?
+            .into_iter()
+            .find(|r| r.job_id == job_id && r.job_kind == job_kind && r.epoch == epoch))
+    }
 
     /// Load the persisted scheduler epoch.
     ///
@@ -742,13 +759,17 @@ impl InMemoryDispatchStore {
 
 impl DispatchStore for InMemoryDispatchStore {
     fn store_record(&mut self, record: &DispatchRecord) -> Result<(), DispatchStoreError> {
-        // Check for duplicate
         if self
             .records
             .iter()
             .any(|r| r.dispatch_id == record.dispatch_id)
         {
             return Err(DispatchStoreError::DuplicateDispatch(record.dispatch_id));
+        }
+        if let Some(existing) = self.records.iter().find(|r| {
+            r.job_id == record.job_id && r.job_kind == record.job_kind && r.epoch == record.epoch
+        }) {
+            return Err(DispatchStoreError::DuplicateDispatch(existing.dispatch_id));
         }
         self.records.push(record.clone());
         Ok(())
@@ -771,6 +792,10 @@ impl DispatchStore for InMemoryDispatchStore {
             .filter(|r| r.can_resume())
             .cloned()
             .collect())
+    }
+
+    fn load_records(&self) -> Result<Vec<DispatchRecord>, DispatchStoreError> {
+        Ok(self.records.clone())
     }
 
     fn load_record(
@@ -1242,7 +1267,35 @@ mod tests {
         );
         store.store_record(&rec).unwrap();
         let err = store.store_record(&rec).unwrap_err();
-        assert!(matches!(err, DispatchStoreError::DuplicateDispatch(DispatchRecordId(5))));
+        assert!(matches!(
+            err,
+            DispatchStoreError::DuplicateDispatch(DispatchRecordId(5))
+        ));
+    }
+
+    #[test]
+    fn duplicate_job_identity_rejected() {
+        let mut store = InMemoryDispatchStore::new();
+        let rec = DispatchRecord::new(
+            JobId(2),
+            JobKind::DeferredCleanup,
+            SchedulerEpoch(1),
+            DispatchRecordId(5),
+            0,
+        );
+        let duplicate_identity = DispatchRecord::new(
+            JobId(2),
+            JobKind::DeferredCleanup,
+            SchedulerEpoch(1),
+            DispatchRecordId(6),
+            0,
+        );
+        store.store_record(&rec).unwrap();
+        let err = store.store_record(&duplicate_identity).unwrap_err();
+        assert!(matches!(
+            err,
+            DispatchStoreError::DuplicateDispatch(DispatchRecordId(5))
+        ));
     }
 
     #[test]
@@ -1297,6 +1350,43 @@ mod tests {
     }
 
     #[test]
+    fn load_records_includes_terminal_records() {
+        let mut store = InMemoryDispatchStore::new();
+        let mut completed = DispatchRecord::new(
+            JobId(1),
+            JobKind::Scrub,
+            SchedulerEpoch(0),
+            DispatchRecordId(1),
+            0,
+        );
+        completed.mark_completed();
+        store.store_record(&completed).unwrap();
+
+        let records = store.load_records().unwrap();
+        assert_eq!(records, vec![completed]);
+        assert!(store.load_resumable().unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_record_by_identity_finds_terminal_record() {
+        let mut store = InMemoryDispatchStore::new();
+        let mut completed = DispatchRecord::new(
+            JobId(8),
+            JobKind::BtreeCompaction,
+            SchedulerEpoch(2),
+            DispatchRecordId(12),
+            0,
+        );
+        completed.mark_completed();
+        store.store_record(&completed).unwrap();
+
+        let loaded = store
+            .load_record_by_identity(JobId(8), JobKind::BtreeCompaction, SchedulerEpoch(2))
+            .unwrap();
+        assert_eq!(loaded, Some(completed));
+    }
+
+    #[test]
     fn update_record_modifies_state() {
         let mut store = InMemoryDispatchStore::new();
         let mut rec = DispatchRecord::new(
@@ -1330,7 +1420,10 @@ mod tests {
             0,
         );
         let err = store.update_record(&rec).unwrap_err();
-        assert!(matches!(err, DispatchStoreError::NotFound(DispatchRecordId(99))));
+        assert!(matches!(
+            err,
+            DispatchStoreError::NotFound(DispatchRecordId(99))
+        ));
     }
 
     #[test]
