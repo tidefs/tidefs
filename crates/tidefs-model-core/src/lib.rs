@@ -11,10 +11,18 @@
 //! `VfsNameToken` values. [`ModelRequest`] remains as a path-oriented helper
 //! for model tests and callers that have not moved to contract envelopes yet.
 
+mod receipt;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::fmt;
 use std::str::FromStr;
+
+pub use receipt::{
+    is_known_model_operation, ModelRunEvidenceScope, ModelRunEvidenceScopeKind, ModelRunReceipt,
+    ModelRunReceiptSerializeError, ModelRunReceiptValidationError, ModelRunValidationTier,
+    MODEL_RUN_RECEIPT_KNOWN_OPERATIONS,
+};
 
 use tidefs_types_vfs_core::{
     CompletionDisposition, CompletionStatus, ContractEpoch, Errno, InodeId, RequestEnvelope,
