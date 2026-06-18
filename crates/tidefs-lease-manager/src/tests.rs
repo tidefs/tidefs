@@ -2,8 +2,8 @@
 mod lease_manager_tests {
     use crate::manager::{LeaseManager, LeaseManagerConfig, LeaseManagerError};
     use crate::membership::{MembershipEvent, MembershipObserver};
-    use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseLifecycle};
-    use tidefs_membership_epoch::{EpochId, MemberId};
+    use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseError, LeaseLifecycle};
+    use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
     fn m(id: u64) -> MemberId {
         MemberId::new(id)
@@ -13,8 +13,20 @@ mod lease_manager_tests {
         EpochId::new(id)
     }
 
+    fn mount(dataset_id: u64, mount_id: u64, committed_epoch: u64) -> DatasetMountIdentity {
+        DatasetMountIdentity::new(dataset_id, mount_id, committed_epoch)
+    }
+
     fn make_manager() -> LeaseManager {
         LeaseManager::new(LeaseManagerConfig::default(), epoch(1))
+    }
+
+    fn make_mounted_manager(mount_identity: DatasetMountIdentity) -> LeaseManager {
+        let config = LeaseManagerConfig {
+            current_mount_identity: mount_identity,
+            ..LeaseManagerConfig::default()
+        };
+        LeaseManager::new(config, epoch(1))
     }
 
     fn inode_domain(dataset_id: u64, ino: u64) -> LeaseDomain {
@@ -140,6 +152,66 @@ mod lease_manager_tests {
         let mut mgr = make_manager();
         let result = mgr.renew(999, m(10), 1_000_000);
         assert!(matches!(result, Err(LeaseManagerError::NotFound(999))));
+    }
+
+    #[test]
+    fn test_renew_rejects_epoch_mismatch() {
+        let current_mount = mount(1, 1, 1);
+        let mut mgr = make_mounted_manager(current_mount);
+        let g = mgr
+            .grant(
+                LeaseClass::Exclusive,
+                inode_domain(1, 42),
+                m(10),
+                3,
+                1_000_000,
+            )
+            .unwrap();
+
+        mgr.advance_epoch(epoch(2));
+        let result = mgr.renew(g.lease_id, m(10), 1_020_000);
+
+        assert!(matches!(
+            result,
+            Err(LeaseManagerError::Lease(LeaseError::EpochMismatch {
+                lease_id,
+                lease_epoch,
+                current_epoch,
+            })) if lease_id == g.lease_id
+                && lease_epoch == epoch(1)
+                && current_epoch == epoch(2)
+        ));
+        assert_eq!(mgr.stats().renewals_total, 0);
+    }
+
+    #[test]
+    fn test_renew_rejects_mount_identity_mismatch() {
+        let old_mount = mount(1, 1, 1);
+        let new_mount = mount(1, 2, 1);
+        let mut mgr = make_mounted_manager(old_mount);
+        let g = mgr
+            .grant(
+                LeaseClass::Exclusive,
+                inode_domain(1, 42),
+                m(10),
+                3,
+                1_000_000,
+            )
+            .unwrap();
+
+        let fenced = mgr.remount_invalidate(new_mount);
+        assert_eq!(fenced, vec![g.lease_id]);
+        assert_eq!(mgr.current_mount_identity(), new_mount);
+
+        let result = mgr.renew(g.lease_id, m(10), 1_020_000);
+        assert!(matches!(
+            result,
+            Err(LeaseManagerError::Lease(LeaseError::MountIdentityMismatch {
+                lease_mount,
+                current_mount,
+            })) if lease_mount == old_mount && current_mount == new_mount
+        ));
+        assert_eq!(mgr.stats().renewals_total, 0);
     }
 
     // ── Release tests ────────────────────────────────────────────────
@@ -497,8 +569,8 @@ mod protocol_integration_tests {
     use crate::manager::{LeaseManager, LeaseManagerConfig};
     use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseGrant, LeaseLifecycle};
     use tidefs_lease::{LeaseMessage, LeaseProtocolError};
-    use tidefs_membership_epoch::{EpochId, MemberId};
     use tidefs_membership_epoch::DatasetMountIdentity;
+    use tidefs_membership_epoch::{EpochId, MemberId};
 
     fn m(id: u64) -> MemberId {
         MemberId::new(id)
