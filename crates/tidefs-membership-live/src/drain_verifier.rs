@@ -102,7 +102,7 @@ mod placement_verifier_tests {
 
     #[test]
     fn placement_verifier_detects_referencing_receipts() {
-        let mut registry = PlacementPlanRegistry::new(EpochId::new(1));
+        let registry = PlacementPlanRegistry::new(EpochId::new(1));
         let verifier = DrainPlacementVerifier::new(&registry);
 
         // Empty registry has no references
