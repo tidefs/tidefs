@@ -19,6 +19,7 @@
 //!
 //! - No conflicting committed writers for the same object/epoch.
 //! - No stale-epoch commit.
+//! - No active lease conflict or stale active lease across epochs.
 //! - No false quorum success (commit with fewer acks than quorum requires).
 //! - No rebuild/reclaim before replacement receipt durability.
 //!
@@ -27,33 +28,37 @@
 //! Trace artifacts feed the claim catalog as model-check evidence only;
 //! runtime distributed correctness remains separately gated.
 
-pub mod network;
 pub mod epoch;
-pub mod lease;
-pub mod quorum;
-pub mod placement;
 pub mod invariants;
+pub mod lease;
+pub mod network;
+pub mod placement;
+pub mod quorum;
+pub mod receipt;
 
 #[cfg(test)]
 mod tests;
 
-pub use network::{DeliveryPolicy, DistributedMessage, NetworkModel, NodeAddress};
 pub use epoch::{EpochState, MembershipEpochModel};
-pub use lease::{LeaseState, LeaseModel, LeaseOutcome};
-pub use quorum::{
-    QuorumWriteModel, QuorumWriteOutcome, QuorumWriteRequest, QuorumWriteState,
+pub use invariants::{
+    check_distributed_invariants, no_active_lease_epoch_conflict, no_conflicting_committed_writers,
+    no_false_quorum_success, no_rebuild_before_receipt, no_stale_epoch_commit,
+    DistributedInvariantViolation,
 };
+pub use lease::{LeaseModel, LeaseOutcome, LeaseState};
+pub use network::{DeliveryPolicy, DistributedMessage, NetworkModel, NodeAddress};
 pub use placement::{
-    PlacementReceiptRef,
-    model_placement_receipt_ref, receipt_ref_to_model_key, PlacementModel,
+    model_placement_receipt_ref, receipt_ref_to_model_key, PlacementModel, PlacementReceiptRef,
     PlacementReceiptState, RebuildAttempt, RebuildPolicy,
 };
-pub use invariants::{
-    check_distributed_invariants, DistributedInvariantViolation,
-    no_conflicting_committed_writers, no_stale_epoch_commit, no_false_quorum_success,
-    no_rebuild_before_receipt,
+pub use quorum::{QuorumWriteModel, QuorumWriteOutcome, QuorumWriteRequest, QuorumWriteState};
+pub use receipt::{
+    checked_combined_safety_invariants, missing_required_combined_invariants,
+    DistributedSafetyBounds, DistributedSafetyInvariantReceipt, DistributedSafetyOutcome,
+    DistributedSafetyReceipt, DistributedSafetyReceiptError, DistributedSafetyViolationReceipt,
+    DISTRIBUTED_COMBINED_SAFETY_EVIDENCE_CLASS, DISTRIBUTED_COMBINED_SAFETY_VALIDATION_TIER,
+    REQUIRED_COMBINED_INVARIANT_IDS,
 };
-
 
 /// Maximum number of nodes in a model-check scenario (keeps state space bounded).
 pub const MAX_MODEL_NODES: usize = 7;
@@ -86,9 +91,7 @@ impl DistributedSystem {
             node_count >= 1 && node_count <= MAX_MODEL_NODES,
             "node_count {node_count} out of range [1, {MAX_MODEL_NODES}]",
         );
-        let nodes: Vec<NodeState> = (0..node_count as u64)
-            .map(NodeState::new)
-            .collect();
+        let nodes: Vec<NodeState> = (0..node_count as u64).map(NodeState::new).collect();
         Self {
             nodes: nodes.clone(),
             network: NetworkModel::new(node_count),
@@ -106,7 +109,8 @@ impl DistributedSystem {
     /// Returns any invariant violations found.
     pub fn step(&mut self) -> Vec<DistributedInvariantViolation> {
         self.step_count += 1;
-        self.network.deliver_pending(&mut self.nodes, &mut self.epoch_model);
+        self.network
+            .deliver_pending(&mut self.nodes, &mut self.epoch_model);
         check_distributed_invariants(self)
     }
 
