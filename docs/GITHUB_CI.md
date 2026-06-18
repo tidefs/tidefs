@@ -34,7 +34,11 @@ may use non-secret repository variables for scheduling gates, such as
   crate list and optional extra `cargo test` arguments when the acceptance
   criteria require touched-package Rust tests outside the standing smoke set.
   It uses the same repo `.#ci` Nix development shell, host-local Cargo scratch,
-  JSON summary artifact, and per-run target cleanup as `Rust Fast`. It also
+  JSON summary artifact, and per-run target cleanup as `Rust Fast`. Newer
+  identical dispatches for the same ref, crate list, and extra cargo-test
+  arguments cancel older queued or running copies so stale branch-head checks
+  do not compete with current merge-gate validation on the self-hosted runner
+  fleet. Distinct crate lists or extra arguments remain independent. It also
   self-tests on pull requests that modify the focused workflow or its runner
   helper so workflow changes get Actions coverage before merge.
 
