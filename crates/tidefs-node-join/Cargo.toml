@@ -13,6 +13,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 bincode = "1"
 tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core" }
 tidefs-replication-model = { path = "../tidefs-replication-model" }
 tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
 tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }

@@ -32,6 +32,7 @@ pub mod state_transfer;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use tidefs_types_pool_label_core::PoolLabelFingerprint;
 use tidefs_membership_epoch::{
     EpochId, HealthClass, MemberId, MembershipConfigRecord, PlacementIntentClass,
 };
@@ -186,13 +187,13 @@ impl CommittedPoolScanEvidence {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LabelAgreementFingerprint {
-    pub fingerprint: [u8; 32],
+    pub fingerprint: PoolLabelFingerprint,
     pub is_committed: bool,
 }
 
 impl LabelAgreementFingerprint {
     #[must_use]
-    pub fn committed(fp: [u8; 32]) -> Self { Self { fingerprint: fp, is_committed: true } }
+    pub fn committed(fp: PoolLabelFingerprint) -> Self { Self { fingerprint: fp, is_committed: true } }
     #[must_use]
     pub fn is_ready(&self) -> bool { self.is_committed }
 }
@@ -1399,7 +1400,7 @@ mod tests {
         JoinSessionEpoch::new(EpochId::new(10), MemberId::new(member_id), 100)
             .with_quorum(qe)
             .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(member_id), [0xAAu8; 32]))
-            .with_label_agreement(LabelAgreementFingerprint::committed([0xBBu8; 32]))
+            .with_label_agreement(LabelAgreementFingerprint::committed(PoolLabelFingerprint::from([0xBBu8; 32])))
             .with_placement_receipt(PlacementReceiptEvidence::new(PlacementIntentClass::ReplicaTarget, EpochId::new(10), 1, [0xCCu8; 32]))
     }
 
@@ -3037,7 +3038,7 @@ mod tests {
         // Valid pool scan but uncommitted label agreement
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]))
-            .with_label_agreement(LabelAgreementFingerprint { fingerprint: [0xBBu8; 32], is_committed: false });
+            .with_label_agreement(LabelAgreementFingerprint { fingerprint: PoolLabelFingerprint::from([0xBBu8; 32]), is_committed: false });
         protocol.record_session_epoch(session);
         protocol.phase_shadow(&config, 2000).unwrap();
 
@@ -3070,7 +3071,7 @@ mod tests {
         // Pool scan + label, but no placement receipt
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]))
-            .with_label_agreement(LabelAgreementFingerprint::committed([0xBBu8; 32]));
+            .with_label_agreement(LabelAgreementFingerprint::committed(PoolLabelFingerprint::from([0xBBu8; 32])));
         protocol.record_session_epoch(session);
         protocol.phase_shadow(&config, 2000).unwrap();
         assert!(protocol.evaluate_health_for_witness(HealthClass::Healthy, 3000).unwrap() == false);
@@ -3142,7 +3143,7 @@ mod tests {
 
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]))
-            .with_label_agreement(LabelAgreementFingerprint::committed([0xBBu8; 32]))
+            .with_label_agreement(LabelAgreementFingerprint::committed(PoolLabelFingerprint::from([0xBBu8; 32])))
             .with_placement_receipt(PlacementReceiptEvidence {
                 intent_class: None,
                 is_committed: false,

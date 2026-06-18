@@ -2897,6 +2897,7 @@ dependencies = [
  "tidefs-membership-epoch",
  "tidefs-replication-model",
  "tidefs-transport",
+ "tidefs-types-pool-label-core",
 ]
 
 [[package]]
