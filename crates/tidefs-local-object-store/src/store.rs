@@ -58,6 +58,7 @@ use crate::*;
 use std::convert::Infallible;
 use tidefs_checksum_tree::{ChecksumTree, ChecksumTreeBuilder, DomainTag, ObjectDigest};
 use tidefs_durability_layout::DurabilityLayoutV1;
+use tidefs_gc_pin_set::SnapshotExtentPinSet;
 use tidefs_pool_allocator::{PoolAllocator, PoolAllocatorError, SpacePressureEvent};
 use tidefs_reclaim::{
     ClearanceEvidence, DrainError, GateDecision, GateDenyReason, ReclaimConfig,
@@ -147,19 +148,23 @@ impl ReceiptBoundDeadObjectDrainPlan {
 struct CommittedDeadObjectReclaimGate {
     eligible_object_ids: BTreeSet<ReclaimObjectKey>,
     stable_committed_txg: u64,
-    pin_clearance_epoch: u64,
+    snapshot_extent_pin_set: SnapshotExtentPinSet,
 }
 
 impl ReclaimGate for CommittedDeadObjectReclaimGate {
     fn check_extent(&self, extent_key: &ReclaimObjectKey) -> GateDecision {
-        if self.eligible_object_ids.contains(extent_key) {
-            GateDecision::Allow(ClearanceEvidence::Verified {
-                deadlist_committed_txg: self.stable_committed_txg,
-                pin_clearance_epoch: self.pin_clearance_epoch,
-            })
-        } else {
-            GateDecision::Deny(GateDenyReason::DeadlistReferenced)
+        if !self.eligible_object_ids.contains(extent_key) {
+            return GateDecision::Deny(GateDenyReason::DeadlistReferenced);
         }
+
+        if self.snapshot_extent_pin_set.is_pinned(extent_key) {
+            return GateDecision::Deny(GateDenyReason::SnapshotPinned);
+        }
+
+        GateDecision::Allow(ClearanceEvidence::Verified {
+            deadlist_committed_txg: self.stable_committed_txg,
+            pin_clearance_epoch: self.snapshot_extent_pin_set.epoch(),
+        })
     }
 }
 
@@ -323,6 +328,7 @@ pub struct LocalObjectStore {
     dead_object_reclaim_queue_dirty: bool,
     reclaim_receipts: Vec<ReclaimReceipt>,
     reclaim_receipts_dirty: bool,
+    snapshot_extent_pin_set: SnapshotExtentPinSet,
     segment_liveness: SegmentLivenessQueue,
     reclaim_consumer: ReclaimConsumerService,
     pub(crate) enospc_bytes_written: u64,
@@ -795,6 +801,7 @@ impl LocalObjectStore {
             dead_object_reclaim_queue_dirty: false,
             reclaim_receipts: Vec::new(),
             reclaim_receipts_dirty: false,
+            snapshot_extent_pin_set: SnapshotExtentPinSet::new(),
             segment_liveness: SegmentLivenessQueue::default(),
             reclaim_consumer: ReclaimConsumerService::new(
                 ReclaimConsumerConfig::default(),
@@ -1098,6 +1105,7 @@ impl LocalObjectStore {
             dead_object_reclaim_queue_dirty: false,
             reclaim_receipts: Vec::new(),
             reclaim_receipts_dirty: false,
+            snapshot_extent_pin_set: SnapshotExtentPinSet::new(),
             segment_liveness: SegmentLivenessQueue::new(),
             reclaim_consumer: ReclaimConsumerService::new(
                 ReclaimConsumerConfig::default(),
@@ -2130,6 +2138,33 @@ impl LocalObjectStore {
         &self.reclaim_receipts
     }
 
+    /// Snapshot extent pins consulted by receipt-bound physical reclaim.
+    #[must_use]
+    pub fn snapshot_extent_pin_set(&self) -> &SnapshotExtentPinSet {
+        &self.snapshot_extent_pin_set
+    }
+
+    /// Mutable snapshot extent pins for callers that own committed snapshot
+    /// lifecycle evidence.
+    pub fn snapshot_extent_pin_set_mut(&mut self) -> &mut SnapshotExtentPinSet {
+        &mut self.snapshot_extent_pin_set
+    }
+
+    /// Replace the snapshot extent pin set used by receipt-bound physical reclaim.
+    pub fn set_snapshot_extent_pin_set(&mut self, pin_set: SnapshotExtentPinSet) {
+        self.snapshot_extent_pin_set = pin_set;
+    }
+
+    /// Pin an extent for a live snapshot.
+    pub fn pin_snapshot_extent(&mut self, snapshot_id: &str, extent_key: ReclaimObjectKey) {
+        self.snapshot_extent_pin_set.pin(snapshot_id, extent_key);
+    }
+
+    /// Release all extent pins for a destroyed snapshot.
+    pub fn release_snapshot_extent_pins(&mut self, snapshot_id: &str) -> usize {
+        self.snapshot_extent_pin_set.release_snapshot(snapshot_id)
+    }
+
     /// Enqueue one dead object whose old placement may be retired only after
     /// replacement/base receipt evidence and commit-group stability agree.
     ///
@@ -2184,7 +2219,7 @@ impl LocalObjectStore {
         let gate = CommittedDeadObjectReclaimGate {
             eligible_object_ids: plan.eligible_object_ids.clone(),
             stable_committed_txg,
-            pin_clearance_epoch: 0,
+            snapshot_extent_pin_set: self.snapshot_extent_pin_set.clone(),
         };
         let mut reclaim_consumer = std::mem::replace(
             &mut self.reclaim_consumer,
@@ -7047,6 +7082,65 @@ mod reclaim_queue_production_tests {
         assert!(reopened.dead_object_reclaim_queue.is_empty());
         assert_eq!(reopened.reclaim_receipts(), &[receipt]);
         assert!(!segment_path(&reopened.segments_dir, old_segment_id).exists());
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_skips_snapshot_pinned_until_release() {
+        let (mut store, _dir) = temp_store();
+        let key = ObjectKey::from_name(b"receipt-bound/dead-object/snapshot-pin");
+        let snapshot_id = "dataset@snap";
+
+        store.put(key, b"snapshot pinned payload").expect("put");
+        let old_segment_id = store.index.get(&key).expect("location").segment_id;
+        assert!(store.delete(key).expect("delete"));
+
+        let reclaim_key = reclaim_key(key);
+        let entry = dead_object_entry_for_key(reclaim_key, 0, true, 1);
+        assert!(store
+            .enqueue_receipt_bound_dead_object(entry)
+            .expect("enqueue receipt-bound dead object"));
+        store.pin_snapshot_extent(snapshot_id, reclaim_key);
+
+        let held = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("snapshot-pinned drain");
+
+        assert_eq!(held.entries_processed, 1);
+        assert_eq!(held.segments_reclaimed, 0);
+        assert_eq!(held.gate_extents_denied, 1);
+        assert_eq!(held.gate_segments_skipped, 1);
+        assert_eq!(held.reclaim_queue_depth, 1);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+        assert!(store.reclaim_receipts().is_empty());
+        assert!(
+            segment_path(&store.segments_dir, old_segment_id).exists(),
+            "snapshot-pinned segment must remain allocated"
+        );
+
+        assert_eq!(store.release_snapshot_extent_pins(snapshot_id), 1);
+
+        let freed = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("released drain");
+
+        assert_eq!(freed.entries_processed, 1);
+        assert_eq!(freed.segments_reclaimed, 1);
+        assert_eq!(freed.blocks_freed, 1);
+        assert_eq!(freed.gate_extents_denied, 0);
+        assert_eq!(freed.reclaim_queue_depth, 0);
+        assert!(store.dead_object_reclaim_queue.is_empty());
+        assert_eq!(store.reclaim_receipts().len(), 1);
+        let receipt = &store.reclaim_receipts()[0];
+        assert_eq!(receipt.freed_extents, vec![reclaim_key]);
+        assert_eq!(receipt.deadlist_committed_txg, 1);
+        assert_eq!(
+            receipt.pin_clearance_epoch,
+            store.snapshot_extent_pin_set().epoch()
+        );
+        assert!(
+            !segment_path(&store.segments_dir, old_segment_id).exists(),
+            "released segment should be physically reclaimed"
+        );
     }
 
     #[test]
