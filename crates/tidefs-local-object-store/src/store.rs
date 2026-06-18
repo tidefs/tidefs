@@ -50,7 +50,7 @@ use crate::io_scheduler::{IoScheduler, IoSchedulerConfig};
 use crate::reclaim_queue::{
     flush_segment_liveness_queue, load_dead_object_reclaim_queue, load_reclaim_queue_entries,
     load_reclaim_receipts, load_segment_liveness_queue, store_dead_object_reclaim_queue,
-    store_reclaim_queue_entries, store_reclaim_receipts,
+    store_reclaim_receipts,
 };
 use crate::segment_builder::{FlushResult, SegmentBuilder};
 use crate::txg_manager::{compute_committed_root_digest, CommitGroupManager};
