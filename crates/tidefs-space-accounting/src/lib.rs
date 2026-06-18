@@ -399,7 +399,7 @@ impl SpaceAccounting {
     #[must_use]
     pub fn committed_free_bytes(&self) -> u64 {
         let statfs = self.statfs();
-        statfs.blocks_free.saturating_mul(statfs.block_size)
+        statfs.blocks_avail.saturating_mul(statfs.block_size)
     }
 
     /// Derive domain-level aggregated counters for clone-family statfs.

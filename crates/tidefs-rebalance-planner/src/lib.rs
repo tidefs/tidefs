@@ -1384,6 +1384,37 @@ mod tests {
     }
 
     #[test]
+    fn committed_free_space_respects_allocation_slop() {
+        let mut sa = SpaceAccounting::empty();
+        let block_size = 4096;
+        sa.set_quota(256 * block_size);
+        sa.set_slop(16 * block_size);
+        sa.update_pool_counters(PoolCounters {
+            phys_free_bytes: 256 * block_size,
+            phys_total_bytes: 256 * block_size,
+            ..Default::default()
+        });
+
+        let statfs = sa.statfs();
+        assert!(statfs.blocks_free > statfs.blocks_avail);
+
+        let planner = RebalancePlanner::default_for_epoch(EpochId::new(1));
+        let committed_free = sa.committed_free_bytes();
+        assert_eq!(
+            committed_free,
+            statfs.blocks_avail.saturating_mul(statfs.block_size)
+        );
+
+        let above_allocation_admissible = committed_free.saturating_add(statfs.block_size);
+        let targets = planner.select_targets_with_committed_free_space(
+            &[MemberId::new(1)],
+            &sa,
+            above_allocation_admissible,
+        );
+        assert!(targets.is_empty());
+    }
+
+    #[test]
     fn rebalance_with_mixed_device_sizes() {
         // Simulate a pool with mixed device sizes: device A has 1 TB,
         // device B has 2 TB, device C has 4 TB. Utilization percentages
