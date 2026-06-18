@@ -672,6 +672,11 @@ fn build_label_agreement_report_for_paths(
             msg: e.to_string(),
         })?;
         let label = read_member_label_from_file(&mut file, device_path)?;
+        ensure_supported_label_features(
+            label.features_incompat,
+            label.features_ro_compat,
+            label.features_compat,
+        )?;
         let committed_root = recover_member_committed_root(&mut file, device_path, min_epoch)?;
         members.push(label_agreement_member(
             device_path.clone(),
@@ -697,6 +702,11 @@ fn build_label_agreement_report_for_devices(
                 msg: format!("decode label: {e}"),
             }
         })?;
+        ensure_supported_label_features(
+            label.features_incompat,
+            label.features_ro_compat,
+            label.features_compat,
+        )?;
         let committed_root =
             recover_member_committed_root(&mut device.file, &device.device_path, min_epoch)?;
         members.push(label_agreement_member(
@@ -783,20 +793,11 @@ fn verify_label_agreement(report: &LabelAgreementReport) -> Result<(), ImportErr
     }
 
     for member in &report.members {
-        let unsupported = member.features_incompat & !SUPPORTED_INCOMPAT_FEATURES;
-        if unsupported != 0 {
-            return Err(ImportError::IncompatibleFeatures { unsupported });
-        }
-
-        let unsupported = member.features_ro_compat & !SUPPORTED_RO_COMPAT_FEATURES;
-        if unsupported != 0 {
-            return Err(ImportError::IncompatibleFeatures { unsupported });
-        }
-
-        let unsupported = member.features_compat & !SUPPORTED_COMPAT_FEATURES;
-        if unsupported != 0 {
-            return Err(ImportError::IncompatibleFeatures { unsupported });
-        }
+        ensure_supported_label_features(
+            member.features_incompat,
+            member.features_ro_compat,
+            member.features_compat,
+        )?;
     }
 
     ensure_pool_uuids_agree(report)?;
@@ -807,6 +808,29 @@ fn verify_label_agreement(report: &LabelAgreementReport) -> Result<(), ImportErr
     ensure_redundancy_policies_agree(report)?;
     ensure_device_classes_agree(report)?;
     ensure_feature_flags_agree(report)?;
+
+    Ok(())
+}
+
+fn ensure_supported_label_features(
+    features_incompat: u64,
+    features_ro_compat: u64,
+    features_compat: u64,
+) -> Result<(), ImportError> {
+    let unsupported = features_incompat & !SUPPORTED_INCOMPAT_FEATURES;
+    if unsupported != 0 {
+        return Err(ImportError::IncompatibleFeatures { unsupported });
+    }
+
+    let unsupported = features_ro_compat & !SUPPORTED_RO_COMPAT_FEATURES;
+    if unsupported != 0 {
+        return Err(ImportError::IncompatibleFeatures { unsupported });
+    }
+
+    let unsupported = features_compat & !SUPPORTED_COMPAT_FEATURES;
+    if unsupported != 0 {
+        return Err(ImportError::IncompatibleFeatures { unsupported });
+    }
 
     Ok(())
 }
@@ -2726,6 +2750,13 @@ mod tests {
                 unsupported,
                 0,
             );
+            f.seek(SeekFrom::Start(
+                crate::committed_root::COMMIT_RECORD_REGION_OFFSET,
+            ))
+            .unwrap();
+            f.write_all(b"not a supported commit-record region")
+                .unwrap();
+            f.flush().unwrap();
         }
 
         match pool_import(&[dev_path], &dir.path().join("locks"), false, None, None).unwrap_err() {
