@@ -31,11 +31,13 @@ for the schema authority.
 
 Key distinctions:
 
-- **Model-only evidence** (`validation_tier: "model-only"`): replayed
-  through `tidefs-model-core` alone. Validates contract shape and
-  deterministic model behavior. Insufficient for runtime crash claims.
-- **Runtime evidence** (`validation_tier: "runtime"`): replayed through a
-  mounted adapter with crash injection and recovery. Required for
+- **Model-only evidence** (`validation_tier: "source-model"`,
+  `evidence_class: "model-only"`): replayed through `tidefs-model-core`
+  alone. Validates contract shape and deterministic model behavior.
+  Insufficient for runtime crash claims.
+- **Runtime evidence** (`validation_tier: "mounted-userspace"` or another
+  runtime `ValidationTier`, `evidence_class: "runtime"`): replayed through
+  a mounted adapter with crash injection and recovery. Required for
   crash-safety claim closure.
 
 ## Crate Structure
@@ -64,5 +66,6 @@ through `tidefs-model-core`'s `ModelFs` via the contract envelope path.
 
 - Nextgen verification plan: `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`
 - Claims gate policy: `docs/CLAIMS_GATE_POLICY.md`
+- Validation tier vocabulary: `crates/tidefs-validation/src/validation_schema.rs`
 - Request contract: `docs/REQUEST_CONTRACT.md`
 - Artifact schema: `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`

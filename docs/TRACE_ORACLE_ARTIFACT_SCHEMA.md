@@ -22,6 +22,8 @@ runner or change the model replay semantics owned by issue #509.
   (`MinimizedManifestEntry`)
 - Request contract: `docs/REQUEST_CONTRACT.md`, `tidefs-types-vfs-core`,
   `tidefs-schema-codec-vfs` (contract version 1)
+- Validation tier vocabulary:
+  `crates/tidefs-validation/src/validation_schema.rs` (`ValidationTier`)
 - Program authority: `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`
 - Claims gate: `docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`
 - Workspace classification: `docs/workspace-package-classification.md`
@@ -43,7 +45,8 @@ Each trace-oracle artifact carries a JSON manifest file. The file is named
 | `request_contract_version` | `u64` | Request contract version used (`1`) |
 | `backend` | `string` | Execution backend: `model`, `local_runtime`, or `compare` |
 | `environment_model` | `string` | Environment model dependency (`tidefs-model-core` for model-only) |
-| `validation_tier` | `string` | Validation tier: `model-only`, `harness-only`, or `runtime` |
+| `validation_tier` | `string` | Canonical `ValidationTier` label such as `source-model`, `harness-only`, `mounted-userspace`, or `mounted-kernel-vfs` |
+| `evidence_class` | `string` | Claim boundary class: `model-only`, `harness-only`, or `runtime` |
 | `generated_at` | `string` | ISO 8601 UTC timestamp of artifact generation |
 | `generated_by` | `string` | Tool and version that produced the artifact |
 
@@ -85,7 +88,8 @@ Each trace-oracle artifact carries a JSON manifest file. The file is named
   "request_contract_version": 1,
   "backend": "<model | local_runtime | compare>",
   "environment_model": "<tidefs-model-core | none | runtime>",
-  "validation_tier": "<model-only | harness-only | runtime>",
+  "validation_tier": "<canonical ValidationTier label>",
+  "evidence_class": "<model-only | harness-only | runtime>",
   "generated_at": "<ISO 8601 UTC>",
   "generated_by": "<tool-and-version>",
   "input": {
@@ -110,16 +114,23 @@ Each trace-oracle artifact carries a JSON manifest file. The file is named
 
 ## Model-Only vs Runtime Trace Evidence
 
-The validation tier recorded in `validation_tier` is the primary boundary
-between model-only and runtime evidence. This distinction is program law
-from `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` and
+The manifest records two related boundaries:
+
+- `validation_tier` uses the canonical `ValidationTier` label from
+  `crates/tidefs-validation/src/validation_schema.rs`.
+- `evidence_class` records the claim-review boundary between model-only,
+  harness-only, and runtime evidence.
+
+The model/runtime distinction is program law from
+`docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` and
 `docs/CLAIMS_GATE_POLICY.md`.
 
-### Model-Only Evidence (`validation_tier: "model-only"`)
+### Model-Only Evidence (`evidence_class: "model-only"`)
 
 - The trace was replayed through `tidefs-model-core` (`ModelFs`) without a
   mounted filesystem, kernel interaction, FUSE adapter, or real storage
   device.
+- Validation tier is normally `source-model`.
 - Backend is `model` or `compare` where one side is the model backend.
 - The environment model is `tidefs-model-core`, which is a deterministic
   in-process simulation of TideFS contract semantics.
@@ -130,10 +141,11 @@ from `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` and
   correctness require a mounted runtime backend with actual crash injection
   and recovery cycles.
 
-### Harness-Only Evidence (`validation_tier: "harness-only"`)
+### Harness-Only Evidence (`evidence_class: "harness-only"`)
 
 - The trace was replayed through a local userspace harness (FUSE or uBLK)
   that exercises the real storage stack but without crash injection.
+- Validation tier is normally `harness-only`.
 - Backend is `local_runtime` or `compare` where one side is the local
   runtime backend.
 - Harness-only evidence may diagnose adapter translation, basic I/O
@@ -141,11 +153,15 @@ from `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` and
 - Harness-only evidence without crash injection is **not runtime crash
   evidence**.
 
-### Runtime Evidence (`validation_tier: "runtime"`)
+### Runtime Evidence (`evidence_class: "runtime"`)
 
 - The trace was replayed through a mounted adapter with crash injection
   and recovery, or through a kernel-resident path with controlled fault
   injection.
+- Validation tier must be one of the canonical runtime tiers such as
+  `mounted-userspace`, `qemu-guest`, `mounted-kernel-vfs`,
+  `kernel-block-io`, `full-kernel-no-daemon`, or
+  `multi-process-distributed`.
 - Runtime evidence requires a `ci_artifact_ref` pointing to a GitHub
   Actions artifact that contains the runtime trace output, crash log, and
   recovery log.
@@ -166,7 +182,8 @@ but **insufficient for runtime crash claims**.
   "request_contract_version": 1,
   "backend": "model",
   "environment_model": "tidefs-model-core",
-  "validation_tier": "model-only",
+  "validation_tier": "source-model",
+  "evidence_class": "model-only",
   "generated_at": "2026-06-18T00:30:00Z",
   "generated_by": "tidefs-trace-oracle 0.1.0",
   "input": {
@@ -225,7 +242,8 @@ secrets or private runner state.
   "request_contract_version": 1,
   "backend": "compare",
   "environment_model": "runtime",
-  "validation_tier": "runtime",
+  "validation_tier": "mounted-userspace",
+  "evidence_class": "runtime",
   "generated_at": "2026-06-18T01:00:00Z",
   "generated_by": "tidefs-trace-oracle 0.1.0",
   "input": {
@@ -244,7 +262,7 @@ secrets or private runner state.
   "claims_covered": ["trace.runtime.compare.v1"],
   "ci_artifact_ref": "trace-compare-smoke-churn-42",
   "ci_run_url": "https://github.com/tidefs/tidefs/actions/runs/1234567890",
-  "notes": "Runtime trace comparison artifact. Model and local-runtime backends compared through FUSE mount with crash injection disabled (harness baseline). Upgrade to crash-evidence tier requires crash-injection cycle with recovery log."
+  "notes": "Runtime trace comparison artifact. Model and local-runtime backends compared through a mounted FUSE backend with crash injection and recovery logging enabled. Claim closure still requires a registered claim id and claims-gate review."
 }
 ```
 
