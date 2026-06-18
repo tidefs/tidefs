@@ -1473,7 +1473,6 @@ pub struct LocalFileSystem {
     dataset_mount_id: u64,
     pool_uuid: u64,
     /// tidefs-queue-root: local_fs.write_buffers
-    /// admission: AdmissionPermit  service_curve: ServiceCurve
     write_buffers: BTreeMap<InodeId, WriteBuffer>,
     write_buffer_config: WriteBufferConfig,
     fsync_stats: FsyncStats,
