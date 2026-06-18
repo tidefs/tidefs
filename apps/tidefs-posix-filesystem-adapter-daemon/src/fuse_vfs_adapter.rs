@@ -53,8 +53,8 @@ use tidefs_cache_core::path_lookup_cache::PathLookupCache;
 use tidefs_local_filesystem::fuse_fsync::DirtyFlush;
 use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
 use tidefs_permission::{
-    check_access, InodeAttr as PermissionInodeAttr, PosixAclEntry, ACCESS_EXECUTE, ACCESS_READ,
-    ACCESS_WRITE,
+    check_access, InodeAttr as PermissionInodeAttr, MountIdentity, PosixAclEntry, ACCESS_EXECUTE,
+    ACCESS_READ, ACCESS_WRITE,
 };
 use tidefs_posix_filesystem_adapter_workers_io::staged_write_hash64;
 use tidefs_posix_filesystem_adapter_workers_io::{FuseCopyFileRangePlan, FuseCopyFileRangeRequest};
@@ -94,6 +94,10 @@ use tidefs_namespace::Namespace;
 /// (`tidefs_local_object_store::intent_log`) handles raw object mutations
 /// only and must not be used for filesystem-level intent recording.
 const _CANONICAL_INTENT_LOG_AUTHORITY: () = {};
+
+// Matches the committed LocalFileSystem root dataset id.
+const ROOT_DATASET_ID: tidefs_dataset_catalog::DatasetId =
+    tidefs_dataset_catalog::DatasetId::from_bytes([0u8; 16]);
 
 // ── Sticky bit (S_ISVTX) enforcement ──────────────────────────────────────
 
@@ -298,9 +302,10 @@ fn check_parent_write_execute(
     engine: &dyn VfsEngine,
     parent: InodeId,
     ctx: &RequestCtx,
+    mount_identity: &MountIdentity,
 ) -> Result<(), Errno> {
     let parent_attr = engine.getattr(parent, None, ctx)?;
-    check_parent_write_execute_with_attr(engine, parent, &parent_attr, ctx)
+    check_parent_write_execute_with_attr(engine, parent, &parent_attr, ctx, mount_identity)
 }
 
 fn check_parent_write_execute_with_attr(
@@ -308,7 +313,11 @@ fn check_parent_write_execute_with_attr(
     parent: InodeId,
     parent_attr: &InodeAttr,
     ctx: &RequestCtx,
+    mount_identity: &MountIdentity,
 ) -> Result<(), Errno> {
+    if !mount_identity.is_valid() {
+        return Err(Errno::EACCES);
+    }
     if parent_attr.kind != NodeKind::Dir {
         return Err(Errno::ENOTDIR);
     }
@@ -326,6 +335,7 @@ fn check_parent_write_execute_with_attr(
         ctx,
         ACCESS_WRITE | ACCESS_EXECUTE,
         acl.as_deref(),
+        mount_identity,
     )
 }
 
@@ -333,11 +343,15 @@ fn check_parent_write_execute_mutation_preflight(
     engine: &dyn VfsEngine,
     parent: InodeId,
     ctx: &RequestCtx,
+    mount_identity: &MountIdentity,
 ) -> Result<(), Errno> {
+    if !mount_identity.is_valid() {
+        return Err(Errno::EACCES);
+    }
     if ctx.uid == 0 {
         return Ok(());
     }
-    check_parent_write_execute(engine, parent, ctx)
+    check_parent_write_execute(engine, parent, ctx, mount_identity)
 }
 
 fn delete_child_attr_for_mutation_preflight(
@@ -345,7 +359,11 @@ fn delete_child_attr_for_mutation_preflight(
     parent: InodeId,
     name: &[u8],
     ctx: &RequestCtx,
+    mount_identity: &MountIdentity,
 ) -> Result<InodeAttr, Errno> {
+    if !mount_identity.is_valid() {
+        return Err(Errno::EACCES);
+    }
     if ctx.uid == 0 {
         let child_attr = engine.lookup(parent, name, ctx)?;
         enforce_immutable_guard(child_attr.flags.to_raw_flags())?;
@@ -353,7 +371,7 @@ fn delete_child_attr_for_mutation_preflight(
     }
 
     let parent_attr = engine.getattr(parent, None, ctx)?;
-    check_parent_write_execute_with_attr(engine, parent, &parent_attr, ctx)?;
+    check_parent_write_execute_with_attr(engine, parent, &parent_attr, ctx, mount_identity)?;
     let child_attr = engine.lookup(parent, name, ctx)?;
     check_sticky_unlink_with_attrs(&parent_attr, &child_attr, ctx)?;
     enforce_immutable_guard(parent_attr.flags.to_raw_flags())?;
@@ -387,10 +405,14 @@ fn rename_mutation_preflight(
     new_parent: InodeId,
     new_name: &[u8],
     ctx: &RequestCtx,
+    mount_identity: &MountIdentity,
 ) -> Result<(), Errno> {
+    if !mount_identity.is_valid() {
+        return Err(Errno::EACCES);
+    }
     if ctx.uid != 0 {
-        check_parent_write_execute(engine, old_parent, ctx)?;
-        check_parent_write_execute(engine, new_parent, ctx)?;
+        check_parent_write_execute(engine, old_parent, ctx, mount_identity)?;
+        check_parent_write_execute(engine, new_parent, ctx, mount_identity)?;
         check_sticky_rename(engine, old_parent, old_name, new_parent, new_name, ctx)?;
     }
 
@@ -1467,12 +1489,20 @@ fn fuse_open_requested_access(open_flags: u32) -> u8 {
     requested
 }
 
+fn mount_identity_from_dataset_id(dataset_id: tidefs_dataset_catalog::DatasetId) -> MountIdentity {
+    MountIdentity::new(*dataset_id.as_bytes(), 1)
+}
+
 fn plan_fuse_access_decision(
     attr: &InodeAttr,
     ctx: &RequestCtx,
     requested: u8,
     acl: Option<&[PosixAclEntry]>,
+    mount_identity: &MountIdentity,
 ) -> Result<(), Errno> {
+    if !mount_identity.is_valid() {
+        return Err(Errno::EACCES);
+    }
     if requested == 0 {
         return Ok(());
     }
@@ -1485,6 +1515,7 @@ fn plan_fuse_access_decision(
         ctx.gid,
         ctx.groups.as_slice(),
         requested,
+        mount_identity,
     ) {
         Ok(())
     } else {
@@ -1497,9 +1528,10 @@ fn plan_fuse_access_result(
     ctx: &RequestCtx,
     requested: u8,
     acl: Option<&[PosixAclEntry]>,
+    mount_identity: &MountIdentity,
 ) -> Result<(), Errno> {
     let attr = attr_result?;
-    plan_fuse_access_decision(&attr, ctx, requested, acl)
+    plan_fuse_access_decision(&attr, ctx, requested, acl, mount_identity)
 }
 
 fn plan_fuse_open_access(
@@ -1507,9 +1539,16 @@ fn plan_fuse_open_access(
     ctx: &RequestCtx,
     open_flags: u32,
     acl: Option<&[PosixAclEntry]>,
+    mount_identity: &MountIdentity,
 ) -> Result<(), Errno> {
     let attr = attr_result?;
-    plan_fuse_access_decision(&attr, ctx, fuse_open_requested_access(open_flags), acl)
+    plan_fuse_access_decision(
+        &attr,
+        ctx,
+        fuse_open_requested_access(open_flags),
+        acl,
+        mount_identity,
+    )
 }
 
 // ── Type mapping helpers ──────────────────────────────────────────────────
@@ -2680,7 +2719,7 @@ impl FuseVfsAdapter {
             orphan_index: Mutex::new(OrphanIndex::new()),
             writeback_seen_inodes: Mutex::new(HashSet::new()),
             relatime_read_atime_pending: Mutex::new(HashSet::new()),
-            dataset_id: None,
+            dataset_id: Some(ROOT_DATASET_ID),
             workload_observer: Arc::new(WorkloadObserver::new()),
             signature_cache: Arc::new(MaterializedSignatureCache::new()),
         })
@@ -2814,6 +2853,18 @@ impl FuseVfsAdapter {
             Err(Errno::EROFS)
         } else {
             Ok(())
+        }
+    }
+
+    fn permission_mount_identity(&self) -> Result<MountIdentity, Errno> {
+        let Some(dataset_id) = self.dataset_id else {
+            return Err(Errno::EACCES);
+        };
+        let mount_identity = mount_identity_from_dataset_id(dataset_id);
+        if mount_identity.is_valid() {
+            Ok(mount_identity)
+        } else {
+            Err(Errno::EACCES)
         }
     }
 
@@ -3385,8 +3436,9 @@ impl FuseVfsAdapter {
         if target.len() > PATH_MAX_BYTES {
             return Err(Errno::ENAMETOOLONG);
         }
+        let mount_identity = self.permission_mount_identity()?;
         let e = self.engine.lock().unwrap();
-        check_parent_write_execute(&**e, InodeId::new(parent), ctx)?;
+        check_parent_write_execute(&**e, InodeId::new(parent), ctx, &mount_identity)?;
         // POSIX: reject symlink creation if parent directory is immutable.
         {
             let parent_attr = e.getattr(InodeId::new(parent), None, ctx)?;
@@ -3766,11 +3818,20 @@ impl FuseVfsAdapter {
         self.check_not_read_only()?;
         // Phase 1: Pre-checks (permissions, sticky-bit) before recording intent.
         // Failures here mean no intent was recorded -- no crash-recovery risk.
+        let mount_identity = self.permission_mount_identity()?;
         let e = self.engine.lock().unwrap();
         let engine: &dyn VfsEngine = &**e;
         let old_parent = InodeId::new(parent);
         let new_parent = InodeId::new(newparent);
-        rename_mutation_preflight(engine, old_parent, name, new_parent, newname, ctx)?;
+        rename_mutation_preflight(
+            engine,
+            old_parent,
+            name,
+            new_parent,
+            newname,
+            ctx,
+            &mount_identity,
+        )?;
         let result = self
             .rename_dispatch
             .dispatch_engine_with_flags(EngineRenameRequest {
@@ -3819,8 +3880,9 @@ impl FuseVfsAdapter {
         newname: &[u8],
     ) -> Result<InodeAttr, Errno> {
         self.check_not_read_only()?;
+        let mount_identity = self.permission_mount_identity()?;
         let e = self.engine.lock().unwrap();
-        check_parent_write_execute(&**e, InodeId::new(newparent), ctx)?;
+        check_parent_write_execute(&**e, InodeId::new(newparent), ctx, &mount_identity)?;
         // POSIX: reject link if target parent directory is immutable.
         {
             let parent_attr = e.getattr(InodeId::new(newparent), None, ctx)?;
@@ -4078,8 +4140,14 @@ impl FuseVfsAdapter {
         mode: u32,
     ) -> Result<InodeAttr, Errno> {
         self.check_not_read_only()?;
+        let mount_identity = self.permission_mount_identity()?;
         let e = self.engine.lock().unwrap();
-        check_parent_write_execute_mutation_preflight(&**e, InodeId::new(parent), ctx)?;
+        check_parent_write_execute_mutation_preflight(
+            &**e,
+            InodeId::new(parent),
+            ctx,
+            &mount_identity,
+        )?;
         let attr = dispatch_mkdir_batch(
             &**e as &dyn tidefs_vfs_engine::VfsEngine,
             &[MkdirBatchRequest {
@@ -4126,9 +4194,11 @@ impl FuseVfsAdapter {
         name: &[u8],
     ) -> Result<(), Errno> {
         self.check_not_read_only()?;
+        let mount_identity = self.permission_mount_identity()?;
         let e = self.engine.lock().unwrap();
         let parent_id = InodeId::new(parent);
-        let child_attr = delete_child_attr_for_mutation_preflight(&**e, parent_id, name, ctx)?;
+        let child_attr =
+            delete_child_attr_for_mutation_preflight(&**e, parent_id, name, ctx, &mount_identity)?;
         // Capacity tracking for freed space is handled by the engine's
         // CapacityAuthority during unlink dispatch.
         let child_inode_for_delete = child_attr.inode_id;
@@ -4436,9 +4506,11 @@ impl FuseVfsAdapter {
         name: &[u8],
     ) -> Result<(), Errno> {
         self.check_not_read_only()?;
+        let mount_identity = self.permission_mount_identity()?;
         let e = self.engine.lock().unwrap();
         let parent_id = InodeId::new(parent);
-        let child_attr = delete_child_attr_for_mutation_preflight(&**e, parent_id, name, ctx)?;
+        let child_attr =
+            delete_child_attr_for_mutation_preflight(&**e, parent_id, name, ctx, &mount_identity)?;
         // Resolve the removed directory's inode before rmdir: needed both
         // for negative-cache invalidation.
         let removed_attr = child_attr;
@@ -4483,6 +4555,7 @@ impl FuseVfsAdapter {
         mask: i32,
     ) -> Result<(), Errno> {
         let requested = fuse_access_requested_from_mask(mask)?;
+        let mount_identity = self.permission_mount_identity()?;
 
         let e = self.engine.lock().unwrap();
         let acl: Option<Vec<PosixAclEntry>> =
@@ -4492,13 +4565,15 @@ impl FuseVfsAdapter {
                 Err(_) => None,
             };
         match e.getattr(InodeId::new(ino), None, ctx) {
-            Ok(attr) => plan_fuse_access_result(Ok(attr), ctx, requested, acl.as_deref()),
+            Ok(attr) => {
+                plan_fuse_access_result(Ok(attr), ctx, requested, acl.as_deref(), &mount_identity)
+            }
             Err(Errno::ENOENT | Errno::ESTALE | Errno::EIO) if self.namespace.is_some() => {
                 drop(e);
                 let ns = self.namespace.as_ref().expect("namespace checked");
                 let attrs = ns.get_attrs(ino).ok_or(Errno::ESTALE)?;
                 let inode_attr = namespace_attrs_to_inode_attr(&attrs);
-                plan_fuse_access_result(Ok(inode_attr), ctx, requested, None)
+                plan_fuse_access_result(Ok(inode_attr), ctx, requested, None, &mount_identity)
             }
             Err(errno) => Err(errno),
         }
@@ -5240,8 +5315,14 @@ impl FuseVfsAdapter {
         if (mode & libc::S_IFMT) == libc::S_IFDIR {
             return Err(Errno::EINVAL);
         }
+        let mount_identity = self.permission_mount_identity()?;
         let e = self.engine.lock().unwrap();
-        check_parent_write_execute_mutation_preflight(&**e, InodeId::new(parent), ctx)?;
+        check_parent_write_execute_mutation_preflight(
+            &**e,
+            InodeId::new(parent),
+            ctx,
+            &mount_identity,
+        )?;
         let attr = e.mknod(InodeId::new(parent), name, mode, rdev, ctx)?;
         self.record_dentry_child_mutation(parent, name);
         self.populate_getattr_cache(attr.inode_id.get(), &attr);
@@ -5292,8 +5373,14 @@ impl FuseVfsAdapter {
         Self::validate_open_flags(open_flags)?;
         let engine_open_flags = Self::engine_open_flags(open_flags);
         // Capacity admission handled by engine CapacityAuthority during create dispatch.
+        let mount_identity = self.permission_mount_identity()?;
         let e = self.engine.lock().unwrap();
-        check_parent_write_execute_mutation_preflight(&**e, InodeId::new(parent), ctx)?;
+        check_parent_write_execute_mutation_preflight(
+            &**e,
+            InodeId::new(parent),
+            ctx,
+            &mount_identity,
+        )?;
         match dispatch_create_batch(
             &**e as &dyn tidefs_vfs_engine::VfsEngine,
             &[CreateBatchRequest {
@@ -8264,6 +8351,7 @@ impl FuseVfsAdapter {
         ino: u64,
     ) -> Result<EngineDirHandle, Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
+        let mount_identity = self.permission_mount_identity()?;
         let e = self.engine.lock().unwrap();
         // POSIX: opendir requires read permission on the directory.
         {
@@ -8284,7 +8372,7 @@ impl FuseVfsAdapter {
                 }
                 Err(errno) => return Err(errno),
             };
-            plan_fuse_access_result(Ok(attr), ctx, ACCESS_READ, acl.as_deref())?;
+            plan_fuse_access_result(Ok(attr), ctx, ACCESS_READ, acl.as_deref(), &mount_identity)?;
         }
         let dh = match e.opendir(InodeId::new(ino), ctx) {
             Ok(dh) => dh,
@@ -8568,6 +8656,7 @@ impl FuseVfsAdapter {
             return self.dispatch_tmpfile(ctx, ino, file_mode, engine_open_flags);
         }
         self.check_open_allowed(ino, engine_open_flags)?;
+        let mount_identity = self.permission_mount_identity()?;
         let engine_fh = {
             let e = self.engine.lock().unwrap();
             let acl: Option<Vec<PosixAclEntry>> =
@@ -8581,6 +8670,7 @@ impl FuseVfsAdapter {
                 ctx,
                 open_flags,
                 acl.as_deref(),
+                &mount_identity,
             )?;
             e.open(InodeId::new(ino), engine_open_flags, ctx)?
         };
@@ -10484,6 +10574,9 @@ mod tests {
         FALLOC_FL_ZERO_RANGE, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFIFO, S_IFLNK, S_IFREG,
         XATTR_CREATE, XATTR_REPLACE,
     };
+
+    const VALID_MOUNT: MountIdentity = MountIdentity::new([0x41; 16], 1);
+
     fn test_attr(inode: u64, generation: u64) -> InodeAttr {
         test_attr_with_mode(inode, generation, 0o644, 1000, 1001)
     }
@@ -19679,7 +19772,10 @@ mod tests {
         let attr = test_attr_with_mode(42, 7, 0, 1000, 1001);
         let ctx = access_ctx(2000, 2001, &[2001]);
 
-        assert_eq!(plan_fuse_access_decision(&attr, &ctx, 0, None), Ok(()));
+        assert_eq!(
+            plan_fuse_access_decision(&attr, &ctx, 0, None, &VALID_MOUNT),
+            Ok(())
+        );
     }
 
     #[test]
@@ -19695,28 +19791,41 @@ mod tests {
                 &attr,
                 &owner,
                 ACCESS_READ | ACCESS_WRITE | ACCESS_EXECUTE,
-                None
+                None,
+                &VALID_MOUNT
             ),
             Ok(())
         );
         assert_eq!(
-            plan_fuse_access_decision(&attr, &group, ACCESS_READ | ACCESS_EXECUTE, None),
+            plan_fuse_access_decision(
+                &attr,
+                &group,
+                ACCESS_READ | ACCESS_EXECUTE,
+                None,
+                &VALID_MOUNT
+            ),
             Ok(())
         );
         assert_eq!(
-            plan_fuse_access_decision(&attr, &supplementary_group, ACCESS_WRITE, None),
+            plan_fuse_access_decision(
+                &attr,
+                &supplementary_group,
+                ACCESS_WRITE,
+                None,
+                &VALID_MOUNT
+            ),
             Err(Errno::EACCES)
         );
         assert_eq!(
-            plan_fuse_access_decision(&attr, &other, ACCESS_READ, None),
+            plan_fuse_access_decision(&attr, &other, ACCESS_READ, None, &VALID_MOUNT),
             Ok(())
         );
         assert_eq!(
-            plan_fuse_access_decision(&attr, &other, ACCESS_WRITE, None),
+            plan_fuse_access_decision(&attr, &other, ACCESS_WRITE, None, &VALID_MOUNT),
             Err(Errno::EACCES)
         );
         assert_eq!(
-            plan_fuse_access_decision(&attr, &other, ACCESS_EXECUTE, None),
+            plan_fuse_access_decision(&attr, &other, ACCESS_EXECUTE, None, &VALID_MOUNT),
             Err(Errno::EACCES)
         );
     }
@@ -19724,14 +19833,19 @@ mod tests {
     #[test]
     fn access_plan_matches_permission_root_override() {
         let attr = test_attr_with_mode(42, 7, 0, 1000, 1001);
+        let executable_attr = test_attr_with_mode(42, 7, 0o001, 1000, 1001);
         let root = access_ctx(0, 0, &[0]);
 
         assert_eq!(
-            plan_fuse_access_decision(&attr, &root, ACCESS_READ | ACCESS_WRITE, None),
+            plan_fuse_access_decision(&attr, &root, ACCESS_READ | ACCESS_WRITE, None, &VALID_MOUNT),
             Ok(())
         );
         assert_eq!(
-            plan_fuse_access_decision(&attr, &root, ACCESS_EXECUTE, None),
+            plan_fuse_access_decision(&attr, &root, ACCESS_EXECUTE, None, &VALID_MOUNT),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(
+            plan_fuse_access_decision(&executable_attr, &root, ACCESS_EXECUTE, None, &VALID_MOUNT),
             Ok(())
         );
     }
@@ -19741,11 +19855,11 @@ mod tests {
         let ctx = access_ctx(1000, 1001, &[1001]);
 
         assert_eq!(
-            plan_fuse_access_result(Err(Errno::ENOENT), &ctx, ACCESS_READ, None),
+            plan_fuse_access_result(Err(Errno::ENOENT), &ctx, ACCESS_READ, None, &VALID_MOUNT),
             Err(Errno::ENOENT)
         );
         assert_eq!(
-            plan_fuse_access_result(Err(Errno::ESTALE), &ctx, ACCESS_READ, None),
+            plan_fuse_access_result(Err(Errno::ESTALE), &ctx, ACCESS_READ, None, &VALID_MOUNT),
             Err(Errno::ESTALE)
         );
     }
@@ -19816,23 +19930,23 @@ mod tests {
         let other = access_ctx(3000, 3001, &[3001]);
 
         assert_eq!(
-            plan_fuse_open_access(Ok(attr), &owner, libc::O_RDWR as u32, None),
+            plan_fuse_open_access(Ok(attr), &owner, libc::O_RDWR as u32, None, &VALID_MOUNT),
             Ok(())
         );
         assert_eq!(
-            plan_fuse_open_access(Ok(attr), &group, libc::O_RDONLY as u32, None),
+            plan_fuse_open_access(Ok(attr), &group, libc::O_RDONLY as u32, None, &VALID_MOUNT),
             Ok(())
         );
         assert_eq!(
-            plan_fuse_open_access(Ok(attr), &group, libc::O_WRONLY as u32, None),
+            plan_fuse_open_access(Ok(attr), &group, libc::O_WRONLY as u32, None, &VALID_MOUNT),
             Err(Errno::EACCES)
         );
         assert_eq!(
-            plan_fuse_open_access(Ok(attr), &group, libc::O_RDWR as u32, None),
+            plan_fuse_open_access(Ok(attr), &group, libc::O_RDWR as u32, None, &VALID_MOUNT),
             Err(Errno::EACCES)
         );
         assert_eq!(
-            plan_fuse_open_access(Ok(attr), &other, libc::O_RDONLY as u32, None),
+            plan_fuse_open_access(Ok(attr), &other, libc::O_RDONLY as u32, None, &VALID_MOUNT),
             Err(Errno::EACCES)
         );
     }
@@ -19847,7 +19961,8 @@ mod tests {
                 Ok(executable),
                 &non_readable_user,
                 libc::O_RDONLY as u32 | LINUX_FMODE_EXEC_OPEN_FLAG,
-                None
+                None,
+                &VALID_MOUNT
             ),
             Ok(())
         );
@@ -19856,7 +19971,8 @@ mod tests {
                 Ok(executable),
                 &non_readable_user,
                 libc::O_RDONLY as u32,
-                None
+                None,
+                &VALID_MOUNT
             ),
             Err(Errno::EACCES)
         );
@@ -19867,7 +19983,8 @@ mod tests {
                 Ok(not_executable),
                 &non_readable_user,
                 libc::O_RDONLY as u32 | LINUX_FMODE_EXEC_OPEN_FLAG,
-                None
+                None,
+                &VALID_MOUNT
             ),
             Err(Errno::EACCES)
         );
@@ -19878,11 +19995,23 @@ mod tests {
         let ctx = access_ctx(1000, 1001, &[1001]);
 
         assert_eq!(
-            plan_fuse_open_access(Err(Errno::ENOENT), &ctx, libc::O_RDONLY as u32, None),
+            plan_fuse_open_access(
+                Err(Errno::ENOENT),
+                &ctx,
+                libc::O_RDONLY as u32,
+                None,
+                &VALID_MOUNT
+            ),
             Err(Errno::ENOENT)
         );
         assert_eq!(
-            plan_fuse_open_access(Err(Errno::ESTALE), &ctx, libc::O_WRONLY as u32, None),
+            plan_fuse_open_access(
+                Err(Errno::ESTALE),
+                &ctx,
+                libc::O_WRONLY as u32,
+                None,
+                &VALID_MOUNT
+            ),
             Err(Errno::ESTALE)
         );
     }
@@ -25407,7 +25536,12 @@ mod tests {
         let missing_parent = InodeId::new(u64::MAX);
 
         assert_eq!(
-            check_parent_write_execute_mutation_preflight(&**engine, missing_parent, &root_ctx()),
+            check_parent_write_execute_mutation_preflight(
+                &**engine,
+                missing_parent,
+                &root_ctx(),
+                &VALID_MOUNT
+            ),
             Ok(()),
             "root creation preflight should not spend a getattr before the engine mutation"
         );
@@ -25415,6 +25549,7 @@ mod tests {
             &**engine,
             missing_parent,
             &access_ctx(1000, 1001, &[1001]),
+            &VALID_MOUNT,
         );
         assert!(
             non_root_result.is_err(),
@@ -25445,9 +25580,14 @@ mod tests {
         };
 
         let engine = fixture.adapter.engine.lock().unwrap();
-        let root_child =
-            delete_child_attr_for_mutation_preflight(&**engine, parent, b"child.txt", &root_ctx)
-                .expect("root delete preflight resolves child");
+        let root_child = delete_child_attr_for_mutation_preflight(
+            &**engine,
+            parent,
+            b"child.txt",
+            &root_ctx,
+            &VALID_MOUNT,
+        )
+        .expect("root delete preflight resolves child");
         assert_eq!(root_child.inode_id, child);
 
         let non_root_result = delete_child_attr_for_mutation_preflight(
@@ -25455,6 +25595,7 @@ mod tests {
             parent,
             b"child.txt",
             &access_ctx(1000, 1001, &[1001]),
+            &VALID_MOUNT,
         );
         assert_eq!(non_root_result.unwrap_err(), Errno::EACCES);
     }
@@ -25489,6 +25630,7 @@ mod tests {
             parent,
             b"dest.txt",
             &root_ctx,
+            &VALID_MOUNT,
         )
         .expect("root rename preflight resolves source without permission scan");
         assert_eq!(
@@ -25499,6 +25641,7 @@ mod tests {
                 parent,
                 b"dest.txt",
                 &root_ctx,
+                &VALID_MOUNT,
             )
             .unwrap_err(),
             Errno::ENOENT,
@@ -25516,6 +25659,7 @@ mod tests {
             parent,
             b"dest.txt",
             &access_ctx(1000, 1001, &[1001]),
+            &VALID_MOUNT,
         );
         assert_eq!(non_root_result.unwrap_err(), Errno::EACCES);
     }

@@ -11,13 +11,15 @@ use tidefs_permission::{
     check_validated_access, deserialize_acl, plan_setgid_create_inheritance,
     plan_sticky_directory_delete, plan_sticky_directory_rename, recalc_acl_mask,
     recalc_mode_from_acl, serialize_acl, validate_access_request, validate_xattr_namespace,
-    AccessRequestError, CreatedEntryKind, InodeAttr, PathTraversalComponent, PosixAcl,
-    PosixAclEntry, SetgidCreateGidSource, StickyDirectoryDeleteAllow, StickyDirectoryDeletePlan,
-    StickyDirectoryRenameDeny, StickyDirectoryRenameTarget, XattrNamespace, XattrNamespaceError,
-    ACCESS_NONE, ACCESS_READ, ACCESS_RWX, ACCESS_WRITE, ACL_GROUP_OBJ, ACL_MASK, ACL_OTHER,
-    ACL_USER_OBJ, S_IRGRP, S_IROTH, S_IRUSR, S_ISGID, S_ISVTX, S_IWGRP, S_IWOTH, S_IWUSR, S_IXGRP,
-    S_IXOTH, S_IXUSR, XATTR_NAME_MAX,
+    AccessRequestError, CreatedEntryKind, InodeAttr, MountIdentity, PathTraversalComponent,
+    PosixAcl, PosixAclEntry, SetgidCreateGidSource, StickyDirectoryDeleteAllow,
+    StickyDirectoryDeletePlan, StickyDirectoryRenameDeny, StickyDirectoryRenameTarget,
+    XattrNamespace, XattrNamespaceError, ACCESS_NONE, ACCESS_READ, ACCESS_RWX, ACCESS_WRITE,
+    ACL_GROUP_OBJ, ACL_MASK, ACL_OTHER, ACL_USER_OBJ, S_IRGRP, S_IROTH, S_IRUSR, S_ISGID, S_ISVTX,
+    S_IWGRP, S_IWOTH, S_IWUSR, S_IXGRP, S_IXOTH, S_IXUSR, XATTR_NAME_MAX,
 };
+
+const VALID_MOUNT: MountIdentity = MountIdentity::new([0x41; 16], 1);
 
 #[derive(Clone, Copy)]
 struct SmokeInode {
@@ -78,35 +80,35 @@ fn smoke_access_checks(h: &mut SmokeHarness) {
 
     h.assert_ev(
         "owner read is allowed by owner bits",
-        can_read(&inode, None, 1000, 100, &[]),
+        can_read(&inode, None, 1000, 100, &[], &VALID_MOUNT),
     );
     h.assert_ev(
         "owner write is allowed by owner bits",
-        can_write(&inode, None, 1000, 100, &[]),
+        can_write(&inode, None, 1000, 100, &[], &VALID_MOUNT),
     );
     h.assert_ev(
         "owner execute is denied without owner execute bit",
-        !can_execute(&inode, None, 1000, 100, &[]),
+        !can_execute(&inode, None, 1000, 100, &[], &VALID_MOUNT),
     );
     h.assert_ev(
         "supplementary group read is allowed by group bits",
-        can_read(&inode, None, 2000, 200, &[100]),
+        can_read(&inode, None, 2000, 200, &[100], &VALID_MOUNT),
     );
     h.assert_ev(
         "other execute is allowed by other bits",
-        can_execute(&inode, None, 2000, 200, &[]),
+        can_execute(&inode, None, 2000, 200, &[], &VALID_MOUNT),
     );
     h.assert_ev(
         "other write is denied without other write bit",
-        !can_write(&inode, None, 2000, 200, &[]),
+        !can_write(&inode, None, 2000, 200, &[], &VALID_MOUNT),
     );
     h.assert_ev(
         "root override grants rwx",
-        check_access(&inode, None, 0, 0, &[], ACCESS_RWX),
+        check_access(&inode, None, 0, 0, &[], ACCESS_RWX, &VALID_MOUNT),
     );
     h.assert_eq_ev(
         "validated ACCESS_NONE succeeds",
-        check_validated_access(&inode, None, 2000, 200, &[], ACCESS_NONE),
+        check_validated_access(&inode, None, 2000, 200, &[], ACCESS_NONE, &VALID_MOUNT),
         Ok(true),
     );
     h.assert_ev(
@@ -145,12 +147,12 @@ fn smoke_path_traversal(h: &mut SmokeHarness) {
     ];
     h.assert_eq_ev(
         "all searchable path components traverse",
-        check_path_traversal(&accessible, 3000, 300, &[]),
+        check_path_traversal(&accessible, 3000, 300, &[], &VALID_MOUNT),
         Ok(()),
     );
     h.assert_ev(
         "can_lookup mirrors execute permission",
-        can_lookup(&searchable_root, None, 3000, 300, &[]),
+        can_lookup(&searchable_root, None, 3000, 300, &[], &VALID_MOUNT),
     );
 
     let denied = [
@@ -159,7 +161,7 @@ fn smoke_path_traversal(h: &mut SmokeHarness) {
     ];
     h.assert_eq_ev(
         "first denied path component is reported",
-        check_path_traversal(&denied, 3000, 300, &[]).map_err(|e| e.component_index),
+        check_path_traversal(&denied, 3000, 300, &[], &VALID_MOUNT).map_err(|e| e.component_index),
         Err(1),
     );
 }
@@ -349,11 +351,27 @@ fn smoke_acl_codec_and_mode_sync(h: &mut SmokeHarness) {
     };
     h.assert_ev(
         "ACL owner entry grants read",
-        check_access(&attrs, Some(&acl), 1000, 100, &[], ACCESS_READ),
+        check_access(
+            &attrs,
+            Some(&acl),
+            1000,
+            100,
+            &[],
+            ACCESS_READ,
+            &VALID_MOUNT,
+        ),
     );
     h.assert_ev(
         "ACL other entry does not grant write",
-        !check_access(&attrs, Some(&acl), 3000, 300, &[], ACCESS_WRITE),
+        !check_access(
+            &attrs,
+            Some(&acl),
+            3000,
+            300,
+            &[],
+            ACCESS_WRITE,
+            &VALID_MOUNT,
+        ),
     );
 }
 
