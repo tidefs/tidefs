@@ -528,6 +528,7 @@ mod tests {
             LeaseClass::Exclusive,
             inode_domain(1, 42),
             m(7),
+            0u64,
             30_000,
             1_000_000,
             epoch(1),

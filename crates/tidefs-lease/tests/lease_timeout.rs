@@ -20,6 +20,7 @@ fn make_grant(id: u64, term_millis: u64, granted_at_millis: u64) -> LeaseGrant {
             ino: 42,
         },
         mid(1),
+        0u64,
         term_millis,
         granted_at_millis,
         EpochId::new(1),
