@@ -33,7 +33,6 @@ pub use tidefs_membership_epoch::NodeIdentity;
 use tidefs_membership_epoch::{EpochId, MemberClass, MemberId, MembershipConfigRecord};
 
 use crate::JoinError;
-use tidefs_types_pool_label_core::PoolLabelFingerprint;
 
 /// Wire protocol version for the discovery/handshake protocol.
 pub const DISCOVERY_PROTOCOL_VERSION: u32 = 1;
@@ -861,6 +860,7 @@ impl ClusterDiscovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_types_pool_label_core::PoolLabelFingerprint;
 
     fn test_identity(id: u64) -> NodeIdentity {
         NodeIdentity::new(id)
