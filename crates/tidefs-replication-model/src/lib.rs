@@ -104,7 +104,9 @@ pub const REBUILD_BACKFILL_REBALANCE_GATE_OW_305: &str =
 pub const ERASURE_CODED_LAYOUT_GATE_OW_306: &str =
     "OW-306 erasure-coded layout model covers decode, rebuild, and partial failure gates";
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd,
+)]
 pub struct ReplicatedSubjectId(pub u64);
 
 impl ReplicatedSubjectId {
@@ -114,7 +116,9 @@ impl ReplicatedSubjectId {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd,
+)]
 pub struct ReplicatedReceiptId(pub u64);
 
 impl ReplicatedReceiptId {
@@ -131,7 +135,9 @@ impl ReplicatedReceiptId {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd,
+)]
 pub struct ObjectDigest(pub u64);
 
 impl ObjectDigest {
