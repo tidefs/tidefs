@@ -133,3 +133,30 @@ fn mutated_historical_record_is_rejected_on_load() {
         ValidationReceiptLedgerError::HistoricalMutation { sequence: 0, .. }
     ));
 }
+
+#[test]
+fn retained_head_digest_rejects_silent_chain_replacement() {
+    let mut ledger = ValidationReceiptLedger::new();
+    let first_digest = ledger
+        .append(receipt(0, ValidationReceiptDigest::ZERO, "pass"))
+        .unwrap();
+    ledger.append(receipt(1, first_digest, "pass")).unwrap();
+    let retained_head = ledger.head_digest();
+
+    let mut replacement = ValidationReceiptLedger::new();
+    let first_digest = replacement
+        .append(receipt(0, ValidationReceiptDigest::ZERO, "fail"))
+        .unwrap();
+    replacement
+        .append(receipt(1, first_digest, "fail"))
+        .unwrap();
+    let (records, digests) = replacement.into_parts();
+    let rebuilt = ValidationReceiptLedger::from_parts(records, digests).unwrap();
+
+    let err = rebuilt.verify_head_digest(retained_head).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ValidationReceiptLedgerError::HeadDigestMismatch { .. }
+    ));
+}
