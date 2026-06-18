@@ -1048,17 +1048,23 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
             if payload[0] == 1 && payload.len() >= 6 {
                 // Response: ok(u8=1) + key_len(u32 LE) + key
                 // + has_recorded_receipt(u8) + optional placement_receipt_ref.
+                // A request with a one-byte key also starts with 1 because its
+                // key_len is u32(1), so only accept the response shape when the
+                // frame length matches exactly; otherwise fall through to
+                // request decoding.
                 let key_len = u32::from_le_bytes(payload[1..5].try_into().ok()?) as usize;
-                if payload.len() < 5 + key_len + 1 {
-                    return None;
+                if payload.len() == 6 + key_len && payload[5 + key_len] == 0 {
+                    let key = payload[5..5 + key_len].to_vec();
+                    return Some(Frame::PutWithReceiptResponse {
+                        key,
+                        recorded_receipt_ref: None,
+                    });
                 }
-                let key = payload[5..5 + key_len].to_vec();
-                let has_receipt = payload[5 + key_len];
-                if has_receipt == 1 {
+                if payload.len() == 6 + key_len + PLACEMENT_RECEIPT_REF_WIRE_LEN
+                    && payload[5 + key_len] == 1
+                {
                     let receipt_start = 6 + key_len;
-                    if payload.len() < receipt_start + PLACEMENT_RECEIPT_REF_WIRE_LEN {
-                        return None;
-                    }
+                    let key = payload[5..5 + key_len].to_vec();
                     let (receipt, receipt_len) =
                         decode_placement_receipt_ref(&payload[receipt_start..])?;
                     if receipt_len == PLACEMENT_RECEIPT_REF_WIRE_LEN {
@@ -1069,10 +1075,6 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
                     }
                     return None;
                 }
-                return Some(Frame::PutWithReceiptResponse {
-                    key,
-                    recorded_receipt_ref: None,
-                });
             }
             if payload.len() >= 4 {
                 // Request: key_len(u32 LE) + key + placement_receipt_ref
@@ -1574,6 +1576,19 @@ mod tests {
         let key = b"object-1".to_vec();
         let payload = b"example-data";
         let receipt = receipt_ref(&key, payload, 7);
+        let f = Frame::PutWithReceipt {
+            key,
+            placement_receipt_ref: receipt,
+            value: payload.to_vec(),
+        };
+        assert_eq!(decode(&encode(&f)), Some(f));
+    }
+
+    #[test]
+    fn roundtrip_put_with_receipt_one_byte_key_request() {
+        let key = b"k".to_vec();
+        let payload = b"example-data";
+        let receipt = receipt_ref(&key, payload, 8);
         let f = Frame::PutWithReceipt {
             key,
             placement_receipt_ref: receipt,
