@@ -132,34 +132,82 @@ impl SessionBindingManager {
     /// Whether session bindings can proceed: checks that the session
     /// epoch is valid for the given member and current epoch.
     #[must_use]
-    pub fn can_bind_sessions(
-        &self,
-        current_epoch: EpochId,
-    ) -> Result<(), crate::JoinError> {
-        let session = self
-            .session_epoch
-            .as_ref()
-            .ok_or_else(|| crate::JoinError::MissingEpochEvidence(
-                "no session epoch recorded".into(),
-            ))?;
-
-        let _ = session.is_valid_for(self.member_id, current_epoch).map_err(|status| match status {
-            crate::JoinStatus::WaitingForQuorum => crate::JoinError::QuorumNotReached {
-                epoch: session.epoch,
-                approvals: session.quorum_evidence.as_ref().map_or(0, |qe| qe.quorum_approvals),
-                threshold: session.quorum_evidence.as_ref().map_or(1, |qe| qe.quorum_threshold),
-            },
-            crate::JoinStatus::StaleEpoch { current_epoch, join_epoch } => crate::JoinError::StaleEpoch {
-                session_epoch: join_epoch,
-                current_epoch,
-                reason: "session binding blocked: stale epoch".into(),
-            },
-            crate::JoinStatus::IdentityMismatch { expected, actual } => crate::JoinError::IdentityMismatch {
-                session_member: expected,
-                caller_member: actual,
-            },
-            _ => crate::JoinError::PreflightDenied(format!("session binding blocked: {:?}", status)),
+    pub fn can_bind_sessions(&self, current_epoch: EpochId) -> Result<(), crate::JoinError> {
+        let session = self.session_epoch.as_ref().ok_or_else(|| {
+            crate::JoinError::MissingEpochEvidence("no session epoch recorded".into())
         })?;
+
+        let _ = session
+            .is_valid_for(self.member_id, current_epoch)
+            .map_err(|status| match status {
+                crate::JoinStatus::WaitingForQuorum => crate::JoinError::QuorumNotReached {
+                    epoch: session.epoch,
+                    approvals: session
+                        .quorum_evidence
+                        .as_ref()
+                        .map_or(0, |qe| qe.quorum_approvals),
+                    threshold: session
+                        .quorum_evidence
+                        .as_ref()
+                        .map_or(1, |qe| qe.quorum_threshold),
+                },
+                crate::JoinStatus::StaleEpoch {
+                    current_epoch,
+                    join_epoch,
+                } => crate::JoinError::StaleEpoch {
+                    session_epoch: join_epoch,
+                    current_epoch,
+                    reason: "session binding blocked: stale epoch".into(),
+                },
+                crate::JoinStatus::IdentityMismatch { expected, actual } => {
+                    crate::JoinError::IdentityMismatch {
+                        session_member: expected,
+                        caller_member: actual,
+                    }
+                }
+                crate::JoinStatus::PoolScanNotCommitted => crate::JoinError::PoolScanNotCommitted {
+                    member_id: self.member_id,
+                },
+                crate::JoinStatus::PoolScanMemberNotFound => {
+                    crate::JoinError::PoolScanMemberNotFound {
+                        member_id: self.member_id,
+                    }
+                }
+                crate::JoinStatus::PoolScanEpochMismatch => {
+                    crate::JoinError::PoolScanEpochMismatch {
+                        member_id: self.member_id,
+                        expected: session.epoch,
+                        got: session
+                            .pool_scan_evidence
+                            .as_ref()
+                            .map_or(session.epoch, |ev| EpochId::new(ev.proposed_epoch_id)),
+                    }
+                }
+                crate::JoinStatus::WaitingForPoolScan => {
+                    crate::JoinError::MissingPoolScanEvidence {
+                        member_id: self.member_id,
+                    }
+                }
+                crate::JoinStatus::WaitingForLabelAgreement => {
+                    crate::JoinError::MissingLabelAgreement {
+                        member_id: self.member_id,
+                    }
+                }
+                crate::JoinStatus::LabelAgreementNotCommitted => {
+                    crate::JoinError::LabelAgreementNotCommitted {
+                        member_id: self.member_id,
+                    }
+                }
+                crate::JoinStatus::LabelAgreementMismatch => {
+                    crate::JoinError::LabelAgreementMismatch {
+                        member_id: self.member_id,
+                    }
+                }
+                _ => crate::JoinError::PreflightDenied(format!(
+                    "session binding blocked: {:?}",
+                    status
+                )),
+            })?;
 
         Ok(())
     }

@@ -32,8 +32,8 @@ use std::collections::BTreeMap;
 pub use tidefs_membership_epoch::NodeIdentity;
 use tidefs_membership_epoch::{EpochId, MemberClass, MemberId, MembershipConfigRecord};
 
-use tidefs_types_pool_label_core::PoolLabelFingerprint;
 use crate::JoinError;
+use tidefs_types_pool_label_core::PoolLabelFingerprint;
 
 /// Wire protocol version for the discovery/handshake protocol.
 pub const DISCOVERY_PROTOCOL_VERSION: u32 = 1;
@@ -2040,17 +2040,30 @@ mod tests {
             crate::NodeJoinProtocol::new(MemberId::new(1), EpochId::new(10), 1, 5000);
         // Provide committed evidence so phase_shadow gates pass
         let session = crate::JoinSessionEpoch::new(commit_result.epoch, MemberId::new(1), 5000)
-            .with_pool_scan_evidence(crate::CommittedPoolScanEvidence {
-                committed_root: 0xBEEF, commit_group: 42, pool_id: commit_result.pool_id,
-                is_committed: true, member_id_present: true, joining_member_id: MemberId::new(1),
-                evidence_hash: [0xAAu8; 32],
-            })
+            .with_pool_scan_evidence(
+                tidefs_membership_epoch::pool_scan_gate::PoolScanEvidence::committed(
+                    commit_result.epoch.0.saturating_sub(1),
+                    commit_result.epoch.0,
+                    42,
+                    1,
+                    [
+                        tidefs_membership_epoch::pool_scan_gate::EpochMemberLabelFingerprint::new(
+                            1,
+                            PoolLabelFingerprint::from([0xBBu8; 32]),
+                        ),
+                    ],
+                ),
+            )
             .with_label_agreement(crate::LabelAgreementFingerprint {
-                fingerprint: PoolLabelFingerprint::from([0xBBu8; 32]), is_committed: true,
+                fingerprint: PoolLabelFingerprint::from([0xBBu8; 32]),
+                is_committed: true,
             })
             .with_placement_receipt(crate::PlacementReceiptEvidence {
-                intent_class: None, is_committed: true, placement_epoch: commit_result.epoch,
-                receipt_id: 1, receipt_hash: [0xCCu8; 32],
+                intent_class: None,
+                is_committed: true,
+                placement_epoch: commit_result.epoch,
+                receipt_id: 1,
+                receipt_hash: [0xCCu8; 32],
             });
         protocol.record_session_epoch(session);
         protocol

@@ -452,11 +452,7 @@ impl NodeJoin {
 
         // Record the session epoch binding from the join commit,
         // including any committed evidence.
-        let mut session = crate::JoinSessionEpoch::new(
-            commit.epoch,
-            self.member_id,
-            at_ns,
-        );
+        let mut session = crate::JoinSessionEpoch::new(commit.epoch, self.member_id, at_ns);
         if let Some(ref ev) = commit.pool_scan_evidence {
             session.pool_scan_evidence = Some(ev.clone());
         }
@@ -828,6 +824,65 @@ mod tests {
         assert_eq!(join.state, NodeJoinState::Bootstrapping);
         assert_eq!(join.bootstrap_peer, Some(MemberId::new(1)));
         assert_eq!(join.current_epoch, EpochId::new(5));
+    }
+
+    #[test]
+    fn node_join_start_from_commit_preserves_evidence() {
+        let mut join = NodeJoin::new(MemberId::new(42), EpochId::new(1), 1_000_000);
+        let label_fingerprint =
+            tidefs_types_pool_label_core::PoolLabelFingerprint::from([0xBBu8; 32]);
+        let pool_scan_evidence =
+            tidefs_membership_epoch::pool_scan_gate::PoolScanEvidence::committed(
+                4,
+                5,
+                42,
+                1,
+                [
+                    tidefs_membership_epoch::pool_scan_gate::EpochMemberLabelFingerprint::new(
+                        42,
+                        label_fingerprint,
+                    ),
+                ],
+            );
+        let label_agreement = crate::LabelAgreementFingerprint::committed(label_fingerprint);
+        let placement_receipt = crate::PlacementReceiptEvidence::new(
+            tidefs_membership_epoch::PlacementIntentClass::ReplicaTarget,
+            EpochId::new(5),
+            77,
+            [0xCCu8; 32],
+        );
+
+        let commit = crate::JoinCommitResult {
+            member_id: MemberId::new(42),
+            membership_config: tidefs_membership_epoch::MembershipConfigRecord {
+                membership_epoch_id: EpochId::new(5),
+                config_class: tidefs_membership_epoch::ConfigClass::Normal,
+                version_index: 0,
+                voter_set_refs: vec![],
+                learner_set_refs: vec![MemberId::new(42)],
+                observer_set_refs: vec![],
+                joint_old_set_refs: vec![],
+                joint_new_set_refs: vec![],
+                issuance_receipt_ref: tidefs_membership_epoch::ReceiptId(0),
+                digest: 0,
+            },
+            committed_root: 0xDEAD,
+            epoch: EpochId::new(5),
+            pool_id: 7,
+            pool_scan_evidence: Some(pool_scan_evidence),
+            label_agreement: Some(label_agreement),
+            placement_receipt: Some(placement_receipt),
+        };
+
+        join.start_from_join_commit(&commit, MemberId::new(1), 2_000_000)
+            .unwrap();
+
+        let session = join.session_epoch.as_ref().unwrap();
+        let scan = session.pool_scan_evidence.as_ref().unwrap();
+        assert!(scan.committed);
+        assert_eq!(scan.label_fingerprint_for(42), Some(label_fingerprint));
+        assert_eq!(session.label_agreement, Some(label_agreement));
+        assert_eq!(session.placement_receipt.as_ref().unwrap().receipt_id, 77);
     }
 
     #[test]
