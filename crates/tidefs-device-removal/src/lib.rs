@@ -1654,7 +1654,7 @@ impl DeviceRemovalDriver {
                 Ok(extent_ids) => match checker.receipts_referencing_extents(&extent_ids) {
                     Ok(refs) if refs.is_empty() => return Ok(()),
                     Ok(refs) => format!(
-                        "{} placement receipt(s) still reference the target device",
+                        "placement receipts still reference the target device: {} receipt ref(s)",
                         refs.len()
                     ),
                     Err(err) => {
