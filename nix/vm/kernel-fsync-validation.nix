@@ -384,7 +384,8 @@ fi
 echo ""
 echo "=== Phase 1 Durability Setup Complete ==="
 echo "PASSED=$PASSED FAILED=$FAILED BLOCKED=$BLOCKED"
-sync
+# Do not run sync here. The crash row must depend only on the fsync,
+# fdatasync, and syncfs calls exercised above.
 poweroff -f
 INITEOF2
 
