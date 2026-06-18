@@ -17,6 +17,7 @@
 {
   pkgs,
   linuxKernel_7_0,
+  tidefsPackage,
 }:
 
 let
@@ -44,8 +45,10 @@ let
     KERNEL_IMG="${linuxKernel_7_0}/bzImage"
     CPIO="${pkgs.cpio}/bin/cpio"
     GZIP="${pkgs.gzip}/bin/gzip"
+    LDD_BIN="${pkgs.lib.getBin pkgs.glibc}/bin/ldd"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     FSYNC_HELPER="${fsyncHelperBin}/bin/tidefs-fsync-guest-helper"
+    TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
     GLIBC_LIB="${pkgs.glibc}/lib"
 
     TMPDIR="''${TIDEFS_FSYNC_TMPDIR:-/tmp/tidefs-kmod-fsync-validation}"
@@ -122,7 +125,7 @@ USAGE
     echo "  Timeout:  ''${TIMEOUT_SEC}s"
     echo ""
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$FSYNC_HELPER"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$FSYNC_HELPER" "$TIDEFSCTL"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "BLOCKED: dependency not found: $dep" >&2
         write_blocked_summary "dependency_missing" "$dep"
@@ -149,7 +152,7 @@ USAGE
     # ── Prepare run directory ──────────────────────────────────────
 
     RUN_DIR="$TMPDIR/validation-$$"
-    mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,validation}
+    mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,validation,etc,run/tidefs/import}
     trap 'if [ -z "''${KEEP_TMP:-}" ]; then rm -rf "$RUN_DIR"; fi' EXIT
 
     # Busybox + applet symlinks
@@ -157,9 +160,31 @@ USAGE
     chmod +x "$RUN_DIR/bin/busybox"
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff \
       mknod mkdir rmdir dd stat cp mv rm touch find wc head cut sync umount \
-      uname date expr test mountpoint tr; do
+      uname date expr test mountpoint tr seq tail awk which basename dirname \
+      env true false printf lsmod; do
       ln -sf /bin/busybox "$RUN_DIR/bin/$applet" 2>/dev/null || true
     done
+
+    copy_elf_deps() {
+      local elf="$1"
+      local deps dep dep_dir ld_so ld_dir
+
+      deps=$("$LDD_BIN" "$elf" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
+      for dep in $deps; do
+        if [ -f "$dep" ]; then
+          dep_dir=$(dirname "$dep")
+          mkdir -p "$RUN_DIR$dep_dir"
+          cp "$dep" "$RUN_DIR$dep" 2>/dev/null || true
+        fi
+      done
+      ld_so=$("$LDD_BIN" "$elf" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
+      if [ -n "$ld_so" ] && [ -f "$ld_so" ]; then
+        ld_dir=$(dirname "$ld_so")
+        mkdir -p "$RUN_DIR$ld_dir"
+        cp "$ld_so" "$RUN_DIR$ld_so" 2>/dev/null || true
+        chmod +x "$RUN_DIR$ld_so" 2>/dev/null || true
+      fi
+    }
 
     # glibc shared libraries at absolute Nix store paths
     if [ -d "$GLIBC_LIB" ]; then
@@ -167,12 +192,19 @@ USAGE
       mkdir -p "$RUN_DIR/$GLIBC_STORE_DIR"
       cp -a "$GLIBC_LIB" "$RUN_DIR/$GLIBC_STORE_DIR/"
     fi
+    copy_elf_deps "$BUSYBOX"
+
+    cp "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
+    chmod +x "$RUN_DIR/bin/tidefsctl"
+    copy_elf_deps "$TIDEFSCTL"
 
     # Copy module and fsync helper into initramfs
     cp "$MODULE_KO" "$RUN_DIR/lib/modules/tidefs_posix_vfs.ko"
     mkdir -p "$RUN_DIR/usr/bin"
     cp "$FSYNC_HELPER" "$RUN_DIR/usr/bin/tidefs-fsync-guest-helper"
     chmod +x "$RUN_DIR/usr/bin/tidefs-fsync-guest-helper"
+    echo "root:x:0:0:root:/root:/bin/sh" > "$RUN_DIR/etc/passwd"
+    echo "root:x:0:" > "$RUN_DIR/etc/group"
 
     # ── Create persistent pool disk image ──────────────────────────
 
@@ -223,12 +255,18 @@ blocked() { echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
 
 MNT=/mnt/tidefs
 EVDIR=/validation
-mkdir -p "$EVDIR" "$MNT" 2>/dev/null
+POOL_NAME=fsync_qemu_pool
+POOL_READY=0
+mkdir -p "$EVDIR" "$MNT" /run/tidefs/import 2>/dev/null
 
 # ── Discover virtio-blk pool device ──────────────────────────────
 POOL_DEV=""
-for d in /dev/vda /dev/vdb; do
-  [ -b "$d" ] && { POOL_DEV="$d"; break; }
+for _ in $(seq 1 30); do
+  for d in /dev/vda /dev/vdb; do
+    [ -b "$d" ] && { POOL_DEV="$d"; break; }
+  done
+  [ -n "$POOL_DEV" ] && break
+  sleep 1
 done
 if [ -z "$POOL_DEV" ]; then
   blocked "virtio_blk_device" "no virtio block device found"
@@ -267,16 +305,49 @@ INITEOF
 
       cat >> "$RUN_DIR/init" << "INITEOF2"
 
+# ── Seed a configured TideFS pool member ─────────────────────────
+echo "--- Creating TideFS pool label and committed-root seed ---"
+if [ -b "$POOL_DEV" ] && command -v tidefsctl >/dev/null 2>&1; then
+  COUT=$(tidefsctl pool create "$POOL_NAME" --devices "$POOL_DEV" --json 2>&1)
+  RC=$?
+  echo "  tidefsctl pool create exit=$RC"
+  if [ "$RC" -eq 0 ]; then
+    pass "pool_member_created"
+    SOUT=$(tidefsctl pool scan --devices "$POOL_DEV" 2>&1)
+    SRC=$?
+    if [ "$SRC" -eq 0 ] && echo "$SOUT" | grep -qi "label"; then
+      pass "pool_label_verified"
+      POOL_READY=1
+    else
+      fail "pool_label_verified" "$SOUT"
+    fi
+  else
+    fail "pool_member_created" "$COUT"
+    blocked "pool_label_verified" "pool member was not created"
+  fi
+else
+  if [ ! -b "$POOL_DEV" ]; then
+    blocked "pool_member_created" "virtio pool device missing"
+  else
+    blocked "pool_member_created" "tidefsctl not found in initramfs"
+  fi
+  blocked "pool_label_verified" "pool member was not created"
+fi
+
 # ── Mount TideFS ─────────────────────────────────────────────────
 echo "--- Mounting TideFS ---"
 
 MOUNT_OK=0
-if mount -t tidefs -o device="$POOL_DEV" none "$MNT" 2>/tmp/mount.err; then
-  pass "mount_pool_backed"
-  MOUNT_OK=1
+if [ "$POOL_READY" -eq 1 ]; then
+  if mount -t tidefs "$POOL_DEV" "$MNT" 2>/tmp/mount.err; then
+    pass "mount_pool_backed"
+    MOUNT_OK=1
+  else
+    MERR=$(head -3 /tmp/mount.err 2>/dev/null | tr '\n' ' ')
+    fail "mount_pool_backed" "$MERR"
+  fi
 else
-  MERR=$(head -3 /tmp/mount.err 2>/dev/null | tr '\n' ' ')
-  blocked "mount_pool_backed" "$MERR"
+  blocked "mount_pool_backed" "pool member was not ready"
 fi
 
 # Bootstrap mounts are intentionally not accepted for this durability row:
@@ -374,12 +445,16 @@ blocked() { echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
 
 MNT=/mnt/tidefs
 EVDIR=/validation
-mkdir -p "$EVDIR" "$MNT" 2>/dev/null
+mkdir -p "$EVDIR" "$MNT" /run/tidefs/import 2>/dev/null
 
 # ── Rediscover persistent virtio-blk pool device ─────────────────
 POOL_DEV=""
-for d in /dev/vda /dev/vdb; do
-  [ -b "$d" ] && { POOL_DEV="$d"; break; }
+for _ in $(seq 1 30); do
+  for d in /dev/vda /dev/vdb; do
+    [ -b "$d" ] && { POOL_DEV="$d"; break; }
+  done
+  [ -n "$POOL_DEV" ] && break
+  sleep 1
 done
 if [ -z "$POOL_DEV" ]; then
   blocked "p2_virtio_blk_device" "no virtio block device found"
@@ -413,12 +488,12 @@ grep -qi tidefs /proc/modules 2>/dev/null && pass "p2_module_lsmod" \
 # ── Remount after crash ──────────────────────────────────────────
 echo "--- Remounting TideFS after crash ---"
 REMOUNT_OK=0
-if mount -t tidefs -o device="$POOL_DEV" none "$MNT" 2>/tmp/mount_p2.err; then
+if mount -t tidefs "$POOL_DEV" "$MNT" 2>/tmp/mount_p2.err; then
   pass "p2_remount_pool"
   REMOUNT_OK=1
 else
   MERR=$(head -3 /tmp/mount_p2.err 2>/dev/null | tr '\n' ' ')
-  blocked "p2_remount_pool" "$MERR"
+  fail "p2_remount_pool" "$MERR"
 fi
 
 if [ "$REMOUNT_OK" -eq 0 ]; then
@@ -556,7 +631,8 @@ P2INIT
     TOTAL_BLOCKED=0
 
     for op in \
-      virtio_blk_device module_load module_lsmod mount_pool_backed \
+      virtio_blk_device module_load module_lsmod \
+      pool_member_created pool_label_verified mount_pool_backed \
       fsync_fd fdatasync_fd syncfs_fd \
       p2_virtio_blk_device p2_module_reload p2_module_lsmod p2_remount_pool \
       p2_fsync_data_survived p2_fdatasync_data_survived \

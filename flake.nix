@@ -3200,6 +3200,7 @@ EOF
           kernelFsyncValidation = import ./nix/vm/kernel-fsync-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
+            tidefsPackage = tidefsCtlRuntime;
           };
           kernelInotifyFanotifyValidation = import ./nix/vm/kernel-inotify-fanotify-validation.nix {
             inherit pkgs;
