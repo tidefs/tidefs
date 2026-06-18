@@ -25,8 +25,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.crates }}
-  cancel-in-progress: false
+  # Keep only the newest identical focused validation for a branch. Distinct
+  # crate selections or extra cargo-test args remain independent.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.crates }}-${{ inputs.cargo_test_args }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
