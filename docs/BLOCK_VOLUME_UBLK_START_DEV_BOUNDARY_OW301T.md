@@ -1,5 +1,7 @@
 # Block Volume ublk START_DEV Boundary OW-301T
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301T guarded ublk START_DEV control boundary is implemented in

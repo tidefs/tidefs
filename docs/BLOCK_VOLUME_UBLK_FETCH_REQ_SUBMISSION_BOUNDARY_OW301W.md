@@ -1,5 +1,7 @@
 # Block Volume ublk FETCH_REQ Submission Boundary OW-301W
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301W guarded ublk FETCH_REQ submission boundary is implemented in

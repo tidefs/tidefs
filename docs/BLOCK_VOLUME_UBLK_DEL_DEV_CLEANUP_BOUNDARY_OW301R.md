@@ -1,5 +1,7 @@
 # Block Volume ublk DEL_DEV Cleanup Boundary OW-301R
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301R executable ublk DEL_DEV cleanup uring_cmd boundary is implemented in

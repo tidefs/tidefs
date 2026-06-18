@@ -1026,6 +1026,17 @@ Important 2026-06-01 findings:
   scopes. This reduces TFR-011/TFR-019 drift but does not close full-kernel,
   broader operator UAPI, kernel residency, storage authority, block-volume,
   xfstests, crash-recovery, distributed, or documentation drift debt.
+- `TFR-019`: GitHub issue #512 extends documentation-authority coverage across
+  the remaining high-impact imported design surface not covered by the #497
+  slice: architecture/local-format references, block-volume and ublk adapter
+  source-boundary docs, FUSE/POSIX adapter docs, kernel/UAPI boundary docs, and
+  operator/placement docs. The new rows in
+  `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` classify scoped source-boundary
+  docs as current specs, the FUSE adapter bypass rule as current policy, and
+  broad production-depth ledgers as historical input. TFR-019 remains open for
+  the separate #497 slice, the remaining design-subdir queue, and any
+  per-document source audit needed before promoting additional docs to current
+  spec or policy.
 - `TFR-019`/`TFR-018`: the current xfstests harness authority slice repairs
   `xfstests-runner` as a diagnostic scoreboard wrapper, and sends output under
   runner help path no longer carries a bare `--per-test` command or duplicate

@@ -1,5 +1,7 @@
 # Membership Config Quorum Set Identity OW-302B
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 OW-302B hardens the deterministic `membership_placement_0` config record in
 `crates/tidefs-membership-epoch`.
 

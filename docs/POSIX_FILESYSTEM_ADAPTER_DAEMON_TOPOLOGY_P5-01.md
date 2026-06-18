@@ -1,5 +1,7 @@
 # POSIX Filesystem Adapter daemon topology (POSIX_FILESYSTEM_ADAPTER pre-preview continuity)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This is the active human-named authority document.
 
 

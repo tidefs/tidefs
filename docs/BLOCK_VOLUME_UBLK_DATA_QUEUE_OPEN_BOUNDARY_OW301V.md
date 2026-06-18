@@ -1,5 +1,7 @@
 # Block Volume ublk Data Queue Open Boundary OW-301V
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301V guarded ublk data-queue runtime-open boundary is implemented in

@@ -1,5 +1,7 @@
 # Pool-Wide Redundancy and Placement Contract
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 Maturity: **implemented** with pool-level property tests.
 
 This document is the source of truth for how TideFS pools place objects across

@@ -1,5 +1,7 @@
 # receipt / response runtime emission path (P3-03) (v0.357)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the source-of-truth for the production-depth receipt /
 response runtime emission path for tidefs.
 

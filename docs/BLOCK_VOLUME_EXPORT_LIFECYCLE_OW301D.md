@@ -1,5 +1,7 @@
 # Block Volume Export Lifecycle OW-301D
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301D executable block-volume export lifecycle slice is implemented in

@@ -1,5 +1,7 @@
 # page-cache / writeback / mmap integration (P5-03) (v0.316)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the production-depth source-of-truth for the posix_filesystem_adapter page-cache, writeback, and mmap contract on Linux 7.0.
 
 For cluster mmap coherency across nodes, see Forgejo #1259 (`[DESIGN] mmap cluster coherency`).

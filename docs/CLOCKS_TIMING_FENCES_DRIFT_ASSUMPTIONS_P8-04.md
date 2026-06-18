@@ -1,5 +1,7 @@
 # clocks / timing / fences / drift assumptions (v0.325)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the source-of-truth for production item **P8-04**.
 
 It settles the live timing law for tidefs across:

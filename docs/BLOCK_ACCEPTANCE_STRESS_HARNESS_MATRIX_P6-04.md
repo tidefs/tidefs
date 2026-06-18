@@ -1,5 +1,7 @@
 # block acceptance / stress harness matrix (v0.324)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the production-depth source-of-truth for **`P6-04`**.
 
 It answers the question:

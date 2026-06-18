@@ -1,5 +1,7 @@
 # Block Volume ublk Started Export Admission Boundary Issue 341
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 Issue 341 binds the existing ublk control and data-queue pieces into one

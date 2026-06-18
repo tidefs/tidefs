@@ -1,5 +1,7 @@
 # Block Volume Resize Fence OW-301F
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301F executable block-volume resize/fence transition slice is implemented in

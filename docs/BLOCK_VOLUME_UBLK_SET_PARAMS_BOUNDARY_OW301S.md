@@ -1,5 +1,7 @@
 # Block Volume ublk SET_PARAMS Boundary OW-301S
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-301S executable ublk SET_PARAMS control uring_cmd boundary is implemented in

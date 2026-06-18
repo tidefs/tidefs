@@ -1,5 +1,7 @@
 # publication pipeline runtime decomposition (P3-02) (v0.357)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the source-of-truth for the production-depth publication
 pipeline runtime decomposition for tidefs.
 

@@ -1,5 +1,7 @@
 # membership / placement / failure-domain model (P8-02) (v0.364)
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 This document is the source-of-truth for the production-depth membership,
 placement, and failure-domain model for tidefs.
 

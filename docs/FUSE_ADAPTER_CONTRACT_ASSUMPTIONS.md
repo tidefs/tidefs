@@ -1,5 +1,7 @@
 # FUSE Adapter Contract Assumptions
 
+> TFR-019 authority classification: Current policy (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 Maturity: current guardrail for issue #290.
 
 The FUSE adapter is an environment boundary. It may parse kernel requests,

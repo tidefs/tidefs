@@ -1,5 +1,7 @@
 # Erasure-Coded Layout Model OW-306
 
+> TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 ## Source Boundary
 
 OW-306 executable erasure-coded layout slice is implemented in
