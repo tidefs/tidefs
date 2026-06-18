@@ -150,6 +150,7 @@ pub struct LeaseGrant {
     pub lease_class: LeaseClass,
     pub domain: LeaseDomain,
     pub holder_id: MemberId,
+    pub dataset_mount_id: u64,
     pub lifecycle: LeaseLifecycle,
     pub granted_at_millis: u64,
     pub term_millis: u64,
@@ -169,6 +170,7 @@ impl LeaseGrant {
         lease_class: LeaseClass,
         domain: LeaseDomain,
         holder_id: MemberId,
+        dataset_mount_id: u64,
         term_millis: u64,
         granted_at_millis: u64,
         epoch: EpochId,
@@ -184,6 +186,7 @@ impl LeaseGrant {
             lease_class,
             domain,
             holder_id,
+            dataset_mount_id,
             lifecycle: LeaseLifecycle::Granted,
             granted_at_millis,
             term_millis,
@@ -400,6 +403,8 @@ pub enum LockMethod {
     LockGrantEvent = 0x0F,
     RecallAll = 0x10,
     RecallAllAck = 0x11,
+    Unmount = 0x12,
+    UnmountAck = 0x13,
 }
 
 impl LockMethod {

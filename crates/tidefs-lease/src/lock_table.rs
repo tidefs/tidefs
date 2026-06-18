@@ -523,6 +523,22 @@ impl LockTable {
         self.owner_index.clear();
         self.pending_locks.clear();
     }
+
+    /// Release every lease associated with a dataset mount identity.
+    /// Returns the count of leases released.
+    pub fn release_by_mount(&mut self, dataset_mount_id: u64, epoch: EpochId) -> u32 {
+        let ids: Vec<u64> = self
+            .grants
+            .values()
+            .filter(|g| g.dataset_mount_id == dataset_mount_id && g.epoch == epoch)
+            .map(|g| g.lease_id)
+            .collect();
+        let count = ids.len() as u32;
+        for lease_id in ids {
+            self.remove_grant(lease_id);
+        }
+        count
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -561,6 +577,7 @@ mod tests {
                 ino: 42,
             },
             mid(5),
+            1u64,
             30_000,
             1_000_000,
             EpochId::new(1),
@@ -585,6 +602,7 @@ mod tests {
                 ino: 7,
             },
             mid(3),
+            1u64,
             30_000,
             1_000_000,
             EpochId::new(1),
@@ -613,6 +631,7 @@ mod tests {
                 ino: 10,
             },
             mid(2),
+            1u64,
             30_000,
             800_000,
             EpochId::new(1),
@@ -648,6 +667,7 @@ mod tests {
                 ino: 1,
             },
             mid(1),
+            1u64,
             30_000,
             100_000,
             EpochId::new(1),
@@ -665,6 +685,7 @@ mod tests {
                 end: 4096,
             },
             mid(2),
+            1u64,
             30_000,
             200_000,
             EpochId::new(1),
@@ -694,6 +715,7 @@ mod tests {
                 ino: 99,
             },
             mid(4),
+            1u64,
             30_000,
             500_000,
             EpochId::new(1),
@@ -721,6 +743,7 @@ mod tests {
                 prefix: "/a/".into(),
             },
             mid(1),
+            1u64,
             30_000,
             100_000,
             EpochId::new(1),
@@ -773,6 +796,7 @@ mod tests {
                 end: 4095,
             },
             mid(1),
+            1u64,
             30_000,
             100_000,
             EpochId::new(1),
@@ -925,5 +949,8 @@ mod tests {
         let json = serde_json::to_string(&owner).unwrap();
         let owner2: LockOwner = serde_json::from_str(&json).unwrap();
         assert_eq!(owner, owner2);
-    }
+    
+
+
+}
 }

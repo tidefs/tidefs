@@ -111,6 +111,7 @@ pub enum FlockError {
 /// Returns `Err(FlockError::WouldBlock)` on conflict.
 pub fn tracker_acquire_flock(
     tracker: &mut LockTracker,
+    dataset_mount_id: u64,
     ino: u64,
     flock_type: FlockType,
     owner: FlockOwner,
@@ -122,16 +123,16 @@ pub fn tracker_acquire_flock(
     // Whole-file lock: start=0, len=0 (EOF).
     let range = LockRange::new(0, 0, lock_type, 0, owner.owner_fd as u32);
     tracker
-        .acquire(ino, range)
+        .acquire(dataset_mount_id, ino, range)
         .map_err(|_| FlockError::WouldBlock)
 }
 
 /// Release the BSD flock on `ino` held by `owner`.
 ///
 /// Does nothing when no flock is held by this owner on this inode.
-pub fn tracker_release_flock(tracker: &mut LockTracker, ino: u64, owner: FlockOwner) {
+pub fn tracker_release_flock(tracker: &mut LockTracker, dataset_mount_id: u64, ino: u64, owner: FlockOwner) {
     let range = LockRange::unlock(0, 0, owner.owner_fd as u32);
-    tracker.release(ino, range);
+    tracker.release(dataset_mount_id, ino, range);
 }
 
 /// Check whether `requested` would conflict with an existing BSD
@@ -142,6 +143,7 @@ pub fn tracker_release_flock(tracker: &mut LockTracker, ino: u64, owner: FlockOw
 #[must_use]
 pub fn tracker_query_flock_conflict(
     tracker: &LockTracker,
+    dataset_mount_id: u64,
     ino: u64,
     flock_type: FlockType,
     owner: FlockOwner,
@@ -151,17 +153,18 @@ pub fn tracker_query_flock_conflict(
         FlockType::Exclusive => LockType::Write,
     };
     let requested = LockRange::new(0, 0, lock_type, 0, owner.owner_fd as u32);
-    tracker.query_conflict(ino, requested)
+    tracker.query_conflict(dataset_mount_id, ino, requested)
 }
 
 /// Dispatch a BSD flock acquire/release through `tracker`.
 pub fn dispatch_flock(
     tracker: &mut LockTracker,
+    dataset_mount_id: u64,
     ino: u64,
     flock_type: FlockType,
     owner: FlockOwner,
 ) -> Result<(), FlockError> {
-    tracker_acquire_flock(tracker, ino, flock_type, owner)
+    tracker_acquire_flock(tracker, dataset_mount_id, ino, flock_type, owner)
 }
 
 // ── Lock operation error type ──────────────────────────────────────────
@@ -202,6 +205,7 @@ pub trait LockBackend {
 /// Per POSIX, an `F_UNLCK` request always returns no conflict.
 pub fn handle_getlk<B: LockBackend>(
     backend: &B,
+    dataset_mount_id: u64,
     ino: u64,
     lock_type: LockType,
     start: u64,
@@ -215,7 +219,7 @@ pub fn handle_getlk<B: LockBackend>(
     let requested = LockRange::new(start, len, lock_type, 0, pid);
     Ok(backend
         .lock_tracker()
-        .query_conflict(ino, requested)
+        .query_conflict(dataset_mount_id, ino, requested)
         .map(|conflict| conflict.existing))
 }
 
@@ -231,6 +235,7 @@ pub fn handle_getlk<B: LockBackend>(
 /// by `pid` is released instead and no conflict is possible.
 pub fn handle_setlk<B: LockBackend>(
     backend: &mut B,
+    dataset_mount_id: u64,
     ino: u64,
     lock_type: LockType,
     start: u64,
@@ -240,7 +245,7 @@ pub fn handle_setlk<B: LockBackend>(
     let requested = LockRange::new(start, len, lock_type, 0, pid);
     backend
         .lock_tracker_mut()
-        .acquire(ino, requested)
+        .acquire(dataset_mount_id, ino, requested)
         .map_err(LockError::Conflict)
 }
 
@@ -253,13 +258,14 @@ pub fn handle_setlk<B: LockBackend>(
 /// layer above.
 pub fn handle_setlkw<B: LockBackend>(
     backend: &mut B,
+    dataset_mount_id: u64,
     ino: u64,
     lock_type: LockType,
     start: u64,
     len: u64,
     pid: u32,
 ) -> Result<(), LockError> {
-    handle_setlk(backend, ino, lock_type, start, len, pid)
+    handle_setlk(backend, dataset_mount_id, ino, lock_type, start, len, pid)
 }
 
 // ── Dispatch wrappers ──────────────────────────────────────────────────
@@ -267,37 +273,40 @@ pub fn handle_setlkw<B: LockBackend>(
 /// Dispatch a FUSE_GETLK request through `backend`.
 pub fn dispatch_getlk<B: LockBackend>(
     backend: &B,
+    dataset_mount_id: u64,
     ino: u64,
     lock_type: LockType,
     start: u64,
     len: u64,
     pid: u32,
 ) -> Result<Option<LockRange>, LockError> {
-    handle_getlk(backend, ino, lock_type, start, len, pid)
+    handle_getlk(backend, dataset_mount_id, ino, lock_type, start, len, pid)
 }
 
 /// Dispatch a FUSE_SETLK request through `backend`.
 pub fn dispatch_setlk<B: LockBackend>(
     backend: &mut B,
+    dataset_mount_id: u64,
     ino: u64,
     lock_type: LockType,
     start: u64,
     len: u64,
     pid: u32,
 ) -> Result<(), LockError> {
-    handle_setlk(backend, ino, lock_type, start, len, pid)
+    handle_setlk(backend, dataset_mount_id, ino, lock_type, start, len, pid)
 }
 
 /// Dispatch a FUSE_SETLKW request through `backend`.
 pub fn dispatch_setlkw<B: LockBackend>(
     backend: &mut B,
+    dataset_mount_id: u64,
     ino: u64,
     lock_type: LockType,
     start: u64,
     len: u64,
     pid: u32,
 ) -> Result<(), LockError> {
-    handle_setlkw(backend, ino, lock_type, start, len, pid)
+    handle_setlkw(backend, dataset_mount_id, ino, lock_type, start, len, pid)
 }
 
 #[cfg(test)]
@@ -362,19 +371,19 @@ mod tests {
     #[test]
     fn single_lock_acquire_tracks_range() {
         let mut tracker = LockTracker::new();
-        tracker.acquire(7, LockRange::write(10, 20, 100)).unwrap();
+        tracker.acquire(1, 7, LockRange::write(10, 20, 100)).unwrap();
 
-        let locks = tracker.locks_for_inode(7).unwrap().locks();
+        let locks = tracker.locks_for_mount_inode(1, 7).unwrap().locks();
         assert_eq!(locks, &[LockRange::write(10, 20, 100)]);
     }
 
     #[test]
     fn read_locks_from_different_processes_are_compatible() {
         let mut tracker = LockTracker::new();
-        tracker.acquire(7, LockRange::read(0, 100, 100)).unwrap();
-        tracker.acquire(7, LockRange::read(50, 10, 200)).unwrap();
+        tracker.acquire(1, 7, LockRange::read(0, 100, 100)).unwrap();
+        tracker.acquire(1, 7, LockRange::read(50, 10, 200)).unwrap();
 
-        assert_eq!(tracker.locks_for_inode(7).unwrap().len(), 2);
+        assert_eq!(tracker.locks_for_mount_inode(1, 7).unwrap().len(), 2);
     }
 
     #[test]
@@ -382,9 +391,9 @@ mod tests {
         let mut tracker = LockTracker::new();
         let existing = LockRange::read(0, 100, 100);
         let requested = LockRange::write(50, 10, 200);
-        tracker.acquire(7, existing).unwrap();
+        tracker.acquire(1, 7, existing).unwrap();
 
-        let conflict = tracker.acquire(7, requested).unwrap_err();
+        let conflict = tracker.acquire(1, 7, requested).unwrap_err();
         assert_eq!(
             conflict,
             LockConflict {
@@ -399,9 +408,9 @@ mod tests {
         let mut tracker = LockTracker::new();
         let existing = LockRange::write(0, 100, 100);
         let requested = LockRange::write(99, 100, 200);
-        tracker.acquire(7, existing).unwrap();
+        tracker.acquire(1, 7, existing).unwrap();
 
-        let conflict = tracker.acquire(7, requested).unwrap_err();
+        let conflict = tracker.acquire(1, 7, requested).unwrap_err();
         assert_eq!(conflict.existing, existing);
         assert_eq!(conflict.requested, requested);
     }
@@ -409,12 +418,12 @@ mod tests {
     #[test]
     fn unlock_splits_existing_range() {
         let mut tracker = LockTracker::new();
-        tracker.acquire(7, LockRange::write(0, 100, 100)).unwrap();
+        tracker.acquire(1, 7, LockRange::write(0, 100, 100)).unwrap();
 
-        tracker.release(7, LockRange::unlock(40, 20, 100));
+        tracker.release(1, 7, LockRange::unlock(40, 20, 100));
 
         assert_eq!(
-            tracker.locks_for_inode(7).unwrap().locks(),
+            tracker.locks_for_mount_inode(1, 7).unwrap().locks(),
             &[LockRange::write(0, 40, 100), LockRange::write(60, 40, 100)]
         );
     }
@@ -433,9 +442,9 @@ mod tests {
         let mut tracker = LockTracker::new();
         let existing = LockRange::write(0, 0, 100);
         let requested = LockRange::read(1000, 1, 200);
-        tracker.acquire(7, existing).unwrap();
+        tracker.acquire(1, 7, existing).unwrap();
 
-        let conflict = tracker.query_conflict(7, requested).unwrap();
+        let conflict = tracker.query_conflict(1, 7, requested).unwrap();
         assert_eq!(
             conflict,
             LockConflict {
@@ -443,21 +452,21 @@ mod tests {
                 existing
             }
         );
-        assert_eq!(tracker.locks_for_inode(7).unwrap().locks(), &[existing]);
+        assert_eq!(tracker.locks_for_mount_inode(1, 7).unwrap().locks(), &[existing]);
     }
 
     #[test]
     fn release_by_pid_clears_all_process_locks() {
         let mut tracker = LockTracker::new();
-        tracker.acquire(7, LockRange::read(0, 10, 100)).unwrap();
-        tracker.acquire(8, LockRange::write(0, 10, 100)).unwrap();
-        tracker.acquire(8, LockRange::read(20, 10, 200)).unwrap();
+        tracker.acquire(1, 7, LockRange::read(0, 10, 100)).unwrap();
+        tracker.acquire(1, 8, LockRange::write(0, 10, 100)).unwrap();
+        tracker.acquire(1, 8, LockRange::read(20, 10, 200)).unwrap();
 
-        tracker.release_by_pid(100);
+        tracker.release_by_pid(1, 100);
 
-        assert!(tracker.locks_for_inode(7).is_none());
+        assert!(tracker.locks_for_mount_inode(1, 7).is_none());
         assert_eq!(
-            tracker.locks_for_inode(8).unwrap().locks(),
+            tracker.locks_for_mount_inode(1, 8).unwrap().locks(),
             &[LockRange::read(20, 10, 200)]
         );
     }
@@ -465,12 +474,12 @@ mod tests {
     #[test]
     fn overlapping_replace_preserves_non_overlapping_segments() {
         let mut tracker = LockTracker::new();
-        tracker.acquire(7, LockRange::read(0, 100, 100)).unwrap();
+        tracker.acquire(1, 7, LockRange::read(0, 100, 100)).unwrap();
 
-        tracker.acquire(7, LockRange::write(25, 50, 100)).unwrap();
+        tracker.acquire(1, 7, LockRange::write(25, 50, 100)).unwrap();
 
         assert_eq!(
-            tracker.locks_for_inode(7).unwrap().locks(),
+            tracker.locks_for_mount_inode(1, 7).unwrap().locks(),
             &[
                 LockRange::read(0, 25, 100),
                 LockRange::write(25, 50, 100),
@@ -482,12 +491,12 @@ mod tests {
     #[test]
     fn eof_lock_unlock_keeps_tail_when_unlock_is_finite() {
         let mut tracker = LockTracker::new();
-        tracker.acquire(7, LockRange::write(10, 0, 100)).unwrap();
+        tracker.acquire(1, 7, LockRange::write(10, 0, 100)).unwrap();
 
-        tracker.release(7, LockRange::unlock(20, 10, 100));
+        tracker.release(1, 7, LockRange::unlock(20, 10, 100));
 
         assert_eq!(
-            tracker.locks_for_inode(7).unwrap().locks(),
+            tracker.locks_for_mount_inode(1, 7).unwrap().locks(),
             &[LockRange::write(10, 10, 100), LockRange::write(30, 0, 100)]
         );
     }
@@ -516,30 +525,30 @@ mod tests {
     fn release_by_owner_inode_clears_all_owner_locks() {
         let mut tracker = LockTracker::new();
         tracker
-            .acquire(7, LockRange::new(0, 50, LockType::Write, 1, 100))
+            .acquire(1, 7, LockRange::new(0, 50, LockType::Write, 1, 100))
             .unwrap();
         tracker
-            .acquire(7, LockRange::new(100, 50, LockType::Read, 1, 100))
+            .acquire(1, 7, LockRange::new(100, 50, LockType::Read, 1, 100))
             .unwrap();
 
-        tracker.release_by_owner_inode(7, 1);
+        tracker.release_by_owner_mount_inode(1, 7, 1);
 
-        assert!(tracker.locks_for_inode(7).is_none());
+        assert!(tracker.locks_for_mount_inode(1, 7).is_none());
     }
 
     #[test]
     fn release_by_owner_inode_preserves_other_owners() {
         let mut tracker = LockTracker::new();
         tracker
-            .acquire(7, LockRange::new(0, 50, LockType::Write, 1, 100))
+            .acquire(1, 7, LockRange::new(0, 50, LockType::Write, 1, 100))
             .unwrap();
         tracker
-            .acquire(7, LockRange::new(60, 40, LockType::Read, 2, 200))
+            .acquire(1, 7, LockRange::new(60, 40, LockType::Read, 2, 200))
             .unwrap();
 
-        tracker.release_by_owner_inode(7, 1);
+        tracker.release_by_owner_mount_inode(1, 7, 1);
 
-        let locks = tracker.locks_for_inode(7).unwrap();
+        let locks = tracker.locks_for_mount_inode(1, 7).unwrap();
         assert_eq!(locks.len(), 1);
         assert_eq!(
             locks.locks(),
@@ -551,28 +560,28 @@ mod tests {
     fn release_by_owner_inode_preserves_other_inodes() {
         let mut tracker = LockTracker::new();
         tracker
-            .acquire(7, LockRange::new(0, 50, LockType::Write, 1, 100))
+            .acquire(1, 7, LockRange::new(0, 50, LockType::Write, 1, 100))
             .unwrap();
         tracker
-            .acquire(9, LockRange::new(0, 50, LockType::Write, 1, 100))
+            .acquire(1, 9, LockRange::new(0, 50, LockType::Write, 1, 100))
             .unwrap();
 
-        tracker.release_by_owner_inode(7, 1);
+        tracker.release_by_owner_mount_inode(1, 7, 1);
 
-        assert!(tracker.locks_for_inode(7).is_none());
-        assert_eq!(tracker.locks_for_inode(9).unwrap().len(), 1);
+        assert!(tracker.locks_for_mount_inode(1, 7).is_none());
+        assert_eq!(tracker.locks_for_mount_inode(1, 9).unwrap().len(), 1);
     }
 
     #[test]
     fn release_by_owner_no_owner_match_is_noop() {
         let mut tracker = LockTracker::new();
         tracker
-            .acquire(7, LockRange::new(0, 50, LockType::Write, 1, 100))
+            .acquire(1, 7, LockRange::new(0, 50, LockType::Write, 1, 100))
             .unwrap();
 
-        tracker.release_by_owner_inode(7, 999);
+        tracker.release_by_owner_mount_inode(1, 7, 999);
 
-        assert_eq!(tracker.locks_for_inode(7).unwrap().len(), 1);
+        assert_eq!(tracker.locks_for_mount_inode(1, 7).unwrap().len(), 1);
     }
 
     #[test]
@@ -600,6 +609,8 @@ mod tests {
     /// Stub backend that owns a `LockTracker` directly.
     struct StubLockBackend {
         tracker: LockTracker,
+        #[allow(dead_code)]
+        mount_id: u64,
     }
 
     impl LockBackend for StubLockBackend {
@@ -616,6 +627,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 tracker: LockTracker::new(),
+                mount_id: 1,
             }
         }
     }
@@ -625,7 +637,7 @@ mod tests {
     #[test]
     fn getlk_no_locks_returns_none() {
         let backend = StubLockBackend::new();
-        let result = handle_getlk(&backend, 1, LockType::Write, 0, 10, 100);
+        let result = handle_getlk(&backend, 1, 1, LockType::Write, 0, 10, 100);
         assert_eq!(result, Ok(None));
     }
 
@@ -633,7 +645,7 @@ mod tests {
     fn getlk_unlock_always_returns_none() {
         let backend = StubLockBackend::new();
         // Even with existing locks, an unlock query returns no conflict
-        let result = handle_getlk(&backend, 1, LockType::Unlock, 0, 10, 100);
+        let result = handle_getlk(&backend, 1, 1, LockType::Unlock, 0, 10, 100);
         assert_eq!(result, Ok(None));
     }
 
@@ -643,10 +655,10 @@ mod tests {
         // Acquire a write lock
         backend
             .tracker
-            .acquire(1, LockRange::write(0, 100, 200))
+            .acquire(1, 1, LockRange::write(0, 100, 200))
             .unwrap();
         // Query with a conflicting read lock
-        let result = handle_getlk(&backend, 1, LockType::Read, 50, 10, 300);
+        let result = handle_getlk(&backend, 1, 1, LockType::Read, 50, 10, 300);
         let conflict = result.unwrap().unwrap();
         assert_eq!(conflict.lock_type, LockType::Write);
         assert_eq!(conflict.pid, 200);
@@ -659,9 +671,9 @@ mod tests {
         let mut backend = StubLockBackend::new();
         backend
             .tracker
-            .acquire(1, LockRange::read(0, 100, 200))
+            .acquire(1, 1, LockRange::read(0, 100, 200))
             .unwrap();
-        let result = handle_getlk(&backend, 1, LockType::Read, 50, 10, 300);
+        let result = handle_getlk(&backend, 1, 1, LockType::Read, 50, 10, 300);
         assert_eq!(result, Ok(None));
     }
 
@@ -670,9 +682,9 @@ mod tests {
         let mut backend = StubLockBackend::new();
         backend
             .tracker
-            .acquire(1, LockRange::write(0, 10, 100))
+            .acquire(1, 1, LockRange::write(0, 10, 100))
             .unwrap();
-        let result = handle_getlk(&backend, 1, LockType::Write, 20, 10, 200);
+        let result = handle_getlk(&backend, 1, 1, LockType::Write, 20, 10, 200);
         assert_eq!(result, Ok(None));
     }
 
@@ -681,11 +693,11 @@ mod tests {
         let mut backend = StubLockBackend::new();
         backend
             .tracker
-            .acquire(1, LockRange::write(0, 100, 100))
+            .acquire(1, 1, LockRange::write(0, 100, 100))
             .unwrap();
         // Same PID requesting overlapping write — POSIX allows same-process
         // lock upgrade/replacement without conflict reporting
-        let result = handle_getlk(&backend, 1, LockType::Write, 50, 20, 100);
+        let result = handle_getlk(&backend, 1, 1, LockType::Write, 50, 20, 100);
         assert_eq!(result, Ok(None));
     }
 
@@ -694,10 +706,10 @@ mod tests {
     #[test]
     fn setlk_acquires_lock_successfully() {
         let mut backend = StubLockBackend::new();
-        let result = handle_setlk(&mut backend, 1, LockType::Write, 0, 100, 100);
+        let result = handle_setlk(&mut backend, 1, 1, LockType::Write, 0, 100, 100);
         assert_eq!(result, Ok(()));
         assert!(!backend.tracker.is_empty());
-        let locks = backend.tracker.locks_for_inode(1).unwrap();
+        let locks = backend.tracker.locks_for_mount_inode(1, 1).unwrap();
         assert_eq!(locks.len(), 1);
         assert_eq!(locks.locks()[0].lock_type, LockType::Write);
     }
@@ -705,8 +717,8 @@ mod tests {
     #[test]
     fn setlk_returns_conflict_on_write_write() {
         let mut backend = StubLockBackend::new();
-        handle_setlk(&mut backend, 1, LockType::Write, 0, 100, 100).unwrap();
-        let result = handle_setlk(&mut backend, 1, LockType::Write, 50, 20, 200);
+        handle_setlk(&mut backend, 1, 1, LockType::Write, 0, 100, 100).unwrap();
+        let result = handle_setlk(&mut backend, 1, 1, LockType::Write, 50, 20, 200);
         match result {
             Err(LockError::Conflict(conflict)) => {
                 assert_eq!(conflict.existing.pid, 100);
@@ -719,9 +731,9 @@ mod tests {
     #[test]
     fn setlk_unlock_releases_existing_lock() {
         let mut backend = StubLockBackend::new();
-        handle_setlk(&mut backend, 1, LockType::Write, 0, 100, 100).unwrap();
+        handle_setlk(&mut backend, 1, 1, LockType::Write, 0, 100, 100).unwrap();
         assert_eq!(backend.tracker.inode_count(), 1);
-        let result = handle_setlk(&mut backend, 1, LockType::Unlock, 0, 100, 100);
+        let result = handle_setlk(&mut backend, 1, 1, LockType::Unlock, 0, 100, 100);
         assert_eq!(result, Ok(()));
         assert!(backend.tracker.is_empty());
     }
@@ -729,19 +741,19 @@ mod tests {
     #[test]
     fn setlk_same_pid_overlapping_write_replaces() {
         let mut backend = StubLockBackend::new();
-        handle_setlk(&mut backend, 1, LockType::Write, 0, 100, 100).unwrap();
+        handle_setlk(&mut backend, 1, 1, LockType::Write, 0, 100, 100).unwrap();
         // Same PID, overlapping range — should replace rather than conflict
-        let result = handle_setlk(&mut backend, 1, LockType::Write, 50, 20, 100);
+        let result = handle_setlk(&mut backend, 1, 1, LockType::Write, 50, 20, 100);
         assert_eq!(result, Ok(()));
-        let locks = backend.tracker.locks_for_inode(1).unwrap().locks();
+        let locks = backend.tracker.locks_for_mount_inode(1, 1).unwrap().locks();
         assert_eq!(locks.len(), 1);
     }
 
     #[test]
     fn setlk_multiple_inodes_independent() {
         let mut backend = StubLockBackend::new();
-        handle_setlk(&mut backend, 1, LockType::Write, 0, 100, 100).unwrap();
-        handle_setlk(&mut backend, 2, LockType::Write, 0, 100, 200).unwrap();
+        handle_setlk(&mut backend, 1, 1, LockType::Write, 0, 100, 100).unwrap();
+        handle_setlk(&mut backend, 1, 2, LockType::Write, 0, 100, 200).unwrap();
         assert_eq!(backend.tracker.inode_count(), 2);
     }
 
@@ -750,15 +762,15 @@ mod tests {
     #[test]
     fn setlkw_behaves_same_as_setlk_on_success() {
         let mut backend = StubLockBackend::new();
-        let result = handle_setlkw(&mut backend, 1, LockType::Read, 0, 50, 100);
+        let result = handle_setlkw(&mut backend, 1, 1, LockType::Read, 0, 50, 100);
         assert_eq!(result, Ok(()));
     }
 
     #[test]
     fn setlkw_returns_conflict_same_as_setlk() {
         let mut backend = StubLockBackend::new();
-        handle_setlk(&mut backend, 1, LockType::Write, 0, 100, 100).unwrap();
-        let result = handle_setlkw(&mut backend, 1, LockType::Read, 50, 10, 200);
+        handle_setlk(&mut backend, 1, 1, LockType::Write, 0, 100, 100).unwrap();
+        let result = handle_setlkw(&mut backend, 1, 1, LockType::Read, 50, 10, 200);
         assert!(matches!(result, Err(LockError::Conflict(_))));
     }
 
@@ -767,29 +779,91 @@ mod tests {
     #[test]
     fn dispatch_getlk_delegates_to_handle_getlk() {
         let backend = StubLockBackend::new();
-        let result = dispatch_getlk(&backend, 1, LockType::Write, 0, 10, 100);
+        let result = dispatch_getlk(&backend, 1, 1, LockType::Write, 0, 10, 100);
         assert_eq!(result, Ok(None));
     }
 
     #[test]
     fn dispatch_setlk_delegates_to_handle_setlk() {
         let mut backend = StubLockBackend::new();
-        let result = dispatch_setlk(&mut backend, 1, LockType::Write, 0, 100, 100);
+        let result = dispatch_setlk(&mut backend, 1, 1, LockType::Write, 0, 100, 100);
         assert_eq!(result, Ok(()));
     }
 
     #[test]
     fn dispatch_setlkw_delegates_to_handle_setlkw() {
         let mut backend = StubLockBackend::new();
-        let result = dispatch_setlkw(&mut backend, 1, LockType::Read, 0, 50, 100);
+        let result = dispatch_setlkw(&mut backend, 1, 1, LockType::Read, 0, 50, 100);
         assert_eq!(result, Ok(()));
     }
 
     #[test]
     fn dispatch_setlkw_preserves_conflict() {
         let mut backend = StubLockBackend::new();
-        dispatch_setlk(&mut backend, 1, LockType::Write, 0, 100, 100).unwrap();
-        let result = dispatch_setlkw(&mut backend, 1, LockType::Read, 50, 10, 200);
+        dispatch_setlk(&mut backend, 1, 1, LockType::Write, 0, 100, 100).unwrap();
+        let result = dispatch_setlkw(&mut backend, 1, 1, LockType::Read, 50, 10, 200);
         assert!(matches!(result, Err(LockError::Conflict(_))));
+    }
+
+    // ── Dataset mount scoping tests ─────────────────────────────────
+
+    #[test]
+    fn cross_dataset_locks_do_not_conflict() {
+        let mut tracker = LockTracker::new();
+        tracker.acquire(1, 42, LockRange::write(0, 100, 100)).unwrap();
+        assert!(tracker.acquire(2, 42, LockRange::write(0, 100, 200)).is_ok());
+        assert_eq!(tracker.inode_count(), 2);
+    }
+
+    #[test]
+    fn cross_dataset_inode_collision_isolated() {
+        let mut tracker = LockTracker::new();
+        tracker.acquire(1, 1, LockRange::write(0, 100, 10)).unwrap();
+        assert!(tracker.query_conflict(2, 1, LockRange::read(0, 100, 20)).is_none());
+        assert!(tracker.query_conflict(1, 1, LockRange::read(0, 100, 20)).is_some());
+    }
+
+    #[test]
+    fn unmount_releases_all_locks_for_mount() {
+        let mut tracker = LockTracker::new();
+        tracker.acquire(1, 1, LockRange::write(0, 100, 10)).unwrap();
+        tracker.acquire(1, 2, LockRange::read(0, 50, 10)).unwrap();
+        tracker.acquire(2, 1, LockRange::write(0, 50, 20)).unwrap();
+        assert_eq!(tracker.inode_count(), 3);
+        let released = tracker.release_all_for_mount(1);
+        assert_eq!(released, 2);
+        assert_eq!(tracker.inode_count(), 1);
+        assert!(tracker.locks_for_mount_inode(2, 1).is_some());
+    }
+
+    #[test]
+    fn forced_unmount_clears_stale_locks() {
+        let mut tracker = LockTracker::new();
+        tracker.acquire(1, 10, LockRange::write(0, 200, 100)).unwrap();
+        tracker.acquire(1, 20, LockRange::read(100, 50, 100)).unwrap();
+        assert_eq!(tracker.release_all_for_mount(1), 2);
+        assert!(tracker.is_empty());
+        tracker.acquire(2, 10, LockRange::write(0, 200, 200)).unwrap();
+        assert_eq!(tracker.inode_count(), 1);
+    }
+
+    #[test]
+    fn ofd_lock_mount_scoping_preserved() {
+        let mut tracker = LockTracker::new();
+        let owner_a: u64 = 100;
+        let owner_b: u64 = 200;
+        tracker.acquire(1, 5, LockRange::new(0, 100, LockType::Write, owner_a, 10)).unwrap();
+        assert!(tracker.acquire(2, 5, LockRange::new(0, 100, LockType::Write, owner_a, 10)).is_ok());
+        assert!(tracker.acquire(1, 5, LockRange::new(0, 100, LockType::Write, owner_b, 20)).is_err());
+    }
+
+    #[test]
+    fn upgrade_deadlock_cross_dataset_no_false_positive() {
+        let mut tracker = LockTracker::new();
+        tracker.acquire(1, 1, LockRange::write(0, 100, 10)).unwrap();
+        tracker.acquire(1, 2, LockRange::write(0, 100, 20)).unwrap();
+        assert!(tracker.acquire(1, 2, LockRange::write(0, 100, 10)).is_err());
+        assert!(tracker.acquire(1, 1, LockRange::write(0, 100, 20)).is_err());
+        assert!(tracker.acquire(2, 1, LockRange::write(0, 100, 20)).is_ok());
     }
 }

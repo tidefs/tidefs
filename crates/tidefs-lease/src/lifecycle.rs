@@ -161,6 +161,7 @@ mod lifecycle_tests {
                 epoch_id: tidefs_membership_epoch::EpochId::new(1),
             },
             tidefs_membership_epoch::MemberId::new(1),
+            0u64,
             60_000,
             0,
             tidefs_membership_epoch::EpochId::new(1),

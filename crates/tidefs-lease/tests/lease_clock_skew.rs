@@ -32,6 +32,7 @@ fn inode_grant(
             ino,
         },
         mid(holder),
+        0u64,
         60_000,
         0,
         EpochId::new(epoch),
@@ -187,6 +188,7 @@ fn skewed_node_cannot_reacquire_fenced_domain() {
             ino: 42,
         },
         mid(2),
+        0u64,
         60_000,
         0,
         EpochId::new(3), // same epoch but post-failover term
@@ -224,6 +226,7 @@ fn lease_expiry_immutable_after_grant() {
             ino: 42,
         },
         mid(1),
+        0u64,
         60_000, // 60s TTL
         0,      // granted at time 0
         EpochId::new(1),
