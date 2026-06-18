@@ -1711,7 +1711,9 @@ fn has_secrets_context(line: &str) -> bool {
     // Bare `secrets.XXX` used in shell or script steps (without the
     // expression braces).  Must be word-bounded to avoid matching
     // e.g. `nosecrets.foo`.
-    if let Some(pos) = line.find("secrets.") {
+    let mut search_start = 0;
+    while let Some(offset) = line[search_start..].find("secrets.") {
+        let pos = search_start + offset;
         // Check left boundary.
         let left_ok = pos == 0 || {
             let before = line.as_bytes()[pos - 1];
@@ -1725,6 +1727,7 @@ fn has_secrets_context(line: &str) -> bool {
         if left_ok && right_ok {
             return true;
         }
+        search_start = pos + "secrets.".len();
     }
     false
 }
@@ -3066,6 +3069,18 @@ license = "GPL-2.0-only WITH Linux-syscall-note"
         let line = "          run: echo nosecrets.foo";
         // "nosecrets." — the 'e' before 's' is alphanumeric, so not a hit.
         assert!(!has_secrets_context(line));
+    }
+
+    #[test]
+    fn later_bare_secrets_dot_after_adjacent_word_is_detected() {
+        let line = "          run: echo nosecrets.foo && echo secrets.REGISTRY_PASS";
+        assert!(has_secrets_context(line));
+    }
+
+    #[test]
+    fn later_bare_secrets_dot_after_wildcard_is_detected() {
+        let line = "          run: echo 'secrets.*' && echo secrets.REGISTRY_PASS";
+        assert!(has_secrets_context(line));
     }
 
     #[test]
