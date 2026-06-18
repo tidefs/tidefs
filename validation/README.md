@@ -47,3 +47,8 @@ Only artifacts produced by the corresponding runtime workflow may use runtime
 tiers such as `mounted-userspace`, `qemu-guest`, `mounted-kernel-vfs`,
 `kernel-block-io`, `full-kernel-no-daemon`, or
 `multi-process-distributed`.
+
+For the current policy mapping from validation tiers to claim evidence
+classes, and for the rule that lower-tier evidence may diagnose but cannot
+validate higher-tier claims, see
+`docs/CLAIMS_GATE_POLICY.md#validation-tier-evidence-map`.
