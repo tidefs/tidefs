@@ -65,6 +65,10 @@ pub enum SecretKeyPolicyRuntimeError {
         handle_id: SecretKeyPolicyId128,
         requested: LeaseUsageClass,
     },
+    LeaseHandleMismatch {
+        lease_id: SecretKeyPolicyId128,
+        handle_id: SecretKeyPolicyId128,
+    },
 
     ManifestIncompatible {
         manifest_id: SecretKeyPolicyId128,
@@ -606,16 +610,27 @@ pub fn activate_policy_revision_after_secret_handle_preflight<S: SealProvider, C
     if clock.has_deadline_passed(lease.expiry_deadline_ref) {
         return Err(SecretKeyPolicyRuntimeError::LeaseExpired { lease_id });
     }
+    let lease_usage = lease.usage_class()?;
+    if lease_usage != LeaseUsageClass::SignOrPublish {
+        return Err(SecretKeyPolicyRuntimeError::LeaseUsageMismatch {
+            handle_id: lease.handle_id,
+            requested: lease_usage,
+        });
+    }
 
     // Initial wrapping-key id accumulator (picked from first handle's
     // envelope); all handles must agree on the same wrapping key.
     let mut activation_wrapping_key_ref = SecretKeyPolicyId128::ZERO;
     let mut first_handle = true;
+    let mut lease_handle_seen = false;
 
     // Gate 3-6: per-handle checks.
     for &handle_id in manifest.required_handles() {
         if handle_id.is_zero() {
             continue;
+        }
+        if handle_id == lease.handle_id {
+            lease_handle_seen = true;
         }
 
         // Gate 3: handle must exist.
@@ -658,12 +673,16 @@ pub fn activate_policy_revision_after_secret_handle_preflight<S: SealProvider, C
         }
     }
 
-    if manifest.required_handles().is_empty()
-        || activation_wrapping_key_ref.is_zero()
-    {
+    if manifest.required_handles().is_empty() || activation_wrapping_key_ref.is_zero() {
         return Err(SecretKeyPolicyRuntimeError::ManifestMissingHandles {
             manifest_id: manifest.manifest_id,
             missing_count: 1,
+        });
+    }
+    if !lease_handle_seen {
+        return Err(SecretKeyPolicyRuntimeError::LeaseHandleMismatch {
+            lease_id,
+            handle_id: lease.handle_id,
         });
     }
 
@@ -1373,9 +1392,7 @@ mod tests {
             _wrapping_key: &WrappingKeyRecord,
         ) -> Result<Vec<u8>, SecretKeyPolicyRuntimeError> {
             if let Some(ref err) = self.forced_error {
-                return Err(SecretKeyPolicyRuntimeError::SealProviderError {
-                    reason: *err,
-                });
+                return Err(SecretKeyPolicyRuntimeError::SealProviderError { reason: *err });
             }
             Ok(b"mock-plaintext-material".to_vec())
         }
@@ -1385,9 +1402,7 @@ mod tests {
             _wrapping_key: &WrappingKeyRecord,
         ) -> Result<SecretKeyPolicyDigest32, SecretKeyPolicyRuntimeError> {
             if let Some(ref err) = self.forced_error {
-                return Err(SecretKeyPolicyRuntimeError::SealProviderError {
-                    reason: *err,
-                });
+                return Err(SecretKeyPolicyRuntimeError::SealProviderError { reason: *err });
             }
             Ok([0xAAu8; 32])
         }
@@ -1396,9 +1411,7 @@ mod tests {
             _secret_class: SecretClass,
         ) -> Result<Vec<u8>, SecretKeyPolicyRuntimeError> {
             if let Some(ref err) = self.forced_error {
-                return Err(SecretKeyPolicyRuntimeError::SealProviderError {
-                    reason: *err,
-                });
+                return Err(SecretKeyPolicyRuntimeError::SealProviderError { reason: *err });
             }
             Ok(vec![0x42u8; 32])
         }
@@ -1408,9 +1421,7 @@ mod tests {
             _child: &WrappingKeyRecord,
         ) -> Result<bool, SecretKeyPolicyRuntimeError> {
             if let Some(ref err) = self.forced_error {
-                return Err(SecretKeyPolicyRuntimeError::SealProviderError {
-                    reason: *err,
-                });
+                return Err(SecretKeyPolicyRuntimeError::SealProviderError { reason: *err });
             }
             Ok(self.wrapping_key_lineage_valid)
         }
@@ -1445,7 +1456,6 @@ mod tests {
             self.always_expired
         }
     }
-
 
     // ── Algorithm 1 tests ───
 
@@ -1862,6 +1872,96 @@ mod tests {
     }
 
     #[test]
+    fn activation_preflight_rejects_wrong_lease_usage() {
+        let provider = MockSealProvider::new();
+        let clock = MockLeaseClock::new();
+        let h_id = SecretKeyPolicyId128::from_u128_le(0x100);
+        let e_id = SecretKeyPolicyId128::from_u128_le(0xE00);
+        let wk_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
+
+        let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Active);
+        let mut lease = make_activation_lease(lease_id, h_id, expiry);
+        lease.usage_class = LeaseUsageClass::TransportTermination.as_u32();
+        store.leases.insert(lease_id.as_u128_le(), lease);
+
+        let manifest = make_activation_manifest(&[h_id]);
+        let bundle = PolicyPublishBundleRecord::default();
+        let disclosure = make_permissive_disclosure();
+
+        let result = activate_policy_revision_after_secret_handle_preflight(
+            &provider,
+            &clock,
+            &store,
+            &manifest,
+            &bundle,
+            lease_id,
+            &disclosure,
+            SecretKeyPolicyId128::from_u128_le(1),
+            SecretKeyPolicyId128::from_u128_le(2),
+            SecretKeyPolicyId128::from_u128_le(3),
+            0,
+        );
+        match result {
+            Err(SecretKeyPolicyRuntimeError::LeaseUsageMismatch {
+                handle_id,
+                requested,
+            }) => {
+                assert_eq!(handle_id, h_id);
+                assert_eq!(requested, LeaseUsageClass::TransportTermination);
+            }
+            other => panic!("expected LeaseUsageMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activation_preflight_rejects_lease_for_foreign_handle() {
+        let provider = MockSealProvider::new();
+        let clock = MockLeaseClock::new();
+        let h_id = SecretKeyPolicyId128::from_u128_le(0x100);
+        let foreign_h_id = SecretKeyPolicyId128::from_u128_le(0x101);
+        let e_id = SecretKeyPolicyId128::from_u128_le(0xE00);
+        let wk_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
+
+        let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Active);
+        store.leases.insert(
+            lease_id.as_u128_le(),
+            make_activation_lease(lease_id, foreign_h_id, expiry),
+        );
+
+        let manifest = make_activation_manifest(&[h_id]);
+        let bundle = PolicyPublishBundleRecord::default();
+        let disclosure = make_permissive_disclosure();
+
+        let result = activate_policy_revision_after_secret_handle_preflight(
+            &provider,
+            &clock,
+            &store,
+            &manifest,
+            &bundle,
+            lease_id,
+            &disclosure,
+            SecretKeyPolicyId128::from_u128_le(1),
+            SecretKeyPolicyId128::from_u128_le(2),
+            SecretKeyPolicyId128::from_u128_le(3),
+            0,
+        );
+        match result {
+            Err(SecretKeyPolicyRuntimeError::LeaseHandleMismatch {
+                lease_id: actual_lease_id,
+                handle_id,
+            }) => {
+                assert_eq!(actual_lease_id, lease_id);
+                assert_eq!(handle_id, foreign_h_id);
+            }
+            other => panic!("expected LeaseHandleMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn activation_preflight_rejects_revoked_handle() {
         let provider = MockSealProvider::new();
         let clock = MockLeaseClock::new();
@@ -1871,7 +1971,8 @@ mod tests {
         let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
         let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
 
-        let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Revoked);
+        let mut store =
+            make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Revoked);
         store.leases.insert(
             lease_id.as_u128_le(),
             make_activation_lease(lease_id, h_id, expiry),
@@ -1912,7 +2013,8 @@ mod tests {
         let lease_id = SecretKeyPolicyId128::from_u128_le(0x3000);
         let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
 
-        let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Quarantined);
+        let mut store =
+            make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Quarantined);
         store.leases.insert(
             lease_id.as_u128_le(),
             make_activation_lease(lease_id, h_id, expiry),
@@ -1994,8 +2096,8 @@ mod tests {
         let expiry = SecretKeyPolicyId128::from_u128_le(0x9999);
 
         // Provider that always returns an unreachable error.
-        let provider = MockSealProvider::new()
-            .with_forced_error(SealProviderErrorKind::ProviderUnreachable);
+        let provider =
+            MockSealProvider::new().with_forced_error(SealProviderErrorKind::ProviderUnreachable);
         let clock = MockLeaseClock::new();
 
         let mut store = make_activation_test_store(h_id, e_id, wk_id, SecretLifecycleState::Active);
@@ -2095,7 +2197,12 @@ mod tests {
         // Manifest with zero continuity_window_start_ref
         let manifest = PolicyStoreManifestRecord {
             required_secret_handle_count: 1,
-            required_secret_handle_refs: [h_id, SecretKeyPolicyId128::ZERO, SecretKeyPolicyId128::ZERO, SecretKeyPolicyId128::ZERO],
+            required_secret_handle_refs: [
+                h_id,
+                SecretKeyPolicyId128::ZERO,
+                SecretKeyPolicyId128::ZERO,
+                SecretKeyPolicyId128::ZERO,
+            ],
             manifest_id: SecretKeyPolicyId128::from_u128_le(0x5000),
             continuity_window_start_ref: SecretKeyPolicyId128::ZERO,
             continuity_window_end_ref: SecretKeyPolicyId128::from_u128_le(0x2000),
@@ -2124,7 +2231,9 @@ mod tests {
             }) => {
                 assert_eq!(manifest_id, manifest.manifest_id);
             }
-            other => panic!("expected ManifestIncompatible with ContinuityWindowClosed, got {other:?}"),
+            other => {
+                panic!("expected ManifestIncompatible with ContinuityWindowClosed, got {other:?}")
+            }
         }
     }
 
