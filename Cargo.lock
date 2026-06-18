@@ -3158,6 +3158,7 @@ dependencies = [
  "tidefs-membership-epoch",
  "tidefs-quorum-write",
  "tidefs-replication",
+ "tidefs-replication-model",
  "tidefs-tdma-scheduler",
 ]
 
