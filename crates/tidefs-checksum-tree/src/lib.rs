@@ -91,6 +91,8 @@ pub enum DomainTag {
     /// Scrub repair validation ledger for domain-separated BLAKE3-256
     /// repair-event recording with deterministic replay.
     ScrubRepair = 0x0E,
+    /// Locator-bound checksum root (domain-separated binding of Merkle root to committed extent locator).
+    LocatorBinding = 0x0F,
 }
 
 impl DomainTag {
@@ -116,6 +118,7 @@ impl DomainTag {
             Self::CommittedRoot => "committed-root",
             Self::ReadVerify => "read-verify",
             Self::ScrubRepair => "scrub-repair",
+            Self::LocatorBinding => "locator-binding",
         }
     }
 
@@ -210,6 +213,67 @@ fn hex_fmt(bytes: &[u8; 32]) -> alloc::string::String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+
+// ---------------------------------------------------------------------------
+// LocatorToken
+// ---------------------------------------------------------------------------
+
+/// A 32-byte token that binds a checksum tree root to committed extent
+/// locator evidence.
+///
+/// Produced by hashing the canonical serialisation of the committed extent
+/// locator fields (pool epoch, device id, offset, length) together with
+/// any receipt identity bytes.  Stored alongside the checksum tree root so
+/// that verification can confirm the locator has not changed since the
+/// checksum was committed.
+///
+/// When a [] carries a [], the published
+///  is the BLAKE3-256 hash of the raw Merkle root concatenated
+/// with the token bytes, domain-separated with
+/// [].  Verification without the matching token
+/// will fail.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct LocatorToken(pub [u8; DIGEST_SIZE]);
+
+impl LocatorToken {
+    /// Construct a locator token from arbitrary locator evidence bytes.
+    ///
+    /// The canonical encoding of the locator (pool epoch, device, offset,
+    /// length, receipt identity) is hashed with a plain BLAKE3-256 to
+    /// produce a fixed-size token.  Callers are responsible for providing
+    /// a deterministic, collision-resistant byte representation.
+    pub fn from_evidence(evidence: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(evidence);
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    /// Return the raw token bytes.
+    pub fn as_bytes(&self) -> &[u8; DIGEST_SIZE] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for LocatorToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("LocatorToken")
+            .field(&hex_fmt(&self.0))
+            .finish()
+    }
+}
+
+impl core::fmt::Display for LocatorToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&hex_fmt(&self.0))
+    }
+}
+
+impl Default for LocatorToken {
+    fn default() -> Self {
+        Self([0u8; DIGEST_SIZE])
+    }
+}
 // ---------------------------------------------------------------------------
 // ChecksumTreeNode
 // ---------------------------------------------------------------------------
@@ -311,6 +375,12 @@ pub struct ChecksumTree {
     pub root_hash: Digest,
     /// Domain key used for leaf-level hashing, if domain separation is active.
     pub domain_key: Option<DomainKey>,
+    /// Locator token binding the root hash to committed extent locator evidence.
+    ///
+    /// When `Some`, the `root_hash` field is the domain-separated BLAKE3-256
+    /// hash of the raw Merkle root concatenated with the token bytes.
+    /// Verification must supply the matching token.
+    pub locator_token: Option<LocatorToken>,
 }
 
 impl ChecksumTree {
@@ -329,6 +399,7 @@ impl ChecksumTree {
                 block_size,
                 root_hash: Digest::default(),
                 domain_key: None,
+                locator_token: None,
             };
         }
 
@@ -364,6 +435,7 @@ impl ChecksumTree {
             block_size,
             root_hash,
             domain_key: None,
+            locator_token: None,
         }
     }
 
@@ -376,6 +448,7 @@ impl ChecksumTree {
         leaf_digests: &[Digest],
         block_size: usize,
         domain_key: Option<DomainKey>,
+        locator_token: Option<LocatorToken>,
     ) -> Self {
         let block_count = leaf_digests.len() as u64;
 
@@ -386,6 +459,7 @@ impl ChecksumTree {
                 block_size,
                 root_hash: Digest::default(),
                 domain_key,
+                locator_token,
             };
         }
 
@@ -411,12 +485,27 @@ impl ChecksumTree {
             nodes.push(root_node);
         }
 
+        // When a locator token is present, bind the Merkle root to the
+        // locator by hashing root_hash || locator_token with a domain-
+        // separated key.  This ensures the published root_hash depends on
+        // both the data content and the physical extent location.
+        let root_hash = if let Some(ref token) = locator_token {
+            let dk = DomainTag::LocatorBinding.derive_key();
+            let mut hasher = blake3::Hasher::new_keyed(dk.as_bytes());
+            hasher.update(&root_hash);
+            hasher.update(token.as_bytes());
+            *hasher.finalize().as_bytes()
+        } else {
+            root_hash
+        };
+
         Self {
             nodes,
             block_count,
             block_size,
             root_hash,
             domain_key,
+            locator_token,
         }
     }
 
@@ -563,6 +652,8 @@ pub struct ChecksumTreeBuilder {
     block_size: usize,
     /// Domain key for leaf-level hashing, if domain separation is active.
     domain_key: Option<DomainKey>,
+    /// Locator token for binding the root hash to committed extent locator evidence.
+    locator_token: Option<LocatorToken>,
     /// Accumulated leaf digests.
     leaf_digests: Vec<Digest>,
 }
@@ -573,6 +664,7 @@ impl ChecksumTreeBuilder {
         Self {
             block_size,
             domain_key: None,
+            locator_token: None,
             leaf_digests: Vec::new(),
         }
     }
@@ -585,6 +677,7 @@ impl ChecksumTreeBuilder {
         Self {
             block_size,
             domain_key: Some(domain_key),
+            locator_token: None,
             leaf_digests: Vec::new(),
         }
     }
@@ -592,6 +685,20 @@ impl ChecksumTreeBuilder {
     /// Return the domain key in use, if any.
     pub fn domain_key(&self) -> Option<&DomainKey> {
         self.domain_key.as_ref()
+    }
+
+    /// Set the locator token for root-hash binding.
+    ///
+    /// When set, the finished tree's `root_hash` will be the domain-separated
+    /// BLAKE3-256 hash of the raw Merkle root concatenated with the token
+    /// bytes, binding the checksum to the committed extent locator.
+    pub fn set_locator(&mut self, token: LocatorToken) {
+        self.locator_token = Some(token);
+    }
+
+    /// Return the locator token, if set.
+    pub fn locator_token(&self) -> Option<&LocatorToken> {
+        self.locator_token.as_ref()
     }
 
     /// Ingest extent data, splitting into `block_size` chunks and computing
@@ -623,8 +730,16 @@ impl ChecksumTreeBuilder {
     }
 
     /// Finish building and return the [`ChecksumTree`].
+    ///
+    /// If a locator token has been set via [`Self::set_locator`], the
+    /// published `root_hash` will be bound to that locator.
     pub fn finish(self) -> ChecksumTree {
-        ChecksumTree::from_leaves_with_domain(&self.leaf_digests, self.block_size, self.domain_key)
+        ChecksumTree::from_leaves_with_domain(
+            &self.leaf_digests,
+            self.block_size,
+            self.domain_key,
+            self.locator_token,
+        )
     }
 
     /// Return the number of leaves ingested so far.
@@ -683,6 +798,15 @@ pub enum VerificationResult {
     Missing {
         /// Byte offset where data is missing.
         offset: u64,
+    },
+    /// The supplied locator token does not match the token bound to the
+    /// checksum tree root.  The data may have been relocated, or the
+    /// caller provided a token for a different extent.
+    LocatorMismatch {
+        /// The locator token supplied for verification.
+        supplied: LocatorToken,
+        /// The locator token bound to the checksum tree.
+        bound: LocatorToken,
     },
 }
 
@@ -872,6 +996,73 @@ impl ChecksumTreeVerifier {
     /// Return a reference to the underlying tree.
     pub fn tree(&self) -> &ChecksumTree {
         &self.tree
+    }
+
+    /// Verify full data with locator binding.
+    ///
+    /// Before verifying the data against the Merkle tree, checks that
+    /// `locator_token` matches the tree's bound locator (if any).
+    /// Returns [`VerificationResult::LocatorMismatch`] when the tokens
+    /// differ, allowing callers to distinguish relocation from corruption.
+    pub fn verify_full_with_locator(
+        &self,
+        data: &[u8],
+        locator_token: Option<&LocatorToken>,
+    ) -> VerificationResult {
+        if let Some(result) = self.check_locator(locator_token) {
+            return result;
+        }
+        self.verify_full(data)
+    }
+
+    /// Verify a byte range with locator binding.
+    ///
+    /// Before verifying the range against the Merkle tree, checks that
+    /// `locator_token` matches the tree's bound locator (if any).
+    pub fn verify_range_with_locator<F>(
+        &self,
+        start: u64,
+        end: u64,
+        data_provider: F,
+        locator_token: Option<&LocatorToken>,
+    ) -> VerificationResult
+    where
+        F: Fn(u64, usize) -> Option<alloc::vec::Vec<u8>>,
+    {
+        if let Some(result) = self.check_locator(locator_token) {
+            return result;
+        }
+        self.verify_range(start, end, data_provider)
+    }
+
+    /// Check whether `supplied_token` matches the tree's bound locator.
+    ///
+    /// Returns `None` when the check passes (or no binding exists).
+    /// Returns `Some(LocatorMismatch)` when the tokens differ.
+    fn check_locator(
+        &self,
+        supplied_token: Option<&LocatorToken>,
+    ) -> Option<VerificationResult> {
+        match (&self.tree.locator_token, supplied_token) {
+            // No binding — no check needed.
+            (None, _) => None,
+            // Binding exists but no token supplied — mismatch.
+            (Some(bound), None) => Some(VerificationResult::LocatorMismatch {
+                supplied: LocatorToken::default(),
+                bound: *bound,
+            }),
+            // Both present — compare.
+            (Some(bound), Some(supplied)) => {
+                if bound == supplied {
+                    None
+                } else {
+                    Some(VerificationResult::LocatorMismatch {
+                        supplied: *supplied,
+                        bound: *bound,
+                    })
+                }
+            }
+        }
     }
 }
 
@@ -1219,11 +1410,14 @@ pub fn incremental_update(
     // Update the changed leaf
     leaf_digests[block_index as usize] = new_leaf_digest;
 
-    // Rebuild the entire tree from the updated leaves, preserving the domain key
+    // Rebuild the entire tree from the updated leaves, preserving the
+    // domain key and locator token so in-place overwrites within the same
+    // extent keep the same binding.
     Some(ChecksumTree::from_leaves_with_domain(
         &leaf_digests,
         tree.block_size,
         tree.domain_key,
+        tree.locator_token,
     ))
 }
 
@@ -1262,8 +1456,12 @@ pub struct ChecksumMismatch {
 /// Verify that `data` hashes to the expected checksum tree root.
 ///
 /// Builds a [`ChecksumTree`] from the data using the default block size and
-/// compares the root digest against `expected_root`. Returns `Ok(())` on
-/// match, or `Err(ChecksumMismatch)` with both digests on mismatch.
+/// compares the root digest against `expected_root`.  When `locator_token`
+/// is `Some`, the computed root is bound to that token before comparison,
+/// matching the binding applied by [`ChecksumTreeBuilder::set_locator`].
+///
+/// Returns `Ok(())` on match, or `Err(ChecksumMismatch)` with both digests
+/// on mismatch.
 ///
 /// This is the single-object verification entry point intended for scrub
 /// consumption: walk objects, read their payloads, and call this function
@@ -1279,11 +1477,18 @@ pub struct ChecksumMismatch {
 /// let tree = builder.finish();
 /// let expected = tree.root_hash;
 ///
-/// assert!(verify_object(data, &expected).is_ok());
-/// assert!(verify_object(b"tampered data", &expected).is_err());
+/// assert!(verify_object(data, &expected, None).is_ok());
+/// assert!(verify_object(b"tampered data", &expected, None).is_err());
 /// ```
-pub fn verify_object(data: &[u8], expected_root: &Digest) -> Result<(), ChecksumMismatch> {
+pub fn verify_object(
+    data: &[u8],
+    expected_root: &Digest,
+    locator_token: Option<&LocatorToken>,
+) -> Result<(), ChecksumMismatch> {
     let mut builder = ChecksumTreeBuilder::new(DEFAULT_BLOCK_SIZE);
+    if let Some(token) = locator_token {
+        builder.set_locator(*token);
+    }
     builder.ingest(data);
     let tree = builder.finish();
     if tree.root_hash == *expected_root {
@@ -3720,6 +3925,273 @@ mod validation_tests {
         assert!(
             !content_digest.verify(data, &dk_wrong),
             "ObjectDigest must not verify under wrong domain key"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LocatorToken binding tests
+    // -----------------------------------------------------------------------
+
+    /// Checksum match with correct locator: build a tree with a locator
+    /// token, then verify with the same token — must succeed.
+    #[test]
+    fn locator_binding_match_correct_token() {
+        let data = b"data protected by locator-bound checksum";
+        let evidence_a = b"pool=1 dev=3 off=4096 len=1024";
+        let token_a = LocatorToken::from_evidence(evidence_a);
+
+        let mut builder = ChecksumTreeBuilder::new(DEFAULT_BLOCK_SIZE);
+        builder.set_locator(token_a);
+        builder.ingest(data);
+        let tree = builder.finish();
+
+        let verifier = ChecksumTreeVerifier::new(tree);
+        let result = verifier.verify_full_with_locator(data, Some(&token_a));
+        assert_eq!(
+            result,
+            VerificationResult::Verified,
+            "verification must pass with correct locator token"
+        );
+    }
+
+    /// Checksum match with wrong locator: build a tree with locator A,
+    /// verify with locator B — must return LocatorMismatch.
+    #[test]
+    fn locator_binding_mismatch_wrong_token() {
+        let data = b"data with locator A";
+        let evidence_a = b"pool=1 dev=3 off=0 len=1024";
+        let evidence_b = b"pool=1 dev=4 off=0 len=1024";
+        let token_a = LocatorToken::from_evidence(evidence_a);
+        let token_b = LocatorToken::from_evidence(evidence_b);
+
+        assert_ne!(token_a, token_b, "different evidence must produce different tokens");
+
+        let mut builder = ChecksumTreeBuilder::new(DEFAULT_BLOCK_SIZE);
+        builder.set_locator(token_a);
+        builder.ingest(data);
+        let tree = builder.finish();
+
+        let verifier = ChecksumTreeVerifier::new(tree);
+        let result = verifier.verify_full_with_locator(data, Some(&token_b));
+        assert!(
+            matches!(result, VerificationResult::LocatorMismatch { .. }),
+            "verification with wrong locator must fail with LocatorMismatch, got {result:?}"
+        );
+    }
+
+    /// Verification with no token supplied when the tree has a binding
+    /// must also fail with LocatorMismatch.
+    #[test]
+    fn locator_binding_mismatch_no_token_supplied() {
+        let data = b"bound data";
+        let token = LocatorToken::from_evidence(b"extent-42");
+
+        let mut builder = ChecksumTreeBuilder::new(DEFAULT_BLOCK_SIZE);
+        builder.set_locator(token);
+        builder.ingest(data);
+        let tree = builder.finish();
+
+        let verifier = ChecksumTreeVerifier::new(tree);
+        let result = verifier.verify_full_with_locator(data, None);
+        assert!(
+            matches!(result, VerificationResult::LocatorMismatch { .. }),
+            "missing locator token must fail verification, got {result:?}"
+        );
+    }
+
+    /// Relocation produces a new bound root: build two trees from the same
+    /// data with different locator tokens; root hashes must differ.
+    #[test]
+    fn locator_binding_relocation_produces_new_root() {
+        let data = b"data that gets relocated";
+        let evidence_old = b"pool=1 dev=1 off=0 len=1024";
+        let evidence_new = b"pool=1 dev=2 off=8192 len=1024";
+        let token_old = LocatorToken::from_evidence(evidence_old);
+        let token_new = LocatorToken::from_evidence(evidence_new);
+
+        let mut builder_old = ChecksumTreeBuilder::new(DEFAULT_BLOCK_SIZE);
+        builder_old.set_locator(token_old);
+        builder_old.ingest(data);
+        let tree_old = builder_old.finish();
+
+        let mut builder_new = ChecksumTreeBuilder::new(DEFAULT_BLOCK_SIZE);
+        builder_new.set_locator(token_new);
+        builder_new.ingest(data);
+        let tree_new = builder_new.finish();
+
+        assert_ne!(
+            tree_old.root_hash, tree_new.root_hash,
+            "relocated extent with different locator must produce a different root hash"
+        );
+
+        // Each tree verifies only with its own token
+        let verifier_old = ChecksumTreeVerifier::new(tree_old.clone());
+        assert_eq!(
+            verifier_old.verify_full_with_locator(data, Some(&token_old)),
+            VerificationResult::Verified
+        );
+        assert!(matches!(
+            verifier_old.verify_full_with_locator(data, Some(&token_new)),
+            VerificationResult::LocatorMismatch { .. }
+        ));
+
+        let verifier_new = ChecksumTreeVerifier::new(tree_new.clone());
+        assert_eq!(
+            verifier_new.verify_full_with_locator(data, Some(&token_new)),
+            VerificationResult::Verified
+        );
+        assert!(matches!(
+            verifier_new.verify_full_with_locator(data, Some(&token_old)),
+            VerificationResult::LocatorMismatch { .. }
+        ));
+    }
+
+    /// Checksum verification across a two-extent file: two extents each
+    /// have their own locator-bound checksum tree. Each must verify with
+    /// its own token and fail with the other's token.
+    #[test]
+    fn two_extent_file_locator_binding() {
+        let extent1_data = b"first extent data block";
+        let extent2_data = b"second extent data block";
+
+        let token1 = LocatorToken::from_evidence(b"extent-1");
+        let token2 = LocatorToken::from_evidence(b"extent-2");
+
+        let mut b1 = ChecksumTreeBuilder::new(DEFAULT_BLOCK_SIZE);
+        b1.set_locator(token1);
+        b1.ingest(extent1_data);
+        let tree1 = b1.finish();
+
+        let mut b2 = ChecksumTreeBuilder::new(DEFAULT_BLOCK_SIZE);
+        b2.set_locator(token2);
+        b2.ingest(extent2_data);
+        let tree2 = b2.finish();
+
+        // Extent 1 verifies with token1
+        let v1 = ChecksumTreeVerifier::new(tree1);
+        assert_eq!(
+            v1.verify_full_with_locator(extent1_data, Some(&token1)),
+            VerificationResult::Verified
+        );
+        assert!(matches!(
+            v1.verify_full_with_locator(extent1_data, Some(&token2)),
+            VerificationResult::LocatorMismatch { .. }
+        ));
+
+        // Extent 2 verifies with token2
+        let v2 = ChecksumTreeVerifier::new(tree2);
+        assert_eq!(
+            v2.verify_full_with_locator(extent2_data, Some(&token2)),
+            VerificationResult::Verified
+        );
+        assert!(matches!(
+            v2.verify_full_with_locator(extent2_data, Some(&token1)),
+            VerificationResult::LocatorMismatch { .. }
+        ));
+
+        // Cross-extent data must not verify (content mismatch + locator mismatch)
+        let result = v1.verify_full_with_locator(extent2_data, Some(&token1));
+        assert!(
+            matches!(result, VerificationResult::Corrupted { .. }),
+            "cross-extent data must fail with Corrupted, got {result:?}"
+        );
+    }
+
+    /// verify_object with locator: produces matching digest when the same
+    /// locator is supplied, and a different digest when no locator is
+    /// supplied (or a different one).
+    #[test]
+    fn verify_object_locator_binding() {
+        let data = b"verify_object test data";
+        let token = LocatorToken::from_evidence(b"locator-X");
+
+        // Compute expected digest with locator binding
+        let mut builder = ChecksumTreeBuilder::new(DEFAULT_BLOCK_SIZE);
+        builder.set_locator(token);
+        builder.ingest(data);
+        let expected = builder.finish().root_hash;
+
+        // verify_object with matching locator must succeed
+        assert!(
+            verify_object(data, &expected, Some(&token)).is_ok(),
+            "verify_object must succeed with matching locator"
+        );
+
+        // verify_object without locator must produce a different computed root
+        // (because the expected was computed with locator binding)
+        let result_no_loc = verify_object(data, &expected, None);
+        assert!(
+            result_no_loc.is_err(),
+            "verify_object without locator must fail against locator-bound expected root"
+        );
+
+        // verify_object with wrong locator must also fail
+        let wrong_token = LocatorToken::from_evidence(b"locator-Y");
+        let result_wrong_loc = verify_object(data, &expected, Some(&wrong_token));
+        assert!(
+            result_wrong_loc.is_err(),
+            "verify_object with wrong locator must fail"
+        );
+    }
+
+    /// LocatorToken determinism: same evidence always produces the same token.
+    #[test]
+    fn locator_token_determinism() {
+        let evidence = b"canonical-locator-bytes";
+        let t1 = LocatorToken::from_evidence(evidence);
+        let t2 = LocatorToken::from_evidence(evidence);
+        assert_eq!(t1, t2);
+        assert_eq!(t1.as_bytes(), t2.as_bytes());
+    }
+
+    /// LocatorToken collision resistance: different evidence produces
+    /// different tokens.
+    #[test]
+    fn locator_token_different_evidence_different_tokens() {
+        let t1 = LocatorToken::from_evidence(b"locator-alpha");
+        let t2 = LocatorToken::from_evidence(b"locator-beta");
+        assert_ne!(t1, t2);
+    }
+
+    /// LocatorToken Display and Debug produce hex strings.
+    #[test]
+    fn locator_token_fmt() {
+        let token = LocatorToken::from_evidence(b"fmt-test");
+        let debug_str = format!("{token:?}");
+        assert!(debug_str.starts_with("LocatorToken("));
+        let display_str = format!("{token}");
+        assert_eq!(display_str.len(), 64);
+        assert!(display_str.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// LocatorToken Default is all zeros.
+    #[test]
+    fn locator_token_default_is_zero() {
+        let token = LocatorToken::default();
+        assert_eq!(token.0, [0u8; DIGEST_SIZE]);
+    }
+
+    /// Unbound tree (no locator) still verifies normally — backward compat.
+    #[test]
+    fn locator_binding_unbound_tree_verifies_normally() {
+        let data = b"unbound tree data";
+        let mut builder = ChecksumTreeBuilder::new(DEFAULT_BLOCK_SIZE);
+        builder.ingest(data);
+        let tree = builder.finish();
+
+        assert!(tree.locator_token.is_none());
+
+        let verifier = ChecksumTreeVerifier::new(tree);
+        // Verification without locator token must work
+        assert_eq!(
+            verifier.verify_full_with_locator(data, None),
+            VerificationResult::Verified
+        );
+        // Verification with some random token must also work (no binding)
+        let random_token = LocatorToken::from_evidence(b"random");
+        assert_eq!(
+            verifier.verify_full_with_locator(data, Some(&random_token)),
+            VerificationResult::Verified
         );
     }
 

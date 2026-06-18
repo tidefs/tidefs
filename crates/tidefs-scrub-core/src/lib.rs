@@ -36,7 +36,7 @@ use std::sync::Mutex;
 use tidefs_background_scheduler::{
     BackgroundService, ServiceBudget, ServiceError, ServicePriority, TickReport,
 };
-use tidefs_checksum_tree::{verify_object, ChecksumMismatch, Digest};
+use tidefs_checksum_tree::{verify_object, ChecksumMismatch, Digest, LocatorToken};
 use tidefs_erasure_coding::ParityRaid1;
 use tidefs_local_object_store::{
     load_suspect_log, write_suspect_log, LocalObjectStore, ObjectKey, SegmentChainStats,
@@ -447,6 +447,16 @@ pub enum ScrubOutcome {
         /// Computed BLAKE3-256 root digest from the actual data.
         computed: Digest,
     },
+    /// The locator token does not match the binding in the checksum tree.
+    /// The object may have been relocated since the checksum was committed.
+    LocatorMismatch {
+        /// Hex-encoded object key.
+        object_id: String,
+        /// Locator token bound to the stored checksum tree.
+        bound: LocatorToken,
+        /// Locator token supplied for verification.
+        supplied: LocatorToken,
+    },
     /// I/O error prevented reading the object.
     IoError {
         /// Hex-encoded object key.
@@ -469,6 +479,7 @@ impl ScrubOutcome {
         match self {
             Self::Clean { object_id }
             | Self::Mismatch { object_id, .. }
+            | Self::LocatorMismatch { object_id, .. }
             | Self::IoError { object_id, .. } => object_id.as_str(),
         }
     }
@@ -492,12 +503,14 @@ pub trait ObjectStoreTraversal: Send + Sync {
     /// between enumeration and read).
     fn read_object(&self, id: &ObjectKey) -> Result<Option<Vec<u8>>, String>;
 
-    /// Return the expected BLAKE3 checksum tree root for the given object.
+    /// Return the expected BLAKE3 checksum tree root for the given object,
+    /// together with its bound locator token (if any).
     ///
-    /// This is the root hash of the checksum tree computed from the full
-    /// object payload.  Returns `None` when no checksum root has been
+    /// The root hash is from the checksum tree computed from the full
+    /// object payload; the locator token binds the root to the committed
+    /// extent location.  Returns `None` when no checksum root has been
     /// stored or computed for this object.
-    fn object_checksum_root(&self, id: &ObjectKey) -> Option<Digest>;
+    fn object_checksum_root(&self, id: &ObjectKey) -> Option<(Digest, Option<LocatorToken>)>;
 }
 
 // ---------------------------------------------------------------------------
@@ -506,12 +519,20 @@ pub trait ObjectStoreTraversal: Send + Sync {
 
 /// Trait wrapping the BLAKE3 checksum tree verification primitive.
 ///
-/// A single function: compare the data payload against an expected root digest.
+/// A single function: compare the data payload against an expected root digest,
+/// optionally bound to a committed extent locator.
 pub trait ChecksumVerifier: Send + Sync {
     /// Verify that `data` matches `expected_root`.
     ///
-    /// Returns `Ok(())` on match, `Err(ChecksumMismatch)` on divergence.
-    fn verify(&self, data: &[u8], expected_root: &Digest) -> Result<(), ChecksumMismatch>;
+    /// When `locator_token` is `Some`, the computed root is bound to that
+    /// token before comparison.  Returns `Ok(())` on match,
+    /// `Err(ChecksumMismatch)` on divergence.
+    fn verify(
+        &self,
+        data: &[u8],
+        expected_root: &Digest,
+        locator_token: Option<&LocatorToken>,
+    ) -> Result<(), ChecksumMismatch>;
 }
 
 // ---------------------------------------------------------------------------
@@ -523,8 +544,13 @@ pub trait ChecksumVerifier: Send + Sync {
 pub struct Blake3Verifier;
 
 impl ChecksumVerifier for Blake3Verifier {
-    fn verify(&self, data: &[u8], expected_root: &Digest) -> Result<(), ChecksumMismatch> {
-        verify_object(data, expected_root)
+    fn verify(
+        &self,
+        data: &[u8],
+        expected_root: &Digest,
+        locator_token: Option<&LocatorToken>,
+    ) -> Result<(), ChecksumMismatch> {
+        verify_object(data, expected_root, locator_token)
     }
 }
 
@@ -568,14 +594,14 @@ impl ObjectStoreTraversal for StoreTraverser {
             .map_err(|e| format!("{e}"))
     }
 
-    fn object_checksum_root(&self, id: &ObjectKey) -> Option<Digest> {
+    fn object_checksum_root(&self, id: &ObjectKey) -> Option<(Digest, Option<LocatorToken>)> {
         self.store
             .lock()
             .expect("StoreTraverser: mutex poisoned")
             .get_checksum_tree(*id, tidefs_checksum_tree::DEFAULT_BLOCK_SIZE)
             .ok()
             .flatten()
-            .map(|tree| tree.root_hash)
+            .map(|tree| (tree.root_hash, tree.locator_token))
     }
 }
 // ---------------------------------------------------------------------------
@@ -614,15 +640,16 @@ impl ScrubWorker {
         for id in &object_ids {
             let outcome = match self.store.read_object(id) {
                 Ok(Some(data)) => {
-                    // Retrieve the expected BLAKE3 checksum tree root from
-                    // the store, computed from the object payload at write
-                    // time and verified against IntegrityTrailerV2 record
-                    // digests on the read path.
-                    let expected_root = self
+                    // Retrieve the expected BLAKE3 checksum tree root and
+                    // locator token (if any) from the store, computed from
+                    // the object payload at write time and verified against
+                    // IntegrityTrailerV2 record digests on the read path.
+                    let (expected_root, locator_token) = self
                         .store
                         .object_checksum_root(id)
-                        .unwrap_or_else(Digest::default);
-                    match self.verifier.verify(&data, &expected_root) {
+                        .map(|(root, lt)| (root, lt))
+                        .unwrap_or_else(|| (Digest::default(), None));
+                    match self.verifier.verify(&data, &expected_root, locator_token.as_ref()) {
                         Ok(()) => ScrubOutcome::Clean {
                             object_id: hex_encode(id.as_bytes()),
                         },
@@ -650,6 +677,10 @@ impl ScrubWorker {
             .iter()
             .filter(|o| matches!(o, ScrubOutcome::Mismatch { .. }))
             .count();
+        let locator_mismatches = outcomes
+            .iter()
+            .filter(|o| matches!(o, ScrubOutcome::LocatorMismatch { .. }))
+            .count();
         let io_errors = outcomes
             .iter()
             .filter(|o| matches!(o, ScrubOutcome::IoError { .. }))
@@ -659,6 +690,7 @@ impl ScrubWorker {
             total,
             clean,
             mismatches,
+            locator_mismatches,
             io_errors,
             outcomes,
         }
@@ -678,6 +710,8 @@ pub struct ScrubSummary {
     pub clean: usize,
     /// Objects with checksum mismatches.
     pub mismatches: usize,
+    /// Objects with locator token mismatches (data intact, locator stale).
+    pub locator_mismatches: usize,
     /// Objects that could not be read due to I/O errors.
     pub io_errors: usize,
     /// Per-object outcomes in enumeration order.
@@ -688,7 +722,7 @@ impl ScrubSummary {
     /// Return true when no mismatches or I/O errors were found.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.mismatches == 0 && self.io_errors == 0
+        self.mismatches == 0 && self.locator_mismatches == 0 && self.io_errors == 0
     }
 
     /// Produce a human-readable text summary.
@@ -713,6 +747,11 @@ impl ScrubSummary {
             "  mismatches: {}
 ",
             self.mismatches
+        ));
+        out.push_str(&format!(
+            "  locator mismatches: {}
+",
+            self.locator_mismatches
         ));
         out.push_str(&format!(
             "  io errors: {}
@@ -3652,10 +3691,10 @@ mod tests {
             Ok(None)
         }
 
-        fn object_checksum_root(&self, id: &ObjectKey) -> Option<Digest> {
+        fn object_checksum_root(&self, id: &ObjectKey) -> Option<(Digest, Option<LocatorToken>)> {
             // Check for a forged override first (used to trigger mismatch tests).
             if let Some(override_root) = self.checksum_overrides.get(id) {
-                return Some(*override_root);
+                return Some((*override_root, None));
             }
             // Compute the checksum tree root from the stored payload,
             // matching the real store's get_checksum_tree() behavior.
@@ -3666,7 +3705,8 @@ mod tests {
                             tidefs_checksum_tree::DEFAULT_BLOCK_SIZE,
                         );
                         builder.ingest(data);
-                        return Some(builder.finish().root_hash);
+                        let tree = builder.finish();
+                        return Some((tree.root_hash, tree.locator_token));
                     }
                     return None;
                 }
@@ -3686,9 +3726,103 @@ mod tests {
     }
 
     impl ChecksumVerifier for MockVerifier {
-        fn verify(&self, data: &[u8], expected_root: &Digest) -> Result<(), ChecksumMismatch> {
+        fn verify(
+            &self,
+            data: &[u8],
+            expected_root: &Digest,
+            locator_token: Option<&LocatorToken>,
+        ) -> Result<(), ChecksumMismatch> {
             // Delegate to the production verification function.
-            verify_object(data, expected_root)
+            verify_object(data, expected_root, locator_token)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Locator-bound scrub tests
+    // -----------------------------------------------------------------------
+
+    /// Scrub with locator binding: a locator-bound checksum tree produces
+    /// a root that differs from an unbound tree for the same data.
+    #[test]
+    fn scrub_locator_bound_root_differs_from_unbound() {
+        let token = LocatorToken::from_evidence(b"extent-1");
+        let data = b"scrub-locator-test-data".to_vec();
+
+        let mut builder = tidefs_checksum_tree::ChecksumTreeBuilder::new(
+            tidefs_checksum_tree::DEFAULT_BLOCK_SIZE,
+        );
+        builder.set_locator(token);
+        builder.ingest(&data);
+        let tree = builder.finish();
+
+        // Rebuild without locator to confirm roots differ
+        let mut builder_no_loc = tidefs_checksum_tree::ChecksumTreeBuilder::new(
+            tidefs_checksum_tree::DEFAULT_BLOCK_SIZE,
+        );
+        builder_no_loc.ingest(&data);
+        let tree_no_loc = builder_no_loc.finish();
+        assert_ne!(tree_no_loc.root_hash, tree.root_hash,
+            "locator-bound root must differ from unbound root");
+    }
+
+    /// Scrub detects locator mismatch: object was relocated so locator
+    /// no longer matches.  The store returns a root that was computed with
+    /// a different locator.
+    #[test]
+    fn scrub_locator_mismatch_detected() {
+        let token_a = LocatorToken::from_evidence(b"extent-old");
+        let token_b = LocatorToken::from_evidence(b"extent-new");
+        let data = b"relocated-data".to_vec();
+
+        // Build root with token_a (old locator)
+        let mut builder_a = tidefs_checksum_tree::ChecksumTreeBuilder::new(
+            tidefs_checksum_tree::DEFAULT_BLOCK_SIZE,
+        );
+        builder_a.set_locator(token_a);
+        builder_a.ingest(&data);
+        let tree_a = builder_a.finish();
+
+        // Build root with token_b (new locator)
+        let mut builder_b = tidefs_checksum_tree::ChecksumTreeBuilder::new(
+            tidefs_checksum_tree::DEFAULT_BLOCK_SIZE,
+        );
+        builder_b.set_locator(token_b);
+        builder_b.ingest(&data);
+        let tree_b = builder_b.finish();
+
+        // The roots must differ
+        assert_ne!(tree_a.root_hash, tree_b.root_hash);
+
+        // Verification with wrong token must fail
+        let result_a_with_b = verify_object(&data, &tree_a.root_hash, Some(&token_b));
+        assert!(result_a_with_b.is_err(),
+            "verify with wrong locator token must fail");
+
+        // Verification with correct token must pass
+        let result_a_with_a = verify_object(&data, &tree_a.root_hash, Some(&token_a));
+        assert!(result_a_with_a.is_ok(),
+            "verify with correct locator token must pass");
+    }
+
+    /// ScrubOutcome::LocatorMismatch variant round-trip.
+    #[test]
+    fn scrub_outcome_locator_mismatch_variant() {
+        let token_bound = LocatorToken::from_evidence(b"bound");
+        let token_supplied = LocatorToken::from_evidence(b"supplied");
+        let outcome = ScrubOutcome::LocatorMismatch {
+            object_id: "abc123".to_string(),
+            bound: token_bound,
+            supplied: token_supplied,
+        };
+        assert!(!outcome.is_clean());
+        assert_eq!(outcome.object_id(), "abc123");
+        match &outcome {
+            ScrubOutcome::LocatorMismatch { object_id, bound, supplied } => {
+                assert_eq!(object_id, "abc123");
+                assert_eq!(*bound, token_bound);
+                assert_eq!(*supplied, token_supplied);
+            }
+            _ => panic!("expected LocatorMismatch"),
         }
     }
 
@@ -3822,6 +3956,7 @@ mod tests {
             total: 10,
             clean: 8,
             mismatches: 1,
+            locator_mismatches: 0,
             io_errors: 1,
             outcomes: vec![
                 ScrubOutcome::Clean {
