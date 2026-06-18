@@ -29,7 +29,7 @@
 //!    Fenced lease does not block a new lease for the same domain.
 
 use tidefs_lease::*;
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 fn mid(v: u64) -> MemberId {
     MemberId::new(v)
@@ -48,6 +48,7 @@ fn inode_grant(id: u64, class: LeaseClass, ds: u64, ino: u64, epoch: u64) -> Lea
         60_000,
         0,
         EpochId::new(epoch),
+        DatasetMountIdentity::ZERO,
         id * 100,
         3,
         3,
@@ -106,6 +107,7 @@ fn leader_failover_fences_lease_and_rejects_renewal() {
         60_000,
         0,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         200,
         3,
         3,
@@ -176,7 +178,7 @@ fn validate_fencing_rejects_operations_from_stale_term() {
 #[test]
 fn epoch_advance_revokes_all_active_leases() {
     // Three leases held by three different nodes in epoch 1.
-    let mut proto = LeaseProtocol::new(EpochId::new(1));
+    let mut proto = LeaseProtocol::new(EpochId::new(1), DatasetMountIdentity::ZERO);
 
     let g1 = proto
         .grant_lease(
@@ -187,6 +189,7 @@ fn epoch_advance_revokes_all_active_leases() {
             },
             mid(1),
             60_000,
+            DatasetMountIdentity::ZERO,
         )
         .unwrap();
     let g2 = proto
@@ -198,6 +201,7 @@ fn epoch_advance_revokes_all_active_leases() {
             },
             mid(2),
             60_000,
+            DatasetMountIdentity::ZERO,
         )
         .unwrap();
     let g3 = proto
@@ -209,6 +213,7 @@ fn epoch_advance_revokes_all_active_leases() {
             },
             mid(3),
             60_000,
+            DatasetMountIdentity::ZERO,
         )
         .unwrap();
 
@@ -276,6 +281,7 @@ fn fenced_lease_does_not_block_reacquisition() {
         60_000,
         0,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         200,
         3,
         3,
@@ -291,7 +297,7 @@ fn fenced_lease_does_not_block_reacquisition() {
 fn three_node_lease_expiry_via_tick_all() {
     // Three nodes each hold a lease. Leases expire via tick_all.
     // Node 1's short-lived lease expires; other nodes' leases survive.
-    let mut proto = LeaseProtocol::new(EpochId::new(1));
+    let mut proto = LeaseProtocol::new(EpochId::new(1), DatasetMountIdentity::ZERO);
 
     // Node 1: very short lease (will expire after sleep)
     proto
@@ -303,6 +309,7 @@ fn three_node_lease_expiry_via_tick_all() {
             },
             mid(1),
             1, // 1ms
+            DatasetMountIdentity::ZERO,
         )
         .unwrap();
 
@@ -316,6 +323,7 @@ fn three_node_lease_expiry_via_tick_all() {
             },
             mid(2),
             60_000,
+            DatasetMountIdentity::ZERO,
         )
         .unwrap();
 
@@ -329,6 +337,7 @@ fn three_node_lease_expiry_via_tick_all() {
             },
             mid(3),
             60_000,
+            DatasetMountIdentity::ZERO,
         )
         .unwrap();
 
@@ -379,6 +388,7 @@ fn full_fencing_lifecycle_three_nodes() {
         60_000,
         0,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         100,
         3,
         3,
@@ -397,6 +407,7 @@ fn full_fencing_lifecycle_three_nodes() {
         60_000,
         0,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         200,
         3,
         3,
@@ -417,6 +428,7 @@ fn full_fencing_lifecycle_three_nodes() {
         60_000,
         0,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         300,
         3,
         3,
@@ -476,6 +488,7 @@ fn full_fencing_lifecycle_three_nodes() {
             60_000,
             0,
             EpochId::new(1),
+        DatasetMountIdentity::ZERO,
             1000 + (i as u64) * 100,
             3,
             3,

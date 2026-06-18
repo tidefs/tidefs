@@ -12,7 +12,7 @@ use tidefs_lease::wire::{
     LeaseGrantPayload, LeaseReleasePayload, LeaseRenewPayload, LeaseRequestPayload,
     LeaseRevokePayload, LeaseWireMessage, RevokeReason,
 };
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 use tidefs_transport::{
     decode_lease_message, encode_lease_message, NodeInfo, SessionCloseReason, SessionId, Transport,
     TransportError,
@@ -56,6 +56,7 @@ fn make_request() -> LeaseWireMessage {
         holder_id: MemberId(7),
         term_millis: 30_000,
         epoch: EpochId(5),
+        mount_identity: DatasetMountIdentity::ZERO,
     })
 }
 
@@ -73,6 +74,7 @@ fn make_grant() -> LeaseWireMessage {
         30_000,
         1_000_000,
         EpochId(5),
+        DatasetMountIdentity::ZERO,
         1,
         3,
         5,

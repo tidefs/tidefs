@@ -5,7 +5,7 @@
 //! timestamps. All time values are passed as parameters (no wall-clock sleep).
 
 use tidefs_lease::*;
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 fn mid(v: u64) -> MemberId {
     MemberId::new(v)
@@ -24,6 +24,7 @@ fn make_grant(id: u64, term_millis: u64, granted_at_millis: u64) -> LeaseGrant {
         term_millis,
         granted_at_millis,
         EpochId::new(1),
+        DatasetMountIdentity::ZERO,
         id * 100,
         3,
         3,
