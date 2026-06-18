@@ -1752,6 +1752,20 @@ fn has_secrets_context(line: &str) -> bool {
         }
         search_start = pos + "secrets.".len();
     }
+    search_start = 0;
+    while let Some(offset) = line[search_start..].find("secrets[") {
+        let pos = search_start + offset;
+        let left_ok = pos == 0 || {
+            let before = line.as_bytes()[pos - 1];
+            !before.is_ascii_alphanumeric() && before != b'_'
+        };
+        let after_bracket = pos + "secrets[".len();
+        let right_ok = matches!(line.as_bytes().get(after_bracket), Some(b'\'' | b'"'));
+        if left_ok && right_ok {
+            return true;
+        }
+        search_start = pos + "secrets[".len();
+    }
     false
 }
 
@@ -3099,6 +3113,18 @@ license = "GPL-2.0-only WITH Linux-syscall-note"
     #[test]
     fn bare_secrets_dot_is_detected() {
         let line = "          run: echo \"$SECRET\" | secrets.REGISTRY_PASS";
+        assert!(has_secrets_context(line));
+    }
+
+    #[test]
+    fn indexed_secrets_context_expression_is_detected() {
+        let line = "          TOKEN: ${{ secrets['DEPLOY_TOKEN'] }}";
+        assert!(has_secrets_context(line));
+    }
+
+    #[test]
+    fn indexed_secrets_context_without_spaces_is_detected() {
+        let line = "          TOKEN: ${{secrets[\"DEPLOY_TOKEN\"]}}";
         assert!(has_secrets_context(line));
     }
 
