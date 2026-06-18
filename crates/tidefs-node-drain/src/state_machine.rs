@@ -18,9 +18,9 @@
 //! `Drained` is idempotent (`Drained -> Drained` is permitted for retry
 //! safety).
 
+use crate::evacuation_receipt::{EvacuationReceipt, EvacuationReceiptId};
 use serde::Serialize;
 use std::fmt;
-use crate::evacuation_receipt::{EvacuationReceipt, EvacuationReceiptId};
 use tidefs_membership_epoch::{EpochId, MemberId};
 
 // ---------------------------------------------------------------------------
@@ -408,7 +408,9 @@ impl DrainProtocolMachine {
         &mut self,
         receipt: EvacuationReceipt,
     ) -> Result<DrainProtocolSnapshot, DrainProtocolError> {
-        self.state = self.state.transition_to(DrainProtocolState::DrainComplete)?;
+        self.state = self
+            .state
+            .transition_to(DrainProtocolState::DrainComplete)?;
         self.evacuation_receipt = Some(receipt);
         Ok(self.snapshot())
     }

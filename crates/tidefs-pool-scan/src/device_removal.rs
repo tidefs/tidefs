@@ -61,7 +61,9 @@ impl core::fmt::Display for DeviceRemovalRefusalClass {
             Self::InsufficientSurvivingTopology => f.write_str("insufficient-surviving-topology"),
             Self::DomainConstraintViolation => f.write_str("domain-constraint-violation"),
             Self::StaleTopologyGeneration => f.write_str("stale-topology-generation"),
-            Self::EvacuationCompletionNotDurable => f.write_str("evacuation-completion-not-durable"),
+            Self::EvacuationCompletionNotDurable => {
+                f.write_str("evacuation-completion-not-durable")
+            }
             Self::EvacuationCompletionMismatch => f.write_str("evacuation-completion-mismatch"),
             Self::PlacementReceiptsStillReferenceDevice => f.write_str("placement-receipts-still-reference-device"),
             Self::EvacuationFailed => f.write_str("evacuation-failed"),
@@ -2683,7 +2685,9 @@ pub fn verify_no_receipts_reference_node(
     node_id: tidefs_membership_epoch::MemberId,
     receipt_ids: &[tidefs_replication_model::ReplicatedReceiptId],
     // closure to look up placed_on from receipt_id
-    receipt_lookup: impl Fn(tidefs_replication_model::ReplicatedReceiptId) -> Option<tidefs_membership_epoch::MemberId>,
+    receipt_lookup: impl Fn(
+        tidefs_replication_model::ReplicatedReceiptId,
+    ) -> Option<tidefs_membership_epoch::MemberId>,
 ) -> Result<(), PostDrainVerificationError> {
     let mut referencing = Vec::new();
     for &rid in receipt_ids {
@@ -2716,7 +2720,10 @@ pub enum PostDrainVerificationError {
 impl std::fmt::Display for PostDrainVerificationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ReceiptsStillReferenceNode { node_id, receipt_ids } => {
+            Self::ReceiptsStillReferenceNode {
+                node_id,
+                receipt_ids,
+            } => {
                 write!(
                     f,
                     "{} placement receipt(s) still reference drained node {}: {:?}",
@@ -2761,11 +2768,7 @@ mod post_drain_tests {
                 _ => None,
             }
         };
-        let result = verify_no_receipts_reference_node(
-            mid(1),
-            &[rid(10), rid(20)],
-            lookup,
-        );
+        let result = verify_no_receipts_reference_node(mid(1), &[rid(10), rid(20)], lookup);
         assert!(result.is_ok());
     }
 
@@ -2778,11 +2781,7 @@ mod post_drain_tests {
                 _ => None,
             }
         };
-        let result = verify_no_receipts_reference_node(
-            mid(1),
-            &[rid(10), rid(20)],
-            lookup,
-        );
+        let result = verify_no_receipts_reference_node(mid(1), &[rid(10), rid(20)], lookup);
         assert!(result.is_err());
         match result.unwrap_err() {
             PostDrainVerificationError::ReceiptsStillReferenceNode {

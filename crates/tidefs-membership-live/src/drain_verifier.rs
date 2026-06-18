@@ -80,7 +80,10 @@ impl<'a> DrainPlacementVerifier<'a> {
 }
 
 impl PlacementEvidenceVerifier for DrainPlacementVerifier<'_> {
-    fn receipts_referencing_node(&self, node_id: tidefs_membership_epoch::MemberId) -> Vec<ReplicatedReceiptId> {
+    fn receipts_referencing_node(
+        &self,
+        node_id: tidefs_membership_epoch::MemberId,
+    ) -> Vec<ReplicatedReceiptId> {
         self.registry.receipts_referencing_node(node_id)
     }
 
@@ -94,7 +97,9 @@ mod placement_verifier_tests {
     use super::*;
     use tidefs_membership_epoch::{EpochId, MemberId};
     use tidefs_placement_runtime::PlacementPlanRegistry;
-    use tidefs_replication_model::{ReplicaPlacementReceipt, ReplicatedReceiptId, ReplicatedSubjectId};
+    use tidefs_replication_model::{
+        ReplicaPlacementReceipt, ReplicatedReceiptId, ReplicatedSubjectId,
+    };
 
     fn mid(id: u64) -> MemberId {
         MemberId::new(id)
@@ -129,7 +134,10 @@ mod placement_verifier_tests {
 
         let verifier = DrainPlacementVerifier::new(&registry);
         assert!(verifier.has_receipts_referencing_node(node));
-        assert_eq!(verifier.receipts_referencing_node(node), vec![ReplicatedReceiptId(1)]);
+        assert_eq!(
+            verifier.receipts_referencing_node(node),
+            vec![ReplicatedReceiptId(1)]
+        );
         assert!(!verifier.has_receipts_referencing_node(mid(99)));
     }
 }

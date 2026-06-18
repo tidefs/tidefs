@@ -154,8 +154,32 @@ impl DrainExecutor {
     }
 
     /// Attach an evacuation receipt to the underlying drain.
-    pub fn set_evacuation_receipt(&mut self, receipt: crate::evacuation_receipt::EvacuationReceipt) {
+    pub fn set_evacuation_receipt(
+        &mut self,
+        receipt: crate::evacuation_receipt::EvacuationReceipt,
+    ) {
         self.drain.set_evacuation_receipt(receipt);
+    }
+
+    /// Mark the data stage complete after external migration has produced
+    /// evacuation evidence.
+    pub fn complete_data_stage_with_evacuation(
+        &mut self,
+        receipt: Option<crate::evacuation_receipt::EvacuationReceipt>,
+    ) -> Result<DrainProgress, DrainError> {
+        while self.drain.stage() < DrainStage::DrainingData {
+            self.drain.advance_stage()?;
+        }
+        if self.drain.stage() != DrainStage::DrainingData {
+            return Ok(self.drain.progress());
+        }
+
+        if let Some(receipt) = receipt {
+            self.drain.set_evacuation_receipt(receipt);
+        }
+        self.drain.update_progress(DrainProgress::ZERO);
+        self.drain.advance_stage()?;
+        Ok(self.drain.progress())
     }
 
     /// Run a single tick of the executor.

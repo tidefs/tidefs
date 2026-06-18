@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+use crate::evacuation_receipt::{EvacuationReceipt, EvacuationReceiptError};
 use std::fmt;
 use tidefs_membership_epoch::MemberId;
-use crate::evacuation_receipt::{EvacuationReceipt, EvacuationReceiptError};
 
 // ---------------------------------------------------------------------------
 // Node lifecycle states
@@ -203,9 +203,7 @@ pub enum DrainError {
         stage: DrainStage,
     },
     /// The evacuation receipt is not yet committed.
-    EvacuationReceiptNotCommitted {
-        node_id: MemberId,
-    },
+    EvacuationReceiptNotCommitted { node_id: MemberId },
     /// The evacuation receipt failed validation.
     EvacuationReceiptInvalid {
         node_id: MemberId,
@@ -456,6 +454,14 @@ impl NodeDrain {
                 // when relocation receipts exist.  If no receipt is attached, the
                 // node had no data to migrate (vacuous satisfaction).
                 if let Some(receipt) = &self.evacuation_receipt {
+                    if receipt.is_empty() {
+                        return Err(DrainError::EvacuationReceiptInvalid {
+                            node_id: self.node_id,
+                            error: EvacuationReceiptError::EmptyEvacuation {
+                                draining_node: self.node_id,
+                            },
+                        });
+                    }
                     if !receipt.is_committed() {
                         return Err(DrainError::EvacuationReceiptNotCommitted {
                             node_id: self.node_id,
@@ -488,10 +494,7 @@ impl NodeDrain {
         }
 
         if let Some(next_stage) = self.stage.next() {
-            self.stage = next_stage;
-            // Reset progress for the new stage
-            self.progress = DrainProgress::ZERO;
-            if self.stage == DrainStage::Drained {
+            if next_stage == DrainStage::Drained {
                 // Drained transition requires committed epoch boundary when
                 // an evacuation receipt exists (data was migrated).
                 if let Some(ref receipt) = self.evacuation_receipt {
@@ -504,6 +507,12 @@ impl NodeDrain {
                         });
                     }
                 }
+            }
+
+            self.stage = next_stage;
+            // Reset progress for the new stage
+            self.progress = DrainProgress::ZERO;
+            if self.stage == DrainStage::Drained {
                 self.state = NodeState::Drained;
             }
         }
@@ -738,6 +747,66 @@ mod tests {
         }
         let err = drain.advance_stage().unwrap_err();
         assert!(matches!(err, DrainError::CannotCancelTerminal { .. }));
+    }
+
+    #[test]
+    fn data_to_cache_rejects_empty_evacuation_receipt() {
+        let (mut drain, _) = NodeDrain::drain(node_id(11));
+        drain.advance_stage().unwrap();
+        drain.update_progress(DrainProgress::ZERO);
+        drain.advance_stage().unwrap();
+        assert_eq!(drain.stage(), DrainStage::DrainingData);
+
+        let receipt = EvacuationReceipt::new(
+            node_id(11),
+            tidefs_membership_epoch::EpochId::new(5),
+            "test".to_string(),
+        );
+        drain.set_evacuation_receipt(receipt);
+        drain.update_progress(DrainProgress::ZERO);
+
+        let err = drain.advance_stage().unwrap_err();
+        assert!(matches!(
+            err,
+            DrainError::EvacuationReceiptInvalid {
+                error: EvacuationReceiptError::EmptyEvacuation { .. },
+                ..
+            }
+        ));
+        assert_eq!(drain.stage(), DrainStage::DrainingData);
+    }
+
+    #[test]
+    fn drained_transition_rejects_missing_epoch_boundary_without_advancing() {
+        let (mut drain, _) = NodeDrain::drain(node_id(12));
+        drain.advance_stage().unwrap();
+        drain.update_progress(DrainProgress::ZERO);
+        drain.advance_stage().unwrap();
+
+        let mut receipt = EvacuationReceipt::new(
+            node_id(12),
+            tidefs_membership_epoch::EpochId::new(5),
+            "test".to_string(),
+        );
+        receipt.record_relocated_receipts([tidefs_replication_model::ReplicatedReceiptId(42)]);
+        drain.set_evacuation_receipt(receipt);
+
+        drain.update_progress(DrainProgress::ZERO);
+        drain.advance_stage().unwrap();
+        drain.update_progress(DrainProgress::ZERO);
+        drain.advance_stage().unwrap();
+
+        assert_eq!(drain.stage(), DrainStage::DrainingAdmin);
+        let err = drain.advance_stage().unwrap_err();
+        assert!(matches!(
+            err,
+            DrainError::EvacuationReceiptInvalid {
+                error: EvacuationReceiptError::EpochBoundaryNotCommitted { .. },
+                ..
+            }
+        ));
+        assert_eq!(drain.stage(), DrainStage::DrainingAdmin);
+        assert_eq!(drain.state(), NodeState::Draining);
     }
 
     #[test]
