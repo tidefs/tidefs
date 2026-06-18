@@ -3845,6 +3845,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tidefs-crash-oracle",
  "tidefs-schema-codec-posix-filesystem-adapter",
  "tidefs-schema-codec-vfs",
  "tidefs-trace-oracle",

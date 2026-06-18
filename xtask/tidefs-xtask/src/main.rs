@@ -8,6 +8,7 @@ mod claims;
 mod cluster;
 mod contract_codecs;
 mod coverage;
+mod crash_oracle;
 mod forgejo_work;
 mod format_golden;
 mod hygiene;
@@ -80,6 +81,12 @@ fn main() {
                 )
             };
             if let Err(err) = result {
+                eprintln!("{err}");
+                process::exit(1);
+            }
+        }
+        Some("check-crash-oracle") => {
+            if let Err(err) = crash_oracle::check_crash_oracle_current_workspace() {
                 eprintln!("{err}");
                 process::exit(1);
             }
@@ -1918,6 +1925,7 @@ fn print_help() {
     println!(
         "  check-trace-oracle --compare-trace <path> compare model/local-runtime backends for one trace"
     );
+    println!("  check-crash-oracle       validate crash oracle crate and crash matrix artifact");
     println!("  check-contract-codecs    validate request contract codec golden vectors");
     println!(
         "  check-locator-table      validate V1 inline-hash locator table implementation markers"

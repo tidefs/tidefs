@@ -15,6 +15,7 @@ toml = "0.8"
 ureq = { version = "3", default-features = false, features = ["json"] }
 tidefs-types-package-profile-catalog = { path = "../../crates/tidefs-types-package-profile-catalog" }
 tidefs-trace-oracle = { path = "../../crates/tidefs-trace-oracle" }
+tidefs-crash-oracle = { path = "../../crates/tidefs-crash-oracle" }
 tidefs-types-dataset-feature-flags-core = { path = "../../crates/tidefs-types-dataset-feature-flags-core" }
 tidefs-schema-codec-vfs = { path = "../../crates/tidefs-schema-codec-vfs" }
 tidefs-schema-codec-posix-filesystem-adapter = { path = "../../crates/tidefs-schema-codec-posix-filesystem-adapter" }
