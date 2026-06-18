@@ -842,7 +842,7 @@ pub struct PolicyPublishBundleRecord {
     pub _reserved0: u64,
 }
 
-// ── PolicyActivationReceipt (224 bytes) ────────────────────────────────────
+// ── PolicyActivationReceipt (216 bytes) ────────────────────────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
