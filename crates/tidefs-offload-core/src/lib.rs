@@ -206,6 +206,18 @@ impl OffloadStatus {
     }
 }
 
+pub const OFFLOAD_STATUS_VALUE_COUNT: usize = 7;
+
+pub const OFFLOAD_STATUS_VALUES: [OffloadStatus; OFFLOAD_STATUS_VALUE_COUNT] = [
+    OffloadStatus::Success,
+    OffloadStatus::Rejected,
+    OffloadStatus::InvalidDescriptor,
+    OffloadStatus::InvalidLease,
+    OffloadStatus::BufferMismatch,
+    OffloadStatus::KernelFailed,
+    OffloadStatus::Unsupported,
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OffloadRequest {
     Crc32cChecksum { input_len: u64 },
@@ -676,6 +688,151 @@ pub fn validate_completion_v1(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OffloadConformanceDigest {
+    pub algorithm: OffloadConformanceDigestAlgorithm,
+    pub bytes: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OffloadConformanceDigestAlgorithm {
+    Sha256,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OffloadBackendClass {
+    CpuReference,
+    Simd,
+    Gpu,
+    Fpga,
+    Dma,
+    Kernel,
+    Rdma,
+    Unsupported { value: u16 },
+}
+
+impl OffloadBackendClass {
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        match self {
+            Self::CpuReference => 0,
+            Self::Simd => 1,
+            Self::Gpu => 2,
+            Self::Fpga => 3,
+            Self::Dma => 4,
+            Self::Kernel => 5,
+            Self::Rdma => 6,
+            Self::Unsupported { value } => value,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_u16(value: u16) -> Self {
+        match value {
+            0 => Self::CpuReference,
+            1 => Self::Simd,
+            2 => Self::Gpu,
+            3 => Self::Fpga,
+            4 => Self::Dma,
+            5 => Self::Kernel,
+            6 => Self::Rdma,
+            value => Self::Unsupported { value },
+        }
+    }
+
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        !matches!(self, Self::Unsupported { .. })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OffloadConformanceValidationTier {
+    CpuEquivalent,
+    ExternalBackendComparison,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OffloadConformanceAuthorityScope {
+    NonAuthoritativeOnly,
+    StorageSemanticsAuthority,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OffloadStatusMapping {
+    pub reference: OffloadStatus,
+    pub backend: OffloadStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OffloadExternalBackendConformanceManifest<'a> {
+    pub claim: &'a str,
+    pub backend_name: &'a str,
+    pub backend_class: OffloadBackendClass,
+    pub vector_digest: OffloadConformanceDigest,
+    pub descriptor_abi_version: ContractVersion,
+    pub completion_abi_version: ContractVersion,
+    pub cpu_reference_digest: Option<OffloadConformanceDigest>,
+    pub status_mapping: &'a [OffloadStatusMapping],
+    pub validation_tier: OffloadConformanceValidationTier,
+    pub authority_scope: OffloadConformanceAuthorityScope,
+}
+
+impl<'a> OffloadExternalBackendConformanceManifest<'a> {
+    /// Validate an external-backend conformance manifest against the CPU reference scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OffloadValidationError`] when the manifest leaves the
+    /// non-authoritative claim, omits CPU reference comparison, uses an
+    /// unsupported ABI/backend class, or fails exact status equivalence.
+    pub fn validate(self) -> Result<(), OffloadValidationError> {
+        if self.claim != OFFLOAD_READY_NON_AUTHORITATIVE_CLAIM {
+            return Err(OffloadValidationError::InvalidConformanceManifestField {
+                field: OffloadConformanceManifestField::Claim,
+            });
+        }
+        if self.backend_name.is_empty() {
+            return Err(OffloadValidationError::InvalidConformanceManifestField {
+                field: OffloadConformanceManifestField::BackendName,
+            });
+        }
+        if !self.backend_class.is_supported() {
+            return Err(OffloadValidationError::UnsupportedBackendClass {
+                value: self.backend_class.as_u16(),
+            });
+        }
+        expect_version(OffloadRecord::DescriptorV1, self.descriptor_abi_version)?;
+        expect_version(OffloadRecord::CompletionV1, self.completion_abi_version)?;
+        if self.authority_scope != OffloadConformanceAuthorityScope::NonAuthoritativeOnly {
+            return Err(OffloadValidationError::AuthoritativeStorageSemanticsClaimed);
+        }
+        let cpu_reference_digest = self
+            .cpu_reference_digest
+            .ok_or(OffloadValidationError::MissingCpuReferenceComparison)?;
+        if self.vector_digest != cpu_reference_digest {
+            return Err(OffloadValidationError::CpuReferenceDigestMismatch {
+                expected: cpu_reference_digest,
+                actual: self.vector_digest,
+            });
+        }
+        validate_exact_status_mapping(self.status_mapping)?;
+        Ok(())
+    }
+}
+
+/// Validate an external-backend conformance manifest.
+///
+/// # Errors
+///
+/// Returns [`OffloadValidationError`] for the same cases as
+/// [`OffloadExternalBackendConformanceManifest::validate`].
+pub fn validate_external_backend_conformance_manifest(
+    manifest: OffloadExternalBackendConformanceManifest<'_>,
+) -> Result<(), OffloadValidationError> {
+    manifest.validate()
+}
+
 pub struct CpuReferenceBackend;
 
 impl CpuReferenceBackend {
@@ -1016,6 +1173,31 @@ pub enum OffloadValidationError {
         expected_len: usize,
         actual_len: usize,
     },
+    InvalidConformanceManifestField {
+        field: OffloadConformanceManifestField,
+    },
+    UnsupportedBackendClass {
+        value: u16,
+    },
+    AuthoritativeStorageSemanticsClaimed,
+    MissingCpuReferenceComparison,
+    CpuReferenceDigestMismatch {
+        expected: OffloadConformanceDigest,
+        actual: OffloadConformanceDigest,
+    },
+    MissingStatusMapping {
+        status: OffloadStatus,
+    },
+    DuplicateStatusMapping {
+        status: OffloadStatus,
+    },
+    CollapsedStatusMapping {
+        status: OffloadStatus,
+    },
+    StatusMappingMismatch {
+        reference: OffloadStatus,
+        backend: OffloadStatus,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1086,6 +1268,12 @@ pub enum OffloadCompletionField {
 pub enum OffloadSliceField {
     Input,
     Output,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OffloadConformanceManifestField {
+    Claim,
+    BackendName,
 }
 
 #[must_use]
@@ -1230,6 +1418,47 @@ fn expect_slice_capacity(
     }
 }
 
+fn validate_exact_status_mapping(
+    mapping: &[OffloadStatusMapping],
+) -> Result<(), OffloadValidationError> {
+    for status in OFFLOAD_STATUS_VALUES {
+        let mut matches = 0_usize;
+        for entry in mapping {
+            if entry.reference == status {
+                matches += 1;
+            }
+        }
+        if matches == 0 {
+            return Err(OffloadValidationError::MissingStatusMapping { status });
+        }
+        if matches > 1 {
+            return Err(OffloadValidationError::DuplicateStatusMapping { status });
+        }
+    }
+
+    for status in OFFLOAD_STATUS_VALUES {
+        let mut matches = 0_usize;
+        for entry in mapping {
+            if entry.backend == status {
+                matches += 1;
+            }
+        }
+        if matches > 1 {
+            return Err(OffloadValidationError::CollapsedStatusMapping { status });
+        }
+    }
+
+    for entry in mapping {
+        if entry.reference != entry.backend {
+            return Err(OffloadValidationError::StatusMappingMismatch {
+                reference: entry.reference,
+                backend: entry.backend,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn write_u16_le(out: &mut [u8], offset: usize, value: u16) {
     out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
@@ -1280,6 +1509,44 @@ mod tests {
     const DESC_ID: OffloadDescId = OffloadDescId(11);
     const LEASE_ID: BufferLeaseId = BufferLeaseId(13);
     const LEASE_GEN: BufferLeaseGeneration = BufferLeaseGeneration(17);
+    const CPU_VECTOR_DIGEST: OffloadConformanceDigest = OffloadConformanceDigest {
+        algorithm: OffloadConformanceDigestAlgorithm::Sha256,
+        bytes: [
+            0x56, 0xe6, 0x71, 0xf6, 0x38, 0xbd, 0xc4, 0xc8, 0x0c, 0x45, 0xaf, 0x3b, 0xde, 0x98,
+            0x16, 0x19, 0x2f, 0x07, 0x9f, 0x3f, 0x1d, 0xbe, 0xd6, 0x72, 0x1a, 0xc9, 0x12, 0x20,
+            0x61, 0x67, 0x28, 0xee,
+        ],
+    };
+    const EXACT_STATUS_MAPPING: [OffloadStatusMapping; OFFLOAD_STATUS_VALUE_COUNT] = [
+        OffloadStatusMapping {
+            reference: OffloadStatus::Success,
+            backend: OffloadStatus::Success,
+        },
+        OffloadStatusMapping {
+            reference: OffloadStatus::Rejected,
+            backend: OffloadStatus::Rejected,
+        },
+        OffloadStatusMapping {
+            reference: OffloadStatus::InvalidDescriptor,
+            backend: OffloadStatus::InvalidDescriptor,
+        },
+        OffloadStatusMapping {
+            reference: OffloadStatus::InvalidLease,
+            backend: OffloadStatus::InvalidLease,
+        },
+        OffloadStatusMapping {
+            reference: OffloadStatus::BufferMismatch,
+            backend: OffloadStatus::BufferMismatch,
+        },
+        OffloadStatusMapping {
+            reference: OffloadStatus::KernelFailed,
+            backend: OffloadStatus::KernelFailed,
+        },
+        OffloadStatusMapping {
+            reference: OffloadStatus::Unsupported,
+            backend: OffloadStatus::Unsupported,
+        },
+    ];
 
     fn lease(input_len: u64, output_len: u64) -> BufferLeaseV1 {
         BufferLeaseV1::new(LEASE_ID, LEASE_GEN, input_len, output_len, 64, 64)
@@ -1289,6 +1556,154 @@ mod tests {
         OffloadRequest::Crc32cChecksum { input_len: 9 }
             .desc_v1(REQUEST_ID, EPOCH, DESC_ID, lease(9, 4))
             .expect("descriptor")
+    }
+
+    fn cpu_equivalent_manifest() -> OffloadExternalBackendConformanceManifest<'static> {
+        OffloadExternalBackendConformanceManifest {
+            claim: OFFLOAD_READY_NON_AUTHORITATIVE_CLAIM,
+            backend_name: "cpu-reference",
+            backend_class: OffloadBackendClass::CpuReference,
+            vector_digest: CPU_VECTOR_DIGEST,
+            descriptor_abi_version: TIDE_CONTRACT_VERSION_V1,
+            completion_abi_version: TIDE_CONTRACT_VERSION_V1,
+            cpu_reference_digest: Some(CPU_VECTOR_DIGEST),
+            status_mapping: &EXACT_STATUS_MAPPING,
+            validation_tier: OffloadConformanceValidationTier::CpuEquivalent,
+            authority_scope: OffloadConformanceAuthorityScope::NonAuthoritativeOnly,
+        }
+    }
+
+    #[test]
+    fn external_backend_manifest_accepts_cpu_equivalent_fixture() {
+        let manifest = cpu_equivalent_manifest();
+
+        manifest.validate().expect("cpu-equivalent manifest");
+        validate_external_backend_conformance_manifest(manifest).expect("free validator");
+    }
+
+    #[test]
+    fn external_backend_manifest_rejects_missing_cpu_reference() {
+        let manifest = OffloadExternalBackendConformanceManifest {
+            cpu_reference_digest: None,
+            ..cpu_equivalent_manifest()
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            Err(OffloadValidationError::MissingCpuReferenceComparison)
+        );
+    }
+
+    #[test]
+    fn external_backend_manifest_rejects_unsupported_backend_class() {
+        let manifest = OffloadExternalBackendConformanceManifest {
+            backend_class: OffloadBackendClass::Unsupported { value: 0xff00 },
+            ..cpu_equivalent_manifest()
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            Err(OffloadValidationError::UnsupportedBackendClass { value: 0xff00 })
+        );
+    }
+
+    #[test]
+    fn external_backend_manifest_rejects_reserved_descriptor_version() {
+        let manifest = OffloadExternalBackendConformanceManifest {
+            descriptor_abi_version: ContractVersion(0),
+            ..cpu_equivalent_manifest()
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            Err(OffloadValidationError::UnsupportedVersion {
+                record: OffloadRecord::DescriptorV1,
+                version: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn external_backend_manifest_rejects_reserved_completion_version() {
+        let manifest = OffloadExternalBackendConformanceManifest {
+            completion_abi_version: ContractVersion(2),
+            ..cpu_equivalent_manifest()
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            Err(OffloadValidationError::UnsupportedVersion {
+                record: OffloadRecord::CompletionV1,
+                version: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn external_backend_manifest_rejects_cpu_digest_mismatch() {
+        let mut backend_digest = CPU_VECTOR_DIGEST;
+        backend_digest.bytes[31] ^= 1;
+        let manifest = OffloadExternalBackendConformanceManifest {
+            vector_digest: backend_digest,
+            ..cpu_equivalent_manifest()
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            Err(OffloadValidationError::CpuReferenceDigestMismatch {
+                expected: CPU_VECTOR_DIGEST,
+                actual: backend_digest,
+            })
+        );
+    }
+
+    #[test]
+    fn external_backend_manifest_rejects_status_mismatch() {
+        let mut mapping = EXACT_STATUS_MAPPING;
+        mapping[1].backend = OffloadStatus::Unsupported;
+        mapping[6].backend = OffloadStatus::Rejected;
+        let manifest = OffloadExternalBackendConformanceManifest {
+            status_mapping: &mapping,
+            ..cpu_equivalent_manifest()
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            Err(OffloadValidationError::StatusMappingMismatch {
+                reference: OffloadStatus::Rejected,
+                backend: OffloadStatus::Unsupported,
+            })
+        );
+    }
+
+    #[test]
+    fn external_backend_manifest_rejects_collapsed_status_values() {
+        let mut mapping = EXACT_STATUS_MAPPING;
+        mapping[0].backend = OffloadStatus::Rejected;
+        let manifest = OffloadExternalBackendConformanceManifest {
+            status_mapping: &mapping,
+            ..cpu_equivalent_manifest()
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            Err(OffloadValidationError::CollapsedStatusMapping {
+                status: OffloadStatus::Rejected,
+            })
+        );
+    }
+
+    #[test]
+    fn external_backend_manifest_rejects_authoritative_storage_scope() {
+        let manifest = OffloadExternalBackendConformanceManifest {
+            authority_scope: OffloadConformanceAuthorityScope::StorageSemanticsAuthority,
+            ..cpu_equivalent_manifest()
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            Err(OffloadValidationError::AuthoritativeStorageSemanticsClaimed)
+        );
     }
 
     #[test]
