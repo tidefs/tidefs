@@ -224,8 +224,27 @@ impl EvacuationReceipt {
         hasher.update(&self.completion_generation.removal_chain_digest);
         hasher.update(&self.receipt_id.to_le_bytes());
         for pr in &self.placement_receipt_refs {
+            hasher.update(&pr.object_id.to_le_bytes());
             hasher.update(&pr.object_key);
+            hasher.update(&pr.receipt_epoch.0.to_le_bytes());
             hasher.update(&pr.receipt_generation.to_le_bytes());
+            match pr.redundancy_policy {
+                tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies } => {
+                    hasher.update(&[0]);
+                    hasher.update(&[copies]);
+                }
+                tidefs_replication_model::ReceiptRedundancyPolicy::Erasure {
+                    data_shards,
+                    parity_shards,
+                } => {
+                    hasher.update(&[1]);
+                    hasher.update(&[data_shards]);
+                    hasher.update(&[parity_shards]);
+                }
+            }
+            hasher.update(&pr.payload_len.to_le_bytes());
+            hasher.update(&pr.payload_digest);
+            hasher.update(&pr.target_count.to_le_bytes());
         }
         hasher.finalize().into()
     }
@@ -3670,7 +3689,7 @@ mod tests {
             evacuation_set_digest: [0xBBu8; 32],
             removal_chain_digest: [0xCCu8; 32],
         };
-        let receipt = EvacuationReceipt::new(completion, vec![], 1);
+        let receipt = EvacuationReceipt::new(completion.clone(), vec![], 1);
         assert!(
             receipt.verify_digest(),
             "fresh receipt must verify its own digest"
@@ -3701,6 +3720,15 @@ mod tests {
         assert!(
             !tampered2.verify_digest(),
             "tampered placement_receipt_refs must invalidate digest"
+        );
+
+        let receipt_with_ref =
+            EvacuationReceipt::new(completion, vec![placement_receipt_ref(9)], 2);
+        let mut tampered_object_id = receipt_with_ref.clone();
+        tampered_object_id.placement_receipt_refs[0].object_id = 10;
+        assert!(
+            !tampered_object_id.verify_digest(),
+            "tampered placement receipt object_id must invalidate digest"
         );
     }
 
