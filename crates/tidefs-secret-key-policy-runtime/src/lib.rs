@@ -238,11 +238,11 @@ pub trait HandleStore {
     ) -> Result<(), SecretKeyPolicyRuntimeError>;
     /// Look up the dataset mount identity binding for a handle.
     ///
-    /// Returns  when the handle has no mount identity binding
-    /// (unrestricted key access). Returns
-    /// when the handle is bound to a specific committed dataset mount.
-    /// Implementations that do not support mount identity gating may
-    /// return the default .
+    /// Returns `Ok(Some((dataset_id, mount_generation)))` when the handle is
+    /// bound to a specific committed dataset mount. `Ok(None)` means the store
+    /// cannot prove a binding, and
+    /// [`validate_dataset_mount_identity_for_handle`] will refuse the lease
+    /// fail-closed.
     fn lookup_dataset_mount_identity(
         &self,
         _handle_id: SecretKeyPolicyId128,
@@ -421,7 +421,7 @@ pub fn issue_bounded_secret_lease_for_runtime_use<S: SealProvider>(
 /// Validate that a dataset mount identity matches the binding on a handle.
 ///
 /// When a handle was minted with a mount identity binding, every lease
-/// issuance must present a matching .
+/// issuance must present a matching dataset identity and mount generation.
 /// This function fails closed: missing, unbound, or mismatched mount identity
 /// causes lease refusal.
 ///
@@ -1916,38 +1916,96 @@ mod tests {
     }
 
     impl HandleStore for MockMountStore {
-        fn lookup_handle(&self, _id: SecretKeyPolicyId128) -> Result<SecretHandleRecord, SecretKeyPolicyRuntimeError> {
+        fn lookup_handle(
+            &self,
+            _id: SecretKeyPolicyId128,
+        ) -> Result<SecretHandleRecord, SecretKeyPolicyRuntimeError> {
             Ok(SecretHandleRecord::default())
         }
-        fn lookup_envelope(&self, _id: SecretKeyPolicyId128) -> Result<SecretEnvelopeRecord, SecretKeyPolicyRuntimeError> {
+        fn lookup_envelope(
+            &self,
+            _id: SecretKeyPolicyId128,
+        ) -> Result<SecretEnvelopeRecord, SecretKeyPolicyRuntimeError> {
             Ok(SecretEnvelopeRecord::default())
         }
-        fn lookup_wrapping_key(&self, _id: SecretKeyPolicyId128) -> Result<WrappingKeyRecord, SecretKeyPolicyRuntimeError> {
+        fn lookup_wrapping_key(
+            &self,
+            _id: SecretKeyPolicyId128,
+        ) -> Result<WrappingKeyRecord, SecretKeyPolicyRuntimeError> {
             Ok(WrappingKeyRecord::default())
         }
-        fn lookup_manifest(&self, _id: SecretKeyPolicyId128) -> Result<PolicyStoreManifestRecord, SecretKeyPolicyRuntimeError> {
+        fn lookup_manifest(
+            &self,
+            _id: SecretKeyPolicyId128,
+        ) -> Result<PolicyStoreManifestRecord, SecretKeyPolicyRuntimeError> {
             Err(SecretKeyPolicyRuntimeError::ManifestIncompatible {
                 manifest_id: SecretKeyPolicyId128::ZERO,
                 reason: ManifestRefusalReason::MissingRevReferences,
             })
         }
-        fn lookup_activation(&self, _id: SecretKeyPolicyId128) -> Result<PolicyActivationReceipt, SecretKeyPolicyRuntimeError> {
+        fn lookup_activation(
+            &self,
+            _id: SecretKeyPolicyId128,
+        ) -> Result<PolicyActivationReceipt, SecretKeyPolicyRuntimeError> {
             Err(SecretKeyPolicyRuntimeError::ActivationPreflightFailed {
                 activation_id: SecretKeyPolicyId128::ZERO,
                 reason: ActivationRefusalReason::MissingHandles,
             })
         }
-        fn lookup_lease(&self, _id: SecretKeyPolicyId128) -> Result<SecretLeaseGrantRecord, SecretKeyPolicyRuntimeError> {
-            Err(SecretKeyPolicyRuntimeError::LeaseNotFound { lease_id: SecretKeyPolicyId128::ZERO })
+        fn lookup_lease(
+            &self,
+            _id: SecretKeyPolicyId128,
+        ) -> Result<SecretLeaseGrantRecord, SecretKeyPolicyRuntimeError> {
+            Err(SecretKeyPolicyRuntimeError::LeaseNotFound {
+                lease_id: SecretKeyPolicyId128::ZERO,
+            })
         }
-        fn store_handle(&mut self, _h: &SecretHandleRecord) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-        fn store_envelope(&mut self, _e: &SecretEnvelopeRecord) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-        fn store_manifest(&mut self, _m: &PolicyStoreManifestRecord) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-        fn store_activation(&mut self, _a: &PolicyActivationReceipt) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-        fn store_lease(&mut self, _l: &SecretLeaseGrantRecord) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-        fn store_rotation_plan(&mut self, _p: &SecretRotationPlanRecord) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-        fn store_revocation(&mut self, _r: &SecretRevocationReceipt) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-        fn lookup_dataset_mount_identity(&self, _id: SecretKeyPolicyId128) -> Result<Option<(String, u64)>, SecretKeyPolicyRuntimeError> {
+        fn store_handle(
+            &mut self,
+            _h: &SecretHandleRecord,
+        ) -> Result<(), SecretKeyPolicyRuntimeError> {
+            Ok(())
+        }
+        fn store_envelope(
+            &mut self,
+            _e: &SecretEnvelopeRecord,
+        ) -> Result<(), SecretKeyPolicyRuntimeError> {
+            Ok(())
+        }
+        fn store_manifest(
+            &mut self,
+            _m: &PolicyStoreManifestRecord,
+        ) -> Result<(), SecretKeyPolicyRuntimeError> {
+            Ok(())
+        }
+        fn store_activation(
+            &mut self,
+            _a: &PolicyActivationReceipt,
+        ) -> Result<(), SecretKeyPolicyRuntimeError> {
+            Ok(())
+        }
+        fn store_lease(
+            &mut self,
+            _l: &SecretLeaseGrantRecord,
+        ) -> Result<(), SecretKeyPolicyRuntimeError> {
+            Ok(())
+        }
+        fn store_rotation_plan(
+            &mut self,
+            _p: &SecretRotationPlanRecord,
+        ) -> Result<(), SecretKeyPolicyRuntimeError> {
+            Ok(())
+        }
+        fn store_revocation(
+            &mut self,
+            _r: &SecretRevocationReceipt,
+        ) -> Result<(), SecretKeyPolicyRuntimeError> {
+            Ok(())
+        }
+        fn lookup_dataset_mount_identity(
+            &self,
+            _id: SecretKeyPolicyId128,
+        ) -> Result<Option<(String, u64)>, SecretKeyPolicyRuntimeError> {
             Ok(self.binding.clone())
         }
     }
@@ -1999,12 +2057,8 @@ mod tests {
         let store = MockMountStore {
             binding: Some(("pool/ds1".into(), 5)),
         };
-        let result = validate_dataset_mount_identity_for_handle(
-            &store,
-            SecretKeyPolicyId128::ZERO,
-            None,
-            0,
-        );
+        let result =
+            validate_dataset_mount_identity_for_handle(&store, SecretKeyPolicyId128::ZERO, None, 0);
         assert!(result.is_err());
     }
 
@@ -2020,12 +2074,8 @@ mod tests {
         );
         assert!(result.is_err());
 
-        let result = validate_dataset_mount_identity_for_handle(
-            &store,
-            SecretKeyPolicyId128::ZERO,
-            None,
-            0,
-        );
+        let result =
+            validate_dataset_mount_identity_for_handle(&store, SecretKeyPolicyId128::ZERO, None, 0);
         assert!(result.is_err());
     }
 
@@ -2036,37 +2086,92 @@ mod tests {
         // cause validation to fail closed.
         struct DefaultStore;
         impl HandleStore for DefaultStore {
-            fn lookup_handle(&self, _id: SecretKeyPolicyId128) -> Result<SecretHandleRecord, SecretKeyPolicyRuntimeError> {
+            fn lookup_handle(
+                &self,
+                _id: SecretKeyPolicyId128,
+            ) -> Result<SecretHandleRecord, SecretKeyPolicyRuntimeError> {
                 Ok(SecretHandleRecord::default())
             }
-            fn lookup_envelope(&self, _id: SecretKeyPolicyId128) -> Result<SecretEnvelopeRecord, SecretKeyPolicyRuntimeError> {
+            fn lookup_envelope(
+                &self,
+                _id: SecretKeyPolicyId128,
+            ) -> Result<SecretEnvelopeRecord, SecretKeyPolicyRuntimeError> {
                 Ok(SecretEnvelopeRecord::default())
             }
-            fn lookup_wrapping_key(&self, _id: SecretKeyPolicyId128) -> Result<WrappingKeyRecord, SecretKeyPolicyRuntimeError> {
+            fn lookup_wrapping_key(
+                &self,
+                _id: SecretKeyPolicyId128,
+            ) -> Result<WrappingKeyRecord, SecretKeyPolicyRuntimeError> {
                 Ok(WrappingKeyRecord::default())
             }
-            fn lookup_manifest(&self, _id: SecretKeyPolicyId128) -> Result<PolicyStoreManifestRecord, SecretKeyPolicyRuntimeError> {
+            fn lookup_manifest(
+                &self,
+                _id: SecretKeyPolicyId128,
+            ) -> Result<PolicyStoreManifestRecord, SecretKeyPolicyRuntimeError> {
                 Err(SecretKeyPolicyRuntimeError::ManifestIncompatible {
                     manifest_id: SecretKeyPolicyId128::ZERO,
                     reason: ManifestRefusalReason::MissingRevReferences,
                 })
             }
-            fn lookup_activation(&self, _id: SecretKeyPolicyId128) -> Result<PolicyActivationReceipt, SecretKeyPolicyRuntimeError> {
+            fn lookup_activation(
+                &self,
+                _id: SecretKeyPolicyId128,
+            ) -> Result<PolicyActivationReceipt, SecretKeyPolicyRuntimeError> {
                 Err(SecretKeyPolicyRuntimeError::ActivationPreflightFailed {
                     activation_id: SecretKeyPolicyId128::ZERO,
                     reason: ActivationRefusalReason::MissingHandles,
                 })
             }
-            fn lookup_lease(&self, _id: SecretKeyPolicyId128) -> Result<SecretLeaseGrantRecord, SecretKeyPolicyRuntimeError> {
-                Err(SecretKeyPolicyRuntimeError::LeaseNotFound { lease_id: SecretKeyPolicyId128::ZERO })
+            fn lookup_lease(
+                &self,
+                _id: SecretKeyPolicyId128,
+            ) -> Result<SecretLeaseGrantRecord, SecretKeyPolicyRuntimeError> {
+                Err(SecretKeyPolicyRuntimeError::LeaseNotFound {
+                    lease_id: SecretKeyPolicyId128::ZERO,
+                })
             }
-            fn store_handle(&mut self, _h: &SecretHandleRecord) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-            fn store_envelope(&mut self, _e: &SecretEnvelopeRecord) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-            fn store_manifest(&mut self, _m: &PolicyStoreManifestRecord) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-            fn store_activation(&mut self, _a: &PolicyActivationReceipt) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-            fn store_lease(&mut self, _l: &SecretLeaseGrantRecord) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-            fn store_rotation_plan(&mut self, _p: &SecretRotationPlanRecord) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
-            fn store_revocation(&mut self, _r: &SecretRevocationReceipt) -> Result<(), SecretKeyPolicyRuntimeError> { Ok(()) }
+            fn store_handle(
+                &mut self,
+                _h: &SecretHandleRecord,
+            ) -> Result<(), SecretKeyPolicyRuntimeError> {
+                Ok(())
+            }
+            fn store_envelope(
+                &mut self,
+                _e: &SecretEnvelopeRecord,
+            ) -> Result<(), SecretKeyPolicyRuntimeError> {
+                Ok(())
+            }
+            fn store_manifest(
+                &mut self,
+                _m: &PolicyStoreManifestRecord,
+            ) -> Result<(), SecretKeyPolicyRuntimeError> {
+                Ok(())
+            }
+            fn store_activation(
+                &mut self,
+                _a: &PolicyActivationReceipt,
+            ) -> Result<(), SecretKeyPolicyRuntimeError> {
+                Ok(())
+            }
+            fn store_lease(
+                &mut self,
+                _l: &SecretLeaseGrantRecord,
+            ) -> Result<(), SecretKeyPolicyRuntimeError> {
+                Ok(())
+            }
+            fn store_rotation_plan(
+                &mut self,
+                _p: &SecretRotationPlanRecord,
+            ) -> Result<(), SecretKeyPolicyRuntimeError> {
+                Ok(())
+            }
+            fn store_revocation(
+                &mut self,
+                _r: &SecretRevocationReceipt,
+            ) -> Result<(), SecretKeyPolicyRuntimeError> {
+                Ok(())
+            }
         }
         let store = DefaultStore;
         let result = validate_dataset_mount_identity_for_handle(
