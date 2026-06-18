@@ -69,18 +69,20 @@
 //!
 //! ## Reclaim authority
 //!
-//! The sole mounted-pool segment-freeing authority is
-//! `LocalObjectStore::drain_dead_segments`.  `BackgroundReclaim` and
-//! `ProcessedDelta` in `background_reclaim` are model/test surfaces
-//! quarantined behind `#[cfg(test)]` — they are not release reclaim validation.
+//! The mounted-pool segment-freeing authority is the receipt-bound
+//! dead-object drain in `LocalObjectStore`. `drain_dead_segments()` only
+//! inspects the older B+tree reclaim queue and fails closed without committed
+//! dead-object clearance evidence. `BackgroundReclaim` and `ProcessedDelta` in
+//! `background_reclaim` are model/test surfaces quarantined behind
+//! `#[cfg(test)]` — they are not release reclaim validation.
 //!
 //! The production reclaim chain:
 //! 1. `record_reclaim_delta()` records entries in the local B+tree queue
 //! 2. `tick_background_services()` Duty 2 drains the queue and calls
 //!    `LocalObjectStore::delete()` for each entry
-//! 3. `delete()` feeds the object-store durable reclaim queue
-//! 4. `LocalObjectStore::drain_dead_segments()` drains the object-store
-//!    queue and frees dead segments — this is the sole segment-freer.
+//! 3. `delete()` feeds the object-store legacy reclaim queue
+//! 4. receipt-bound dead-object drains free segments only after committed
+//!    clearance evidence authorizes the object ids.
 //!
 //! The scrub-to-repair scheduling chain:
 //! 1. `BackgroundScrubber` periodically opens a read-only store, runs
@@ -3791,13 +3793,13 @@ impl LocalFileSystem {
     }
 
     /// Drain entries from the local B+tree reclaim queue and hand them off
-    /// to the object-store durable reclaim queue via `store.delete()`.
+    /// to the object-store legacy reclaim queue via `store.delete()`.
     ///
     /// This is the production reclaim handoff: each entry is removed from the
     /// local queue and passed to `LocalObjectStore::delete()`, which removes
-    /// the in-memory object index entry and enqueues a reclaim entry in the
-    /// object-store durable reclaim queue. `LocalObjectStore::drain_dead_segments`
-    /// is the sole segment-freeing authority that processes that queue.
+    /// the in-memory object index entry and enqueues a legacy object-store
+    /// reclaim entry. Physical segment freeing requires receipt-bound
+    /// dead-object clearance evidence.
     ///
     /// Budget: at most 256 entries per call to bound reclaim latency.
     pub fn drain_local_reclaim_queue_into_store(&mut self) -> ReclaimDrainStats {
@@ -4377,9 +4379,8 @@ impl LocalFileSystem {
 
         // --- Duty 2: drain reclaim queue into object-store authority ---
         // Hands off local B+tree reclaim queue entries to the object-store
-        // durable reclaim queue via store.delete().  The object-store queue
-        // is drained by LocalObjectStore::drain_dead_segments, the sole
-        // segment-freeing authority.
+        // legacy reclaim queue via store.delete(). Physical segment freeing is
+        // reserved for receipt-bound dead-object drains.
         let _drain_stats = self.drain_local_reclaim_queue_into_store();
 
         // Process deferred rewrite extent trims: promote old extent keys to
@@ -12329,14 +12330,14 @@ mod orphan_index_integration_tests {
         assert_eq!(dest_attr.size, 2048, "/new size must match old content");
     }
 
-    /// Full end-to-end reclaim chain verification (issue #6166):
+    /// Legacy reclaim queue fail-closed verification:
     /// unlink → local reclaim queue → tick_background_services Duty 2 →
-    /// store.delete() → object-store durable reclaim queue →
-    /// drain_dead_segments() → segments freed.
+    /// store.delete() → object-store legacy reclaim queue →
+    /// drain_dead_segments() leaves physical segments allocated.
     ///
     /// Surviving objects must remain reachable after reopen.
     #[test]
-    fn full_reclaim_chain_unlink_to_drain_dead_segments_reopen_readback() {
+    fn legacy_reclaim_chain_unlink_to_drain_dead_segments_reopen_readback() {
         let root = std::env::temp_dir().join("reclaim_chain_full");
         if root.exists() {
             let _ = std::fs::remove_dir_all(&root);
@@ -12386,23 +12387,22 @@ mod orphan_index_integration_tests {
             "local reclaim queue must be empty after tick_background_services"
         );
 
-        // ---- Phase 4: drain object-store reclaim queue ----
+        // ---- Phase 4: inspect object-store reclaim queue ----
         let drain_stats = fs
             .store
             .raw_primary_store_mut()
             .drain_dead_segments(&tidefs_reclaim::ReclaimConsumerConfig::default())
             .expect("drain_dead_segments");
 
-        assert!(
-            drain_stats.entries_processed > 0,
-            "drain must process reclaim entries from object-store queue; got entries_processed={} reclaim_queue_depth={}",
-            drain_stats.entries_processed,
-            drain_stats.reclaim_queue_depth,
+        assert_eq!(
+            drain_stats.entries_processed, 0,
+            "legacy queue drain must fail closed without receipt-bound clearance"
         );
-        // Physical segment reclamation is opportunistic: if /drop objects
-        // share a segment with live objects (e.g. /keep in the same segment),
-        // the segment stays alive, which is correct behavior.  The reclaim
-        // pipeline is verified by the entries_processed assertion above.
+        assert_eq!(drain_stats.segments_reclaimed, 0);
+        assert!(
+            drain_stats.reclaim_queue_depth > 0,
+            "legacy object-store reclaim queue should remain queued"
+        );
 
         // ---- Phase 5: reopen and verify surviving file ----
         drop(fs);

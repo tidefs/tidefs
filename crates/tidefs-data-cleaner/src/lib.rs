@@ -9,10 +9,10 @@
 //! into the mounted product path (LocalFileSystem, LocalObjectStore, FUSE,
 //! storage-node, or kernel-cutover runtime).
 //!
-//! The live mounted-pool reclaim authority is
-//! `LocalObjectStore::drain_dead_segments` in `tidefs-local-object-store`,
-//! which owns the durable reclaim queue, SegmentLiveCounts, segment
-//! resolution, spacemap checkpointing, and segment-liveness persistence.
+//! Live mounted-pool physical reclaim requires the receipt-bound dead-object
+//! drain in `tidefs-local-object-store`. `LocalObjectStore::drain_dead_segments`
+//! only inspects the older reclaim queue and fails closed without committed
+//! clearance evidence.
 //!
 //! ## Model Architecture
 //!

@@ -105,8 +105,9 @@ Four background services are wired via [`tidefs_background_scheduler`]:
   when fill ratios drop below the configured threshold, using
   [`BPlusTreeReclaimQueue`] from [`tidefs_reclaim_queue_core`].
 - **`BackgroundReclaim`** — model/test surface only (quarantined behind
-  `#[cfg(test)]`); the live mounted-pool reclaim authority is
-  `LocalObjectStore::drain_dead_segments` (see Reclaim Authority below).
+  `#[cfg(test)]`); live mounted-pool physical reclaim requires the
+  receipt-bound dead-object drain in `LocalObjectStore` (see Reclaim
+  Authority below).
 - **`BackgroundOrphanReclamation`** — cleans up orphaned inodes and
   blocks that lost their last reference path.
 - **`WritebackDaemon`** — flushes dirty data from the page cache to
@@ -114,11 +115,12 @@ Four background services are wired via [`tidefs_background_scheduler`]:
 
 ## Reclaim Authority
 
-The sole mounted-pool segment-freeing authority is
-`LocalObjectStore::drain_dead_segments` in `tidefs-local-object-store`.
-There is exactly one production segment-freer; `BackgroundReclaim` and
-`ProcessedDelta` in `background_reclaim.rs` are model/test surfaces
-quarantined behind `#[cfg(test)]` and are not release reclaim validation.
+The mounted-pool segment-freeing authority is the receipt-bound dead-object
+drain in `tidefs-local-object-store`. `LocalObjectStore::drain_dead_segments`
+now inspects the older object-store reclaim queue and fails closed without
+committed receipt evidence. `BackgroundReclaim` and `ProcessedDelta` in
+`background_reclaim.rs` are model/test surfaces quarantined behind
+`#[cfg(test)]` and are not release reclaim validation.
 
 Production reclaim chain:
 
@@ -127,11 +129,10 @@ Production reclaim chain:
 2. `tick_background_services()` Duty 2 — drains the local queue and calls
    `LocalObjectStore::delete()` for each entry.
 3. `LocalObjectStore::delete()` — removes the object from the in-memory
-   index and enqueues a reclaim entry in the object-store durable
-   reclaim queue.
-4. `LocalObjectStore::drain_dead_segments()` — processes the object-store
-   reclaim queue, identifies fully-dead segments, frees them via the pool
-   allocator, and removes segment files — the **sole segment-freeing authority**.
+   index and enqueues a legacy object-store reclaim entry.
+4. Receipt-bound dead-object drain — frees physical segments only after
+   committed deadlist and snapshot-pin clearance evidence authorizes the
+   dead object ids.
 
 ## Dedup
 
