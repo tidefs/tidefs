@@ -1631,8 +1631,8 @@ impl DeviceRemovalDriver {
         operation: &str,
     ) -> Result<(), DeviceRemovalError> {
         let details = match self.placement_receipt_checker.as_ref() {
-            Some(checker) => {
-                match checker.receipts_referencing_extents(&self.state.evacuated_extent_ids) {
+            Some(checker) => match self.placement_receipt_check_extent_ids() {
+                Ok(extent_ids) => match checker.receipts_referencing_extents(&extent_ids) {
                     Ok(refs) if refs.is_empty() => return Ok(()),
                     Ok(refs) => format!(
                         "{} placement receipt(s) still reference the target device",
@@ -1641,8 +1641,9 @@ impl DeviceRemovalDriver {
                     Err(err) => {
                         format!("placement receipt checker failed during {operation}: {err}")
                     }
-                }
-            }
+                },
+                Err(details) => details,
+            },
             None => format!(
                 "placement receipt checker is missing; {operation} requires committed placement receipt verification"
             ),
@@ -1654,6 +1655,36 @@ impl DeviceRemovalDriver {
             details,
         );
         Err(self.transition_to_failed(evidence))
+    }
+
+    fn placement_receipt_check_extent_ids(&self) -> Result<Vec<ExtentId>, String> {
+        if !self.state.evacuated_extent_ids.is_empty() {
+            return Ok(self.state.evacuated_extent_ids.clone());
+        }
+
+        let mut recovered_extent_ids: Vec<ExtentId> = self
+            .state
+            .evacuation_receipt
+            .as_ref()
+            .map(|receipt| {
+                receipt
+                    .placement_receipt_refs
+                    .iter()
+                    .map(|receipt_ref| ExtentId(receipt_ref.object_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        recovered_extent_ids.sort_unstable();
+        recovered_extent_ids.dedup();
+
+        if recovered_extent_ids.is_empty() && self.state.objects_evacuated > 0 {
+            return Err(
+                "evacuated extent identity is missing after replay; placement receipt verification cannot be proven"
+                    .to_string(),
+            );
+        }
+
+        Ok(recovered_extent_ids)
     }
 
     fn transition_to_failed(&mut self, evidence: DeviceRemovalRefusal) -> DeviceRemovalError {
@@ -2068,6 +2099,37 @@ mod tests {
             _extent_ids: &[ExtentId],
         ) -> Result<Vec<PlacementReceiptRef>, DeviceRemovalError> {
             Ok(self.refs.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ExpectingPlacementReceiptChecker {
+        expected_extent_ids: Vec<ExtentId>,
+        refs: Vec<PlacementReceiptRef>,
+    }
+
+    impl PlacementReceiptChecker for ExpectingPlacementReceiptChecker {
+        fn receipts_referencing_extents(
+            &self,
+            extent_ids: &[ExtentId],
+        ) -> Result<Vec<PlacementReceiptRef>, DeviceRemovalError> {
+            assert_eq!(extent_ids, self.expected_extent_ids.as_slice());
+            Ok(self.refs.clone())
+        }
+    }
+
+    fn placement_receipt_ref(object_id: u64) -> PlacementReceiptRef {
+        PlacementReceiptRef {
+            object_id,
+            object_key: [object_id as u8; 32],
+            receipt_epoch: tidefs_membership_epoch::EpochId(0),
+            receipt_generation: object_id.saturating_add(1),
+            redundancy_policy: tidefs_replication_model::ReceiptRedundancyPolicy::Replicated {
+                copies: 2,
+            },
+            payload_len: 0,
+            payload_digest: [0u8; 32],
+            target_count: 0,
         }
     }
 
@@ -3505,6 +3567,98 @@ mod tests {
 
         resumed.mark_removed().unwrap();
         assert_eq!(resumed.state().phase, DeviceRemovalPhase::Removed);
+    }
+
+    #[test]
+    fn replay_uses_receipt_refs_for_placement_check_extent_ids() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config.clone(),
+            vec![DeviceId(0)],
+            1,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver
+            .record_object_evacuated(ExtentId::from(42u64), 4096)
+            .unwrap();
+        driver.mark_evacuated().unwrap();
+
+        let serialized = driver.serialize_state().unwrap();
+        let recovered_state = DeviceRemovalDriver::deserialize_state(&serialized).unwrap();
+        assert!(
+            recovered_state.evacuated_extent_ids.is_empty(),
+            "serialized recovery intentionally drops in-memory extent ids"
+        );
+
+        let mut resumed = DeviceRemovalDriver::resume(
+            Box::new(NoopAllocationFence::new()),
+            recovered_state,
+            config,
+            vec![DeviceId(0)],
+        );
+        resumed.record_evacuation_receipt(vec![placement_receipt_ref(42)], 7);
+        resumed.set_placement_receipt_checker(Box::new(ExpectingPlacementReceiptChecker {
+            expected_extent_ids: vec![ExtentId::from(42u64)],
+            refs: vec![],
+        }));
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+        resumed.commit_vacated(updated).unwrap();
+        assert_eq!(resumed.state().phase, DeviceRemovalPhase::Vacated);
+    }
+
+    #[test]
+    fn replay_rejects_missing_checkable_extent_identity() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config.clone(),
+            vec![DeviceId(0)],
+            1,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver
+            .record_object_evacuated(ExtentId::from(42u64), 4096)
+            .unwrap();
+        driver.mark_evacuated().unwrap();
+
+        let serialized = driver.serialize_state().unwrap();
+        let recovered_state = DeviceRemovalDriver::deserialize_state(&serialized).unwrap();
+        let mut resumed = DeviceRemovalDriver::resume(
+            Box::new(NoopAllocationFence::new()),
+            recovered_state,
+            config,
+            vec![DeviceId(0)],
+        );
+        resumed.record_evacuation_receipt(vec![], 7);
+        attach_empty_receipt_checker(&mut resumed);
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+        let err = resumed.commit_vacated(updated).unwrap_err();
+        let evidence = assert_refusal_class(
+            err,
+            DeviceRemovalRefusalClass::PlacementReceiptsStillReferenceDevice,
+        );
+        assert!(
+            evidence
+                .details
+                .contains("evacuated extent identity is missing after replay"),
+            "details must mention missing replay extent identity"
+        );
+        assert_eq!(resumed.state().phase, DeviceRemovalPhase::Failed);
     }
     // ── Evacuation receipt gating tests ─────────────────────────────
 
